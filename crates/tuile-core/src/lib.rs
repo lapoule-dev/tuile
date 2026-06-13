@@ -23,11 +23,13 @@
 //! - [`protocol`] — the streaming protocol trait and in-process binding
 //! - [`runtime`] — the geometry server driving it all
 //! - [`tiles3d`] — the 3D Tiles binding of the source seam (tree + loader)
+//! - [`drive`] — render-agnostic consumer driving (progressive + bulk)
 //! - [`fetch`] — abstract byte source ([`fetch::FsFetcher`], `HttpFetcher`)
 //! - [`cache`] — resident-content LRU under a byte budget
 
 pub mod cache;
 pub mod content;
+pub mod drive;
 pub mod fetch;
 pub mod geo;
 pub mod implicit;
@@ -41,6 +43,7 @@ pub mod tileset;
 pub mod traversal;
 
 pub use content::{ContentFormat, DecodedTileContent, TileContent};
+pub use drive::{drive_until_complete, BulkFrame, SceneState};
 pub use protocol::{ClientMessage, GeometryStream, InProcessStream, ServerMessage};
 pub use runtime::{in_process, in_process_with, GeometryServer};
 pub use source::{
