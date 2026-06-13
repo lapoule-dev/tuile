@@ -1,0 +1,23 @@
+[package]
+name = "wgpu-viewer"
+description = "Demo viewer for tuile: winit + tuile-wgpu"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+glam = "0.33.1"
+pollster = "0.4.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
+tuile-core = { version = "0.0.1", path = "../../crates/tuile-core", features = ["http"] }
+tuile-wgpu = { version = "0.0.1", path = "../../crates/tuile-wgpu" }
+wgpu = "29.0.3"
+winit = "0.30.13"
