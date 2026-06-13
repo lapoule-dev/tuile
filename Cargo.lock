@@ -2766,6 +2766,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuile-bing"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-executor",
+ "image",
+ "serde",
+ "serde_json",
+ "tuile-core",
+ "url",
+]
+
+[[package]]
 name = "tuile-cesium-ion"
 version = "0.0.1"
 dependencies = [
