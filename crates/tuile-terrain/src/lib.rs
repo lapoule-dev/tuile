@@ -19,9 +19,11 @@
 //! `layer.json` availability) lives in the source/connector layer.
 
 pub mod decode;
+pub mod layer;
 pub mod mesh;
 pub mod tiling;
 
 pub use decode::{decode, DecodeError, Header, QuantizedMesh};
+pub use layer::{LayerError, LayerJson};
 pub use mesh::{surface_uvs, to_decoded};
 pub use tiling::{level_geometric_error, GeoRect, GeographicTilingScheme, TileCoord};

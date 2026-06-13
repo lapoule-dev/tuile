@@ -2774,7 +2774,10 @@ dependencies = [
 name = "tuile-terrain"
 version = "0.0.1"
 dependencies = [
+ "flate2",
  "glam",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tuile-core",
 ]

@@ -30,6 +30,8 @@ pub enum DecodeError {
     Truncated(&'static str),
     #[error("index {idx} out of range (vertex_count {count})")]
     BadIndex { idx: u32, count: u32 },
+    #[error("gzip: {0}")]
+    Gzip(String),
 }
 
 /// Header of a quantized-mesh tile (88 bytes).
@@ -125,8 +127,22 @@ fn zigzag(value: u16) -> i32 {
     (v >> 1) ^ (-(v & 1))
 }
 
-/// Decodes a quantized-mesh tile. `bytes` must already be un-gzipped.
+/// Decodes a quantized-mesh tile. Transparently gunzips the input when it
+/// is gzip-framed (`.terrain` tiles are gzip on the wire; a transport that
+/// already decoded Content-Encoding passes raw bytes — both work).
 pub fn decode(bytes: &[u8]) -> Result<QuantizedMesh, DecodeError> {
+    let owned;
+    let bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(bytes)
+            .read_to_end(&mut out)
+            .map_err(|e| DecodeError::Gzip(e.to_string()))?;
+        owned = out;
+        owned.as_slice()
+    } else {
+        bytes
+    };
     let mut r = Reader::new(bytes);
 
     let header = Header {
@@ -468,5 +484,27 @@ mod tests {
     #[test]
     fn truncated_is_a_typed_error() {
         assert!(matches!(decode(&[0u8; 10]), Err(DecodeError::Truncated(_))));
+    }
+
+    #[test]
+    fn decodes_gzip_framed_input() {
+        use std::io::Write;
+        let u = vec![0.0, 1.0, 0.0, 1.0];
+        let v = vec![0.0, 0.0, 1.0, 1.0];
+        let height = vec![0.0, 0.0, 0.0, 0.0];
+        let indices = vec![0u32, 1, 2, 2, 1, 3];
+        let edges = [vec![0u32, 2], vec![0u32, 1], vec![1u32, 3], vec![2u32, 3]];
+        let raw = encode(&test_header(), &u, &v, &height, &indices, None, &edges);
+
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&raw).expect("gzip");
+        let gzipped = gz.finish().expect("finish");
+        assert_eq!(&gzipped[0..2], &[0x1f, 0x8b], "gzip framed");
+
+        // decode() must transparently gunzip and match the raw decode.
+        let from_gz = decode(&gzipped).expect("decode gzip");
+        let from_raw = decode(&raw).expect("decode raw");
+        assert_eq!(from_gz.vertex_count(), from_raw.vertex_count());
+        assert_eq!(from_gz.indices, from_raw.indices);
     }
 }
