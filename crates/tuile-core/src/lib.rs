@@ -41,6 +41,8 @@ pub mod traversal;
 pub use content::{ContentFormat, DecodedTileContent, TileContent};
 pub use protocol::{ClientMessage, GeometryStream, InProcessStream, ServerMessage};
 pub use runtime::{in_process, GeometryServer};
-pub use source::{TileId, TileProperties, TileTree};
+pub use source::{
+    CompositeLoader, CompositeTileTree, LoadError, TileId, TileLoader, TileProperties, TileTree,
+};
 pub use tileset::Tileset;
 pub use traversal::{Config, ViewState};
