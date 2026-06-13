@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tuile-b3dm",
+    "crates/tuile-cesium-ion",
+    "crates/tuile-core",
+    "crates/tuile-terrain",
+    "crates/tuile-wgpu",
+    "examples/wgpu-viewer",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+authors = ["lapoule.dev"]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+panic = "warn"
+
+[profile.release]
+lto = "thin"
+strip = true

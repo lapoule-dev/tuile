@@ -1,0 +1,10 @@
+Tuile
+Copyright (c) lapoule.dev
+
+This product is an independent implementation of the OGC 3D Tiles
+Community Standard (https://www.ogc.org/standard/3dtiles/).
+
+No third-party code has been ported into this repository.
+Algorithmic inspiration from open-source Apache-2.0 implementations of the
+standard creates no attribution obligation; any literal porting, should it
+ever occur, will be recorded here.
