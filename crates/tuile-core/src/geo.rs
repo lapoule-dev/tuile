@@ -7,6 +7,7 @@
 
 use crate::math::Obb;
 use glam::{DMat3, DVec3};
+use std::f64::consts::{FRAC_PI_2, PI};
 
 /// WGS84 semi-major axis (meters).
 pub const WGS84_A: f64 = 6_378_137.0;
@@ -82,46 +83,191 @@ pub fn enu_frame(g: Geodetic) -> DMat3 {
 }
 
 /// 3D Tiles `boundingVolume.region`: west, south, east, north (radians),
-/// min height, max height (meters).
+/// min height, max height (meters). Converts to an ECEF [`Obb`].
 ///
-/// Converts to an ECEF [`Obb`] that encloses the region. The fit samples
-/// the region boundary and is conservative for the moderate extents found
-/// in real tilesets (the v1 approximation documented in the primer).
+/// Thin wrapper over [`obb_from_rectangle`] taking the packed 6-float layout.
 pub fn region_to_obb(region: &[f64; 6]) -> Obb {
-    let [west, south, east, north, min_h, max_h] = *region;
-    let mid = Geodetic {
-        lon: (west + east) / 2.0,
-        lat: (south + north) / 2.0,
-        height: (min_h + max_h) / 2.0,
-    };
-    let frame = enu_frame(mid);
-    let origin = geodetic_to_ecef(mid);
+    obb_from_rectangle(
+        region[0], region[1], region[2], region[3], region[4], region[5],
+    )
+}
 
-    // Sample boundary points (corners + edge midpoints, both heights) and
-    // fit an axis-aligned box in the local ENU frame.
-    let lons = [west, mid.lon, east];
-    let lats = [south, mid.lat, north];
-    let mut min = DVec3::splat(f64::INFINITY);
-    let mut max = DVec3::splat(f64::NEG_INFINITY);
-    for &lon in &lons {
-        for &lat in &lats {
-            for &height in &[min_h, max_h] {
-                let p = geodetic_to_ecef(Geodetic { lon, lat, height });
-                let local = frame.transpose() * (p - origin);
-                min = min.min(local);
-                max = max.max(local);
-            }
-        }
+/// An oriented bounding box enclosing a geographic rectangle (radians) on the
+/// WGS84 ellipsoid, extruded by `min_height`..`max_height` (meters).
+///
+/// Reimplementation of `OrientedBoundingBox.fromRectangle` (Cesium, modelled
+/// — not ported): a tangent-plane fit for rectangles up to π wide, and a
+/// distinct equator-oriented construction beyond π (hemispheres and larger),
+/// so the box stays tight and correctly centered at every level — from a
+/// street tile to a whole hemisphere.
+pub fn obb_from_rectangle(
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+    min_height: f64,
+    max_height: f64,
+) -> Obb {
+    let width = east - west;
+
+    if width <= PI {
+        // Tangent plane at the rectangle center; axes = east/north/up there.
+        let lon_center = (west + east) / 2.0;
+        let lat_mid = (south + north) / 2.0;
+        let origin = geodetic_to_ecef(Geodetic {
+            lon: lon_center,
+            lat: lat_mid,
+            height: 0.0,
+        });
+        let frame = enu_frame(Geodetic {
+            lon: lon_center,
+            lat: lat_mid,
+            height: 0.0,
+        });
+        let (east_ax, north_ax, up_ax) = (frame.col(0), frame.col(1), frame.col(2));
+
+        // The equator sticks out farthest; align CW to it when straddling.
+        let lat_center = if south < 0.0 && north > 0.0 {
+            0.0
+        } else {
+            lat_mid
+        };
+        let at = |lon: f64, lat: f64, h: f64| {
+            geodetic_to_ecef(Geodetic {
+                lon,
+                lat,
+                height: h,
+            })
+        };
+        // Projected (x, y) of a point onto the tangent plane.
+        let proj = |p: DVec3| ((p - origin).dot(east_ax), (p - origin).dot(north_ax));
+
+        let (_, nc_y) = proj(at(lon_center, north, max_height));
+        let (nw_x, nw_y) = proj(at(west, north, max_height));
+        let (cw_x, _) = proj(at(west, lat_center, max_height));
+        let (sw_x, sw_y) = proj(at(west, south, max_height));
+        let (_, sc_y) = proj(at(lon_center, south, max_height));
+
+        let min_x = nw_x.min(cw_x).min(sw_x);
+        let max_x = -min_x; // symmetrical
+        let max_y = nw_y.max(nc_y);
+        let min_y = sw_y.min(sc_y);
+
+        // Min Z from the corners at min_height (they dip below the plane).
+        let plane_dist = |p: DVec3| (p - origin).dot(up_ax);
+        let min_z =
+            plane_dist(at(west, north, min_height)).min(plane_dist(at(west, south, min_height)));
+        let max_z = max_height; // plane touches the surface at height 0
+
+        return from_plane_extents(
+            origin, east_ax, north_ax, up_ax, min_x, max_x, min_y, max_y, min_z, max_z,
+        );
     }
-    let half = (max - min) / 2.0;
-    let center_local = (max + min) / 2.0;
+
+    // width > π: a plane at the center longitude and the latitude nearest the
+    // equator, rotating around Z — a better fit than a center-normal box.
+    let fully_above = south > 0.0;
+    let fully_below = north < 0.0;
+    let lat_nearest = if fully_above {
+        south
+    } else if fully_below {
+        north
+    } else {
+        0.0
+    };
+    let center_lon = (west + east) / 2.0;
+
+    let mut plane_origin = geodetic_to_ecef(Geodetic {
+        lon: center_lon,
+        lat: lat_nearest,
+        height: max_height,
+    });
+    plane_origin.z = 0.0; // center on the equatorial plane
+    let is_pole = plane_origin.x.abs() < 1e-10 && plane_origin.y.abs() < 1e-10;
+    let plane_normal = if is_pole {
+        DVec3::X
+    } else {
+        plane_origin.normalize()
+    };
+    let plane_y = DVec3::Z;
+    let plane_x = plane_normal.cross(plane_y);
+
+    let at = |lon: f64, lat: f64, h: f64| {
+        geodetic_to_ecef(Geodetic {
+            lon,
+            lat,
+            height: h,
+        })
+    };
+    // Orthogonal projection onto the plane (point − (signed dist)·normal).
+    let signed_dist = |p: DVec3| (p - plane_origin).dot(plane_normal);
+    let project_onto = |p: DVec3| p - signed_dist(p) * plane_normal;
+
+    let horizon = at(center_lon + FRAC_PI_2, lat_nearest, max_height);
+    let max_x = (project_onto(horizon) - plane_origin).dot(plane_x);
+    let min_x = -max_x;
+
+    let max_y = at(
+        0.0,
+        north,
+        if fully_below { min_height } else { max_height },
+    )
+    .z;
+    let min_y = at(
+        0.0,
+        south,
+        if fully_above { min_height } else { max_height },
+    )
+    .z;
+
+    let far = at(east, lat_nearest, max_height);
+    let min_z = signed_dist(far);
+    let max_z = 0.0;
+
+    from_plane_extents(
+        plane_origin,
+        plane_x,
+        plane_y,
+        plane_normal,
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+        min_z,
+        max_z,
+    )
+}
+
+/// Builds an [`Obb`] from a plane origin, three orthonormal axes, and the
+/// box extents along each (Cesium `fromPlaneExtents`).
+#[allow(clippy::too_many_arguments)]
+fn from_plane_extents(
+    origin: DVec3,
+    x_axis: DVec3,
+    y_axis: DVec3,
+    z_axis: DVec3,
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
+    min_z: f64,
+    max_z: f64,
+) -> Obb {
+    let center_offset = DVec3::new(
+        (min_x + max_x) / 2.0,
+        (min_y + max_y) / 2.0,
+        (min_z + max_z) / 2.0,
+    );
+    let scale = DVec3::new(
+        (max_x - min_x) / 2.0,
+        (max_y - min_y) / 2.0,
+        (max_z - min_z) / 2.0,
+    );
+    let center =
+        origin + x_axis * center_offset.x + y_axis * center_offset.y + z_axis * center_offset.z;
     Obb {
-        center: origin + frame * center_local,
-        half_axes: DMat3::from_cols(
-            frame.col(0) * half.x,
-            frame.col(1) * half.y,
-            frame.col(2) * half.z,
-        ),
+        center,
+        half_axes: DMat3::from_cols(x_axis * scale.x, y_axis * scale.y, z_axis * scale.z),
     }
 }
 
@@ -220,10 +366,49 @@ mod tests {
                         height,
                     };
                     let d = obb.distance_to_point(geodetic_to_ecef(g));
-                    // Tolerate a small margin: the fit is sample-based.
-                    assert!(d < 5.0, "sample {g:?} outside obb by {d} m");
+                    assert!(d < 1.0, "sample {g:?} outside obb by {d} m");
                 }
             }
         }
+    }
+
+    /// Containment must hold at ALL scales — including a hemisphere and the
+    /// whole ellipsoid (the case `region_to_obb`'s old sampling fit broke on).
+    #[test]
+    fn obb_encloses_large_rectangles() {
+        let cases: [[f64; 6]; 3] = [
+            // Western hemisphere (width = π), pole to pole.
+            [-PI, -FRAC_PI_2, 0.0, FRAC_PI_2, 0.0, 0.0],
+            // Three-quarters around, mid latitudes (width = 1.5π > π branch).
+            [-PI, -0.5, PI / 2.0, 0.5, 0.0, 1000.0],
+            // The entire ellipsoid (width = 2π, height = π).
+            [-PI, -FRAC_PI_2, PI, FRAC_PI_2, -500.0, 9000.0],
+        ];
+        for region in cases {
+            let obb = region_to_obb(&region);
+            let [w, s, e, n, min_h, max_h] = region;
+            // Dense surface samples of the rectangle must all sit inside.
+            for i in 0..=6 {
+                for j in 0..=6 {
+                    for &h in &[min_h, max_h] {
+                        let g = Geodetic {
+                            lon: w + (e - w) * i as f64 / 6.0,
+                            lat: s + (n - s) * j as f64 / 6.0,
+                            height: h,
+                        };
+                        let d = obb.distance_to_point(geodetic_to_ecef(g));
+                        assert!(d < 1.0, "region {region:?}: sample outside obb by {d} m");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn whole_ellipsoid_obb_is_centered_at_origin() {
+        // Cesium's "spans over half the ellipsoid" test: full globe → center
+        // at the geocenter.
+        let obb = region_to_obb(&[-PI, -FRAC_PI_2, PI, FRAC_PI_2, 0.0, 0.0]);
+        assert!(obb.center.length() < 1.0, "center {:?}", obb.center);
     }
 }
