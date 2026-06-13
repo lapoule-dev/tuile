@@ -1,0 +1,15 @@
+[package]
+name = "tuile-b3dm"
+description = "Batched 3D Model (b3dm) codec: parse and encode the legacy 3D Tiles 1.0 container"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = "1"
+thiserror = "2"
