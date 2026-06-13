@@ -1,0 +1,19 @@
+[package]
+name = "tuile-terrain"
+description = "Quantized-mesh terrain decoding and geographic tiling for tuile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+glam = "0.33"
+thiserror = "2"
+tuile-core = { version = "0.0.1", path = "../tuile-core" }
+
+[dev-dependencies]
+glam = "0.33"
