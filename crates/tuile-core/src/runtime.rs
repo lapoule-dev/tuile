@@ -14,15 +14,15 @@
 //! fetches through `FuturesUnordered`; the caller decides where it runs.
 
 use crate::cache::ResidentCache;
-use crate::content::{self, ContentHints, TileContent};
-use crate::fetch::{FetchError, TileFetcher};
+use crate::content::TileContent;
+use crate::fetch::TileFetcher;
 use crate::protocol::{
     in_process_pair, ClientMessage, InProcessStream, ServerEndpoint, ServerMessage,
 };
-use crate::source::TileId;
-use crate::tileset::{ContentKind, Tileset};
+use crate::source::{LoadError, Loaded, TileId, TileLoader, TileTree};
+use crate::tiles3d::{TilesetLoader, TilesetTree};
+use crate::tileset::Tileset;
 use crate::traversal::{traverse, Config, ResidencyView, TraversalOutput, ViewState};
-use bytes::Bytes;
 use futures_channel::mpsc::UnboundedSender;
 use futures_core::Stream;
 use futures_util::future::{poll_fn, AbortHandle, Abortable, Aborted};
@@ -30,13 +30,15 @@ use futures_util::stream::FuturesUnordered;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::Poll;
 
-type FetchMsg = (TileId, ContentKind, url::Url, Result<Bytes, FetchError>);
-type FetchFuture = Abortable<Pin<Box<dyn Future<Output = FetchMsg> + Send>>>;
+type LoadMsg = (TileId, Result<Loaded, LoadError>);
+type LoadFuture = Abortable<Pin<Box<dyn Future<Output = LoadMsg> + Send>>>;
 
-/// Creates a geometry server bound in-process to one consumer.
+/// Creates a geometry server for a **3D Tiles** tileset, bound in-process to
+/// one consumer. Convenience over [`in_process_with`]: it wraps the tileset in
+/// a shared arena and builds the [`TilesetTree`]/[`TilesetLoader`] pair.
 ///
 /// Drive [`GeometryServer::run`] on whatever executor fits your host
 /// (a tokio task, a wasm spawn_local, `futures_executor` in tests) and hand
@@ -45,14 +47,29 @@ pub fn in_process<F: TileFetcher + 'static>(
     tileset: Tileset,
     fetcher: Arc<F>,
     config: Config,
-) -> (InProcessStream, GeometryServer<F>) {
+) -> (InProcessStream, GeometryServer) {
+    let arena = Arc::new(RwLock::new(tileset));
+    let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
+    let loader: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, fetcher));
+    in_process_with(tree, loader, config)
+}
+
+/// Creates a geometry server over **any** tile source: a [`TileTree`] for the
+/// traversal and a [`TileLoader`] for async content. This is the seam the
+/// globe (terrain × imagery) and compositions plug into — the server knows
+/// neither glb nor terrain nor grafting.
+pub fn in_process_with(
+    tree: Box<dyn TileTree>,
+    loader: Arc<dyn TileLoader>,
+    config: Config,
+) -> (InProcessStream, GeometryServer) {
     let (client, endpoint) = in_process_pair();
     let cache = ResidentCache::new(config.resident_budget_bytes);
     (
         client,
         GeometryServer {
-            tileset,
-            fetcher,
+            tree,
+            loader,
             config,
             endpoint,
             cache,
@@ -67,11 +84,11 @@ pub fn in_process<F: TileFetcher + 'static>(
     )
 }
 
-/// One streaming session: owns the tile arena, residency and in-flight
+/// One streaming session: owns the tile tree, loader, residency and in-flight
 /// state for one consumer. N sessions = N servers sharing nothing mutable.
-pub struct GeometryServer<F: TileFetcher> {
-    tileset: Tileset,
-    fetcher: Arc<F>,
+pub struct GeometryServer {
+    tree: Box<dyn TileTree>,
+    loader: Arc<dyn TileLoader>,
     config: Config,
     endpoint: ServerEndpoint,
     cache: ResidentCache,
@@ -84,15 +101,15 @@ pub struct GeometryServer<F: TileFetcher> {
     frame: u64,
 }
 
-impl<F: TileFetcher + 'static> GeometryServer<F> {
+impl GeometryServer {
     /// Runs the session until the consumer goes away.
     pub async fn run(mut self) {
         let mut rx = self.endpoint.rx;
         let tx = self.endpoint.tx.clone();
-        let mut fetches: FuturesUnordered<FetchFuture> = FuturesUnordered::new();
+        let mut loads: FuturesUnordered<LoadFuture> = FuturesUnordered::new();
         let mut session = Session {
-            tileset: &mut self.tileset,
-            fetcher: &self.fetcher,
+            tree: self.tree.as_ref(),
+            loader: &self.loader,
             config: &self.config,
             cache: &mut self.cache,
             residency: &mut self.residency,
@@ -105,16 +122,16 @@ impl<F: TileFetcher + 'static> GeometryServer<F> {
         };
 
         enum Event {
-            Fetch(Result<FetchMsg, Aborted>),
+            Load(Result<LoadMsg, Aborted>),
             Client(ClientMessage),
             Closed,
         }
 
         loop {
-            // Fetch completions first (biased), then client messages.
+            // Load completions first (biased), then client messages.
             let event = poll_fn(|cx| {
-                if let Poll::Ready(Some(done)) = Pin::new(&mut fetches).poll_next(cx) {
-                    return Poll::Ready(Event::Fetch(done));
+                if let Poll::Ready(Some(done)) = Pin::new(&mut loads).poll_next(cx) {
+                    return Poll::Ready(Event::Load(done));
                 }
                 match Pin::new(&mut rx).poll_next(cx) {
                     Poll::Ready(Some(msg)) => Poll::Ready(Event::Client(msg)),
@@ -125,13 +142,13 @@ impl<F: TileFetcher + 'static> GeometryServer<F> {
             .await;
 
             match event {
-                Event::Fetch(Ok(msg)) => {
-                    if session.on_fetch_done(msg, &tx, &mut fetches).is_err() {
+                Event::Load(Ok(msg)) => {
+                    if session.on_load_done(msg, &tx, &mut loads).is_err() {
                         break; // consumer dropped
                     }
                 }
-                // Cancelled fetch: cleaned up at abort time.
-                Event::Fetch(Err(Aborted)) => {}
+                // Cancelled load: cleaned up at abort time.
+                Event::Load(Err(Aborted)) => {}
                 Event::Client(first) => {
                     let mut dirty = session.on_client(first);
                     // Coalesce bursts: drain whatever is already queued so a
@@ -139,7 +156,7 @@ impl<F: TileFetcher + 'static> GeometryServer<F> {
                     while let Ok(more) = rx.try_recv() {
                         dirty |= session.on_client(more);
                     }
-                    if dirty && session.retraverse(&tx, &mut fetches).is_err() {
+                    if dirty && session.retraverse(&tx, &mut loads).is_err() {
                         break;
                     }
                 }
@@ -150,9 +167,9 @@ impl<F: TileFetcher + 'static> GeometryServer<F> {
 }
 
 /// Borrowed view of the server state for the message handlers.
-struct Session<'a, F: TileFetcher> {
-    tileset: &'a mut Tileset,
-    fetcher: &'a Arc<F>,
+struct Session<'a> {
+    tree: &'a dyn TileTree,
+    loader: &'a Arc<dyn TileLoader>,
     config: &'a Config,
     cache: &'a mut ResidentCache,
     residency: &'a mut ResidencyView,
@@ -167,7 +184,7 @@ struct Session<'a, F: TileFetcher> {
 /// Consumer went away; unwind the run loop.
 struct Gone;
 
-impl<F: TileFetcher + 'static> Session<'_, F> {
+impl Session<'_> {
     /// Returns true when a re-traversal is needed.
     fn on_client(&mut self, msg: ClientMessage) -> bool {
         match msg {
@@ -188,17 +205,26 @@ impl<F: TileFetcher + 'static> Session<'_, F> {
     fn retraverse(
         &mut self,
         tx: &UnboundedSender<ServerMessage>,
-        fetches: &mut FuturesUnordered<FetchFuture>,
+        loads: &mut FuturesUnordered<LoadFuture>,
     ) -> Result<(), Gone> {
         *self.frame += 1;
         traverse(
-            self.tileset,
+            self.tree,
             self.residency,
             self.views,
             self.config,
             *self.frame,
             self.out,
         );
+
+        // Drop tiles we've given up on from the request set, so the reported
+        // request count converges to zero (a failed REPLACE child stays
+        // requested forever otherwise) — what lets bulk drivers terminate.
+        if !self.failed.is_empty() {
+            let failed = &*self.failed;
+            self.out.requests.retain(|r| !failed.contains(&r.tile));
+            self.out.stats.requested = self.out.requests.len() as u32;
+        }
 
         self.selected.clear();
         for (t, _) in &self.out.selected {
@@ -211,7 +237,7 @@ impl<F: TileFetcher + 'static> Session<'_, F> {
         })
         .map_err(|_| Gone)?;
 
-        // Cancel in-flight fetches that fell out of the request set.
+        // Cancel in-flight loads that fell out of the request set.
         let wanted: HashSet<TileId> = self.out.requests.iter().map(|r| r.tile).collect();
         let stale: Vec<TileId> = self
             .in_flight
@@ -225,7 +251,9 @@ impl<F: TileFetcher + 'static> Session<'_, F> {
             }
         }
 
-        // Spawn new fetches, highest priority first, within the cap.
+        // Spawn new loads, highest priority first, within the cap. The
+        // traversal only requests tiles that have content, so the loader is
+        // never asked to load a structural-empty tile.
         for req in &self.out.requests {
             if self.in_flight.len() >= self.config.maximum_simultaneous_fetches {
                 break;
@@ -237,57 +265,32 @@ impl<F: TileFetcher + 'static> Session<'_, F> {
             {
                 continue;
             }
-            let Some(content) = self.tileset.tile(tile).content.clone() else {
-                continue;
-            };
-            let fetcher = Arc::clone(self.fetcher);
-            let url = content.url.clone();
+            let loader = Arc::clone(self.loader);
             let (handle, registration) = AbortHandle::new_pair();
-            let fut: Pin<Box<dyn Future<Output = FetchMsg> + Send>> = Box::pin(async move {
-                let result = fetcher.fetch(&url).await;
-                (tile, content.kind, url, result)
+            let fut: Pin<Box<dyn Future<Output = LoadMsg> + Send>> = Box::pin(async move {
+                let result = loader.load(tile).await;
+                (tile, result)
             });
-            fetches.push(Abortable::new(fut, registration));
+            loads.push(Abortable::new(fut, registration));
             self.in_flight.insert(tile, handle);
         }
         Ok(())
     }
 
-    fn on_fetch_done(
+    fn on_load_done(
         &mut self,
-        (tile, kind, url, result): FetchMsg,
+        (tile, result): LoadMsg,
         tx: &UnboundedSender<ServerMessage>,
-        fetches: &mut FuturesUnordered<FetchFuture>,
+        loads: &mut FuturesUnordered<LoadFuture>,
     ) -> Result<(), Gone> {
         self.in_flight.remove(&tile);
-        let bytes = match result {
-            Ok(b) => b,
-            Err(e) => return self.fail(tile, e.to_string(), tx, fetches),
-        };
-        match kind {
-            ContentKind::ExternalTileset => {
-                let json = match serde_json::from_slice(&bytes) {
-                    Ok(j) => j,
-                    Err(e) => return self.fail(tile, e.to_string(), tx, fetches),
-                };
-                if let Err(e) = self.tileset.graft(tile, json, &url) {
-                    return self.fail(tile, e.to_string(), tx, fetches);
-                }
-                self.retraverse(tx, fetches)
-            }
-            ContentKind::Binary => {
-                let t = self.tileset.tile(tile);
-                let hints = ContentHints {
-                    world_transform: t.world_transform,
-                    origin_ecef: t.bounding_volume.center(),
-                };
-                // Blocking decode, off any render thread by construction
-                // (run() lives on its own task). Finer scheduling
-                // (spawn_blocking / workers) is the host's M2 refinement.
-                let decoded = match content::decode(&bytes, &hints) {
-                    Ok(d) => d,
-                    Err(e) => return self.fail(tile, e.to_string(), tx, fetches),
-                };
+        match result {
+            Err(e) => self.fail(tile, e.to_string(), tx, loads),
+            // Topology grew in place (external tileset grafted): the graft
+            // cleared the host's content, so the next traversal won't
+            // re-request it; the revealed children load on their own.
+            Ok(Loaded::Expanded) => self.retraverse(tx, loads),
+            Ok(Loaded::Content(decoded)) => {
                 let size = decoded.byte_size();
                 let evicted = self.cache.insert(tile, size, self.selected);
                 for e in &evicted {
@@ -303,7 +306,7 @@ impl<F: TileFetcher + 'static> Session<'_, F> {
                     content: TileContent::Decoded(decoded),
                 })
                 .map_err(|_| Gone)?;
-                self.retraverse(tx, fetches)
+                self.retraverse(tx, loads)
             }
         }
     }
@@ -313,7 +316,7 @@ impl<F: TileFetcher + 'static> Session<'_, F> {
         tile: TileId,
         message: String,
         tx: &UnboundedSender<ServerMessage>,
-        fetches: &mut FuturesUnordered<FetchFuture>,
+        loads: &mut FuturesUnordered<LoadFuture>,
     ) -> Result<(), Gone> {
         self.failed.insert(tile);
         tx.unbounded_send(ServerMessage::Error {
@@ -322,7 +325,7 @@ impl<F: TileFetcher + 'static> Session<'_, F> {
         })
         .map_err(|_| Gone)?;
         // A failed tile may have been holding a REPLACE: re-evaluate.
-        self.retraverse(tx, fetches)
+        self.retraverse(tx, loads)
     }
 }
 

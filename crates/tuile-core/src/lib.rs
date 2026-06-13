@@ -22,6 +22,7 @@
 //! - [`traversal`] — pure SSE selection, multi-view
 //! - [`protocol`] — the streaming protocol trait and in-process binding
 //! - [`runtime`] — the geometry server driving it all
+//! - [`tiles3d`] — the 3D Tiles binding of the source seam (tree + loader)
 //! - [`fetch`] — abstract byte source ([`fetch::FsFetcher`], `HttpFetcher`)
 //! - [`cache`] — resident-content LRU under a byte budget
 
@@ -35,14 +36,17 @@ pub mod protocol;
 pub mod raster;
 pub mod runtime;
 pub mod source;
+pub mod tiles3d;
 pub mod tileset;
 pub mod traversal;
 
 pub use content::{ContentFormat, DecodedTileContent, TileContent};
 pub use protocol::{ClientMessage, GeometryStream, InProcessStream, ServerMessage};
-pub use runtime::{in_process, GeometryServer};
+pub use runtime::{in_process, in_process_with, GeometryServer};
 pub use source::{
-    CompositeLoader, CompositeTileTree, LoadError, TileId, TileLoader, TileProperties, TileTree,
+    CompositeLoader, CompositeTileTree, LoadError, Loaded, TileId, TileLoader, TileProperties,
+    TileTree,
 };
+pub use tiles3d::{SharedTileset, TilesetLoader, TilesetTree};
 pub use tileset::Tileset;
 pub use traversal::{Config, ViewState};
