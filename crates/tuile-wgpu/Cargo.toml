@@ -1,0 +1,28 @@
+[package]
+name = "tuile-wgpu"
+description = "Reference wgpu render backend for tuile-core (native + wasm)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+glam = "0.33"
+thiserror = "2"
+tuile-core = { version = "0.0.1", path = "../tuile-core" }
+wgpu = "29"
+
+[dev-dependencies]
+futures-executor = "0.3.32"
+futures-util = "0.3"
+glam = "0.33"
+image = { version = "0.25", default-features = false, features = ["png"] }
+pollster = "0.4"
+tuile-core = { path = "../tuile-core" }
+url = "2.5.8"
