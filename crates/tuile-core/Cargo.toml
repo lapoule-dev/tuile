@@ -1,0 +1,39 @@
+[package]
+name = "tuile-core"
+description = "Render-agnostic OGC 3D Tiles engine: parsing, SSE traversal, content decoding, geometry streaming"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+bytes = "1.11.1"
+futures-channel = "0.3.32"
+futures-core = "0.3.32"
+futures-util = { version = "0.3.32", default-features = false, features = ["std", "alloc", "async-await"] }
+glam = { version = "0.33.1", features = ["serde"] }
+gltf = "1.4.1"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+tracing = { version = "0.1.44", optional = true }
+tuile-b3dm = { version = "0.0.1", path = "../tuile-b3dm" }
+url = "2.5.8"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "http2"] }
+
+[dev-dependencies]
+futures-executor = "0.3.32"
+tempfile = "3"
+
+[features]
+default = []
+http = ["dep:reqwest"]
+tracing = ["dep:tracing"]
