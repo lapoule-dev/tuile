@@ -25,6 +25,12 @@ use std::sync::Arc;
 use tuile_core::fetch::{FetchError, TileFetcher};
 use url::Url;
 
+mod terrain;
+#[cfg(test)]
+mod tests_support;
+
+pub use terrain::IonTerrainSource;
+
 pub const ION_API_BASE: &str = "https://api.cesium.com/";
 
 #[derive(Debug, thiserror::Error)]
@@ -73,13 +79,39 @@ struct EndpointJson {
     #[serde(rename = "externalType")]
     external_type: Option<String>,
     #[serde(default)]
+    options: Option<ImageryOptions>,
+    #[serde(default)]
     attributions: Vec<Attribution>,
+}
+
+/// Provider-specific options of an external imagery endpoint (e.g. Bing:
+/// `key`, `url`, `mapStyle`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ImageryOptions {
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(rename = "mapStyle", default)]
+    pub map_style: Option<String>,
 }
 
 /// A resolved 3D Tiles asset endpoint.
 #[derive(Debug, Clone)]
 pub struct Tiles3dEndpoint {
     /// URL of the asset's tileset.json.
+    pub url: Url,
+    /// Short-lived asset-scoped token (NOT the account token).
+    pub access_token: String,
+    pub attributions: Vec<Attribution>,
+}
+
+/// A resolved terrain asset endpoint (quantized-mesh). Transport-level: the
+/// `layer.json` and `.terrain` tiles are fetched relative to `url` with the
+/// asset-scoped bearer. Parsing `layer.json` is `tuile-terrain`'s job.
+#[derive(Debug, Clone)]
+pub struct TerrainEndpoint {
+    /// Base URL of the terrain depot (layer.json + tiles are relative to it).
     pub url: Url,
     /// Short-lived asset-scoped token (NOT the account token).
     pub access_token: String,
@@ -96,6 +128,8 @@ pub struct ImageryEndpoint {
     /// Set when ion proxies an external provider (e.g. `"BING"`); tile URL
     /// layouts differ per provider then.
     pub external_type: Option<String>,
+    /// Provider-specific options (Bing: key, url, mapStyle).
+    pub options: ImageryOptions,
     pub attributions: Vec<Attribution>,
 }
 
@@ -110,6 +144,7 @@ impl ImageryEndpoint {
 #[derive(Debug, Clone)]
 pub enum AssetEndpoint {
     Tiles3d(Tiles3dEndpoint),
+    Terrain(TerrainEndpoint),
     Imagery(ImageryEndpoint),
 }
 
@@ -157,10 +192,16 @@ impl<H: IonHttp> IonClient<H> {
                 access_token: json.access_token.unwrap_or_default(),
                 attributions: json.attributions,
             })),
+            "TERRAIN" => Ok(AssetEndpoint::Terrain(TerrainEndpoint {
+                url: endpoint_url(&json.url)?,
+                access_token: json.access_token.unwrap_or_default(),
+                attributions: json.attributions,
+            })),
             "IMAGERY" => Ok(AssetEndpoint::Imagery(ImageryEndpoint {
                 url: endpoint_url(&json.url)?,
                 access_token: json.access_token.unwrap_or_default(),
                 external_type: json.external_type,
+                options: json.options.unwrap_or_default(),
                 attributions: json.attributions,
             })),
             other => Err(IonError::UnsupportedAssetType {
@@ -168,6 +209,28 @@ impl<H: IonHttp> IonClient<H> {
                 kind: other.to_owned(),
             }),
         }
+    }
+
+    /// Resolves a TERRAIN asset endpoint (errors on any other asset type).
+    pub async fn terrain_endpoint(&self, asset_id: u64) -> Result<TerrainEndpoint, IonError> {
+        match self.asset_endpoint(asset_id).await? {
+            AssetEndpoint::Terrain(t) => Ok(t),
+            AssetEndpoint::Tiles3d(_) | AssetEndpoint::Imagery(_) => {
+                Err(IonError::UnsupportedAssetType {
+                    asset_id,
+                    kind: "expected TERRAIN".into(),
+                })
+            }
+        }
+    }
+
+    /// The underlying HTTP transport (used by source helpers).
+    pub fn http(&self) -> &H {
+        &self.http
+    }
+
+    pub fn account_token(&self) -> &str {
+        &self.account_token
     }
 }
 
@@ -208,6 +271,12 @@ impl<H: IonHttp> IonTileFetcher<H> {
         }
         let e = match self.client.asset_endpoint(self.asset_id).await? {
             AssetEndpoint::Tiles3d(e) => e,
+            AssetEndpoint::Terrain(_) => {
+                return Err(IonError::UnsupportedAssetType {
+                    asset_id: self.asset_id,
+                    kind: "TERRAIN (use IonTerrainSource, not a TileFetcher)".into(),
+                })
+            }
             AssetEndpoint::Imagery(_) => {
                 return Err(IonError::UnsupportedAssetType {
                     asset_id: self.asset_id,
@@ -306,51 +375,7 @@ impl IonHttp for ReqwestHttp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::Mutex as StdMutex;
-
-    /// Scripted transport: per-URL response queues + a call log.
-    #[derive(Default)]
-    struct MockHttp {
-        responses: StdMutex<HashMap<String, Vec<HttpResponse>>>,
-        log: StdMutex<Vec<(String, Option<String>)>>,
-    }
-
-    impl MockHttp {
-        fn push(&self, url: &str, status: u16, body: &str) {
-            self.responses
-                .lock()
-                .expect("lock")
-                .entry(url.to_owned())
-                .or_default()
-                .push(HttpResponse {
-                    status,
-                    body: Bytes::from(body.to_owned()),
-                });
-        }
-        fn calls(&self) -> Vec<(String, Option<String>)> {
-            self.log.lock().expect("lock").clone()
-        }
-    }
-
-    #[async_trait]
-    impl IonHttp for MockHttp {
-        async fn get(&self, url: &Url, bearer: Option<&str>) -> Result<HttpResponse, IonError> {
-            self.log
-                .lock()
-                .expect("lock")
-                .push((url.to_string(), bearer.map(str::to_owned)));
-            let mut map = self.responses.lock().expect("lock");
-            let queue = map
-                .get_mut(url.as_str())
-                .unwrap_or_else(|| unreachable!("unexpected request to {url}"));
-            Ok(if queue.len() > 1 {
-                queue.remove(0)
-            } else {
-                queue[0].clone()
-            })
-        }
-    }
+    use crate::tests_support::MockHttp;
 
     const ENDPOINT_URL: &str = "https://api.cesium.com/v1/assets/1415/endpoint";
 
@@ -436,12 +461,33 @@ mod tests {
     }
 
     #[test]
-    fn terrain_assets_are_a_typed_error() {
+    fn resolves_terrain_endpoint() {
+        let http = Arc::new(MockHttp::default());
+        http.push(
+            "https://api.cesium.com/v1/assets/1/endpoint",
+            200,
+            r#"{ "type": "TERRAIN",
+                 "url": "https://assets.ion.cesium.com/1/CesiumWorldTerrain/v1.2/",
+                 "accessToken": "terrain-token",
+                 "attributions": [{ "html": "<span>USGS</span>", "collapsible": true }] }"#,
+        );
+        let client = IonClient::new(Arc::clone(&http), "account-token");
+        let endpoint = futures_executor::block_on(client.asset_endpoint(1)).expect("resolve");
+        let AssetEndpoint::Terrain(terrain) = endpoint else {
+            unreachable!("terrain expected");
+        };
+        assert_eq!(terrain.access_token, "terrain-token");
+        assert!(terrain.url.as_str().ends_with("/v1.2/"));
+        assert_eq!(terrain.attributions.len(), 1);
+    }
+
+    #[test]
+    fn unknown_asset_type_is_a_typed_error() {
         let http = Arc::new(MockHttp::default());
         http.push(
             "https://api.cesium.com/v1/assets/3/endpoint",
             200,
-            r#"{ "type": "TERRAIN", "url": "https://x/", "accessToken": "t" }"#,
+            r#"{ "type": "CZML", "url": "https://x/", "accessToken": "t" }"#,
         );
         let client = IonClient::new(Arc::clone(&http), "account-token");
         let err = futures_executor::block_on(client.asset_endpoint(3)).expect_err("unsupported");

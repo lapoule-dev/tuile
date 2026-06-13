@@ -18,13 +18,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tuile-core = { version = "0.0.1", path = "../tuile-core" }
+tuile-terrain = { version = "0.0.1", path = "../tuile-terrain" }
 url = "2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "http2"] }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "http2", "gzip"] }
 
 [dev-dependencies]
 futures-executor = "0.3"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [features]
 default = []
