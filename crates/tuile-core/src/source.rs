@@ -100,7 +100,10 @@ pub struct TileProperties {
 /// The tile hierarchy as the traversal sees it: pure, synchronous, walked
 /// every frame. Implemented by [`crate::tileset::Tileset`] (3D Tiles), by
 /// terrain quadtrees (`tuile-terrain`), and by [`CompositeTileTree`].
-pub trait TileTree {
+///
+/// `Send` so the [`crate::runtime::GeometryServer`] can move a boxed tree into
+/// the session future and run it on any executor.
+pub trait TileTree: Send {
     /// Root tiles (one for a 3D Tiles tileset, several for a global terrain
     /// or a composition).
     fn roots(&self) -> Vec<TileId>;
@@ -112,13 +115,25 @@ pub trait TileTree {
     fn properties(&self, id: TileId) -> TileProperties;
 }
 
+/// Outcome of a [`TileLoader::load`].
+pub enum Loaded {
+    /// Render-ready content: the server caches it and streams it to the
+    /// consumer (terrain → draped imagery, glb → intrinsic textures).
+    Content(DecodedTileContent),
+    /// The load expanded the tile tree in place — e.g. an external 3D Tiles
+    /// tileset whose root was grafted into the shared arena. Nothing to
+    /// render: the server re-traverses and the newly revealed children load
+    /// on their own. Mirrors Cesium's `TileExternalContent` junction node.
+    Expanded,
+}
+
 /// Loads + decodes + textures a tile into render-ready content. Async; the
 /// runtime drives it off the frame. Each source's loader is responsible for
 /// the textures that correspond to its tiles (terrain → draped imagery, glb
 /// → intrinsic textures).
 #[async_trait]
 pub trait TileLoader: Send + Sync {
-    async fn load(&self, id: TileId) -> Result<DecodedTileContent, LoadError>;
+    async fn load(&self, id: TileId) -> Result<Loaded, LoadError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -195,7 +210,7 @@ impl CompositeLoader {
 
 #[async_trait]
 impl TileLoader for CompositeLoader {
-    async fn load(&self, id: TileId) -> Result<DecodedTileContent, LoadError> {
+    async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
         let tag = id.tag();
         match self.loaders.get(tag as usize) {
             Some(l) => l.load(id.payload()).await,
@@ -289,14 +304,21 @@ mod tests {
     }
     #[async_trait]
     impl TileLoader for StubLoader {
-        async fn load(&self, _id: TileId) -> Result<DecodedTileContent, LoadError> {
-            Ok(DecodedTileContent {
+        async fn load(&self, _id: TileId) -> Result<Loaded, LoadError> {
+            Ok(Loaded::Content(DecodedTileContent {
                 meshes: Vec::new(),
                 textures: Vec::new(),
                 local_origin_ecef: DVec3::new(self.marker as f64, 0.0, 0.0),
                 transform_local: Mat4::IDENTITY,
-            })
+            }))
         }
+    }
+
+    fn content_origin_x(loaded: Loaded) -> f64 {
+        let Loaded::Content(c) = loaded else {
+            unreachable!("expected content, got Expanded");
+        };
+        c.local_origin_ecef.x
     }
 
     #[test]
@@ -307,8 +329,8 @@ mod tests {
         ]);
         let from_a = futures_executor::block_on(loader.load(TileId(0).with_tag(0))).expect("a");
         let from_b = futures_executor::block_on(loader.load(TileId(0).with_tag(1))).expect("b");
-        assert_eq!(from_a.local_origin_ecef.x, 1.0);
-        assert_eq!(from_b.local_origin_ecef.x, 2.0);
+        assert_eq!(content_origin_x(from_a), 1.0);
+        assert_eq!(content_origin_x(from_b), 2.0);
         // Unknown tag → typed error, not a panic.
         let err = futures_executor::block_on(loader.load(TileId(0).with_tag(7)));
         assert!(matches!(err, Err(LoadError::BadTag(7))));
