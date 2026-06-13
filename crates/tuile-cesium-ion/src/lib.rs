@@ -118,12 +118,15 @@ pub struct TerrainEndpoint {
     pub attributions: Vec<Attribution>,
 }
 
-/// A resolved imagery asset endpoint. Transport-level only: build tile URLs
-/// with [`ImageryEndpoint::tile_url`] and fetch them with the same bearer.
+/// A resolved imagery asset endpoint. Transport-level only.
+///
+/// `url` is `None` for external providers (e.g. Bing), where the tile layout
+/// lives in [`ImageryEndpoint::options`] instead; it is `Some` for
+/// ion-hosted slippy-map imagery.
 #[derive(Debug, Clone)]
 pub struct ImageryEndpoint {
-    /// Base URL of the imagery service.
-    pub url: Url,
+    /// Base URL of an ion-hosted imagery service (`None` for external types).
+    pub url: Option<Url>,
     pub access_token: String,
     /// Set when ion proxies an external provider (e.g. `"BING"`); tile URL
     /// layouts differ per provider then.
@@ -135,9 +138,14 @@ pub struct ImageryEndpoint {
 
 impl ImageryEndpoint {
     /// Slippy-map tile URL (`{base}/{z}/{x}/{y}.{ext}`) for ion-hosted
-    /// imagery (`external_type == None`).
+    /// imagery (`external_type == None`). Errors for external providers,
+    /// which have no ion base URL (use their dedicated connector instead).
     pub fn tile_url(&self, z: u32, x: u64, y: u64, ext: &str) -> Result<Url, IonError> {
-        Ok(self.url.join(&format!("{z}/{x}/{y}.{ext}"))?)
+        let base = self
+            .url
+            .as_ref()
+            .ok_or_else(|| IonError::Transport("imagery endpoint has no base url".into()))?;
+        Ok(base.join(&format!("{z}/{x}/{y}.{ext}"))?)
     }
 }
 
@@ -198,7 +206,10 @@ impl<H: IonHttp> IonClient<H> {
                 attributions: json.attributions,
             })),
             "IMAGERY" => Ok(AssetEndpoint::Imagery(ImageryEndpoint {
-                url: endpoint_url(&json.url)?,
+                url: match json.url.as_deref() {
+                    Some(u) if !u.is_empty() => Some(Url::parse(u)?),
+                    _ => None,
+                },
                 access_token: json.access_token.unwrap_or_default(),
                 external_type: json.external_type,
                 options: json.options.unwrap_or_default(),
