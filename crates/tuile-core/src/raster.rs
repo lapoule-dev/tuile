@@ -15,7 +15,7 @@
 //! goes through the same [`TileFetcher`] abstraction as geometry content —
 //! so local files, plain HTTP and `tuile-cesium-ion` all work unchanged.
 
-use crate::content::DecodedTexture;
+use crate::content::{DecodedTexture, DecodedTileContent};
 use crate::fetch::{FetchError, TileFetcher};
 use crate::geo::{ecef_to_geodetic, Geodetic};
 use crate::math::Obb;
@@ -182,6 +182,28 @@ impl TilingScheme {
         out
     }
 
+    /// The deepest single imagery tile that fully contains `rect`. Used for
+    /// simple single-texture draping: one imagery tile covers a whole
+    /// geometry tile (coarser than per-tile multi-texturing, but no atlas).
+    pub fn containing_tile(&self, rect: &GeoRect) -> ImageryCoord {
+        let mut best = ImageryCoord {
+            level: 0,
+            x: 0,
+            y: 0,
+        };
+        // Level 0 may itself have several root tiles; start from the level
+        // where the rect first fits in one tile.
+        for level in 0..=self.maximum_level {
+            let tiles = self.tiles_in_rectangle(rect, level);
+            if tiles.len() == 1 {
+                best = tiles[0];
+            } else {
+                break;
+            }
+        }
+        best
+    }
+
     /// Texture coordinates of ECEF-rebased positions within one imagery
     /// tile. (0,0) = tile north-west corner, v grows southward (image
     /// convention); values outside [0,1] mean the vertex falls outside the
@@ -238,6 +260,41 @@ pub struct OverlayAttachment {
     pub imagery: ImageryCoord,
     /// One uv set per mesh, parallel to `DecodedTileContent::meshes`.
     pub uvs: Vec<Vec<[f32; 2]>>,
+}
+
+/// Computes the single-tile overlay attachment for a decoded geometry tile:
+/// the deepest imagery tile covering its geographic extent, plus the per-mesh
+/// uv sets. `rect` is the geometry tile's geographic extent.
+pub fn single_tile_attachment(
+    content: &DecodedTileContent,
+    rect: &GeoRect,
+    scheme: &TilingScheme,
+) -> OverlayAttachment {
+    let imagery = scheme.containing_tile(rect);
+    let uvs = content
+        .meshes
+        .iter()
+        .map(|m| scheme.uvs_for_positions(&m.positions, content.local_origin_ecef, imagery))
+        .collect();
+    OverlayAttachment { imagery, uvs }
+}
+
+/// Drapes a single imagery texture onto a decoded geometry tile, in place:
+/// adds the texture, writes per-mesh uvs from `attachment`, and points each
+/// mesh's `base_color_texture` at it. The existing PBR pipeline then renders
+/// the geometry textured with the imagery (base color × imagery). For terrain
+/// (neutral base color) this is simply the imagery.
+pub fn drape_single(
+    content: &mut DecodedTileContent,
+    attachment: &OverlayAttachment,
+    texture: DecodedTexture,
+) {
+    let index = content.textures.len();
+    content.textures.push(texture);
+    for (mesh, uvs) in content.meshes.iter_mut().zip(&attachment.uvs) {
+        mesh.uvs = Some(uvs.clone());
+        mesh.material.base_color_texture = Some(index);
+    }
 }
 
 /// An imagery source: a tiling scheme plus tile fetching+decoding.
@@ -304,7 +361,92 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedTexture, RasterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::{DecodedMesh, MaterialDesc};
     use crate::geo::geodetic_to_ecef;
+    use glam::Mat4;
+
+    #[test]
+    fn containing_tile_is_deepest_single_cover() {
+        let wm = TilingScheme::web_mercator();
+        // A tiny rect near the equator/prime meridian: the deepest tile that
+        // still contains it should be reasonably deep, and unique.
+        let rect = GeoRect {
+            west: 0.001,
+            south: 0.001,
+            east: 0.0011,
+            north: 0.0011,
+        };
+        let tile = wm.containing_tile(&rect);
+        // The rect must lie inside the chosen tile's extent.
+        let (x0, y0, x1, y1) = wm.tile_extent(tile);
+        let nw = wm.projection.to_normalized(Geodetic {
+            lon: rect.west,
+            lat: rect.north,
+            height: 0.0,
+        });
+        let se = wm.projection.to_normalized(Geodetic {
+            lon: rect.east,
+            lat: rect.south,
+            height: 0.0,
+        });
+        assert!(x0 <= nw.0 && se.0 <= x1 && y0 <= nw.1 && se.1 <= y1);
+        // One level deeper would split the rect across tiles.
+        assert!(wm.tiles_in_rectangle(&rect, tile.level + 1).len() > 1);
+    }
+
+    #[test]
+    fn drape_single_attaches_texture_and_uvs() {
+        // A flat geometry tile near (lon 0.01, lat 0.01).
+        let center = geodetic_to_ecef(Geodetic {
+            lon: 0.01,
+            lat: 0.01,
+            height: 0.0,
+        });
+        let p = |lon: f64, lat: f64| {
+            let e = geodetic_to_ecef(Geodetic {
+                lon,
+                lat,
+                height: 0.0,
+            }) - center;
+            [e.x as f32, e.y as f32, e.z as f32]
+        };
+        let mut content = DecodedTileContent {
+            meshes: vec![DecodedMesh {
+                positions: vec![p(0.009, 0.011), p(0.011, 0.011), p(0.009, 0.009)],
+                normals: None,
+                uvs: None,
+                indices: vec![0, 1, 2],
+                material: MaterialDesc::default(),
+            }],
+            textures: Vec::new(),
+            local_origin_ecef: center,
+            transform_local: Mat4::IDENTITY,
+        };
+        let rect = GeoRect {
+            west: 0.009,
+            south: 0.009,
+            east: 0.011,
+            north: 0.011,
+        };
+        let wm = TilingScheme::web_mercator();
+        let attachment = single_tile_attachment(&content, &rect, &wm);
+        assert_eq!(attachment.uvs.len(), 1);
+        assert_eq!(attachment.uvs[0].len(), 3);
+        // All uvs inside [0,1] (the geometry fits in the chosen imagery tile).
+        for uv in &attachment.uvs[0] {
+            assert!((0.0..=1.0).contains(&uv[0]) && (0.0..=1.0).contains(&uv[1]));
+        }
+
+        let tex = DecodedTexture {
+            width: 1,
+            height: 1,
+            rgba8: vec![1, 2, 3, 255],
+        };
+        drape_single(&mut content, &attachment, tex);
+        assert_eq!(content.textures.len(), 1);
+        assert_eq!(content.meshes[0].material.base_color_texture, Some(0));
+        assert!(content.meshes[0].uvs.is_some());
+    }
 
     #[test]
     fn normalized_projection_reference_points() {
