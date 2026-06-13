@@ -10,7 +10,8 @@
 //! `docs/10-crate-core.md`, « Décisions tranchées »).
 
 use crate::math::Frustum;
-use crate::tileset::{Refine, TileId, Tileset};
+use crate::source::{TileId, TileTree};
+use crate::tileset::Refine;
 use glam::{DMat4, DVec2, DVec3};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -209,7 +210,7 @@ pub struct TraversalOutput {
 /// `_frame` is reserved for history-dependent refinements (LOD fades);
 /// injecting it keeps tests deterministic (no clocks in the core).
 pub fn traverse(
-    tileset: &Tileset,
+    tree: &dyn TileTree,
     residency: &ResidencyView,
     views: &[ViewState],
     config: &Config,
@@ -220,20 +221,15 @@ pub fn traverse(
     out.requests.clear();
     out.to_evict_hint.clear();
     out.stats = TraversalStats::default();
-    if views.is_empty() || tileset.is_empty() {
+    let roots = tree.roots();
+    if views.is_empty() || roots.is_empty() {
         return;
     }
 
     let mut requested = HashSet::new();
-    visit(
-        tileset,
-        residency,
-        views,
-        config,
-        tileset.root(),
-        out,
-        &mut requested,
-    );
+    for root in roots {
+        visit(tree, residency, views, config, root, 0, out, &mut requested);
+    }
 
     // Group first (Urgent before Normal before Preload), then nearest first;
     // tile id as the deterministic tie-break.
@@ -252,26 +248,29 @@ pub fn traverse(
     out.to_evict_hint.sort();
 }
 
-/// Recursive visit. Returns whether this subtree renders a complete picture
-/// (everything it decided to show is resident) — the REPLACE hold predicate.
+/// Recursive visit over the abstract [`TileTree`]. Returns whether this
+/// subtree renders a complete picture (everything it decided to show is
+/// resident) — the REPLACE hold-until-ready predicate.
+#[allow(clippy::too_many_arguments)]
 fn visit(
-    ts: &Tileset,
+    tree: &dyn TileTree,
     residency: &ResidencyView,
     views: &[ViewState],
     config: &Config,
     id: TileId,
+    depth: u32,
     out: &mut TraversalOutput,
     requested: &mut HashSet<TileId>,
 ) -> bool {
-    let tile = ts.tile(id);
+    let props = tree.properties(id);
     out.stats.visited += 1;
-    out.stats.max_depth = out.stats.max_depth.max(tile.depth);
+    out.stats.max_depth = out.stats.max_depth.max(depth);
 
     // Frustum culling: a tile invisible in every view contributes nothing
     // and never blocks an ancestor's REPLACE.
     if !views
         .iter()
-        .any(|v| tile.bounding_volume.intersects_frustum(v.frustum()))
+        .any(|v| props.bounding_volume.intersects_frustum(v.frustum()))
     {
         out.stats.culled += 1;
         return true;
@@ -279,18 +278,19 @@ fn visit(
 
     let distance = views
         .iter()
-        .map(|v| tile.bounding_volume.distance_to_point(v.position()))
+        .map(|v| props.bounding_volume.distance_to_point(v.position()))
         .fold(f64::INFINITY, f64::min);
     let sse = views
         .iter()
         .map(|v| {
-            let d = tile.bounding_volume.distance_to_point(v.position());
-            v.screen_space_error(tile.geometric_error, d)
+            let d = props.bounding_volume.distance_to_point(v.position());
+            v.screen_space_error(props.geometric_error, d)
         })
         .fold(0.0, f64::max);
 
-    let has_content = tile.content.is_some();
-    let has_children = !tile.children.is_empty();
+    let children = tree.children(id);
+    let has_content = props.has_content;
+    let has_children = !children.is_empty();
     // Refine when too coarse — or when there is nothing to render here
     // (structural empty tiles always descend).
     let refines = has_children && (sse > config.maximum_screen_space_error || !has_content);
@@ -308,7 +308,7 @@ fn visit(
         return false;
     }
 
-    match tile.refine {
+    match props.refine {
         Refine::Add => {
             // Additive: the parent stays visible; children refine on top.
             if has_content {
@@ -318,8 +318,17 @@ fn visit(
                     request(out, requested, id, PriorityGroup::Normal, distance);
                 }
             }
-            for child in tile.children.clone() {
-                visit(ts, residency, views, config, child, out, requested);
+            for child in children {
+                visit(
+                    tree,
+                    residency,
+                    views,
+                    config,
+                    child,
+                    depth + 1,
+                    out,
+                    requested,
+                );
             }
             true
         }
@@ -328,8 +337,17 @@ fn visit(
             // any visible branch is not renderable yet (hold-until-ready).
             let mark = out.selected.len();
             let mut all_ready = true;
-            for child in tile.children.clone() {
-                all_ready &= visit(ts, residency, views, config, child, out, requested);
+            for child in children {
+                all_ready &= visit(
+                    tree,
+                    residency,
+                    views,
+                    config,
+                    child,
+                    depth + 1,
+                    out,
+                    requested,
+                );
             }
             if all_ready || !config.forbid_holes {
                 return all_ready;
@@ -367,6 +385,7 @@ fn request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tileset::Tileset;
     use glam::{dvec2, dvec3};
     use url::Url;
 

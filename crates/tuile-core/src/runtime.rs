@@ -19,7 +19,8 @@ use crate::fetch::{FetchError, TileFetcher};
 use crate::protocol::{
     in_process_pair, ClientMessage, InProcessStream, ServerEndpoint, ServerMessage,
 };
-use crate::tileset::{ContentKind, TileId, Tileset};
+use crate::source::TileId;
+use crate::tileset::{ContentKind, Tileset};
 use crate::traversal::{traverse, Config, ResidencyView, TraversalOutput, ViewState};
 use bytes::Bytes;
 use futures_channel::mpsc::UnboundedSender;

@@ -17,7 +17,7 @@
 //! mode is this same in-process binding running over an HTTP fetcher.
 
 use crate::content::TileContent;
-use crate::tileset::TileId;
+use crate::source::TileId;
 use crate::traversal::{TraversalStats, ViewState};
 use futures_channel::mpsc;
 use futures_core::Stream;

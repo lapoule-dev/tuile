@@ -160,9 +160,15 @@ mod tests {
         let l = LayerJson::from_slice(LAYER.as_bytes()).expect("parse");
         assert!(l.is_available(TileCoord::new(0, 0, 0)));
         assert!(l.is_available(TileCoord::new(0, 1, 0)));
-        assert!(!l.is_available(TileCoord::new(0, 2, 0)), "x=2 absent at level 0");
+        assert!(
+            !l.is_available(TileCoord::new(0, 2, 0)),
+            "x=2 absent at level 0"
+        );
         assert!(l.is_available(TileCoord::new(1, 3, 1)));
-        assert!(!l.is_available(TileCoord::new(5, 0, 0)), "level 5 has no ranges");
+        assert!(
+            !l.is_available(TileCoord::new(5, 0, 0)),
+            "level 5 has no ranges"
+        );
     }
 
     #[test]

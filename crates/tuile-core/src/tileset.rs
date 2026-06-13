@@ -10,6 +10,7 @@
 
 use crate::implicit::ImplicitTilingJson;
 use crate::math::{BoundingVolume, Obb, Sphere};
+use crate::source::{TileId, TileProperties, TileTree};
 use glam::{DMat4, DVec3};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -112,10 +113,6 @@ pub enum RefineJson {
 // ---------------------------------------------------------------------------
 // Runtime layer (arena)
 // ---------------------------------------------------------------------------
-
-/// Index of a tile in the arena.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TileId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refine {
@@ -227,9 +224,33 @@ impl Tileset {
         self.tiles
             .iter()
             .enumerate()
-            .map(|(i, t)| (TileId(i as u32), t))
+            .map(|(i, t)| (TileId(i as u64), t))
+    }
+}
+
+/// A 3D Tiles tileset is a [`TileTree`]: arena lookups, the root as the
+/// single root, content presence as `has_content`.
+impl TileTree for Tileset {
+    fn roots(&self) -> Vec<TileId> {
+        vec![self.root]
     }
 
+    fn children(&self, id: TileId) -> Vec<TileId> {
+        self.tile(id).children.clone()
+    }
+
+    fn properties(&self, id: TileId) -> TileProperties {
+        let t = self.tile(id);
+        TileProperties {
+            bounding_volume: t.bounding_volume,
+            geometric_error: t.geometric_error,
+            refine: t.refine,
+            has_content: t.content.is_some(),
+        }
+    }
+}
+
+impl Tileset {
     /// Grafts an external tileset under `host`: the external root becomes a
     /// child of `host`, composed with its world transform, and `host` stops
     /// carrying content (it has been consumed).
@@ -313,7 +334,7 @@ fn build_tile(
         None => None,
     };
 
-    let id = TileId(tiles.len() as u32);
+    let id = TileId(tiles.len() as u64);
     tiles.push(Tile {
         bounding_volume,
         geometric_error,

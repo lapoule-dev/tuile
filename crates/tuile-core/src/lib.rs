@@ -34,11 +34,13 @@ pub mod math;
 pub mod protocol;
 pub mod raster;
 pub mod runtime;
+pub mod source;
 pub mod tileset;
 pub mod traversal;
 
 pub use content::{ContentFormat, DecodedTileContent, TileContent};
 pub use protocol::{ClientMessage, GeometryStream, InProcessStream, ServerMessage};
 pub use runtime::{in_process, GeometryServer};
-pub use tileset::{TileId, Tileset};
+pub use source::{TileId, TileProperties, TileTree};
+pub use tileset::Tileset;
 pub use traversal::{Config, ViewState};

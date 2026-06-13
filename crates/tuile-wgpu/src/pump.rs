@@ -15,7 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::task::{Context, Poll};
 use tuile_core::content::{DecodedTileContent, TileContent};
 use tuile_core::protocol::{ClientMessage, GeometryStream, ServerMessage};
-use tuile_core::tileset::TileId;
+use tuile_core::source::TileId;
 use tuile_core::traversal::TraversalStats;
 
 pub struct ContentPump {

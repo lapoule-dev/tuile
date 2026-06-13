@@ -6,7 +6,7 @@
 //! Invariant: a currently selected tile is never evicted — the budget may
 //! be temporarily exceeded rather than dropping visible content.
 
-use crate::tileset::TileId;
+use crate::source::TileId;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy)]
@@ -98,7 +98,7 @@ impl ResidentCache {
 mod tests {
     use super::*;
 
-    fn t(n: u32) -> TileId {
+    fn t(n: u64) -> TileId {
         TileId(n)
     }
 
