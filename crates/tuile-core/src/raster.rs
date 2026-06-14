@@ -634,6 +634,26 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedTexture, RasterError> {
     })
 }
 
+/// Upsamples one quadrant of a parent imagery texture back to a full tile —
+/// the quality fallback for imagery a provider lacks at a given zoom. `qx`/`qy`
+/// select the quadrant (0/1); `qy = 0` is the north (top) half. Uses `image`'s
+/// Catmull-Rom (bicubic) filter, so the magnified result stays smooth rather
+/// than blocky.
+pub fn upsample_quadrant(src: &DecodedTexture, qx: u32, qy: u32) -> DecodedTexture {
+    use image::{imageops, RgbaImage};
+    let Some(img) = RgbaImage::from_raw(src.width, src.height, src.rgba8.clone()) else {
+        return src.clone();
+    };
+    let (hw, hh) = (src.width / 2, src.height / 2);
+    let quadrant = imageops::crop_imm(&img, qx * hw, qy * hh, hw, hh).to_image();
+    let full = imageops::resize(&quadrant, src.width, src.height, imageops::FilterType::CatmullRom);
+    DecodedTexture {
+        width: src.width,
+        height: src.height,
+        rgba8: full.into_raw(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

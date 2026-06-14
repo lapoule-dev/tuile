@@ -23,13 +23,15 @@ use tuile_native_fetchers::NativeHttp;
 use tuile_core::runtime::in_process_with;
 use tuile_core::source::{TileLoader, TileTree};
 use tuile_core::traversal::Config;
-use tuile_planetary::{globe, GlobeOptions};
+use tuile_planetary::{globe, GlobeOptions, ImageryDetail};
 use winit::event_loop::{ControlFlow, EventLoop};
 
 /// Resolves the Cesium-ion globe sources and crosses them through the
 /// backend-agnostic `tuile-planetary`. The app decides ion + the native HTTP
 /// transport here, not planetary.
-async fn ion_globe(token: String) -> anyhow::Result<(Box<dyn TileTree>, Arc<dyn TileLoader>)> {
+async fn ion_globe(
+    token: String,
+) -> anyhow::Result<(Box<dyn TileTree>, Arc<dyn TileLoader>, ImageryDetail)> {
     // One pooled, cached native transport drives both ion and Bing.
     let http = Arc::new(NativeHttp::shared().await?);
     let terrain = IonTerrainSource::new(IonClient::new(Arc::clone(&http), token.clone()), 1);
@@ -79,7 +81,7 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let (tree, loader) = rt.block_on(ion_globe(token))?;
+    let (tree, loader, detail) = rt.block_on(ion_globe(token))?;
     let config = Config {
         maximum_screen_space_error: 2.0,
         maximum_simultaneous_fetches: 64,
@@ -109,6 +111,7 @@ fn main() -> anyhow::Result<()> {
     let app_config = ViewerConfig {
         stream,
         controller,
+        detail,
         title: "tuile — globe (streaming)".into(),
     };
 

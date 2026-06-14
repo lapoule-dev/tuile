@@ -21,6 +21,7 @@ use winit::window::{Window, WindowId};
 pub struct ViewerConfig {
     pub stream: InProcessStream,
     pub controller: CameraController,
+    pub detail: tuile_planetary::ImageryDetail,
     pub title: String,
 }
 
@@ -39,6 +40,7 @@ struct Active {
 pub struct App {
     config: Option<ViewerConfig>,
     controller: CameraController,
+    detail: tuile_planetary::ImageryDetail,
     title: String,
     active: Option<Active>,
     // Input state.
@@ -54,6 +56,7 @@ impl App {
     pub fn new(config: ViewerConfig) -> Self {
         Self {
             controller: config.controller.clone(),
+            detail: config.detail.clone(),
             title: config.title.clone(),
             config: Some(config),
             active: None,
@@ -212,6 +215,14 @@ impl App {
             return;
         };
         let viewport = DVec2::new(active.size.0 as f64, active.size.1 as f64);
+
+        // Drive imagery resolution by altitude: the ground metres that map to
+        // one screen pixel ≈ 2·altitude·tan(fovy/2) / viewport_height. The
+        // loader drapes imagery at (at least) that texel spacing — a giant fine
+        // mosaic up close, coarse from orbit.
+        let target_texel =
+            2.0 * cam.altitude() * (cam.fovy * 0.5).tan() / viewport.y.max(1.0);
+        self.detail.set_target_texel_spacing(target_texel);
 
         if !self.freeze {
             let _ = active.stream.send(ClientMessage::ViewerState {

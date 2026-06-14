@@ -174,7 +174,8 @@ async fn ion_globe(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    Ok(globe(terrain, bing, layer, GlobeOptions { no_imagery }))
+    let (tree, loader, _detail) = globe(terrain, bing, layer, GlobeOptions { no_imagery });
+    Ok((tree, loader))
 }
 
 /// Logs to stderr; `RUST_LOG` overrides. Default shows tile streaming
