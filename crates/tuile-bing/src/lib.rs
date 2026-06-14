@@ -90,9 +90,12 @@ pub struct BingImageryProvider<F: TileFetcher> {
 impl<F: TileFetcher> BingImageryProvider<F> {
     /// Builds from already-fetched metadata.
     pub fn new(fetcher: Arc<F>, metadata: BingMetadata) -> Self {
-        // Bing is Web Mercator; tile size from the metadata.
+        // Bing is Web Mercator; tile size from the metadata. Bing serves no
+        // level-0 tile (the empty quadkey is invalid), so draping must clamp
+        // to level 1 at the coarsest.
         let mut scheme = TilingScheme::web_mercator();
         scheme.tile_size = metadata.tile_width.max(1);
+        scheme.minimum_level = 1;
         Self {
             fetcher,
             metadata,
