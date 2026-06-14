@@ -1,0 +1,25 @@
+[package]
+name = "tuile-native-fetchers"
+description = "Native HTTP fetchers for tuile: pooled reqwest client + browser-style disk & in-memory cache, implementing the core fetch seams"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+url = { workspace = true }
+tuile-core = { version = "0.0.1", path = "../tuile-core" }
+tuile-cesium-ion = { version = "0.0.1", path = "../tuile-cesium-ion" }
+thiserror = { workspace = true }
+reqwest-middleware = { workspace = true }
+http-cache-reqwest = { workspace = true }
+http-cache = { workspace = true }
+foyer = { workspace = true }

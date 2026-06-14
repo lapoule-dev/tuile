@@ -5,6 +5,7 @@ members = [
     "crates/tuile-bing",
     "crates/tuile-cesium-ion",
     "crates/tuile-camera",
+    "crates/tuile-native-fetchers",
     "crates/tuile-core",
     "crates/tuile-planetary",
     "crates/tuile-terrain",
@@ -42,7 +43,11 @@ wgpu = "29.0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1.0.102"
 pollster = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "gzip", "cookies"] }
+reqwest-middleware = "0.5"
+http-cache-reqwest = { version = "1.0.0-alpha.6", default-features = false, features = ["manager-foyer", "url-standard"] }
+http-cache = { version = "1.0.0-alpha.6", default-features = false, features = ["manager-foyer", "url-standard"] }
+foyer = "0.22.3"
 gltf = "1.4.1"
 flate2 = "1.1.9"
 bytemuck = { version = "1", features = ["derive"] }
