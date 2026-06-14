@@ -137,6 +137,10 @@ impl GpuContext {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("tuile headless"),
+                // Take the adapter's full limits so high-resolution offscreen
+                // targets (8K readback buffers, large textures) aren't capped
+                // at the conservative defaults (256 MiB / 8192 px).
+                required_limits: adapter.limits(),
                 ..Default::default()
             })
             .await

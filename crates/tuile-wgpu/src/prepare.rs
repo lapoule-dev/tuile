@@ -39,10 +39,26 @@ pub struct PreparedMesh {
 pub struct PreparedTile {
     pub meshes: Vec<PreparedMesh>,
     pub tile_bg: wgpu::BindGroup,
-    _tile_buf: wgpu::Buffer,
+    tile_buf: wgpu::Buffer,
+    /// The tile's own rebasing origin (ECEF) and intrinsic transform, kept so
+    /// the model matrix can be recomputed against a moving render origin.
+    origin_ecef: DVec3,
+    transform_local: Mat4,
     _textures: Vec<wgpu::Texture>,
     /// Approximate GPU memory of this tile, bytes.
     pub gpu_bytes: usize,
+}
+
+impl PreparedTile {
+    /// Recomputes the model matrix relative to a new render origin and rewrites
+    /// the tile uniform — the second half of the anti-jitter protocol for a
+    /// MOVING camera: keep the render origin near the eye so the f32 the GPU
+    /// sees stays small (sub-meter precise), even at planetary ECEF scale.
+    pub fn rebase(&self, queue: &wgpu::Queue, render_origin: DVec3) {
+        let offset = (self.origin_ecef - render_origin).as_vec3();
+        let model = Mat4::from_translation(offset) * self.transform_local;
+        queue.write_buffer(&self.tile_buf, 0, bytemuck::cast_slice(&model.to_cols_array()));
+    }
 }
 
 /// Uploads a decoded tile. `render_origin` is the f64 world point the view
@@ -62,7 +78,8 @@ pub fn prepare(
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tuile tile uniform"),
             contents: bytemuck::cast_slice(&model.to_cols_array()),
-            usage: wgpu::BufferUsages::UNIFORM,
+            // COPY_DST so the model can be rewritten on rebase (moving camera).
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
     let tile_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tuile tile"),
@@ -95,7 +112,9 @@ pub fn prepare(
     PreparedTile {
         meshes,
         tile_bg,
-        _tile_buf: tile_buf,
+        tile_buf,
+        origin_ecef: content.local_origin_ecef,
+        transform_local: content.transform_local,
         _textures: textures.into_iter().map(|(t, _)| t).collect(),
         gpu_bytes,
     }

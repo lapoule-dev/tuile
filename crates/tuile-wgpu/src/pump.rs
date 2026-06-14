@@ -11,7 +11,7 @@
 use crate::context::GpuContext;
 use crate::prepare::{prepare, PreparedTile};
 use glam::DVec3;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::task::{Context, Poll};
 use tuile_core::content::{DecodedTileContent, TileContent};
 use tuile_core::protocol::{ClientMessage, GeometryStream, ServerMessage};
@@ -85,6 +85,20 @@ impl ContentPump {
         uploaded
     }
 
+    /// Re-bases every prepared tile onto a new render origin — call with the
+    /// camera position each frame so the f32 coordinates the GPU sees stay
+    /// near zero (sub-meter precise) however far the camera is from the
+    /// geocenter. Skips the work when the origin hasn't meaningfully moved.
+    pub fn rebase(&mut self, queue: &wgpu::Queue, render_origin: DVec3) {
+        if (render_origin - self.render_origin).length() < 1.0 {
+            return;
+        }
+        self.render_origin = render_origin;
+        for tile in self.prepared.values() {
+            tile.rebase(queue, render_origin);
+        }
+    }
+
     fn on_message(&mut self, msg: ServerMessage) {
         match msg {
             ServerMessage::Select { tiles, stats } => {
@@ -118,6 +132,32 @@ impl ContentPump {
         self.selection
             .iter()
             .filter_map(|(t, _)| self.prepared.get(t))
+    }
+
+    /// Like [`Self::visible`], but for any selected tile not yet uploaded,
+    /// substitutes its nearest already-prepared ancestor (via `parent_of`) —
+    /// so the coarser tile a refinement replaces stays on screen until the
+    /// finer one is ready, instead of flashing the background. `parent_of`
+    /// returns the parent id, or `None` at a root.
+    pub fn visible_resolved(
+        &self,
+        parent_of: impl Fn(TileId) -> Option<TileId>,
+    ) -> Vec<&PreparedTile> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for (tile, _) in &self.selection {
+            let mut cur = Some(*tile);
+            while let Some(id) = cur {
+                if let Some(prepared) = self.prepared.get(&id) {
+                    if seen.insert(id) {
+                        out.push(prepared);
+                    }
+                    break;
+                }
+                cur = parent_of(id);
+            }
+        }
+        out
     }
 
     /// Number of selected tiles still waiting for content or upload.
