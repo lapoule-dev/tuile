@@ -140,6 +140,23 @@ impl<H: IonHttp> IonTerrainSource<H> {
     }
 }
 
+/// Exposes the ion terrain source through the backend-agnostic
+/// [`tuile_terrain::TerrainSource`] seam, so `tuile-planetary` consumes it
+/// without knowing about ion.
+#[async_trait::async_trait]
+impl<H: IonHttp> tuile_terrain::TerrainSource for IonTerrainSource<H> {
+    async fn fetch_tile(
+        &self,
+        coord: TileCoord,
+    ) -> Result<Vec<u8>, tuile_terrain::TerrainSourceError> {
+        // Disambiguate from the trait method of the same name (inherent call).
+        IonTerrainSource::fetch_tile(self, coord)
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| tuile_terrain::TerrainSourceError(e.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
