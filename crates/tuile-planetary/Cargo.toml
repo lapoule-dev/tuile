@@ -1,0 +1,17 @@
+[package]
+name = "tuile-planetary"
+description = "Planetary scene assembly for tuile: terrain × imagery as a TileTree + TileLoader (backend-agnostic, wasm-able)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+tuile-core = { version = "0.0.1", path = "../tuile-core" }
+tuile-terrain = { version = "0.0.1", path = "../tuile-terrain" }
