@@ -17,7 +17,7 @@
 
 use crate::content::{DecodedTexture, DecodedTileContent};
 use crate::fetch::{FetchError, TileFetcher};
-use crate::geo::{ecef_to_geodetic, Geodetic};
+use crate::geo::{ecef_to_geodetic, Geodetic, WGS84_A};
 use crate::math::Obb;
 use async_trait::async_trait;
 use glam::DVec3;
@@ -98,6 +98,10 @@ pub struct TilingScheme {
     pub root_tiles_y: u64,
     /// Texture size of one tile, pixels.
     pub tile_size: u32,
+    /// Shallowest level the source actually serves. 0 for most schemes; some
+    /// providers (Bing: empty quadkey at level 0 is invalid) start at 1, so
+    /// draping must never pick a tile shallower than this.
+    pub minimum_level: u32,
     pub maximum_level: u32,
 }
 
@@ -108,6 +112,7 @@ impl TilingScheme {
             root_tiles_x: 1,
             root_tiles_y: 1,
             tile_size: 256,
+            minimum_level: 0,
             maximum_level: 19,
         }
     }
@@ -118,6 +123,7 @@ impl TilingScheme {
             root_tiles_x: 2,
             root_tiles_y: 1,
             tile_size: 256,
+            minimum_level: 0,
             maximum_level: 19,
         }
     }
@@ -201,7 +207,125 @@ impl TilingScheme {
                 break;
             }
         }
+        if best.level < self.minimum_level {
+            // The natural containing level is shallower than this source
+            // serves (e.g. a coarse geographic geometry tile straddles two
+            // Web-Mercator tiles in latitude, so it only "fits" at level 0,
+            // which Bing has no tile for). Drop to the minimum level and take
+            // the tile covering the rect's centre; the geometry tile may
+            // overflow it slightly and `uvs_for_positions` clamps the overflow.
+            best = self.tile_at_center(rect, self.minimum_level);
+        }
         best
+    }
+
+    /// The tile at `level` whose extent contains the rectangle's centre.
+    fn tile_at_center(&self, rect: &GeoRect, level: u32) -> ImageryCoord {
+        let (nx, ny) = self.tiles_at(level);
+        let (u, v) = self.projection.to_normalized(Geodetic {
+            lon: 0.5 * (rect.west + rect.east),
+            lat: 0.5 * (rect.south + rect.north),
+            height: 0.0,
+        });
+        ImageryCoord {
+            level,
+            x: ((u * nx as f64) as u64).min(nx - 1),
+            y: ((v * ny as f64) as u64).min(ny - 1),
+        }
+    }
+
+    /// Matched-LOD mosaic of every imagery tile covering `rect`: the level is
+    /// chosen so the rectangle is sampled by ~`target_texels` texels across
+    /// (clamped to the served range and coarsened until at most `max_tiles`
+    /// tiles), and ALL overlapping tiles are returned. A geometry tile
+    /// straddling an imagery-tile boundary (the prime meridian is one at every
+    /// Web-Mercator level) is thus fully covered — no coarse single-tile
+    /// fallback, no seam. This is how Cesium's `ImageryLayer` drapes terrain.
+    pub fn mosaic_for_rectangle(
+        &self,
+        rect: &GeoRect,
+        target_texels: f64,
+        max_tiles: u32,
+    ) -> ImageryMosaic {
+        let level = self.level_for_rectangle(rect, target_texels);
+        self.mosaic_at_level(rect, level, max_tiles)
+    }
+
+    /// The imagery level whose texel spacing best matches `texel_spacing`
+    /// meters at `lat` (radians) — Cesium's `getLevelWithMaximumTexelSpacing`.
+    /// Pass a terrain tile's geometric error to tie imagery detail to terrain
+    /// detail (the imagery is as sharp as the geometry it drapes, no sharper).
+    pub fn level_for_texel_spacing(&self, texel_spacing: f64, lat: f64) -> u32 {
+        use std::f64::consts::TAU;
+        let lat_factor = match self.projection {
+            Projection::WebMercator => lat.cos(),
+            Projection::Geographic => 1.0,
+        };
+        let level_zero_spacing =
+            WGS84_A * TAU * lat_factor / (self.tile_size as f64 * self.root_tiles_x as f64);
+        let ratio = level_zero_spacing / texel_spacing.max(1.0e-3);
+        let level = ratio.log2().round().max(0.0) as u32;
+        level.clamp(self.minimum_level, self.maximum_level)
+    }
+
+    /// The mosaic covering `rect` at exactly `level` (clamped to the served
+    /// range), coarsened a step at a time until it fits in `max_tiles`.
+    pub fn mosaic_at_level(&self, rect: &GeoRect, level: u32, max_tiles: u32) -> ImageryMosaic {
+        let mut level = level.clamp(self.minimum_level, self.maximum_level);
+        loop {
+            let tiles = self.tiles_in_rectangle(rect, level);
+            let x0 = tiles.iter().map(|t| t.x).min().unwrap_or(0);
+            let x1 = tiles.iter().map(|t| t.x).max().unwrap_or(0);
+            let y0 = tiles.iter().map(|t| t.y).min().unwrap_or(0);
+            let y1 = tiles.iter().map(|t| t.y).max().unwrap_or(0);
+            let cols = (x1 - x0 + 1) as u32;
+            let rows = (y1 - y0 + 1) as u32;
+            if cols * rows <= max_tiles || level <= self.minimum_level {
+                return ImageryMosaic {
+                    level,
+                    x0,
+                    y0,
+                    cols,
+                    rows,
+                };
+            }
+            level -= 1; // too many tiles for one drape — coarsen a step
+        }
+    }
+
+    /// Normalized `(x0, y0, x1, y1)` extent a mosaic covers.
+    pub fn mosaic_extent(&self, m: &ImageryMosaic) -> (f64, f64, f64, f64) {
+        let (nx, ny) = self.tiles_at(m.level);
+        (
+            m.x0 as f64 / nx as f64,
+            m.y0 as f64 / ny as f64,
+            (m.x0 + u64::from(m.cols)) as f64 / nx as f64,
+            (m.y0 + u64::from(m.rows)) as f64 / ny as f64,
+        )
+    }
+
+    /// UVs of ECEF-rebased positions within an arbitrary normalized extent
+    /// (a mosaic's union), v growing southward; clamped to `[0,1]`.
+    pub fn uvs_in_extent(
+        &self,
+        positions: &[[f32; 3]],
+        origin: DVec3,
+        ext: (f64, f64, f64, f64),
+    ) -> Vec<[f32; 2]> {
+        let (x0, y0, x1, y1) = ext;
+        let w = (x1 - x0).max(1e-15);
+        let h = (y1 - y0).max(1e-15);
+        positions
+            .iter()
+            .map(|p| {
+                let ecef = origin + DVec3::new(f64::from(p[0]), f64::from(p[1]), f64::from(p[2]));
+                let (x, y) = self.projection.to_normalized(ecef_to_geodetic(ecef));
+                [
+                    (((x - x0) / w).clamp(0.0, 1.0)) as f32,
+                    (((y - y0) / h).clamp(0.0, 1.0)) as f32,
+                ]
+            })
+            .collect()
     }
 
     /// Texture coordinates of ECEF-rebased positions within one imagery
@@ -229,6 +353,158 @@ impl TilingScheme {
             })
             .collect()
     }
+}
+
+/// A rectangular block of imagery tiles at one level, covering a geometry
+/// tile's extent — the matched-LOD mosaic from [`TilingScheme::mosaic_for_rectangle`].
+#[derive(Debug, Clone)]
+pub struct ImageryMosaic {
+    pub level: u32,
+    pub x0: u64,
+    pub y0: u64,
+    pub cols: u32,
+    pub rows: u32,
+}
+
+impl ImageryMosaic {
+    /// The tiles, row-major NW→SE — the order [`stitch_mosaic`] expects.
+    pub fn tiles(&self) -> Vec<ImageryCoord> {
+        let mut out = Vec::with_capacity((self.cols * self.rows) as usize);
+        for j in 0..self.rows {
+            for i in 0..self.cols {
+                out.push(ImageryCoord {
+                    level: self.level,
+                    x: self.x0 + u64::from(i),
+                    y: self.y0 + u64::from(j),
+                });
+            }
+        }
+        out
+    }
+
+    pub fn tile_count(&self) -> u32 {
+        self.cols * self.rows
+    }
+}
+
+/// Stitches mosaic tiles (row-major NW→SE, each ≤ `tile_size`²) into one RGBA8
+/// texture laid out as a `cols × rows` grid. Tiles smaller than `tile_size`
+/// are copied into the top-left of their cell.
+pub fn stitch_mosaic(
+    tiles: &[DecodedTexture],
+    cols: u32,
+    rows: u32,
+    tile_size: u32,
+) -> DecodedTexture {
+    let ts = tile_size as usize;
+    let w = cols as usize * ts;
+    let h = rows as usize * ts;
+    let mut rgba8 = vec![0u8; w * h * 4];
+    for (idx, tex) in tiles.iter().enumerate() {
+        let ci = (idx % cols as usize) * ts;
+        let cj = (idx / cols as usize) * ts;
+        let tw = (tex.width as usize).min(ts);
+        let th = (tex.height as usize).min(ts);
+        for row in 0..th {
+            let src = row * tex.width as usize * 4;
+            let dst = ((cj + row) * w + ci) * 4;
+            rgba8[dst..dst + tw * 4].copy_from_slice(&tex.rgba8[src..src + tw * 4]);
+        }
+    }
+    DecodedTexture {
+        width: w as u32,
+        height: h as u32,
+        rgba8,
+    }
+}
+
+/// Resamples an imagery texture from its source projection (covering
+/// `src_extent` in normalized projection coords) into a **geographic**-spaced
+/// texture over `rect` (radians) — Cesium's `reprojectToGeographic`, on the
+/// CPU. Draping the result with linear lon/lat UVs ([`uvs_geographic`]) is then
+/// correct on geographic terrain: no Web-Mercator twist, and latitudes past
+/// the projection's limit clamp to its edge row (a smooth polar cap, no
+/// pinwheel of stretched meridian wedges).
+pub fn reproject_to_geographic(
+    src: &DecodedTexture,
+    src_extent: (f64, f64, f64, f64),
+    rect: &GeoRect,
+    projection: Projection,
+) -> DecodedTexture {
+    let (w, h) = (src.width.max(1), src.height.max(1));
+    let (x0, y0, x1, y1) = src_extent;
+    let sw = (x1 - x0).max(1e-15);
+    let sh = (y1 - y0).max(1e-15);
+    let denom_x = (w - 1).max(1) as f64;
+    let denom_y = (h - 1).max(1) as f64;
+    let mut rgba8 = vec![0u8; (w * h * 4) as usize];
+    for row in 0..h {
+        let lat = rect.north - (row as f64 / denom_y) * (rect.north - rect.south);
+        for col in 0..w {
+            let lon = rect.west + (col as f64 / denom_x) * (rect.east - rect.west);
+            let (mx, my) = projection.to_normalized(Geodetic {
+                lon,
+                lat,
+                height: 0.0,
+            });
+            let su = ((mx - x0) / sw).clamp(0.0, 1.0);
+            let sv = ((my - y0) / sh).clamp(0.0, 1.0);
+            let px = bilinear(src, su, sv);
+            let di = ((row * w + col) * 4) as usize;
+            rgba8[di..di + 4].copy_from_slice(&px);
+        }
+    }
+    DecodedTexture {
+        width: w,
+        height: h,
+        rgba8,
+    }
+}
+
+fn bilinear(t: &DecodedTexture, u: f64, v: f64) -> [u8; 4] {
+    let fx = u * (t.width.saturating_sub(1)) as f64;
+    let fy = v * (t.height.saturating_sub(1)) as f64;
+    let x0 = fx.floor() as u32;
+    let y0 = fy.floor() as u32;
+    let x1 = (x0 + 1).min(t.width - 1);
+    let y1 = (y0 + 1).min(t.height - 1);
+    let tx = (fx - x0 as f64) as f32;
+    let ty = (fy - y0 as f64) as f32;
+    let texel = |x: u32, y: u32| {
+        let i = ((y * t.width + x) * 4) as usize;
+        [t.rgba8[i], t.rgba8[i + 1], t.rgba8[i + 2], t.rgba8[i + 3]]
+    };
+    let lerp = |a: u8, b: u8, f: f32| (a as f32 + (b as f32 - a as f32) * f) as u8;
+    let mix = |a: [u8; 4], b: [u8; 4], f: f32| {
+        [
+            lerp(a[0], b[0], f),
+            lerp(a[1], b[1], f),
+            lerp(a[2], b[2], f),
+            lerp(a[3], b[3], f),
+        ]
+    };
+    let top = mix(texel(x0, y0), texel(x1, y0), tx);
+    let bottom = mix(texel(x0, y1), texel(x1, y1), tx);
+    mix(top, bottom, ty)
+}
+
+/// Per-vertex UVs mapping ECEF positions **linearly** into a geographic
+/// rectangle (radians) — for draping a [`reproject_to_geographic`] texture.
+/// `v` grows southward (north = 0).
+pub fn uvs_geographic(positions: &[[f32; 3]], origin: DVec3, rect: &GeoRect) -> Vec<[f32; 2]> {
+    let dw = (rect.east - rect.west).max(1e-12);
+    let dh = (rect.north - rect.south).max(1e-12);
+    positions
+        .iter()
+        .map(|p| {
+            let ecef = origin + DVec3::new(f64::from(p[0]), f64::from(p[1]), f64::from(p[2]));
+            let g = ecef_to_geodetic(ecef);
+            [
+                (((g.lon - rect.west) / dw).clamp(0.0, 1.0)) as f32,
+                (((rect.north - g.lat) / dh).clamp(0.0, 1.0)) as f32,
+            ]
+        })
+        .collect()
 }
 
 /// Geographic extent of a world-space OBB (corner sampling — fine for tile
