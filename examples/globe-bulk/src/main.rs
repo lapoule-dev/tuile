@@ -25,8 +25,8 @@ use tuile_core::traversal::{Config, ViewState};
 use tuile_core::TileContent;
 use std::sync::Arc;
 use tuile_bing::{BingImageryProvider, BingMetadata};
-use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource, ReqwestHttp};
-use tuile_core::fetch::HttpFetcher;
+use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
+use tuile_native_fetchers::NativeHttp;
 use tuile_planetary::{globe, GlobeOptions};
 use tuile_wgpu::{prepare, GpuContext, PreparedTile, TileRenderer, ViewUniform};
 use tuile_wgpu::{DEPTH_FORMAT, TEXTURE_FORMAT};
@@ -155,11 +155,12 @@ async fn ion_globe(
     no_imagery: bool,
     log: bool,
 ) -> Result<(Box<dyn TileTree>, Arc<dyn TileLoader>)> {
-    let ion_http = Arc::new(ReqwestHttp::default());
-    let terrain = IonTerrainSource::new(IonClient::new(Arc::clone(&ion_http), token.clone()), 1);
+    // One pooled, cached native transport drives both ion and Bing.
+    let http = Arc::new(NativeHttp::shared().await.context("native http cache")?);
+    let terrain = IonTerrainSource::new(IonClient::new(Arc::clone(&http), token.clone()), 1);
     let layer = terrain.layer().await.context("terrain layer.json")?;
 
-    let ion2 = IonClient::new(ion_http, token);
+    let ion2 = IonClient::new(Arc::clone(&http), token);
     let endpoint = match ion2.asset_endpoint(2).await.context("bing endpoint")? {
         AssetEndpoint::Imagery(e) => e,
         _ => bail!("ion asset 2 is not imagery"),
@@ -170,7 +171,7 @@ async fn ion_globe(
         o.map_style.as_deref().unwrap_or("Aerial"),
         o.key.as_deref().context("bing key")?,
     );
-    let bing = BingImageryProvider::from_metadata_url(Arc::new(HttpFetcher::default()), &meta_url)
+    let bing = BingImageryProvider::from_metadata_url(Arc::clone(&http), &meta_url)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 

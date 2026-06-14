@@ -18,8 +18,8 @@ use app::{App, ViewerConfig};
 use std::sync::Arc;
 use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_camera::{CameraController, GlobeCamera};
-use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource, ReqwestHttp};
-use tuile_core::fetch::HttpFetcher;
+use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
+use tuile_native_fetchers::NativeHttp;
 use tuile_core::runtime::in_process_with;
 use tuile_core::source::{TileLoader, TileTree};
 use tuile_core::traversal::Config;
@@ -30,11 +30,12 @@ use winit::event_loop::{ControlFlow, EventLoop};
 /// backend-agnostic `tuile-planetary`. The app decides ion + the native HTTP
 /// transport here, not planetary.
 async fn ion_globe(token: String) -> anyhow::Result<(Box<dyn TileTree>, Arc<dyn TileLoader>)> {
-    let ion_http = Arc::new(ReqwestHttp::default());
-    let terrain = IonTerrainSource::new(IonClient::new(Arc::clone(&ion_http), token.clone()), 1);
+    // One pooled, cached native transport drives both ion and Bing.
+    let http = Arc::new(NativeHttp::shared().await?);
+    let terrain = IonTerrainSource::new(IonClient::new(Arc::clone(&http), token.clone()), 1);
     let layer = terrain.layer().await?;
 
-    let ion2 = IonClient::new(ion_http, token);
+    let ion2 = IonClient::new(Arc::clone(&http), token);
     let endpoint = match ion2.asset_endpoint(2).await? {
         AssetEndpoint::Imagery(e) => e,
         _ => anyhow::bail!("ion asset 2 is not imagery"),
@@ -45,7 +46,7 @@ async fn ion_globe(token: String) -> anyhow::Result<(Box<dyn TileTree>, Arc<dyn 
         o.map_style.as_deref().unwrap_or("Aerial"),
         o.key.as_deref().ok_or_else(|| anyhow::anyhow!("bing key"))?,
     );
-    let bing = BingImageryProvider::from_metadata_url(Arc::new(HttpFetcher::default()), &meta_url)
+    let bing = BingImageryProvider::from_metadata_url(Arc::clone(&http), &meta_url)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 

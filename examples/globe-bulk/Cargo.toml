@@ -18,9 +18,10 @@ glam = { workspace = true }
 image = { workspace = true }
 tokio = { workspace = true }
 wgpu = { workspace = true }
-tuile-core = { version = "0.0.1", path = "../../crates/tuile-core", features = ["http"] }
+tuile-core = { version = "0.0.1", path = "../../crates/tuile-core" }
 tuile-terrain = { version = "0.0.1", path = "../../crates/tuile-terrain" }
-tuile-cesium-ion = { version = "0.0.1", path = "../../crates/tuile-cesium-ion", features = ["reqwest"] }
+tuile-cesium-ion = { version = "0.0.1", path = "../../crates/tuile-cesium-ion" }
 tuile-bing = { version = "0.0.1", path = "../../crates/tuile-bing" }
 tuile-planetary = { version = "0.0.1", path = "../../crates/tuile-planetary" }
+tuile-native-fetchers = { version = "0.0.1", path = "../../crates/tuile-native-fetchers" }
 tuile-wgpu = { version = "0.0.1", path = "../../crates/tuile-wgpu" }
