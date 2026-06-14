@@ -1,0 +1,26 @@
+[package]
+name = "globe-bulk"
+description = "Bulk multi-tile globe renders (terrain + Bing via ion) — hemisphere & Pyrénées — to high-res PNG"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+dotenvy = { workspace = true }
+glam = { workspace = true }
+image = { workspace = true }
+tokio = { workspace = true }
+wgpu = { workspace = true }
+tuile-core = { version = "0.0.1", path = "../../crates/tuile-core", features = ["http"] }
+tuile-terrain = { version = "0.0.1", path = "../../crates/tuile-terrain" }
+tuile-cesium-ion = { version = "0.0.1", path = "../../crates/tuile-cesium-ion", features = ["reqwest"] }
+tuile-bing = { version = "0.0.1", path = "../../crates/tuile-bing" }
+tuile-planetary = { version = "0.0.1", path = "../../crates/tuile-planetary" }
+tuile-wgpu = { version = "0.0.1", path = "../../crates/tuile-wgpu" }
