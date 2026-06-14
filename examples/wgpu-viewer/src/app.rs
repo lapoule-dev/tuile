@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! The winit application: owns the window, surface and render loop, drives
-//! the geometry stream through the [`ContentPump`].
+//! The winit application: owns the window, surface and render loop, feeds
+//! pixel gestures to the render-agnostic [`tuile_camera::CameraController`] and
+//! drives the geometry stream through the [`ContentPump`].
 
-use crate::camera::OrbitCamera;
-use glam::{DVec2, DVec3, Vec3};
+use glam::DVec2;
 use std::sync::Arc;
+use tuile_camera::CameraController;
 use tuile_core::protocol::{ClientMessage, GeometryStream, InProcessStream};
+use tuile_core::source::TileId;
 use tuile_wgpu::{ContentPump, GpuContext, TileRenderer, DEPTH_FORMAT};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -18,8 +20,7 @@ use winit::window::{Window, WindowId};
 /// Everything known before the window exists.
 pub struct ViewerConfig {
     pub stream: InProcessStream,
-    pub camera: OrbitCamera,
-    pub render_origin: DVec3,
+    pub controller: CameraController,
     pub title: String,
 }
 
@@ -37,14 +38,13 @@ struct Active {
 
 pub struct App {
     config: Option<ViewerConfig>,
-    camera: OrbitCamera,
-    render_origin: DVec3,
+    controller: CameraController,
     title: String,
     active: Option<Active>,
     // Input state.
-    cursor: Option<(f64, f64)>,
-    orbiting: bool,
-    panning: bool,
+    cursor: (f64, f64),
+    dragging: bool,
+    tilting: bool,
     wireframe: bool,
     freeze: bool,
     last_log: std::time::Instant,
@@ -52,20 +52,24 @@ pub struct App {
 
 impl App {
     pub fn new(config: ViewerConfig) -> Self {
-        let camera = OrbitCamera::new(config.camera.target, config.camera.distance);
         Self {
-            render_origin: config.render_origin,
+            controller: config.controller.clone(),
             title: config.title.clone(),
-            camera,
             config: Some(config),
             active: None,
-            cursor: None,
-            orbiting: false,
-            panning: false,
+            cursor: (0.0, 0.0),
+            dragging: false,
+            tilting: false,
             wireframe: false,
             freeze: false,
             last_log: std::time::Instant::now(),
         }
+    }
+
+    fn viewport(&self) -> (f64, f64) {
+        self.active
+            .as_ref()
+            .map_or((1920.0, 1080.0), |a| (a.size.0 as f64, a.size.1 as f64))
     }
 }
 
@@ -80,7 +84,8 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         let size = (size.width.max(1), size.height.max(1));
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance
             .create_surface(window.clone())
             .expect("create surface");
@@ -92,6 +97,7 @@ impl ApplicationHandler for App {
         .expect("adapter");
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("viewer"),
+            required_limits: adapter.limits(),
             ..Default::default()
         }))
         .expect("device");
@@ -105,7 +111,8 @@ impl ApplicationHandler for App {
             .unwrap_or(caps.formats[0]);
         let gpu = GpuContext::new(device, queue);
         let renderer = TileRenderer::new(&gpu, surface_format);
-        let pump = ContentPump::new(self.render_origin);
+        // The render origin tracks the eye (set each frame); start there.
+        let pump = ContentPump::new(self.controller.camera.position);
         let depth = make_depth(&gpu, size);
 
         let active = Active {
@@ -130,16 +137,18 @@ impl ApplicationHandler for App {
         _id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(active) = self.active.as_mut() else {
+        if self.active.is_none() {
             return;
-        };
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(new) => {
-                active.size = (new.width.max(1), new.height.max(1));
-                configure_surface(active);
-                active.depth = make_depth(&active.gpu, active.size);
-                active.window.request_redraw();
+                if let Some(active) = self.active.as_mut() {
+                    active.size = (new.width.max(1), new.height.max(1));
+                    configure_surface(active);
+                    active.depth = make_depth(&active.gpu, active.size);
+                    active.window.request_redraw();
+                }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 match event.logical_key {
@@ -157,29 +166,31 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 match button {
-                    MouseButton::Left => self.orbiting = pressed,
-                    MouseButton::Right => self.panning = pressed,
+                    MouseButton::Left => self.dragging = pressed,
+                    MouseButton::Right => self.tilting = pressed,
                     _ => {}
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let pos = (position.x, position.y);
-                if let Some((px, py)) = self.cursor {
-                    let (dx, dy) = (pos.0 - px, pos.1 - py);
-                    if self.orbiting {
-                        self.camera.orbit(dx * 0.005, -dy * 0.005);
-                    } else if self.panning {
-                        self.camera.pan(dx, dy);
-                    }
+                let vp = self.viewport();
+                let prev = self.cursor;
+                let cur = (position.x, position.y);
+                if self.dragging {
+                    // Drag the globe: the grabbed point follows the cursor.
+                    self.controller.drag(prev, cur, vp);
+                } else if self.tilting {
+                    // Right-drag: vertical = tilt, horizontal = heading.
+                    self.controller.tilt((cur.1 - prev.1) * 0.005, vp);
+                    self.controller.rotate_heading((cur.0 - prev.0) * 0.005, vp);
                 }
-                self.cursor = Some(pos);
+                self.cursor = cur;
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let amount = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
                     MouseScrollDelta::PixelDelta(p) => p.y / 50.0,
                 };
-                self.camera.zoom(amount);
+                self.controller.zoom(amount, self.cursor, self.viewport());
             }
             WindowEvent::RedrawRequested => {
                 self.render();
@@ -194,33 +205,55 @@ impl ApplicationHandler for App {
 
 impl App {
     fn render(&mut self) {
+        // Ease the camera toward the gesture target (smooth motion).
+        self.controller.update(0.3);
+        let cam = self.controller.camera;
         let Some(active) = self.active.as_mut() else {
             return;
         };
         let viewport = DVec2::new(active.size.0 as f64, active.size.1 as f64);
 
-        // Feed the camera to the geometry server unless frozen, then pump
-        // GPU uploads (budget per frame to avoid hitches).
         if !self.freeze {
-            let _ = active.stream_send(ClientMessage::ViewerState {
-                views: vec![self.camera.view_state(viewport)],
+            let _ = active.stream.send(ClientMessage::ViewerState {
+                views: vec![cam.view_state(viewport)],
             });
         }
-        active.pump.pump(&mut active.streamed(), &active.gpu, 8);
+        active.pump.pump(&mut active.stream, &active.gpu, 8);
+        // Anti-jitter: render origin = eye, so the f32 the GPU sees is small.
+        let origin = cam.position;
+        active.pump.rebase(&active.gpu.queue, origin);
 
         let aspect = active.size.0 as f32 / active.size.1 as f32;
-        let sun = Vec3::new(-0.4, -0.8, -0.45).normalize();
-        let view = self.camera.view_uniform(self.render_origin, aspect, sun);
-        active.renderer.set_view(&active.gpu.queue, &view);
+        // Headlight: light travels along the view direction (behind the camera).
+        let sun = cam.direction.as_vec3();
+        active.renderer.set_view(
+            &active.gpu.queue,
+            &tuile_wgpu::ViewUniform {
+                view_proj: cam.view_proj(origin, aspect),
+                sun_dir: [sun.x, sun.y, sun.z, 0.0],
+                params: [0.5, 0.0, 0.0, 0.0],
+            },
+        );
+
+        // For any selected terrain tile not yet uploaded, fall back to its
+        // nearest ready ancestor so refinement never flashes the background.
+        let tiles = active.pump.visible_resolved(|id| {
+            let (z, x, y) = id.terrain_coord();
+            (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2))
+        });
+        let rendered = tiles.len();
 
         let frame = match active.surface.get_current_texture() {
-            Ok(f) => f,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
+                f
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 configure_surface(active);
                 return;
             }
-            Err(e) => {
-                eprintln!("surface error: {e:?}");
+            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => return,
+            wgpu::CurrentSurfaceTexture::Validation => {
+                eprintln!("surface validation error");
                 return;
             }
         };
@@ -240,10 +273,11 @@ impl App {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
+                        // Space black.
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.45,
-                            g: 0.62,
-                            b: 0.82,
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -261,34 +295,29 @@ impl App {
             });
             active
                 .renderer
-                .render(&mut pass, active.pump.visible(), self.wireframe);
+                .render(&mut pass, tiles.iter().copied(), self.wireframe);
         }
         active.gpu.queue.submit([encoder.finish()]);
         frame.present();
 
         if self.last_log.elapsed().as_secs_f32() > 1.0 {
             self.last_log = std::time::Instant::now();
+            let s = &active.pump.stats;
             eprintln!(
-                "selected {} | prepared {} | pending {} | missing {} | {:.1} MiB GPU",
+                "alt {:.0} km | selected {} | rendered {} | prepared {} | missing {} | visited {} culled {} | {:.0} MiB GPU",
+                cam.altitude() / 1000.0,
                 active.pump.selection.len(),
+                rendered,
                 active.pump.prepared_count(),
-                active.pump.pending_uploads(),
                 active.pump.missing(),
+                s.visited,
+                s.culled,
                 active.pump.gpu_bytes as f32 / (1024.0 * 1024.0),
             );
             for err in active.pump.errors.drain(..) {
                 eprintln!("server: {err}");
             }
         }
-    }
-}
-
-impl Active {
-    fn stream_send(&self, msg: ClientMessage) -> Result<(), tuile_core::protocol::StreamError> {
-        self.stream.send(msg)
-    }
-    fn streamed(&mut self) -> &mut InProcessStream {
-        &mut self.stream
     }
 }
 
