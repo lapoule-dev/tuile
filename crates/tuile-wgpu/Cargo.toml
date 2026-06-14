@@ -24,5 +24,7 @@ futures-util = { workspace = true }
 glam = { workspace = true }
 image = { workspace = true }
 pollster = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 tuile-core = { path = "../tuile-core" }
 url = { workspace = true }

@@ -153,7 +153,6 @@ impl Preset {
 async fn ion_globe(
     token: String,
     no_imagery: bool,
-    log: bool,
 ) -> Result<(Box<dyn TileTree>, Arc<dyn TileLoader>)> {
     // One pooled, cached native transport drives both ion and Bing.
     let http = Arc::new(NativeHttp::shared().await.context("native http cache")?);
@@ -175,12 +174,27 @@ async fn ion_globe(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    Ok(globe(terrain, bing, layer, GlobeOptions { no_imagery, log }))
+    Ok(globe(terrain, bing, layer, GlobeOptions { no_imagery }))
+}
+
+/// Logs to stderr; `RUST_LOG` overrides. Default shows tile streaming
+/// (`tuile_planetary=debug`) plus app-level info.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,tuile_planetary=debug".into()),
+        )
+        .without_time()
+        .with_target(false)
+        .init();
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+    init_tracing();
     let token = std::env::var("CESIUM_ION_TOKEN")
         .context("set CESIUM_ION_TOKEN (env or .env; never stored)")?;
 
@@ -214,7 +228,7 @@ async fn main() -> Result<()> {
 
     // Resolve the ion sources HERE (the app decides ion + transport), then
     // hand the abstract terrain × imagery to the backend-agnostic planetary.
-    let (tree, loader) = ion_globe(token, !drape, true).await?;
+    let (tree, loader) = ion_globe(token, !drape).await?;
 
     // --- Tree + loader → generic geometry server, driven in bulk ---
     let config = Config {
@@ -228,11 +242,11 @@ async fn main() -> Result<()> {
     let (mut stream, server) = in_process_with(tree, loader, config);
     tokio::spawn(server.run());
 
-    eprintln!("bulk-loading selection for '{name}'…");
+    tracing::info!("bulk-loading selection for {name}…");
     let frame = drive_until_complete(&mut stream, vec![preset.view_state(SSE_VIEWPORT)])
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    eprintln!(
+    tracing::info!(
         "selection stable: {} tiles, {} decoded, {} errors (visited {}, culled {})",
         frame.selected.len(),
         frame.contents.len(),
@@ -241,7 +255,7 @@ async fn main() -> Result<()> {
         frame.stats.culled,
     );
     for (tile, msg) in &frame.errors {
-        eprintln!("  ! {tile:?}: {msg}");
+        tracing::warn!("tile {tile:?}: {msg}");
     }
 
     // JSON view of the generated geometry, next to the PNG. Render-agnostic
@@ -254,7 +268,7 @@ async fn main() -> Result<()> {
     }
     let json_path = std::path::Path::new(&out).with_extension("json");
     std::fs::write(&json_path, report.to_json_pretty()).context("write report json")?;
-    eprintln!(
+    tracing::info!(
         "geometry: {} verts, {} tris ({} degenerate), {} textures → {}",
         report.totals.vertices,
         report.totals.triangles,
@@ -284,14 +298,14 @@ async fn main() -> Result<()> {
             _ => None,
         })
         .collect();
-    eprintln!("rendering {} tiles at {size}×{size}…", prepared.len());
+    tracing::info!("rendering {} tiles at {size}×{size}…", prepared.len());
 
     let pixels = render_to_png(&gpu, &renderer, &prepared, size);
     image::RgbaImage::from_raw(size, size, pixels)
         .context("image from pixels")?
         .save(&out)
         .with_context(|| format!("save {out}"))?;
-    eprintln!("wrote {out}");
+    tracing::info!("wrote {out}");
     Ok(())
 }
 

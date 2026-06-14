@@ -1,0 +1,22 @@
+[package]
+name = "tile-probe"
+description = "Probe ion terrain availability directly: walk the tile column at a point and explicitly test sub-tiles, to prove the true maximum LOD"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+dotenvy = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tuile-cesium-ion = { version = "0.0.1", path = "../../crates/tuile-cesium-ion" }
+tuile-terrain = { version = "0.0.1", path = "../../crates/tuile-terrain" }
+tuile-native-fetchers = { version = "0.0.1", path = "../../crates/tuile-native-fetchers" }

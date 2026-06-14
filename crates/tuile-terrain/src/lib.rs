@@ -18,6 +18,7 @@
 //! Pure and wasm-clean: no I/O. Fetching `.terrain` tiles (gzip, ion bearer,
 //! `layer.json` availability) lives in the source/connector layer.
 
+pub mod availability;
 pub mod decode;
 pub mod layer;
 pub mod mesh;
@@ -25,6 +26,7 @@ pub mod source;
 pub mod tiling;
 pub mod tree;
 
+pub use availability::Availability;
 pub use decode::{decode, DecodeError, Header, QuantizedMesh};
 pub use layer::{LayerError, LayerJson};
 pub use mesh::{surface_uvs, to_decoded};

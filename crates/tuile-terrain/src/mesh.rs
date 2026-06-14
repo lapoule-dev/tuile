@@ -141,6 +141,7 @@ mod tests {
             indices: vec![0, 1, 2, 2, 1, 3],
             normals: Some(vec![[0.0, 0.0, 1.0]; 4]),
             edges: [vec![0, 2], vec![0, 1], vec![1, 3], vec![2, 3]],
+            metadata_available: None,
         }
     }
 

@@ -26,8 +26,8 @@ use tuile_core::geo::WGS84_A;
 use tuile_core::raster::{self, GeoRect, ImageryCoord, ImageryProvider, OverlayAttachment};
 use tuile_core::source::{LoadError, Loaded, TileId, TileLoader, TileTree};
 use tuile_terrain::{
-    decode, level_geometric_error, to_decoded, GeographicTilingScheme, LayerJson, TerrainSource,
-    TerrainTree, TileCoord,
+    decode, level_geometric_error, to_decoded, Availability, GeographicTilingScheme, LayerJson,
+    TerrainSource, TerrainTree, TileCoord,
 };
 
 /// A small FIFO cache of decoded imagery tiles, so the many terrain tiles that
@@ -67,10 +67,8 @@ impl ImageryCache {
 /// Tuning for [`globe`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GlobeOptions {
-    /// When false, terrain only (no imagery) — the geometry debug view.
+    /// When true, terrain only (no imagery) — the geometry debug view.
     pub no_imagery: bool,
-    /// Log each terrain/imagery tile as it loads (batch progress).
-    pub log: bool,
 }
 
 /// Loads a terrain tile and drapes the matched-LOD imagery mosaic covering it.
@@ -82,6 +80,10 @@ pub struct PlanetaryLoader<T: TerrainSource, I: ImageryProvider> {
     scheme: GeographicTilingScheme,
     opts: GlobeOptions,
     cache: Mutex<ImageryCache>,
+    /// Shared with the tree: each terrain tile's `metadata` extension reveals
+    /// the availability of its descendants, folded in here so traversal can
+    /// keep refining toward the finest LOD.
+    availability: Arc<Availability>,
 }
 
 impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T, I> {
@@ -94,9 +96,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
             .fetch_tile(c)
             .await
             .map_err(|e| LoadError::Failed(format!("imagery {c:?}: {e}")))?;
-        if self.opts.log {
-            eprintln!("  ⬇ imagery {}/{}/{}", c.level, c.x, c.y);
-        }
+        tracing::trace!(level = c.level, x = c.x, y = c.y, "imagery tile");
         self.cache
             .lock()
             .expect("imagery cache")
@@ -161,10 +161,22 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader for Pl
             .fetch_tile(coord)
             .await
             .map_err(|e| LoadError::Failed(format!("terrain {z}/{x}/{y}: {e}")))?;
-        if self.opts.log {
-            eprintln!("⬇ terrain {z}/{x}/{y}  ({} KB)", bytes.len() / 1024);
-        }
+        tracing::debug!(z, x, y, kib = bytes.len() / 1024, "terrain tile");
         let qm = decode(&bytes).map_err(|e| LoadError::Failed(e.to_string()))?;
+        // The tile's `metadata` extension lists which deeper tiles exist:
+        // fold it into the shared availability so the next traversal can refine
+        // past this level (how Cesium World Terrain reaches its finest LOD).
+        if let Some(ranges) = &qm.metadata_available {
+            tracing::debug!(
+                z,
+                x,
+                y,
+                levels = ranges.len(),
+                deepest = z as usize + ranges.len(),
+                "metadata availability"
+            );
+            self.availability.add_descendant_ranges(z, ranges);
+        }
         let rect = self.scheme.tile_rect(coord);
         // Skirts dropped: same-level neighbours share edges; skirts would show
         // as textured smears at the many LOD boundaries an SSE-2 globe makes.
@@ -201,13 +213,23 @@ where
     T: TerrainSource + 'static,
     I: ImageryProvider + 'static,
 {
-    let tree = terrain_tree(layer);
+    // One growing availability, shared by the tree (reader) and loader (writer):
+    // the loader folds in each tile's `metadata` ranges, the tree refines on them.
+    let scheme = GeographicTilingScheme::default();
+    let availability = Arc::new(Availability::from_layer(
+        &layer,
+        scheme.root_tiles_x,
+        scheme.root_tiles_y,
+    ));
+    let tree: Box<dyn TileTree> =
+        Box::new(TerrainTree::with_availability(layer, Arc::clone(&availability)));
     let loader: Arc<dyn TileLoader> = Arc::new(PlanetaryLoader {
         terrain,
         imagery,
-        scheme: GeographicTilingScheme::default(),
+        scheme,
         opts,
         cache: Mutex::new(ImageryCache::new(512)),
+        availability,
     });
     (tree, loader)
 }

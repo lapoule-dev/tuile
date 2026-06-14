@@ -38,6 +38,16 @@ impl AvailabilityRange {
     }
 }
 
+/// The JSON carried by a tile's `metadata` extension (quantized-mesh extension
+/// id 4). Cesium World Terrain ships only shallow availability in `layer.json`
+/// and delivers the deeper levels here, per tile: `available[offset]` lists the
+/// existing tiles at level `tile_level + offset + 1`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TileMetadata {
+    #[serde(default)]
+    pub available: Vec<Vec<AvailabilityRange>>,
+}
+
 /// Parsed `layer.json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LayerJson {
@@ -58,6 +68,12 @@ pub struct LayerJson {
     pub minzoom: u32,
     #[serde(default)]
     pub maxzoom: u32,
+    /// `metadataAvailability` (Cesium World Terrain): the stride at which tiles
+    /// carry deeper availability in their `metadata` extension. Its presence
+    /// means `available` below is only a shallow seed — the rest is discovered
+    /// per tile as they download.
+    #[serde(default, rename = "metadataAvailability")]
+    pub metadata_availability: Option<u32>,
     /// Available extensions: "octvertexnormals", "watermask", "metadata".
     #[serde(default)]
     pub extensions: Vec<String>,

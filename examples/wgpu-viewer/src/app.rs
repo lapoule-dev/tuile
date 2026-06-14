@@ -157,7 +157,7 @@ impl ApplicationHandler for App {
                     }
                     Key::Character(ref c) if c.eq_ignore_ascii_case("f") => {
                         self.freeze = !self.freeze;
-                        eprintln!("traversal freeze: {}", self.freeze);
+                        tracing::info!("traversal freeze: {}", self.freeze);
                     }
                     Key::Named(NamedKey::Escape) => event_loop.exit(),
                     _ => {}
@@ -253,7 +253,7 @@ impl App {
             }
             wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => return,
             wgpu::CurrentSurfaceTexture::Validation => {
-                eprintln!("surface validation error");
+                tracing::warn!("surface validation error");
                 return;
             }
         };
@@ -303,7 +303,7 @@ impl App {
         if self.last_log.elapsed().as_secs_f32() > 1.0 {
             self.last_log = std::time::Instant::now();
             let s = &active.pump.stats;
-            eprintln!(
+            tracing::info!(
                 "alt {:.0} km | selected {} | rendered {} | prepared {} | missing {} | visited {} culled {} | {:.0} MiB GPU",
                 cam.altitude() / 1000.0,
                 active.pump.selection.len(),
@@ -315,7 +315,7 @@ impl App {
                 active.pump.gpu_bytes as f32 / (1024.0 * 1024.0),
             );
             for err in active.pump.errors.drain(..) {
-                eprintln!("server: {err}");
+                tracing::warn!("server: {err}");
             }
         }
     }

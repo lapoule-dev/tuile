@@ -10,6 +10,9 @@
 //! height range (the real min/max is only known once a tile is decoded);
 //! this is enough for SSE and frustum culling, and refines later.
 
+use std::sync::Arc;
+
+use crate::availability::Availability;
 use crate::layer::LayerJson;
 use crate::tiling::{level_geometric_error, GeographicTilingScheme, TileCoord};
 use tuile_core::geo::{region_to_obb, WGS84_A};
@@ -22,6 +25,12 @@ use tuile_core::tileset::Refine;
 pub struct TerrainTree {
     scheme: GeographicTilingScheme,
     layer: LayerJson,
+    /// Tile existence, shared with the loader so the per-tile `metadata`
+    /// availability it discovers feeds this traversal (reach the finest LOD).
+    availability: Arc<Availability>,
+    /// No availability info at all (legacy heightmap): assume present up to
+    /// maxzoom rather than consult the (root-only) table.
+    assume_full: bool,
     /// Estimated height range (meters) for bounding volumes, until a tile's
     /// real min/max is known.
     min_height: f64,
@@ -29,10 +38,27 @@ pub struct TerrainTree {
 }
 
 impl TerrainTree {
-    /// Builds a terrain tree from a parsed `layer.json`.
+    /// Builds a terrain tree from a parsed `layer.json`, with its own
+    /// availability. For the streaming globe, prefer [`TerrainTree::with_availability`]
+    /// so the tree and loader share one growing availability.
     pub fn new(layer: LayerJson) -> Self {
+        let scheme = GeographicTilingScheme::default();
+        let availability = Arc::new(Availability::from_layer(
+            &layer,
+            scheme.root_tiles_x,
+            scheme.root_tiles_y,
+        ));
+        Self::with_availability(layer, availability)
+    }
+
+    /// Builds a terrain tree reading the given shared availability — the same
+    /// `Arc` the loader writes its discovered ranges into.
+    pub fn with_availability(layer: LayerJson, availability: Arc<Availability>) -> Self {
+        let assume_full = layer.available.is_empty() && layer.metadata_availability.is_none();
         Self {
             scheme: GeographicTilingScheme::default(),
+            assume_full,
+            availability,
             layer,
             // Generous global bounds (Dead Sea shore ≈ -430 m, Everest ≈ 8849 m).
             min_height: -1000.0,
@@ -64,14 +90,21 @@ impl TerrainTree {
         TileId::from_terrain(c.level, c.x, c.y)
     }
 
-    /// Whether a tile exists (available, or — when the layer ships no
-    /// availability table — assumed present up to maxzoom).
+    /// Whether a tile exists: the shared availability (seeded from `layer.json`,
+    /// grown from each tile's `metadata` extension), or — for a legacy layer
+    /// with no availability info at all — assumed present up to maxzoom.
     fn available(&self, c: TileCoord) -> bool {
-        if self.layer.available.is_empty() {
+        if self.assume_full {
             c.level <= self.layer.maxzoom
         } else {
-            self.layer.is_available(c)
+            self.availability.is_available(c)
         }
+    }
+
+    /// The shared availability — clone the `Arc` to give the loader the writer
+    /// side (it folds in each tile's discovered `metadata` ranges).
+    pub fn availability(&self) -> Arc<Availability> {
+        Arc::clone(&self.availability)
     }
 }
 

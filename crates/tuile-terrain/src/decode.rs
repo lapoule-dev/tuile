@@ -23,6 +23,7 @@
 
 const SCALE: f64 = 32767.0;
 const EXT_OCT_NORMALS: u8 = 1;
+const EXT_METADATA: u8 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
@@ -63,6 +64,11 @@ pub struct QuantizedMesh {
     /// Edge vertex indices, in `[west, south, east, north]` order — the
     /// skirt borders.
     pub edges: [Vec<u32>; 4],
+    /// Deeper tile availability from the `metadata` extension, if present:
+    /// `metadata_available[offset]` lists tiles existing at level
+    /// `this_tile_level + offset + 1`. The driver of multi-level refinement on
+    /// Cesium World Terrain.
+    pub metadata_available: Option<Vec<Vec<crate::layer::AvailabilityRange>>>,
 }
 
 impl QuantizedMesh {
@@ -179,14 +185,17 @@ pub fn decode(bytes: &[u8]) -> Result<QuantizedMesh, DecodeError> {
 
     // Extension records until EOF.
     let mut normals = None;
+    let mut metadata_available = None;
     while r.remaining() > 0 {
         let id = r.u8("extId")?;
         let len = r.u32("extLen")? as usize;
         let payload = r.take(len, "extData")?;
         if id == EXT_OCT_NORMALS && payload.len() == vertex_count * 2 {
             normals = Some(decode_oct_normals(payload));
+        } else if id == EXT_METADATA {
+            metadata_available = decode_metadata_availability(payload);
         }
-        // Other extensions (watermask id 2, metadata id 4) are skipped in v1.
+        // Watermask (id 2) is skipped.
     }
 
     Ok(QuantizedMesh {
@@ -197,7 +206,22 @@ pub fn decode(bytes: &[u8]) -> Result<QuantizedMesh, DecodeError> {
         indices,
         normals,
         edges,
+        metadata_available,
     })
+}
+
+/// The `metadata` extension payload: `stringLength: u32` then a JSON document
+/// whose `available` field carries the deeper availability. Malformed metadata
+/// is non-fatal (returns `None`) — it only costs refinement depth, not the tile.
+fn decode_metadata_availability(
+    payload: &[u8],
+) -> Option<Vec<Vec<crate::layer::AvailabilityRange>>> {
+    let len_bytes = payload.get(0..4)?;
+    let string_len = u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]])
+        as usize;
+    let json = payload.get(4..4 + string_len)?;
+    let meta: crate::layer::TileMetadata = serde_json::from_slice(json).ok()?;
+    (!meta.available.is_empty()).then_some(meta.available)
 }
 
 fn decode_zigzag_delta(

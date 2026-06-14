@@ -17,6 +17,8 @@ dotenvy = { workspace = true }
 glam = { workspace = true }
 image = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 wgpu = { workspace = true }
 tuile-core = { version = "0.0.1", path = "../../crates/tuile-core" }
 tuile-terrain = { version = "0.0.1", path = "../../crates/tuile-terrain" }

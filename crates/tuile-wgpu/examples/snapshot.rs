@@ -26,6 +26,13 @@ use tuile_wgpu::{
 };
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .without_time()
+        .with_target(false)
+        .init();
     let mut args = std::env::args().skip(1);
     let tileset_path = args
         .next()
@@ -59,7 +66,7 @@ fn main() {
     let eye = center + (east * 0.4 - north * 0.7 + up * 0.55).normalize() * distance;
     let render_origin = center;
 
-    eprintln!(
+    tracing::info!(
         "tileset: {} tiles, root center {:.1?}, radius {:.1} m, eye distance {:.1} m",
         tileset.len(),
         center,
@@ -102,9 +109,9 @@ fn main() {
     }
 
     for err in &pump.errors {
-        eprintln!("server error: {err}");
+        tracing::warn!("server error: {err}");
     }
-    eprintln!(
+    tracing::info!(
         "selected {} tiles, {} prepared, {} bytes GPU, {} still missing",
         pump.selection.len(),
         pump.prepared_count(),
@@ -133,7 +140,7 @@ fn main() {
         .expect("image")
         .save(&out_path)
         .expect("save png");
-    eprintln!("wrote {out_path}");
+    tracing::info!("wrote {out_path}");
 }
 
 fn render_to_png(

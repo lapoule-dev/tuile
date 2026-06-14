@@ -50,11 +50,26 @@ async fn ion_globe(token: String) -> anyhow::Result<(Box<dyn TileTree>, Arc<dyn 
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    Ok(globe(terrain, bing, layer, GlobeOptions { log: true, ..Default::default() }))
+    Ok(globe(terrain, bing, layer, GlobeOptions::default()))
+}
+
+/// Logs to stderr; `RUST_LOG` overrides. Default shows tile streaming
+/// (`tuile_planetary=debug`) plus app-level info.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,tuile_planetary=debug".into()),
+        )
+        .without_time()
+        .with_target(false)
+        .init();
 }
 
 fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
+    init_tracing();
     let token = std::env::var("CESIUM_ION_TOKEN")
         .map_err(|_| anyhow::anyhow!("set CESIUM_ION_TOKEN (env or .env)"))?;
 
@@ -87,7 +102,7 @@ fn main() -> anyhow::Result<()> {
     );
     let controller = CameraController::new(camera).with_min_altitude(150.0);
 
-    eprintln!(
+    tracing::info!(
         "tuile globe viewer — streaming Cesium World Terrain + Bing via ion\n\
          drag: pan globe · right-drag: tilt/heading · wheel: zoom · W: wireframe · F: freeze · Esc"
     );

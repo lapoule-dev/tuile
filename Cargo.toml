@@ -11,7 +11,7 @@ members = [
     "crates/tuile-terrain",
     "crates/tuile-wgpu",
     "examples/globe-bulk",
-    "examples/globe-snapshot",
+    "examples/tile-probe",
     "examples/wgpu-viewer",
 ]
 
@@ -52,6 +52,7 @@ gltf = "1.4.1"
 flate2 = "1.1.9"
 bytemuck = { version = "1", features = ["derive"] }
 tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 winit = "0.30.13"
 dotenvy = "0.15"
 tempfile = "3"
