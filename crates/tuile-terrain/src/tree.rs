@@ -101,6 +101,11 @@ impl TileTree for TerrainTree {
             .collect()
     }
 
+    fn parent(&self, id: TileId) -> Option<TileId> {
+        let c = Self::coord(id);
+        (c.level > 0).then(|| TileId::from_terrain(c.level - 1, c.x / 2, c.y / 2))
+    }
+
     fn properties(&self, id: TileId) -> TileProperties {
         let c = Self::coord(id);
         let rect = self.scheme.tile_rect(c);
