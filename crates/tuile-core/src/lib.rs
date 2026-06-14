@@ -36,6 +36,7 @@ pub mod implicit;
 pub mod math;
 pub mod protocol;
 pub mod raster;
+pub mod report;
 pub mod runtime;
 pub mod source;
 pub mod tiles3d;
@@ -45,6 +46,7 @@ pub mod traversal;
 pub use content::{ContentFormat, DecodedTileContent, TileContent};
 pub use drive::{drive_until_complete, BulkFrame, SceneState};
 pub use protocol::{ClientMessage, GeometryStream, InProcessStream, ServerMessage};
+pub use report::GeometryReport;
 pub use runtime::{in_process, in_process_with, GeometryServer};
 pub use source::{
     CompositeLoader, CompositeTileTree, LoadError, Loaded, TileId, TileLoader, TileProperties,
