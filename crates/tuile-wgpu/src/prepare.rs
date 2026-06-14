@@ -55,8 +55,8 @@ impl PreparedTile {
     /// MOVING camera: keep the render origin near the eye so the f32 the GPU
     /// sees stays small (sub-meter precise), even at planetary ECEF scale.
     pub fn rebase(&self, queue: &wgpu::Queue, render_origin: DVec3) {
-        let offset = (self.origin_ecef - render_origin).as_vec3();
-        let model = Mat4::from_translation(offset) * self.transform_local;
+        let model =
+            tuile_core::geo::rebased_model(self.origin_ecef, self.transform_local, render_origin);
         queue.write_buffer(&self.tile_buf, 0, bytemuck::cast_slice(&model.to_cols_array()));
     }
 }
@@ -70,8 +70,11 @@ pub fn prepare(
     content: &DecodedTileContent,
     render_origin: DVec3,
 ) -> PreparedTile {
-    let offset = (content.local_origin_ecef - render_origin).as_vec3();
-    let model = Mat4::from_translation(offset) * content.transform_local;
+    let model = tuile_core::geo::rebased_model(
+        content.local_origin_ecef,
+        content.transform_local,
+        render_origin,
+    );
 
     let tile_buf = gpu
         .device

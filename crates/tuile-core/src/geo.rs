@@ -6,8 +6,19 @@
 //! All angles are radians, all lengths meters, everything f64.
 
 use crate::math::Obb;
-use glam::{DMat3, DVec3};
+use glam::{DMat3, DVec3, Mat4};
 use std::f64::consts::{FRAC_PI_2, PI};
+
+/// Anti-jitter model matrix (the second half of the protocol): places a tile —
+/// whose vertices are stored relative to `origin_ecef`, with intrinsic
+/// `transform_local` — into a frame rebased on `render_origin`, as the f32
+/// translation `(origin_ecef - render_origin)`. Keep `render_origin` near the
+/// eye so the f32 the renderer sees stays small (sub-meter precise) however far
+/// the tile is from the geocenter. Render-agnostic: every backend (wgpu today,
+/// THREE.js / RealityKit / Hydra tomorrow) applies this same formula.
+pub fn rebased_model(origin_ecef: DVec3, transform_local: Mat4, render_origin: DVec3) -> Mat4 {
+    Mat4::from_translation((origin_ecef - render_origin).as_vec3()) * transform_local
+}
 
 /// WGS84 semi-major axis (meters).
 pub const WGS84_A: f64 = 6_378_137.0;
