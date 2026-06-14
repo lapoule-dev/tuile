@@ -11,18 +11,18 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-bytemuck = { version = "1", features = ["derive"] }
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
-glam = "0.33"
-thiserror = "2"
+bytemuck = { workspace = true }
+futures-util = { workspace = true }
+glam = { workspace = true }
+thiserror = { workspace = true }
 tuile-core = { version = "0.0.1", path = "../tuile-core" }
-wgpu = "29"
+wgpu = { workspace = true }
 
 [dev-dependencies]
-futures-executor = "0.3.32"
-futures-util = "0.3"
-glam = "0.33"
-image = { version = "0.25", default-features = false, features = ["png"] }
-pollster = "0.4"
+futures-executor = { workspace = true }
+futures-util = { workspace = true }
+glam = { workspace = true }
+image = { workspace = true }
+pollster = { workspace = true }
 tuile-core = { path = "../tuile-core" }
-url = "2.5.8"
+url = { workspace = true }

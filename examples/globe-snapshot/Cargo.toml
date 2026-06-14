@@ -12,12 +12,12 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-anyhow = "1"
-glam = "0.33"
-image = { version = "0.25", default-features = false, features = ["png"] }
-pollster = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-wgpu = "29"
+anyhow = { workspace = true }
+glam = { workspace = true }
+image = { workspace = true }
+pollster = { workspace = true }
+tokio = { workspace = true }
+wgpu = { workspace = true }
 tuile-core = { version = "0.0.1", path = "../../crates/tuile-core", features = ["http"] }
 tuile-terrain = { version = "0.0.1", path = "../../crates/tuile-terrain" }
 tuile-cesium-ion = { version = "0.0.1", path = "../../crates/tuile-cesium-ion", features = ["reqwest"] }

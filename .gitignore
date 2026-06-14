@@ -2,3 +2,6 @@
 /references/
 .gitmodules
 .DS_Store
+# Secrets — ion token etc. Never commit.
+.env
+.env.*

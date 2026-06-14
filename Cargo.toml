@@ -4,9 +4,12 @@ members = [
     "crates/tuile-b3dm",
     "crates/tuile-bing",
     "crates/tuile-cesium-ion",
+    "crates/tuile-camera",
     "crates/tuile-core",
+    "crates/tuile-planetary",
     "crates/tuile-terrain",
     "crates/tuile-wgpu",
+    "examples/globe-bulk",
     "examples/globe-snapshot",
     "examples/wgpu-viewer",
 ]
@@ -17,6 +20,36 @@ edition = "2021"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 authors = ["lapoule.dev"]
+
+[workspace.dependencies]
+# Single source of truth for shared external crates, so the whole workspace
+# builds one copy of each (one DVec3, one error type, one async runtime).
+# Features are additive and unified across the graph: a feature listed here is
+# enabled wherever the dep is used — harmless for crates that don't need it.
+glam = { version = "0.33.1", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+bytes = "1.11.1"
+async-trait = "0.1.89"
+url = "2.5.8"
+futures-channel = "0.3.32"
+futures-core = "0.3.32"
+futures-util = { version = "0.3.32", default-features = false, features = ["std", "alloc", "async-await"] }
+futures-executor = "0.3.32"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+wgpu = "29.0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1.0.102"
+pollster = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+gltf = "1.4.1"
+flate2 = "1.1.9"
+bytemuck = { version = "1", features = ["derive"] }
+tracing = "0.1.44"
+winit = "0.30.13"
+dotenvy = "0.15"
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
