@@ -101,9 +101,11 @@ pub struct TileProperties {
 /// every frame. Implemented by [`crate::tileset::Tileset`] (3D Tiles), by
 /// terrain quadtrees (`tuile-terrain`), and by [`CompositeTileTree`].
 ///
-/// `Send` so the [`crate::runtime::GeometryServer`] can move a boxed tree into
-/// the session future and run it on any executor.
-pub trait TileTree: Send {
+/// `Send + Sync` so the [`crate::runtime::GeometryServer`] can move a boxed
+/// tree into the session future and run it on any executor — including
+/// multi-threaded ones (`tokio::spawn`), where the future is held across
+/// threads and the traversal borrows the tree by shared reference.
+pub trait TileTree: Send + Sync {
     /// Root tiles (one for a 3D Tiles tileset, several for a global terrain
     /// or a composition).
     fn roots(&self) -> Vec<TileId>;
@@ -113,6 +115,15 @@ pub trait TileTree: Send {
 
     /// Topological properties of a tile.
     fn properties(&self, id: TileId) -> TileProperties;
+
+    /// Parent of a tile, or `None` at a root. Lets the server keep the path
+    /// from the rendered frontier up to the root resident, so a coarser
+    /// ancestor is always available as a fallback while finer tiles stream in
+    /// (no holes). Default `None` — sources without cheap parent lookup (a
+    /// 3D Tiles arena) simply don't pin ancestors.
+    fn parent(&self, _id: TileId) -> Option<TileId> {
+        None
+    }
 }
 
 /// Outcome of a [`TileLoader::load`].
@@ -188,6 +199,14 @@ impl TileTree for CompositeTileTree {
     fn properties(&self, id: TileId) -> TileProperties {
         // A missing tag should never reach here (handles come from roots()).
         self.sources[id.tag() as usize].properties(id.payload())
+    }
+
+    fn parent(&self, id: TileId) -> Option<TileId> {
+        let tag = id.tag();
+        self.sources
+            .get(tag as usize)
+            .and_then(|s| s.parent(id.payload()))
+            .map(|p| p.with_tag(tag))
     }
 }
 

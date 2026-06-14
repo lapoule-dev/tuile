@@ -231,6 +231,23 @@ impl Session<'_> {
             self.selected.insert(*t);
             self.cache.touch(*t);
         }
+        // Pin the path from each selected tile up to the root: keep ancestors
+        // resident (protected from eviction, kept LRU-warm) so the consumer
+        // always has a coarser fallback to draw while finer tiles stream in —
+        // no holes. Pinned, but NOT sent as selection (they're not the
+        // frontier; the consumer renders them only where finer tiles are not
+        // ready yet).
+        let frontier: Vec<TileId> = self.out.selected.iter().map(|(t, _)| *t).collect();
+        for tile in frontier {
+            let mut ancestor = self.tree.parent(tile);
+            while let Some(a) = ancestor {
+                if !self.selected.insert(a) {
+                    break; // this ancestor (and its chain) is already pinned
+                }
+                self.cache.touch(a);
+                ancestor = self.tree.parent(a);
+            }
+        }
         tx.unbounded_send(ServerMessage::Select {
             tiles: self.out.selected.clone(),
             stats: self.out.stats,
