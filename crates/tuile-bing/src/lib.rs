@@ -40,6 +40,48 @@ impl BingMetadata {
         )
     }
 
+    /// The Web Mercator tiling scheme for this layer. Bing serves no level-0
+    /// tile (the empty quadkey is invalid), so draping clamps to level 1.
+    pub fn tiling_scheme(&self) -> TilingScheme {
+        let mut scheme = TilingScheme::web_mercator();
+        scheme.tile_size = self.tile_width.max(1);
+        scheme.minimum_level = 1;
+        scheme
+    }
+
+    /// Bing quadkey of a Web Mercator tile: interleave x/y bits, MSB → level 1.
+    pub fn quadkey(x: u64, y: u64, level: u32) -> String {
+        let mut s = String::with_capacity(level as usize);
+        for i in (1..=level).rev() {
+            let mask = 1u64 << (i - 1);
+            let mut digit = 0u8;
+            if x & mask != 0 {
+                digit += 1;
+            }
+            if y & mask != 0 {
+                digit += 2;
+            }
+            s.push((b'0' + digit) as char);
+        }
+        s
+    }
+
+    /// The image URL for a tile: subdomain + quadkey substituted into the
+    /// metadata template. Pure (no fetch) — usable from a wasm host that lets
+    /// JS do the fetching.
+    pub fn tile_url(&self, coord: ImageryCoord) -> String {
+        let quadkey = Self::quadkey(coord.x, coord.y, coord.level);
+        let subdomain = if self.subdomains.is_empty() {
+            ""
+        } else {
+            let i = (coord.x + coord.y + u64::from(coord.level)) as usize % self.subdomains.len();
+            &self.subdomains[i]
+        };
+        self.image_url
+            .replace("{subdomain}", subdomain)
+            .replace("{quadkey}", &quadkey)
+    }
+
     /// Parses the Bing metadata JSON document.
     pub fn from_json(bytes: &[u8]) -> Result<Self, RasterError> {
         let doc: MetadataDoc =
@@ -90,12 +132,7 @@ pub struct BingImageryProvider<F: TileFetcher> {
 impl<F: TileFetcher> BingImageryProvider<F> {
     /// Builds from already-fetched metadata.
     pub fn new(fetcher: Arc<F>, metadata: BingMetadata) -> Self {
-        // Bing is Web Mercator; tile size from the metadata. Bing serves no
-        // level-0 tile (the empty quadkey is invalid), so draping must clamp
-        // to level 1 at the coarsest.
-        let mut scheme = TilingScheme::web_mercator();
-        scheme.tile_size = metadata.tile_width.max(1);
-        scheme.minimum_level = 1;
+        let scheme = metadata.tiling_scheme();
         Self {
             fetcher,
             metadata,
@@ -115,41 +152,19 @@ impl<F: TileFetcher> BingImageryProvider<F> {
         Ok(Self::new(fetcher, BingMetadata::from_json(&bytes)?))
     }
 
-    /// Bing quadkey of a Web Mercator tile: interleave the x/y bits from the
-    /// most significant level down to 1.
+    /// Bing quadkey of a Web Mercator tile (see [`BingMetadata::quadkey`]).
     pub fn quadkey(x: u64, y: u64, level: u32) -> String {
-        let mut s = String::with_capacity(level as usize);
-        for i in (1..=level).rev() {
-            let mask = 1u64 << (i - 1);
-            let mut digit = 0u8;
-            if x & mask != 0 {
-                digit += 1;
-            }
-            if y & mask != 0 {
-                digit += 2;
-            }
-            s.push((b'0' + digit) as char);
-        }
-        s
+        BingMetadata::quadkey(x, y, level)
     }
 
-    fn tile_url(&self, coord: ImageryCoord) -> String {
-        let quadkey = Self::quadkey(coord.x, coord.y, coord.level);
-        let subdomain = if self.metadata.subdomains.is_empty() {
-            ""
-        } else {
-            let i = (coord.x + coord.y + u64::from(coord.level)) as usize
-                % self.metadata.subdomains.len();
-            &self.metadata.subdomains[i]
-        };
-        self.metadata
-            .image_url
-            .replace("{subdomain}", subdomain)
-            .replace("{quadkey}", &quadkey)
+    /// Image URL of a tile (see [`BingMetadata::tile_url`]).
+    pub fn tile_url(&self, coord: ImageryCoord) -> String {
+        self.metadata.tile_url(coord)
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl<F: TileFetcher> ImageryProvider for BingImageryProvider<F> {
     fn tiling_scheme(&self) -> TilingScheme {
         self.scheme
@@ -157,6 +172,7 @@ impl<F: TileFetcher> ImageryProvider for BingImageryProvider<F> {
 
     async fn fetch_tile(&self, coord: ImageryCoord) -> Result<DecodedTexture, RasterError> {
         let url = self
+            .metadata
             .tile_url(coord)
             .parse()
             .map_err(|e: url::ParseError| RasterError::Image(e.to_string()))?;
@@ -188,7 +204,8 @@ mod tests {
                 .insert(url.to_owned(), bytes);
         }
     }
-    #[async_trait]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     impl TileFetcher for MockFetcher {
         async fn fetch(&self, url: &Url) -> Result<Bytes, FetchError> {
             self.log.lock().expect("lock").push(url.to_string());

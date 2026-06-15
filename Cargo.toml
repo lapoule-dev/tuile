@@ -12,6 +12,7 @@ members = [
     "crates/tuile-wgpu",
     "examples/globe-bulk",
     "examples/tile-probe",
+    "examples/wasm-globe",
     "examples/wgpu-viewer",
 ]
 

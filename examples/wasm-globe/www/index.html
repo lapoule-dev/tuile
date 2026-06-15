@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>tuile — raw wasm globe (Pyrénées)</title>
+    <style>
+      body { font: 14px/1.5 ui-monospace, monospace; margin: 2rem; max-width: 60rem; }
+      h1 { font-size: 1.1rem; }
+      input { width: 32rem; font: inherit; padding: .3rem; }
+      button { font: inherit; padding: .3rem .8rem; }
+      #log { white-space: pre-wrap; background: #111; color: #0f0; padding: 1rem;
+             border-radius: 6px; height: 16rem; overflow: auto; }
+      #report { white-space: pre; background: #f6f6f6; padding: 1rem; border-radius: 6px;
+                max-height: 24rem; overflow: auto; }
+      .muted { color: #666; }
+    </style>
+  </head>
+  <body>
+    <h1>tuile — raw wasm globe · Pyrénées (no server, no wgpu)</h1>
+    <p class="muted">
+      The wasm module does everything in this browser tab — assemble the ion globe,
+      drive the SSE traversal, decode quantized-mesh tiles, accumulate geometry.
+      JavaScript only performs <code>fetch</code>.
+    </p>
+    <p>
+      <input id="token" type="password" placeholder="paste your CESIUM_ION_TOKEN" />
+      <button id="run">Run Pyrénées</button>
+    </p>
+    <div id="log"></div>
+    <h2>GeometryReport</h2>
+    <pre id="report" class="muted">(runs here)</pre>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
