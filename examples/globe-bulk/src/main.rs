@@ -16,6 +16,9 @@
 
 use anyhow::{bail, Context, Result};
 use glam::{DVec2, DVec3, Mat4};
+use std::sync::Arc;
+use tuile_bing::{BingImageryProvider, BingMetadata};
+use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
 use tuile_core::drive::drive_until_complete;
 use tuile_core::geo::{ecef_to_geodetic, enu_frame, geodetic_to_ecef, Geodetic, WGS84_A};
 use tuile_core::report::GeometryReport;
@@ -23,9 +26,6 @@ use tuile_core::runtime::in_process_with;
 use tuile_core::source::{TileId, TileLoader, TileTree};
 use tuile_core::traversal::{Config, ViewState};
 use tuile_core::TileContent;
-use std::sync::Arc;
-use tuile_bing::{BingImageryProvider, BingMetadata};
-use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
 use tuile_native_fetchers::NativeHttp;
 use tuile_planetary::{globe, GlobeOptions};
 use tuile_wgpu::{prepare, GpuContext, PreparedTile, TileRenderer, ViewUniform};

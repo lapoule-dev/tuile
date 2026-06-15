@@ -217,8 +217,8 @@ fn decode_metadata_availability(
     payload: &[u8],
 ) -> Option<Vec<Vec<crate::layer::AvailabilityRange>>> {
     let len_bytes = payload.get(0..4)?;
-    let string_len = u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]])
-        as usize;
+    let string_len =
+        u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
     let json = payload.get(4..4 + string_len)?;
     let meta: crate::layer::TileMetadata = serde_json::from_slice(json).ok()?;
     (!meta.available.is_empty()).then_some(meta.available)

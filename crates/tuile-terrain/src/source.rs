@@ -13,7 +13,8 @@ use async_trait::async_trait;
 /// Supplies the raw bytes of a quantized-mesh terrain tile. The bytes may be
 /// gzipped — [`crate::decode`] handles that. Transport- and backend-agnostic:
 /// the implementor decides HTTP, disk, ion bearer auth, etc.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait TerrainSource: Send + Sync {
     async fn fetch_tile(&self, coord: TileCoord) -> Result<Vec<u8>, TerrainSourceError>;
 }

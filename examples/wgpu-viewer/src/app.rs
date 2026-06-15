@@ -87,8 +87,7 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         let size = (size.width.max(1), size.height.max(1));
 
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance
             .create_surface(window.clone())
             .expect("create surface");
@@ -134,12 +133,7 @@ impl ApplicationHandler for App {
         self.active = Some(active);
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         if self.active.is_none() {
             return;
         }
@@ -220,8 +214,7 @@ impl App {
         // one screen pixel ≈ 2·altitude·tan(fovy/2) / viewport_height. The
         // loader drapes imagery at (at least) that texel spacing — a giant fine
         // mosaic up close, coarse from orbit.
-        let target_texel =
-            2.0 * cam.altitude() * (cam.fovy * 0.5).tan() / viewport.y.max(1.0);
+        let target_texel = 2.0 * cam.altitude() * (cam.fovy * 0.5).tan() / viewport.y.max(1.0);
         self.detail.set_target_texel_spacing(target_texel);
 
         if !self.freeze {
@@ -255,9 +248,8 @@ impl App {
         let rendered = tiles.len();
 
         let frame = match active.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
-                f
-            }
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 configure_surface(active);
                 return;

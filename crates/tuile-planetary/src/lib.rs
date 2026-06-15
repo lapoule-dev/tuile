@@ -24,7 +24,9 @@ use std::sync::{Arc, Mutex};
 use tuile_core::content::DecodedTexture;
 use tuile_core::fetch::FetchError;
 use tuile_core::geo::WGS84_A;
-use tuile_core::raster::{self, GeoRect, ImageryCoord, ImageryProvider, OverlayAttachment, RasterError};
+use tuile_core::raster::{
+    self, GeoRect, ImageryCoord, ImageryProvider, OverlayAttachment, RasterError,
+};
 use tuile_core::source::{LoadError, Loaded, TileId, TileLoader, TileTree};
 use tuile_terrain::{
     decode, level_geometric_error, to_decoded, Availability, GeographicTilingScheme, LayerJson,
@@ -140,7 +142,12 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                     y: c.y / 2,
                 };
                 let ptex = Box::pin(self.fetch_imagery(parent)).await?;
-                tracing::debug!(z = c.level, x = c.x, y = c.y, "imagery upsampled (parent fallback)");
+                tracing::debug!(
+                    z = c.level,
+                    x = c.x,
+                    y = c.y,
+                    "imagery upsampled (parent fallback)"
+                );
                 raster::upsample_quadrant(&ptex, (c.x & 1) as u32, (c.y & 1) as u32)
             }
             Err(e) => return Err(LoadError::Failed(format!("imagery {c:?}: {e}"))),
@@ -208,8 +215,11 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
     }
 }
 
-#[async_trait]
-impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader for PlanetaryLoader<T, I> {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
+    for PlanetaryLoader<T, I>
+{
     async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
         let (z, x, y) = id.terrain_coord();
         let coord = TileCoord::new(z, x, y);
@@ -279,8 +289,10 @@ where
         scheme.root_tiles_x,
         scheme.root_tiles_y,
     ));
-    let tree: Box<dyn TileTree> =
-        Box::new(TerrainTree::with_availability(layer, Arc::clone(&availability)));
+    let tree: Box<dyn TileTree> = Box::new(TerrainTree::with_availability(
+        layer,
+        Arc::clone(&availability),
+    ));
     let detail = ImageryDetail::default();
     let loader: Arc<dyn TileLoader> = Arc::new(PlanetaryLoader {
         terrain,
@@ -293,4 +305,3 @@ where
     });
     (tree, loader, detail)
 }
-

@@ -49,7 +49,8 @@ pub enum IonError {
 
 /// Minimal HTTP transport seam (lets tests run without network and hosts
 /// pick their client). `bearer` goes out as `Authorization: Bearer …`.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait IonHttp: Send + Sync {
     async fn get(&self, url: &Url, bearer: Option<&str>) -> Result<HttpResponse, IonError>;
 }
@@ -314,7 +315,8 @@ fn ion_to_fetch_error(e: IonError, url: &Url) -> FetchError {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl<H: IonHttp> TileFetcher for IonTileFetcher<H> {
     async fn fetch(&self, url: &Url) -> Result<Bytes, FetchError> {
         let endpoint = self
@@ -363,7 +365,8 @@ pub struct ReqwestHttp {
 }
 
 #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl IonHttp for ReqwestHttp {
     async fn get(&self, url: &Url, bearer: Option<&str>) -> Result<HttpResponse, IonError> {
         let mut req = self.client.get(url.clone());

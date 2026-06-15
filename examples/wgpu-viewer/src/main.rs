@@ -19,10 +19,10 @@ use std::sync::Arc;
 use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_camera::{CameraController, GlobeCamera};
 use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
-use tuile_native_fetchers::NativeHttp;
 use tuile_core::runtime::in_process_with;
 use tuile_core::source::{TileLoader, TileTree};
 use tuile_core::traversal::Config;
+use tuile_native_fetchers::NativeHttp;
 use tuile_planetary::{globe, GlobeOptions, ImageryDetail};
 use winit::event_loop::{ControlFlow, EventLoop};
 
@@ -44,9 +44,13 @@ async fn ion_globe(
     };
     let o = &endpoint.options;
     let meta_url = BingMetadata::metadata_url(
-        o.url.as_deref().ok_or_else(|| anyhow::anyhow!("bing url"))?,
+        o.url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("bing url"))?,
         o.map_style.as_deref().unwrap_or("Aerial"),
-        o.key.as_deref().ok_or_else(|| anyhow::anyhow!("bing key"))?,
+        o.key
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("bing key"))?,
     );
     let bing = BingImageryProvider::from_metadata_url(Arc::clone(&http), &meta_url)
         .await

@@ -32,7 +32,9 @@ fn init_tracing() {
 fn coord_at(scheme: &GeographicTilingScheme, lon_deg: f64, lat_deg: f64, level: u32) -> TileCoord {
     let tx = scheme.tiles_x(level) as f64;
     let ty = scheme.tiles_y(level) as f64;
-    let x = ((lon_deg + 180.0) / 360.0 * tx).floor().clamp(0.0, tx - 1.0) as u64;
+    let x = ((lon_deg + 180.0) / 360.0 * tx)
+        .floor()
+        .clamp(0.0, tx - 1.0) as u64;
     let y = ((lat_deg + 90.0) / 180.0 * ty).floor().clamp(0.0, ty - 1.0) as u64;
     TileCoord::new(level, x, y)
 }

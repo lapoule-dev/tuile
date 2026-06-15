@@ -34,7 +34,14 @@ use std::sync::{Arc, RwLock};
 use std::task::Poll;
 
 type LoadMsg = (TileId, Result<Loaded, LoadError>);
-type LoadFuture = Abortable<Pin<Box<dyn Future<Output = LoadMsg> + Send>>>;
+// The boxed load future is `Send` on native (driven by a multi-thread executor
+// like tokio) but `?Send` on wasm, where it holds JS futures (`!Send`) and runs
+// single-threaded under `spawn_local`. Same server loop, two host models.
+#[cfg(not(target_arch = "wasm32"))]
+type BoxLoadFut = Pin<Box<dyn Future<Output = LoadMsg> + Send>>;
+#[cfg(target_arch = "wasm32")]
+type BoxLoadFut = Pin<Box<dyn Future<Output = LoadMsg>>>;
+type LoadFuture = Abortable<BoxLoadFut>;
 
 /// Creates a geometry server for a **3D Tiles** tileset, bound in-process to
 /// one consumer. Convenience over [`in_process_with`]: it wraps the tileset in
@@ -284,7 +291,7 @@ impl Session<'_> {
             }
             let loader = Arc::clone(self.loader);
             let (handle, registration) = AbortHandle::new_pair();
-            let fut: Pin<Box<dyn Future<Output = LoadMsg> + Send>> = Box::pin(async move {
+            let fut: BoxLoadFut = Box::pin(async move {
                 let result = loader.load(tile).await;
                 (tile, result)
             });

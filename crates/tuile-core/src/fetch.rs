@@ -27,7 +27,8 @@ pub enum FetchError {
 /// Abstract byte source. `Send + Sync` bounds are the native baseline; the
 /// single-threaded wasm relaxation (`maybe_send`) is an M2 follow-up noted
 /// in `docs/01-architecture.md`.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait TileFetcher: Send + Sync {
     async fn fetch(&self, url: &Url) -> Result<Bytes, FetchError>;
 }
@@ -40,7 +41,8 @@ pub trait TileFetcher: Send + Sync {
 pub struct FsFetcher;
 
 #[cfg(not(target_arch = "wasm32"))]
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl TileFetcher for FsFetcher {
     async fn fetch(&self, url: &Url) -> Result<Bytes, FetchError> {
         if url.scheme() != "file" {
@@ -73,7 +75,8 @@ pub struct HttpFetcher {
 }
 
 #[cfg(all(feature = "http", not(target_arch = "wasm32")))]
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl TileFetcher for HttpFetcher {
     async fn fetch(&self, url: &Url) -> Result<Bytes, FetchError> {
         let response = self

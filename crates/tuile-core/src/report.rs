@@ -190,7 +190,12 @@ mod tests {
     fn report_counts_geometry_and_flags_degenerate_skirts() {
         // One real triangle + one collapsed (degenerate) triangle.
         let mesh = DecodedMesh {
-            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [2.0, 2.0, 2.0]],
+            positions: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [2.0, 2.0, 2.0],
+            ],
             normals: None,
             uvs: Some(vec![[0.0, 0.0], [1.5, 0.0], [0.0, 1.0], [0.0, 0.0]]),
             indices: vec![0, 1, 2, /* collapsed: */ 3, 3, 3],

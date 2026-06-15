@@ -143,7 +143,8 @@ impl<H: IonHttp> IonTerrainSource<H> {
 /// Exposes the ion terrain source through the backend-agnostic
 /// [`tuile_terrain::TerrainSource`] seam, so `tuile-planetary` consumes it
 /// without knowing about ion.
-#[async_trait::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl<H: IonHttp> tuile_terrain::TerrainSource for IonTerrainSource<H> {
     async fn fetch_tile(
         &self,

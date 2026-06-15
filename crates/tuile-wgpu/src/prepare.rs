@@ -57,7 +57,11 @@ impl PreparedTile {
     pub fn rebase(&self, queue: &wgpu::Queue, render_origin: DVec3) {
         let model =
             tuile_core::geo::rebased_model(self.origin_ecef, self.transform_local, render_origin);
-        queue.write_buffer(&self.tile_buf, 0, bytemuck::cast_slice(&model.to_cols_array()));
+        queue.write_buffer(
+            &self.tile_buf,
+            0,
+            bytemuck::cast_slice(&model.to_cols_array()),
+        );
     }
 }
 

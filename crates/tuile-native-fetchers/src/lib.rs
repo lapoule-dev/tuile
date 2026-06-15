@@ -50,7 +50,11 @@ pub fn default_cache_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
         let mac = home.join("Library/Caches");
-        let base = if mac.is_dir() { mac } else { home.join(".cache") };
+        let base = if mac.is_dir() {
+            mac
+        } else {
+            home.join(".cache")
+        };
         return base.join("tuile");
     }
     std::env::temp_dir().join("tuile-cache")

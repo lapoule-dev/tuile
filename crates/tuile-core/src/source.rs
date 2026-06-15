@@ -142,7 +142,8 @@ pub enum Loaded {
 /// runtime drives it off the frame. Each source's loader is responsible for
 /// the textures that correspond to its tiles (terrain → draped imagery, glb
 /// → intrinsic textures).
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait TileLoader: Send + Sync {
     async fn load(&self, id: TileId) -> Result<Loaded, LoadError>;
 }
@@ -227,7 +228,8 @@ impl CompositeLoader {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl TileLoader for CompositeLoader {
     async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
         let tag = id.tag();
@@ -321,7 +323,8 @@ mod tests {
     struct StubLoader {
         marker: f32,
     }
-    #[async_trait]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     impl TileLoader for StubLoader {
         async fn load(&self, _id: TileId) -> Result<Loaded, LoadError> {
             Ok(Loaded::Content(DecodedTileContent {

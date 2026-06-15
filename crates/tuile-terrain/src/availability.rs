@@ -100,8 +100,18 @@ mod tests {
         a.add_descendant_ranges(
             0,
             &[
-                vec![AvailabilityRange { start_x: 0, start_y: 0, end_x: 3, end_y: 1 }],
-                vec![AvailabilityRange { start_x: 0, start_y: 0, end_x: 7, end_y: 3 }],
+                vec![AvailabilityRange {
+                    start_x: 0,
+                    start_y: 0,
+                    end_x: 3,
+                    end_y: 1,
+                }],
+                vec![AvailabilityRange {
+                    start_x: 0,
+                    start_y: 0,
+                    end_x: 7,
+                    end_y: 3,
+                }],
             ],
         );
         assert!(a.is_available(TileCoord::new(1, 3, 1)));
@@ -111,10 +121,7 @@ mod tests {
 
     #[test]
     fn static_table_is_used_as_is() {
-        let layer = layer_with(
-            r#"[[{"startX":0,"startY":0,"endX":1,"endY":0}]]"#,
-            "",
-        );
+        let layer = layer_with(r#"[[{"startX":0,"startY":0,"endX":1,"endY":0}]]"#, "");
         let a = Availability::from_layer(&layer, 2, 1);
         assert!(a.is_available(TileCoord::new(0, 1, 0)));
         assert!(!a.is_available(TileCoord::new(1, 0, 0)));

@@ -574,7 +574,8 @@ pub fn drape_single(
 }
 
 /// An imagery source: a tiling scheme plus tile fetching+decoding.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait ImageryProvider: Send + Sync {
     fn tiling_scheme(&self) -> TilingScheme;
     async fn fetch_tile(&self, coord: ImageryCoord) -> Result<DecodedTexture, RasterError>;
@@ -609,7 +610,8 @@ impl<F: TileFetcher> TemplateProvider<F> {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl<F: TileFetcher> ImageryProvider for TemplateProvider<F> {
     fn tiling_scheme(&self) -> TilingScheme {
         self.scheme
@@ -646,7 +648,12 @@ pub fn upsample_quadrant(src: &DecodedTexture, qx: u32, qy: u32) -> DecodedTextu
     };
     let (hw, hh) = (src.width / 2, src.height / 2);
     let quadrant = imageops::crop_imm(&img, qx * hw, qy * hh, hw, hh).to_image();
-    let full = imageops::resize(&quadrant, src.width, src.height, imageops::FilterType::CatmullRom);
+    let full = imageops::resize(
+        &quadrant,
+        src.width,
+        src.height,
+        imageops::FilterType::CatmullRom,
+    );
     DecodedTexture {
         width: src.width,
         height: src.height,

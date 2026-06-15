@@ -20,9 +20,7 @@
 //! - **tilt** / **heading** orbit the look-at point on the surface.
 
 use glam::{DQuat, DVec3, Mat4};
-use tuile_core::geo::{
-    ecef_to_geodetic, enu_frame, geodetic_to_ecef, Geodetic, WGS84_A, WGS84_B,
-};
+use tuile_core::geo::{ecef_to_geodetic, enu_frame, geodetic_to_ecef, Geodetic, WGS84_A, WGS84_B};
 use tuile_core::traversal::ViewState;
 
 /// WGS84 ellipsoid radii (x = y = equatorial, z = polar).
@@ -321,7 +319,10 @@ mod tests {
         // After the drag the grabbed surface point sits under the end cursor.
         let now = ctrl.pick(end, vp).expect("hit after drag");
         let d = (now.normalize() - grabbed.normalize()).length();
-        assert!(d < 1.0e-3, "grabbed point should track the cursor (drift {d})");
+        assert!(
+            d < 1.0e-3,
+            "grabbed point should track the cursor (drift {d})"
+        );
     }
 
     #[test]
