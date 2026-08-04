@@ -15,6 +15,7 @@
 //! finest LOD as the path streams in — mirroring `CesiumTerrainProvider`'s
 //! `TileAvailability`.
 
+use std::collections::HashSet;
 use std::sync::RwLock;
 
 use crate::layer::{AvailabilityRange, LayerJson};
@@ -25,6 +26,14 @@ use crate::tiling::TileCoord;
 pub struct Availability {
     /// `levels[z]` = the ranges of existing tiles known at level `z`.
     levels: RwLock<Vec<Vec<AvailabilityRange>>>,
+    /// The same ranges as a set, purely to reject repeats on the way in.
+    ///
+    /// Neighbouring tiles describe overlapping slices of the quadtree, so the
+    /// identical rectangle arrives again and again. Appending blindly makes
+    /// `is_available` — a linear scan, run for every child of every visited
+    /// tile, on every traversal — grow without bound, and the session slows to
+    /// a halt long before memory becomes the complaint.
+    seen: RwLock<HashSet<RangeKey>>,
 }
 
 impl Availability {
@@ -45,9 +54,26 @@ impl Availability {
                 end_y: root_tiles_y.saturating_sub(1),
             }];
         }
+        let seen = levels
+            .iter()
+            .enumerate()
+            .flat_map(|(level, ranges)| ranges.iter().map(move |r| key(level as u32, r)))
+            .collect();
         Self {
             levels: RwLock::new(levels),
+            seen: RwLock::new(seen),
         }
+    }
+
+    /// How many distinct ranges are held, all levels together. Diagnostics: a
+    /// number that keeps climbing means dedup is failing to bite.
+    pub fn range_count(&self) -> usize {
+        self.levels
+            .read()
+            .expect("availability")
+            .iter()
+            .map(Vec::len)
+            .sum()
     }
 
     /// Whether a tile is known to exist.
@@ -63,14 +89,26 @@ impl Availability {
     /// `metadata` extension convention).
     pub fn add_descendant_ranges(&self, base_level: u32, ranges: &[Vec<AvailabilityRange>]) {
         let mut levels = self.levels.write().expect("availability");
+        let mut seen = self.seen.write().expect("availability");
         for (offset, at_level) in ranges.iter().enumerate() {
             let level = base_level as usize + offset + 1;
             if level >= levels.len() {
                 levels.resize_with(level + 1, Vec::new);
             }
-            levels[level].extend_from_slice(at_level);
+            for range in at_level {
+                if seen.insert(key(level as u32, range)) {
+                    levels[level].push(*range);
+                }
+            }
         }
     }
+}
+
+/// Identity of a range at a level: the level plus the rectangle's corners.
+type RangeKey = (u32, u64, u64, u64, u64);
+
+fn key(level: u32, r: &AvailabilityRange) -> RangeKey {
+    (level, r.start_x, r.start_y, r.end_x, r.end_y)
 }
 
 #[cfg(test)]
@@ -125,5 +163,47 @@ mod tests {
         let a = Availability::from_layer(&layer, 2, 1);
         assert!(a.is_available(TileCoord::new(0, 1, 0)));
         assert!(!a.is_available(TileCoord::new(1, 0, 0)));
+    }
+
+    /// Neighbouring tiles keep describing the same slices of the quadtree.
+    /// Storing each repeat makes `is_available` — a linear scan run per child
+    /// per traversal — grow without bound, and the session grinds to a halt.
+    #[test]
+    fn repeated_ranges_are_recorded_once() {
+        let a = Availability::from_layer(&layer_with("[]", ""), 2, 1);
+        let ranges = vec![vec![AvailabilityRange {
+            start_x: 0,
+            start_y: 0,
+            end_x: 3,
+            end_y: 1,
+        }]];
+        let before = a.range_count();
+        for _ in 0..100 {
+            a.add_descendant_ranges(0, &ranges);
+        }
+        assert_eq!(
+            a.range_count() - before,
+            1,
+            "100 identical reveals should leave one range"
+        );
+        assert!(a.is_available(TileCoord::new(1, 3, 1)));
+    }
+
+    #[test]
+    fn distinct_ranges_are_all_kept() {
+        let a = Availability::from_layer(&layer_with("[]", ""), 2, 1);
+        let before = a.range_count();
+        for x in 0..4u64 {
+            a.add_descendant_ranges(
+                0,
+                &[vec![AvailabilityRange {
+                    start_x: x,
+                    start_y: 0,
+                    end_x: x,
+                    end_y: 0,
+                }]],
+            );
+        }
+        assert_eq!(a.range_count() - before, 4);
     }
 }

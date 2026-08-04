@@ -71,14 +71,33 @@ impl ResidentCache {
             self.used -= prev.size;
         }
         self.used += size;
+        // The tile just admitted is never its own victim.
+        self.trim_except(protected, Some(t))
+    }
 
+    /// Evicts down to the budget without admitting anything.
+    ///
+    /// Insertion is not enough on its own: it is the only other place eviction
+    /// happens, so a session that stops loading — a camera that settles on a
+    /// view it already holds — stays over budget indefinitely, however much of
+    /// the residency has stopped being needed. Call this whenever the protected
+    /// set changes, which is once per traversal.
+    pub fn trim(&mut self, protected: &HashSet<TileId>) -> Vec<TileId> {
+        self.trim_except(protected, None)
+    }
+
+    fn trim_except(
+        &mut self,
+        protected: &HashSet<TileId>,
+        keep: Option<TileId>,
+    ) -> Vec<TileId> {
         let mut evicted = Vec::new();
         while self.used > self.budget {
             // LRU among evictable entries; tile id breaks ties deterministically.
             let victim = self
                 .entries
                 .iter()
-                .filter(|(id, _)| !protected.contains(id) && **id != t)
+                .filter(|(id, _)| !protected.contains(id) && Some(**id) != keep)
                 .min_by(|a, b| a.1.last_used.cmp(&b.1.last_used).then(a.0.cmp(b.0)))
                 .map(|(id, _)| *id);
             match victim {

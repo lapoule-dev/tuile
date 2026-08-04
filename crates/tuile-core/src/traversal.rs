@@ -124,9 +124,25 @@ pub struct Config {
     /// Soft cap on simultaneously loading descendants (reserved, M2 honours it).
     pub loading_descendant_limit: u32,
     /// Resident-content budget in bytes (CPU side). Default 512 MiB.
+    ///
+    /// A consumer that uploads this content pays more than this for it: mip
+    /// chains, interleaved vertices and format padding all land on its side of
+    /// the wire. Budget for the consumer's memory, not for this number.
     pub resident_budget_bytes: usize,
     /// Maximum simultaneous content fetches.
     pub maximum_simultaneous_fetches: usize,
+    /// How many recent camera positions keep a tile safe from eviction.
+    ///
+    /// `1` protects only what the current view needs, which makes a turning
+    /// camera evict the tiles behind it and reload them the moment it turns
+    /// back — the residency has no memory of where it just was. Counting
+    /// *camera positions* rather than traversals is deliberate: a traversal
+    /// also runs on every load completion, so a window measured in traversals
+    /// would expire in milliseconds under a burst of fetches.
+    ///
+    /// Larger values hold more, and are the difference between a smooth
+    /// rotation and one that re-streams its own wake. Default 4.
+    pub protected_view_generations: usize,
 }
 
 impl Default for Config {
@@ -137,6 +153,7 @@ impl Default for Config {
             loading_descendant_limit: 20,
             resident_budget_bytes: 512 * 1024 * 1024,
             maximum_simultaneous_fetches: 20,
+            protected_view_generations: 4,
         }
     }
 }
@@ -200,8 +217,6 @@ pub struct TraversalOutput {
     /// Content to fetch, sorted: group first (Urgent → Preload), then
     /// ascending priority value.
     pub requests: Vec<ContentRequest>,
-    /// Resident tiles that this frame does not select (eviction candidates).
-    pub to_evict_hint: Vec<TileId>,
     pub stats: TraversalStats,
 }
 
@@ -219,7 +234,6 @@ pub fn traverse(
 ) {
     out.selected.clear();
     out.requests.clear();
-    out.to_evict_hint.clear();
     out.stats = TraversalStats::default();
     let roots = tree.roots();
     if views.is_empty() || roots.is_empty() {
@@ -241,11 +255,6 @@ pub fn traverse(
     });
     out.stats.selected = out.selected.len() as u32;
     out.stats.requested = out.requests.len() as u32;
-
-    let selected: HashSet<TileId> = out.selected.iter().map(|(t, _)| *t).collect();
-    out.to_evict_hint
-        .extend(residency.iter().filter(|t| !selected.contains(t)));
-    out.to_evict_hint.sort();
 }
 
 /// Recursive visit over the abstract [`TileTree`]. Returns whether this
@@ -501,8 +510,6 @@ mod tests {
         assert_eq!(sel.len(), 4);
         assert!(!sel.contains(&root), "parent and children never coexist");
         assert!(out.requests.is_empty());
-        // The parent is now an eviction candidate.
-        assert_eq!(out.to_evict_hint, vec![root]);
     }
 
     #[test]
@@ -710,4 +717,5 @@ mod tests {
         let sse_b = back.screen_space_error(10.0, 100.0);
         assert!((sse_a - sse_b).abs() < 1e-9);
     }
+
 }

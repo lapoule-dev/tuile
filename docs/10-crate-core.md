@@ -73,7 +73,6 @@ pub struct ContentRequest {
 pub struct TraversalOutput {
     pub selected: Vec<(TileId, f64)>,    // tile + current SSE (debug overlay, future fades)
     pub requests: Vec<ContentRequest>,   // sorted: group, then priority
-    pub to_evict_hint: Vec<TileId>,
     pub stats: TraversalStats,           // visited, culled, max_depth… — the viewer overlay lives off it
 }
 ```
