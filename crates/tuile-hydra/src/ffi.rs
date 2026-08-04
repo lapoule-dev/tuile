@@ -34,6 +34,12 @@ pub enum TuileStatus {
     TilesFailed = 4,
     /// A panic was caught at the boundary. Always a bug on this side.
     InternalError = 5,
+    /// A texture could not be encoded.
+    EncodeFailed = 6,
+    /// The index named nothing — an untextured tile, or past the end. Distinct
+    /// from [`TuileStatus::BadArgument`] because it is an ordinary answer, not a
+    /// mistake: a caller enumerating textures stops on it.
+    NotFound = 7,
 }
 
 /// A borrowed span of a Rust-owned buffer.
@@ -88,7 +94,8 @@ pub struct TuileTile {
     pub vertex_count: u32,
     pub index_count: u32,
     pub base_color_factor: [f32; 4],
-    /// Index into the frame's textures, or `-1` for an untextured tile.
+    /// Index into **this tile's** textures, or `-1` for an untextured tile.
+    /// Pass it back to [`tuile_frame_texture`] along with the tile's own index.
     pub base_color_texture: i32,
 }
 
@@ -98,6 +105,8 @@ impl From<&FrameError> for TuileStatus {
             FrameError::TimedOut(_) => TuileStatus::TimedOut,
             FrameError::ServerGone => TuileStatus::ServerGone,
             FrameError::TilesFailed { .. } => TuileStatus::TilesFailed,
+            FrameError::TextureEncode(_) => TuileStatus::EncodeFailed,
+            FrameError::Poisoned => TuileStatus::InternalError,
         }
     }
 }
@@ -211,6 +220,58 @@ pub unsafe extern "C" fn tuile_frame_tile(
     })
 }
 
+/// One tile texture: the URI it is published under, and its PNG bytes.
+///
+/// Both borrows stay valid until the frame is freed.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TuileTexture {
+    /// UTF-8, **not** null-terminated — the length is in the buffer.
+    pub uri: TuileBuffer,
+    pub png: TuileBuffer,
+}
+
+/// Encodes (once) and borrows a tile's texture.
+///
+/// PNG rather than the raw RGBA the tile decoded to, because the host's image
+/// plugin decodes encoded bytes and nothing else. That re-encode is real CPU
+/// per texture per frame; it is the price of draping a private copy per tile,
+/// and it goes away when imagery is referenced rather than baked.
+///
+/// Returns [`TuileStatus::NotFound`] when either index names nothing, which is
+/// how a caller enumerates: ask for 0, 1, 2… until it stops.
+///
+/// # Safety
+/// `frame` must be a live frame and `out` must point at a writable
+/// [`TuileTexture`].
+#[no_mangle]
+pub unsafe extern "C" fn tuile_frame_texture(
+    frame: *const Frame,
+    tile_index: usize,
+    texture_index: usize,
+    out: *mut TuileTexture,
+) -> TuileStatus {
+    if frame.is_null() || out.is_null() {
+        return TuileStatus::BadArgument;
+    }
+    guard(|| {
+        let frame = unsafe { &*frame };
+        match frame.texture_png(tile_index, texture_index) {
+            Ok(Some(texture)) => {
+                unsafe {
+                    *out = TuileTexture {
+                        uri: TuileBuffer::of(texture.uri.as_bytes()),
+                        png: TuileBuffer::of(&texture.png),
+                    }
+                };
+                TuileStatus::Ok
+            }
+            Ok(None) => TuileStatus::NotFound,
+            Err(e) => TuileStatus::from(&e),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,7 +299,7 @@ mod tests {
             unsafe { tuile_frame_tile_count(std::ptr::null(), &mut count) },
             TuileStatus::BadArgument
         );
-        let frame = Frame { tiles: Vec::new() };
+        let frame = Frame::new(Vec::new());
         assert_eq!(
             unsafe { tuile_frame_tile_count(&frame, std::ptr::null_mut()) },
             TuileStatus::BadArgument
@@ -247,7 +308,7 @@ mod tests {
 
     #[test]
     fn an_empty_frame_reports_no_tiles() {
-        let frame = Frame { tiles: Vec::new() };
+        let frame = Frame::new(Vec::new());
         let mut count = 99usize;
         assert_eq!(
             unsafe { tuile_frame_tile_count(&frame, &mut count) },
@@ -260,6 +321,22 @@ mod tests {
             unsafe { tuile_frame_tile(&frame, 0, tile.as_mut_ptr()) },
             TuileStatus::BadArgument,
             "an out-of-range index must not be read"
+        );
+    }
+
+    /// Asking a frame with no tiles for a texture is absence, not a mistake:
+    /// the distinction is what lets a caller enumerate until it stops.
+    #[test]
+    fn an_absent_texture_is_not_found_rather_than_bad_argument() {
+        let frame = Frame::new(Vec::new());
+        let mut texture = std::mem::MaybeUninit::<TuileTexture>::uninit();
+        assert_eq!(
+            unsafe { tuile_frame_texture(&frame, 0, 0, texture.as_mut_ptr()) },
+            TuileStatus::NotFound
+        );
+        assert_eq!(
+            unsafe { tuile_frame_texture(std::ptr::null(), 0, 0, texture.as_mut_ptr()) },
+            TuileStatus::BadArgument
         );
     }
 
