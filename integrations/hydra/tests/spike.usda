@@ -1,0 +1,53 @@
+#usda 1.0
+(
+    """The smallest stage that exercises every link in the chain.
+
+    Renders a single procedural whose mesh subdivision follows the camera's
+    distance. Two frames are rendered from the same stage at different times;
+    if their images are identical the procedural was never re-cooked, which is
+    the failure this file exists to catch.
+    """
+    defaultPrim = "World"
+    startTimeCode = 1
+    endTimeCode = 2
+    timeCodesPerSecond = 24
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+def Xform "World"
+{
+    def Camera "ShotCam"
+    {
+        float focalLength = 24
+        float2 clippingRange = (0.1, 10000)
+        # The whole point: the camera moves, so the procedural must re-cook and
+        # the second frame must differ from the first.
+        #
+        # The range is chosen so BOTH frames show the patch at a workable size.
+        # An earlier version started at 400, where a 2-unit patch covers about
+        # three pixels — the render was correct and the comparison meaningless.
+        # At 12 the patch is ~19% of the frame width and refines to 16
+        # divisions; at 4 it fills the frame and refines to 50.
+        double3 xformOp:translate.timeSamples = {
+            1: (0, 0, 12),
+            2: (0, 0, 4),
+        }
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def GenerativeProcedural "Globe" (
+        prepend apiSchemas = ["HydraGenerativeProceduralAPI"]
+    )
+    {
+        # Matched against the plugin's `displayName` in plugInfo.json.
+        token primvars:hdGp:proceduralType = "tuileGlobe"
+        # Ladder step 1, and the only step this file exercises.
+        #
+        # No RenderSettings prim on purpose: usdrecord also sets the primary
+        # camera (step 3), so with a settings prim as well, three rungs would
+        # name the same camera and a failure in any one of them would be
+        # invisible. One rung, one assertion.
+        rel primvars:tuile:cameras = </World/ShotCam>
+    }
+}

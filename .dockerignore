@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# The build context is uploaded to the builder before anything runs, and the
+# builder may be on the other side of a network — so this file is the difference
+# between a two-second transfer and shipping ten gigabytes to a Kubernetes pod.
+
+# Host build output. 9 GB, entirely rebuilt inside the image, and mixing host
+# artefacts into a container build is how a stale object file silently survives.
+target/
+
+# Local clones of the reference implementations. Gitignored, never built, never
+# linked — and they have no business crossing into an image.
+references/
+
+.git/
+.github/
+
+# Editor and OS noise.
+.DS_Store
+*.swp
+
+# Session and scratch files.
+claude.session
+*.log

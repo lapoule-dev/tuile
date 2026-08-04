@@ -1,0 +1,30 @@
+{
+    "Plugins": [
+        {
+            "Info": {
+                "Types": {
+                    "TuileGlobeProceduralPlugin": {
+                        "bases": [
+                            "HdGpGenerativeProceduralPlugin"
+                        ],
+                        "displayName": "tuileGlobe",
+                        "priority": 0
+                    },
+                    "Tuile_SpikeResolver": {
+                        "bases": [
+                            "ArResolver"
+                        ],
+                        "uriSchemes": [
+                            "tuile"
+                        ]
+                    }
+                }
+            },
+            "LibraryPath": "@PLUG_INFO_LIBRARY_PATH@",
+            "Name": "tuileHydra",
+            "ResourcePath": "@PLUG_INFO_RESOURCE_PATH@",
+            "Root": "@PLUG_INFO_ROOT@",
+            "Type": "library"
+        }
+    ]
+}
