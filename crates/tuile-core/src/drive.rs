@@ -94,12 +94,27 @@ impl SceneState {
 
 /// A fully-loaded frame: every selected tile, decoded and resident.
 pub struct BulkFrame {
-    /// The stable selection (tile + SSE).
+    /// The stable selection (tile + SSE), in traversal order.
+    ///
+    /// **This is what a consumer iterates**, looking each tile up in
+    /// [`contents`](Self::contents) — not the other way round. See that field.
     pub selected: Vec<(TileId, f64)>,
     /// Decoded content for every resident selected tile.
+    ///
+    /// A lookup table, not a sequence. `HashMap` iteration order depends on a
+    /// per-process random seed, so anything that walks this map emits its
+    /// results in a different order on every run. That is invisible in a viewer
+    /// and corrosive anywhere output is kept: two renders of the same frame on
+    /// two machines differ by prim ordering alone, and a farm comparing them
+    /// reports a change that is not there. Iterate
+    /// [`selected`](Self::selected), which is ordered.
     pub contents: HashMap<TileId, TileContent>,
     pub stats: TraversalStats,
-    /// Non-fatal load failures encountered while converging.
+    /// Load failures encountered while converging. Non-fatal *to the frame* —
+    /// it still returns — but not harmless: a failed tile leaves no hole,
+    /// because its ancestor stands in, so the frame renders plausibly at the
+    /// wrong level of detail. Anything keeping its output should treat a
+    /// non-empty `errors` as a failed frame rather than a warning.
     pub errors: Vec<(Option<TileId>, String)>,
 }
 
