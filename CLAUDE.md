@@ -24,6 +24,7 @@ The executable heart is a **logical geometry server**, not a network server. The
 | `docs/11-crate-wgpu.md` | Detailed spec for `tuile-wgpu` + viewer example |
 | `docs/12-crate-server.md` | Detailed spec for `tuile-server` (axum + Workers, pluggable cache) |
 | `docs/13-crate-usd.md` | Detailed spec for `tuile-usd` (USDZ export, track animations) |
+| `docs/14-crate-hydra.md` | Detailed spec for `tuile-hydra` (C ABI + OpenUSD/Hydra plugin, camera resolution, Dockerfiles) |
 | `docs/20-conventions.md` | Style, tests, CI, licenses, commits |
 
 ## Non-negotiable rules

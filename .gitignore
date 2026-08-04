@@ -5,3 +5,10 @@
 # Secrets — ion token etc. Never commit.
 .env
 .env.*
+
+# Python bytecode from the spike assertion.
+__pycache__/
+*.pyc
+
+# Session scratch.
+claude.session
