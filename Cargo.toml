@@ -7,6 +7,7 @@ members = [
     "crates/tuile-camera",
     "crates/tuile-native-fetchers",
     "crates/tuile-core",
+    "crates/tuile-hydra",
     "crates/tuile-planetary",
     "crates/tuile-storage-foyer",
     "crates/tuile-terrain",
