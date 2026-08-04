@@ -25,7 +25,10 @@ tuile-core = { version = "0.0.1", path = "../../crates/tuile-core" }
 tuile-cesium-ion = { version = "0.0.1", path = "../../crates/tuile-cesium-ion" }
 tuile-bing = { version = "0.0.1", path = "../../crates/tuile-bing" }
 tuile-planetary = { version = "0.0.1", path = "../../crates/tuile-planetary" }
+tuile-storage-foyer = { version = "0.0.1", path = "../../crates/tuile-storage-foyer" }
+tuile-terrain = { version = "0.0.1", path = "../../crates/tuile-terrain" }
 tuile-native-fetchers = { version = "0.0.1", path = "../../crates/tuile-native-fetchers" }
+tuile-ui = { version = "0.0.1", path = "../../crates/tuile-ui" }
 tuile-wgpu = { version = "0.0.1", path = "../../crates/tuile-wgpu" }
 wgpu = { workspace = true }
 winit = { workspace = true }

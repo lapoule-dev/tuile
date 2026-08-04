@@ -12,12 +12,12 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tuile-core = { version = "0.0.1", path = "../tuile-core" }
 url = { workspace = true }
 
 [dev-dependencies]
-bytes = { workspace = true }
 futures-executor = { workspace = true }
 image = { workspace = true }

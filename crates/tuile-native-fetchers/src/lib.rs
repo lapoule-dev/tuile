@@ -23,6 +23,7 @@
 //! deliberately outside the render-agnostic, wasm-able core.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -34,7 +35,7 @@ use http_cache::FoyerManager;
 use http_cache_reqwest::{Cache, CacheMode, HttpCache, HttpCacheOptions};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use tuile_cesium_ion::{HttpResponse, IonError, IonHttp};
-use tuile_core::fetch::{FetchError, TileFetcher};
+use tuile_core::fetch::{FetchError, Fetched, TileFetcher};
 use url::Url;
 
 /// Host whose responses carry short-lived ion tokens — never cache them.
@@ -155,11 +156,16 @@ impl IonHttp for NativeHttp {
             .await
             .map_err(|e| IonError::Transport(e.to_string()))?;
         let status = response.status().as_u16();
+        let max_age = max_age(response.headers());
         let body = response
             .bytes()
             .await
             .map_err(|e| IonError::Transport(e.to_string()))?;
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            body,
+            max_age,
+        })
     }
 }
 
@@ -187,6 +193,57 @@ impl TileFetcher for NativeHttp {
             message: e.to_string(),
         })
     }
+
+    async fn fetch_cacheable(&self, url: &Url) -> Result<Fetched<Bytes>, FetchError> {
+        let response = NativeHttp::get(self, url, None)
+            .await
+            .map_err(|e| FetchError::Io {
+                url: url.clone(),
+                message: e.to_string(),
+            })?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(FetchError::NotFound(url.clone()));
+        }
+        if !status.is_success() {
+            return Err(FetchError::Status {
+                status: status.as_u16(),
+                url: url.clone(),
+            });
+        }
+        let ttl = max_age(response.headers());
+        let value = response.bytes().await.map_err(|e| FetchError::Io {
+            url: url.clone(),
+            message: e.to_string(),
+        })?;
+        Ok(Fetched { value, ttl })
+    }
+}
+
+/// `Cache-Control: max-age=<seconds>`, when the response states one.
+///
+/// Only `max-age` is read, and only to be passed on to whatever stores the
+/// body. Full HTTP freshness — `Expires`, `s-maxage`, revalidation — is the
+/// middleware's job one layer down; duplicating it here would be a second,
+/// disagreeing implementation. `no-store` and `no-cache` are honoured by
+/// returning nothing, so a response the origin marked uncacheable never
+/// arrives with a lifetime attached.
+fn max_age(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let directives = headers
+        .get(reqwest::header::CACHE_CONTROL)?
+        .to_str()
+        .ok()?
+        .to_ascii_lowercase();
+    if directives
+        .split(',')
+        .any(|d| matches!(d.trim(), "no-store" | "no-cache"))
+    {
+        return None;
+    }
+    directives.split(',').find_map(|directive| {
+        let seconds = directive.trim().strip_prefix("max-age=")?;
+        seconds.trim().parse().ok().map(Duration::from_secs)
+    })
 }
 
 /// Assembles the foyer hybrid cache: a payload-weighed, bounded memory tier in
@@ -207,4 +264,47 @@ async fn build_cache(cfg: &CacheConfig) -> Result<HybridCache<String, Vec<u8>>, 
         .build()
         .await
         .map_err(|e| NativeFetchError(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue, CACHE_CONTROL};
+
+    fn headers(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(CACHE_CONTROL, HeaderValue::from_str(value).expect("header"));
+        h
+    }
+
+    #[test]
+    fn max_age_is_read_from_cache_control() {
+        assert_eq!(
+            max_age(&headers("max-age=3600")),
+            Some(Duration::from_secs(3600))
+        );
+    }
+
+    #[test]
+    fn max_age_survives_company_and_casing() {
+        assert_eq!(
+            max_age(&headers("public, MAX-AGE=60, immutable")),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn an_uncacheable_response_states_no_lifetime() {
+        // Even alongside a max-age: the store must not be handed a lifetime
+        // for a body the origin said not to keep.
+        assert_eq!(max_age(&headers("no-store, max-age=600")), None);
+        assert_eq!(max_age(&headers("no-cache")), None);
+    }
+
+    #[test]
+    fn a_silent_or_unparsable_header_states_nothing() {
+        assert_eq!(max_age(&HeaderMap::new()), None);
+        assert_eq!(max_age(&headers("public")), None);
+        assert_eq!(max_age(&headers("max-age=soon")), None);
+    }
 }

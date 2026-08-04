@@ -24,6 +24,46 @@ pub enum FetchError {
     Status { status: u16, url: Url },
 }
 
+/// Something fetched, with how long it may be reused.
+///
+/// The lifetime is the origin's, carried from wherever it was stated — an HTTP
+/// `Cache-Control: max-age`, a token expiry — down to whatever stores the
+/// value. Deriving it locally instead would be a guess: only the origin knows
+/// whether a tile is immutable or reissued nightly.
+///
+/// `None` means the origin said nothing. Treat that as "cacheable, freshness
+/// unknown" and let the store apply its own policy — not as "do not cache",
+/// which would throw away most of the benefit, most origins being silent.
+#[derive(Debug, Clone)]
+pub struct Fetched<T> {
+    pub value: T,
+    pub ttl: Option<std::time::Duration>,
+}
+
+impl<T> Fetched<T> {
+    /// A value whose origin stated no lifetime.
+    pub fn undated(value: T) -> Self {
+        Self { value, ttl: None }
+    }
+
+    /// Applies `f` to the value, keeping the lifetime — the usual shape when a
+    /// layer decodes what a lower one fetched.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Fetched<U> {
+        Fetched {
+            value: f(self.value),
+            ttl: self.ttl,
+        }
+    }
+
+    /// Like [`Self::map`], for a decode that can fail.
+    pub fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<Fetched<U>, E> {
+        Ok(Fetched {
+            value: f(self.value)?,
+            ttl: self.ttl,
+        })
+    }
+}
+
 /// Abstract byte source. `Send + Sync` bounds are the native baseline; the
 /// single-threaded wasm relaxation (`maybe_send`) is an M2 follow-up noted
 /// in `docs/01-architecture.md`.
@@ -31,6 +71,16 @@ pub enum FetchError {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait TileFetcher: Send + Sync {
     async fn fetch(&self, url: &Url) -> Result<Bytes, FetchError>;
+
+    /// Like [`Self::fetch`], but also reports how long the bytes may be reused.
+    ///
+    /// Provided so the many fetchers that have no notion of freshness — a
+    /// filesystem, a test double — stay one method. Transports that do carry it
+    /// (HTTP, with `Cache-Control`) override this; callers that intend to store
+    /// what they fetch should prefer it.
+    async fn fetch_cacheable(&self, url: &Url) -> Result<Fetched<Bytes>, FetchError> {
+        Ok(Fetched::undated(self.fetch(url).await?))
+    }
 }
 
 /// Reads `file://` URLs from the local filesystem. Meant for tests and the

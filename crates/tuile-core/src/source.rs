@@ -121,6 +121,14 @@ pub trait TileTree: Send + Sync {
     /// ancestor is always available as a fallback while finer tiles stream in
     /// (no holes). Default `None` — sources without cheap parent lookup (a
     /// 3D Tiles arena) simply don't pin ancestors.
+    /// The tile one level up, or `None` at a root.
+    ///
+    /// Defaults to `None`, which is honest but costly: the server pins the
+    /// ancestor chain of everything it selects (so a coarser tile is always
+    /// available to stand in while a finer one streams), and a consumer walks
+    /// the same chain to fill gaps. A tree that does not answer this gets
+    /// neither — no fallback, and holes where a coarse tile would have done.
+    /// Implement it wherever the topology allows.
     fn parent(&self, _id: TileId) -> Option<TileId> {
         None
     }

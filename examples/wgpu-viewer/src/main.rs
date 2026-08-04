@@ -21,9 +21,13 @@ use tuile_camera::{CameraController, GlobeCamera};
 use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
 use tuile_core::runtime::in_process_with;
 use tuile_core::source::{TileLoader, TileTree};
+use tuile_core::raster::CachedImagery;
+use tuile_core::storage::ContentStore;
 use tuile_core::traversal::Config;
 use tuile_native_fetchers::NativeHttp;
 use tuile_planetary::{globe, GlobeOptions, ImageryDetail};
+use tuile_terrain::{CachedTerrain, TerrainHeights};
+use tuile_storage_foyer::FoyerStore;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 /// Resolves the Cesium-ion globe sources and crosses them through the
@@ -31,7 +35,13 @@ use winit::event_loop::{ControlFlow, EventLoop};
 /// transport here, not planetary.
 async fn ion_globe(
     token: String,
-) -> anyhow::Result<(Box<dyn TileTree>, Arc<dyn TileLoader>, ImageryDetail)> {
+) -> anyhow::Result<(
+    Box<dyn TileTree>,
+    Arc<dyn TileLoader>,
+    ImageryDetail,
+    Arc<TerrainHeights>,
+    Option<Arc<FoyerStore>>,
+)> {
     // One pooled, cached native transport drives both ion and Bing.
     let http = Arc::new(NativeHttp::shared().await?);
     let terrain = IonTerrainSource::new(IonClient::new(Arc::clone(&http), token.clone()), 1);
@@ -56,7 +66,32 @@ async fn ion_globe(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    Ok(globe(terrain, bing, layer, GlobeOptions::default()))
+    // One store, two tiers of caller: the terrain source and the imagery
+    // provider each keep their own bytes in it, keyed by tile rather than by
+    // URL. The server evicts decoded tiles to stay inside its GPU budget, and
+    // this is what makes coming back to them cheap. A store that fails to open
+    // is not worth failing the app over.
+    let store = match FoyerStore::shared("tiles").await {
+        Ok(store) => Some(Arc::new(store)),
+        Err(e) => {
+            tracing::warn!("no tile store ({e}); every tile will be re-fetched");
+            None
+        }
+    };
+
+    let Some(store) = store else {
+        let (tree, loader, detail, heights) =
+            globe(terrain, bing, layer, GlobeOptions::default());
+        return Ok((tree, loader, detail, heights, None));
+    };
+    let shared = Arc::clone(&store) as Arc<dyn ContentStore>;
+    let (tree, loader, detail, heights) = globe(
+        CachedTerrain::new(terrain, Arc::clone(&shared), "ion-cwt"),
+        CachedImagery::new(bing, shared, "bing-aerial"),
+        layer,
+        GlobeOptions::default(),
+    );
+    Ok((tree, loader, detail, heights, Some(store)))
 }
 
 /// Logs to stderr; `RUST_LOG` overrides. Default shows tile streaming
@@ -85,15 +120,29 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let (tree, loader, detail) = rt.block_on(ion_globe(token))?;
+    // The runtime moves to the server thread; keep a handle so the store can
+    // still be flushed from here on the way out.
+    let handle = rt.handle().clone();
+    let (tree, loader, detail, heights, store) = rt.block_on(ion_globe(token))?;
+    // The budget counts decoded CPU bytes; the GPU copy costs about 1.35× that
+    // (mip chains, interleaved vertices), measured — so 3 GiB here is ~4 GiB of
+    // GPU, which unified memory carries comfortably now that a drape is a
+    // quarter of what it was.
+    //
+    // Sized above the working set on purpose. `forbid_holes` loads a whole
+    // subtree before selecting any of it, and a tile loaded but not yet
+    // selected is protected by nothing: squeeze the budget below what a view
+    // needs and those tiles are evicted and re-requested forever. At 768 MiB a
+    // motionless camera still churned twenty tiles a second — the session never
+    // settles, and it reads as the app hanging.
     let config = Config {
         maximum_screen_space_error: 2.0,
         maximum_simultaneous_fetches: 64,
-        resident_budget_bytes: 2 << 30,
+        resident_budget_bytes: 3072 * 1024 * 1024,
         ..Config::default()
     };
     let (stream, server) = in_process_with(tree, loader, config);
-    std::thread::Builder::new()
+    let server_thread = std::thread::Builder::new()
         .name("geometry-server".into())
         .spawn(move || rt.block_on(server.run()))?;
 
@@ -106,7 +155,12 @@ fn main() -> anyhow::Result<()> {
         std::f64::consts::FRAC_PI_2,
         60f64.to_radians(),
     );
-    let controller = CameraController::new(camera).with_min_altitude(150.0);
+    // Clamp against the terrain, not the ellipsoid: 150 m over the sea and
+    // 150 m over a summit are the same request, and only the relief tells them
+    // apart. The handle is shared and live, so the floor sharpens as tiles land.
+    let controller = CameraController::new(camera)
+        .with_min_altitude(150.0)
+        .with_ground(heights);
 
     tracing::info!(
         "tuile globe viewer — streaming Cesium World Terrain + Bing via ion\n\
@@ -122,6 +176,24 @@ fn main() -> anyhow::Result<()> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(app_config);
-    event_loop.run_app(&mut app)?;
+    let outcome = event_loop.run_app(&mut app);
+    let report = app.report();
+
+    // Shut down in dependency order. The server writes into the store, so
+    // closing the store first leaves its flusher shouting into a closed channel
+    // — thousands of lines of it, and nothing persisted. Dropping the app drops
+    // the client stream, which is how the server learns the session is over.
+    drop(app);
+    if server_thread.join().is_err() {
+        tracing::error!("the geometry server panicked; its last work is lost");
+    }
+    if let Some(store) = store {
+        match handle.block_on(store.close()) {
+            Ok(()) => tracing::info!("tile store flushed"),
+            Err(e) => tracing::warn!("tile store not flushed ({e}); the next run starts cold"),
+        }
+    }
+    tracing::info!("{report}");
+    outcome?;
     Ok(())
 }

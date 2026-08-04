@@ -1,6 +1,6 @@
 [package]
-name = "tuile-terrain"
-description = "Quantized-mesh terrain decoding and geographic tiling for tuile"
+name = "tuile-storage-foyer"
+description = "Hybrid memory + disk content store for tuile, backed by foyer (native only)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,13 +13,11 @@ workspace = true
 [dependencies]
 async-trait = { workspace = true }
 bytes = { workspace = true }
-flate2 = { workspace = true }
-glam = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+foyer = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 tuile-core = { version = "0.0.1", path = "../tuile-core" }
 
 [dev-dependencies]
-futures-executor = { workspace = true }
-glam = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }

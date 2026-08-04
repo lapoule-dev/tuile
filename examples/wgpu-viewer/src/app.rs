@@ -10,10 +10,11 @@ use std::sync::Arc;
 use tuile_camera::CameraController;
 use tuile_core::protocol::{ClientMessage, GeometryStream, InProcessStream};
 use tuile_core::source::TileId;
-use tuile_wgpu::{ContentPump, GpuContext, TileRenderer, DEPTH_FORMAT};
+use tuile_ui::NavWidget;
+use tuile_wgpu::{ContentPump, GpuContext, OverlayRenderer, OverlayVertex, TileRenderer, DEPTH_FORMAT};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
@@ -31,6 +32,7 @@ struct Active {
     surface_format: wgpu::TextureFormat,
     gpu: GpuContext,
     renderer: TileRenderer,
+    overlay: OverlayRenderer,
     pump: ContentPump,
     stream: InProcessStream,
     depth: wgpu::TextureView,
@@ -49,7 +51,57 @@ pub struct App {
     tilting: bool,
     wireframe: bool,
     freeze: bool,
+    /// The on-screen navigation control. It sees pointer events first and, when
+    /// it takes one, the globe must not also act on it.
+    nav: NavWidget,
+    /// The window is hidden (another window covers it, the display slept, the
+    /// app was minimized). Rendering while occluded leaks GPU memory on Apple
+    /// platforms — see [`App::render`].
+    occluded: bool,
     last_log: std::time::Instant,
+    /// Running totals, reported once per second and again on the way out.
+    /// Rates matter more than levels here: content that keeps *arriving* long
+    /// after the view settled means tiles are being evicted and reloaded, which
+    /// no snapshot of memory would reveal.
+    stats: Stats,
+}
+
+/// What the session has done since it started.
+#[derive(Debug, Default, Clone, Copy)]
+struct Stats {
+    frames: u64,
+    /// Tiles uploaded to the GPU. Compare against `distinct` below: the gap is
+    /// wasted work.
+    uploads: u64,
+    /// Tiles the server told us to drop.
+    evictions: u64,
+    /// Frames that had to draw a coarser ancestor because the selected tile
+    /// was not ready — visible as softness, or as a hole when even the
+    /// ancestor is gone.
+    frames_with_gaps: u64,
+    /// Errors the server reported.
+    errors: u64,
+    started: Option<std::time::Instant>,
+}
+
+impl std::fmt::Display for Stats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secs = self
+            .started
+            .map_or(0.0, |t| t.elapsed().as_secs_f64())
+            .max(1e-3);
+        write!(
+            f,
+            "session over: {} frames in {secs:.0}s ({:.0} fps) | {} uploads, {} evictions, \
+             {} frames with gaps, {} errors",
+            self.frames,
+            self.frames as f64 / secs,
+            self.uploads,
+            self.evictions,
+            self.frames_with_gaps,
+            self.errors,
+        )
+    }
 }
 
 impl App {
@@ -65,8 +117,19 @@ impl App {
             tilting: false,
             wireframe: false,
             freeze: false,
+            nav: NavWidget::new(),
+            occluded: false,
             last_log: std::time::Instant::now(),
+            stats: Stats {
+                started: Some(std::time::Instant::now()),
+                ..Stats::default()
+            },
         }
+    }
+
+    /// A one-line summary of the session, for the exit log.
+    pub fn report(&self) -> String {
+        self.stats.to_string()
     }
 
     fn viewport(&self) -> (f64, f64) {
@@ -113,6 +176,8 @@ impl ApplicationHandler for App {
             .unwrap_or(caps.formats[0]);
         let gpu = GpuContext::new(device, queue);
         let renderer = TileRenderer::new(&gpu, surface_format);
+        // The viewer's pass carries depth, so the overlay must declare it too.
+        let overlay = OverlayRenderer::new(&gpu, surface_format, Some(DEPTH_FORMAT));
         // The render origin tracks the eye (set each frame); start there.
         let pump = ContentPump::new(self.controller.camera.position);
         let depth = make_depth(&gpu, size);
@@ -123,6 +188,7 @@ impl ApplicationHandler for App {
             surface_format,
             gpu,
             renderer,
+            overlay,
             pump,
             stream: config.stream,
             depth,
@@ -163,7 +229,17 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 match button {
-                    MouseButton::Left => self.dragging = pressed,
+                    MouseButton::Left if pressed => {
+                        // The control gets first refusal; only what it declines
+                        // becomes a globe drag.
+                        let vp = self.viewport();
+                        let cursor = self.cursor;
+                        self.dragging = !self.nav.press(cursor, vp, &mut self.controller);
+                    }
+                    MouseButton::Left => {
+                        self.dragging = false;
+                        self.nav.release();
+                    }
                     MouseButton::Right => self.tilting = pressed,
                     _ => {}
                 }
@@ -172,7 +248,9 @@ impl ApplicationHandler for App {
                 let vp = self.viewport();
                 let prev = self.cursor;
                 let cur = (position.x, position.y);
-                if self.dragging {
+                if self.nav.drag(prev, cur, vp, &mut self.controller) {
+                    // The control owns this gesture.
+                } else if self.dragging {
                     // Drag the globe: the grabbed point follows the cursor.
                     self.controller.drag(prev, cur, vp);
                 } else if self.tilting {
@@ -180,6 +258,7 @@ impl ApplicationHandler for App {
                     self.controller.tilt((cur.1 - prev.1) * 0.005, vp);
                     self.controller.rotate_heading((cur.0 - prev.0) * 0.005, vp);
                 }
+                self.nav.hover(cur, vp);
                 self.cursor = cur;
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -189,19 +268,53 @@ impl ApplicationHandler for App {
                 };
                 self.controller.zoom(amount, self.cursor, self.viewport());
             }
-            WindowEvent::RedrawRequested => {
-                self.render();
+            // The display slept, the window was minimized or another window
+            // covers it. Rendering anyway leaks GPU memory on Apple platforms
+            // (see `render`), and an occluded surface does not block on vsync,
+            // so the loop would free-run and leak all the faster.
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
                 if let Some(active) = self.active.as_ref() {
                     active.window.request_redraw();
                 }
             }
+            WindowEvent::RedrawRequested => self.render(),
             _ => {}
+        }
+    }
+
+    /// Drives the animation: one redraw per loop iteration while the window is
+    /// visible. Requesting from here rather than from the `RedrawRequested`
+    /// handler is what lets an occluded window stop cleanly — the loop parks on
+    /// `Wait` until the next event instead of spinning.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(if self.occluded {
+            ControlFlow::Wait
+        } else {
+            ControlFlow::Poll
+        });
+        if !self.occluded {
+            if let Some(active) = self.active.as_ref() {
+                active.window.request_redraw();
+            }
         }
     }
 }
 
 impl App {
+    /// Renders one frame — unless the window is hidden.
+    ///
+    /// Apple's Metal driver leaks memory in proportion to the number of render
+    /// passes created (gfx-rs/wgpu#8768), and nothing on the wgpu side reclaims
+    /// it. A hidden window still accepts frames, and its surface does not block
+    /// on vsync, so drawing into one burns render passes at CPU speed for no
+    /// pixels: minutes of that exhausts the driver and takes the machine with
+    /// it. Skipping the frame entirely is the workaround the ecosystem settled
+    /// on (the wgpu examples carry the same guard).
     fn render(&mut self) {
+        if self.occluded {
+            return;
+        }
         // Ease the camera toward the gesture target (smooth motion).
         self.controller.update(0.3);
         let cam = self.controller.camera;
@@ -222,18 +335,28 @@ impl App {
                 views: vec![cam.view_state(viewport)],
             });
         }
-        active.pump.pump(&mut active.stream, &active.gpu, 8);
+        self.stats.frames += 1;
+        let before = active.pump.prepared_count();
+        let uploaded = active.pump.pump(&mut active.stream, &active.gpu, 8);
+        self.stats.uploads += uploaded as u64;
+        // A drop in the prepared count is the server reclaiming: worth counting
+        // separately from uploads, since a healthy session does far more of the
+        // former than the latter once the view settles.
+        self.stats.evictions += (before + uploaded).saturating_sub(active.pump.prepared_count()) as u64;
         // Anti-jitter: render origin = eye, so the f32 the GPU sees is small.
         let origin = cam.position;
         active.pump.rebase(&active.gpu.queue, origin);
 
         let aspect = active.size.0 as f32 / active.size.1 as f32;
+        // Through the controller, not the camera: only it knows how far the
+        // ground is, and the near plane has to be placed against that.
+        let view_proj = self.controller.view_proj(origin, aspect);
         // Headlight: light travels along the view direction (behind the camera).
         let sun = cam.direction.as_vec3();
         active.renderer.set_view(
             &active.gpu.queue,
             &tuile_wgpu::ViewUniform {
-                view_proj: cam.view_proj(origin, aspect),
+                view_proj,
                 sun_dir: [sun.x, sun.y, sun.z, 0.0],
                 params: [0.5, 0.0, 0.0, 0.0],
             },
@@ -246,6 +369,26 @@ impl App {
             (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2))
         });
         let rendered = tiles.len();
+        // Fewer drawn than selected means at least one tile fell back to an
+        // ancestor — or to nothing at all, which is the black square.
+        if rendered < active.pump.selection.len() {
+            self.stats.frames_with_gaps += 1;
+        }
+
+        // The control reads the camera as it now stands, so the needle and the
+        // horizon bar agree with the frame they are drawn over.
+        let nav_mesh: Vec<OverlayVertex> = self
+            .nav
+            .mesh((viewport.x, viewport.y), &self.controller)
+            .into_iter()
+            .map(|v| OverlayVertex {
+                position: v.position,
+                color: v.color,
+            })
+            .collect();
+        active
+            .overlay
+            .set_geometry(&active.gpu, &nav_mesh, active.size);
 
         let frame = match active.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -299,25 +442,39 @@ impl App {
             active
                 .renderer
                 .render(&mut pass, tiles.iter().copied(), self.wireframe);
+            // After the scene, into the same colour attachment: the control is
+            // always on top and shares no depth with the globe.
+            active.overlay.render(&mut pass);
         }
         active.gpu.queue.submit([encoder.finish()]);
+        // Lets the compositor start its own work while we present.
+        active.window.pre_present_notify();
         frame.present();
 
         if self.last_log.elapsed().as_secs_f32() > 1.0 {
             self.last_log = std::time::Instant::now();
             let s = &active.pump.stats;
             tracing::info!(
-                "alt {:.0} km | selected {} | rendered {} | prepared {} | missing {} | visited {} culled {} | {:.0} MiB GPU",
+                "alt {:.0} km | ground {:.0} m | selected {} | rendered {} | prepared {} | \
+                 missing {} | visited {} culled {} requested {} depth {} | {:.0} MiB GPU | \
+                 +{} uploads -{} evictions",
                 cam.altitude() / 1000.0,
+                self.controller.height_above_ground(),
                 active.pump.selection.len(),
                 rendered,
                 active.pump.prepared_count(),
                 active.pump.missing(),
                 s.visited,
                 s.culled,
+                s.requested,
+                s.max_depth,
                 active.pump.gpu_bytes as f32 / (1024.0 * 1024.0),
+                self.stats.uploads,
+                self.stats.evictions,
             );
-            for err in active.pump.errors.drain(..) {
+            let errors = active.pump.errors.drain(..).collect::<Vec<_>>();
+            self.stats.errors += errors.len() as u64;
+            for err in errors {
                 tracing::warn!("server: {err}");
             }
         }

@@ -20,6 +20,7 @@
 
 pub mod availability;
 pub mod decode;
+mod heights;
 pub mod layer;
 pub mod mesh;
 pub mod source;
@@ -28,8 +29,9 @@ pub mod tree;
 
 pub use availability::Availability;
 pub use decode::{decode, DecodeError, Header, QuantizedMesh};
-pub use layer::{LayerError, LayerJson};
+pub use heights::TerrainHeights;
+pub use layer::{AvailabilityRange, LayerError, LayerJson};
 pub use mesh::{surface_uvs, to_decoded};
-pub use source::{TerrainSource, TerrainSourceError};
+pub use source::{CachedTerrain, TerrainSource, TerrainSourceError};
 pub use tiling::{level_geometric_error, GeoRect, GeographicTilingScheme, TileCoord};
 pub use tree::TerrainTree;

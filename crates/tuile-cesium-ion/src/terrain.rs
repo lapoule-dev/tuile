@@ -11,6 +11,7 @@
 
 use crate::{Attribution, IonClient, IonError, IonHttp};
 use bytes::Bytes;
+use tuile_core::fetch::Fetched;
 use futures_util::lock::Mutex;
 use tuile_terrain::{LayerJson, TileCoord};
 
@@ -66,7 +67,7 @@ impl<H: IonHttp> IonTerrainSource<H> {
     /// Fetches the raw bytes of a `.terrain` tile (still possibly gzipped;
     /// `tuile_terrain::decode` handles that). Refreshes the asset token once
     /// on 401/403.
-    pub async fn fetch_tile(&self, coord: TileCoord) -> Result<Bytes, IonError> {
+    pub async fn fetch_tile(&self, coord: TileCoord) -> Result<Fetched<Bytes>, IonError> {
         self.ensure().await?;
         let (url, mut token) = {
             let guard = self.state.lock().await;
@@ -76,7 +77,12 @@ impl<H: IonHttp> IonTerrainSource<H> {
         for attempt in 0..2 {
             let response = self.client.http().get(&url, Some(&token)).await?;
             match response.status {
-                200 => return Ok(response.body),
+                200 => {
+                    return Ok(Fetched {
+                        value: response.body,
+                        ttl: response.max_age,
+                    })
+                }
                 404 => return Err(IonError::Status { status: 404, url }),
                 401 | 403 if attempt == 0 => token = self.refresh_token().await?,
                 status => return Err(IonError::Status { status, url }),
@@ -149,11 +155,11 @@ impl<H: IonHttp> tuile_terrain::TerrainSource for IonTerrainSource<H> {
     async fn fetch_tile(
         &self,
         coord: TileCoord,
-    ) -> Result<Vec<u8>, tuile_terrain::TerrainSourceError> {
+    ) -> Result<Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError> {
         // Disambiguate from the trait method of the same name (inherent call).
         IonTerrainSource::fetch_tile(self, coord)
             .await
-            .map(|b| b.to_vec())
+            .map(|fetched| fetched.map(|b| b.to_vec()))
             .map_err(|e| tuile_terrain::TerrainSourceError(e.to_string()))
     }
 }
@@ -198,7 +204,7 @@ mod tests {
                 .fetch_tile(TileCoord::new(9, 541, 386))
                 .await
                 .expect("tile");
-            assert_eq!(&bytes[..], b"QMTILE");
+            assert_eq!(&bytes.value[..], b"QMTILE");
             assert_eq!(source.attributions().await.expect("attr").len(), 1);
         });
 
@@ -225,7 +231,7 @@ mod tests {
         let source = IonTerrainSource::new(IonClient::new(Arc::clone(&http), "account-tok"), 1);
         let bytes = futures_executor::block_on(source.fetch_tile(TileCoord::new(0, 0, 0)))
             .expect("after refresh");
-        assert_eq!(&bytes[..], b"OK");
+        assert_eq!(&bytes.value[..], b"OK");
         let tile_calls: Vec<_> = http.calls().into_iter().filter(|c| c.0 == tile).collect();
         assert_eq!(tile_calls.len(), 2);
         assert_eq!(tile_calls[0].1.as_deref(), Some("expired"));

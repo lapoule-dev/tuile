@@ -15,16 +15,20 @@
 //!   device supports it, + debug lines for bounding volumes)
 //! - [`ContentPump`] — the async→frame bridge over any
 //!   [`tuile_core::protocol::GeometryStream`]
+//! - [`OverlayRenderer`] — pixel-space triangles over the scene, for the
+//!   on-screen controls a host builds with `tuile-ui`
 //!
 //! The crate never creates a window or a surface; the host owns the event
 //! loop and the render pass.
 
 mod context;
+mod overlay;
 mod prepare;
 mod pump;
 mod renderer;
 
 pub use context::{ContextError, GpuContext, DEPTH_FORMAT, TEXTURE_FORMAT};
+pub use overlay::{OverlayRenderer, OverlayVertex};
 pub use prepare::{prepare, PreparedMesh, PreparedTile, Vertex};
 pub use pump::ContentPump;
 pub use renderer::{LineVertex, TileRenderer, ViewUniform};

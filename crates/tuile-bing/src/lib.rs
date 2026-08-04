@@ -13,11 +13,11 @@
 //! a [`tuile_core::fetch::TileFetcher`] — wasm-clean, no reqwest here.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde::Deserialize;
 use std::sync::Arc;
-use tuile_core::content::DecodedTexture;
-use tuile_core::fetch::TileFetcher;
-use tuile_core::raster::{decode_image, ImageryCoord, ImageryProvider, RasterError, TilingScheme};
+use tuile_core::fetch::{Fetched, TileFetcher};
+use tuile_core::raster::{ImageryCoord, ImageryProvider, RasterError, TilingScheme};
 
 /// Metadata of a Bing imagery layer (the parts we need).
 #[derive(Debug, Clone)]
@@ -170,14 +170,13 @@ impl<F: TileFetcher> ImageryProvider for BingImageryProvider<F> {
         self.scheme
     }
 
-    async fn fetch_tile(&self, coord: ImageryCoord) -> Result<DecodedTexture, RasterError> {
+    async fn fetch_tile_bytes(&self, coord: ImageryCoord) -> Result<Fetched<Bytes>, RasterError> {
         let url = self
             .metadata
             .tile_url(coord)
             .parse()
             .map_err(|e: url::ParseError| RasterError::Image(e.to_string()))?;
-        let bytes = self.fetcher.fetch(&url).await?;
-        decode_image(&bytes)
+        Ok(self.fetcher.fetch_cacheable(&url).await?)
     }
 }
 
@@ -185,7 +184,6 @@ impl<F: TileFetcher> ImageryProvider for BingImageryProvider<F> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use bytes::Bytes;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use tuile_core::fetch::FetchError;
@@ -278,7 +276,7 @@ mod tests {
         fetcher.put(&url, png_2x2());
 
         let tex = futures_executor::block_on(provider.fetch_tile(coord)).expect("fetch");
-        assert_eq!((tex.width, tex.height), (2, 2));
-        assert_eq!(&tex.rgba8[0..4], &[10, 20, 30, 255]);
+        assert_eq!((tex.value.width, tex.value.height), (2, 2));
+        assert_eq!(&tex.value.rgba8[0..4], &[10, 20, 30, 255]);
     }
 }

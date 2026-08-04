@@ -59,6 +59,10 @@ pub trait IonHttp: Send + Sync {
 pub struct HttpResponse {
     pub status: u16,
     pub body: Bytes,
+    /// `Cache-Control: max-age`, when the origin stated one. Carried so callers
+    /// that store what they fetch can honour the origin's own freshness rather
+    /// than inventing a lifetime for it.
+    pub max_age: Option<std::time::Duration>,
 }
 
 /// An attribution that consumers must display (ion terms of use).
@@ -382,7 +386,11 @@ impl IonHttp for ReqwestHttp {
             .bytes()
             .await
             .map_err(|e| IonError::Transport(e.to_string()))?;
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            body,
+            max_age: None,
+        })
     }
 }
 

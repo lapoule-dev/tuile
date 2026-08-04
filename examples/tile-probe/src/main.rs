@@ -46,7 +46,8 @@ async fn probe(
     c: TileCoord,
 ) -> anyhow::Result<Option<(usize, Option<usize>)>> {
     match terrain.fetch_tile(c).await {
-        Ok(bytes) => {
+        Ok(fetched) => {
+            let bytes = fetched.value;
             let qm = decode(&bytes).ok();
             let vc = qm.as_ref().map(|m| m.vertex_count()).unwrap_or(0);
             let meta_deepest = qm

@@ -16,10 +16,12 @@
 //! so local files, plain HTTP and `tuile-cesium-ion` all work unchanged.
 
 use crate::content::{DecodedTexture, DecodedTileContent};
-use crate::fetch::{FetchError, TileFetcher};
+use crate::fetch::{FetchError, Fetched, TileFetcher};
 use crate::geo::{ecef_to_geodetic, Geodetic, WGS84_A};
 use crate::math::Obb;
+use crate::storage::ContentStore;
 use async_trait::async_trait;
+use bytes::Bytes;
 use glam::DVec3;
 use std::sync::Arc;
 use url::Url;
@@ -578,7 +580,25 @@ pub fn drape_single(
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait ImageryProvider: Send + Sync {
     fn tiling_scheme(&self) -> TilingScheme;
-    async fn fetch_tile(&self, coord: ImageryCoord) -> Result<DecodedTexture, RasterError>;
+
+    /// The tile's bytes **as served** — JPEG or PNG, still encoded — with the
+    /// lifetime its origin stated.
+    ///
+    /// This is the primary method because it is what a cache should hold. The
+    /// decoded form is an order of magnitude larger (a 20 KiB JPEG becomes
+    /// 256 KiB of RGBA), so storing it would spend the disk tier ten times
+    /// faster to save a decode that costs microseconds.
+    async fn fetch_tile_bytes(&self, coord: ImageryCoord) -> Result<Fetched<Bytes>, RasterError>;
+
+    /// The decoded tile. Provided: every provider decodes the same way.
+    async fn fetch_tile(
+        &self,
+        coord: ImageryCoord,
+    ) -> Result<Fetched<DecodedTexture>, RasterError> {
+        self.fetch_tile_bytes(coord)
+            .await?
+            .try_map(|bytes| decode_image(&bytes))
+    }
 }
 
 /// URL-template imagery provider: expands `{z}/{x}/{y}` against any
@@ -617,10 +637,60 @@ impl<F: TileFetcher> ImageryProvider for TemplateProvider<F> {
         self.scheme
     }
 
-    async fn fetch_tile(&self, coord: ImageryCoord) -> Result<DecodedTexture, RasterError> {
+    async fn fetch_tile_bytes(&self, coord: ImageryCoord) -> Result<Fetched<Bytes>, RasterError> {
         let url = self.tile_url(coord)?;
-        let bytes = self.fetcher.fetch(&url).await?;
-        decode_image(&bytes)
+        Ok(self.fetcher.fetch_cacheable(&url).await?)
+    }
+}
+
+/// Wraps an [`ImageryProvider`] with a [`ContentStore`], so a tile served once
+/// is not fetched again — across runs, if the store is persistent.
+///
+/// Caches the tile **as served** (JPEG/PNG), never the decoded RGBA: decoded is
+/// an order of magnitude larger, and the decode it would save costs
+/// microseconds against a disk read. Entries are kept for the lifetime the
+/// origin stated ([`Fetched::ttl`]).
+///
+/// `namespace` separates providers that number their tiles differently — two
+/// sources sharing one store must never read each other's z/x/y.
+pub struct CachedImagery<P> {
+    inner: P,
+    store: Arc<dyn ContentStore>,
+    namespace: String,
+}
+
+impl<P: ImageryProvider> CachedImagery<P> {
+    pub fn new(inner: P, store: Arc<dyn ContentStore>, namespace: impl Into<String>) -> Self {
+        Self {
+            inner,
+            store,
+            namespace: namespace.into(),
+        }
+    }
+
+    fn key(&self, c: ImageryCoord) -> String {
+        let ImageryCoord { level, x, y } = c;
+        format!("img/{}/{level}/{x}/{y}", self.namespace)
+    }
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+impl<P: ImageryProvider> ImageryProvider for CachedImagery<P> {
+    fn tiling_scheme(&self) -> TilingScheme {
+        self.inner.tiling_scheme()
+    }
+
+    async fn fetch_tile_bytes(&self, coord: ImageryCoord) -> Result<Fetched<Bytes>, RasterError> {
+        let key = self.key(coord);
+        if let Some(bytes) = self.store.get(&key).await {
+            // The store already applied the lifetime this was written with;
+            // re-stating one here would only be a second, weaker guess.
+            return Ok(Fetched::undated(bytes));
+        }
+        let fetched = self.inner.fetch_tile_bytes(coord).await?;
+        self.store.put(&key, fetched.value.clone(), fetched.ttl).await;
+        Ok(fetched)
     }
 }
 
@@ -983,6 +1053,115 @@ mod tests {
         assert!(rect.width() < (region[2] - region[0]) * 1.5);
     }
 
+    /// A store shared by the tests: records every write so a test can assert
+    /// what was cached, not merely that a second read succeeded.
+    #[derive(Default)]
+    struct MemStore {
+        entries: Mutex<HashMap<String, Bytes>>,
+        writes: Mutex<Vec<(String, Option<std::time::Duration>)>>,
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    impl ContentStore for MemStore {
+        async fn get(&self, key: &str) -> Option<Bytes> {
+            self.entries.lock().expect("lock").get(key).cloned()
+        }
+        async fn put(&self, key: &str, value: Bytes, ttl: Option<std::time::Duration>) {
+            self.entries
+                .lock()
+                .expect("lock")
+                .insert(key.to_owned(), value);
+            self.writes.lock().expect("lock").push((key.to_owned(), ttl));
+        }
+    }
+
+    /// Counts how many times the origin was actually asked.
+    struct CountingImagery {
+        calls: Mutex<u32>,
+        ttl: Option<std::time::Duration>,
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    impl ImageryProvider for CountingImagery {
+        fn tiling_scheme(&self) -> TilingScheme {
+            TilingScheme::web_mercator()
+        }
+        async fn fetch_tile_bytes(&self, _c: ImageryCoord) -> Result<Fetched<Bytes>, RasterError> {
+            *self.calls.lock().expect("lock") += 1;
+            Ok(Fetched {
+                value: Bytes::from_static(b"encoded"),
+                ttl: self.ttl,
+            })
+        }
+    }
+
+    fn coord(level: u32, x: u64, y: u64) -> ImageryCoord {
+        ImageryCoord { level, x, y }
+    }
+
+    #[test]
+    fn a_cached_provider_asks_the_origin_once() {
+        let store = Arc::new(MemStore::default());
+        let ttl = Some(std::time::Duration::from_secs(600));
+        let inner = CountingImagery {
+            calls: Mutex::new(0),
+            ttl,
+        };
+        let provider = CachedImagery::new(inner, store.clone(), "test");
+
+        let c = coord(3, 4, 5);
+        let first = futures_executor::block_on(provider.fetch_tile_bytes(c)).expect("first");
+        let second = futures_executor::block_on(provider.fetch_tile_bytes(c)).expect("second");
+
+        assert_eq!(first.value, second.value);
+        // The second call is served from the store, not the origin.
+        let calls = *provider.inner.calls.lock().expect("lock");
+        assert_eq!(calls, 1, "origin asked {calls} times");
+    }
+
+    #[test]
+    fn a_cached_provider_stores_the_bytes_as_served_with_their_ttl() {
+        let store = Arc::new(MemStore::default());
+        let ttl = Some(std::time::Duration::from_secs(600));
+        let provider = CachedImagery::new(
+            CountingImagery {
+                calls: Mutex::new(0),
+                ttl,
+            },
+            store.clone(),
+            "test",
+        );
+        futures_executor::block_on(provider.fetch_tile_bytes(coord(3, 4, 5))).expect("fetch");
+
+        let writes = store.writes.lock().expect("lock");
+        let (key, written_ttl) = writes.first().expect("one write");
+        assert_eq!(*written_ttl, ttl, "the origin's lifetime is forwarded");
+        // Encoded as served — never the decoded RGBA, which is far larger.
+        let stored = store.entries.lock().expect("lock")[key].clone();
+        assert_eq!(stored, Bytes::from_static(b"encoded"));
+    }
+
+    #[test]
+    fn cached_keys_separate_tiles_and_namespaces() {
+        let store = Arc::new(MemStore::default());
+        let mk = |ns: &str| {
+            CachedImagery::new(
+                CountingImagery {
+                    calls: Mutex::new(0),
+                    ttl: None,
+                },
+                store.clone(),
+                ns,
+            )
+        };
+        let (a, b) = (mk("bing"), mk("osm"));
+        assert_ne!(a.key(coord(3, 4, 5)), a.key(coord(3, 4, 6)));
+        // Two providers number their tiles differently: never share entries.
+        assert_ne!(a.key(coord(3, 4, 5)), b.key(coord(3, 4, 5)));
+    }
+
     #[test]
     fn template_provider_fetches_and_decodes() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1009,8 +1188,8 @@ mod tests {
             y: 7,
         }))
         .expect("fetch");
-        assert_eq!((tex.width, tex.height), (2, 2));
-        assert_eq!(&tex.rgba8[0..4], &[255, 0, 0, 255]);
+        assert_eq!((tex.value.width, tex.value.height), (2, 2));
+        assert_eq!(&tex.value.rgba8[0..4], &[255, 0, 0, 255]);
 
         // A miss is a typed error.
         let err = futures_executor::block_on(provider.fetch_tile(ImageryCoord {

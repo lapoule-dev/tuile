@@ -174,7 +174,10 @@ async fn ion_globe(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let (tree, loader, _detail) = globe(terrain, bing, layer, GlobeOptions { no_imagery });
+    // No cache wrappers: a bulk run visits each tile once, so a store would
+    // only pay the cost of writing entries nothing comes back for.
+    let (tree, loader, _detail, _heights) =
+        globe(terrain, bing, layer, GlobeOptions { no_imagery });
     Ok((tree, loader))
 }
 

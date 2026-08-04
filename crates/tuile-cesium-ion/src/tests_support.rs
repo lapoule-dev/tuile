@@ -28,6 +28,7 @@ impl MockHttp {
             .entry(url.to_owned())
             .or_default()
             .push(HttpResponse {
+                max_age: None,
                 status,
                 body: Bytes::from(body.to_owned()),
             });
