@@ -1,0 +1,36 @@
+[package]
+name = "tuile-hydra"
+description = "C ABI over the tuile geometry server, for an OpenUSD/Hydra plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# A static library the C++ plugin links, plus an rlib so the Rust tests can
+# exercise the same code without going through the FFI.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+# Deliberately NOT `[lints] workspace = true`. The workspace denies unsafe code,
+# which is right everywhere else and impossible here: an `extern "C"` boundary is
+# unsafe by construction. The exception is narrow and lives only in this crate.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "warn"
+panic = "warn"
+
+[dependencies]
+glam = { workspace = true }
+image = { workspace = true }
+# `time` for the frame deadline: a bulk frame blocks, and an unbounded block
+# on a farm node is indistinguishable from a hang.
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tuile-core = { version = "0.0.1", path = "../tuile-core" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

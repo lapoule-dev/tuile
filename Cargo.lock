@@ -3618,6 +3618,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuile-hydra"
+version = "0.0.1"
+dependencies = [
+ "glam",
+ "image",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tuile-core",
+]
+
+[[package]]
 name = "tuile-native-fetchers"
 version = "0.0.1"
 dependencies = [
@@ -3630,6 +3643,7 @@ dependencies = [
  "reqwest-middleware",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "tuile-cesium-ion",
  "tuile-core",
  "url",
