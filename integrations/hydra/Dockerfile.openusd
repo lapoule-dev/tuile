@@ -5,6 +5,14 @@
 #
 # Built on the in-cluster amd64 builder, cached and published through Harbor:
 #
+# Locally, on an arm64 developer machine — no driver stack, Embree only:
+#
+#   docker build -f integrations/hydra/Dockerfile.openusd \
+#       --build-arg BASE_IMAGE=ubuntu:24.04 \
+#       -t tuile-openusd:26.08-local-arm64 .
+#
+# For the farm, natively on amd64, cached and published through Harbor:
+#
 #   docker buildx build --builder stl-builder-k8s --platform linux/amd64 \
 #       -f integrations/hydra/Dockerfile.openusd \
 #       --cache-to   type=registry,ref=harbor.sportstracklive.com/tuile/openusd-cache,mode=max \
@@ -25,15 +33,28 @@
 # build that compiles here and copies /opt/usd into nvidia/cuda:...-runtime.
 # Not done now: one recipe, one artefact, until size is a real problem.
 #
-# NOT YET EXECUTED. It needs an amd64 host with enough memory; see the job-count
-# note below, which is the thing most likely to bite.
+# The amd64 variant has NOT been executed yet — it needs an amd64 host with
+# enough memory, and the job-count note below is the thing most likely to bite
+# there. The arm64 variant is built and proven: the plugin loads and renders
+# under usdrecord in it.
 
 ARG USD_VERSION=v26.08
-# Pinned for the same reason as OpenUSD: a moving base changes the toolchain
-# under a plugin that is only loadable by the exact build it was made against.
-ARG CUDA_IMAGE=nvidia/cuda:12.6.2-devel-ubuntu24.04
 
-FROM ${CUDA_IMAGE}
+# The only thing that differs between the image the farm pulls and the one a
+# developer renders against locally. It was two Dockerfiles until it became
+# clear they had converged on the same feature set and the same assertions,
+# leaving one line of actual difference — which is an argument, not a file.
+#
+#   default                 x86_64 with a CUDA/GL driver stack. Storm and Embree.
+#   ubuntu:24.04            no driver stack; Embree only in practice. What an
+#                           arm64 developer machine can build and run.
+#
+# Pinned for the same reason as OpenUSD itself: a moving base changes the
+# toolchain under a plugin that is only loadable by the exact build it was made
+# against.
+ARG BASE_IMAGE=nvidia/cuda:12.6.2-devel-ubuntu24.04
+
+FROM ${BASE_IMAGE}
 ARG USD_VERSION
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -116,13 +137,21 @@ RUN set -eu; \
     usd="$(ls -d /opt/usd/lib/python*/site-packages | head -1)"; \
     echo "$usd" > "$sp/openusd.pth"; \
     python3 -c 'import pxr; print("pxr importable from", pxr.__file__)'; \
-    usdrecord --help > /dev/null
+    usdrecord --help > /dev/null; \
+    for lib in hdGp usdProcImaging usdImaging; do \
+        test -e "/opt/usd/lib/libusd_${lib}.so" || { echo "missing lib: $lib" >&2; exit 1; }; \
+    done; \
+    test -e /opt/usd/plugin/usd/hdEmbree.so || { echo "missing hdEmbree" >&2; exit 1; }; \
+    echo "base image verified: hdGp, usdProcImaging, usdImaging, hdEmbree"
 
 ENV HDGP_INCLUDE_DEFAULT_RESOLVER=1
 
 # Ask the container runtime for a driver that can do graphics, not only compute.
 # The default is compute-only and Storm then fails to create a context, with an
 # error that says nothing about this.
+#
+# Harmless on a base image with no NVIDIA runtime underneath — nothing reads
+# them — which is what lets one recipe serve both bases.
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
 
