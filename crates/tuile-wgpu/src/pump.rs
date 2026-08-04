@@ -77,7 +77,11 @@ impl ContentPump {
             };
             let prepared = prepare(gpu, &content, self.render_origin);
             self.gpu_bytes += prepared.gpu_bytes;
-            self.prepared.insert(tile, prepared);
+            // A re-upload replaces its predecessor: charge for the new one,
+            // refund the old, or the total drifts up until it is fiction.
+            if let Some(replaced) = self.prepared.insert(tile, prepared) {
+                self.gpu_bytes -= replaced.gpu_bytes;
+            }
             // Best effort: a closed stream just means the session is over.
             let _ = stream.send(ClientMessage::Ack { tile });
             uploaded += 1;
@@ -112,11 +116,18 @@ impl ContentPump {
                     .push(format!("tile {tile:?}: raw content reached the renderer")),
             },
             ServerMessage::Evict { tiles } => {
-                for tile in tiles {
-                    if let Some(p) = self.prepared.remove(&tile) {
+                for tile in &tiles {
+                    if let Some(p) = self.prepared.remove(tile) {
                         self.gpu_bytes -= p.gpu_bytes;
                     }
                 }
+                // Uploads are spread over frames, so a tile can still be
+                // queued when its eviction arrives. Dropping it here is what
+                // keeps that from leaking: uploaded after its own `Evict`, it
+                // would enter `prepared` with the server no longer considering
+                // it resident — so no further `Evict` would ever name it, and
+                // its GPU memory would be held until the session ends.
+                self.pending.retain(|(t, _)| !tiles.contains(t));
             }
             ServerMessage::Error { tile, message } => {
                 self.errors.push(match tile {

@@ -661,9 +661,48 @@ pub fn upsample_quadrant(src: &DecodedTexture, qx: u32, qy: u32) -> DecodedTextu
     }
 }
 
+/// The mip chain of a texture: levels 1.., each half the size of the previous
+/// one (WebGPU's `max(1, size >> level)` rule), down to 1×1. The mirror of
+/// [`upsample_quadrant`] — same `image` filters, the other direction; `Triangle`
+/// over an exact halving is a plain box average.
+///
+/// Backends generate the chain here, on the CPU, rather than blitting it level
+/// by level on the GPU: Apple's Metal driver leaks memory in proportion to the
+/// number of **render passes** created (gfx-rs/wgpu#8768, and Dawn has it too),
+/// and a GPU chain costs one render pass per level per texture.
+///
+/// Like `upsample_quadrant`, this averages in the encoded domain rather than in
+/// linear light, so the chain darkens very slightly against a filtering GPU
+/// sampler's own result. Consistent with the rest of the module.
+pub fn mip_chain(src: &DecodedTexture) -> Vec<DecodedTexture> {
+    use image::{imageops, ImageBuffer, Rgba};
+    let mut levels: Vec<DecodedTexture> = Vec::new();
+    loop {
+        let prev = levels.last().unwrap_or(src);
+        if prev.width <= 1 && prev.height <= 1 {
+            return levels;
+        }
+        let Some(view) =
+            ImageBuffer::<Rgba<u8>, _>::from_raw(prev.width, prev.height, &prev.rgba8[..])
+        else {
+            return levels;
+        };
+        let width = (prev.width / 2).max(1);
+        let height = (prev.height / 2).max(1);
+        let next = imageops::resize(&view, width, height, imageops::FilterType::Triangle);
+        levels.push(DecodedTexture {
+            width,
+            height,
+            rgba8: next.into_raw(),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use crate::content::{DecodedMesh, MaterialDesc};
     use crate::geo::geodetic_to_ecef;
     use glam::Mat4;
@@ -883,6 +922,53 @@ mod tests {
             "{:?}",
             uvs[1]
         );
+    }
+
+    #[test]
+    fn mip_chain_halves_down_to_one_texel() {
+        let src = DecodedTexture {
+            width: 8,
+            height: 4,
+            rgba8: vec![128; 8 * 4 * 4],
+        };
+        let chain = mip_chain(&src);
+        // 8×4 → 4×2 → 2×1 → 1×1: the WebGPU `max(1, size >> level)` rule, so
+        // the chain runs past the shorter side rather than stopping at it.
+        let sizes: Vec<(u32, u32)> = chain.iter().map(|t| (t.width, t.height)).collect();
+        assert_eq!(sizes, vec![(4, 2), (2, 1), (1, 1)]);
+        for level in &chain {
+            assert_eq!(
+                level.rgba8.len(),
+                (level.width * level.height * 4) as usize,
+                "each level is tightly packed RGBA8"
+            );
+        }
+    }
+
+    #[test]
+    fn mip_chain_of_a_flat_image_keeps_its_colour() {
+        // A box filter over a constant image is that constant: this catches a
+        // downsample that misreads the row stride or drops the alpha channel.
+        let src = DecodedTexture {
+            width: 4,
+            height: 4,
+            rgba8: [40u8, 90, 200, 255].repeat(4 * 4),
+        };
+        for level in mip_chain(&src) {
+            for texel in level.rgba8.chunks_exact(4) {
+                assert_eq!(texel, &[40, 90, 200, 255]);
+            }
+        }
+    }
+
+    #[test]
+    fn mip_chain_of_a_single_texel_is_empty() {
+        let src = DecodedTexture {
+            width: 1,
+            height: 1,
+            rgba8: vec![255; 4],
+        };
+        assert!(mip_chain(&src).is_empty(), "nothing left to halve");
     }
 
     #[test]

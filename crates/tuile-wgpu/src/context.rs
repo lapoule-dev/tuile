@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! GPU context: device, queue, shared bind-group layouts, default
-//! resources and the mip generator.
+//! GPU context: device, queue, shared bind-group layouts and default
+//! resources.
 //!
 //! The crate never creates a window or a surface — the host owns those
 //! (`docs/11-crate-wgpu.md`). [`GpuContext::headless`] exists for tests
@@ -32,7 +32,6 @@ pub struct GpuContext {
     pub(crate) sampler: wgpu::Sampler,
     /// 1×1 white texture for untextured materials.
     pub(crate) white_view: wgpu::TextureView,
-    pub(crate) mip: MipGenerator,
 }
 
 impl GpuContext {
@@ -79,10 +78,17 @@ impl GpuContext {
                 },
             ],
         });
+        // Clamp, never repeat. A tile's texture covers exactly that tile, with
+        // UVs spanning the full [0,1] range, so `Repeat` makes the filter wrap
+        // at the border and blend the opposite edge in: a hairline of the far
+        // side's colour along every tile boundary — the land at the top of a
+        // coastal tile bleeding across the sea at its bottom. The seam widens
+        // in ground metres at each mip level, so it reads as a lit thread over
+        // the whole globe.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("tuile sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
@@ -108,7 +114,6 @@ impl GpuContext {
             &[255, 255, 255, 255],
         );
         let white_view = white.create_view(&wgpu::TextureViewDescriptor::default());
-        let mip = MipGenerator::new(&device);
         Self {
             device,
             queue,
@@ -117,7 +122,6 @@ impl GpuContext {
             material_bgl,
             sampler,
             white_view,
-            mip,
         }
     }
 
@@ -146,129 +150,5 @@ impl GpuContext {
             .await
             .map_err(|e| ContextError::NoDevice(e.to_string()))?;
         Ok(Self::new(device, queue))
-    }
-}
-
-/// Generates mip chains by blitting each level from the previous one.
-/// Without mips, distant tiles shimmer (`docs/11-crate-wgpu.md`).
-pub(crate) struct MipGenerator {
-    pipeline: wgpu::RenderPipeline,
-    bgl: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
-}
-
-impl MipGenerator {
-    fn new(device: &wgpu::Device) -> Self {
-        let shader = device.create_shader_module(wgpu::include_wgsl!("mip.wgsl"));
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("tuile mip"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("tuile mip"),
-            bind_group_layouts: &[Some(&bgl)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("tuile mip"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(TEXTURE_FORMAT.into())],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("tuile mip"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        Self {
-            pipeline,
-            bgl,
-            sampler,
-        }
-    }
-
-    /// Fills levels 1.. of `texture` from level 0.
-    pub(crate) fn generate(
-        &self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        texture: &wgpu::Texture,
-        mip_count: u32,
-    ) {
-        for level in 1..mip_count {
-            let src = texture.create_view(&wgpu::TextureViewDescriptor {
-                base_mip_level: level - 1,
-                mip_level_count: Some(1),
-                ..Default::default()
-            });
-            let dst = texture.create_view(&wgpu::TextureViewDescriptor {
-                base_mip_level: level,
-                mip_level_count: Some(1),
-                ..Default::default()
-            });
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tuile mip"),
-                layout: &self.bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&src),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("tuile mip"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.draw(0..3, 0..1);
-        }
     }
 }

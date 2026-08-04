@@ -8,7 +8,11 @@
 use crate::context::{GpuContext, TEXTURE_FORMAT};
 use glam::{DVec3, Mat4, Vec3};
 use tuile_core::content::{DecodedMesh, DecodedTexture, DecodedTileContent};
+use tuile_core::raster;
 use wgpu::util::DeviceExt;
+
+/// Bytes per texel in [`TEXTURE_FORMAT`].
+const BYTES_PER_TEXEL: u32 = 4;
 
 /// Interleaved vertex layout: position, normal, uv.
 #[repr(C)]
@@ -98,15 +102,10 @@ pub fn prepare(
     });
 
     let mut gpu_bytes = 0usize;
-    let mut encoder = gpu
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("tuile prepare"),
-        });
     let textures: Vec<(wgpu::Texture, wgpu::TextureView)> = content
         .textures
         .iter()
-        .map(|t| upload_texture(gpu, &mut encoder, t, &mut gpu_bytes))
+        .map(|t| upload_texture(gpu, t, &mut gpu_bytes))
         .collect();
 
     let meshes = content
@@ -114,7 +113,6 @@ pub fn prepare(
         .iter()
         .map(|m| prepare_mesh(gpu, m, &textures, &mut gpu_bytes))
         .collect();
-    gpu.queue.submit([encoder.finish()]);
 
     PreparedTile {
         meshes,
@@ -127,51 +125,61 @@ pub fn prepare(
     }
 }
 
+/// Uploads a base-color texture with its full mip chain.
+///
+/// The chain is built on the CPU ([`raster::mip_chain`]) rather than blitted
+/// level-by-level on the GPU. Apple's Metal driver leaks memory in proportion
+/// to the number of **render passes** created — `AGX::Compiler::compileProgram`
+/// under `renderCommandEncoderWithDescriptor`, see gfx-rs/wgpu#8768; Dawn has
+/// it too, and no wgpu-side workaround exists. A GPU chain costs one render
+/// pass per level per texture: at eight uploads a frame that is ~80 passes a
+/// frame, enough to exhaust the driver in minutes and take the machine down
+/// with it. Filtering on the CPU costs zero render passes.
 fn upload_texture(
     gpu: &GpuContext,
-    encoder: &mut wgpu::CommandEncoder,
     t: &DecodedTexture,
     gpu_bytes: &mut usize,
 ) -> (wgpu::Texture, wgpu::TextureView) {
-    let mip_count = (t.width.max(t.height).max(1) as f32).log2().floor() as u32 + 1;
+    let mips = raster::mip_chain(t);
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("tuile base color"),
         size: wgpu::Extent3d {
-            width: t.width.max(1),
-            height: t.height.max(1),
+            width: t.width,
+            height: t.height,
             depth_or_array_layers: 1,
         },
-        mip_level_count: mip_count,
+        mip_level_count: 1 + mips.len() as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: TEXTURE_FORMAT,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        // No RENDER_ATTACHMENT: nothing draws into this texture any more.
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    gpu.queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &t.rgba8,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(t.width * 4),
-            rows_per_image: Some(t.height),
-        },
-        wgpu::Extent3d {
-            width: t.width.max(1),
-            height: t.height.max(1),
-            depth_or_array_layers: 1,
-        },
-    );
-    gpu.mip.generate(&gpu.device, encoder, &texture, mip_count);
-    // Mips add ~1/3 on top of level 0.
-    *gpu_bytes += t.rgba8.len() * 4 / 3;
+
+    for (level, image) in std::iter::once(t).chain(mips.iter()).enumerate() {
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &image.rgba8,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(image.width * BYTES_PER_TEXEL),
+                rows_per_image: Some(image.height),
+            },
+            wgpu::Extent3d {
+                width: image.width,
+                height: image.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        *gpu_bytes += image.rgba8.len();
+    }
+
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
 }
