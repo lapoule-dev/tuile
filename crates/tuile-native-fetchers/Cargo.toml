@@ -14,7 +14,9 @@ workspace = true
 async-trait = { workspace = true }
 bytes = { workspace = true }
 reqwest = { workspace = true }
-tokio = { workspace = true, features = ["fs"] }
+# `time` for the retry backoff sleeps.
+tokio = { workspace = true, features = ["fs", "time"] }
+tracing = { workspace = true }
 url = { workspace = true }
 tuile-core = { version = "0.0.1", path = "../tuile-core" }
 tuile-cesium-ion = { version = "0.0.1", path = "../tuile-cesium-ion" }
