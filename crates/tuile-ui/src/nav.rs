@@ -25,6 +25,10 @@ const RING_INNER: f64 = 34.0;
 const HANDLE: f64 = 26.0;
 /// Radius of each zoom button.
 const BUTTON: f64 = 15.0;
+/// Half-width of the atmosphere checkbox. Square rather than round, because a
+/// round control here would read as another button to press repeatedly rather
+/// than a state that stays where it is put.
+const CHECKBOX: f64 = 11.0;
 /// Gap between the ring and the zoom buttons, and between the buttons.
 const GAP: f64 = 10.0;
 /// Segments per full circle. 48 is smooth at these radii and still trivial.
@@ -53,6 +57,8 @@ pub enum Part {
     Tilt,
     ZoomIn,
     ZoomOut,
+    /// A checkbox: whether the globe is drawn with air around it.
+    Atmosphere,
 }
 
 /// Where every part sits, for one viewport.
@@ -61,6 +67,7 @@ struct Layout {
     center: (f64, f64),
     zoom_in: (f64, f64),
     zoom_out: (f64, f64),
+    atmosphere: (f64, f64),
 }
 
 impl Layout {
@@ -68,17 +75,21 @@ impl Layout {
         // Everything below the compass centre: the ring's lower half, then two
         // buttons each preceded by a gap. Derived rather than guessed, so the
         // stack cannot quietly grow past the bottom margin when a size changes.
-        let below_center = RING_OUTER + 2.0 * GAP + 4.0 * BUTTON;
+        let below_center = RING_OUTER + 3.0 * GAP + 4.0 * BUTTON + 2.0 * CHECKBOX;
         let cx = viewport.0 - MARGIN - RING_OUTER;
         let cy = viewport.1 - MARGIN - below_center;
         Self {
             center: (cx, cy),
             zoom_in: (cx, cy + RING_OUTER + GAP + BUTTON),
             zoom_out: (cx, cy + RING_OUTER + 2.0 * GAP + 3.0 * BUTTON),
+            atmosphere: (cx, cy + RING_OUTER + 3.0 * GAP + 4.0 * BUTTON + CHECKBOX),
         }
     }
 
     fn hit(&self, px: (f64, f64)) -> Option<Part> {
+        if within_square(px, self.atmosphere, CHECKBOX) {
+            return Some(Part::Atmosphere);
+        }
         if within(px, self.zoom_in, BUTTON) {
             return Some(Part::ZoomIn);
         }
@@ -106,11 +117,25 @@ pub struct NavWidget {
     grabbed: Option<Part>,
     /// The part under the cursor when nothing is grabbed, for highlighting.
     hovered: Option<Part>,
+    /// Whether the host should draw air around the globe. State, not a gesture:
+    /// it outlives every press, which is the whole difference between this and
+    /// the buttons above it.
+    atmosphere: bool,
 }
 
 impl NavWidget {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            // On. The air is what the globe is meant to look like; off is the
+            // comparison you reach for, not the state you start in.
+            atmosphere: true,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the atmosphere checkbox is ticked.
+    pub fn atmosphere_enabled(&self) -> bool {
+        self.atmosphere
     }
 
     /// The part at a pixel, if any.
@@ -148,6 +173,7 @@ impl NavWidget {
         match part {
             Part::ZoomIn => controller.zoom(ZOOM_STEP, centre_of(viewport), viewport),
             Part::ZoomOut => controller.zoom(-ZOOM_STEP, centre_of(viewport), viewport),
+            Part::Atmosphere => self.atmosphere = !self.atmosphere,
             Part::Ring | Part::Tilt => {}
         }
         true
@@ -182,8 +208,9 @@ impl NavWidget {
                 let swept = (to.1 - from.1) / TILT_TRAVEL_PX * FRAC_PI_2;
                 controller.tilt(swept, viewport);
             }
-            // A button has nothing to drag; it already fired on press.
-            Part::ZoomIn | Part::ZoomOut => {}
+            // A button or a checkbox has nothing to drag; both already acted
+            // on press.
+            Part::ZoomIn | Part::ZoomOut | Part::Atmosphere => {}
         }
         true
     }
@@ -211,6 +238,17 @@ impl NavWidget {
         plus(&mut mesh, layout.zoom_in);
         disc(&mut mesh, layout.zoom_out, BUTTON, self.tint(Part::ZoomOut));
         minus(&mut mesh, layout.zoom_out);
+
+        // The checkbox, and its tick when the air is on.
+        square(
+            &mut mesh,
+            layout.atmosphere,
+            CHECKBOX,
+            self.tint(Part::Atmosphere),
+        );
+        if self.atmosphere {
+            square(&mut mesh, layout.atmosphere, CHECKBOX * 0.5, STROKE);
+        }
 
         mesh
     }
@@ -242,6 +280,17 @@ fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
 
 fn within(px: (f64, f64), centre: (f64, f64), radius: f64) -> bool {
     distance(px, centre) <= radius
+}
+
+fn within_square(px: (f64, f64), centre: (f64, f64), half: f64) -> bool {
+    (px.0 - centre.0).abs() <= half && (px.1 - centre.1).abs() <= half
+}
+
+fn square(mesh: &mut Mesh, centre: (f64, f64), half: f64, color: [f32; 4]) {
+    let (x0, y0) = (centre.0 - half, centre.1 - half);
+    let (x1, y1) = (centre.0 + half, centre.1 + half);
+    push_tri(mesh, (x0, y0), (x1, y0), (x1, y1), color);
+    push_tri(mesh, (x0, y0), (x1, y1), (x0, y1), color);
 }
 
 /// Screen angle of a point about a centre, measured clockwise from straight up
