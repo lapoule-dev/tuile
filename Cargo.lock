@@ -3621,13 +3621,19 @@ dependencies = [
 name = "tuile-hydra"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
+ "bytes",
  "glam",
  "image",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tuile-bing",
+ "tuile-cesium-ion",
  "tuile-core",
+ "tuile-native-fetchers",
+ "tuile-planetary",
 ]
 
 [[package]]

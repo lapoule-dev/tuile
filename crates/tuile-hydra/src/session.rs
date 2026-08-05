@@ -192,6 +192,18 @@ impl Frame {
     }
 }
 
+impl std::fmt::Debug for Session {
+    /// Deliberately says almost nothing. A session owns a tokio runtime, a
+    /// server thread and a live stream, none of which have a useful textual
+    /// form — and its configuration can carry an ion token, which must not end
+    /// up in a log line because someone printed a `Result`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("frame_timeout", &self.config.frame_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A live session over one tile source.
 pub struct Session {
     stream: tuile_core::protocol::InProcessStream,
@@ -211,9 +223,28 @@ impl Session {
         loader: Arc<dyn TileLoader>,
         config: SessionConfig,
     ) -> std::io::Result<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        Self::from_parts(Self::runtime()?, tree, loader, config)
+    }
+
+    /// The runtime a session drives everything on.
+    ///
+    /// Exposed to the crate because resolving sources is itself async — an ion
+    /// endpoint and a Bing metadata document have to be fetched before there is
+    /// a tree to hand over — and doing that on a second runtime would mean two
+    /// thread pools and two sets of connections for one session.
+    pub(crate) fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+        tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .build()?;
+            .build()
+    }
+
+    /// Starts a session on an already-built runtime.
+    pub(crate) fn from_parts(
+        runtime: tokio::runtime::Runtime,
+        tree: Box<dyn TileTree>,
+        loader: Arc<dyn TileLoader>,
+        config: SessionConfig,
+    ) -> std::io::Result<Self> {
         let (stream, server) = in_process_with(tree, loader, config.traversal.clone());
 
         // The server runs on its own runtime handle so a frame call can block

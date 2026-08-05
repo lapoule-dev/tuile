@@ -16,6 +16,9 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use glam::{DVec2, DVec3};
+use tuile_core::traversal::{ViewState, ViewStateParams};
+
 use crate::session::{Frame, FrameError, Session};
 
 /// The outcome of a call. Zero is success; everything else is a reason.
@@ -118,6 +121,199 @@ fn guard<F: FnOnce() -> TuileStatus>(f: F) -> TuileStatus {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(TuileStatus::InternalError)
 }
 
+/// A UTF-8 string the caller lends us for the duration of one call.
+///
+/// Length-carrying rather than null-terminated, for the same reason as
+/// [`TuileBuffer`]: a C++ `std::string` may contain anything, and asking the
+/// caller to guarantee a terminator is asking it to build a temporary it does
+/// not otherwise need.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TuileStr {
+    pub data: *const u8,
+    pub len: usize,
+}
+
+impl TuileStr {
+    /// Borrows the string, or `None` if it is null, empty or not UTF-8.
+    ///
+    /// # Safety
+    /// `data` must point at `len` readable bytes for the duration of the call.
+    unsafe fn as_str<'a>(&self) -> Option<&'a str> {
+        if self.data.is_null() || self.len == 0 {
+            return None;
+        }
+        std::str::from_utf8(unsafe { std::slice::from_raw_parts(self.data, self.len) }).ok()
+    }
+}
+
+/// What a host states to open a globe.
+///
+/// Every field is a plain value or a borrowed string, so C++ can build one on
+/// the stack without allocating and without owning anything afterwards.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TuileGlobeConfig {
+    /// A Cesium ion access token. Required.
+    pub ion_token: TuileStr,
+    /// The ion asset holding terrain. `0` selects Cesium World Terrain.
+    pub terrain_asset_id: i64,
+    /// The ion asset holding imagery. `0` selects Bing Aerial; **negative**
+    /// disables imagery entirely, which is the terrain-only debug view.
+    pub imagery_asset_id: i64,
+    /// Where to keep the tile cache. Empty selects the per-user default.
+    pub cache_dir: TuileStr,
+    /// Screen-space error target. `0` or less keeps the traversal default.
+    pub maximum_screen_space_error: f64,
+    /// How long one frame may take to converge. `0` or less keeps the default.
+    pub frame_timeout_seconds: f64,
+    /// Whether a frame that lost tiles is an error. Should stay true anywhere
+    /// the output is kept: a failed tile leaves no hole, its ancestor stands
+    /// in, and the frame renders plausibly at the wrong level of detail.
+    pub fail_on_tile_errors: bool,
+}
+
+/// One camera, as the traversal needs it: twelve doubles and nothing else.
+///
+/// ECEF, f64, and that is not negotiable — narrowing a position on the globe to
+/// f32 is what jitter is made of.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TuileViewState {
+    pub position: [f64; 3],
+    pub direction: [f64; 3],
+    pub up: [f64; 3],
+    /// Width and height in pixels. What turns a geometric error into a
+    /// screen-space one, so it must be the real render resolution.
+    pub viewport_px: [f64; 2],
+    pub fovy_rad: f64,
+}
+
+/// Reads the three meanings packed into `imagery_asset_id`.
+///
+/// Negative disables imagery; zero means "whatever the default is"; positive
+/// names an asset. Three meanings in one integer because a C struct has no
+/// `Option`, and the alternative — a separate boolean — is a second field that
+/// can contradict the first, which is worse than an encoding one has to read.
+fn imagery_asset(id: i64) -> Option<i64> {
+    match id {
+        id if id < 0 => None,
+        0 => Some(crate::globe::BING_AERIAL),
+        id => Some(id),
+    }
+}
+
+/// Opens a session on a Cesium ion globe.
+///
+/// Blocks while it resolves sources — an ion endpoint and a Bing metadata
+/// document have to be fetched before a tile can be asked for. Call it once,
+/// off a thread the host can afford to block.
+///
+/// On success `*out` owns a session the caller must release with
+/// [`tuile_session_free`]. On failure `*out` is left null.
+///
+/// # Safety
+/// `config` must point at a readable [`TuileGlobeConfig`] whose strings are
+/// valid for the call, and `out` at a writable pointer.
+#[no_mangle]
+pub unsafe extern "C" fn tuile_session_new(
+    config: *const TuileGlobeConfig,
+    out: *mut *mut Session,
+) -> TuileStatus {
+    if config.is_null() || out.is_null() {
+        return TuileStatus::BadArgument;
+    }
+    guard(|| {
+        unsafe { *out = std::ptr::null_mut() };
+        let config = unsafe { &*config };
+
+        let Some(token) = (unsafe { config.ion_token.as_str() }) else {
+            return TuileStatus::BadArgument;
+        };
+
+        let mut globe = crate::globe::GlobeConfig::new(token);
+        if config.terrain_asset_id != 0 {
+            globe.terrain_asset_id = config.terrain_asset_id;
+        }
+        globe.imagery_asset_id = imagery_asset(config.imagery_asset_id);
+        if let Some(dir) = unsafe { config.cache_dir.as_str() } {
+            globe.cache_dir = Some(std::path::PathBuf::from(dir));
+        }
+        if config.maximum_screen_space_error > 0.0 {
+            globe.session.traversal.maximum_screen_space_error = config.maximum_screen_space_error;
+        }
+        globe.session.frame_timeout =
+            crate::globe::duration_or(config.frame_timeout_seconds, globe.session.frame_timeout);
+        globe.session.fail_on_tile_errors = config.fail_on_tile_errors;
+
+        match Session::globe(globe) {
+            Ok(session) => {
+                unsafe { *out = Box::into_raw(Box::new(session)) };
+                TuileStatus::Ok
+            }
+            Err(error) => {
+                // The token is in the config, never in the message.
+                tracing::error!(%error, "opening the globe");
+                TuileStatus::ServerGone
+            }
+        }
+    })
+}
+
+/// Resolves one frame for the given views, blocking until it converges.
+///
+/// Several views are a **union**, not a choice: a stereo pair must share one
+/// selection or the eyes disagree at level-of-detail boundaries.
+///
+/// On success `*out` owns a frame the caller must release with
+/// [`tuile_frame_free`], and every buffer borrowed from it stays valid until
+/// then. On failure `*out` is left null.
+///
+/// # Safety
+/// `session` must be a live session, `views` must point at `view_count`
+/// readable [`TuileViewState`]s, and `out` at a writable pointer.
+#[no_mangle]
+pub unsafe extern "C" fn tuile_session_frame(
+    session: *mut Session,
+    views: *const TuileViewState,
+    view_count: usize,
+    out: *mut *mut Frame,
+) -> TuileStatus {
+    if session.is_null() || views.is_null() || view_count == 0 || out.is_null() {
+        return TuileStatus::BadArgument;
+    }
+    guard(|| {
+        unsafe { *out = std::ptr::null_mut() };
+        let session = unsafe { &mut *session };
+        let views = unsafe { std::slice::from_raw_parts(views, view_count) };
+
+        let views: Vec<ViewState> = views
+            .iter()
+            .map(|v| {
+                ViewStateParams {
+                    position: DVec3::from_array(v.position),
+                    direction: DVec3::from_array(v.direction),
+                    up: DVec3::from_array(v.up),
+                    viewport_px: DVec2::from_array(v.viewport_px),
+                    fovy_rad: v.fovy_rad,
+                }
+                .into()
+            })
+            .collect();
+
+        match session.frame(views) {
+            Ok(frame) => {
+                unsafe { *out = Box::into_raw(Box::new(frame)) };
+                TuileStatus::Ok
+            }
+            Err(error) => {
+                tracing::error!(%error, "resolving a frame");
+                TuileStatus::from(&error)
+            }
+        }
+    })
+}
+
 /// Releases a session created by the host.
 ///
 /// # Safety
@@ -154,7 +350,10 @@ pub unsafe extern "C" fn tuile_frame_free(frame: *mut Frame) {
 /// # Safety
 /// `frame` must be a live frame.
 #[no_mangle]
-pub unsafe extern "C" fn tuile_frame_tile_count(frame: *const Frame, out: *mut usize) -> TuileStatus {
+pub unsafe extern "C" fn tuile_frame_tile_count(
+    frame: *const Frame,
+    out: *mut usize,
+) -> TuileStatus {
     if frame.is_null() || out.is_null() {
         return TuileStatus::BadArgument;
     }
@@ -198,9 +397,10 @@ pub unsafe extern "C" fn tuile_frame_tile(
                 tile_id: tile.tile.0,
                 origin_ecef: [origin.x, origin.y, origin.z],
                 positions: TuileBuffer::of(&mesh.positions),
-                normals: mesh.normals.as_ref().map_or(TuileBuffer::EMPTY, |n| {
-                    TuileBuffer::of(n)
-                }),
+                normals: mesh
+                    .normals
+                    .as_ref()
+                    .map_or(TuileBuffer::EMPTY, |n| TuileBuffer::of(n)),
                 uvs: mesh
                     .uvs
                     .as_ref()
@@ -336,6 +536,118 @@ mod tests {
         );
         assert_eq!(
             unsafe { tuile_frame_texture(std::ptr::null(), 0, 0, texture.as_mut_ptr()) },
+            TuileStatus::BadArgument
+        );
+    }
+
+    /// Three meanings in one integer is exactly the kind of encoding that gets
+    /// inverted, and inverting it means silently rendering an untextured globe.
+    #[test]
+    fn the_imagery_asset_id_encodes_three_things() {
+        assert_eq!(imagery_asset(0), Some(crate::globe::BING_AERIAL));
+        assert_eq!(imagery_asset(3812), Some(3812));
+        assert_eq!(imagery_asset(-1), None, "negative disables imagery");
+        assert_eq!(imagery_asset(i64::MIN), None);
+    }
+
+    fn as_str(s: &str) -> TuileStr {
+        TuileStr {
+            data: s.as_ptr(),
+            len: s.len(),
+        }
+    }
+
+    #[test]
+    fn a_borrowed_string_round_trips() {
+        let text = "a token";
+        assert_eq!(unsafe { as_str(text).as_str() }, Some(text));
+    }
+
+    /// Null, empty and non-UTF-8 all mean "the caller stated nothing", because
+    /// the alternative is reading whatever happens to be at that address.
+    #[test]
+    fn a_missing_or_invalid_string_is_nothing() {
+        let null = TuileStr {
+            data: std::ptr::null(),
+            len: 7,
+        };
+        assert_eq!(unsafe { null.as_str() }, None);
+        assert_eq!(unsafe { as_str("").as_str() }, None);
+
+        let invalid: [u8; 2] = [0xff, 0xfe];
+        let bad = TuileStr {
+            data: invalid.as_ptr(),
+            len: invalid.len(),
+        };
+        assert_eq!(unsafe { bad.as_str() }, None);
+    }
+
+    /// No network here: these must be refused before anything is attempted, so
+    /// a misconfigured host fails immediately rather than after a timeout.
+    #[test]
+    fn opening_a_session_refuses_bad_arguments() {
+        let mut out: *mut Session = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { tuile_session_new(std::ptr::null(), &mut out) },
+            TuileStatus::BadArgument
+        );
+
+        let config = TuileGlobeConfig {
+            ion_token: as_str(""),
+            terrain_asset_id: 0,
+            imagery_asset_id: 0,
+            cache_dir: as_str(""),
+            maximum_screen_space_error: 0.0,
+            frame_timeout_seconds: 0.0,
+            fail_on_tile_errors: true,
+        };
+        assert_eq!(
+            unsafe { tuile_session_new(&config, &mut out) },
+            TuileStatus::BadArgument,
+            "an empty token must not reach the network"
+        );
+        assert!(out.is_null(), "a failed open must leave the pointer null");
+
+        assert_eq!(
+            unsafe { tuile_session_new(&config, std::ptr::null_mut()) },
+            TuileStatus::BadArgument
+        );
+    }
+
+    #[test]
+    fn resolving_a_frame_refuses_bad_arguments() {
+        let view = TuileViewState {
+            position: [0.0; 3],
+            direction: [0.0, 0.0, -1.0],
+            up: [0.0, 1.0, 0.0],
+            viewport_px: [512.0, 512.0],
+            fovy_rad: 0.8,
+        };
+        let mut out: *mut Frame = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { tuile_session_frame(std::ptr::null_mut(), &view, 1, &mut out) },
+            TuileStatus::BadArgument
+        );
+        assert_eq!(
+            unsafe { tuile_session_frame(std::ptr::null_mut(), &view, 1, std::ptr::null_mut()) },
+            TuileStatus::BadArgument
+        );
+
+        // Zero views is a mistake rather than an empty answer: the traversal
+        // has nothing to select against, and a frame with no camera is not a
+        // frame.
+        //
+        // The session pointer here is non-null and never dereferenced, which
+        // holds only because every argument is validated before any is read.
+        // Keep it that way: moving a dereference above the count check would
+        // make this test undefined rather than merely failing.
+        let unreadable = std::ptr::NonNull::<Session>::dangling().as_ptr();
+        assert_eq!(
+            unsafe { tuile_session_frame(unreadable, &view, 0, &mut out) },
+            TuileStatus::BadArgument
+        );
+        assert_eq!(
+            unsafe { tuile_session_frame(unreadable, std::ptr::null(), 1, &mut out) },
             TuileStatus::BadArgument
         );
     }

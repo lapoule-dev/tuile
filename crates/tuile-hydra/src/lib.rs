@@ -34,6 +34,8 @@
 //!   from them must be too.
 
 mod ffi;
+mod globe;
 mod session;
 
-pub use session::{Frame, Session, SessionConfig, TileGeometry};
+pub use globe::{GlobeConfig, GlobeError, BING_AERIAL, CESIUM_WORLD_TERRAIN};
+pub use session::{EncodedTexture, Frame, Session, SessionConfig, TileGeometry};
