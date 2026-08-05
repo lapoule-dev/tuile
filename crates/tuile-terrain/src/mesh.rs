@@ -63,6 +63,9 @@ pub fn to_decoded(mesh: &QuantizedMesh, rect: &GeoRect, skirt_height: f64) -> De
             material: MaterialDesc::default(),
         }],
         textures: Vec::new(),
+        // Terrain owns no texture; imagery is draped by whoever composes the
+        // globe, and referenced rather than copied in here.
+        imagery: Vec::new(),
         local_origin_ecef: origin,
         transform_local: Mat4::IDENTITY,
     }

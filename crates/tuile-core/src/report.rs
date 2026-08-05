@@ -211,6 +211,7 @@ mod tests {
                 height: 256,
                 rgba8: vec![0; 256 * 256 * 4],
             }],
+            imagery: Vec::new(),
             local_origin_ecef: DVec3::new(1.0, 2.0, 3.0),
             transform_local: Mat4::IDENTITY,
         };

@@ -52,6 +52,7 @@ fn quad_content(origin: DVec3) -> DecodedTileContent {
                 255, 255, 255, 255, // (1,1) white
             ],
         }],
+        imagery: Vec::new(),
         local_origin_ecef: origin,
         transform_local: Mat4::IDENTITY,
     }
