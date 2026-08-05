@@ -373,6 +373,7 @@ mod tests {
                         height: 2,
                         rgba8: vec![255u8; 2 * 2 * 4],
                     }],
+                    imagery: Vec::new(),
                     local_origin_ecef: DVec3::ZERO,
                     transform_local: glam::Mat4::IDENTITY,
                 },

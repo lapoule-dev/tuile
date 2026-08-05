@@ -338,6 +338,7 @@ mod tests {
             Ok(Loaded::Content(DecodedTileContent {
                 meshes: Vec::new(),
                 textures: Vec::new(),
+                imagery: Vec::new(),
                 local_origin_ecef: DVec3::new(self.marker as f64, 0.0, 0.0),
                 transform_local: Mat4::IDENTITY,
             }))
