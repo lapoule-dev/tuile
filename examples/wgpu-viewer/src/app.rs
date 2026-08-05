@@ -11,7 +11,9 @@ use tuile_camera::CameraController;
 use tuile_core::protocol::{ClientMessage, GeometryStream, InProcessStream};
 use tuile_core::source::TileId;
 use tuile_ui::NavWidget;
-use tuile_wgpu::{ContentPump, GpuContext, OverlayRenderer, OverlayVertex, TileRenderer, DEPTH_FORMAT};
+use tuile_wgpu::{
+    ContentPump, GpuContext, OverlayRenderer, OverlayVertex, TileRenderer, DEPTH_FORMAT,
+};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
@@ -342,7 +344,8 @@ impl App {
         // A drop in the prepared count is the server reclaiming: worth counting
         // separately from uploads, since a healthy session does far more of the
         // former than the latter once the view settles.
-        self.stats.evictions += (before + uploaded).saturating_sub(active.pump.prepared_count()) as u64;
+        self.stats.evictions +=
+            (before + uploaded).saturating_sub(active.pump.prepared_count()) as u64;
         // Anti-jitter: render origin = eye, so the f32 the GPU sees is small.
         let origin = cam.position;
         active.pump.rebase(&active.gpu.queue, origin);
