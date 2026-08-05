@@ -74,7 +74,17 @@ pub struct ContentHints {
 #[derive(Debug, Clone)]
 pub struct DecodedTileContent {
     pub meshes: Vec<DecodedMesh>,
+    /// Textures this tile **owns**: the images its own glTF payload carried.
+    ///
+    /// Distinct from [`DecodedTileContent::imagery`], and deliberately so. A
+    /// b3dm building's façade belongs to that building and to nothing else;
+    /// draped imagery belongs to the map and is shared by every tile it covers.
+    /// Conflating the two is what made every terrain tile carry a private copy
+    /// of the same pixels.
     pub textures: Vec<DecodedTexture>,
+    /// Imagery draped over this tile, referenced rather than owned. Empty for
+    /// content that carries its own texturing.
+    pub imagery: Vec<crate::raster::ImageryLayer>,
     /// The rebasing origin, f64 ECEF.
     pub local_origin_ecef: DVec3,
     /// Residual transform to apply at render time (identity: everything is
@@ -83,7 +93,18 @@ pub struct DecodedTileContent {
 }
 
 impl DecodedTileContent {
-    /// Approximate CPU-side size in bytes (for the resident-cache budget).
+    /// Approximate CPU-side size in bytes, for the resident-cache budget —
+    /// **excluding draped imagery**.
+    ///
+    /// Imagery is shared: twenty terrain tiles routinely drape one Bing tile.
+    /// Charging each of them the full texture would report twenty copies of
+    /// memory that was allocated once, and the cache would then evict geometry
+    /// to reclaim bytes that do not exist — spending the sharing on nothing.
+    ///
+    /// Imagery is budgeted where it is actually held, keyed by `ImageryCoord`,
+    /// which is the only place the count can be right. What this number means
+    /// is therefore "what dropping this tile would free", and that is what a
+    /// resident cache needs it to mean.
     pub fn byte_size(&self) -> usize {
         let meshes: usize = self
             .meshes
@@ -97,6 +118,17 @@ impl DecodedTileContent {
             .sum();
         let textures: usize = self.textures.iter().map(|t| t.rgba8.len()).sum();
         meshes + textures
+    }
+
+    /// What this tile's imagery would cost **if it were not shared** — the sum
+    /// over its layers, counting a texture once per tile that references it.
+    ///
+    /// Only meaningful as a diagnostic: against the true cost of the same
+    /// layers held once each, the ratio is the sharing factor, and that number
+    /// is the whole argument for referencing rather than resampling. Never feed
+    /// it to a budget; see [`DecodedTileContent::byte_size`].
+    pub fn imagery_byte_size_unshared(&self) -> usize {
+        self.imagery.iter().map(|l| l.texture.rgba8.len()).sum()
     }
 }
 
@@ -199,6 +231,8 @@ fn decode_glb(
     Ok(DecodedTileContent {
         meshes,
         textures,
+        // glTF content carries its own texturing; draping happens above.
+        imagery: Vec::new(),
         local_origin_ecef: hints.origin_ecef,
         transform_local: Mat4::IDENTITY,
     })

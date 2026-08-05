@@ -63,6 +63,16 @@ impl GeoRect {
     }
 }
 
+/// The latitude Web Mercator stops at, `2·atan(e^π) − π/2` — the one that
+/// makes the projected world square.
+///
+/// Written to full double precision rather than rounded, because it is used in
+/// both directions: `to_normalized` clamps to it and `from_normalized` produces
+/// it, and a truncated constant makes the pair disagree by a few metres at the
+/// top of the map. That difference is invisible in a picture and very visible
+/// in a round-trip assertion, which is how it was found.
+pub const MERCATOR_MAX_LAT: f64 = 1.484_422_229_745_332_4;
+
 /// Map projection of an imagery layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Projection {
@@ -80,14 +90,33 @@ impl Projection {
         let x = (g.lon + PI) / TAU;
         let y = match self {
             Projection::WebMercator => {
-                // Clamp to the mercator square (±85.051°).
-                let lat = g.lat.clamp(-1.484_422, 1.484_422);
+                let lat = g.lat.clamp(-MERCATOR_MAX_LAT, MERCATOR_MAX_LAT);
                 let merc = (FRAC_PI_4 + lat / 2.0).tan().ln();
                 0.5 - merc / TAU
             }
             Projection::Geographic => 0.5 - g.lat / PI,
         };
         (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0))
+    }
+
+    /// Inverse of [`Projection::to_normalized`], at height 0.
+    ///
+    /// Not an exact inverse at the poles, and cannot be: `to_normalized`
+    /// *clamps* latitudes past the Mercator limit onto the edge of the square,
+    /// which throws the excess away. Round-tripping such a latitude returns the
+    /// limit — which is what the clamp meant, and what every consumer here wants.
+    pub fn from_normalized(&self, x: f64, y: f64) -> Geodetic {
+        use std::f64::consts::{FRAC_PI_2, PI, TAU};
+        let lon = x * TAU - PI;
+        let lat = match self {
+            Projection::WebMercator => 2.0 * ((0.5 - y) * TAU).exp().atan() - FRAC_PI_2,
+            Projection::Geographic => (0.5 - y) * PI,
+        };
+        Geodetic {
+            lon,
+            lat,
+            height: 0.0,
+        }
     }
 }
 
@@ -145,6 +174,29 @@ impl TilingScheme {
             (c.x + 1) as f64 * w,
             (c.y + 1) as f64 * h,
         )
+    }
+
+    /// The geographic rectangle an imagery tile covers.
+    ///
+    /// [`TilingScheme::tile_extent`] read back through the projection. The
+    /// latitude mapping is nonlinear under Web Mercator but strictly monotone,
+    /// so the corners of the normalized extent are the corners of the rectangle
+    /// and no sampling in between is needed.
+    ///
+    /// This is what makes an imagery tile placeable *on its own*, without
+    /// reference to whatever geometry happens to be draped in it — which is the
+    /// whole point of sharing one reprojected texture between the many geometry
+    /// tiles it covers.
+    pub fn tile_rect(&self, c: ImageryCoord) -> GeoRect {
+        let (x0, y0, x1, y1) = self.tile_extent(c);
+        let nw = self.projection.from_normalized(x0, y0);
+        let se = self.projection.from_normalized(x1, y1);
+        GeoRect {
+            west: nw.lon,
+            north: nw.lat,
+            east: se.lon,
+            south: se.lat,
+        }
     }
 
     /// Picks the level where one imagery texel roughly covers
@@ -529,6 +581,123 @@ pub fn rectangle_from_obb(obb: &Obb) -> GeoRect {
     rect
 }
 
+/// One imagery texture draped over a geometry tile — **referenced, not owned**.
+///
+/// This is the type that stops us copying. A geometry tile names the imagery
+/// tiles that cover it and says where each one lands in its own uv space; the
+/// pixels stay in exactly one place, shared by every geometry tile that names
+/// the same [`ImageryCoord`]. Two neighbours therefore cannot disagree about
+/// colour or filtering the way they do when each resamples its own copy.
+///
+/// It follows the shape Cesium's `sampleAndBlend` consumes, because that shape
+/// is the minimum a fragment shader needs and no less: a coverage rectangle to
+/// mask with, and an affine map into the texture.
+#[derive(Debug, Clone)]
+pub struct ImageryLayer {
+    /// Identity. The upload key on the GPU and the cache key on the CPU — two
+    /// geometry tiles naming the same coord must resolve to the same texture.
+    pub coord: ImageryCoord,
+    /// The pixels, reprojected to geographic spacing over the imagery tile's
+    /// own rectangle. Shared; never cloned per geometry tile.
+    pub texture: Arc<DecodedTexture>,
+    /// The part of the geometry tile's uv space this layer covers, as
+    /// `[u_min, v_min, u_max, v_max]`, v growing southward.
+    ///
+    /// A layer finer than the geometry tile covers a sub-rectangle of it and the
+    /// others cover the rest; a layer coarser than it covers all of it. Outside
+    /// this rectangle the layer contributes nothing — masking on it is what
+    /// lets several layers be blended in one pass without bleeding into each
+    /// other.
+    pub coverage: [f32; 4],
+    /// With [`ImageryLayer::scale`]: `texture_uv = tile_uv * scale + translation`.
+    pub translation: [f32; 2],
+    pub scale: [f32; 2],
+}
+
+impl ImageryLayer {
+    /// Places an imagery tile within a geometry tile's uv space.
+    ///
+    /// Both rectangles are geographic, and both uv spaces are linear in lon/lat
+    /// over their own rectangle — which is precisely what reprojecting the
+    /// imagery to geographic spacing buys ([`reproject_tile_to_geographic`]).
+    /// The map between them is therefore affine, and this is it.
+    ///
+    /// Nothing here assumes the imagery is finer than the geometry: a coarse
+    /// ancestor standing in for a tile still loading places by the same formula,
+    /// with a scale below 1 and full coverage.
+    pub fn placed(
+        coord: ImageryCoord,
+        texture: Arc<DecodedTexture>,
+        tile: &GeoRect,
+        imagery: &GeoRect,
+    ) -> Self {
+        let (tw, th) = (tile.width().max(1e-15), tile.height().max(1e-15));
+        let (iw, ih) = (imagery.width().max(1e-15), imagery.height().max(1e-15));
+        // texture_u = (lon - imagery.west) / iw, and lon = tile.west + u * tw.
+        // v grows southward on both sides, hence north rather than south.
+        let scale = [(tw / iw) as f32, (th / ih) as f32];
+        let translation = [
+            ((tile.west - imagery.west) / iw) as f32,
+            ((imagery.north - tile.north) / ih) as f32,
+        ];
+        let coverage = [
+            (((imagery.west - tile.west) / tw).clamp(0.0, 1.0)) as f32,
+            (((tile.north - imagery.north) / th).clamp(0.0, 1.0)) as f32,
+            (((imagery.east - tile.west) / tw).clamp(0.0, 1.0)) as f32,
+            (((tile.north - imagery.south) / th).clamp(0.0, 1.0)) as f32,
+        ];
+        Self {
+            coord,
+            texture,
+            coverage,
+            translation,
+            scale,
+        }
+    }
+
+    /// Whether this layer covers any of the geometry tile at all.
+    ///
+    /// A degenerate coverage rectangle means the two rectangles only touched at
+    /// an edge — real, because tile grids are half-open and a geometry tile's
+    /// extent is a conservative bound on its vertices. Such a layer costs a
+    /// texture binding and contributes no pixels, so it is worth dropping.
+    pub fn is_visible(&self) -> bool {
+        self.coverage[2] > self.coverage[0] && self.coverage[3] > self.coverage[1]
+    }
+}
+
+/// Resamples one imagery tile onto geographic spacing over its **own**
+/// rectangle, so it can be placed by an affine map alone.
+///
+/// This is the per-imagery-tile replacement for reprojecting a stitched mosaic
+/// per geometry tile, and it is the reason the result can be shared: the output
+/// depends on the imagery tile and nothing else.
+///
+/// Two cases skip the work entirely, both from Cesium's `_reprojectTexture`:
+/// a provider already serving geographic tiles has nothing to remap, and a tile
+/// whose rectangle spans less than ~1e-5 radians per texel has a Mercator
+/// distortion smaller than one texel across its whole height — resampling it
+/// would only cost a generation of filtering.
+pub fn reproject_tile_to_geographic(
+    src: &DecodedTexture,
+    scheme: &TilingScheme,
+    coord: ImageryCoord,
+) -> Option<DecodedTexture> {
+    let rect = scheme.tile_rect(coord);
+    if scheme.projection == Projection::Geographic {
+        return None;
+    }
+    if rect.height() / f64::from(src.height.max(1)) <= 1.0e-5 {
+        return None;
+    }
+    Some(reproject_to_geographic(
+        src,
+        scheme.tile_extent(coord),
+        &rect,
+        scheme.projection,
+    ))
+}
+
 /// The geometry↔imagery crossing point: which imagery tile drapes a decoded
 /// geometry tile, with which texture coordinates. Imagery PIXELS are not
 /// here — they are shared N:M and travel as their own protocol content,
@@ -833,6 +1002,7 @@ mod tests {
                 material: MaterialDesc::default(),
             }],
             textures: Vec::new(),
+            imagery: Vec::new(),
             local_origin_ecef: center,
             transform_local: Mat4::IDENTITY,
         };
@@ -860,6 +1030,242 @@ mod tests {
         assert_eq!(content.textures.len(), 1);
         assert_eq!(content.meshes[0].material.base_color_texture, Some(0));
         assert!(content.meshes[0].uvs.is_some());
+    }
+
+    /// The inverse must actually invert, away from the clamped poles — every
+    /// rectangle an imagery tile is placed by is read back through it.
+    #[test]
+    fn normalized_projection_round_trips() {
+        for projection in [Projection::WebMercator, Projection::Geographic] {
+            for lon in [-3.0, -0.4, 0.0, 1.2, 3.0] {
+                for lat in [-1.4, -0.7, 0.0, 0.3, 1.4] {
+                    let g = Geodetic {
+                        lon,
+                        lat,
+                        height: 0.0,
+                    };
+                    let (x, y) = projection.to_normalized(g);
+                    let back = projection.from_normalized(x, y);
+                    assert!(
+                        (back.lon - lon).abs() < 1e-9 && (back.lat - lat).abs() < 1e-9,
+                        "{projection:?} at ({lon}, {lat}) came back ({}, {})",
+                        back.lon,
+                        back.lat
+                    );
+                }
+            }
+        }
+    }
+
+    /// A tile's rectangle is its normalized extent read back through the
+    /// projection — so projecting the rectangle's corners must return the
+    /// extent it came from. Under Web Mercator this is the nonlinear direction,
+    /// which is exactly where a wrong inverse would hide.
+    #[test]
+    fn a_tile_rect_projects_back_to_its_extent() {
+        for scheme in [TilingScheme::web_mercator(), TilingScheme::geographic()] {
+            for c in [coord(0, 0, 0), coord(3, 5, 2), coord(9, 100, 300)] {
+                let (nx, ny) = scheme.tiles_at(c.level);
+                if c.x >= nx || c.y >= ny {
+                    continue;
+                }
+                let rect = scheme.tile_rect(c);
+                let (x0, y0, x1, y1) = scheme.tile_extent(c);
+                let nw = scheme.projection.to_normalized(Geodetic {
+                    lon: rect.west,
+                    lat: rect.north,
+                    height: 0.0,
+                });
+                let se = scheme.projection.to_normalized(Geodetic {
+                    lon: rect.east,
+                    lat: rect.south,
+                    height: 0.0,
+                });
+                assert!(
+                    (nw.0 - x0).abs() < 1e-9 && (nw.1 - y0).abs() < 1e-9,
+                    "{c:?} north-west: {nw:?} vs ({x0}, {y0})"
+                );
+                assert!(
+                    (se.0 - x1).abs() < 1e-9 && (se.1 - y1).abs() < 1e-9,
+                    "{c:?} south-east: {se:?} vs ({x1}, {y1})"
+                );
+                assert!(rect.width() > 0.0 && rect.height() > 0.0);
+            }
+        }
+    }
+
+    fn tex1x1() -> Arc<DecodedTexture> {
+        Arc::new(DecodedTexture {
+            width: 1,
+            height: 1,
+            rgba8: vec![0, 0, 0, 255],
+        })
+    }
+
+    /// The invariant the whole layered model rests on: a point on the ground
+    /// has one texture coordinate, and going there through the geometry tile's
+    /// uv space must land where the imagery tile's own uv space puts it.
+    ///
+    /// Checked in both directions of nesting, because they are the two real
+    /// cases and they exercise opposite signs: imagery finer than the geometry
+    /// (several layers tiling it) and imagery coarser (one ancestor standing in
+    /// for a tile still loading).
+    #[test]
+    fn a_placed_layer_agrees_with_the_imagery_tile_s_own_uvs() {
+        let tile = GeoRect {
+            west: 0.10,
+            south: 0.20,
+            east: 0.14,
+            north: 0.26,
+        };
+        let finer = GeoRect {
+            west: 0.11,
+            south: 0.22,
+            east: 0.13,
+            north: 0.25,
+        };
+        let coarser = GeoRect {
+            west: 0.00,
+            south: 0.10,
+            east: 0.40,
+            north: 0.60,
+        };
+
+        for imagery in [finer, coarser] {
+            let layer = ImageryLayer::placed(coord(5, 1, 1), tex1x1(), &tile, &imagery);
+            for (lon, lat) in [(0.115, 0.23), (0.125, 0.245), (0.12, 0.225)] {
+                let tile_uv = [
+                    (lon - tile.west) / tile.width(),
+                    (tile.north - lat) / tile.height(),
+                ];
+                let got = [
+                    tile_uv[0] * f64::from(layer.scale[0]) + f64::from(layer.translation[0]),
+                    tile_uv[1] * f64::from(layer.scale[1]) + f64::from(layer.translation[1]),
+                ];
+                let want = [
+                    (lon - imagery.west) / imagery.width(),
+                    (imagery.north - lat) / imagery.height(),
+                ];
+                assert!(
+                    (got[0] - want[0]).abs() < 1e-6 && (got[1] - want[1]).abs() < 1e-6,
+                    "({lon}, {lat}) mapped to {got:?}, the imagery tile says {want:?}"
+                );
+            }
+        }
+    }
+
+    /// Coverage is what masks a layer outside its own ground, and it must be
+    /// stated in the geometry tile's uv space with v southward. A layer nested
+    /// inside the tile covers a strict sub-rectangle; one containing the tile
+    /// covers all of it.
+    #[test]
+    fn coverage_masks_a_finer_layer_and_admits_a_coarser_one() {
+        let tile = GeoRect {
+            west: 0.0,
+            south: 0.0,
+            east: 1.0,
+            north: 1.0,
+        };
+        // The north-east quarter of the tile.
+        let quarter = GeoRect {
+            west: 0.5,
+            south: 0.5,
+            east: 1.0,
+            north: 1.0,
+        };
+        let layer = ImageryLayer::placed(coord(1, 1, 0), tex1x1(), &tile, &quarter);
+        // u from the west edge, v from the NORTH edge: the north-east quarter is
+        // the upper half in v, not the lower.
+        assert_eq!(layer.coverage, [0.5, 0.0, 1.0, 0.5]);
+        assert!(layer.is_visible());
+
+        let containing = GeoRect {
+            west: -1.0,
+            south: -1.0,
+            east: 2.0,
+            north: 2.0,
+        };
+        let ancestor = ImageryLayer::placed(coord(0, 0, 0), tex1x1(), &tile, &containing);
+        assert_eq!(ancestor.coverage, [0.0, 0.0, 1.0, 1.0]);
+        assert!(ancestor.scale[0] < 1.0 && ancestor.scale[1] < 1.0);
+        assert!(ancestor.is_visible());
+    }
+
+    /// A layer that only touches the tile along an edge draws nothing, and tile
+    /// grids being half-open makes that a routine outcome rather than a corner
+    /// case. It still costs a texture binding, so it is worth naming.
+    #[test]
+    fn a_layer_touching_only_an_edge_is_not_visible() {
+        let tile = GeoRect {
+            west: 0.0,
+            south: 0.0,
+            east: 1.0,
+            north: 1.0,
+        };
+        let east_neighbour = GeoRect {
+            west: 1.0,
+            south: 0.0,
+            east: 2.0,
+            north: 1.0,
+        };
+        let layer = ImageryLayer::placed(coord(1, 1, 0), tex1x1(), &tile, &east_neighbour);
+        assert!(!layer.is_visible(), "coverage {:?}", layer.coverage);
+    }
+
+    /// Reprojection is a resample, so the cheapest correct answer is not to do
+    /// it. A geographic provider has nothing to remap at all; a deep Mercator
+    /// tile distorts by less than one texel across its own height.
+    #[test]
+    fn reprojection_is_skipped_where_it_would_change_nothing() {
+        let src = DecodedTexture {
+            width: 256,
+            height: 256,
+            rgba8: vec![128; 256 * 256 * 4],
+        };
+        let geo = TilingScheme::geographic();
+        assert!(
+            reproject_tile_to_geographic(&src, &geo, coord(4, 3, 2)).is_none(),
+            "a geographic provider is already in the target spacing"
+        );
+
+        let wm = TilingScheme::web_mercator();
+        // A shallow tile spans tens of degrees: the latitude remap is gross.
+        assert!(reproject_tile_to_geographic(&src, &wm, coord(2, 1, 1)).is_some());
+        // A deep one spans a few metres, well under a texel of distortion.
+        let deep = coord(19, 100_000, 100_000);
+        assert!(
+            reproject_tile_to_geographic(&src, &wm, deep).is_none(),
+            "{:?} rad tall over 256 texels",
+            wm.tile_rect(deep).height()
+        );
+    }
+
+    /// Reprojecting a tile must not move its own corners — they are the fixed
+    /// points of the remap, and they are what the affine placement relies on.
+    #[test]
+    fn reprojection_keeps_a_tile_within_its_own_rectangle() {
+        // A vertical ramp: row 0 black, last row white. After a latitude remap
+        // the ends must still be the ends, whatever happened in between.
+        let (w, h) = (16u32, 16u32);
+        let mut rgba8 = Vec::with_capacity((w * h * 4) as usize);
+        for row in 0..h {
+            let v = (row * 255 / (h - 1)) as u8;
+            for _ in 0..w {
+                rgba8.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let src = DecodedTexture {
+            width: w,
+            height: h,
+            rgba8,
+        };
+        let wm = TilingScheme::web_mercator();
+        let out = reproject_tile_to_geographic(&src, &wm, coord(2, 1, 1)).expect("reprojected");
+        assert_eq!((out.width, out.height), (w, h));
+        let first = out.rgba8[0];
+        let last = out.rgba8[((h - 1) * w * 4) as usize];
+        assert!(first < 8, "north edge drifted to {first}");
+        assert!(last > 247, "south edge drifted to {last}");
     }
 
     #[test]
