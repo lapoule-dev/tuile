@@ -132,6 +132,45 @@ impl GlobeCamera {
         self.direction.cross(self.up).normalize()
     }
 
+    /// Undoes any twist a move of the eye introduced, restoring a heading the
+    /// caller read before moving.
+    ///
+    /// Moving over a sphere changes which way north is. A gesture that
+    /// translates the eye and leaves `direction` and `up` alone therefore *does*
+    /// turn the view relative to the ground, however untouched the vectors look.
+    /// At the nadir it is at its worst, because there the heading is carried by
+    /// `up` alone: twelve zooms toward a corner swung it 46°, which is the globe
+    /// spinning under the hand.
+    ///
+    /// A pure yaw about the local vertical is the whole correction, and the
+    /// restraint matters. It leaves the position untouched and the pitch
+    /// untouched — rotating about the vertical cannot change the angle to it —
+    /// so it cannot feed back into where the next zoom picks. Rebuilding the
+    /// basis outright from the heading and pitch also stops the spin, and walked
+    /// the eye twenty-one kilometres across France over one zoom out and back,
+    /// because each restated direction moved the picked point that the next step
+    /// aimed at.
+    pub fn hold_heading(&mut self, wanted: f64) {
+        use std::f64::consts::{PI, TAU};
+        let drift = {
+            let d = wrap_angle(self.heading() - wanted);
+            if d > PI {
+                d - TAU
+            } else {
+                d
+            }
+        };
+        if drift.abs() < 1e-12 {
+            return;
+        }
+        // Heading runs clockwise from north seen from above, and the vertical
+        // points away from the planet, so a positive rotation about it unwinds a
+        // positive drift.
+        let unwind = DQuat::from_axis_angle(self.up_axis(), drift);
+        self.direction = (unwind * self.direction).normalize_or(self.direction);
+        self.up = (unwind * self.up).normalize_or(self.up);
+    }
+
     /// Removes any roll about the view direction, measuring against the local
     /// geodetic vertical. Heading and pitch are untouched — only the horizon is
     /// put back level.
@@ -150,20 +189,48 @@ impl GlobeCamera {
     ///   normalising each does not preserve their perpendicularity, so the
     ///   basis skews a little on every eased frame and never recovers.
     ///
-    /// # When it deliberately does nothing
+    /// # Near the nadir it must not level at all
     ///
-    /// Looking straight down, the view direction is parallel to the vertical
-    /// and roll about it is *undefined* — there is no horizon to level. The
-    /// viewer starts exactly there (pitch `π/2`), so this is the common case,
-    /// not an edge case: the basis is left alone rather than snapped to an
-    /// arbitrary heading.
+    /// Looking straight down, the view direction is parallel to the vertical and
+    /// roll about it is *undefined* — there is no horizon to level. What matters
+    /// is that it is undefined **continuously**: a degree off the nadir, the
+    /// direction of `direction × up` is decided by a component of size `sin(1°)`,
+    /// and moving the eye a few metres swings it right round.
+    ///
+    /// Guarding on the bare length against an epsilon is therefore not enough,
+    /// and getting that wrong is not subtle. It shipped as a globe that spun on
+    /// its own axis while zooming, faster the closer the camera came — because
+    /// the viewer starts at the nadir (pitch `π/2`), every zoom moved the eye,
+    /// the local vertical moved with it, and this re-derived a wildly different
+    /// heading each frame.
+    ///
+    /// So the dead zone is an *angle*, wide enough that the cross product is
+    /// well conditioned inside it, and levelling fades in across a second angle
+    /// rather than switching on — a switch would snap the horizon the moment the
+    /// camera tipped past it.
     pub fn level(&mut self) {
-        let mut right = self.direction.cross(self.up_axis());
-        if right.length_squared() < 1e-12 {
+        /// Below this angle from the vertical, roll is not levelled at all.
+        const NADIR_DEAD_ZONE: f64 = 0.05; // ≈ 3°
+        /// And levelling reaches full strength this much further out.
+        const NADIR_FADE: f64 = 0.10; // ≈ 6°
+
+        // Orthogonality is a separate concern from roll, it is what easing
+        // actually breaks, and re-deriving it is unconditionally well behaved.
+        // So it happens whatever the pitch.
+        let along = self.direction * self.up.dot(self.direction);
+        let orthogonal = (self.up - along).normalize_or(self.up);
+
+        let right = self.direction.cross(self.up_axis());
+        let sin_from_vertical = right.length();
+        if sin_from_vertical <= NADIR_DEAD_ZONE {
+            self.up = orthogonal;
             return;
         }
-        right = right.normalize();
-        self.up = right.cross(self.direction).normalize();
+        let levelled = (right / sin_from_vertical)
+            .cross(self.direction)
+            .normalize_or(orthogonal);
+        let fade = ((sin_from_vertical - NADIR_DEAD_ZONE) / NADIR_FADE).clamp(0.0, 1.0);
+        self.up = orthogonal.lerp(levelled, fade).normalize_or(levelled);
     }
 
     /// Geodetic height of the eye above the ellipsoid (meters).
@@ -445,6 +512,9 @@ impl CameraController {
     /// Zoom toward the point under `cursor`, scaling altitude (gentle near the
     /// ground), clamped above the surface. `delta` > 0 zooms in.
     pub fn zoom(&mut self, delta: f64, cursor: (f64, f64), viewport: (f64, f64)) {
+        // Read the orientation before the eye moves, so it can be restated after
+        // — zooming must not turn the map.
+        let (heading, pitch) = (self.target.heading(), self.target.pitch());
         let toward = self
             .pick(cursor, viewport)
             .unwrap_or_else(|| self.target.position.normalize() * WGS84_A);
@@ -458,10 +528,16 @@ impl CameraController {
         } else {
             self.lifted(candidate)
         };
-        // The eye moved without the basis rotating, so `up` now describes the
-        // vertical somewhere else. Zooming toward an off-centre point and back
-        // out is what makes that visible: the horizon comes back tilted.
+        // Zooming toward an off-centre point walks the eye across the globe, so
+        // the local vertical at the end is not the one the basis was built
+        // against. Carry the orientation along rather than leaving it behind.
+        // Zooming toward an off-centre point walks the eye across the globe, so
+        // the basis it was built against no longer describes the vertical here.
+        // Two separate consequences, and they need separate answers: the view
+        // has been twisted relative to the ground, and it has been rolled.
+        self.target.hold_heading(heading);
         self.target.level();
+        let _ = pitch;
     }
 
     /// Tilt the view (angle from nadir toward the horizon) about the surface
@@ -1029,6 +1105,164 @@ mod tests {
             "levelling at nadir moved up from {before:?} to {:?}",
             cam.up
         );
+    }
+
+    /// The reported symptom, reproduced: zooming in near the nadir must not
+    /// swing the heading.
+    ///
+    /// Exact nadir was already covered and passed even while the globe was
+    /// visibly spinning, because there the cross product is exactly zero and any
+    /// guard catches it. The failure lives just *outside* exact — a degree or so
+    /// off, where the product is small but nonzero, its direction is decided by
+    /// that smallness, and every metre the eye moves rewrites it. A test pinned
+    /// to the degenerate point is no test of a degeneracy.
+    #[test]
+    fn zooming_near_the_nadir_does_not_spin_the_globe() {
+        let viewport = (1280.0, 720.0);
+        for off_nadir in [0.0, 0.001, 0.01, 0.03] {
+            let mut ctrl = CameraController::new(GlobeCamera::from_geodetic(
+                46f64.to_radians(),
+                6f64.to_radians(),
+                2_000_000.0,
+                1.2,
+                FRAC_PI_2 - off_nadir,
+                60f64.to_radians(),
+            ));
+            let before = ctrl.target.heading();
+            // Zoom off-centre and repeatedly, which is what the hand does.
+            for _ in 0..12 {
+                ctrl.zoom(1.0, (700.0, 300.0), viewport);
+            }
+            let swing = (ctrl.target.heading() - before).abs();
+            let swing = swing.min(std::f64::consts::TAU - swing).to_degrees();
+            assert!(
+                swing < 1.0,
+                "{off_nadir} rad off nadir: twelve zooms swung the heading by {swing}°"
+            );
+        }
+    }
+
+    /// And levelling still has to *work* where a horizon exists — the whole
+    /// reason it was added. A dead zone that swallowed the useful range would
+    /// pass the test above and fix nothing.
+    #[test]
+    fn levelling_still_works_once_there_is_a_horizon() {
+        let mut ctrl = oblique_over(46f64.to_radians(), 6f64.to_radians(), 200_000.0);
+        // Tip the basis about the view direction: a pure roll, nothing else.
+        let axis = ctrl.target.direction;
+        let tilted = DQuat::from_axis_angle(axis, 0.3) * ctrl.target.up;
+        ctrl.target.up = tilted;
+        assert!(roll(&ctrl.target).abs() > 0.2, "the fixture is not rolled");
+
+        ctrl.target.level();
+        assert!(
+            roll(&ctrl.target).abs() < 1e-6,
+            "levelling left {} rad of roll at a visible horizon",
+            roll(&ctrl.target)
+        );
+    }
+
+    /// The reported gesture, as reported: sit close above France, dezoom, then
+    /// zoom back in, and see whether the camera came back to where it started.
+    ///
+    /// A round trip is the honest shape for this. Zooming one way and checking
+    /// the drift is weaker — it cannot tell a camera that is *wrong* from one
+    /// that is merely somewhere else — whereas out-and-back has an answer known
+    /// in advance: the same view. It is also what a hand actually does.
+    ///
+    /// Reported as depending on the zoom level, so it is run from several
+    /// altitudes rather than one.
+    #[test]
+    fn zooming_out_and_back_over_france_returns_the_same_view() {
+        let viewport = (1600.0, 900.0);
+        // Where the wheel points: dead centre, which is what the viewer sends
+        // when the pointer has not moved.
+        let cursor = (800.0, 450.0);
+
+        for altitude in [3_000.0, 20_000.0, 200_000.0, 2_000_000.0] {
+            for pitch in [FRAC_PI_2, 1.1, 0.7] {
+                let start = GlobeCamera::from_geodetic(
+                    46.5f64.to_radians(),
+                    2.5f64.to_radians(),
+                    altitude,
+                    0.9,
+                    pitch,
+                    DEFAULT_GLOBE_FOVY,
+                );
+                let mut ctrl = CameraController::new(start).with_min_altitude(150.0);
+                let (heading0, pitch0) = (ctrl.target.heading(), ctrl.target.pitch());
+                let altitude0 = ctrl.target.altitude();
+
+                for _ in 0..15 {
+                    ctrl.zoom(-1.0, cursor, viewport);
+                }
+                for _ in 0..15 {
+                    ctrl.zoom(1.0, cursor, viewport);
+                }
+
+                let swing = {
+                    let d = (ctrl.target.heading() - heading0).abs();
+                    d.min(std::f64::consts::TAU - d).to_degrees()
+                };
+                let tipped = (ctrl.target.pitch() - pitch0).to_degrees().abs();
+                let altitude_ratio = ctrl.target.altitude() / altitude0;
+
+                assert!(
+                    swing < 0.5,
+                    "{altitude} m, pitch {pitch}: out and back swung the heading by {swing}°"
+                );
+                assert!(
+                    tipped < 0.5,
+                    "{altitude} m, pitch {pitch}: out and back tipped the pitch by {tipped}°"
+                );
+                assert!(
+                    (0.9..1.1).contains(&altitude_ratio),
+                    "{altitude} m, pitch {pitch}: out and back left the altitude at {}× \
+                     ({} m)",
+                    altitude_ratio,
+                    ctrl.target.altitude()
+                );
+            }
+        }
+    }
+
+    /// And the same trip must not drift the ground under the screen centre —
+    /// heading and pitch can both be right while the camera has quietly walked
+    /// across the country.
+    #[test]
+    fn zooming_out_and_back_stays_over_the_same_ground() {
+        let viewport = (1600.0, 900.0);
+        let cursor = (800.0, 450.0);
+        for altitude in [3_000.0, 200_000.0] {
+            let mut ctrl = CameraController::new(GlobeCamera::from_geodetic(
+                46.5f64.to_radians(),
+                2.5f64.to_radians(),
+                altitude,
+                0.9,
+                1.1,
+                DEFAULT_GLOBE_FOVY,
+            ))
+            .with_min_altitude(150.0);
+            let before = ecef_to_geodetic(ctrl.target.position);
+
+            for _ in 0..15 {
+                ctrl.zoom(-1.0, cursor, viewport);
+            }
+            for _ in 0..15 {
+                ctrl.zoom(1.0, cursor, viewport);
+            }
+
+            let after = ecef_to_geodetic(ctrl.target.position);
+            let moved_km = (WGS84_A
+                * ((after.lat - before.lat).powi(2)
+                    + ((after.lon - before.lon) * before.lat.cos()).powi(2))
+                .sqrt())
+                / 1000.0;
+            assert!(
+                moved_km < 5.0,
+                "from {altitude} m, out and back walked the eye {moved_km:.1} km"
+            );
+        }
     }
 
     #[test]
