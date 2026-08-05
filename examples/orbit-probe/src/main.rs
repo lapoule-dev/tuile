@@ -145,8 +145,7 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .without_time()
         .with_target(false)
@@ -202,9 +201,7 @@ async fn main() -> Result<()> {
         true => Some(pollster::block_on(GpuContext::headless())?),
         false => None,
     };
-    let renderer = gpu
-        .as_ref()
-        .map(|g| TileRenderer::new(g, TEXTURE_FORMAT));
+    let renderer = gpu.as_ref().map(|g| TileRenderer::new(g, TEXTURE_FORMAT));
 
     let mut ledger = Ledger::default();
     let mut contents = HashMap::new();
@@ -219,8 +216,7 @@ async fn main() -> Result<()> {
         let camera = camera_at(bearing);
         // Drive imagery detail exactly as the viewer does, or the probe would
         // measure a different scene from the one that misbehaves.
-        let target_texel =
-            2.0 * camera.altitude() * (camera.fovy * 0.5).tan() / VIEWPORT.1;
+        let target_texel = 2.0 * camera.altitude() * (camera.fovy * 0.5).tan() / VIEWPORT.1;
         detail.set_target_texel_spacing(target_texel);
 
         let mut cost = StepCost::default();
@@ -402,8 +398,8 @@ fn render_step(
     );
 
     let pixels = render_to_rgba(gpu, renderer, &tiles, PNG_SIZE);
-    let image = image::RgbaImage::from_raw(PNG_SIZE, PNG_SIZE, pixels)
-        .context("frame buffer size")?;
+    let image =
+        image::RgbaImage::from_raw(PNG_SIZE, PNG_SIZE, pixels).context("frame buffer size")?;
     image.save(path)?;
     Ok(())
 }
@@ -499,8 +495,7 @@ fn render_to_rgba(
     for row in 0..size as usize {
         let src = row * bytes_per_row as usize;
         let dst = row * size as usize * 4;
-        pixels[dst..dst + size as usize * 4]
-            .copy_from_slice(&data[src..src + size as usize * 4]);
+        pixels[dst..dst + size as usize * 4].copy_from_slice(&data[src..src + size as usize * 4]);
     }
     drop(data);
     readback.unmap();

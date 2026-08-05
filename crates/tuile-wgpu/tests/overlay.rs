@@ -122,8 +122,7 @@ fn render(gpu: &GpuContext, vertices: &[OverlayVertex]) -> Vec<u8> {
     for row in 0..SIZE as usize {
         let src = row * bytes_per_row as usize;
         let dst = row * SIZE as usize * 4;
-        pixels[dst..dst + SIZE as usize * 4]
-            .copy_from_slice(&data[src..src + SIZE as usize * 4]);
+        pixels[dst..dst + SIZE as usize * 4].copy_from_slice(&data[src..src + SIZE as usize * 4]);
     }
     drop(data);
     readback.unmap();
@@ -167,7 +166,11 @@ fn a_translucent_quad_blends_with_what_is_behind() {
 fn clearing_the_geometry_draws_nothing() {
     let Some(gpu) = gpu() else { return };
     let mut overlay = OverlayRenderer::new(&gpu, FORMAT, None);
-    overlay.set_geometry(&gpu, &quad(0.0, 0.0, 32.0, 32.0, [0.0, 1.0, 0.0, 1.0]), (SIZE, SIZE));
+    overlay.set_geometry(
+        &gpu,
+        &quad(0.0, 0.0, 32.0, 32.0, [0.0, 1.0, 0.0, 1.0]),
+        (SIZE, SIZE),
+    );
     overlay.set_geometry(&gpu, &[], (SIZE, SIZE));
 
     let pixels = render(&gpu, &[]);

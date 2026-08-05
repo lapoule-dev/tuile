@@ -194,7 +194,13 @@ impl NavWidget {
         let mut mesh = Mesh::new();
 
         // The band, then the needle riding on it.
-        ring(&mut mesh, layout.center, RING_INNER, RING_OUTER, self.tint(Part::Ring));
+        ring(
+            &mut mesh,
+            layout.center,
+            RING_INNER,
+            RING_OUTER,
+            self.tint(Part::Ring),
+        );
         needle(&mut mesh, layout.center, controller.camera.heading());
 
         // The tilt handle, with a bar whose lean shows the current pitch.
@@ -211,8 +217,13 @@ impl NavWidget {
 
     /// A part is lit while grabbed, or while merely hovered.
     fn tint(&self, part: Part) -> [f32; 4] {
-        let active = self.grabbed == Some(part) || (self.grabbed.is_none() && self.hovered == Some(part));
-        let base = if part == Part::Tilt { HANDLE_FILL } else { IDLE };
+        let active =
+            self.grabbed == Some(part) || (self.grabbed.is_none() && self.hovered == Some(part));
+        let base = if part == Part::Tilt {
+            HANDLE_FILL
+        } else {
+            IDLE
+        };
         if active {
             HOT
         } else {

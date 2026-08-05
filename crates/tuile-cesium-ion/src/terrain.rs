@@ -11,8 +11,8 @@
 
 use crate::{Attribution, IonClient, IonError, IonHttp};
 use bytes::Bytes;
-use tuile_core::fetch::Fetched;
 use futures_util::lock::Mutex;
+use tuile_core::fetch::Fetched;
 use tuile_terrain::{LayerJson, TileCoord};
 
 /// A terrain asset served by ion (e.g. Cesium World Terrain = asset 1).
