@@ -22,13 +22,12 @@ use winit::window::{Window, WindowId};
 
 /// How much air to put between the eye and the ground.
 ///
-/// 1.0 is the physical atmosphere. This is above it because the viewer is
-/// usually looking at tens of kilometres rather than the hundreds where the
-/// physical figure becomes obvious, and the cue has to be readable at the range
-/// people actually fly the camera at. Turned down, the globe looks like a
-/// texture on a ball; turned much further up, distant ground washes out before
-/// it is far enough away for that to read as distance.
-const ATMOSPHERE_STRENGTH: f32 = 1.6;
+/// 1.0 is the physical atmosphere, and the physical atmosphere is the right
+/// answer: Earth's own haze is already the cue people read, and anything above
+/// it starts hiding the ground it is meant to place. This sat at 1.6 while the
+/// optical depth was computed wrongly, which is the usual way a fudge factor
+/// gets in — it was compensating for a bug, not for the physics.
+const ATMOSPHERE_STRENGTH: f32 = 1.0;
 
 /// How much of a surface's colour survives facing away from the light.
 ///
@@ -380,23 +379,36 @@ impl App {
         // Through the controller, not the camera: only it knows how far the
         // ground is, and the near plane has to be placed against that.
         let view_proj = self.controller.view_proj(origin, aspect);
-        // Headlight: light travels along the view direction (behind the camera).
-        // Deliberately not the real sun — a globe lit only by a low sun is half
-        // black, and the point of this viewer is to look at terrain. The *air*,
-        // below, does use the real sun, so the haze reddens and darkens with the
-        // hour even though the ground stays evenly lit.
-        let headlight = cam.direction.as_vec3();
+        // One light, and it is the real sun.
+        //
+        // This used a headlight — light along the view direction — on the
+        // argument that a globe lit by a low sun is half black and the point of
+        // the viewer is to look at terrain. That argument does not survive the
+        // atmosphere: the air is lit by where the sun actually is, so a
+        // headlit ground put two light directions in one image, and orbiting
+        // moved one of them and not the other. It reads exactly as what it is,
+        // the light swinging round as you turn.
+        //
+        // The hour is the knob for this, not a second light. TUILE_LIT_AT.
+        let sun = self.sun.light_travel_direction().as_vec3();
         active.renderer.set_view(
             &active.gpu.queue,
             &tuile_wgpu::ViewUniform {
                 view_proj,
-                sun_dir: [headlight.x, headlight.y, headlight.z, 0.0],
+                sun_dir: [sun.x, sun.y, sun.z, 0.0],
                 params: [AMBIENT, 0.0, 0.0, 0.0],
+                // Strength 0 is what turns it off, so the checkbox needs no
+                // second path through the renderer — the shader already
+                // short-circuits on it.
                 atmosphere: tuile_atmosphere::AerialPerspective::new(
                     cam.position,
                     origin,
                     &self.sun,
-                    ATMOSPHERE_STRENGTH,
+                    if self.nav.atmosphere_enabled() {
+                        ATMOSPHERE_STRENGTH
+                    } else {
+                        0.0
+                    },
                 ),
             },
         );
@@ -493,9 +505,12 @@ impl App {
         if self.last_log.elapsed().as_secs_f32() > 1.0 {
             self.last_log = std::time::Instant::now();
             let s = &active.pump.stats;
+            let (imagery_textures, imagery_bytes) =
+                active.gpu.imagery.lock().expect("imagery textures").live();
             tracing::info!(
                 "alt {:.0} km | ground {:.0} m | selected {} | rendered {} | prepared {} | \
-                 missing {} | visited {} culled {} requested {} depth {} | {:.0} MiB GPU | \
+                 missing {} | visited {} culled {} requested {} depth {} | \
+                 {:.0} MiB geometry + {:.0} MiB imagery over {} textures | \
                  +{} uploads -{} evictions",
                 cam.altitude() / 1000.0,
                 self.controller.height_above_ground(),
@@ -508,6 +523,13 @@ impl App {
                 s.requested,
                 s.max_depth,
                 active.pump.gpu_bytes as f32 / (1024.0 * 1024.0),
+                // Reported apart from geometry, and counted once per texture
+                // rather than once per tile that drapes it. A single total would
+                // have to pick one of those and be wrong either way — and while
+                // this said "GPU" and meant geometry only, it read 1 MiB for a
+                // globe holding hundreds.
+                imagery_bytes as f32 / (1024.0 * 1024.0),
+                imagery_textures,
                 self.stats.uploads,
                 self.stats.evictions,
             );
