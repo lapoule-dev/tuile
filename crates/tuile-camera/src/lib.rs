@@ -114,6 +114,40 @@ impl GlobeCamera {
         self.direction.cross(self.up).normalize()
     }
 
+    /// Removes any roll about the view direction, measuring against the local
+    /// geodetic vertical. Heading and pitch are untouched — only the horizon is
+    /// put back level.
+    ///
+    /// # Why this has to be called rather than maintained
+    ///
+    /// Two things break the basis, and both are ordinary use rather than bugs
+    /// in the gestures themselves:
+    ///
+    /// - **Moving the eye without rotating the basis.** [`zoom`](Self::zoom)
+    ///   translates toward a picked point; the geodetic vertical at the new
+    ///   position is a different direction, but `up` still describes the old
+    ///   one. Zoom into a corner of the screen and back out, and the horizon
+    ///   stays tilted — the reported symptom.
+    /// - **Easing.** Interpolating `direction` and `up` separately and
+    ///   normalising each does not preserve their perpendicularity, so the
+    ///   basis skews a little on every eased frame and never recovers.
+    ///
+    /// # When it deliberately does nothing
+    ///
+    /// Looking straight down, the view direction is parallel to the vertical
+    /// and roll about it is *undefined* — there is no horizon to level. The
+    /// viewer starts exactly there (pitch `π/2`), so this is the common case,
+    /// not an edge case: the basis is left alone rather than snapped to an
+    /// arbitrary heading.
+    pub fn level(&mut self) {
+        let mut right = self.direction.cross(self.up_axis());
+        if right.length_squared() < 1e-12 {
+            return;
+        }
+        right = right.normalize();
+        self.up = right.cross(self.direction).normalize();
+    }
+
     /// Geodetic height of the eye above the ellipsoid (meters).
     pub fn altitude(&self) -> f64 {
         ecef_to_geodetic(self.position).height
@@ -139,7 +173,9 @@ impl GlobeCamera {
     /// Pitch of the view below **horizontal**, radians: `0` looks level,
     /// `π/2` straight down. Negative looks up into the sky.
     pub fn pitch(&self) -> f64 {
-        (-self.direction.dot(self.up_axis())).clamp(-1.0, 1.0).asin()
+        (-self.direction.dot(self.up_axis()))
+            .clamp(-1.0, 1.0)
+            .asin()
     }
 
     /// How far the view is outside the usable pitch band, in radians; `0` when
@@ -404,6 +440,10 @@ impl CameraController {
         } else {
             self.lifted(candidate)
         };
+        // The eye moved without the basis rotating, so `up` now describes the
+        // vertical somewhere else. Zooming toward an off-centre point and back
+        // out is what makes that visible: the horizon comes back tilted.
+        self.target.level();
     }
 
     /// Tilt the view (angle from nadir toward the horizon) about the surface
@@ -482,6 +522,11 @@ impl CameraController {
         c.direction = c.direction.lerp(t.direction, k).normalize();
         c.up = c.up.lerp(t.up, k).normalize();
         c.fovy = t.fovy;
+        // Lerping the two axes independently and normalising each does not keep
+        // them perpendicular, so the basis skews a little every frame and never
+        // recovers on its own. Levelling costs a cross product and makes the
+        // easing self-correcting instead of self-degrading.
+        c.level();
         // The eased position is between two legal points, but the ground between
         // them may stand higher than either.
         self.camera.position = self.lifted(self.camera.position);
@@ -736,14 +781,8 @@ mod tests {
 
     #[test]
     fn heading_is_a_bearing_never_negative() {
-        let cam = GlobeCamera::from_geodetic(
-            0.7,
-            -0.2,
-            5_000.0,
-            -0.5,
-            0.4,
-            std::f64::consts::FRAC_PI_3,
-        );
+        let cam =
+            GlobeCamera::from_geodetic(0.7, -0.2, 5_000.0, -0.5, 0.4, std::f64::consts::FRAC_PI_3);
         let h = cam.heading();
         assert!((0.0..std::f64::consts::TAU).contains(&h), "heading {h}");
         assert!((h - (std::f64::consts::TAU - 0.5)).abs() < 1e-6);
@@ -887,6 +926,91 @@ mod tests {
         let a0 = ctrl.target.altitude();
         ctrl.zoom(-1.0, (400.0, 300.0), (800.0, 600.0));
         assert!(ctrl.target.altitude() > a0);
+    }
+
+    /// Roll about the view direction, measured against the local vertical.
+    /// Zero means the horizon is level; this is the quantity the user sees as
+    /// "the ground is crooked".
+    fn roll(cam: &GlobeCamera) -> f64 {
+        let vertical = cam.up_axis();
+        // Undefined looking straight down — the caller must not ask there.
+        let level_right = cam.direction.cross(vertical).normalize();
+        let level_up = level_right.cross(cam.direction).normalize();
+        cam.up.dot(level_right).atan2(cam.up.dot(level_up))
+    }
+
+    fn oblique_over(lat: f64, lon: f64, alt: f64) -> CameraController {
+        // Pitched well off nadir, so roll is defined and measurable.
+        let cam = GlobeCamera::from_geodetic(lat, lon, alt, 0.7, 0.6, 60f64.to_radians());
+        CameraController::new(cam).with_min_altitude(100.0)
+    }
+
+    /// The reported symptom: zoom into an off-centre point, zoom back out, and
+    /// the horizon comes back tilted. `zoom` moved the eye without rotating the
+    /// basis, so `up` went on describing the vertical somewhere else.
+    #[test]
+    fn zooming_off_centre_and_back_leaves_the_horizon_level() {
+        let mut ctrl = oblique_over(45f64.to_radians(), 6f64.to_radians(), 300_000.0);
+        let viewport = (1600.0, 900.0);
+        let corner = (1300.0, 250.0);
+
+        for _ in 0..12 {
+            ctrl.zoom(1.0, corner, viewport);
+        }
+        for _ in 0..12 {
+            ctrl.zoom(-1.0, corner, viewport);
+        }
+
+        let roll = roll(&ctrl.target);
+        assert!(
+            roll.abs() < 1e-9,
+            "horizon rolled by {} rad after zooming in and out",
+            roll
+        );
+    }
+
+    /// Easing lerps `direction` and `up` independently and normalises each,
+    /// which does not keep them perpendicular. Left alone the basis skews a
+    /// little every frame and never recovers, so this asserts the invariant
+    /// over enough frames for drift to show.
+    #[test]
+    fn easing_does_not_skew_the_basis() {
+        let mut ctrl = oblique_over(48f64.to_radians(), 2f64.to_radians(), 200_000.0);
+        let viewport = (1600.0, 900.0);
+
+        ctrl.drag((800.0, 450.0), (1100.0, 300.0), viewport);
+        ctrl.zoom(3.0, (600.0, 600.0), viewport);
+        for _ in 0..200 {
+            ctrl.update(0.2);
+        }
+
+        let cam = &ctrl.camera;
+        assert!(
+            cam.direction.dot(cam.up).abs() < 1e-9,
+            "direction and up are not perpendicular: {}",
+            cam.direction.dot(cam.up)
+        );
+        assert!(
+            roll(cam).abs() < 1e-9,
+            "horizon rolled by {} rad after easing",
+            roll(cam)
+        );
+    }
+
+    /// Looking straight down there is no horizon, so roll is undefined and
+    /// levelling must leave the basis alone rather than snap it to an arbitrary
+    /// heading. The viewer starts exactly here, so this is the common case.
+    #[test]
+    fn levelling_at_nadir_preserves_heading() {
+        let mut cam =
+            GlobeCamera::from_geodetic(0.0, 0.0, 500_000.0, 1.2, FRAC_PI_2, 60f64.to_radians());
+        let before = cam.up;
+        cam.level();
+        assert!(
+            (cam.up - before).length() < 1e-12,
+            "levelling at nadir moved up from {before:?} to {:?}",
+            cam.up
+        );
     }
 
     #[test]

@@ -15,9 +15,26 @@ struct Entry {
     last_used: u64,
 }
 
+/// How far below the budget an eviction sweep goes, as a fraction of it.
+///
+/// Evicting to exactly the budget means evicting again on the very next insert,
+/// forever, once the cache is full — and each sweep drops the least-recently
+/// used tile, which on a turning camera is often one about to be wanted again.
+/// Clearing a margin instead makes eviction occasional rather than continuous.
+///
+/// It also closes a way a bulk frame can fail to converge: that mode blocks
+/// until every selected tile is resident, so if eviction keeps firing while
+/// tiles arrive, the outstanding-request count need never reach zero. A margin
+/// bounds how much of the frame's own working set a sweep can take back.
+///
+/// 0.8 is the SportsTrackLive viewer's figure, arrived at independently.
+const EVICTION_LOW_WATER: f64 = 0.8;
+
 #[derive(Debug)]
 pub struct ResidentCache {
     budget: usize,
+    /// Where a sweep stops. Derived from the budget once, not per call.
+    low_water: usize,
     used: usize,
     tick: u64,
     entries: HashMap<TileId, Entry>,
@@ -27,6 +44,7 @@ impl ResidentCache {
     pub fn new(budget_bytes: usize) -> Self {
         Self {
             budget: budget_bytes,
+            low_water: (budget_bytes as f64 * EVICTION_LOW_WATER) as usize,
             used: 0,
             tick: 0,
             entries: HashMap::new(),
@@ -86,13 +104,16 @@ impl ResidentCache {
         self.trim_except(protected, None)
     }
 
-    fn trim_except(
-        &mut self,
-        protected: &HashSet<TileId>,
-        keep: Option<TileId>,
-    ) -> Vec<TileId> {
+    fn trim_except(&mut self, protected: &HashSet<TileId>, keep: Option<TileId>) -> Vec<TileId> {
         let mut evicted = Vec::new();
-        while self.used > self.budget {
+        // Nothing to do until the budget is actually exceeded — the margin
+        // governs how far a sweep goes, not when one starts. Sweeping down to
+        // the low-water mark on every insert would evict far more than the
+        // budget asks for.
+        if self.used <= self.budget {
+            return evicted;
+        }
+        while self.used > self.low_water {
             // LRU among evictable entries; tile id breaks ties deterministically.
             let victim = self
                 .entries
@@ -141,7 +162,39 @@ mod tests {
         c.insert(t(2), 50, &none);
         c.touch(t(1)); // t2 becomes the LRU
         let evicted = c.insert(t(3), 50, &none);
-        assert_eq!(evicted, vec![t(2)]);
+        // Order, not count: a sweep clears down to the low-water mark, so how
+        // many go depends on their sizes. What this pins is that the touched
+        // tile is not the one taken first.
+        assert_eq!(evicted.first(), Some(&t(2)));
+    }
+
+    /// A sweep starts only when the budget is exceeded, and then clears a
+    /// margin. Evicting to exactly the budget means evicting again on the next
+    /// insert, forever — and each sweep takes the least-recently-used tile,
+    /// which on a turning camera is often one about to be wanted again.
+    #[test]
+    fn a_sweep_clears_a_margin_below_the_budget() {
+        let mut c = ResidentCache::new(1000);
+        let none = HashSet::new();
+        for i in 1..=10 {
+            c.insert(t(i), 100, &none);
+        }
+        assert_eq!(c.used_bytes(), 1000, "at budget, nothing evicted yet");
+
+        c.insert(t(11), 100, &none);
+        assert!(
+            c.used_bytes() <= 800,
+            "a sweep must clear to the low-water mark, left {} bytes",
+            c.used_bytes()
+        );
+
+        // And having cleared it, the next few inserts cost nothing: that is the
+        // whole point — eviction becomes occasional instead of continuous.
+        let quiet = c.insert(t(12), 100, &none);
+        assert!(
+            quiet.is_empty(),
+            "insert right after a sweep should not evict, took {quiet:?}"
+        );
     }
 
     #[test]
