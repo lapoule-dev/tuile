@@ -499,7 +499,7 @@ mod tests {
             unsafe { tuile_frame_tile_count(std::ptr::null(), &mut count) },
             TuileStatus::BadArgument
         );
-        let frame = Frame::new(Vec::new());
+        let frame = Frame::new("test", Vec::new());
         assert_eq!(
             unsafe { tuile_frame_tile_count(&frame, std::ptr::null_mut()) },
             TuileStatus::BadArgument
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn an_empty_frame_reports_no_tiles() {
-        let frame = Frame::new(Vec::new());
+        let frame = Frame::new("test", Vec::new());
         let mut count = 99usize;
         assert_eq!(
             unsafe { tuile_frame_tile_count(&frame, &mut count) },
@@ -528,7 +528,7 @@ mod tests {
     /// the distinction is what lets a caller enumerate until it stops.
     #[test]
     fn an_absent_texture_is_not_found_rather_than_bad_argument() {
-        let frame = Frame::new(Vec::new());
+        let frame = Frame::new("test", Vec::new());
         let mut texture = std::mem::MaybeUninit::<TuileTexture>::uninit();
         assert_eq!(
             unsafe { tuile_frame_texture(&frame, 0, 0, texture.as_mut_ptr()) },
