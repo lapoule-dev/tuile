@@ -50,6 +50,24 @@ fn wrap_angle(radians: f64) -> f64 {
     radians.rem_euclid(TAU)
 }
 
+/// A sensible vertical field of view for looking at a globe: 35°, radians.
+///
+/// The apps used 60°, which is a ~24 mm lens. On any ordinary subject that is
+/// merely wide; on a *sphere* it is wrong in a way people notice without being
+/// able to name, because the horizon's curvature across the frame is a function
+/// of the angle subtended, not of the altitude. A 60° frame bends the Earth
+/// visibly at heights where the real horizon is nearly flat, and the globe reads
+/// as a small ball rather than as a planet.
+///
+/// 35° is around a 60 mm lens — slightly long, which is what aerial and
+/// satellite imagery is shot at and therefore what the eye expects of this
+/// subject.
+///
+/// Not free: the imagery detail target goes as `tan(fovy / 2)`, so narrowing the
+/// lens asks for **sharper** imagery over a smaller area. Anything that changes
+/// this should re-measure with `examples/orbit-probe` rather than assume.
+pub const DEFAULT_GLOBE_FOVY: f64 = 35.0 * std::f64::consts::PI / 180.0;
+
 /// A free camera in ECEF: eye position, view direction and up — the minimal
 /// state Cesium's `Camera` carries, enough to build any view.
 #[derive(Debug, Clone, Copy)]

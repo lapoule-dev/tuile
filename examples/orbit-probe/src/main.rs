@@ -54,7 +54,10 @@ const LON_DEG: f64 = 6.50;
 const ALTITUDE_M: f64 = 6_000.0;
 /// Well below the horizon, so the view always has ground in it.
 const PITCH: f64 = 0.6;
-const FOVY: f64 = 60.0;
+/// The viewer's own lens — the probe measures what the viewer will pay, and the
+/// imagery detail target goes as `tan(fovy / 2)`, so a probe on a different lens
+/// measures a different globe.
+const FOVY: f64 = tuile_camera::DEFAULT_GLOBE_FOVY;
 
 /// Bearings sampled around the turn. 24 is every 15°: fine enough that
 /// consecutive views overlap heavily, which is exactly the case where nothing
@@ -86,7 +89,7 @@ fn camera_at(bearing: f64) -> GlobeCamera {
         ALTITUDE_M,
         bearing,
         PITCH,
-        FOVY.to_radians(),
+        FOVY,
     )
 }
 
