@@ -157,13 +157,12 @@ impl GeometryServer {
 
         loop {
             let event = poll_fn(|cx| {
-                let mut poll_client = |cx: &mut std::task::Context<'_>| {
-                    match Pin::new(&mut rx).poll_next(cx) {
+                let mut poll_client =
+                    |cx: &mut std::task::Context<'_>| match Pin::new(&mut rx).poll_next(cx) {
                         Poll::Ready(Some(msg)) => Poll::Ready(Some(Event::Client(msg))),
                         Poll::Ready(None) => Poll::Ready(Some(Event::Closed)),
                         Poll::Pending => Poll::Ready(None),
-                    }
-                };
+                    };
                 if client_first {
                     if let Poll::Ready(Some(event)) = poll_client(cx) {
                         return Poll::Ready(event);
@@ -613,7 +612,10 @@ mod tests {
             })
             .expect("send");
         let near_selection = selection_after(&mut server, &mut stream);
-        assert!(near_selection.len() > 1, "the near view selected several tiles");
+        assert!(
+            near_selection.len() > 1,
+            "the near view selected several tiles"
+        );
 
         stream
             .send(ClientMessage::ViewerState {
@@ -710,7 +712,10 @@ mod tests {
             })
             .expect("send");
         let (loaded, _) = settle(&mut server, &mut stream).expect("first view settles");
-        assert!(loaded > 1, "the near view loaded several tiles (got {loaded})");
+        assert!(
+            loaded > 1,
+            "the near view loaded several tiles (got {loaded})"
+        );
 
         // Pull far back and stay away. One move is deliberately not enough —
         // the window still remembers where the camera came from — so move past

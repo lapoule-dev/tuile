@@ -689,7 +689,9 @@ impl<P: ImageryProvider> ImageryProvider for CachedImagery<P> {
             return Ok(Fetched::undated(bytes));
         }
         let fetched = self.inner.fetch_tile_bytes(coord).await?;
-        self.store.put(&key, fetched.value.clone(), fetched.ttl).await;
+        self.store
+            .put(&key, fetched.value.clone(), fetched.ttl)
+            .await;
         Ok(fetched)
     }
 }
@@ -771,11 +773,11 @@ pub fn mip_chain(src: &DecodedTexture) -> Vec<DecodedTexture> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
     use crate::content::{DecodedMesh, MaterialDesc};
     use crate::geo::geodetic_to_ecef;
     use glam::Mat4;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
     #[test]
     fn containing_tile_is_deepest_single_cover() {
@@ -1072,7 +1074,10 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .insert(key.to_owned(), value);
-            self.writes.lock().expect("lock").push((key.to_owned(), ttl));
+            self.writes
+                .lock()
+                .expect("lock")
+                .push((key.to_owned(), ttl));
         }
     }
 
