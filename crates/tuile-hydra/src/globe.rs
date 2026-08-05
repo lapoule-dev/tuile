@@ -97,12 +97,30 @@ impl Session {
         // one, so the connection pool and cache that serve this call are the
         // same ones that will serve every tile afterwards.
         let (tree, loader) = runtime.block_on(resolve(&config))?;
-        Ok(Session::from_parts(
-            runtime,
-            tree,
-            loader,
-            config.session.clone(),
-        )?)
+
+        let mut session_config = config.session.clone();
+        session_config.dataset = config.dataset_name();
+        Ok(Session::from_parts(runtime, tree, loader, session_config)?)
+    }
+}
+
+impl GlobeConfig {
+    /// A stable name for the data this configuration reads.
+    ///
+    /// Derived from the ion asset ids and nothing else — not the token, not the
+    /// cache directory, not the screen-space error. Those change *how* the same
+    /// tiles are fetched, and two sessions differing only in them serve
+    /// identical imagery, so sharing a name is correct rather than a collision.
+    ///
+    /// What it must never do is depend on the order sessions are opened: two
+    /// farm nodes rendering the same frame would then emit different asset
+    /// paths for identical data, and a comparison would report a difference
+    /// that is not there.
+    pub fn dataset_name(&self) -> String {
+        match self.imagery_asset_id {
+            Some(imagery) => format!("ion-{}-{imagery}", self.terrain_asset_id),
+            None => format!("ion-{}-noimagery", self.terrain_asset_id),
+        }
     }
 }
 

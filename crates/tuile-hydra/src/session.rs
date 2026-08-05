@@ -38,6 +38,15 @@ pub struct SessionConfig {
     /// defect — invisible until someone compares two frames rendered on
     /// different machines.
     pub fail_on_tile_errors: bool,
+    /// Names the data this session serves, and scopes every asset URI it hands
+    /// out. See [`Frame::texture_uri`] for why it exists and why it is a name
+    /// rather than a counter.
+    ///
+    /// It must be stable for the same sources and distinct for different ones.
+    /// [`Session::globe`] derives it from the ion asset ids; a host wiring its
+    /// own sources chooses its own, and choosing badly means one session's
+    /// textures answering another's requests.
+    pub dataset: String,
 }
 
 impl Default for SessionConfig {
@@ -46,6 +55,9 @@ impl Default for SessionConfig {
             traversal: Config::default(),
             frame_timeout: Duration::from_secs(120),
             fail_on_tile_errors: true,
+            // Deliberately not "" — an empty dataset would collapse the URI to
+            // `tuile:///tile/...`, which resolves but scopes nothing.
+            dataset: "default".into(),
         }
     }
 }
@@ -108,6 +120,8 @@ pub struct Frame {
     /// the textures it will actually sample, which after frustum and material
     /// culling is rarely all of them.
     encoded: Mutex<HashMap<(usize, usize), Arc<EncodedTexture>>>,
+    /// Scopes this frame's asset URIs. See [`Frame::texture_uri`].
+    dataset: Arc<str>,
 }
 
 impl std::fmt::Debug for Frame {
@@ -120,21 +134,45 @@ impl std::fmt::Debug for Frame {
 
 impl Frame {
     /// Builds a frame from its tiles, with nothing encoded yet.
-    pub fn new(tiles: Vec<TileGeometry>) -> Self {
+    pub fn new(dataset: impl Into<Arc<str>>, tiles: Vec<TileGeometry>) -> Self {
         Self {
             tiles,
             encoded: Mutex::new(HashMap::new()),
+            dataset: dataset.into(),
         }
+    }
+
+    /// What scopes this frame's asset URIs.
+    pub fn dataset(&self) -> &str {
+        &self.dataset
     }
 
     /// The URI under which a tile's texture is published.
     ///
-    /// Defined here, in one place, because both sides need to agree: the
-    /// material a consumer authors names this string, and the asset resolver is
-    /// handed it back verbatim. Deriving it independently on each side is how
-    /// the two drift and every texture silently resolves to nothing.
-    pub fn texture_uri(tile: TileId, texture: usize) -> String {
-        format!("tuile://tile/{}/texture/{}.png", tile.0, texture)
+    /// Defined here, in one place, because both sides must agree: the material
+    /// a consumer authors names this string and the asset resolver is handed it
+    /// back verbatim. Deriving it independently on each side is how they drift
+    /// and every texture silently resolves to nothing.
+    ///
+    /// # Why the dataset is in the path
+    ///
+    /// A [`TileId`] is unique **within one tree**, not globally. Two sessions —
+    /// two ion assets, or a terrain-only globe beside a textured one — hand out
+    /// the same ids for different tiles, and a resolver keyed on the id alone
+    /// would serve one session's texture to the other. Silently: the bytes are
+    /// a valid PNG, so nothing errors, and the wrong imagery simply appears.
+    ///
+    /// # Why a name and not a counter
+    ///
+    /// The dataset is derived from what the session reads — for an ion globe,
+    /// its asset ids — rather than assigned from a counter at open time. A
+    /// counter depends on the order sessions happen to be opened, so two farm
+    /// nodes rendering the same frame would emit different asset paths for
+    /// identical data, and a comparison would report a difference that is not
+    /// there. Same reason `BulkFrame.selected` is iterated rather than its
+    /// `HashMap`.
+    pub fn texture_uri(dataset: &str, tile: TileId, texture: usize) -> String {
+        format!("tuile://{dataset}/tile/{}/texture/{texture}.png", tile.0)
     }
 
     /// The PNG for one tile's texture, encoding it on first request.
@@ -179,7 +217,7 @@ impl Frame {
         .map_err(|e| FrameError::TextureEncode(e.to_string()))?;
 
         let entry = Arc::new(EncodedTexture {
-            uri: Self::texture_uri(tile.tile, texture_index),
+            uri: Self::texture_uri(&self.dataset, tile.tile, texture_index),
             png,
         });
 
@@ -312,7 +350,7 @@ impl Session {
             })
             .collect();
 
-        Ok(Frame::new(tiles))
+        Ok(Frame::new(self.config.dataset.as_str(), tiles))
     }
 }
 
@@ -323,20 +361,23 @@ mod tests {
 
     /// A frame holding one tile with one small opaque texture.
     fn frame_with_a_texture() -> Frame {
-        Frame::new(vec![TileGeometry {
-            tile: TileId(7),
-            origin_ecef: DVec3::ZERO,
-            content: DecodedTileContent {
-                meshes: Vec::new(),
-                textures: vec![DecodedTexture {
-                    width: 2,
-                    height: 2,
-                    rgba8: vec![255u8; 2 * 2 * 4],
-                }],
-                local_origin_ecef: DVec3::ZERO,
-                transform_local: glam::Mat4::IDENTITY,
-            },
-        }])
+        Frame::new(
+            "ion-1-2",
+            vec![TileGeometry {
+                tile: TileId(7),
+                origin_ecef: DVec3::ZERO,
+                content: DecodedTileContent {
+                    meshes: Vec::new(),
+                    textures: vec![DecodedTexture {
+                        width: 2,
+                        height: 2,
+                        rgba8: vec![255u8; 2 * 2 * 4],
+                    }],
+                    local_origin_ecef: DVec3::ZERO,
+                    transform_local: glam::Mat4::IDENTITY,
+                },
+            }],
+        )
     }
 
     /// Both sides derive the texture's name from this one function, so it is
@@ -344,8 +385,20 @@ mod tests {
     #[test]
     fn the_texture_uri_is_stable_and_scheme_qualified() {
         assert_eq!(
-            Frame::texture_uri(TileId(7), 0),
-            "tuile://tile/7/texture/0.png"
+            Frame::texture_uri("ion-1-2", TileId(7), 0),
+            "tuile://ion-1-2/tile/7/texture/0.png"
+        );
+    }
+
+    /// The whole reason the dataset is in the path: a TileId is unique within
+    /// one tree, so two sessions hand out the same ids for different tiles and
+    /// a resolver keyed on the id alone would answer with the wrong imagery —
+    /// silently, since the bytes are a valid PNG either way.
+    #[test]
+    fn two_datasets_never_collide_on_a_tile_id() {
+        assert_ne!(
+            Frame::texture_uri("ion-1-2", TileId(7), 0),
+            Frame::texture_uri("ion-1-3812", TileId(7), 0)
         );
     }
 
@@ -356,7 +409,7 @@ mod tests {
             .texture_png(0, 0)
             .expect("encoding")
             .expect("the texture exists");
-        assert_eq!(texture.uri, "tuile://tile/7/texture/0.png");
+        assert_eq!(texture.uri, "tuile://ion-1-2/tile/7/texture/0.png");
         // The PNG signature, so this is decodable bytes rather than the raw
         // RGBA the host's image plugin cannot read.
         assert_eq!(&texture.png[..8], b"\x89PNG\r\n\x1a\n");
