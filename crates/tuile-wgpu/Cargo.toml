@@ -15,6 +15,7 @@ bytemuck = { workspace = true }
 futures-util = { workspace = true }
 glam = { workspace = true }
 thiserror = { workspace = true }
+tuile-atmosphere = { version = "0.0.1", path = "../tuile-atmosphere" }
 tuile-core = { version = "0.0.1", path = "../tuile-core" }
 wgpu = { workspace = true }
 
@@ -26,5 +27,6 @@ image = { workspace = true }
 pollster = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tuile-atmosphere = { path = "../tuile-atmosphere" }
 tuile-core = { path = "../tuile-core" }
 url = { workspace = true }
