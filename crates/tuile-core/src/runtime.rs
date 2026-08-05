@@ -428,7 +428,15 @@ impl Session<'_> {
             Ok(Loaded::Expanded) => Ok(()),
             Ok(Loaded::Content(decoded)) => {
                 let size = decoded.byte_size();
-                let evicted = self.cache.insert(tile, size, &self.protected());
+                // Imagery is charged separately because it is shared: what this
+                // tile costs the budget is its geometry plus whatever share of
+                // the draped textures no other resident tile is already paying.
+                let imagery: Vec<_> = decoded
+                    .imagery
+                    .iter()
+                    .map(|l| (l.coord, l.texture.rgba8.len()))
+                    .collect();
+                let evicted = self.cache.insert(tile, size, &imagery, &self.protected());
                 for e in &evicted {
                     self.residency.remove(*e);
                 }
