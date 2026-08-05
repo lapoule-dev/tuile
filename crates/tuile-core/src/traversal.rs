@@ -717,5 +717,4 @@ mod tests {
         let sse_b = back.screen_space_error(10.0, 100.0);
         assert!((sse_a - sse_b).abs() < 1e-9);
     }
-
 }
