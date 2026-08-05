@@ -176,14 +176,30 @@ const MIN_EXTINCTION: f32 = 1e-12;
 /// costs an instruction and a NaN costs the frame.
 const MIN_PHASE_DENOM: f32 = 1e-4;
 
-/// Mean density of one species along a ray, from the heights of its two ends.
+/// Below this fraction of a scale height of climb, a path counts as level — the
+/// substitution in `air_column` would otherwise divide by its own rise.
+const LEVEL_PATH_RISE: f32 = 1e-6;
+
+/// How much air a ray actually crosses, as a sea-level-equivalent length:
+/// `∫ exp(-h/H) ds` between two endpoint heights over a distance.
 ///
-/// The profile between them is exponential rather than linear, so the endpoints
-/// only bracket the true mean — but over a path that stays within a scale height
-/// or two of the ground the gap is well under what a colour can show, and the
-/// alternative is marching the ray.
-fn mean_density(from_height: f32, to_height: f32, scale_height: f32) -> f32 {
-    return 0.5 * (exp(-from_height / scale_height) + exp(-to_height / scale_height));
+/// Mirrors `tuile_atmosphere::aerial::air_column`, where the derivation and the
+/// tests live. Exact when height varies linearly along the path — substituting
+/// `ds = dh · distance / Δh` closes the integral.
+///
+/// Averaging the two endpoint densities instead is the obvious thing and it is
+/// wrong: it only agrees when the ends sit at similar heights. From orbit it
+/// charges half a ray's length at ground density and renders the planet as a
+/// featureless blue disc.
+fn air_column(height_a: f32, height_b: f32, distance: f32, scale_height: f32) -> f32 {
+    let low = max(min(height_a, height_b), 0.0);
+    let high = max(max(height_a, height_b), 0.0);
+    let rise = high - low;
+    if (rise < scale_height * LEVEL_PATH_RISE) {
+        return exp(-low / scale_height) * distance;
+    }
+    return scale_height * (exp(-low / scale_height) - exp(-high / scale_height))
+        * (distance / rise);
 }
 
 fn aerial_perspective(lit: vec3f, world: vec3f) -> vec3f {
@@ -200,19 +216,15 @@ fn aerial_perspective(lit: vec3f, world: vec3f) -> vec3f {
     let ground_height = max(length(world - view.air_earth.xyz) - view.air_earth.w, 0.0);
     let eye_height = view.air_eye.w;
 
-    // Mean density along the ray from its endpoints. The profile between them is
-    // exponential, not linear, so this is an approximation — but the endpoints
-    // bracket it, and over a path that stays within a scale height or two of the
-    // ground the error is far below what a colour can show.
+    // How much air is actually on this ray, integrated rather than averaged.
     let rayleigh_scale = view.air_rayleigh.w;
     let mie_scale = view.air_mie.y;
-    let rayleigh_density = mean_density(eye_height, ground_height, rayleigh_scale);
-    let mie_density = mean_density(eye_height, ground_height, mie_scale);
+    let rayleigh_column = air_column(eye_height, ground_height, distance, rayleigh_scale);
+    let mie_column = air_column(eye_height, ground_height, distance, mie_scale);
 
-    let rayleigh_extinction = view.air_rayleigh.xyz * rayleigh_density;
-    let mie_extinction = vec3f(view.air_mie.x * mie_density);
-    let extinction = rayleigh_extinction + mie_extinction;
-    let transmittance = exp(-extinction * distance * strength);
+    let rayleigh_depth = view.air_rayleigh.xyz * rayleigh_column;
+    let mie_depth = vec3f(view.air_mie.x * mie_column);
+    let transmittance = exp(-(rayleigh_depth + mie_depth) * strength);
 
     // Phase functions: how much of the sunlight crossing the ray is turned
     // toward the eye. Rayleigh is nearly symmetric; Mie throws light forward,
@@ -231,9 +243,8 @@ fn aerial_perspective(lit: vec3f, world: vec3f) -> vec3f {
     // as (1 - transmittance), which is far larger for blue. That is why distance
     // is blue near to and washes out to grey far away, and why this is not the
     // same thing as a fog colour someone picked.
-    let scattering = view.air_rayleigh.xyz * rayleigh_density * rayleigh_phase
-        + mie_extinction * mie_phase;
-    let source = scattering / max(extinction, vec3f(MIN_EXTINCTION));
+    let scattering = rayleigh_depth * rayleigh_phase + mie_depth * mie_phase;
+    let source = scattering / max(rayleigh_depth + mie_depth, vec3f(MIN_EXTINCTION));
 
     // How lit the air over this point is. Below the horizon there is no
     // sunlight to scatter, and haze on the night side has to go dark or the
