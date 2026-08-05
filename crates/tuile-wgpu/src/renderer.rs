@@ -7,6 +7,7 @@
 use crate::context::{GpuContext, DEPTH_FORMAT};
 use crate::prepare::{PreparedTile, Vertex};
 use glam::Mat4;
+use tuile_atmosphere::AerialPerspective;
 use wgpu::util::DeviceExt;
 
 /// Per-frame view data. `view_proj` must be relative to the same render
@@ -19,6 +20,11 @@ pub struct ViewUniform {
     pub sun_dir: [f32; 4],
     /// x = ambient term.
     pub params: [f32; 4],
+    /// The air between the eye and the ground. Off by default — a scene that is
+    /// not a planet has no air in it, and the model is
+    /// [`tuile_atmosphere`]'s rather than this crate's so that a second backend
+    /// cannot quietly disagree about the colour of air.
+    pub atmosphere: AerialPerspective,
 }
 
 impl Default for ViewUniform {
@@ -27,6 +33,7 @@ impl Default for ViewUniform {
             view_proj: Mat4::IDENTITY.to_cols_array(),
             sun_dir: [0.0, 0.0, -1.0, 0.0],
             params: [0.25, 0.0, 0.0, 0.0],
+            atmosphere: AerialPerspective::default(),
         }
     }
 }

@@ -9,6 +9,19 @@ struct ViewUniform {
     sun_dir: vec4f,
     // x = ambient amount, yzw unused.
     params: vec4f,
+    // Aerial perspective. Mirrors tuile_atmosphere::AerialPerspective field for
+    // field; that crate owns the physics, this only spends it.
+    //   air_eye:      eye in render space (xyz), its height above ground (w)
+    //   air_earth:    planet centre in render space (xyz), its radius (w)
+    //   air_rayleigh: scattering per metre RGB (xyz), scale height (w)
+    //   air_mie:      scattering (x), scale height (y), anisotropy (z),
+    //                 strength (w) — 0 turns the atmosphere off
+    //   air_sun:      direction sunlight travels (xyz), haze brightness (w)
+    air_eye: vec4f,
+    air_earth: vec4f,
+    air_rayleigh: vec4f,
+    air_mie: vec4f,
+    air_sun: vec4f,
 }
 @group(0) @binding(0) var<uniform> view: ViewUniform;
 
@@ -62,6 +75,10 @@ struct VsOut {
     @builtin(position) clip: vec4f,
     @location(0) normal: vec3f,
     @location(1) uv: vec2f,
+    // Render space, not ECEF. Interpolating an ECEF position across a triangle
+    // in f32 loses metres; render space keeps the magnitudes small enough that
+    // it does not, which is the same reason the positions were rebased.
+    @location(2) world: vec3f,
 }
 
 @vertex
@@ -71,6 +88,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.clip = view.view_proj * world;
     out.normal = (tile.model * vec4f(in.normal, 0.0)).xyz;
     out.uv = in.uv;
+    out.world = world.xyz;
     return out;
 }
 
@@ -120,5 +138,109 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let lambert = max(dot(n, -view.sun_dir.xyz), 0.0);
     let ambient = view.params.x;
     let lit = albedo.rgb * (ambient + (1.0 - ambient) * lambert);
-    return vec4f(lit, albedo.a);
+    return vec4f(aerial_perspective(lit, in.world), albedo.a);
+}
+
+/// What the air between the eye and this fragment does to its colour.
+///
+/// Single scattering through an exponential atmosphere, integrated in closed
+/// form. The reference implementation ray-marches this; over the ground the two
+/// agree closely and a march costs sixty-four samples a fragment.
+///
+/// Two things come out of it, and the second is the one people notice. Distant
+/// ground *loses* its own colour — extinction — and it *gains* the colour of the
+/// air in front of it. Only the second makes a ridge read as far away; extinction
+/// alone would just make it dark.
+const PI: f32 = 3.14159265358979;
+
+/// Normalisation of the Rayleigh phase function, `3 / 16π`. Written as the
+/// expression rather than its decimal so it can be checked against the physics
+/// instead of against a previous copy of itself.
+const RAYLEIGH_PHASE_NORM: f32 = 3.0 / (16.0 * PI);
+
+/// Normalisation of the Henyey-Greenstein phase function, `1 / 4π`.
+const MIE_PHASE_NORM: f32 = 1.0 / (4.0 * PI);
+
+/// A phase function integrates to 1 over the sphere, so it answers "per
+/// steradian". The in-scattered term wants the whole sky's worth, which is the
+/// sphere's solid angle.
+const SPHERE_SOLID_ANGLE: f32 = 4.0 * PI;
+
+/// Floor on total extinction before dividing by it. Not a physical quantity:
+/// extinction is strictly positive wherever there is air, and this only keeps a
+/// fragment far enough out that the density underflows from producing a NaN.
+const MIN_EXTINCTION: f32 = 1e-12;
+
+/// Floor on the Henyey-Greenstein denominator, which vanishes as `g` approaches
+/// 1 looking straight at the light. Real haze never reaches `g = 1`; clamping
+/// costs an instruction and a NaN costs the frame.
+const MIN_PHASE_DENOM: f32 = 1e-4;
+
+/// Mean density of one species along a ray, from the heights of its two ends.
+///
+/// The profile between them is exponential rather than linear, so the endpoints
+/// only bracket the true mean — but over a path that stays within a scale height
+/// or two of the ground the gap is well under what a colour can show, and the
+/// alternative is marching the ray.
+fn mean_density(from_height: f32, to_height: f32, scale_height: f32) -> f32 {
+    return 0.5 * (exp(-from_height / scale_height) + exp(-to_height / scale_height));
+}
+
+fn aerial_perspective(lit: vec3f, world: vec3f) -> vec3f {
+    let strength = view.air_mie.w;
+    // Uniform across the draw: it comes from a uniform buffer, and nothing
+    // inside samples a texture, so branching here is free and legal.
+    if (strength <= 0.0) {
+        return lit;
+    }
+
+    let to_eye = view.air_eye.xyz - world;
+    let distance = length(to_eye);
+    let up = normalize(world - view.air_earth.xyz);
+    let ground_height = max(length(world - view.air_earth.xyz) - view.air_earth.w, 0.0);
+    let eye_height = view.air_eye.w;
+
+    // Mean density along the ray from its endpoints. The profile between them is
+    // exponential, not linear, so this is an approximation — but the endpoints
+    // bracket it, and over a path that stays within a scale height or two of the
+    // ground the error is far below what a colour can show.
+    let rayleigh_scale = view.air_rayleigh.w;
+    let mie_scale = view.air_mie.y;
+    let rayleigh_density = mean_density(eye_height, ground_height, rayleigh_scale);
+    let mie_density = mean_density(eye_height, ground_height, mie_scale);
+
+    let rayleigh_extinction = view.air_rayleigh.xyz * rayleigh_density;
+    let mie_extinction = vec3f(view.air_mie.x * mie_density);
+    let extinction = rayleigh_extinction + mie_extinction;
+    let transmittance = exp(-extinction * distance * strength);
+
+    // Phase functions: how much of the sunlight crossing the ray is turned
+    // toward the eye. Rayleigh is nearly symmetric; Mie throws light forward,
+    // which is why haze glares when you look toward the sun and not away.
+    let view_dir = -normalize(to_eye);
+    let cos_angle = dot(view_dir, -view.air_sun.xyz);
+    let cos_sq = cos_angle * cos_angle;
+    let rayleigh_phase = RAYLEIGH_PHASE_NORM * (1.0 + cos_sq);
+    let g = view.air_mie.z;
+    let g_sq = g * g;
+    let mie_phase = MIE_PHASE_NORM * (1.0 - g_sq)
+        / pow(max(1.0 + g_sq - 2.0 * g * cos_angle, MIN_PHASE_DENOM), 1.5);
+
+    // The source function: scattering toward the eye over total extinction. Its
+    // *colour* comes out near white — but the amount that reaches the eye goes
+    // as (1 - transmittance), which is far larger for blue. That is why distance
+    // is blue near to and washes out to grey far away, and why this is not the
+    // same thing as a fog colour someone picked.
+    let scattering = view.air_rayleigh.xyz * rayleigh_density * rayleigh_phase
+        + mie_extinction * mie_phase;
+    let source = scattering / max(extinction, vec3f(MIN_EXTINCTION));
+
+    // How lit the air over this point is. Below the horizon there is no
+    // sunlight to scatter, and haze on the night side has to go dark or the
+    // terminator glows.
+    let sun_up = clamp(dot(-view.air_sun.xyz, up), 0.0, 1.0);
+    let in_scatter = source * (vec3f(1.0) - transmittance)
+        * (SPHERE_SOLID_ANGLE * sun_up * view.air_sun.w);
+
+    return lit * transmittance + in_scatter;
 }

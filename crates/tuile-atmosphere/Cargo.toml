@@ -1,0 +1,16 @@
+[package]
+name = "tuile-atmosphere"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Sun position, aerial perspective and sky for a rendered globe — renderer-agnostic"
+
+[dependencies]
+glam.workspace = true
+# Only so the uniform structs can cross to a GPU buffer without a backend having
+# to restate their layout — a restatement is exactly the drift this crate exists
+# to prevent. bytemuck is plain-data plumbing, not a renderer.
+bytemuck.workspace = true
+tuile-core = { path = "../tuile-core" }

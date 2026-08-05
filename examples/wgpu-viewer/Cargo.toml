@@ -20,6 +20,7 @@ pollster = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tuile-atmosphere = { version = "0.0.1", path = "../../crates/tuile-atmosphere" }
 tuile-camera = { version = "0.0.1", path = "../../crates/tuile-camera" }
 tuile-core = { version = "0.0.1", path = "../../crates/tuile-core" }
 tuile-cesium-ion = { version = "0.0.1", path = "../../crates/tuile-cesium-ion" }

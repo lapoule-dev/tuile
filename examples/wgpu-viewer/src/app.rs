@@ -20,12 +20,33 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+/// How much air to put between the eye and the ground.
+///
+/// 1.0 is the physical atmosphere. This is above it because the viewer is
+/// usually looking at tens of kilometres rather than the hundreds where the
+/// physical figure becomes obvious, and the cue has to be readable at the range
+/// people actually fly the camera at. Turned down, the globe looks like a
+/// texture on a ball; turned much further up, distant ground washes out before
+/// it is far enough away for that to read as distance.
+const ATMOSPHERE_STRENGTH: f32 = 1.6;
+
+/// How much of a surface's colour survives facing away from the light.
+///
+/// Not a physical quantity — it stands in for every bounce the single-bounce
+/// lighting above does not model. At 0 an unlit slope is pure black, which no
+/// daylit terrain ever is; at 1 the shading disappears and with it every hint of
+/// relief the mesh carries.
+const AMBIENT: f32 = 0.5;
+
 /// Everything known before the window exists.
 pub struct ViewerConfig {
     pub stream: InProcessStream,
     pub controller: CameraController,
     pub detail: tuile_planetary::ImageryDetail,
     pub title: String,
+    /// The instant the scene is lit for, UTC seconds since the Unix epoch —
+    /// which sets where the sun is, and so where the terminator falls.
+    pub lit_at_unix_seconds: f64,
 }
 
 struct Active {
@@ -46,6 +67,10 @@ pub struct App {
     controller: CameraController,
     detail: tuile_planetary::ImageryDetail,
     title: String,
+    /// Where the sun is for the instant the scene is lit at. Resolved once: the
+    /// hour is fixed for a session, so recomputing the ephemeris every frame
+    /// would answer the same question sixty times a second.
+    sun: tuile_atmosphere::Sun,
     active: Option<Active>,
     // Input state.
     cursor: (f64, f64),
@@ -112,6 +137,7 @@ impl App {
             controller: config.controller.clone(),
             detail: config.detail.clone(),
             title: config.title.clone(),
+            sun: tuile_atmosphere::Sun::at_unix_seconds(config.lit_at_unix_seconds),
             config: Some(config),
             active: None,
             cursor: (0.0, 0.0),
@@ -355,13 +381,23 @@ impl App {
         // ground is, and the near plane has to be placed against that.
         let view_proj = self.controller.view_proj(origin, aspect);
         // Headlight: light travels along the view direction (behind the camera).
-        let sun = cam.direction.as_vec3();
+        // Deliberately not the real sun — a globe lit only by a low sun is half
+        // black, and the point of this viewer is to look at terrain. The *air*,
+        // below, does use the real sun, so the haze reddens and darkens with the
+        // hour even though the ground stays evenly lit.
+        let headlight = cam.direction.as_vec3();
         active.renderer.set_view(
             &active.gpu.queue,
             &tuile_wgpu::ViewUniform {
                 view_proj,
-                sun_dir: [sun.x, sun.y, sun.z, 0.0],
-                params: [0.5, 0.0, 0.0, 0.0],
+                sun_dir: [headlight.x, headlight.y, headlight.z, 0.0],
+                params: [AMBIENT, 0.0, 0.0, 0.0],
+                atmosphere: tuile_atmosphere::AerialPerspective::new(
+                    cam.position,
+                    origin,
+                    &self.sun,
+                    ATMOSPHERE_STRENGTH,
+                ),
             },
         );
 

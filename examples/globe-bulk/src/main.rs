@@ -143,6 +143,7 @@ impl Preset {
             view_proj: (p * v).to_cols_array(),
             sun_dir: [headlight.x, headlight.y, headlight.z, 0.0],
             params: [self.ambient, 0.0, 0.0, 0.0],
+            atmosphere: Default::default(),
         }
     }
 }
