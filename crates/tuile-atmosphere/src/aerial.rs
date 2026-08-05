@@ -156,20 +156,54 @@ impl AerialPerspective {
         if strength <= 0.0 {
             return [1.0; 3];
         }
-        let mean = |scale_height: f64| {
-            0.5 * ((-from_height.max(0.0) / scale_height).exp()
-                + (-to_height.max(0.0) / scale_height).exp())
-        };
-        let rayleigh_density = mean(f64::from(self.rayleigh[3]));
-        let mie_density = mean(f64::from(self.mie[1]));
-        let mie_depth = f64::from(self.mie[0]) * mie_density * distance;
+        let rayleigh_column = air_column(
+            from_height,
+            to_height,
+            distance,
+            f64::from(self.rayleigh[3]),
+        );
+        let mie_column = air_column(from_height, to_height, distance, f64::from(self.mie[1]));
+        let mie_depth = f64::from(self.mie[0]) * mie_column;
         let mut out = [0.0; 3];
         for (channel, slot) in out.iter_mut().enumerate() {
-            let rayleigh_depth = f64::from(self.rayleigh[channel]) * rayleigh_density * distance;
+            let rayleigh_depth = f64::from(self.rayleigh[channel]) * rayleigh_column;
             *slot = (-(rayleigh_depth + mie_depth) * strength).exp();
         }
         out
     }
+}
+
+/// How much air a ray actually crosses, as a sea-level-equivalent length:
+/// `∫ exp(-h/H) ds` between two endpoint heights over a given distance.
+///
+/// Exact when height varies linearly along the path. Substituting
+/// `ds = dh · distance / Δh` turns the integral into one that closes:
+///
+/// ```text
+/// column = H · (e^(−h_low/H) − e^(−h_high/H)) · distance / Δh
+/// ```
+///
+/// **Averaging the two endpoint densities and multiplying by distance is the
+/// obvious thing, and it is wrong.** It agrees with this only when the ends sit
+/// at similar heights — which is exactly the case both unit tests here happened
+/// to cover, so they passed while the viewer showed a featureless blue disc. A
+/// ray from twenty-three thousand kilometres spends all but a thousandth of its
+/// length in vacuum; averaging its ends charges half of it at ground density and
+/// returns an optical depth of six hundred instead of a quarter.
+///
+/// This form tends instead to one vertical scale height's worth of air as the
+/// eye climbs, which is the right answer, and is why Earth from orbit is faintly
+/// blue rather than opaque.
+fn air_column(height_a: f64, height_b: f64, distance: f64, scale_height: f64) -> f64 {
+    let low = height_a.min(height_b).max(0.0);
+    let high = height_a.max(height_b).max(0.0);
+    let rise = high - low;
+    // A level path has a constant density and no substitution to make — and
+    // would divide by zero if one were attempted.
+    if rise < scale_height * 1e-6 {
+        return (-low / scale_height).exp() * distance;
+    }
+    scale_height * ((-low / scale_height).exp() - (-high / scale_height).exp()) * (distance / rise)
 }
 
 #[cfg(test)]
@@ -259,6 +293,91 @@ mod tests {
         // That gap *is* the blue of distance; without it haze is only a fog.
         let far = air.transmittance(0.0, 0.0, 50_000.0);
         assert!(far[2] < far[0] * 0.5, "not blue enough at 50 km: {far:?}");
+    }
+
+    /// From orbit, a ray to the ground crosses one vertical column of air and no
+    /// more — however many thousands of kilometres of vacuum it also crossed.
+    ///
+    /// This is the case the endpoint-average form got catastrophically wrong,
+    /// and the case neither earlier test covered, because both put their two
+    /// ends at the same height — the one place the wrong form and the right one
+    /// agree. It cost a viewer session showing a featureless blue disc, so it is
+    /// pinned against the closed-form answer rather than against a threshold.
+    #[test]
+    fn a_ray_from_orbit_crosses_one_vertical_column_of_air() {
+        let air = AerialPerspective::new(eye_at(0.0, 0.0, 0.0), DVec3::ZERO, &noon(), 1.0);
+        let altitude = 23_000_000.0;
+        let from_space = air.transmittance(altitude, 0.0, altitude);
+
+        // Straight down from orbit, the whole atmosphere is one scale height's
+        // worth of air: T = exp(-β·H).
+        for (channel, name) in ["red", "green", "blue"].iter().enumerate() {
+            let expected = (-f64::from(RAYLEIGH_SCATTERING[channel] * RAYLEIGH_SCALE_HEIGHT)
+                - f64::from(MIE_SCATTERING * MIE_SCALE_HEIGHT))
+            .exp();
+            assert!(
+                (from_space[channel] - expected).abs() < 0.02,
+                "{name} from orbit is {} against {expected}",
+                from_space[channel]
+            );
+        }
+        // Which is to say: the planet stays visible. Blue is dimmed, not erased.
+        assert!(
+            from_space[2] > 0.6,
+            "the globe is opaque from orbit: {from_space:?}"
+        );
+        assert!(
+            from_space[0] > from_space[2],
+            "and still faintly blue: {from_space:?}"
+        );
+    }
+
+    /// Looking straight down, climbing puts *more* of the column below you — so
+    /// transmittance falls. But it falls toward a **limit**, the whole
+    /// atmosphere's worth, and never past it however far out the eye goes.
+    ///
+    /// That bound is the property the endpoint-average form destroyed: it made
+    /// optical depth grow without end with altitude, so the ground went black
+    /// from orbit. A limit is a much stronger thing to assert than a threshold,
+    /// and it is the one that was actually violated.
+    #[test]
+    fn transmittance_approaches_the_whole_column_and_never_passes_it() {
+        let air = AerialPerspective::new(eye_at(0.0, 0.0, 0.0), DVec3::ZERO, &noon(), 1.0);
+        let whole_column: Vec<f64> = (0..3)
+            .map(|c| {
+                (-f64::from(RAYLEIGH_SCATTERING[c] * RAYLEIGH_SCALE_HEIGHT)
+                    - f64::from(MIE_SCATTERING * MIE_SCALE_HEIGHT))
+                .exp()
+            })
+            .collect();
+
+        let mut previous = [1.0; 3];
+        for altitude in [100.0, 1_000.0, 10_000.0, 100_000.0, 1e6, 1e7, 2.3e7] {
+            let t = air.transmittance(altitude, 0.0, altitude);
+            for c in 0..3 {
+                assert!(
+                    t[c] <= previous[c] + 1e-12,
+                    "channel {c} cleared up climbing to {altitude} m: {t:?} after {previous:?}"
+                );
+                assert!(
+                    t[c] >= whole_column[c] - 1e-9,
+                    "channel {c} at {altitude} m is {} — past the whole atmosphere's {}",
+                    t[c],
+                    whole_column[c]
+                );
+            }
+            previous = t;
+        }
+        // And it really does converge, rather than merely staying above.
+        let far_out = air.transmittance(2.3e7, 0.0, 2.3e7);
+        for c in 0..3 {
+            assert!(
+                (far_out[c] - whole_column[c]).abs() < 1e-6,
+                "channel {c} from orbit is {} against the column's {}",
+                far_out[c],
+                whole_column[c]
+            );
+        }
     }
 
     /// Air thins with height, so the same distance costs less of it higher up —
