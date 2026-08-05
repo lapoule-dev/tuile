@@ -132,6 +132,7 @@ fn main() {
             [d.x, d.y, d.z, 0.0]
         },
         params: [0.35, 0.0, 0.0, 0.0],
+        atmosphere: Default::default(),
     };
     renderer.set_view(&gpu.queue, &view);
 

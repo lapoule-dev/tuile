@@ -854,7 +854,12 @@ pub fn reproject_tile_to_geographic(
     if scheme.projection == Projection::Geographic {
         return None;
     }
-    if rect.height() / f64::from(src.height.max(1)) <= 1.0e-5 {
+    // Below this many radians of latitude per texel, the Mercator remap moves
+    // nothing by as much as a texel across the whole tile — so the resample
+    // would only cost a generation of filtering and buy a picture identical to
+    // the one it started from.
+    const NEGLIGIBLE_DISTORTION_PER_TEXEL: f64 = 1.0e-5;
+    if rect.height() / f64::from(src.height.max(1)) <= NEGLIGIBLE_DISTORTION_PER_TEXEL {
         return None;
     }
     Some(reproject_to_geographic(

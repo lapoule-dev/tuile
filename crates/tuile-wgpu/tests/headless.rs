@@ -206,6 +206,8 @@ fn looking_down_z(distance: f32) -> ViewUniform {
         view_proj: (proj * view).to_cols_array(),
         sun_dir: [0.0, 0.0, -1.0, 0.0],
         params: [0.25, 0.0, 0.0, 0.0],
+        // Off: these tests assert exact colours, and air would change them.
+        atmosphere: Default::default(),
     }
 }
 
@@ -418,6 +420,133 @@ fn imagery_shared_between_tiles_is_uploaded_once() {
         gpu.imagery.lock().expect("imagery").live().0,
         0,
         "dropping the last holder left the texture behind"
+    );
+}
+
+/// A synthetic globe for the atmosphere tests, in render space.
+///
+/// The eye sits at the origin looking down `-Z`; the planet's centre is one
+/// radius below, so "up" at the origin is `+Z` and the sun shining straight down
+/// lights the air fully. Everything is stated rather than derived from a real
+/// ECEF camera, because what is under test here is the *shader* — the Rust that
+/// fills these fields has its own tests in `tuile-atmosphere`.
+fn air_at(eye_height_m: f32, strength: f32) -> tuile_atmosphere::AerialPerspective {
+    let radius = tuile_core::geo::WGS84_A as f32;
+    tuile_atmosphere::AerialPerspective {
+        eye: [0.0, 0.0, 0.0, eye_height_m],
+        earth: [0.0, 0.0, -(radius + eye_height_m), radius],
+        // Straight down: with up at `+Z`, the air over the target is fully lit.
+        sun: [0.0, 0.0, -1.0, 1.0],
+        mie: [
+            tuile_atmosphere::aerial::MIE_SCATTERING,
+            tuile_atmosphere::aerial::MIE_SCALE_HEIGHT,
+            tuile_atmosphere::aerial::MIE_ANISOTROPY,
+            strength,
+        ],
+        ..Default::default()
+    }
+}
+
+/// How dark the test surface is, linear.
+///
+/// Dark on purpose. Over *white* ground the air's two effects nearly cancel —
+/// extinction takes blue out of the surface while in-scattering puts blue back —
+/// and the shift is a couple of percent. Over dark ground there is almost
+/// nothing to take away and the air's own colour is all that is left, which is
+/// why it is distant forest and distant mountains that go blue and distant snow
+/// that does not. Testing on white would have measured the cancellation.
+const DARK_SURFACE: f32 = 0.1;
+
+/// A dark quad `metres` away **horizontally**, filling the frame.
+///
+/// Horizontally rather than straight ahead so the geometry stays honest: a point
+/// 80 km away across a curved planet really does stand higher above the
+/// tangent plane than one 2 km away, and the shader reads that height. Placing
+/// the quad along the view axis would have buried it below the surface at the
+/// far distance and the test would have been measuring a clamp.
+fn dark_quad_at(metres: f32) -> (DecodedTileContent, ViewUniform) {
+    let mut content = quad_content(DVec3::ZERO);
+    content.meshes[0].material.base_color_texture = None;
+    content.meshes[0].material.base_color_factor = [DARK_SURFACE, DARK_SURFACE, DARK_SURFACE, 1.0];
+    content.textures.clear();
+    // Out along -X, turned to face the eye, and scaled to fill the frame at
+    // whatever distance it sits.
+    content.transform_local = Mat4::from_translation(Vec3::new(-metres, 0.0, 0.0))
+        * Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2)
+        * Mat4::from_scale(Vec3::splat(metres));
+
+    let proj = Mat4::perspective_rh(60f32.to_radians(), 1.0, metres * 0.01, metres * 10.0);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(-metres, 0.0, 0.0), Vec3::Z);
+    let uniform = ViewUniform {
+        view_proj: (proj * view).to_cols_array(),
+        // A headlight, and full ambient besides: lighting then contributes
+        // exactly the same at both distances, so any difference between the two
+        // frames is the air and nothing else.
+        sun_dir: [-1.0, 0.0, 0.0, 0.0],
+        params: [1.0, 0.0, 0.0, 0.0],
+        atmosphere: Default::default(),
+    };
+    (content, uniform)
+}
+
+/// Aerial perspective, end to end through the shader: distant ground has to come
+/// back hazier and bluer than near ground.
+///
+/// The blue/red *ratio* is what is asserted, not brightness. Brightness alone
+/// would also move if the shader merely dimmed things with distance, and a
+/// distance fog is exactly what this must not be — the cue people read is the
+/// colour shift, because that is what real air does and what a grey fade does
+/// not.
+#[test]
+fn distant_ground_comes_back_hazier_and_bluer_than_near_ground() {
+    let Some(gpu) = gpu() else { return };
+    let renderer = TileRenderer::new(&gpu, wgpu::TextureFormat::Rgba8UnormSrgb);
+
+    let sample = |metres: f32, strength: f32, name: &str| -> [u8; 4] {
+        let (content, mut uniform) = dark_quad_at(metres);
+        uniform.atmosphere = air_at(1_000.0, strength);
+        let tile = prepare(&gpu, &content, DVec3::ZERO);
+        let frame = render_frame(&gpu, &renderer, &[&tile], &uniform);
+        frame.save(name);
+        frame.px(SIZE / 2, SIZE / 2)
+    };
+
+    let near = sample(2_000.0, 1.0, "headless-air-near.png");
+    let far = sample(80_000.0, 1.0, "headless-air-far.png");
+    let no_air = sample(80_000.0, 0.0, "headless-air-off.png");
+
+    // Off means off: with no air the quad must come back the neutral grey it
+    // actually is, or the default is quietly tinting every scene that has no
+    // planet in it.
+    let [r, g, b, _] = no_air.map(i32::from);
+    let spread = r.max(g).max(b) - r.min(g).min(b);
+    assert!(
+        spread <= 1,
+        "with the atmosphere off the quad should be neutral, got {no_air:?}"
+    );
+    assert!(
+        far != no_air,
+        "the atmosphere changed nothing at 80 km: {far:?}"
+    );
+
+    // On, and blue: over dark ground the air's own colour is most of what comes
+    // back, and the air is blue.
+    assert!(
+        far[2] > far[0] + 8,
+        "80 km of air left the ground neutral: {far:?}"
+    );
+    let blueness = |px: [u8; 4]| f32::from(px[2]) / f32::from(px[0]).max(1.0);
+    assert!(
+        blueness(far) > blueness(near),
+        "80 km ({far:?}, blue/red {:.3}) is no bluer than 2 km ({near:?}, {:.3})",
+        blueness(far),
+        blueness(near)
+    );
+    // And it must *lighten* as well as blue: haze adds light to dark ground.
+    // Extinction alone would darken it, which is a fog, not distance.
+    assert!(
+        far[2] > near[2],
+        "the far quad is not brighter in blue: {far:?} against {near:?}"
     );
 }
 

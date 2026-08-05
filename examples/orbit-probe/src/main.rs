@@ -433,6 +433,9 @@ fn render_step(
             view_proj: camera.view_proj(origin, 1.0),
             sun_dir: [sun.x, sun.y, sun.z, 0.0],
             params: [0.5, 0.0, 0.0, 0.0],
+            // Off: the probe measures tile counts, and haze would only make
+            // its reference frames harder to compare.
+            atmosphere: Default::default(),
         },
     );
 
