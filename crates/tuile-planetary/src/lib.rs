@@ -33,6 +33,32 @@ use tuile_terrain::{
 };
 
 use tuile_core::raster::MAX_IMAGERY_LAYERS;
+/// Extends the top and bottom rows of an imagery grid to the poles.
+///
+/// Web Mercator stops at ±85°: the projection has no tile for the caps, and it
+/// never will, because the projection sends them to infinity. Terrain does not
+/// stop there. So a geometry tile reaching past the limit had fragments that
+/// fell outside *every* layer's coverage, kept the material's base colour, and
+/// showed as a white disc centred on the pole with its edge exactly at 85° — one
+/// of the more legible bugs to come out of a render.
+///
+/// The answer is the one the per-tile resample used to give implicitly, by
+/// clamping its sampling coordinate: the edge row of imagery is the best data
+/// there is up there, so let it stand for everything beyond. Widening the
+/// *coverage* does that, and the clamping sampler supplies the rest — texture
+/// coordinates past the tile resolve to its edge, which is what a polar cap
+/// looks like anyway.
+fn to_the_pole(mut rect: GeoRect, coord: ImageryCoord, rows: u64) -> GeoRect {
+    use std::f64::consts::FRAC_PI_2;
+    if coord.y == 0 {
+        rect.north = FRAC_PI_2;
+    }
+    if coord.y + 1 >= rows {
+        rect.south = -FRAC_PI_2;
+    }
+    rect
+}
+
 /// Shared, host-updated imagery detail target: the desired ground texel
 /// spacing (metres per texel) for draped imagery, which the app recomputes from
 /// the camera each frame (≈ `2·altitude·tan(fovy/2) / viewport_height`). The
@@ -231,6 +257,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         let fetched =
             futures_util::future::join_all(coords.iter().map(|c| self.fetch_imagery(*c))).await;
 
+        let rows = scheme.tiles_at(mosaic.level).1;
         let mut layers = Vec::with_capacity(coords.len());
         for (requested, got) in coords.iter().zip(fetched) {
             let (served, texture) = got?;
@@ -239,7 +266,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                 texture,
                 rect,
                 &scheme.tile_rect(served),
-                &scheme.tile_rect(*requested),
+                &to_the_pole(scheme.tile_rect(*requested), *requested, rows),
             );
             // A tile the mosaic's bounding box included but the rectangle only
             // touches contributes no pixels and would still cost a binding.
