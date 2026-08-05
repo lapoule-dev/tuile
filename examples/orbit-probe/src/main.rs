@@ -247,6 +247,7 @@ async fn main() -> Result<()> {
     }
 
     report(&ledger);
+    report_imagery(&contents);
     // Same order as the viewer: let the server see the session end before the
     // store closes, or its flusher shouts into a channel nobody holds.
     drop(stream);
@@ -327,6 +328,41 @@ async fn settle<S: GeometryStream + Unpin>(
         );
     }
     Ok(selection)
+}
+
+/// What the imagery covering this orbit costs, held once versus held per tile.
+///
+/// The ratio is the sharing factor, and it is the whole argument for
+/// referencing imagery instead of resampling it per tile: it says how many
+/// copies of the same pixels the old drape was carrying. A ratio of 1 would mean
+/// no tile shares imagery with any other — worth knowing, because it would mean
+/// the levels are being chosen so finely that nothing overlaps.
+fn report_imagery(contents: &HashMap<TileId, tuile_core::DecodedTileContent>) {
+    use std::collections::HashMap as Map;
+    let mut distinct: Map<tuile_core::raster::ImageryCoord, usize> = Map::new();
+    let mut drapes = 0usize;
+    let mut unshared = 0usize;
+    for content in contents.values() {
+        unshared += content.imagery_byte_size_unshared();
+        for layer in &content.imagery {
+            distinct.insert(layer.coord, layer.texture.rgba8.len());
+            drapes += 1;
+        }
+    }
+    if drapes == 0 {
+        tracing::info!("no imagery draped");
+        return;
+    }
+    let shared: usize = distinct.values().sum();
+    let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+    tracing::info!(
+        "imagery: {drapes} drapes over {} distinct tiles ({:.2}× sharing), \
+         {:.1} MiB held vs {:.1} MiB if each tile owned its own",
+        distinct.len(),
+        drapes as f64 / distinct.len().max(1) as f64,
+        mib(shared),
+        mib(unshared),
+    );
 }
 
 fn report(ledger: &Ledger) {
