@@ -176,7 +176,8 @@ impl OverlayRenderer {
         }
         match &self.vertices {
             Some((buf, _)) if count <= self.capacity => {
-                gpu.queue.write_buffer(buf, 0, bytemuck::cast_slice(vertices));
+                gpu.queue
+                    .write_buffer(buf, 0, bytemuck::cast_slice(vertices));
                 self.vertices = Some((buf.clone(), count));
             }
             _ => {

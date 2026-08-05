@@ -25,10 +25,7 @@ use tuile_core::storage::ContentStore;
 pub trait TerrainSource: Send + Sync {
     /// The tile's bytes, with the lifetime its origin stated — a decoded mesh
     /// is worth storing, and only the origin knows for how long.
-    async fn fetch_tile(
-        &self,
-        coord: TileCoord,
-    ) -> Result<Fetched<Vec<u8>>, TerrainSourceError>;
+    async fn fetch_tile(&self, coord: TileCoord) -> Result<Fetched<Vec<u8>>, TerrainSourceError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,10 +69,7 @@ impl<T: TerrainSource> CachedTerrain<T> {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl<T: TerrainSource> TerrainSource for CachedTerrain<T> {
-    async fn fetch_tile(
-        &self,
-        coord: TileCoord,
-    ) -> Result<Fetched<Vec<u8>>, TerrainSourceError> {
+    async fn fetch_tile(&self, coord: TileCoord) -> Result<Fetched<Vec<u8>>, TerrainSourceError> {
         let key = self.key(coord);
         if let Some(bytes) = self.store.get(&key).await {
             // The store already applied the lifetime this was written with.
@@ -112,7 +106,10 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .insert(key.to_owned(), value);
-            self.writes.lock().expect("lock").push((key.to_owned(), ttl));
+            self.writes
+                .lock()
+                .expect("lock")
+                .push((key.to_owned(), ttl));
         }
     }
 
@@ -123,10 +120,7 @@ mod tests {
 
     #[async_trait]
     impl TerrainSource for CountingTerrain {
-        async fn fetch_tile(
-            &self,
-            _c: TileCoord,
-        ) -> Result<Fetched<Vec<u8>>, TerrainSourceError> {
+        async fn fetch_tile(&self, _c: TileCoord) -> Result<Fetched<Vec<u8>>, TerrainSourceError> {
             *self.calls.lock().expect("lock") += 1;
             Ok(Fetched {
                 value: b"quantized-mesh".to_vec(),
@@ -135,7 +129,10 @@ mod tests {
         }
     }
 
-    fn cached(store: Arc<MemStore>, ttl: Option<std::time::Duration>) -> CachedTerrain<CountingTerrain> {
+    fn cached(
+        store: Arc<MemStore>,
+        ttl: Option<std::time::Duration>,
+    ) -> CachedTerrain<CountingTerrain> {
         CachedTerrain::new(
             CountingTerrain {
                 calls: Mutex::new(0),

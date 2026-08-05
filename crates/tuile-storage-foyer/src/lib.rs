@@ -318,7 +318,11 @@ mod tests {
             .await
             .expect("store");
         store
-            .put("fresh", Bytes::from_static(b"new"), Some(Duration::from_secs(3600)))
+            .put(
+                "fresh",
+                Bytes::from_static(b"new"),
+                Some(Duration::from_secs(3600)),
+            )
             .await;
         assert_eq!(store.get("fresh").await.as_deref(), Some(&b"new"[..]));
     }

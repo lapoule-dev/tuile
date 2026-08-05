@@ -19,15 +19,15 @@ use std::sync::Arc;
 use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_camera::{CameraController, GlobeCamera};
 use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
+use tuile_core::raster::CachedImagery;
 use tuile_core::runtime::in_process_with;
 use tuile_core::source::{TileLoader, TileTree};
-use tuile_core::raster::CachedImagery;
 use tuile_core::storage::ContentStore;
 use tuile_core::traversal::Config;
 use tuile_native_fetchers::NativeHttp;
 use tuile_planetary::{globe, GlobeOptions, ImageryDetail};
-use tuile_terrain::{CachedTerrain, TerrainHeights};
 use tuile_storage_foyer::FoyerStore;
+use tuile_terrain::{CachedTerrain, TerrainHeights};
 use winit::event_loop::{ControlFlow, EventLoop};
 
 /// Resolves the Cesium-ion globe sources and crosses them through the
@@ -80,8 +80,7 @@ async fn ion_globe(
     };
 
     let Some(store) = store else {
-        let (tree, loader, detail, heights) =
-            globe(terrain, bing, layer, GlobeOptions::default());
+        let (tree, loader, detail, heights) = globe(terrain, bing, layer, GlobeOptions::default());
         return Ok((tree, loader, detail, heights, None));
     };
     let shared = Arc::clone(&store) as Arc<dyn ContentStore>;
