@@ -152,7 +152,7 @@ fn main() -> anyhow::Result<()> {
         2_000_000.0,
         0.0,
         std::f64::consts::FRAC_PI_2,
-        60f64.to_radians(),
+        tuile_camera::DEFAULT_GLOBE_FOVY,
     );
     // Clamp against the terrain, not the ellipsoid: 150 m over the sea and
     // 150 m over a summit are the same request, and only the relief tells them
