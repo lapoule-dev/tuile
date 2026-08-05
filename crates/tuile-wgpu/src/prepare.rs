@@ -5,10 +5,11 @@
 //! the core's `PrepareRenderResources` contract: the core decodes, this
 //! materializes.
 
-use crate::context::{GpuContext, TEXTURE_FORMAT};
+use crate::context::{GpuContext, GpuImagery, IMAGERY_BINDING_0, TEXTURE_FORMAT};
 use glam::{DVec3, Mat4, Vec3};
+use std::sync::Arc;
 use tuile_core::content::{DecodedMesh, DecodedTexture, DecodedTileContent};
-use tuile_core::raster;
+use tuile_core::raster::{self, MAX_IMAGERY_LAYERS};
 use wgpu::util::DeviceExt;
 
 /// Bytes per texel in [`TEXTURE_FORMAT`].
@@ -48,8 +49,15 @@ pub struct PreparedTile {
     /// the model matrix can be recomputed against a moving render origin.
     origin_ecef: DVec3,
     transform_local: Mat4,
-    _textures: Vec<wgpu::Texture>,
-    /// Approximate GPU memory of this tile, bytes.
+    _textures: Vec<GpuImagery>,
+    /// Imagery this tile drapes, held so the shared textures outlive it. Which
+    /// tile holds the last reference is what frees the memory.
+    _imagery: Vec<Arc<GpuImagery>>,
+    _imagery_buf: wgpu::Buffer,
+    /// Approximate GPU memory of this tile, bytes — **excluding draped
+    /// imagery**, for the reason [`DecodedTileContent::byte_size`] gives: a
+    /// texture twenty tiles share is not twenty textures. Ask
+    /// [`crate::context::ImageryTextures::live`] for that side of the total.
     pub gpu_bytes: usize,
 }
 
@@ -101,17 +109,35 @@ pub fn prepare(
         }],
     });
 
-    let mut gpu_bytes = 0usize;
-    let textures: Vec<(wgpu::Texture, wgpu::TextureView)> = content
+    // Textures the tile owns, uploaded for it alone.
+    let textures: Vec<GpuImagery> = content
         .textures
         .iter()
-        .map(|t| upload_texture(gpu, t, &mut gpu_bytes))
+        .map(|t| upload_texture(gpu, t))
         .collect();
+    let mut gpu_bytes: usize = textures.iter().map(|t| t.bytes).sum();
+
+    // Imagery it merely references: uploaded once per imagery tile, however
+    // many geometry tiles name it. This is where the memory win lands, and it
+    // is why the upload is keyed by coord rather than by tile.
+    let imagery: Vec<Arc<GpuImagery>> = content
+        .imagery
+        .iter()
+        .take(MAX_IMAGERY_LAYERS as usize)
+        .map(|layer| gpu.shared_imagery(layer.coord, || upload_texture(gpu, &layer.texture)))
+        .collect();
+    let imagery_buf = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tuile imagery layers"),
+            contents: bytemuck::cast_slice(&raster::imagery_layer_table(&content.imagery)),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
 
     let meshes = content
         .meshes
         .iter()
-        .map(|m| prepare_mesh(gpu, m, &textures, &mut gpu_bytes))
+        .map(|m| prepare_mesh(gpu, m, &textures, &imagery, &imagery_buf, &mut gpu_bytes))
         .collect();
 
     PreparedTile {
@@ -120,7 +146,9 @@ pub fn prepare(
         tile_buf,
         origin_ecef: content.local_origin_ecef,
         transform_local: content.transform_local,
-        _textures: textures.into_iter().map(|(t, _)| t).collect(),
+        _textures: textures,
+        _imagery: imagery,
+        _imagery_buf: imagery_buf,
         gpu_bytes,
     }
 }
@@ -135,11 +163,7 @@ pub fn prepare(
 /// pass per level per texture: at eight uploads a frame that is ~80 passes a
 /// frame, enough to exhaust the driver in minutes and take the machine down
 /// with it. Filtering on the CPU costs zero render passes.
-fn upload_texture(
-    gpu: &GpuContext,
-    t: &DecodedTexture,
-    gpu_bytes: &mut usize,
-) -> (wgpu::Texture, wgpu::TextureView) {
+fn upload_texture(gpu: &GpuContext, t: &DecodedTexture) -> GpuImagery {
     let mips = raster::mip_chain(t);
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("tuile base color"),
@@ -157,6 +181,7 @@ fn upload_texture(
         view_formats: &[],
     });
 
+    let mut bytes = 0usize;
     for (level, image) in std::iter::once(t).chain(mips.iter()).enumerate() {
         gpu.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -177,17 +202,19 @@ fn upload_texture(
                 depth_or_array_layers: 1,
             },
         );
-        *gpu_bytes += image.rgba8.len();
+        bytes += image.rgba8.len();
     }
 
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (texture, view)
+    GpuImagery::new(texture, view, bytes)
 }
 
 fn prepare_mesh(
     gpu: &GpuContext,
     mesh: &DecodedMesh,
-    textures: &[(wgpu::Texture, wgpu::TextureView)],
+    textures: &[GpuImagery],
+    imagery: &[Arc<GpuImagery>],
+    imagery_buf: &wgpu::Buffer,
     gpu_bytes: &mut usize,
 ) -> PreparedMesh {
     let normals = match &mesh.normals {
@@ -237,25 +264,44 @@ fn prepare_mesh(
         .material
         .base_color_texture
         .and_then(|i| textures.get(i))
-        .map(|(_, v)| v)
+        .map(|t| &t.view)
         .unwrap_or(&gpu.white_view);
+    // Every slot is bound, always. An unused one reads the 1×1 white texture and
+    // is masked out by an empty coverage rectangle, so the shader needs no count
+    // and no branch — see `imagery_uniform`.
+    let mut entries = vec![
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: material_buf.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: wgpu::BindingResource::TextureView(texture_view),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: wgpu::BindingResource::Sampler(&gpu.sampler),
+        },
+        wgpu::BindGroupEntry {
+            binding: 3,
+            resource: imagery_buf.as_entire_binding(),
+        },
+    ];
+    entries.extend((0..MAX_IMAGERY_LAYERS).map(|slot| {
+        wgpu::BindGroupEntry {
+            binding: IMAGERY_BINDING_0 + slot,
+            resource: wgpu::BindingResource::TextureView(
+                imagery
+                    .get(slot as usize)
+                    .map(|t| &t.view)
+                    .unwrap_or(&gpu.white_view),
+            ),
+        }
+    }));
     let material_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tuile material"),
         layout: &gpu.material_bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: material_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(texture_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::Sampler(&gpu.sampler),
-            },
-        ],
+        entries: &entries,
     });
 
     PreparedMesh {

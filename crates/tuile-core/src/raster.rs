@@ -581,6 +581,57 @@ pub fn rectangle_from_obb(obb: &Obb) -> GeoRect {
     rect
 }
 
+/// How many imagery textures may drape one geometry tile.
+///
+/// A **binding** limit, not a memory one, and the difference is the point of
+/// the layered model. It used to be a memory limit: a drape stitched its
+/// imagery into one private texture, so allowing sixteen tiles meant a 1024²
+/// image per terrain tile — 657 of those over one orbit against a 1.5 GiB
+/// budget is what made the second half of a turn spend itself reloading what
+/// the first half had paid for. A graded per-level allowance existed only to
+/// hold that down.
+///
+/// Layers are referenced now, so one imagery tile costs the same whether one
+/// geometry tile names it or twenty, and the allowance can be flat. What is
+/// left to bound is how many textures one draw binds, against the sixteen per
+/// shader stage that wgpu's default limits guarantee.
+///
+/// Twelve, because a tile draped one level finer than its own geometric error
+/// straddles up to a 3×3 block, and a budget of eight would coarsen exactly
+/// those tiles back a level. That is not a small loss of sharpness: it is
+/// *neighbours disagreeing about their level*, which is one of the two reasons
+/// adjacent tiles visibly differed in colour. Whatever the budget is, it has to
+/// clear 3×3 cleanly, and the room above that absorbs a rectangle that straddles
+/// worse than most.
+///
+/// A tile needing more than this coarsens, which is the remaining reason the
+/// ground cannot be made arbitrarily sharper than the mesh under it. The way
+/// past that is to refine the geometry quadtree past its data by upsampling the
+/// parent mesh — Cesium's answer — not a larger number here.
+///
+/// The renderer's shader must bind exactly this many slots.
+pub const MAX_IMAGERY_LAYERS: u32 = 12;
+
+/// The budget is what one draw binds, so it has to stay inside the per-stage
+/// texture limit wgpu's default limits guarantee, with the tile's own base
+/// colour alongside it. A build error rather than a test, because a value over
+/// the limit does not fail *somewhere* — it fails on the narrowest device that
+/// ever runs this, which is nowhere near here.
+const _: () = assert!(
+    MAX_IMAGERY_LAYERS < 16,
+    "an imagery slot per texture unit leaves none for the base colour"
+);
+
+/// And it has to admit the ordinary case without coarsening: a geometry tile
+/// draped one level finer than its own geometric error straddles up to a 3×3
+/// block. Coarsening exactly those tiles is neighbours disagreeing about their
+/// level, which is what makes them differ in colour — the symptom this whole
+/// model exists to remove.
+const _: () = assert!(
+    MAX_IMAGERY_LAYERS >= 9,
+    "a tile one level finer than its match needs up to 3x3 layers"
+);
+
 /// One imagery texture draped over a geometry tile — **referenced, not owned**.
 ///
 /// This is the type that stops us copying. A geometry tile names the imagery
@@ -623,28 +674,49 @@ impl ImageryLayer {
     /// The map between them is therefore affine, and this is it.
     ///
     /// Nothing here assumes the imagery is finer than the geometry: a coarse
-    /// ancestor standing in for a tile still loading places by the same formula,
-    /// with a scale below 1 and full coverage.
+    /// tile containing the geometry places by the same formula, with a scale
+    /// below 1 and full coverage.
     pub fn placed(
         coord: ImageryCoord,
         texture: Arc<DecodedTexture>,
         tile: &GeoRect,
         imagery: &GeoRect,
     ) -> Self {
+        Self::substituted(coord, texture, tile, imagery, imagery)
+    }
+
+    /// Places a texture that spans `source` over the ground `covers` asks for.
+    ///
+    /// The two differ when a provider has no tile at the level wanted and an
+    /// ancestor stands in: the pixels span the ancestor's whole rectangle, but
+    /// this layer is only responsible for the descendant's share of it — the
+    /// siblings covering the rest are placed from the same texture, each masked
+    /// to its own quarter. Sampling from the ancestor while masking to the
+    /// descendant is how Cesium's `TileImagery` shows a coarse tile under a fine
+    /// one, and it is what makes the fallback free: no upsampled copy, no second
+    /// generation of filtering, one texture on the GPU however many tiles lean
+    /// on it.
+    pub fn substituted(
+        coord: ImageryCoord,
+        texture: Arc<DecodedTexture>,
+        tile: &GeoRect,
+        source: &GeoRect,
+        covers: &GeoRect,
+    ) -> Self {
         let (tw, th) = (tile.width().max(1e-15), tile.height().max(1e-15));
-        let (iw, ih) = (imagery.width().max(1e-15), imagery.height().max(1e-15));
-        // texture_u = (lon - imagery.west) / iw, and lon = tile.west + u * tw.
+        let (sw, sh) = (source.width().max(1e-15), source.height().max(1e-15));
+        // texture_u = (lon - source.west) / sw, and lon = tile.west + u * tw.
         // v grows southward on both sides, hence north rather than south.
-        let scale = [(tw / iw) as f32, (th / ih) as f32];
+        let scale = [(tw / sw) as f32, (th / sh) as f32];
         let translation = [
-            ((tile.west - imagery.west) / iw) as f32,
-            ((imagery.north - tile.north) / ih) as f32,
+            ((tile.west - source.west) / sw) as f32,
+            ((source.north - tile.north) / sh) as f32,
         ];
         let coverage = [
-            (((imagery.west - tile.west) / tw).clamp(0.0, 1.0)) as f32,
-            (((tile.north - imagery.north) / th).clamp(0.0, 1.0)) as f32,
-            (((imagery.east - tile.west) / tw).clamp(0.0, 1.0)) as f32,
-            (((tile.north - imagery.south) / th).clamp(0.0, 1.0)) as f32,
+            (((covers.west - tile.west) / tw).clamp(0.0, 1.0)) as f32,
+            (((tile.north - covers.north) / th).clamp(0.0, 1.0)) as f32,
+            (((covers.east - tile.west) / tw).clamp(0.0, 1.0)) as f32,
+            (((tile.north - covers.south) / th).clamp(0.0, 1.0)) as f32,
         ];
         Self {
             coord,
@@ -663,6 +735,101 @@ impl ImageryLayer {
     /// texture binding and contributes no pixels, so it is worth dropping.
     pub fn is_visible(&self) -> bool {
         self.coverage[2] > self.coverage[0] && self.coverage[3] > self.coverage[1]
+    }
+}
+
+/// The layer table a renderer uploads for one geometry tile: two `vec4` per
+/// slot — coverage, then placement — for **every** slot, used or not.
+///
+/// `[2i]` is `[u_min, v_min, u_max, v_max]` and `[2i + 1]` is
+/// `[translation.x, translation.y, scale.x, scale.y]`.
+///
+/// An unused slot gets an *empty* coverage rectangle rather than a count the
+/// shader would have to test. `[1, 1, 0, 0]` fails the mask for every uv in
+/// `[0, 1]`, including both corners, so the slot contributes nothing while the
+/// shader stays branch-free — which matters because the coverage test sits in
+/// the same control flow as a texture sample, and a divergent branch around a
+/// sample is exactly what shading languages forbid.
+///
+/// This lives here rather than in a backend because it is the contract *between*
+/// backends: the packing, the sentinel, and the masking rule are the same
+/// whether the shader is WGSL, GLSL or a scene-graph material. Only the binding
+/// mechanics differ.
+pub fn imagery_layer_table(layers: &[ImageryLayer]) -> [[f32; 4]; 2 * MAX_IMAGERY_LAYERS as usize] {
+    const EMPTY_COVERAGE: [f32; 4] = [1.0, 1.0, 0.0, 0.0];
+    let mut table = [EMPTY_COVERAGE; 2 * MAX_IMAGERY_LAYERS as usize];
+    for (slot, layer) in layers.iter().take(MAX_IMAGERY_LAYERS as usize).enumerate() {
+        table[2 * slot] = layer.coverage;
+        table[2 * slot + 1] = [
+            layer.translation[0],
+            layer.translation[1],
+            layer.scale[0],
+            layer.scale[1],
+        ];
+    }
+    table
+}
+
+/// A pool of per-imagery-tile resources shared between the geometry tiles that
+/// drape them — a backend's uploaded textures, typically.
+///
+/// The sharing is the point of the layered model, and where it is enforced is
+/// here rather than in any one renderer: an imagery tile covering twenty
+/// geometry tiles is materialised once.
+///
+/// Eviction is by reference counting rather than by a budget, because the right
+/// answer is already known exactly — a resource is needed for precisely as long
+/// as some resident tile references it. The pool therefore holds [`Weak`]
+/// handles and hands out [`Arc`]s: when the last tile referencing an entry is
+/// dropped, the resource frees itself and the dangling key is swept on the next
+/// insert. A byte budget here would only be a worse guess at the same question,
+/// and one that could free something still being drawn.
+pub struct ImageryPool<T> {
+    entries: std::collections::HashMap<ImageryCoord, std::sync::Weak<T>>,
+}
+
+impl<T> Default for ImageryPool<T> {
+    fn default() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl<T> ImageryPool<T> {
+    /// The resource for `coord`, building it only if no live holder already has
+    /// one. `make` runs at most once per coord per lifetime of the resource.
+    pub fn get_or_insert(&mut self, coord: ImageryCoord, make: impl FnOnce() -> T) -> Arc<T> {
+        if let Some(live) = self.entries.get(&coord).and_then(std::sync::Weak::upgrade) {
+            return live;
+        }
+        let entry = Arc::new(make());
+        self.entries.insert(coord, Arc::downgrade(&entry));
+        // Dead keys accumulate silently otherwise: nothing runs when the last
+        // `Arc` drops. Sweeping in proportion to the map's own growth keeps the
+        // cost amortised without needing a schedule of its own.
+        if self.entries.len() > 2 * self.live_count() {
+            self.entries.retain(|_, w| w.strong_count() > 0);
+        }
+        entry
+    }
+
+    fn live_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|w| w.strong_count() > 0)
+            .count()
+    }
+
+    /// Everything still held by some tile. Counting these is the only honest
+    /// measure of what imagery costs — a per-tile total counts a shared resource
+    /// once per tile that names it, which is the number the sharing exists to
+    /// stop being true.
+    pub fn live(&self) -> Vec<Arc<T>> {
+        self.entries
+            .values()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect()
     }
 }
 
@@ -1151,6 +1318,78 @@ mod tests {
                     "({lon}, {lat}) mapped to {got:?}, the imagery tile says {want:?}"
                 );
             }
+        }
+    }
+
+    /// When a provider has no tile at the level wanted, the four descendants
+    /// stand on their parent's pixels — but each must still answer only for its
+    /// own quarter, or they blend over each other. The affine map is the
+    /// parent's, identically for all four; only the mask differs.
+    #[test]
+    fn ancestor_substitution_shares_one_texture_across_disjoint_quarters() {
+        let tile = GeoRect {
+            west: 0.0,
+            south: 0.0,
+            east: 1.0,
+            north: 1.0,
+        };
+        let parent = tile; // the ancestor happens to span the geometry tile
+        let quarters = [
+            (
+                "north-west",
+                GeoRect {
+                    west: 0.0,
+                    south: 0.5,
+                    east: 0.5,
+                    north: 1.0,
+                },
+                [0.0, 0.0, 0.5, 0.5],
+            ),
+            (
+                "north-east",
+                GeoRect {
+                    west: 0.5,
+                    south: 0.5,
+                    east: 1.0,
+                    north: 1.0,
+                },
+                [0.5, 0.0, 1.0, 0.5],
+            ),
+            (
+                "south-west",
+                GeoRect {
+                    west: 0.0,
+                    south: 0.0,
+                    east: 0.5,
+                    north: 0.5,
+                },
+                [0.0, 0.5, 0.5, 1.0],
+            ),
+            (
+                "south-east",
+                GeoRect {
+                    west: 0.5,
+                    south: 0.0,
+                    east: 1.0,
+                    north: 0.5,
+                },
+                [0.5, 0.5, 1.0, 1.0],
+            ),
+        ];
+        let texture = tex1x1();
+        for (name, covers, expected) in quarters {
+            let layer = ImageryLayer::substituted(
+                coord(3, 1, 1),
+                Arc::clone(&texture),
+                &tile,
+                &parent,
+                &covers,
+            );
+            assert_eq!(layer.coverage, expected, "{name}");
+            // Every sibling reads the parent the same way — only the mask moves.
+            assert_eq!(layer.scale, [1.0, 1.0], "{name}");
+            assert_eq!(layer.translation, [0.0, 0.0], "{name}");
+            assert!(Arc::ptr_eq(&layer.texture, &texture), "{name} copied");
         }
     }
 
