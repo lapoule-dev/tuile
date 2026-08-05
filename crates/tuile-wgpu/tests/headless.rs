@@ -276,6 +276,151 @@ fn depth_test_orders_overlapping_quads() {
     );
 }
 
+/// A 4×1 strip: red on its west half, green on its east. Sampling it tells you
+/// *where* in the texture a fragment landed, which a flat colour cannot.
+fn ramp_texture() -> std::sync::Arc<DecodedTexture> {
+    std::sync::Arc::new(DecodedTexture {
+        width: 4,
+        height: 1,
+        rgba8: vec![
+            255, 0, 0, 255, // texel 0 red
+            255, 0, 0, 255, // texel 1 red
+            0, 255, 0, 255, // texel 2 green
+            0, 255, 0, 255, // texel 3 green
+        ],
+    })
+}
+
+/// Screen x of a point at tile-uv `u`, for the quad under `looking_down_z(2.5)`.
+///
+/// The quad is the local `[-1, 1]` square, which a 60° lens at 2.5 puts at
+/// ±`1 / (2.5 · tan 30°)` in NDC.
+fn screen_x(u: f32) -> u32 {
+    let half = 1.0 / (2.5 * (30f32.to_radians()).tan());
+    let ndc = -half + 2.0 * half * u;
+    (((ndc + 1.0) * 0.5) * SIZE as f32) as u32
+}
+
+/// The whole layered model, end to end on the GPU: two imagery tiles draping
+/// one quad, each masked to its own half and each mapped into its texture by its
+/// own affine transform.
+///
+/// The ramp is what makes this an assertion about *placement* rather than about
+/// colour. A flat texture per layer would pass with the transform ignored
+/// entirely; sampling a texture that differs across its own width means the four
+/// probes only read red, green, red, green if each layer both covers the right
+/// half of the tile and stretches correctly across it.
+#[test]
+fn two_imagery_layers_cover_their_own_halves_of_a_tile() {
+    let Some(gpu) = gpu() else { return };
+    let origin = DVec3::ZERO;
+    let mut content = quad_content(origin);
+    // The ground is the layers; nothing underneath them contributes.
+    content.meshes[0].material.base_color_texture = None;
+    content.textures.clear();
+
+    let texture = ramp_texture();
+    content.imagery = vec![
+        // West half of the tile, stretched over the whole strip.
+        tuile_core::raster::ImageryLayer {
+            coord: tuile_core::raster::ImageryCoord {
+                level: 4,
+                x: 2,
+                y: 3,
+            },
+            texture: std::sync::Arc::clone(&texture),
+            coverage: [0.0, 0.0, 0.5, 1.0],
+            translation: [0.0, 0.0],
+            scale: [2.0, 1.0],
+        },
+        // East half: same stretch, shifted a tile-width west.
+        tuile_core::raster::ImageryLayer {
+            coord: tuile_core::raster::ImageryCoord {
+                level: 4,
+                x: 3,
+                y: 3,
+            },
+            texture: std::sync::Arc::clone(&texture),
+            coverage: [0.5, 0.0, 1.0, 1.0],
+            translation: [-1.0, 0.0],
+            scale: [2.0, 1.0],
+        },
+    ];
+
+    let tile = prepare(&gpu, &content, origin);
+    let renderer = TileRenderer::new(&gpu, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let frame = render_frame(&gpu, &renderer, &[&tile], &looking_down_z(2.5));
+    frame.save("headless-imagery-layers.png");
+
+    let y = SIZE / 2;
+    for (u, want) in [
+        (0.05, "red"),
+        (0.45, "green"),
+        (0.55, "red"),
+        (0.95, "green"),
+    ] {
+        let px = frame.px(screen_x(u), y);
+        let ok = match want {
+            "red" => px[0] > 150 && px[1] < 90,
+            _ => px[1] > 150 && px[0] < 90,
+        };
+        assert!(ok, "tile u={u} rendered {px:?}, want {want}");
+    }
+}
+
+/// The claim the whole change rests on: an imagery tile draped by several
+/// geometry tiles is uploaded once.
+///
+/// Asserted on the GPU-side count rather than on a byte total, because the byte
+/// total is what a per-tile figure gets wrong — and counting distinct textures
+/// is the thing a per-tile figure cannot say at all.
+#[test]
+fn imagery_shared_between_tiles_is_uploaded_once() {
+    let Some(gpu) = gpu() else { return };
+    let origin = DVec3::ZERO;
+    let shared = tuile_core::raster::ImageryCoord {
+        level: 7,
+        x: 11,
+        y: 13,
+    };
+    let texture = ramp_texture();
+    let layer = tuile_core::raster::ImageryLayer {
+        coord: shared,
+        texture: std::sync::Arc::clone(&texture),
+        coverage: [0.0, 0.0, 1.0, 1.0],
+        translation: [0.0, 0.0],
+        scale: [1.0, 1.0],
+    };
+
+    let mut first = quad_content(origin);
+    first.imagery = vec![layer.clone()];
+    let mut second = quad_content(origin);
+    second.imagery = vec![layer.clone()];
+
+    let a = prepare(&gpu, &first, origin);
+    let b = prepare(&gpu, &second, origin);
+    let (count, bytes) = gpu.imagery.lock().expect("imagery").live();
+    assert_eq!(
+        count, 1,
+        "two tiles draping one imagery tile uploaded {count}"
+    );
+    assert!(bytes > 0, "the shared texture reports no memory");
+
+    // And it is the *last* holder that frees it — not the first to be dropped.
+    drop(a);
+    assert_eq!(
+        gpu.imagery.lock().expect("imagery").live().0,
+        1,
+        "dropping one of two holders freed the shared texture"
+    );
+    drop(b);
+    assert_eq!(
+        gpu.imagery.lock().expect("imagery").live().0,
+        0,
+        "dropping the last holder left the texture behind"
+    );
+}
+
 #[test]
 fn untextured_mesh_without_normals_gets_computed_normals() {
     let Some(gpu) = gpu() else { return };
