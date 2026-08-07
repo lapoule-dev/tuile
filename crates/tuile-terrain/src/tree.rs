@@ -20,6 +20,10 @@ use tuile_core::math::BoundingVolume;
 use tuile_core::source::{TileId, TileProperties, TileTree};
 use tuile_core::tileset::Refine;
 
+/// A backstop for a source that declares nothing, so a degenerate view cannot
+/// divide without end. Never reached in practice: refinement stops at the data.
+const ABSOLUTE_MAX_LEVEL: u32 = 22;
+
 /// A terrain quadtree as a [`TileTree`].
 #[derive(Debug, Clone)]
 pub struct TerrainTree {
@@ -35,6 +39,20 @@ pub struct TerrainTree {
     /// real min/max is known.
     min_height: f64,
     max_height: f64,
+    /// How far past the data the quadtree may keep dividing.
+    ///
+    /// Refinement does not stop where the source runs out: a tile with no data
+    /// is built from its nearest available ancestor's surface. See
+    /// [`crate::upsample`] for why that has to be possible at all — briefly,
+    /// because a mosaic's coverage boundaries would otherwise punch holes, and
+    /// because imagery can be far sharper than terrain and has nothing small
+    /// enough to be drawn on.
+    ///
+    /// So this is a bound on *division*, not on data. Screen-space error stops
+    /// the traversal long before it in any real view — an upsampled tile's
+    /// geometric error halves like any other — and this only keeps a degenerate
+    /// view from dividing without end.
+    max_level: u32,
 }
 
 impl TerrainTree {
@@ -55,6 +73,7 @@ impl TerrainTree {
     /// `Arc` the loader writes its discovered ranges into.
     pub fn with_availability(layer: LayerJson, availability: Arc<Availability>) -> Self {
         let assume_full = layer.available.is_empty() && layer.metadata_availability.is_none();
+        let max_level = ABSOLUTE_MAX_LEVEL;
         Self {
             scheme: GeographicTilingScheme::default(),
             assume_full,
@@ -63,7 +82,15 @@ impl TerrainTree {
             // Generous global bounds (Dead Sea shore ≈ -430 m, Everest ≈ 8849 m).
             min_height: -1000.0,
             max_height: 9000.0,
+            max_level,
         }
+    }
+
+    /// How far the quadtree may divide past the data. See
+    /// [`TerrainTree::max_level`].
+    pub fn with_max_level(mut self, level: u32) -> Self {
+        self.max_level = level;
+        self
     }
 
     /// Overrides the estimated height range used for bounding volumes.
@@ -124,14 +151,66 @@ impl TileTree for TerrainTree {
 
     fn children(&self, id: TileId) -> Vec<TileId> {
         let c = Self::coord(id);
-        if c.level >= self.layer.maxzoom {
+        // Not `layer.maxzoom`. That is where the source's *data* stops, and it
+        // used to stop the division too — which is why the ground could never be
+        // sharper than the terrain, however much finer the imagery went. Bing
+        // reaches level 19 over ground where Cesium World Terrain stops at 12,
+        // and none of it could be shown, because nothing small enough existed to
+        // draw it on. Past the data a tile is built from its ancestor's surface;
+        // see [`crate::upsample`].
+        if c.level >= self.max_level {
             return Vec::new();
         }
-        c.children()
-            .into_iter()
-            .filter(|child| self.available(*child))
-            .map(Self::id)
-            .collect()
+
+        // Refine only while there is data to refine *into*, and then into all
+        // four children whether they have data or not.
+        //
+        // Both halves matter and each was wrong on its own:
+        //
+        // - Handing back only the children with data punched black strips
+        //   through the globe. Refinement is REPLACE, so those took over and
+        //   released their parent, leaving the quadrants without a child drawn
+        //   by nothing at all. A source of this kind is a mosaic whose coverage
+        //   stops mid-tile — twenty-seven such tiles in one session over
+        //   Kamchatka, one of them with a single available child, right where
+        //   two boundaries crossed.
+        //
+        // - Refining regardless, on the theory that smaller tiles are what let
+        //   imagery be sharper than terrain, divided to level twenty-two over
+        //   ground whose data ended at twelve. That is sixty-five thousand times
+        //   the tiles for a surface no more accurate, because an upsampled tile
+        //   has its ancestor's shape and only its ancestor's shape. The server
+        //   drowned and the view stopped following the camera.
+        //
+        // The reference implementation's rule is the one that holds: it refuses
+        // to refine when all four children would be pure upsamples — "no point
+        // in rendering the children because they're all upsampled" — and gets
+        // sharp imagery on coarse terrain a different way entirely, by putting
+        // *more imagery layers* on one tile and drawing it in several passes
+        // when they outrun the texture units. Tile size is not the lever.
+        if !c.children().iter().any(|child| self.available(*child)) {
+            return Vec::new();
+        }
+
+        //
+        // Filtering by availability was the earlier answer and it punched holes
+        // through the globe. A source of this kind is a mosaic whose coverage
+        // stops mid-tile: Cesium World Terrain has level-11 data over one
+        // quadrant and nothing over the next, and the boundaries run as straight
+        // lines through the quadtree. Twenty-seven such tiles were in one
+        // session over Kamchatka, one of them with a single available child,
+        // right where two boundaries crossed. Refinement is REPLACE, so the
+        // children that existed took over and released their parent — leaving
+        // the quadrants with no child drawn by nothing at all. Black strips with
+        // clean tile edges, which never healed, because every frame reached the
+        // same decision.
+        //
+        // The reference implementation reads the same availability and never
+        // asks this question: its `canRefine` only checks that the answer is
+        // *knowable*, and a child with no data is built from its parent's
+        // surface instead. That is what [`crate::upsample`] is for, and it is
+        // what makes this line safe.
+        c.children().map(Self::id).to_vec()
     }
 
     fn parent(&self, id: TileId) -> Option<TileId> {
@@ -183,13 +262,24 @@ mod tests {
         .expect("layer")
     }
 
-    #[test]
-    fn two_roots_at_level_zero() {
-        let tree = TerrainTree::new(cwt_layer());
-        let roots = tree.roots();
-        assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0].terrain_coord(), (0, 0, 0));
-        assert_eq!(roots[1].terrain_coord(), (0, 1, 0));
+    /// Availability that stops mid-tile, which a mosaic source really does.
+    ///
+    /// Level 2 reaches x = 2 but not x = 3, so the level-1 tile at x = 1 has two
+    /// of its four children and the one at x = 0 has all four.
+    fn layer_with_a_coverage_boundary() -> LayerJson {
+        LayerJson::from_slice(
+            br#"{
+              "format": "quantized-mesh-1.0", "scheme": "tms",
+              "projection": "EPSG:4326", "tiles": ["{z}/{x}/{y}.terrain"],
+              "maxzoom": 2,
+              "available": [
+                [{"startX":0,"startY":0,"endX":1,"endY":0}],
+                [{"startX":0,"startY":0,"endX":3,"endY":1}],
+                [{"startX":0,"startY":0,"endX":2,"endY":3}]
+              ]
+            }"#,
+        )
+        .expect("layer")
     }
 
     #[test]
@@ -204,15 +294,55 @@ mod tests {
         }
     }
 
+    /// Refinement stops where the data does, and not one level further.
+    ///
+    /// Dividing past the data was tried and it is a trap: an upsampled tile has
+    /// its ancestor's surface and only that, so every extra level multiplies the
+    /// tile count by four for a shape no more accurate. At an SSE of 2 it
+    /// reached level twenty-two over ground whose data ended at twelve. The
+    /// reference implementation refuses at exactly this line — it will not
+    /// refine a tile whose four children would all be upsamples.
     #[test]
-    fn no_children_past_maxzoom() {
+    fn refinement_stops_where_the_data_stops() {
         let tree = TerrainTree::new(cwt_layer());
-        let deep = TileId::from_terrain(4, 0, 0); // maxzoom
-        assert!(tree.children(deep).is_empty());
+
+        // Inside the data: divides.
+        assert_eq!(tree.children(TileId::from_terrain(3, 4, 2)).len(), 4);
+
+        // The fixture's data ends at level 4, so a level-4 tile has no child
+        // with anything in it, and dividing it would buy nothing.
+        assert!(
+            tree.children(TileId::from_terrain(4, 8, 4)).is_empty(),
+            "nothing divides past the data"
+        );
+    }
+
+    /// But a tile that straddles a coverage boundary still divides into **all
+    /// four** children — the ones without data are built from its own surface.
+    ///
+    /// Handing back only the children that exist is what punched black strips
+    /// through the globe: refinement is REPLACE, so they took over and released
+    /// their parent, leaving the rest of its ground drawn by nothing.
+    #[test]
+    fn a_coverage_boundary_still_divides_into_four() {
+        let tree = TerrainTree::new(layer_with_a_coverage_boundary());
+        let straddling = TileId::from_terrain(1, 1, 0);
+
+        let with_data = TileCoord::new(1, 1, 0)
+            .children()
+            .into_iter()
+            .filter(|c| tree.available(*c))
+            .count();
+        assert_eq!(with_data, 2, "the fixture must straddle the boundary");
+        assert_eq!(
+            tree.children(straddling).len(),
+            4,
+            "a quadtree node has four children, whatever the coverage says"
+        );
     }
 
     #[test]
-    fn unavailable_children_are_filtered() {
+    fn unavailable_children_are_still_children() {
         // A layer where level 1 only has x in 0..1 available.
         let layer = LayerJson::from_slice(
             br#"{ "format":"quantized-mesh-1.0","tiles":["{z}/{x}/{y}.terrain"],"maxzoom":2,
@@ -223,12 +353,16 @@ mod tests {
         )
         .expect("layer");
         let tree = TerrainTree::new(layer);
-        let kids = tree.children(TileId::from_terrain(0, 0, 0));
-        // Of the 4 children (1,0,0),(1,1,0),(1,0,1),(1,1,1), only x=0 ones exist.
-        assert_eq!(kids.len(), 2);
-        for k in &kids {
-            assert_eq!(k.terrain_coord().1, 0, "only x=0 available");
-        }
+
+        // Two of the four have data. All four are in the tree: the two without
+        // are built from their parent's surface when they load.
+        assert_eq!(tree.children(TileId::from_terrain(0, 0, 0)).len(), 4);
+        let with_data = TileCoord::new(0, 0, 0)
+            .children()
+            .into_iter()
+            .filter(|c| tree.available(*c))
+            .count();
+        assert_eq!(with_data, 2, "only the x = 0 children have data");
     }
 
     #[test]

@@ -11,6 +11,9 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+# Availability gaps are worth naming when they happen; the source crates
+# already log their fetches, and tracing is wasm-clean.
+tracing = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }

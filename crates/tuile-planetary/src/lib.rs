@@ -229,6 +229,89 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         }
     }
 
+    /// The mesh for a tile, built from an ancestor's when the source has none of
+    /// its own.
+    ///
+    /// The quadtree divides past the data on purpose — a mosaic's coverage
+    /// boundaries would otherwise punch holes, and imagery reaches far finer
+    /// than terrain and needs something small enough to be drawn on. So a miss
+    /// here is ordinary, not a failure: walk up to the nearest tile that does
+    /// exist and clip its surface to this one's ground.
+    ///
+    /// No new detail is invented. The tile has the ancestor's shape described by
+    /// fewer triangles per unit of ground, which is the honest answer: the mesh
+    /// stops improving where the data stops while the imagery on it keeps
+    /// sharpening.
+    async fn terrain_mesh(
+        &self,
+        coord: TileCoord,
+    ) -> Result<tuile_terrain::QuantizedMesh, LoadError> {
+        // Jump straight to the deepest tile the source actually has, rather than
+        // discovering it by asking for ones it does not.
+        //
+        // Refinement now runs past the data, so most deep tiles have none —
+        // that is the point. Probing for them costs a round trip each, and
+        // walking up a level at a time turned one tile into as many as twenty-two
+        // sequential failing requests. Thousands of tiles doing that drowned the
+        // server: the traversal stopped getting a turn, the selection froze, and
+        // the view stopped following the camera at all.
+        //
+        // Availability is already here, shared with the tree, and it answers
+        // this exactly. The probe below stays as the fallback for a source that
+        // declares nothing.
+        let mut source = coord;
+        if self.availability.range_count() > 0 {
+            while source.level > 0 && !self.availability.is_available(source) {
+                source = TileCoord::new(source.level - 1, source.x / 2, source.y / 2);
+            }
+        }
+        loop {
+            match self.terrain.fetch_tile(source).await {
+                Ok(fetched) => {
+                    tracing::debug!(
+                        z = source.level,
+                        x = source.x,
+                        y = source.y,
+                        kib = fetched.value.len() / 1024,
+                        "terrain tile"
+                    );
+                    let mesh =
+                        decode(&fetched.value).map_err(|e| LoadError::Failed(e.to_string()))?;
+                    // Decoding is also what reveals which descendants exist — the
+                    // source may have served these bytes from a cache, but the
+                    // ranges still reach the shared availability, so refinement
+                    // never stalls at a cached level.
+                    self.reveal(source, mesh.metadata_available.as_deref());
+                    if source == coord {
+                        return Ok(mesh);
+                    }
+                    tracing::debug!(
+                        z = coord.level,
+                        x = coord.x,
+                        y = coord.y,
+                        from = source.level,
+                        "terrain upsampled from an ancestor"
+                    );
+                    return tuile_terrain::upsample(&mesh, source, coord).ok_or_else(|| {
+                        LoadError::Failed(format!(
+                            "terrain {}/{}/{}: nothing of {}/{}/{} covers it",
+                            coord.level, coord.x, coord.y, source.level, source.x, source.y
+                        ))
+                    });
+                }
+                Err(_) if source.level > 0 => {
+                    source = TileCoord::new(source.level - 1, source.x / 2, source.y / 2);
+                }
+                Err(e) => {
+                    return Err(LoadError::Failed(format!(
+                        "terrain {}/{}/{}: {e}",
+                        coord.level, coord.x, coord.y
+                    )))
+                }
+            }
+        }
+    }
+
     async fn drape(
         &self,
         content: &mut tuile_core::DecodedTileContent,
@@ -253,6 +336,20 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         }
         .min(scheme.maximum_level);
         let mosaic = scheme.mosaic_at_level(rect, level, MAX_IMAGERY_LAYERS);
+        // The four numbers that decide how sharp the ground gets, in the order
+        // they constrain each other: what the terrain's own error asks for, what
+        // the camera's altitude asks for, what was requested, and what survived
+        // the layer budget. A gap between the last two is the budget coarsening
+        // the request back, which is the thing to watch — it is the only reason
+        // imagery cannot go deeper than the mesh it drapes.
+        tracing::debug!(
+            terrain_level,
+            matched = base,
+            wanted = level,
+            got = mosaic.level,
+            tiles = mosaic.tile_count(),
+            "imagery level"
+        );
         let coords = mosaic.tiles();
         let fetched =
             futures_util::future::join_all(coords.iter().map(|c| self.fetch_imagery(*c))).await;
@@ -275,15 +372,15 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
             }
         }
 
-        // One uv set per mesh, in the TILE's own space — every layer maps out of
-        // it by its own affine transform, so the vertices carry no imagery level
-        // and a layer can be swapped without touching the geometry.
+        // The uv set is the TILE's own space, and the mesh already stated it —
+        // `to_decoded` carries it straight from the quantized mesh. It used to
+        // be recovered here instead, by projecting every vertex back to a
+        // longitude and measuring it against the tile's rectangle, which is
+        // slower and tears at the antimeridian: see `tuile_terrain::surface_uvs`.
+        // Every layer maps out of that space by its own affine transform, so the
+        // vertices carry no imagery level and a layer can be swapped without
+        // touching the geometry.
         for mesh in &mut content.meshes {
-            mesh.uvs = Some(raster::uvs_geographic(
-                &mesh.positions,
-                content.local_origin_ecef,
-                rect,
-            ));
             // Terrain owns no base-colour texture; the layers are the ground.
             mesh.material.base_color_texture = None;
         }
@@ -300,17 +397,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
     async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
         let (z, x, y) = id.terrain_coord();
         let coord = TileCoord::new(z, x, y);
-        let fetched = self
-            .terrain
-            .fetch_tile(coord)
-            .await
-            .map_err(|e| LoadError::Failed(format!("terrain {z}/{x}/{y}: {e}")))?;
-        tracing::debug!(z, x, y, kib = fetched.value.len() / 1024, "terrain tile");
-        let qm = decode(&fetched.value).map_err(|e| LoadError::Failed(e.to_string()))?;
-        // Decoding is also what reveals which descendants exist — the source may
-        // have served these bytes from a cache, but the ranges still reach the
-        // shared availability, so refinement never stalls at a cached level.
-        self.reveal(coord, qm.metadata_available.as_deref());
+        let qm = self.terrain_mesh(coord).await?;
         // The header already carries the tile's relief, so the surface a camera
         // is clamped against sharpens for free as the globe refines.
         self.heights.record(coord, qm.header.max_height);

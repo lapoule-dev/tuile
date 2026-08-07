@@ -41,6 +41,7 @@ pub fn to_decoded(mesh: &QuantizedMesh, rect: &GeoRect, skirt_height: f64) -> De
     let mut positions: Vec<[f32; 3]> = (0..vc).map(|i| local(to_ecef(i, 0.0))).collect();
     let mut normals: Option<Vec<[f32; 3]>> = mesh.normals.clone();
     let mut indices = mesh.indices.clone();
+    let mut uvs = surface_uvs(mesh);
 
     if skirt_height > 0.0 {
         append_skirts(
@@ -48,9 +49,12 @@ pub fn to_decoded(mesh: &QuantizedMesh, rect: &GeoRect, skirt_height: f64) -> De
             skirt_height,
             &to_ecef,
             &local,
-            &mut positions,
-            &mut normals,
-            &mut indices,
+            &mut Vertices {
+                positions: &mut positions,
+                normals: &mut normals,
+                uvs: &mut uvs,
+                indices: &mut indices,
+            },
         );
     }
 
@@ -58,7 +62,9 @@ pub fn to_decoded(mesh: &QuantizedMesh, rect: &GeoRect, skirt_height: f64) -> De
         meshes: vec![DecodedMesh {
             positions,
             normals,
-            uvs: None, // imagery UVs are attached separately (core::raster)
+            // The mesh states its own tile coordinates, so they are used rather
+            // than recovered from the vertex positions. See `surface_uvs`.
+            uvs: Some(uvs),
             indices,
             material: MaterialDesc::default(),
         }],
@@ -71,10 +77,26 @@ pub fn to_decoded(mesh: &QuantizedMesh, rect: &GeoRect, skirt_height: f64) -> De
     }
 }
 
-/// Per-vertex normalized (u, v) for imagery draping: imagery UVs come from
-/// the tile rectangle, not from the mesh, so the raster layer can map any
-/// imagery tiling onto these. Returned parallel to the base vertices (skirt
-/// vertices reuse their source edge UV).
+/// Per-vertex position within the tile, which is what every imagery layer maps
+/// out of.
+///
+/// Taken straight from the quantized mesh, which already states it. The
+/// alternative — projecting each vertex back to a longitude and latitude and
+/// measuring it against the tile's rectangle — is slower, and wrong at the
+/// antimeridian: `ecef_to_geodetic` returns longitude in `(-180°, +180°]`, so on
+/// the easternmost column of tiles a vertex just past the cut comes back as
+/// -179.99° instead of +180.01°. Differencing that against a west edge of +179°
+/// gives a large negative number, which clamps to the *opposite* side of the
+/// texture. The result was a bright torn seam running pole to pole through the
+/// Pacific, where every east-edge vertex sampled the west edge's texels.
+///
+/// The reference implementation does the same thing for the same reason: it
+/// never recovers a vertex's tile coordinates from its position, because the
+/// format already carries them and a branch cut lies between the two.
+///
+/// `v` is flipped: the format counts it northward, texture space counts it down.
+/// Returned parallel to the base vertices; skirt vertices reuse their source
+/// edge's value.
 pub fn surface_uvs(mesh: &QuantizedMesh) -> Vec<[f32; 2]> {
     (0..mesh.vertex_count())
         .map(|i| [mesh.u[i] as f32, 1.0 - mesh.v[i] as f32])
@@ -85,27 +107,37 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 
+/// The vertex arrays under construction, so that adding a vertex is one act
+/// rather than four that have to be kept in step.
+struct Vertices<'a> {
+    positions: &'a mut Vec<[f32; 3]>,
+    normals: &'a mut Option<Vec<[f32; 3]>>,
+    uvs: &'a mut Vec<[f32; 2]>,
+    indices: &'a mut Vec<u32>,
+}
+
 /// Extrudes each edge vertex downward by `skirt_height` and stitches a
 /// vertical wall, mirroring cesium-native's `addSkirt`.
-#[allow(clippy::type_complexity)]
 fn append_skirts(
     mesh: &QuantizedMesh,
     skirt_height: f64,
     to_ecef: &dyn Fn(usize, f64) -> DVec3,
     local: &dyn Fn(DVec3) -> [f32; 3],
-    positions: &mut Vec<[f32; 3]>,
-    normals: &mut Option<Vec<[f32; 3]>>,
-    indices: &mut Vec<u32>,
+    out: &mut Vertices<'_>,
 ) {
     for edge in &mesh.edges {
         if edge.len() < 2 {
             continue;
         }
         // New skirt vertices: the edge vertices pushed down.
-        let base = positions.len() as u32;
+        let base = out.positions.len() as u32;
         for &vi in edge {
-            positions.push(local(to_ecef(vi as usize, -skirt_height)));
-            if let Some(ns) = normals.as_mut() {
+            out.positions
+                .push(local(to_ecef(vi as usize, -skirt_height)));
+            // A skirt vertex hangs directly below its edge vertex, so it stands
+            // at the same place in the tile and takes the same texture with it.
+            out.uvs.push(out.uvs[vi as usize]);
+            if let Some(ns) = out.normals.as_mut() {
                 // Reuse the surface normal at the edge vertex.
                 ns.push(ns[vi as usize]);
             }
@@ -116,7 +148,8 @@ fn append_skirts(
             let top1 = edge[seg + 1];
             let bot0 = base + seg as u32;
             let bot1 = base + seg as u32 + 1;
-            indices.extend_from_slice(&[top0, top1, bot0, bot0, top1, bot1]);
+            out.indices
+                .extend_from_slice(&[top0, top1, bot0, bot0, top1, bot1]);
         }
     }
 }
@@ -146,6 +179,63 @@ mod tests {
             edges: [vec![0, 2], vec![0, 1], vec![1, 3], vec![2, 3]],
             metadata_available: None,
         }
+    }
+
+    /// The antimeridian seam, as a unit test.
+    ///
+    /// The easternmost column of tiles ends exactly at the branch cut of
+    /// longitude. Recovering a vertex's tile coordinate from its position has to
+    /// difference two longitudes across that cut, and gets a full turn wrong;
+    /// reading the coordinate the mesh already states does not. This asserts
+    /// both halves — that the mesh's own u spans the tile, and that the
+    /// recovery would not have.
+    #[test]
+    fn the_easternmost_tile_is_not_torn_by_the_branch_cut() {
+        use tuile_core::raster::{uvs_geographic, GeoRect as RasterRect};
+
+        let scheme = GeographicTilingScheme::default();
+        // Level 3: x runs 0..16, so x = 15 is the column that ends at +180°.
+        let coord = TileCoord::new(3, 15, 4);
+        let rect = scheme.tile_rect(coord);
+        assert!(
+            (rect.east - std::f64::consts::PI).abs() < 1e-9,
+            "the fixture must sit against the cut, east is {}",
+            rect.east
+        );
+
+        let (clon, clat) = rect.center();
+        let centre = geodetic_to_ecef(Geodetic {
+            lon: clon,
+            lat: clat,
+            height: 0.0,
+        });
+        let decoded = to_decoded(&quad_mesh([centre.x, centre.y, centre.z]), &rect, 0.0);
+        let mesh = &decoded.meshes[0];
+        let uvs = mesh.uvs.as_ref().expect("the mesh carries its own uv");
+
+        // The fixture's four vertices sit at the tile's corners, so their u must
+        // be 0 on the west edge and 1 on the east — the whole tile, once.
+        let us: Vec<f32> = uvs.iter().map(|uv| uv[0]).collect();
+        assert_eq!(us, vec![0.0, 1.0, 0.0, 1.0], "the tile is torn");
+
+        // And the recovery this replaced collapses the east edge onto the west,
+        // which is exactly the bright seam it drew down the Pacific.
+        let recovered = uvs_geographic(
+            &mesh.positions,
+            decoded.local_origin_ecef,
+            &RasterRect {
+                west: rect.west,
+                south: rect.south,
+                east: rect.east,
+                north: rect.north,
+            },
+        );
+        let recovered_us: Vec<f32> = recovered.iter().map(|uv| uv[0]).collect();
+        assert_ne!(
+            recovered_us, us,
+            "the fixture no longer reproduces the tear, so it no longer guards \
+             against it"
+        );
     }
 
     #[test]

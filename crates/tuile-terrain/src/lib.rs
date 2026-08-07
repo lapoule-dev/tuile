@@ -26,6 +26,7 @@ pub mod mesh;
 pub mod source;
 pub mod tiling;
 pub mod tree;
+mod upsample;
 
 pub use availability::Availability;
 pub use decode::{decode, DecodeError, Header, QuantizedMesh};
@@ -35,3 +36,4 @@ pub use mesh::{surface_uvs, to_decoded};
 pub use source::{CachedTerrain, TerrainSource, TerrainSourceError};
 pub use tiling::{level_geometric_error, GeoRect, GeographicTilingScheme, TileCoord};
 pub use tree::TerrainTree;
+pub use upsample::upsample;
