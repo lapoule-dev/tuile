@@ -121,6 +121,15 @@ pub struct Config {
     pub maximum_screen_space_error: f64,
     /// REPLACE hold-until-ready: never show holes during refinement.
     pub forbid_holes: bool,
+    /// Whether to drop tiles no view can see. Off is a diagnostic, not a mode.
+    ///
+    /// A culled tile is reported *ready* so that it never holds up an ancestor's
+    /// REPLACE — which is right when it is genuinely invisible, and is a hole
+    /// punched clean through the globe when it is not: the ancestor is released
+    /// on the strength of a child that then draws nothing. Culling is therefore
+    /// the first thing to rule out when geometry goes missing, and ruling it out
+    /// by measurement rather than by reading the frustum test is worth a flag.
+    pub cull: bool,
     /// Soft cap on simultaneously loading descendants (reserved, M2 honours it).
     pub loading_descendant_limit: u32,
     /// Resident-content budget in bytes (CPU side). Default 512 MiB.
@@ -150,6 +159,7 @@ impl Default for Config {
         Self {
             maximum_screen_space_error: 16.0,
             forbid_holes: true,
+            cull: true,
             loading_descendant_limit: 20,
             resident_budget_bytes: 512 * 1024 * 1024,
             maximum_simultaneous_fetches: 20,
@@ -206,6 +216,14 @@ pub struct TraversalStats {
     pub selected: u32,
     pub requested: u32,
     pub max_depth: u32,
+    /// Empty leaves reached: ground the traversal decided to draw nothing on,
+    /// while releasing the ancestor that was covering it.
+    ///
+    /// Legitimate in a 3D Tiles set, where an empty leaf means there is nothing
+    /// there. Never legitimate over terrain, where every tile carries content —
+    /// so a count above zero on a globe is a hole, and this is what makes it
+    /// visible instead of silent.
+    pub gaps: u32,
 }
 
 /// Output buffers, reused across frames (no per-frame allocations once the
@@ -277,9 +295,10 @@ fn visit(
 
     // Frustum culling: a tile invisible in every view contributes nothing
     // and never blocks an ancestor's REPLACE.
-    if !views
-        .iter()
-        .any(|v| props.bounding_volume.intersects_frustum(v.frustum()))
+    if config.cull
+        && !views
+            .iter()
+            .any(|v| props.bounding_volume.intersects_frustum(v.frustum()))
     {
         out.stats.culled += 1;
         return true;
@@ -306,7 +325,29 @@ fn visit(
 
     if !refines {
         if !has_content {
-            // Leaf without content: nothing to show, nothing to wait for.
+            // A leaf with nothing in it and nowhere to descend. Reported ready,
+            // because in 3D Tiles an empty leaf genuinely means *there is
+            // nothing here* — a region with no buildings is not a region that
+            // failed to load.
+            //
+            // But the traversal cannot tell that apart from data that should
+            // have been there and was not, and the two look identical from
+            // here: both return ready, both draw nothing, and under REPLACE
+            // both release the ancestor that was covering that ground. The
+            // result is a hole with clean tile edges, and it is silent.
+            //
+            // So it is counted. A globe should never produce one — terrain
+            // tiles all carry content — and a count above zero over a terrain
+            // traversal means the tree is saying something it should not.
+            // Counted *and* named. The count is what a host can watch every
+            // frame without reading anything; the line is what says which
+            // ground, when someone is looking at a hole and wants to know.
+            out.stats.gaps += 1;
+            tracing::debug!(
+                ?id,
+                depth,
+                "empty leaf: nothing is drawn here, and the ancestor covering                  it is released"
+            );
             return true;
         }
         if residency.is_resident(id) {

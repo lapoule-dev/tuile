@@ -177,33 +177,53 @@ impl AerialPerspective {
 /// `∫ exp(-h/H) ds` between two endpoint heights over a given distance.
 ///
 /// Exact when height varies linearly along the path. Substituting
-/// `ds = dh · distance / Δh` turns the integral into one that closes:
+/// `ds = dh · distance / Δh` closes the integral, and the closed form is written
+/// here as
 ///
 /// ```text
-/// column = H · (e^(−h_low/H) − e^(−h_high/H)) · distance / Δh
+/// column = exp(-h_low/H) · (1 − e^(−x)) / x · distance,   x = Δh / H
 /// ```
 ///
-/// **Averaging the two endpoint densities and multiplying by distance is the
-/// obvious thing, and it is wrong.** It agrees with this only when the ends sit
-/// at similar heights — which is exactly the case both unit tests here happened
-/// to cover, so they passed while the viewer showed a featureless blue disc. A
-/// ray from twenty-three thousand kilometres spends all but a thousandth of its
-/// length in vacuum; averaging its ends charges half of it at ground density and
-/// returns an optical depth of six hundred instead of a quarter.
+/// rather than as the algebraically equal
+/// `H · (e^(−h_low/H) − e^(−h_high/H)) · distance / Δh`.
 ///
-/// This form tends instead to one vertical scale height's worth of air as the
-/// eye climbs, which is the right answer, and is why Earth from orbit is faintly
-/// blue rather than opaque.
+/// **The two are the same function and only one of them can be computed.** The
+/// second subtracts two exponentials that both approach 1 as the path levels
+/// out, then divides by the vanishing `Δh`. In f32 that is catastrophic: a ray
+/// from a few hundred metres up to ground two hundred kilometres away has the
+/// two terms agreeing to five digits, and the quotient multiplies whatever noise
+/// is left by `distance / Δh`. The optical depth ran away, transmittance went to
+/// zero, and terrain rendered **black** — appearing on zoom-in, as the eye
+/// descended toward the ground it was looking at, while the coarser tile above
+/// it stayed fine because it sat at a different height.
+///
+/// The first form has no subtraction of near-equal numbers in it. `(1 − e^(−x))
+/// / x` tends to 1 as `x → 0`, and for small `x` its series is used, so the
+/// level-path case is reached continuously instead of by a branch that would
+/// show as a seam.
+///
+/// **Averaging the endpoint densities**, incidentally, is a third form and is
+/// simply wrong: it agrees only when the ends are at similar heights. From orbit
+/// it charges half a ray's length at ground density and renders the planet as a
+/// featureless blue disc, which is how *that* one was found.
 fn air_column(height_a: f64, height_b: f64, distance: f64, scale_height: f64) -> f64 {
     let low = height_a.min(height_b).max(0.0);
     let high = height_a.max(height_b).max(0.0);
-    let rise = high - low;
-    // A level path has a constant density and no substitution to make — and
-    // would divide by zero if one were attempted.
-    if rise < scale_height * 1e-6 {
-        return (-low / scale_height).exp() * distance;
+    let x = (high - low) / scale_height;
+    (-low / scale_height).exp() * falling_mean(x) * distance
+}
+
+/// `(1 − e^(−x)) / x`, the mean of `e^(−t)` over `t ∈ [0, x]`.
+///
+/// One at `x = 0`, and the series is used near there because the closed form is
+/// `0 / 0` and, just before that, a subtraction of two numbers that agree.
+fn falling_mean(x: f64) -> f64 {
+    if x < 1.0e-4 {
+        // 1 − x/2 + x²/6, which is exact to well past f64's precision here.
+        1.0 - x * 0.5 + x * x / 6.0
+    } else {
+        (1.0 - (-x).exp()) / x
     }
-    scale_height * ((-low / scale_height).exp() - (-high / scale_height).exp()) * (distance / rise)
 }
 
 #[cfg(test)]

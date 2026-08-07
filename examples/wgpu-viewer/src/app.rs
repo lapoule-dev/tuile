@@ -85,6 +85,8 @@ pub struct App {
     /// platforms — see [`App::render`].
     occluded: bool,
     last_log: std::time::Instant,
+    /// Heading of the rendered camera on the previous frame, for the turn watch.
+    last_heading: Option<f64>,
     /// Running totals, reported once per second and again on the way out.
     /// Rates matter more than levels here: content that keeps *arriving* long
     /// after the view settled means tiles are being evicted and reloaded, which
@@ -147,6 +149,7 @@ impl App {
             nav: NavWidget::new(),
             occluded: false,
             last_log: std::time::Instant::now(),
+            last_heading: None,
             stats: Stats {
                 started: Some(std::time::Instant::now()),
                 ..Stats::default()
@@ -157,6 +160,38 @@ impl App {
     /// A one-line summary of the session, for the exit log.
     pub fn report(&self) -> String {
         self.stats.to_string()
+    }
+
+    /// Watches the *rendered* camera between frames and reports any sudden turn.
+    ///
+    /// The per-wheel log measures the target, and the target is provably steady:
+    /// its heading did not move by a hundredth of a degree over thirteen hundred
+    /// wheel events. So whatever turns, turns somewhere else — either in the
+    /// eased camera the target feeds, or not in the camera at all. This is the
+    /// instrument that tells those apart, and it costs nothing until it fires.
+    fn watch_for_a_sudden_turn(&mut self) {
+        /// A frame-to-frame turn no easing should ever produce.
+        const SUDDEN_DEGREES: f64 = 2.0;
+        let now = self.controller.camera;
+        let heading = now.heading().to_degrees();
+        if let Some(was) = self.last_heading {
+            let turn = {
+                let d = (heading - was).abs();
+                d.min(360.0 - d)
+            };
+            if turn > SUDDEN_DEGREES {
+                let g = tuile_core::geo::ecef_to_geodetic(now.position);
+                tracing::warn!(
+                    "SUDDEN TURN {turn:.1} deg in one frame | heading {was:.2} -> \
+                     {heading:.2} | pitch {:.2} | alt {:.0} m | pos {:.5},{:.5}",
+                    now.pitch().to_degrees(),
+                    g.height,
+                    g.lat.to_degrees(),
+                    g.lon.to_degrees(),
+                );
+            }
+        }
+        self.last_heading = Some(heading);
     }
 
     fn viewport(&self) -> (f64, f64) {
@@ -293,7 +328,45 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
                     MouseScrollDelta::PixelDelta(p) => p.y / 50.0,
                 };
+                // Instrumented on request: a view that turns under a zoom has
+                // survived two rounds of tests that reproduce the gesture and
+                // pass, so the gesture being reproduced is evidently not the one
+                // being made. Log the input and the camera, per wheel event, and
+                // read it rather than reason about it.
+                let before = *self.controller.target();
+                let picked = self.controller.pick(self.cursor, self.viewport());
                 self.controller.zoom(amount, self.cursor, self.viewport());
+                let after = *self.controller.target();
+                let turn = {
+                    let d = (after.heading() - before.heading()).abs();
+                    d.min(std::f64::consts::TAU - d).to_degrees()
+                };
+                let at = |c: &tuile_camera::GlobeCamera| {
+                    let g = tuile_core::geo::ecef_to_geodetic(c.position);
+                    (g.lat.to_degrees(), g.lon.to_degrees(), g.height)
+                };
+                let (lat0, lon0, alt0) = at(&before);
+                let (lat1, lon1, alt1) = at(&after);
+                tracing::info!(
+                    "WHEEL {amount:+.2} at cursor {:.0},{:.0} of {:?} | picked {} | \
+                     alt {alt0:.0} -> {alt1:.0} m | pos {lat0:.5},{lon0:.5} -> \
+                     {lat1:.5},{lon1:.5} | heading {:.2} -> {:.2} (TURN {turn:.2} deg) | \
+                     pitch {:.2} -> {:.2}",
+                    self.cursor.0,
+                    self.cursor.1,
+                    self.viewport(),
+                    match picked {
+                        Some(p) => {
+                            let g = tuile_core::geo::ecef_to_geodetic(p);
+                            format!("{:.5},{:.5}", g.lat.to_degrees(), g.lon.to_degrees())
+                        }
+                        None => "NOTHING — fell back to the point below the eye".to_owned(),
+                    },
+                    before.heading().to_degrees(),
+                    after.heading().to_degrees(),
+                    before.pitch().to_degrees(),
+                    after.pitch().to_degrees(),
+                );
             }
             // The display slept, the window was minimized or another window
             // covers it. Rendering anyway leaks GPU memory on Apple platforms
@@ -344,6 +417,7 @@ impl App {
         }
         // Ease the camera toward the gesture target (smooth motion).
         self.controller.update(0.3);
+        self.watch_for_a_sudden_turn();
         let cam = self.controller.camera;
         let Some(active) = self.active.as_mut() else {
             return;
@@ -509,8 +583,9 @@ impl App {
                 active.gpu.imagery.lock().expect("imagery textures").live();
             tracing::info!(
                 "alt {:.0} km | ground {:.0} m | selected {} | rendered {} | prepared {} | \
-                 missing {} | visited {} culled {} requested {} depth {} | \
+                 missing {} | visited {} culled {} gaps {} requested {} depth {} | \
                  {:.0} MiB geometry + {:.0} MiB imagery over {} textures | \
+                 air {} strength {:.2} sun {:.1} deg up | \
                  +{} uploads -{} evictions",
                 cam.altitude() / 1000.0,
                 self.controller.height_above_ground(),
@@ -520,6 +595,10 @@ impl App {
                 active.pump.missing(),
                 s.visited,
                 s.culled,
+                // Ground the traversal drew nothing on while releasing whatever
+                // was covering it. Over terrain this should always be zero; a
+                // non-zero count is a hole, before anyone has to spot one.
+                s.gaps,
                 s.requested,
                 s.max_depth,
                 active.pump.gpu_bytes as f32 / (1024.0 * 1024.0),
@@ -530,6 +609,21 @@ impl App {
                 // globe holding hundreds.
                 imagery_bytes as f32 / (1024.0 * 1024.0),
                 imagery_textures,
+                if self.nav.atmosphere_enabled() {
+                    "ON"
+                } else {
+                    "off"
+                },
+                if self.nav.atmosphere_enabled() {
+                    ATMOSPHERE_STRENGTH
+                } else {
+                    0.0
+                },
+                // How high the sun stands over the ground under the eye. The
+                // in-scattered haze is proportional to it, so a sun below the
+                // horizon means the air adds no colour however thick it is —
+                // which looks exactly like an atmosphere that was never wired up.
+                self.sun.elevation_at(cam.position).to_degrees(),
                 self.stats.uploads,
                 self.stats.evictions,
             );
