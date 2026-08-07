@@ -176,30 +176,34 @@ const MIN_EXTINCTION: f32 = 1e-12;
 /// costs an instruction and a NaN costs the frame.
 const MIN_PHASE_DENOM: f32 = 1e-4;
 
-/// Below this fraction of a scale height of climb, a path counts as level — the
-/// substitution in `air_column` would otherwise divide by its own rise.
-const LEVEL_PATH_RISE: f32 = 1e-6;
+/// Below this, `(1 - e^-x) / x` is taken from its series instead of its closed
+/// form — the closed form is 0/0 at zero and, just before that, a subtraction of
+/// two numbers that agree to every digit f32 has.
+const SMALL_RISE: f32 = 1e-3;
 
-/// How much air a ray actually crosses, as a sea-level-equivalent length:
-/// `∫ exp(-h/H) ds` between two endpoint heights over a distance.
+/// `(1 - e^-x) / x`, the mean of `e^-t` over `t` in `[0, x]`. One at `x = 0`.
+fn falling_mean(x: f32) -> f32 {
+    if (x < SMALL_RISE) {
+        return 1.0 - x * 0.5 + x * x / 6.0;
+    }
+    return (1.0 - exp(-x)) / x;
+}
+
+/// How much air a ray actually crosses, as a sea-level-equivalent length.
 ///
 /// Mirrors `tuile_atmosphere::aerial::air_column`, where the derivation and the
-/// tests live. Exact when height varies linearly along the path — substituting
-/// `ds = dh · distance / Δh` closes the integral.
-///
-/// Averaging the two endpoint densities instead is the obvious thing and it is
-/// wrong: it only agrees when the ends sit at similar heights. From orbit it
-/// charges half a ray's length at ground density and renders the planet as a
-/// featureless blue disc.
+/// tests live. Written as `exp(-h_low/H) * (1 - e^-x) / x * distance` rather
+/// than the algebraically equal `H * (e^-lo - e^-hi) * distance / rise`, because
+/// only the first can be computed in f32: the second subtracts two exponentials
+/// that both approach 1 as the path levels out, then divides by the vanishing
+/// rise. That ran the optical depth away, drove transmittance to zero, and
+/// rendered terrain black — appearing as the eye descended toward the ground it
+/// was looking at, while the coarser tile above stayed fine at its own height.
 fn air_column(height_a: f32, height_b: f32, distance: f32, scale_height: f32) -> f32 {
     let low = max(min(height_a, height_b), 0.0);
     let high = max(max(height_a, height_b), 0.0);
-    let rise = high - low;
-    if (rise < scale_height * LEVEL_PATH_RISE) {
-        return exp(-low / scale_height) * distance;
-    }
-    return scale_height * (exp(-low / scale_height) - exp(-high / scale_height))
-        * (distance / rise);
+    let x = (high - low) / scale_height;
+    return exp(-low / scale_height) * falling_mean(x) * distance;
 }
 
 fn aerial_perspective(lit: vec3f, world: vec3f) -> vec3f {

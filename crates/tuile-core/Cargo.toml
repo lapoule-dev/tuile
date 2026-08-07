@@ -22,7 +22,14 @@ image = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true, optional = true }
+# A facade, not a backend: with no subscriber installed the macros compile
+# down to a check the optimiser removes, and it is wasm-clean. The rule this
+# crate lives under is about wgpu, tokio and axum — about anything that would
+# decide a consumer's runtime for it — not about being able to say what
+# happened. Not optional: a log line that disappears depending on how the
+# crate was built is worse than no log line, and the flag bought nothing —
+# it was declared and never used.
+tracing = { workspace = true }
 tuile-b3dm = { version = "0.0.1", path = "../tuile-b3dm" }
 url = { workspace = true }
 
@@ -36,4 +43,3 @@ tempfile = { workspace = true }
 [features]
 default = []
 http = ["dep:reqwest"]
-tracing = ["dep:tracing"]
