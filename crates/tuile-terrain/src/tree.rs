@@ -20,8 +20,20 @@ use tuile_core::math::BoundingVolume;
 use tuile_core::source::{TileId, TileProperties, TileTree};
 use tuile_core::tileset::Refine;
 
-/// A backstop for a source that declares nothing, so a degenerate view cannot
-/// divide without end. Never reached in practice: refinement stops at the data.
+/// How far past its data the quadtree keeps dividing.
+///
+/// Where division stops when nobody says otherwise.
+///
+/// A backstop, not a policy. The policy belongs to whoever composes the scene:
+/// dividing past the terrain's data is only worth doing while the *imagery* can
+/// still get sharper on the smaller tiles it produces, so the bound is the
+/// imagery's own maximum level, and `tuile-planetary` sets it from the provider
+/// it was handed. See [`TerrainTree::with_max_level`].
+///
+/// It has to be bounded by something, because screen-space error will not do it:
+/// an upsampled tile's error keeps halving with the level while its surface,
+/// being its parent's, gets no more accurate at all. Unbounded, an SSE of 2
+/// reached level 22.
 const ABSOLUTE_MAX_LEVEL: u32 = 22;
 
 /// A terrain quadtree as a [`TileTree`].
@@ -162,35 +174,25 @@ impl TileTree for TerrainTree {
             return Vec::new();
         }
 
-        // Refine only while there is data to refine *into*, and then into all
-        // four children whether they have data or not.
+        // All four children, always. Availability decides whether a tile has
+        // *data*, never whether it exists — and division carries on past the
+        // data, bounded by `max_level`.
         //
-        // Both halves matter and each was wrong on its own:
+        // Handing back only the children with data was the earlier answer and it
+        // punched black strips through the globe: refinement is REPLACE, so
+        // those took over and released their parent, leaving the quadrants
+        // without a child drawn by nothing at all. A source of this kind is a
+        // mosaic whose coverage stops mid-tile — twenty-seven such tiles in one
+        // session over Kamchatka, one with a single available child, right where
+        // two boundaries crossed.
         //
-        // - Handing back only the children with data punched black strips
-        //   through the globe. Refinement is REPLACE, so those took over and
-        //   released their parent, leaving the quadrants without a child drawn
-        //   by nothing at all. A source of this kind is a mosaic whose coverage
-        //   stops mid-tile — twenty-seven such tiles in one session over
-        //   Kamchatka, one of them with a single available child, right where
-        //   two boundaries crossed.
+        // Stopping at the data was the other answer, and it costs the sharpest
+        // imagery: the tiles stay large, and a large tile can only carry imagery
+        // a couple of levels finer than itself however much finer the source
+        // goes. The reference implementation stops there and recovers the detail
+        // by binding *more layers per tile* and drawing it in several passes;
+        // until that exists here, dividing is what gets the ground sharp.
         //
-        // - Refining regardless, on the theory that smaller tiles are what let
-        //   imagery be sharper than terrain, divided to level twenty-two over
-        //   ground whose data ended at twelve. That is sixty-five thousand times
-        //   the tiles for a surface no more accurate, because an upsampled tile
-        //   has its ancestor's shape and only its ancestor's shape. The server
-        //   drowned and the view stopped following the camera.
-        //
-        // The reference implementation's rule is the one that holds: it refuses
-        // to refine when all four children would be pure upsamples — "no point
-        // in rendering the children because they're all upsampled" — and gets
-        // sharp imagery on coarse terrain a different way entirely, by putting
-        // *more imagery layers* on one tile and drawing it in several passes
-        // when they outrun the texture units. Tile size is not the lever.
-        if !c.children().iter().any(|child| self.available(*child)) {
-            return Vec::new();
-        }
 
         //
         // Filtering by availability was the earlier answer and it punched holes
@@ -294,26 +296,35 @@ mod tests {
         }
     }
 
-    /// Refinement stops where the data does, and not one level further.
+    /// Division carries on past the data, and stops where it is told to.
     ///
-    /// Dividing past the data was tried and it is a trap: an upsampled tile has
-    /// its ancestor's surface and only that, so every extra level multiplies the
-    /// tile count by four for a shape no more accurate. At an SSE of 2 it
-    /// reached level twenty-two over ground whose data ended at twelve. The
-    /// reference implementation refuses at exactly this line — it will not
-    /// refine a tile whose four children would all be upsamples.
+    /// Past the data a tile is built from its parent's surface, which is what
+    /// keeps a coverage boundary from punching holes — the children a boundary
+    /// leaves without data still exist and are still drawn.
+    ///
+    /// Where it stops is not this crate's call. Dividing past the terrain is
+    /// only worth doing while the *imagery* draped on the smaller tiles can
+    /// still get sharper, so the bound is the imagery's maximum and
+    /// `tuile-planetary` sets it from the provider it was handed. Picking a
+    /// number here instead is how the ground once stopped sharpening several
+    /// levels short of what the photography actually had.
     #[test]
-    fn refinement_stops_where_the_data_stops() {
-        let tree = TerrainTree::new(cwt_layer());
-
-        // Inside the data: divides.
-        assert_eq!(tree.children(TileId::from_terrain(3, 4, 2)).len(), 4);
-
-        // The fixture's data ends at level 4, so a level-4 tile has no child
-        // with anything in it, and dividing it would buy nothing.
+    fn division_runs_past_the_data_and_stops_where_it_is_told() {
+        // The fixture declares data to level 4.
+        let tree = TerrainTree::new(cwt_layer()).with_max_level(9);
+        assert_eq!(
+            tree.children(TileId::from_terrain(4, 20, 12)).len(),
+            4,
+            "the deepest tile with data divides"
+        );
+        assert_eq!(
+            tree.children(TileId::from_terrain(8, 320, 192)).len(),
+            4,
+            "four levels past the data, still dividing"
+        );
         assert!(
-            tree.children(TileId::from_terrain(4, 8, 4)).is_empty(),
-            "nothing divides past the data"
+            tree.children(TileId::from_terrain(9, 640, 384)).is_empty(),
+            "and it stops at the level it was given"
         );
     }
 

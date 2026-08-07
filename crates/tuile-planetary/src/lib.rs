@@ -83,6 +83,49 @@ impl ImageryDetail {
     }
 }
 
+/// A small FIFO memo of decoded terrain meshes.
+///
+/// It exists for the upsample chain. A tile past the source's data is built from
+/// its **immediate parent's** mesh, one level at a time — which is what the
+/// reference implementation does, and the only affordable way: rebuilding each
+/// descendant from a distant ancestor re-clips that ancestor's whole mesh once
+/// per tile, which is quadratic in the gap and pinned a core at a hundred
+/// percent over ten levels.
+///
+/// With each rung remembered, a chain is walked once and a tile's siblings find
+/// their shared parent already built. Without this, "start from the real data
+/// and come back down" is exactly the quadratic thing again.
+struct MeshCache {
+    map: HashMap<TileCoord, Arc<tuile_terrain::QuantizedMesh>>,
+    order: VecDeque<TileCoord>,
+    cap: usize,
+}
+
+impl MeshCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn get(&self, c: TileCoord) -> Option<Arc<tuile_terrain::QuantizedMesh>> {
+        self.map.get(&c).map(Arc::clone)
+    }
+
+    fn put(&mut self, c: TileCoord, mesh: Arc<tuile_terrain::QuantizedMesh>) {
+        if self.map.insert(c, mesh).is_none() {
+            self.order.push_back(c);
+            while self.order.len() > self.cap {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
+    }
+}
+
 /// A small FIFO cache of decoded, reprojected imagery tiles, so the many
 /// terrain tiles that share one imagery tile neither re-decode nor re-resample
 /// it. (The network cache — disk, in-memory — belongs to the injected provider.)
@@ -143,6 +186,8 @@ pub struct PlanetaryLoader<T: TerrainSource, I: ImageryProvider> {
     scheme: GeographicTilingScheme,
     opts: GlobeOptions,
     cache: Mutex<ImageryCache>,
+    /// Decoded terrain meshes, so an upsample chain is walked once.
+    meshes: Mutex<MeshCache>,
     /// Shared with the tree: each terrain tile's `metadata` extension reveals
     /// the availability of its descendants, folded in here so traversal can
     /// keep refining toward the finest LOD.
@@ -229,87 +274,122 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         }
     }
 
-    /// The mesh for a tile, built from an ancestor's when the source has none of
+    /// The mesh for a tile, built from its parent's when the source has none of
     /// its own.
     ///
-    /// The quadtree divides past the data on purpose — a mosaic's coverage
-    /// boundaries would otherwise punch holes, and imagery reaches far finer
-    /// than terrain and needs something small enough to be drawn on. So a miss
-    /// here is ordinary, not a failure: walk up to the nearest tile that does
-    /// exist and clip its surface to this one's ground.
+    /// One level at a time, always, and every rung remembered. That is the whole
+    /// design and both halves earn their place:
     ///
-    /// No new detail is invented. The tile has the ancestor's shape described by
-    /// fewer triangles per unit of ground, which is the honest answer: the mesh
-    /// stops improving where the data stops while the imagery on it keeps
-    /// sharpening.
-    async fn terrain_mesh(
-        &self,
+    /// - **From the parent**, because the parent's mesh already covers only the
+    ///   parent's ground. Rebuilding a deep tile from a distant ancestor re-clips
+    ///   that ancestor's entire mesh once per descendant, which is quadratic in
+    ///   the gap; ten levels of it pinned a core at a hundred percent and stopped
+    ///   the traversal getting a turn at all.
+    /// - **Remembered**, because a tile's three siblings share its parent, and
+    ///   its own children will share it in turn. Without the memo, walking down
+    ///   from the real data is the quadratic thing wearing a different hat.
+    ///
+    /// The reference implementation does exactly this: `upsample` there reads
+    /// `parent.data.terrainData` and waits if the parent is not ready yet.
+    ///
+    /// No new detail is invented. The tile has its ancestor's shape described by
+    /// fewer triangles per unit of ground — the mesh stops improving where the
+    /// data stops, while the imagery draped on it keeps sharpening.
+    fn terrain_mesh<'a>(
+        &'a self,
         coord: TileCoord,
-    ) -> Result<tuile_terrain::QuantizedMesh, LoadError> {
-        // Jump straight to the deepest tile the source actually has, rather than
-        // discovering it by asking for ones it does not.
-        //
-        // Refinement now runs past the data, so most deep tiles have none —
-        // that is the point. Probing for them costs a round trip each, and
-        // walking up a level at a time turned one tile into as many as twenty-two
-        // sequential failing requests. Thousands of tiles doing that drowned the
-        // server: the traversal stopped getting a turn, the selection froze, and
-        // the view stopped following the camera at all.
-        //
-        // Availability is already here, shared with the tree, and it answers
-        // this exactly. The probe below stays as the fallback for a source that
-        // declares nothing.
-        let mut source = coord;
-        if self.availability.range_count() > 0 {
-            while source.level > 0 && !self.availability.is_available(source) {
-                source = TileCoord::new(source.level - 1, source.x / 2, source.y / 2);
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Arc<tuile_terrain::QuantizedMesh>, LoadError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if let Some(mesh) = self.meshes.lock().expect("mesh cache").get(coord) {
+                return Ok(mesh);
             }
-        }
-        loop {
-            match self.terrain.fetch_tile(source).await {
-                Ok(fetched) => {
-                    tracing::debug!(
-                        z = source.level,
-                        x = source.x,
-                        y = source.y,
-                        kib = fetched.value.len() / 1024,
-                        "terrain tile"
-                    );
-                    let mesh =
-                        decode(&fetched.value).map_err(|e| LoadError::Failed(e.to_string()))?;
-                    // Decoding is also what reveals which descendants exist — the
-                    // source may have served these bytes from a cache, but the
-                    // ranges still reach the shared availability, so refinement
-                    // never stalls at a cached level.
-                    self.reveal(source, mesh.metadata_available.as_deref());
-                    if source == coord {
-                        return Ok(mesh);
+
+            // Whether the source has this tile at all. Asking the network to find
+            // out costs a round trip per level and, over ground the source does
+            // not reach, drowned the server in failures; availability is already
+            // here and answers without one.
+            let known = self.availability.range_count() > 0;
+            let has_data = !known || self.availability.is_available(coord);
+
+            let mesh = if has_data {
+                match self.terrain.fetch_tile(coord).await {
+                    Ok(fetched) => {
+                        tracing::debug!(
+                            z = coord.level,
+                            x = coord.x,
+                            y = coord.y,
+                            kib = fetched.value.len() / 1024,
+                            "terrain tile"
+                        );
+                        let decoded =
+                            decode(&fetched.value).map_err(|e| LoadError::Failed(e.to_string()))?;
+                        // Decoding is also what reveals which descendants exist —
+                        // the source may have served these bytes from a cache, but
+                        // the ranges still reach the shared availability, so
+                        // refinement never stalls at a cached level.
+                        self.reveal(coord, decoded.metadata_available.as_deref());
+                        Some(Arc::new(decoded))
                     }
+                    // Availability said yes and the source disagreed. Fall through
+                    // and build it from the parent rather than fail the tile.
+                    Err(e) if coord.level > 0 => {
+                        tracing::debug!(
+                            z = coord.level,
+                            x = coord.x,
+                            y = coord.y,
+                            "terrain absent though available: {e}"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        return Err(LoadError::Failed(format!(
+                            "terrain {}/{}/{}: {e}",
+                            coord.level, coord.x, coord.y
+                        )))
+                    }
+                }
+            } else {
+                None
+            };
+
+            let mesh = match mesh {
+                Some(mesh) => mesh,
+                None => {
+                    if coord.level == 0 {
+                        return Err(LoadError::Failed(
+                            "terrain 0/0/0 is missing and has no parent to stand on".into(),
+                        ));
+                    }
+                    let parent = TileCoord::new(coord.level - 1, coord.x / 2, coord.y / 2);
+                    let from = self.terrain_mesh(parent).await?;
+                    let built = tuile_terrain::upsample(&from, parent, coord).ok_or_else(|| {
+                        LoadError::Failed(format!(
+                            "terrain {}/{}/{}: nothing of its parent covers it",
+                            coord.level, coord.x, coord.y
+                        ))
+                    })?;
                     tracing::debug!(
                         z = coord.level,
                         x = coord.x,
                         y = coord.y,
-                        from = source.level,
-                        "terrain upsampled from an ancestor"
+                        "terrain upsampled from its parent"
                     );
-                    return tuile_terrain::upsample(&mesh, source, coord).ok_or_else(|| {
-                        LoadError::Failed(format!(
-                            "terrain {}/{}/{}: nothing of {}/{}/{} covers it",
-                            coord.level, coord.x, coord.y, source.level, source.x, source.y
-                        ))
-                    });
+                    Arc::new(built)
                 }
-                Err(_) if source.level > 0 => {
-                    source = TileCoord::new(source.level - 1, source.x / 2, source.y / 2);
-                }
-                Err(e) => {
-                    return Err(LoadError::Failed(format!(
-                        "terrain {}/{}/{}: {e}",
-                        coord.level, coord.x, coord.y
-                    )))
-                }
-            }
-        }
+            };
+
+            self.meshes
+                .lock()
+                .expect("mesh cache")
+                .put(coord, Arc::clone(&mesh));
+            Ok(mesh)
+        })
     }
 
     async fn drape(
@@ -453,10 +533,23 @@ where
         scheme.root_tiles_x,
         scheme.root_tiles_y,
     ));
-    let tree: Box<dyn TileTree> = Box::new(TerrainTree::with_availability(
-        layer,
-        Arc::clone(&availability),
-    ));
+    // Divide the terrain as deep as the *imagery* can still be sharp on it, and
+    // no deeper.
+    //
+    // The two are not independent: a tile carries imagery about a level or two
+    // finer than its own match, so the only way to show the sharpest photography
+    // a provider has is for the tiles under it to be smaller than the terrain
+    // data goes. Past the imagery's own maximum, dividing buys smaller tiles and
+    // identical pictures.
+    //
+    // This belongs here rather than in the tree because it is the one place that
+    // holds both: the tree knows nothing about imagery, and the imagery provider
+    // knows nothing about the quadtree it drapes.
+    let deepest_useful = imagery.tiling_scheme().maximum_level;
+    let tree: Box<dyn TileTree> = Box::new(
+        TerrainTree::with_availability(layer, Arc::clone(&availability))
+            .with_max_level(deepest_useful),
+    );
     let detail = ImageryDetail::default();
     let heights = Arc::new(TerrainHeights::new(scheme));
     let loader: Arc<dyn TileLoader> = Arc::new(PlanetaryLoader {
@@ -465,6 +558,7 @@ where
         scheme,
         opts,
         cache: Mutex::new(ImageryCache::new(512)),
+        meshes: Mutex::new(MeshCache::new(512)),
         availability,
         detail: detail.clone(),
         heights: Arc::clone(&heights),
