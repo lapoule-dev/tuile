@@ -263,6 +263,10 @@ impl Session<'_> {
         tx: &UnboundedSender<ServerMessage>,
         loads: &mut FuturesUnordered<LoadFuture>,
     ) -> Result<(), Gone> {
+        // Whether this pass was provoked by the camera or by a tile arriving.
+        // It decides whether in-flight loads may be cancelled below, and it has
+        // to be read before `remember_protected` consumes it.
+        let camera_moved = *self.view_moved;
         *self.frame += 1;
         traverse(
             self.tree,
@@ -342,17 +346,34 @@ impl Session<'_> {
         })
         .map_err(|_| Gone)?;
 
-        // Cancel in-flight loads that fell out of the request set.
-        let wanted: HashSet<TileId> = self.out.requests.iter().map(|r| r.tile).collect();
-        let stale: Vec<TileId> = self
-            .in_flight
-            .keys()
-            .filter(|t| !wanted.contains(t))
-            .copied()
-            .collect();
-        for t in stale {
-            if let Some(handle) = self.in_flight.remove(&t) {
-                handle.abort();
+        // Cancel in-flight loads the camera has moved away from — and only
+        // then.
+        //
+        // A traversal runs on **every load completion**, not only on a camera
+        // move, and cancelling on all of them livelocks. One tile arrives, the
+        // pass re-runs, `forbid_holes` rolls back a different branch, other
+        // tiles fall out of the request set and are killed; the next pass asks
+        // for them again, they are spawned again, and the pass after that kills
+        // them again. Nothing ever finishes. The symptom is a request count
+        // frozen at some number, a selection that stops following the camera,
+        // and — the part that cost the most time — *no log output at all*, since
+        // every load dies before it can say anything.
+        //
+        // A load provoked by a tile arriving is still wanted; the pass simply
+        // reordered what it needs first. Only a camera move can make one
+        // pointless, and even then finishing is often cheaper than restarting.
+        if camera_moved {
+            let wanted: HashSet<TileId> = self.out.requests.iter().map(|r| r.tile).collect();
+            let stale: Vec<TileId> = self
+                .in_flight
+                .keys()
+                .filter(|t| !wanted.contains(t))
+                .copied()
+                .collect();
+            for t in stale {
+                if let Some(handle) = self.in_flight.remove(&t) {
+                    handle.abort();
+                }
             }
         }
 
