@@ -132,6 +132,25 @@ impl GlobeCamera {
         self.direction.cross(self.up).normalize()
     }
 
+    /// The camera's orientation as a rotation.
+    ///
+    /// Exists so easing can interpolate the basis as one thing. Lerping
+    /// `direction` and `up` separately and normalising each does not keep them
+    /// perpendicular — the basis skews a little every frame — and the repair for
+    /// that skew is what turned the view. Slerping a rotation cannot skew.
+    pub fn orientation(&self) -> glam::DQuat {
+        let right = self.direction.cross(self.up).normalize_or(DVec3::X);
+        let up = right.cross(self.direction).normalize_or(self.up);
+        glam::DQuat::from_mat3(&glam::DMat3::from_cols(right, up, -self.direction))
+    }
+
+    /// Sets the basis from a rotation, the inverse of [`Self::orientation`].
+    pub fn set_orientation(&mut self, q: glam::DQuat) {
+        let m = glam::DMat3::from_quat(q);
+        self.direction = -m.col(2);
+        self.up = m.col(1);
+    }
+
     /// Undoes any twist a move of the eye introduced, restoring a heading the
     /// caller read before moving.
     ///
@@ -189,48 +208,29 @@ impl GlobeCamera {
     ///   normalising each does not preserve their perpendicularity, so the
     ///   basis skews a little on every eased frame and never recovers.
     ///
-    /// # Near the nadir it must not level at all
+    /// # At the nadir there is nothing to level
     ///
     /// Looking straight down, the view direction is parallel to the vertical and
-    /// roll about it is *undefined* — there is no horizon to level. What matters
-    /// is that it is undefined **continuously**: a degree off the nadir, the
-    /// direction of `direction × up` is decided by a component of size `sin(1°)`,
-    /// and moving the eye a few metres swings it right round.
+    /// roll about it is undefined, so the cross product below vanishes and this
+    /// leaves the basis alone.
     ///
-    /// Guarding on the bare length against an epsilon is therefore not enough,
-    /// and getting that wrong is not subtle. It shipped as a globe that spun on
-    /// its own axis while zooming, faster the closer the camera came — because
-    /// the viewer starts at the nadir (pitch `π/2`), every zoom moved the eye,
-    /// the local vertical moved with it, and this re-derived a wildly different
-    /// heading each frame.
-    ///
-    /// So the dead zone is an *angle*, wide enough that the cross product is
-    /// well conditioned inside it, and levelling fades in across a second angle
-    /// rather than switching on — a switch would snap the horizon the moment the
-    /// camera tipped past it.
+    /// It once carried a dead zone and a fade around that point, to stop a
+    /// near-degenerate cross product from swinging the view. That was the wrong
+    /// repair and it was worse than the disease: blending between the current
+    /// `up` and the levelled one *is itself a rotation*, and the fade band sat
+    /// at three to nine degrees off the nadir — exactly where the pitch drifts
+    /// as a zoom walks the eye. Crossing it turned the map. What the guard was
+    /// really protecting against was an unpinned heading, and
+    /// [`hold_heading`](Self::hold_heading) pins it now, at the nadir included.
     pub fn level(&mut self) {
-        /// Below this angle from the vertical, roll is not levelled at all.
-        const NADIR_DEAD_ZONE: f64 = 0.05; // ≈ 3°
-        /// And levelling reaches full strength this much further out.
-        const NADIR_FADE: f64 = 0.10; // ≈ 6°
-
-        // Orthogonality is a separate concern from roll, it is what easing
-        // actually breaks, and re-deriving it is unconditionally well behaved.
-        // So it happens whatever the pitch.
-        let along = self.direction * self.up.dot(self.direction);
-        let orthogonal = (self.up - along).normalize_or(self.up);
-
         let right = self.direction.cross(self.up_axis());
-        let sin_from_vertical = right.length();
-        if sin_from_vertical <= NADIR_DEAD_ZONE {
-            self.up = orthogonal;
+        if right.length_squared() < 1e-12 {
             return;
         }
-        let levelled = (right / sin_from_vertical)
+        self.up = right
+            .normalize()
             .cross(self.direction)
-            .normalize_or(orthogonal);
-        let fade = ((sin_from_vertical - NADIR_DEAD_ZONE) / NADIR_FADE).clamp(0.0, 1.0);
-        self.up = orthogonal.lerp(levelled, fade).normalize_or(levelled);
+            .normalize_or(self.up);
     }
 
     /// Geodetic height of the eye above the ellipsoid (meters).
@@ -523,6 +523,20 @@ impl CameraController {
         // Always allow zooming out; zooming in stops at the floor rather than
         // being refused, so the gesture still travels as far as it legally can
         // instead of dying the moment the next step would clip.
+        // A zoom is meant to change how far away the ground is, and only
+        // incidentally which ground. Toward an off-centre cursor it does both,
+        // and at altitude the second overwhelms the first: from 40 000 km the
+        // picked point is most of a hemisphere away, so one wheel step moved the
+        // eye 360 km sideways against 145 km of descent. Repeat that and the
+        // camera crosses the Pacific — which is not felt as travel, because the
+        // compass bearing swings as the local frame turns underneath, and what
+        // it looks like is the map spinning. It was reported as exactly that.
+        //
+        // So the sideways part is capped against the part that is doing the
+        // actual zooming. Near the ground the ratio sits around a fifth and
+        // nothing is touched, which is the point: zoom-to-cursor keeps working
+        // where it is useful and stops being a catapult where it is not.
+        let candidate = self.bound_the_sideways_travel(candidate);
         self.target.position = if factor >= 1.0 {
             candidate
         } else {
@@ -538,6 +552,33 @@ impl CameraController {
         self.target.hold_heading(heading);
         self.target.level();
         let _ = pitch;
+    }
+
+    /// Trims a zoom's sideways travel to the size of its up-and-down travel.
+    ///
+    /// Splits the step into the part along the local vertical — the zoom proper
+    /// — and the part across it, and shortens the second so it never exceeds the
+    /// first. A step that is genuinely mostly vertical passes through unchanged.
+    fn bound_the_sideways_travel(&self, candidate: DVec3) -> DVec3 {
+        /// How far a zoom may carry the eye sideways, as a multiple of how far
+        /// it carries it up or down. One, because beyond that a zoom is mostly
+        /// a journey, and a journey is what dragging is for.
+        const MOST_SIDEWAYS: f64 = 1.0;
+
+        let from = self.target.position;
+        let step = candidate - from;
+        let vertical = from.normalize_or_zero();
+        if vertical == DVec3::ZERO {
+            return candidate;
+        }
+        let climb = step.dot(vertical);
+        let sideways = step - vertical * climb;
+        let allowed = climb.abs() * MOST_SIDEWAYS;
+        let travelled = sideways.length();
+        if travelled <= allowed || travelled < 1e-9 {
+            return candidate;
+        }
+        from + vertical * climb + sideways * (allowed / travelled)
     }
 
     /// Tilt the view (angle from nadir toward the horizon) about the surface
@@ -603,6 +644,15 @@ impl CameraController {
 
     /// Eases the live camera toward the gesture target — call once per frame
     /// for smooth motion. `k` in (0,1]; 1 = instant.
+    /// The camera the gestures act on, before easing.
+    ///
+    /// `camera` is what reaches the screen; this is where it is heading. A
+    /// gesture that misbehaves shows here one frame before it shows there, so
+    /// anything instrumenting a gesture wants this one.
+    pub fn target(&self) -> &GlobeCamera {
+        &self.target
+    }
+
     pub fn update(&mut self, k: f64) {
         let k = k.clamp(0.0, 1.0);
         // One clamp for every gesture. Tilting and dragging move the eye
@@ -613,14 +663,13 @@ impl CameraController {
         let c = &mut self.camera;
         let t = &self.target;
         c.position = c.position.lerp(t.position, k);
-        c.direction = c.direction.lerp(t.direction, k).normalize();
-        c.up = c.up.lerp(t.up, k).normalize();
+        // One rotation, slerped — not two axes lerped independently. Lerping
+        // them separately does not keep them perpendicular, so the basis skewed
+        // a little every frame and needed levelling to repair it; and levelling
+        // near the nadir is exactly what turned the view. A rotation cannot
+        // skew, so there is nothing to repair.
+        c.set_orientation(c.orientation().slerp(t.orientation(), k));
         c.fovy = t.fovy;
-        // Lerping the two axes independently and normalising each does not keep
-        // them perpendicular, so the basis skews a little every frame and never
-        // recovers on its own. Levelling costs a cross product and makes the
-        // easing self-correcting instead of self-degrading.
-        c.level();
         // The eased position is between two legal points, but the ground between
         // them may stand higher than either.
         self.camera.position = self.lifted(self.camera.position);
@@ -1261,6 +1310,119 @@ mod tests {
             assert!(
                 moved_km < 5.0,
                 "from {altitude} m, out and back walked the eye {moved_km:.1} km"
+            );
+        }
+    }
+
+    /// The gesture as the viewer actually makes it: the wheel zooms toward
+    /// **wherever the pointer is**, not the screen centre, and what reaches the
+    /// screen is the *eased* camera, not the target.
+    ///
+    /// Both matter and the earlier round-trip test had neither. Zooming toward
+    /// an off-centre point walks the eye sideways as well as down, which is the
+    /// path that twists; and easing lerps direction and up independently, so the
+    /// rendered basis is not simply the target's.
+    #[test]
+    fn zooming_at_an_off_centre_pointer_does_not_turn_the_rendered_view() {
+        let viewport = (1600.0, 900.0);
+        // Where a hand actually leaves the pointer: off to one side, well away
+        // from the centre, so the zoom axis is oblique.
+        let pointer = (1180.0, 260.0);
+
+        for altitude in [3_000.0, 20_000.0, 200_000.0, 2_000_000.0] {
+            for pitch in [FRAC_PI_2, 1.1, 0.7] {
+                let mut ctrl = CameraController::new(GlobeCamera::from_geodetic(
+                    46.5f64.to_radians(),
+                    2.5f64.to_radians(),
+                    altitude,
+                    0.9,
+                    pitch,
+                    DEFAULT_GLOBE_FOVY,
+                ))
+                .with_min_altitude(150.0);
+                // Settle the eased camera onto the target before measuring.
+                for _ in 0..200 {
+                    ctrl.update(0.25);
+                }
+                let heading0 = ctrl.camera.heading();
+
+                // Fifteen out, fifteen back, easing between every step exactly
+                // as a frame loop would.
+                for step in 0..30 {
+                    ctrl.zoom(if step < 15 { -1.0 } else { 1.0 }, pointer, viewport);
+                    for _ in 0..8 {
+                        ctrl.update(0.25);
+                    }
+                }
+                for _ in 0..200 {
+                    ctrl.update(0.25);
+                }
+
+                let swing = {
+                    let d = (ctrl.camera.heading() - heading0).abs();
+                    d.min(std::f64::consts::TAU - d).to_degrees()
+                };
+                assert!(
+                    swing < 1.0,
+                    "{altitude} m, pitch {pitch}: out and back at an off-centre \
+                     pointer turned the rendered view by {swing}°"
+                );
+            }
+        }
+    }
+
+    /// The rotation the log finally caught, pinned as an invariant: across a
+    /// long zoom, the rendered view must not turn **at any point**, not merely
+    /// end up where it started.
+    ///
+    /// Every earlier test here measured the endpoints and passed while the map
+    /// visibly turned, because a rotation that goes out and comes back leaves no
+    /// trace at the end. Watching the maximum excursion is what catches it.
+    ///
+    /// The trajectory is the one the instrumented viewer recorded: a few degrees
+    /// off the nadir, drifting closer as the eye zooms in. That band is where
+    /// levelling used to blend between the current `up` and the levelled one,
+    /// and a blend between two `up` vectors *is* a rotation.
+    #[test]
+    fn a_long_zoom_never_turns_the_view_at_any_point() {
+        let viewport = (1600.0, 1200.0);
+        let pointer = (1098.0, 811.0);
+
+        // Pitches spanning the old dead zone (0.05) and fade (to 0.15) in sine
+        // from the vertical: 87° is 0.052, 85° is 0.087, 81° is 0.156.
+        for pitch_deg in [89.0f64, 87.5, 87.0, 86.0, 85.0, 83.0, 81.0, 75.0] {
+            let mut ctrl = CameraController::new(GlobeCamera::from_geodetic(
+                46.5f64.to_radians(),
+                2.5f64.to_radians(),
+                2_000_000.0,
+                0.0,
+                pitch_deg.to_radians(),
+                DEFAULT_GLOBE_FOVY,
+            ))
+            .with_min_altitude(150.0);
+            for _ in 0..200 {
+                ctrl.update(0.25);
+            }
+            let reference = ctrl.camera.heading();
+
+            let mut worst: f64 = 0.0;
+            let mut worst_at = 0.0;
+            for step in 0..40 {
+                ctrl.zoom(if step < 20 { 1.0 } else { -1.0 }, pointer, viewport);
+                for _ in 0..8 {
+                    ctrl.update(0.25);
+                    let d = (ctrl.camera.heading() - reference).abs();
+                    let d = d.min(std::f64::consts::TAU - d).to_degrees();
+                    if d > worst {
+                        worst = d;
+                        worst_at = ctrl.camera.pitch().to_degrees();
+                    }
+                }
+            }
+            assert!(
+                worst < 1.0,
+                "starting at pitch {pitch_deg}°, the view turned {worst:.1}° \
+                 along the way (worst at pitch {worst_at:.1}°)"
             );
         }
     }

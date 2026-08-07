@@ -161,6 +161,10 @@ fn main() -> anyhow::Result<()> {
         maximum_screen_space_error: 2.0,
         maximum_simultaneous_fetches: 64,
         resident_budget_bytes: 3072 * 1024 * 1024,
+        // TUILE_NO_CULL=1 keeps every tile the traversal reaches, however far
+        // off screen. Expensive and not a mode anyone should run in — it exists
+        // to answer one question: whether geometry that is missing was culled.
+        cull: std::env::var("TUILE_NO_CULL").is_err(),
         ..Config::default()
     };
     let (stream, server) = in_process_with(tree, loader, config);
