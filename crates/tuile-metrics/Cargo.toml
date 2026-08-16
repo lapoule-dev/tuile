@@ -1,0 +1,20 @@
+[package]
+name = "tuile-metrics"
+description = "Publishes tuile-core's counters to a Prometheus endpoint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The recorder and its exposition format, plus an HTTP listener. Both were
+# briefly hand-written, which was a waste and worse than what these do.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tuile-core = { version = "0.0.1", path = "../tuile-core" }
