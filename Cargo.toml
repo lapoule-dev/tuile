@@ -9,15 +9,18 @@ members = [
     "crates/tuile-native-fetchers",
     "crates/tuile-core",
     "crates/tuile-hydra",
+    "crates/tuile-metrics",
     "crates/tuile-planetary",
     "crates/tuile-storage-foyer",
+    "crates/tuile-tape",
     "crates/tuile-terrain",
+    "crates/tuile-web",
     "crates/tuile-ui",
     "crates/tuile-wgpu",
     "examples/globe-bulk",
     "examples/orbit-probe",
-    "examples/tile-probe",
     "examples/wasm-globe",
+    "examples/warm-cache",
     "examples/wgpu-viewer",
 ]
 
@@ -72,4 +75,18 @@ panic = "warn"
 
 [profile.release]
 lto = "thin"
-strip = true
+
+# Profilable, because an unprofilable release build is one nobody can fix.
+#
+# `strip = true` sat here, and a `sample` of a live session came back with every
+# Rust frame as `???` — the whole engine invisible, only Metal and libsystem
+# named. The one thing a profile is for, saying *which of our functions* is
+# spending the time, was the one thing it could not do.
+#
+# `line-tables-only` is the cheap half of debug info: function names and line
+# numbers, no local variable types. It is what a sampling profiler reads, and it
+# costs a fraction of `debug = true` in size and link time. On macOS the tables
+# go to a `.dSYM` beside the binary rather than inside it, so what ships is
+# unchanged — `strip` was buying nothing here that `split-debuginfo` does not.
+debug = "line-tables-only"
+split-debuginfo = "packed"
