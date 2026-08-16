@@ -9,7 +9,7 @@ use crate::context::{GpuContext, GpuImagery, IMAGERY_BINDING_0, TEXTURE_FORMAT};
 use glam::{DVec3, Mat4, Vec3};
 use std::sync::Arc;
 use tuile_core::content::{DecodedMesh, DecodedTexture, DecodedTileContent};
-use tuile_core::raster::{self, MAX_IMAGERY_LAYERS};
+use tuile_core::raster;
 use wgpu::util::DeviceExt;
 
 /// Bytes per texel in [`TEXTURE_FORMAT`].
@@ -36,8 +36,34 @@ pub struct PreparedMesh {
     pub vertex_buf: wgpu::Buffer,
     pub index_buf: wgpu::Buffer,
     pub index_count: u32,
-    pub material_bg: wgpu::BindGroup,
-    _material_buf: wgpu::Buffer,
+    /// One bind group per imagery pass, in the order they must be drawn.
+    ///
+    /// Never empty: a mesh with no imagery still has one pass, carrying its base
+    /// colour and a table of slots that all mask themselves out. The first is
+    /// drawn opaque and writes depth; the rest are the same geometry again, with
+    /// the next batch of layers, composed by alpha blending — see
+    /// [`crate::TileRenderer::render`] and `raster::MAX_IMAGERY_PASSES`.
+    pub material_bgs: Vec<wgpu::BindGroup>,
+    _material_bufs: Vec<wgpu::Buffer>,
+}
+
+/// One batch of imagery layers: as many as a single draw can bind, and the
+/// packed table that places them.
+struct ImageryPass {
+    textures: Vec<Arc<GpuImagery>>,
+    table: wgpu::Buffer,
+}
+
+/// What one draw of one mesh is told about its material. Mirrors
+/// `MaterialUniform` in `shader.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MaterialUniform {
+    base_color: [f32; 4],
+    /// x = 1 on the first pass, 0 after — the rest is padding the uniform
+    /// alignment would cost anyway. Named `flags` rather than `pass` because
+    /// WGSL reserves that word, and the two declarations must match.
+    flags: [f32; 4],
 }
 
 /// GPU-resident tile, ready to draw.
@@ -49,11 +75,18 @@ pub struct PreparedTile {
     /// the model matrix can be recomputed against a moving render origin.
     origin_ecef: DVec3,
     transform_local: Mat4,
+    /// The render origin this tile's uniform currently holds.
+    ///
+    /// A `Cell` so a tile can bring itself up to date through a shared
+    /// reference, at the moment it is about to be drawn, rather than being
+    /// swept along with every other resident tile whether or not anyone will
+    /// look at it. See [`Self::rebase`].
+    rebased_to: std::cell::Cell<DVec3>,
     _textures: Vec<GpuImagery>,
-    /// Imagery this tile drapes, held so the shared textures outlive it. Which
-    /// tile holds the last reference is what frees the memory.
-    _imagery: Vec<Arc<GpuImagery>>,
-    _imagery_buf: wgpu::Buffer,
+    /// Imagery this tile drapes, batched into the passes that bind it, held so
+    /// the shared textures and their tables outlive the tile. Which tile holds
+    /// the last reference is what frees the memory.
+    _imagery: Vec<ImageryPass>,
     /// Approximate GPU memory of this tile, bytes — **excluding draped
     /// imagery**, for the reason [`DecodedTileContent::byte_size`] gives: a
     /// texture twenty tiles share is not twenty textures. Ask
@@ -62,11 +95,33 @@ pub struct PreparedTile {
 }
 
 impl PreparedTile {
+    /// Whether any mesh here carries more layers than one draw could bind.
+    ///
+    /// Asked before switching pipelines rather than discovered mesh by mesh: a
+    /// scene where nothing needs a second pass must not pay for a pipeline
+    /// switch, and most scenes are that scene.
+    pub fn needs_more_passes(&self) -> bool {
+        self.meshes.iter().any(|m| m.material_bgs.len() > 1)
+    }
+
     /// Recomputes the model matrix relative to a new render origin and rewrites
     /// the tile uniform — the second half of the anti-jitter protocol for a
     /// MOVING camera: keep the render origin near the eye so the f32 the GPU
     /// sees stays small (sub-meter precise), even at planetary ECEF scale.
     pub fn rebase(&self, queue: &wgpu::Queue, render_origin: DVec3) {
+        // Already there, to within a metre. The threshold used to live on the
+        // caller, which meant it was asked once for the whole resident set: if
+        // the eye had moved, *every* tile was rewritten. Asking per tile is what
+        // lets a tile nobody is drawing simply not be written.
+        //
+        // A metre of staleness is invisible. The whole point of the render
+        // origin is to keep the f32 the GPU sees small, and a metre out of the
+        // tens of kilometres it is allowed to drift costs no precision at all.
+        const CLOSE_ENOUGH_METRES: f64 = 1.0;
+        if (render_origin - self.rebased_to.get()).length() < CLOSE_ENOUGH_METRES {
+            return;
+        }
+        self.rebased_to.set(render_origin);
         let model =
             tuile_core::geo::rebased_model(self.origin_ecef, self.transform_local, render_origin);
         queue.write_buffer(
@@ -120,25 +175,60 @@ pub fn prepare(
     // Imagery it merely references: uploaded once per imagery tile, however
     // many geometry tiles name it. This is where the memory win lands, and it
     // is why the upload is keyed by coord rather than by tile.
-    let imagery: Vec<Arc<GpuImagery>> = content
+    //
+    // Split into passes rather than truncated. What one draw cannot bind, a
+    // second draw over the same geometry carries — see
+    // [`raster::MAX_IMAGERY_PASSES`]. Truncating was the old answer and it lost
+    // the *sharpest* layers, which is the half of the mosaic worth having.
+    let slots = gpu.imagery_slots as usize;
+    let passes: Vec<ImageryPass> = content
         .imagery
-        .iter()
-        .take(MAX_IMAGERY_LAYERS as usize)
-        .map(|layer| gpu.shared_imagery(layer.coord, || upload_texture(gpu, &layer.texture)))
+        .chunks(slots)
+        .take(raster::MAX_IMAGERY_PASSES as usize)
+        .map(|batch| ImageryPass {
+            textures: batch
+                .iter()
+                .map(|layer| {
+                    gpu.shared_imagery(layer.coord, || upload_texture(gpu, &layer.texture))
+                })
+                .collect(),
+            table: gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("tuile imagery layers"),
+                    contents: bytemuck::cast_slice(&raster::imagery_layer_table(
+                        batch,
+                        gpu.imagery_slots,
+                    )),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                }),
+        })
         .collect();
-    let imagery_buf = gpu
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tuile imagery layers"),
-            contents: bytemuck::cast_slice(&raster::imagery_layer_table(&content.imagery)),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+    // Content with no imagery at all still needs one pass: it has a base colour
+    // to draw, and every slot masks itself out.
+    let passes = if passes.is_empty() {
+        vec![ImageryPass {
+            textures: Vec::new(),
+            table: gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("tuile imagery layers"),
+                    contents: bytemuck::cast_slice(&raster::imagery_layer_table(
+                        &[],
+                        gpu.imagery_slots,
+                    )),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                }),
+        }]
+    } else {
+        passes
+    };
 
     let meshes = content
         .meshes
         .iter()
-        .map(|m| prepare_mesh(gpu, m, &textures, &imagery, &imagery_buf, &mut gpu_bytes))
-        .collect();
+        .map(|m| prepare_mesh(gpu, m, &textures, &passes, &mut gpu_bytes))
+        .collect::<Vec<_>>();
 
     PreparedTile {
         meshes,
@@ -146,9 +236,12 @@ pub fn prepare(
         tile_buf,
         origin_ecef: content.local_origin_ecef,
         transform_local: content.transform_local,
+        // Built against this origin just above, so it starts up to date — a
+        // fresh tile that claimed otherwise would be rewritten on its first
+        // frame for nothing.
+        rebased_to: std::cell::Cell::new(render_origin),
         _textures: textures,
-        _imagery: imagery,
-        _imagery_buf: imagery_buf,
+        _imagery: passes,
         gpu_bytes,
     }
 }
@@ -213,8 +306,7 @@ fn prepare_mesh(
     gpu: &GpuContext,
     mesh: &DecodedMesh,
     textures: &[GpuImagery],
-    imagery: &[Arc<GpuImagery>],
-    imagery_buf: &wgpu::Buffer,
+    passes: &[ImageryPass],
     gpu_bytes: &mut usize,
 ) -> PreparedMesh {
     let normals = match &mesh.normals {
@@ -253,63 +345,77 @@ fn prepare_mesh(
         });
     *gpu_bytes += vertices.len() * std::mem::size_of::<Vertex>() + mesh.indices.len() * 4;
 
-    let material_buf = gpu
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tuile material"),
-            contents: bytemuck::cast_slice(&mesh.material.base_color_factor),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
     let texture_view = mesh
         .material
         .base_color_texture
         .and_then(|i| textures.get(i))
         .map(|t| &t.view)
         .unwrap_or(&gpu.white_view);
-    // Every slot is bound, always. An unused one reads the 1×1 white texture and
-    // is masked out by an empty coverage rectangle, so the shader needs no count
-    // and no branch — see `imagery_uniform`.
-    let mut entries = vec![
-        wgpu::BindGroupEntry {
-            binding: 0,
-            resource: material_buf.as_entire_binding(),
-        },
-        wgpu::BindGroupEntry {
-            binding: 1,
-            resource: wgpu::BindingResource::TextureView(texture_view),
-        },
-        wgpu::BindGroupEntry {
-            binding: 2,
-            resource: wgpu::BindingResource::Sampler(&gpu.sampler),
-        },
-        wgpu::BindGroupEntry {
-            binding: 3,
-            resource: imagery_buf.as_entire_binding(),
-        },
-    ];
-    entries.extend((0..MAX_IMAGERY_LAYERS).map(|slot| {
-        wgpu::BindGroupEntry {
+
+    // One bind group per pass. They differ in two things and only two: which
+    // batch of layers is bound, and whether the shader is told this is the first
+    // pass — which is what decides that a later pass starts from nothing and
+    // writes only where its own layers reached.
+    let mut material_bufs = Vec::with_capacity(passes.len());
+    let mut material_bgs = Vec::with_capacity(passes.len());
+    for (index, imagery) in passes.iter().enumerate() {
+        let first = f32::from(index == 0);
+        let uniform = MaterialUniform {
+            base_color: mesh.material.base_color_factor,
+            flags: [first, 0.0, 0.0, 0.0],
+        };
+        let material_buf = gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tuile material"),
+                contents: bytemuck::bytes_of(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        // Every slot is bound, always. An unused one reads the 1×1 white texture
+        // and is masked out by an empty coverage rectangle, so the shader needs
+        // no count and no branch — see `raster::imagery_layer_table`.
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: material_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&gpu.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: imagery.table.as_entire_binding(),
+            },
+        ];
+        entries.extend((0..gpu.imagery_slots).map(|slot| wgpu::BindGroupEntry {
             binding: IMAGERY_BINDING_0 + slot,
             resource: wgpu::BindingResource::TextureView(
                 imagery
+                    .textures
                     .get(slot as usize)
                     .map(|t| &t.view)
                     .unwrap_or(&gpu.white_view),
             ),
-        }
-    }));
-    let material_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("tuile material"),
-        layout: &gpu.material_bgl,
-        entries: &entries,
-    });
+        }));
+        material_bgs.push(gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tuile material"),
+            layout: &gpu.material_bgl,
+            entries: &entries,
+        }));
+        material_bufs.push(material_buf);
+    }
 
     PreparedMesh {
         vertex_buf,
         index_buf,
         index_count: mesh.indices.len() as u32,
-        material_bg,
-        _material_buf: material_buf,
+        material_bgs,
+        _material_bufs: material_bufs,
     }
 }
 
