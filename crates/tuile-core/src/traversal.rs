@@ -121,6 +121,20 @@ pub struct Config {
     pub maximum_screen_space_error: f64,
     /// REPLACE hold-until-ready: never show holes during refinement.
     pub forbid_holes: bool,
+    /// The coarse level to keep resident whatever the ceilings say.
+    ///
+    /// The floor every fallback lands on: a complete level is what makes the
+    /// difference between soft ground and no ground while a view streams in.
+    /// `None` disables the pin, which is right for a bulk render that visits
+    /// each view once.
+    pub pinned_level: Option<u32>,
+    /// How many tiles may stay resident, whatever they weigh.
+    ///
+    /// A byte budget alone does not bound a long session: a detail tile at
+    /// level 19 seen from five hundred kilometres is useless and costs no more
+    /// than a level-3 tile covering a continent. A count says "this many, the
+    /// most recently used", which is what actually bounds it.
+    pub resident_tile_limit: usize,
     /// Whether to drop tiles no view can see. Off is a diagnostic, not a mode.
     ///
     /// A culled tile is reported *ready* so that it never holds up an ancestor's
@@ -154,6 +168,22 @@ pub struct Config {
     pub protected_view_generations: usize,
 }
 
+impl Config {
+    /// What an interactive globe wants: a demanding screen-space error, enough
+    /// requests in flight to fill a view, and a pinned coarse level so a
+    /// fallback always has ground to land on.
+    pub fn interactive_globe(pinned_level: Option<u32>) -> Self {
+        Self {
+            maximum_screen_space_error: 2.0,
+            maximum_simultaneous_fetches: 64,
+            resident_budget_bytes: 4 * 1024 * 1024 * 1024,
+            resident_tile_limit: 16_000,
+            pinned_level,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -164,6 +194,8 @@ impl Default for Config {
             resident_budget_bytes: 512 * 1024 * 1024,
             maximum_simultaneous_fetches: 20,
             protected_view_generations: 4,
+            pinned_level: None,
+            resident_tile_limit: 16_000,
         }
     }
 }
@@ -248,6 +280,11 @@ pub fn traverse(
     views: &[ViewState],
     config: &Config,
     _frame: FrameNumber,
+    // What the consumer actually drew last frame. Taken and not yet consulted:
+    // the hold-until-ready rule at this point is stated in terms of residency
+    // alone, and a caller that already knows what reached the screen should not
+    // have to discover later that the signature changed under it.
+    _rendered_last: &std::collections::HashSet<TileId>,
     out: &mut TraversalOutput,
 ) {
     out.selected.clear();
@@ -484,7 +521,15 @@ mod tests {
 
     fn run(ts: &Tileset, residency: &ResidencyView, views: &[ViewState]) -> TraversalOutput {
         let mut out = TraversalOutput::default();
-        traverse(ts, residency, views, &Config::default(), 0, &mut out);
+        traverse(
+            ts,
+            residency,
+            views,
+            &Config::default(),
+            0,
+            &std::collections::HashSet::new(),
+            &mut out,
+        );
         out
     }
 

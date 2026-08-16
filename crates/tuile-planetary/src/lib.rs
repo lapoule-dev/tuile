@@ -164,6 +164,39 @@ impl ImageryCache {
     }
 }
 
+/// Shared, host-declared count of imagery layers one drape may carry.
+///
+/// A handle rather than a number for a reason of ordering: the answer belongs
+/// to the renderer — how many textures it will bind in one draw — and the loader
+/// is usually built **before** there is a window to have a device in.
+///
+/// Taken and not yet consulted at this point: the drape here is bounded by
+/// [`raster::MAX_IMAGERY_LAYERS`], a constant. The handle exists so a host that
+/// already knows its device's limit does not have to change its call when the
+/// loader starts asking.
+#[derive(Clone, Default)]
+pub struct LayerBudget(Arc<std::sync::atomic::AtomicU32>);
+
+impl std::fmt::Debug for LayerBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LayerBudget({})", self.get())
+    }
+}
+
+impl LayerBudget {
+    /// Declares how many imagery textures one draw will bind.
+    pub fn set_from_device(&self, max_sampled_textures_per_stage: u32) {
+        self.0.store(
+            max_sampled_textures_per_stage,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    pub fn get(&self) -> u32 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Tuning for [`globe`].
 ///
 /// Caching is deliberately absent here. A terrain source and an imagery
@@ -171,10 +204,12 @@ impl ImageryCache {
 /// `tuile_core::raster::CachedImagery`), which is where the bytes and their
 /// stated lifetimes actually are — this crate composes what the host hands it
 /// and adds no tier of its own.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct GlobeOptions {
     /// When true, terrain only (no imagery) — the geometry debug view.
     pub no_imagery: bool,
+    /// How many imagery layers one drape may carry — see [`LayerBudget`].
+    pub imagery_slots: LayerBudget,
 }
 
 /// Loads a terrain tile and drapes the imagery covering it, by reference.
@@ -434,16 +469,21 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         let fetched =
             futures_util::future::join_all(coords.iter().map(|c| self.fetch_imagery(*c))).await;
 
-        let rows = scheme.tiles_at(mosaic.level).1;
+        // The mosaic's coverage rectangles, computed once for the whole grid so
+        // neighbours share an edge **to the bit**. Deriving each one separately
+        // from geography rounds the shared edge twice, and a fragment landing
+        // between the two values is covered by neither — a hairline grid over
+        // otherwise perfect imagery. See `ImageryMosaic::coverage`.
+        let coverage = mosaic.coverage(&scheme, rect);
         let mut layers = Vec::with_capacity(coords.len());
-        for (requested, got) in coords.iter().zip(fetched) {
+        for (got, covers) in fetched.into_iter().zip(coverage) {
             let (served, texture) = got?;
             let layer = raster::ImageryLayer::substituted(
                 served,
                 texture,
                 rect,
                 &scheme.tile_rect(served),
-                &to_the_pole(scheme.tile_rect(*requested), *requested, rows),
+                covers,
             );
             // A tile the mosaic's bounding box included but the rectangle only
             // touches contributes no pixels and would still cost a binding.
@@ -501,6 +541,33 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
 /// The terrain quadtree of a parsed `layer.json`, as a boxed [`TileTree`].
 pub fn terrain_tree(layer: LayerJson) -> Box<dyn TileTree> {
     Box::new(TerrainTree::new(layer))
+}
+
+/// [`globe`], told where CPU work should run.
+///
+/// The loader at this point decodes inline, so the handle is taken and not yet
+/// used: a host that already knows which pool it wants should not have to
+/// change its call when the loader starts consulting it. See
+/// [`tuile_core::offload`] for why that matters — the geometry server is one
+/// future, and a decode left on the thread polling it queues every other load
+/// behind it.
+pub fn globe_on<T, I>(
+    terrain: T,
+    imagery: I,
+    layer: LayerJson,
+    opts: GlobeOptions,
+    _offload: Arc<dyn tuile_core::offload::Offload>,
+) -> (
+    Box<dyn TileTree>,
+    Arc<dyn TileLoader>,
+    ImageryDetail,
+    Arc<TerrainHeights>,
+)
+where
+    T: TerrainSource + 'static,
+    I: ImageryProvider + 'static,
+{
+    globe(terrain, imagery, layer, opts)
 }
 
 /// Crosses an already-resolved terrain source and imagery provider into a

@@ -268,12 +268,16 @@ impl Session<'_> {
         // to be read before `remember_protected` consumes it.
         let camera_moved = *self.view_moved;
         *self.frame += 1;
+        // Nothing to report about what the consumer drew: this server tracks
+        // residency, not the screen. The parameter exists for hosts that do.
+        let rendered_last = std::collections::HashSet::new();
         traverse(
             self.tree,
             self.residency,
             self.views,
             self.config,
             *self.frame,
+            &rendered_last,
             self.out,
         );
 
@@ -834,6 +838,10 @@ mod tests {
                         unreachable!("unexpected error: {message}")
                     }
                     ServerMessage::Evict { .. } => {}
+                    // Neither is part of what this test drives: a stand-in is
+                    // only sent when the config asks for one, and the priming
+                    // report says what the coarse pyramid holds.
+                    ServerMessage::Fill { .. } | ServerMessage::Priming(_) => {}
                 }
             }
             (contents, last_select)

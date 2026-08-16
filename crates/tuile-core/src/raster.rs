@@ -420,7 +420,112 @@ pub struct ImageryMosaic {
     pub rows: u32,
 }
 
+/// One imagery texture draped over a geometry tile — **referenced, not owned**.
+///
+/// This is the type that stops us copying. A geometry tile names the imagery
+/// tiles that cover it and says where each one lands in its own uv space; the
+/// pixels stay in exactly one place, shared by every geometry tile that names
+/// the same [`ImageryCoord`]. Two neighbours therefore cannot disagree about
+/// colour or filtering the way they do when each resamples its own copy.
+///
+/// It follows the shape Cesium's `sampleAndBlend` consumes, because that shape
+/// is the minimum a fragment shader needs and no less: a coverage rectangle to
+/// How far the mosaic's **outer** edges reach beyond the geometry tile, in its
+/// own uv space.
+///
+/// Interior edges are exact and must stay exact — they are chained, so a
+/// neighbour's west edge *is* this tile's east edge and the mask covers the
+/// boundary from both sides. The outer edges are a different problem: the uv
+/// reaching the fragment shader is **interpolated across the primitive**, and at
+/// the very edge of a tile it can land an ULP past 1.0. `step(uv, 1.0)` is then
+/// zero, no layer claims the fragment, and what shows is whatever sits under the
+/// mosaic.
+///
+/// That is the hairline grid that survived every other fix: dashed rather than
+/// solid, because only the fragments that happen to overshoot are affected, and
+/// invisible until the colour under the mosaic stopped being black.
+///
+/// The reference has the same exposure and never sees it — its `Globe.baseColor`
+/// is a dark blue, so a fragment that falls through costs a pixel nobody
+/// notices. Reaching past the edge closes it instead.
+///
+/// A tenth of a pixel on a thousand-pixel tile, and four orders of magnitude
+/// above the interpolation error it absorbs.
+const EDGE_REACH: f32 = 1.0e-4;
+
 impl ImageryMosaic {
+
+    /// The tiles, row-major NW→SE — the order [`stitch_mosaic`] expects.
+    /// The coverage rectangles of every tile in this mosaic, in the geometry
+    /// tile's uv space, **sharing exact edges**.
+    ///
+    /// Returned in the same order as [`ImageryMosaic::tiles`], so the two zip.
+    ///
+    /// # Why this is not computed per layer
+    ///
+    /// Because two neighbours must agree *to the bit*, and independently
+    /// derived numbers do not. Computing each rectangle from geographic
+    /// coordinates rounds the shared edge twice — once as one tile's east, once
+    /// as the next tile's west — and an `f32` apart is enough: the shader tests
+    /// the mask against a uv interpolated per fragment, so a fragment landing
+    /// between the two values is covered by neither and shows whatever is under
+    /// the mosaic. On screen that is a hairline grid over otherwise perfect
+    /// imagery, and it was reported as one.
+    ///
+    /// So the edges are **chained**: each tile's west edge *is* the previous
+    /// tile's east edge, the same float, never recomputed. The reference
+    /// implementation does exactly this (`ImageryLayer.js`, `minU = maxU`), and
+    /// it is why its mask — identical to ours, down to the branch-free `step` —
+    /// leaves no gap.
+    ///
+    /// The outer edges are forced to `0.0` and `1.0` for the same reason,
+    /// stated the same way there: "rounding errors" must not "make the last
+    /// image fall shy of the edge of the terrain tile".
+    ///
+    /// `rect` is the geometry tile's rectangle, `scheme` the one this mosaic is
+    /// indexed in.
+    pub fn coverage(&self, scheme: &TilingScheme, rect: &GeoRect) -> Vec<[f32; 4]> {
+        let (tw, th) = (rect.width().max(1e-15), rect.height().max(1e-15));
+
+        // The column edges, chained: `cols + 1` values, the first exactly 0 and
+        // the last exactly 1.
+        let mut west = Vec::with_capacity(self.cols as usize + 1);
+        west.push(0.0f32); // replaced below; the reach is applied to the ends
+        for i in 0..self.cols {
+            let coord = ImageryCoord {
+                level: self.level,
+                x: self.x0 + u64::from(i),
+                y: self.y0,
+            };
+            west.push((((scheme.tile_rect(coord).east - rect.west) / tw) as f32).clamp(0.0, 1.0));
+        }
+        west[0] = -EDGE_REACH;
+        *west.last_mut().expect("cols + 1 edges") = 1.0 + EDGE_REACH;
+
+        // And the row edges. v grows southward, so a row's top edge is measured
+        // from the tile's north.
+        let mut north = Vec::with_capacity(self.rows as usize + 1);
+        north.push(0.0f32); // idem
+        for j in 0..self.rows {
+            let coord = ImageryCoord {
+                level: self.level,
+                x: self.x0,
+                y: self.y0 + u64::from(j),
+            };
+            north.push((((rect.north - scheme.tile_rect(coord).south) / th) as f32).clamp(0.0, 1.0));
+        }
+        north[0] = -EDGE_REACH;
+        *north.last_mut().expect("rows + 1 edges") = 1.0 + EDGE_REACH;
+
+        let mut out = Vec::with_capacity((self.cols * self.rows) as usize);
+        for j in 0..self.rows as usize {
+            for i in 0..self.cols as usize {
+                out.push([west[i], north[j], west[i + 1], north[j + 1]]);
+            }
+        }
+        out
+    }
+
     /// The tiles, row-major NW→SE — the order [`stitch_mosaic`] expects.
     pub fn tiles(&self) -> Vec<ImageryCoord> {
         let mut out = Vec::with_capacity((self.cols * self.rows) as usize);
@@ -682,7 +787,29 @@ impl ImageryLayer {
         tile: &GeoRect,
         imagery: &GeoRect,
     ) -> Self {
-        Self::substituted(coord, texture, tile, imagery, imagery)
+        // The imagery's own share of the tile, in tile uv — the single-layer
+        // case, where there is no neighbour to chain an edge with.
+        let (tw, th) = (tile.width().max(1e-15), tile.height().max(1e-15));
+        // Clamped to the tile, then reaching a hair past wherever it already
+        // touches an edge — an interpolated uv can land an ULP outside, and a
+        // layer that stops exactly at 1.0 leaves that fragment to the base
+        // colour. See [`EDGE_REACH`].
+        let reach = |v: f32| {
+            if v <= 0.0 {
+                -EDGE_REACH
+            } else if v >= 1.0 {
+                1.0 + EDGE_REACH
+            } else {
+                v
+            }
+        };
+        let coverage = [
+            reach((((imagery.west - tile.west) / tw) as f32).clamp(0.0, 1.0)),
+            reach((((tile.north - imagery.north) / th) as f32).clamp(0.0, 1.0)),
+            reach((((imagery.east - tile.west) / tw) as f32).clamp(0.0, 1.0)),
+            reach((((tile.north - imagery.south) / th) as f32).clamp(0.0, 1.0)),
+        ];
+        Self::substituted(coord, texture, tile, imagery, coverage)
     }
 
     /// Places a texture that spans `source` over the ground `covers` asks for.
@@ -701,7 +828,16 @@ impl ImageryLayer {
         texture: Arc<DecodedTexture>,
         tile: &GeoRect,
         source: &GeoRect,
-        covers: &GeoRect,
+        // Where this tile lands in the geometry tile's own uv space,
+        // **computed by the mosaic** rather than here.
+        //
+        // Two neighbours must agree on their shared edge to the bit, and
+        // independently derived numbers do not: deriving each rectangle from
+        // geography rounds the shared edge twice, and a fragment landing
+        // between the two values is covered by neither — a hairline grid over
+        // otherwise perfect imagery. `ImageryMosaic::coverage` chains them, so
+        // each tile's west edge *is* the previous tile's east edge.
+        coverage: [f32; 4],
     ) -> Self {
         let (tw, th) = (tile.width().max(1e-15), tile.height().max(1e-15));
         let (sw, sh) = (source.width().max(1e-15), source.height().max(1e-15));
@@ -711,12 +847,6 @@ impl ImageryLayer {
         let translation = [
             ((tile.west - source.west) / sw) as f32,
             ((source.north - tile.north) / sh) as f32,
-        ];
-        let coverage = [
-            (((covers.west - tile.west) / tw).clamp(0.0, 1.0)) as f32,
-            (((tile.north - covers.north) / th).clamp(0.0, 1.0)) as f32,
-            (((covers.east - tile.west) / tw).clamp(0.0, 1.0)) as f32,
-            (((tile.north - covers.south) / th).clamp(0.0, 1.0)) as f32,
         ];
         Self {
             coord,
@@ -768,6 +898,32 @@ pub fn imagery_layer_table(layers: &[ImageryLayer]) -> [[f32; 4]; 2 * MAX_IMAGER
         ];
     }
     table
+}
+
+/// Everything that turns fetched imagery bytes into a drapeable texture, as one
+/// call: decode, then resample onto geographic spacing if the provider's
+/// projection is not already geographic.
+///
+/// The unit exists because it is the unit that **crosses boundaries**. Bytes in,
+/// pixels out, no borrowed state and no handle to anything — so the same call is
+/// what a native thread pool runs off the server's thread and what a Web Worker
+/// runs off the browser's main thread. A closure could express the same work and
+/// could not cross: a `Box<dyn FnOnce()>` is a pointer into linear memory, and a
+/// Worker only shares that memory under `SharedArrayBuffer`, which costs atomics,
+/// a nightly `build-std` and COOP/COEP headers on the server. Shaped as data, it
+/// costs a `postMessage` and a transferred buffer.
+///
+/// Blocking and I/O-free, like [`decode_image`] and `content::decode`; the caller
+/// still decides which thread runs it.
+pub fn decode_and_reproject(
+    bytes: &[u8],
+    scheme: &TilingScheme,
+    coord: ImageryCoord,
+) -> Result<DecodedTexture, RasterError> {
+    let decoded = decode_image(bytes)?;
+    // `None` means the tile is already on geographic spacing — the common case
+    // for a geographic provider, and not a failure.
+    Ok(reproject_tile_to_geographic(&decoded, scheme, coord).unwrap_or(decoded))
 }
 
 /// A pool of per-imagery-tile resources shared between the geometry tiles that
@@ -1112,6 +1268,253 @@ pub fn mip_chain(src: &DecodedTexture) -> Vec<DecodedTexture> {
 }
 
 #[cfg(test)]
+mod seam_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn texture(size: u32) -> Arc<DecodedTexture> {
+        Arc::new(DecodedTexture {
+            width: size,
+            height: size,
+            rgba8: vec![255; (size * size * 4) as usize],
+        })
+    }
+
+    /// A geometry tile somewhere awkward: not aligned to the imagery grid, and
+    /// not a round number, so the arithmetic has to actually work.
+    fn tile() -> GeoRect {
+        GeoRect {
+            west: -0.371,
+            south: 0.117,
+            east: 0.229,
+            north: 0.593,
+        }
+    }
+
+    /// **Neighbouring coverage rectangles share an edge to the bit.**
+    ///
+    /// Not "within an epsilon" — the same `f32`. That is the whole mechanism:
+    /// the shader tests the mask against a uv interpolated per fragment, so two
+    /// edges an ULP apart leave fragments covered by neither, and what shows
+    /// through is whatever is under the mosaic. On screen, a hairline grid.
+    ///
+    /// Deriving each rectangle from geography cannot give this — it rounds the
+    /// shared edge twice. Chaining can, and does. The reference implementation
+    /// reaches the same conclusion the same way (`ImageryLayer.js`,
+    /// `minU = maxU`).
+    #[test]
+    fn neighbouring_coverage_rectangles_share_an_edge_exactly() {
+        let scheme = TilingScheme::geographic();
+        let rect = tile();
+        let mosaic = scheme.mosaic_at_level(&rect, 6, 64);
+        let coverage = mosaic.coverage(&scheme, &rect);
+        assert!(
+            mosaic.cols >= 2 && mosaic.rows >= 2,
+            "the fixture must straddle several imagery tiles, got {}×{}",
+            mosaic.cols,
+            mosaic.rows
+        );
+
+        let at = |col: u32, row: u32| coverage[(row * mosaic.cols + col) as usize];
+        for row in 0..mosaic.rows {
+            for col in 0..mosaic.cols - 1 {
+                let (left, right) = (at(col, row), at(col + 1, row));
+                assert_eq!(
+                    left[2].to_bits(),
+                    right[0].to_bits(),
+                    "column {col}/{} of row {row}: east {} and west {} differ",
+                    col + 1,
+                    left[2],
+                    right[0]
+                );
+            }
+        }
+        for col in 0..mosaic.cols {
+            for row in 0..mosaic.rows - 1 {
+                let (upper, lower) = (at(col, row), at(col, row + 1));
+                assert_eq!(
+                    upper[3].to_bits(),
+                    lower[1].to_bits(),
+                    "row {row}/{} of column {col}: south {} and north {} differ",
+                    row + 1,
+                    upper[3],
+                    lower[1]
+                );
+            }
+        }
+    }
+
+    /// The mosaic reaches the tile's own edges exactly, so nothing falls shy of
+    /// them — the reference states the same requirement in the same words:
+    /// "rounding errors" must not "make the last image fall shy of the edge".
+    #[test]
+    fn the_mosaic_covers_the_tile_from_edge_to_edge() {
+        let scheme = TilingScheme::geographic();
+        let rect = tile();
+        let mosaic = scheme.mosaic_at_level(&rect, 6, 64);
+        let coverage = mosaic.coverage(&scheme, &rect);
+        let last = coverage.len() - 1;
+
+        // Past the edge, not on it. An interpolated uv can land an ULP outside
+        // the tile, and a mask stopping exactly at 1.0 leaves that fragment
+        // uncovered — a dashed hairline at every tile boundary, which is what
+        // survived every other fix. See `EDGE_REACH`.
+        assert!(coverage[0][0] < 0.0, "the west edge stops at {}", coverage[0][0]);
+        assert!(coverage[0][1] < 0.0, "the north edge stops at {}", coverage[0][1]);
+        assert!(
+            coverage[last][2] > 1.0,
+            "the east edge stops at {}",
+            coverage[last][2]
+        );
+        assert!(
+            coverage[last][3] > 1.0,
+            "the south edge stops at {}",
+            coverage[last][3]
+        );
+        // And not by enough to see: a tenth of a pixel on a thousand-pixel tile.
+        assert!(coverage[last][2] - 1.0 < 1.0e-3);
+    }
+
+    /// **A texture covering exactly its tile maps edge to edge, untouched.**
+    ///
+    /// The identity case, and the one a half-texel inset breaks: `translation`
+    /// must be exactly zero and `scale` exactly one, whatever the texture's
+    /// size. Both reference implementations compute precisely this affine map
+    /// and add no term to it, and the inset that briefly lived here displaced
+    /// every tile leaning on an ancestor by several of its own texels.
+    #[test]
+    fn a_texture_covering_its_tile_maps_edge_to_edge() {
+        let rect = tile();
+        for size in [2u32, 64, 256, 512] {
+            let layer = ImageryLayer::placed(
+                ImageryCoord {
+                    level: 0,
+                    x: 0,
+                    y: 0,
+                },
+                texture(size),
+                &rect,
+                &rect,
+            );
+            assert_eq!(
+                layer.translation,
+                [0.0, 0.0],
+                "a {size}-pixel texture shifted its own tile"
+            );
+            assert_eq!(
+                layer.scale,
+                [1.0, 1.0],
+                "a {size}-pixel texture rescaled its own tile"
+            );
+        }
+    }
+
+    /// **A tile leaning on an ancestor lands on the ancestor's exact quarter.**
+    ///
+    /// The substitution case is most of the ground during any movement, and it
+    /// is where a size-dependent term does the most damage: measured on the
+    /// *source* texture, an inset displaces the drape by the ancestor's texel,
+    /// which is `2^levels` of the descendant's.
+    #[test]
+    fn a_tile_leaning_on_an_ancestor_lands_on_its_exact_quarter() {
+        let parent = tile();
+        // The north-west quarter of it.
+        let child = GeoRect {
+            west: parent.west,
+            east: (parent.west + parent.east) / 2.0,
+            south: (parent.south + parent.north) / 2.0,
+            north: parent.north,
+        };
+        let layer = ImageryLayer::substituted(
+            ImageryCoord {
+                level: 0,
+                x: 0,
+                y: 0,
+            },
+            texture(256),
+            &child,
+            &parent,
+            [0.0, 0.0, 1.0, 1.0],
+        );
+        assert_eq!(layer.scale, [0.5, 0.5], "the quarter is not a quarter");
+        assert_eq!(
+            layer.translation,
+            [0.0, 0.0],
+            "the north-west quarter starts at the texture's origin"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mosaic_coverage_tests {
+    use super::*;
+
+    /// **Every rectangle a mosaic hands back is real, and together they tile the
+    /// geometry tile exactly.**
+    ///
+    /// This is the test that was missing when `ImageryLayer::substituted` stopped
+    /// computing its own coverage. It used to derive the rectangle from
+    /// geography and clamp it to `[0, 1]`, which cannot produce a degenerate
+    /// one; it now *receives* one, so that two neighbours share an edge to the
+    /// bit. That is the right change and it moved the failure: a rectangle that
+    /// comes back inverted or empty fails `is_visible`, the layer is dropped
+    /// **silently**, and the tile falls through to whatever single coarse layer
+    /// sits under the mosaic — one image stretched over ground it does not
+    /// describe, which draws as a flat rectangle of uniform colour.
+    ///
+    /// Nothing counts that. `tiles_without_imagery` stays at zero, because the
+    /// tile does have a layer; it has the wrong one.
+    #[test]
+    fn every_coverage_rectangle_is_visible_and_the_set_tiles_the_whole_tile() {
+        let scheme = TilingScheme::web_mercator();
+        // Rectangles of several shapes and latitudes: Mercator's rows are not
+        // uniform in latitude, so a mosaic near the equator and one at 60 N
+        // divide their tile differently.
+        let rects = [
+            GeoRect { west: 0.10, south: 0.20, east: 0.104, north: 0.206 },
+            GeoRect { west: -0.9, south: 0.75, east: -0.88, north: 0.79 },
+            GeoRect { west: 2.0, south: -0.6, east: 2.02, north: -0.55 },
+        ];
+        for rect in rects {
+            for level in 0..=18 {
+                // The one budget a drape can carry — see `MAX_IMAGERY_LAYERS`.
+                for budget in [MAX_IMAGERY_LAYERS] {
+                    let mosaic = scheme.mosaic_at_level(&rect, level, budget);
+                    let covers = mosaic.coverage(&scheme, &rect);
+                    assert_eq!(
+                        covers.len() as u32,
+                        mosaic.tile_count(),
+                        "one rectangle per tile, so the two can be zipped"
+                    );
+                    for (n, c) in covers.iter().enumerate() {
+                        assert!(
+                            c[2] > c[0] && c[3] > c[1],
+                            "level {level}, budget {budget}, tile {n} of {}: \
+                             coverage {c:?} fails `is_visible`, so this layer is \
+                             dropped and the ground falls through to whatever is \
+                             under the mosaic",
+                            mosaic.tile_count()
+                        );
+                    }
+                    // And the set reaches both corners: a mosaic that covers only
+                    // part of its tile leaves the rest showing the layer beneath.
+                    let umin = covers.iter().map(|c| c[0]).fold(f32::INFINITY, f32::min);
+                    let vmin = covers.iter().map(|c| c[1]).fold(f32::INFINITY, f32::min);
+                    let umax = covers.iter().map(|c| c[2]).fold(f32::NEG_INFINITY, f32::max);
+                    let vmax = covers.iter().map(|c| c[3]).fold(f32::NEG_INFINITY, f32::max);
+                    assert!(
+                        umin <= 0.0 && vmin <= 0.0 && umax >= 1.0 && vmax >= 1.0,
+                        "level {level}, budget {budget}: the mosaic spans \
+                         u {umin}..{umax}, v {vmin}..{vmax} of a tile that is \
+                         0..1 in both — the rest draws whatever is underneath"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::content::{DecodedMesh, MaterialDesc};
@@ -1382,13 +1785,16 @@ mod tests {
             ),
         ];
         let texture = tex1x1();
-        for (name, covers, expected) in quarters {
+        // The coverage rectangle is the mosaic's to compute now, so it is handed
+        // in rather than derived from geography here — which is the invariant
+        // that keeps two neighbours agreeing on a shared edge to the bit.
+        for (name, _covers, expected) in quarters {
             let layer = ImageryLayer::substituted(
                 coord(3, 1, 1),
                 Arc::clone(&texture),
                 &tile,
                 &parent,
-                &covers,
+                expected,
             );
             assert_eq!(layer.coverage, expected, "{name}");
             // Every sibling reads the parent the same way — only the mask moves.
