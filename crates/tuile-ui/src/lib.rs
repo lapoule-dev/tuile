@@ -13,9 +13,17 @@
 //!
 //! Keeping the widget out of the render backend is what lets the same control
 //! work on every façade, and keeping it out of `tuile-camera` is what keeps
-//! that crate to camera state and gestures. This crate is pure: no I/O, no
+//! that crate to camera state and gestures. The widgets are pure: no I/O, no
 //! graphics API, wasm-clean.
+//!
+//! One thing here is not a widget and not pure: [`StatusBar`], behind the
+//! `statusbar` feature, which is a **native menu-bar item**. It lives here
+//! because it is a control a viewer offers a person, and it is optional
+//! because nothing else in this crate should have to carry a platform
+//! dependency to get the compass.
 
+#[cfg(feature = "statusbar")]
+mod statusbar;
 mod nav;
 
 pub use nav::{NavWidget, Part};
@@ -44,3 +52,6 @@ impl Vertex {
 /// Triangles to draw, in submission order. Later triangles paint over earlier
 /// ones; nothing is depth-tested.
 pub type Mesh = Vec<Vertex>;
+
+#[cfg(feature = "statusbar")]
+pub use statusbar::StatusBar;
