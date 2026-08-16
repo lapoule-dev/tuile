@@ -42,7 +42,7 @@ use tuile_core::source::TileId;
 use tuile_core::storage::ContentStore;
 use tuile_core::traversal::Config;
 use tuile_native_fetchers::NativeHttp;
-use tuile_planetary::{globe, GlobeOptions};
+use tuile_planetary::{globe_on, GlobeOptions};
 use tuile_storage_foyer::FoyerStore;
 use tuile_terrain::CachedTerrain;
 use tuile_wgpu::{prepare, GpuContext, PreparedTile, TileRenderer, ViewUniform};
@@ -181,11 +181,12 @@ async fn main() -> Result<()> {
     // configuration rather than a stripped-down one.
     let foyer = Arc::new(FoyerStore::shared("tiles").await?);
     let store = Arc::clone(&foyer) as Arc<dyn ContentStore>;
-    let (tree, loader, detail, _heights) = globe(
+    let (tree, loader, detail, _heights) = globe_on(
         CachedTerrain::new(terrain, Arc::clone(&store), "ion-cwt"),
         CachedImagery::new(bing, Arc::clone(&store), "bing-aerial"),
         layer,
         GlobeOptions::default(),
+        tuile_core::offload::threaded(),
     );
 
     let config = Config {
@@ -308,6 +309,9 @@ async fn settle<S: GeometryStream + Unpin>(
                     contents.insert(tile, decoded);
                 }
             }
+            // A probe measures what the session really streams; a stand-in is
+            // synthesised locally and would flatter every number it touched.
+            ServerMessage::Fill { .. } => {}
             ServerMessage::Evict { tiles } => {
                 for t in &tiles {
                     contents.remove(t);
@@ -317,6 +321,9 @@ async fn settle<S: GeometryStream + Unpin>(
             ServerMessage::Error { tile, message } => {
                 tracing::warn!("server error on {tile:?}: {message}");
             }
+            // The probe shows no window, so it holds nothing back on the
+            // coarse pyramid's account.
+            ServerMessage::Priming(_) => {}
         }
     }
     if std::time::Instant::now() >= deadline || messages >= MAX_SETTLE_MESSAGES {

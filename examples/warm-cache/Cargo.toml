@@ -1,0 +1,23 @@
+[package]
+name = "warm-cache"
+description = "Fills the tile store with the coarse pyramid, once, before flying."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+dotenvy = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tuile-bing = { version = "0.0.1", path = "../../crates/tuile-bing" }
+tuile-cesium-ion = { version = "0.0.1", path = "../../crates/tuile-cesium-ion" }
+tuile-core = { version = "0.0.1", path = "../../crates/tuile-core" }
+tuile-native-fetchers = { version = "0.0.1", path = "../../crates/tuile-native-fetchers" }
+tuile-planetary = { version = "0.0.1", path = "../../crates/tuile-planetary" }
+tuile-storage-foyer = { version = "0.0.1", path = "../../crates/tuile-storage-foyer" }
+tuile-terrain = { version = "0.0.1", path = "../../crates/tuile-terrain" }
