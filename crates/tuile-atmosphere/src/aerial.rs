@@ -24,6 +24,13 @@
 //! surface effect — and lives in [`crate::sky`].
 
 use crate::sun::Sun;
+/// This module's own expression as a shader, for any backend that wants it.
+///
+/// WGSL because that is the language the reference backend speaks and the one
+/// naga can translate out of; it declares no bindings and no entry point, so it
+/// is a fragment to be concatenated, not a program.
+pub const WGSL: &str = include_str!("aerial.wgsl");
+
 use glam::DVec3;
 use tuile_core::geo::WGS84_A;
 
