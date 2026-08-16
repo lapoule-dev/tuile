@@ -27,7 +27,7 @@ use tuile_core::source::{TileId, TileLoader, TileTree};
 use tuile_core::traversal::{Config, ViewState};
 use tuile_core::TileContent;
 use tuile_native_fetchers::NativeHttp;
-use tuile_planetary::{globe, GlobeOptions};
+use tuile_planetary::{globe_on, GlobeOptions};
 use tuile_wgpu::{prepare, GpuContext, PreparedTile, TileRenderer, ViewUniform};
 use tuile_wgpu::{DEPTH_FORMAT, TEXTURE_FORMAT};
 
@@ -143,7 +143,19 @@ impl Preset {
             view_proj: (p * v).to_cols_array(),
             sun_dir: [headlight.x, headlight.y, headlight.z, 0.0],
             params: [self.ambient, 0.0, 0.0, 0.0],
-            atmosphere: Default::default(),
+            // Off by default: these renders are for judging geometry and
+            // imagery, and haze only makes two frames harder to compare.
+            // TUILE_AIR=<strength> turns it on, which is how the viewer's own
+            // look gets reproduced somewhere it can be inspected offline.
+            atmosphere: match std::env::var("TUILE_AIR").ok().and_then(|v| v.parse().ok()) {
+                Some(strength) if strength > 0.0 => tuile_atmosphere::AerialPerspective::new(
+                    self.eye,
+                    self.render_origin,
+                    &tuile_atmosphere::Sun::from_direction(self.eye.normalize()),
+                    strength,
+                ),
+                _ => Default::default(),
+            },
         }
     }
 }
@@ -177,8 +189,16 @@ async fn ion_globe(
 
     // No cache wrappers: a bulk run visits each tile once, so a store would
     // only pay the cost of writing entries nothing comes back for.
-    let (tree, loader, _detail, _heights) =
-        globe(terrain, bing, layer, GlobeOptions { no_imagery });
+    let (tree, loader, _detail, _heights) = globe_on(
+        terrain,
+        bing,
+        layer,
+        GlobeOptions {
+            no_imagery,
+            ..Default::default()
+        },
+        tuile_core::offload::threaded(),
+    );
     Ok((tree, loader))
 }
 
