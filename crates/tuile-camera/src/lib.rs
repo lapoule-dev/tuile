@@ -333,15 +333,32 @@ impl GlobeCamera {
         aspect: f32,
         clearance: f64,
     ) -> [f32; 16] {
+        self.clip_planes(clearance);
+        self.projection(render_origin, aspect, clearance)
+    }
+
+    /// The near and far planes this view would use, in metres.
+    ///
+    /// Exposed because a clip plane is invisible until it is wrong, and then it
+    /// is indistinguishable from missing geometry: ground beyond `far` is not
+    /// drawn dark, it is not drawn at all, and the result is a black region that
+    /// looks exactly like a tile that never arrived. A reader watching these two
+    /// numbers against the altitude can tell the two apart in one glance.
+    pub fn clip_planes(&self, clearance: f64) -> (f32, f32) {
+        let altitude = self.altitude().max(1.0);
+        let horizon = (altitude * (2.0 * WGS84_A + altitude)).sqrt();
+        let near = (clearance.max(1.0) * 0.25).max(1.0) as f32;
+        let far = (horizon * 1.5 + 10_000.0) as f32;
+        (near, far)
+    }
+
+    fn projection(&self, render_origin: DVec3, aspect: f32, clearance: f64) -> [f32; 16] {
         let eye = (self.position - render_origin).as_vec3();
         let target = (self.position + self.direction - render_origin).as_vec3();
         let view = Mat4::look_at_rh(eye, target, self.up.as_vec3());
         // Far still comes from the ellipsoid: it is the horizon, which is set
         // by how high the eye is over the globe, not by what is underfoot.
-        let altitude = self.altitude().max(1.0);
-        let horizon = (altitude * (2.0 * WGS84_A + altitude)).sqrt();
-        let near = (clearance.max(1.0) * 0.25).max(1.0) as f32;
-        let far = (horizon * 1.5 + 10_000.0) as f32;
+        let (near, far) = self.clip_planes(clearance);
         let proj = Mat4::perspective_rh(self.fovy as f32, aspect.max(1e-3), near, far);
         (proj * view).to_cols_array()
     }
@@ -397,7 +414,11 @@ impl CameraController {
     pub fn new(camera: GlobeCamera) -> Self {
         Self {
             camera,
-            min_altitude: 100.0,
+            // A metre. Low enough to stand on the ground rather than hover over
+            // it; above zero because the clamp is against *sampled* relief, and
+            // a floor of zero would let the eye sink through a summit the
+            // moment a finer tile raised it.
+            min_altitude: 1.0,
             target: camera,
             ground: None,
         }
@@ -407,6 +428,16 @@ impl CameraController {
     ///
     /// The surface is read live, so it sharpens as the globe streams: pass the
     /// same shared handle the terrain loader writes into.
+    /// The relief this controller was given, if any.
+    ///
+    /// Exposed so a renderer can sample the same surface the camera stands on.
+    /// Two samplers would be two answers to "how high is the ground here", and
+    /// a stand-in surface built from one while the camera flies over the other
+    /// is a stand-in that floats or sinks.
+    pub fn ground(&self) -> Option<&Arc<dyn GroundHeight>> {
+        self.ground.as_ref()
+    }
+
     pub fn with_ground(mut self, ground: Arc<dyn GroundHeight>) -> Self {
         self.ground = Some(ground);
         self
@@ -651,6 +682,37 @@ impl CameraController {
     /// anything instrumenting a gesture wants this one.
     pub fn target(&self) -> &GlobeCamera {
         &self.target
+    }
+
+    /// Eases the live camera toward the gesture target by a **duration**, not by
+    /// a fixed fraction — call once a frame with the time since the last one.
+    ///
+    /// [`Self::update`] takes the fraction directly, and that fraction is only
+    /// equivalent to a speed while the frame time holds still. It does not hold
+    /// still here: frames stretch and snap back as tiles decode and upload, so a
+    /// constant fraction moved the eye a different distance every frame for the
+    /// same gesture. What that reads as on screen is stutter — and the cause is
+    /// not the amount of smoothing but its unevenness, which is why turning the
+    /// fraction up or down never helped.
+    ///
+    /// An exponential ease has one honest parameter, a time, and that time is
+    /// what stays fixed while the frame rate moves under it.
+    pub fn advance(&mut self, dt: f64) {
+        /// How long the eye takes to cover most of the gap to its target.
+        ///
+        /// The time constant: 63 % of the distance after one, 95 % after three.
+        /// Short enough that a drag stays attached to the hand, long enough to
+        /// absorb a wheel notch and an uneven frame.
+        const SETTLE_SECONDS: f64 = 0.08;
+        /// The longest step the ease will take in one call.
+        ///
+        /// A frame that took a quarter of a second — a burst of uploads, a
+        /// shader compile, a window drag — must not be repaid by teleporting the
+        /// eye across the gap it missed. Arriving late is better than jumping.
+        const LONGEST_STEP: f64 = 1.0 / 30.0;
+
+        let dt = dt.clamp(0.0, LONGEST_STEP);
+        self.update(1.0 - (-dt / SETTLE_SECONDS).exp());
     }
 
     pub fn update(&mut self, k: f64) {
@@ -1112,10 +1174,60 @@ mod tests {
         );
     }
 
-    /// Easing lerps `direction` and `up` independently and normalises each,
-    /// which does not keep them perpendicular. Left alone the basis skews a
-    /// little every frame and never recovers, so this asserts the invariant
-    /// over enough frames for drift to show.
+    /// **The same elapsed time lands in the same place, however it is cut up.**
+    ///
+    /// This is what "frame-rate independent" means, and it is the whole reason
+    /// [`CameraController::advance`] exists. [`CameraController::update`] takes
+    /// the fraction directly, so a second of easing at sixty frames covers far
+    /// more of the gap than the same second at thirty — the eye's *speed* then
+    /// depends on how busy the machine is, and every hitch in the frame time
+    /// becomes a visible hitch in the motion.
+    ///
+    /// The window is deliberately **shorter** than the 0.08 s time constant. Over
+    /// a long one every scheme converges — the eye arrives whatever the rate, and
+    /// the test passes while measuring nothing. It was written that way first and
+    /// went green with the fix reverted, which is exactly the failure
+    /// `CLAUDE.md` warns about. The difference lives in the approach, so the
+    /// approach is what has to be sampled.
+    #[test]
+    fn the_same_easing_time_lands_in_the_same_place_at_any_frame_rate() {
+        let start = || {
+            let mut c = oblique_over(48f64.to_radians(), 2f64.to_radians(), 200_000.0);
+            c.zoom(4.0, (600.0, 600.0), (1600.0, 900.0));
+            c
+        };
+
+        // A twentieth of a second, cut two ways.
+        let mut fast = start();
+        for _ in 0..6 {
+            fast.advance(1.0 / 120.0);
+        }
+        let mut slow = start();
+        for _ in 0..3 {
+            slow.advance(1.0 / 60.0);
+        }
+
+        let apart = (fast.camera.position - slow.camera.position).length();
+        let travelled = (fast.camera.position - start().camera.position).length();
+        assert!(
+            travelled > 1.0,
+            "the fixture did not move, so it cannot show a difference"
+        );
+        assert!(
+            apart < travelled * 1.0e-3,
+            "the same easing time landed {apart:.1} m apart at 120 fps and 60 fps, \
+             having travelled {travelled:.0} m — the motion depends on the frame \
+             rate, so every uneven frame is a visible jerk"
+        );
+    }
+
+    /// The eased basis stays square.
+    ///
+    /// `update` slerps one rotation rather than interpolating `direction` and
+    /// `up` separately — separate interpolation does not keep them
+    /// perpendicular, so the basis skewed a little every frame and never
+    /// recovered. A rotation cannot skew, and this asserts it over enough
+    /// frames for any drift to show.
     #[test]
     fn easing_does_not_skew_the_basis() {
         let mut ctrl = oblique_over(48f64.to_radians(), 2f64.to_radians(), 200_000.0);
