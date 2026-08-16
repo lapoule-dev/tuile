@@ -50,6 +50,9 @@ pub struct TileRenderer {
     pipeline: wgpu::RenderPipeline,
     /// Draws without touching depth — see [`TileRenderer::render_background`].
     background: wgpu::RenderPipeline,
+    /// Redraws geometry the main pipeline already drew, to spend imagery layers
+    /// one draw could not bind. See [`TileRenderer::render`].
+    layers: wgpu::RenderPipeline,
     wireframe: Option<wgpu::RenderPipeline>,
     lines: wgpu::RenderPipeline,
     view_buf: wgpu::Buffer,
@@ -62,9 +65,20 @@ impl TileRenderer {
     /// offscreen target. Wireframe is created only when the device has
     /// `POLYGON_MODE_LINE`.
     pub fn new(gpu: &GpuContext, target_format: wgpu::TextureFormat) -> Self {
+        // Assembled, not one file: the two halves that are not about wgpu live
+        // with the code they mirror — the air in `tuile-atmosphere`, the mosaic
+        // rule beside the table it consumes in `tuile-core::raster`. What is
+        // left in `shader.wgsl` is the bindings and the entry points, which is
+        // what this crate is actually for.
+        //
+        // Order matters: WGSL wants a declaration before its use, and the
+        // plumbing calls into both fragments.
         let shader = gpu
             .device
-            .create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("tuile ground"),
+                source: wgpu::ShaderSource::Wgsl(ground_wgsl(gpu.imagery_slots).into()),
+            });
         let layout = gpu
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -77,7 +91,27 @@ impl TileRenderer {
                 immediate_size: 0,
             });
 
-        let make_pipeline = |polygon_mode: wgpu::PolygonMode, background: bool| {
+        // Three shapes of the same pipeline, differing only in how they meet
+        // the depth buffer and what they do to the colour already there.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Pass {
+            /// Writes depth, tests `Less`, replaces the colour. The scene.
+            Solid,
+            /// Neither writes nor tests depth. What is behind everything.
+            Backdrop,
+            /// The same geometry a `Solid` pass already drew, carrying the next
+            /// batch of imagery layers.
+            ///
+            /// `LessOrEqual` rather than `Less`, because the fragments are at
+            /// *exactly* the depth the first pass wrote and `Less` would reject
+            /// every one of them — the pass would compile, bind, draw, and
+            /// change nothing. Alpha blending composes it over what is there,
+            /// which is what makes an uncovered fragment keep the pass beneath
+            /// it rather than be painted with untextured ground.
+            Layers,
+        }
+        let make_pipeline = |polygon_mode: wgpu::PolygonMode, kind: Pass| {
+            let background = kind == Pass::Backdrop;
             gpu.device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("tuile tiles"),
@@ -97,21 +131,26 @@ impl TileRenderer {
                     depth_stencil: Some(wgpu::DepthStencilState {
                         format: DEPTH_FORMAT,
                         // A background neither writes depth nor tests against
-                        // it: it is not geometry competing for a place in the
-                        // scene, it is what sits behind everything.
+                        // it. It is not geometry competing for a place in the
+                        // scene — it is what is behind everything, and saying
+                        // so is the whole difference between a backstop that
+                        // works and one that has to guess how deep to sit.
+                        //
+                        // Guessing was tried: a shell five hundred metres under
+                        // the ellipsoid was shredded by the terrain's own
+                        // triangles, which cut chords through the sphere and
+                        // dip kilometres below it at coarse levels. There is no
+                        // depth at which that stops being true for every level
+                        // at once.
                         depth_write_enabled: Some(!background),
-                        depth_compare: Some(if background {
-                            wgpu::CompareFunction::Always
-                        } else {
-                            wgpu::CompareFunction::Less
+                        depth_compare: Some(match kind {
+                            Pass::Backdrop => wgpu::CompareFunction::Always,
+                            Pass::Solid => wgpu::CompareFunction::Less,
+                            Pass::Layers => wgpu::CompareFunction::LessEqual,
                         }),
                         stencil: Default::default(),
                         bias: Default::default(),
                     }),
-                    // The one number that must match the render targets: a
-                    // pipeline built for one sample fails validation at the
-                    // first draw into a multisampled pass, and says so in terms
-                    // of formats rather than of samples.
                     multisample: wgpu::MultisampleState {
                         count: crate::context::SAMPLES,
                         ..Default::default()
@@ -120,19 +159,25 @@ impl TileRenderer {
                         module: &shader,
                         entry_point: Some("fs_main"),
                         compilation_options: Default::default(),
-                        targets: &[Some(target_format.into())],
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: target_format,
+                            blend: (kind == Pass::Layers)
+                                .then_some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
                     }),
                     multiview_mask: None,
                     cache: None,
                 })
         };
-        let pipeline = make_pipeline(wgpu::PolygonMode::Fill, false);
-        let background = make_pipeline(wgpu::PolygonMode::Fill, true);
+        let pipeline = make_pipeline(wgpu::PolygonMode::Fill, Pass::Solid);
+        let background = make_pipeline(wgpu::PolygonMode::Fill, Pass::Backdrop);
+        let layers = make_pipeline(wgpu::PolygonMode::Fill, Pass::Layers);
         let wireframe = gpu
             .device
             .features()
             .contains(wgpu::Features::POLYGON_MODE_LINE)
-            .then(|| make_pipeline(wgpu::PolygonMode::Line, false));
+            .then(|| make_pipeline(wgpu::PolygonMode::Line, Pass::Solid));
 
         let line_shader = gpu
             .device
@@ -171,9 +216,9 @@ impl TileRenderer {
                     bias: Default::default(),
                 }),
                 multisample: wgpu::MultisampleState {
-                    count: crate::context::SAMPLES,
-                    ..Default::default()
-                },
+                        count: crate::context::SAMPLES,
+                        ..Default::default()
+                    },
                 fragment: Some(wgpu::FragmentState {
                     module: &line_shader,
                     entry_point: Some("fs_main"),
@@ -203,6 +248,7 @@ impl TileRenderer {
         Self {
             pipeline,
             background,
+            layers,
             wireframe,
             lines,
             view_buf,
@@ -239,9 +285,6 @@ impl TileRenderer {
     /// Draws tiles into the host's pass (color target = `target_format`,
     /// depth = [`DEPTH_FORMAT`]). Falls back to fill when wireframe is
     /// requested but unsupported.
-    /// Draws tiles into the host's pass (color target = `target_format`,
-    /// depth = [`DEPTH_FORMAT`]). Falls back to fill when wireframe is
-    /// requested but unsupported.
     /// Draws a surface **behind** everything, taking no part in depth.
     ///
     /// For the whole-planet shell that guarantees ground is never bare. Drawn
@@ -265,11 +308,71 @@ impl TileRenderer {
                 // a second pass over it would not be composed on top of the
                 // first — it would race it, and the winner would be whichever
                 // was submitted last. What is behind everything is drawn once.
-                pass.set_bind_group(2, &mesh.material_bg, &[]);
+                let Some(first) = mesh.material_bgs.first() else {
+                    continue;
+                };
+                pass.set_bind_group(2, first, &[]);
                 pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                 pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
             }
+        }
+    }
+
+    pub fn render<'t>(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        tiles: impl Iterator<Item = &'t PreparedTile>,
+        wireframe: bool,
+    ) {
+        let (solid, wireframing) = match (wireframe, &self.wireframe) {
+            (true, Some(wf)) => (wf, true),
+            _ => (&self.pipeline, false),
+        };
+        // Every first pass, then every later one. Grouping by pipeline rather
+        // than by mesh is not an optimisation here, it is the correctness: a
+        // later pass has to compose over the *finished* solid surface, and a
+        // per-mesh interleaving would compose it over whatever happened to be
+        // drawn so far — a neighbouring tile's ground, in the worst case.
+        pass.set_pipeline(solid);
+        pass.set_bind_group(0, &self.view_bg, &[]);
+        let tiles: Vec<&PreparedTile> = tiles.collect();
+        for tile in &tiles {
+            pass.set_bind_group(1, &tile.tile_bg, &[]);
+            for mesh in &tile.meshes {
+                let Some(first) = mesh.material_bgs.first() else {
+                    continue;
+                };
+                pass.set_bind_group(2, first, &[]);
+                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+        }
+        // A wireframe is not a surface and has no layers to add; drawing them
+        // would fill the lines back in.
+        if !wireframing && tiles.iter().any(|t| t.needs_more_passes()) {
+            pass.set_pipeline(&self.layers);
+            for tile in &tiles {
+                pass.set_bind_group(1, &tile.tile_bg, &[]);
+                for mesh in &tile.meshes {
+                    for bg in mesh.material_bgs.iter().skip(1) {
+                        pass.set_bind_group(2, bg, &[]);
+                        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        pass.set_index_buffer(
+                            mesh.index_buf.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    }
+                }
+            }
+        }
+        if let Some((buf, count)) = &self.line_buf {
+            pass.set_pipeline(&self.lines);
+            pass.set_bind_group(0, &self.view_bg, &[]);
+            pass.set_vertex_buffer(0, buf.slice(..));
+            pass.draw(0..*count, 0..1);
         }
     }
 
@@ -305,33 +408,46 @@ impl TileRenderer {
             overlay.render(pass);
         }
     }
+}
 
-    pub fn render<'t>(
-        &self,
-        pass: &mut wgpu::RenderPass<'_>,
-        tiles: impl Iterator<Item = &'t PreparedTile>,
-        wireframe: bool,
-    ) {
-        let pipeline = match (wireframe, &self.wireframe) {
-            (true, Some(wf)) => wf,
-            _ => &self.pipeline,
-        };
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &self.view_bg, &[]);
-        for tile in tiles {
-            pass.set_bind_group(1, &tile.tile_bg, &[]);
-            for mesh in &tile.meshes {
-                pass.set_bind_group(2, &mesh.material_bg, &[]);
-                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-            }
-        }
-        if let Some((buf, count)) = &self.line_buf {
-            pass.set_pipeline(&self.lines);
-            pass.set_bind_group(0, &self.view_bg, &[]);
-            pass.set_vertex_buffer(0, buf.slice(..));
-            pass.draw(0..*count, 0..1);
-        }
+/// The ground shader, assembled from its three parts and sized for `slots`
+/// imagery layers.
+///
+/// `slots` is what the device said it would bind, passed through
+/// [`tuile_core::raster::imagery_slots`] — not a number anyone wrote down. It
+/// decides three things that must agree exactly, and this is the only place all
+/// three are stated: the length of the uniform array, how many textures are
+/// declared, and how many are sampled. A shader that declares more than the
+/// bind-group layout binds fails validation; one that samples fewer than it
+/// declares loses its finest layers silently, at exactly the tiles that straddle
+/// worst.
+///
+/// Public so a test — or a translator aiming at another shading language — can
+/// ask for exactly what the backend compiles, rather than reassembling it and
+/// hoping the order matches.
+pub fn ground_wgsl(slots: u32) -> String {
+    let mut bindings = String::from("struct ImageryUniform {\n");
+    // Two vec4 per slot: coverage, then placement. One array rather than an
+    // array of structs, because that is the layout with no padding to reason
+    // about — see `tuile_core::raster::imagery_layer_table`, which packs it.
+    bindings.push_str(&format!("    layers: array<vec4f, {}>,\n}}\n", 2 * slots));
+    bindings.push_str("@group(2) @binding(3) var<uniform> imagery: ImageryUniform;\n");
+    let mut samples = String::new();
+    for slot in 0..slots {
+        bindings.push_str(&format!(
+            "@group(2) @binding({}) var img{slot}: texture_2d<f32>;\n",
+            crate::context::IMAGERY_BINDING_0 + slot
+        ));
+        samples.push_str(&format!(
+            "    ground = layer(ground, img{slot}, in.uv, {slot}u);\n"
+        ));
     }
+    format!(
+        "{}\n{}\n{}",
+        tuile_core::raster::WGSL,
+        tuile_atmosphere::WGSL,
+        include_str!("shader.wgsl")
+            .replace("//#IMAGERY_BINDINGS", &bindings)
+            .replace("//#IMAGERY_SAMPLES", samples.trim_start()),
+    )
 }
