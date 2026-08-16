@@ -48,6 +48,24 @@ pub enum ServerMessage {
     },
     /// Content for a tile. Always `Decoded` on the consumer side.
     Content { tile: TileId, content: TileContent },
+    /// A **stand-in** surface for a tile the consumer has not got yet.
+    ///
+    /// Its own variant rather than a flag on [`ServerMessage::Content`], for two
+    /// reasons. A consumer must be able to *refuse* it — a stand-in racing the
+    /// real content it was covering for would otherwise overwrite it, since both
+    /// are filed under the same tile — and a variant makes that decision
+    /// unavoidable at the match rather than optional at a boolean. And a backend
+    /// that would rather draw an ancestor can ignore the message entirely and
+    /// lose nothing but sharpness.
+    ///
+    /// Occupies exactly the tile's own rectangle, which is the point: the
+    /// alternative, drawing the nearest ready ancestor, also covers the siblings
+    /// that did arrive, and two surfaces over one patch of ground fight in the
+    /// depth buffer.
+    Fill {
+        tile: TileId,
+        content: crate::content::DecodedTileContent,
+    },
     /// These tiles left residency; release their resources.
     Evict { tiles: Vec<TileId> },
     /// Non-fatal failure (a tile failed to fetch or decode).
@@ -55,6 +73,48 @@ pub enum ServerMessage {
         tile: Option<TileId>,
         message: String,
     },
+    /// How the coarse pyramid is going. Sent whenever the count changes, so a
+    /// host holding its first frame back learns the shape of the wait on the
+    /// session's first pass and every change after it.
+    Priming(Priming),
+}
+
+/// The state of the coarse pyramid a session primes at startup.
+///
+/// A host that holds its first frame back until the pyramid is on the GPU needs
+/// a condition it can actually **reach**, and "every primed tile is on the GPU"
+/// is not one: a source does not serve every tile of a global grid — there is no
+/// terrain over most of the ocean at coarse levels — and a tile that will never
+/// be served can never be uploaded. Waiting for it is waiting for ever, which is
+/// exactly what a viewer did: 618 of 682 tiles held, an empty queue, and a window
+/// that never opened.
+///
+/// So a primed tile ends in one of two states and the server reports both.
+/// [`Priming::expected`] is the number the consumer can actually hold, and
+/// [`Priming::settled`] says the answer will not change again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Priming {
+    /// Tiles the session asked for at the pinned levels.
+    pub total: u32,
+    /// Of those, how many the session has given up on: the source has no such
+    /// tile, the load failed, or the content turned out to be topology rather
+    /// than geometry. **Resolved, not pending** — none of them will ever arrive.
+    pub unavailable: u32,
+    /// Still to be asked for, or asked for and not yet answered. Falls to zero;
+    /// nothing else is a bound on the wait.
+    pub outstanding: u32,
+}
+
+impl Priming {
+    /// Whether every primed tile has been answered one way or the other.
+    pub fn settled(&self) -> bool {
+        self.outstanding == 0
+    }
+
+    /// How many of the primed tiles a consumer can ever hold.
+    pub fn expected(&self) -> u32 {
+        self.total.saturating_sub(self.unavailable)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

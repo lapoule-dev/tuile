@@ -197,7 +197,10 @@ async fn resolve(
     // looks wrong and a texture is the last thing you want on top of it.
     let Some(imagery_asset_id) = config.imagery_asset_id else {
         let (tree, loader, _detail, _heights) =
-            globe(terrain, NoImagery, layer, GlobeOptions { no_imagery: true });
+            globe(terrain, NoImagery, layer, GlobeOptions {
+                no_imagery: true,
+                ..Default::default()
+            });
         return Ok((tree, loader));
     };
 
@@ -228,7 +231,10 @@ async fn resolve(
         .map_err(|e| GlobeError::Bing(e.to_string()))?;
 
     let (tree, loader, _detail, _heights) =
-        globe(terrain, bing, layer, GlobeOptions { no_imagery: false });
+        globe(terrain, bing, layer, GlobeOptions {
+            no_imagery: false,
+            ..Default::default()
+        });
     Ok((tree, loader))
 }
 
