@@ -38,6 +38,28 @@ The executable heart is a **logical geometry server**, not a network server. The
 7. **All geospatial precision in f64** until rebasing. f32 only after the switch to a local frame. Never raw ECEF coordinates in f32 — that is the source of jitter.
 8. **On the wasm side, rely as much as possible on stable, widely adopted crates** (wasm-bindgen, web-sys, js-sys, gloo, getrandom/js). No experimental, exotic pre-1.0, or poorly maintained crate in the wasm path without a written justification in the PR.
 
+## Black ground is a bug, always
+
+**No black square, no black region, not for one frame.** A black quad on a globe
+is indistinguishable from a rendering fault, and it is what a client sees. Soft,
+blurry or stale ground is *always* preferable to absent ground.
+
+Two consequences that have each been violated and had to be undone:
+
+- **Never refuse to draw a fallback in order to avoid another artefact.** Every
+  refusal is a hole. Overlap, shimmer and blur are all strictly better than
+  black — fix them without ever removing coverage. Switching off the consumer's
+  climb to the nearest resident ancestor produced large black rectangles at both
+  zoom-in and zoom-out.
+- **Swap surfaces in this order: create the new mesh and its texture in GPU
+  memory, activate it, and only then deactivate the old one.** There must be no
+  instant where neither is active. A replacement may overlap for one frame; it
+  may never gap for one frame.
+
+Note also that any instrument counting "did every *selected* tile draw
+something" is blind to ground that was never selected. A green counter is not a
+covered globe.
+
 ## Expected workflow
 
 - Implement milestone by milestone in the order of `docs/03-roadmap.md`. Do not start M2 until the M1 acceptance criteria pass.
@@ -54,3 +76,18 @@ cargo test --workspace
 cargo clippy --workspace -- -D warnings
 cargo run -p wgpu-viewer -- fixtures/tileset-simple/tileset.json
 ```
+
+**Never pipe a test, build or clippy run through `head` or `tail`.** `head` closes
+the pipe as soon as it has its lines and kills the run partway through, so the
+`test result:` summary never arrives and a truncated run is indistinguishable from
+a hang; `tail` shows nothing until the process exits. Redirect the whole run to a
+file and grep it afterwards:
+
+```bash
+cargo test --workspace > /tmp/tests.log 2>&1
+grep -E "(test result|FAILED|panicked)" /tmp/tests.log
+```
+
+**A green suite is not proof.** Write the test in the same change as the behaviour,
+then revert the behaviour and confirm the test fails. Say plainly what a test does
+not cover rather than letting a passing run imply coverage it does not have.
