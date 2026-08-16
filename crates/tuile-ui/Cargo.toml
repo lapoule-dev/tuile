@@ -10,5 +10,16 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The menu-bar readout. Off by default so the crate stays pure and wasm-clean
+# for every consumer that only wants the on-screen widgets; a native host that
+# wants the readout asks for it.
+statusbar = ["dep:tray-icon", "dep:muda"]
+
 [dependencies]
 tuile-camera = { version = "0.0.1", path = "../tuile-camera" }
+tuile-core = { version = "0.0.1", path = "../tuile-core" }
+# macOS-only in practice; the crates are a no-op elsewhere, so a host that asks
+# for the feature still builds on other platforms.
+tray-icon = { version = "0.24", optional = true }
+muda = { version = "0.18", optional = true }
