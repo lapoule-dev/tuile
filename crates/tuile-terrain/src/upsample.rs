@@ -361,6 +361,83 @@ mod tests {
         );
     }
 
+    /// A parent with a ridge inside one of its quadrants, so that the quadrant's
+    /// four corners say nothing about what is between them.
+    ///
+    /// The peak sits at `u = 0.25`, which is the middle of the western children
+    /// and an interior point of them — the one place a plane through the corners
+    /// cannot follow.
+    fn ridged_tile(steps: usize) -> QuantizedMesh {
+        let mut mesh = sloping_tile(steps);
+        for i in 0..mesh.u.len() {
+            let u = mesh.u[i];
+            // A tent peaking at u = 0.25 and reaching zero at 0 and 0.5.
+            mesh.height[i] = (1.0 - (4.0 * u - 1.0).abs()).max(0.0);
+        }
+        mesh
+    }
+
+    /// **A stand-in built this way follows the ground; a plane through the
+    /// corners does not, and the gap is hundreds of metres.**
+    ///
+    /// This is the test the flat stand-in never had. `fill_content` builds a
+    /// ruled surface from four corner heights, which is exact where the terrain
+    /// is flat and wrong by the whole relief where it is not. Used as a stand-in
+    /// it put a plane under ground that has ridges, and wherever an ancestor was
+    /// still drawn beside it — which happens whenever the loader declines to
+    /// build one — the real relief **punched through the plane**: large flat
+    /// patches with ridges showing through in ragged outlines following the
+    /// terrain rather than the tile grid. Measured on screen twice.
+    ///
+    /// So the property a stand-in mesh must have is not "cheap" or "smooth", it
+    /// is *this*: the same surface as what it stands in for. The assertion below
+    /// is the difference between the two constructions, in metres.
+    #[test]
+    fn the_upsampled_surface_departs_from_a_plane_through_its_corners() {
+        let parent = ridged_tile(8);
+        let coord = TileCoord::new(5, 3, 7);
+
+        let worst = coord
+            .children()
+            .into_iter()
+            .map(|child| {
+                let up = upsample(&parent, coord, child).expect("a child of its own parent");
+                let h = heights_of(&up);
+                // The four corners, as `fill_content` samples them.
+                let corner = |cu: f64, cv: f64| {
+                    up.u
+                        .iter()
+                        .zip(&up.v)
+                        .zip(&h)
+                        .filter(|((u, v), _)| (**u - cu).abs() < 1e-9 && (**v - cv).abs() < 1e-9)
+                        .map(|(_, h)| *h)
+                        .next()
+                        .unwrap_or(0.0)
+                };
+                let (sw, se) = (corner(0.0, 0.0), corner(1.0, 0.0));
+                let (nw, ne) = (corner(0.0, 1.0), corner(1.0, 1.0));
+                // The ruled surface between them — `fill_content`'s whole mesh.
+                up.u
+                    .iter()
+                    .zip(&up.v)
+                    .zip(&h)
+                    .map(|((u, v), h)| {
+                        let south = sw + (se - sw) * u;
+                        let north = nw + (ne - nw) * u;
+                        (h - (south + (north - south) * v)).abs()
+                    })
+                    .fold(0.0f64, f64::max)
+            })
+            .fold(0.0f64, f64::max);
+
+        assert!(
+            worst > 100.0,
+            "the ridge inside the quadrant is only {worst:.1} m away from a \
+             plane through its corners — the fixture has stopped exercising the \
+             difference, and the test no longer says anything"
+        );
+    }
+
     /// Asking for a tile that is not below the one being upsampled is a caller's
     /// mistake, and answering with a plausible mesh would hide it.
     #[test]
