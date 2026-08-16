@@ -35,6 +35,8 @@ pub mod geo;
 pub mod ground;
 pub mod implicit;
 pub mod math;
+pub mod metrics;
+pub mod offload;
 pub mod protocol;
 pub mod raster;
 pub mod report;
