@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Deserialize;
 use std::sync::Arc;
-use tuile_core::fetch::{Fetched, TileFetcher};
+use tuile_core::fetch::{FetchError, Fetched, TileFetcher};
 use tuile_core::raster::{ImageryCoord, ImageryProvider, RasterError, TilingScheme};
 
 /// Metadata of a Bing imagery layer (the parts we need).
@@ -79,7 +79,18 @@ pub fn cache_name(style: &str) -> String {
 /// Belt and braces with [`cache_name`]: a host that shares one store between
 /// several providers still needs its keys not to collide.
 pub fn cache_namespace(style: &str) -> String {
-    format!("bing-{}", style.to_lowercase())
+    // The suffix is a **generation**, and it exists because the store is keyed
+    // by tile coordinate rather than by URL: a change in what we ask Bing for
+    // is invisible to it, and every tile already cached keeps being served as
+    // it was.
+    //
+    // Generation 2 is the `n=z` change. Everything cached before it may be
+    // Bing's "no imagery" placeholder — a pale square with a crossed-out icon,
+    // served at HTTP 200, decoding into a perfectly valid texture that nothing
+    // downstream can tell from aerial photography. They are indistinguishable
+    // from real tiles in the store too, so the only honest move is to stop
+    // reading the whole generation.
+    format!("bing2-{}", style.to_lowercase())
 }
 
 impl BingMetadata {
@@ -130,9 +141,28 @@ impl BingMetadata {
             let i = (coord.x + coord.y + u64::from(coord.level)) as usize % self.subdomains.len();
             &self.subdomains[i]
         };
-        self.image_url
+        let url = self
+            .image_url
             .replace("{subdomain}", subdomain)
-            .replace("{quadkey}", &quadkey)
+            .replace("{quadkey}", &quadkey);
+        // `n=z`: answer a tile Bing does not have with a **zero-length body**
+        // rather than with a placeholder image.
+        //
+        // The default is the trap. Bing answers a missing tile with a pale
+        // square carrying a "no imagery" icon, at HTTP 200, and it decodes into
+        // a perfectly valid texture — so nothing downstream can tell it from
+        // aerial photography. It is cached, draped, drawn, and reads on screen
+        // as a flat pale rectangle over ground that has real imagery beside it.
+        // Every instrument agrees the tile is fine, including
+        // `tiles_without_imagery`, because the tile *does* have imagery.
+        //
+        // An empty body is a miss, and a miss is what makes the drape fall back
+        // to the ancestor's picture — coarser, and of the actual ground.
+        //
+        // The reference implementation sends the same parameter for the same
+        // stated reason (`BingMapsImageryProvider.js`, `buildImageResource`).
+        let separator = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{separator}n=z")
     }
 
     /// Parses the Bing metadata JSON document.
@@ -229,7 +259,115 @@ impl<F: TileFetcher> ImageryProvider for BingImageryProvider<F> {
             .tile_url(coord)
             .parse()
             .map_err(|e: url::ParseError| RasterError::Image(e.to_string()))?;
-        Ok(self.fetcher.fetch_cacheable(&url).await?)
+        let fetched = self.fetcher.fetch_cacheable(&url).await?;
+        // An empty body is Bing saying it has no imagery here — see the `n=z`
+        // parameter in [`BingMetadata::tile_url`]. It arrives with HTTP 200, so
+        // nothing below this line would call it a miss: the decoder would simply
+        // fail on zero bytes, the whole tile load would fail with it, and the
+        // ground would stay coarse for as long as the camera looked at it while
+        // the traversal asked again and again.
+        //
+        // Named as `NotFound` because that is what it is, and because the drape
+        // already knows what to do with one: climb to the ancestor and use its
+        // picture of the same ground.
+        if fetched.value.is_empty() {
+            return Err(RasterError::Fetch(FetchError::NotFound(url)));
+        }
+        Ok(fetched)
+    }
+}
+
+#[cfg(test)]
+mod missing_tile_tests {
+    use super::*;
+    use super::tests::MockFetcher;
+
+    fn metadata(template: &str) -> BingMetadata {
+        BingMetadata {
+            image_url: template.into(),
+            subdomains: vec!["t0".into()],
+            tile_width: 256,
+            tile_height: 256,
+        }
+    }
+
+    /// **Every tile request asks for a zero-length response where Bing has no
+    /// imagery, rather than for a picture of a crossed-out camera.**
+    ///
+    /// Bing's default is to answer a tile it does not have with a *placeholder
+    /// image* — a pale square carrying a "no imagery" icon. It arrives with HTTP
+    /// 200, it decodes, and it is a perfectly valid texture, so nothing
+    /// downstream can tell it from aerial photography: it is draped, drawn, and
+    /// reads on screen as a flat pale rectangle over ground that has real
+    /// imagery beside it. `tiles_without_imagery` stays at zero throughout,
+    /// because the tile *does* have imagery. It has that.
+    ///
+    /// `n=z` asks for a zero-length body instead, which the drape treats as "no
+    /// tile at this level" and answers with the ancestor's imagery — coarser,
+    /// and a picture of the actual ground. The reference implementation sends
+    /// exactly this parameter, and says why in the same words:
+    /// "this parameter tells the Bing servers to send a zero-length response
+    /// instead of a placeholder image for missing tiles"
+    /// (`BingMapsImageryProvider.js`, `buildImageResource`).
+    /// **An empty body is a miss, not a decode failure.**
+    ///
+    /// The other half of `n=z`, and useless without it. Bing answers a tile it
+    /// does not have with HTTP **200** and zero bytes, so nothing between the
+    /// socket and the drape would call it missing on its own: the decoder would
+    /// fail on an empty buffer, the failure would take the whole geometry tile
+    /// down with it, and the ground would stay coarse for as long as the camera
+    /// looked at it — while the traversal asked for the same tile again every
+    /// pass.
+    ///
+    /// `NotFound` is what the drape already knows how to answer: climb to the
+    /// ancestor and drape its picture of the same ground, which is exactly the
+    /// behaviour that was wanted.
+    #[test]
+    fn an_empty_body_is_reported_as_a_missing_tile() {
+        let fetcher = Arc::new(MockFetcher::default());
+        let coord = ImageryCoord {
+            level: 12,
+            x: 2100,
+            y: 1500,
+        };
+        let meta = metadata("https://example.test/{subdomain}/{quadkey}.jpeg");
+        fetcher.put(&meta.tile_url(coord), Vec::new());
+        let meta = metadata("https://example.test/{subdomain}/{quadkey}.jpeg");
+        let provider = BingImageryProvider::new(Arc::clone(&fetcher), meta);
+
+        match futures_executor::block_on(provider.fetch_tile_bytes(coord)) {
+            Err(RasterError::Fetch(FetchError::NotFound(_))) => {}
+            other => panic!(
+                "an empty Bing body must read as a missing tile so the drape \
+                 climbs to the ancestor; got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_tile_request_asks_for_no_placeholder() {
+        // Bing's own template already carries a query string; a second one
+        // would make the whole parameter silently ignored.
+        for template in [
+            "https://ecn.{subdomain}.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=1&mkt=en-GB",
+            "https://example.test/{subdomain}/{quadkey}.jpeg",
+        ] {
+            let url = metadata(template).tile_url(ImageryCoord {
+                level: 12,
+                x: 2100,
+                y: 1500,
+            });
+            assert!(
+                url.contains("n=z"),
+                "{url} would be answered with Bing's placeholder image, which is \
+                 indistinguishable from real imagery once decoded"
+            );
+            assert_eq!(
+                url.matches('?').count(),
+                1,
+                "{url} has two query strings, so the parameter is not read"
+            );
+        }
     }
 }
 
@@ -243,12 +381,12 @@ mod tests {
     use url::Url;
 
     #[derive(Default)]
-    struct MockFetcher {
+    pub(super) struct MockFetcher {
         files: Mutex<HashMap<String, Vec<u8>>>,
         log: Mutex<Vec<String>>,
     }
     impl MockFetcher {
-        fn put(&self, url: &str, bytes: Vec<u8>) {
+        pub(super) fn put(&self, url: &str, bytes: Vec<u8>) {
             self.files
                 .lock()
                 .expect("lock")
@@ -324,7 +462,7 @@ mod tests {
         // subdomain index = (541+364+10) % 4 = 915 % 4 = 3 → "t3"; quadkey as above.
         assert_eq!(
             url,
-            "https://ecn.t3.tiles.virtualearth.net/tiles/a1202213301.jpeg"
+            "https://ecn.t3.tiles.virtualearth.net/tiles/a1202213301.jpeg?n=z"
         );
         fetcher.put(&url, png_2x2());
 
