@@ -1,0 +1,61 @@
+[package]
+name = "tuile-web"
+version = "0.0.1"
+description = "Browser transport and in-worker geometry server for tuile-core (wasm32)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+# `cdylib` is what `wasm-pack` links into a module the browser can import;
+# `rlib` keeps the crate usable as a normal dependency, which is what lets
+# `cargo check --workspace` see it at all.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+tuile-core = { version = "0.0.1", path = "../tuile-core" }
+tuile-cesium-ion = { version = "0.0.1", path = "../tuile-cesium-ion" }
+tuile-bing = { version = "0.0.1", path = "../tuile-bing" }
+tuile-planetary = { version = "0.0.1", path = "../tuile-planetary" }
+glam = { workspace = true }
+
+# The browser is the only target this crate has: everything below exists solely
+# there, and building it for a native host would produce a library that cannot
+# do anything. Gated rather than optional so a `--workspace` build on a laptop
+# skips it instead of failing on a missing `window`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2.99"
+wasm-bindgen-futures = "0.4.49"
+js-sys = "0.3.76"
+# Without it a Rust panic reaches the browser as a bare
+# `RuntimeError: unreachable` with no file, no line and no message — which is
+# exactly how the `Instant::now()` panic below cost an evening.
+console_error_panic_hook = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3.76"
+features = [
+    "Headers",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "Window",
+    "WorkerGlobalScope",
+]
+
+# The toolchain emits bulk-memory instructions (`memory.copy`) by default, and a
+# `wasm-opt` older than that refuses the module outright. Naming the features
+# rather than switching the optimiser off: a 1 MiB module that ships unoptimised
+# is a megabyte every visitor downloads.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O', '--enable-bulk-memory', '--enable-nontrapping-float-to-int', '--enable-sign-ext']
