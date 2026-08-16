@@ -48,6 +48,8 @@ pub struct LineVertex {
 
 pub struct TileRenderer {
     pipeline: wgpu::RenderPipeline,
+    /// Draws without touching depth — see [`TileRenderer::render_background`].
+    background: wgpu::RenderPipeline,
     wireframe: Option<wgpu::RenderPipeline>,
     lines: wgpu::RenderPipeline,
     view_buf: wgpu::Buffer,
@@ -75,7 +77,7 @@ impl TileRenderer {
                 immediate_size: 0,
             });
 
-        let make_pipeline = |polygon_mode: wgpu::PolygonMode| {
+        let make_pipeline = |polygon_mode: wgpu::PolygonMode, background: bool| {
             gpu.device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("tuile tiles"),
@@ -94,8 +96,15 @@ impl TileRenderer {
                     },
                     depth_stencil: Some(wgpu::DepthStencilState {
                         format: DEPTH_FORMAT,
-                        depth_write_enabled: Some(true),
-                        depth_compare: Some(wgpu::CompareFunction::Less),
+                        // A background neither writes depth nor tests against
+                        // it: it is not geometry competing for a place in the
+                        // scene, it is what sits behind everything.
+                        depth_write_enabled: Some(!background),
+                        depth_compare: Some(if background {
+                            wgpu::CompareFunction::Always
+                        } else {
+                            wgpu::CompareFunction::Less
+                        }),
                         stencil: Default::default(),
                         bias: Default::default(),
                     }),
@@ -110,12 +119,13 @@ impl TileRenderer {
                     cache: None,
                 })
         };
-        let pipeline = make_pipeline(wgpu::PolygonMode::Fill);
+        let pipeline = make_pipeline(wgpu::PolygonMode::Fill, false);
+        let background = make_pipeline(wgpu::PolygonMode::Fill, true);
         let wireframe = gpu
             .device
             .features()
             .contains(wgpu::Features::POLYGON_MODE_LINE)
-            .then(|| make_pipeline(wgpu::PolygonMode::Line));
+            .then(|| make_pipeline(wgpu::PolygonMode::Line, false));
 
         let line_shader = gpu
             .device
@@ -182,6 +192,7 @@ impl TileRenderer {
 
         Self {
             pipeline,
+            background,
             wireframe,
             lines,
             view_buf,
@@ -218,6 +229,73 @@ impl TileRenderer {
     /// Draws tiles into the host's pass (color target = `target_format`,
     /// depth = [`DEPTH_FORMAT`]). Falls back to fill when wireframe is
     /// requested but unsupported.
+    /// Draws tiles into the host's pass (color target = `target_format`,
+    /// depth = [`DEPTH_FORMAT`]). Falls back to fill when wireframe is
+    /// requested but unsupported.
+    /// Draws a surface **behind** everything, taking no part in depth.
+    ///
+    /// For the whole-planet shell that guarantees ground is never bare. Drawn
+    /// first, it fills the colour buffer where the globe is; every tile drawn
+    /// afterwards passes the depth test against a cleared buffer and covers it.
+    /// The shell therefore cannot poke through the terrain no matter how coarse
+    /// that terrain's triangulation is — which a depth-tested shell did, in
+    /// bands of spikes, because a level-2 tile's flat triangles cut a chord
+    /// kilometres below the ellipsoid the shell was following.
+    pub fn render_background<'t>(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        tiles: impl Iterator<Item = &'t PreparedTile>,
+    ) {
+        pass.set_pipeline(&self.background);
+        pass.set_bind_group(0, &self.view_bg, &[]);
+        for tile in tiles {
+            pass.set_bind_group(1, &tile.tile_bg, &[]);
+            for mesh in &tile.meshes {
+                // First pass only. A backdrop neither writes nor tests depth, so
+                // a second pass over it would not be composed on top of the
+                // first — it would race it, and the winner would be whichever
+                // was submitted last. What is behind everything is drawn once.
+                pass.set_bind_group(2, &mesh.material_bg, &[]);
+                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+        }
+    }
+
+    /// The whole scene, in the order it has to go in.
+    ///
+    /// The order **is** the guarantee, and that is why it lives here instead of
+    /// in each host. The backdrop is drawn first and without touching depth, so
+    /// the selection always covers it and no frame can show bare ground; the
+    /// overlay is drawn last into the same colour attachment, so a control is
+    /// always on top and shares no depth with the globe.
+    ///
+    /// Left to the host, this was a sequence of four calls with the reason for
+    /// their order written in a comment beside them — which is exactly the kind
+    /// of instruction a second host reimplements in a different order without
+    /// ever seeing the comment. `CLAUDE.md` calls black ground the one forbidden
+    /// output; this is the smallest shape that makes the ordering part of the
+    /// signature rather than part of the folklore.
+    ///
+    /// `backdrop` is whatever should sit behind the selection — a whole-planet
+    /// shell, a complete coarse level, both, or nothing at all. What goes in it
+    /// is the host's choice; that it is drawn *first and depthless* is not.
+    pub fn paint<'t>(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        backdrop: impl Iterator<Item = &'t PreparedTile>,
+        tiles: impl Iterator<Item = &'t PreparedTile>,
+        overlay: Option<&crate::overlay::OverlayRenderer>,
+        wireframe: bool,
+    ) {
+        self.render_background(pass, backdrop);
+        self.render(pass, tiles, wireframe);
+        if let Some(overlay) = overlay {
+            overlay.render(pass);
+        }
+    }
+
     pub fn render<'t>(
         &self,
         pass: &mut wgpu::RenderPass<'_>,

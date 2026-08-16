@@ -20,6 +20,18 @@ pub enum ContextError {
     NoDevice(String),
 }
 
+/// How many samples every attachment and every pipeline uses.
+///
+/// A globe is mostly long, near-horizontal edges — the limb against space, a
+/// ridge against the sky — and those are exactly the edges a single sample
+/// renders as a staircase. Four samples removes it; eight buys little more on
+/// content this smooth and costs another copy of every attachment.
+///
+/// One number, exported, because a pipeline and its render target must agree:
+/// they are created in different crates, and a mismatch is a validation error
+/// at the first draw rather than something visible in review.
+pub const SAMPLES: u32 = 4;
+
 /// Texture format used for all base-color textures.
 pub const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// Depth format expected by [`crate::TileRenderer`].
