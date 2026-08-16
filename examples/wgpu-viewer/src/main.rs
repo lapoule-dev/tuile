@@ -8,133 +8,44 @@
 //! tiles stream in one by one, refining as you orbit and zoom.
 //!
 //! ```text
-//! cargo run -p wgpu-viewer        # reads CESIUM_ION_TOKEN (env or .env)
+//! CESIUM_ION_TOKEN=... cargo run -p wgpu-viewer
 //! ```
 //! Drag: orbit. Right-drag: pan. Wheel: zoom. W: wireframe. F: freeze. Esc: quit.
+//!
+//! `TUILE_RECORD=path.jsonl` writes the camera path; `TUILE_REPLAY=path.jsonl`
+//! flies it again exactly. See [`tape`].
 
 mod app;
+mod backdrop;
+mod settings;
+mod sources;
+mod recording;
+mod session;
+mod signals;
 
 use app::{App, ViewerConfig};
-use std::sync::Arc;
-use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_camera::{CameraController, GlobeCamera};
-use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
-use tuile_core::raster::CachedImagery;
 use tuile_core::runtime::in_process_with;
-use tuile_core::source::{TileLoader, TileTree};
-use tuile_core::storage::ContentStore;
 use tuile_core::traversal::Config;
-use tuile_native_fetchers::NativeHttp;
-use tuile_planetary::{globe, GlobeOptions, ImageryDetail};
-use tuile_storage_foyer::FoyerStore;
-use tuile_terrain::{CachedTerrain, TerrainHeights};
 use winit::event_loop::{ControlFlow, EventLoop};
 
-/// Resolves the Cesium-ion globe sources and crosses them through the
-/// backend-agnostic `tuile-planetary`. The app decides ion + the native HTTP
-/// transport here, not planetary.
-async fn ion_globe(
-    token: String,
-) -> anyhow::Result<(
-    Box<dyn TileTree>,
-    Arc<dyn TileLoader>,
-    ImageryDetail,
-    Arc<TerrainHeights>,
-    Option<Arc<FoyerStore>>,
-)> {
-    // One pooled, cached native transport drives both ion and Bing.
-    let http = Arc::new(NativeHttp::shared().await?);
-    let terrain = IonTerrainSource::new(IonClient::new(Arc::clone(&http), token.clone()), 1);
-    let layer = terrain.layer().await?;
-
-    let ion2 = IonClient::new(Arc::clone(&http), token);
-    let endpoint = match ion2.asset_endpoint(2).await? {
-        AssetEndpoint::Imagery(e) => e,
-        _ => anyhow::bail!("ion asset 2 is not imagery"),
-    };
-    let o = &endpoint.options;
-    let meta_url = BingMetadata::metadata_url(
-        o.url
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("bing url"))?,
-        o.map_style.as_deref().unwrap_or("Aerial"),
-        o.key
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("bing key"))?,
-    );
-    let bing = BingImageryProvider::from_metadata_url(Arc::clone(&http), &meta_url)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    // One store, two tiers of caller: the terrain source and the imagery
-    // provider each keep their own bytes in it, keyed by tile rather than by
-    // URL. The server evicts decoded tiles to stay inside its GPU budget, and
-    // this is what makes coming back to them cheap. A store that fails to open
-    // is not worth failing the app over.
-    let store = match FoyerStore::shared("tiles").await {
-        Ok(store) => Some(Arc::new(store)),
-        Err(e) => {
-            tracing::warn!("no tile store ({e}); every tile will be re-fetched");
-            None
-        }
-    };
-
-    let Some(store) = store else {
-        let (tree, loader, detail, heights) = globe(terrain, bing, layer, GlobeOptions::default());
-        return Ok((tree, loader, detail, heights, None));
-    };
-    let shared = Arc::clone(&store) as Arc<dyn ContentStore>;
-    let (tree, loader, detail, heights) = globe(
-        CachedTerrain::new(terrain, Arc::clone(&shared), "ion-cwt"),
-        CachedImagery::new(bing, shared, "bing-aerial"),
-        layer,
-        GlobeOptions::default(),
-    );
-    Ok((tree, loader, detail, heights, Some(store)))
-}
-
-/// Logs to stderr; `RUST_LOG` overrides. Default shows tile streaming
-/// (`tuile_planetary=debug`) plus app-level info.
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,tuile_planetary=debug".into()),
-        )
-        .without_time()
-        .with_target(false)
-        .init();
-}
-
-/// The instant the scene is lit for, UTC seconds since the Unix epoch.
-///
-/// `TUILE_LIT_AT` overrides it, so a session can be pinned to a stated moment —
-/// which is the only way two runs, or two machines, can be compared. Without it
-/// the answer is "now", and "now" is never the same twice.
-///
-/// Seconds rather than a formatted date because this crate has no calendar in
-/// it and adding one to parse a debugging knob would be the wrong trade. `date
-/// -u -d '2024-06-21 06:00' +%s` produces the number.
-fn lit_at() -> anyhow::Result<f64> {
-    if let Ok(pinned) = std::env::var("TUILE_LIT_AT") {
-        let seconds: f64 = pinned
-            .trim()
-            .parse()
-            .map_err(|_| anyhow::anyhow!("TUILE_LIT_AT must be UTC seconds, got {pinned:?}"))?;
-        tracing::info!("scene lit for the instant TUILE_LIT_AT={seconds}");
-        return Ok(seconds);
-    }
-    Ok(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs_f64())
-}
-
 fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
-    init_tracing();
-    let token = std::env::var("CESIUM_ION_TOKEN")
-        .map_err(|_| anyhow::anyhow!("set CESIUM_ION_TOKEN (env or .env)"))?;
+    settings::init_tracing();
+    // From the environment, and only from the environment.
+    //
+    // A `.env` file used to be read here as well. That is convenient exactly
+    // once and misleading afterwards: the process then behaves differently
+    // depending on the directory it was launched from, a stale file silently
+    // wins over the variable that was deliberately exported, and a credential
+    // ends up sitting in the working tree where it is one `git add -A` away from
+    // being published. What a session ran with should be visible in the command
+    // that started it.
+    let token = std::env::var("CESIUM_ION_TOKEN").map_err(|_| {
+        anyhow::anyhow!(
+            "no CESIUM_ION_TOKEN in the environment — export it, or prefix the \
+             command: CESIUM_ION_TOKEN=... cargo run -p wgpu-viewer"
+        )
+    })?;
 
     // The geometry server is async (ion fetches over reqwest): build the scene
     // and run the server on a background multi-thread runtime. The window
@@ -145,7 +56,8 @@ fn main() -> anyhow::Result<()> {
     // The runtime moves to the server thread; keep a handle so the store can
     // still be flushed from here on the way out.
     let handle = rt.handle().clone();
-    let (tree, loader, detail, heights, store) = rt.block_on(ion_globe(token))?;
+    let (tree, loader, detail, heights, store, layer_budget) =
+        rt.block_on(sources::ion_globe(token))?;
     // The budget counts decoded CPU bytes; the GPU copy costs about 1.35× that
     // (mip chains, interleaved vertices), measured — so 3 GiB here is ~4 GiB of
     // GPU, which unified memory carries comfortably now that a drape is a
@@ -157,15 +69,16 @@ fn main() -> anyhow::Result<()> {
     // needs and those tiles are evicted and re-requested forever. At 768 MiB a
     // motionless camera still churned twenty tiles a second — the session never
     // settles, and it reads as the app hanging.
+    // The reference session, shared with the headless tests rather than written
+    // out here. When these numbers lived only in this file, every test invented
+    // its own and a harness that never evicted passed while the globe went
+    // black — see `Config::interactive_globe`.
     let config = Config {
-        maximum_screen_space_error: 2.0,
-        maximum_simultaneous_fetches: 64,
-        resident_budget_bytes: 3072 * 1024 * 1024,
         // TUILE_NO_CULL=1 keeps every tile the traversal reaches, however far
         // off screen. Expensive and not a mode anyone should run in — it exists
         // to answer one question: whether geometry that is missing was culled.
         cull: std::env::var("TUILE_NO_CULL").is_err(),
-        ..Config::default()
+        ..Config::interactive_globe(settings::pinned_level())
     };
     let (stream, server) = in_process_with(tree, loader, config);
     let server_thread = std::thread::Builder::new()
@@ -181,11 +94,18 @@ fn main() -> anyhow::Result<()> {
         std::f64::consts::FRAC_PI_2,
         tuile_camera::DEFAULT_GLOBE_FOVY,
     );
-    // Clamp against the terrain, not the ellipsoid: 150 m over the sea and
-    // 150 m over a summit are the same request, and only the relief tells them
+    // Clamp against the terrain, not the ellipsoid: a metre over the sea and a
+    // metre over a summit are the same request, and only the relief tells them
     // apart. The handle is shared and live, so the floor sharpens as tiles land.
+    //
+    // One metre, not the hundred and fifty it was. A floor that high is a
+    // helicopter: it puts the eye above everything a person might want to stand
+    // next to, and at the levels the source actually serves there is detail well
+    // below it. The near plane follows — it is a quarter of the clearance — so
+    // getting close costs nothing but the precision that rebasing already
+    // provides.
     let controller = CameraController::new(camera)
-        .with_min_altitude(150.0)
+        .with_min_altitude(1.0)
         .with_ground(heights);
 
     tracing::info!(
@@ -196,29 +116,42 @@ fn main() -> anyhow::Result<()> {
         stream,
         controller,
         detail,
+        layer_budget,
         title: "tuile — globe (streaming)".into(),
-        lit_at_unix_seconds: lit_at()?,
+        lit_at_unix_seconds: settings::lit_at()?,
     };
 
+    // Everything the engine counts, scrapeable, so the log can stop being a
+    // wall of numbers and go back to reporting events.
+    tuile_metrics::serve(&handle);
+
+    // Before the loop: Ctrl-C and `kill` must end the session, not the process,
+    // or a recording dies with it.
+    signals::catch_interruptions();
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(app_config);
     let outcome = event_loop.run_app(&mut app);
+    // Belt and braces: `exiting` covers a loop that unwinds normally, this
+    // covers one that does not. Closing an already-closed tape is a no-op.
+    app.close_the_tape();
     let report = app.report();
 
-    // Shut down in dependency order. The server writes into the store, so
-    // closing the store first leaves its flusher shouting into a closed channel
-    // — thousands of lines of it, and nothing persisted. Dropping the app drops
-    // the client stream, which is how the server learns the session is over.
+    // Shut down in dependency order. Dropping the app drops the client stream,
+    // which is how the server learns the session is over.
     drop(app);
+    // The store is closed *before* the join, not after.
+    //
+    // The server thread owns the tokio runtime and `block_on`s the session on
+    // it, so when `run()` returns the runtime drops on that thread — and
+    // `Runtime::drop` waits for the store's blocking workers to finish. Waiting
+    // for the thread first and only then asking the store to close is a
+    // deadlock by construction: the thread cannot finish until a `close()` that
+    // cannot be issued until it has. It survives only because `run()` normally
+    // outlives this point.
+    settings::close_the_store(store, &handle);
     if server_thread.join().is_err() {
         tracing::error!("the geometry server panicked; its last work is lost");
-    }
-    if let Some(store) = store {
-        match handle.block_on(store.close()) {
-            Ok(()) => tracing::info!("tile store flushed"),
-            Err(e) => tracing::warn!("tile store not flushed ({e}); the next run starts cold"),
-        }
     }
     tracing::info!("{report}");
     outcome?;
