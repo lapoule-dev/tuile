@@ -149,6 +149,22 @@ pub struct DecodedTexture {
     pub rgba8: Vec<u8>,
 }
 
+impl DecodedTexture {
+    /// What holding this texture actually costs a consumer, mip chain included.
+    ///
+    /// A full chain adds exactly a third: each level is a quarter of the one
+    /// above, and `1/4 + 1/16 + …` sums to `1/3`. Deterministic, so there is no
+    /// excuse for a budget that counts only the base.
+    ///
+    /// Counting only the base is what let a session hold 3386 MiB of imagery
+    /// under a 3072 MiB budget without a single eviction: the cache measured
+    /// 2540 MiB, the GPU held the other third, and the two never disagreed
+    /// loudly enough to notice.
+    pub fn resident_bytes(&self) -> usize {
+        self.rgba8.len() * 4 / 3
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MaterialDesc {
     pub base_color_factor: [f32; 4],

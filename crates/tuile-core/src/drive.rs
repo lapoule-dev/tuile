@@ -46,6 +46,10 @@ impl SceneState {
                 self.pending = stats.requested;
                 self.started = true;
             }
+            // A stand-in is not residency: the tile it covers for has still
+            // not arrived, and counting it here would make a scene look
+            // complete while it is being held together by approximations.
+            ServerMessage::Fill { .. } => {}
             ServerMessage::Content { tile, .. } => {
                 self.resident.insert(*tile);
             }
@@ -59,6 +63,9 @@ impl SceneState {
                     self.resident.remove(t);
                 }
             }
+            // Startup accounting for a host that holds a first frame back. A
+            // bulk driver holds nothing back, so it has nothing to do with it.
+            ServerMessage::Priming(_) => {}
         }
     }
 
@@ -141,13 +148,16 @@ pub async fn drive_until_complete<S: GeometryStream + Unpin>(
             ServerMessage::Content { tile, content } => {
                 contents.insert(tile, content);
             }
+            // This driver collects finished content for inspection; a stand-in
+            // is by definition unfinished and would only dilute the answer.
+            ServerMessage::Fill { .. } => {}
             ServerMessage::Evict { tiles } => {
                 for t in tiles {
                     contents.remove(&t);
                 }
             }
             ServerMessage::Error { tile, message } => errors.push((tile, message)),
-            ServerMessage::Select { .. } => {}
+            ServerMessage::Select { .. } | ServerMessage::Priming(_) => {}
         }
         if state.is_complete() {
             // Keep only what is still selected & resident.
