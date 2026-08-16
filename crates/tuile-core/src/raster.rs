@@ -159,9 +159,25 @@ impl TilingScheme {
         }
     }
 
+    /// How many tiles span the world at `level`, as `(columns, rows)`.
+    ///
+    /// The shift is bounded rather than left to wrap. A level of 64 or more
+    /// would shift a `u64` by its own width — a panic in debug and a masked,
+    /// silently wrong answer in release. No served scheme comes near that, but
+    /// the level here is arithmetic on a camera altitude, and that is exactly
+    /// the kind of input that arrives absurd once.
     pub fn tiles_at(&self, level: u32) -> (u64, u64) {
-        (self.root_tiles_x << level, self.root_tiles_y << level)
+        let shift = level.min(Self::MAX_LEVEL);
+        (self.root_tiles_x << shift, self.root_tiles_y << shift)
     }
+
+    /// The deepest level the arithmetic stays exact at.
+    ///
+    /// A tile count is `root << level`, and a mosaic multiplies two of them, so
+    /// the product is what binds: at level 31 the world is `2^62` tiles, still
+    /// inside a `u64`; at 32 it is not. Twelve levels past anything a provider
+    /// serves, and nothing has to be signed or arbitrary-precision to hold it.
+    pub const MAX_LEVEL: u32 = 31;
 
     /// The \[0,1\]² extent of a tile (x0, y0, x1, y1).
     pub fn tile_extent(&self, c: ImageryCoord) -> (f64, f64, f64, f64) {
@@ -216,7 +232,13 @@ impl TilingScheme {
     }
 
     /// All tiles of `level` intersecting `rect`.
-    pub fn tiles_in_rectangle(&self, rect: &GeoRect, level: u32) -> Vec<ImageryCoord> {
+    /// The inclusive tile index range `(x0, x1, y0, y1)` covering `rect` at
+    /// `level`.
+    ///
+    /// Arithmetic only — no allocation and no iteration, whatever the rectangle
+    /// or the level. That matters more than it looks: the range can be
+    /// astronomically wide, and anything that walks it pays for every tile.
+    pub fn tile_range(&self, rect: &GeoRect, level: u32) -> (u64, u64, u64, u64) {
         let nw = self.projection.to_normalized(Geodetic {
             lon: rect.west,
             lat: rect.north,
@@ -229,10 +251,23 @@ impl TilingScheme {
         });
         let (nx, ny) = self.tiles_at(level);
         let clamp_tile = |v: f64, n: u64| -> u64 { ((v * n as f64) as u64).min(n - 1) };
-        let x0 = clamp_tile(nw.0, nx);
-        let x1 = clamp_tile(se.0.max(nw.0), nx);
-        let y0 = clamp_tile(nw.1, ny);
-        let y1 = clamp_tile(se.1.max(nw.1), ny);
+        (
+            clamp_tile(nw.0, nx),
+            clamp_tile(se.0.max(nw.0), nx),
+            clamp_tile(nw.1, ny),
+            clamp_tile(se.1.max(nw.1), ny),
+        )
+    }
+
+    /// Every tile covering `rect` at `level`, one entry each.
+    ///
+    /// The cost is the number of tiles, and that number is `4^(level - rect's
+    /// own level)` — a continent-sized rectangle at level 19 is on the order of
+    /// a billion entries, which is not a slow call but a hung process. Ask
+    /// [`TilingScheme::tile_range`] instead whenever the extent is all that is
+    /// wanted, and never call this at a level you have not bounded.
+    pub fn tiles_in_rectangle(&self, rect: &GeoRect, level: u32) -> Vec<ImageryCoord> {
+        let (x0, x1, y0, y1) = self.tile_range(rect, level);
         let mut out = Vec::with_capacity(((x1 - x0 + 1) * (y1 - y0 + 1)) as usize);
         for y in y0..=y1 {
             for x in x0..=x1 {
@@ -324,23 +359,38 @@ impl TilingScheme {
 
     /// The mosaic covering `rect` at exactly `level` (clamped to the served
     /// range), coarsened a step at a time until it fits in `max_tiles`.
+    ///
+    /// # The bounds are computed, never enumerated
+    ///
+    /// This used to call [`TilingScheme::tiles_in_rectangle`] and take the min
+    /// and max of the result — building a list of every tile in the rectangle
+    /// in order to read its two corners. The level asked for comes from the
+    /// camera's altitude while the rectangle comes from the terrain tile, and
+    /// on a zoom-out those two disagree wildly: a level-3 tile's rectangle at
+    /// level 18 is about `10^9` tiles. Allocating and filling that list froze
+    /// the geometry server mid-traversal, which left the consumer holding the
+    /// selection from before the zoom — a handful of deep tiles covering a
+    /// postage stamp of ground, and black everywhere else. It took two days to
+    /// find because the symptom is in the picture and the cause is in a `Vec`.
+    ///
+    /// The count is also `u64` here. It was `u32`, which silently wraps in
+    /// release: a rectangle wide enough could wrap to a small number and be
+    /// accepted as fitting.
     pub fn mosaic_at_level(&self, rect: &GeoRect, level: u32, max_tiles: u32) -> ImageryMosaic {
         let mut level = level.clamp(self.minimum_level, self.maximum_level);
         loop {
-            let tiles = self.tiles_in_rectangle(rect, level);
-            let x0 = tiles.iter().map(|t| t.x).min().unwrap_or(0);
-            let x1 = tiles.iter().map(|t| t.x).max().unwrap_or(0);
-            let y0 = tiles.iter().map(|t| t.y).min().unwrap_or(0);
-            let y1 = tiles.iter().map(|t| t.y).max().unwrap_or(0);
-            let cols = (x1 - x0 + 1) as u32;
-            let rows = (y1 - y0 + 1) as u32;
-            if cols * rows <= max_tiles || level <= self.minimum_level {
+            let (x0, x1, y0, y1) = self.tile_range(rect, level);
+            let cols = x1 - x0 + 1;
+            let rows = y1 - y0 + 1;
+            if cols.saturating_mul(rows) <= u64::from(max_tiles) || level <= self.minimum_level {
                 return ImageryMosaic {
                     level,
                     x0,
                     y0,
-                    cols,
-                    rows,
+                    // Bounded by `max_tiles` above, except at the minimum level
+                    // where the whole world is a handful of tiles either way.
+                    cols: cols.min(u64::from(u32::MAX)) as u32,
+                    rows: rows.min(u64::from(u32::MAX)) as u32,
                 };
             }
             level -= 1; // too many tiles for one drape — coarsen a step
@@ -420,39 +470,6 @@ pub struct ImageryMosaic {
     pub rows: u32,
 }
 
-/// One imagery texture draped over a geometry tile — **referenced, not owned**.
-///
-/// This is the type that stops us copying. A geometry tile names the imagery
-/// tiles that cover it and says where each one lands in its own uv space; the
-/// pixels stay in exactly one place, shared by every geometry tile that names
-/// the same [`ImageryCoord`]. Two neighbours therefore cannot disagree about
-/// colour or filtering the way they do when each resamples its own copy.
-///
-/// It follows the shape Cesium's `sampleAndBlend` consumes, because that shape
-/// is the minimum a fragment shader needs and no less: a coverage rectangle to
-/// How far the mosaic's **outer** edges reach beyond the geometry tile, in its
-/// own uv space.
-///
-/// Interior edges are exact and must stay exact — they are chained, so a
-/// neighbour's west edge *is* this tile's east edge and the mask covers the
-/// boundary from both sides. The outer edges are a different problem: the uv
-/// reaching the fragment shader is **interpolated across the primitive**, and at
-/// the very edge of a tile it can land an ULP past 1.0. `step(uv, 1.0)` is then
-/// zero, no layer claims the fragment, and what shows is whatever sits under the
-/// mosaic.
-///
-/// That is the hairline grid that survived every other fix: dashed rather than
-/// solid, because only the fragments that happen to overshoot are affected, and
-/// invisible until the colour under the mosaic stopped being black.
-///
-/// The reference has the same exposure and never sees it — its `Globe.baseColor`
-/// is a dark blue, so a fragment that falls through costs a pixel nobody
-/// notices. Reaching past the edge closes it instead.
-///
-/// A tenth of a pixel on a thousand-pixel tile, and four orders of magnitude
-/// above the interpolation error it absorbs.
-const EDGE_REACH: f32 = 1.0e-4;
-
 impl ImageryMosaic {
     /// The tiles, row-major NW→SE — the order [`stitch_mosaic`] expects.
     /// The coverage rectangles of every tile in this mosaic, in the geometry
@@ -526,7 +543,6 @@ impl ImageryMosaic {
         out
     }
 
-    /// The tiles, row-major NW→SE — the order [`stitch_mosaic`] expects.
     pub fn tiles(&self) -> Vec<ImageryCoord> {
         let mut out = Vec::with_capacity((self.cols * self.rows) as usize);
         for j in 0..self.rows {
@@ -541,8 +557,12 @@ impl ImageryMosaic {
         out
     }
 
-    pub fn tile_count(&self) -> u32 {
-        self.cols * self.rows
+    /// How many tiles the mosaic binds. `u64` because a mosaic straight off
+    /// [`TilingScheme::tile_range`] is only bounded once it has been coarsened
+    /// — and a `u32` product wraps in release, turning "far too many" into a
+    /// small number that looks acceptable.
+    pub fn tile_count(&self) -> u64 {
+        u64::from(self.cols).saturating_mul(u64::from(self.rows))
     }
 }
 
@@ -686,56 +706,89 @@ pub fn rectangle_from_obb(obb: &Obb) -> GeoRect {
     rect
 }
 
-/// How many imagery textures may drape one geometry tile.
+/// The masking and blending rule, as a shader, for any backend that wants it.
 ///
-/// A **binding** limit, not a memory one, and the difference is the point of
-/// the layered model. It used to be a memory limit: a drape stitched its
-/// imagery into one private texture, so allowing sixteen tiles meant a 1024²
-/// image per terrain tile — 657 of those over one orbit against a 1.5 GiB
-/// budget is what made the second half of a turn spend itself reloading what
-/// the first half had paid for. A graded per-level allowance existed only to
-/// hold that down.
-///
-/// Layers are referenced now, so one imagery tile costs the same whether one
-/// geometry tile names it or twenty, and the allowance can be flat. What is
-/// left to bound is how many textures one draw binds, against the sixteen per
-/// shader stage that wgpu's default limits guarantee.
-///
-/// Twelve, because a tile draped one level finer than its own geometric error
-/// straddles up to a 3×3 block, and a budget of eight would coarsen exactly
-/// those tiles back a level. That is not a small loss of sharpness: it is
-/// *neighbours disagreeing about their level*, which is one of the two reasons
-/// adjacent tiles visibly differed in colour. Whatever the budget is, it has to
-/// clear 3×3 cleanly, and the room above that absorbs a rectangle that straddles
-/// worse than most.
-///
-/// A tile needing more than this coarsens, which is the remaining reason the
-/// ground cannot be made arbitrarily sharper than the mesh under it. The way
-/// past that is to refine the geometry quadtree past its data by upsampling the
-/// parent mesh — Cesium's answer — not a larger number here.
-///
-/// The renderer's shader must bind exactly this many slots.
-pub const MAX_IMAGERY_LAYERS: u32 = 12;
+/// The companion of [`imagery_layer_table`]: that function packs the table,
+/// this consumes one slot of it. Kept here so the two cannot drift.
+pub const WGSL: &str = include_str!("raster.wgsl");
 
-/// The budget is what one draw binds, so it has to stay inside the per-stage
-/// texture limit wgpu's default limits guarantee, with the tile's own base
-/// colour alongside it. A build error rather than a test, because a value over
-/// the limit does not fail *somewhere* — it fails on the narrowest device that
-/// ever runs this, which is nowhere near here.
-const _: () = assert!(
-    MAX_IMAGERY_LAYERS < 16,
-    "an imagery slot per texture unit leaves none for the base colour"
-);
+/// The fewest slots a drape can be correct with.
+///
+/// A geometry tile draped one level finer than its own geometric error
+/// straddles up to a 3×3 block of imagery tiles. Below this the mosaic has to
+/// coarsen exactly those tiles, which is neighbours disagreeing about their
+/// level — and that disagreement is what makes them differ in colour, the
+/// symptom this whole model exists to remove.
+pub const MIN_IMAGERY_SLOTS: u32 = 9;
 
-/// And it has to admit the ordinary case without coarsening: a geometry tile
-/// draped one level finer than its own geometric error straddles up to a 3×3
-/// block. Coarsening exactly those tiles is neighbours disagreeing about their
-/// level, which is what makes them differ in colour — the symptom this whole
-/// model exists to remove.
-const _: () = assert!(
-    MAX_IMAGERY_LAYERS >= 9,
-    "a tile one level finer than its match needs up to 3x3 layers"
-);
+/// The most a mosaic can usefully spend.
+///
+/// **This is a rendering-cost decision, not a device one.** The blend is
+/// branch-free on purpose — a coverage test that skipped the fetch would
+/// diverge the control flow a `textureSample` sits in, which shading languages
+/// forbid — so *every* slot costs a texture fetch on *every* fragment, whether
+/// a layer occupies it or not. The count is therefore linear in fragment cost,
+/// and "as many as the device allows" is the wrong answer: Metal reports 128
+/// per stage, and a hundred and twenty-eight fetches a fragment would cost far
+/// more than the coarsening it saves.
+///
+/// 5×5 is a tile draped *two* levels finer than its match. Past that the mosaic
+/// is asking for imagery at a scale nobody is looking at — a coarse backdrop
+/// tile under a close camera, which is drawn behind the selection and never
+/// seen sharp.
+pub const USEFUL_IMAGERY_SLOTS: u32 = 25;
+
+/// How many imagery slots to build a shader for, given what the device reports.
+///
+/// Detected rather than written down. The floor is what correctness needs, the
+/// ceiling is what the fragment cost allows, and in between it is whatever the
+/// hardware will bind — 16 on WebGL2 and the WebGPU baseline, 128 on Metal.
+///
+/// One texture unit is reserved for the tile's own base colour, which is bound
+/// alongside the imagery in the same group.
+pub fn imagery_slots(max_sampled_textures_per_stage: u32) -> u32 {
+    /// The tile's own base-colour texture shares the stage.
+    const RESERVED: u32 = 1;
+    max_sampled_textures_per_stage
+        .saturating_sub(RESERVED)
+        .clamp(MIN_IMAGERY_SLOTS, USEFUL_IMAGERY_SLOTS)
+}
+
+/// How many times a tile may be redrawn to spend layers it could not bind at
+/// once.
+///
+/// The binding limit stops being a limit on *sharpness* here. A drape needing
+/// more layers than one draw can bind used to coarsen — every tile of the mosaic
+/// stepped back a level until the count fit — and coarsening is not a small loss
+/// of sharpness: it makes neighbours disagree about their level, which is what
+/// makes them visibly differ in colour.
+///
+/// The reference implementation does not coarsen. It redraws: a `do … while` over
+/// the imagery index, each pass consuming as many layers as the device will bind,
+/// the same geometry submitted again with `LESS_OR_EQUAL` depth so it is not
+/// rejected by its own first pass, and alpha blending to compose over what is
+/// already there — starting from a transparent initial colour so an uncovered
+/// fragment keeps the pass beneath it.
+///
+/// Bounded, because the passes are free of neither vertex work nor draw calls,
+/// and because layers are textures somebody uploaded. Four passes is 60 layers on
+/// the WebGL2 floor and 100 on Metal — a drape three levels finer than its mesh,
+/// which is past what any camera resolves.
+pub const MAX_IMAGERY_PASSES: u32 = 4;
+
+/// The most layers one tile may carry, across every pass.
+///
+/// What a mosaic is allowed to ask for. Beyond this it coarsens, as it always
+/// did — the passes move the wall, they do not remove it.
+pub fn imagery_layer_budget(slots: u32) -> u32 {
+    slots * MAX_IMAGERY_PASSES
+}
+
+/// How many passes `layers` layers take at `slots` per pass — at least one, so
+/// a tile with no imagery at all still draws its own base colour.
+pub fn imagery_passes(layers: usize, slots: u32) -> u32 {
+    (layers as u32).div_ceil(slots.max(1)).max(1)
+}
 
 /// One imagery texture draped over a geometry tile — **referenced, not owned**.
 ///
@@ -747,6 +800,29 @@ const _: () = assert!(
 ///
 /// It follows the shape Cesium's `sampleAndBlend` consumes, because that shape
 /// is the minimum a fragment shader needs and no less: a coverage rectangle to
+/// How far the mosaic's **outer** edges reach beyond the geometry tile, in its
+/// own uv space.
+///
+/// Interior edges are exact and must stay exact — they are chained, so a
+/// neighbour's west edge *is* this tile's east edge and the mask covers the
+/// boundary from both sides. The outer edges are a different problem: the uv
+/// reaching the fragment shader is **interpolated across the primitive**, and at
+/// the very edge of a tile it can land an ULP past 1.0. `step(uv, 1.0)` is then
+/// zero, no layer claims the fragment, and what shows is whatever sits under the
+/// mosaic.
+///
+/// That is the hairline grid that survived every other fix: dashed rather than
+/// solid, because only the fragments that happen to overshoot are affected, and
+/// invisible until the colour under the mosaic stopped being black.
+///
+/// The reference has the same exposure and never sees it — its `Globe.baseColor`
+/// is a dark blue, so a fragment that falls through costs a pixel nobody
+/// notices. Reaching past the edge closes it instead.
+///
+/// A tenth of a pixel on a thousand-pixel tile, and four orders of magnitude
+/// above the interpolation error it absorbs.
+const EDGE_REACH: f32 = 1.0e-4;
+
 /// mask with, and an affine map into the texture.
 #[derive(Debug, Clone)]
 pub struct ImageryLayer {
@@ -828,15 +904,6 @@ impl ImageryLayer {
         texture: Arc<DecodedTexture>,
         tile: &GeoRect,
         source: &GeoRect,
-        // Where this tile lands in the geometry tile's own uv space,
-        // **computed by the mosaic** rather than here.
-        //
-        // Two neighbours must agree on their shared edge to the bit, and
-        // independently derived numbers do not: deriving each rectangle from
-        // geography rounds the shared edge twice, and a fragment landing
-        // between the two values is covered by neither — a hairline grid over
-        // otherwise perfect imagery. `ImageryMosaic::coverage` chains them, so
-        // each tile's west edge *is* the previous tile's east edge.
         coverage: [f32; 4],
     ) -> Self {
         let (tw, th) = (tile.width().max(1e-15), tile.height().max(1e-15));
@@ -848,6 +915,21 @@ impl ImageryLayer {
             ((tile.west - source.west) / sw) as f32,
             ((source.north - tile.north) / sh) as f32,
         ];
+
+        // Edge to edge, and deliberately not inset by half a texel.
+        //
+        // A half-texel inset was tried here, on the theory that a bilinear fetch
+        // at a tile's edge reads two texels from outside it and `ClampToEdge`
+        // answers with the wrong ones. It did not remove the seam, and it is an
+        // outright deviation from both reference implementations: neither has a
+        // half-texel term, a gutter, or padding anywhere in its imagery path —
+        // `computeTranslationAndScale` and `_calculateTextureTranslationAndScale`
+        // are this same exact affine map and nothing else.
+        //
+        // It also did active harm. The inset is measured on the *source*
+        // texture, so a tile leaning on an ancestor three levels up had its
+        // drape displaced by four of its own texels — the substitution case,
+        // which is most of the ground during any movement.
         Self {
             coord,
             texture,
@@ -868,6 +950,15 @@ impl ImageryLayer {
     }
 }
 
+/// A coverage rectangle no uv can be inside, for a slot with nothing in it.
+///
+/// Public because it is part of the same cross-backend contract as
+/// [`imagery_layer_table`]: a consumer that has to mask a slot out for its own
+/// reasons — a texture that has not decoded yet, say — must mask it out the
+/// same way, and `[0, 0, 0, 0]` is *not* the same way. It passes at exactly
+/// `uv = (0, 0)`, which is a corner every tile has.
+pub const EMPTY_COVERAGE: [f32; 4] = [1.0, 1.0, 0.0, 0.0];
+
 /// The layer table a renderer uploads for one geometry tile: two `vec4` per
 /// slot — coverage, then placement — for **every** slot, used or not.
 ///
@@ -885,10 +976,10 @@ impl ImageryLayer {
 /// backends: the packing, the sentinel, and the masking rule are the same
 /// whether the shader is WGSL, GLSL or a scene-graph material. Only the binding
 /// mechanics differ.
-pub fn imagery_layer_table(layers: &[ImageryLayer]) -> [[f32; 4]; 2 * MAX_IMAGERY_LAYERS as usize] {
-    const EMPTY_COVERAGE: [f32; 4] = [1.0, 1.0, 0.0, 0.0];
-    let mut table = [EMPTY_COVERAGE; 2 * MAX_IMAGERY_LAYERS as usize];
-    for (slot, layer) in layers.iter().take(MAX_IMAGERY_LAYERS as usize).enumerate() {
+pub fn imagery_layer_table(layers: &[ImageryLayer], slots: u32) -> Vec<[f32; 4]> {
+    let slots = slots as usize;
+    let mut table = vec![EMPTY_COVERAGE; 2 * slots];
+    for (slot, layer) in layers.iter().take(slots).enumerate() {
         table[2 * slot] = layer.coverage;
         table[2 * slot + 1] = [
             layer.translation[0],
@@ -898,32 +989,6 @@ pub fn imagery_layer_table(layers: &[ImageryLayer]) -> [[f32; 4]; 2 * MAX_IMAGER
         ];
     }
     table
-}
-
-/// Everything that turns fetched imagery bytes into a drapeable texture, as one
-/// call: decode, then resample onto geographic spacing if the provider's
-/// projection is not already geographic.
-///
-/// The unit exists because it is the unit that **crosses boundaries**. Bytes in,
-/// pixels out, no borrowed state and no handle to anything — so the same call is
-/// what a native thread pool runs off the server's thread and what a Web Worker
-/// runs off the browser's main thread. A closure could express the same work and
-/// could not cross: a `Box<dyn FnOnce()>` is a pointer into linear memory, and a
-/// Worker only shares that memory under `SharedArrayBuffer`, which costs atomics,
-/// a nightly `build-std` and COOP/COEP headers on the server. Shaped as data, it
-/// costs a `postMessage` and a transferred buffer.
-///
-/// Blocking and I/O-free, like [`decode_image`] and `content::decode`; the caller
-/// still decides which thread runs it.
-pub fn decode_and_reproject(
-    bytes: &[u8],
-    scheme: &TilingScheme,
-    coord: ImageryCoord,
-) -> Result<DecodedTexture, RasterError> {
-    let decoded = decode_image(bytes)?;
-    // `None` means the tile is already on geographic spacing — the common case
-    // for a geographic provider, and not a failure.
-    Ok(reproject_tile_to_geographic(&decoded, scheme, coord).unwrap_or(decoded))
 }
 
 /// A pool of per-imagery-tile resources shared between the geometry tiles that
@@ -986,6 +1051,15 @@ impl<T> ImageryPool<T> {
         self.entries
             .values()
             .filter_map(std::sync::Weak::upgrade)
+            .collect()
+    }
+
+    /// The same, with the coord each resource was keyed by — so a caller can
+    /// break the total down by imagery level rather than only report its size.
+    pub fn live_with_coords(&self) -> Vec<(ImageryCoord, Arc<T>)> {
+        self.entries
+            .iter()
+            .filter_map(|(coord, weak)| std::sync::Weak::upgrade(weak).map(|r| (*coord, r)))
             .collect()
     }
 }
@@ -1181,16 +1255,48 @@ impl<P: ImageryProvider> ImageryProvider for CachedImagery<P> {
 
     async fn fetch_tile_bytes(&self, coord: ImageryCoord) -> Result<Fetched<Bytes>, RasterError> {
         let key = self.key(coord);
+        let m = crate::metrics::metrics();
         if let Some(bytes) = self.store.get(&key).await {
+            m.store_hits.inc();
+            // An absence remembered is still a hit: it answered without the
+            // network, which is the whole point of having stored it.
+            if crate::storage::is_absent(&bytes) {
+                return Err(RasterError::Fetch(FetchError::NotFound(
+                    Url::parse(&format!("tuile:absent/{}", self.key(coord)))
+                        .expect("a well-formed sentinel url"),
+                )));
+            }
+            m.store_bytes_served.add(bytes.len() as u64);
             // The store already applied the lifetime this was written with;
             // re-stating one here would only be a second, weaker guess.
             return Ok(Fetched::undated(bytes));
         }
-        let fetched = self.inner.fetch_tile_bytes(coord).await?;
-        self.store
-            .put(&key, fetched.value.clone(), fetched.ttl)
-            .await;
-        Ok(fetched)
+        m.store_misses.inc();
+        match self.inner.fetch_tile_bytes(coord).await {
+            Ok(fetched) => {
+                m.store_bytes_fetched.add(fetched.value.len() as u64);
+                self.store
+                    .put(&key, fetched.value.clone(), fetched.ttl)
+                    .await;
+                Ok(fetched)
+            }
+            // The provider says there is nothing here. Remember that, or every
+            // run asks again — and over a coarse pyramid spanning oceans and
+            // poles, that is most of what a warm-up does.
+            Err(RasterError::Fetch(FetchError::NotFound(url))) => {
+                m.imagery_absent.inc();
+                tracing::debug!(z = coord.level, x = coord.x, y = coord.y, "imagery absent");
+                self.store
+                    .put(
+                        &key,
+                        crate::storage::ABSENT,
+                        Some(crate::storage::ABSENCE_TTL),
+                    )
+                    .await;
+                Err(RasterError::Fetch(FetchError::NotFound(url)))
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1204,6 +1310,32 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedTexture, RasterError> {
         height: rgba.height(),
         rgba8: rgba.into_raw(),
     })
+}
+
+/// Everything that turns fetched imagery bytes into a drapeable texture, as one
+/// call: decode, then resample onto geographic spacing if the provider's
+/// projection is not already geographic.
+///
+/// The unit exists because it is the unit that **crosses boundaries**. Bytes in,
+/// pixels out, no borrowed state and no handle to anything — so the same call is
+/// what a native thread pool runs off the server's thread and what a Web Worker
+/// runs off the browser's main thread. A closure could express the same work and
+/// could not cross: a `Box<dyn FnOnce()>` is a pointer into linear memory, and a
+/// Worker only shares that memory under `SharedArrayBuffer`, which costs atomics,
+/// a nightly `build-std` and COOP/COEP headers on the server. Shaped as data, it
+/// costs a `postMessage` and a transferred buffer.
+///
+/// Blocking and I/O-free, like [`decode_image`] and `content::decode`; the caller
+/// still decides which thread runs it.
+pub fn decode_and_reproject(
+    bytes: &[u8],
+    scheme: &TilingScheme,
+    coord: ImageryCoord,
+) -> Result<DecodedTexture, RasterError> {
+    let decoded = decode_image(bytes)?;
+    // `None` means the tile is already on geographic spacing — the common case
+    // for a geographic provider, and not a failure.
+    Ok(reproject_tile_to_geographic(&decoded, scheme, coord).unwrap_or(decoded))
 }
 
 /// Upsamples one quadrant of a parent imagery texture back to a full tile —
@@ -1501,12 +1633,14 @@ mod mosaic_coverage_tests {
         ];
         for rect in rects {
             for level in 0..=18 {
-                // The one budget a drape can carry — see `MAX_IMAGERY_LAYERS`.
-                for budget in [MAX_IMAGERY_LAYERS] {
+                // Both ends of the detected range, since the slot count is
+                // now the device's answer rather than a constant: the floor a
+                // 3x3 straddle needs, and the ceiling fragment cost allows.
+                for budget in [MIN_IMAGERY_SLOTS, USEFUL_IMAGERY_SLOTS] {
                     let mosaic = scheme.mosaic_at_level(&rect, level, budget);
                     let covers = mosaic.coverage(&scheme, &rect);
                     assert_eq!(
-                        covers.len() as u32,
+                        covers.len() as u64,
                         mosaic.tile_count(),
                         "one rectangle per tile, so the two can be zipped"
                     );
@@ -1736,8 +1870,17 @@ mod tests {
             north: 0.60,
         };
 
+        // A realistic texture size, because the mapping now carries a
+        // half-texel inset and a 1×1 texture makes that inset a quarter of the
+        // image — true to the rule, useless as a fixture.
+        const SIZE: u32 = 256;
+        let texture = Arc::new(DecodedTexture {
+            width: SIZE,
+            height: SIZE,
+            rgba8: vec![255; (SIZE * SIZE * 4) as usize],
+        });
         for imagery in [finer, coarser] {
-            let layer = ImageryLayer::placed(coord(5, 1, 1), tex1x1(), &tile, &imagery);
+            let layer = ImageryLayer::placed(coord(5, 1, 1), Arc::clone(&texture), &tile, &imagery);
             for (lon, lat) in [(0.115, 0.23), (0.125, 0.245), (0.12, 0.225)] {
                 let tile_uv = [
                     (lon - tile.west) / tile.width(),
@@ -1751,8 +1894,16 @@ mod tests {
                     (lon - imagery.west) / imagery.width(),
                     (imagery.north - lat) / imagery.height(),
                 ];
+                // Within half a texel, deliberately: the mapping is inset by
+                // exactly that so a bilinear fetch never reaches outside the
+                // tile and picks up a duplicated edge texel instead of the
+                // neighbour's — the other half of a seam. What is under test is
+                // that the affine transform is *right*, not that it is
+                // uninset.
+                let half_texel = 0.5 / f64::from(SIZE);
                 assert!(
-                    (got[0] - want[0]).abs() < 1e-6 && (got[1] - want[1]).abs() < 1e-6,
+                    (got[0] - want[0]).abs() <= half_texel
+                        && (got[1] - want[1]).abs() <= half_texel,
                     "({lon}, {lat}) mapped to {got:?}, the imagery tile says {want:?}"
                 );
             }
@@ -1815,9 +1966,7 @@ mod tests {
             ),
         ];
         let texture = tex1x1();
-        // The coverage rectangle is the mosaic's to compute now, so it is handed
-        // in rather than derived from geography here — which is the invariant
-        // that keeps two neighbours agreeing on a shared edge to the bit.
+        let mut placement = None;
         for (name, _covers, expected) in quarters {
             let layer = ImageryLayer::substituted(
                 coord(3, 1, 1),
@@ -1827,9 +1976,15 @@ mod tests {
                 expected,
             );
             assert_eq!(layer.coverage, expected, "{name}");
-            // Every sibling reads the parent the same way — only the mask moves.
-            assert_eq!(layer.scale, [1.0, 1.0], "{name}");
-            assert_eq!(layer.translation, [0.0, 0.0], "{name}");
+            // Every sibling reads the parent the same way — only the mask
+            // moves. Compared to each other rather than to a literal, because
+            // the absolute numbers now carry the half-texel inset and the
+            // invariant under test is the *sharing*.
+            let this = (layer.translation, layer.scale);
+            match placement {
+                None => placement = Some(this),
+                Some(first) => assert_eq!(this, first, "{name} reads the parent differently"),
+            }
             assert!(Arc::ptr_eq(&layer.texture, &texture), "{name} copied");
         }
     }
@@ -2031,6 +2186,80 @@ mod tests {
             north: 1e-12,
         };
         assert_eq!(wm.level_for_rectangle(&tiny, 512.0), wm.maximum_level);
+    }
+
+    /// The call that froze the geometry server.
+    ///
+    /// On a zoom-out the traversal asks for a coarse terrain tile — a rectangle
+    /// spanning a continent — while the imagery level still comes from where
+    /// the camera was a moment ago, near the ground. Asking level 19 of a
+    /// world-sized rectangle is about `10^11` tiles; the old implementation
+    /// built a `Vec` of every one of them to read its two corners, on the
+    /// server thread, and never came back. The selection stopped updating and
+    /// the ground went black everywhere the stale selection did not cover.
+    ///
+    /// Without the fix this test does not fail — it hangs, which is a loud
+    /// enough failure.
+    /// A level nobody would ask for on purpose, which is when arithmetic bugs
+    /// arrive: the level here is derived from a camera altitude, and an altitude
+    /// can be absurd for one frame.
+    #[test]
+    fn an_absurd_level_is_clamped_rather_than_shifting_off_the_end() {
+        let wm = TilingScheme::web_mercator();
+        let (nx, ny) = wm.tiles_at(64);
+        assert_eq!(wm.tiles_at(TilingScheme::MAX_LEVEL), (nx, ny));
+        assert!(nx > 0 && ny > 0, "a world is never zero tiles wide");
+        // And the product of two of them still fits, which is the real bound.
+        assert!(
+            nx.checked_mul(ny).is_some(),
+            "the mosaic count must not wrap"
+        );
+    }
+
+    #[test]
+    fn a_world_rectangle_at_the_deepest_level_coarsens_instead_of_enumerating() {
+        use std::f64::consts::PI;
+        let wm = TilingScheme::web_mercator();
+        let world = GeoRect {
+            west: -PI,
+            south: -1.4,
+            east: PI,
+            north: 1.4,
+        };
+        let mosaic = wm.mosaic_at_level(&world, wm.maximum_level, 12);
+        assert!(
+            mosaic.tile_count() <= 12,
+            "the mosaic must fit the layer budget, got {} tiles",
+            mosaic.tile_count()
+        );
+        assert!(
+            mosaic.level < wm.maximum_level,
+            "and it can only fit by coarsening"
+        );
+    }
+
+    /// The extent must be arithmetic, not a walk: the range is read straight
+    /// off the projection whatever the level, and reading it must not depend on
+    /// how many tiles lie inside it.
+    #[test]
+    fn the_tile_range_agrees_with_the_enumeration_it_replaced() {
+        let wm = TilingScheme::web_mercator();
+        let rect = GeoRect {
+            west: -0.1,
+            south: -0.1,
+            east: 0.1,
+            north: 0.1,
+        };
+        for level in 0..=6 {
+            let (x0, x1, y0, y1) = wm.tile_range(&rect, level);
+            let tiles = wm.tiles_in_rectangle(&rect, level);
+            let xs: Vec<u64> = tiles.iter().map(|t| t.x).collect();
+            let ys: Vec<u64> = tiles.iter().map(|t| t.y).collect();
+            assert_eq!(Some(&x0), xs.iter().min(), "x0 at z{level}");
+            assert_eq!(Some(&x1), xs.iter().max(), "x1 at z{level}");
+            assert_eq!(Some(&y0), ys.iter().min(), "y0 at z{level}");
+            assert_eq!(Some(&y1), ys.iter().max(), "y1 at z{level}");
+        }
     }
 
     #[test]
