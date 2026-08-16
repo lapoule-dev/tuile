@@ -29,4 +29,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tuile-atmosphere = { path = "../tuile-atmosphere" }
 tuile-core = { path = "../tuile-core" }
+tuile-terrain = { path = "../tuile-terrain" }
+tuile-planetary = { path = "../tuile-planetary" }
+async-trait = { workspace = true }
 url = { workspace = true }
