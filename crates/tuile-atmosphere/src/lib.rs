@@ -56,6 +56,6 @@ pub mod aerial;
 pub mod sky;
 pub mod sun;
 
-pub use aerial::AerialPerspective;
+pub use aerial::{AerialPerspective, WGSL};
 pub use sky::SkyShell;
 pub use sun::Sun;
