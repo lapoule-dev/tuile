@@ -4,7 +4,7 @@
 //! The overlay pipeline on a real device: pixel coordinates must land where
 //! they claim, and translucency must composite rather than replace.
 
-use tuile_wgpu::{GpuContext, OverlayRenderer, OverlayVertex, DEPTH_FORMAT};
+use tuile_wgpu::{GpuContext, OverlayRenderer, OverlayVertex, DEPTH_FORMAT, SAMPLES};
 
 const SIZE: u32 = 64;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -54,7 +54,24 @@ fn render(gpu: &GpuContext, vertices: &[OverlayVertex]) -> Vec<u8> {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
+    // Multisampled, as the session is: the overlay pipeline is built for
+    // `SAMPLES` and a single-sample pass will not accept it.
+    let msaa = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("overlay test msaa"),
+        size: wgpu::Extent3d {
+            width: SIZE,
+            height: SIZE,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: SAMPLES,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
     let view = color.create_view(&Default::default());
+    let msaa_view = msaa.create_view(&Default::default());
 
     // 256-byte row alignment for the readback buffer.
     let bytes_per_row = (SIZE * 4).div_ceil(256) * 256;
@@ -70,8 +87,8 @@ fn render(gpu: &GpuContext, vertices: &[OverlayVertex]) -> Vec<u8> {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("overlay pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
+                view: &msaa_view,
+                resolve_target: Some(&view),
                 depth_slice: None,
                 ops: wgpu::Operations {
                     // Opaque red, so blending is visible in the result.
@@ -200,7 +217,7 @@ fn the_overlay_draws_into_a_pass_that_carries_depth() {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: SAMPLES,
             dimension: wgpu::TextureDimension::D2,
             format,
             usage,
