@@ -1,19 +1,51 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! Resident-content cache: LRU bounded by a byte budget.
+//! Resident-content cache: an LRU bounded by a tile count, with a byte ceiling
+//! behind it.
 //!
-//! Invariant: a currently selected tile is never evicted — the budget may
-//! be temporarily exceeded rather than dropping visible content.
+//! The shape is the reference implementation's `TileReplacementQueue`: entries
+//! ordered by when they were last used, a cap on how many may stay, and a sweep
+//! from the least-recently-used end that stops the moment the cap holds. What
+//! the current pass touched is never a victim, even if that leaves the cache
+//! over its cap — the reference is explicit that going over beats dropping
+//! something in use.
+//!
+//! The count is what actually bounds a session, and the bytes are a backstop.
+//! Size does not distinguish a level-19 tile nobody is looking at from a
+//! level-3 tile covering a continent, so a byte budget alone never singles the
+//! first one out: measured, one session held 3386 MiB of imagery and evicted
+//! nothing at all. Recency does distinguish them, which is the whole argument
+//! for an LRU over a high-water mark.
 
 use crate::raster::ImageryCoord;
 use crate::source::TileId;
 use std::collections::{HashMap, HashSet};
 
+/// Where a sweep starts, as a fraction of a ceiling.
+///
+/// Below the ceiling on purpose: waiting for the cache to be full means every
+/// eviction happens under pressure, in the same pass as the loads that caused
+/// it, so the sweep competes with exactly the work it is meant to make room
+/// for. Starting early means reclaiming happens in the quiet between bursts.
+const HIGH_WATER: f64 = 0.9;
+
+/// Where a sweep stops, as a fraction of a ceiling.
+///
+/// Clearing a margin rather than stopping at the mark makes eviction occasional
+/// instead of continuous: stop exactly at the trigger and the next insert trips
+/// it again, forever. The gap between the two marks is the hysteresis.
+const LOW_WATER: f64 = 0.8;
+
 #[derive(Debug, Clone)]
 struct Entry {
     size: usize,
     last_used: u64,
+    /// The pass that last touched this tile. Compared against
+    /// [`ResidentCache::pass`] to answer "was this used *now*", which is a
+    /// different question from "was this used recently" and the only one that
+    /// makes a sweep safe.
+    touched_pass: u64,
     /// The imagery this tile references, with repeats. Repeats are real — four
     /// siblings standing on one ancestor name it four times — and are kept
     /// rather than deduplicated so that release is the exact inverse of admit.
@@ -27,29 +59,22 @@ struct ImageryEntry {
     refs: u32,
 }
 
-/// How far below the budget an eviction sweep goes, as a fraction of it.
-///
-/// Evicting to exactly the budget means evicting again on the very next insert,
-/// forever, once the cache is full — and each sweep drops the least-recently
-/// used tile, which on a turning camera is often one about to be wanted again.
-/// Clearing a margin instead makes eviction occasional rather than continuous.
-///
-/// It also closes a way a bulk frame can fail to converge: that mode blocks
-/// until every selected tile is resident, so if eviction keeps firing while
-/// tiles arrive, the outstanding-request count need never reach zero. A margin
-/// bounds how much of the frame's own working set a sweep can take back.
-///
-/// 0.8 is the SportsTrackLive viewer's figure, arrived at independently.
-const EVICTION_LOW_WATER: f64 = 0.8;
-
 #[derive(Debug)]
 pub struct ResidentCache {
+    /// A backstop, not the working bound. See [`ResidentCache::tile_limit`].
     budget: usize,
-    /// Where a sweep stops. Derived from the budget once, not per call.
-    low_water: usize,
+    /// How many tiles may stay, whatever they weigh — the reference
+    /// implementation's `tileCacheSize`, and what actually bounds a session.
+    /// See [`crate::traversal::Config::resident_tile_limit`].
+    tile_limit: usize,
+    /// Levels at or above this are never evicted. See
+    /// [`crate::traversal::Config::pinned_level`].
+    pinned_level: Option<u32>,
     /// Geometry, charged per tile.
     used: usize,
     tick: u64,
+    /// Which traversal pass is current. See [`ResidentCache::start_pass`].
+    pass: u64,
     entries: HashMap<TileId, Entry>,
     /// Draped imagery, charged **once per texture** however many tiles drape it.
     ///
@@ -66,11 +91,22 @@ pub struct ResidentCache {
 
 impl ResidentCache {
     pub fn new(budget_bytes: usize) -> Self {
+        Self::with_limits(budget_bytes, usize::MAX)
+    }
+
+    pub fn with_limits(budget_bytes: usize, tile_limit: usize) -> Self {
+        Self::pinning(budget_bytes, tile_limit, None)
+    }
+
+    /// As [`ResidentCache::with_limits`], plus a level that is never reclaimed.
+    pub fn pinning(budget_bytes: usize, tile_limit: usize, pinned_level: Option<u32>) -> Self {
         Self {
             budget: budget_bytes,
-            low_water: (budget_bytes as f64 * EVICTION_LOW_WATER) as usize,
+            tile_limit,
+            pinned_level,
             used: 0,
             tick: 0,
+            pass: 0,
             entries: HashMap::new(),
             imagery: HashMap::new(),
             imagery_used: 0,
@@ -115,12 +151,22 @@ impl ResidentCache {
     /// Releases a tile's claim. A texture's bytes come back only when the last
     /// tile holding it lets go — until then it is still on the GPU.
     fn release_imagery(&mut self, held: &[ImageryCoord]) {
+        // Coarse imagery outlives whatever happened to be holding it.
+        //
+        // A level-5 texture is the floor of the layer stack — the thing that
+        // shows through wherever a sharp tile is missing — and it is typically
+        // referenced by one deep tile at a time. Freeing it when that tile is
+        // evicted means the safety net is collected exactly when the churn that
+        // needs it begins. There are at most 4^5 of them for the whole planet,
+        // so keeping every one ever fetched is bounded and small.
+        let pinned = self.pinned_level;
         for coord in held {
             let Some(entry) = self.imagery.get_mut(coord) else {
                 continue;
             };
-            entry.refs -= 1;
-            if entry.refs == 0 {
+            entry.refs = entry.refs.saturating_sub(1);
+            let evictable = pinned.is_none_or(|floor| coord.level > floor);
+            if entry.refs == 0 && evictable {
                 self.imagery_used -= entry.bytes;
                 self.imagery.remove(coord);
             }
@@ -134,10 +180,31 @@ impl ResidentCache {
     /// Marks a tile as recently used (call when it is selected).
     pub fn touch(&mut self, t: TileId) {
         self.tick += 1;
-        let tick = self.tick;
+        let (tick, pass) = (self.tick, self.pass);
         if let Some(e) = self.entries.get_mut(&t) {
             e.last_used = tick;
+            e.touched_pass = pass;
         }
+    }
+
+    /// Whether this tile sits at or above the pinned level, and so may never be
+    /// reclaimed.
+    fn is_pinned(&self, t: TileId) -> bool {
+        self.pinned_level
+            .is_some_and(|floor| t.terrain_coord().0 <= floor)
+    }
+
+    /// Opens a new pass. Everything touched from here until the next call is
+    /// off limits to a sweep.
+    ///
+    /// The reference implementation's `markStartOfRenderFrame`: it snapshots
+    /// the head of its queue, and `trimTiles` refuses to walk past that mark —
+    /// "*Tiles that were used last frame will not be unloaded, even if that
+    /// puts the number of tiles above the specified maximum*". Going over the
+    /// ceiling is the lesser evil; reclaiming something the camera is looking
+    /// at is not a trade-off, it is a hole.
+    pub fn start_pass(&mut self) {
+        self.pass += 1;
     }
 
     pub fn remove(&mut self, t: TileId) {
@@ -169,6 +236,9 @@ impl ResidentCache {
             Entry {
                 size,
                 last_used: self.tick,
+                // What has just arrived was, by definition, asked for by the
+                // pass that is running: it may not be swept out from under it.
+                touched_pass: self.pass,
                 imagery: held,
             },
         ) {
@@ -194,34 +264,108 @@ impl ResidentCache {
         self.trim_except(protected, None)
     }
 
+    /// How many tiles are resident.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Whether either ceiling has reached its high-water mark.
+    fn over_high_water(&self) -> bool {
+        self.used_bytes() as f64 > self.budget as f64 * HIGH_WATER
+            || self.entries.len() as f64 > self.tile_limit as f64 * HIGH_WATER
+    }
+
+    /// Whether both ceilings are back under their low-water marks.
+    fn under_low_water(&self) -> bool {
+        (self.used_bytes() as f64) <= self.budget as f64 * LOW_WATER
+            && (self.entries.len() as f64) <= self.tile_limit as f64 * LOW_WATER
+    }
+
+    /// Evicts, worst first, from the high-water mark down to the low-water one.
+    ///
+    /// **Whether** to sweep is the ceilings, and a sweep starts before either is
+    /// reached — waiting for full means every eviction lands in the same pass as
+    /// the loads that caused it. **Who** goes is least-recently-used, and
+    /// nothing else.
+    ///
+    /// Two sets are untouchable. `protected` — what this pass selected, its
+    /// ancestors, what it asked for — and anything [`ResidentCache::touch`]ed
+    /// during the current pass, even if `protected` does not name it. Both hold
+    /// even when that leaves the cache over its ceilings: going over budget is a
+    /// trade-off, reclaiming ground the camera is looking at is a hole.
+    ///
+    /// A residency can be well under the bytes and far over the count — ten
+    /// thousand deep tiles weigh less than a few hundred coarse ones — so either
+    /// ceiling is enough to start a sweep, and both must clear to stop one.
+    ///
+    /// [`Session`]: crate::runtime
     fn trim_except(&mut self, protected: &HashSet<TileId>, keep: Option<TileId>) -> Vec<TileId> {
         let mut evicted = Vec::new();
-        // Nothing to do until the budget is actually exceeded — the margin
-        // governs how far a sweep goes, not when one starts. Sweeping down to
-        // the low-water mark on every insert would evict far more than the
-        // budget asks for.
-        if self.used_bytes() <= self.budget {
+        if !self.over_high_water() {
             return evicted;
         }
-        // Evicting a tile always frees its geometry but frees its imagery only
-        // if it was the last to hold it, so a sweep can shrink slowly. It still
-        // terminates: every pass removes an entry, so the victim search runs out.
-        while self.used_bytes() > self.low_water {
-            // LRU among evictable entries; tile id breaks ties deterministically.
-            let victim = self
-                .entries
-                .iter()
-                .filter(|(id, _)| !protected.contains(id) && Some(**id) != keep)
-                .min_by(|a, b| a.1.last_used.cmp(&b.1.last_used).then(a.0.cmp(b.0)))
-                .map(|(id, _)| *id);
-            match victim {
-                Some(id) => {
-                    self.remove(id);
-                    evicted.push(id);
-                }
-                // Everything left is protected: accept being over budget.
-                None => break,
+        // Ordered once, not searched per eviction: a sweep can take hundreds of
+        // tiles, and a scan of the whole residency for each of them is the
+        // difference between a sweep costing nothing and a sweep costing a
+        // frame.
+        let pass = self.pass;
+        let mut victims: Vec<(TileId, u32, u64)> = self
+            .entries
+            .iter()
+            .filter(|(id, e)| {
+                !protected.contains(id)
+                    && Some(**id) != keep
+                    && e.touched_pass != pass
+                    && !self.is_pinned(**id)
+            })
+            .map(|(id, e)| (*id, id.terrain_coord().0, e.last_used))
+            .collect();
+        // **Deepest first, then least recently used.**
+        //
+        // The depth term is a deliberate departure from the reference, whose
+        // queue is 119 lines and mentions neither level nor distance nor error.
+        // It earns its place on one asymmetry: what a tile is worth to the
+        // picture is not what it costs to hold. A level-18 tile covers a few
+        // hundred metres and stands in for nothing; a level-3 tile covers a
+        // continent and is what *every* unready tile beneath it falls back to.
+        // Reclaiming the deep one costs a patch of sharpness somewhere nobody
+        // is looking; reclaiming the coarse one can take ground off the screen
+        // across a whole region.
+        //
+        // A weight of `1/screen-space-error` sat here once and did exactly
+        // that, in the opposite direction: under a tilted camera the distance
+        // term made most of the frame the most depletable thing in the cache,
+        // and the coarse ancestor everything falls back to is by construction
+        // the lowest-error tile there is — so it went first of all. Measured: a
+        // selection of 866 tiles collapsed to 1 in a single frame, with 1792
+        // tiles sitting ready on the GPU and undrawn. The lesson was not "never
+        // consider level"; it was "never make the fallback the first victim".
+        //
+        // Recency still decides *within* a level, so a session that stays at
+        // one depth behaves exactly as it did before.
+        //
+        // Imagery follows for free. Textures are freed by reference count when
+        // the last tile naming them goes, so evicting the deep tiles first
+        // releases the fine textures first — which is where the memory actually
+        // is: measured at 1.14 GB of imagery against 6.9 MB of geometry.
+        victims.sort_by(|a, b| {
+            b.1.cmp(&a.1) // deepest level first
+                .then(a.2.cmp(&b.2)) // then least recently used
+                .then(a.0.cmp(&b.0)) // then by id, so a sweep is reproducible
+        });
+        for (id, _, _) in victims {
+            // Checked as we go: evicting a tile always frees its geometry but
+            // frees its imagery only if it was the last to hold it, so how far a
+            // sweep gets per tile is not known in advance.
+            if self.under_low_water() {
+                break;
             }
+            self.remove(id);
+            evicted.push(id);
         }
         evicted
     }
@@ -247,16 +391,31 @@ mod tests {
         }
     }
 
+    /// A sweep starts at the high-water mark, not at the ceiling. Waiting for
+    /// full means every eviction happens in the same pass as the loads that
+    /// filled the cache, so reclaiming competes with exactly the work it is
+    /// making room for.
     #[test]
-    fn budget_is_respected_to_the_byte() {
+    fn a_sweep_starts_before_the_ceiling_is_reached() {
+        // 100 bytes: high water 90, low water 80.
         let mut c = ResidentCache::new(100);
         let none = HashSet::new();
         assert!(c.insert(t(1), 60, NO_IMAGERY, &none).is_empty());
-        assert!(c.insert(t(2), 40, NO_IMAGERY, &none).is_empty());
-        assert_eq!(c.used_bytes(), 100, "exactly at budget: no eviction");
-        let evicted = c.insert(t(3), 1, NO_IMAGERY, &none);
-        assert_eq!(evicted, vec![t(1)], "LRU goes first");
-        assert_eq!(c.used_bytes(), 41);
+        assert!(
+            c.insert(t(2), 25, NO_IMAGERY, &none).is_empty(),
+            "85 bytes is under the high-water mark: still nothing to do"
+        );
+        // A later pass: what arrived above is now history, not in use.
+        c.start_pass();
+
+        // 95 bytes — under the 100-byte ceiling, over the 90-byte mark.
+        let evicted = c.insert(t(3), 10, NO_IMAGERY, &none);
+        assert_eq!(evicted, vec![t(1)], "the sweep fired without being full");
+        assert!(
+            c.used_bytes() <= 80,
+            "and ran to the low-water mark, left {} bytes",
+            c.used_bytes()
+        );
     }
 
     #[test]
@@ -265,6 +424,7 @@ mod tests {
         let none = HashSet::new();
         c.insert(t(1), 50, NO_IMAGERY, &none);
         c.insert(t(2), 50, NO_IMAGERY, &none);
+        c.start_pass();
         c.touch(t(1)); // t2 becomes the LRU
         let evicted = c.insert(t(3), 50, NO_IMAGERY, &none);
         // Order, not count: a sweep clears down to the low-water mark, so how
@@ -273,32 +433,185 @@ mod tests {
         assert_eq!(evicted.first(), Some(&t(2)));
     }
 
-    /// A sweep starts only when the budget is exceeded, and then clears a
-    /// margin. Evicting to exactly the budget means evicting again on the next
-    /// insert, forever — and each sweep takes the least-recently-used tile,
-    /// which on a turning camera is often one about to be wanted again.
+    /// The gap between the marks is hysteresis. Stop a sweep at the mark that
+    /// triggered it and the next insert trips it again, forever; clearing a
+    /// margin makes eviction occasional instead of continuous.
     #[test]
-    fn a_sweep_clears_a_margin_below_the_budget() {
+    fn a_sweep_clears_a_margin_so_the_next_insert_is_free() {
+        // 1000 bytes: high water 900, low water 800.
         let mut c = ResidentCache::new(1000);
         let none = HashSet::new();
-        for i in 1..=10 {
+        for i in 1..=9 {
             c.insert(t(i), 100, NO_IMAGERY, &none);
         }
-        assert_eq!(c.used_bytes(), 1000, "at budget, nothing evicted yet");
+        assert_eq!(
+            c.used_bytes(),
+            900,
+            "at the mark, not over it: no sweep yet"
+        );
+        // A later pass: what arrived above is history, not in use.
+        c.start_pass();
 
-        c.insert(t(11), 100, NO_IMAGERY, &none);
-        assert!(
-            c.used_bytes() <= 800,
-            "a sweep must clear to the low-water mark, left {} bytes",
-            c.used_bytes()
+        c.insert(t(10), 100, NO_IMAGERY, &none);
+        assert_eq!(
+            c.used_bytes(),
+            800,
+            "the sweep must run to the low-water mark"
         );
 
-        // And having cleared it, the next few inserts cost nothing: that is the
-        // whole point — eviction becomes occasional instead of continuous.
-        let quiet = c.insert(t(12), 100, NO_IMAGERY, &none);
+        // Having cleared it, the next insert costs nothing. That is the whole
+        // point of the two marks being different numbers.
+        let quiet = c.insert(t(11), 100, NO_IMAGERY, &none);
         assert!(
             quiet.is_empty(),
             "insert right after a sweep should not evict, took {quiet:?}"
+        );
+    }
+
+    /// A tile the current pass has touched is never a victim, even when that
+    /// leaves the cache over its ceiling.
+    ///
+    /// This is the reference implementation's `markStartOfRenderFrame` barrier,
+    /// and it is the difference between a degraded picture and a hole. Without
+    /// it a sweep can reclaim ground the camera is looking at *right now*, and
+    /// the coarse ancestor everything unready falls back to goes with it —
+    /// measured in the viewer as a selection of 866 tiles collapsing to 1 in one
+    /// frame, with 1792 tiles ready on the GPU and undrawn.
+    /// The floor of the fallback chain is never reclaimed, geometry or imagery.
+    ///
+    /// Without this the guarantee is empty: an ancestor walk reaches level 5,
+    /// finds nothing, and the ground is bare — which is the black square. The
+    /// count is what makes it affordable: `4^5` is 1024 tiles for the whole
+    /// planet, and only those under ground the camera has visited are ever
+    /// fetched.
+    #[test]
+    fn the_pinned_level_survives_any_pressure() {
+        // One tile of room, so every sweep is as aggressive as it can be.
+        let mut c = ResidentCache::pinning(100, 1, Some(5));
+        let none = HashSet::new();
+        let coarse = TileId::from_terrain(4, 3, 3);
+        let deep = TileId::from_terrain(18, 7, 7);
+        let shared = &[(img(1), 40)][..];
+
+        c.insert(coarse, 40, shared, &none);
+        c.start_pass();
+        // Enough deep tiles to force sweep after sweep.
+        for n in 0..8 {
+            c.insert(TileId::from_terrain(18, n, 0), 40, NO_IMAGERY, &none);
+            c.start_pass();
+        }
+        assert!(c.contains(coarse), "the pinned tile was reclaimed");
+
+        // And its imagery outlives the last deep tile that referenced it.
+        c.insert(deep, 40, shared, &none);
+        c.start_pass();
+        c.remove(deep);
+        c.remove(coarse);
+        assert_eq!(
+            c.imagery_bytes(),
+            (1, 40),
+            "pinned imagery must outlive every holder"
+        );
+    }
+
+    #[test]
+    fn a_tile_touched_this_pass_survives_a_full_cache() {
+        let mut c = ResidentCache::new(1000);
+        let none = HashSet::new();
+        for i in 1..=9 {
+            c.insert(t(i), 100, NO_IMAGERY, &none);
+        }
+
+        // Every one of them is in use *now*. Note they are touched in order, so
+        // the recency ranking among them is unchanged — a sweep that only knew
+        // about recency would still happily take the first few. Only the
+        // barrier can save them.
+        c.start_pass();
+        for i in 1..=9 {
+            c.touch(t(i));
+        }
+
+        let evicted = c.insert(t(10), 100, NO_IMAGERY, &none);
+        assert!(
+            evicted.is_empty(),
+            "the sweep took ground the pass is using: {evicted:?}"
+        );
+        assert!(
+            c.used_bytes() > 900,
+            "and it must go over its ceiling to do so, which is the trade the \
+             reference implementation makes explicitly"
+        );
+    }
+
+    /// The barrier lasts one pass, not for ever: open the next one and the same
+    /// tiles are ordinary LRU candidates again. Otherwise nothing is ever
+    /// evictable and the ceiling bounds nothing.
+    #[test]
+    fn the_barrier_lifts_on_the_next_pass() {
+        // 300 bytes: high water 270, low water 240, so a third 100-byte tile
+        // forces exactly one eviction.
+        let mut c = ResidentCache::new(300);
+        let none = HashSet::new();
+        c.insert(t(1), 100, NO_IMAGERY, &none);
+        c.insert(t(2), 100, NO_IMAGERY, &none);
+
+        c.start_pass();
+        c.touch(t(1)); // in use *now*, and incidentally the most recent
+        let evicted = c.insert(t(3), 100, NO_IMAGERY, &none);
+        assert_eq!(evicted, vec![t(2)], "the tile in use was spared");
+
+        // Next pass: t1 was not touched, so it is an ordinary candidate again —
+        // and being the oldest of what is left, it goes first.
+        c.start_pass();
+        let evicted = c.insert(t(4), 100, NO_IMAGERY, &none);
+        assert_eq!(
+            evicted,
+            vec![t(1)],
+            "the barrier must last one pass, or nothing is ever evictable"
+        );
+    }
+
+    /// Order is least-recently-used, and only that.
+    #[test]
+    fn tiles_go_least_recently_used_first() {
+        let mut c = ResidentCache::new(1000);
+        let none = HashSet::new();
+        for i in 1..=9 {
+            c.insert(t(i), 100, NO_IMAGERY, &none);
+        }
+        c.start_pass();
+        c.touch(t(1)); // now the most recently used, though the first inserted
+
+        let evicted = c.insert(t(10), 100, NO_IMAGERY, &none);
+        assert_eq!(
+            evicted,
+            vec![t(2), t(3)],
+            "the touched tile survived and the next-oldest went instead"
+        );
+    }
+
+    /// The count sweeps on its own account. A residency can sit far under its
+    /// byte ceiling and still hold far too many tiles — ten thousand deep tiles
+    /// weigh less than a few hundred coarse ones — and the count is the ceiling
+    /// that bounds a long session.
+    #[test]
+    fn the_tile_count_sweeps_with_bytes_to_spare() {
+        // 10 tiles: high water 9, low water 8. Bytes effectively unlimited.
+        let mut c = ResidentCache::with_limits(1_000_000, 10);
+        let none = HashSet::new();
+        for i in 1..=9 {
+            c.insert(t(i), 1, NO_IMAGERY, &none);
+        }
+        assert_eq!(c.len(), 9, "at the mark, nothing swept");
+        c.start_pass();
+
+        let evicted = c.insert(t(10), 1, NO_IMAGERY, &none);
+        assert_eq!(evicted.len(), 2, "swept to the low-water count");
+        assert_eq!(c.len(), 8);
+        assert!(
+            c.used_bytes() < 100,
+            "bytes were never remotely the reason: {} used",
+            c.used_bytes()
         );
     }
 
@@ -384,6 +697,7 @@ mod tests {
         // geometry total says this cache is full.
         for i in 1..=5u64 {
             c.insert(t(i), 10, &[(img(i), 200)], &none);
+            c.start_pass();
         }
         assert!(
             c.used_bytes() <= 800,

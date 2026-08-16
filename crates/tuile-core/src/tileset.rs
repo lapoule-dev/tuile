@@ -248,6 +248,28 @@ impl TileTree for Tileset {
             has_content: t.content.is_some(),
         }
     }
+
+    /// The parent link the arena has carried all along.
+    ///
+    /// [`TileTree::parent`] defaults to `None`, and its own documentation names
+    /// this case — "sources without cheap parent lookup (a 3D Tiles arena)
+    /// simply don't pin ancestors". The premise was wrong: every node stores
+    /// [`Tile::parent`], set when the tree is built and when an external
+    /// tileset is grafted. The lookup is an index into a `Vec`.
+    ///
+    /// What answering it buys is not a nicety. The server pins the chain from
+    /// each selected tile up to the root so a coarser tile can always stand in
+    /// while a finer one streams; a tree that returns `None` gets no such pin,
+    /// and its root is protected only on the passes that happen to be
+    /// requesting it. Measured on a three-level fixture with room for three
+    /// tiles: the root left the protected set on one pass in three, was
+    /// evicted, was re-requested, and reloaded — twenty-one times before a
+    /// counter stopped it. Because those loads resolve from disk inside the
+    /// same poll, the server never returned `Pending` either, so the run
+    /// stopped being a slow test and became a core at 100 % for ever.
+    fn parent(&self, id: TileId) -> Option<TileId> {
+        self.tile(id).parent
+    }
 }
 
 impl Tileset {

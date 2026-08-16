@@ -154,6 +154,56 @@ pub enum Loaded {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait TileLoader: Send + Sync {
     async fn load(&self, id: TileId) -> Result<Loaded, LoadError>;
+
+    /// A stand-in surface for a tile whose real content has not arrived, built
+    /// from what is already in memory. **Synchronous, and never any I/O.**
+    ///
+    /// Synchronous because it exists to answer *now*: the selection names ground
+    /// the camera is looking at this instant, and a stand-in that arrives after
+    /// a fetch would arrive alongside the real tile and be pointless.
+    ///
+    /// # Why the engine needs this at all
+    ///
+    /// A consumer that lacks a selected tile draws its nearest ready ancestor.
+    /// That works and it has a defect: the ancestor also covers the siblings
+    /// that *did* arrive, so two approximations of the same hillside end up
+    /// over the same ground, interpenetrating within a few metres, and the
+    /// depth test picks a winner per pixel. The reference implementation builds
+    /// a fill mesh for exactly this reason (`TerrainFillMesh`), and so does
+    /// this: one surface per patch of ground, always.
+    ///
+    /// # Why here and not in a renderer
+    ///
+    /// It is pure geometry over a tile rectangle — no device, no pipeline, no
+    /// texture. Putting it in a backend would mean every backend reimplementing
+    /// it, and eventually disagreeing about where the ground is. Emitted by the
+    /// server, it reaches wgpu, a browser and a USD renderer identically, and
+    /// each one draws it through the path it already has for content.
+    ///
+    /// Default: `None`, for the many sources with nothing coarse to build from.
+    fn fill(&self, _id: TileId) -> Option<crate::content::DecodedTileContent> {
+        None
+    }
+
+    /// Fetches everything down to `through_level` into whatever store sits
+    /// behind this loader, before anything asks for it.
+    ///
+    /// The coarse levels are what every fallback lands on: a tile that has not
+    /// arrived is drawn by its nearest resident ancestor, and if that walk
+    /// reaches the top and finds nothing, the ground is bare. Waiting for the
+    /// camera to happen upon them means the safety net is built out of exactly
+    /// the tiles a fast movement has not fetched yet — measured on a session
+    /// that had flown the same ground repeatedly, level 5 held 291 of its 1024
+    /// tiles and level 3 held none at all.
+    ///
+    /// The whole planet at level 5 is `4^5` tiles, a few tens of megabytes once
+    /// and cached on disk thereafter. Every level below that is a quarter of
+    /// the one above, so the sum is a third again — cheap for a floor that
+    /// never moves.
+    ///
+    /// Default: nothing. A source with no store, or one that is already local,
+    /// has nothing to gain.
+    async fn warm_up(&self, _through_level: u32) {}
 }
 
 #[derive(Debug, thiserror::Error)]

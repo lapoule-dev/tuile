@@ -29,6 +29,59 @@ pub struct BingMetadata {
     pub tile_height: u32,
 }
 
+/// Which imagery style to ask Bing for, from `TUILE_IMAGERY`.
+///
+/// **The single place that decides.** It lived in the viewer, and the warm-up
+/// job did not know about it: the job filled a cache under one name while the
+/// viewer read another, so a warmed session was cold and nothing said so. Two
+/// hosts cannot agree on a name by both being careful — they agree by calling
+/// the same function.
+///
+/// `labels` is the one worth knowing about. Labelled imagery is not a prettier
+/// picture, it is a **legible** one: aerial ground is smooth and a seam between
+/// two tiles can be invisible, while a road that stops at a straight edge or a
+/// town name cut in half says exactly where one tile ends and whether its
+/// neighbour arrived.
+///
+/// | `TUILE_IMAGERY` | Bing style |
+/// |---|---|
+/// | *unset* | whatever the endpoint states, else `Aerial` |
+/// | `labels` | `AerialWithLabelsOnDemand` |
+/// | `aerial` | `Aerial` |
+/// | `road` | `RoadOnDemand` |
+/// | anything else | passed through unchanged |
+pub fn map_style(from_endpoint: Option<&str>) -> String {
+    let Ok(asked) = std::env::var("TUILE_IMAGERY") else {
+        return from_endpoint.unwrap_or("Aerial").to_owned();
+    };
+    match asked.trim().to_ascii_lowercase().as_str() {
+        "labels" | "labelled" | "labeled" => "AerialWithLabelsOnDemand",
+        "aerial" => "Aerial",
+        "road" | "roads" => "RoadOnDemand",
+        _ => asked.trim(),
+    }
+    .to_owned()
+}
+
+/// The on-disk cache directory for a style.
+///
+/// A prefix rather than one shared bucket, because the store is keyed by tile
+/// coordinate: aerial and labelled imagery for the same coordinate are the same
+/// key. One cache would serve whichever arrived first — silently, and looking
+/// exactly like a working session showing the wrong picture. Separate
+/// directories also stop the two evicting each other while they are compared.
+pub fn cache_name(style: &str) -> String {
+    format!("tiles-{}", style.to_lowercase())
+}
+
+/// The namespace tiles are filed under *inside* a store.
+///
+/// Belt and braces with [`cache_name`]: a host that shares one store between
+/// several providers still needs its keys not to collide.
+pub fn cache_namespace(style: &str) -> String {
+    format!("bing-{}", style.to_lowercase())
+}
+
 impl BingMetadata {
     /// The Bing metadata REST URL for a map style + key.
     pub fn metadata_url(base: &str, map_style: &str, key: &str) -> String {

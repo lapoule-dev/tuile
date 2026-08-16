@@ -45,6 +45,13 @@ impl TileTree for TilesetTree {
     fn properties(&self, id: TileId) -> TileProperties {
         self.arena.read().expect("tileset lock").properties(id)
     }
+
+    /// Forwarded, like everything else here. Omitting it left the arena's own
+    /// parent links unreachable and the server unable to pin an ancestor chain
+    /// — see [`Tileset::parent`] for what that cost.
+    fn parent(&self, id: TileId) -> Option<TileId> {
+        self.arena.read().expect("tileset lock").parent(id)
+    }
 }
 
 /// Fetches + decodes 3D Tiles content for the shared arena. Binary content

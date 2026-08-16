@@ -160,7 +160,19 @@ impl<H: IonHttp> tuile_terrain::TerrainSource for IonTerrainSource<H> {
         IonTerrainSource::fetch_tile(self, coord)
             .await
             .map(|fetched| fetched.map(|b| b.to_vec()))
-            .map_err(|e| tuile_terrain::TerrainSourceError(e.to_string()))
+            // ion answering 404 is a statement about the data — that tile is
+            // not served — and is worth remembering. Anything else is a
+            // statement about this moment and must not be.
+            .map_err(|e| match &e {
+                // 404 is a statement about the data — ion does not serve that
+                // tile — and is worth remembering. Every other status, and every
+                // transport failure, is a statement about this moment and must
+                // not be cached as though the planet had a hole in it.
+                IonError::Status { status: 404, .. } => {
+                    tuile_terrain::TerrainSourceError::no_such_tile(e.to_string())
+                }
+                _ => tuile_terrain::TerrainSourceError::failed(e.to_string()),
+            })
     }
 }
 
