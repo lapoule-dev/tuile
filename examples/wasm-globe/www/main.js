@@ -8,6 +8,7 @@
 // fetching each terrain and imagery tile and feeding the bytes back.
 
 import init, { Globe } from "../pkg/wasm_globe.js";
+import { DecodePool } from "./decode-pool.js";
 
 const TERRAIN_ASSET = 1; // Cesium World Terrain
 const IMAGERY_ASSET = 2; // Bing Aerial
@@ -55,6 +56,17 @@ async function run(token) {
   globe.set_imagery(metaJson);
   log("Bing metadata loaded");
 
+  // Decoding and reprojecting imagery is the heaviest thing this page does, and
+  // on one thread it is what everything else waits behind. Same metadata
+  // document as the Globe, so both derive the same tiling scheme.
+  const pool = new DecodePool(metaJson);
+  const workers = await pool.start();
+  log(
+    workers > 0
+      ? `${workers} decode worker(s) — imagery decoded off the main thread`
+      : "no decode workers available; decoding on the main thread",
+  );
+
   let terrainFetched = 0;
   let imageryFetched = 0;
   for (let round = 1; round <= MAX_ROUNDS; round++) {
@@ -87,10 +99,20 @@ async function run(token) {
         try {
           const resp = await fetch(r.url);
           if (!resp.ok) return globe.fail_imagery(r.tz, r.tx, r.ty, r.level, r.x, r.y);
-          globe.provide_imagery(
-            r.tz, r.tx, r.ty, r.level, r.x, r.y,
-            new Uint8Array(await resp.arrayBuffer()),
-          );
+          const bytes = await resp.arrayBuffer();
+          if (pool.available) {
+            // The buffer is transferred into the worker and the pixels are
+            // transferred back; neither crossing copies.
+            const tile = await pool.decode(bytes, r.level, r.x, r.y);
+            globe.provide_imagery_decoded(
+              r.tz, r.tx, r.ty, r.level, r.x, r.y,
+              tile.rgba, tile.width, tile.height,
+            );
+          } else {
+            globe.provide_imagery(
+              r.tz, r.tx, r.ty, r.level, r.x, r.y, new Uint8Array(bytes),
+            );
+          }
           imageryFetched++;
         } catch {
           globe.fail_imagery(r.tz, r.tx, r.ty, r.level, r.x, r.y);
@@ -99,6 +121,7 @@ async function run(token) {
     ]);
   }
 
+  pool.terminate();
   document.getElementById("report").textContent = globe.report();
   document.getElementById("report").classList.remove("muted");
 }

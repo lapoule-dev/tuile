@@ -94,6 +94,8 @@ pub struct Globe {
     views: Vec<ViewState>,
     residency: ResidencyView,
     out: TraversalOutput,
+    /// What the previous step drew — see `Config::loading_descendant_limit`.
+    rendered_last: std::collections::HashSet<tuile_core::source::TileId>,
     report: GeometryReport,
     failed: HashSet<TileId>,
     pending: HashMap<TileId, Pending>,
@@ -143,6 +145,7 @@ impl Globe {
             views: vec![view],
             residency: ResidencyView::default(),
             out: TraversalOutput::default(),
+            rendered_last: std::collections::HashSet::new(),
             report: GeometryReport::new(),
             failed: HashSet::new(),
             pending: HashMap::new(),
@@ -227,6 +230,44 @@ impl Globe {
         self.store_imagery(tz, tx, ty, level, x, y, tex);
     }
 
+    /// Folds in an imagery tile a Web Worker already decoded and reprojected.
+    ///
+    /// Same effect as [`Self::provide_imagery`], minus the work: the pixels
+    /// arrive finished, so this call is a move into the mosaic rather than a
+    /// decode. `rgba` is tightly packed RGBA8, `width * height * 4` long — the
+    /// buffer [`decode_imagery_tile`] produced in the worker, handed over by
+    /// `postMessage` as a transferable.
+    ///
+    /// A length that does not match is dropped for a neutral tile rather than
+    /// panicking across the wasm boundary: the mosaic still stitches, and the
+    /// tile is merely grey.
+    #[allow(clippy::too_many_arguments)]
+    pub fn provide_imagery_decoded(
+        &mut self,
+        tz: u32,
+        tx: u32,
+        ty: u32,
+        level: u32,
+        x: u32,
+        y: u32,
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+    ) {
+        let size = self.img_scheme.map_or(256, |s| s.tile_size);
+        let expected = (width as usize) * (height as usize) * 4;
+        let tex = if rgba.len() == expected && expected > 0 {
+            DecodedTexture {
+                width,
+                height,
+                rgba8: rgba,
+            }
+        } else {
+            gray_tile(size)
+        };
+        self.store_imagery(tz, tx, ty, level, x, y, tex);
+    }
+
     /// Marks an imagery tile missing (JS calls this on a 404); a neutral tile
     /// fills its slot so the mosaic can still stitch.
     pub fn fail_imagery(&mut self, tz: u32, tx: u32, ty: u32, level: u32, x: u32, y: u32) {
@@ -245,8 +286,12 @@ impl Globe {
             &self.views,
             &self.config,
             self.frame,
+            &self.rendered_last,
             &mut self.out,
         );
+        self.rendered_last.clear();
+        self.rendered_last
+            .extend(self.out.selected.iter().map(|(tile, _)| *tile));
         let terrain: Vec<Req> = self
             .out
             .requests
@@ -400,5 +445,81 @@ fn gray_tile(size: u32) -> DecodedTexture {
         width: size,
         height: size,
         rgba8: vec![128u8; (size * size * 4) as usize],
+    }
+}
+
+/// One imagery tile, decoded and reprojected, on its way out of a Web Worker.
+///
+/// Flat and owned so `postMessage` can hand the pixels over as a transferable
+/// rather than copy them: a 256×256 tile is 256 KiB, and a mosaic is several of
+/// those per terrain tile.
+#[wasm_bindgen]
+pub struct DecodedTile {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl DecodedTile {
+    #[wasm_bindgen(getter)]
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// The pixels, moved out. Consumes the tile — there is one reader and
+    /// copying a quarter-megabyte to be polite would defeat the point.
+    #[wasm_bindgen(getter)]
+    pub fn rgba(self) -> Vec<u8> {
+        self.rgba
+    }
+}
+
+/// Decodes and reprojects one imagery tile. **The whole point of the worker.**
+///
+/// Free rather than a method, and stateless but for the tiling scheme, because
+/// a Worker runs its own instance of this module and has no `Globe` to call
+/// into. Everything it needs arrives as arguments; everything it returns is
+/// bytes. That is what lets the work leave the browser's main thread at all —
+/// see [`tuile_core::raster::decode_and_reproject`] for why a closure could not.
+///
+/// `metadata_json` is the same Bing metadata document `Globe::set_imagery`
+/// takes, so both sides derive the identical scheme from the identical source
+/// rather than agreeing by hand.
+#[wasm_bindgen]
+pub struct ImageryDecoder {
+    scheme: TilingScheme,
+}
+
+#[wasm_bindgen]
+impl ImageryDecoder {
+    #[wasm_bindgen(constructor)]
+    pub fn new(metadata_json: &str) -> Result<ImageryDecoder, JsError> {
+        let meta = BingMetadata::from_json(metadata_json.as_bytes())
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(ImageryDecoder {
+            scheme: meta.tiling_scheme(),
+        })
+    }
+
+    /// Decode + reproject, the unit of work this worker exists to run.
+    pub fn decode(&self, bytes: &[u8], level: u32, x: u32, y: u32) -> Result<DecodedTile, JsError> {
+        let coord = ImageryCoord {
+            level,
+            x: x as u64,
+            y: y as u64,
+        };
+        let tex = raster::decode_and_reproject(bytes, &self.scheme, coord)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(DecodedTile {
+            width: tex.width,
+            height: tex.height,
+            rgba: tex.rgba8,
+        })
     }
 }

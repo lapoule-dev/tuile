@@ -24,3 +24,8 @@ console_error_panic_hook = "0.1"
 tuile-core = { version = "0.0.1", path = "../../crates/tuile-core" }
 tuile-terrain = { version = "0.0.1", path = "../../crates/tuile-terrain" }
 tuile-bing = { version = "0.0.1", path = "../../crates/tuile-bing" }
+
+# As in `crates/tuile-web`: the toolchain emits bulk-memory instructions and an
+# older `wasm-opt` rejects the module outright. Named rather than switched off.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O', '--enable-bulk-memory', '--enable-nontrapping-float-to-int', '--enable-sign-ext']
