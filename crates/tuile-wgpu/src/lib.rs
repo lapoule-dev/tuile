@@ -17,6 +17,11 @@
 //!   [`tuile_core::protocol::GeometryStream`]
 //! - [`OverlayRenderer`] — pixel-space triangles over the scene, for the
 //!   on-screen controls a host builds with `tuile-ui`
+//! - [`FrameTargets`] — the multisampled colour and depth a frame is drawn
+//!   into, with the sample count that has to match the pipelines
+//! - [`Readback`] — a drawn frame back on the CPU, rows correctly unpadded
+//! - [`draw_to_surface`] — one frame onto a surface the host created, with the
+//!   four ways acquiring a drawable can fail already handled
 //!
 //! The crate never creates a window or a surface; the host owns the event
 //! loop and the render pass.
@@ -33,8 +38,8 @@ mod targets;
 pub use context::{ContextError, GpuContext, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT};
 pub use overlay::{OverlayRenderer, OverlayVertex};
 pub use prepare::{prepare, PreparedMesh, PreparedTile, Vertex};
-pub use pump::{ContentPump, Resolution, UPLOADS_PER_FRAME};
+pub use pump::{ContentPump, Drawn, Resolution, UPLOADS_PER_FRAME};
 pub use readback::Readback;
-pub use renderer::{LineVertex, TileRenderer, ViewUniform};
 pub use surface::{draw_to_surface, preferred_format, FrameOnSurface, Presented};
 pub use targets::FrameTargets;
+pub use renderer::{LineVertex, TileRenderer, ViewUniform};
