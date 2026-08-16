@@ -301,7 +301,9 @@ fn render_and_count(
         },
     );
 
-    let (drawn, _) = pump.resolve(&gpu.queue, |id| {
+    // One list: at this point a tile standing in for a missing descendant is
+    // drawn as ordinary geometry, like everything else.
+    let drawn = pump.visible_resolved(|id: TileId| {
         let (z, x, y) = id.terrain_coord();
         (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2))
     });
@@ -336,14 +338,11 @@ fn render_and_count(
         // The backstop the session draws first: a whole-planet shell, carrying
         // no imagery of its own, behind everything. Leaving it out of the
         // fixture would hide the very thing that shows through a seam.
-        if let Some(shell) = backdrop {
-            renderer.render_background(&mut pass, std::iter::once(shell));
-        }
-        // A fallback ancestor is backdrop, not geometry: it stands in for ground
-        // that is not its own and must never win a pixel from a surface that
-        // owns it. See `tuile_wgpu::Drawn`.
-        renderer.render_background(&mut pass, drawn.fallback.into_iter());
-        renderer.render(&mut pass, drawn.exact.into_iter(), false);
+        renderer.render(
+            &mut pass,
+            backdrop.into_iter().chain(drawn.into_iter()),
+            false,
+        );
     }
 
     let bytes = (SIZE * SIZE * 4) as u64;

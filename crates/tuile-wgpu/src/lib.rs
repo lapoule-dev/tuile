@@ -25,10 +25,16 @@ mod context;
 mod overlay;
 mod prepare;
 mod pump;
+mod readback;
 mod renderer;
+mod surface;
+mod targets;
 
-pub use context::{ContextError, GpuContext, DEPTH_FORMAT, TEXTURE_FORMAT};
+pub use context::{ContextError, GpuContext, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT};
 pub use overlay::{OverlayRenderer, OverlayVertex};
 pub use prepare::{prepare, PreparedMesh, PreparedTile, Vertex};
-pub use pump::ContentPump;
+pub use pump::{ContentPump, Resolution, UPLOADS_PER_FRAME};
+pub use readback::Readback;
 pub use renderer::{LineVertex, TileRenderer, ViewUniform};
+pub use surface::{draw_to_surface, preferred_format, FrameOnSurface, Presented};
+pub use targets::FrameTargets;

@@ -225,7 +225,7 @@ impl App {
             (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2))
         };
         let (drawn, resolution) = active.pump.resolve(&active.gpu.queue, parent_of);
-        let rendered = drawn.exact.len() + drawn.fallback.len();
+        let rendered = drawn.len();
         // `resolve` has already brought the selection onto the current render
         // origin. The coarse layer behind it is drawn without going through
         // `resolve`, so it asks for itself.
@@ -286,9 +286,10 @@ impl App {
                     backdrop
                         .then_some(&active.shell)
                         .into_iter()
-                        .chain(coarse.iter().copied())
-                        .chain(drawn.fallback.iter().copied()),
-                    drawn.exact.iter().copied(),
+                        .chain(coarse.iter().copied()),
+                    // One list: a tile standing in for a missing descendant is
+                    // drawn as ordinary geometry here, like everything else.
+                    drawn.iter().copied(),
                     Some(&active.overlay),
                     wireframe,
                 );
