@@ -392,15 +392,17 @@ fn prepare_mesh(
                 resource: imagery.table.as_entire_binding(),
             },
         ];
-        entries.extend((0..gpu.imagery_slots).map(|slot| wgpu::BindGroupEntry {
-            binding: IMAGERY_BINDING_0 + slot,
-            resource: wgpu::BindingResource::TextureView(
-                imagery
-                    .textures
-                    .get(slot as usize)
-                    .map(|t| &t.view)
-                    .unwrap_or(&gpu.white_view),
-            ),
+        entries.extend((0..gpu.imagery_slots).map(|slot| {
+            wgpu::BindGroupEntry {
+                binding: IMAGERY_BINDING_0 + slot,
+                resource: wgpu::BindingResource::TextureView(
+                    imagery
+                        .textures
+                        .get(slot as usize)
+                        .map(|t| &t.view)
+                        .unwrap_or(&gpu.white_view),
+                ),
+            }
         }));
         material_bgs.push(gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tuile material"),

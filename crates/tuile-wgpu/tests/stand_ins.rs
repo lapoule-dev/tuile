@@ -113,7 +113,10 @@ fn grandparent() -> TileId {
 /// one of those is an ancestor spanning ground its descendants already cover —
 /// two surfaces over one patch, which is the z-fighting. `unresolved` names
 /// them.
-fn resolve(gpu: &GpuContext, script: Vec<ServerMessage>) -> (usize, tuile_wgpu::Resolution, Vec<TileId>) {
+fn resolve(
+    gpu: &GpuContext,
+    script: Vec<ServerMessage>,
+) -> (usize, tuile_wgpu::Resolution, Vec<TileId>) {
     let mut stream = Scripted(VecDeque::from(script));
     let mut pump = ContentPump::new(DVec3::ZERO);
     pump.pump(&mut stream, gpu, 16);
@@ -194,7 +197,10 @@ fn a_fill_for_the_missing_tile_keeps_the_ancestor_off_the_screen() {
          of its own — that is two surfaces over one patch of ground, and it is \
          what z-fights. Still wanting their own surface: {unresolved:?}"
     );
-    assert_eq!(counts.exact, 2, "both selected tiles drawn at their own level");
+    assert_eq!(
+        counts.exact, 2,
+        "both selected tiles drawn at their own level"
+    );
     assert_eq!(drawn, 2, "one surface per selected tile, no more");
 }
 

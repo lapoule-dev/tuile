@@ -405,8 +405,7 @@ mod tests {
                 let h = heights_of(&up);
                 // The four corners, as `fill_content` samples them.
                 let corner = |cu: f64, cv: f64| {
-                    up.u
-                        .iter()
+                    up.u.iter()
                         .zip(&up.v)
                         .zip(&h)
                         .filter(|((u, v), _)| (**u - cu).abs() < 1e-9 && (**v - cv).abs() < 1e-9)
@@ -417,8 +416,7 @@ mod tests {
                 let (sw, se) = (corner(0.0, 0.0), corner(1.0, 0.0));
                 let (nw, ne) = (corner(0.0, 1.0), corner(1.0, 1.0));
                 // The ruled surface between them — `fill_content`'s whole mesh.
-                up.u
-                    .iter()
+                up.u.iter()
                     .zip(&up.v)
                     .zip(&h)
                     .map(|((u, v), h)| {

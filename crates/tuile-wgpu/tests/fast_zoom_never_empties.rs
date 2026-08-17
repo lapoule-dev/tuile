@@ -249,7 +249,11 @@ impl Bench {
             wgpu::TextureUsages::RENDER_ATTACHMENT,
             SAMPLES,
         );
-        let depth = make(DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT, SAMPLES);
+        let depth = make(
+            DEPTH_FORMAT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+            SAMPLES,
+        );
         Self {
             colour: target.create_view(&wgpu::TextureViewDescriptor::default()),
             msaa: msaa.create_view(&wgpu::TextureViewDescriptor::default()),
@@ -280,11 +284,8 @@ impl Bench {
     ) -> f64 {
         // The same projection the traversal culled with, so this looks at
         // exactly the volume the engine was asked about.
-        let view_m = glam::Mat4::look_to_rh(
-            glam::Vec3::ZERO,
-            view.direction().as_vec3(),
-            up.as_vec3(),
-        );
+        let view_m =
+            glam::Mat4::look_to_rh(glam::Vec3::ZERO, view.direction().as_vec3(), up.as_vec3());
         let far = (eye.length() * 2.0) as f32;
         let proj = glam::Mat4::perspective_rh(45f32.to_radians(), 1.0, 100.0, far);
         self.renderer.set_view(
@@ -328,13 +329,13 @@ impl Bench {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-        // A fallback ancestor is backdrop, not geometry: it stands in for ground
-        // that is not its own and must never win a pixel from a surface that
-        // owns it. See `tuile_wgpu::Drawn`.
-            self.renderer
-                .render_background(&mut pass, drawn.fallback.iter().copied());
+            // A fallback ancestor is backdrop, not geometry: it stands in for ground
+            // that is not its own and must never win a pixel from a surface that
+            // owns it. See `tuile_wgpu::Drawn`.
             self.renderer
                 .render(&mut pass, drawn.exact.iter().copied(), false);
+            self.renderer
+                .render_fallback(&mut pass, drawn.fallback.iter().copied());
         }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -419,7 +420,17 @@ fn a_fast_zoom_never_leaves_a_tile_empty() {
     // Settle at altitude first: the coarse pyramid is what every fallback lands
     // on, and a session that has not got it yet is a cold start, not a zoom.
     let (view, eye, up) = looking_down(4_000_000.0);
-    frame(&mut server, &mut stream, &mut pump, &gpu, &bench, view, up, eye, 300);
+    frame(
+        &mut server,
+        &mut stream,
+        &mut pump,
+        &gpu,
+        &bench,
+        view,
+        up,
+        eye,
+        300,
+    );
 
     // The reproduction, as described: a **continuous, aggressive zoom out**,
     // one engine step per frame, exactly as a wheel spun hard produces it.
@@ -437,7 +448,17 @@ fn a_fast_zoom_never_leaves_a_tile_empty() {
     // Start settled down low: the user zooms out *from* somewhere they have
     // been looking at, not from a cold engine.
     let (view, eye, up) = looking_down(low);
-    frame(&mut server, &mut stream, &mut pump, &gpu, &bench, view, up, eye, 300);
+    frame(
+        &mut server,
+        &mut stream,
+        &mut pump,
+        &gpu,
+        &bench,
+        view,
+        up,
+        eye,
+        300,
+    );
 
     let mut worst: (f64, f64, usize) = (0.0, low, 0);
     for i in 0..=FRAMES {
@@ -446,7 +467,17 @@ fn a_fast_zoom_never_leaves_a_tile_empty() {
         // grow faster than a selection can describe it.
         let altitude = low * (high / low).powf(i as f64 / FRAMES as f64);
         let (view, eye, up) = looking_down(altitude);
-        let f = frame(&mut server, &mut stream, &mut pump, &gpu, &bench, view, up, eye, 1);
+        let f = frame(
+            &mut server,
+            &mut stream,
+            &mut pump,
+            &gpu,
+            &bench,
+            view,
+            up,
+            eye,
+            1,
+        );
         if f.black > worst.0 {
             worst = (f.black, altitude, f.lost);
         }
@@ -466,7 +497,17 @@ fn a_fast_zoom_never_leaves_a_tile_empty() {
     for i in 0..=FRAMES {
         let altitude = high * (low / high).powf(i as f64 / FRAMES as f64);
         let (view, eye, up) = looking_down(altitude);
-        let f = frame(&mut server, &mut stream, &mut pump, &gpu, &bench, view, up, eye, 1);
+        let f = frame(
+            &mut server,
+            &mut stream,
+            &mut pump,
+            &gpu,
+            &bench,
+            view,
+            up,
+            eye,
+            1,
+        );
         if f.black > worst_in.0 {
             worst_in = (f.black, altitude);
         }

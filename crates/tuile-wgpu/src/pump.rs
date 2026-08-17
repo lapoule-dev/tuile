@@ -236,8 +236,7 @@ impl ContentPump {
             // one would replace real geometry with an approximation — the exact
             // failure the separate variant exists to make impossible to miss.
             ServerMessage::Fill { tile, content } => {
-                let already = self.prepared.contains_key(&tile)
-                    && !self.fills.contains(&tile)
+                let already = self.prepared.contains_key(&tile) && !self.fills.contains(&tile)
                     || self.pending.iter().any(|(t, _, fill)| *t == tile && !*fill);
                 if !already {
                     // Ahead of real content, and deliberately. A stand-in is
@@ -286,7 +285,6 @@ impl ContentPump {
             .iter()
             .filter_map(|(t, _)| self.prepared.get(t))
     }
-
 
     /// What the selection resolved to, and what it failed to resolve to.
     ///
@@ -489,7 +487,6 @@ impl Resolution {
         self.lost > 0
     }
 }
-
 
 /// Which tiles to draw for a selection, and what that cost in sharpness.
 ///
@@ -699,7 +696,11 @@ mod coverage_tests {
         let selection = vec![(coarse, 0.0), (deep, 0.0)];
 
         let (exact, fallback, counts, _) = walk(&selection, |id| id == coarse, parent_of);
-        assert_eq!(exact, vec![coarse], "the selected coarse tile owns its ground");
+        assert_eq!(
+            exact,
+            vec![coarse],
+            "the selected coarse tile owns its ground"
+        );
         assert!(
             fallback.is_empty(),
             "the same surface must not be drawn twice — fallback: {fallback:?}"
@@ -725,7 +726,10 @@ mod coverage_tests {
 
         let (exact, fallback, counts, _) = walk(&selection, has, parent_of);
         assert_eq!(exact.len(), 2, "one surface per selected tile — {exact:?}");
-        assert!(fallback.is_empty(), "nothing left to stand in — {fallback:?}");
+        assert!(
+            fallback.is_empty(),
+            "nothing left to stand in — {fallback:?}"
+        );
         assert_eq!(counts.coarser, 0);
         assert_eq!(counts.lost, 0);
     }
@@ -736,8 +740,7 @@ mod coverage_tests {
     #[test]
     fn a_chain_with_nothing_on_it_is_counted_as_lost() {
         let orphan = TileId::from_terrain(3, 4, 4);
-        let (exact, fallback, counts, unresolved) =
-            walk(&[(orphan, 0.0)], |_| false, parent_of);
+        let (exact, fallback, counts, unresolved) = walk(&[(orphan, 0.0)], |_| false, parent_of);
         assert!(exact.is_empty() && fallback.is_empty());
         assert_eq!(counts.lost, 1);
         assert_eq!(counts.deepest_lost, 3);

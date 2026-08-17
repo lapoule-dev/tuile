@@ -740,7 +740,8 @@ impl Session<'_> {
     fn report_priming(&mut self, tx: &UnboundedSender<ServerMessage>) -> Result<(), Gone> {
         self.priming_state.outstanding = self.priming_outstanding.len() as u32;
         let m = crate::metrics::metrics();
-        m.priming_pending.set(u64::from(self.priming_state.outstanding));
+        m.priming_pending
+            .set(u64::from(self.priming_state.outstanding));
         m.priming_unavailable
             .set(u64::from(self.priming_state.unavailable));
         if *self.priming_reported == Some(*self.priming_state) {
@@ -1106,8 +1107,7 @@ mod tests {
 
         let arena = Arc::new(RwLock::new(tileset));
         let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
-        let inner: Arc<dyn TileLoader> =
-            Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher)));
+        let inner: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher)));
         let (mut stream, server) = in_process_with(
             tree,
             Arc::new(Standing(inner)) as Arc<dyn TileLoader>,
