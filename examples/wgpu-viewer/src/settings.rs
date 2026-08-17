@@ -97,7 +97,10 @@ pub fn pinned_level() -> Option<u32> {
 /// So it is reported either way, with the numbers that say whether the cache
 /// earned its keep this session. `SIGKILL` still takes the buffer with it and
 /// nothing can be done about that from inside the process.
-pub(crate) fn close_the_store(store: Option<std::sync::Arc<FoyerStore>>, handle: &tokio::runtime::Handle) {
+pub(crate) fn close_the_store(
+    store: Option<std::sync::Arc<FoyerStore>>,
+    handle: &tokio::runtime::Handle,
+) {
     let m = tuile_core::metrics::metrics();
     let (hits, misses) = (m.store_hits.get(), m.store_misses.get());
     let served = m.store_bytes_served.get();
@@ -126,4 +129,3 @@ pub(crate) fn close_the_store(store: Option<std::sync::Arc<FoyerStore>>, handle:
         ),
     }
 }
-

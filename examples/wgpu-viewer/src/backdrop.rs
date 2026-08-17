@@ -46,4 +46,3 @@ pub(crate) fn shell_content() -> tuile_core::content::DecodedTileContent {
 pub(crate) fn shell_enabled() -> bool {
     !std::env::var("TUILE_SHELL").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"))
 }
-

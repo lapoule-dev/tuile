@@ -324,7 +324,11 @@ impl WorkerEngine {
                     set(&l, "coord", &JsValue::from_str(&coord_key(layer.coord)));
                     if self.sent_imagery.insert(layer.coord) {
                         set(&l, "width", &JsValue::from_f64(layer.texture.width as f64));
-                        set(&l, "height", &JsValue::from_f64(layer.texture.height as f64));
+                        set(
+                            &l,
+                            "height",
+                            &JsValue::from_f64(layer.texture.height as f64),
+                        );
                         let rgba = js_sys::Uint8Array::from(&layer.texture.rgba8[..]);
                         set(&l, "rgba", &rgba);
                     }
@@ -339,7 +343,11 @@ impl WorkerEngine {
             ServerMessage::Priming(p) => {
                 set(&obj, "kind", &JsValue::from_str("priming"));
                 set(&obj, "total", &JsValue::from_f64(p.total as f64));
-                set(&obj, "outstanding", &JsValue::from_f64(p.outstanding as f64));
+                set(
+                    &obj,
+                    "outstanding",
+                    &JsValue::from_f64(p.outstanding as f64),
+                );
                 set(
                     &obj,
                     "unavailable",
