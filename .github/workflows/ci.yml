@@ -18,6 +18,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The tray icon and the native menu are GTK on Linux, so every job that
+      # builds the viewer needs the development headers. See `tuile-ui`.
+      - run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -30,9 +33,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Software Vulkan rasterizer so the headless wgpu render tests run on Linux CI.
+      # Software Vulkan rasterizer so the headless wgpu render tests run on
+      # Linux CI, and the GTK headers the tray icon and native menu need.
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 \
+            libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
       - run: cargo test --workspace
 
   wasm-guard:
@@ -53,4 +60,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
       - run: cargo doc --workspace --no-deps
