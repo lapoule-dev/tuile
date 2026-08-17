@@ -53,6 +53,9 @@ pub struct TileRenderer {
     /// Redraws geometry the main pipeline already drew, to spend imagery layers
     /// one draw could not bind. See [`TileRenderer::render`].
     layers: wgpu::RenderPipeline,
+    /// Draws ancestors standing in for ground that is not theirs: tests depth,
+    /// never writes it, drawn last. See `Pass::Fallback`.
+    fallback: wgpu::RenderPipeline,
     wireframe: Option<wgpu::RenderPipeline>,
     lines: wgpu::RenderPipeline,
     view_buf: wgpu::Buffer,
@@ -99,6 +102,23 @@ impl TileRenderer {
             Solid,
             /// Neither writes nor tests depth. What is behind everything.
             Backdrop,
+            /// An ancestor standing in for ground that is not its own.
+            ///
+            /// It **tests** depth and never **writes** it, and it is drawn after
+            /// the surfaces that own their ground. Testing is what keeps it on
+            /// the near side of the planet: a skirt is a vertical wall, so on the
+            /// far side of the globe its outward face still points at the camera
+            /// and back-face culling does not remove it. Drawn with `Always` —
+            /// which is right for the shell, and was wrong here — such a wall
+            /// paints straight through the Earth, and that is exactly what it
+            /// looked like: pale ribbons crossing the ocean at angles, brightest
+            /// at the limb, because a fragment that far away comes back as pure
+            /// haze.
+            ///
+            /// Not writing is what keeps it from blocking anything: it colours
+            /// the ground nothing else reached and leaves the depth buffer as
+            /// the surfaces that own their ground left it.
+            Fallback,
             /// The same geometry a `Solid` pass already drew, carrying the next
             /// batch of imagery layers.
             ///
@@ -111,7 +131,6 @@ impl TileRenderer {
             Layers,
         }
         let make_pipeline = |polygon_mode: wgpu::PolygonMode, kind: Pass| {
-            let background = kind == Pass::Backdrop;
             gpu.device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("tuile tiles"),
@@ -142,10 +161,10 @@ impl TileRenderer {
                         // dip kilometres below it at coarse levels. There is no
                         // depth at which that stops being true for every level
                         // at once.
-                        depth_write_enabled: Some(!background),
+                        depth_write_enabled: Some(matches!(kind, Pass::Solid | Pass::Layers)),
                         depth_compare: Some(match kind {
                             Pass::Backdrop => wgpu::CompareFunction::Always,
-                            Pass::Solid => wgpu::CompareFunction::Less,
+                            Pass::Solid | Pass::Fallback => wgpu::CompareFunction::Less,
                             Pass::Layers => wgpu::CompareFunction::LessEqual,
                         }),
                         stencil: Default::default(),
@@ -173,6 +192,7 @@ impl TileRenderer {
         let pipeline = make_pipeline(wgpu::PolygonMode::Fill, Pass::Solid);
         let background = make_pipeline(wgpu::PolygonMode::Fill, Pass::Backdrop);
         let layers = make_pipeline(wgpu::PolygonMode::Fill, Pass::Layers);
+        let fallback = make_pipeline(wgpu::PolygonMode::Fill, Pass::Fallback);
         let wireframe = gpu
             .device
             .features()
@@ -216,9 +236,9 @@ impl TileRenderer {
                     bias: Default::default(),
                 }),
                 multisample: wgpu::MultisampleState {
-                        count: crate::context::SAMPLES,
-                        ..Default::default()
-                    },
+                    count: crate::context::SAMPLES,
+                    ..Default::default()
+                },
                 fragment: Some(wgpu::FragmentState {
                     module: &line_shader,
                     entry_point: Some("fs_main"),
@@ -249,6 +269,7 @@ impl TileRenderer {
             pipeline,
             background,
             layers,
+            fallback,
             wireframe,
             lines,
             view_buf,
@@ -294,6 +315,45 @@ impl TileRenderer {
     /// that terrain's triangulation is — which a depth-tested shell did, in
     /// bands of spikes, because a level-2 tile's flat triangles cut a chord
     /// kilometres below the ellipsoid the shell was following.
+    /// Draws ancestors standing in for ground that is not their own.
+    ///
+    /// **After** the surfaces that own their ground, testing depth and never
+    /// writing it. Both halves matter and each was got wrong once:
+    ///
+    /// - drawn with the shell, taking no part in depth, a fallback paints
+    ///   through the planet. Not the tile — back-face culling removes that —
+    ///   but its **skirt**, which is a vertical wall whose outward face still
+    ///   points at the camera from the far side of the globe. On screen: pale
+    ///   ribbons crossing the ocean at angles, brightest at the limb.
+    /// - writing depth, a fallback blocks the surfaces that own the ground it
+    ///   is only borrowing.
+    ///
+    /// What this does not fix, said plainly: where a coarse ancestor's surface
+    /// rises *above* the fine tiles under it — which real relief does — it still
+    /// passes `Less` and paints over them. Testing depth cannot express "lose to
+    /// that surface but be occluded by it"; only a per-pixel mark can, and that
+    /// is a stencil the depth format does not currently carry.
+    pub fn render_fallback<'t>(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        tiles: impl Iterator<Item = &'t PreparedTile>,
+    ) {
+        pass.set_pipeline(&self.fallback);
+        pass.set_bind_group(0, &self.view_bg, &[]);
+        for tile in tiles {
+            pass.set_bind_group(1, &tile.tile_bg, &[]);
+            for mesh in &tile.meshes {
+                let Some(first) = mesh.material_bgs.first() else {
+                    continue;
+                };
+                pass.set_bind_group(2, first, &[]);
+                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+        }
+    }
+
     pub fn render_background<'t>(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -359,10 +419,7 @@ impl TileRenderer {
                     for bg in mesh.material_bgs.iter().skip(1) {
                         pass.set_bind_group(2, bg, &[]);
                         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                        pass.set_index_buffer(
-                            mesh.index_buf.slice(..),
-                            wgpu::IndexFormat::Uint32,
-                        );
+                        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                     }
                 }
@@ -399,11 +456,15 @@ impl TileRenderer {
         pass: &mut wgpu::RenderPass<'_>,
         backdrop: impl Iterator<Item = &'t PreparedTile>,
         tiles: impl Iterator<Item = &'t PreparedTile>,
+        fallback: impl Iterator<Item = &'t PreparedTile>,
         overlay: Option<&crate::overlay::OverlayRenderer>,
         wireframe: bool,
     ) {
         self.render_background(pass, backdrop);
         self.render(pass, tiles, wireframe);
+        // After the tiles that own their ground, so it is occluded by them —
+        // see `render_fallback`.
+        self.render_fallback(pass, fallback);
         if let Some(overlay) = overlay {
             overlay.render(pass);
         }

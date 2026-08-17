@@ -40,6 +40,6 @@ pub use overlay::{OverlayRenderer, OverlayVertex};
 pub use prepare::{prepare, PreparedMesh, PreparedTile, Vertex};
 pub use pump::{ContentPump, Drawn, Resolution, UPLOADS_PER_FRAME};
 pub use readback::Readback;
+pub use renderer::{LineVertex, TileRenderer, ViewUniform};
 pub use surface::{draw_to_surface, preferred_format, FrameOnSurface, Presented};
 pub use targets::FrameTargets;
-pub use renderer::{LineVertex, TileRenderer, ViewUniform};
