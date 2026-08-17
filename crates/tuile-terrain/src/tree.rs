@@ -98,8 +98,8 @@ impl TerrainTree {
         }
     }
 
-    /// How far the quadtree may divide past the data. See
-    /// [`TerrainTree::max_level`].
+    /// How far the quadtree may divide past the data. See `TerrainTree`'s
+    /// own `max_level`.
     pub fn with_max_level(mut self, level: u32) -> Self {
         self.max_level = level;
         self
