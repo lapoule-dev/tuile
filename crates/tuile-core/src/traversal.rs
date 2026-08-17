@@ -267,6 +267,17 @@ pub struct TraversalOutput {
     /// Content to fetch, sorted: group first (Urgent → Preload), then
     /// ascending priority value.
     pub requests: Vec<ContentRequest>,
+    /// Tiles a held REPLACE is waiting on: descendants this pass chose not to
+    /// draw *yet*, because a sibling is still missing.
+    ///
+    /// Not drawn, not requested — already resident — and so invisible to a
+    /// residency that only knows about those two sets. Reclaim one and the next
+    /// pass asks for it again, gets it, holds again, and reclaims it again:
+    /// loads resolve inside a single poll of the server, so that cycle does not
+    /// merely waste bandwidth, it never yields. The reference implementation
+    /// marks these children rendered at exactly this point, for exactly this
+    /// reason.
+    pub awaiting: Vec<TileId>,
     pub stats: TraversalStats,
 }
 
@@ -289,6 +300,7 @@ pub fn traverse(
 ) {
     out.selected.clear();
     out.requests.clear();
+    out.awaiting.clear();
     out.stats = TraversalStats::default();
     let roots = tree.roots();
     if views.is_empty() || roots.is_empty() {
@@ -439,8 +451,11 @@ fn visit(
             if all_ready || !config.forbid_holes {
                 return all_ready;
             }
-            // Hold: drop descendant selections, stand in with this tile.
-            out.selected.truncate(mark);
+            // Hold: drop descendant selections, stand in with this tile. The
+            // descendants are still wanted — they are what the hold is waiting
+            // for — so they are moved aside rather than forgotten.
+            out.awaiting
+                .extend(out.selected.drain(mark..).map(|(tile, _)| tile));
             if has_content {
                 if residency.is_resident(id) {
                     out.selected.push((id, sse));

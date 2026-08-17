@@ -71,7 +71,14 @@ pub fn in_process_with(
     config: Config,
 ) -> (InProcessStream, GeometryServer) {
     let (client, endpoint) = in_process_pair();
-    let cache = ResidentCache::new(config.resident_budget_bytes);
+    // Both ceilings, and the pinned floor. The count is the one that bounds a
+    // session — geometry tiles vary by orders of magnitude in weight, so a byte
+    // budget alone lets a field of light tiles grow without limit.
+    let cache = ResidentCache::pinning(
+        config.resident_budget_bytes,
+        config.resident_tile_limit,
+        config.pinned_level,
+    );
     (
         client,
         GeometryServer {
@@ -271,6 +278,13 @@ impl Session<'_> {
         // Nothing to report about what the consumer drew: this server tracks
         // residency, not the screen. The parameter exists for hosts that do.
         let rendered_last = std::collections::HashSet::new();
+        // Open a new pass before anything is touched: from here on, every tile
+        // this traversal reaches is off limits to the sweep at the end of it.
+        // Without this the pass counter never moves, every entry looks touched
+        // by the current pass, and the sweep at the end of `retraverse` finds
+        // nothing it is allowed to take — the residency then grows past its
+        // budget without ever giving a byte back.
+        self.cache.start_pass();
         traverse(
             self.tree,
             self.residency,
@@ -330,6 +344,16 @@ impl Session<'_> {
         // degraded, but progressing.
         for req in &self.out.requests {
             self.selected.insert(req.tile);
+        }
+        // And so is what a held REPLACE is waiting on. Those are resident, not
+        // drawn and not requested — the one category a residency built from
+        // "selected plus requested" cannot see — so without this they are swept
+        // and asked for again on the very next pass, for ever. Measured once
+        // the sweep could actually take something: 821 000 traversals with the
+        // request count frozen at two, inside a single poll of the server.
+        for tile in &self.out.awaiting {
+            self.selected.insert(*tile);
+            self.cache.touch(*tile);
         }
         self.remember_protected();
         // The protected set just changed, so content that was held only by the
@@ -694,19 +718,23 @@ mod tests {
         selection
     }
 
-    /// The window is a window, not a leak: keep moving and the oldest positions
-    /// must eventually stop protecting anything.
+    /// A camera going back and forth over a cache too small for both views has
+    /// to converge, not oscillate. Each move evicts what the other view wanted;
+    /// the guarantee is that every pass still reaches quiescence rather than
+    /// evicting and reloading inside a single traversal.
     #[test]
-    fn a_one_move_window_forgets_immediately() {
+    fn a_camera_moving_back_and_forth_converges() {
         let dir = tempfile::tempdir().expect("tempdir");
         let url = write_deep_fixture(dir.path());
         let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
         let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
 
         let config = Config {
-            resident_budget_bytes: 300,
-            // Only the current position counts — the old behaviour.
-            protected_view_generations: 1,
+            resident_tile_limit: 2,
+            // The fixture is three levels deep, so the default pinned floor
+            // would cover all of it and nothing could ever be reclaimed. The
+            // pin is a production guarantee, not a property under test here.
+            pinned_level: None,
             ..Config::default()
         };
         let (mut stream, server) = in_process(tileset, Arc::new(FsFetcher), config);
@@ -718,10 +746,10 @@ mod tests {
                 .expect("send");
             settle(&mut server, &mut stream).expect("settles");
         }
-        // Nothing asserted about counts here beyond termination: the point is
-        // that a one-move window still converges rather than spinning.
     }
 
+    /// The cap is what bounds a session: park the camera somewhere that needs
+    /// fewer tiles than it holds, and the ones it left must be reclaimed.
     #[test]
     fn tiles_left_behind_by_the_camera_are_evicted() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -730,10 +758,15 @@ mod tests {
         let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
 
         // Room for a working set, not for the whole tree: the tiles the camera
-        // leaves behind are what has to go. (One decoded fixture tile is a
-        // 3-vertex triangle, well under 100 bytes.)
+        // leaves behind are what has to go. The count is the ceiling that
+        // matters — the fixture's tiles are 3-vertex triangles, so no plausible
+        // byte budget would ever separate them.
         let config = Config {
-            resident_budget_bytes: 300,
+            resident_tile_limit: 3,
+            // The fixture is three levels deep, so the default pinned floor
+            // would cover all of it and nothing could ever be reclaimed. The
+            // pin is a production guarantee, not a property under test here.
+            pinned_level: None,
             ..Config::default()
         };
         let (mut stream, server) = in_process(tileset, Arc::new(FsFetcher), config);
@@ -750,9 +783,11 @@ mod tests {
             "the near view loaded several tiles (got {loaded})"
         );
 
-        // Pull far back and stay away. One move is deliberately not enough —
-        // the window still remembers where the camera came from — so move past
-        // it and check the budget then does its job.
+        // Pull far back and stay there. The far view needs fewer tiles than the
+        // near one did, so what it stops selecting stops being protected, and
+        // scores lowest for the camera's new distance. Past the window of
+        // recent camera positions, which protects where the camera came from —
+        // one move is deliberately not enough.
         let moves = Config::default().protected_view_generations + 2;
         let mut evicted = Vec::new();
         for _ in 0..moves {
