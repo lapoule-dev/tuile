@@ -121,6 +121,20 @@ impl App {
             }
         }
 
+        // A server that says nothing about priming is not a server that is still
+        // priming. Holding the window on a report that never comes is an
+        // indefinite hang with a healthy log — and the coarse tiles are already
+        // on the GPU, which is the thing the hold exists to guarantee.
+        if priming.is_none() && held > 0 {
+            tracing::info!(
+                tiles = held,
+                seconds = self.warmup.since.elapsed().as_secs_f32(),
+                "no priming report from this server; showing the globe on what is \
+                 already resident"
+            );
+            return false;
+        }
+
         let m = tuile_core::metrics::metrics();
         let p = priming.unwrap_or_default();
         if self.warmup.last_report.elapsed() >= REPORT_EVERY {
