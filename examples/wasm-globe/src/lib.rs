@@ -235,7 +235,7 @@ impl Globe {
     /// Same effect as [`Self::provide_imagery`], minus the work: the pixels
     /// arrive finished, so this call is a move into the mosaic rather than a
     /// decode. `rgba` is tightly packed RGBA8, `width * height * 4` long — the
-    /// buffer [`decode_imagery_tile`] produced in the worker, handed over by
+    /// buffer `decode_imagery_tile` produced in the worker, handed over by
     /// `postMessage` as a transferable.
     ///
     /// A length that does not match is dropped for a neutral tile rather than

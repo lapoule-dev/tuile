@@ -57,7 +57,7 @@ pub struct PreparedTile {
     /// Approximate GPU memory of this tile, bytes — **excluding draped
     /// imagery**, for the reason [`DecodedTileContent::byte_size`] gives: a
     /// texture twenty tiles share is not twenty textures. Ask
-    /// [`crate::context::ImageryTextures::live`] for that side of the total.
+    /// `ImageryTextures::live` for that side of the total.
     pub gpu_bytes: usize,
 }
 

@@ -199,7 +199,7 @@ impl GlobeCamera {
     /// Two things break the basis, and both are ordinary use rather than bugs
     /// in the gestures themselves:
     ///
-    /// - **Moving the eye without rotating the basis.** [`zoom`](Self::zoom)
+    /// - **Moving the eye without rotating the basis.** [`zoom`](CameraController::zoom)
     ///   translates toward a picked point; the geodetic vertical at the new
     ///   position is a different direction, but `up` still describes the old
     ///   one. Zoom into a corner of the screen and back out, and the horizon

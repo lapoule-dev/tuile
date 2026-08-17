@@ -13,7 +13,8 @@
 //! Drag: orbit. Right-drag: pan. Wheel: zoom. W: wireframe. F: freeze. Esc: quit.
 //!
 //! `TUILE_RECORD=path.jsonl` writes the camera path; `TUILE_REPLAY=path.jsonl`
-//! flies it again exactly. See [`tape`].
+//! flies it again exactly. The format and the replay live in the `tuile-tape`
+//! crate.
 
 mod app;
 mod backdrop;

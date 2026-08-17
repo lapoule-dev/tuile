@@ -62,7 +62,8 @@ impl TileId {
         )
     }
 
-    /// As an arena index (for [`Tileset`]-backed sources). Ignores the tag.
+    /// As an arena index (for [`Tileset`](crate::tileset::Tileset)-backed
+    /// sources). Ignores the tag.
     pub fn index(self) -> usize {
         (self.0 & PAYLOAD_MASK) as usize
     }

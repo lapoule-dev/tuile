@@ -4,7 +4,8 @@
 //! A serializable summary of the geometry the server produces — a JSON view of
 //! "what got generated", independent of any renderer and of the driving mode.
 //!
-//! Build it incrementally from [`ServerMessage::Content`] as tiles stream in
+//! Build it incrementally from [`ServerMessage::Content`](crate::protocol::ServerMessage::Content)
+//! as tiles stream in
 //! (progressive), or from a [`crate::drive::BulkFrame`] in one shot (bulk):
 //! either way [`GeometryReport::add`] folds one decoded tile into the report.
 //! Per mesh it records vertex/triangle counts, the local bounding box, the

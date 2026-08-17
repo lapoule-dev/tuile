@@ -83,7 +83,7 @@ pub enum Projection {
 }
 
 impl Projection {
-    /// Projects to normalized [0,1]² map space; (0,0) is the north-west
+    /// Projects to normalized \[0,1\]² map space; (0,0) is the north-west
     /// corner (image convention: v grows southward).
     pub fn to_normalized(&self, g: Geodetic) -> (f64, f64) {
         use std::f64::consts::{FRAC_PI_4, PI, TAU};
@@ -163,7 +163,7 @@ impl TilingScheme {
         (self.root_tiles_x << level, self.root_tiles_y << level)
     }
 
-    /// The [0,1]² extent of a tile (x0, y0, x1, y1).
+    /// The \[0,1\]² extent of a tile (x0, y0, x1, y1).
     pub fn tile_extent(&self, c: ImageryCoord) -> (f64, f64, f64, f64) {
         let (nx, ny) = self.tiles_at(c.level);
         let w = 1.0 / nx as f64;
@@ -384,7 +384,7 @@ impl TilingScheme {
 
     /// Texture coordinates of ECEF-rebased positions within one imagery
     /// tile. (0,0) = tile north-west corner, v grows southward (image
-    /// convention); values outside [0,1] mean the vertex falls outside the
+    /// convention); values outside \[0,1\] mean the vertex falls outside the
     /// tile (clamped).
     pub fn uvs_for_positions(
         &self,
@@ -935,7 +935,8 @@ pub fn decode_and_reproject(
 ///
 /// Eviction is by reference counting rather than by a budget, because the right
 /// answer is already known exactly — a resource is needed for precisely as long
-/// as some resident tile references it. The pool therefore holds [`Weak`]
+/// as some resident tile references it. The pool therefore holds
+/// [`Weak`](std::sync::Weak)
 /// handles and hands out [`Arc`]s: when the last tile referencing an entry is
 /// dropped, the resource frees itself and the dangling key is swept on the next
 /// insert. A byte budget here would only be a worse guess at the same question,
