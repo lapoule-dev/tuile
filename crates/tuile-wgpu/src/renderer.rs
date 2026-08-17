@@ -108,7 +108,14 @@ impl TileRenderer {
                         stencil: Default::default(),
                         bias: Default::default(),
                     }),
-                    multisample: wgpu::MultisampleState::default(),
+                    // The one number that must match the render targets: a
+                    // pipeline built for one sample fails validation at the
+                    // first draw into a multisampled pass, and says so in terms
+                    // of formats rather than of samples.
+                    multisample: wgpu::MultisampleState {
+                        count: crate::context::SAMPLES,
+                        ..Default::default()
+                    },
                     fragment: Some(wgpu::FragmentState {
                         module: &shader,
                         entry_point: Some("fs_main"),
@@ -163,7 +170,10 @@ impl TileRenderer {
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: wgpu::MultisampleState {
+                    count: crate::context::SAMPLES,
+                    ..Default::default()
+                },
                 fragment: Some(wgpu::FragmentState {
                     module: &line_shader,
                     entry_point: Some("fs_main"),
