@@ -1855,7 +1855,19 @@ mod tests {
         let layer = ImageryLayer::placed(coord(1, 1, 0), tex1x1(), &tile, &quarter);
         // u from the west edge, v from the NORTH edge: the north-east quarter is
         // the upper half in v, not the lower.
-        assert_eq!(layer.coverage, [0.5, 0.0, 1.0, 0.5]);
+        // The interior edges are exact; the two that touch the tile's own
+        // boundary reach a hair past it, so an interpolated uv landing an ULP
+        // outside is still covered. See `EDGE_REACH`.
+        assert_eq!(layer.coverage[0], 0.5, "the interior west edge is exact");
+        assert_eq!(layer.coverage[3], 0.5, "the interior south edge is exact");
+        assert!(
+            layer.coverage[1] < 0.0,
+            "the north edge reaches past the tile"
+        );
+        assert!(
+            layer.coverage[2] > 1.0,
+            "the east edge reaches past the tile"
+        );
         assert!(layer.is_visible());
 
         let containing = GeoRect {
@@ -1865,7 +1877,10 @@ mod tests {
             north: 2.0,
         };
         let ancestor = ImageryLayer::placed(coord(0, 0, 0), tex1x1(), &tile, &containing);
-        assert_eq!(ancestor.coverage, [0.0, 0.0, 1.0, 1.0]);
+        // A layer containing the whole tile covers all of it, and reaches a
+        // hair past every edge so no interpolated uv falls through.
+        assert!(ancestor.coverage[0] < 0.0 && ancestor.coverage[1] < 0.0);
+        assert!(ancestor.coverage[2] > 1.0 && ancestor.coverage[3] > 1.0);
         assert!(ancestor.scale[0] < 1.0 && ancestor.scale[1] < 1.0);
         assert!(ancestor.is_visible());
     }
