@@ -51,11 +51,11 @@ pub struct Header {
 #[derive(Debug, Clone)]
 pub struct QuantizedMesh {
     pub header: Header,
-    /// Per-vertex u in [0,1] (west→east across the tile rectangle).
+    /// Per-vertex u in \[0,1\] (west→east across the tile rectangle).
     pub u: Vec<f64>,
-    /// Per-vertex v in [0,1] (south→north).
+    /// Per-vertex v in \[0,1\] (south→north).
     pub v: Vec<f64>,
-    /// Per-vertex height in [0,1] (min_height→max_height).
+    /// Per-vertex height in \[0,1\] (min_height→max_height).
     pub height: Vec<f64>,
     /// Triangle indices (3 per triangle).
     pub indices: Vec<u32>,

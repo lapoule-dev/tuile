@@ -20,8 +20,9 @@
 //! metric that is only there when someone remembered to turn it on is not there
 //! when it is needed.
 //!
-//! [`Metrics::prometheus`] renders the text exposition format, so this can be
-//! scraped directly, dumped to a log line, or diffed between two runs.
+//! [`Metrics::one_line`] renders the whole set as a single line and
+//! [`Metrics::by_level_line`] breaks a per-level counter out, so this can be
+//! dumped to a log, put in a status bar, or diffed between two runs.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

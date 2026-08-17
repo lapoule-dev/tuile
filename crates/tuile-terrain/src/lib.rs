@@ -6,7 +6,7 @@
 //! Quantized-mesh terrain decoding and geographic tiling — the data side of
 //! the globe pipeline (`docs/03-roadmap.md`, MG).
 //!
-//! - [`decode`] — quantized-mesh-1.0 → [`decode::QuantizedMesh`] (normalized
+//! - [`decode`](mod@decode) — quantized-mesh-1.0 → [`decode::QuantizedMesh`] (normalized
 //!   vertices, high-water-mark indices, oct-decoded normals, skirt edges),
 //!   plus a minimal encoder for round-trip tests
 //! - [`tiling`] — the EPSG:4326 geographic quadtree (Cesium World Terrain's

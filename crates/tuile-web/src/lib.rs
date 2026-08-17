@@ -9,7 +9,8 @@
 //! `tuile-core` takes no backend, and the browser is a backend like any other —
 //! `web-sys` is as much a transport dependency as `reqwest` is. This crate is
 //! the browser's counterpart to `tuile-native-fetchers`: it implements the same
-//! two seams ([`TileFetcher`] and [`IonHttp`]) against `window.fetch`, and adds
+//! two seams ([`TileFetcher`](tuile_core::fetch::TileFetcher) and
+//! [`IonHttp`](tuile_cesium_ion::IonHttp)) against `window.fetch`, and adds
 //! nothing else to the engine's vocabulary.
 //!
 //! # Where it runs
@@ -18,7 +19,7 @@
 //! engine's traversal, its decodes and its resamples are CPU work, and on the
 //! main thread they are work the browser cannot paint through. `fetch` is
 //! available in a worker through `WorkerGlobalScope`, which is why
-//! [`global_fetch`] looks for either scope rather than assuming a `Window`.
+//! `global_fetch` looks for either scope rather than assuming a `Window`.
 //!
 //! # Single-threaded, and honest about it
 //!
