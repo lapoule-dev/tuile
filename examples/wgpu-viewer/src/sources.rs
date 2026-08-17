@@ -105,4 +105,3 @@ pub(crate) async fn ion_globe(
     );
     Ok((tree, loader, detail, heights, Some(store), budget))
 }
-

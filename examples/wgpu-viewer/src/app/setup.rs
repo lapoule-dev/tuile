@@ -9,8 +9,8 @@
 //! not have got it.
 
 use super::{Active, App};
-use std::sync::Arc;
 use glam::DVec3;
+use std::sync::Arc;
 use tuile_wgpu::{ContentPump, GpuContext, OverlayRenderer, TileRenderer, DEPTH_FORMAT};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
@@ -86,8 +86,8 @@ impl App {
         // outright, because a hard requirement here would turn a missing
         // stopwatch into a viewer that refuses to start — on someone else's
         // machine, over a diagnostic they were not using.
-        let wanted = wgpu::Features::TIMESTAMP_QUERY
-            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let wanted =
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
         let features = adapter.features() & wanted;
         // Said out loud either way. A capability that is silently absent is one
         // that gets reported later as a broken tool.
@@ -197,6 +197,3 @@ pub(super) fn configure(
         },
     );
 }
-
-
-

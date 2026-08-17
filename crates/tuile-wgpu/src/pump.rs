@@ -16,8 +16,8 @@ use std::task::{Context, Poll};
 use tuile_core::content::{DecodedTileContent, TileContent};
 use tuile_core::protocol::{ClientMessage, GeometryStream, Priming, ServerMessage};
 use tuile_core::source::TileId;
-use tuile_core::traversal::ViewState;
 use tuile_core::traversal::TraversalStats;
+use tuile_core::traversal::ViewState;
 
 pub struct ContentPump {
     /// The f64 world point all tiles and the view matrix are relative to.
@@ -247,7 +247,11 @@ impl ContentPump {
         _queue: &wgpu::Queue,
         parent_of: impl Fn(TileId) -> Option<TileId>,
     ) -> (Vec<&PreparedTile>, Resolution) {
-        let (ids, counts, _) = walk(&self.selection, |id| self.prepared.contains_key(&id), parent_of);
+        let (ids, counts, _) = walk(
+            &self.selection,
+            |id| self.prepared.contains_key(&id),
+            parent_of,
+        );
         let out = ids
             .into_iter()
             .filter_map(|id| self.prepared.get(&id))

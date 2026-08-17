@@ -25,7 +25,6 @@
 //! cargo run --release -p tuile-tape --bin scan-black -- trace.mcap
 //! ```
 
-
 /// A pixel this dark on every channel is the clear colour rather than dark
 /// ground. Ground lit by ambient alone still lands well above it.
 const BLACK: u8 = 8;
@@ -77,10 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
             "/frame" => {
                 frames += 1;
-                let Some((_, camera)) = cameras
-                    .iter()
-                    .rev()
-                    .find(|(t, _)| *t <= message.log_time)
+                let Some((_, camera)) = cameras.iter().rev().find(|(t, _)| *t <= message.log_time)
                 else {
                     continue;
                 };
@@ -205,8 +201,7 @@ fn field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 }
 
 fn base64_decode(text: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut table = [255u8; 256];
     for (i, c) in ALPHABET.iter().enumerate() {
         table[*c as usize] = i as u8;

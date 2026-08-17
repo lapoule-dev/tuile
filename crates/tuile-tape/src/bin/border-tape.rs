@@ -57,33 +57,33 @@ const E2: f64 = 6.694_379_990_141_32e-3;
 /// The path has to *cover* the country's edge, not survey it, and a denser
 /// outline would buy nothing a tile is large enough to notice.
 const BORDER: [(f64, f64); 27] = [
-    (2.38, 51.03),   // Dunkerque
-    (1.85, 50.95),   // Calais
-    (1.08, 49.93),   // Dieppe
-    (0.11, 49.49),   // Le Havre
-    (-1.61, 49.64),  // Cherbourg
-    (-4.49, 48.39),  // Brest
-    (-3.12, 47.48),  // Quiberon
-    (-2.20, 47.28),  // Saint-Nazaire
-    (-1.78, 46.50),  // Les Sables-d'Olonne
-    (-1.15, 46.16),  // La Rochelle
-    (-1.16, 44.66),  // Arcachon
-    (-1.56, 43.48),  // Biarritz
-    (-0.37, 42.80),  // the western Pyrenees
-    (1.00, 42.70),   // Andorra
-    (3.03, 42.50),   // Perpignan
-    (3.88, 43.60),   // Montpellier
-    (5.37, 43.30),   // Marseille
-    (7.27, 43.70),   // Nice
-    (6.63, 44.90),   // Briançon
-    (6.87, 45.92),   // Chamonix
-    (6.14, 46.20),   // the Geneva border
-    (7.59, 47.56),   // Basel
-    (7.75, 48.58),   // Strasbourg
-    (8.17, 48.97),   // Lauterbourg
-    (6.13, 49.46),   // the Luxembourg border
-    (4.72, 49.77),   // Charleville-Mézières
-    (3.06, 50.63),   // Lille
+    (2.38, 51.03),  // Dunkerque
+    (1.85, 50.95),  // Calais
+    (1.08, 49.93),  // Dieppe
+    (0.11, 49.49),  // Le Havre
+    (-1.61, 49.64), // Cherbourg
+    (-4.49, 48.39), // Brest
+    (-3.12, 47.48), // Quiberon
+    (-2.20, 47.28), // Saint-Nazaire
+    (-1.78, 46.50), // Les Sables-d'Olonne
+    (-1.15, 46.16), // La Rochelle
+    (-1.16, 44.66), // Arcachon
+    (-1.56, 43.48), // Biarritz
+    (-0.37, 42.80), // the western Pyrenees
+    (1.00, 42.70),  // Andorra
+    (3.03, 42.50),  // Perpignan
+    (3.88, 43.60),  // Montpellier
+    (5.37, 43.30),  // Marseille
+    (7.27, 43.70),  // Nice
+    (6.63, 44.90),  // Briançon
+    (6.87, 45.92),  // Chamonix
+    (6.14, 46.20),  // the Geneva border
+    (7.59, 47.56),  // Basel
+    (7.75, 48.58),  // Strasbourg
+    (8.17, 48.97),  // Lauterbourg
+    (6.13, 49.46),  // the Luxembourg border
+    (4.72, 49.77),  // Charleville-Mézières
+    (3.06, 50.63),  // Lille
 ];
 
 /// Geodetic to ECEF on the WGS84 ellipsoid.
@@ -105,7 +105,8 @@ fn geodetic_to_ecef(lon: f64, lat: f64, height: f64) -> [f64; 3] {
 fn arc(a: (f64, f64), b: (f64, f64)) -> f64 {
     let (lon1, lat1) = a;
     let (lon2, lat2) = b;
-    let d = (lat1.sin() * lat2.sin() + lat1.cos() * lat2.cos() * (lon2 - lon1).cos()).clamp(-1.0, 1.0);
+    let d =
+        (lat1.sin() * lat2.sin() + lat1.cos() * lat2.cos() * (lon2 - lon1).cos()).clamp(-1.0, 1.0);
     d.acos()
 }
 
@@ -182,7 +183,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // A little further on, to take the bearing from — the camera faces the
         // way it is going, which is what makes this a flight rather than a
         // sequence of stills.
-        let ahead = along(points[leg], points[(leg + 1) % points.len()], (t + 0.01).min(1.0));
+        let ahead = along(
+            points[leg],
+            points[(leg + 1) % points.len()],
+            (t + 0.01).min(1.0),
+        );
 
         let (east, north, up) = frame_at(here.0, here.1);
         let bearing = {

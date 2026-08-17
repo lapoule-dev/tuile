@@ -16,9 +16,7 @@ use std::sync::Arc;
 use tuile_camera::CameraController;
 use tuile_core::protocol::InProcessStream;
 use tuile_ui::NavWidget;
-use tuile_wgpu::{
-    ContentPump, GpuContext, OverlayRenderer, TileRenderer,
-};
+use tuile_wgpu::{ContentPump, GpuContext, OverlayRenderer, TileRenderer};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
@@ -117,7 +115,10 @@ struct Active {
 const DIAGNOSTICS: [(&str, &str); 4] = [
     ("normal", "the real picture"),
     ("unlit", "imagery only; sun and air off"),
-    ("coverage", "magenta = no imagery here, green = one layer, blue = several"),
+    (
+        "coverage",
+        "magenta = no imagery here, green = one layer, blue = several",
+    ),
     ("geometry", "flat lit surface; black = no mesh drawn"),
 ];
 
@@ -293,4 +294,3 @@ impl Drop for App {
         self.close_the_tape();
     }
 }
-

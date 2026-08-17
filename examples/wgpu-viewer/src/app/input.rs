@@ -44,12 +44,7 @@ pub(super) struct Views {
 }
 
 impl App {
-    pub(super) fn on_window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        event: WindowEvent,
-    ) {
-
+    pub(super) fn on_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         if self.active.is_none() {
             return;
         }
@@ -138,7 +133,8 @@ impl App {
                 // read it rather than reason about it.
                 let before = *self.controller.target();
                 let picked = self.controller.pick(self.pointer.cursor, self.viewport());
-                self.controller.zoom(amount, self.pointer.cursor, self.viewport());
+                self.controller
+                    .zoom(amount, self.pointer.cursor, self.viewport());
                 let after = *self.controller.target();
                 let turn = {
                     let d = (after.heading() - before.heading()).abs();

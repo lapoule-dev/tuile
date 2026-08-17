@@ -17,11 +17,11 @@
 
 mod app;
 mod backdrop;
-mod settings;
-mod sources;
 mod recording;
 mod session;
+mod settings;
 mod signals;
+mod sources;
 
 use app::{App, ViewerConfig};
 use tuile_camera::{CameraController, GlobeCamera};

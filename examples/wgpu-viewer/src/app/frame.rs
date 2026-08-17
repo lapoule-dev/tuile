@@ -10,8 +10,8 @@
 //! backdrop is drawn before the selection so that ground is never bare.
 
 use super::{App, AMBIENT, ATMOSPHERE_STRENGTH, DIAGNOSTICS};
-use std::fmt;
 use glam::DVec2;
+use std::fmt;
 use tuile_core::source::TileId;
 use tuile_wgpu::OverlayVertex;
 
@@ -126,9 +126,11 @@ impl App {
         // withholds the camera, which is what makes `F` a test of the renderer
         // against a fixed selection.
         let uploaded = if self.views.freeze {
-            active
-                .pump
-                .pump(&mut active.stream, &active.gpu, tuile_wgpu::UPLOADS_PER_FRAME)
+            active.pump.pump(
+                &mut active.stream,
+                &active.gpu,
+                tuile_wgpu::UPLOADS_PER_FRAME,
+            )
         } else {
             active.pump.advance(
                 &mut active.stream,
@@ -231,9 +233,10 @@ impl App {
         // `resolve`, so it asks for itself.
         if crate::backdrop::shell_enabled() {
             tuile_core::metrics::metrics().rebase_seconds.time(|| {
-                active
-                    .pump
-                    .rebase_for_drawing(&active.gpu.queue, active.pump.at_level(crate::backdrop::BASE_LEVEL));
+                active.pump.rebase_for_drawing(
+                    &active.gpu.queue,
+                    active.pump.at_level(crate::backdrop::BASE_LEVEL),
+                );
             });
         }
         let backdrop = crate::backdrop::shell_enabled();
@@ -472,31 +475,30 @@ impl App {
     /// all sit perfectly still when the server is dead — which is
     /// indistinguishable from a server with nothing to do. This one is not.
     fn watch_that_the_server_is_still_turning(&mut self, cam: tuile_camera::GlobeCamera) {
-            // The server's own pass counter, so a loop that has stopped turning
-            // is one glance away instead of an afternoon. Every server-sourced
-            // number below is a *last received* value: they all sit perfectly
-            // still when the server is dead, which is indistinguishable from a
-            // server with nothing to do. This one is not.
-            let traversals = tuile_core::metrics::metrics().traversals.get();
-            let moved = (cam.altitude() - self.watch.last_altitude.unwrap_or(f64::MIN)).abs() > 1.0;
-            if moved && traversals == self.watch.last_traversals {
-                self.watch.silent_passes += 1;
-                if self.watch.silent_passes >= 3 {
-                    tracing::error!(
-                        traversals,
-                        seconds = self.watch.silent_passes,
-                        "THE GEOMETRY SERVER HAS STOPPED: the camera is moving and no \
+        // The server's own pass counter, so a loop that has stopped turning
+        // is one glance away instead of an afternoon. Every server-sourced
+        // number below is a *last received* value: they all sit perfectly
+        // still when the server is dead, which is indistinguishable from a
+        // server with nothing to do. This one is not.
+        let traversals = tuile_core::metrics::metrics().traversals.get();
+        let moved = (cam.altitude() - self.watch.last_altitude.unwrap_or(f64::MIN)).abs() > 1.0;
+        if moved && traversals == self.watch.last_traversals {
+            self.watch.silent_passes += 1;
+            if self.watch.silent_passes >= 3 {
+                tracing::error!(
+                    traversals,
+                    seconds = self.watch.silent_passes,
+                    "THE GEOMETRY SERVER HAS STOPPED: the camera is moving and no \
                          traversal has run"
-                    );
-                }
-            } else {
-                self.watch.silent_passes = 0;
+                );
             }
-            self.watch.last_traversals = traversals;
-            self.watch.last_altitude = Some(cam.altitude());
+        } else {
+            self.watch.silent_passes = 0;
+        }
+        self.watch.last_traversals = traversals;
+        self.watch.last_altitude = Some(cam.altitude());
     }
 }
-
 
 /// Whether every selected tile was drawn by *something*.
 ///
