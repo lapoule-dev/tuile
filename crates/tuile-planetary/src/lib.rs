@@ -71,7 +71,9 @@ type MeshFuture<'a> = std::pin::Pin<
 
 #[cfg(target_arch = "wasm32")]
 type MeshFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<Arc<tuile_terrain::QuantizedMesh>, LoadError>> + 'a>,
+    Box<
+        dyn std::future::Future<Output = Result<Arc<tuile_terrain::QuantizedMesh>, LoadError>> + 'a,
+    >,
 >;
 
 /// The tile to lay underneath the sharp mosaic: the closest ancestor already
@@ -567,10 +569,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         let parent = TileCoord::new(coord.level - 1, coord.x / 2, coord.y / 2);
         let from = self.stand_in_mesh(parent)?;
         let built = Arc::new(tuile_terrain::upsample(&from, parent, coord)?);
-        self.fill_meshes
-            .lock()
-            .ok()?
-            .put(coord, Arc::clone(&built));
+        self.fill_meshes.lock().ok()?.put(coord, Arc::clone(&built));
         Some(built)
     }
 
@@ -962,7 +961,11 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
                     served,
                     texture,
                     &geo,
-                    &to_the_pole(scheme.tile_rect(served), served, scheme.tiles_at(served.level).1),
+                    &to_the_pole(
+                        scheme.tile_rect(served),
+                        served,
+                        scheme.tiles_at(served.level).1,
+                    ),
                     covers,
                 );
                 if layer.is_visible() {

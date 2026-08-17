@@ -301,9 +301,7 @@ fn render_and_count(
         },
     );
 
-    // One list: at this point a tile standing in for a missing descendant is
-    // drawn as ordinary geometry, like everything else.
-    let drawn = pump.visible_resolved(|id: TileId| {
+    let (drawn, _) = pump.resolve(&gpu.queue, |id| {
         let (z, x, y) = id.terrain_coord();
         (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2))
     });
@@ -338,7 +336,14 @@ fn render_and_count(
         // The backstop the session draws first: a whole-planet shell, carrying
         // no imagery of its own, behind everything. Leaving it out of the
         // fixture would hide the very thing that shows through a seam.
-        renderer.render(&mut pass, backdrop.into_iter().chain(drawn), false);
+        if let Some(shell) = backdrop {
+            renderer.render_background(&mut pass, std::iter::once(shell));
+        }
+        // A fallback ancestor is backdrop, not geometry: it stands in for ground
+        // that is not its own and must never win a pixel from a surface that
+        // owns it. See `tuile_wgpu::Drawn`.
+        renderer.render(&mut pass, drawn.exact.into_iter(), false);
+        renderer.render_fallback(&mut pass, drawn.fallback.into_iter());
     }
 
     let bytes = (SIZE * SIZE * 4) as u64;
@@ -441,21 +446,6 @@ fn textured(tile: TileId, steps: usize, skirts: bool) -> DecodedTileContent {
 /// shell behind it — which is the exact combination a camera sees: a crack, and
 /// underneath it a backstop that carries no imagery of its own.
 #[test]
-// Neutralised on this branch, not deleted: the fixture can no longer reproduce
-// the defect here, and it says so itself — measured `bare = 0` with skirts off,
-// where it must be positive for the assertion below to mean anything.
-//
-// The reason is the backstop's role. Separating it — ground a tile does not own
-// is drawn as backdrop, depth neither written nor tested, so it covers without
-// ever winning a pixel — is what leaves the crack visible for this fixture to
-// count. Here the shell goes through `render` like ordinary geometry, fills the
-// crack itself, and both counts read zero: the property holds, and the test
-// proves nothing about why.
-//
-// Revived by whatever brings `Drawn { exact, fallback }` and `render_fallback`
-// to this branch; until then a green run here would be the false comfort the
-// `bare > 0` guard exists to refuse.
-#[ignore = "needs the backdrop/fallback split to reproduce the defect it guards"]
 fn a_lod_boundary_leaves_no_fragment_without_imagery() {
     let Some(gpu) = gpu() else { return };
 

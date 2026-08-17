@@ -215,8 +215,8 @@ fn black_fraction_in_the_middle(gpu: &GpuContext, pump: &mut ContentPump, eye: D
         // A fallback ancestor is backdrop, not geometry: it stands in for ground
         // that is not its own and must never win a pixel from a surface that
         // owns it. See `tuile_wgpu::Drawn`.
-        renderer.render_background(&mut pass, drawn.fallback.into_iter());
         renderer.render(&mut pass, drawn.exact.into_iter(), false);
+        renderer.render_fallback(&mut pass, drawn.fallback.into_iter());
     }
 
     // 256 px × 4 bytes is already the 256-byte row alignment `copy_texture_to_buffer`
@@ -253,7 +253,9 @@ fn black_fraction_in_the_middle(gpu: &GpuContext, pump: &mut ContentPump, eye: D
 
     let slice = readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |_| {});
-    gpu.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
     let data = slice.get_mapped_range();
 
     let (lo, hi) = (SIZE / 4, SIZE * 3 / 4);

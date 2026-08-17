@@ -47,7 +47,8 @@ use tuile_terrain::{
     skirt_height, to_decoded, GeoRect, GeographicTilingScheme, Header, QuantizedMesh, TileCoord,
 };
 use tuile_wgpu::{
-    ContentPump, GpuContext, TileRenderer, ViewUniform, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT,
+    prepare, ContentPump, GpuContext, TileRenderer, ViewUniform, DEPTH_FORMAT, SAMPLES,
+    TEXTURE_FORMAT,
 };
 
 const SIZE: u32 = 512;
@@ -204,6 +205,20 @@ fn parent_of(id: TileId) -> Option<TileId> {
 /// Renders the fixture straight down on `look_at` and returns the resolved
 /// frame, RGBA8.
 fn render(gpu: &GpuContext, pump: &mut ContentPump, eye: DVec3, look_at: DVec3) -> Vec<u8> {
+    pump.rebase(&gpu.queue, eye);
+    let (drawn, _) = pump.resolve(&gpu.queue, parent_of);
+    draw(gpu, eye, look_at, &drawn.exact, &drawn.fallback)
+}
+
+/// Draws `exact` as surfaces that own their ground and `fallback` as ancestors
+/// borrowing it, and returns the resolved frame, RGBA8.
+fn draw(
+    gpu: &GpuContext,
+    eye: DVec3,
+    look_at: DVec3,
+    exact: &[&tuile_wgpu::PreparedTile],
+    fallback: &[&tuile_wgpu::PreparedTile],
+) -> Vec<u8> {
     let make = |label, format, usage, samples| {
         gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
@@ -243,7 +258,6 @@ fn render(gpu: &GpuContext, pump: &mut ContentPump, eye: DVec3, look_at: DVec3) 
     let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
 
     let renderer = TileRenderer::new(gpu, TEXTURE_FORMAT);
-    pump.rebase(&gpu.queue, eye);
 
     let forward = (look_at - eye).normalize();
     let up = DVec3::Z.cross(forward).normalize_or(DVec3::X);
@@ -260,7 +274,6 @@ fn render(gpu: &GpuContext, pump: &mut ContentPump, eye: DVec3, look_at: DVec3) 
         },
     );
 
-    let (drawn, _) = pump.resolve(&gpu.queue, parent_of);
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -290,8 +303,8 @@ fn render(gpu: &GpuContext, pump: &mut ContentPump, eye: DVec3, look_at: DVec3) 
         });
         // Exactly the order the renderer guarantees: fallbacks are backdrop,
         // chosen tiles are geometry. See `tuile_wgpu::Drawn`.
-        renderer.render_background(&mut pass, drawn.fallback.into_iter());
-        renderer.render(&mut pass, drawn.exact.into_iter(), false);
+        renderer.render(&mut pass, exact.iter().copied(), false);
+        renderer.render_fallback(&mut pass, fallback.iter().copied());
     }
 
     let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -416,11 +429,87 @@ fn an_ancestor_drawn_for_a_late_sibling_does_not_show_over_the_others() {
     let area = u64::from(hi - lo) * u64::from(hi - lo);
 
     assert_eq!(
-        intruding,
-        0,
+        intruding, 0,
         "{intruding} of {area} pixels over a child that HAS its own surface were \
          won by the ancestor drawn for its late sibling — two surfaces on one \
          patch of ground, decided per pixel. That is the interleaving of sharp \
          and blurry imagery in ragged outlines that follow the relief."
+    );
+}
+
+/// **Nothing on the far side of the globe paints through it.**
+///
+/// The regression this exists to make impossible, and it was shipped: fallback
+/// ancestors were drawn with the shell, taking no part in depth at all. Whole
+/// tiles were still removed by back-face culling — but a **skirt is a vertical
+/// wall**, so on the far side of the planet its outward face still points at the
+/// camera and survives culling. With no depth test it then painted straight
+/// through the Earth: pale ribbons crossing the ocean at angles, brightest near
+/// the limb, because a fragment eight thousand kilometres away comes back as
+/// almost pure haze.
+///
+/// The two surfaces are prepared and drawn by hand rather than resolved, because
+/// what is under test is which **pipeline** each is drawn with — and a selection
+/// where both tiles are resident would put both in `exact` and exercise neither.
+#[test]
+fn a_fallback_on_the_far_side_does_not_paint_through_the_planet() {
+    let Some(gpu) = gpu() else { return };
+
+    let near = TileId::from_terrain(4, 8, 8);
+    // Just **beyond the horizon**, not at the antipode.
+    //
+    // From 400 km up the horizon is `acos(R / (R + h))` = 19.6 degrees of arc
+    // away. The antipode is 180 degrees away, which puts it behind the camera
+    // and out of frame entirely: a fixture aimed there passes with the defect
+    // present, which is what the first two versions of this test did. Three
+    // tiles east at level 4 is 33.75 degrees — hidden by the planet's own bulge,
+    // and squarely inside a frustum pointed at the horizon.
+    let (nz, nx, ny) = near.terrain_coord();
+    let columns = 2u64 << nz;
+    let far = TileId::from_terrain(nz, (nx + 3) % columns, ny);
+
+    // A **grazing** view across the limb, which is where the ribbons were seen
+    // and the only framing that can see them. Straight down from orbit, the far
+    // side is directly behind the near side and every one of its fragments is
+    // covered by nearer geometry whatever the depth test does — a fixture that
+    // frames it that way passes with the defect present, which is what the first
+    // version of this test did.
+    let rect = rect_of(near);
+    let (lon, lat) = rect.center();
+    let ground = geodetic_to_ecef(Geodetic {
+        lon,
+        lat,
+        height: 0.0,
+    });
+    let up = ground.normalize();
+    // Low enough that the horizon is in frame, and aimed along the surface so
+    // the far side of the planet is just beyond it.
+    let eye = ground + up * 400_000.0;
+    let east = DVec3::Z.cross(up).normalize();
+    // Toward the horizon: along the surface, tilted a little down so the limb
+    // sits across the middle of the frame rather than at its edge.
+    let look_at = eye + east * 4_000_000.0 - up * 400_000.0;
+
+    // The ground between the camera and the horizon, drawn as surfaces that own
+    // it. Without this strip there is nothing in the frame to occlude the far
+    // tile, and the test passes whatever the fallback pipeline does — which is
+    // how two earlier versions of it managed to guard nothing at all.
+    let between: Vec<_> = (0..3)
+        .map(|i| {
+            let id = TileId::from_terrain(nz, (nx + i) % columns, ny);
+            prepare(&gpu, &content(id, 8, CHILD_COLOUR, i + 1), eye)
+        })
+        .collect();
+    let behind_the_planet = prepare(&gpu, &content(far, 8, ANCESTOR_COLOUR, 9), eye);
+
+    let on_screen: Vec<&tuile_wgpu::PreparedTile> = between.iter().collect();
+    let pixels = draw(&gpu, eye, look_at, &on_screen, &[&behind_the_planet]);
+    let through = ancestor_pixels(&pixels, 0, SIZE);
+    assert_eq!(
+        through, 0,
+        "{through} pixels of a surface on the other side of the planet were \
+         drawn in front of it — a fallback that takes no part in depth paints \
+         through the Earth, and its skirt walls are what survive back-face \
+         culling to do it"
     );
 }
