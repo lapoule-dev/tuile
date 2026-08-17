@@ -482,7 +482,19 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                 served,
                 texture,
                 rect,
-                &scheme.tile_rect(served),
+                // The served tile's own rectangle, with its outer row reaching
+                // to the pole. Web Mercator stops at ±85° and always will:
+                // the projection sends the caps to infinity. Terrain does not
+                // stop there, so a geometry tile reaching past the limit had
+                // fragments outside *every* layer's source rectangle and kept
+                // the material's base colour — a white disc centred on the pole
+                // with its edge exactly at 85°, which is one of the more legible
+                // bugs this engine has produced.
+                &to_the_pole(
+                    scheme.tile_rect(served),
+                    served,
+                    scheme.tiles_at(served.level).1,
+                ),
                 covers,
             );
             // A tile the mosaic's bounding box included but the rectangle only
