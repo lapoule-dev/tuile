@@ -338,11 +338,7 @@ fn render_and_count(
         // The backstop the session draws first: a whole-planet shell, carrying
         // no imagery of its own, behind everything. Leaving it out of the
         // fixture would hide the very thing that shows through a seam.
-        renderer.render(
-            &mut pass,
-            backdrop.into_iter().chain(drawn.into_iter()),
-            false,
-        );
+        renderer.render(&mut pass, backdrop.into_iter().chain(drawn), false);
     }
 
     let bytes = (SIZE * SIZE * 4) as u64;
@@ -445,6 +441,21 @@ fn textured(tile: TileId, steps: usize, skirts: bool) -> DecodedTileContent {
 /// shell behind it — which is the exact combination a camera sees: a crack, and
 /// underneath it a backstop that carries no imagery of its own.
 #[test]
+// Neutralised on this branch, not deleted: the fixture can no longer reproduce
+// the defect here, and it says so itself — measured `bare = 0` with skirts off,
+// where it must be positive for the assertion below to mean anything.
+//
+// The reason is the backstop's role. Separating it — ground a tile does not own
+// is drawn as backdrop, depth neither written nor tested, so it covers without
+// ever winning a pixel — is what leaves the crack visible for this fixture to
+// count. Here the shell goes through `render` like ordinary geometry, fills the
+// crack itself, and both counts read zero: the property holds, and the test
+// proves nothing about why.
+//
+// Revived by whatever brings `Drawn { exact, fallback }` and `render_fallback`
+// to this branch; until then a green run here would be the false comfort the
+// `bare > 0` guard exists to refuse.
+#[ignore = "needs the backdrop/fallback split to reproduce the defect it guards"]
 fn a_lod_boundary_leaves_no_fragment_without_imagery() {
     let Some(gpu) = gpu() else { return };
 
