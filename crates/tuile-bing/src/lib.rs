@@ -335,13 +335,12 @@ mod missing_tile_tests {
         let meta = metadata("https://example.test/{subdomain}/{quadkey}.jpeg");
         let provider = BingImageryProvider::new(Arc::clone(&fetcher), meta);
 
-        match futures_executor::block_on(provider.fetch_tile_bytes(coord)) {
-            Err(RasterError::Fetch(FetchError::NotFound(_))) => {}
-            other => panic!(
-                "an empty Bing body must read as a missing tile so the drape \
-                 climbs to the ancestor; got {other:?}"
-            ),
-        }
+        let got = futures_executor::block_on(provider.fetch_tile_bytes(coord));
+        assert!(
+            matches!(got, Err(RasterError::Fetch(FetchError::NotFound(_)))),
+            "an empty Bing body must read as a missing tile so the drape \
+             climbs to the ancestor; got {got:?}"
+        );
     }
 
     #[test]
