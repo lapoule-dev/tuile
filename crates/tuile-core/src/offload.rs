@@ -201,7 +201,8 @@ where
         // ordinary event (the camera moved), and nothing to report.
         let _ = tx.send(job());
     }));
-    rx.await.expect("the offload dropped a job without running it")
+    rx.await
+        .expect("the offload dropped a job without running it")
 }
 
 #[cfg(test)]
@@ -227,9 +228,8 @@ mod tests {
             }
         }
         let here = std::thread::current().id();
-        let there = futures_executor::block_on(run(&OnItsOwnThread, move || {
-            std::thread::current().id()
-        }));
+        let there =
+            futures_executor::block_on(run(&OnItsOwnThread, move || std::thread::current().id()));
         assert_ne!(there, here, "the job ran on the calling thread");
     }
 

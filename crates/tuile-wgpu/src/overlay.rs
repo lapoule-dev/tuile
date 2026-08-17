@@ -114,9 +114,9 @@ impl OverlayRenderer {
                     bias: Default::default(),
                 }),
                 multisample: wgpu::MultisampleState {
-                        count: crate::context::SAMPLES,
-                        ..Default::default()
-                    },
+                    count: crate::context::SAMPLES,
+                    ..Default::default()
+                },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
                     entry_point: Some("fs_main"),

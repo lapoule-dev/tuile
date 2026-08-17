@@ -22,9 +22,9 @@
 //! because nothing else in this crate should have to carry a platform
 //! dependency to get the compass.
 
+mod nav;
 #[cfg(feature = "statusbar")]
 mod statusbar;
-mod nav;
 
 pub use nav::{NavWidget, Part};
 

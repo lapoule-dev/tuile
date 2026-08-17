@@ -279,8 +279,8 @@ impl<F: TileFetcher> ImageryProvider for BingImageryProvider<F> {
 
 #[cfg(test)]
 mod missing_tile_tests {
-    use super::*;
     use super::tests::MockFetcher;
+    use super::*;
 
     fn metadata(template: &str) -> BingMetadata {
         BingMetadata {

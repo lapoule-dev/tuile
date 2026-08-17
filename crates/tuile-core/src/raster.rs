@@ -454,7 +454,6 @@ pub struct ImageryMosaic {
 const EDGE_REACH: f32 = 1.0e-4;
 
 impl ImageryMosaic {
-
     /// The tiles, row-major NW→SE — the order [`stitch_mosaic`] expects.
     /// The coverage rectangles of every tile in this mosaic, in the geometry
     /// tile's uv space, **sharing exact edges**.
@@ -512,7 +511,8 @@ impl ImageryMosaic {
                 x: self.x0,
                 y: self.y0 + u64::from(j),
             };
-            north.push((((rect.north - scheme.tile_rect(coord).south) / th) as f32).clamp(0.0, 1.0));
+            north
+                .push((((rect.north - scheme.tile_rect(coord).south) / th) as f32).clamp(0.0, 1.0));
         }
         north[0] = -EDGE_REACH;
         *north.last_mut().expect("rows + 1 edges") = 1.0 + EDGE_REACH;
@@ -1359,8 +1359,16 @@ mod seam_tests {
         // the tile, and a mask stopping exactly at 1.0 leaves that fragment
         // uncovered — a dashed hairline at every tile boundary, which is what
         // survived every other fix. See `EDGE_REACH`.
-        assert!(coverage[0][0] < 0.0, "the west edge stops at {}", coverage[0][0]);
-        assert!(coverage[0][1] < 0.0, "the north edge stops at {}", coverage[0][1]);
+        assert!(
+            coverage[0][0] < 0.0,
+            "the west edge stops at {}",
+            coverage[0][0]
+        );
+        assert!(
+            coverage[0][1] < 0.0,
+            "the north edge stops at {}",
+            coverage[0][1]
+        );
         assert!(
             coverage[last][2] > 1.0,
             "the east edge stops at {}",
@@ -1471,9 +1479,24 @@ mod mosaic_coverage_tests {
         // uniform in latitude, so a mosaic near the equator and one at 60 N
         // divide their tile differently.
         let rects = [
-            GeoRect { west: 0.10, south: 0.20, east: 0.104, north: 0.206 },
-            GeoRect { west: -0.9, south: 0.75, east: -0.88, north: 0.79 },
-            GeoRect { west: 2.0, south: -0.6, east: 2.02, north: -0.55 },
+            GeoRect {
+                west: 0.10,
+                south: 0.20,
+                east: 0.104,
+                north: 0.206,
+            },
+            GeoRect {
+                west: -0.9,
+                south: 0.75,
+                east: -0.88,
+                north: 0.79,
+            },
+            GeoRect {
+                west: 2.0,
+                south: -0.6,
+                east: 2.02,
+                north: -0.55,
+            },
         ];
         for rect in rects {
             for level in 0..=18 {
@@ -1500,8 +1523,14 @@ mod mosaic_coverage_tests {
                     // part of its tile leaves the rest showing the layer beneath.
                     let umin = covers.iter().map(|c| c[0]).fold(f32::INFINITY, f32::min);
                     let vmin = covers.iter().map(|c| c[1]).fold(f32::INFINITY, f32::min);
-                    let umax = covers.iter().map(|c| c[2]).fold(f32::NEG_INFINITY, f32::max);
-                    let vmax = covers.iter().map(|c| c[3]).fold(f32::NEG_INFINITY, f32::max);
+                    let umax = covers
+                        .iter()
+                        .map(|c| c[2])
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let vmax = covers
+                        .iter()
+                        .map(|c| c[3])
+                        .fold(f32::NEG_INFINITY, f32::max);
                     assert!(
                         umin <= 0.0 && vmin <= 0.0 && umax >= 1.0 && vmax >= 1.0,
                         "level {level}, budget {budget}: the mosaic spans \

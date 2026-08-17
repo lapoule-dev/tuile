@@ -110,7 +110,6 @@ const COLUMNS: [&str; 10] = [
     "fovy",
 ];
 
-
 /// The topic the camera path is published on.
 const CAMERA_TOPIC: &str = "/camera";
 
@@ -632,8 +631,7 @@ fn write_image<W: std::io::Write + std::io::Seek>(
 /// that a host will take it, and an encoder with one caller and no branches is
 /// not worth a version to track.
 fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b = [
@@ -670,7 +668,8 @@ fn base64(bytes: &[u8]) -> String {
 /// a path nobody trusts.
 fn write_mcap(path: &Path, runs: &[Run]) -> Result<(), TapeError> {
     let mut writer = mcap::Writer::new(BufWriter::new(File::create(path)?))?;
-    let schema_id = writer.add_schema(CAMERA_SCHEMA, "jsonschema", CAMERA_JSON_SCHEMA.as_bytes())?;
+    let schema_id =
+        writer.add_schema(CAMERA_SCHEMA, "jsonschema", CAMERA_JSON_SCHEMA.as_bytes())?;
     let channel_id = writer.add_channel(
         schema_id,
         CAMERA_TOPIC,
@@ -946,10 +945,7 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read");
         let messages = mcap::MessageStream::new(&bytes)
             .expect("stream")
-            .filter(|m| {
-                m.as_ref()
-                    .is_ok_and(|m| m.channel.topic == CAMERA_TOPIC)
-            })
+            .filter(|m| m.as_ref().is_ok_and(|m| m.channel.topic == CAMERA_TOPIC))
             .count();
         assert_eq!(
             messages, 2,

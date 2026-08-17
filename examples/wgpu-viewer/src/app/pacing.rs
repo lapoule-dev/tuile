@@ -108,5 +108,4 @@ impl App {
         }
         self.pacing.last_heading = Some(heading);
     }
-
 }

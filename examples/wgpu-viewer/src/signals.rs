@@ -30,4 +30,3 @@ pub fn catch_interruptions() {
         tracing::warn!("no signal handler ({e}); Ctrl-C will lose an open recording");
     }
 }
-

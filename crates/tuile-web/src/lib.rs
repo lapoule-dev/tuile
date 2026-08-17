@@ -83,8 +83,8 @@ async fn get(url: &Url, bearer: Option<&str>) -> Result<(u16, Bytes, Option<u64>
     // fetched opaquely, which `NoCors` would give us.
     opts.set_mode(web_sys::RequestMode::Cors);
 
-    let request = web_sys::Request::new_with_str_and_init(url.as_str(), &opts)
-        .map_err(|e| js_message(&e))?;
+    let request =
+        web_sys::Request::new_with_str_and_init(url.as_str(), &opts).map_err(|e| js_message(&e))?;
     if let Some(token) = bearer {
         request
             .headers()

@@ -519,7 +519,9 @@ mod tests {
                 "a wall's upper edge must be the tile's own vertices"
             );
             let (a, b) = (seg.top0 as usize, seg.top1 as usize);
-            let span = (mesh.u[a] - mesh.u[b]).abs().max((mesh.v[a] - mesh.v[b]).abs());
+            let span = (mesh.u[a] - mesh.u[b])
+                .abs()
+                .max((mesh.v[a] - mesh.v[b]).abs());
             assert!(
                 span <= STEP + 1.0e-9,
                 "a wall segment spans {span} of the tile, joining vertex {a} to {b} — \
@@ -575,8 +577,7 @@ mod tests {
         let mut outside = 0;
         for p in &m.positions[surface..] {
             let g = ecef_to_geodetic(
-                decoded.local_origin_ecef
-                    + DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64),
+                decoded.local_origin_ecef + DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64),
             );
             if g.lon < rect.west || g.lon > rect.east || g.lat < rect.south || g.lat > rect.north {
                 outside += 1;
@@ -704,7 +705,10 @@ pub fn fill_content(
     // that reach the GPU are f32, and absolute ECEF in f32 resolves to about
     // half a metre at the Earth's radius.
     let origin = world.iter().copied().sum::<DVec3>() / (world.len() as f64);
-    let positions: Vec<[f32; 3]> = world.iter().map(|p| (*p - origin).as_vec3().into()).collect();
+    let positions: Vec<[f32; 3]> = world
+        .iter()
+        .map(|p| (*p - origin).as_vec3().into())
+        .collect();
     // The outward normal of the ellipsoid, which for a surface this smooth is
     // indistinguishable from the true one and costs no cross products.
     let normals: Vec<[f32; 3]> = world
