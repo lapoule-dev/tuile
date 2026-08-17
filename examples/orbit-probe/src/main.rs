@@ -404,7 +404,7 @@ fn report(ledger: &Ledger) {
         .filter(|(_, n)| **n > 1)
         .map(|(t, n)| (*n, *t))
         .collect();
-    worst.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    worst.sort_unstable_by_key(|(times, _)| std::cmp::Reverse(*times));
     if worst.is_empty() {
         tracing::info!("no tile was ever loaded twice");
     } else {
