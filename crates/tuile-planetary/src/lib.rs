@@ -167,6 +167,70 @@ const UNCOVERED_GROUND: [f32; 4] = [0.16, 0.20, 0.24, 1.0];
 /// *coverage* does that, and the clamping sampler supplies the rest — texture
 /// coordinates past the tile resolve to its edge, which is what a polar cap
 /// looks like anyway.
+/// What a cache-only drape can honestly show for one tile: the sharpest
+/// **complete** level as the floor, and over it the sharpest level holding
+/// anything at all, taken **partially**.
+///
+/// The one decision that matters is in the word "partially". The previous
+/// policy collected a level's textures into an `Option<Vec<_>>`, so a single
+/// missing tile discarded every sibling that *was* in hand and the walk fell a
+/// level — repeatedly, down to whatever level happened to be complete. Measured
+/// in the viewer: 3550 stand-ins built that way, 84 of them covered by exactly
+/// one image, while 1469 level-19 textures sat decoded in the cache. On screen
+/// each was a flat rectangle wearing the fine grid of an upsampled mesh.
+///
+/// Floor first, partial after: later layers win in the shader, so the sharp
+/// tiles paint over the floor exactly where they exist and the floor shows
+/// through everywhere else. Coverage outranks sharpness — the floor is never
+/// trimmed for the budget; the partial is.
+///
+/// Pure, and injected with `has` rather than the cache, so the policy is
+/// testable without a provider, a network or a lock.
+fn stand_in_layers(
+    scheme: &raster::TilingScheme,
+    geo: &GeoRect,
+    budget: u32,
+    sharpest: u32,
+    has: impl Fn(ImageryCoord) -> bool,
+) -> Vec<(ImageryCoord, [f32; 4])> {
+    let mut partial: Option<Vec<(ImageryCoord, [f32; 4])>> = None;
+    let mut level = sharpest.min(scheme.maximum_level);
+    loop {
+        let mosaic = scheme.mosaic_at_level(geo, level, budget);
+        let coords = mosaic.tiles();
+        let covers = mosaic.coverage(scheme, geo);
+        let present: Vec<(ImageryCoord, [f32; 4])> = coords
+            .iter()
+            .copied()
+            .zip(covers.iter().copied())
+            .filter(|(c, _)| has(*c))
+            .collect();
+        if !coords.is_empty() && present.len() == coords.len() {
+            // The floor. Everything under this tile is covered; the sharper
+            // partial — recorded at a strictly finer level, since a complete
+            // level returns here — goes on top, within the budget.
+            let mut out = present;
+            if let Some(sharp) = partial {
+                let room = (budget as usize).saturating_sub(out.len());
+                out.extend(sharp.into_iter().take(room));
+            }
+            return out;
+        }
+        if partial.is_none() && !present.is_empty() {
+            partial = Some(present);
+        }
+        if mosaic.level <= scheme.minimum_level {
+            // No complete level anywhere on the way down: the partial alone is
+            // still better than nothing — uncovered ground shows the base
+            // colour, which is exactly what it would have shown anyway.
+            return partial.unwrap_or_default();
+        }
+        // `mosaic_at_level` may have coarsened itself to fit the budget;
+        // follow it rather than re-walking levels it already skipped.
+        level = mosaic.level - 1;
+    }
+}
+
 fn to_the_pole(mut rect: GeoRect, coord: ImageryCoord, rows: u64) -> GeoRect {
     use std::f64::consts::FRAC_PI_2;
     if coord.y == 0 {
@@ -1025,22 +1089,16 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
         // planet, so it always terminates on something.
         let budget = self.opts.imagery_slots.get().saturating_sub(1).max(1);
         let deepest = scheme.containing_tile(&geo);
-        let picked = self.cache.lock().ok().and_then(|c| {
-            let from = (deepest.level + 2).min(scheme.maximum_level);
-            (scheme.minimum_level..=from).rev().find_map(|level| {
-                let mosaic = scheme.mosaic_at_level(&geo, level, budget);
-                let textures: Option<Vec<_>> = mosaic
-                    .tiles()
-                    .into_iter()
-                    .map(|coord| c.get(&coord).map(|texture| (coord, texture)))
-                    .collect();
-                textures.map(|textures| (mosaic, textures))
-            })
-        });
-        if let Some((mosaic, textures)) = picked {
-            for ((served, texture), covers) in
-                textures.into_iter().zip(mosaic.coverage(&scheme, &geo))
+        let from = (deepest.level + 2).min(scheme.maximum_level);
+        if let Ok(cache) = self.cache.lock() {
+            // The floor-plus-partial pick — see `stand_in_layers` for why
+            // "partial" is the word that matters here.
+            for (served, covers) in
+                stand_in_layers(&scheme, &geo, budget, from, |c| cache.get(&c).is_some())
             {
+                let Some(texture) = cache.get(&served) else {
+                    continue;
+                };
                 let layer = raster::ImageryLayer::substituted(
                     served,
                     texture,
@@ -1307,6 +1365,128 @@ mod tests {
     /// Draping asks for the mosaic at a level and gets back at most the layer
     /// budget, whatever the level asked for — the coarsening is what keeps the
     /// shader's binding count a promise rather than a hope.
+    /// A rect strictly inside `coord`, so tile ranges never pick up the
+    /// boundary neighbours.
+    fn inset(scheme: &raster::TilingScheme, coord: ImageryCoord) -> GeoRect {
+        let r = scheme.tile_rect(coord);
+        let (w, h) = (r.width() * 0.01, r.height() * 0.01);
+        GeoRect {
+            west: r.west + w,
+            east: r.east - w,
+            // v grows southward: north > south.
+            south: r.south + h,
+            north: r.north - h,
+        }
+    }
+
+    /// **One missing tile at the sharp level no longer discards its siblings.**
+    ///
+    /// The previous policy collected a level into `Option<Vec<_>>`, so a single
+    /// cache miss dropped every sibling that was in hand and the walk fell to
+    /// whatever level happened to be complete — measured at 84 stand-ins
+    /// covered by exactly one image while the sharp textures sat decoded in the
+    /// cache. The pick must keep the three present tiles and floor them with
+    /// the complete coarser level, floor first so the sharp ones paint over it.
+    #[test]
+    fn a_missing_sharp_tile_keeps_its_siblings_over_a_coarser_floor() {
+        let scheme = raster::TilingScheme::web_mercator();
+        let parent = ImageryCoord {
+            level: 9,
+            x: 261,
+            y: 178,
+        };
+        let geo = inset(&scheme, parent);
+        // The four level-10 children of `parent`; one of them is missing.
+        let missing = ImageryCoord {
+            level: 10,
+            x: 523,
+            y: 357,
+        };
+        let has = |c: ImageryCoord| c == parent || (c.level == 10 && c != missing);
+
+        let picked = stand_in_layers(&scheme, &geo, 8, 10, has);
+
+        assert_eq!(
+            picked.first().map(|(c, _)| *c),
+            Some(parent),
+            "the complete coarser level floors the pick, and comes first so the \
+             sharp tiles paint over it: {picked:?}"
+        );
+        let sharp: Vec<_> = picked.iter().filter(|(c, _)| c.level == 10).collect();
+        assert_eq!(
+            sharp.len(),
+            3,
+            "the three cached siblings survive their missing fourth: {picked:?}"
+        );
+        assert!(
+            !picked.iter().any(|(c, _)| *c == missing),
+            "the missing tile itself is not invented"
+        );
+    }
+
+    /// A complete sharp level needs no floor: it is its own.
+    #[test]
+    fn a_complete_sharp_level_is_taken_whole_and_alone() {
+        let scheme = raster::TilingScheme::web_mercator();
+        let parent = ImageryCoord {
+            level: 9,
+            x: 261,
+            y: 178,
+        };
+        let geo = inset(&scheme, parent);
+        let picked = stand_in_layers(&scheme, &geo, 8, 10, |c| c.level == 10);
+        assert_eq!(
+            picked.len(),
+            4,
+            "the four children, nothing else: {picked:?}"
+        );
+        assert!(picked.iter().all(|(c, _)| c.level == 10));
+    }
+
+    /// An empty cache yields an empty pick — the caller then refuses the
+    /// stand-in outright, which is its documented behaviour.
+    #[test]
+    fn nothing_cached_yields_nothing() {
+        let scheme = raster::TilingScheme::web_mercator();
+        let parent = ImageryCoord {
+            level: 9,
+            x: 261,
+            y: 178,
+        };
+        let geo = inset(&scheme, parent);
+        assert!(stand_in_layers(&scheme, &geo, 8, 10, |_| false).is_empty());
+    }
+
+    /// Coverage outranks sharpness: when floor plus partial exceed the budget,
+    /// the partial is trimmed and the floor is not.
+    #[test]
+    fn the_floor_is_never_trimmed_for_the_budget() {
+        let scheme = raster::TilingScheme::web_mercator();
+        // A small rect straddling the shared edge of two level-9 tiles: two
+        // tiles at level 9, two at level 10.
+        let west = scheme.tile_rect(ImageryCoord {
+            level: 9,
+            x: 261,
+            y: 178,
+        });
+        let h = west.height() * 0.01;
+        let w = west.width() * 0.01;
+        let geo = GeoRect {
+            west: west.east - w,
+            east: west.east + w,
+            south: west.south + west.height() * 0.45,
+            north: west.north - west.height() * 0.45 - h,
+        };
+        // Both level-9 tiles cached, one of the two level-10 ones.
+        let has = |c: ImageryCoord| c.level == 9 || (c.level == 10 && c.x == 522);
+        let picked = stand_in_layers(&scheme, &geo, 2, 10, has);
+        assert_eq!(picked.len(), 2, "the budget holds: {picked:?}");
+        assert!(
+            picked.iter().all(|(c, _)| c.level == 9),
+            "what fits is the floor, whole — sharpness is what gets trimmed: {picked:?}"
+        );
+    }
+
     #[test]
     fn a_drape_never_asks_for_more_layers_than_a_draw_can_bind() {
         let scheme = tuile_core::raster::TilingScheme::web_mercator();
