@@ -387,10 +387,13 @@ impl App {
             );
             tracing::info!(
                 "alt {:.0} km | ground {:.0} m | {} tiles, {complete}, {sharpness} | \
+                 {} stand-ins, {} coplanar | \
                  {} loading | {:.0} MiB | near {:.0} m far {:.0} km{pacing}{view}",
                 cam.altitude() / 1000.0,
                 self.controller.height_above_ground(),
                 rendered,
+                resolution.stand_ins,
+                resolution.coplanar,
                 s.requested,
                 (active.pump.gpu_bytes as f32 + imagery_bytes as f32) / (1024.0 * 1024.0),
                 near,
