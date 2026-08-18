@@ -791,6 +791,19 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // between the two values is covered by neither — a hairline grid over
         // otherwise perfect imagery. See `ImageryMosaic::coverage`.
         let coverage = mosaic.coverage(&scheme, rect);
+        let floor_layers = layers.len();
+        let mut dropped = 0usize;
+        // `zip` stops at the shorter of the two and says nothing. If the mosaic
+        // ever hands back fewer rectangles than tiles, the surplus tiles are
+        // fetched, decoded, uploaded — and then silently never placed.
+        if coverage.len() != fetched.len() {
+            tracing::warn!(
+                z = terrain_level,
+                tiles = fetched.len(),
+                rectangles = coverage.len(),
+                "MOSAIC MISMATCH: zip drops the surplus without a word"
+            );
+        }
         for (got, covers) in fetched.into_iter().zip(coverage) {
             let (served, texture) = got?;
             let layer = raster::ImageryLayer::substituted(
@@ -816,7 +829,42 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
             // touches contributes no pixels and would still cost a binding.
             if layer.is_visible() {
                 layers.push(layer);
+            } else {
+                dropped += 1;
             }
+        }
+
+        // **The mosaic contributed nothing, and the floor is holding the tile
+        // on its own.**
+        //
+        // Not the same fault as no imagery at all, which is counted just below
+        // and painted marker green. Here the tile *has* a layer, so every
+        // instrument reads it as covered — and what it has is one coarse image
+        // stretched over ground it does not describe, which at any depth is a
+        // rectangle of flat colour with straight tile-aligned edges. That is a
+        // different artefact from the ragged organic outlines of two surfaces
+        // fighting, and it was mistaken for one.
+        //
+        // A rectangle that fails `is_visible` is inverted or empty, which the
+        // arithmetic in `ImageryMosaic::coverage` should never produce for a
+        // rect the mosaic was built from — so reaching here at all says the
+        // geometry tile's rectangle is degenerate or crosses the antimeridian,
+        // which `rectangle_from_obb` states is out of scope.
+        if layers.len() == floor_layers {
+            tracing::warn!(
+                z = terrain_level,
+                west = rect.west,
+                south = rect.south,
+                east = rect.east,
+                north = rect.north,
+                dropped,
+                wanted = level,
+                got = mosaic.level,
+                mosaic_tiles = mosaic.tile_count(),
+                "MOSAIC LOST over this tile: one layer covers all of it, so the coverage \
+                 view reads green where it should read blue, and the ground is one \
+                 flat colour"
+            );
         }
 
         // The uv set is the TILE's own space, and the mesh already stated it —
@@ -877,6 +925,42 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
             };
         }
         content.imagery = layers;
+
+        // **Do the layers actually reach the ground, or merely exist?**
+        //
+        // Every count above asks whether a layer is *present*. None asks whether
+        // it covers, and those are different questions: the shader masks each
+        // layer to its own coverage rectangle, so a tile can hold a full set of
+        // visible layers and still show `UNCOVERED_GROUND` on every fragment.
+        // That is a rectangle of flat dark blue with straight tile-aligned
+        // edges — reported from the viewer, and invisible to every instrument
+        // here, because `layers` was neither empty nor short.
+        //
+        // The union must reach both corners. `placed` gives the floor the whole
+        // tile with `EDGE_REACH` past each side, so this can only fail if the
+        // floor is missing *and* the mosaic's own rectangles fall short.
+        if !content.imagery.is_empty() {
+            let (mut umin, mut vmin) = (f32::INFINITY, f32::INFINITY);
+            let (mut umax, mut vmax) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+            for l in &content.imagery {
+                umin = umin.min(l.coverage[0]);
+                vmin = vmin.min(l.coverage[1]);
+                umax = umax.max(l.coverage[2]);
+                vmax = vmax.max(l.coverage[3]);
+            }
+            if umin > 0.0 || vmin > 0.0 || umax < 1.0 || vmax < 1.0 {
+                tracing::warn!(
+                    z = terrain_level,
+                    layers = content.imagery.len(),
+                    umin,
+                    vmin,
+                    umax,
+                    vmax,
+                    "COVERAGE SHORT: the layers span u {umin}..{umax}, v {vmin}..{vmax} \
+                     of a tile that is 0..1 in both — the rest draws UNCOVERED_GROUND"
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -980,6 +1064,31 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
         // consumer keeps whatever it had for one more frame.
         if content.imagery.is_empty() {
             return None;
+        }
+        // **The one imagery path with no instrument on it.**
+        //
+        // `drape` counts five different ways its layers can come up short;
+        // this counted none, so a stand-in that covered its ground with a
+        // single very coarse image looked, from every log and every metric,
+        // exactly like one that covered it properly. On screen it is a flat
+        // rectangle of one colour with a *finely tessellated* grid inside it —
+        // the upsampled mesh — which is why it reads as a deep tile that failed
+        // rather than as the approximation it is.
+        //
+        // The mosaic here is cache-only by contract, so it settles on the
+        // sharpest level every tile of which is already decoded. When that is
+        // several levels above the ground being covered, one texel is stretched
+        // across the whole tile.
+        if content.imagery.len() < 4 {
+            tracing::warn!(
+                z,
+                x,
+                y,
+                layers = content.imagery.len(),
+                "THIN STAND-IN: covered by {} imagery layer(s), so the ground is \
+                 close to one flat colour",
+                content.imagery.len()
+            );
         }
         Some(content)
     }
