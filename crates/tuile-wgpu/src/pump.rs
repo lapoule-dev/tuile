@@ -383,6 +383,30 @@ impl ContentPump {
                 .filter_map(|id| self.prepared.get(&id))
                 .collect()
         };
+        let stand_ins = exact.iter().filter(|id| self.fills.contains(id)).count();
+        let is_ancestor = |a: TileId, b: TileId| {
+            let mut cur = self.ancestry.get(&b).and_then(|x| x.parent);
+            while let Some(id) = cur {
+                if id == a {
+                    return true;
+                }
+                cur = self.ancestry.get(&id).and_then(|x| x.parent);
+            }
+            false
+        };
+        let coplanar = fallback
+            .iter()
+            .flat_map(|f| {
+                exact
+                    .iter()
+                    .filter(move |e| self.fills.contains(e) && is_ancestor(*f, **e))
+            })
+            .count();
+        let counts = Resolution {
+            stand_ins,
+            coplanar,
+            ..counts
+        };
         let drawn = Drawn {
             exact: surfaces(exact),
             fallback: surfaces(fallback),
@@ -527,6 +551,25 @@ pub struct Resolution {
     /// The level actually drawn, and the level asked for, at that worst gap.
     pub worst_gap_drawn: u32,
     pub worst_gap_wanted: u32,
+    /// Drawn surfaces that are a stand-in rather than the tile's own content.
+    ///
+    /// Counted apart because **no other number here can see them**: a stand-in
+    /// satisfies [`ContentPump::has`], so the walk stops at it and the tile is
+    /// reported `exact` — a selection reads *complete* while the ground on
+    /// screen is an upsample of something coarser. See that method's doc, which
+    /// says the indistinguishability is deliberate.
+    pub stand_ins: usize,
+    /// Drawn (stand-in, drawn ancestor of it) pairs: **the same surface twice**.
+    ///
+    /// A stand-in is `tuile_terrain::upsample` of an ancestor — "a mesh of
+    /// exactly the same surface over exactly the child's ground". So when that
+    /// ancestor is *also* drawn, because some sibling has nothing, the two are
+    /// not two guesses at one hillside: they are one surface submitted twice,
+    /// once writing depth and once testing `Less` after it. Which one wins a
+    /// pixel is then decided by float equality, and that is z-fighting.
+    ///
+    /// Zero on `main`, which has no stand-ins at all.
+    pub coplanar: usize,
 }
 
 impl Resolution {
