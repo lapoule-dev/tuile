@@ -386,11 +386,22 @@ impl Session<'_> {
         // Ground the camera has left. Without this the consumer keeps a surface
         // for every tile ever briefly selected — a leak the server cannot see,
         // because it never charged itself for any of them.
+        // Never a tile the consumer has acknowledged. An ack means it holds the
+        // real geometry, filed under this same id — so taking "the stand-in"
+        // back takes that instead. It then holds nothing while this side still
+        // counts the tile resident *and* acked, so the next look at that ground
+        // gets neither `Content` nor `Fill`, and an ancestor is drawn there for
+        // the rest of the session.
+        //
+        // Clearing `filled` when the content is sent is not enough on its own,
+        // and that was tried: the ack arrives a poll later, so the traversal in
+        // between sees a selected tile that is neither filled nor acked and
+        // sends a second stand-in, putting it straight back.
         let stale: Vec<TileId> = self
             .filled
             .iter()
             .copied()
-            .filter(|t| !self.selected.contains(t))
+            .filter(|t| !self.selected.contains(t) && !self.acked.contains(t))
             .collect();
         for tile in &stale {
             self.filled.remove(tile);
@@ -831,6 +842,15 @@ impl Session<'_> {
                         .map_err(|_| Gone)?;
                 }
                 self.residency.insert(tile);
+                // The stand-in has just been superseded. Both are filed under
+                // this id by the consumer, so the real content *is* the
+                // replacement — but `filled` is what decides who gets taken back
+                // when the camera leaves this ground, and a tile left in it
+                // makes that take-back name real geometry. The consumer drops
+                // it, this side still holds it resident and acked, and so sends
+                // neither `Content` nor `Fill` when the ground is looked at
+                // again: it is drawn by an ancestor for the rest of the session.
+                self.filled.remove(&tile);
                 self.resolve_primed(tile, true);
                 tx.unbounded_send(ServerMessage::Content {
                     tile,
@@ -1079,6 +1099,108 @@ mod tests {
             }
         }
         None
+    }
+
+    /// **A stand-in that has been replaced is not evicted.**
+    ///
+    /// `Fill` and `Content` are filed under the same id by the consumer, so the
+    /// real thing simply replaces the stand-in when it lands. The server has to
+    /// notice: it keeps a `filled` set so it can take a stand-in back when the
+    /// camera leaves that ground, and if the tile is still in that set once its
+    /// real content has been sent, the take-back names real geometry.
+    ///
+    /// What that costs, measured in the viewer before this test existed: the
+    /// consumer drops the tile, the server still holds it resident and still has
+    /// its ack, so it sends neither `Content` (resident) nor `Fill` (acked)
+    /// when the ground is looked at again. The walk climbs to an ancestor and
+    /// stays there — **28 tiles drawn coarse with nothing loading and no error
+    /// reported**, stable, for as long as the session ran. On screen that is
+    /// blurry rectangles with straight tile-aligned edges, which is a different
+    /// artefact from the ragged organic outlines of two surfaces fighting, and
+    /// was mistaken for it.
+    #[test]
+    fn a_stand_in_that_has_been_replaced_is_not_evicted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = write_deep_fixture(dir.path());
+        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
+        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
+
+        /// Real content for everything, and a stand-in on demand.
+        struct Standing(Arc<dyn TileLoader>);
+
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        impl TileLoader for Standing {
+            async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
+                self.0.load(id).await
+            }
+            fn fill(&self, _id: TileId) -> Option<crate::content::DecodedTileContent> {
+                Some(crate::content::DecodedTileContent {
+                    meshes: Vec::new(),
+                    textures: Vec::new(),
+                    imagery: Vec::new(),
+                    local_origin_ecef: glam::DVec3::ZERO,
+                    transform_local: glam::Mat4::IDENTITY,
+                })
+            }
+        }
+
+        let arena = Arc::new(RwLock::new(tileset));
+        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
+        let inner: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher)));
+        let (mut stream, server) = in_process_with(
+            tree,
+            Arc::new(Standing(inner)) as Arc<dyn TileLoader>,
+            Config {
+                pinned_level: None,
+                ..Config::default()
+            },
+        );
+        let mut server = Box::pin(server.run());
+
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut delivered: HashSet<TileId> = HashSet::new();
+        let mut wrongly_taken: Vec<TileId> = Vec::new();
+
+        // Look somewhere, then look elsewhere: the second view is what makes the
+        // first view's ground leave the selection, which is when a stand-in is
+        // taken back.
+        for view in [near_view(), far_view()] {
+            stream
+                .send(ClientMessage::ViewerState { views: vec![view] })
+                .expect("send");
+            for _ in 0..256 {
+                let _ = server.as_mut().poll(&mut cx);
+                while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
+                    match msg {
+                        ServerMessage::Content { tile, .. } => {
+                            delivered.insert(tile);
+                            // A real consumer acks what it uploads; a stand-in
+                            // is never acked, which is what the server relies on.
+                            let _ = stream.send(ClientMessage::Ack { tile });
+                        }
+                        ServerMessage::Evict { tiles } => {
+                            for t in tiles {
+                                if delivered.contains(&t) {
+                                    wrongly_taken.push(t);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert!(
+            wrongly_taken.is_empty(),
+            "the server took back {} tiles whose real content it had already \
+             sent: {wrongly_taken:?}. The consumer drops them, the server still \
+             holds them resident and acked, and that ground is coarse for the \
+             rest of the session",
+            wrongly_taken.len()
+        );
     }
 
     /// A turn must not re-stream its own wake.
