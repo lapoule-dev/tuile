@@ -58,6 +58,9 @@ impl SceneState {
                     self.resident.remove(t);
                 }
             }
+            // Stand-ins were never counted into residency (see `Fill` above),
+            // so taking them back changes nothing here either.
+            ServerMessage::Retire { .. } => {}
             ServerMessage::Error { tile, .. } => {
                 if let Some(t) = tile {
                     self.resident.remove(t);
@@ -151,6 +154,8 @@ pub async fn drive_until_complete<S: GeometryStream + Unpin>(
             // This driver collects finished content for inspection; a stand-in
             // is by definition unfinished and would only dilute the answer.
             ServerMessage::Fill { .. } => {}
+            // And since no stand-in was kept, there is none to take back.
+            ServerMessage::Retire { .. } => {}
             ServerMessage::Evict { tiles } => {
                 for t in tiles {
                     contents.remove(&t);

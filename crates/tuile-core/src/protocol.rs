@@ -128,7 +128,32 @@ pub enum ServerMessage {
         content: crate::content::DecodedTileContent,
     },
     /// These tiles left residency; release their resources.
+    ///
+    /// **Everything** goes: the prepared surface, and any copy still waiting in
+    /// the consumer's upload queue. That totality is correct here — the server
+    /// dropped the tile from its own residency and will re-request and re-send
+    /// it when the ground is next needed — and it is exactly why this message
+    /// must never be used to take back a stand-in: see [`ServerMessage::Retire`].
     Evict { tiles: Vec<TileId> },
+    /// Take back the **stand-ins** for these tiles, and nothing else.
+    ///
+    /// Its own variant for the same reason [`ServerMessage::Fill`] is one: the
+    /// two acts that were folded into [`ServerMessage::Evict`] have different
+    /// blast radii, and the consumer cannot tell them apart from the message.
+    /// `Content` is sent **once** per residency — the server marks the tile
+    /// resident and never re-sends — so an `Evict` that reaches a consumer
+    /// whose real copy is still in its upload queue destroys the only delivery
+    /// there will ever be. The ground then wears its stand-in for as long as
+    /// the server's cache holds the tile: measured at 1853 tiles taken back in
+    /// one flight, 232 of them re-issued a stand-in immediately after, coarse
+    /// with nothing loading and nothing failed.
+    ///
+    /// A consumer honours this by dropping only what it holds **as a
+    /// stand-in** — surfaces flagged as fills, queued fill uploads — and never
+    /// touching real content, prepared or queued. A tile it does not hold as a
+    /// stand-in is a no-op, which makes the message safe to send on stale
+    /// knowledge.
+    Retire { tiles: Vec<TileId> },
     /// Non-fatal failure (a tile failed to fetch or decode).
     Error {
         tile: Option<TileId>,

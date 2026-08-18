@@ -312,6 +312,8 @@ async fn settle<S: GeometryStream + Unpin>(
             // A probe measures what the session really streams; a stand-in is
             // synthesised locally and would flatter every number it touched.
             ServerMessage::Fill { .. } => {}
+            // No stand-in was kept, so there is none to take back.
+            ServerMessage::Retire { .. } => {}
             ServerMessage::Evict { tiles } => {
                 for t in &tiles {
                     contents.remove(t);
