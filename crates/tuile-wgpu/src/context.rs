@@ -9,7 +9,7 @@
 //! and offscreen rendering.
 
 use std::sync::{Arc, Mutex};
-use tuile_core::raster::{ImageryCoord, ImageryPool, MAX_IMAGERY_LAYERS};
+use tuile_core::raster::{ImageryCoord, ImageryPool};
 use wgpu::util::DeviceExt;
 
 #[derive(Debug, thiserror::Error)]
@@ -20,6 +20,7 @@ pub enum ContextError {
     NoDevice(String),
 }
 
+/// Texture format used for all base-color textures.
 /// How many samples every attachment and every pipeline uses.
 ///
 /// A globe is mostly long, near-horizontal edges — the limb against space, a
@@ -32,10 +33,24 @@ pub enum ContextError {
 /// at the first draw rather than something visible in review.
 pub const SAMPLES: u32 = 4;
 
-/// Texture format used for all base-color textures.
 pub const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// Depth format expected by [`crate::TileRenderer`].
-pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Depth **and stencil**, because depth alone cannot say "cover this ground but
+/// never win a pixel from the surface that owns it".
+///
+/// Every comparison that rejects a fallback above an owning surface also
+/// rejects it above bare ground, where it is the only thing covering — so the
+/// distinction is not expressible as a depth test. A one-bit mark per pixel is,
+/// and that needs a format that carries one. See `TileRenderer`'s `Pass`.
+///
+/// `Depth24PlusStencil8` rather than `Depth32FloatStencil8`: this one is
+/// mandatory in WebGPU, so it needs no feature request and no runtime branch,
+/// and it can stay a constant. On Metal it maps to `Depth32Float_Stencil8`
+/// anyway — Apple silicon has no 24-bit depth — so the precision is unchanged
+/// there. Where it really is 24-bit unorm, the camera's own clip planes already
+/// bound the near/far ratio; if that is ever not enough, reverse-Z is the fix
+/// for precision and it is orthogonal to this.
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
 /// Where the imagery slots start in the material bind group; slot `i` is at
 /// `IMAGERY_BINDING_0 + i`. Must match `shader.wgsl`.
 pub(crate) const IMAGERY_BINDING_0: u32 = 4;
@@ -73,6 +88,20 @@ impl GpuImagery {
 pub struct ImageryTextures(ImageryPool<GpuImagery>);
 
 impl ImageryTextures {
+    /// Live imagery by its own level: how many textures, and their bytes.
+    ///
+    /// The imagery level is not the terrain level a tile sits at, and the gap
+    /// between them is exactly the question of whether the ground is as sharp as
+    /// the source allows — so the breakdown has to be by the level the pixels
+    /// came from, not the level they are drawn on.
+    pub fn live_by_level(&self) -> Vec<(u32, usize)> {
+        self.0
+            .live_with_coords()
+            .into_iter()
+            .map(|(coord, held)| (coord.level, held.bytes))
+            .collect()
+    }
+
     /// Live imagery on the GPU: distinct textures, and the bytes they hold.
     ///
     /// Counted once each however many tiles reference them — which is the number
@@ -95,6 +124,16 @@ pub struct GpuContext {
     /// Shared imagery, behind a lock because `prepare` takes the context by
     /// shared reference from wherever the host drives it.
     pub imagery: Mutex<ImageryTextures>,
+    /// How many imagery textures one draw may bind, as this device allows.
+    ///
+    /// Detected here because this is where the device is: the limit is 16 on
+    /// the WebGPU baseline and on WebGL2, 128 on Metal, and
+    /// [`tuile_core::raster::imagery_slots`] turns that into the number worth
+    /// spending. Everything downstream — the bind-group layout above, the
+    /// generated shader, the uniform table a tile uploads, and the mosaic the
+    /// loader is allowed to ask for — reads it from here rather than agreeing
+    /// with a constant.
+    pub imagery_slots: u32,
 }
 
 impl GpuContext {
@@ -115,6 +154,9 @@ impl GpuContext {
     /// Wraps an existing device/queue (the viewer path: the host created
     /// them against its surface).
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        let imagery_slots = tuile_core::raster::imagery_slots(
+            device.limits().max_sampled_textures_per_shader_stage,
+        );
         let uniform_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -158,8 +200,7 @@ impl GpuContext {
             },
             uniform_entry(3),
         ];
-        material_entries
-            .extend((0..MAX_IMAGERY_LAYERS).map(|i| texture_entry(IMAGERY_BINDING_0 + i)));
+        material_entries.extend((0..imagery_slots).map(|i| texture_entry(IMAGERY_BINDING_0 + i)));
         let material_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tuile material"),
             entries: &material_entries,
@@ -209,6 +250,7 @@ impl GpuContext {
             sampler,
             white_view,
             imagery: Mutex::new(ImageryTextures::default()),
+            imagery_slots,
         }
     }
 
@@ -244,44 +286,80 @@ impl GpuContext {
 mod tests {
     use super::*;
 
-    const SHADER: &str = include_str!("shader.wgsl");
+    /// The assembled source for a given budget, which is what the backend
+    /// actually compiles.
+    fn ground(slots: u32) -> String {
+        crate::renderer::ground_wgsl(slots)
+    }
 
-    /// The shader's slot count is written out by hand, because generating twelve
-    /// bindings and twelve blend calls would cost more in readability than the
-    /// drift costs here. So the drift is what gets tested: three declarations
-    /// have to agree, and a mismatch is silent at runtime — extra slots are
-    /// simply never sampled, and the ground quietly loses its finest layers at
-    /// exactly the tiles that straddle worst.
+    /// **Every slot the budget allows is declared, and every declared slot is
+    /// read — at every budget a device can produce.**
+    ///
+    /// The three numbers that have to agree are written in three different
+    /// syntaxes in the same generated file: the length of the uniform array, a
+    /// run of `@binding` declarations, and a run of calls. A mismatch between
+    /// the last two is silent at run time — extra slots are simply never
+    /// sampled, and the ground quietly loses its finest layers at exactly the
+    /// tiles that straddle worst, which is the artefact hardest to attribute.
+    ///
+    /// This used to be written out by hand against a constant, and needed a test
+    /// that read the count back out of the `.wgsl` with a regex. That is what a
+    /// value with two homes costs; it has one now.
     #[test]
-    fn the_shader_binds_every_imagery_slot_the_core_allows() {
-        let declared = SHADER
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("const IMAGERY_LAYERS: u32 = "))
-            .and_then(|v| v.trim_end_matches(&['u', ';'][..]).parse::<u32>().ok())
-            .expect("shader.wgsl declares IMAGERY_LAYERS");
-        assert_eq!(
-            declared, MAX_IMAGERY_LAYERS,
-            "shader.wgsl says {declared} imagery slots, the core allows \
-             {MAX_IMAGERY_LAYERS}"
-        );
-
-        // Two vec4 per slot, one uniform array.
-        assert!(
-            SHADER.contains(&format!("array<vec4f, {}>", 2 * MAX_IMAGERY_LAYERS)),
-            "the layer table must hold two vec4 per slot"
-        );
-
-        // And each slot needs its own texture binding and its own blend call.
-        for slot in 0..MAX_IMAGERY_LAYERS {
-            let binding = format!(
-                "@group(2) @binding({}) var img{slot}: texture_2d<f32>;",
-                IMAGERY_BINDING_0 + slot
-            );
-            assert!(SHADER.contains(&binding), "missing binding: {binding}");
-            let blend = format!("blend_layer(ground, img{slot}, in.uv, {slot}u)");
+    fn the_shader_declares_and_reads_exactly_the_budgeted_slots() {
+        for slots in [
+            tuile_core::raster::MIN_IMAGERY_SLOTS,
+            tuile_core::raster::imagery_slots(16),
+            tuile_core::raster::USEFUL_IMAGERY_SLOTS,
+        ] {
+            let shader = ground(slots);
+            // Two vec4 per slot, one uniform array.
             assert!(
-                SHADER.contains(&blend),
-                "slot {slot} is bound but never read"
+                shader.contains(&format!("array<vec4f, {}>", 2 * slots)),
+                "budget {slots}: the layer table must hold two vec4 per slot"
+            );
+            for slot in 0..slots {
+                let binding = format!(
+                    "@group(2) @binding({}) var img{slot}: texture_2d<f32>;",
+                    IMAGERY_BINDING_0 + slot
+                );
+                assert!(
+                    shader.contains(&binding),
+                    "budget {slots}: missing {binding}"
+                );
+                let read = format!("layer(ground, img{slot}, in.uv, {slot}u)");
+                assert!(
+                    shader.contains(&read),
+                    "budget {slots}: slot {slot} is declared but never read"
+                );
+            }
+            // And not one past the budget, which would be a texture the
+            // bind-group layout never declared.
+            assert!(
+                !shader.contains(&format!("var img{slots}:")),
+                "budget {slots}: declared a slot past the budget"
+            );
+        }
+    }
+
+    /// **The assembled shader carries both fragments, once each.**
+    ///
+    /// Cheap, and it catches the one way the split can fail silently: an
+    /// assembly that forgets a part still compiles as Rust, and only fails when
+    /// a pipeline is created — which is to say, on a machine with a GPU, which
+    /// is not every machine that runs these tests.
+    #[test]
+    fn the_assembled_shader_carries_both_fragments() {
+        let shader = ground(tuile_core::raster::MIN_IMAGERY_SLOTS);
+        for (what, needle) in [
+            ("the mosaic rule", "fn blend_layer("),
+            ("the air", "fn aerial_perspective("),
+            ("the bindings", "@group(0) @binding(0)"),
+        ] {
+            assert_eq!(
+                shader.matches(needle).count(),
+                1,
+                "{what} should appear exactly once in the assembled shader"
             );
         }
     }
@@ -295,7 +373,8 @@ mod tests {
             IMAGERY_BINDING_0, 4,
             "the imagery slots start after the layer table"
         );
-        assert!(SHADER.contains("@group(2) @binding(3) var<uniform> imagery:"));
-        assert!(SHADER.contains("@group(2) @binding(2) var base_samp: sampler;"));
+        let shader = ground(tuile_core::raster::MIN_IMAGERY_SLOTS);
+        assert!(shader.contains("@group(2) @binding(3) var<uniform> imagery:"));
+        assert!(shader.contains("@group(2) @binding(2) var base_samp: sampler;"));
     }
 }

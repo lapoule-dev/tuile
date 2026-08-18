@@ -301,12 +301,7 @@ fn render_and_count(
         },
     );
 
-    // One list: at this point a tile standing in for a missing descendant is
-    // drawn as ordinary geometry, like everything else.
-    let drawn = pump.visible_resolved(|id: TileId| {
-        let (z, x, y) = id.terrain_coord();
-        (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2))
-    });
+    let (drawn, _) = pump.resolve(&gpu.queue);
 
     let mut encoder = gpu
         .device
@@ -329,7 +324,13 @@ fn render_and_count(
                     load: wgpu::LoadOp::Clear(1.0),
                     store: wgpu::StoreOp::Store,
                 }),
-                stencil_ops: None,
+                stencil_ops: Some(wgpu::Operations {
+                    // Cleared to 0, and never read back: the mark says "a
+                    // surface that owns this ground drew here", which is only
+                    // true within one frame.
+                    load: wgpu::LoadOp::Clear(0),
+                    store: wgpu::StoreOp::Discard,
+                }),
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -338,7 +339,14 @@ fn render_and_count(
         // The backstop the session draws first: a whole-planet shell, carrying
         // no imagery of its own, behind everything. Leaving it out of the
         // fixture would hide the very thing that shows through a seam.
-        renderer.render(&mut pass, backdrop.into_iter().chain(drawn), false);
+        if let Some(shell) = backdrop {
+            renderer.render_background(&mut pass, std::iter::once(shell));
+        }
+        // A fallback ancestor is backdrop, not geometry: it stands in for ground
+        // that is not its own and must never win a pixel from a surface that
+        // owns it. See `tuile_wgpu::Drawn`.
+        renderer.render(&mut pass, drawn.exact.into_iter(), false);
+        renderer.render_fallback(&mut pass, drawn.fallback.into_iter());
     }
 
     let bytes = (SIZE * SIZE * 4) as u64;
@@ -403,15 +411,18 @@ fn magenta_at_a_lod_boundary(gpu: &GpuContext, skirts: bool) -> u64 {
     let fine = TileId::from_terrain(5, 33, 21);
     let mut stream = Scripted(VecDeque::from([
         ServerMessage::Select {
-            tiles: vec![(coarse, 0.0), (fine, 0.0)],
+            tiles: selected(&[coarse, fine]),
+            ancestry: tree_shape(&[coarse, fine]),
             stats: TraversalStats::default(),
         },
         ServerMessage::Content {
             tile: coarse,
+            ancestry: ancestry(coarse),
             content: TileContent::Decoded(textured(coarse, 2, skirts)),
         },
         ServerMessage::Content {
             tile: fine,
+            ancestry: ancestry(fine),
             content: TileContent::Decoded(textured(fine, 8, skirts)),
         },
     ]));
@@ -441,21 +452,6 @@ fn textured(tile: TileId, steps: usize, skirts: bool) -> DecodedTileContent {
 /// shell behind it — which is the exact combination a camera sees: a crack, and
 /// underneath it a backstop that carries no imagery of its own.
 #[test]
-// Neutralised on this branch, not deleted: the fixture can no longer reproduce
-// the defect here, and it says so itself — measured `bare = 0` with skirts off,
-// where it must be positive for the assertion below to mean anything.
-//
-// The reason is the backstop's role. Separating it — ground a tile does not own
-// is drawn as backdrop, depth neither written nor tested, so it covers without
-// ever winning a pixel — is what leaves the crack visible for this fixture to
-// count. Here the shell goes through `render` like ordinary geometry, fills the
-// crack itself, and both counts read zero: the property holds, and the test
-// proves nothing about why.
-//
-// Revived by whatever brings `Drawn { exact, fallback }` and `render_fallback`
-// to this branch; until then a green run here would be the false comfort the
-// `bare > 0` guard exists to refuse.
-#[ignore = "needs the backdrop/fallback split to reproduce the defect it guards"]
 fn a_lod_boundary_leaves_no_fragment_without_imagery() {
     let Some(gpu) = gpu() else { return };
 
@@ -485,15 +481,18 @@ fn holes_at_a_lod_boundary(gpu: &GpuContext, skirts: bool) -> u64 {
 
     let mut stream = Scripted(VecDeque::from([
         ServerMessage::Select {
-            tiles: vec![(coarse, 0.0), (fine, 0.0)],
+            tiles: selected(&[coarse, fine]),
+            ancestry: tree_shape(&[coarse, fine]),
             stats: TraversalStats::default(),
         },
         ServerMessage::Content {
             tile: coarse,
+            ancestry: ancestry(coarse),
             content: TileContent::Decoded(content_for(coarse, 2, skirts)),
         },
         ServerMessage::Content {
             tile: fine,
+            ancestry: ancestry(fine),
             content: TileContent::Decoded(content_for(fine, 8, skirts)),
         },
     ]));
@@ -561,15 +560,18 @@ fn uncovered_fragments_along_a_shared_edge(gpu: &GpuContext) -> u64 {
 
     let mut stream = Scripted(VecDeque::from([
         ServerMessage::Select {
-            tiles: vec![(west, 0.0), (east, 0.0)],
+            tiles: selected(&[west, east]),
+            ancestry: tree_shape(&[west, east]),
             stats: TraversalStats::default(),
         },
         ServerMessage::Content {
             tile: west,
+            ancestry: ancestry(west),
             content: TileContent::Decoded(content(west)),
         },
         ServerMessage::Content {
             tile: east,
+            ancestry: ancestry(east),
             content: TileContent::Decoded(content(east)),
         },
     ]));
@@ -629,4 +631,38 @@ fn a_lod_boundary_shows_no_seam() {
         "{skirted} pixels of void through the ground at the boundary between \
          two levels ({bare} without skirts) — the wall did not cover the crack"
     );
+}
+
+/// The selection, as the server sends it.
+fn selected(tiles: &[TileId]) -> Vec<(TileId, f64)> {
+    tiles.iter().map(|t| (*t, 0.0)).collect()
+}
+
+/// The shape of the tree around a selection: every tile named, **and every
+/// ancestor of one**, up to the root.
+///
+/// The closure, not one link per tile — a walk climbs *through* tiles it holds
+/// nothing for, so a chain that stops after one step reports the ground as lost.
+/// See `tuile_core::protocol::ServerMessage::Select`.
+fn tree_shape(tiles: &[TileId]) -> Vec<(TileId, tuile_core::protocol::Ancestry)> {
+    let mut out = Vec::new();
+    for tile in tiles {
+        let mut cur = Some(*tile);
+        while let Some(id) = cur {
+            let (z, x, y) = id.terrain_coord();
+            let parent = (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2));
+            out.push((id, tuile_core::protocol::Ancestry { level: z, parent }));
+            cur = parent;
+        }
+    }
+    out
+}
+
+/// The terrain ancestry of a tile, as the server states it on the wire.
+fn ancestry(tile: TileId) -> tuile_core::protocol::Ancestry {
+    let (z, x, y) = tile.terrain_coord();
+    tuile_core::protocol::Ancestry {
+        level: z,
+        parent: (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2)),
+    }
 }
