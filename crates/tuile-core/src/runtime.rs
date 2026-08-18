@@ -328,6 +328,10 @@ impl Session<'_> {
             // stand-in is needed. It used to be dropped here.
             ClientMessage::Ack { tile } => {
                 self.acked.insert(tile);
+                // The ack is the proof the stand-in is gone: real geometry is
+                // filed under the same id, so uploading it replaced the fill
+                // on the consumer's side. Nothing left to take back.
+                self.filled.remove(&tile);
                 false
             }
             ClientMessage::Cancel { tile } => {
@@ -383,31 +387,38 @@ impl Session<'_> {
             .map_err(|_| Gone)?;
         }
 
-        // Ground the camera has left. Without this the consumer keeps a surface
-        // for every tile ever briefly selected — a leak the server cannot see,
-        // because it never charged itself for any of them.
-        // Never a tile the consumer has acknowledged. An ack means it holds the
-        // real geometry, filed under this same id — so taking "the stand-in"
-        // back takes that instead. It then holds nothing while this side still
-        // counts the tile resident *and* acked, so the next look at that ground
-        // gets neither `Content` nor `Fill`, and an ancestor is drawn there for
-        // the rest of the session.
+        // Ground the camera has left: take those stand-ins back, so the
+        // consumer does not keep a surface for every tile ever briefly
+        // selected — a leak the server cannot see, because it never charged
+        // itself for any of them.
         //
-        // Clearing `filled` when the content is sent is not enough on its own,
-        // and that was tried: the ack arrives a poll later, so the traversal in
-        // between sees a selected tile that is neither filled nor acked and
-        // sends a second stand-in, putting it straight back.
+        // **As a `Retire`, never as an `Evict`.** `Content` is sent once per
+        // residency, so an `Evict` reaching a consumer whose real copy is
+        // still in its upload queue destroys the only delivery there will
+        // ever be — the ground then wears its stand-in for as long as the
+        // cache holds the tile. Two guards were tried before this message
+        // existed and both leaked: clearing `filled` when the content is sent
+        // races the traversal in between, and sparing acked tiles turns
+        // `filled` into a set nothing ever prunes (measured at 3912 and
+        // climbing). `Retire` removes the race by construction: the consumer
+        // drops only what it holds as a stand-in, so sending it on stale
+        // knowledge costs nothing.
         let stale: Vec<TileId> = self
             .filled
             .iter()
             .copied()
-            .filter(|t| !self.selected.contains(t) && !self.acked.contains(t))
+            .filter(|t| !self.selected.contains(t))
             .collect();
         for tile in &stale {
             self.filled.remove(tile);
         }
         if !stale.is_empty() {
-            tx.unbounded_send(ServerMessage::Evict { tiles: stale })
+            tracing::debug!(
+                taken = stale.len(),
+                held = self.filled.len(),
+                "stand-ins retired"
+            );
+            tx.unbounded_send(ServerMessage::Retire { tiles: stale })
                 .map_err(|_| Gone)?;
         }
         if just_sent > 0 {
@@ -543,6 +554,13 @@ impl Session<'_> {
         let reclaimed = self.cache.trim(self.selected);
         for tile in &reclaimed {
             self.residency.remove(*tile);
+            // Same hygiene as the insert-path eviction: the `Evict` below takes
+            // the consumer's copy and its stand-in alike, so both records stop
+            // being true here. `acked` left behind is the worse of the two — it
+            // suppresses the stand-in the next time this ground is looked at,
+            // and grows for the life of the session.
+            self.acked.remove(tile);
+            self.filled.remove(tile);
         }
         // Counted here as well as on insert. This is now the path that reclaims
         // most of what a session gives back — expiry fires while there is still
@@ -834,23 +852,17 @@ impl Session<'_> {
                     self.residency.remove(*e);
                     // The consumer is about to drop it too, so its ack stops
                     // being true. Left behind, it would suppress the stand-in
-                    // the next time this ground is looked at.
+                    // the next time this ground is looked at. The same goes for
+                    // `filled`: an `Evict` takes the stand-in with everything
+                    // else, so tracking it past this point is fiction.
                     self.acked.remove(e);
+                    self.filled.remove(e);
                 }
                 if !evicted.is_empty() {
                     tx.unbounded_send(ServerMessage::Evict { tiles: evicted })
                         .map_err(|_| Gone)?;
                 }
                 self.residency.insert(tile);
-                // The stand-in has just been superseded. Both are filed under
-                // this id by the consumer, so the real content *is* the
-                // replacement — but `filled` is what decides who gets taken back
-                // when the camera leaves this ground, and a tile left in it
-                // makes that take-back name real geometry. The consumer drops
-                // it, this side still holds it resident and acked, and so sends
-                // neither `Content` nor `Fill` when the ground is looked at
-                // again: it is drawn by an ancestor for the rest of the session.
-                self.filled.remove(&tile);
                 self.resolve_primed(tile, true);
                 tx.unbounded_send(ServerMessage::Content {
                     tile,
@@ -1200,6 +1212,103 @@ mod tests {
              holds them resident and acked, and that ground is coarse for the \
              rest of the session",
             wrongly_taken.len()
+        );
+    }
+
+    /// **Taking back a stand-in must never cost the consumer real content.**
+    ///
+    /// `Content` is sent exactly once per residency: the server marks the tile
+    /// resident and never re-sends it. So anything that makes the consumer
+    /// discard that one delivery — including its copy still waiting in the
+    /// upload queue, which is the state `Evict` explicitly purges — loses the
+    /// tile for as long as the server's cache holds it. Measured in the viewer:
+    /// 1853 tiles taken back in one flight, 232 of them re-issued a stand-in
+    /// right after, coarse for the rest of the session with nothing loading.
+    ///
+    /// The consumer that matters here is the honest one: it uploads on a
+    /// budget, so its ack arrives *later* than the content. This test holds
+    /// that gap open by never acking, and asserts the server still never sends
+    /// an `Evict` for a tile whose content it has delivered — a take-back of
+    /// the stand-in must travel as [`ServerMessage::Retire`], which the
+    /// consumer applies only to surfaces it holds *as stand-ins*.
+    #[test]
+    fn a_stand_in_take_back_never_travels_as_evict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = write_deep_fixture(dir.path());
+        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
+        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
+
+        struct Standing(Arc<dyn TileLoader>);
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        impl TileLoader for Standing {
+            async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
+                self.0.load(id).await
+            }
+            fn fill(&self, _id: TileId) -> Option<crate::content::DecodedTileContent> {
+                Some(crate::content::DecodedTileContent {
+                    meshes: Vec::new(),
+                    textures: Vec::new(),
+                    imagery: Vec::new(),
+                    local_origin_ecef: glam::DVec3::ZERO,
+                    transform_local: glam::Mat4::IDENTITY,
+                })
+            }
+        }
+
+        let arena = Arc::new(RwLock::new(tileset));
+        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
+        let inner: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher)));
+        let (mut stream, server) = in_process_with(
+            tree,
+            Arc::new(Standing(inner)) as Arc<dyn TileLoader>,
+            Config {
+                pinned_level: None,
+                ..Config::default()
+            },
+        );
+        let mut server = Box::pin(server.run());
+
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut delivered: HashSet<TileId> = HashSet::new();
+        let mut evicted_after_delivery: Vec<TileId> = Vec::new();
+
+        // Look somewhere, then elsewhere — the move is what makes the first
+        // view's stand-ins leave the selection. **Never ack**: the upload queue
+        // of a real consumer is exactly this window, held open.
+        for view in [near_view(), far_view()] {
+            stream
+                .send(ClientMessage::ViewerState { views: vec![view] })
+                .expect("send");
+            for _ in 0..256 {
+                let _ = server.as_mut().poll(&mut cx);
+                while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
+                    match msg {
+                        ServerMessage::Content { tile, .. } => {
+                            delivered.insert(tile);
+                        }
+                        ServerMessage::Evict { tiles } => {
+                            for t in tiles {
+                                if delivered.contains(&t) {
+                                    evicted_after_delivery.push(t);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert!(
+            evicted_after_delivery.is_empty(),
+            "{} tiles were named by an Evict after their one Content delivery, \
+             with no cache pressure to justify it: the consumer purges them from \
+             its upload queue and the server never re-sends — that ground is a \
+             stand-in for the rest of the session. A stand-in take-back must be \
+             a Retire. Tiles: {evicted_after_delivery:?}",
+            evicted_after_delivery.len()
         );
     }
 
@@ -1687,6 +1796,7 @@ mod tests {
                         );
                         contents.push(tile);
                     }
+                    ServerMessage::Retire { .. } => {}
                     // Stand-ins are not content: this test counts what actually
                     // arrived, and folding them in would let it pass on
                     // approximations.
