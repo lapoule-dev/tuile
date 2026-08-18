@@ -12,7 +12,6 @@
 use super::{App, AMBIENT, ATMOSPHERE_STRENGTH, DIAGNOSTICS};
 use glam::DVec2;
 use std::fmt;
-use tuile_core::source::TileId;
 use tuile_wgpu::OverlayVertex;
 
 impl App {
@@ -220,14 +219,18 @@ impl App {
     /// status line.
     fn draw_and_present(&mut self) -> Option<(usize, tuile_wgpu::Resolution)> {
         let active = self.active.as_mut()?;
-        // For any selected terrain tile not yet uploaded, fall back to its
-        // nearest ready ancestor so refinement never flashes the background.
-        let parent_of = |id: TileId| {
-            let (z, x, y) = id.terrain_coord();
-            (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2))
-        };
-        let (drawn, resolution) = active.pump.resolve(&active.gpu.queue, parent_of);
-        let rendered = drawn.len();
+        // For any selected tile not yet uploaded, fall back to its nearest ready
+        // ancestor so refinement never flashes the background.
+        //
+        // This host used to supply the parent function itself, by taking the
+        // terrain encoding apart. That is right for a globe and silently wrong
+        // for anything else: a 3D Tiles handle is an arena index, `z` came back
+        // 0, the closure returned `None` at the first step and there was **no
+        // fallback chain at all** — every unready tile reported lost, which is
+        // the black square. The tree is the only thing that can answer, so the
+        // server sends it and the pump reads it. Nothing here to get wrong.
+        let (drawn, resolution) = active.pump.resolve(&active.gpu.queue);
+        let rendered = drawn.exact.len() + drawn.fallback.len();
         // `resolve` has already brought the selection onto the current render
         // origin. The coarse layer behind it is drawn without going through
         // `resolve`, so it asks for itself.
@@ -290,9 +293,11 @@ impl App {
                         .then_some(&active.shell)
                         .into_iter()
                         .chain(coarse.iter().copied()),
-                    // One list: a tile standing in for a missing descendant is
-                    // drawn as ordinary geometry here, like everything else.
-                    drawn.iter().copied(),
+                    drawn.exact.iter().copied(),
+                    // Last, testing depth and never writing it: an ancestor
+                    // borrowing ground it does not own must be occluded by the
+                    // planet in front of it. See `TileRenderer::render_fallback`.
+                    drawn.fallback.iter().copied(),
                     Some(&active.overlay),
                     wireframe,
                 );
@@ -382,10 +387,13 @@ impl App {
             );
             tracing::info!(
                 "alt {:.0} km | ground {:.0} m | {} tiles, {complete}, {sharpness} | \
+                 {} stand-ins, {} coplanar | \
                  {} loading | {:.0} MiB | near {:.0} m far {:.0} km{pacing}{view}",
                 cam.altitude() / 1000.0,
                 self.controller.height_above_ground(),
                 rendered,
+                resolution.stand_ins,
+                resolution.coplanar,
                 s.requested,
                 (active.pump.gpu_bytes as f32 + imagery_bytes as f32) / (1024.0 * 1024.0),
                 near,

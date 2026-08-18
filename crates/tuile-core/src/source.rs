@@ -133,6 +133,29 @@ pub trait TileTree: Send + Sync {
     fn parent(&self, _id: TileId) -> Option<TileId> {
         None
     }
+
+    /// How deep this tile sits, roots at 0.
+    ///
+    /// **Only the tree can answer this, and that is the whole point.** A
+    /// [`TileId`] is an opaque handle — the doc on the type says so — whose
+    /// payload the owning tree interprets: a packed `(level, x, y)` for terrain,
+    /// a flat arena index for a 3D Tiles tileset. Reading a level out of the
+    /// bits works for one of those and silently answers 0 for the other, which
+    /// is what made a pinned floor pin every tile in a tileset and the residency
+    /// grow without bound.
+    ///
+    /// The default walks [`TileTree::parent`], so any tree that answers parent
+    /// answers this. Override it wherever the level is cheaper than the walk —
+    /// terrain has it in the id, an arena node stores it.
+    fn level(&self, id: TileId) -> u32 {
+        let mut level = 0;
+        let mut cur = self.parent(id);
+        while let Some(p) = cur {
+            level += 1;
+            cur = self.parent(p);
+        }
+        level
+    }
 }
 
 /// Outcome of a [`TileLoader::load`].
@@ -267,6 +290,15 @@ impl TileTree for CompositeTileTree {
             .get(tag as usize)
             .and_then(|s| s.parent(id.payload()))
             .map(|p| p.with_tag(tag))
+    }
+
+    /// Forwarded rather than defaulted: the sub-source may know its level
+    /// without a walk, and the default here would walk through `with_tag`
+    /// round trips for nothing.
+    fn level(&self, id: TileId) -> u32 {
+        self.sources
+            .get(id.tag() as usize)
+            .map_or(0, |s| s.level(id.payload()))
     }
 }
 

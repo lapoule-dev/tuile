@@ -40,7 +40,7 @@ impl SceneState {
     /// Folds one server message into the scene view.
     pub fn apply(&mut self, msg: &ServerMessage) {
         match msg {
-            ServerMessage::Select { tiles, stats } => {
+            ServerMessage::Select { tiles, stats, .. } => {
                 self.selected = tiles.clone();
                 self.stats = *stats;
                 self.pending = stats.requested;
@@ -58,6 +58,9 @@ impl SceneState {
                     self.resident.remove(t);
                 }
             }
+            // Stand-ins were never counted into residency (see `Fill` above),
+            // so taking them back changes nothing here either.
+            ServerMessage::Retire { .. } => {}
             ServerMessage::Error { tile, .. } => {
                 if let Some(t) = tile {
                     self.resident.remove(t);
@@ -145,12 +148,14 @@ pub async fn drive_until_complete<S: GeometryStream + Unpin>(
     while let Some(msg) = stream.next_message().await {
         state.apply(&msg);
         match msg {
-            ServerMessage::Content { tile, content } => {
+            ServerMessage::Content { tile, content, .. } => {
                 contents.insert(tile, content);
             }
             // This driver collects finished content for inspection; a stand-in
             // is by definition unfinished and would only dilute the answer.
             ServerMessage::Fill { .. } => {}
+            // And since no stand-in was kept, there is none to take back.
+            ServerMessage::Retire { .. } => {}
             ServerMessage::Evict { tiles } => {
                 for t in tiles {
                     contents.remove(&t);

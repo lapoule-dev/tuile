@@ -270,6 +270,13 @@ impl TileTree for Tileset {
     fn parent(&self, id: TileId) -> Option<TileId> {
         self.tile(id).parent
     }
+
+    /// Read straight off the node — [`Tile::depth`], set when the tree is built
+    /// and when an external tileset is grafted. The default walk would be
+    /// correct and would climb the whole chain for a number already in hand.
+    fn level(&self, id: TileId) -> u32 {
+        self.tile(id).depth
+    }
 }
 
 impl Tileset {

@@ -106,15 +106,48 @@ impl<T: TerrainSource> CachedTerrain<T> {
 impl<T: TerrainSource> TerrainSource for CachedTerrain<T> {
     async fn fetch_tile(&self, coord: TileCoord) -> Result<Fetched<Vec<u8>>, TerrainSourceError> {
         let key = self.key(coord);
+        let m = tuile_core::metrics::metrics();
         if let Some(bytes) = self.store.get(&key).await {
+            m.store_hits.inc();
+            // An absence remembered is still a hit: it answered without the
+            // network, which is why it was stored.
+            if tuile_core::storage::is_absent(&bytes) {
+                return Err(TerrainSourceError::no_such_tile(format!(
+                    "{}/{}/{} is not served",
+                    coord.level, coord.x, coord.y
+                )));
+            }
+            m.store_bytes_served.add(bytes.len() as u64);
             // The store already applied the lifetime this was written with.
             return Ok(Fetched::undated(bytes.to_vec()));
         }
-        let fetched = self.inner.fetch_tile(coord).await?;
-        self.store
-            .put(&key, Bytes::from(fetched.value.clone()), fetched.ttl)
-            .await;
-        Ok(fetched)
+        m.store_misses.inc();
+        match self.inner.fetch_tile(coord).await {
+            Ok(fetched) => {
+                m.store_bytes_fetched.add(fetched.value.len() as u64);
+                self.store
+                    .put(&key, Bytes::from(fetched.value.clone()), fetched.ttl)
+                    .await;
+                Ok(fetched)
+            }
+            // The source says there is nothing here. Remembered, or every run
+            // asks again — and over a coarse pyramid spanning oceans and poles
+            // that is most of what a warm-up does: measured, 1630 of 4094 tiles
+            // were missing on the first pass and *the same 1630* on the second.
+            Err(e) if e.is_absence() => {
+                m.terrain_absent.inc();
+                tracing::debug!(z = coord.level, x = coord.x, y = coord.y, "terrain absent");
+                self.store
+                    .put(
+                        &key,
+                        tuile_core::storage::ABSENT,
+                        Some(tuile_core::storage::ABSENCE_TTL),
+                    )
+                    .await;
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

@@ -52,6 +52,10 @@ impl TileTree for TilesetTree {
     fn parent(&self, id: TileId) -> Option<TileId> {
         self.arena.read().expect("tileset lock").parent(id)
     }
+
+    fn level(&self, id: TileId) -> u32 {
+        self.arena.read().expect("tileset lock").level(id)
+    }
 }
 
 /// Fetches + decodes 3D Tiles content for the shared arena. Binary content

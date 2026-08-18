@@ -40,6 +40,19 @@ const LOW_WATER: f64 = 0.8;
 #[derive(Debug, Clone)]
 struct Entry {
     size: usize,
+    /// The tile's level **as the tree gave it**, never decoded from the id.
+    ///
+    /// A [`TileId`] is an opaque handle whose payload only the owning
+    /// [`TileTree`] can read — for a 3D Tiles arena it is an *index*, not a
+    /// quadtree coordinate. This cache used to call `terrain_coord()` on it,
+    /// which shifts right by 54 and so answered level 0 for every arena index
+    /// below 2^54. With a pinned floor set, `is_pinned` was then true for
+    /// every tile in the tileset: the sweep never found a victim, the residency
+    /// grew for the life of the session, and `trim_except` re-sorted the whole
+    /// map on every insert to evict nothing.
+    ///
+    /// See [`crate::source::TileTree::level`].
+    level: u32,
     last_used: u64,
     /// The pass that last touched this tile. Compared against
     /// [`ResidentCache::pass`] to answer "was this used *now*", which is a
@@ -188,10 +201,10 @@ impl ResidentCache {
     }
 
     /// Whether this tile sits at or above the pinned level, and so may never be
-    /// reclaimed.
-    fn is_pinned(&self, t: TileId) -> bool {
-        self.pinned_level
-            .is_some_and(|floor| t.terrain_coord().0 <= floor)
+    /// reclaimed. Reads the level the tree supplied at insertion — see
+    /// [`Entry::level`].
+    fn is_pinned(&self, level: u32) -> bool {
+        self.pinned_level.is_some_and(|floor| level <= floor)
     }
 
     /// Opens a new pass. Everything touched from here until the next call is
@@ -225,6 +238,7 @@ impl ResidentCache {
     pub fn insert(
         &mut self,
         t: TileId,
+        level: u32,
         size: usize,
         imagery: &[(ImageryCoord, usize)],
         protected: &HashSet<TileId>,
@@ -235,6 +249,7 @@ impl ResidentCache {
             t,
             Entry {
                 size,
+                level,
                 last_used: self.tick,
                 // What has just arrived was, by definition, asked for by the
                 // pass that is running: it may not be swept out from under it.
@@ -320,9 +335,9 @@ impl ResidentCache {
                 !protected.contains(id)
                     && Some(**id) != keep
                     && e.touched_pass != pass
-                    && !self.is_pinned(**id)
+                    && !self.is_pinned(e.level)
             })
-            .map(|(id, e)| (*id, id.terrain_coord().0, e.last_used))
+            .map(|(id, e)| (*id, e.level, e.last_used))
             .collect();
         // **Deepest first, then least recently used.**
         //
@@ -373,6 +388,22 @@ impl ResidentCache {
 
 #[cfg(test)]
 mod tests {
+    /// Inserts with the level read out of the handle.
+    ///
+    /// Legitimate **here and nowhere else**: every fixture in this module builds
+    /// its ids with [`TileId::from_terrain`], so the level really is packed in
+    /// them. Production takes it from [`crate::source::TileTree::level`],
+    /// because a handle from any other tree does not carry one.
+    fn insert(
+        c: &mut ResidentCache,
+        t: TileId,
+        size: usize,
+        imagery: &[(ImageryCoord, usize)],
+        protected: &HashSet<TileId>,
+    ) -> Vec<TileId> {
+        c.insert(t, t.terrain_coord().0, size, imagery, protected)
+    }
+
     use super::*;
 
     fn t(n: u64) -> TileId {
@@ -400,16 +431,16 @@ mod tests {
         // 100 bytes: high water 90, low water 80.
         let mut c = ResidentCache::new(100);
         let none = HashSet::new();
-        assert!(c.insert(t(1), 60, NO_IMAGERY, &none).is_empty());
+        assert!(insert(&mut c, t(1), 60, NO_IMAGERY, &none).is_empty());
         assert!(
-            c.insert(t(2), 25, NO_IMAGERY, &none).is_empty(),
+            insert(&mut c, t(2), 25, NO_IMAGERY, &none).is_empty(),
             "85 bytes is under the high-water mark: still nothing to do"
         );
         // A later pass: what arrived above is now history, not in use.
         c.start_pass();
 
         // 95 bytes — under the 100-byte ceiling, over the 90-byte mark.
-        let evicted = c.insert(t(3), 10, NO_IMAGERY, &none);
+        let evicted = insert(&mut c, t(3), 10, NO_IMAGERY, &none);
         assert_eq!(evicted, vec![t(1)], "the sweep fired without being full");
         assert!(
             c.used_bytes() <= 80,
@@ -422,11 +453,11 @@ mod tests {
     fn touch_changes_eviction_order() {
         let mut c = ResidentCache::new(100);
         let none = HashSet::new();
-        c.insert(t(1), 50, NO_IMAGERY, &none);
-        c.insert(t(2), 50, NO_IMAGERY, &none);
+        insert(&mut c, t(1), 50, NO_IMAGERY, &none);
+        insert(&mut c, t(2), 50, NO_IMAGERY, &none);
         c.start_pass();
         c.touch(t(1)); // t2 becomes the LRU
-        let evicted = c.insert(t(3), 50, NO_IMAGERY, &none);
+        let evicted = insert(&mut c, t(3), 50, NO_IMAGERY, &none);
         // Order, not count: a sweep clears down to the low-water mark, so how
         // many go depends on their sizes. What this pins is that the touched
         // tile is not the one taken first.
@@ -442,7 +473,7 @@ mod tests {
         let mut c = ResidentCache::new(1000);
         let none = HashSet::new();
         for i in 1..=9 {
-            c.insert(t(i), 100, NO_IMAGERY, &none);
+            insert(&mut c, t(i), 100, NO_IMAGERY, &none);
         }
         assert_eq!(
             c.used_bytes(),
@@ -452,7 +483,7 @@ mod tests {
         // A later pass: what arrived above is history, not in use.
         c.start_pass();
 
-        c.insert(t(10), 100, NO_IMAGERY, &none);
+        insert(&mut c, t(10), 100, NO_IMAGERY, &none);
         assert_eq!(
             c.used_bytes(),
             800,
@@ -461,7 +492,7 @@ mod tests {
 
         // Having cleared it, the next insert costs nothing. That is the whole
         // point of the two marks being different numbers.
-        let quiet = c.insert(t(11), 100, NO_IMAGERY, &none);
+        let quiet = insert(&mut c, t(11), 100, NO_IMAGERY, &none);
         assert!(
             quiet.is_empty(),
             "insert right after a sweep should not evict, took {quiet:?}"
@@ -493,17 +524,23 @@ mod tests {
         let deep = TileId::from_terrain(18, 7, 7);
         let shared = &[(img(1), 40)][..];
 
-        c.insert(coarse, 40, shared, &none);
+        insert(&mut c, coarse, 40, shared, &none);
         c.start_pass();
         // Enough deep tiles to force sweep after sweep.
         for n in 0..8 {
-            c.insert(TileId::from_terrain(18, n, 0), 40, NO_IMAGERY, &none);
+            insert(
+                &mut c,
+                TileId::from_terrain(18, n, 0),
+                40,
+                NO_IMAGERY,
+                &none,
+            );
             c.start_pass();
         }
         assert!(c.contains(coarse), "the pinned tile was reclaimed");
 
         // And its imagery outlives the last deep tile that referenced it.
-        c.insert(deep, 40, shared, &none);
+        insert(&mut c, deep, 40, shared, &none);
         c.start_pass();
         c.remove(deep);
         c.remove(coarse);
@@ -514,12 +551,56 @@ mod tests {
         );
     }
 
+    /// **A pinned floor pins a floor, not the whole tileset.**
+    ///
+    /// A [`TileId`] is opaque, and only the tree that made it can say how deep
+    /// it sits. This cache used to ask the *handle* — `terrain_coord()`, which
+    /// shifts right by 54 — and a 3D Tiles arena index is a small integer, so
+    /// every tile in a tileset answered level 0. With the default
+    /// `pinned_level: Some(5)` that made `is_pinned` true for all of them: the
+    /// sweep never found a victim, and the residency grew for the whole
+    /// session while `trim_except` re-sorted the entire map on every insert to
+    /// evict nothing.
+    ///
+    /// Arena-style ids here on purpose — small consecutive integers, exactly
+    /// what [`crate::tileset::Tileset`] hands out.
+    #[test]
+    fn an_arena_index_is_not_a_level() {
+        let mut c = ResidentCache::pinning(100, 1, Some(5));
+        let none = HashSet::new();
+        // Deep tiles of a tileset: the tree calls them level 9, their handles
+        // are the indices 1..9.
+        for n in 1..9u64 {
+            c.insert(TileId(n), 9, 40, NO_IMAGERY, &none);
+            c.start_pass();
+        }
+        assert!(
+            c.len() < 8,
+            "nothing was reclaimed: {} tiles resident under a limit of 1, \
+             because every arena index read as level 0 and so as pinned",
+            c.len()
+        );
+
+        // And the floor still holds when the tree really does say it is coarse.
+        let mut c = ResidentCache::pinning(100, 1, Some(5));
+        c.insert(TileId(100), 4, 40, NO_IMAGERY, &none);
+        c.start_pass();
+        for n in 1..9u64 {
+            c.insert(TileId(n), 9, 40, NO_IMAGERY, &none);
+            c.start_pass();
+        }
+        assert!(
+            c.contains(TileId(100)),
+            "the tile the tree put at level 4 was reclaimed under a floor of 5"
+        );
+    }
+
     #[test]
     fn a_tile_touched_this_pass_survives_a_full_cache() {
         let mut c = ResidentCache::new(1000);
         let none = HashSet::new();
         for i in 1..=9 {
-            c.insert(t(i), 100, NO_IMAGERY, &none);
+            insert(&mut c, t(i), 100, NO_IMAGERY, &none);
         }
 
         // Every one of them is in use *now*. Note they are touched in order, so
@@ -531,7 +612,7 @@ mod tests {
             c.touch(t(i));
         }
 
-        let evicted = c.insert(t(10), 100, NO_IMAGERY, &none);
+        let evicted = insert(&mut c, t(10), 100, NO_IMAGERY, &none);
         assert!(
             evicted.is_empty(),
             "the sweep took ground the pass is using: {evicted:?}"
@@ -552,18 +633,18 @@ mod tests {
         // forces exactly one eviction.
         let mut c = ResidentCache::new(300);
         let none = HashSet::new();
-        c.insert(t(1), 100, NO_IMAGERY, &none);
-        c.insert(t(2), 100, NO_IMAGERY, &none);
+        insert(&mut c, t(1), 100, NO_IMAGERY, &none);
+        insert(&mut c, t(2), 100, NO_IMAGERY, &none);
 
         c.start_pass();
         c.touch(t(1)); // in use *now*, and incidentally the most recent
-        let evicted = c.insert(t(3), 100, NO_IMAGERY, &none);
+        let evicted = insert(&mut c, t(3), 100, NO_IMAGERY, &none);
         assert_eq!(evicted, vec![t(2)], "the tile in use was spared");
 
         // Next pass: t1 was not touched, so it is an ordinary candidate again —
         // and being the oldest of what is left, it goes first.
         c.start_pass();
-        let evicted = c.insert(t(4), 100, NO_IMAGERY, &none);
+        let evicted = insert(&mut c, t(4), 100, NO_IMAGERY, &none);
         assert_eq!(
             evicted,
             vec![t(1)],
@@ -577,12 +658,12 @@ mod tests {
         let mut c = ResidentCache::new(1000);
         let none = HashSet::new();
         for i in 1..=9 {
-            c.insert(t(i), 100, NO_IMAGERY, &none);
+            insert(&mut c, t(i), 100, NO_IMAGERY, &none);
         }
         c.start_pass();
         c.touch(t(1)); // now the most recently used, though the first inserted
 
-        let evicted = c.insert(t(10), 100, NO_IMAGERY, &none);
+        let evicted = insert(&mut c, t(10), 100, NO_IMAGERY, &none);
         assert_eq!(
             evicted,
             vec![t(2), t(3)],
@@ -600,12 +681,12 @@ mod tests {
         let mut c = ResidentCache::with_limits(1_000_000, 10);
         let none = HashSet::new();
         for i in 1..=9 {
-            c.insert(t(i), 1, NO_IMAGERY, &none);
+            insert(&mut c, t(i), 1, NO_IMAGERY, &none);
         }
         assert_eq!(c.len(), 9, "at the mark, nothing swept");
         c.start_pass();
 
-        let evicted = c.insert(t(10), 1, NO_IMAGERY, &none);
+        let evicted = insert(&mut c, t(10), 1, NO_IMAGERY, &none);
         assert_eq!(evicted.len(), 2, "swept to the low-water count");
         assert_eq!(c.len(), 8);
         assert!(
@@ -619,9 +700,9 @@ mod tests {
     fn selected_tiles_are_never_evicted() {
         let mut c = ResidentCache::new(100);
         let protected: HashSet<TileId> = [t(1), t(2)].into();
-        c.insert(t(1), 60, NO_IMAGERY, &protected);
-        c.insert(t(2), 60, NO_IMAGERY, &protected); // over budget, but both protected
-        let evicted = c.insert(t(3), 60, NO_IMAGERY, &protected);
+        insert(&mut c, t(1), 60, NO_IMAGERY, &protected);
+        insert(&mut c, t(2), 60, NO_IMAGERY, &protected); // over budget, but both protected
+        let evicted = insert(&mut c, t(3), 60, NO_IMAGERY, &protected);
         assert_eq!(evicted, vec![]);
         assert!(c.contains(t(1)) && c.contains(t(2)) && c.contains(t(3)));
         assert!(c.used_bytes() > 100, "over budget rather than holes");
@@ -635,9 +716,9 @@ mod tests {
         let mut c = ResidentCache::new(10_000);
         let none = HashSet::new();
         let shared = &[(img(1), 1000)][..];
-        c.insert(t(1), 10, shared, &none);
-        c.insert(t(2), 10, shared, &none);
-        c.insert(t(3), 10, shared, &none);
+        insert(&mut c, t(1), 10, shared, &none);
+        insert(&mut c, t(2), 10, shared, &none);
+        insert(&mut c, t(3), 10, shared, &none);
         assert_eq!(
             c.used_bytes(),
             30 + 1000,
@@ -654,8 +735,8 @@ mod tests {
         let mut c = ResidentCache::new(10_000);
         let none = HashSet::new();
         let shared = &[(img(1), 1000)][..];
-        c.insert(t(1), 10, shared, &none);
-        c.insert(t(2), 10, shared, &none);
+        insert(&mut c, t(1), 10, shared, &none);
+        insert(&mut c, t(2), 10, shared, &none);
 
         c.remove(t(1));
         assert_eq!(
@@ -676,7 +757,7 @@ mod tests {
         let mut c = ResidentCache::new(10_000);
         let none = HashSet::new();
         let repeated = &[(img(1), 500), (img(1), 500), (img(1), 500), (img(1), 500)][..];
-        c.insert(t(1), 10, repeated, &none);
+        insert(&mut c, t(1), 10, repeated, &none);
         assert_eq!(
             c.imagery_bytes(),
             (1, 500),
@@ -696,7 +777,7 @@ mod tests {
         // Tiny geometry, heavy and *unshared* imagery: nothing about the
         // geometry total says this cache is full.
         for i in 1..=5u64 {
-            c.insert(t(i), 10, &[(img(i), 200)], &none);
+            insert(&mut c, t(i), 10, &[(img(i), 200)], &none);
             c.start_pass();
         }
         assert!(
@@ -717,8 +798,8 @@ mod tests {
         let mut c = ResidentCache::new(10_000);
         let none = HashSet::new();
         let same = &[(img(1), 1000)][..];
-        c.insert(t(1), 10, same, &none);
-        c.insert(t(1), 20, same, &none);
+        insert(&mut c, t(1), 10, same, &none);
+        insert(&mut c, t(1), 20, same, &none);
         assert_eq!(c.imagery_bytes(), (1, 1000));
         assert_eq!(c.used_bytes(), 20 + 1000);
     }
@@ -727,8 +808,8 @@ mod tests {
     fn reinsert_replaces_size() {
         let mut c = ResidentCache::new(100);
         let none = HashSet::new();
-        c.insert(t(1), 80, NO_IMAGERY, &none);
-        c.insert(t(1), 20, NO_IMAGERY, &none);
+        insert(&mut c, t(1), 80, NO_IMAGERY, &none);
+        insert(&mut c, t(1), 20, NO_IMAGERY, &none);
         assert_eq!(c.used_bytes(), 20);
     }
 }
