@@ -91,11 +91,6 @@ fn surface() -> DecodedTileContent {
     }
 }
 
-fn parent_of(id: TileId) -> Option<TileId> {
-    let (z, x, y) = id.terrain_coord();
-    (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2))
-}
-
 fn here() -> TileId {
     TileId::from_terrain(3, 4, 4)
 }
@@ -120,7 +115,7 @@ fn resolve(
     let mut stream = Scripted(VecDeque::from(script));
     let mut pump = ContentPump::new(DVec3::ZERO);
     pump.pump(&mut stream, gpu, 16);
-    let (drawn, counts, unresolved) = pump.resolve_reporting(&gpu.queue, parent_of);
+    let (drawn, counts, unresolved) = pump.resolve_reporting(&gpu.queue);
     (drawn.exact.len() + drawn.fallback.len(), counts, unresolved)
 }
 
@@ -129,15 +124,18 @@ fn resolve(
 fn missing_neighbour() -> Vec<ServerMessage> {
     vec![
         ServerMessage::Select {
-            tiles: vec![(here(), 0.0), (neighbour(), 0.0)],
+            tiles: selected(&[here(), neighbour()]),
+            ancestry: tree_shape(&[here(), neighbour()]),
             stats: TraversalStats::default(),
         },
         ServerMessage::Content {
             tile: here(),
+            ancestry: ancestry(here()),
             content: TileContent::Decoded(surface()),
         },
         ServerMessage::Content {
             tile: grandparent(),
+            ancestry: ancestry(grandparent()),
             content: TileContent::Decoded(surface()),
         },
     ]
@@ -186,6 +184,7 @@ fn a_fill_for_the_missing_tile_keeps_the_ancestor_off_the_screen() {
     let mut script = missing_neighbour();
     script.push(ServerMessage::Fill {
         tile: neighbour(),
+        ancestry: ancestry(neighbour()),
         content: surface(),
     });
     let (drawn, counts, unresolved) = resolve(&gpu, script);
@@ -220,11 +219,13 @@ fn the_real_tile_replaces_its_stand_in_without_a_gap() {
 
     let mut stream = Scripted(VecDeque::from(vec![
         ServerMessage::Select {
-            tiles: vec![(neighbour(), 0.0)],
+            tiles: selected(&[neighbour()]),
+            ancestry: tree_shape(&[neighbour()]),
             stats: TraversalStats::default(),
         },
         ServerMessage::Fill {
             tile: neighbour(),
+            ancestry: ancestry(neighbour()),
             content: surface(),
         },
     ]));
@@ -237,6 +238,7 @@ fn the_real_tile_replaces_its_stand_in_without_a_gap() {
 
     let mut arrival = Scripted(VecDeque::from(vec![ServerMessage::Content {
         tile: neighbour(),
+        ancestry: ancestry(neighbour()),
         content: TileContent::Decoded(surface()),
     }]));
     pump.pump(&mut arrival, &gpu, 16);
@@ -245,4 +247,38 @@ fn the_real_tile_replaces_its_stand_in_without_a_gap() {
         "the ground lost its surface when the real tile arrived — a replacement \
          may overlap for a frame, it may never gap for one"
     );
+}
+
+/// The selection, as the server sends it.
+fn selected(tiles: &[TileId]) -> Vec<(TileId, f64)> {
+    tiles.iter().map(|t| (*t, 0.0)).collect()
+}
+
+/// The shape of the tree around a selection: every tile named, **and every
+/// ancestor of one**, up to the root.
+///
+/// The closure, not one link per tile — a walk climbs *through* tiles it holds
+/// nothing for, so a chain that stops after one step reports the ground as lost.
+/// See `tuile_core::protocol::ServerMessage::Select`.
+fn tree_shape(tiles: &[TileId]) -> Vec<(TileId, tuile_core::protocol::Ancestry)> {
+    let mut out = Vec::new();
+    for tile in tiles {
+        let mut cur = Some(*tile);
+        while let Some(id) = cur {
+            let (z, x, y) = id.terrain_coord();
+            let parent = (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2));
+            out.push((id, tuile_core::protocol::Ancestry { level: z, parent }));
+            cur = parent;
+        }
+    }
+    out
+}
+
+/// The terrain ancestry of a tile, as the server states it on the wire.
+fn ancestry(tile: TileId) -> tuile_core::protocol::Ancestry {
+    let (z, x, y) = tile.terrain_coord();
+    tuile_core::protocol::Ancestry {
+        level: z,
+        parent: (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2)),
+    }
 }

@@ -177,10 +177,7 @@ fn black_fraction_in_the_middle(gpu: &GpuContext, pump: &mut ContentPump, eye: D
         },
     );
 
-    let (drawn, _) = pump.resolve(&gpu.queue, |id| {
-        let (z, x, y) = id.terrain_coord();
-        (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2))
-    });
+    let (drawn, _) = pump.resolve(&gpu.queue);
 
     let mut encoder = gpu
         .device
@@ -296,17 +293,20 @@ fn ground_under_the_camera_is_never_black() {
 
     let mut stream = Scripted(VecDeque::from([
         ServerMessage::Select {
-            tiles: vec![(here, 0.0), (neighbour, 0.0)],
+            tiles: selected(&[here, neighbour]),
+            ancestry: tree_shape(&[here, neighbour]),
             stats: TraversalStats::default(),
         },
         ServerMessage::Content {
             tile: here,
+            ancestry: ancestry(here),
             content: TileContent::Decoded(content_for(here)),
         },
         // The grandparent is resident; the neighbour has not arrived and is the
         // ground that must not go black.
         ServerMessage::Content {
             tile: grandparent,
+            ancestry: ancestry(grandparent),
             content: TileContent::Decoded(content_for(grandparent)),
         },
     ]));
@@ -324,4 +324,38 @@ fn ground_under_the_camera_is_never_black() {
          looking at was not drawn at all",
         black * 100.0
     );
+}
+
+/// The selection, as the server sends it.
+fn selected(tiles: &[TileId]) -> Vec<(TileId, f64)> {
+    tiles.iter().map(|t| (*t, 0.0)).collect()
+}
+
+/// The shape of the tree around a selection: every tile named, **and every
+/// ancestor of one**, up to the root.
+///
+/// The closure, not one link per tile — a walk climbs *through* tiles it holds
+/// nothing for, so a chain that stops after one step reports the ground as lost.
+/// See `tuile_core::protocol::ServerMessage::Select`.
+fn tree_shape(tiles: &[TileId]) -> Vec<(TileId, tuile_core::protocol::Ancestry)> {
+    let mut out = Vec::new();
+    for tile in tiles {
+        let mut cur = Some(*tile);
+        while let Some(id) = cur {
+            let (z, x, y) = id.terrain_coord();
+            let parent = (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2));
+            out.push((id, tuile_core::protocol::Ancestry { level: z, parent }));
+            cur = parent;
+        }
+    }
+    out
+}
+
+/// The terrain ancestry of a tile, as the server states it on the wire.
+fn ancestry(tile: TileId) -> tuile_core::protocol::Ancestry {
+    let (z, x, y) = tile.terrain_coord();
+    tuile_core::protocol::Ancestry {
+        level: z,
+        parent: (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2)),
+    }
 }

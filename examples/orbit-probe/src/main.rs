@@ -303,7 +303,7 @@ async fn settle<S: GeometryStream + Unpin>(
             ServerMessage::Select { tiles, .. } => {
                 selection = tiles.iter().map(|(t, _)| *t).collect();
             }
-            ServerMessage::Content { tile, content } => {
+            ServerMessage::Content { tile, content, .. } => {
                 ledger.on_content(tile, cost);
                 if let TileContent::Decoded(decoded) = content {
                     contents.insert(tile, decoded);

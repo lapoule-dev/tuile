@@ -40,7 +40,7 @@ impl SceneState {
     /// Folds one server message into the scene view.
     pub fn apply(&mut self, msg: &ServerMessage) {
         match msg {
-            ServerMessage::Select { tiles, stats } => {
+            ServerMessage::Select { tiles, stats, .. } => {
                 self.selected = tiles.clone();
                 self.stats = *stats;
                 self.pending = stats.requested;
@@ -145,7 +145,7 @@ pub async fn drive_until_complete<S: GeometryStream + Unpin>(
     while let Some(msg) = stream.next_message().await {
         state.apply(&msg);
         match msg {
-            ServerMessage::Content { tile, content } => {
+            ServerMessage::Content { tile, content, .. } => {
                 contents.insert(tile, content);
             }
             // This driver collects finished content for inspection; a stand-in
