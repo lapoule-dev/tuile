@@ -171,10 +171,7 @@ fn frame(
     // — the settle loop alone was doing tens of millions of them, and that, not
     // the engine, was the three minutes.
     pump.rebase(&gpu.queue, eye);
-    let (drawn, resolution) = pump.resolve(&gpu.queue, |id| {
-        let (z, x, y) = id.terrain_coord();
-        (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2))
-    });
+    let (drawn, resolution) = pump.resolve(&gpu.queue);
     Frame {
         lost: resolution.lost,
         drawn: drawn.exact.len() + drawn.fallback.len(),

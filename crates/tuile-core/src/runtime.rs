@@ -375,8 +375,12 @@ impl Session<'_> {
         }
         let just_sent = sent.len();
         for (tile, content) in sent {
-            tx.unbounded_send(ServerMessage::Fill { tile, content })
-                .map_err(|_| Gone)?;
+            tx.unbounded_send(ServerMessage::Fill {
+                tile,
+                ancestry: self.ancestry(tile),
+                content,
+            })
+            .map_err(|_| Gone)?;
         }
 
         // Ground the camera has left. Without this the consumer keeps a surface
@@ -402,6 +406,17 @@ impl Session<'_> {
             .tiles_filled
             .set(self.filled.len() as u64);
         Ok(())
+    }
+
+    /// What the tree knows about a tile, for the wire.
+    ///
+    /// One place, so no emission site is tempted to derive it from the handle —
+    /// which is the mistake this whole change exists to remove.
+    fn ancestry(&self, tile: TileId) -> crate::protocol::Ancestry {
+        crate::protocol::Ancestry {
+            level: self.tree.level(tile),
+            parent: self.tree.parent(tile),
+        }
     }
 
     fn retraverse(
@@ -540,6 +555,15 @@ impl Session<'_> {
         // line and removes the window entirely.
         tx.unbounded_send(ServerMessage::Select {
             tiles: self.out.selected.clone(),
+            // `self.selected` is the protected closure — the frontier, the chain
+            // from each of its tiles up to the root, what is requested and what
+            // a held REPLACE waits on. That is exactly the set a consumer's walk
+            // can pass through, so it is exactly the set whose shape it needs.
+            ancestry: self
+                .selected
+                .iter()
+                .map(|tile| (*tile, self.ancestry(*tile)))
+                .collect(),
             stats: self.out.stats,
         })
         .map_err(|_| Gone)?;
@@ -810,6 +834,7 @@ impl Session<'_> {
                 self.resolve_primed(tile, true);
                 tx.unbounded_send(ServerMessage::Content {
                     tile,
+                    ancestry: self.ancestry(tile),
                     content: TileContent::Decoded(decoded),
                 })
                 .map_err(|_| Gone)?;
@@ -1533,7 +1558,7 @@ mod tests {
             let mut last_select: Vec<(TileId, f64)> = Vec::new();
             while let Some(msg) = stream.next_message().await {
                 match msg {
-                    ServerMessage::Content { tile, content } => {
+                    ServerMessage::Content { tile, content, .. } => {
                         assert!(
                             matches!(content, TileContent::Decoded(_)),
                             "in-process content is always decoded"
