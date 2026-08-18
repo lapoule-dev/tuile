@@ -46,6 +46,14 @@ pub struct LineVertex {
     pub color: [f32; 3],
 }
 
+/// The mark a surface stamps to claim the ground it owns.
+///
+/// One value, set on every pass that touches the stencil. It must be set: the
+/// default reference is 0, so an unset pass would stamp 0 and the fallback's
+/// `NotEqual` test would then be false everywhere — the fallback would draw
+/// nothing at all, which is a hole, which is black ground.
+const OWNED: u32 = 1;
+
 pub struct TileRenderer {
     pipeline: wgpu::RenderPipeline,
     /// Draws without touching depth — see [`TileRenderer::render_background`].
@@ -130,6 +138,26 @@ impl TileRenderer {
             /// it rather than be painted with untextured ground.
             Layers,
         }
+        /// How a pass treats the ownership mark. See `stencil` below.
+        fn stencil_face(kind: Pass) -> wgpu::StencilFaceState {
+            match kind {
+                // Owns its ground: stamp the mark.
+                Pass::Solid | Pass::Layers => wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Always,
+                    fail_op: wgpu::StencilOperation::Keep,
+                    depth_fail_op: wgpu::StencilOperation::Keep,
+                    pass_op: wgpu::StencilOperation::Replace,
+                },
+                // Borrows it: draw only where nobody stamped.
+                Pass::Fallback => wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::NotEqual,
+                    fail_op: wgpu::StencilOperation::Keep,
+                    depth_fail_op: wgpu::StencilOperation::Keep,
+                    pass_op: wgpu::StencilOperation::Keep,
+                },
+                Pass::Backdrop => wgpu::StencilFaceState::IGNORE,
+            }
+        }
         let make_pipeline = |polygon_mode: wgpu::PolygonMode, kind: Pass| {
             gpu.device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -167,7 +195,44 @@ impl TileRenderer {
                             Pass::Solid | Pass::Fallback => wgpu::CompareFunction::Less,
                             Pass::Layers => wgpu::CompareFunction::LessEqual,
                         }),
-                        stencil: Default::default(),
+                        // **The mark that says who owns this ground.**
+                        //
+                        // A surface the traversal chose writes 1. A fallback —
+                        // an ancestor borrowing ground that is not its own —
+                        // draws only where the mark is *not* 1, so it covers
+                        // everything nobody owns and can never take a pixel from
+                        // a surface that does.
+                        //
+                        // Depth cannot express that, and the failure is not
+                        // subtle: over real relief a coarse tessellation rises
+                        // *above* the fine tiles under it, passes `Less`, and
+                        // paints over them — measured at 16384 pixels of 16384
+                        // in `tests/no_two_surfaces.rs`, and on a globe as sharp
+                        // and blurry imagery interleaved in ragged outlines that
+                        // follow the terrain. Every comparison that would reject
+                        // the fallback there also rejects it over bare ground,
+                        // where it is the only thing covering — so the two cases
+                        // are not separable by depth at all.
+                        //
+                        // A stand-in makes it worse and is why this could not
+                        // wait: a stand-in *is* `tuile_terrain::upsample` of an
+                        // ancestor, so a drawn stand-in and its drawn ancestor
+                        // are one surface submitted twice, and the winner is
+                        // decided by float equality. Measured in the viewer at
+                        // 34 such pairs, stable while nothing was loading.
+                        //
+                        // `Backdrop` writes nothing and tests nothing: it is
+                        // behind everything by construction and must not disturb
+                        // the mark.
+                        stencil: wgpu::StencilState {
+                            front: stencil_face(kind),
+                            back: stencil_face(kind),
+                            read_mask: 0xff,
+                            write_mask: match kind {
+                                Pass::Solid | Pass::Layers => 0xff,
+                                Pass::Backdrop | Pass::Fallback => 0,
+                            },
+                        },
                         bias: Default::default(),
                     }),
                     multisample: wgpu::MultisampleState {
@@ -338,6 +403,7 @@ impl TileRenderer {
         pass: &mut wgpu::RenderPass<'_>,
         tiles: impl Iterator<Item = &'t PreparedTile>,
     ) {
+        pass.set_stencil_reference(OWNED);
         pass.set_pipeline(&self.fallback);
         pass.set_bind_group(0, &self.view_bg, &[]);
         for tile in tiles {
@@ -359,6 +425,7 @@ impl TileRenderer {
         pass: &mut wgpu::RenderPass<'_>,
         tiles: impl Iterator<Item = &'t PreparedTile>,
     ) {
+        pass.set_stencil_reference(OWNED);
         pass.set_pipeline(&self.background);
         pass.set_bind_group(0, &self.view_bg, &[]);
         for tile in tiles {
@@ -394,6 +461,7 @@ impl TileRenderer {
         // later pass has to compose over the *finished* solid surface, and a
         // per-mesh interleaving would compose it over whatever happened to be
         // drawn so far — a neighbouring tile's ground, in the worst case.
+        pass.set_stencil_reference(OWNED);
         pass.set_pipeline(solid);
         pass.set_bind_group(0, &self.view_bg, &[]);
         let tiles: Vec<&PreparedTile> = tiles.collect();
