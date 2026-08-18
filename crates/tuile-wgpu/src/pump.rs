@@ -14,7 +14,7 @@ use glam::DVec3;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::task::{Context, Poll};
 use tuile_core::content::{DecodedTileContent, TileContent};
-use tuile_core::protocol::{ClientMessage, GeometryStream, Priming, ServerMessage};
+use tuile_core::protocol::{Ancestry, ClientMessage, GeometryStream, Priming, ServerMessage};
 use tuile_core::source::TileId;
 use tuile_core::traversal::TraversalStats;
 use tuile_core::traversal::ViewState;
@@ -28,8 +28,22 @@ pub struct ContentPump {
     pending: VecDeque<(TileId, DecodedTileContent, bool)>,
     /// Which prepared tiles are stand-ins rather than real geometry.
     fills: HashSet<TileId>,
-    /// Current selection (tile + SSE), as sent by the geometry server.
+    /// Current selection, as sent by the geometry server.
     pub selection: Vec<(TileId, f64)>,
+    /// What the server has said about the shape of the tree, accumulated.
+    ///
+    /// **The consumer cannot derive this and must not try.** A `TileId` is an
+    /// opaque handle whose payload only the owning tree can read; this crate
+    /// used to shift its bits, which is right for terrain and answers level 0
+    /// for every 3D Tiles arena index — so such a session had no fallback chain
+    /// at all and reported every unready tile as lost.
+    ///
+    /// Grows with every message that names a tile and is **not** pruned by
+    /// `Evict`, unlike everything else here: the link to a tile's parent is
+    /// exactly what lets a walk climb *past* it once it is no longer resident,
+    /// so dropping it would cut the chain at the first evicted ancestor. Twelve
+    /// bytes per tile the session has ever heard of. See [`Ancestry`].
+    ancestry: HashMap<TileId, Ancestry>,
     pub stats: TraversalStats,
     /// Sum of GPU bytes of prepared tiles.
     pub gpu_bytes: usize,
@@ -60,6 +74,7 @@ impl ContentPump {
             pending: VecDeque::new(),
             fills: HashSet::new(),
             selection: Vec::new(),
+            ancestry: HashMap::new(),
             stats: TraversalStats::default(),
             gpu_bytes: 0,
             closed: false,
@@ -107,7 +122,7 @@ impl ContentPump {
             let prepared = prepare(gpu, &content, self.render_origin);
             m.upload_seconds.record(started.elapsed());
             m.uploads.inc();
-            let level = tile.terrain_coord().0;
+            let level = self.level(tile);
             m.meshes_by_level.inc(level);
             m.mesh_bytes_by_level.add(level, prepared.gpu_bytes as u64);
             // Imagery is shared, so it is counted where it is actually held —
@@ -221,12 +236,24 @@ impl ContentPump {
 
     fn on_message(&mut self, msg: ServerMessage) {
         match msg {
-            ServerMessage::Select { tiles, stats } => {
+            ServerMessage::Select {
+                tiles,
+                ancestry,
+                stats,
+            } => {
+                self.ancestry.extend(ancestry);
                 self.selection = tiles;
                 self.stats = stats;
             }
-            ServerMessage::Content { tile, content } => match content {
-                TileContent::Decoded(decoded) => self.pending.push_back((tile, decoded, false)),
+            ServerMessage::Content {
+                tile,
+                ancestry,
+                content,
+            } => match content {
+                TileContent::Decoded(decoded) => {
+                    self.ancestry.insert(tile, ancestry);
+                    self.pending.push_back((tile, decoded, false));
+                }
                 TileContent::Raw { .. } => self
                     .errors
                     .push(format!("tile {tile:?}: raw content reached the renderer")),
@@ -235,10 +262,15 @@ impl ContentPump {
             // its way. Both are filed under the same tile, so accepting a late
             // one would replace real geometry with an approximation — the exact
             // failure the separate variant exists to make impossible to miss.
-            ServerMessage::Fill { tile, content } => {
+            ServerMessage::Fill {
+                tile,
+                ancestry,
+                content,
+            } => {
                 let already = self.prepared.contains_key(&tile) && !self.fills.contains(&tile)
                     || self.pending.iter().any(|(t, _, fill)| *t == tile && !*fill);
                 if !already {
+                    self.ancestry.insert(tile, ancestry);
                     // Ahead of real content, and deliberately. A stand-in is
                     // twenty-five vertices and it is what keeps the ground
                     // covered; a real tile is orders of magnitude larger and
@@ -255,7 +287,7 @@ impl ContentPump {
                     if let Some(p) = self.prepared.remove(tile) {
                         self.fills.remove(tile);
                         self.gpu_bytes -= p.gpu_bytes;
-                        let level = tile.terrain_coord().0;
+                        let level = self.level(*tile);
                         m.meshes_by_level.sub(level, 1);
                         m.mesh_bytes_by_level.sub(level, p.gpu_bytes as u64);
                     }
@@ -311,12 +343,23 @@ impl ContentPump {
     /// was still positioned against an origin the eye had left. Nothing in the
     /// type system objected. Deciding what to draw and making it drawable are
     /// one act, so they are one call, and the mistake is no longer available.
-    pub fn resolve(
-        &self,
-        queue: &wgpu::Queue,
-        parent_of: impl Fn(TileId) -> Option<TileId>,
-    ) -> (Drawn<'_>, Resolution) {
-        let (drawn, counts, _) = self.resolve_reporting(queue, parent_of);
+    ///
+    /// # No parent function is asked for, and that is the change
+    ///
+    /// This used to take a `parent_of` closure, and every host wrote the same
+    /// one: shift the id, halve the coordinates. That is the terrain encoding,
+    /// and a `TileId` from any other tree does not carry it — a 3D Tiles arena
+    /// index answered level 0, so the closure returned `None` at the first step
+    /// and **the fallback chain did not exist**. Every unready tile counted as
+    /// lost, which is the black square, silently, in a configuration that
+    /// looked exactly like a working one.
+    ///
+    /// The tree is the only thing that can answer, so the tree answers: the
+    /// server sends [`Ancestry`] with every message that names a tile and this
+    /// walks the table it has accumulated. A host can no longer get it wrong
+    /// because it is no longer asked.
+    pub fn resolve(&self, queue: &wgpu::Queue) -> (Drawn<'_>, Resolution) {
+        let (drawn, counts, _) = self.resolve_reporting(queue);
         (drawn, counts)
     }
 
@@ -328,15 +371,12 @@ impl ContentPump {
     /// two surfaces end up over the same ground and the depth test picks a
     /// winner per pixel. Giving each of these its own stand-in over its own
     /// rectangle is what removes both the black and the shimmer.
-    pub fn resolve_reporting(
-        &self,
-        queue: &wgpu::Queue,
-        parent_of: impl Fn(TileId) -> Option<TileId>,
-    ) -> (Drawn<'_>, Resolution, Vec<TileId>) {
+    pub fn resolve_reporting(&self, queue: &wgpu::Queue) -> (Drawn<'_>, Resolution, Vec<TileId>) {
         let (exact, fallback, counts, unresolved) = walk(
             &self.selection,
             |id| self.prepared.contains_key(&id),
-            parent_of,
+            |id| self.ancestry.get(&id).and_then(|a| a.parent),
+            |id| self.level(id),
         );
         let surfaces = |ids: Vec<TileId>| -> Vec<&PreparedTile> {
             ids.into_iter()
@@ -378,6 +418,14 @@ impl ContentPump {
         self.prepared.contains_key(&tile)
     }
 
+    /// How deep a tile sits, as the *server* said — never decoded from the id.
+    ///
+    /// `0` for a tile nothing has ever mentioned, which is the honest answer:
+    /// this side has no tree to ask. See [`Ancestry`].
+    pub fn level(&self, tile: TileId) -> u32 {
+        self.ancestry.get(&tile).map_or(0, |a| a.level)
+    }
+
     pub fn prepared_count(&self) -> usize {
         self.prepared.len()
     }
@@ -401,14 +449,14 @@ impl ContentPump {
     pub fn at_level(&self, level: u32) -> impl Iterator<Item = &PreparedTile> {
         self.prepared
             .iter()
-            .filter(move |(id, _)| id.terrain_coord().0 == level)
+            .filter(move |(id, _)| self.level(**id) == level)
             .map(|(_, tile)| tile)
     }
 
     pub fn prepared_through_level(&self, level: u32) -> usize {
         self.prepared
             .keys()
-            .filter(|t| t.terrain_coord().0 <= level)
+            .filter(|t| self.level(**t) <= level)
             .count()
     }
 
@@ -516,10 +564,15 @@ impl Resolution {
 /// selected tile a surface of its own **before** the ancestor stops being drawn
 /// — new active, then old inactive, never a gap — not withholding the fallback
 /// and hoping.
+///
+/// `parent_of` and `level_of` are lookups into what the server has said, not
+/// arithmetic on the handle. See [`ContentPump::resolve`] for why that
+/// distinction is the difference between a fallback chain and a black screen.
 fn walk(
     selection: &[(TileId, f64)],
     has: impl Fn(TileId) -> bool,
     parent_of: impl Fn(TileId) -> Option<TileId>,
+    level_of: impl Fn(TileId) -> u32,
 ) -> (Vec<TileId>, Vec<TileId>, Resolution, Vec<TileId>) {
     let mut out = Vec::new();
     let mut fallback = Vec::new();
@@ -535,7 +588,7 @@ fn walk(
                 // ground is drawn by nothing, and that is the one number worth
                 // shouting about.
                 counts.lost += 1;
-                counts.deepest_lost = counts.deepest_lost.max(tile.terrain_coord().0);
+                counts.deepest_lost = counts.deepest_lost.max(level_of(*tile));
                 unresolved.push(*tile);
                 break;
             };
@@ -552,11 +605,11 @@ fn walk(
                 } else {
                     counts.coarser += 1;
                     unresolved.push(*tile);
-                    let gap = tile.terrain_coord().0.saturating_sub(id.terrain_coord().0);
+                    let gap = level_of(*tile).saturating_sub(level_of(id));
                     if gap > counts.worst_gap {
                         counts.worst_gap = gap;
-                        counts.worst_gap_drawn = id.terrain_coord().0;
-                        counts.worst_gap_wanted = tile.terrain_coord().0;
+                        counts.worst_gap_drawn = level_of(id);
+                        counts.worst_gap_wanted = level_of(*tile);
                     }
                 }
                 break;
@@ -578,9 +631,23 @@ fn walk(
 mod coverage_tests {
     use super::*;
 
+    /// The terrain encoding, read out of the handle.
+    ///
+    /// Legitimate **here and nowhere else**: every fixture in this module builds
+    /// its ids with [`TileId::from_terrain`], so a parent really is derivable
+    /// from them. Production reads what the server said — see
+    /// [`ContentPump::resolve`], and the black screen that came of guessing.
     fn parent_of(id: TileId) -> Option<TileId> {
         let (z, x, y) = id.terrain_coord();
         (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2))
+    }
+
+    fn level_of(id: TileId) -> u32 {
+        id.terrain_coord().0
+    }
+
+    fn sel(tiles: &[TileId]) -> Vec<(TileId, f64)> {
+        tiles.iter().map(|t| (*t, 0.0)).collect()
     }
 
     /// How many of `drawn` sit over ground another of them already covers.
@@ -624,10 +691,10 @@ mod coverage_tests {
         let here = TileId::from_terrain(3, 4, 4);
         let neighbour = TileId::from_terrain(3, 5, 4);
         let grandparent = TileId::from_terrain(1, 1, 1);
-        let selection = vec![(here, 0.0), (neighbour, 0.0)];
+        let selection = sel(&[here, neighbour]);
         let has = |id: TileId| id == here || id == grandparent;
 
-        let (exact, fallback, counts, unresolved) = walk(&selection, has, parent_of);
+        let (exact, fallback, counts, unresolved) = walk(&selection, has, parent_of, level_of);
         assert_eq!(
             exact,
             vec![here],
@@ -666,10 +733,14 @@ mod coverage_tests {
         let here = TileId::from_terrain(3, 4, 4);
         let neighbour = TileId::from_terrain(3, 5, 4);
         let grandparent = TileId::from_terrain(1, 1, 1);
-        let selection = vec![(here, 0.0), (neighbour, 0.0)];
+        let selection = sel(&[here, neighbour]);
 
-        let (exact, fallback, _, _) =
-            walk(&selection, |id| id == here || id == grandparent, parent_of);
+        let (exact, fallback, _, _) = walk(
+            &selection,
+            |id| id == here || id == grandparent,
+            parent_of,
+            level_of,
+        );
         assert_eq!(
             overlapping_surfaces(&exact),
             0,
@@ -693,9 +764,9 @@ mod coverage_tests {
     fn a_selected_tile_is_not_demoted_because_something_else_leans_on_it() {
         let coarse = TileId::from_terrain(1, 1, 1);
         let deep = TileId::from_terrain(3, 4, 4);
-        let selection = vec![(coarse, 0.0), (deep, 0.0)];
+        let selection = sel(&[coarse, deep]);
 
-        let (exact, fallback, counts, _) = walk(&selection, |id| id == coarse, parent_of);
+        let (exact, fallback, counts, _) = walk(&selection, |id| id == coarse, parent_of, level_of);
         assert_eq!(
             exact,
             vec![coarse],
@@ -719,12 +790,12 @@ mod coverage_tests {
         let here = TileId::from_terrain(3, 4, 4);
         let neighbour = TileId::from_terrain(3, 5, 4);
         let grandparent = TileId::from_terrain(1, 1, 1);
-        let selection = vec![(here, 0.0), (neighbour, 0.0)];
+        let selection = sel(&[here, neighbour]);
         // To the consumer a stand-in is indistinguishable from the real tile,
         // which is the design: `resolve` asks "do I have a surface for this?".
         let has = |id: TileId| id == here || id == neighbour || id == grandparent;
 
-        let (exact, fallback, counts, _) = walk(&selection, has, parent_of);
+        let (exact, fallback, counts, _) = walk(&selection, has, parent_of, level_of);
         assert_eq!(exact.len(), 2, "one surface per selected tile — {exact:?}");
         assert!(
             fallback.is_empty(),
@@ -734,13 +805,68 @@ mod coverage_tests {
         assert_eq!(counts.lost, 0);
     }
 
+    /// **A tileset gets a fallback chain too.**
+    ///
+    /// The walk climbs by asking what the server said, not by taking the handle
+    /// apart. A 3D Tiles `TileId` is an arena index: shifting it right by 54
+    /// answers level 0 for every tile, so a host that derived the parent got
+    /// `None` at the first step and the chain did not exist. Every unready tile
+    /// counted as lost — the black square — in a configuration that from the
+    /// outside looked exactly like a working one.
+    ///
+    /// The ids here are small consecutive integers, which is what
+    /// [`crate::ContentPump`] receives from a `Tileset`-backed session, and the
+    /// ancestry is stated rather than computed.
+    #[test]
+    fn an_arena_backed_selection_still_falls_back_to_its_ancestor() {
+        let root = TileId(1);
+        let mid = TileId(2);
+        let leaf = TileId(3);
+        let chain = |id: TileId| match id {
+            t if t == leaf => Ancestry {
+                level: 2,
+                parent: Some(mid),
+            },
+            t if t == mid => Ancestry {
+                level: 1,
+                parent: Some(root),
+            },
+            _ => Ancestry {
+                level: 0,
+                parent: None,
+            },
+        };
+        let selection = vec![(leaf, 0.0)];
+
+        let (exact, fallback, counts, unresolved) = walk(
+            &selection,
+            |id| id == root,
+            |id| chain(id).parent,
+            |id| chain(id).level,
+        );
+        assert!(exact.is_empty(), "the leaf has no surface of its own");
+        assert_eq!(
+            fallback,
+            vec![root],
+            "the walk must climb an arena chain: {counts:?}"
+        );
+        assert_eq!(
+            counts.lost, 0,
+            "ground drawn by nothing is the black square"
+        );
+        assert_eq!(counts.coarser, 1);
+        assert_eq!(counts.worst_gap, 2, "two levels of sharpness given up");
+        assert_eq!(unresolved, vec![leaf]);
+    }
+
     /// Nothing anywhere on the chain is the one case that is genuinely bare, and
     /// it must be counted rather than hidden — it is the number that says the
     /// picture is broken.
     #[test]
     fn a_chain_with_nothing_on_it_is_counted_as_lost() {
         let orphan = TileId::from_terrain(3, 4, 4);
-        let (exact, fallback, counts, unresolved) = walk(&[(orphan, 0.0)], |_| false, parent_of);
+        let (exact, fallback, counts, unresolved) =
+            walk(&sel(&[orphan]), |_| false, parent_of, level_of);
         assert!(exact.is_empty() && fallback.is_empty());
         assert_eq!(counts.lost, 1);
         assert_eq!(counts.deepest_lost, 3);

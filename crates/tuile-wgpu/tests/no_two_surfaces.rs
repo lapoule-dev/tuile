@@ -197,16 +197,11 @@ fn content(tile: TileId, steps: usize, colour: [u8; 3], key: u64) -> DecodedTile
 const ANCESTOR_COLOUR: [u8; 3] = [230, 30, 30];
 const CHILD_COLOUR: [u8; 3] = [30, 230, 30];
 
-fn parent_of(id: TileId) -> Option<TileId> {
-    let (z, x, y) = id.terrain_coord();
-    (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2))
-}
-
 /// Renders the fixture straight down on `look_at` and returns the resolved
 /// frame, RGBA8.
 fn render(gpu: &GpuContext, pump: &mut ContentPump, eye: DVec3, look_at: DVec3) -> Vec<u8> {
     pump.rebase(&gpu.queue, eye);
-    let (drawn, _) = pump.resolve(&gpu.queue, parent_of);
+    let (drawn, _) = pump.resolve(&gpu.queue);
     draw(gpu, eye, look_at, &drawn.exact, &drawn.fallback)
 }
 
@@ -390,18 +385,21 @@ fn an_ancestor_drawn_for_a_late_sibling_does_not_show_over_the_others() {
     let arrived: Vec<TileId> = children.iter().copied().filter(|c| *c != late).collect();
 
     let mut script = vec![ServerMessage::Select {
-        tiles: children.iter().map(|c| (*c, 0.0)).collect(),
+        tiles: selected(&children),
+        ancestry: tree_shape(&children),
         stats: TraversalStats::default(),
     }];
     // Coarse: two quads across the whole ancestor, which is what makes its
     // surface disagree with the children's.
     script.push(ServerMessage::Content {
         tile: ancestor,
+        ancestry: ancestry(ancestor),
         content: TileContent::Decoded(content(ancestor, 2, ANCESTOR_COLOUR, 0)),
     });
     for (n, child) in arrived.iter().enumerate() {
         script.push(ServerMessage::Content {
             tile: *child,
+            ancestry: ancestry(*child),
             content: TileContent::Decoded(content(*child, 16, CHILD_COLOUR, n as u64 + 1)),
         });
     }
@@ -512,4 +510,38 @@ fn a_fallback_on_the_far_side_does_not_paint_through_the_planet() {
          through the Earth, and its skirt walls are what survive back-face \
          culling to do it"
     );
+}
+
+/// The selection, as the server sends it.
+fn selected(tiles: &[TileId]) -> Vec<(TileId, f64)> {
+    tiles.iter().map(|t| (*t, 0.0)).collect()
+}
+
+/// The shape of the tree around a selection: every tile named, **and every
+/// ancestor of one**, up to the root.
+///
+/// The closure, not one link per tile — a walk climbs *through* tiles it holds
+/// nothing for, so a chain that stops after one step reports the ground as lost.
+/// See `tuile_core::protocol::ServerMessage::Select`.
+fn tree_shape(tiles: &[TileId]) -> Vec<(TileId, tuile_core::protocol::Ancestry)> {
+    let mut out = Vec::new();
+    for tile in tiles {
+        let mut cur = Some(*tile);
+        while let Some(id) = cur {
+            let (z, x, y) = id.terrain_coord();
+            let parent = (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2));
+            out.push((id, tuile_core::protocol::Ancestry { level: z, parent }));
+            cur = parent;
+        }
+    }
+    out
+}
+
+/// The terrain ancestry of a tile, as the server states it on the wire.
+fn ancestry(tile: TileId) -> tuile_core::protocol::Ancestry {
+    let (z, x, y) = tile.terrain_coord();
+    tuile_core::protocol::Ancestry {
+        level: z,
+        parent: (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2)),
+    }
 }

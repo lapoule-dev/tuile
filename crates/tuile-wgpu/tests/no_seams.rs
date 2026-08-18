@@ -301,10 +301,7 @@ fn render_and_count(
         },
     );
 
-    let (drawn, _) = pump.resolve(&gpu.queue, |id| {
-        let (z, x, y) = id.terrain_coord();
-        (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2))
-    });
+    let (drawn, _) = pump.resolve(&gpu.queue);
 
     let mut encoder = gpu
         .device
@@ -408,15 +405,18 @@ fn magenta_at_a_lod_boundary(gpu: &GpuContext, skirts: bool) -> u64 {
     let fine = TileId::from_terrain(5, 33, 21);
     let mut stream = Scripted(VecDeque::from([
         ServerMessage::Select {
-            tiles: vec![(coarse, 0.0), (fine, 0.0)],
+            tiles: selected(&[coarse, fine]),
+            ancestry: tree_shape(&[coarse, fine]),
             stats: TraversalStats::default(),
         },
         ServerMessage::Content {
             tile: coarse,
+            ancestry: ancestry(coarse),
             content: TileContent::Decoded(textured(coarse, 2, skirts)),
         },
         ServerMessage::Content {
             tile: fine,
+            ancestry: ancestry(fine),
             content: TileContent::Decoded(textured(fine, 8, skirts)),
         },
     ]));
@@ -475,15 +475,18 @@ fn holes_at_a_lod_boundary(gpu: &GpuContext, skirts: bool) -> u64 {
 
     let mut stream = Scripted(VecDeque::from([
         ServerMessage::Select {
-            tiles: vec![(coarse, 0.0), (fine, 0.0)],
+            tiles: selected(&[coarse, fine]),
+            ancestry: tree_shape(&[coarse, fine]),
             stats: TraversalStats::default(),
         },
         ServerMessage::Content {
             tile: coarse,
+            ancestry: ancestry(coarse),
             content: TileContent::Decoded(content_for(coarse, 2, skirts)),
         },
         ServerMessage::Content {
             tile: fine,
+            ancestry: ancestry(fine),
             content: TileContent::Decoded(content_for(fine, 8, skirts)),
         },
     ]));
@@ -551,15 +554,18 @@ fn uncovered_fragments_along_a_shared_edge(gpu: &GpuContext) -> u64 {
 
     let mut stream = Scripted(VecDeque::from([
         ServerMessage::Select {
-            tiles: vec![(west, 0.0), (east, 0.0)],
+            tiles: selected(&[west, east]),
+            ancestry: tree_shape(&[west, east]),
             stats: TraversalStats::default(),
         },
         ServerMessage::Content {
             tile: west,
+            ancestry: ancestry(west),
             content: TileContent::Decoded(content(west)),
         },
         ServerMessage::Content {
             tile: east,
+            ancestry: ancestry(east),
             content: TileContent::Decoded(content(east)),
         },
     ]));
@@ -619,4 +625,38 @@ fn a_lod_boundary_shows_no_seam() {
         "{skirted} pixels of void through the ground at the boundary between \
          two levels ({bare} without skirts) — the wall did not cover the crack"
     );
+}
+
+/// The selection, as the server sends it.
+fn selected(tiles: &[TileId]) -> Vec<(TileId, f64)> {
+    tiles.iter().map(|t| (*t, 0.0)).collect()
+}
+
+/// The shape of the tree around a selection: every tile named, **and every
+/// ancestor of one**, up to the root.
+///
+/// The closure, not one link per tile — a walk climbs *through* tiles it holds
+/// nothing for, so a chain that stops after one step reports the ground as lost.
+/// See `tuile_core::protocol::ServerMessage::Select`.
+fn tree_shape(tiles: &[TileId]) -> Vec<(TileId, tuile_core::protocol::Ancestry)> {
+    let mut out = Vec::new();
+    for tile in tiles {
+        let mut cur = Some(*tile);
+        while let Some(id) = cur {
+            let (z, x, y) = id.terrain_coord();
+            let parent = (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2));
+            out.push((id, tuile_core::protocol::Ancestry { level: z, parent }));
+            cur = parent;
+        }
+    }
+    out
+}
+
+/// The terrain ancestry of a tile, as the server states it on the wire.
+fn ancestry(tile: TileId) -> tuile_core::protocol::Ancestry {
+    let (z, x, y) = tile.terrain_coord();
+    tuile_core::protocol::Ancestry {
+        level: z,
+        parent: (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2)),
+    }
 }

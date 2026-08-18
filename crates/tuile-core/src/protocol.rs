@@ -37,17 +37,77 @@ pub enum ClientMessage {
     Cancel { tile: TileId },
 }
 
+/// What the tree knows about a tile, travelling with every message that names
+/// one.
+///
+/// # Why this is on the wire at all
+///
+/// A [`TileId`] is an opaque handle: its payload means whatever the owning
+/// [`TileTree`] says it means — a packed `(level, x, y)` for terrain, a flat
+/// arena index for a 3D Tiles tileset. **The server has that tree; the consumer
+/// does not, and never will.** That is the split the whole project is built on:
+/// the core is renderer-agnostic and the consumer receives decoded content over
+/// a channel that may be a WebSocket or a worker.
+///
+/// So a consumer cannot answer "how deep is this tile" or "what is its parent"
+/// by looking at the handle. It tried anyway — by shifting the bits — and got 0
+/// for every arena index, which meant a 3D Tiles session had **no fallback
+/// chain at all**: the walk in the consumer climbed, found nothing, and counted
+/// every unready tile as lost. Lost is the black square.
+///
+/// [`TileTree`]: crate::source::TileTree
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ancestry {
+    /// Depth in the tree, roots at 0. See [`crate::source::TileTree::level`].
+    pub level: u32,
+    /// The tile one level up, or `None` at a root.
+    ///
+    /// One step, not the whole chain: a chain per tile would be the same
+    /// ancestors repeated across every message. The consumer accumulates the
+    /// links instead, and every tile it is ever handed contributes its own — so
+    /// a walk climbs as far as the server has actually told it about, which is
+    /// exactly as far as it can usefully go.
+    pub parent: Option<TileId>,
+}
+
 /// Geometry server → consumer.
 #[derive(Debug, Clone)]
 pub enum ServerMessage {
-    /// Full selection for the current viewer state (tile + current SSE),
-    /// plus traversal stats for overlays.
+    /// Full selection for the current viewer state (tile + current SSE), plus
+    /// traversal stats for overlays.
     Select {
         tiles: Vec<(TileId, f64)>,
+        /// The shape of the tree around this selection: every tile named above,
+        /// **and every ancestor of one**, with what the tree says about it.
+        ///
+        /// The closure, not one link per selected tile. A consumer that lacks a
+        /// tile climbs to the nearest ancestor it holds, and that climb passes
+        /// *through* tiles it holds nothing for and has never been told about —
+        /// so a single parent link per selection breaks the chain at the first
+        /// such tile and the walk reports the ground as lost, which is the black
+        /// square. Measured with exactly that shape:
+        /// `ground_under_the_camera_is_never_black` went to 100 % black.
+        ///
+        /// The server already materialises this set every traversal — it is what
+        /// it protects from eviction — so sending it costs a walk of a set it
+        /// has in hand, and roughly doubles a message that was already one entry
+        /// per selected tile.
+        ancestry: Vec<(TileId, Ancestry)>,
         stats: TraversalStats,
     },
     /// Content for a tile. Always `Decoded` on the consumer side.
-    Content { tile: TileId, content: TileContent },
+    ///
+    /// Carries its own [`Ancestry`] rather than leaning on a preceding
+    /// `Select`, because not every tile that gets content is selected: the
+    /// coarse pyramid is **requested, not selected** — it is the floor every
+    /// fallback lands on — so a consumer that learned levels only from
+    /// selections would hold the whole pyramid and be unable to say what any of
+    /// it was.
+    Content {
+        tile: TileId,
+        ancestry: Ancestry,
+        content: TileContent,
+    },
     /// A **stand-in** surface for a tile the consumer has not got yet.
     ///
     /// Its own variant rather than a flag on [`ServerMessage::Content`], for two
@@ -64,6 +124,7 @@ pub enum ServerMessage {
     /// depth buffer.
     Fill {
         tile: TileId,
+        ancestry: Ancestry,
         content: crate::content::DecodedTileContent,
     },
     /// These tiles left residency; release their resources.
