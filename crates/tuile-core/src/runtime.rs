@@ -445,11 +445,11 @@ impl Session<'_> {
         m.gaps.set(u64::from(self.out.stats.gaps));
         m.selected_by_level.clear();
         for (tile, _) in &self.out.selected {
-            m.selected_by_level.inc(tile.terrain_coord().0);
+            m.selected_by_level.inc(self.tree.level(*tile));
         }
         m.queued_by_level.clear();
         for req in &self.out.requests {
-            m.queued_by_level.inc(req.tile.terrain_coord().0);
+            m.queued_by_level.inc(self.tree.level(req.tile));
         }
 
         // Drop tiles we've given up on from the request set, so the reported
@@ -627,7 +627,7 @@ impl Session<'_> {
             self.in_flight.insert(tile, handle);
             let m = crate::metrics::metrics();
             m.loads_started.inc();
-            m.loads_by_level.inc(tile.terrain_coord().0);
+            m.loads_by_level.inc(self.tree.level(tile));
             m.loads_in_flight.set(self.in_flight.len() as u64);
         }
         // Spawn new loads, highest priority first, within the cap. The
@@ -654,7 +654,7 @@ impl Session<'_> {
             self.in_flight.insert(tile, handle);
             let m = crate::metrics::metrics();
             m.loads_started.inc();
-            m.loads_by_level.inc(tile.terrain_coord().0);
+            m.loads_by_level.inc(self.tree.level(tile));
             m.loads_in_flight.set(self.in_flight.len() as u64);
         }
 
@@ -784,7 +784,11 @@ impl Session<'_> {
                     .iter()
                     .map(|l| (l.coord, l.texture.resident_bytes()))
                     .collect();
-                let evicted = self.cache.insert(tile, size, &imagery, self.selected);
+                // The level comes from the tree, which is the only thing that
+                // can read an opaque handle — see `TileTree::level`.
+                let evicted =
+                    self.cache
+                        .insert(tile, self.tree.level(tile), size, &imagery, self.selected);
                 m.loads_completed.inc();
                 m.tiles_evicted.add(evicted.len() as u64);
                 m.resident_bytes.set(self.cache.used_bytes() as u64);
