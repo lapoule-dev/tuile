@@ -281,6 +281,35 @@ impl ContentPump {
                     self.pending.push_front((tile, content, true));
                 }
             }
+            // A take-back of stand-ins, and of nothing else. The narrow scope
+            // is the whole point of the variant: `Content` is sent once per
+            // residency, so purging a queued real upload here — which `Evict`
+            // rightly does — would destroy the only delivery there will ever
+            // be, and this ground would wear its stand-in until the server's
+            // cache let the tile go. That was measured, at length, before this
+            // message existed.
+            ServerMessage::Retire { tiles } => {
+                let m = tuile_core::metrics::metrics();
+                for tile in &tiles {
+                    // Only a surface held *as a stand-in*. Real content — the
+                    // fill that was already replaced, or a tile never filled —
+                    // is not ours to touch on this message.
+                    if self.fills.contains(tile) {
+                        if let Some(p) = self.prepared.remove(tile) {
+                            self.fills.remove(tile);
+                            self.gpu_bytes -= p.gpu_bytes;
+                            let level = self.level(*tile);
+                            m.meshes_by_level.sub(level, 1);
+                            m.mesh_bytes_by_level.sub(level, p.gpu_bytes as u64);
+                        }
+                    }
+                }
+                // Queued *fill* uploads go too; queued real content stays,
+                // whatever else this message names.
+                self.pending
+                    .retain(|(t, _, is_fill)| !(*is_fill && tiles.contains(t)));
+                m.prepared_tiles.set(self.prepared.len() as u64);
+            }
             ServerMessage::Evict { tiles } => {
                 let m = tuile_core::metrics::metrics();
                 for tile in &tiles {
@@ -900,6 +929,59 @@ mod coverage_tests {
         assert_eq!(counts.coarser, 1);
         assert_eq!(counts.worst_gap, 2, "two levels of sharpness given up");
         assert_eq!(unresolved, vec![leaf]);
+    }
+
+    /// **A `Retire` takes back stand-ins and leaves real content alone** — in
+    /// the queue above all, because that is where the original defect lived:
+    /// `Content` is sent once per residency, and an `Evict` purging it from the
+    /// upload queue destroyed the only delivery there would ever be. The tile
+    /// then wore its stand-in for the rest of the session.
+    #[test]
+    fn a_retire_spares_queued_real_content() {
+        fn empty() -> tuile_core::content::DecodedTileContent {
+            tuile_core::content::DecodedTileContent {
+                meshes: Vec::new(),
+                textures: Vec::new(),
+                imagery: Vec::new(),
+                local_origin_ecef: glam::DVec3::ZERO,
+                transform_local: glam::Mat4::IDENTITY,
+            }
+        }
+        let anc = |level| Ancestry {
+            level,
+            parent: None,
+        };
+        let real = TileId(7);
+        let filled = TileId(8);
+        let mut pump = ContentPump::new(glam::DVec3::ZERO);
+        pump.on_message(ServerMessage::Content {
+            tile: real,
+            ancestry: anc(3),
+            content: tuile_core::content::TileContent::Decoded(empty()),
+        });
+        pump.on_message(ServerMessage::Fill {
+            tile: filled,
+            ancestry: anc(3),
+            content: empty(),
+        });
+        assert_eq!(pump.pending_uploads(), 2);
+
+        // Retire names both. Only the fill may go.
+        pump.on_message(ServerMessage::Retire {
+            tiles: vec![real, filled],
+        });
+        assert_eq!(
+            pump.pending_uploads(),
+            1,
+            "the queued fill goes, the queued real content stays"
+        );
+        // And what stays is the real one: an Evict for it still finds it.
+        pump.on_message(ServerMessage::Evict { tiles: vec![real] });
+        assert_eq!(
+            pump.pending_uploads(),
+            0,
+            "the survivor was the real content, which a true Evict may take"
+        );
     }
 
     /// Nothing anywhere on the chain is the one case that is genuinely bare, and

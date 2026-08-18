@@ -223,6 +223,18 @@ impl WorkerEngine {
                 }
                 set(&obj, "tiles", &ids);
             }
+            // A take-back of stand-ins only. Forwarded under its own kind so
+            // the page can drop exactly the meshes it flagged as fills — an
+            // "evict" here would also drop real content still queued page-side,
+            // which is the failure the variant exists to prevent.
+            ServerMessage::Retire { tiles } => {
+                set(&obj, "kind", &JsValue::from_str("retire"));
+                let ids = js_sys::Array::new();
+                for tile in &tiles {
+                    ids.push(&JsValue::from_str(&tile_key(*tile)));
+                }
+                set(&obj, "tiles", &ids);
+            }
             // A stand-in reaches the page through the same door as content and
             // says so, so THREE can drop it the moment the real tile lands — and
             // so a page held together by approximations can be seen to be.
