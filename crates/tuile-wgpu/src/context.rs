@@ -35,7 +35,22 @@ pub const SAMPLES: u32 = 4;
 
 pub const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// Depth format expected by [`crate::TileRenderer`].
-pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Depth **and stencil**, because depth alone cannot say "cover this ground but
+/// never win a pixel from the surface that owns it".
+///
+/// Every comparison that rejects a fallback above an owning surface also
+/// rejects it above bare ground, where it is the only thing covering — so the
+/// distinction is not expressible as a depth test. A one-bit mark per pixel is,
+/// and that needs a format that carries one. See `TileRenderer`'s `Pass`.
+///
+/// `Depth24PlusStencil8` rather than `Depth32FloatStencil8`: this one is
+/// mandatory in WebGPU, so it needs no feature request and no runtime branch,
+/// and it can stay a constant. On Metal it maps to `Depth32Float_Stencil8`
+/// anyway — Apple silicon has no 24-bit depth — so the precision is unchanged
+/// there. Where it really is 24-bit unorm, the camera's own clip planes already
+/// bound the near/far ratio; if that is ever not enough, reverse-Z is the fix
+/// for precision and it is orthogonal to this.
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
 /// Where the imagery slots start in the material bind group; slot `i` is at
 /// `IMAGERY_BINDING_0 + i`. Must match `shader.wgsl`.
 pub(crate) const IMAGERY_BINDING_0: u32 = 4;

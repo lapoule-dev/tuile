@@ -248,7 +248,13 @@ fn the_overlay_draws_into_a_pass_that_carries_depth() {
                     load: wgpu::LoadOp::Clear(0.0),
                     store: wgpu::StoreOp::Store,
                 }),
-                stencil_ops: None,
+                stencil_ops: Some(wgpu::Operations {
+                    // Cleared to 0, and never read back: the mark says "a
+                    // surface that owns this ground drew here", which is only
+                    // true within one frame.
+                    load: wgpu::LoadOp::Clear(0),
+                    store: wgpu::StoreOp::Discard,
+                }),
             }),
             ..Default::default()
         });

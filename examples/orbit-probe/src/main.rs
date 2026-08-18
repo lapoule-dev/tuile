@@ -509,7 +509,13 @@ fn render_to_rgba(
                     load: wgpu::LoadOp::Clear(1.0),
                     store: wgpu::StoreOp::Store,
                 }),
-                stencil_ops: None,
+                stencil_ops: Some(wgpu::Operations {
+                    // Cleared to 0, and never read back: the mark says "a
+                    // surface that owns this ground drew here", which is only
+                    // true within one frame.
+                    load: wgpu::LoadOp::Clear(0),
+                    store: wgpu::StoreOp::Discard,
+                }),
             }),
             ..Default::default()
         });
