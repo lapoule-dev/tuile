@@ -303,7 +303,7 @@ async fn settle<S: GeometryStream + Unpin>(
             ServerMessage::Select { tiles, .. } => {
                 selection = tiles.iter().map(|(t, _)| *t).collect();
             }
-            ServerMessage::Content { tile, content } => {
+            ServerMessage::Content { tile, content, .. } => {
                 ledger.on_content(tile, cost);
                 if let TileContent::Decoded(decoded) = content {
                     contents.insert(tile, decoded);
@@ -312,6 +312,8 @@ async fn settle<S: GeometryStream + Unpin>(
             // A probe measures what the session really streams; a stand-in is
             // synthesised locally and would flatter every number it touched.
             ServerMessage::Fill { .. } => {}
+            // No stand-in was kept, so there is none to take back.
+            ServerMessage::Retire { .. } => {}
             ServerMessage::Evict { tiles } => {
                 for t in &tiles {
                     contents.remove(t);
@@ -509,7 +511,13 @@ fn render_to_rgba(
                     load: wgpu::LoadOp::Clear(1.0),
                     store: wgpu::StoreOp::Store,
                 }),
-                stencil_ops: None,
+                stencil_ops: Some(wgpu::Operations {
+                    // Cleared to 0, and never read back: the mark says "a
+                    // surface that owns this ground drew here", which is only
+                    // true within one frame.
+                    load: wgpu::LoadOp::Clear(0),
+                    store: wgpu::StoreOp::Discard,
+                }),
             }),
             ..Default::default()
         });

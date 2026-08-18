@@ -220,6 +220,12 @@ impl TileTree for TerrainTree {
         (c.level > 0).then(|| TileId::from_terrain(c.level - 1, c.x / 2, c.y / 2))
     }
 
+    /// The level is packed into the id here, so this is the one tree that may
+    /// read it out of the handle — it owns the encoding.
+    fn level(&self, id: TileId) -> u32 {
+        Self::coord(id).level
+    }
+
     fn properties(&self, id: TileId) -> TileProperties {
         let c = Self::coord(id);
         let rect = self.scheme.tile_rect(c);

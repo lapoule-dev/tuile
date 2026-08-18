@@ -14,7 +14,7 @@ use glam::DVec3;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::task::{Context, Poll};
 use tuile_core::content::{DecodedTileContent, TileContent};
-use tuile_core::protocol::{ClientMessage, GeometryStream, Priming, ServerMessage};
+use tuile_core::protocol::{Ancestry, ClientMessage, GeometryStream, Priming, ServerMessage};
 use tuile_core::source::TileId;
 use tuile_core::traversal::TraversalStats;
 use tuile_core::traversal::ViewState;
@@ -23,9 +23,27 @@ pub struct ContentPump {
     /// The f64 world point all tiles and the view matrix are relative to.
     pub render_origin: DVec3,
     prepared: HashMap<TileId, PreparedTile>,
-    pending: VecDeque<(TileId, DecodedTileContent)>,
-    /// Current selection (tile + SSE), as sent by the geometry server.
+    /// Decoded tiles awaiting a frame's upload budget. The flag says whether
+    /// the entry is a stand-in — see [`ServerMessage::Fill`].
+    pending: VecDeque<(TileId, DecodedTileContent, bool)>,
+    /// Which prepared tiles are stand-ins rather than real geometry.
+    fills: HashSet<TileId>,
+    /// Current selection, as sent by the geometry server.
     pub selection: Vec<(TileId, f64)>,
+    /// What the server has said about the shape of the tree, accumulated.
+    ///
+    /// **The consumer cannot derive this and must not try.** A `TileId` is an
+    /// opaque handle whose payload only the owning tree can read; this crate
+    /// used to shift its bits, which is right for terrain and answers level 0
+    /// for every 3D Tiles arena index — so such a session had no fallback chain
+    /// at all and reported every unready tile as lost.
+    ///
+    /// Grows with every message that names a tile and is **not** pruned by
+    /// `Evict`, unlike everything else here: the link to a tile's parent is
+    /// exactly what lets a walk climb *past* it once it is no longer resident,
+    /// so dropping it would cut the chain at the first evicted ancestor. Twelve
+    /// bytes per tile the session has ever heard of. See [`Ancestry`].
+    ancestry: HashMap<TileId, Ancestry>,
     pub stats: TraversalStats,
     /// Sum of GPU bytes of prepared tiles.
     pub gpu_bytes: usize,
@@ -40,10 +58,12 @@ pub struct ContentPump {
 
 /// Tiles uploaded per frame by an interactive session.
 ///
-/// Shared rather than written into the host: a headless test that picks its own
+/// Shared rather than written into the host, for the reason the whole
+/// `Config::interactive_globe` exists: a headless test that picks its own
 /// number is testing a renderer nobody runs. Uploading is a stall — buffers are
 /// created and written on the frame's own thread — so this is deliberately
-/// small.
+/// small, and it is why a stand-in must jump the queue rather than wait behind
+/// real content.
 pub const UPLOADS_PER_FRAME: usize = 8;
 
 impl ContentPump {
@@ -52,7 +72,9 @@ impl ContentPump {
             render_origin,
             prepared: HashMap::new(),
             pending: VecDeque::new(),
+            fills: HashSet::new(),
             selection: Vec::new(),
+            ancestry: HashMap::new(),
             stats: TraversalStats::default(),
             gpu_bytes: 0,
             closed: false,
@@ -85,18 +107,60 @@ impl ContentPump {
 
         let mut uploaded = 0;
         while uploaded < max_uploads {
-            let Some((tile, content)) = self.pending.pop_front() else {
+            let Some((tile, content, is_fill)) = self.pending.pop_front() else {
                 break;
             };
+            // The real tile may have landed while this stand-in waited its turn
+            // in the queue. Uploading it now would overwrite geometry with an
+            // approximation, and the frame after would look *worse* than the one
+            // before — the one failure mode a stand-in must never have.
+            if is_fill && self.prepared.contains_key(&tile) && !self.fills.contains(&tile) {
+                continue;
+            }
+            let m = tuile_core::metrics::metrics();
+            let started = std::time::Instant::now();
             let prepared = prepare(gpu, &content, self.render_origin);
+            m.upload_seconds.record(started.elapsed());
+            m.uploads.inc();
+            let level = self.level(tile);
+            m.meshes_by_level.inc(level);
+            m.mesh_bytes_by_level.add(level, prepared.gpu_bytes as u64);
+            // Imagery is shared, so it is counted where it is actually held —
+            // once per texture, at the *imagery* level, which is not this tile's.
+            m.textures_by_level.clear();
+            m.texture_bytes_by_level.clear();
+            for held in gpu
+                .imagery
+                .lock()
+                .expect("imagery textures")
+                .live_by_level()
+            {
+                m.textures_by_level.inc(held.0);
+                m.texture_bytes_by_level.add(held.0, held.1 as u64);
+            }
             self.gpu_bytes += prepared.gpu_bytes;
             // A re-upload replaces its predecessor: charge for the new one,
             // refund the old, or the total drifts up until it is fiction.
             if let Some(replaced) = self.prepared.insert(tile, prepared) {
                 self.gpu_bytes -= replaced.gpu_bytes;
+                m.meshes_by_level.sub(level, 1);
+                m.mesh_bytes_by_level.sub(level, replaced.gpu_bytes as u64);
             }
+            m.prepared_tiles.set(self.prepared.len() as u64);
+            m.pending_uploads.set(self.pending.len() as u64);
             // Best effort: a closed stream just means the session is over.
-            let _ = stream.send(ClientMessage::Ack { tile });
+            if is_fill {
+                self.fills.insert(tile);
+            } else {
+                self.fills.remove(&tile);
+            }
+            // Only real geometry is acknowledged. Acking a stand-in would tell
+            // the server the consumer holds the tile, and it would stop sending
+            // the very thing everyone is waiting for.
+            if !is_fill {
+                // Best effort: a closed stream just means the session is over.
+                let _ = stream.send(ClientMessage::Ack { tile });
+            }
             uploaded += 1;
         }
         uploaded
@@ -106,73 +170,54 @@ impl ContentPump {
     /// camera position each frame so the f32 coordinates the GPU sees stay
     /// near zero (sub-meter precise) however far the camera is from the
     /// geocenter. Skips the work when the origin hasn't meaningfully moved.
-    pub fn rebase(&mut self, queue: &wgpu::Queue, render_origin: DVec3) {
-        if (render_origin - self.render_origin).length() < 1.0 {
-            return;
-        }
+    /// One frame of the streaming loop, exactly as an interactive host runs it.
+    ///
+    /// Send the camera, take whatever the server has produced up to this
+    /// frame's upload budget, and rebase what is resident onto the new origin —
+    /// in that order, which is the order that matters. Rebasing before the
+    /// uploads would leave the tiles that arrived this frame holding a model
+    /// matrix for the *previous* origin, and at planetary scale that draws them
+    /// somewhere else entirely.
+    ///
+    /// Extracted from `wgpu-viewer` so a headless test can run the host's own
+    /// loop rather than an approximation of it. Everything after this — the
+    /// resolve and the draw — is immutable and belongs to whoever owns a
+    /// surface.
+    ///
+    /// Returns how many tiles reached the GPU.
+    pub fn advance<S: GeometryStream>(
+        &mut self,
+        stream: &mut S,
+        gpu: &crate::context::GpuContext,
+        view: ViewState,
+        render_origin: DVec3,
+    ) -> usize {
+        // Best effort: a closed stream means the session is over, and a frame is
+        // not the place to discover it.
+        let _ = stream.send(ClientMessage::ViewerState { views: vec![view] });
+        let uploaded = self.pump(stream, gpu, UPLOADS_PER_FRAME);
+        self.rebase(&gpu.queue, render_origin);
+        uploaded
+    }
+
+    /// Moves the render origin. Tiles follow when they are drawn, not now.
+    ///
+    /// This used to rewrite the model uniform of **every resident tile** on any
+    /// frame where the eye had moved a metre — a session holding 8 500 tiles to
+    /// draw 400 paid eight thousand `write_buffer` calls per moving frame. A
+    /// profile named the cost precisely: each one allocates a fresh Metal
+    /// staging buffer through `StagingBuffer::new`, each allocation is a kernel
+    /// round trip, and freeing them again at submit cost as much again. Together
+    /// they were 60 % of the real work in a frame, and all of it only while the
+    /// camera moved — which is exactly when it was felt.
+    ///
+    /// So the origin is recorded and nothing is written. A tile brings itself up
+    /// to date in [`Self::rebase_for_drawing`], which is called with the handful
+    /// that will actually be drawn.
+    pub fn rebase(&mut self, _queue: &wgpu::Queue, render_origin: DVec3) {
         self.render_origin = render_origin;
-        for tile in self.prepared.values() {
-            tile.rebase(queue, render_origin);
-        }
     }
 
-    fn on_message(&mut self, msg: ServerMessage) {
-        match msg {
-            ServerMessage::Select { tiles, stats } => {
-                self.selection = tiles;
-                self.stats = stats;
-            }
-            ServerMessage::Content { tile, content } => match content {
-                TileContent::Decoded(decoded) => self.pending.push_back((tile, decoded)),
-                TileContent::Raw { .. } => self
-                    .errors
-                    .push(format!("tile {tile:?}: raw content reached the renderer")),
-            },
-            ServerMessage::Evict { tiles } => {
-                for tile in &tiles {
-                    if let Some(p) = self.prepared.remove(tile) {
-                        self.gpu_bytes -= p.gpu_bytes;
-                    }
-                }
-                // Uploads are spread over frames, so a tile can still be
-                // queued when its eviction arrives. Dropping it here is what
-                // keeps that from leaking: uploaded after its own `Evict`, it
-                // would enter `prepared` with the server no longer considering
-                // it resident — so no further `Evict` would ever name it, and
-                // its GPU memory would be held until the session ends.
-                self.pending.retain(|(t, _)| !tiles.contains(t));
-            }
-            ServerMessage::Error { tile, message } => {
-                self.errors.push(match tile {
-                    Some(t) => format!("tile {t:?}: {message}"),
-                    None => message,
-                });
-            }
-            // A stand-in surface for a tile that has not arrived. This consumer
-            // does not draw them — `Config::stand_ins` is off, so none are sent
-            // — and a surface that is *not* real geometry must never be uploaded
-            // as though it were: it would be acknowledged, the server would
-            // stop sending the tile it stands in for, and the approximation
-            // would become permanent.
-            ServerMessage::Fill { .. } => {}
-            // What the coarse pyramid holds, which this consumer does not gate
-            // its first frame on.
-            ServerMessage::Priming(p) => self.priming = Some(p),
-        }
-    }
-
-    /// Selected tiles whose GPU resources are ready to draw.
-    pub fn visible(&self) -> impl Iterator<Item = &PreparedTile> {
-        self.selection
-            .iter()
-            .filter_map(|(t, _)| self.prepared.get(t))
-    }
-
-    /// Like [`Self::visible`], but for any selected tile not yet uploaded,
-    /// substitutes its nearest already-prepared ancestor (via `parent_of`) —
-    /// so the coarser tile a refinement replaces stays on screen until the
-    /// finer one is ready, instead of flashing the background. `parent_of`
-    /// returns the parent id, or `None` at a root.
     /// Brings the tiles about to be drawn onto the current render origin.
     ///
     /// Called with the output of [`Self::resolve`], so the work is proportional
@@ -187,6 +232,255 @@ impl ContentPump {
         for tile in tiles {
             tile.rebase(queue, self.render_origin);
         }
+    }
+
+    fn on_message(&mut self, msg: ServerMessage) {
+        match msg {
+            ServerMessage::Select {
+                tiles,
+                ancestry,
+                stats,
+            } => {
+                self.ancestry.extend(ancestry);
+                self.selection = tiles;
+                self.stats = stats;
+            }
+            ServerMessage::Content {
+                tile,
+                ancestry,
+                content,
+            } => match content {
+                TileContent::Decoded(decoded) => {
+                    self.ancestry.insert(tile, ancestry);
+                    self.pending.push_back((tile, decoded, false));
+                }
+                TileContent::Raw { .. } => self
+                    .errors
+                    .push(format!("tile {tile:?}: raw content reached the renderer")),
+            },
+            // A stand-in, refused whenever the real thing is already here or on
+            // its way. Both are filed under the same tile, so accepting a late
+            // one would replace real geometry with an approximation — the exact
+            // failure the separate variant exists to make impossible to miss.
+            ServerMessage::Fill {
+                tile,
+                ancestry,
+                content,
+            } => {
+                let already = self.prepared.contains_key(&tile) && !self.fills.contains(&tile)
+                    || self.pending.iter().any(|(t, _, fill)| *t == tile && !*fill);
+                if !already {
+                    self.ancestry.insert(tile, ancestry);
+                    // Ahead of real content, and deliberately. A stand-in is
+                    // twenty-five vertices and it is what keeps the ground
+                    // covered; a real tile is orders of magnitude larger and
+                    // its absence is invisible while a stand-in holds its
+                    // place. Queued behind, they would arrive frames late and
+                    // the hole they exist to fill would be on screen the whole
+                    // time.
+                    self.pending.push_front((tile, content, true));
+                }
+            }
+            // A take-back of stand-ins, and of nothing else. The narrow scope
+            // is the whole point of the variant: `Content` is sent once per
+            // residency, so purging a queued real upload here — which `Evict`
+            // rightly does — would destroy the only delivery there will ever
+            // be, and this ground would wear its stand-in until the server's
+            // cache let the tile go. That was measured, at length, before this
+            // message existed.
+            ServerMessage::Retire { tiles } => {
+                let m = tuile_core::metrics::metrics();
+                for tile in &tiles {
+                    // Only a surface held *as a stand-in*. Real content — the
+                    // fill that was already replaced, or a tile never filled —
+                    // is not ours to touch on this message.
+                    if self.fills.contains(tile) {
+                        if let Some(p) = self.prepared.remove(tile) {
+                            self.fills.remove(tile);
+                            self.gpu_bytes -= p.gpu_bytes;
+                            let level = self.level(*tile);
+                            m.meshes_by_level.sub(level, 1);
+                            m.mesh_bytes_by_level.sub(level, p.gpu_bytes as u64);
+                        }
+                    }
+                }
+                // Queued *fill* uploads go too; queued real content stays,
+                // whatever else this message names.
+                self.pending
+                    .retain(|(t, _, is_fill)| !(*is_fill && tiles.contains(t)));
+                m.prepared_tiles.set(self.prepared.len() as u64);
+            }
+            ServerMessage::Evict { tiles } => {
+                let m = tuile_core::metrics::metrics();
+                for tile in &tiles {
+                    if let Some(p) = self.prepared.remove(tile) {
+                        self.fills.remove(tile);
+                        self.gpu_bytes -= p.gpu_bytes;
+                        let level = self.level(*tile);
+                        m.meshes_by_level.sub(level, 1);
+                        m.mesh_bytes_by_level.sub(level, p.gpu_bytes as u64);
+                    }
+                }
+                m.prepared_tiles.set(self.prepared.len() as u64);
+                // Uploads are spread over frames, so a tile can still be
+                // queued when its eviction arrives. Dropping it here is what
+                // keeps that from leaking: uploaded after its own `Evict`, it
+                // would enter `prepared` with the server no longer considering
+                // it resident — so no further `Evict` would ever name it, and
+                // its GPU memory would be held until the session ends.
+                self.pending.retain(|(t, _, _)| !tiles.contains(t));
+            }
+            ServerMessage::Error { tile, message } => {
+                self.errors.push(match tile {
+                    Some(t) => format!("tile {t:?}: {message}"),
+                    None => message,
+                });
+            }
+            ServerMessage::Priming(priming) => self.priming = Some(priming),
+        }
+    }
+
+    /// Selected tiles whose GPU resources are ready to draw.
+    pub fn visible(&self) -> impl Iterator<Item = &PreparedTile> {
+        self.selection
+            .iter()
+            .filter_map(|(t, _)| self.prepared.get(t))
+    }
+
+    /// What the selection resolved to, and what it failed to resolve to.
+    ///
+    /// Three outcomes per selected tile, and only the third is a bug:
+    ///
+    /// | outcome | on screen |
+    /// |---|---|
+    /// | the tile itself is prepared | the intended detail |
+    /// | an ancestor is prepared | coarser ground — degraded, not broken |
+    /// | the walk reached a root with nothing | **nothing at all: the black square** |
+    ///
+    /// The three used to be one number. `missing` counts the first against the
+    /// other two, which says how *sharp* the picture is and nothing about
+    /// whether it is there; and it is computed against the last selection
+    /// received, so a stale one reports `missing 0` while describing ground
+    /// nobody is looking at. Black ground was therefore invisible in the logs
+    /// for two days — the count that mattered was never taken.
+    /// Takes the queue because resolving is also what brings the chosen tiles
+    /// onto the current render origin.
+    ///
+    /// Those were two calls for one afternoon, and the second one was forgotten
+    /// exactly where it mattered: a harness that resolved and drew without
+    /// rebasing put **60 % of a frame bare** during a zoom, because every tile
+    /// was still positioned against an origin the eye had left. Nothing in the
+    /// type system objected. Deciding what to draw and making it drawable are
+    /// one act, so they are one call, and the mistake is no longer available.
+    ///
+    /// # No parent function is asked for, and that is the change
+    ///
+    /// This used to take a `parent_of` closure, and every host wrote the same
+    /// one: shift the id, halve the coordinates. That is the terrain encoding,
+    /// and a `TileId` from any other tree does not carry it — a 3D Tiles arena
+    /// index answered level 0, so the closure returned `None` at the first step
+    /// and **the fallback chain did not exist**. Every unready tile counted as
+    /// lost, which is the black square, silently, in a configuration that
+    /// looked exactly like a working one.
+    ///
+    /// The tree is the only thing that can answer, so the tree answers: the
+    /// server sends [`Ancestry`] with every message that names a tile and this
+    /// walks the table it has accumulated. A host can no longer get it wrong
+    /// because it is no longer asked.
+    pub fn resolve(&self, queue: &wgpu::Queue) -> (Drawn<'_>, Resolution) {
+        let (drawn, counts, _) = self.resolve_reporting(queue);
+        (drawn, counts)
+    }
+
+    /// [`Self::resolve`], and the tiles it could not draw exactly.
+    ///
+    /// Those are the fill candidates, and naming them is the point: a tile drawn
+    /// by its ancestor is not a hole — it is *worse than a hole in one specific
+    /// way*, because the ancestor also covers the siblings that did arrive, so
+    /// two surfaces end up over the same ground and the depth test picks a
+    /// winner per pixel. Giving each of these its own stand-in over its own
+    /// rectangle is what removes both the black and the shimmer.
+    pub fn resolve_reporting(&self, queue: &wgpu::Queue) -> (Drawn<'_>, Resolution, Vec<TileId>) {
+        let (exact, fallback, counts, unresolved) = walk(
+            &self.selection,
+            |id| self.prepared.contains_key(&id),
+            |id| self.ancestry.get(&id).and_then(|a| a.parent),
+            |id| self.level(id),
+        );
+        let surfaces = |ids: Vec<TileId>| -> Vec<&PreparedTile> {
+            ids.into_iter()
+                .filter_map(|id| self.prepared.get(&id))
+                .collect()
+        };
+        let stand_ins = exact.iter().filter(|id| self.fills.contains(id)).count();
+        let is_ancestor = |a: TileId, b: TileId| {
+            let mut cur = self.ancestry.get(&b).and_then(|x| x.parent);
+            while let Some(id) = cur {
+                if id == a {
+                    return true;
+                }
+                cur = self.ancestry.get(&id).and_then(|x| x.parent);
+            }
+            false
+        };
+        let coplanar = fallback
+            .iter()
+            .flat_map(|f| {
+                exact
+                    .iter()
+                    .filter(move |e| self.fills.contains(e) && is_ancestor(*f, **e))
+            })
+            .count();
+        let counts = Resolution {
+            stand_ins,
+            coplanar,
+            ..counts
+        };
+        let drawn = Drawn {
+            exact: surfaces(exact),
+            fallback: surfaces(fallback),
+        };
+        self.rebase_for_drawing(
+            queue,
+            drawn.exact.iter().chain(drawn.fallback.iter()).copied(),
+        );
+        (drawn, counts, unresolved)
+    }
+
+    /// Number of selected tiles still waiting for content or upload.
+    ///
+    /// Says how sharp the picture is, not whether it is there — see
+    /// [`ContentPump::resolve`].
+    pub fn missing(&self) -> usize {
+        self.selection
+            .iter()
+            .filter(|(t, _)| !self.prepared.contains_key(t))
+            .count()
+    }
+
+    /// Whether the GPU holds a surface for `tile` — **its own**, real or
+    /// stand-in.
+    ///
+    /// The question `resolve` asks of every selected tile, and the one that
+    /// decides whether an ancestor is drawn over it. Exposed because it is the
+    /// only honest way to observe the stand-in path from outside: a stand-in
+    /// and the real tile are deliberately indistinguishable here, and a test
+    /// that could tell them apart would be testing something the renderer does
+    /// not know.
+    pub fn has(&self, tile: TileId) -> bool {
+        self.prepared.contains_key(&tile)
+    }
+
+    /// How deep a tile sits, as the *server* said — never decoded from the id.
+    ///
+    /// `0` for a tile nothing has ever mentioned, which is the honest answer:
+    /// this side has no tree to ask. See [`Ancestry`].
+    pub fn level(&self, tile: TileId) -> u32 {
+        self.ancestry.get(&tile).map_or(0, |a| a.level)
+    }
+
+    pub fn prepared_count(&self) -> usize {
+        self.prepared.len()
     }
 
     /// How many tiles at or above `level` are on the GPU.
@@ -208,88 +502,15 @@ impl ContentPump {
     pub fn at_level(&self, level: u32) -> impl Iterator<Item = &PreparedTile> {
         self.prepared
             .iter()
-            .filter(move |(id, _)| id.terrain_coord().0 == level)
+            .filter(move |(id, _)| self.level(**id) == level)
             .map(|(_, tile)| tile)
     }
 
     pub fn prepared_through_level(&self, level: u32) -> usize {
         self.prepared
             .keys()
-            .filter(|t| t.terrain_coord().0 <= level)
+            .filter(|t| self.level(**t) <= level)
             .count()
-    }
-
-    /// One frame of the streaming loop, exactly as an interactive host runs it.
-    ///
-    /// Send the camera, take this frame's share of uploads, and rebase what is
-    /// resident onto the new origin — in that order, which is the order that
-    /// matters. Rebasing before the uploads would leave the tiles that arrived
-    /// this frame holding a model matrix for the *previous* origin, and at
-    /// planetary scale that draws them somewhere else entirely.
-    pub fn advance<S: GeometryStream>(
-        &mut self,
-        stream: &mut S,
-        gpu: &crate::context::GpuContext,
-        view: ViewState,
-        render_origin: DVec3,
-    ) -> usize {
-        // Best effort: a closed stream means the session is over, and a frame is
-        // not the place to discover it.
-        let _ = stream.send(ClientMessage::ViewerState { views: vec![view] });
-        let uploaded = self.pump(stream, gpu, UPLOADS_PER_FRAME);
-        self.rebase(&gpu.queue, render_origin);
-        uploaded
-    }
-
-    /// [`Self::visible_resolved`], and what the selection cost in sharpness.
-    pub fn resolve(
-        &self,
-        _queue: &wgpu::Queue,
-        parent_of: impl Fn(TileId) -> Option<TileId>,
-    ) -> (Vec<&PreparedTile>, Resolution) {
-        let (ids, counts, _) = walk(
-            &self.selection,
-            |id| self.prepared.contains_key(&id),
-            parent_of,
-        );
-        let out = ids
-            .into_iter()
-            .filter_map(|id| self.prepared.get(&id))
-            .collect();
-        (out, counts)
-    }
-
-    pub fn visible_resolved(
-        &self,
-        parent_of: impl Fn(TileId) -> Option<TileId>,
-    ) -> Vec<&PreparedTile> {
-        let mut out = Vec::new();
-        let mut seen = HashSet::new();
-        for (tile, _) in &self.selection {
-            let mut cur = Some(*tile);
-            while let Some(id) = cur {
-                if let Some(prepared) = self.prepared.get(&id) {
-                    if seen.insert(id) {
-                        out.push(prepared);
-                    }
-                    break;
-                }
-                cur = parent_of(id);
-            }
-        }
-        out
-    }
-
-    /// Number of selected tiles still waiting for content or upload.
-    pub fn missing(&self) -> usize {
-        self.selection
-            .iter()
-            .filter(|(t, _)| !self.prepared.contains_key(t))
-            .count()
-    }
-
-    pub fn prepared_count(&self) -> usize {
-        self.prepared.len()
     }
 
     pub fn pending_uploads(&self) -> usize {
@@ -297,12 +518,96 @@ impl ContentPump {
     }
 }
 
-/// Which tiles to draw for a selection, and what that cost in sharpness.
+/// The surfaces a frame draws, in the two kinds that must not be mixed.
 ///
-/// Pure, and separated from the GPU so the invariant it encodes can be tested
-/// without a device: for each selected tile, draw its own surface or the
-/// nearest ancestor that has one, and **never refuse the climb**. Coverage is
-/// the whole job, and every refusal is a hole.
+/// # Why they are separated
+///
+/// An ancestor drawn because some descendant has not arrived spans **all** of
+/// that ancestor's descendants — including the siblings that did arrive. Drawn
+/// as ordinary geometry it therefore competes with them for the depth buffer,
+/// and over real relief a coarse tessellation crosses a fine one repeatedly: the
+/// winner changes from pixel to pixel along the crossing curve. On screen that
+/// is sharp imagery and blurry imagery interleaved in ragged outlines that
+/// follow the terrain rather than the tile grid — measured at 100 % of the
+/// pixels over a tile that had its own surface, in
+/// `tests/no_two_surfaces.rs`.
+///
+/// So a fallback is not geometry, it is **backdrop**: it is drawn without
+/// touching depth, before everything, exactly like the whole-planet shell. It
+/// still colours every pixel nothing else covers — no coverage is refused, which
+/// is what the two earlier attempts at this got wrong — but it can never win a
+/// pixel from a surface that owns that ground.
+///
+/// What it costs, stated: a fallback does not depth-test against *itself*
+/// either, so relief inside one cannot occlude relief behind it. At a grazing
+/// angle a far ridge of a stand-in ancestor can paint over a near one, for the
+/// few frames the real tile takes to arrive. That is a wrong-but-plausible
+/// picture of ground that is coarse anyway, against a per-pixel flicker over
+/// ground that is already correct.
+pub struct Drawn<'a> {
+    /// Tiles the traversal chose, holding their own ground.
+    pub exact: Vec<&'a PreparedTile>,
+    /// Ancestors standing in for ground that is not their own.
+    pub fallback: Vec<&'a PreparedTile>,
+}
+
+/// How a selection resolved onto what the GPU actually holds.
+///
+/// See [`ContentPump::resolve`]. `lost` is the only one of the three that is a
+/// defect: it is ground the traversal asked for, with not one tile on its
+/// ancestor chain resident to stand in — which on screen is the clear colour,
+/// and the clear colour here is black.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Resolution {
+    /// Drawn at the level the traversal chose.
+    pub exact: usize,
+    /// Drawn by a coarser ancestor while the chosen tile streams in.
+    pub coarser: usize,
+    /// Drawn by nothing.
+    pub lost: usize,
+    /// The deepest level that was lost, which says whether the hole is a
+    /// detail tile at the horizon or a whole coarse region.
+    pub deepest_lost: u32,
+    /// The largest number of levels any fallback had to climb.
+    ///
+    /// A stand-in one or two levels up is a softer patch of ground. One eight
+    /// levels up is a mesh spanning a whole region, interpolated straight
+    /// through the relief — and a camera near the surface is then *underneath*
+    /// it, seeing only its back faces, which the pipeline discards. That draws
+    /// nothing while counting as a success, which is why the gap is measured
+    /// and not just the fact of falling back.
+    pub worst_gap: u32,
+    /// The level actually drawn, and the level asked for, at that worst gap.
+    pub worst_gap_drawn: u32,
+    pub worst_gap_wanted: u32,
+    /// Drawn surfaces that are a stand-in rather than the tile's own content.
+    ///
+    /// Counted apart because **no other number here can see them**: a stand-in
+    /// satisfies [`ContentPump::has`], so the walk stops at it and the tile is
+    /// reported `exact` — a selection reads *complete* while the ground on
+    /// screen is an upsample of something coarser. See that method's doc, which
+    /// says the indistinguishability is deliberate.
+    pub stand_ins: usize,
+    /// Drawn (stand-in, drawn ancestor of it) pairs: **the same surface twice**.
+    ///
+    /// A stand-in is `tuile_terrain::upsample` of an ancestor — "a mesh of
+    /// exactly the same surface over exactly the child's ground". So when that
+    /// ancestor is *also* drawn, because some sibling has nothing, the two are
+    /// not two guesses at one hillside: they are one surface submitted twice,
+    /// once writing depth and once testing `Less` after it. Which one wins a
+    /// pixel is then decided by float equality, and that is z-fighting.
+    ///
+    /// Zero on `main`, which has no stand-ins at all.
+    pub coplanar: usize,
+}
+
+impl Resolution {
+    /// Whether any ground was drawn by nothing.
+    pub fn has_holes(&self) -> bool {
+        self.lost > 0
+    }
+}
+
 /// Which tiles to draw for a selection, and what that cost in sharpness.
 ///
 /// Pure, and separated from the GPU so the invariant it encodes can be tested
@@ -331,12 +636,18 @@ impl ContentPump {
 /// selected tile a surface of its own **before** the ancestor stops being drawn
 /// — new active, then old inactive, never a gap — not withholding the fallback
 /// and hoping.
+///
+/// `parent_of` and `level_of` are lookups into what the server has said, not
+/// arithmetic on the handle. See [`ContentPump::resolve`] for why that
+/// distinction is the difference between a fallback chain and a black screen.
 fn walk(
     selection: &[(TileId, f64)],
     has: impl Fn(TileId) -> bool,
     parent_of: impl Fn(TileId) -> Option<TileId>,
-) -> (Vec<TileId>, Resolution, Vec<TileId>) {
+    level_of: impl Fn(TileId) -> u32,
+) -> (Vec<TileId>, Vec<TileId>, Resolution, Vec<TileId>) {
     let mut out = Vec::new();
+    let mut fallback = Vec::new();
     let mut seen = HashSet::new();
     let mut counts = Resolution::default();
     let mut unresolved = Vec::new();
@@ -349,24 +660,28 @@ fn walk(
                 // ground is drawn by nothing, and that is the one number worth
                 // shouting about.
                 counts.lost += 1;
-                counts.deepest_lost = counts.deepest_lost.max(tile.terrain_coord().0);
+                counts.deepest_lost = counts.deepest_lost.max(level_of(*tile));
                 unresolved.push(*tile);
                 break;
             };
             if has(id) {
                 if seen.insert(id) {
-                    out.push(id);
+                    if exact {
+                        out.push(id);
+                    } else {
+                        fallback.push(id);
+                    }
                 }
                 if exact {
                     counts.exact += 1;
                 } else {
                     counts.coarser += 1;
                     unresolved.push(*tile);
-                    let gap = tile.terrain_coord().0.saturating_sub(id.terrain_coord().0);
+                    let gap = level_of(*tile).saturating_sub(level_of(id));
                     if gap > counts.worst_gap {
                         counts.worst_gap = gap;
-                        counts.worst_gap_drawn = id.terrain_coord().0;
-                        counts.worst_gap_wanted = tile.terrain_coord().0;
+                        counts.worst_gap_drawn = level_of(id);
+                        counts.worst_gap_wanted = level_of(*tile);
                     }
                 }
                 break;
@@ -375,37 +690,311 @@ fn walk(
             cur = parent_of(id);
         }
     }
-    (out, counts, unresolved)
+    // A tile can be both: chosen by the traversal *and* the nearest resident
+    // ancestor of some other tile. It is then real geometry and must not be
+    // demoted — the fallback list is only for surfaces standing in for ground
+    // that is not their own.
+    let exact: HashSet<TileId> = out.iter().copied().collect();
+    fallback.retain(|id| !exact.contains(id));
+    (out, fallback, counts, unresolved)
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Resolution {
-    /// Drawn at the level the traversal chose.
-    pub exact: usize,
-    /// Drawn by a coarser ancestor while the chosen tile streams in.
-    pub coarser: usize,
-    /// Drawn by nothing.
-    pub lost: usize,
-    /// The deepest level that was lost, which says whether the hole is a
-    /// detail tile at the horizon or a whole coarse region.
-    pub deepest_lost: u32,
-    /// The largest number of levels any fallback had to climb.
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    /// The terrain encoding, read out of the handle.
     ///
-    /// A stand-in one or two levels up is a softer patch of ground. One eight
-    /// levels up is a mesh spanning a whole region, interpolated straight
-    /// through the relief — and a camera near the surface is then *underneath*
-    /// it, seeing only its back faces, which the pipeline discards. That draws
-    /// nothing while counting as a success, which is why the gap is measured
-    /// and not just the fact of falling back.
-    pub worst_gap: u32,
-    /// The level actually drawn, and the level asked for, at that worst gap.
-    pub worst_gap_drawn: u32,
-    pub worst_gap_wanted: u32,
-}
+    /// Legitimate **here and nowhere else**: every fixture in this module builds
+    /// its ids with [`TileId::from_terrain`], so a parent really is derivable
+    /// from them. Production reads what the server said — see
+    /// [`ContentPump::resolve`], and the black screen that came of guessing.
+    fn parent_of(id: TileId) -> Option<TileId> {
+        let (z, x, y) = id.terrain_coord();
+        (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2))
+    }
 
-impl Resolution {
-    /// Whether any ground was drawn by nothing.
-    pub fn has_holes(&self) -> bool {
-        self.lost > 0
+    fn level_of(id: TileId) -> u32 {
+        id.terrain_coord().0
+    }
+
+    fn sel(tiles: &[TileId]) -> Vec<(TileId, f64)> {
+        tiles.iter().map(|t| (*t, 0.0)).collect()
+    }
+
+    /// How many of `drawn` sit over ground another of them already covers.
+    ///
+    /// An ancestor spans every one of its descendants, so an ancestor and a
+    /// descendant both being drawn *into the same depth buffer* is two surfaces
+    /// over one patch of ground: both write depth, and over real relief a coarse
+    /// tessellation crosses a fine one repeatedly, so the winner changes from
+    /// pixel to pixel along the crossing curve.
+    ///
+    /// Counting it is the point. "Two surfaces over the same ground" was
+    /// described in a comment for months and never measured, which is why it
+    /// survived three wrong explanations before
+    /// `tests/no_two_surfaces.rs` put a number on it.
+    fn overlapping_surfaces(drawn: &[TileId]) -> usize {
+        let is_ancestor_of = |a: TileId, b: TileId| {
+            let (az, ax, ay) = a.terrain_coord();
+            let (bz, bx, by) = b.terrain_coord();
+            let up = match bz.checked_sub(az) {
+                Some(0) | None => return false,
+                Some(up) => up,
+            };
+            bx >> up == ax && by >> up == ay
+        };
+        drawn
+            .iter()
+            .flat_map(|a| drawn.iter().map(move |b| (*a, *b)))
+            .filter(|(a, b)| is_ancestor_of(*a, *b))
+            .count()
+    }
+
+    /// **Coverage is never traded away.** A selected tile with no surface of its
+    /// own is still covered by its nearest resident ancestor.
+    ///
+    /// Two attempts to remove the overlap by *withholding* that ancestor — stop
+    /// climbing entirely, then refuse only the ancestors that overlap — each
+    /// replaced the shimmer with large black rectangles at both zoom-in and
+    /// zoom-out. Black ground is forbidden (`CLAUDE.md`); shimmer is not.
+    #[test]
+    fn an_ancestor_still_covers_a_tile_that_has_not_arrived() {
+        let here = TileId::from_terrain(3, 4, 4);
+        let neighbour = TileId::from_terrain(3, 5, 4);
+        let grandparent = TileId::from_terrain(1, 1, 1);
+        let selection = sel(&[here, neighbour]);
+        let has = |id: TileId| id == here || id == grandparent;
+
+        let (exact, fallback, counts, unresolved) = walk(&selection, has, parent_of, level_of);
+        assert_eq!(
+            exact,
+            vec![here],
+            "the tile that arrived is the only one holding its own ground"
+        );
+        assert_eq!(
+            fallback,
+            vec![grandparent],
+            "the fallback was withheld, which is a hole — black ground is never \
+             the lesser evil"
+        );
+        assert_eq!(counts.lost, 0, "nothing may be left uncovered");
+        assert_eq!(counts.exact, 1);
+        assert_eq!(counts.coarser, 1);
+        assert_eq!(
+            unresolved,
+            vec![neighbour],
+            "a tile drawn only by an ancestor must still be reported as wanting \
+             its own surface"
+        );
+    }
+
+    /// **Nothing that competes for the depth buffer overlaps anything else.**
+    ///
+    /// This is the invariant, and it holds for *every* selection rather than for
+    /// the lucky ones. The two kinds are separated at the source: tiles holding
+    /// their own ground go to `exact` and compete normally; ancestors standing in
+    /// for ground that is not theirs go to `fallback` and are drawn as backdrop,
+    /// without touching depth. So an ancestor can never win a pixel from a
+    /// surface that owns it, whatever the relief does.
+    ///
+    /// The fixture is the one that used to z-fight: a tile, a neighbour that has
+    /// not arrived, and the grandparent covering both.
+    #[test]
+    fn the_depth_buffer_never_sees_two_surfaces_on_one_patch() {
+        let here = TileId::from_terrain(3, 4, 4);
+        let neighbour = TileId::from_terrain(3, 5, 4);
+        let grandparent = TileId::from_terrain(1, 1, 1);
+        let selection = sel(&[here, neighbour]);
+
+        let (exact, fallback, _, _) = walk(
+            &selection,
+            |id| id == here || id == grandparent,
+            parent_of,
+            level_of,
+        );
+        assert_eq!(
+            overlapping_surfaces(&exact),
+            0,
+            "two competing surfaces over one patch of ground — exact: {exact:?}"
+        );
+        assert!(
+            !exact.contains(&grandparent),
+            "the ancestor is standing in for ground that is not its own and must \
+             not compete for it — exact: {exact:?}, fallback: {fallback:?}"
+        );
+    }
+
+    /// **A tile that is both chosen and an ancestor stays real geometry.**
+    ///
+    /// The demotion is per *role*, not per tile: a coarse tile the traversal
+    /// selected in its own right owns its ground, and it may simultaneously be
+    /// the nearest resident ancestor of some deeper tile that has not arrived.
+    /// Demoting it then would take a chosen surface out of the depth buffer and
+    /// let anything drawn later paint over it.
+    #[test]
+    fn a_selected_tile_is_not_demoted_because_something_else_leans_on_it() {
+        let coarse = TileId::from_terrain(1, 1, 1);
+        let deep = TileId::from_terrain(3, 4, 4);
+        let selection = sel(&[coarse, deep]);
+
+        let (exact, fallback, counts, _) = walk(&selection, |id| id == coarse, parent_of, level_of);
+        assert_eq!(
+            exact,
+            vec![coarse],
+            "the selected coarse tile owns its ground"
+        );
+        assert!(
+            fallback.is_empty(),
+            "the same surface must not be drawn twice — fallback: {fallback:?}"
+        );
+        assert_eq!(counts.lost, 0);
+        assert_eq!(counts.coarser, 1, "the deep tile is still standing in");
+    }
+
+    /// **A stand-in moves a tile out of the fallback set entirely.**
+    ///
+    /// A stand-in *is* that tile's surface, so the walk stops there and no
+    /// ancestor is named at all. Nothing is refused — which is the difference
+    /// between this and the two attempts that withheld the fallback.
+    #[test]
+    fn a_stand_in_leaves_nothing_to_fall_back_to() {
+        let here = TileId::from_terrain(3, 4, 4);
+        let neighbour = TileId::from_terrain(3, 5, 4);
+        let grandparent = TileId::from_terrain(1, 1, 1);
+        let selection = sel(&[here, neighbour]);
+        // To the consumer a stand-in is indistinguishable from the real tile,
+        // which is the design: `resolve` asks "do I have a surface for this?".
+        let has = |id: TileId| id == here || id == neighbour || id == grandparent;
+
+        let (exact, fallback, counts, _) = walk(&selection, has, parent_of, level_of);
+        assert_eq!(exact.len(), 2, "one surface per selected tile — {exact:?}");
+        assert!(
+            fallback.is_empty(),
+            "nothing left to stand in — {fallback:?}"
+        );
+        assert_eq!(counts.coarser, 0);
+        assert_eq!(counts.lost, 0);
+    }
+
+    /// **A tileset gets a fallback chain too.**
+    ///
+    /// The walk climbs by asking what the server said, not by taking the handle
+    /// apart. A 3D Tiles `TileId` is an arena index: shifting it right by 54
+    /// answers level 0 for every tile, so a host that derived the parent got
+    /// `None` at the first step and the chain did not exist. Every unready tile
+    /// counted as lost — the black square — in a configuration that from the
+    /// outside looked exactly like a working one.
+    ///
+    /// The ids here are small consecutive integers, which is what
+    /// [`crate::ContentPump`] receives from a `Tileset`-backed session, and the
+    /// ancestry is stated rather than computed.
+    #[test]
+    fn an_arena_backed_selection_still_falls_back_to_its_ancestor() {
+        let root = TileId(1);
+        let mid = TileId(2);
+        let leaf = TileId(3);
+        let chain = |id: TileId| match id {
+            t if t == leaf => Ancestry {
+                level: 2,
+                parent: Some(mid),
+            },
+            t if t == mid => Ancestry {
+                level: 1,
+                parent: Some(root),
+            },
+            _ => Ancestry {
+                level: 0,
+                parent: None,
+            },
+        };
+        let selection = vec![(leaf, 0.0)];
+
+        let (exact, fallback, counts, unresolved) = walk(
+            &selection,
+            |id| id == root,
+            |id| chain(id).parent,
+            |id| chain(id).level,
+        );
+        assert!(exact.is_empty(), "the leaf has no surface of its own");
+        assert_eq!(
+            fallback,
+            vec![root],
+            "the walk must climb an arena chain: {counts:?}"
+        );
+        assert_eq!(
+            counts.lost, 0,
+            "ground drawn by nothing is the black square"
+        );
+        assert_eq!(counts.coarser, 1);
+        assert_eq!(counts.worst_gap, 2, "two levels of sharpness given up");
+        assert_eq!(unresolved, vec![leaf]);
+    }
+
+    /// **A `Retire` takes back stand-ins and leaves real content alone** — in
+    /// the queue above all, because that is where the original defect lived:
+    /// `Content` is sent once per residency, and an `Evict` purging it from the
+    /// upload queue destroyed the only delivery there would ever be. The tile
+    /// then wore its stand-in for the rest of the session.
+    #[test]
+    fn a_retire_spares_queued_real_content() {
+        fn empty() -> tuile_core::content::DecodedTileContent {
+            tuile_core::content::DecodedTileContent {
+                meshes: Vec::new(),
+                textures: Vec::new(),
+                imagery: Vec::new(),
+                local_origin_ecef: glam::DVec3::ZERO,
+                transform_local: glam::Mat4::IDENTITY,
+            }
+        }
+        let anc = |level| Ancestry {
+            level,
+            parent: None,
+        };
+        let real = TileId(7);
+        let filled = TileId(8);
+        let mut pump = ContentPump::new(glam::DVec3::ZERO);
+        pump.on_message(ServerMessage::Content {
+            tile: real,
+            ancestry: anc(3),
+            content: tuile_core::content::TileContent::Decoded(empty()),
+        });
+        pump.on_message(ServerMessage::Fill {
+            tile: filled,
+            ancestry: anc(3),
+            content: empty(),
+        });
+        assert_eq!(pump.pending_uploads(), 2);
+
+        // Retire names both. Only the fill may go.
+        pump.on_message(ServerMessage::Retire {
+            tiles: vec![real, filled],
+        });
+        assert_eq!(
+            pump.pending_uploads(),
+            1,
+            "the queued fill goes, the queued real content stays"
+        );
+        // And what stays is the real one: an Evict for it still finds it.
+        pump.on_message(ServerMessage::Evict { tiles: vec![real] });
+        assert_eq!(
+            pump.pending_uploads(),
+            0,
+            "the survivor was the real content, which a true Evict may take"
+        );
+    }
+
+    /// Nothing anywhere on the chain is the one case that is genuinely bare, and
+    /// it must be counted rather than hidden — it is the number that says the
+    /// picture is broken.
+    #[test]
+    fn a_chain_with_nothing_on_it_is_counted_as_lost() {
+        let orphan = TileId::from_terrain(3, 4, 4);
+        let (exact, fallback, counts, unresolved) =
+            walk(&sel(&[orphan]), |_| false, parent_of, level_of);
+        assert!(exact.is_empty() && fallback.is_empty());
+        assert_eq!(counts.lost, 1);
+        assert_eq!(counts.deepest_lost, 3);
+        assert_eq!(unresolved, vec![orphan]);
     }
 }
