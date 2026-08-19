@@ -30,6 +30,11 @@ pub struct ContentPump {
     fills: HashSet<TileId>,
     /// Current selection, as sent by the geometry server.
     pub selection: Vec<(TileId, f64)>,
+    /// How many `Select` messages this pump has applied — the correlation a
+    /// deterministic consumer needs: send a camera, then wait for this to
+    /// advance, and the selection is *that* camera's (the server coalesces
+    /// bursts, so the next Select always reflects the latest views sent).
+    selects_seen: u64,
     /// What the server has said about the shape of the tree, accumulated.
     ///
     /// **The consumer cannot derive this and must not try.** A `TileId` is an
@@ -74,6 +79,7 @@ impl ContentPump {
             pending: VecDeque::new(),
             fills: HashSet::new(),
             selection: Vec::new(),
+            selects_seen: 0,
             ancestry: HashMap::new(),
             stats: TraversalStats::default(),
             gpu_bytes: 0,
@@ -264,6 +270,7 @@ impl ContentPump {
                 self.ancestry.extend(ancestry);
                 self.selection = tiles;
                 self.stats = stats;
+                self.selects_seen += 1;
             }
             ServerMessage::Content {
                 tile,
@@ -486,6 +493,11 @@ impl ContentPump {
     /// an interactive viewer wants exactly that. A recorder does not: its
     /// eager gate must refuse to encode while any selected ground is a flat
     /// approximation, and this is the count it gates on.
+    /// See the field: the Select counter a consumer correlates on.
+    pub fn selects_seen(&self) -> u64 {
+        self.selects_seen
+    }
+
     pub fn provisional(&self) -> usize {
         self.selection
             .iter()
