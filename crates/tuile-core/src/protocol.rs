@@ -30,7 +30,15 @@ pub enum ClientMessage {
     /// Camera update; one [`ViewState`] per view (stereo = two).
     /// Send one per frame: the server coalesces bursts, only the latest
     /// matters.
-    ViewerState { views: Vec<ViewState> },
+    ViewerState {
+        views: Vec<ViewState>,
+        /// Consumer-chosen, monotonically increasing. Echoed on every
+        /// [`ServerMessage::Select`] produced from these views, so a consumer
+        /// can tell WHICH camera a selection answers — the property a
+        /// deterministic renderer needs, by construction rather than by
+        /// heuristic. Interactive hosts may send 0 and never look.
+        generation: u64,
+    },
     /// The consumer materialized this tile (GPU upload done).
     Ack { tile: TileId },
     /// The consumer no longer wants this in-flight tile.
@@ -94,6 +102,8 @@ pub enum ServerMessage {
         /// per selected tile.
         ancestry: Vec<(TileId, Ancestry)>,
         stats: TraversalStats,
+        /// The [`ClientMessage::ViewerState::generation`] these tiles answer.
+        generation: u64,
     },
     /// Content for a tile. Always `Decoded` on the consumer side.
     ///

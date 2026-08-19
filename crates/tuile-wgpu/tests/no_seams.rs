@@ -414,6 +414,7 @@ fn magenta_at_a_lod_boundary(gpu: &GpuContext, skirts: bool) -> u64 {
             tiles: selected(&[coarse, fine]),
             ancestry: tree_shape(&[coarse, fine]),
             stats: TraversalStats::default(),
+            generation: 0,
         },
         ServerMessage::Content {
             tile: coarse,
@@ -484,6 +485,7 @@ fn holes_at_a_lod_boundary(gpu: &GpuContext, skirts: bool) -> u64 {
             tiles: selected(&[coarse, fine]),
             ancestry: tree_shape(&[coarse, fine]),
             stats: TraversalStats::default(),
+            generation: 0,
         },
         ServerMessage::Content {
             tile: coarse,
@@ -563,6 +565,7 @@ fn uncovered_fragments_along_a_shared_edge(gpu: &GpuContext) -> u64 {
             tiles: selected(&[west, east]),
             ancestry: tree_shape(&[west, east]),
             stats: TraversalStats::default(),
+            generation: 0,
         },
         ServerMessage::Content {
             tile: west,

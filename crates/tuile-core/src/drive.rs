@@ -140,7 +140,7 @@ pub async fn drive_until_complete<S: GeometryStream + Unpin>(
     stream: &mut S,
     views: Vec<ViewState>,
 ) -> Result<BulkFrame, StreamError> {
-    stream.send(ClientMessage::ViewerState { views })?;
+    stream.send(ClientMessage::ViewerState { views, generation: 1 })?;
     let mut state = SceneState::default();
     let mut contents: HashMap<TileId, TileContent> = HashMap::new();
     let mut errors: Vec<(Option<TileId>, String)> = Vec::new();

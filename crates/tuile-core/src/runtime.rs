@@ -94,6 +94,7 @@ pub fn in_process_with(
             priming_state: Priming::default(),
             priming_reported: None,
             views: Vec::new(),
+            view_generation: 0,
             out: TraversalOutput::default(),
             selected: HashSet::new(),
             rendered_last: HashSet::new(),
@@ -130,6 +131,7 @@ pub struct GeometryServer {
     priming_state: Priming,
     priming_reported: Option<Priming>,
     views: Vec<ViewState>,
+    view_generation: u64,
     out: TraversalOutput,
     selected: HashSet<TileId>,
     rendered_last: HashSet<TileId>,
@@ -159,6 +161,7 @@ impl GeometryServer {
             priming_state: &mut self.priming_state,
             priming_reported: &mut self.priming_reported,
             views: &mut self.views,
+            view_generation: &mut self.view_generation,
             out: &mut self.out,
             selected: &mut self.selected,
             rendered_last: &mut self.rendered_last,
@@ -289,6 +292,7 @@ struct Session<'a> {
     priming_state: &'a mut Priming,
     priming_reported: &'a mut Option<Priming>,
     views: &'a mut Vec<ViewState>,
+    view_generation: &'a mut u64,
     out: &'a mut TraversalOutput,
     /// What this pass touched: the frontier, every ancestor of it, and
     /// everything it asked for. Never a victim — the reference implementation's
@@ -314,8 +318,9 @@ impl Session<'_> {
     /// Returns true when a re-traversal is needed.
     fn on_client(&mut self, msg: ClientMessage) -> bool {
         match msg {
-            ClientMessage::ViewerState { views } => {
+            ClientMessage::ViewerState { views, generation } => {
                 *self.views = views;
+                *self.view_generation = generation;
                 // A new camera position: the traversal it triggers starts a new
                 // generation, and the one it displaces becomes history rather
                 // than being forgotten.
@@ -594,6 +599,7 @@ impl Session<'_> {
                 .map(|tile| (*tile, self.ancestry(*tile)))
                 .collect(),
             stats: self.out.stats,
+            generation: *self.view_generation,
         })
         .map_err(|_| Gone)?;
         if !reclaimed.is_empty() {
@@ -973,6 +979,7 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![near_view()],
+                generation: 0,
             })
             .expect("send");
 
@@ -1180,7 +1187,7 @@ mod tests {
         // taken back.
         for view in [near_view(), far_view()] {
             stream
-                .send(ClientMessage::ViewerState { views: vec![view] })
+                .send(ClientMessage::ViewerState { views: vec![view], generation: 0 })
                 .expect("send");
             for _ in 0..256 {
                 let _ = server.as_mut().poll(&mut cx);
@@ -1279,7 +1286,7 @@ mod tests {
         // of a real consumer is exactly this window, held open.
         for view in [near_view(), far_view()] {
             stream
-                .send(ClientMessage::ViewerState { views: vec![view] })
+                .send(ClientMessage::ViewerState { views: vec![view], generation: 0 })
                 .expect("send");
             for _ in 0..256 {
                 let _ = server.as_mut().poll(&mut cx);
@@ -1383,6 +1390,7 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![near_view()],
+                generation: 0,
             })
             .expect("send");
 
@@ -1438,6 +1446,7 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![near_view()],
+                generation: 0,
             })
             .expect("send");
         let near_selection = selection_after(&mut server, &mut stream);
@@ -1449,6 +1458,7 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![far_view()],
+                generation: 0,
             })
             .expect("send");
         let (_, evicted) = settle(&mut server, &mut stream).expect("far view settles");
@@ -1570,6 +1580,7 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![near_view()],
+                generation: 0,
             })
             .expect("send");
         settle(&mut server, &mut stream).expect("a still camera settles");
@@ -1608,7 +1619,7 @@ mod tests {
 
         for view in [near_view(), far_view(), near_view(), far_view()] {
             stream
-                .send(ClientMessage::ViewerState { views: vec![view] })
+                .send(ClientMessage::ViewerState { views: vec![view], generation: 0 })
                 .expect("send");
             settle(&mut server, &mut stream).expect("settles");
         }
@@ -1641,6 +1652,7 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![near_view()],
+                generation: 0,
             })
             .expect("send");
         let (loaded, _) = settle(&mut server, &mut stream).expect("first view settles");
@@ -1658,6 +1670,7 @@ mod tests {
             stream
                 .send(ClientMessage::ViewerState {
                     views: vec![far_view()],
+                    generation: 0,
                 })
                 .expect("send");
             let (_, dropped) = settle(&mut server, &mut stream).expect("far view settles");
@@ -1711,6 +1724,7 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![near_view()],
+                generation: 0,
             })
             .expect("send");
         settle(&mut server, &mut stream).expect("the near view settles");
@@ -1718,6 +1732,7 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![far_view()],
+                generation: 0,
             })
             .expect("send");
         let (_, evicted) = settle(&mut server, &mut stream).expect("the far view settles");
@@ -1782,6 +1797,7 @@ mod tests {
             stream
                 .send(ClientMessage::ViewerState {
                     views: vec![near_view()],
+                    generation: 0,
                 })
                 .expect("send");
 
@@ -1861,6 +1877,7 @@ mod tests {
             stream
                 .send(ClientMessage::ViewerState {
                     views: vec![near_view()],
+                    generation: 0,
                 })
                 .expect("send");
             while let Some(msg) = stream.next_message().await {
@@ -1906,6 +1923,7 @@ mod tests {
             stream
                 .send(ClientMessage::ViewerState {
                     views: vec![near_view()],
+                    generation: 0,
                 })
                 .expect("send");
             while let Some(msg) = stream.next_message().await {

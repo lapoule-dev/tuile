@@ -127,6 +127,7 @@ fn missing_neighbour() -> Vec<ServerMessage> {
             tiles: selected(&[here(), neighbour()]),
             ancestry: tree_shape(&[here(), neighbour()]),
             stats: TraversalStats::default(),
+            generation: 0,
         },
         ServerMessage::Content {
             tile: here(),
@@ -222,6 +223,7 @@ fn the_real_tile_replaces_its_stand_in_without_a_gap() {
             tiles: selected(&[neighbour()]),
             ancestry: tree_shape(&[neighbour()]),
             stats: TraversalStats::default(),
+            generation: 0,
         },
         ServerMessage::Fill {
             tile: neighbour(),

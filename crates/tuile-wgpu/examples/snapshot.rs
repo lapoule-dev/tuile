@@ -94,6 +94,7 @@ fn main() {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![view_state],
+                generation: 0,
             })
             .expect("send viewer state");
         pool.run_until_stalled();
