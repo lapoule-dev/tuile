@@ -71,6 +71,11 @@ pub struct ContentPump {
 /// real content.
 pub const UPLOADS_PER_FRAME: usize = 8;
 
+/// How many levels the sharpest draped imagery may sit above a tile before
+/// the tile counts as smeared in [`Resolution::smeared_drawn`]. Two levels is
+/// a 4× stretch per axis — visibly soft; beyond it is a flat wall.
+pub const SMEAR_GAP: u32 = 2;
+
 impl ContentPump {
     pub fn new(render_origin: DVec3) -> Self {
         Self {
@@ -450,6 +455,19 @@ impl ContentPump {
             }
             false
         };
+        // The smear count: a drawn surface whose sharpest imagery sits more
+        // than SMEAR_GAP levels above its own level is one texel stretched
+        // over its whole ground — the flat-colour wall a recorder must refuse.
+        let smeared_drawn = exact
+            .iter()
+            .chain(fallback.iter())
+            .filter(|id| {
+                self.prepared.get(id).is_some_and(|p| {
+                    p.sharpest_imagery_level
+                        .is_none_or(|sharpest| self.level(**id).saturating_sub(sharpest) > SMEAR_GAP)
+                })
+            })
+            .count();
         let coplanar = fallback
             .iter()
             .flat_map(|f| {
@@ -461,6 +479,7 @@ impl ContentPump {
         let counts = Resolution {
             stand_ins,
             coplanar,
+            smeared_drawn,
             ..counts
         };
         let drawn = Drawn {
@@ -608,6 +627,11 @@ pub struct Drawn<'a> {
 pub struct Resolution {
     /// Drawn at the level the traversal chose.
     pub exact: usize,
+    /// Drawn surfaces whose sharpest draped imagery sits more than
+    /// [`SMEAR_GAP`] levels above the tile — one texel stretched over the
+    /// ground: the flat-colour smear, counted at the only honest place, the
+    /// draw list itself. Tiles with no imagery at all count too.
+    pub smeared_drawn: usize,
     /// Drawn by a coarser ancestor while the chosen tile streams in.
     pub coarser: usize,
     /// Drawn by nothing.
