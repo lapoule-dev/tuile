@@ -271,7 +271,7 @@ async fn settle<S: GeometryStream + Unpin>(
     cost: &mut StepCost,
     contents: &mut HashMap<TileId, tuile_core::DecodedTileContent>,
 ) -> Result<Vec<TileId>> {
-    stream.send(ClientMessage::ViewerState { views: vec![view] })?;
+    stream.send(ClientMessage::ViewerState { views: vec![view], generation: 0 })?;
 
     let mut selection: Vec<TileId> = Vec::new();
     let mut messages = 0usize;
