@@ -192,9 +192,29 @@ impl ContentPump {
         view: ViewState,
         render_origin: DVec3,
     ) -> usize {
+        self.advance_with(stream, gpu, &[view], render_origin)
+    }
+
+    /// [`Self::advance`] with several views at once.
+    ///
+    /// The traversal's multi-view contract does the work: selection is the
+    /// **union** over views, refinement depth is the max, fetch priority the
+    /// best view per tile (see `tuile_core::traversal`). That is what lets a
+    /// headless consumer load a whole slice of camera path eagerly — send the
+    /// slice's views together and [`Self::missing`] gates on all of them —
+    /// while the previous slice is still being rendered from residency.
+    pub fn advance_with<S: GeometryStream>(
+        &mut self,
+        stream: &mut S,
+        gpu: &crate::context::GpuContext,
+        views: &[ViewState],
+        render_origin: DVec3,
+    ) -> usize {
         // Best effort: a closed stream means the session is over, and a frame is
         // not the place to discover it.
-        let _ = stream.send(ClientMessage::ViewerState { views: vec![view] });
+        let _ = stream.send(ClientMessage::ViewerState {
+            views: views.to_vec(),
+        });
         let uploaded = self.pump(stream, gpu, UPLOADS_PER_FRAME);
         self.rebase(&gpu.queue, render_origin);
         uploaded
