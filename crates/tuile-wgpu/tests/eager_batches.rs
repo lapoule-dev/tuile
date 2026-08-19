@@ -122,7 +122,9 @@ fn settle(
     for _ in 0..2_000 {
         let _ = server.as_mut().poll(&mut cx);
         let uploaded = pump.pump(stream, gpu, tuile_wgpu::UPLOADS_PER_FRAME);
-        let done = !pump.selection.is_empty() && pump.missing() == 0 && pump.pending_uploads() == 0;
+        let done = !pump.selection.is_empty()
+            && pump.provisional() == 0
+            && pump.pending_uploads() == 0;
         quiet = if uploaded == 0 && done { quiet + 1 } else { 0 };
         if quiet > 8 {
             break;
@@ -193,4 +195,9 @@ fn a_second_view_loads_its_ground_too() {
         "two views must refine both grounds (west={west}, east={east})"
     );
     assert_eq!(pump.missing(), 0, "the union settled completely");
+    assert_eq!(
+        pump.provisional(),
+        0,
+        "nothing selected is a stand-in — real ground everywhere"
+    );
 }

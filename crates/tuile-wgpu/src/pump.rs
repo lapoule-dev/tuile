@@ -478,6 +478,21 @@ impl ContentPump {
             .count()
     }
 
+    /// Selected tiles whose ground is not the real thing yet: absent
+    /// entirely, or held by a stand-in.
+    ///
+    /// [`Self::missing`] cannot see a stand-in — a stand-in **is** prepared;
+    /// covering the ground while the real tile travels is its whole job, and
+    /// an interactive viewer wants exactly that. A recorder does not: its
+    /// eager gate must refuse to encode while any selected ground is a flat
+    /// approximation, and this is the count it gates on.
+    pub fn provisional(&self) -> usize {
+        self.selection
+            .iter()
+            .filter(|(t, _)| !self.prepared.contains_key(t) || self.fills.contains(t))
+            .count()
+    }
+
     /// Whether the GPU holds a surface for `tile` — **its own**, real or
     /// stand-in.
     ///
