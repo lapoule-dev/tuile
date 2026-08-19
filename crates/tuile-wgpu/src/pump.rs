@@ -30,11 +30,16 @@ pub struct ContentPump {
     fills: HashSet<TileId>,
     /// Current selection, as sent by the geometry server.
     pub selection: Vec<(TileId, f64)>,
-    /// How many `Select` messages this pump has applied — the correlation a
-    /// deterministic consumer needs: send a camera, then wait for this to
-    /// advance, and the selection is *that* camera's (the server coalesces
-    /// bursts, so the next Select always reflects the latest views sent).
+    /// How many `Select` messages this pump has applied.
     selects_seen: u64,
+    /// The generation this pump last sent with a `ViewerState` — monotone,
+    /// one per send.
+    generation_sent: u64,
+    /// The generation the current selection answers, echoed by the server.
+    /// `generation_selected() >= generation_sent()` is the correlation a
+    /// deterministic consumer renders on: the selection is for the LAST
+    /// camera this pump sent — by construction, not by heuristic.
+    generation_selected: u64,
     /// What the server has said about the shape of the tree, accumulated.
     ///
     /// **The consumer cannot derive this and must not try.** A `TileId` is an
@@ -85,6 +90,8 @@ impl ContentPump {
             fills: HashSet::new(),
             selection: Vec::new(),
             selects_seen: 0,
+            generation_sent: 0,
+            generation_selected: 0,
             ancestry: HashMap::new(),
             stats: TraversalStats::default(),
             gpu_bytes: 0,
@@ -223,8 +230,10 @@ impl ContentPump {
     ) -> usize {
         // Best effort: a closed stream means the session is over, and a frame is
         // not the place to discover it.
+        self.generation_sent += 1;
         let _ = stream.send(ClientMessage::ViewerState {
             views: views.to_vec(),
+            generation: self.generation_sent,
         });
         let uploaded = self.pump(stream, gpu, UPLOADS_PER_FRAME);
         self.rebase(&gpu.queue, render_origin);
@@ -271,11 +280,13 @@ impl ContentPump {
                 tiles,
                 ancestry,
                 stats,
+                generation,
             } => {
                 self.ancestry.extend(ancestry);
                 self.selection = tiles;
                 self.stats = stats;
                 self.selects_seen += 1;
+                self.generation_selected = generation;
             }
             ServerMessage::Content {
                 tile,
@@ -515,6 +526,18 @@ impl ContentPump {
     /// See the field: the Select counter a consumer correlates on.
     pub fn selects_seen(&self) -> u64 {
         self.selects_seen
+    }
+
+    /// The generation of the last `ViewerState` this pump sent.
+    pub fn generation_sent(&self) -> u64 {
+        self.generation_sent
+    }
+
+    /// The generation the current selection answers. When this has caught up
+    /// with [`Self::generation_sent`], the selection is the last camera's —
+    /// the render-purity property, by construction.
+    pub fn generation_selected(&self) -> u64 {
+        self.generation_selected
     }
 
     pub fn provisional(&self) -> usize {
