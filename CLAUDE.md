@@ -25,6 +25,7 @@ The executable heart is a **logical geometry server**, not a network server. The
 | `docs/12-crate-server.md` | Detailed spec for `tuile-server` (axum + Workers, pluggable cache) |
 | `docs/13-crate-usd.md` | Detailed spec for `tuile-usd` (USDZ export, track animations) |
 | `docs/14-crate-hydra.md` | Detailed spec for `tuile-hydra` (C ABI + OpenUSD/Hydra plugin, camera resolution, Dockerfiles) |
+| `docs/15-usd-scene-index.md` | Vision et trajectoire OpenUSD : le cœur scene index Hydra 2.0, la façade hdGp, le jumeau usdrecord du recorder |
 | `docs/20-conventions.md` | Style, tests, CI, licenses, commits |
 
 ## Non-negotiable rules
