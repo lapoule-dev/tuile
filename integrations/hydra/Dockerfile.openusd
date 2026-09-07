@@ -56,6 +56,8 @@ ARG BASE_IMAGE=nvidia/cuda:12.6.2-devel-ubuntu24.04
 
 FROM ${BASE_IMAGE}
 ARG USD_VERSION
+# Explicit job count; 0 = derive from the cgroup (see the blind spot below).
+ARG BUILD_JOBS=0
 ENV DEBIAN_FRONTEND=noninteractive
 
 # libglvnd + EGL: Storm renders headless through EGL, with no X server and no
@@ -85,6 +87,14 @@ RUN curl -fL --retry 5 --retry-delay 5 --retry-all-errors \
 # for 31 GB and the pod is OOM-killed — after an hour, with an exit code that
 # says nothing useful. The cgroup files below are the only honest source.
 #
+# BUT the cgroup files have a blind spot, measured live on the k8s buildx
+# builder: buildkit executes RUN steps in a *nested* cgroup namespace where
+# memory.max reads "max", so the fallback below read the NODE's 31 GB, chose
+# -j 12 inside a 4Gi limit, and pinned the pod at 4095Mi during OpenVDB —
+# the OOM death foretold. On such builders, pass the honest count yourself:
+#
+#   --build-arg BUILD_JOBS=2      # 4Gi limit / 1.5 GB per compiler
+#
 # 1.5 GB per compiler is measured, not guessed: an earlier arm64 build ran
 # `-j 8` on 8 cores with 10 GB, drove available memory under 1 GB, pushed
 # 3.6 GB into swap, and its throughput collapsed from ~30 compiled objects per
@@ -94,6 +104,10 @@ RUN curl -fL --retry 5 --retry-delay 5 --retry-all-errors \
 # The same feature set in every build. Embree stays alongside Storm: a node
 # whose driver failed can still produce a frame, and that should be a flag
 # rather than a redeploy.
+#
+# --onetbb is REQUIRED: the Cycles Hydra delegate links oneTBB, and a
+# classic-TBB USD cannot host it (incompatible ABIs — proven on the native
+# macOS build, see integrations/hydra/build-macos-metal.sh).
 RUN set -eu; \
     mem="$(cat /sys/fs/cgroup/memory.max 2>/dev/null \
         || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null \
@@ -105,11 +119,13 @@ RUN set -eu; \
     if [ "$jobs" -lt 1 ]; then jobs=1; fi; \
     cpus="$(nproc)"; \
     if [ "$jobs" -gt "$cpus" ]; then jobs="$cpus"; fi; \
+    if [ "${BUILD_JOBS}" -gt 0 ]; then jobs="${BUILD_JOBS}"; fi; \
     echo "building with -j ${jobs} (memory budget $((mem / 1024 / 1024)) MiB, ${cpus} cpus)"; \
     python3 -u OpenUSD/build_scripts/build_usd.py \
         --python --usd-imaging --embree \
         --materialx --openimageio --opencolorio --openvdb \
         --alembic --ptex --draco \
+        --onetbb \
         --no-usdview \
         --no-examples --no-tutorials --no-tests --no-docs --no-python-docs \
         --no-prman --no-vulkan \
