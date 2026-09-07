@@ -163,6 +163,11 @@ def main():
                   flush=True)
             args.keep_frames = True
         else:
+            # Blender 5.x filters the format list by media_type; VIDEO must
+            # be selected before FFMPEG exists as a choice (4.x has no such
+            # property).
+            if hasattr(scene.render.image_settings, "media_type"):
+                scene.render.image_settings.media_type = "VIDEO"
             scene.render.image_settings.file_format = "FFMPEG"
             scene.render.ffmpeg.format = "MPEG4"
             scene.render.ffmpeg.codec = "H264"
@@ -199,6 +204,8 @@ def main():
 
     if args.video and ffmpeg_capable:
         # Encode from the rendered sequence via the sequencer (no re-render).
+        if hasattr(scene.render.image_settings, "media_type"):
+            scene.render.image_settings.media_type = "VIDEO"
         scene.render.image_settings.file_format = "FFMPEG"
         scene.render.ffmpeg.format = "MPEG4"
         scene.render.ffmpeg.codec = "H264"
