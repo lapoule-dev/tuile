@@ -35,6 +35,7 @@ JOB_THRESHOLD="${JOB_THRESHOLD:-0.05}"
 JOB_GPUS="${JOB_GPUS:-1}"
 JOB_PROCS_PER_GPU="${JOB_PROCS_PER_GPU:-4}"
 JOB_BATCH_FRAMES="${JOB_BATCH_FRAMES:-60}"
+JOB_FPS="${JOB_FPS:-24}"
 JOB_EXTRA_ARGS="${JOB_EXTRA_ARGS:-}"
 JOB_OUT="${JOB_OUT:-/out/render.mp4}"
 
@@ -86,6 +87,16 @@ done
 wait
 echo "WALL: $(($(date +%s) - t0))s pour $total frames en $jobs processus / $JOB_GPUS GPU"
 
+# Blender 5.x has no built-in encoder: the driver leaves PNG sequences and
+# each range is encoded here with the static ffmpeg.
+for i in $(seq 0 $((jobs - 1))); do
+    if [ ! -s "$outdir/seg$i.mp4" ] && ls "$outdir/s$i".*.png > /dev/null 2>&1; then
+        a=$((first + i * span))
+        ffmpeg -y -framerate "$JOB_FPS" -start_number "$a" \
+            -i "$outdir/s$i.%d.png" -c:v libx264 -pix_fmt yuv420p -crf 18 \
+            "$outdir/seg$i.mp4" > /dev/null 2>&1 && rm -f "$outdir/s$i".*.png
+    fi
+done
 n=$(ls "$outdir"/seg*.mp4 2>/dev/null | wc -l)
 if [ "$n" = "$jobs" ]; then
     for i in $(seq 0 $((jobs - 1))); do echo "file '$outdir/seg$i.mp4'"; done > "$outdir/list.txt"
