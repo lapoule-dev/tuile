@@ -65,8 +65,17 @@ job loudly. No degraded frame ever reaches a deliverable.
 | M | Deliverable | Proves |
 |---|---|---|
 | M1 | `usdview` + Storm: a stage with one `Globe` prim streams live | the core, the C ABI, the camera ladder — 90 % of doc 14 |
-| M2 | `usdrecord` batch: track → stage (animated camera) → video, eager-fatal | the product twin; `--dump-camera` output becomes the `UsdGeomCamera` |
+| M2 | batch: track → stage (animated camera) → video, eager-fatal | the product twin; `--dump-camera` output becomes the `UsdGeomCamera` |
 | M3 | Solaris, then Omniverse | the facades; no core changes allowed |
+
+**M2's batch harness is Blender headless, decided 2026-09-07** (see
+`integrations/blender/`): Blender imports the stage natively, its
+persistent session removes the per-frame re-sync that usdrecord pays on a
+deprecated code path, and it carries both tiers (Cycles/OptiX photoreal,
+EEVEE fast) plus direct-to-video output. Measured on farm GPUs: 0.31
+s/frame at full quality on 2×RTX 5090 — under the 0.47 s/frame product
+budget. `usdrecord` remains the conformity check: a control frame proves
+the stage is standard USD, not Blender-flavored.
 
 Throughout: `tuile-usd` (doc 13, baked USDZ files) remains the zero-plugin
 compatibility floor, unrelated to this crate by design.
