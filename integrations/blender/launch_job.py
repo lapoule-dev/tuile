@@ -61,7 +61,7 @@ def main():
     p.add_argument("--frames", required=True, help="A:B inclus")
     p.add_argument("--name", default="render-job")
     p.add_argument("--image",
-                   default="harbor.sportstracklive.com/stl/blender-render:4.5")
+                   default="harbor.sportstracklive.com/stl/blender-render:5.1")
     p.add_argument("--registry-name", default="harbor-stl",
                    help="credential registre déjà enregistré chez RunPod")
     p.add_argument("--gpu-type", default="NVIDIA GeForce RTX 5090")
