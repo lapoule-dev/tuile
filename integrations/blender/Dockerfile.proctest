@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# Image du test décisif procédural : compile NOTRE mini-procédural hdGp
+# (un cube) contre le prefix USD de la base — la répétition générale exacte
+# de TuileGlobe (même API, même CMake, même chargement) — puis embarque le
+# protocole de verdict. Le pod GPU la tire et répond en ~3 minutes.
+FROM harbor.sportstracklive.com/stl/blender-usd-base:5.1-2508
+
+COPY proctest/cubeProc /opt/src/cubeProc
+RUN cmake -S /opt/src/cubeProc -B /tmp/build \
+        -DCMAKE_BUILD_TYPE=Release -Dpxr_DIR=/opt/usd -DCMAKE_PREFIX_PATH=/opt/usd \
+    && cmake --build /tmp/build -j 2 \
+    && cmake --install /tmp/build --prefix /opt/plugins/cubeProc \
+    && test -f /opt/plugins/cubeProc/plugin/libcubeProc.so \
+    && rm -rf /tmp/build
+
+COPY proctest/proc_driver.py /opt/proc/proc_driver.py
+COPY proctest/proc_run.sh /opt/proc/proc_run.sh
+
+CMD ["bash", "/opt/proc/proc_run.sh"]

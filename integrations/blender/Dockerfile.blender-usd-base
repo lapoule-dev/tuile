@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# The durable base: Ubuntu + Blender + a from-source OpenUSD prefix matching
+# the version Blender bundles — the only environment a Blender-loadable USD
+# plugin can be compiled against (Blender ships no headers). Plugin images
+# (the procedural test, TuileGlobe) and the render image are FROM this.
+#
+# The pairing is a hard invariant, asserted at build time: Blender 5.1
+# bundles USD 25.08 — bump them TOGETHER or plugins stop loading. Probed
+# empirically (2026-09-07): the LINUX 5.1.2 build carries the built-in
+# FFMPEG video encoder (the macOS 5.1.0 build does not — platform
+# difference, not a 5.x removal), so newest Blender, the generative
+# machinery and integrated encoding coexist here.
+#
+#   docker buildx build --builder stl-builder-k8s --platform linux/amd64 \
+#       -f integrations/blender/Dockerfile.blender-usd-base \
+#       -t harbor.sportstracklive.com/stl/blender-usd-base:5.1-2508 --push .
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ARG BUILD_JOBS=2
+ARG BLENDER_VERSION=5.1.2
+ARG USD_VERSION=25.08
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake python3 git curl ca-certificates xz-utils \
+        libx11-dev libxt-dev libgl1-mesa-dev libglu1-mesa-dev libglvnd-dev \
+        libegl1-mesa-dev libegl1 libgles2 zlib1g-dev libbz2-dev liblzma-dev \
+        libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6 libice6 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsL -o /tmp/b.tar.xz \
+        "https://download.blender.org/release/Blender${BLENDER_VERSION%.*}/blender-${BLENDER_VERSION}-linux-x64.tar.xz" \
+    && mkdir -p /opt/blender \
+    && tar -xJf /tmp/b.tar.xz -C /opt/blender --strip-components=1 \
+    && rm /tmp/b.tar.xz
+
+ENV PATH=/opt/blender:$PATH
+
+# Minimal USD with --examples: Pixar's example hdGp generative procedural
+# rides along (the decisive-test subject), and the prefix keeps headers +
+# libs — the compile base for our own plugins. Source tree kept: plugin
+# builds and the test read it.
+RUN curl -fsL -o /tmp/usd.tar.gz \
+        "https://github.com/PixarAnimationStudios/OpenUSD/archive/refs/tags/v${USD_VERSION}.tar.gz" \
+    && tar -xzf /tmp/usd.tar.gz -C /opt \
+    && python3 /opt/OpenUSD-${USD_VERSION}/build_scripts/build_usd.py \
+        --no-python --no-tests --no-docs --no-python-docs --no-tutorials \
+        --examples \
+        --no-materialx --no-opencolorio --no-openimageio --no-openvdb \
+        --no-alembic --no-draco --no-ptex --no-usdview --no-prman --no-vulkan \
+        -j ${BUILD_JOBS} /opt/usd \
+    && rm -rf /opt/usd/build /opt/usd/src /tmp/usd.tar.gz \
+    && ln -s /opt/OpenUSD-${USD_VERSION} /opt/openusd-src
+
+# Build assertions: the bundled and built USD versions MATCH, and the
+# example procedural plugin exists.
+RUN blender -b --factory-startup --python-exit-code 1 --python-expr "from pxr import Usd; v = Usd.GetVersion(); want = tuple(int(x) for x in '${USD_VERSION}'.split('.')); print('bundled', v, 'built', want); assert (v[1], v[2]) == want, 'bundled/built USD mismatch'" \
+    && test -f /opt/usd/include/pxr/imaging/hdGp/generativeProceduralPluginRegistry.h \
+    && ls /opt/usd/lib/libusd_hdGp* > /dev/null \
+    && echo "base verified: blender ${BLENDER_VERSION}, usd ${USD_VERSION}, hdGp headers+lib present"
+
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+
+CMD ["blender", "--version"]
