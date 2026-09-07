@@ -1147,6 +1147,99 @@ pub fn drape_single(
     }
 }
 
+/// CPU replica of `blend_layer` (raster.wgsl): composites a stack of
+/// [`ImageryLayer`]s into one texture over the geometry tile's own uv space.
+///
+/// Semantics texel by texel, kept deliberately identical to the shader: a
+/// layer contributes only inside its `coverage` rectangle (bounds inclusive,
+/// the shader's `step`), samples at `tile_uv * scale + translation` through a
+/// clamping bilinear fetch, and mixes over the accumulated colour weighted by
+/// its own texel alpha — layers in order, later ones over earlier ones. A
+/// texel no layer reaches keeps `base`.
+///
+/// Deterministic: same layers, same size, same bytes.
+pub fn bake_layers(layers: &[ImageryLayer], base: [f32; 4], size: (u32, u32)) -> DecodedTexture {
+    let (w, h) = (size.0.max(1), size.1.max(1));
+    let mut rgba8 = vec![0u8; (w as usize) * (h as usize) * 4];
+    let base_rgb = [
+        base[0].clamp(0.0, 1.0) * 255.0,
+        base[1].clamp(0.0, 1.0) * 255.0,
+        base[2].clamp(0.0, 1.0) * 255.0,
+    ];
+    for row in 0..h {
+        let v = (row as f32 + 0.5) / h as f32;
+        for col in 0..w {
+            let u = (col as f32 + 0.5) / w as f32;
+            let mut rgb = base_rgb;
+            for layer in layers {
+                let c = layer.coverage;
+                if u < c[0] || v < c[1] || u > c[2] || v > c[3] {
+                    continue;
+                }
+                let tu = (u * layer.scale[0] + layer.translation[0]).clamp(0.0, 1.0);
+                let tv = (v * layer.scale[1] + layer.translation[1]).clamp(0.0, 1.0);
+                let texel = bilinear(&layer.texture, f64::from(tu), f64::from(tv));
+                let a = f32::from(texel[3]) / 255.0;
+                for (dst, src) in rgb.iter_mut().zip(texel) {
+                    *dst += (f32::from(src) - *dst) * a;
+                }
+            }
+            let i = ((row * w + col) * 4) as usize;
+            rgba8[i] = (rgb[0] + 0.5) as u8;
+            rgba8[i + 1] = (rgb[1] + 0.5) as u8;
+            rgba8[i + 2] = (rgb[2] + 0.5) as u8;
+            rgba8[i + 3] = 255;
+        }
+    }
+    DecodedTexture {
+        width: w,
+        height: h,
+        rgba8,
+    }
+}
+
+/// Bakes a tile's draped imagery into a texture it owns.
+///
+/// The portable form of the drape: offline renderers and interchange formats
+/// want one texture per material, not the N-layer pass a rasterizer blends at
+/// draw time. After this, `content.textures` carries the mosaic,
+/// every mesh's material points at it, and `imagery` is empty — the content
+/// renders identically through a path that knows nothing about layers.
+///
+/// The bake resolution follows the sharpest layer (its texel count across the
+/// tile, `texture width × scale`), clamped to `[64, max_size]` — a coarse
+/// stand-in stays cheap, a fine mosaic keeps its detail up to the cap. Tiles
+/// whose meshes carry no uvs (non-terrain content) are left untouched, as is
+/// content with no imagery.
+pub fn bake_imagery(content: &mut DecodedTileContent, max_size: u32) {
+    if content.imagery.is_empty() || content.meshes.iter().any(|m| m.uvs.is_none()) {
+        return;
+    }
+    let side = content
+        .imagery
+        .iter()
+        .map(|l| {
+            let x = (l.texture.width as f32 * l.scale[0]).ceil() as u32;
+            let y = (l.texture.height as f32 * l.scale[1]).ceil() as u32;
+            x.max(y)
+        })
+        .max()
+        .unwrap_or(64)
+        .clamp(64, max_size.max(64));
+    let base = content
+        .meshes
+        .first()
+        .map(|m| m.material.base_color_factor)
+        .unwrap_or([1.0; 4]);
+    let baked = bake_layers(&content.imagery, base, (side, side));
+    let index = content.textures.len();
+    content.textures.push(baked);
+    for mesh in &mut content.meshes {
+        mesh.material.base_color_texture = Some(index);
+    }
+    content.imagery.clear();
+}
+
 /// An imagery source: a tiling scheme plus tile fetching+decoding.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -2536,5 +2629,111 @@ mod tests {
             err,
             Err(RasterError::Fetch(FetchError::NotFound(_)))
         ));
+    }
+
+    /// A 1×1 solid texture as a shareable layer source.
+    fn solid(rgba: [u8; 4]) -> Arc<DecodedTexture> {
+        Arc::new(DecodedTexture {
+            width: 1,
+            height: 1,
+            rgba8: rgba.to_vec(),
+        })
+    }
+
+    fn layer(texture: Arc<DecodedTexture>, coverage: [f32; 4]) -> ImageryLayer {
+        ImageryLayer {
+            coord: ImageryCoord { level: 0, x: 0, y: 0 },
+            texture,
+            coverage,
+            translation: [0.0, 0.0],
+            scale: [1.0, 1.0],
+        }
+    }
+
+    #[test]
+    fn bake_reproduces_blend_layer_by_hand() {
+        // Base colour, a full-coverage opaque red layer, then a half-alpha
+        // green layer masked to the right half — the shader's own composition
+        // rule, computed by hand.
+        let layers = [
+            layer(solid([255, 0, 0, 255]), [-0.1, -0.1, 1.1, 1.1]),
+            layer(solid([0, 255, 0, 128]), [0.5, -0.1, 1.1, 1.1]),
+        ];
+        let baked = bake_layers(&layers, [0.2, 0.4, 0.6, 1.0], (4, 4));
+        assert_eq!((baked.width, baked.height), (4, 4));
+        // Left half: red only (the green layer's mask is zero there).
+        assert_eq!(&baked.rgba8[0..4], &[255, 0, 0, 255]);
+        // Right half: mix(red, green, 128/255) — 255·(1−a) then 255·a.
+        let a = 128.0 / 255.0;
+        let expected = [
+            (255.0 * (1.0 - a) + 0.5) as u8,
+            (255.0 * a + 0.5) as u8,
+            0,
+            255,
+        ];
+        assert_eq!(&baked.rgba8[3 * 4..3 * 4 + 4], &expected);
+        // A texel no layer reaches keeps the base colour.
+        let bare = bake_layers(&[], [0.2, 0.4, 0.6, 1.0], (1, 1));
+        assert_eq!(&bare.rgba8[0..4], &[51, 102, 153, 255]);
+    }
+
+    #[test]
+    fn bake_imagery_owns_the_mosaic_and_clears_the_layers() {
+        let rect = GeoRect {
+            west: 0.0,
+            south: 0.0,
+            east: 0.01,
+            north: 0.01,
+        };
+        let origin = geodetic_to_ecef(crate::geo::Geodetic {
+            lon: 0.005,
+            lat: 0.005,
+            height: 0.0,
+        });
+        let positions = vec![[0.0f32; 3]; 3];
+        let uvs = uvs_geographic(&positions, origin, &rect);
+        let mut content = DecodedTileContent {
+            meshes: vec![DecodedMesh {
+                positions,
+                normals: None,
+                uvs: Some(uvs),
+                indices: vec![0, 1, 2],
+                material: MaterialDesc {
+                    base_color_factor: [1.0; 4],
+                    base_color_texture: None,
+                },
+            }],
+            textures: Vec::new(),
+            imagery: vec![layer(solid([10, 20, 30, 255]), [-0.1, -0.1, 1.1, 1.1])],
+            local_origin_ecef: origin,
+            transform_local: Mat4::IDENTITY,
+        };
+
+        bake_imagery(&mut content, 256);
+        assert_eq!(content.textures.len(), 1, "the tile owns its mosaic now");
+        assert!(content.imagery.is_empty(), "the layer stack is consumed");
+        assert_eq!(content.meshes[0].material.base_color_texture, Some(0));
+        // A 1×1 source floors at 64; solid colour everywhere.
+        assert_eq!(content.textures[0].width, 64);
+        assert_eq!(&content.textures[0].rgba8[0..4], &[10, 20, 30, 255]);
+
+        // The cap binds: a sharp source is clamped, never exceeded.
+        let mut sharp = content.clone();
+        sharp.imagery = vec![layer(
+            Arc::new(DecodedTexture {
+                width: 512,
+                height: 512,
+                rgba8: vec![255; 512 * 512 * 4],
+            }),
+            [-0.1, -0.1, 1.1, 1.1],
+        )];
+        bake_imagery(&mut sharp, 128);
+        assert_eq!(sharp.textures.last().unwrap().width, 128);
+
+        // No imagery: untouched.
+        let mut plain = content.clone();
+        let before = plain.textures.len();
+        bake_imagery(&mut plain, 256);
+        assert_eq!(plain.textures.len(), before);
     }
 }
