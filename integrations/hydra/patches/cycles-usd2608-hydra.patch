@@ -1,0 +1,116 @@
+diff --git a/src/hydra/plugin.cpp b/src/hydra/plugin.cpp
+index c8a1f88..5db4429 100644
+--- a/src/hydra/plugin.cpp
++++ b/src/hydra/plugin.cpp
+@@ -4,6 +4,10 @@
+  * SPDX-License-Identifier: Apache-2.0 */
+ 
+ #include "hydra/plugin.h"
++
++#if PXR_VERSION >= 2608
++#  include <pxr/imaging/hd/rendererCreateArgsSchema.h>
++#endif
+ #include "hydra/render_delegate.h"
+ #include "util/log.h"
+ #include "util/path.h"
+@@ -39,17 +43,25 @@ bool HdCyclesPlugin::IsSupported() const
+   return true;
+ }
+ #else
+-#  if PXR_VERSION >= 2511
++#  if PXR_VERSION >= 2608
++bool HdCyclesPlugin::IsSupported(const HdRendererCreateArgsSchema & /*rendererCreateArgs*/,
++                                 std::string * /*reasonWhyNot*/) const
++{
++  return true;
++}
++#  elif PXR_VERSION >= 2511
+ bool HdCyclesPlugin::IsSupported(HdRendererCreateArgs const & /*rendererCreateArgs*/,
+                                  std::string * /*reasonWhyNot*/) const
+ {
+   return true;
+ }
+ #  endif
++#  if PXR_VERSION < 2608
+ bool HdCyclesPlugin::IsSupported(bool /*gpuEnabled*/) const
+ {
+   return true;
+ }
++#  endif
+ #endif
+ 
+ HdRenderDelegate *HdCyclesPlugin::CreateRenderDelegate()
+diff --git a/src/hydra/plugin.h b/src/hydra/plugin.h
+index 44d88de..cc6a401 100644
+--- a/src/hydra/plugin.h
++++ b/src/hydra/plugin.h
+@@ -7,6 +7,9 @@
+ 
+ #include "hydra/config.h"
+ #include <pxr/imaging/hd/rendererPlugin.h>
++#if PXR_VERSION >= 2608
++#  include <pxr/imaging/hd/rendererCreateArgsSchema.h>
++#endif
+ 
+ PXR_NAMESPACE_OPEN_SCOPE
+ 
+@@ -15,11 +18,16 @@ class HdCyclesPlugin final : public PXR_NS::HdRendererPlugin {
+   HdCyclesPlugin();
+   ~HdCyclesPlugin() override;
+ 
+-#if PXR_VERSION >= 2511
++#if PXR_VERSION >= 2608
++  bool IsSupported(const PXR_NS::HdRendererCreateArgsSchema &rendererCreateArgs,
++                   std::string *reasonWhyNot = nullptr) const override;
++#elif PXR_VERSION >= 2511
+   bool IsSupported(HdRendererCreateArgs const &rendererCreateArgs,
+                    std::string *reasonWhyNot = nullptr) const override;
+ #endif
++#if PXR_VERSION < 2608
+   bool IsSupported(bool gpuEnabled) const override;
++#endif
+ 
+   PXR_NS::HdRenderDelegate *CreateRenderDelegate() override;
+   PXR_NS::HdRenderDelegate *CreateRenderDelegate(
+diff --git a/src/hydra/render_delegate.cpp b/src/hydra/render_delegate.cpp
+index 3cda4a5..b6a2308 100644
+--- a/src/hydra/render_delegate.cpp
++++ b/src/hydra/render_delegate.cpp
+@@ -67,7 +67,11 @@ SessionParams GetSessionParams(const HdRenderSettingsMap &settings)
+ {
+   SessionParams params;
+   params.threads = 0;
+-  params.background = false;
++  /* Batch mode on demand: sample straight to the target and denoise once,
++   * instead of progressive refinement with repeated denoising. The mode a
++   * frame recorder wants; interactive viewers keep the default. */
++  params.background = !PXR_NS::TfGetenv("CYCLES_BACKGROUND").empty() &&
++                      PXR_NS::TfGetenv("CYCLES_BACKGROUND") != "0";
+   params.use_resolution_divider = false;
+ 
+   HdRenderSettingsMap::const_iterator it;
+@@ -138,6 +142,24 @@ HdCyclesDelegate::HdCyclesDelegate(const HdRenderSettingsMap &settingsMap,
+ 
+     SetRenderSetting(setting.first, setting.second);
+   }
++
++  /* Environment overrides, consistent with CYCLES_DEVICE: hosts whose
++   * recording path cannot deliver render settings to the delegate (usdrecord
++   * outside the render-settings scene index) still need control over the
++   * sample budget. */
++  const std::string samplesEnv = PXR_NS::TfGetenv("CYCLES_SAMPLES");
++  if (!samplesEnv.empty()) {
++    SetRenderSetting(HdCyclesRenderSettingsTokens->samples, VtValue(atoi(samplesEnv.c_str())));
++  }
++  const std::string denoiseEnv = PXR_NS::TfGetenv("CYCLES_DENOISE");
++  if (!denoiseEnv.empty()) {
++    SetRenderSetting(TfToken("cycles:integrator:use_denoise"), VtValue(denoiseEnv != "0"));
++  }
++  const std::string timeLimitEnv = PXR_NS::TfGetenv("CYCLES_TIME_LIMIT");
++  if (!timeLimitEnv.empty()) {
++    SetRenderSetting(HdCyclesRenderSettingsTokens->timeLimit,
++                     VtValue(atof(timeLimitEnv.c_str())));
++  }
+ }
+ 
+ HdCyclesDelegate::~HdCyclesDelegate() = default;
