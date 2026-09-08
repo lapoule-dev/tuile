@@ -264,8 +264,10 @@ impl NativeHttp {
         let mut builder = reqwest::Client::builder()
             .user_agent(concat!("tuile/", env!("CARGO_PKG_VERSION")))
             // Saturate the fiber: keep many keep-alive connections per host so
-            // parallel tile/imagery requests don't serialize on the pool.
-            .pool_max_idle_per_host(32)
+            // parallel tile/imagery requests don't serialize on the pool. 64
+            // matches the bulk path's fetch waves — fewer and every wave pays
+            // reconnects between bursts.
+            .pool_max_idle_per_host(64)
             .cookie_store(true);
         if let Some(timeout) = cfg.request_timeout {
             builder = builder.timeout(timeout);

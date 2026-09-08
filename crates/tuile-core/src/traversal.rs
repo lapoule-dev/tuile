@@ -212,9 +212,21 @@ pub struct Config {
     /// Implemented by pricing every tile's screen-space error at one shared
     /// distance: the distance to the nearest existing content under the
     /// camera, found by a greedy root-to-leaf descent before the traversal.
-    /// The cost grows with the view's reach — that is the point, and the
-    /// caller turning this on has declared its budget infinite.
+    /// Bounded by [`Config::uniform_detail_radius`].
     pub uniform_detail: bool,
+    /// How far the uniform zone reaches, as a multiple of the nearest-content
+    /// distance.
+    ///
+    /// Threshold precision, not concentric and not boundless: within
+    /// `radius × d_near` every tile is priced at `d_near` — uniformly fine
+    /// where the eye is, no LOD wall anywhere in the foreground. Beyond, the
+    /// effective distance is `d − (radius − 1)·d_near`: continuous at the
+    /// threshold (no visible ring), concentric degradation past it, so the
+    /// cost is a disc around the camera instead of the whole frustum to the
+    /// horizon — pricing the entire horizon at the near level was measured to
+    /// select for minutes of fetching on one frame. `f64::INFINITY` restores
+    /// the unbounded decree.
+    pub uniform_detail_radius: f64,
     /// Whether to drop tiles no view can see. Off is a diagnostic, not a mode.
     ///
     /// A culled tile is reported *ready* so that it never holds up an ancestor's
@@ -361,6 +373,7 @@ impl Default for Config {
             forbid_holes: true,
             stand_ins: true,
             uniform_detail: false,
+            uniform_detail_radius: 8.0,
             cull: true,
             loading_descendant_limit: 20,
             resident_budget_bytes: 512 * 1024 * 1024,
@@ -716,11 +729,17 @@ fn visit(
     let sse = views
         .iter()
         .map(|v| {
-            // Uniform detail: every tile is priced as if it stood where the
-            // nearest one does, so the whole frame refines to one level.
-            let d = uniform_distance.unwrap_or_else(|| {
-                props.bounding_volume.distance_to_point(v.position())
-            });
+            // Uniform detail by threshold: inside `radius × d_near` every
+            // tile is priced at d_near (one level, no LOD wall in the
+            // foreground); beyond, the shifted true distance takes over,
+            // continuously.
+            let d = match uniform_distance {
+                Some(near) => {
+                    let d = props.bounding_volume.distance_to_point(v.position());
+                    near.max(d - (config.uniform_detail_radius - 1.0).max(0.0) * near)
+                }
+                None => props.bounding_volume.distance_to_point(v.position()),
+            };
             v.screen_space_error(props.geometric_error, d)
         })
         .fold(0.0, f64::max);
@@ -1502,11 +1521,27 @@ mod tests {
 
         let mut uniform = Config::default();
         uniform.uniform_detail = true;
+        uniform.uniform_detail_radius = f64::INFINITY;
         let uniform_wants = wants(&uniform);
         assert!(uniform_wants.contains(&near_leaf));
         assert!(
             uniform_wants.contains(&far_leaf),
-            "uniform detail refines the far branch like the near one"
+            "unbounded uniform detail refines the far branch like the near one"
+        );
+
+        // Threshold precision: with a radius that reaches the far branch it
+        // refines; with one that stops short, it holds — the disc is the
+        // whole point (pricing the horizon at the near level was measured to
+        // fetch for minutes on one frame).
+        uniform.uniform_detail_radius = 20.0;
+        assert!(
+            wants(&uniform).contains(&far_leaf),
+            "a radius that covers the far branch refines it"
+        );
+        uniform.uniform_detail_radius = 2.0;
+        assert!(
+            !wants(&uniform).contains(&far_leaf),
+            "past the threshold, concentric degradation resumes"
         );
     }
 
