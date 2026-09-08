@@ -31,13 +31,13 @@ cam.parent = rig
 cam.location = (11, 0, 6)
 cam.rotation_euler = (1.05, 0.0, math.pi / 2)
 sc.camera = cam
+# Interpolation LINEAR à la source : Blender 5.x a remplacé
+# action.fcurves par les actions en couches (layers/strips/channelbags).
+bpy.context.preferences.edit.keyframe_new_interpolation_type = 'LINEAR'
 rig.rotation_euler = (0.0, 0.0, 0.0)
 rig.keyframe_insert('rotation_euler', frame=1)
 rig.rotation_euler = (0.0, 0.0, 2.0 * math.pi)
 rig.keyframe_insert('rotation_euler', frame=96)
-for fc in rig.animation_data.action.fcurves:
-    for kp in fc.keyframe_points:
-        kp.interpolation = 'LINEAR'
 
 
 class ProcHook(bpy.types.USDHook):
