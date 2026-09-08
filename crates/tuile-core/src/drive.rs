@@ -34,17 +34,32 @@ pub struct SceneState {
     /// request count, already net of tiles it gave up on).
     pending: u32,
     started: bool,
+    /// The generation the last `Select` answered.
+    ///
+    /// A consumer that drives frame after frame on one stream needs this: the
+    /// server keeps traversing as tiles land, so a `Select` for the *previous*
+    /// camera can arrive — and satisfy [`is_complete`](Self::is_complete) —
+    /// after a new camera was sent. Comparing this against what was sent is
+    /// what makes "the selection answers the current camera" a fact rather
+    /// than a hope.
+    generation: u64,
 }
 
 impl SceneState {
     /// Folds one server message into the scene view.
     pub fn apply(&mut self, msg: &ServerMessage) {
         match msg {
-            ServerMessage::Select { tiles, stats, .. } => {
+            ServerMessage::Select {
+                tiles,
+                stats,
+                generation,
+                ..
+            } => {
                 self.selected = tiles.clone();
                 self.stats = *stats;
                 self.pending = stats.requested;
                 self.started = true;
+                self.generation = *generation;
             }
             // A stand-in is not residency: the tile it covers for has still
             // not arrived, and counting it here would make a scene look
@@ -89,6 +104,11 @@ impl SceneState {
 
     pub fn stats(&self) -> TraversalStats {
         self.stats
+    }
+
+    /// The generation the current selection answers. See the field.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Tiles to draw *this frame*: the selection intersected with what has

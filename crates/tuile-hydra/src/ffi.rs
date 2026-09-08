@@ -108,6 +108,9 @@ impl From<&FrameError> for TuileStatus {
             FrameError::TimedOut(_) => TuileStatus::TimedOut,
             FrameError::ServerGone => TuileStatus::ServerGone,
             FrameError::TilesFailed { .. } => TuileStatus::TilesFailed,
+            // A selected tile with no content is the same class of failure as
+            // a tile that failed to load: the frame is not the one asked for.
+            FrameError::MissingContent { .. } => TuileStatus::TilesFailed,
             FrameError::TextureEncode(_) => TuileStatus::EncodeFailed,
             FrameError::Poisoned => TuileStatus::InternalError,
         }
