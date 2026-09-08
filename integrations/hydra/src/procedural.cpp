@@ -45,11 +45,11 @@
 
 PXR_NAMESPACE_OPEN_SCOPE
 
-// Enable with TF_DEBUG=TUILE_HYDRA_PROCEDURAL. Kept in the shipped plugin
-// rather than removed after the fact: the failure this was written to diagnose
-// — a procedural that cooks once and then silently stops — produces a plausible
-// image and no error at all, so the next person to hit it needs a way in.
-TF_DEBUG_CODES(TUILE_HYDRA_PROCEDURAL);
+// The debug code itself is declared in the header (the plugin counts
+// constructions with it). Kept in the shipped plugin rather than removed after
+// the fact: the failure it was written to diagnose — a procedural that cooks
+// once and then silently stops — produces a plausible image and no error at
+// all, so the next person to hit it needs a way in.
 TF_REGISTRY_FUNCTION(TfDebug)
 {
     TF_DEBUG_ENVIRONMENT_SYMBOL(
@@ -642,10 +642,15 @@ TuileGlobeProcedural::Update(
         _tilesByPath[tilePath] = entry;
     }
 
+    // Cooks on THIS instance. Read next to the plugin's construction count:
+    // one construction and N cooks is hdGp working as designed; N of each is
+    // the host rebuilding its scene index every frame.
+    ++_cooks;
     TF_DEBUG(TUILE_HYDRA_PROCEDURAL).Msg(
-        "[tuile] Update: camera=%s tiles=%zu textured=%zu origin=(%g, %g, %g)\n",
-        _cameraPath.GetText(), count, textured, _renderOrigin[0],
-        _renderOrigin[1], _renderOrigin[2]);
+        "[tuile] Update: cook #%llu on this instance, camera=%s tiles=%zu "
+        "textured=%zu origin=(%g, %g, %g)\n",
+        static_cast<unsigned long long>(_cooks), _cameraPath.GetText(), count,
+        textured, _renderOrigin[0], _renderOrigin[1], _renderOrigin[2]);
 
     return result;
 }

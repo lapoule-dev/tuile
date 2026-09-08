@@ -77,6 +77,23 @@ RUN set -e; SDK=/opt/usd-blender; \
 # The staticlib must not leak: no Rust ABI symbol may be dynamically visible.
 RUN ! nm -D /opt/plugins/tuileHydra/tuileHydra.so | grep -qE "tuile_session_new|rust_eh_personality" \
     && echo "plugin: rust symbols hidden"
+# Prune Blender IN the compile stage so the final copies only what a
+# headless farm render reads. Measured: python tests/__pycache__/wheels and
+# the symbol tables of the binary and the dep libs are ~250 MB that no
+# render ever touches. Locale, asset library and studiolights are UI food.
+RUN set -e; \
+    strip --strip-unneeded /opt/blender/blender 2>/dev/null || true; \
+    find /opt/blender/lib -name "*.so*" -type f \
+        -exec strip --strip-debug {} + 2>/dev/null || true; \
+    PY=/opt/blender/5.1/python; \
+    find "$PY" -type d -name __pycache__ -prune -exec rm -rf {} +; \
+    find "$PY" -type d \( -name tests -o -name test \) -prune -exec rm -rf {} +; \
+    rm -rf "$PY"/lib/python3*/ensurepip "$PY"/lib/python3*/idlelib \
+           "$PY"/lib/python3*/tkinter "$PY"/lib/python3*/distutils; \
+    rm -rf /opt/blender/5.1/datafiles/locale \
+           /opt/blender/5.1/datafiles/assets \
+           /opt/blender/5.1/datafiles/studiolights; \
+    du -m -s /opt/blender /opt/blender/lib /opt/blender/5.1
 
 # ------------------------------------------------------------------- final --
 # A fresh runtime, NOT the base: the base's runtime doubles as a compile SDK
@@ -98,7 +115,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=plugin /opt/blender/lib /opt/blender/lib
 COPY --from=plugin /opt/blender/blender /opt/blender/blender
 COPY --from=plugin /opt/blender/5.1 /opt/blender/5.1
-RUN rm -rf /opt/blender/5.1/datafiles/locale
+COPY --from=plugin /opt/blender/license /opt/blender/license
 COPY --from=plugin /opt/plugins/tuileHydra /opt/plugins/tuileHydra
 # Static ffmpeg for per-range encodes and the concat, same recipe as
 # stl/blender-render:5.1.

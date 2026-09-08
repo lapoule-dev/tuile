@@ -8,6 +8,7 @@
 
 #include <pxr/pxr.h>
 #include <pxr/base/gf/vec3d.h>
+#include <pxr/base/tf/debug.h>
 #include <pxr/imaging/hdGp/generativeProcedural.h>
 #include <pxr/usd/sdf/path.h>
 
@@ -16,6 +17,11 @@
 #include <vector>
 
 PXR_NAMESPACE_OPEN_SCOPE
+
+// Enable with TF_DEBUG=TUILE_HYDRA_PROCEDURAL. Declared here rather than in
+// the implementation because the plugin's Construct counts instances with it,
+// and the count is only meaningful next to the cook count.
+TF_DEBUG_CODES(TUILE_HYDRA_PROCEDURAL);
 
 /// Emits terrain tiles for whichever camera the scene says to render through.
 ///
@@ -94,6 +100,10 @@ private:
     /// Cached between `UpdateDependencies` and `Update` so both agree on which
     /// camera this cook is about.
     SdfPath _cameraPath;
+
+    /// Cooks served by this instance — the other half of the plugin's
+    /// construction count.
+    uint64_t _cooks = 0;
 
     TuileSession *_session = nullptr;
     /// Set after a session open failed: the error was reported once, loudly,

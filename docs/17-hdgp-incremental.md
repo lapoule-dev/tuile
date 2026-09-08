@@ -65,7 +65,33 @@ mais c'est la voie pour un futur viewport interactif.
 
 ## 2. Ce que notre chemin viole
 
-### 2.1 Blender détruit le resolver à chaque frame
+### 2.1 Blender détruit le resolver à chaque frame — et nous sommes sur le
+chemin que Blender lui-même appelle « lent »
+
+Établi dans la source Blender (`source/blender/render/hydra/`), sans rendu :
+
+```cpp
+// Engine::sync(), engine.cc
+if (scene_->hydra.export_method == SCE_HYDRA_EXPORT_HYDRA) {
+    hydra_scene_index_->populate(depsgraph, ...);   /* Fast path. */
+} else {
+    usd_scene_delegate_->populate(depsgraph);       /* Slow USD export for reference. */
+}
+```
+
+Deux chemins, et nous sommes sur le second — celui que le commentaire de
+Blender qualifie de « **slow USD export for reference** » — parce que c'est le
+seul où un `USDHook` peut injecter notre prim Globe dans un stage. Le premier
+est un scene index natif Hydra 2.0, sans stage du tout.
+
+Et `sync()` est appelé **par frame** : `python.cc` l'appelle depuis
+`engine_update_func`, que l'API `RenderEngine` de Blender invoque avant chaque
+`render()` d'une séquence.
+
+Conséquence pour l'étape É2 : dès que notre prim ne voyage plus dans le stage
+exporté, l'`export_method` cesse de nous concerner — Blender peut reprendre son
+chemin rapide pour sa propre scène pendant que le globe vit dans notre scene
+index persistant.
 
 Notre patch `usd_scene_delegate.cc::populate()` est appelé par frame et fait
 `RemoveSceneIndex` puis reconstruit toute la chaîne. Le resolver meurt, sa
