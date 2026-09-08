@@ -46,7 +46,8 @@ add_library(tuileHydra SHARED
     src/procedural.cpp
     src/proceduralPlugin.cpp
     src/resolver.cpp
-    src/tiles.cpp)
+    src/tiles.cpp
+    src/view.cpp)
 
 add_dependencies(tuileHydra tuile_hydra_rust)
 
@@ -66,6 +67,12 @@ if(APPLE)
     # which is why the staticlib is linked here rather than above.
     target_link_options(tuileHydra PRIVATE
         "LINKER:-load_hidden,${TUILE_STATICLIB}")
+    # The Rust side's TLS stack (native HTTP to ion and Bing) resolves against
+    # the system frameworks; a staticlib carries the references, not the link.
+    target_link_libraries(tuileHydra PRIVATE
+        "-framework Security"
+        "-framework CoreFoundation"
+        "-framework SystemConfiguration")
 else()
     target_link_libraries(tuileHydra PRIVATE "${TUILE_STATICLIB}")
     target_link_options(tuileHydra PRIVATE "LINKER:--exclude-libs,ALL")
