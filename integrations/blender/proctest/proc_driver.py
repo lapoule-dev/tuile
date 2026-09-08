@@ -41,11 +41,20 @@ class ProcRefHook(bpy.types.USDHook):
         else:
             # Définition directe, sans référence : élimine la résolution de
             # chemin comme variable.
+            Sdf = __import__('pxr').Sdf
             prim = stage.DefinePrim('/proc_direct', 'GenerativeProcedural')
-            prim.ApplyAPI('HydraGenerativeProceduralAPI')
+            ok = prim.ApplyAPI('HydraGenerativeProceduralAPI')
+            print(f'APPLY-API ok={ok}', flush=True)
             attr = prim.CreateAttribute('primvars:hdGp:proceduralType',
-                                        __import__('pxr').Sdf.ValueTypeNames.Token)
+                                        Sdf.ValueTypeNames.Token)
             attr.Set('TestCube')
+            # L'adaptateur usdProcImaging type le prim hydra d'après
+            # proceduralSystem ; sans lui (fallback d'API schema non
+            # délivré), il sort inertGenerativeProcedural et le resolver
+            # l'ignore. Autoré explicitement : déterministe.
+            prim.CreateAttribute('proceduralSystem',
+                                 Sdf.ValueTypeNames.Token).Set(
+                                     'hydraGenerativeProcedural')
         stage.Export('/tmp/composed-' + MODE['v'] + '.usda')
         return True
 
