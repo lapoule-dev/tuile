@@ -30,6 +30,12 @@ COPY examples ./examples
 RUN cargo --version \
     && cargo build --release -p tuile-hydra \
     && test -f target/release/libtuile_hydra.a
+# The trajectory generators and the manifest writer: a generative farm job
+# carries six numbers, not fourteen hundred baked camera matrices. Baked
+# samples remain the road for REAL recorded tracks (JOB_STAGE_URL).
+RUN cargo build --release -p tuile-tape -p tuile-usd --bins \
+    && for b in orbit-tape zoom-tape tape-to-stage; do \
+        test -x "target/release/$b"; done
 
 # ------------------------------------------------------------------ plugin --
 FROM ${BASE} AS plugin
@@ -84,16 +90,27 @@ RUN curl -fsL -o /tmp/ffmpeg.tar.xz \
     && ffmpeg -version | sed -n 1p
 COPY integrations/blender/render_usd.py /opt/render/render_usd.py
 COPY integrations/blender/render_job.sh /opt/render/render_job.sh
+COPY --from=rustlib /src/target/release/orbit-tape \
+                    /src/target/release/zoom-tape \
+                    /src/target/release/tape-to-stage \
+                    /opt/tuile/bin/
 
 ENV PXR_PLUGINPATH_NAME=/opt/plugins/tuileHydra/resources \
     HDGP_INCLUDE_DEFAULT_RESOLVER=1
 
 # The assertion that defines this image: the procedural plugin REGISTERS in
 # the very Blender that will render (cooking needs a token, registration does
-# not). dash has no pipefail, so capture-then-grep.
+# not). Blender's internal USD only scans PXR_PLUGINPATH_NAME once its own
+# plug registry wakes up, and `import bpy` does not wake it — a real USD
+# export does. dash has no pipefail, so capture-then-grep, and dump the log
+# when the grep misses so the failure is diagnosable from the build output.
 RUN out=$(TF_DEBUG=PLUG_REGISTRATION blender -b --factory-startup \
-        --python-exit-code 1 --python-expr "import bpy; from pxr import Usd" 2>&1); \
-    echo "$out" | grep -m1 "plugin 'tuileHydra'" \
-    && echo "blender-globe verified: tuileHydra registers"
+        --python-exit-code 1 --python-expr \
+        "import bpy; bpy.ops.wm.usd_export(filepath='/tmp/probe.usda')" 2>&1); \
+    if echo "$out" | grep -m1 "plugin 'tuileHydra'"; then \
+        echo "blender-globe verified: tuileHydra registers"; \
+    else \
+        echo "$out" | tail -40; exit 1; \
+    fi
 
 CMD ["bash", "/opt/render/render_job.sh"]

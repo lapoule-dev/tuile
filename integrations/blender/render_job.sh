@@ -81,6 +81,25 @@ fi
 STAGE="${JOB_STAGE:-/tmp/job-stage.usda}"
 if [ -n "${JOB_STAGE_B64_GZ:-}" ]; then
     echo "$JOB_STAGE_B64_GZ" | base64 -d | gunzip > "$STAGE"
+elif [ -n "${JOB_STAGE_URL:-}" ]; then
+    # A real recorded track (thousands of exact f64 camera samples) is
+    # irreducible data; it travels as a presigned GET.
+    curl -fsS -o "$STAGE" "$JOB_STAGE_URL" || { echo STAGE-FETCH-FAILED; exit 1; }
+elif [ -n "${JOB_TRAJECTORY:-}" ]; then
+    # The generative road: the pod builds its own manifest from parameters.
+    #   orbit:frames:lon:lat:radius_m:alt_m   (defaults after the kind)
+    #   zoom:frames_each_way
+    IFS=: read -r kind p1 p2 p3 p4 p5 <<< "$JOB_TRAJECTORY"
+    case "$kind" in
+        orbit) /opt/tuile/bin/orbit-tape /tmp/traj.mcap \
+                   "${p1:-1440}" "${p2:-2.17}" "${p3:-42.52}" \
+                   "${p4:-8000}" "${p5:-5000}" ;;
+        zoom)  /opt/tuile/bin/zoom-tape /tmp/traj.mcap "${p1:-64}" ;;
+        *) echo "TRAJECTORY-UNKNOWN: $kind"; exit 1 ;;
+    esac
+    /opt/tuile/bin/tape-to-stage /tmp/traj.mcap "$STAGE" \
+        --viewport "${JOB_VIEWPORT:-1280x960}" --sse "${JOB_SSE:-3}" \
+        --fps "$JOB_FPS" || { echo MANIFEST-GEN-FAILED; exit 1; }
 fi
 [ -s "$STAGE" ] || { echo "stage absente: $STAGE" >&2; exit 1; }
 
@@ -91,7 +110,20 @@ for i in $(seq 0 $((jobs - 1))); do
     gpu=$((i / JOB_PROCS_PER_GPU))
     a=$((first + i * span))
     if [ "$i" = "$((jobs - 1))" ]; then b=$last; else b=$((first + (i + 1) * span - 1)); fi
-    CUDA_VISIBLE_DEVICES=$gpu stdbuf -oL blender -b -P /opt/render/render_usd.py -- \
+    # One tile cache per process, SEEDED from the shared one: the store is a
+    # single-writer design (two writers corrupt it quietly), so sharing is
+    # done by copy-on-start — a warm seed means each process starts at ~100%
+    # hit rate and only pays network for its own range's novelty. The real
+    # shared cache is the M2 architecture (one GeometryStream session, N
+    # consumers), not a shared directory.
+    seed="${TUILE_CACHE_DIR:-/tmp/tuile-cache}"
+    proc_cache="$seed/r$i"
+    if [ -d "$seed" ] && [ ! -d "$proc_cache" ] && ls "$seed"/foyer-* > /dev/null 2>&1; then
+        mkdir -p "$proc_cache"
+        cp -a "$seed"/foyer-* "$proc_cache"/ 2>/dev/null || true
+    fi
+    CUDA_VISIBLE_DEVICES=$gpu TUILE_CACHE_DIR="$proc_cache" \
+        stdbuf -oL blender -b -P /opt/render/render_usd.py -- \
         --stage "$STAGE" --engine "$JOB_ENGINE" --tier "$JOB_TIER" \
         --frames "$a:$b" --width "$JOB_WIDTH" \
         --samples "$JOB_SAMPLES" --adaptive-threshold "$JOB_THRESHOLD" \
