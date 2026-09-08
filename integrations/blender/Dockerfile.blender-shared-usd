@@ -1,0 +1,135 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# Image 3: Blender built from source against a SHARED OpenUSD — the "build
+# fork". No source patches: this is the configuration Debian/Arch already
+# ship. What it buys over the official binaries (probed 2026-09-07): a USD
+# runtime with exported pxr symbols, so third-party USD plugins (hdGp
+# generative procedurals — cubeProc today, TuileGlobe tomorrow) load into
+# the very runtime Blender renders with.
+#
+# Multi-stage, deliberately non-monolithic:
+#   sources  — Blender source + its precompiled linux libs (~10 GB, changes
+#              only per Blender version; cached).
+#   usdpy    — shared USD 25.08 built WITH python, against Blender's own
+#              python 3.13 (the USDHook API hands python pxr objects to
+#              addons; without matching bindings the injection path dies).
+#              Image 1 (stl/usd-shared:25.08, no python) stays the plugin
+#              compile base — same ABI, same version.
+#   build    — Blender cmake'd with USD_ROOT_DIR pointing at usdpy.
+#   runtime  — thin: Blender + /opt/usd + runtime libs. No toolchain.
+#
+#   docker buildx build --builder stl-builder-k8s --platform linux/amd64 \
+#       -f integrations/blender/Dockerfile.blender-shared-usd \
+#       -t harbor.sportstracklive.com/stl/blender-shared-usd:5.1-2508 --push .
+
+ARG BLENDER_VERSION=5.1.2
+ARG USD_VERSION=25.08
+ARG BUILD_JOBS=2
+
+# ---------------------------------------------------------------- sources
+FROM ubuntu:24.04 AS sources
+ENV DEBIAN_FRONTEND=noninteractive
+ARG BLENDER_VERSION
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git git-lfs ca-certificates curl python3 \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch v${BLENDER_VERSION} \
+        https://projects.blender.org/blender/blender.git /opt/src/blender
+# Matching precompiled dependencies (python 3.13 included) — the supported
+# way to build the exact official feature set without packaging 40 deps.
+RUN cd /opt/src/blender \
+    && python3 build_files/utils/make_update.py --use-linux-libraries --no-blender
+
+# ------------------------------------------------------------------ usdpy
+FROM ubuntu:24.04 AS usdpy
+ENV DEBIAN_FRONTEND=noninteractive
+ARG USD_VERSION
+ARG BUILD_JOBS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake python3 git curl ca-certificates xz-utils \
+        libx11-dev libxt-dev libgl1-mesa-dev libglu1-mesa-dev libglvnd-dev \
+        libegl1-mesa-dev zlib1g-dev libbz2-dev liblzma-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=sources /opt/src/blender/lib/linux_x64/python /opt/blender-python
+RUN curl -fsL -o /tmp/usd.tar.gz \
+        "https://github.com/PixarAnimationStudios/OpenUSD/archive/refs/tags/v${USD_VERSION}.tar.gz" \
+    && tar -xzf /tmp/usd.tar.gz -C /opt
+# Build WITH python bindings against Blender's own interpreter, so the
+# python pxr modules and the shared libs come from one build.
+RUN PYBIN=$(ls /opt/blender-python/bin/python3* | head -1) \
+    && "$PYBIN" -m ensurepip 2>/dev/null || true \
+    && "$PYBIN" -m pip install --quiet jinja2 pyside6 2>/dev/null || true \
+    && "$PYBIN" /opt/OpenUSD-${USD_VERSION}/build_scripts/build_usd.py \
+        --python --no-tools --no-tests --no-docs --no-python-docs --no-tutorials \
+        --examples \
+        --no-materialx --no-opencolorio --no-openimageio --no-openvdb \
+        --no-alembic --no-draco --no-ptex --no-usdview --no-prman --no-vulkan \
+        -j ${BUILD_JOBS} /opt/usd \
+    && rm -rf /opt/usd/build /opt/usd/src /tmp/usd.tar.gz
+
+# ------------------------------------------------------------------ build
+FROM sources AS build
+ENV DEBIAN_FRONTEND=noninteractive
+ARG BUILD_JOBS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential gcc-14 g++-14 cmake ninja-build \
+        libx11-dev libxxf86vm-dev libxcursor-dev libxi-dev libxrandr-dev \
+        libxinerama-dev libegl-dev libwayland-dev wayland-protocols \
+        libxkbcommon-dev libdbus-1-dev libdecor-0-dev libvulkan-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=usdpy /opt/usd /opt/usd
+# The build-fork's one source patch: scene-index population with the hdGp
+# resolver (generative procedurals cook). Whole-file replacement of a
+# 100-line file; obsolete the day upstream lands its Hydra 2.0 migration.
+COPY integrations/blender/blender-patches/usd_scene_delegate.cc \
+     integrations/blender/blender-patches/usd_scene_delegate.hh \
+     /opt/src/blender/source/blender/io/usd/hydra/
+RUN cd /opt/src/blender \
+    && cmake -S . -B /opt/build -G Ninja \
+        -C build_files/cmake/config/blender_release.cmake \
+        -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DWITH_USD=ON \
+        -DUSD_ROOT_DIR=/opt/usd \
+        -DWITH_HYDRA=ON \
+        -DCMAKE_INSTALL_PREFIX=/opt/blender \
+    && cmake --build /opt/build -j ${BUILD_JOBS} \
+    && cmake --install /opt/build
+
+# ---------------------------------------------------------------- runtime
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl xz-utils \
+        libglvnd0 libgl1 libegl1 libgles2 \
+        libx11-6 libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 \
+        libsm6 libice6 libxrandr2 libxinerama1 libxcursor1 libdbus-1-3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /opt/blender /opt/blender
+COPY --from=usdpy /opt/usd /opt/usd
+# Blender's own precompiled USD SDK (pxrBlender namespace, shared libs):
+# revealed by the build to be what Blender actually links — therefore the
+# ABI a loadable plugin must target. Shipped for plugin compile stages.
+COPY --from=sources /opt/src/blender/lib/linux_x64/usd /opt/usd-blender
+COPY --from=sources /opt/src/blender/lib/linux_x64/tbb /opt/tbb-blender
+COPY --from=sources /opt/src/blender/lib/linux_x64/python/include /opt/python-blender-include
+
+ENV PATH=/opt/blender:$PATH \
+    LD_LIBRARY_PATH=/opt/blender/lib:/opt/usd/lib \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+
+# The assertions that define this image's existence:
+# 1. Blender links the SHARED USD (ldd shows libusd_*), i.e. pxr symbols
+#    resolvable by plugins — the official build's wall, inverted.
+# 2. The python pxr bindings work (the USDHook injection path).
+# 3. The built-in video encoder actually encodes.
+RUN ldd /opt/blender/blender | grep -q libusd_ \
+    && blender -b --factory-startup --python-exit-code 1 --python-expr \
+        "import bpy; from pxr import Usd; v = Usd.GetVersion(); print('usd', v); assert v[1] == 25 and v[2] == 8" \
+    && blender -b --factory-startup --python-exit-code 1 --python-expr "import bpy; sc = bpy.context.scene; sc.render.engine = 'CYCLES'; sc.cycles.samples = 1; sc.render.resolution_x = 64; sc.render.resolution_y = 48; sc.frame_start = 1; sc.frame_end = 2; sc.render.image_settings.media_type = 'VIDEO'; sc.render.image_settings.file_format = 'FFMPEG'; sc.render.ffmpeg.format = 'MPEG4'; sc.render.ffmpeg.codec = 'H264'; sc.render.filepath = '/tmp/e.mp4'; bpy.ops.render.render(animation=True)" \
+    && test -s /tmp/e*.mp4 && rm -f /tmp/e* \
+    && echo "blender-shared-usd verified: shared USD linked, pxr python OK, encoder OK"
+
+CMD ["blender", "--version"]
