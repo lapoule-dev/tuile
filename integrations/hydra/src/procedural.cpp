@@ -433,8 +433,13 @@ TuileGlobeProcedural::_EnsureSession(const HdSceneIndexBaseRefPtr &inputScene)
         _DoubleArg(inputScene, _primPath, _tokens->imageryAssetId, 0.0));
     config.maximum_screen_space_error =
         _DoubleArg(inputScene, _primPath, _tokens->maxSse, 0.0);
-    config.frame_timeout_seconds = 0.0;  // the session default
-    config.fail_on_tile_errors = true;   // eager-fatal, docs/15
+    // A farm frame under the uniform-detail decree legitimately fetches
+    // thousands of tiles; the session's 120 s default is an interactive
+    // reflex. Thirty minutes still catches a genuine hang loudly, and
+    // TUILE_FRAME_TIMEOUT (seconds) overrides it per job.
+    config.frame_timeout_seconds =
+        TfGetenvDouble("TUILE_FRAME_TIMEOUT", 1800.0);
+    config.fail_on_tile_errors = true;  // eager-fatal, docs/15
 
     const TuileStatus status = tuile_session_new(&config, &_session);
     if (status != TuileStatus_Ok || !_session) {

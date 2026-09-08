@@ -15,7 +15,7 @@ use tuile_core::content::DecodedTileContent;
 use tuile_core::drive::drive_until_complete;
 use tuile_core::runtime::in_process_with;
 use tuile_core::source::{TileId, TileLoader, TileTree};
-use tuile_core::traversal::{Config, ViewState};
+use tuile_core::traversal::{Config, ViewState, ViewStateParams};
 
 /// What a renderer must decide before the first frame.
 #[derive(Debug, Clone)]
@@ -255,6 +255,14 @@ pub struct Session {
     stream: tuile_core::protocol::InProcessStream,
     runtime: tokio::runtime::Runtime,
     config: SessionConfig,
+    /// The imagery-resolution handle, when the source exposes one.
+    ///
+    /// Imagery detail is driven by the **camera's altitude**, decoupled from
+    /// the terrain LOD. Left unset, draped imagery follows the terrain's
+    /// geometric error — and since adjacent terrain levels carry imagery from
+    /// different capture batches, every LOD boundary becomes an exposure seam
+    /// across the ground (measured on the first SSE-1 gate render).
+    imagery_detail: Option<tuile_planetary::ImageryDetail>,
     /// Kept alive for as long as the session: dropping it ends the server.
     _server: std::thread::JoinHandle<()>,
 }
@@ -306,15 +314,36 @@ impl Session {
             stream,
             runtime,
             config,
+            imagery_detail: None,
             _server: server_thread,
         })
+    }
+
+    /// Hands the session the imagery-resolution handle its source exposes.
+    pub(crate) fn set_imagery_detail(&mut self, detail: tuile_planetary::ImageryDetail) {
+        self.imagery_detail = Some(detail);
     }
 
     /// Resolves one frame for the given views, blocking until it converges.
     ///
     /// Multiple views are a union, not a choice: stereo pairs must share one
     /// selection or the eyes drift apart at LOD boundaries.
-    pub fn frame(&mut self, views: Vec<ViewState>) -> Result<Frame, FrameError> {
+    pub fn frame(&mut self, views: Vec<ViewStateParams>) -> Result<Frame, FrameError> {
+        if let Some(detail) = &self.imagery_detail {
+            // TUILE_TEXEL_SPACING (metres/texel) pins the imagery level by
+            // hand — the diagnosis knob for "which level is this seam from",
+            // and the farm's override when a shot wants one level throughout.
+            let forced = std::env::var("TUILE_TEXEL_SPACING")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0);
+            if let Some(spacing) = forced.or_else(|| target_texel_spacing(&views)) {
+                tracing::info!(spacing, forced = forced.is_some(), "imagery texel target");
+                detail.set_target_texel_spacing(spacing);
+            }
+        }
+        let views: Vec<ViewState> = views.into_iter().map(Into::into).collect();
+
         let timeout = self.config.frame_timeout;
         let stream = &mut self.stream;
 
@@ -360,6 +389,33 @@ impl Session {
     }
 }
 
+/// The ground texel spacing (metres/texel) the given views want, or `None`
+/// when no view says anything usable.
+///
+/// The classic screen-density formula — `2·altitude·tan(fovy/2) /
+/// viewport_height` — over a spherical-Earth altitude: this sizes texels, not
+/// geometry, and the sphere/ellipsoid difference vanishes into the level
+/// quantisation. The minimum across views, because a union selection must
+/// satisfy its most demanding eye.
+fn target_texel_spacing(views: &[ViewStateParams]) -> Option<f64> {
+    const EARTH_RADIUS: f64 = 6_378_137.0;
+    views
+        .iter()
+        .filter_map(|v| {
+            let altitude = (v.position.length() - EARTH_RADIUS).max(1.0);
+            let height_px = v.viewport_px.y;
+            if height_px <= 0.0
+                || height_px.is_nan()
+                || !v.fovy_rad.is_finite()
+                || v.fovy_rad <= 0.0
+            {
+                return None;
+            }
+            Some(2.0 * altitude * (v.fovy_rad / 2.0).tan() / height_px)
+        })
+        .min_by(f64::total_cmp)
+}
+
 /// The traversal a bulk frame runs, whatever the caller asked for.
 ///
 /// Stand-ins are an interactive kindness — a plausible surface while the real
@@ -368,9 +424,22 @@ impl Session {
 /// docs/15 forbids (two farm nodes disagreeing about which tiles were real).
 /// Holes are forbidden for the same reason, whichever way the caller's config
 /// leans.
+///
+/// Residency budgets are interactive kindnesses too — they exist so a viewer
+/// stays inside a device. This path renders on farm nodes where, in Laurent's
+/// words, the budget is infinite: an eviction *during* convergence keeps the
+/// request count above zero forever, so a budget here is not a limit, it is a
+/// hang. Lifted outright rather than raised.
 fn exact_traversal(mut config: Config) -> Config {
     config.stand_ins = false;
     config.forbid_holes = true;
+    config.resident_budget_bytes = usize::MAX;
+    config.resident_tile_limit = usize::MAX;
+    config.maximum_simultaneous_fetches = 64;
+    // The USD decree: the whole frame as fine as its nearest tile, meshes and
+    // imagery both. LOD boundaries are walls across a rendered image, and a
+    // farm's budget is infinite.
+    config.uniform_detail = true;
     config
 }
 

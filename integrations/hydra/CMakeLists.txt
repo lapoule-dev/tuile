@@ -67,6 +67,10 @@ if(APPLE)
     # which is why the staticlib is linked here rather than above.
     target_link_options(tuileHydra PRIVATE
         "LINKER:-load_hidden,${TUILE_STATICLIB}")
+    # A link OPTION is not a link DEPENDENCY: without this, a fresh cargo
+    # build leaves the dylib stale, and every render quietly runs yesterday's
+    # Rust — measured, and maddening.
+    set_target_properties(tuileHydra PROPERTIES LINK_DEPENDS "${TUILE_STATICLIB}")
     # The Rust side's TLS stack (native HTTP to ion and Bing) resolves against
     # the system frameworks; a staticlib carries the references, not the link.
     target_link_libraries(tuileHydra PRIVATE

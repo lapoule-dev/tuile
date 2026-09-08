@@ -20,7 +20,7 @@ use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
 use tuile_native_fetchers::NativeHttp;
 use tuile_core::offload;
-use tuile_planetary::{globe_on, GlobeOptions};
+use tuile_planetary::{globe_on, GlobeOptions, ImageryDetail};
 
 use crate::session::{Session, SessionConfig};
 
@@ -97,11 +97,16 @@ impl Session {
         // Sources resolve on the session's own runtime rather than a temporary
         // one, so the connection pool and cache that serve this call are the
         // same ones that will serve every tile afterwards.
-        let (tree, loader) = runtime.block_on(resolve(&config))?;
+        let (tree, loader, detail) = runtime.block_on(resolve(&config))?;
 
         let mut session_config = config.session.clone();
         session_config.dataset = config.dataset_name();
-        Ok(Session::from_parts(runtime, tree, loader, session_config)?)
+        let mut session = Session::from_parts(runtime, tree, loader, session_config)?;
+        // The session drives imagery resolution from the camera each frame —
+        // decoupled from terrain LOD, so exposure seams between imagery
+        // capture batches stop lining up with terrain level boundaries.
+        session.set_imagery_detail(detail);
+        Ok(session)
     }
 }
 
@@ -172,6 +177,7 @@ async fn resolve(
     (
         Box<dyn tuile_core::source::TileTree>,
         Arc<dyn tuile_core::source::TileLoader>,
+        ImageryDetail,
     ),
     GlobeError,
 > {
@@ -201,7 +207,7 @@ async fn resolve(
         // thread polling the server, and `globe()`'s inline offload would put
         // every tile's decode on that same thread — measured at sixty-four
         // loads in flight and one core busy.
-        let (tree, loader, _detail, _heights) = globe_on(
+        let (tree, loader, detail, _heights) = globe_on(
             terrain,
             NoImagery,
             layer,
@@ -211,7 +217,7 @@ async fn resolve(
             },
             offload::threaded(),
         );
-        return Ok((tree, loader));
+        return Ok((tree, loader, detail));
     };
 
     let ion = IonClient::new(Arc::clone(&http), config.ion_token.clone());
@@ -240,7 +246,7 @@ async fn resolve(
         .await
         .map_err(|e| GlobeError::Bing(e.to_string()))?;
 
-    let (tree, loader, _detail, _heights) = globe_on(
+    let (tree, loader, detail, _heights) = globe_on(
         terrain,
         bing,
         layer,
@@ -250,7 +256,7 @@ async fn resolve(
         },
         offload::threaded(),
     );
-    Ok((tree, loader))
+    Ok((tree, loader, detail))
 }
 
 /// Seconds, as a C ABI carries a duration, into a `Duration`.
