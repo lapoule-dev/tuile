@@ -95,20 +95,28 @@ void USDSceneDelegate::populate(Depsgraph *depsgraph)
   stage_ = io::usd::export_to_stage(params, depsgraph, temp_file_.c_str());
 
   /* Hydra 2.0: the standard usdImaging scene-index chain (instancing,
-   * materials, draw modes), wrapped in the hdGp resolver so generative
+   * materials, draw modes), with the hdGp resolver so generative
    * procedural prims cook — the point of this patch.
    *
-   * Ordering is load-bearing: the resolver cooks ONLY on PrimsAdded
-   * notices, never on scene queries (its own words, GetPrim). The whole
-   * chain must therefore observe the stage index BEFORE population —
-   * SetStage/SetTime come last, so their notices flow through the
-   * resolver and cook the procedurals. */
+   * Two orderings are load-bearing:
+   * 1. The resolver goes through overridesSceneIndexCallback — right
+   *    after the stage scene index, UPSTREAM of the chain's internal
+   *    flattening. Generated children then inherit xform, visibility and
+   *    materialBindings authored on the procedural prim: geometry comes
+   *    from the procedural, the look from stage-side composition.
+   * 2. The resolver cooks ONLY on PrimsAdded notices, never on scene
+   *    queries (its own words, GetPrim). SetStage/SetTime come after the
+   *    whole chain is assembled and inserted, so the population notices
+   *    flow through the resolver. */
   pxr::UsdImagingCreateSceneIndicesInfo info;
+  info.overridesSceneIndexCallback =
+      [](pxr::HdSceneIndexBaseRefPtr const &input)
+      -> pxr::HdSceneIndexBaseRefPtr {
+    return pxr::HdGpGenerativeProceduralResolvingSceneIndex::New(input);
+  };
   pxr::UsdImagingSceneIndices indices = pxr::UsdImagingCreateSceneIndices(info);
   stage_index_ = indices.stageSceneIndex;
-
-  terminal_index_ = pxr::HdGpGenerativeProceduralResolvingSceneIndex::New(
-      indices.finalSceneIndex);
+  terminal_index_ = indices.finalSceneIndex;
   render_index_->InsertSceneIndex(terminal_index_, delegate_id_);
 
   stage_index_->SetStage(stage_);
