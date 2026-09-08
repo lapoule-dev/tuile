@@ -1,0 +1,61 @@
+#usda 1.0
+(
+    """
+    Le look « terrain » par composition pure : ce layer SUBLAYE un manifeste
+    TuileGlobe (place ou symlinke le tien sous ./manifest.usda) et compose
+    par-dessus — sans toucher au procédural, qui n'émet que la géométrie.
+
+    Ce qu'il ajoute :
+      - un DomeLight avec un VRAI ciel HDRI (./sky.exr, non commité — un
+        panorama équirect CC0 fait l'affaire, ex. Poly Haven « kiara_1_dawn »),
+        orienté pour que son zénith soit le zénith LOCAL du terrain ;
+      - un DistantLight solaire BAS (élévation ~18°) : c'est l'angle rasant
+        qui fait exister le relief — le soleil au zénith aplatit tout ;
+      - un over caméra : focale doublée (24 → 47 mm équiv.) — la compression
+        de perspective est ce qui fait « photo aérienne » plutôt que « jeu ».
+
+    Orientation : la scène est rebasée (primvars:tuile:renderOrigin) mais PAS
+    réorientée — le haut local du terrain est le zénith ECEF, pas +Z monde.
+    Un DistantLight laissé par défaut éclaire un pôle (mesuré : image noire).
+    Les deux matrices ci-dessous alignent les lumières sur le zénith local du
+    manifeste d'orbite (Ariège) ; un autre manifeste veut ses matrices —
+    recalcule-les depuis son renderOrigin normalisé.
+
+    Rendu :
+      usdrecord --camera /World/ShotCam --frames 1:1 look.usda out.#.png
+    (avec l'environnement TuileGlobe habituel : PXR_PLUGINPATH_NAME,
+     HDGP_INCLUDE_DEFAULT_RESOLVER=1, TUILE_ION_TOKEN, TUILE_CACHE_DIR.)
+    """
+    subLayers = [
+        @./manifest.usda@
+    ]
+)
+
+over "World"
+{
+    over "ShotCam"
+    {
+        # Focale longue : l'aperture reste 24, le champ vertical passe de 90°
+        # à ~29°. La sélection suit (view.cpp lit aperture/focal), donc les
+        # tuiles se raffinent pour ce cadrage serré — cohérent par
+        # construction.
+        float focalLength = 47
+    }
+
+    def DomeLight "Sky"
+    {
+        float inputs:intensity = 1.0
+        asset inputs:texture:file = @./sky-day.exr@
+        matrix4d xformOp:transform = ( (-0.03786459100977573, 0.999282879242741, 0.0, 0), (-0.6753628605029083, -0.025590690111206172, 0.737041466427067, 0), (0.7365129186925315, 0.02790777368350624, 0.6758475247916785, 0), (0, 0, 0, 1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+    }
+
+    def DistantLight "Sun"
+    {
+        float inputs:intensity = 5.0
+        color3f inputs:color = (1.0, 0.98, 0.94)
+        float inputs:angle = 0.53
+        matrix4d xformOp:transform = ( (0.6038136894729326, -0.47747925188469065, -0.6382966335683756, 0), (0.7781936292585871, 0.5265753665160334, 0.3422470726826655, 0), (0.17269540754297322, -0.7033718414879438, 0.6895247267614303, 0), (0, 0, 0, 1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+    }
+}
