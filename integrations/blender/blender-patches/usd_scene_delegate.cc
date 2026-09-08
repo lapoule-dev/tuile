@@ -6,7 +6,6 @@
 
 #include "usd_scene_delegate.hh"
 
-#include <pxr/imaging/hdGp/generativeProceduralPluginRegistry.h>
 #include <pxr/imaging/hdGp/generativeProceduralResolvingSceneIndex.h>
 #include <pxr/usdImaging/usdImaging/sceneIndices.h>
 
@@ -121,31 +120,6 @@ void USDSceneDelegate::populate(Depsgraph *depsgraph)
 
   stage_index_->SetStage(stage_);
   stage_index_->SetTime(pxr::UsdTimeCode::Default());
-
-  /* tuile-diag: one-shot observability for the generative pipeline. */
-  {
-    const pxr::SdfPath probe("/proc_direct");
-    pxr::HdSceneIndexPrim p = terminal_index_->GetPrim(probe);
-    fprintf(stderr,
-            "[tuile-diag] %s primType='%s' hasDataSource=%d\n",
-            probe.GetText(),
-            p.primType.GetText(),
-            int(bool(p.dataSource)));
-    for (const pxr::SdfPath &c : terminal_index_->GetChildPrimPaths(probe)) {
-      fprintf(stderr, "[tuile-diag] child: %s\n", c.GetText());
-    }
-    for (const pxr::SdfPath &c :
-         terminal_index_->GetChildPrimPaths(pxr::SdfPath::AbsoluteRootPath()))
-    {
-      fprintf(stderr, "[tuile-diag] root child: %s\n", c.GetText());
-    }
-    pxr::HdGpGenerativeProcedural *gp =
-        pxr::HdGpGenerativeProceduralPluginRegistry::GetInstance()
-            .ConstructProcedural(pxr::TfToken("TestCube"), probe);
-    fprintf(stderr, "[tuile-diag] ConstructProcedural(TestCube) -> %p\n",
-            static_cast<void *>(gp));
-    delete gp;
-  }
 
   WM_reports_from_reports_move(nullptr, &worker_reports);
 
