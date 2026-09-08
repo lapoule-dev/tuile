@@ -57,7 +57,15 @@ def call(key, method, path, body=None):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--stage", required=True, help=".usda à rendre (embarquée gzip+b64)")
+    p.add_argument("--stage", default="", help=".usda à rendre (embarquée gzip+b64)")
+    p.add_argument("--stage-url", default="",
+                   help="URL GET (présignée) du .usda — la voie des vraies "
+                        "tracks enregistrées")
+    p.add_argument("--trajectory", default="",
+                   help="la voie générative : le pod fabrique son manifeste "
+                        "(ex: orbit:1440:2.17:42.52:8000:5000, zoom:64)")
+    p.add_argument("--sse", type=float, default=3.0)
+    p.add_argument("--viewport", default="1280x960")
     p.add_argument("--frames", required=True, help="A:B inclus")
     p.add_argument("--name", default="render-job")
     p.add_argument("--image",
@@ -97,14 +105,21 @@ def main():
         raise SystemExit(f"credential registre '{args.registry_name}' absent — "
                          "à créer une fois (secret hors conversation)")
 
-    stage_b64 = base64.b64encode(
-        gzip.compress(pathlib.Path(args.stage).read_bytes())).decode()
+    if not args.stage and not args.stage_url and not args.trajectory:
+        raise SystemExit("--stage, --stage-url ou --trajectory requis")
+    stage_b64 = ""
+    if args.stage:
+        stage_b64 = base64.b64encode(
+            gzip.compress(pathlib.Path(args.stage).read_bytes())).decode()
+        if len(stage_b64) > 48_000:
+            raise SystemExit(
+                f"manifeste trop gros pour l'env d'un pod ({len(stage_b64)} o "
+                "en base64) — passe-le par --stage-url (URL présignée)")
 
-    known = ["13.2", "13.3"]
+    known = ["12.4", "12.8", "13.2", "13.3"]
     cuda = [v for v in known if v >= args.cuda_min] or [args.cuda_min]
 
     env = {
-        "JOB_STAGE_B64_GZ": stage_b64,
         "JOB_FRAMES": args.frames,
         "JOB_ENGINE": args.engine,
         "JOB_TIER": args.tier,
@@ -117,6 +132,14 @@ def main():
         "JOB_EXTRA_ARGS": args.extra,
         "JOB_OUT": "/out/render.mp4",
     }
+    if stage_b64:
+        env["JOB_STAGE_B64_GZ"] = stage_b64
+    if args.stage_url:
+        env["JOB_STAGE_URL"] = args.stage_url
+    if args.trajectory:
+        env["JOB_TRAJECTORY"] = args.trajectory
+        env["JOB_SSE"] = str(args.sse)
+        env["JOB_VIEWPORT"] = args.viewport
     if args.ssh_pubkey:
         env["JOB_SSH_PUBKEY"] = args.ssh_pubkey
     if args.upload_url:
