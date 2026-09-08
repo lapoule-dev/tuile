@@ -74,9 +74,22 @@ public:
             0, 3, 2, 1,  4, 5, 6, 7,  0, 1, 5, 4,
             2, 3, 7, 6,  1, 2, 6, 5,  0, 4, 7, 3,
         };
+        /* Face-varying normals (one per face-vertex, faces in the order of
+         * `indices`): crisp facet shading under any light, instead of the
+         * fallback smooth-ish grey. */
+        static const VtVec3fArray normals = {
+            {0, 0, -1}, {0, 0, -1}, {0, 0, -1}, {0, 0, -1},
+            {0, 0, 1},  {0, 0, 1},  {0, 0, 1},  {0, 0, 1},
+            {0, -1, 0}, {0, -1, 0}, {0, -1, 0}, {0, -1, 0},
+            {0, 1, 0},  {0, 1, 0},  {0, 1, 0},  {0, 1, 0},
+            {1, 0, 0},  {1, 0, 0},  {1, 0, 0},  {1, 0, 0},
+            {-1, 0, 0}, {-1, 0, 0}, {-1, 0, 0}, {-1, 0, 0},
+        };
+        static const VtVec3fArray displayColor = {{1.0f, 0.45f, 0.12f}};
 
+        /* Posé sur le sol z=0 (extent ±1). */
         GfMatrix4d xf(1.0);
-        xf.SetTranslate(GfVec3d(0.0, 0.0, 2.0));
+        xf.SetTranslate(GfVec3d(0.0, 0.0, 1.0));
 
         prim.dataSource = HdRetainedContainerDataSource::New(
             HdMeshSchema::GetSchemaToken(),
@@ -108,6 +121,28 @@ public:
                             HdPrimvarSchemaTokens->vertex))
                     .SetRole(HdPrimvarSchema::BuildRoleDataSource(
                         HdPrimvarSchemaTokens->point))
+                    .Build(),
+                HdTokens->normals,
+                HdPrimvarSchema::Builder()
+                    .SetPrimvarValue(
+                        HdRetainedTypedSampledDataSource<VtVec3fArray>::New(
+                            normals))
+                    .SetInterpolation(
+                        HdPrimvarSchema::BuildInterpolationDataSource(
+                            HdPrimvarSchemaTokens->faceVarying))
+                    .SetRole(HdPrimvarSchema::BuildRoleDataSource(
+                        HdPrimvarSchemaTokens->normal))
+                    .Build(),
+                HdTokens->displayColor,
+                HdPrimvarSchema::Builder()
+                    .SetPrimvarValue(
+                        HdRetainedTypedSampledDataSource<VtVec3fArray>::New(
+                            displayColor))
+                    .SetInterpolation(
+                        HdPrimvarSchema::BuildInterpolationDataSource(
+                            HdPrimvarSchemaTokens->constant))
+                    .SetRole(HdPrimvarSchema::BuildRoleDataSource(
+                        HdPrimvarSchemaTokens->color))
                     .Build()),
             HdXformSchema::GetSchemaToken(),
             HdXformSchema::Builder()
