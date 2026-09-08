@@ -65,7 +65,9 @@ impl Default for SessionConfig {
             // Deliberately not "" — an empty dataset would collapse the URI to
             // `tuile:///tile/...`, which resolves but scopes nothing.
             dataset: "default".into(),
-            bake_max_size: 2048,
+            // TUILE_BAKE_MAX caps the baked mosaic's side per job: sharper
+            // shots raise it where the RAM is real, a laptop lowers it.
+            bake_max_size: env_knob("TUILE_BAKE_MAX", 2048_u32).clamp(64, 8192),
         }
     }
 }
@@ -416,6 +418,19 @@ fn target_texel_spacing(views: &[ViewStateParams]) -> Option<f64> {
         .min_by(f64::total_cmp)
 }
 
+/// A numeric knob from the environment, or its default.
+///
+/// The USD path's tuning lives in the environment on purpose: the stage
+/// carries the SHOT (camera, assets, SSE), the job carries the MACHINE
+/// (memory, concurrency, sharpness ceilings) — a farm pod and a laptop
+/// render the same manifest with different envs.
+fn env_knob<T: std::str::FromStr + PartialOrd>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<T>().ok())
+        .unwrap_or(default)
+}
+
 /// The traversal a bulk frame runs, whatever the caller asked for.
 ///
 /// Stand-ins are an interactive kindness — a plausible surface while the real
@@ -436,21 +451,22 @@ fn target_texel_spacing(views: &[ViewStateParams]) -> Option<f64> {
 fn exact_traversal(mut config: Config) -> Config {
     config.stand_ins = false;
     config.forbid_holes = true;
-    let budget_gb = std::env::var("TUILE_RESIDENT_BUDGET_GB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(4);
+    let budget_gb: usize = env_knob("TUILE_RESIDENT_BUDGET_GB", 4).max(1);
     config.resident_budget_bytes = budget_gb.saturating_mul(1024 * 1024 * 1024);
     config.resident_tile_limit = usize::MAX;
     // Bulk, not trickle: a converging frame should saturate the pooled HTTP
     // client (keep-alive per host, HTTP/2 multiplexing) rather than dribble
     // tiles 64 at a time through a knob sized for a viewer's frame budget.
-    config.maximum_simultaneous_fetches = 256;
-    // The USD decree: the whole frame as fine as its nearest tile, meshes and
-    // imagery both. LOD boundaries are walls across a rendered image, and a
-    // farm's budget is infinite.
-    config.uniform_detail = true;
+    config.maximum_simultaneous_fetches = env_knob("TUILE_FETCHES", 256).max(1);
+    // The USD decree: the whole frame as fine as its nearest tile, meshes
+    // and imagery both — LOD boundaries are walls across a rendered image.
+    // TUILE_UNIFORM_RADIUS sizes the uniform disc (multiples of the nearest
+    // content distance); 0 disables uniform detail, plain concentric SSE.
+    let radius: f64 = env_knob("TUILE_UNIFORM_RADIUS", 8.0);
+    config.uniform_detail = radius > 0.0;
+    if config.uniform_detail {
+        config.uniform_detail_radius = radius;
+    }
     config
 }
 
