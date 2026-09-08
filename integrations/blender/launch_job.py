@@ -55,6 +55,15 @@ def call(key, method, path, body=None):
         raise SystemExit(f"{method} {path} -> {e.code}: {e.read().decode()[:300]}")
 
 
+# Les pods sont aux États-Unis, le registre Harbor est en Europe. Mesuré sur un
+# hôte US-IL froid : vingt et une minutes à tirer stl/blender-globe depuis
+# Harbor, les mêmes couches recyclant sans jamais finir — un pod payé à ne rien
+# faire. Le même contenu dans ECR us-west-1 est à une région des pods. Harbor
+# reste la source de vérité de la pile ; ECR est le miroir de livraison, et
+# c'est lui que tire un job.
+ECR_HOST = "057321054380.dkr.ecr.us-west-1.amazonaws.com"
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--stage", default="", help=".usda à rendre (embarquée gzip+b64)")
@@ -70,7 +79,7 @@ def main():
     p.add_argument("--name", default="render-job")
     p.add_argument("--image",
                    default="harbor.sportstracklive.com/stl/blender-render:5.1")
-    p.add_argument("--registry-name", default="harbor-stl",
+    p.add_argument("--registry-name", default="ecr-usw1-stl",
                    help="credential registre déjà enregistré chez RunPod")
     p.add_argument("--gpu-type", default="NVIDIA GeForce RTX 5090")
     p.add_argument("--gpu-count", type=int, default=1)
@@ -111,7 +120,7 @@ def main():
                    help="clé publique à autoriser (rapatriement scp)")
     args = p.parse_args()
     if args.engine == "hydra" and args.image == p.get_default("image"):
-        args.image = "harbor.sportstracklive.com/stl/blender-globe:5.1-su"
+        args.image = ECR_HOST + "/stl/blender-globe:5.1-su"
 
     key = api_key()
     regs = call(key, "GET", "/registries")
