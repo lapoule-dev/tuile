@@ -14,6 +14,7 @@ members = [
     "crates/tuile-storage-foyer",
     "crates/tuile-tape",
     "crates/tuile-terrain",
+    "crates/tuile-usd",
     "crates/tuile-web",
     "crates/tuile-ui",
     "crates/tuile-wgpu",
