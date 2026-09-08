@@ -35,7 +35,7 @@ RUN cargo --version \
 # samples remain the road for REAL recorded tracks (JOB_STAGE_URL).
 RUN cargo build --release -p tuile-tape -p tuile-usd --bins \
     && for b in orbit-tape zoom-tape tape-to-stage; do \
-        test -x "target/release/$b"; done
+        test -x "target/release/$b" && strip "target/release/$b"; done
 
 # ------------------------------------------------------------------ plugin --
 FROM ${BASE} AS plugin
@@ -72,13 +72,33 @@ RUN set -e; SDK=/opt/usd-blender; \
         -e 's|@PLUG_INFO_ROOT@|..|' \
         /opt/src/tuileHydra/plugInfo.json.in \
         > /opt/plugins/tuileHydra/resources/plugInfo.json; \
+    strip --strip-debug /opt/plugins/tuileHydra/tuileHydra.so; \
     test -s /opt/plugins/tuileHydra/tuileHydra.so
 # The staticlib must not leak: no Rust ABI symbol may be dynamically visible.
 RUN ! nm -D /opt/plugins/tuileHydra/tuileHydra.so | grep -qE "tuile_session_new|rust_eh_personality" \
     && echo "plugin: rust symbols hidden"
 
 # ------------------------------------------------------------------- final --
-FROM ${BASE}
+# A fresh runtime, NOT the base: the base's runtime doubles as a compile SDK
+# (usd-blender headers, a second shared USD, TBB and python headers) and a
+# farm pull pays for all of it on every cold host. Measured on the fat image:
+# /opt/usd 231 MB is unused at runtime (Blender ships its own pxr python —
+# proven by running the export with it removed), the compile SDK is 99 MB,
+# datafiles/locale is 76 MB of translations no headless render reads, and
+# the unstripped Rust debuginfo added ~90 MB more. Re-layering also splits
+# the one 478 MB layer into parallel pulls.
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl xz-utils \
+        libglvnd0 libgl1 libegl1 libgles2 \
+        libx11-6 libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 \
+        libsm6 libice6 libxrandr2 libxinerama1 libxcursor1 libdbus-1-3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=plugin /opt/blender/lib /opt/blender/lib
+COPY --from=plugin /opt/blender/blender /opt/blender/blender
+COPY --from=plugin /opt/blender/5.1 /opt/blender/5.1
+RUN rm -rf /opt/blender/5.1/datafiles/locale
 COPY --from=plugin /opt/plugins/tuileHydra /opt/plugins/tuileHydra
 # Static ffmpeg for per-range encodes and the concat, same recipe as
 # stl/blender-render:5.1.
@@ -95,7 +115,11 @@ COPY --from=rustlib /src/target/release/orbit-tape \
                     /src/target/release/tape-to-stage \
                     /opt/tuile/bin/
 
-ENV PXR_PLUGINPATH_NAME=/opt/plugins/tuileHydra/resources \
+ENV PATH=/opt/blender:$PATH \
+    LD_LIBRARY_PATH=/opt/blender/lib \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+    PXR_PLUGINPATH_NAME=/opt/plugins/tuileHydra/resources \
     HDGP_INCLUDE_DEFAULT_RESOLVER=1
 
 # The assertion that defines this image: the procedural plugin REGISTERS in
