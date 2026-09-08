@@ -89,6 +89,14 @@ def main():
     p.add_argument("--tier", default="cycles", choices=["cycles", "eevee"])
     p.add_argument("--upload-url", default="",
                    help="URL PUT présignée : le pod y dépose la vidéo finie")
+    p.add_argument("--wait", action="store_true",
+                   help="reboucle tant que RunPod n'a pas d'instance libre "
+                        "(45 s entre essais) — la loterie des 4x5090 se gagne "
+                        "en restant dans la file")
+    p.add_argument("--resident-gb", type=int, default=12,
+                   help="budget mémoire tuiles PAR PROCESSUS (GiB). Le défaut "
+                        "du code est 4 — dimensionné laptop ; un pod de ferme "
+                        "monte à RAM/(GPU×procs)")
     p.add_argument("--width", type=int, default=1920)
     p.add_argument("--samples", type=int, default=128)
     p.add_argument("--threshold", type=float, default=0.05)
@@ -165,11 +173,12 @@ def main():
                              "le moteur hydra ne cuit pas sans")
         env["TUILE_ION_TOKEN"] = token
         env["TUILE_CACHE_DIR"] = "/tmp/tuile-cache"
+        env["TUILE_RESIDENT_BUDGET_GB"] = str(args.resident_gb)
 
     gpu = {"id": args.gpu_type, "count": args.gpu_count}
     if not args.cuda_any:
         gpu["allowedCudaVersions"] = cuda
-    pod = call(key, "POST", "/pods", {
+    body = {
         "name": args.name,
         "image": args.image,
         "registry": reg["id"],
@@ -179,7 +188,23 @@ def main():
         "ports": ["22/tcp"] if args.ssh_pubkey else [],
         "env": env,
         "args": "bash /opt/render/render_job.sh",
-    })
+    }
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            pod = call(key, "POST", "/pods", body)
+            break
+        except SystemExit as e:
+            # The capacity lottery answers 400 "no instances available"; every
+            # other error is real and must not be retried into a bill.
+            if args.wait and "no longer any instances" in str(e):
+                print(f"essai {attempt}: pas d'instance libre, on reste dans "
+                      "la file (45 s)", flush=True)
+                import time
+                time.sleep(45)
+                continue
+            raise
     print(f"pod: {pod['id']}  {args.gpu_count}x {args.gpu_type} ({args.cloud})"
           f"  {pod.get('cost')} $/h")
 
