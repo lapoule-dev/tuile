@@ -68,7 +68,7 @@ class ProcHook(bpy.types.USDHook):
 
     @staticmethod
     def on_export(ctx):
-        from pxr import Sdf
+        from pxr import Sdf, UsdGeom, UsdShade
         stage = ctx.get_stage()
         prim = stage.DefinePrim('/proc_direct', 'GenerativeProcedural')
         prim.ApplyAPI('HydraGenerativeProceduralAPI')
@@ -79,6 +79,24 @@ class ProcHook(bpy.types.USDHook):
         prim.CreateAttribute('proceduralSystem',
                              Sdf.ValueTypeNames.Token).Set(
                                  'hydraGenerativeProcedural')
+
+        # Le look par COMPOSITION, pas dans le procédural : le cube généré
+        # est pris tel quel, et l'habillage est autoré sur le prim parent
+        # côté stage — le flattening Hydra hérite binding et xform aux
+        # enfants générés. C'est le modèle TuileGlobe : géométrie émise,
+        # apparence composée par-dessus.
+        mat = UsdShade.Material.Define(stage, '/Looks/CubeMat')
+        shader = UsdShade.Shader.Define(stage, '/Looks/CubeMat/Preview')
+        shader.CreateIdAttr('UsdPreviewSurface')
+        shader.CreateInput('diffuseColor', Sdf.ValueTypeNames.Color3f).Set(
+            (1.0, 0.45, 0.12))
+        shader.CreateInput('roughness', Sdf.ValueTypeNames.Float).Set(0.4)
+        mat.CreateSurfaceOutput().ConnectToSource(
+            shader.ConnectableAPI(), 'surface')
+        UsdShade.MaterialBindingAPI.Apply(prim).Bind(mat)
+        # Placement par composition aussi : le cube émis s'étend sur
+        # z=1..3 ; -1 sur le parent le pose au sol.
+        UsdGeom.Xformable(prim).AddTranslateOp().Set((0.0, 0.0, -1.0))
         print('VIDEO-HOOK-FIRED', flush=True)
         return True
 
