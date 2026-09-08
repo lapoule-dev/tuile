@@ -26,12 +26,20 @@ use crate::session::{Session, SessionConfig};
 
 /// How many levels finer than the terrain the baked imagery may go.
 ///
-/// Four levels is a 16×16 sub-mosaic per terrain tile — deep zoom where the
-/// camera is close (its terrain is fine), proportionally coarse where it is
-/// far, and one imagery level per terrain level everywhere: the
-/// checkerboard's actual cure. The old effective value was +2, imposed
-/// silently by the GPU shading ceiling this path does not have.
-const IMAGERY_BOOST_CAP: u32 = 4;
+/// Default +1, and that number is a MEMORY decision as much as a sharpness
+/// one: each extra level quadruples the imagery held per terrain tile (+4
+/// run locally ballooned to 60 GB allocated on a frame that never
+/// converged; measured the hard way). `TUILE_IMAGERY_BOOST=0` disables the
+/// boost outright — imagery exactly matches the terrain level — and a farm
+/// job raises it to taste, where the RAM is real. Whatever the value, it
+/// stays proportional per tile: one imagery level per terrain level, the
+/// checkerboard's cure.
+fn imagery_boost_cap() -> u32 {
+    std::env::var("TUILE_IMAGERY_BOOST")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1)
+}
 
 /// ion's asset id for Cesium World Terrain.
 pub const CESIUM_WORLD_TERRAIN: i64 = 1;
@@ -231,7 +239,7 @@ async fn resolve(
             GlobeOptions {
                 no_imagery: true,
                 imagery_slots: imagery_slots.clone(),
-                imagery_boost_cap: IMAGERY_BOOST_CAP,
+                imagery_boost_cap: imagery_boost_cap(),
             },
             offload::threaded(),
         );
@@ -271,7 +279,7 @@ async fn resolve(
         GlobeOptions {
             no_imagery: false,
             imagery_slots,
-            imagery_boost_cap: IMAGERY_BOOST_CAP,
+            imagery_boost_cap: imagery_boost_cap(),
         },
         offload::threaded(),
     );
