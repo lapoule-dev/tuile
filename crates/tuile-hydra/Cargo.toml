@@ -31,6 +31,7 @@ image = { workspace = true }
 # on a farm node is indistinguishable from a hang.
 tokio = { workspace = true, features = ["time"] }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 tuile-core = { version = "0.0.1", path = "../tuile-core" }
 # The host is OpenUSD, which has no way to resolve tile sources for itself: a
