@@ -19,7 +19,8 @@ use std::time::Duration;
 use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
 use tuile_native_fetchers::NativeHttp;
-use tuile_planetary::{globe, GlobeOptions};
+use tuile_core::offload;
+use tuile_planetary::{globe_on, GlobeOptions};
 
 use crate::session::{Session, SessionConfig};
 
@@ -196,7 +197,11 @@ async fn resolve(
     // Terrain only: a valid mode, and the one to reach for when the geometry
     // looks wrong and a texture is the last thing you want on top of it.
     let Some(imagery_asset_id) = config.imagery_asset_id else {
-        let (tree, loader, _detail, _heights) = globe(
+        // Decode and resample on a real pool: the bulk driver blocks one
+        // thread polling the server, and `globe()`'s inline offload would put
+        // every tile's decode on that same thread — measured at sixty-four
+        // loads in flight and one core busy.
+        let (tree, loader, _detail, _heights) = globe_on(
             terrain,
             NoImagery,
             layer,
@@ -204,6 +209,7 @@ async fn resolve(
                 no_imagery: true,
                 ..Default::default()
             },
+            offload::threaded(),
         );
         return Ok((tree, loader));
     };
@@ -234,7 +240,7 @@ async fn resolve(
         .await
         .map_err(|e| GlobeError::Bing(e.to_string()))?;
 
-    let (tree, loader, _detail, _heights) = globe(
+    let (tree, loader, _detail, _heights) = globe_on(
         terrain,
         bing,
         layer,
@@ -242,6 +248,7 @@ async fn resolve(
             no_imagery: false,
             ..Default::default()
         },
+        offload::threaded(),
     );
     Ok((tree, loader))
 }
