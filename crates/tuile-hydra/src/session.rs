@@ -47,6 +47,13 @@ pub struct SessionConfig {
     /// own sources chooses its own, and choosing badly means one session's
     /// textures answering another's requests.
     pub dataset: String,
+    /// Largest side of the per-tile imagery mosaic baked before the boundary.
+    ///
+    /// Draped imagery crosses the ABI as one owned texture per tile
+    /// ([`tuile_core::raster::bake_imagery`]) — a Hydra host authors one
+    /// `UsdUVTexture` per tile and knows nothing about layers. This caps the
+    /// bake; the bake itself picks the finest layer's scale below it.
+    pub bake_max_size: u32,
 }
 
 impl Default for SessionConfig {
@@ -58,6 +65,7 @@ impl Default for SessionConfig {
             // Deliberately not "" — an empty dataset would collapse the URI to
             // `tuile:///tile/...`, which resolves but scopes nothing.
             dataset: "default".into(),
+            bake_max_size: 2048,
         }
     }
 }
@@ -283,7 +291,8 @@ impl Session {
         loader: Arc<dyn TileLoader>,
         config: SessionConfig,
     ) -> std::io::Result<Self> {
-        let (stream, server) = in_process_with(tree, loader, config.traversal.clone());
+        let (stream, server) =
+            in_process_with(tree, loader, exact_traversal(config.traversal.clone()));
 
         // The server runs on its own runtime handle so a frame call can block
         // the calling thread — which is what Hydra's cook wants — without
@@ -332,6 +341,7 @@ impl Session {
         }
 
         let mut contents = bulk.contents;
+        let bake_max_size = self.config.bake_max_size;
         let tiles = bulk
             .selected
             .iter()
@@ -342,15 +352,44 @@ impl Session {
                     // would mean the server was misconfigured.
                     return None;
                 };
-                Some(TileGeometry {
-                    tile: *tile,
-                    origin_ecef: decoded.local_origin_ecef,
-                    content: decoded,
-                })
+                Some(finish_tile(*tile, decoded, bake_max_size))
             })
             .collect();
 
         Ok(Frame::new(self.config.dataset.as_str(), tiles))
+    }
+}
+
+/// The traversal a bulk frame runs, whatever the caller asked for.
+///
+/// Stand-ins are an interactive kindness — a plausible surface while the real
+/// tile is in flight. A bulk frame has no "while": it converges or it fails,
+/// and a stand-in that slipped into a kept frame is the invisible defect
+/// docs/15 forbids (two farm nodes disagreeing about which tiles were real).
+/// Holes are forbidden for the same reason, whichever way the caller's config
+/// leans.
+fn exact_traversal(mut config: Config) -> Config {
+    config.stand_ins = false;
+    config.forbid_holes = true;
+    config
+}
+
+/// One decoded tile, made boundary-ready.
+///
+/// Draped imagery is baked to a single owned texture here — before anything
+/// crosses the ABI — so the host sees `textures` and a `base_color_texture`
+/// index and never the layer stack. Without this, every ion terrain tile
+/// crosses with `textures` empty and `base_color_texture == -1`.
+fn finish_tile(
+    tile: TileId,
+    mut decoded: DecodedTileContent,
+    bake_max_size: u32,
+) -> TileGeometry {
+    tuile_core::raster::bake_imagery(&mut decoded, bake_max_size);
+    TileGeometry {
+        tile,
+        origin_ecef: decoded.local_origin_ecef,
+        content: decoded,
     }
 }
 
@@ -451,5 +490,82 @@ mod tests {
     #[test]
     fn tile_errors_fail_the_frame_by_default() {
         assert!(SessionConfig::default().fail_on_tile_errors);
+    }
+
+    /// Whatever the caller's traversal config says, a bulk frame is exact:
+    /// no stand-in surface may reach a kept frame, and holes stay forbidden.
+    #[test]
+    fn bulk_traversal_is_exact_whatever_the_caller_asked() {
+        let mut config = Config::default();
+        config.stand_ins = true;
+        config.forbid_holes = false;
+        let exact = exact_traversal(config);
+        assert!(!exact.stand_ins);
+        assert!(exact.forbid_holes);
+    }
+
+    /// A tile with draped imagery must cross the boundary as one owned
+    /// texture: the bake happens in the session, before the ABI, or every ion
+    /// terrain tile reports `base_color_texture == -1` and renders untextured.
+    #[test]
+    fn a_finished_tile_owns_its_mosaic() {
+        use tuile_core::content::{DecodedMesh, MaterialDesc};
+        use tuile_core::geo::{geodetic_to_ecef, Geodetic};
+        use tuile_core::raster::{
+            uvs_geographic, GeoRect, ImageryCoord, ImageryLayer,
+        };
+
+        let rect = GeoRect {
+            west: 0.0,
+            south: 0.0,
+            east: 0.01,
+            north: 0.01,
+        };
+        let origin = geodetic_to_ecef(Geodetic {
+            lon: 0.005,
+            lat: 0.005,
+            height: 0.0,
+        });
+        let positions = vec![[0.0f32; 3]; 3];
+        let uvs = uvs_geographic(&positions, origin, &rect);
+        let decoded = DecodedTileContent {
+            meshes: vec![DecodedMesh {
+                positions,
+                normals: None,
+                uvs: Some(uvs),
+                indices: vec![0, 1, 2],
+                material: MaterialDesc {
+                    base_color_factor: [1.0; 4],
+                    base_color_texture: None,
+                },
+            }],
+            textures: Vec::new(),
+            imagery: vec![ImageryLayer {
+                coord: ImageryCoord {
+                    level: 0,
+                    x: 0,
+                    y: 0,
+                },
+                texture: Arc::new(DecodedTexture {
+                    width: 2,
+                    height: 2,
+                    rgba8: vec![128u8; 2 * 2 * 4],
+                }),
+                coverage: [-0.1, -0.1, 1.1, 1.1],
+                translation: [0.0, 0.0],
+                scale: [1.0, 1.0],
+            }],
+            local_origin_ecef: origin,
+            transform_local: glam::Mat4::IDENTITY,
+        };
+
+        let tile = finish_tile(TileId(7), decoded, 256);
+        assert_eq!(tile.content.textures.len(), 1, "the mosaic is owned");
+        assert!(tile.content.imagery.is_empty(), "the layers are consumed");
+        assert_eq!(
+            tile.content.meshes[0].material.base_color_texture,
+            Some(0),
+            "the material points at the baked texture"
+        );
     }
 }
