@@ -89,6 +89,11 @@ def main():
     p.add_argument("--tier", default="cycles", choices=["cycles", "eevee"])
     p.add_argument("--upload-url", default="",
                    help="URL PUT présignée : le pod y dépose la vidéo finie")
+    p.add_argument("--env", action="append", default=[],
+                   metavar="K=V",
+                   help="variable d'env supplémentaire pour le pod "
+                        "(répétable) — le réglage machine du chemin USD "
+                        "(TUILE_IMAGERY_BOOST, TUILE_FETCHES, ...) passe ici")
     p.add_argument("--wait", action="store_true",
                    help="reboucle tant que RunPod n'a pas d'instance libre "
                         "(45 s entre essais) — la loterie des 4x5090 se gagne "
@@ -174,6 +179,11 @@ def main():
         env["TUILE_ION_TOKEN"] = token
         env["TUILE_CACHE_DIR"] = "/tmp/tuile-cache"
         env["TUILE_RESIDENT_BUDGET_GB"] = str(args.resident_gb)
+    for pair in args.env:
+        k, _, v = pair.partition("=")
+        if not k or not v:
+            raise SystemExit(f"--env attend K=V, reçu: {pair}")
+        env[k] = v
 
     gpu = {"id": args.gpu_type, "count": args.gpu_count}
     if not args.cuda_any:
