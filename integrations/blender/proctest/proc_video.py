@@ -52,6 +52,11 @@ class ProcHook(bpy.types.USDHook):
         prim.ApplyAPI('HydraGenerativeProceduralAPI')
         prim.CreateAttribute('primvars:hdGp:proceduralType',
                              Sdf.ValueTypeNames.Token).Set('TestCube')
+        # Type hydra déterministe pour l'adaptateur usdProcImaging (le
+        # fallback d'API schema n'est pas garanti dans ce process).
+        prim.CreateAttribute('proceduralSystem',
+                             Sdf.ValueTypeNames.Token).Set(
+                                 'hydraGenerativeProcedural')
         print('VIDEO-HOOK-FIRED', flush=True)
         return True
 

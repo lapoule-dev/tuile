@@ -125,6 +125,13 @@ public:
     }
 };
 
+} // namespace
+
+// At global scope on purpose: TfType registers the demangled class name,
+// and an anonymous namespace would register
+// "(anonymous namespace)::CubeProceduralPlugin" — which can never match
+// the "CubeProceduralPlugin" key in plugInfo.json (the exact failure:
+// "Plugin CubeProceduralPlugin is missing TfType registration").
 class CubeProceduralPlugin final : public HdGpGenerativeProceduralPlugin
 {
 public:
@@ -134,8 +141,6 @@ public:
         return new CubeProcedural(proceduralPrimPath);
     }
 };
-
-} // namespace
 
 TF_REGISTRY_FUNCTION(TfType)
 {

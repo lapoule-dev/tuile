@@ -25,7 +25,11 @@
 
 ARG BLENDER_VERSION=5.1.2
 ARG USD_VERSION=25.08
+# Two knobs on purpose: the usdpy stage is cache-hot at 8 and memory-light;
+# the Blender ninja stage is the memory hog (8×cc1plus thrashes a 12Gi
+# builder). Changing one must not invalidate the other's cached layer.
 ARG BUILD_JOBS=2
+ARG USD_BUILD_JOBS=8
 
 # ---------------------------------------------------------------- sources
 FROM ubuntu:24.04 AS sources
@@ -45,7 +49,7 @@ RUN cd /opt/src/blender \
 FROM ubuntu:24.04 AS usdpy
 ENV DEBIAN_FRONTEND=noninteractive
 ARG USD_VERSION
-ARG BUILD_JOBS
+ARG USD_BUILD_JOBS
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake python3 git curl ca-certificates xz-utils \
         libx11-dev libxt-dev libgl1-mesa-dev libglu1-mesa-dev libglvnd-dev \
@@ -65,7 +69,7 @@ RUN PYBIN=$(ls /opt/blender-python/bin/python3* | head -1) \
         --examples \
         --no-materialx --no-opencolorio --no-openimageio --no-openvdb \
         --no-alembic --no-draco --no-ptex --no-usdview --no-prman --no-vulkan \
-        -j ${BUILD_JOBS} /opt/usd \
+        -j ${USD_BUILD_JOBS} /opt/usd \
     && rm -rf /opt/usd/build /opt/usd/src /tmp/usd.tar.gz
 
 # ------------------------------------------------------------------ build
