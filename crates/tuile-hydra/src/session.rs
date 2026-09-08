@@ -435,7 +435,10 @@ fn exact_traversal(mut config: Config) -> Config {
     config.forbid_holes = true;
     config.resident_budget_bytes = usize::MAX;
     config.resident_tile_limit = usize::MAX;
-    config.maximum_simultaneous_fetches = 64;
+    // Bulk, not trickle: a converging frame should saturate the pooled HTTP
+    // client (keep-alive per host, HTTP/2 multiplexing) rather than dribble
+    // tiles 64 at a time through a knob sized for a viewer's frame budget.
+    config.maximum_simultaneous_fetches = 256;
     // The USD decree: the whole frame as fine as its nearest tile, meshes and
     // imagery both. LOD boundaries are walls across a rendered image, and a
     // farm's budget is infinite.
