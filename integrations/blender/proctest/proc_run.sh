@@ -21,6 +21,7 @@ cat > /tmp/proc.usda <<USDA
 def Xform "P" {
     def GenerativeProcedural "proc" (prepend apiSchemas = ["HydraGenerativeProceduralAPI"]) {
         token primvars:hdGp:proceduralType = "$PROCTYPE"
+        token proceduralSystem = "hydraGenerativeProcedural"
     }
 }
 USDA

@@ -96,16 +96,23 @@ void USDSceneDelegate::populate(Depsgraph *depsgraph)
 
   /* Hydra 2.0: the standard usdImaging scene-index chain (instancing,
    * materials, draw modes), wrapped in the hdGp resolver so generative
-   * procedural prims cook — the point of this patch. */
+   * procedural prims cook — the point of this patch.
+   *
+   * Ordering is load-bearing: the resolver cooks ONLY on PrimsAdded
+   * notices, never on scene queries (its own words, GetPrim). The whole
+   * chain must therefore observe the stage index BEFORE population —
+   * SetStage/SetTime come last, so their notices flow through the
+   * resolver and cook the procedurals. */
   pxr::UsdImagingCreateSceneIndicesInfo info;
   pxr::UsdImagingSceneIndices indices = pxr::UsdImagingCreateSceneIndices(info);
   stage_index_ = indices.stageSceneIndex;
-  stage_index_->SetStage(stage_);
-  stage_index_->SetTime(pxr::UsdTimeCode::Default());
 
   terminal_index_ = pxr::HdGpGenerativeProceduralResolvingSceneIndex::New(
       indices.finalSceneIndex);
   render_index_->InsertSceneIndex(terminal_index_, delegate_id_);
+
+  stage_index_->SetStage(stage_);
+  stage_index_->SetTime(pxr::UsdTimeCode::Default());
 
   /* tuile-diag: one-shot observability for the generative pipeline. */
   {
