@@ -105,10 +105,10 @@ private:
     /// construction count.
     uint64_t _cooks = 0;
 
-    TuileSession *_session = nullptr;
-    /// Set after a session open failed: the error was reported once, loudly,
-    /// and every later cook stays empty instead of re-failing per frame.
-    bool _sessionFailed = false;
+    /// The session this prim reads, owned by a process-wide registry rather
+    /// than by this instance — see `_SharedSession` in the implementation.
+    /// Null until the first cook resolves it.
+    struct _SharedSession *_shared = nullptr;
     /// The converged frame the current children read from. Freed at the start
     /// of the next cook — `GetChildPrim` copies into retained data sources, so
     /// nothing outlives it.
