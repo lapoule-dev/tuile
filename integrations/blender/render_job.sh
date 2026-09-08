@@ -10,7 +10,10 @@
 #
 #   JOB_STAGE_B64_GZ   gzip+base64 of the .usda (or JOB_STAGE=path in image)
 #   JOB_FRAMES         "1:1440" (inclusive)
-#   JOB_TIER           cycles | eevee            (default cycles)
+#   JOB_ENGINE         native | hydra            (default native; hydra = the
+#                      manifest path, HYDRA_STORM, procedurals cook — needs
+#                      TUILE_ION_TOKEN in the pod env)
+#   JOB_TIER           cycles | eevee            (default cycles; native only)
 #   JOB_WIDTH          pixels                    (default 1920)
 #   JOB_SAMPLES        max samples               (default 128)
 #   JOB_THRESHOLD      adaptive noise threshold  (default 0.05)
@@ -19,6 +22,8 @@
 #   JOB_BATCH_FRAMES   progress log granularity  (default 60)
 #   JOB_EXTRA_ARGS     extra render_usd.py args  (e.g. "--demo-fixups --no-dof")
 #   JOB_OUT            final video path          (default /out/render.mp4)
+#   JOB_UPLOAD_PUT_URL if set: curl -T the finished video to this presigned
+#                      URL (no credential ever reaches the pod)
 #   JOB_SSH_PUBKEY     if set: start sshd with this authorized key
 #
 # Contract, exact-or-die: the GPU probe must match JOB_GPUS or the job bails
@@ -28,6 +33,7 @@
 set -uo pipefail
 
 JOB_FRAMES="${JOB_FRAMES:?JOB_FRAMES requis (ex: 1:1440)}"
+JOB_ENGINE="${JOB_ENGINE:-native}"
 JOB_TIER="${JOB_TIER:-cycles}"
 JOB_WIDTH="${JOB_WIDTH:-1920}"
 JOB_SAMPLES="${JOB_SAMPLES:-128}"
@@ -45,11 +51,21 @@ jobs=$((JOB_GPUS * JOB_PROCS_PER_GPU))
 span=$((total / jobs))
 [ "$span" -ge 1 ] || { echo "plage trop courte pour $jobs processus" >&2; exit 1; }
 
-# GPU probe first: never a silent CPU render.
-probe=$(blender -b --python-expr "import bpy; p = bpy.context.preferences.addons['cycles'].preferences; p.compute_device_type = 'OPTIX'; p.get_devices(); print('NGPU', sum(1 for d in p.devices if d.type == 'OPTIX'))" 2>&1 | grep -oE 'NGPU [0-9]+' | head -1)
+# GPU probe first: never a silent CPU render. Storm draws through GL, not
+# OptiX, so the hydra engine probes the driver itself.
+if [ "$JOB_ENGINE" = "hydra" ]; then
+    probe="NGPU $(nvidia-smi -L 2>/dev/null | grep -c '^GPU')"
+else
+    probe=$(blender -b --python-expr "import bpy; p = bpy.context.preferences.addons['cycles'].preferences; p.compute_device_type = 'OPTIX'; p.get_devices(); print('NGPU', sum(1 for d in p.devices if d.type == 'OPTIX'))" 2>&1 | grep -oE 'NGPU [0-9]+' | head -1)
+fi
 echo "probe: $probe (attendu: NGPU $JOB_GPUS)"
 if [ "$probe" != "NGPU $JOB_GPUS" ]; then
     echo NO-GPU-BAIL
+    sleep "${JOB_BAIL_SLEEP:-600}"
+    exit 1
+fi
+if [ "$JOB_ENGINE" = "hydra" ] && [ -z "${TUILE_ION_TOKEN:-}" ]; then
+    echo NO-TOKEN-BAIL
     sleep "${JOB_BAIL_SLEEP:-600}"
     exit 1
 fi
@@ -76,7 +92,7 @@ for i in $(seq 0 $((jobs - 1))); do
     a=$((first + i * span))
     if [ "$i" = "$((jobs - 1))" ]; then b=$last; else b=$((first + (i + 1) * span - 1)); fi
     CUDA_VISIBLE_DEVICES=$gpu stdbuf -oL blender -b -P /opt/render/render_usd.py -- \
-        --stage "$STAGE" --tier "$JOB_TIER" \
+        --stage "$STAGE" --engine "$JOB_ENGINE" --tier "$JOB_TIER" \
         --frames "$a:$b" --width "$JOB_WIDTH" \
         --samples "$JOB_SAMPLES" --adaptive-threshold "$JOB_THRESHOLD" \
         --batch-frames "$JOB_BATCH_FRAMES" $JOB_EXTRA_ARGS \
@@ -104,6 +120,15 @@ if [ "$n" = "$jobs" ]; then
 fi
 if [ -s "$JOB_OUT" ]; then
     ls -la "$JOB_OUT"
+    if [ -n "${JOB_UPLOAD_PUT_URL:-}" ]; then
+        # Presigned PUT: the pod ships its own result home and no credential
+        # ever reaches it.
+        if curl -fsS -T "$JOB_OUT" "$JOB_UPLOAD_PUT_URL" > /dev/null; then
+            echo UPLOAD-DONE
+        else
+            echo UPLOAD-FAILED
+        fi
+    fi
     echo RENDER-DONE
     sleep "${JOB_DONE_SLEEP:-7200}"
 else
