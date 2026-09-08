@@ -101,6 +101,15 @@ pub struct TileGeometry {
     pub tile: TileId,
     pub origin_ecef: DVec3,
     pub content: DecodedTileContent,
+    /// What this tile's baked mosaic is keyed by in the session's memo, when
+    /// it has one. Computed before the bake so a repeat can be recognised.
+    pub(crate) baked: Option<TextureKey>,
+    /// The baked texture, when an earlier frame already produced it.
+    ///
+    /// Held as an `Arc` rather than looked up again on demand: the memo
+    /// evicts, and a frame that promised a texture must be able to hand out
+    /// its bytes however long it lives.
+    pub(crate) memoized: Option<Arc<EncodedTexture>>,
 }
 
 /// A texture, as the renderer will ask for it.
@@ -111,6 +120,112 @@ pub struct EncodedTexture {
     pub uri: String,
     /// PNG bytes.
     pub png: Vec<u8>,
+}
+
+/// What makes one tile's texture unique across frames.
+///
+/// Identity alone is not enough. The same tile is re-draped at a different
+/// imagery level when the camera moves, and serving the previous drape would
+/// pin the ground at the sharpness of a frame that is gone. What decides the
+/// pixels is the set of layers that went into the bake — so that is what
+/// decides the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct TextureKey {
+    tile: TileId,
+    /// Hash of the drape: every layer coordinate, in order, plus the bake
+    /// size. Zero for a texture the tile owns rather than one we composed.
+    drape: u64,
+    texture_index: usize,
+}
+
+/// Baked, encoded textures kept **between** frames.
+///
+/// The reason this exists, measured on the farm: a camera orbit re-selects
+/// almost the same tiles every frame, and without a memo each one is re-baked
+/// (a 2048² mosaic composed from its layers) and re-encoded to PNG — around
+/// sixty seconds of pure CPU per frame, on a GPU that draws it in
+/// milliseconds. With it, only tiles that are new or re-draped pay.
+///
+/// Bounded on purpose. This holds megabytes per tile and a long shot visits
+/// thousands: `TUILE_TEXTURE_MEMO_MB` (default 1024) caps it, and the
+/// least-recently-used entries go first. Eviction is safe at any moment
+/// because every frame holds an `Arc` to the textures it handed out.
+#[derive(Debug)]
+pub(crate) struct TextureMemo {
+    inner: Mutex<MemoInner>,
+    budget_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct MemoInner {
+    entries: HashMap<TextureKey, (Arc<EncodedTexture>, u64)>,
+    bytes: usize,
+    clock: u64,
+}
+
+impl Default for TextureMemo {
+    fn default() -> Self {
+        Self::new(env_knob("TUILE_TEXTURE_MEMO_MB", 1024_usize).max(1) * 1024 * 1024)
+    }
+}
+
+impl TextureMemo {
+    pub(crate) fn new(budget_bytes: usize) -> Self {
+        Self {
+            inner: Mutex::new(MemoInner::default()),
+            budget_bytes,
+        }
+    }
+
+    /// The texture for `key`, if it is still held. Marks it as just used.
+    pub(crate) fn get(&self, key: TextureKey) -> Option<Arc<EncodedTexture>> {
+        // A poisoned memo degrades to a miss: it costs a re-bake, and that is
+        // strictly better than failing a render over a cache.
+        let mut inner = self.inner.lock().ok()?;
+        inner.clock += 1;
+        let clock = inner.clock;
+        let (entry, used) = inner.entries.get_mut(&key)?;
+        *used = clock;
+        Some(Arc::clone(entry))
+    }
+
+    /// Records `entry` under `key`, evicting the oldest entries if the budget
+    /// is exceeded.
+    pub(crate) fn insert(&self, key: TextureKey, entry: &Arc<EncodedTexture>) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.clock += 1;
+        let clock = inner.clock;
+        let size = entry.png.len();
+        if inner
+            .entries
+            .insert(key, (Arc::clone(entry), clock))
+            .is_none()
+        {
+            inner.bytes += size;
+        }
+        if inner.bytes <= self.budget_bytes {
+            return;
+        }
+        // Bulk-evict down to 80 % rather than one entry at a time: the sort is
+        // paid once instead of on every insert while a big frame streams in.
+        let mut ages: Vec<(u64, TextureKey)> = inner
+            .entries
+            .iter()
+            .map(|(k, (_, used))| (*used, *k))
+            .collect();
+        ages.sort_unstable_by_key(|(used, _)| *used);
+        let target = self.budget_bytes * 4 / 5;
+        for (_, key) in ages {
+            if inner.bytes <= target {
+                break;
+            }
+            if let Some((entry, _)) = inner.entries.remove(&key) {
+                inner.bytes -= entry.png.len();
+            }
+        }
+    }
 }
 
 /// A converged answer for one camera.
@@ -130,6 +245,9 @@ pub struct Frame {
     /// the textures it will actually sample, which after frustum and material
     /// culling is rarely all of them.
     encoded: Mutex<HashMap<(usize, usize), Arc<EncodedTexture>>>,
+    /// Textures kept across frames. The per-frame map above is what keeps a
+    /// handed-out borrow alive; this is what stops the work being redone.
+    memo: Arc<TextureMemo>,
     /// Scopes this frame's asset URIs. See [`Frame::texture_uri`].
     dataset: Arc<str>,
 }
@@ -145,9 +263,19 @@ impl std::fmt::Debug for Frame {
 impl Frame {
     /// Builds a frame from its tiles, with nothing encoded yet.
     pub fn new(dataset: impl Into<Arc<str>>, tiles: Vec<TileGeometry>) -> Self {
+        Self::with_memo(dataset, tiles, Arc::new(TextureMemo::default()))
+    }
+
+    /// Builds a frame that shares a session's texture memo.
+    pub(crate) fn with_memo(
+        dataset: impl Into<Arc<str>>,
+        tiles: Vec<TileGeometry>,
+        memo: Arc<TextureMemo>,
+    ) -> Self {
         Self {
             tiles,
             encoded: Mutex::new(HashMap::new()),
+            memo,
             dataset: dataset.into(),
         }
     }
@@ -198,9 +326,6 @@ impl Frame {
         let Some(tile) = self.tiles.get(tile_index) else {
             return Ok(None);
         };
-        let Some(texture) = tile.content.textures.get(texture_index) else {
-            return Ok(None);
-        };
 
         let key = (tile_index, texture_index);
         if let Some(hit) = self
@@ -211,6 +336,21 @@ impl Frame {
         {
             return Ok(Some(Arc::clone(hit)));
         }
+
+        // Already baked and encoded by an earlier frame: the bake was skipped,
+        // so this is the only copy that exists.
+        if texture_index == 0 {
+            if let Some(hit) = &tile.memoized {
+                let mut map = self.encoded.lock().map_err(|_| FrameError::Poisoned)?;
+                return Ok(Some(Arc::clone(
+                    map.entry(key).or_insert_with(|| Arc::clone(hit)),
+                )));
+            }
+        }
+
+        let Some(texture) = tile.content.textures.get(texture_index) else {
+            return Ok(None);
+        };
 
         // Encoded outside the lock: this is milliseconds of CPU per texture,
         // and holding the map while it runs would serialise every other tile's
@@ -234,9 +374,14 @@ impl Frame {
         // Another thread may have won the race; keep whichever landed first so
         // every caller sees one buffer at one address.
         let mut map = self.encoded.lock().map_err(|_| FrameError::Poisoned)?;
-        Ok(Some(Arc::clone(
-            map.entry(key).or_insert_with(|| Arc::clone(&entry)),
-        )))
+        let entry = Arc::clone(map.entry(key).or_insert_with(|| Arc::clone(&entry)));
+        drop(map);
+        // Offered to the next frame. Only a baked drape is worth keeping: a
+        // texture the tile owns is decoded from its own content anyway.
+        if let (0, Some(baked)) = (texture_index, tile.baked) {
+            self.memo.insert(baked, &entry);
+        }
+        Ok(Some(entry))
     }
 }
 
@@ -265,6 +410,8 @@ pub struct Session {
     /// different capture batches, every LOD boundary becomes an exposure seam
     /// across the ground (measured on the first SSE-1 gate render).
     imagery_detail: Option<tuile_planetary::ImageryDetail>,
+    /// Baked, encoded textures kept across frames. See [`TextureMemo`].
+    textures: Arc<TextureMemo>,
     /// Kept alive for as long as the session: dropping it ends the server.
     _server: std::thread::JoinHandle<()>,
 }
@@ -317,6 +464,7 @@ impl Session {
             runtime,
             config,
             imagery_detail: None,
+            textures: Arc::new(TextureMemo::default()),
             _server: server_thread,
         })
     }
@@ -383,11 +531,21 @@ impl Session {
                     // would mean the server was misconfigured.
                     return None;
                 };
-                Some(finish_tile(*tile, decoded, bake_max_size))
+                Some(finish_tile(&self.textures, *tile, decoded, bake_max_size))
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let reused = tiles.iter().filter(|t| t.memoized.is_some()).count();
+        tracing::info!(
+            tiles = tiles.len(),
+            reused,
+            "frame resolved (reused = drapes already baked by an earlier frame)"
+        );
 
-        Ok(Frame::new(self.config.dataset.as_str(), tiles))
+        Ok(Frame::with_memo(
+            self.config.dataset.as_str(),
+            tiles,
+            Arc::clone(&self.textures),
+        ))
     }
 }
 
@@ -477,6 +635,7 @@ fn exact_traversal(mut config: Config) -> Config {
 /// index and never the layer stack. Without this, every ion terrain tile
 /// crosses with `textures` empty and `base_color_texture == -1`.
 fn finish_tile(
+    memo: &TextureMemo,
     tile: TileId,
     mut decoded: DecodedTileContent,
     bake_max_size: u32,
@@ -493,12 +652,62 @@ fn finish_tile(
             "draped imagery before bake"
         );
     }
-    tuile_core::raster::bake_imagery(&mut decoded, bake_max_size);
+    let baked = drape_key(tile, &decoded, bake_max_size);
+    let memoized = baked.and_then(|key| memo.get(key));
+    match &memoized {
+        // The same tile under the same drape was baked and encoded by an
+        // earlier frame: skip both. This is where the sixty seconds went — an
+        // orbit re-selects nearly the same tiles every frame, and composing a
+        // 2048² mosaic then PNG-encoding it, per tile, per frame, is the
+        // whole cost of a frame the GPU draws in milliseconds.
+        Some(_) => {
+            decoded.imagery.clear();
+            for mesh in &mut decoded.meshes {
+                mesh.material.base_color_texture = Some(0);
+            }
+        }
+        None => tuile_core::raster::bake_imagery(&mut decoded, bake_max_size),
+    }
     TileGeometry {
         tile,
         origin_ecef: decoded.local_origin_ecef,
         content: decoded,
+        baked,
+        memoized,
     }
+}
+
+/// The memo key for a tile's baked mosaic, or `None` when there is nothing to
+/// bake.
+///
+/// The guard mirrors [`tuile_core::raster::bake_imagery`]'s own, plus one: the
+/// tile must own no texture of its own, so the baked mosaic is unambiguously
+/// texture 0 — which is what lets a memo hit stand in for content that was
+/// never composed at all.
+fn drape_key(
+    tile: TileId,
+    content: &DecodedTileContent,
+    bake_max_size: u32,
+) -> Option<TextureKey> {
+    if content.imagery.is_empty()
+        || !content.textures.is_empty()
+        || content.meshes.iter().any(|m| m.uvs.is_none())
+    {
+        return None;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bake_max_size.hash(&mut hasher);
+    for layer in &content.imagery {
+        layer.coord.level.hash(&mut hasher);
+        layer.coord.x.hash(&mut hasher);
+        layer.coord.y.hash(&mut hasher);
+    }
+    Some(TextureKey {
+        tile,
+        drape: hasher.finish(),
+        texture_index: 0,
+    })
 }
 
 #[cfg(test)]
@@ -524,6 +733,8 @@ mod tests {
                     local_origin_ecef: DVec3::ZERO,
                     transform_local: glam::Mat4::IDENTITY,
                 },
+                baked: None,
+                memoized: None,
             }],
         )
     }
@@ -615,6 +826,59 @@ mod tests {
     /// A tile with draped imagery must cross the boundary as one owned
     /// texture: the bake happens in the session, before the ABI, or every ion
     /// terrain tile reports `base_color_texture == -1` and renders untextured.
+    /// One tile of terrain with one draped imagery layer — the shape every
+    /// ion tile arrives in, and the only one the bake path acts on.
+    fn draped_content() -> DecodedTileContent {
+        use tuile_core::content::{DecodedMesh, MaterialDesc};
+        use tuile_core::geo::{geodetic_to_ecef, Geodetic};
+        use tuile_core::raster::{
+            uvs_geographic, GeoRect, ImageryCoord, ImageryLayer,
+        };
+        let rect = GeoRect {
+            west: 0.0,
+            south: 0.0,
+            east: 0.01,
+            north: 0.01,
+        };
+        let origin = geodetic_to_ecef(Geodetic {
+            lon: 0.005,
+            lat: 0.005,
+            height: 0.0,
+        });
+        let positions = vec![[0.0f32; 3]; 3];
+        let uvs = uvs_geographic(&positions, origin, &rect);
+        DecodedTileContent {
+            meshes: vec![DecodedMesh {
+                positions,
+                normals: None,
+                uvs: Some(uvs),
+                indices: vec![0, 1, 2],
+                material: MaterialDesc {
+                    base_color_factor: [1.0; 4],
+                    base_color_texture: None,
+                },
+            }],
+            textures: Vec::new(),
+            imagery: vec![ImageryLayer {
+                coord: ImageryCoord {
+                    level: 0,
+                    x: 0,
+                    y: 0,
+                },
+                texture: Arc::new(DecodedTexture {
+                    width: 2,
+                    height: 2,
+                    rgba8: vec![128u8; 2 * 2 * 4],
+                }),
+                coverage: [-0.1, -0.1, 1.1, 1.1],
+                translation: [0.0, 0.0],
+                scale: [1.0, 1.0],
+            }],
+            local_origin_ecef: origin,
+            transform_local: glam::Mat4::IDENTITY,
+        }
+    }
+
     #[test]
     fn a_finished_tile_owns_its_mosaic() {
         use tuile_core::content::{DecodedMesh, MaterialDesc};
@@ -667,7 +931,8 @@ mod tests {
             transform_local: glam::Mat4::IDENTITY,
         };
 
-        let tile = finish_tile(TileId(7), decoded, 256);
+        let memo = TextureMemo::default();
+        let tile = finish_tile(&memo, TileId(7), decoded, 256);
         assert_eq!(tile.content.textures.len(), 1, "the mosaic is owned");
         assert!(tile.content.imagery.is_empty(), "the layers are consumed");
         assert_eq!(
@@ -675,5 +940,75 @@ mod tests {
             Some(0),
             "the material points at the baked texture"
         );
+    }
+
+    /// The fix for sixty seconds a frame: a tile whose drape has already been
+    /// baked and encoded is not composed again, and the second frame hands out
+    /// the very same bytes rather than an identical copy.
+    #[test]
+    fn a_repeated_drape_is_baked_and_encoded_once() {
+        let memo = Arc::new(TextureMemo::default());
+
+        // Frame 1: nothing is known, so the mosaic is composed and encoded.
+        let first = finish_tile(&memo, TileId(7), draped_content(), 256);
+        assert!(first.memoized.is_none(), "nothing to reuse yet");
+        assert_eq!(first.content.textures.len(), 1, "frame 1 composes");
+        let frame1 = Frame::with_memo("ion-1-2", vec![first], Arc::clone(&memo));
+        let png1 = frame1
+            .texture_png(0, 0)
+            .expect("encoding")
+            .expect("present");
+
+        // Frame 2: same tile, same drape — no bake, no encode.
+        let second = finish_tile(&memo, TileId(7), draped_content(), 256);
+        assert!(second.memoized.is_some(), "the drape is recognised");
+        assert!(
+            second.content.textures.is_empty(),
+            "frame 2 skips the bake entirely"
+        );
+        assert_eq!(
+            second.content.meshes[0].material.base_color_texture,
+            Some(0),
+            "the material still points at texture 0, served from the memo"
+        );
+        let frame2 = Frame::with_memo("ion-1-2", vec![second], Arc::clone(&memo));
+        let png2 = frame2
+            .texture_png(0, 0)
+            .expect("encoding")
+            .expect("present");
+        assert!(Arc::ptr_eq(&png1, &png2), "one allocation, two frames");
+    }
+
+    /// A drape at a different imagery level is a different picture, and must
+    /// not be served from the memo — that is how a moving camera would keep
+    /// yesterday's sharpness.
+    #[test]
+    fn a_different_drape_is_a_different_key() {
+        let memo = Arc::new(TextureMemo::default());
+        let baseline = finish_tile(&memo, TileId(7), draped_content(), 256);
+        let coarser = finish_tile(&memo, TileId(7), draped_content(), 128);
+        assert_ne!(
+            baseline.baked.expect("keyed"),
+            coarser.baked.expect("keyed"),
+            "the bake size is part of what the pixels are"
+        );
+    }
+
+    /// Eviction must never strand a frame that already promised a texture:
+    /// the frame holds its own reference to the bytes.
+    #[test]
+    fn eviction_cannot_strand_a_live_frame() {
+        // A budget of one byte evicts on every insert.
+        let memo = Arc::new(TextureMemo::new(1));
+        let tile = finish_tile(&memo, TileId(7), draped_content(), 256);
+        let frame = Frame::with_memo("ion-1-2", vec![tile], Arc::clone(&memo));
+        let png = frame.texture_png(0, 0).expect("encoding").expect("present");
+        // Push another texture through; the first is evicted from the memo.
+        let other = finish_tile(&memo, TileId(9), draped_content(), 256);
+        let other_frame = Frame::with_memo("ion-1-2", vec![other], Arc::clone(&memo));
+        let _ = other_frame.texture_png(0, 0).expect("encoding");
+        // The first frame still answers, from its own map.
+        let again = frame.texture_png(0, 0).expect("encoding").expect("present");
+        assert!(Arc::ptr_eq(&png, &again));
     }
 }
