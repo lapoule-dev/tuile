@@ -213,12 +213,16 @@ _RenderSettingsCamera(const HdSceneIndexBaseRefPtr &scene)
     if (!rs) {
         return SdfPath();
     }
+#if PXR_VERSION >= 2608
+    // The settings-level camera only exists from 26.08; on 25.08 (the
+    // Blender fork's USD) rung 2 reads the per-product camera below.
     if (HdPathDataSourceHandle camera = rs.GetCamera()) {
         const SdfPath path = camera->GetTypedValue(0.0f);
         if (!path.IsEmpty()) {
             return path;
         }
     }
+#endif
 
     // The settings-level camera is optional; a product may name its own, and
     // that product is also where `resolution` lives — which a real
@@ -735,9 +739,22 @@ TuileGlobeProcedural::GetChildPrim(
         primvarNames.push_back(_tokens->st);
         primvarSources.push_back(
             HdPrimvarSchema::Builder()
-                .SetPrimvarValue(
-                    HdRetainedTypedSampledDataSource<VtVec2fArray>::New(
-                        _CopyBuffer<GfVec2f>(tile.uvs, vertexCount)))
+                .SetPrimvarValue([&] {
+                    // The baked mosaic's rows follow the tile's v — which
+                    // grows SOUTHWARD (the drape convention) — while a
+                    // sampled texture's t grows from the image's bottom row
+                    // up. Without this flip every tile wears its
+                    // south-north-mirrored imagery: same biome, so it looks
+                    // plausible, and the roads stop dead at every tile
+                    // border (found by Laurent following a road).
+                    VtVec2fArray st =
+                        _CopyBuffer<GfVec2f>(tile.uvs, vertexCount);
+                    for (GfVec2f &uv : st) {
+                        uv[1] = 1.0f - uv[1];
+                    }
+                    return HdRetainedTypedSampledDataSource<
+                        VtVec2fArray>::New(st);
+                }())
                 .SetInterpolation(HdPrimvarSchema::BuildInterpolationDataSource(
                     HdPrimvarSchemaTokens->vertex))
                 .SetRole(HdPrimvarSchema::BuildRoleDataSource(

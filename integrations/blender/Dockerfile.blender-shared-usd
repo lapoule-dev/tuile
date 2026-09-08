@@ -97,6 +97,7 @@ RUN cd /opt/src/blender \
         -DWITH_USD=ON \
         -DUSD_ROOT_DIR=/opt/usd \
         -DWITH_HYDRA=ON \
+        -DWITH_CYCLES_HYDRA_RENDER_DELEGATE=ON \
         -DCMAKE_INSTALL_PREFIX=/opt/blender \
     && cmake --build /opt/build -j ${BUILD_JOBS} \
     && cmake --install /opt/build
