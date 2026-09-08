@@ -42,6 +42,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <memory>
+#include <mutex>
 
 PXR_NAMESPACE_OPEN_SCOPE
 
@@ -86,6 +88,29 @@ TF_DEFINE_PRIVATE_TOKENS(
     (Texture)
     (StReader)
 );
+
+/// A session, shared by every procedural that reads the same globe.
+///
+/// A session is not a cheap thing to own: it holds the resident tile set, the
+/// baked-texture memo, a tokio runtime, a server thread and a warm HTTP pool.
+/// It is also not a cheap thing to *lose* — the server sends a tile's content
+/// once per residency, so a fresh session starts from nothing every time.
+///
+/// hdGp would keep one procedural instance alive for a whole render, and with
+/// it the session; Blender does not, because it rebuilds its scene index on
+/// every frame (`Engine::sync`, the export path Blender itself calls "slow").
+/// So the session outlives the instance instead — process-lifetime, keyed by
+/// what it actually serves.
+struct _SharedSession
+{
+    TuileSession *session = nullptr;
+    /// Set once if opening failed, so a broken configuration is reported
+    /// once rather than retried on every cook of every frame.
+    bool failed = false;
+    /// `tuile_session_frame` takes the session mutably. One prim cooks at a
+    /// time today; this makes that a fact rather than an assumption.
+    std::mutex frameLock;
+};
 
 namespace {
 
@@ -359,6 +384,22 @@ _MaterialNetwork(const std::string &textureUri)
         HdMaterialSchemaTokens->universalRenderContext, network);
 }
 
+struct _SessionRegistry
+{
+    std::mutex mutex;
+    std::map<std::string, std::unique_ptr<_SharedSession>> sessions;
+};
+
+/// Function-local static: constructed on first use, never destroyed — the
+/// same shape as the tile store next door, and for the same reason (a plugin
+/// has no controlled shutdown).
+_SessionRegistry &
+_TheSessions()
+{
+    static _SessionRegistry registry;
+    return registry;
+}
+
 }  // namespace
 
 TuileGlobeProcedural::TuileGlobeProcedural(const SdfPath &proceduralPrimPath)
@@ -372,9 +413,8 @@ TuileGlobeProcedural::~TuileGlobeProcedural()
     if (_frame) {
         tuile_frame_free(_frame);
     }
-    if (_session) {
-        tuile_session_free(_session);
-    }
+    // The session is deliberately NOT freed: it belongs to the process
+    // registry and outlives this instance, which Blender destroys per frame.
 }
 
 SdfPath
@@ -409,16 +449,15 @@ TuileGlobeProcedural::_ResolveCamera(const HdSceneIndexBaseRefPtr &inputScene) c
 bool
 TuileGlobeProcedural::_EnsureSession(const HdSceneIndexBaseRefPtr &inputScene)
 {
-    if (_session) {
+    if (_shared && _shared->session) {
         return true;
     }
-    if (_sessionFailed) {
+    if (_shared && _shared->failed) {
         return false;
     }
 
     const std::string token = TfGetenv("TUILE_ION_TOKEN");
     if (token.empty()) {
-        _sessionFailed = true;
         TF_RUNTIME_ERROR(
             "tuile: TUILE_ION_TOKEN is not set — the globe cannot stream. "
             "The token deliberately never lives in a stage.");
@@ -427,6 +466,32 @@ TuileGlobeProcedural::_EnsureSession(const HdSceneIndexBaseRefPtr &inputScene)
     const std::string cacheDir = TfGetenv("TUILE_CACHE_DIR");
 
     TuileGlobeConfig config = {};
+    // The key is what the session SERVES, never who is allowed to read it:
+    // the token selects permission, not data, and keeping it out means it can
+    // never surface in a diagnostic that prints a key.
+    const std::string key = TfStringPrintf(
+        "%lld|%lld|%g|%s",
+        static_cast<long long>(
+            _DoubleArg(inputScene, _primPath, _tokens->terrainAssetId, 0.0)),
+        static_cast<long long>(
+            _DoubleArg(inputScene, _primPath, _tokens->imageryAssetId, 0.0)),
+        _DoubleArg(inputScene, _primPath, _tokens->maxSse, 0.0),
+        cacheDir.c_str());
+
+    _SessionRegistry &registry = _TheSessions();
+    std::lock_guard<std::mutex> registryLock(registry.mutex);
+    std::unique_ptr<_SharedSession> &entry = registry.sessions[key];
+    if (!entry) {
+        entry = std::make_unique<_SharedSession>();
+    }
+    _shared = entry.get();
+    if (_shared->session) {
+        return true;
+    }
+    if (_shared->failed) {
+        return false;
+    }
+
     config.ion_token = {reinterpret_cast<const uint8_t *>(token.data()),
                         token.size()};
     config.cache_dir = {reinterpret_cast<const uint8_t *>(cacheDir.data()),
@@ -445,9 +510,9 @@ TuileGlobeProcedural::_EnsureSession(const HdSceneIndexBaseRefPtr &inputScene)
         TfGetenvDouble("TUILE_FRAME_TIMEOUT", 1800.0);
     config.fail_on_tile_errors = true;  // eager-fatal, docs/15
 
-    const TuileStatus status = tuile_session_new(&config, &_session);
-    if (status != TuileStatus_Ok || !_session) {
-        _sessionFailed = true;
+    const TuileStatus status = tuile_session_new(&config, &_shared->session);
+    if (status != TuileStatus_Ok || !_shared->session) {
+        _shared->failed = true;
         TF_RUNTIME_ERROR(
             "tuile: opening the globe failed (status %d) — check the token, "
             "the asset ids and the network. Nothing will be emitted.",
@@ -564,7 +629,11 @@ TuileGlobeProcedural::Update(
     // Eager and fatal: this blocks until every selected tile is resident, or
     // reports why not. A frame that lost tiles must be a loud failure, never a
     // plausible image at the wrong level of detail.
-    const TuileStatus status = tuile_session_frame(_session, &view, 1, &_frame);
+    TuileStatus status;
+    {
+        std::lock_guard<std::mutex> frameLock(_shared->frameLock);
+        status = tuile_session_frame(_shared->session, &view, 1, &_frame);
+    }
     if (status != TuileStatus_Ok || !_frame) {
         TF_RUNTIME_ERROR(
             "tuile: the frame did not converge (status %d) — nothing is "
