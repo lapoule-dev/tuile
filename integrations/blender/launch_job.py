@@ -71,7 +71,13 @@ def main():
                    help="versions CUDA hôte acceptées, à partir de celle-ci")
     p.add_argument("--cloud", default="COMMUNITY", choices=["COMMUNITY", "SECURE"])
     p.add_argument("--disk", type=int, default=30)
+    p.add_argument("--engine", default="native", choices=["native", "hydra"],
+                   help="hydra = manifeste + procéduraux (image blender-globe; "
+                        "CESIUM_ION_TOKEN local requis, passé au pod sans "
+                        "jamais être affiché)")
     p.add_argument("--tier", default="cycles", choices=["cycles", "eevee"])
+    p.add_argument("--upload-url", default="",
+                   help="URL PUT présignée : le pod y dépose la vidéo finie")
     p.add_argument("--width", type=int, default=1920)
     p.add_argument("--samples", type=int, default=128)
     p.add_argument("--threshold", type=float, default=0.05)
@@ -80,6 +86,8 @@ def main():
     p.add_argument("--ssh-pubkey", default="",
                    help="clé publique à autoriser (rapatriement scp)")
     args = p.parse_args()
+    if args.engine == "hydra" and args.image == p.get_default("image"):
+        args.image = "harbor.sportstracklive.com/stl/blender-globe:5.1-su"
 
     key = api_key()
     regs = call(key, "GET", "/registries")
@@ -98,6 +106,7 @@ def main():
     env = {
         "JOB_STAGE_B64_GZ": stage_b64,
         "JOB_FRAMES": args.frames,
+        "JOB_ENGINE": args.engine,
         "JOB_TIER": args.tier,
         "JOB_WIDTH": str(args.width),
         "JOB_SAMPLES": str(args.samples),
@@ -110,6 +119,26 @@ def main():
     }
     if args.ssh_pubkey:
         env["JOB_SSH_PUBKEY"] = args.ssh_pubkey
+    if args.upload_url:
+        env["JOB_UPLOAD_PUT_URL"] = args.upload_url
+    if args.engine == "hydra":
+        # The ion token travels env-to-env and is never printed; same .env
+        # discipline as the API key.
+        token = os.environ.get("CESIUM_ION_TOKEN", "")
+        if not token:
+            root = pathlib.Path(__file__).resolve()
+            for parent in root.parents:
+                dotenv = parent / ".env"
+                if dotenv.is_file():
+                    for line in dotenv.read_text().splitlines():
+                        if line.startswith("CESIUM_ION_TOKEN="):
+                            token = line.split("=", 1)[1].strip()
+                    break
+        if not token:
+            raise SystemExit("CESIUM_ION_TOKEN introuvable (env ou .env) — "
+                             "le moteur hydra ne cuit pas sans")
+        env["TUILE_ION_TOKEN"] = token
+        env["TUILE_CACHE_DIR"] = "/tmp/tuile-cache"
 
     pod = call(key, "POST", "/pods", {
         "name": args.name,

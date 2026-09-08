@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# The farm image for the generative globe: the scene-index Blender fork plus
+# the TuileGlobe hdGp procedural — C++ compiled against the fork's own USD SDK
+# (pxrBlender namespace, /opt/usd-blender), Rust streaming core linked in as a
+# staticlib. One image, three procedural pieces that must share one ABI.
+#
+# Non-monolithic on purpose:
+#   rustlib — the tuile-hydra staticlib, built once per Rust change (the
+#             workspace context is source-only; .dockerignore keeps target/,
+#             references/ and .git out of the transfer).
+#   plugin  — the .so, linked against the SDK the base image ships.
+#   final   — base + plugin + farm scripts; nothing else.
+#
+#   docker buildx build --builder stl-builder-k8s --platform linux/amd64 \
+#       -f integrations/blender/Dockerfile.globe \
+#       -t harbor.sportstracklive.com/stl/blender-globe:5.1-su --push .
+
+ARG BASE=harbor.sportstracklive.com/stl/blender-shared-usd:5.1-2508
+
+# ----------------------------------------------------------------- rustlib --
+FROM rust:1-bookworm AS rustlib
+WORKDIR /src
+# The whole workspace manifest set: cargo refuses to parse a workspace with
+# absent members, and the members ARE the context (sources only, few MiB).
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY examples ./examples
+RUN cargo --version \
+    && cargo build --release -p tuile-hydra \
+    && test -f target/release/libtuile_hydra.a
+
+# ------------------------------------------------------------------ plugin --
+FROM ${BASE} AS plugin
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+COPY integrations/hydra/src /opt/src/tuileHydra/src
+COPY integrations/hydra/resources/plugInfo.json /opt/src/tuileHydra/plugInfo.json.in
+COPY --from=rustlib /src/target/release/libtuile_hydra.a /opt/src/tuileHydra/
+# The exact ELF recipe of integrations/hydra/CMakeLists.txt, transposed to the
+# SDK the base image ships: the monolith libusd_ms carries every pxr lib the
+# CMake build names individually, and --exclude-libs,ALL keeps the Rust
+# runtime's symbols out of the dynamic table — a plugin must never resolve its
+# host's calls into its own copy of a common crate.
+RUN set -e; SDK=/opt/usd-blender; \
+    PYINC=$(ls -d /opt/python-blender-include/python3* | head -1); \
+    mkdir -p /opt/plugins/tuileHydra/resources; \
+    g++ -std=c++17 -fPIC -shared \
+        /opt/src/tuileHydra/src/procedural.cpp \
+        /opt/src/tuileHydra/src/proceduralPlugin.cpp \
+        /opt/src/tuileHydra/src/resolver.cpp \
+        /opt/src/tuileHydra/src/tiles.cpp \
+        /opt/src/tuileHydra/src/view.cpp \
+        -I/opt/src/tuileHydra/src \
+        -I"$SDK/include" -I/opt/tbb-blender/include -I"$PYINC" \
+        -L"$SDK/lib" -lusd_ms \
+        /opt/src/tuileHydra/libtuile_hydra.a \
+        -Wl,--exclude-libs,ALL \
+        -lpthread -ldl -lm \
+        -o /opt/plugins/tuileHydra/tuileHydra.so; \
+    sed -e 's|@PLUG_INFO_LIBRARY_PATH@|tuileHydra.so|' \
+        -e 's|@PLUG_INFO_RESOURCE_PATH@|resources|' \
+        -e 's|@PLUG_INFO_ROOT@|..|' \
+        /opt/src/tuileHydra/plugInfo.json.in \
+        > /opt/plugins/tuileHydra/resources/plugInfo.json; \
+    test -s /opt/plugins/tuileHydra/tuileHydra.so
+# The staticlib must not leak: no Rust ABI symbol may be dynamically visible.
+RUN ! nm -D /opt/plugins/tuileHydra/tuileHydra.so | grep -qE "tuile_session_new|rust_eh_personality" \
+    && echo "plugin: rust symbols hidden"
+
+# ------------------------------------------------------------------- final --
+FROM ${BASE}
+COPY --from=plugin /opt/plugins/tuileHydra /opt/plugins/tuileHydra
+# Static ffmpeg for per-range encodes and the concat, same recipe as
+# stl/blender-render:5.1.
+RUN curl -fsL -o /tmp/ffmpeg.tar.xz \
+        "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" \
+    && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp \
+    && mv /tmp/ffmpeg-*-static/ffmpeg /usr/local/bin/ffmpeg \
+    && rm -rf /tmp/ffmpeg* \
+    && ffmpeg -version | sed -n 1p
+COPY integrations/blender/render_usd.py /opt/render/render_usd.py
+COPY integrations/blender/render_job.sh /opt/render/render_job.sh
+
+ENV PXR_PLUGINPATH_NAME=/opt/plugins/tuileHydra/resources \
+    HDGP_INCLUDE_DEFAULT_RESOLVER=1
+
+# The assertion that defines this image: the procedural plugin REGISTERS in
+# the very Blender that will render (cooking needs a token, registration does
+# not). dash has no pipefail, so capture-then-grep.
+RUN out=$(TF_DEBUG=PLUG_REGISTRATION blender -b --factory-startup \
+        --python-exit-code 1 --python-expr "import bpy; from pxr import Usd" 2>&1); \
+    echo "$out" | grep -m1 "plugin 'tuileHydra'" \
+    && echo "blender-globe verified: tuileHydra registers"
+
+CMD ["bash", "/opt/render/render_job.sh"]
