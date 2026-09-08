@@ -426,14 +426,22 @@ fn target_texel_spacing(views: &[ViewStateParams]) -> Option<f64> {
 /// leans.
 ///
 /// Residency budgets are interactive kindnesses too — they exist so a viewer
-/// stays inside a device. This path renders on farm nodes where, in Laurent's
-/// words, the budget is infinite: an eviction *during* convergence keeps the
-/// request count above zero forever, so a budget here is not a limit, it is a
-/// hang. Lifted outright rather than raised.
+/// stays inside a device. On a farm node the budget is effectively infinite
+/// (an eviction *during* convergence keeps the request count above zero
+/// forever — a hang, not a limit), and TUILE_RESIDENT_BUDGET_GB says so per
+/// job. The DEFAULT stays finite on purpose: "infinite" run on a laptop
+/// alongside a renderer took the whole machine down (measured the hard way,
+/// 2026-09-08). Generous enough for every local gate render so far, bounded
+/// enough to fail a frame instead of the host.
 fn exact_traversal(mut config: Config) -> Config {
     config.stand_ins = false;
     config.forbid_holes = true;
-    config.resident_budget_bytes = usize::MAX;
+    let budget_gb = std::env::var("TUILE_RESIDENT_BUDGET_GB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(4);
+    config.resident_budget_bytes = budget_gb.saturating_mul(1024 * 1024 * 1024);
     config.resident_tile_limit = usize::MAX;
     // Bulk, not trickle: a converging frame should saturate the pooled HTTP
     // client (keep-alive per host, HTTP/2 multiplexing) rather than dribble
@@ -457,6 +465,18 @@ fn finish_tile(
     mut decoded: DecodedTileContent,
     bake_max_size: u32,
 ) -> TileGeometry {
+    if tracing::enabled!(tracing::Level::DEBUG) && !decoded.imagery.is_empty() {
+        let mut levels: Vec<u32> =
+            decoded.imagery.iter().map(|l| l.coord.level).collect();
+        levels.sort_unstable();
+        levels.dedup();
+        tracing::debug!(
+            tile = tile.0,
+            layers = decoded.imagery.len(),
+            ?levels,
+            "draped imagery before bake"
+        );
+    }
     tuile_core::raster::bake_imagery(&mut decoded, bake_max_size);
     TileGeometry {
         tile,

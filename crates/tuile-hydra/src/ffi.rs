@@ -224,6 +224,17 @@ pub unsafe extern "C" fn tuile_session_new(
         return TuileStatus::BadArgument;
     }
     guard(|| {
+        // The host is a render process with no Rust logging of its own:
+        // TUILE_LOG=debug turns the crate's tracing into stderr lines, once.
+        static LOGGING: std::sync::Once = std::sync::Once::new();
+        LOGGING.call_once(|| {
+            if let Ok(filter) = std::env::var("TUILE_LOG") {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(std::io::stderr)
+                    .try_init();
+            }
+        });
         unsafe { *out = std::ptr::null_mut() };
         let config = unsafe { &*config };
 
