@@ -592,19 +592,8 @@ TuileGlobeProcedural::Update(
 {
     (void)previousResult;
     (void)dirtiedDependencies;
-    (void)outputDirtiedPrims;
 
     ChildPrimTypeMap result;
-
-    // The previous cook's frame dies here — GetChildPrim copied everything it
-    // served into retained data sources, and the texture bytes were copied
-    // into the resolver's store, so nothing borrows from it any more.
-    if (_frame) {
-        tuile_frame_free(_frame);
-        _frame = nullptr;
-    }
-    _tilesByPath.clear();
-    _materialsByPath.clear();
 
     if (!_EnsureSession(inputScene)) {
         return result;
@@ -612,6 +601,15 @@ TuileGlobeProcedural::Update(
 
     _renderOrigin =
         _Vec3dArg(inputScene, _primPath, _tokens->renderOrigin, GfVec3d(0.0));
+    // Every child's transform is `origin − renderOrigin`. If the manifest
+    // moved the render origin, every prim built against the old one is wrong,
+    // and none of them can be kept.
+    if (_haveBuilt && _renderOrigin != _builtOrigin) {
+        _tilesByPath.clear();
+        _materialsByPath.clear();
+    }
+    _builtOrigin = _renderOrigin;
+    _haveBuilt = true;
     const GfVec2d viewport = _Vec2dArg(
         inputScene, _primPath, _tokens->viewportPx,
         GfVec2d(_fallbackViewportPx[0], _fallbackViewportPx[1]));
@@ -648,21 +646,51 @@ TuileGlobeProcedural::Update(
     const SdfPath tileRoot = _primPath.AppendChild(_tokens->tileRoot);
     const SdfPath materialRoot = _primPath.AppendChild(_tokens->materialRoot);
 
+    // What this cook actually had to do. `kept` is the number that matters:
+    // hdGp emits nothing for a child re-declared unchanged, so those tiles
+    // cost nothing at all — no notice, no GetChildPrim, no data source.
     size_t textured = 0;
+    size_t kept = 0;
+    size_t built = 0;
+    size_t redraped = 0;
+
     for (size_t i = 0; i < count; ++i) {
         TuileTile tile = {};
         if (tuile_frame_tile(_frame, i, &tile) != TuileStatus_Ok) {
             continue;
         }
 
-        _Tile entry;
-        entry.index = i;
-        entry.id = tile.tile_id;
+        // The tile's PATH is its identity: a refinement change selects
+        // different tile ids, so it removes prims and adds prims rather than
+        // mutating one in place — the invariant hdEmbree taught us (a dirtied
+        // mesh whose vertex count changed rendered an empty frame).
+        const SdfPath tilePath = tileRoot.AppendChild(TfToken(TfStringPrintf(
+            "t%llu", static_cast<unsigned long long>(tile.tile_id))));
+        const SdfPath materialPath = materialRoot.AppendChild(TfToken(
+            TfStringPrintf("m%llu",
+                           static_cast<unsigned long long>(tile.tile_id))));
 
-        // Push this tile's textures into the resolver's store, copying: the
-        // store owns its bytes, so nothing ties an in-flight texture load to
-        // this frame's lifetime. The URI is content-stable across cooks, so a
-        // tile kept from the previous frame is already served.
+        const auto known = _tilesByPath.find(tilePath);
+        const bool unchanged =
+            known != _tilesByPath.end() && known->second.drape == tile.drape;
+
+        if (unchanged) {
+            // Re-declared exactly as it was. The resolver compares this map
+            // against the previous one and stays silent — which is the whole
+            // point, since a PrimsAdded on a prim that already exists is a
+            // resync and makes the renderer re-fetch everything.
+            result[tilePath] = HdPrimTypeTokens->mesh;
+            if (known->second.textured) {
+                result[materialPath] = HdPrimTypeTokens->material;
+                ++textured;
+            }
+            ++kept;
+            continue;
+        }
+
+        // New, or the same ground re-draped at another imagery level. Either
+        // way its pixels have to be fetched, and its prim rebuilt.
+        std::string textureUri;
         for (size_t t = 0;; ++t) {
             TuileTexture texture = {};
             const TuileStatus ts = tuile_frame_texture(_frame, i, t, &texture);
@@ -681,8 +709,10 @@ TuileGlobeProcedural::Update(
                 reinterpret_cast<const char *>(texture.uri.data),
                 texture.uri.len);
             if (t == 0) {
-                entry.textureUri = uri;
+                textureUri = uri;
             }
+            // The URI carries the drape, so a re-drape is a different asset
+            // and this never serves stale pixels under a name it already has.
             if (!TuileSpikeTiles::Has(uri)) {
                 TuileSpikeTiles::Put(
                     uri,
@@ -691,25 +721,96 @@ TuileGlobeProcedural::Update(
             }
         }
 
-        // The tile's PATH is its identity: a refinement change selects
-        // different tile ids, so it removes prims and adds prims rather than
-        // mutating one in place — the invariant hdEmbree taught us (a dirtied
-        // mesh whose vertex count changed rendered an empty frame).
-        const TfToken tileName(TfStringPrintf(
-            "t%llu", static_cast<unsigned long long>(tile.tile_id)));
-        const SdfPath tilePath = tileRoot.AppendChild(tileName);
-        result[tilePath] = HdPrimTypeTokens->mesh;
+        _Tile entry;
+        entry.id = tile.tile_id;
+        entry.drape = tile.drape;
+        entry.textureUri = textureUri;
+        entry.textured = tile.base_color_texture >= 0 && !textureUri.empty() &&
+                         tile.uvs.len ==
+                             static_cast<size_t>(tile.vertex_count) *
+                                 sizeof(float) * 2;
 
-        if (tile.base_color_texture >= 0 && !entry.textureUri.empty()) {
-            const SdfPath materialPath = materialRoot.AppendChild(TfToken(
-                TfStringPrintf("m%llu",
-                               static_cast<unsigned long long>(tile.tile_id))));
-            result[materialPath] = HdPrimTypeTokens->material;
-            _materialsByPath[materialPath] = entry;
-            ++textured;
+        const bool wasHere = known != _tilesByPath.end();
+        const bool wasTextured = wasHere && known->second.textured;
+        // A re-drape changes the imagery, never the ground: same tile id, same
+        // vertices, same transform. So the mesh is kept and only its material
+        // is rebuilt — unless the tile gained or lost its texture, which
+        // rewrites the mesh's own primvars and binding.
+        if (wasHere && wasTextured == entry.textured) {
+            entry.prim = known->second.prim;
+            ++redraped;
+        } else {
+            entry.prim = _BuildTilePrim(tile, entry.textured, materialPath);
+            if (wasHere) {
+                ++redraped;
+            } else {
+                ++built;
+            }
         }
-        _tilesByPath[tilePath] = entry;
+
+        result[tilePath] = HdPrimTypeTokens->mesh;
+        _tilesByPath[tilePath] = std::move(entry);
+
+        if (_tilesByPath[tilePath].textured) {
+            _Tile material;
+            material.id = tile.tile_id;
+            material.drape = tile.drape;
+            material.textured = true;
+            material.textureUri = textureUri;
+            material.prim.primType = HdPrimTypeTokens->material;
+            material.prim.dataSource = HdRetainedContainerDataSource::New(
+                HdMaterialSchemaTokens->material, _MaterialNetwork(textureUri));
+            _materialsByPath[materialPath] = std::move(material);
+            result[materialPath] = HdPrimTypeTokens->material;
+            ++textured;
+        } else {
+            _materialsByPath.erase(materialPath);
+        }
+
+        // A kept path with new data is the one case the resolver cannot see:
+        // same path, same type, so it says nothing. Saying it here is the only
+        // way the renderer learns the pixels moved.
+        if (wasHere && outputDirtiedPrims) {
+            if (_tilesByPath[tilePath].textured) {
+                outputDirtiedPrims->emplace_back(
+                    materialPath, HdMaterialSchema::GetDefaultLocator());
+            }
+            // Gaining or losing a texture rewrites the mesh itself — its
+            // primvars (st against displayColor) and its binding — so the
+            // whole prim is dirty, not just its material.
+            if (wasTextured != _tilesByPath[tilePath].textured) {
+                outputDirtiedPrims->emplace_back(
+                    tilePath, HdDataSourceLocator::EmptyLocator());
+            }
+        }
     }
+
+    // Everything the selection dropped. Absent from `result`, the resolver
+    // emits PrimsRemoved for it; dropping the entry here is what stops the
+    // maps growing for the length of a shot.
+    size_t dropped = 0;
+    for (auto it = _tilesByPath.begin(); it != _tilesByPath.end();) {
+        if (result.find(it->first) == result.end()) {
+            it = _tilesByPath.erase(it);
+            ++dropped;
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = _materialsByPath.begin(); it != _materialsByPath.end();) {
+        if (result.find(it->first) == result.end()) {
+            it = _materialsByPath.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // The frame's borrows are all copied by now — into the prims above and
+    // into the resolver's texture store — so it dies here rather than at the
+    // start of the next cook. That is what lets GetChildPrim be a map lookup
+    // with nothing to outlive.
+    tuile_frame_free(_frame);
+    _frame = nullptr;
 
     // Cooks on THIS instance. Read next to the plugin's construction count:
     // one construction and N cooks is hdGp working as designed; N of each is
@@ -717,41 +818,47 @@ TuileGlobeProcedural::Update(
     ++_cooks;
     TF_DEBUG(TUILE_HYDRA_PROCEDURAL).Msg(
         "[tuile] Update: cook #%llu on this instance, camera=%s tiles=%zu "
-        "textured=%zu origin=(%g, %g, %g)\n",
+        "kept=%zu built=%zu redraped=%zu dropped=%zu textured=%zu "
+        "origin=(%g, %g, %g)\n",
         static_cast<unsigned long long>(_cooks), _cameraPath.GetText(), count,
-        textured, _renderOrigin[0], _renderOrigin[1], _renderOrigin[2]);
+        kept, built, redraped, dropped, textured, _renderOrigin[0],
+        _renderOrigin[1], _renderOrigin[2]);
 
     return result;
 }
 
+/// Hands back a child built during a cook.
+///
+/// A map lookup and nothing else, on purpose. It is called from several
+/// threads, and it used to read the frame that the *next* cook frees — which
+/// only ever worked because the whole procedural was thrown away every frame.
+/// Now that a prim can outlive the frame it came from, it has to.
 HdSceneIndexPrim
 TuileGlobeProcedural::GetChildPrim(
     const HdSceneIndexBaseRefPtr &inputScene,
     const SdfPath &childPrimPath)
 {
     (void)inputScene;
-    HdSceneIndexPrim prim;
 
-    if (const auto materialIt = _materialsByPath.find(childPrimPath);
-        materialIt != _materialsByPath.end())
+    if (const auto it = _materialsByPath.find(childPrimPath);
+        it != _materialsByPath.end())
     {
-        prim.primType = HdPrimTypeTokens->material;
-        prim.dataSource = HdRetainedContainerDataSource::New(
-            HdMaterialSchemaTokens->material,
-            _MaterialNetwork(materialIt->second.textureUri));
-        return prim;
+        return it->second.prim;
     }
-
-    const auto it = _tilesByPath.find(childPrimPath);
-    if (it == _tilesByPath.end() || !_frame) {
-        return prim;
+    if (const auto it = _tilesByPath.find(childPrimPath);
+        it != _tilesByPath.end())
+    {
+        return it->second.prim;
     }
+    return HdSceneIndexPrim();
+}
 
-    TuileTile tile = {};
-    if (tuile_frame_tile(_frame, it->second.index, &tile) != TuileStatus_Ok) {
-        return prim;
-    }
-
+HdSceneIndexPrim
+TuileGlobeProcedural::_BuildTilePrim(const TuileTile &tile,
+                                     bool textured,
+                                     const SdfPath &materialPath) const
+{
+    HdSceneIndexPrim prim;
     const size_t vertexCount = tile.vertex_count;
     const size_t indexCount = tile.index_count;
 
@@ -772,10 +879,6 @@ TuileGlobeProcedural::GetChildPrim(
     xf.SetTranslate(GfVec3d(tile.origin_ecef[0] - _renderOrigin[0],
                             tile.origin_ecef[1] - _renderOrigin[1],
                             tile.origin_ecef[2] - _renderOrigin[2]));
-
-    const bool textured = tile.base_color_texture >= 0 &&
-                          !it->second.textureUri.empty() &&
-                          tile.uvs.len == vertexCount * sizeof(float) * 2;
 
     std::vector<TfToken> primvarNames;
     std::vector<HdDataSourceBaseHandle> primvarSources;
@@ -884,10 +987,6 @@ TuileGlobeProcedural::GetChildPrim(
                               HdRetainedTypedSampledDataSource<bool>::New(false))
                           .Build());
     if (textured) {
-        const SdfPath materialPath =
-            _primPath.AppendChild(_tokens->materialRoot)
-                .AppendChild(TfToken(TfStringPrintf(
-                    "m%llu", static_cast<unsigned long long>(tile.tile_id))));
         names.push_back(HdMaterialBindingsSchemaTokens->materialBindings);
         sources.push_back(HdRetainedContainerDataSource::New(
             HdMaterialBindingsSchemaTokens->allPurpose,
