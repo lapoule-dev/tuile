@@ -100,6 +100,13 @@ pub struct TuileTile {
     /// Index into **this tile's** textures, or `-1` for an untextured tile.
     /// Pass it back to [`tuile_frame_texture`] along with the tile's own index.
     pub base_color_texture: i32,
+    /// What the tile's imagery was composed from, or `0` when it carries none.
+    ///
+    /// A tile keeps its id across frames; its imagery does not, because the
+    /// camera moves and it is re-draped at another level. A consumer that
+    /// keeps prims between frames needs to tell those two cases apart, and
+    /// this makes it an integer compare instead of a string rebuild.
+    pub drape: u64,
 }
 
 impl From<&FrameError> for TuileStatus {
@@ -425,6 +432,7 @@ pub unsafe extern "C" fn tuile_frame_tile(
                     .base_color_texture
                     .and_then(|i| i32::try_from(i).ok())
                     .unwrap_or(-1),
+                drape: tile.drape(),
             }
         };
         TuileStatus::Ok
