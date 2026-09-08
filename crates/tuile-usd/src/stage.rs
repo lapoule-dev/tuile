@@ -132,6 +132,29 @@ fn matrix_literal(rows: &[[f64; 4]; 4]) -> String {
     )
 }
 
+/// WGS84 equatorial radius, metres. Used only to estimate altitude for the
+/// clipping range — a camera position, never geometry — so the sphere/ellipsoid
+/// difference (≤ 21 km) is absorbed by the clamp below.
+const EARTH_RADIUS: f64 = 6_378_137.0;
+
+/// The camera's near/far for one frame, from its height over the ellipsoid.
+///
+/// Near at 5% of altitude keeps the ratio to `far` around 1e5–1e6, where an
+/// f32 depth buffer still separates overlapping tile surfaces; the floor stops
+/// a ground-hugging frame from clipping its own foreground, the ceiling stops
+/// a geostationary one from clipping the globe. Far is the distance to the
+/// visible limb from geostationary, once, for every frame — it costs nothing
+/// and never truncates a horizon.
+fn clipping_range(position: [f64; 3]) -> (f64, f64) {
+    let r = (position[0] * position[0]
+        + position[1] * position[1]
+        + position[2] * position[2])
+        .sqrt();
+    let altitude = (r - EARTH_RADIUS).max(10.0);
+    let near = (0.05 * altitude).clamp(0.5, 100_000.0);
+    (near, 60_000_000.0)
+}
+
 /// The focal length (mm) that reproduces a vertical field of view on a 24 mm
 /// aperture. The aperture is a free choice — only the ratio reaches the fovy —
 /// and 24 is the full-frame convention every DCC displays sensibly.
@@ -176,10 +199,19 @@ pub fn write_manifest(
     writeln!(out, "{{")?;
     writeln!(out, "    def Camera \"ShotCam\"")?;
     writeln!(out, "    {{")?;
-    writeln!(
-        out,
-        "        float2 clippingRange = (0.05, 10000000000)"
-    )?;
+    // Per-frame clipping, computed from altitude, because a fixed wide range
+    // is how the first gate render broke: (0.05, 1e10) is a near/far ratio of
+    // 2e11, an f32 depth buffer collapses, and everywhere two tile surfaces
+    // overlap — every LOD boundary — the loser z-fights through as black
+    // confetti, worse with distance (error grows as z²). Near tracks the
+    // camera's height over the ellipsoid; far covers the visible limb from
+    // any altitude up to geostationary.
+    writeln!(out, "        float2 clippingRange.timeSamples = {{")?;
+    for (i, frame) in frames.iter().enumerate() {
+        let (near, far) = clipping_range(frame.position);
+        writeln!(out, "            {}: ({near}, {far}),", i + 1)?;
+    }
+    writeln!(out, "        }}")?;
     writeln!(
         out,
         "        float horizontalAperture = {}",
@@ -215,6 +247,33 @@ pub fn write_manifest(
     writeln!(
         out,
         "        uniform token[] xformOpOrder = [\"xformOp:transform\"]"
+    )?;
+    writeln!(out, "    }}")?;
+    writeln!(out)?;
+    // Lighting is stage-side composition, exactly like any other look
+    // decision. The dome matters beyond taste: tile skirts are vertical
+    // walls, and under a renderer's lone camera light they shade to black
+    // cracks along every tile boundary (measured). An ambient dome lights
+    // them from everywhere; the distant light keeps relief readable.
+    writeln!(out, "    def DomeLight \"Sky\"")?;
+    writeln!(out, "    {{")?;
+    writeln!(out, "        float inputs:intensity = 0.8")?;
+    writeln!(
+        out,
+        "        color3f inputs:color = (0.9, 0.95, 1.0)"
+    )?;
+    writeln!(out, "    }}")?;
+    writeln!(out)?;
+    writeln!(out, "    def DistantLight \"Sun\"")?;
+    writeln!(out, "    {{")?;
+    writeln!(out, "        float inputs:intensity = 2.5")?;
+    writeln!(
+        out,
+        "        color3f inputs:color = (1.0, 0.98, 0.92)"
+    )?;
+    writeln!(
+        out,
+        "        float inputs:angle = 0.53"
     )?;
     writeln!(out, "    }}")?;
     writeln!(out)?;
@@ -350,6 +409,10 @@ mod tests {
             "endTimeCode = 2",
             "timeCodesPerSecond = 24",
             "def Camera \"ShotCam\"",
+            // Test positions sit far inside the ellipsoid: altitude clamps to
+            // its floor, near to its own — the degenerate case stays sane.
+            "float2 clippingRange.timeSamples = {",
+            "1: (0.5, 60000000),",
             "float focalLength = 12",
             "float horizontalAperture = 32",
             "matrix4d xformOp:transform.timeSamples = {",

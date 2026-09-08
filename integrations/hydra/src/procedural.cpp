@@ -3,16 +3,28 @@
 
 #include "procedural.h"
 
+#include "tiles.h"
+#include "view.h"
+
 #include <pxr/base/gf/matrix4d.h>
+#include <pxr/base/gf/vec2d.h>
 #include <pxr/base/gf/vec3d.h>
 #include <pxr/base/gf/vec3f.h>
 #include <pxr/base/tf/debug.h>
 #include <pxr/base/tf/diagnostic.h>
+#include <pxr/base/tf/getenv.h>
 #include <pxr/base/tf/registryManager.h>
 #include <pxr/base/tf/staticTokens.h>
 #include <pxr/base/tf/stringUtils.h>
 #include <pxr/base/vt/array.h>
 #include <pxr/imaging/hd/cameraSchema.h>
+#include <pxr/imaging/hd/materialBindingSchema.h>
+#include <pxr/imaging/hd/materialBindingsSchema.h>
+#include <pxr/imaging/hd/materialConnectionSchema.h>
+#include <pxr/imaging/hd/materialNetworkSchema.h>
+#include <pxr/imaging/hd/materialNodeParameterSchema.h>
+#include <pxr/imaging/hd/materialNodeSchema.h>
+#include <pxr/imaging/hd/materialSchema.h>
 #include <pxr/imaging/hd/meshSchema.h>
 #include <pxr/imaging/hd/meshTopologySchema.h>
 #include <pxr/imaging/hd/primvarSchema.h>
@@ -25,9 +37,11 @@
 #include <pxr/imaging/hd/tokens.h>
 #include <pxr/imaging/hd/xformSchema.h>
 #include <pxr/imaging/pxOsd/tokens.h>
+#include <pxr/usd/sdf/assetPath.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 PXR_NAMESPACE_OPEN_SCOPE
 
@@ -46,38 +60,66 @@ TF_REGISTRY_FUNCTION(TfDebug)
 TF_DEFINE_PRIVATE_TOKENS(
     _tokens,
     ((cameras, "tuile:cameras"))
+    ((renderOrigin, "tuile:renderOrigin"))
+    ((terrainAssetId, "tuile:terrainAssetId"))
+    ((imageryAssetId, "tuile:imageryAssetId"))
+    ((maxSse, "tuile:maxSse"))
+    ((viewportPx, "tuile:viewportPx"))
     ((tileRoot, "tiles"))
+    ((materialRoot, "materials"))
     (displayColor)
+    (st)
+    (surface)
+    (rgb)
+    (result)
+    (file)
+    (varname)
+    (diffuseColor)
+    (roughness)
+    (wrapS)
+    (wrapT)
+    ((clampWrap, "clamp"))
+    (UsdPreviewSurface)
+    (UsdUVTexture)
+    (UsdPrimvarReader_float2)
+    (PreviewSurface)
+    (Texture)
+    (StReader)
 );
 
 namespace {
 
-/// Reads a relationship-like path argument off our own prim.
-///
-/// Procedural arguments arrive as primvars on the procedural prim — that is how
-/// hdGp passes configuration — so a "relationship" is a path-valued primvar
-/// rather than an `SdfRelationship`.
+/// A primvar's value off a prim, at shutter 0 — procedural arguments arrive as
+/// primvars, and none of them vary within a frame.
+VtValue
+_PrimvarValue(const HdSceneIndexBaseRefPtr &scene,
+              const SdfPath &primPath,
+              const TfToken &name)
+{
+    HdSceneIndexPrim prim = scene->GetPrim(primPath);
+    HdPrimvarsSchema primvars = HdPrimvarsSchema::GetFromParent(prim.dataSource);
+    if (!primvars) {
+        return VtValue();
+    }
+    HdPrimvarSchema primvar = primvars.GetPrimvar(name);
+    if (!primvar) {
+        return VtValue();
+    }
+    HdSampledDataSourceHandle value = primvar.GetPrimvarValue();
+    if (!value) {
+        return VtValue();
+    }
+    return value->GetValue(0.0f);
+}
+
+/// Reads a relationship-like path argument off our own prim: a "relationship"
+/// is a path-valued primvar, because that is how hdGp passes configuration.
 SdfPath
 _PathArg(const HdSceneIndexBaseRefPtr &scene,
          const SdfPath &primPath,
          const TfToken &name)
 {
-    HdSceneIndexPrim prim = scene->GetPrim(primPath);
-    HdPrimvarsSchema primvars = HdPrimvarsSchema::GetFromParent(prim.dataSource);
-    if (!primvars) {
-        return SdfPath();
-    }
-    HdPrimvarSchema primvar = primvars.GetPrimvar(name);
-    if (!primvar) {
-        return SdfPath();
-    }
-    HdSampledDataSourceHandle value = primvar.GetPrimvarValue();
-    if (!value) {
-        return SdfPath();
-    }
-    // Shutter offset 0: the argument is which camera, not where it is, and
-    // that does not vary within a frame.
-    const VtValue v = value->GetValue(0.0f);
+    const VtValue v = _PrimvarValue(scene, primPath, name);
     if (v.IsHolding<SdfPath>()) {
         return v.UncheckedGet<SdfPath>();
     }
@@ -86,6 +128,62 @@ _PathArg(const HdSceneIndexBaseRefPtr &scene,
         return paths.empty() ? SdfPath() : paths[0];
     }
     return SdfPath();
+}
+
+/// Numeric primvars arrive as whatever the stage authored (int, double, or a
+/// one-element array of either); read them all as double.
+double
+_DoubleArg(const HdSceneIndexBaseRefPtr &scene,
+           const SdfPath &primPath,
+           const TfToken &name,
+           double fallback)
+{
+    const VtValue v = _PrimvarValue(scene, primPath, name);
+    if (v.IsEmpty()) {
+        return fallback;
+    }
+    if (v.CanCast<double>()) {
+        return VtValue::Cast<double>(v).UncheckedGet<double>();
+    }
+    if (v.IsHolding<VtDoubleArray>() && !v.UncheckedGet<VtDoubleArray>().empty()) {
+        return v.UncheckedGet<VtDoubleArray>()[0];
+    }
+    if (v.IsHolding<VtIntArray>() && !v.UncheckedGet<VtIntArray>().empty()) {
+        return v.UncheckedGet<VtIntArray>()[0];
+    }
+    return fallback;
+}
+
+GfVec3d
+_Vec3dArg(const HdSceneIndexBaseRefPtr &scene,
+          const SdfPath &primPath,
+          const TfToken &name,
+          const GfVec3d &fallback)
+{
+    const VtValue v = _PrimvarValue(scene, primPath, name);
+    if (v.IsHolding<GfVec3d>()) {
+        return v.UncheckedGet<GfVec3d>();
+    }
+    if (v.IsHolding<VtVec3dArray>() && !v.UncheckedGet<VtVec3dArray>().empty()) {
+        return v.UncheckedGet<VtVec3dArray>()[0];
+    }
+    return fallback;
+}
+
+GfVec2d
+_Vec2dArg(const HdSceneIndexBaseRefPtr &scene,
+          const SdfPath &primPath,
+          const TfToken &name,
+          const GfVec2d &fallback)
+{
+    const VtValue v = _PrimvarValue(scene, primPath, name);
+    if (v.IsHolding<GfVec2d>()) {
+        return v.UncheckedGet<GfVec2d>();
+    }
+    if (v.IsHolding<VtVec2dArray>() && !v.UncheckedGet<VtVec2dArray>().empty()) {
+        return v.UncheckedGet<VtVec2dArray>()[0];
+    }
+    return fallback;
 }
 
 /// The camera named by the active render settings, if any.
@@ -146,45 +244,118 @@ _RenderSettingsCamera(const HdSceneIndexBaseRefPtr &scene)
     return SdfPath();
 }
 
-/// Where a camera is, in world space.
-GfVec3d
-_CameraPosition(const HdSceneIndexBaseRefPtr &scene, const SdfPath &cameraPath)
+/// A float-buffer borrow as a typed VtArray copy. Copying is the point: the
+/// borrow dies with the frame, the VtArray lives inside a retained data source
+/// for as long as the renderer holds the prim.
+template <typename Vec>
+VtArray<Vec>
+_CopyBuffer(const TuileBuffer &buffer, size_t count)
 {
-    HdSceneIndexPrim camera = scene->GetPrim(cameraPath);
-    HdXformSchema xform = HdXformSchema::GetFromParent(camera.dataSource);
-    if (!xform) {
-        return GfVec3d(0.0);
+    VtArray<Vec> out(count);
+    if (count > 0 && buffer.data && buffer.len == count * sizeof(Vec)) {
+        std::memcpy(out.data(), buffer.data, buffer.len);
     }
-    HdMatrixDataSourceHandle matrixDs = xform.GetMatrix();
-    if (!matrixDs) {
-        return GfVec3d(0.0);
-    }
-    return matrixDs->GetTypedValue(0.0f).ExtractTranslation();
+    return out;
+}
+
+/// The standard preview-material triple: PrimvarReader(st) -> UsdUVTexture ->
+/// UsdPreviewSurface, under the universal render context. Every Hydra renderer
+/// that can texture at all resolves this network.
+HdDataSourceBaseHandle
+_MaterialNetwork(const std::string &textureUri)
+{
+    HdContainerDataSourceHandle stReader = HdMaterialNodeSchema::Builder()
+        .SetNodeIdentifier(HdRetainedTypedSampledDataSource<TfToken>::New(
+            _tokens->UsdPrimvarReader_float2))
+        .SetParameters(HdRetainedContainerDataSource::New(
+            _tokens->varname,
+            HdMaterialNodeParameterSchema::Builder()
+                .SetValue(HdRetainedTypedSampledDataSource<TfToken>::New(
+                    _tokens->st))
+                .Build()))
+        .Build();
+
+    HdContainerDataSourceHandle texture = HdMaterialNodeSchema::Builder()
+        .SetNodeIdentifier(HdRetainedTypedSampledDataSource<TfToken>::New(
+            _tokens->UsdUVTexture))
+        .SetParameters(HdRetainedContainerDataSource::New(
+            _tokens->file,
+            HdMaterialNodeParameterSchema::Builder()
+                .SetValue(HdRetainedTypedSampledDataSource<SdfAssetPath>::New(
+                    SdfAssetPath(textureUri, textureUri)))
+                .Build(),
+            _tokens->wrapS,
+            HdMaterialNodeParameterSchema::Builder()
+                .SetValue(HdRetainedTypedSampledDataSource<TfToken>::New(
+                    _tokens->clampWrap))
+                .Build(),
+            _tokens->wrapT,
+            HdMaterialNodeParameterSchema::Builder()
+                .SetValue(HdRetainedTypedSampledDataSource<TfToken>::New(
+                    _tokens->clampWrap))
+                .Build()))
+        .SetInputConnections([] {
+            const HdDataSourceBaseHandle connection =
+                HdMaterialConnectionSchema::Builder()
+                    .SetUpstreamNodePath(
+                        HdRetainedTypedSampledDataSource<TfToken>::New(
+                            _tokens->StReader))
+                    .SetUpstreamNodeOutputName(
+                        HdRetainedTypedSampledDataSource<TfToken>::New(
+                            _tokens->result))
+                    .Build();
+            return HdRetainedContainerDataSource::New(
+                _tokens->st,
+                HdRetainedSmallVectorDataSource::New(1, &connection));
+        }())
+        .Build();
+
+    HdContainerDataSourceHandle previewSurface = HdMaterialNodeSchema::Builder()
+        .SetNodeIdentifier(HdRetainedTypedSampledDataSource<TfToken>::New(
+            _tokens->UsdPreviewSurface))
+        .SetParameters(HdRetainedContainerDataSource::New(
+            _tokens->roughness,
+            HdMaterialNodeParameterSchema::Builder()
+                .SetValue(HdRetainedTypedSampledDataSource<float>::New(1.0f))
+                .Build()))
+        .SetInputConnections([] {
+            const HdDataSourceBaseHandle connection =
+                HdMaterialConnectionSchema::Builder()
+                    .SetUpstreamNodePath(
+                        HdRetainedTypedSampledDataSource<TfToken>::New(
+                            _tokens->Texture))
+                    .SetUpstreamNodeOutputName(
+                        HdRetainedTypedSampledDataSource<TfToken>::New(
+                            _tokens->rgb))
+                    .Build();
+            return HdRetainedContainerDataSource::New(
+                _tokens->diffuseColor,
+                HdRetainedSmallVectorDataSource::New(1, &connection));
+        }())
+        .Build();
+
+    HdContainerDataSourceHandle network = HdMaterialNetworkSchema::Builder()
+        .SetNodes(HdRetainedContainerDataSource::New(
+            _tokens->StReader, stReader,
+            _tokens->Texture, texture,
+            _tokens->PreviewSurface, previewSurface))
+        .SetTerminals(HdRetainedContainerDataSource::New(
+            _tokens->surface,
+            HdMaterialConnectionSchema::Builder()
+                .SetUpstreamNodePath(
+                    HdRetainedTypedSampledDataSource<TfToken>::New(
+                        _tokens->PreviewSurface))
+                .SetUpstreamNodeOutputName(
+                    HdRetainedTypedSampledDataSource<TfToken>::New(
+                        _tokens->surface))
+                .Build()))
+        .Build();
+
+    return HdRetainedContainerDataSource::New(
+        HdMaterialSchemaTokens->universalRenderContext, network);
 }
 
 }  // namespace
-
-/// How finely to grid the patch at a given camera distance.
-///
-/// Shared by Update, which needs it to name the prim, and GetChildPrim, which
-/// needs it to build the geometry. Computing it twice from one function is what
-/// keeps the name and the contents describing the same thing.
-int
-TuileGlobeProcedural::_Divisions(double distance)
-{
-    return static_cast<int>(std::clamp(200.0 / std::max(distance, 1.0), 1.0, 64.0));
-}
-
-double
-TuileGlobeProcedural::_CameraDistance(const HdSceneIndexBaseRefPtr &scene) const
-{
-    // No camera resolves: a fixed distance, which is the view-independent mode
-    // rather than a failure.
-    const GfVec3d eye = _cameraPath.IsEmpty()
-        ? GfVec3d(0.0, 0.0, 100.0)
-        : _CameraPosition(scene, _cameraPath);
-    return std::max(eye.GetLength(), 1.0);
-}
 
 TuileGlobeProcedural::TuileGlobeProcedural(const SdfPath &proceduralPrimPath)
     : HdGpGenerativeProcedural(proceduralPrimPath)
@@ -192,7 +363,15 @@ TuileGlobeProcedural::TuileGlobeProcedural(const SdfPath &proceduralPrimPath)
 {
 }
 
-TuileGlobeProcedural::~TuileGlobeProcedural() = default;
+TuileGlobeProcedural::~TuileGlobeProcedural()
+{
+    if (_frame) {
+        tuile_frame_free(_frame);
+    }
+    if (_session) {
+        tuile_session_free(_session);
+    }
+}
 
 SdfPath
 TuileGlobeProcedural::_ResolveCamera(const HdSceneIndexBaseRefPtr &inputScene) const
@@ -218,9 +397,92 @@ TuileGlobeProcedural::_ResolveCamera(const HdSceneIndexBaseRefPtr &inputScene) c
         }
     }
 
-    // 4. None. The caller falls back to a fixed geometric error, which is the
-    //    view-independent mode rather than a failure.
+    // 4. None. The caller falls back to a fixed view above the render origin,
+    //    which is the view-independent mode rather than a failure.
     return SdfPath();
+}
+
+bool
+TuileGlobeProcedural::_EnsureSession(const HdSceneIndexBaseRefPtr &inputScene)
+{
+    if (_session) {
+        return true;
+    }
+    if (_sessionFailed) {
+        return false;
+    }
+
+    const std::string token = TfGetenv("TUILE_ION_TOKEN");
+    if (token.empty()) {
+        _sessionFailed = true;
+        TF_RUNTIME_ERROR(
+            "tuile: TUILE_ION_TOKEN is not set — the globe cannot stream. "
+            "The token deliberately never lives in a stage.");
+        return false;
+    }
+    const std::string cacheDir = TfGetenv("TUILE_CACHE_DIR");
+
+    TuileGlobeConfig config = {};
+    config.ion_token = {reinterpret_cast<const uint8_t *>(token.data()),
+                        token.size()};
+    config.cache_dir = {reinterpret_cast<const uint8_t *>(cacheDir.data()),
+                        cacheDir.size()};
+    config.terrain_asset_id = static_cast<int64_t>(
+        _DoubleArg(inputScene, _primPath, _tokens->terrainAssetId, 0.0));
+    config.imagery_asset_id = static_cast<int64_t>(
+        _DoubleArg(inputScene, _primPath, _tokens->imageryAssetId, 0.0));
+    config.maximum_screen_space_error =
+        _DoubleArg(inputScene, _primPath, _tokens->maxSse, 0.0);
+    config.frame_timeout_seconds = 0.0;  // the session default
+    config.fail_on_tile_errors = true;   // eager-fatal, docs/15
+
+    const TuileStatus status = tuile_session_new(&config, &_session);
+    if (status != TuileStatus_Ok || !_session) {
+        _sessionFailed = true;
+        TF_RUNTIME_ERROR(
+            "tuile: opening the globe failed (status %d) — check the token, "
+            "the asset ids and the network. Nothing will be emitted.",
+            static_cast<int>(status));
+        return false;
+    }
+    return true;
+}
+
+bool
+TuileGlobeProcedural::_ViewForCook(const HdSceneIndexBaseRefPtr &inputScene,
+                                   TuileViewState *out) const
+{
+    const double origin[3] = {_renderOrigin[0], _renderOrigin[1],
+                              _renderOrigin[2]};
+    if (!_cameraPath.IsEmpty() &&
+        TuileViewFromCamera::Read(inputScene, _cameraPath, origin,
+                                  _fallbackViewportPx, out))
+    {
+        return true;
+    }
+
+    // View-independent fallback: straight down from the render origin, which a
+    // manifest places on the trajectory — above the ground it flies over. With
+    // no origin either there is nothing sane to look at, and saying so beats
+    // selecting tiles at the centre of the Earth.
+    const double length = _renderOrigin.GetLength();
+    if (length < 1.0) {
+        return false;
+    }
+    const GfVec3d down = -_renderOrigin / length;
+    // Any horizontal completes the basis; east of the origin's meridian.
+    GfVec3d east(-_renderOrigin[1], _renderOrigin[0], 0.0);
+    const double eastLength = east.GetLength();
+    east = eastLength > 1e-9 ? east / eastLength : GfVec3d(1.0, 0.0, 0.0);
+    for (int i = 0; i < 3; ++i) {
+        out->position[i] = _renderOrigin[i];
+        out->direction[i] = down[i];
+        out->up[i] = east[i];
+    }
+    out->viewport_px[0] = _fallbackViewportPx[0];
+    out->viewport_px[1] = _fallbackViewportPx[1];
+    out->fovy_rad = 45.0 * M_PI / 180.0;
+    return true;
 }
 
 HdGpGenerativeProcedural::DependencyMap
@@ -240,8 +502,6 @@ TuileGlobeProcedural::UpdateDependencies(const HdSceneIndexBaseRefPtr &inputScen
     }
 
     // The frame number, so a scrub re-cooks even when the camera is static.
-    // Without this a stage whose camera never moves would refine once and then
-    // ignore the timeline entirely.
     result[HdSceneGlobalsSchema::GetDefaultPrimPath()] = {
         HdSceneGlobalsSchema::GetCurrentFrameLocator(),
     };
@@ -256,40 +516,128 @@ TuileGlobeProcedural::Update(
     const DependencyMap &dirtiedDependencies,
     HdSceneIndexObserver::DirtiedPrimEntries *outputDirtiedPrims)
 {
+    (void)previousResult;
     (void)dirtiedDependencies;
+    (void)outputDirtiedPrims;
 
     ChildPrimTypeMap result;
-    // The child's PATH encodes its refinement, so a change of refinement is a
-    // different prim rather than the same prim mutated.
-    //
-    // This is not a stylistic choice, it is what works. Dirtying a mesh whose
-    // *vertex count* changed is not enough: traced against hdEmbree, the
-    // procedural re-cooked correctly and produced the finer grid, the renderer
-    // re-read the topology, and the frame came out empty — a 289-vertex
-    // topology indexing a 4-vertex point buffer it never re-read. Removing one
-    // prim and adding another leaves no stale buffer to disagree with.
-    //
-    // It is also what the real thing does. Tiles appear and disappear as the
-    // view moves; they do not mutate in place, so the path carrying the tile's
-    // identity is the honest model rather than a workaround.
-    _childPath = _primPath.AppendChild(_tokens->tileRoot)
-                     .AppendChild(TfToken(TfStringPrintf("grid_%d", _Divisions(
-                         _CameraDistance(inputScene)))));
-    result[_childPath] = HdPrimTypeTokens->mesh;
 
-    if (TfDebug::IsEnabled(TUILE_HYDRA_PROCEDURAL)) {
-        TF_DEBUG(TUILE_HYDRA_PROCEDURAL).Msg(
-            "[tuile] Update: camera=%s previous=%zu dirtied=%zu\n",
-            _cameraPath.GetText(), previousResult.size(),
-            dirtiedDependencies.size());
+    // The previous cook's frame dies here — GetChildPrim copied everything it
+    // served into retained data sources, and the texture bytes were copied
+    // into the resolver's store, so nothing borrows from it any more.
+    if (_frame) {
+        tuile_frame_free(_frame);
+        _frame = nullptr;
+    }
+    _tilesByPath.clear();
+    _materialsByPath.clear();
+
+    if (!_EnsureSession(inputScene)) {
+        return result;
     }
 
-    // Nothing is dirtied here on purpose. hdGp reads the returned map and does
-    // the work itself: a path absent from it is removed, a path new to it is
-    // added. Dirtying would only matter for a prim that kept its path, and by
-    // construction none does.
-    (void)previousResult;
-    (void)outputDirtiedPrims;
+    _renderOrigin =
+        _Vec3dArg(inputScene, _primPath, _tokens->renderOrigin, GfVec3d(0.0));
+    const GfVec2d viewport = _Vec2dArg(
+        inputScene, _primPath, _tokens->viewportPx,
+        GfVec2d(_fallbackViewportPx[0], _fallbackViewportPx[1]));
+    _fallbackViewportPx[0] = viewport[0];
+    _fallbackViewportPx[1] = viewport[1];
+
+    TuileViewState view = {};
+    if (!_ViewForCook(inputScene, &view)) {
+        TF_RUNTIME_ERROR(
+            "tuile: no camera resolves and no render origin is authored — "
+            "there is no view to select tiles for.");
+        return result;
+    }
+
+    // Eager and fatal: this blocks until every selected tile is resident, or
+    // reports why not. A frame that lost tiles must be a loud failure, never a
+    // plausible image at the wrong level of detail.
+    const TuileStatus status = tuile_session_frame(_session, &view, 1, &_frame);
+    if (status != TuileStatus_Ok || !_frame) {
+        TF_RUNTIME_ERROR(
+            "tuile: the frame did not converge (status %d) — nothing is "
+            "emitted rather than a partial globe.",
+            static_cast<int>(status));
+        return result;
+    }
+
+    size_t count = 0;
+    tuile_frame_tile_count(_frame, &count);
+
+    const SdfPath tileRoot = _primPath.AppendChild(_tokens->tileRoot);
+    const SdfPath materialRoot = _primPath.AppendChild(_tokens->materialRoot);
+
+    size_t textured = 0;
+    for (size_t i = 0; i < count; ++i) {
+        TuileTile tile = {};
+        if (tuile_frame_tile(_frame, i, &tile) != TuileStatus_Ok) {
+            continue;
+        }
+
+        _Tile entry;
+        entry.index = i;
+        entry.id = tile.tile_id;
+
+        // Push this tile's textures into the resolver's store, copying: the
+        // store owns its bytes, so nothing ties an in-flight texture load to
+        // this frame's lifetime. The URI is content-stable across cooks, so a
+        // tile kept from the previous frame is already served.
+        for (size_t t = 0;; ++t) {
+            TuileTexture texture = {};
+            const TuileStatus ts = tuile_frame_texture(_frame, i, t, &texture);
+            if (ts == TuileStatus_NotFound) {
+                break;
+            }
+            if (ts != TuileStatus_Ok) {
+                TF_RUNTIME_ERROR(
+                    "tuile: encoding texture %zu of tile %llu failed "
+                    "(status %d)",
+                    t, static_cast<unsigned long long>(tile.tile_id),
+                    static_cast<int>(ts));
+                break;
+            }
+            const std::string uri(
+                reinterpret_cast<const char *>(texture.uri.data),
+                texture.uri.len);
+            if (t == 0) {
+                entry.textureUri = uri;
+            }
+            if (!TuileSpikeTiles::Has(uri)) {
+                TuileSpikeTiles::Put(
+                    uri,
+                    std::vector<uint8_t>(texture.png.data,
+                                         texture.png.data + texture.png.len));
+            }
+        }
+
+        // The tile's PATH is its identity: a refinement change selects
+        // different tile ids, so it removes prims and adds prims rather than
+        // mutating one in place — the invariant hdEmbree taught us (a dirtied
+        // mesh whose vertex count changed rendered an empty frame).
+        const TfToken tileName(TfStringPrintf(
+            "t%llu", static_cast<unsigned long long>(tile.tile_id)));
+        const SdfPath tilePath = tileRoot.AppendChild(tileName);
+        result[tilePath] = HdPrimTypeTokens->mesh;
+
+        if (tile.base_color_texture >= 0 && !entry.textureUri.empty()) {
+            const SdfPath materialPath = materialRoot.AppendChild(TfToken(
+                TfStringPrintf("m%llu",
+                               static_cast<unsigned long long>(tile.tile_id))));
+            result[materialPath] = HdPrimTypeTokens->material;
+            _materialsByPath[materialPath] = entry;
+            ++textured;
+        }
+        _tilesByPath[tilePath] = entry;
+    }
+
+    TF_DEBUG(TUILE_HYDRA_PROCEDURAL).Msg(
+        "[tuile] Update: camera=%s tiles=%zu textured=%zu origin=(%g, %g, %g)\n",
+        _cameraPath.GetText(), count, textured, _renderOrigin[0],
+        _renderOrigin[1], _renderOrigin[2]);
+
     return result;
 }
 
@@ -298,57 +646,120 @@ TuileGlobeProcedural::GetChildPrim(
     const HdSceneIndexBaseRefPtr &inputScene,
     const SdfPath &childPrimPath)
 {
-    if (childPrimPath != _childPath) {
-        return HdSceneIndexPrim();
-    }
-
-    // The spike's stand-in for a tile pyramid: one patch whose subdivision
-    // follows the camera's distance. It proves the only thing that is in doubt
-    // — that we are re-cooked with a current camera — and nothing else.
-    const double distance = _CameraDistance(inputScene);
-    const int divisions = _Divisions(distance);
-    TF_DEBUG(TUILE_HYDRA_PROCEDURAL).Msg(
-        "[tuile] GetChildPrim: %s camera=%s distance=%.1f divisions=%d\n",
-        childPrimPath.GetText(), _cameraPath.GetText(), distance, divisions);
-
-    VtVec3fArray points;
-    VtIntArray faceVertexCounts;
-    VtIntArray faceVertexIndices;
-    points.reserve((divisions + 1) * (divisions + 1));
-
-    // A dome, not a plane, and that choice is the test rather than decoration.
-    // Subdividing a flat quad changes the triangle count and nothing a renderer
-    // can show — the silhouette is identical at 1 division and at 64, so an
-    // image comparison would pass on a couple of anti-aliased pixels whether or
-    // not the procedural was ever re-cooked. Displacing the grid makes the
-    // refinement visible: one division is a flat quad through the corners,
-    // sixteen is a recognisable curved surface.
-    for (int row = 0; row <= divisions; ++row) {
-        for (int col = 0; col <= divisions; ++col) {
-            const float u = static_cast<float>(col) / divisions;
-            const float v = static_cast<float>(row) / divisions;
-            const float x = u * 2.0f - 1.0f;
-            const float y = v * 2.0f - 1.0f;
-            const float r2 = x * x + y * y;
-            const float z = r2 < 1.0f ? std::sqrt(1.0f - r2) : 0.0f;
-            points.push_back(GfVec3f(x, y, z));
-        }
-    }
-    for (int row = 0; row < divisions; ++row) {
-        for (int col = 0; col < divisions; ++col) {
-            const int base = row * (divisions + 1) + col;
-            faceVertexCounts.push_back(4);
-            faceVertexIndices.push_back(base);
-            faceVertexIndices.push_back(base + 1);
-            faceVertexIndices.push_back(base + divisions + 2);
-            faceVertexIndices.push_back(base + divisions + 1);
-        }
-    }
-
+    (void)inputScene;
     HdSceneIndexPrim prim;
-    prim.primType = HdPrimTypeTokens->mesh;
-    prim.dataSource = HdRetainedContainerDataSource::New(
-        HdMeshSchemaTokens->mesh,
+
+    if (const auto materialIt = _materialsByPath.find(childPrimPath);
+        materialIt != _materialsByPath.end())
+    {
+        prim.primType = HdPrimTypeTokens->material;
+        prim.dataSource = HdRetainedContainerDataSource::New(
+            HdMaterialSchemaTokens->material,
+            _MaterialNetwork(materialIt->second.textureUri));
+        return prim;
+    }
+
+    const auto it = _tilesByPath.find(childPrimPath);
+    if (it == _tilesByPath.end() || !_frame) {
+        return prim;
+    }
+
+    TuileTile tile = {};
+    if (tuile_frame_tile(_frame, it->second.index, &tile) != TuileStatus_Ok) {
+        return prim;
+    }
+
+    const size_t vertexCount = tile.vertex_count;
+    const size_t indexCount = tile.index_count;
+
+    VtVec3fArray points = _CopyBuffer<GfVec3f>(tile.positions, vertexCount);
+    VtIntArray indices(indexCount);
+    if (indexCount > 0 && tile.indices.data &&
+        tile.indices.len == indexCount * sizeof(uint32_t))
+    {
+        std::memcpy(indices.data(), tile.indices.data, tile.indices.len);
+    }
+    // glTF-shaped content: triangle lists.
+    VtIntArray faceVertexCounts(indexCount / 3, 3);
+
+    // Placement, and the whole precision protocol in two lines: positions are
+    // f32 relative to the tile's ECEF origin, the child transform carries
+    // `origin − renderOrigin` computed in double. Never narrowed on the way.
+    GfMatrix4d xf(1.0);
+    xf.SetTranslate(GfVec3d(tile.origin_ecef[0] - _renderOrigin[0],
+                            tile.origin_ecef[1] - _renderOrigin[1],
+                            tile.origin_ecef[2] - _renderOrigin[2]));
+
+    const bool textured = tile.base_color_texture >= 0 &&
+                          !it->second.textureUri.empty() &&
+                          tile.uvs.len == vertexCount * sizeof(float) * 2;
+
+    std::vector<TfToken> primvarNames;
+    std::vector<HdDataSourceBaseHandle> primvarSources;
+    primvarNames.push_back(HdPrimvarsSchemaTokens->points);
+    primvarSources.push_back(
+        HdPrimvarSchema::Builder()
+            .SetPrimvarValue(
+                HdRetainedTypedSampledDataSource<VtVec3fArray>::New(points))
+            .SetInterpolation(HdPrimvarSchema::BuildInterpolationDataSource(
+                HdPrimvarSchemaTokens->vertex))
+            .SetRole(HdPrimvarSchema::BuildRoleDataSource(
+                HdPrimvarSchemaTokens->point))
+            .Build());
+
+    if (tile.normals.len == vertexCount * sizeof(float) * 3) {
+        // Authored normals give the smooth surface; without them Storm
+        // flat-shades every triangle into facets. The price — vertical skirt
+        // faces going black under a lone camera light (measured on the first
+        // gate render) — is paid by lighting, not geometry: the manifest
+        // authors a dome light, so walls are lit from everywhere.
+        primvarNames.push_back(HdTokens->normals);
+        primvarSources.push_back(
+            HdPrimvarSchema::Builder()
+                .SetPrimvarValue(
+                    HdRetainedTypedSampledDataSource<VtVec3fArray>::New(
+                        _CopyBuffer<GfVec3f>(tile.normals, vertexCount)))
+                .SetInterpolation(HdPrimvarSchema::BuildInterpolationDataSource(
+                    HdPrimvarSchemaTokens->vertex))
+                .SetRole(HdPrimvarSchema::BuildRoleDataSource(
+                    HdPrimvarSchemaTokens->normal))
+                .Build());
+    }
+
+    if (textured) {
+        primvarNames.push_back(_tokens->st);
+        primvarSources.push_back(
+            HdPrimvarSchema::Builder()
+                .SetPrimvarValue(
+                    HdRetainedTypedSampledDataSource<VtVec2fArray>::New(
+                        _CopyBuffer<GfVec2f>(tile.uvs, vertexCount)))
+                .SetInterpolation(HdPrimvarSchema::BuildInterpolationDataSource(
+                    HdPrimvarSchemaTokens->vertex))
+                .SetRole(HdPrimvarSchema::BuildRoleDataSource(
+                    HdPrimvarSchemaTokens->textureCoordinate))
+                .Build());
+    } else {
+        // Untextured (terrain-only, or a tile with no uvs): the factor is the
+        // whole material. A constant displayColor needs no network.
+        primvarNames.push_back(_tokens->displayColor);
+        primvarSources.push_back(
+            HdPrimvarSchema::Builder()
+                .SetPrimvarValue(
+                    HdRetainedTypedSampledDataSource<VtVec3fArray>::New(
+                        VtVec3fArray{GfVec3f(tile.base_color_factor[0],
+                                             tile.base_color_factor[1],
+                                             tile.base_color_factor[2])}))
+                .SetInterpolation(HdPrimvarSchema::BuildInterpolationDataSource(
+                    HdPrimvarSchemaTokens->constant))
+                .SetRole(HdPrimvarSchema::BuildRoleDataSource(
+                    HdPrimvarSchemaTokens->color))
+                .Build());
+    }
+
+    std::vector<TfToken> names;
+    std::vector<HdDataSourceBaseHandle> sources;
+    names.push_back(HdMeshSchemaTokens->mesh);
+    sources.push_back(
         HdMeshSchema::Builder()
             .SetTopology(
                 HdMeshTopologySchema::Builder()
@@ -357,45 +768,43 @@ TuileGlobeProcedural::GetChildPrim(
                             faceVertexCounts))
                     .SetFaceVertexIndices(
                         HdRetainedTypedSampledDataSource<VtIntArray>::New(
-                            faceVertexIndices))
+                            indices))
+                    .SetOrientation(HdRetainedTypedSampledDataSource<TfToken>::New(
+                        HdTokens->rightHanded))
                     .Build())
-            // Polygonal, not subdivided. Hydra's default is catmullClark,
-            // which would smooth the grid into the same shape at every
-            // division count — hiding the very thing this spike measures.
-            .SetSubdivisionScheme(
-                HdRetainedTypedSampledDataSource<TfToken>::New(
-                    PxOsdOpenSubdivTokens->none))
-            .Build(),
-        HdPrimvarsSchemaTokens->primvars,
-        HdRetainedContainerDataSource::New(
-            HdPrimvarsSchemaTokens->points,
-            HdPrimvarSchema::Builder()
-                .SetPrimvarValue(
-                    HdRetainedTypedSampledDataSource<VtVec3fArray>::New(points))
-                .SetInterpolation(
-                    HdPrimvarSchema::BuildInterpolationDataSource(
-                        HdPrimvarSchemaTokens->vertex))
-                .SetRole(
-                    HdPrimvarSchema::BuildRoleDataSource(
-                        HdPrimvarSchemaTokens->point))
-                .Build(),
-            // Without a colour the surface is rendered white on a white
-            // background: present, correct, and invisible. A displayColor is
-            // the cheapest material a mesh can carry — no material network, no
-            // shader — and it is what makes the image worth comparing.
-            _tokens->displayColor,
-            HdPrimvarSchema::Builder()
-                .SetPrimvarValue(
-                    HdRetainedTypedSampledDataSource<VtVec3fArray>::New(
-                        VtVec3fArray{GfVec3f(0.15f, 0.45f, 0.85f)}))
-                .SetInterpolation(
-                    HdPrimvarSchema::BuildInterpolationDataSource(
-                        HdPrimvarSchemaTokens->constant))
-                .SetRole(
-                    HdPrimvarSchema::BuildRoleDataSource(
-                        HdPrimvarSchemaTokens->color))
+            // Terrain is polygons, not a subdivision cage.
+            .SetSubdivisionScheme(HdRetainedTypedSampledDataSource<TfToken>::New(
+                PxOsdOpenSubdivTokens->none))
+            .SetDoubleSided(HdRetainedTypedSampledDataSource<bool>::New(true))
+            .Build());
+    names.push_back(HdPrimvarsSchemaTokens->primvars);
+    sources.push_back(HdRetainedContainerDataSource::New(
+        primvarNames.size(), primvarNames.data(), primvarSources.data()));
+    names.push_back(HdXformSchemaTokens->xform);
+    sources.push_back(HdXformSchema::Builder()
+                          .SetMatrix(HdRetainedTypedSampledDataSource<
+                                     GfMatrix4d>::New(xf))
+                          .SetResetXformStack(
+                              HdRetainedTypedSampledDataSource<bool>::New(false))
+                          .Build());
+    if (textured) {
+        const SdfPath materialPath =
+            _primPath.AppendChild(_tokens->materialRoot)
+                .AppendChild(TfToken(TfStringPrintf(
+                    "m%llu", static_cast<unsigned long long>(tile.tile_id))));
+        names.push_back(HdMaterialBindingsSchemaTokens->materialBindings);
+        sources.push_back(HdRetainedContainerDataSource::New(
+            HdMaterialBindingsSchemaTokens->allPurpose,
+            HdMaterialBindingSchema::Builder()
+                .SetPath(HdRetainedTypedSampledDataSource<SdfPath>::New(
+                    materialPath))
                 .Build()));
+    }
 
+    prim.primType = HdPrimTypeTokens->mesh;
+    prim.dataSource =
+        HdRetainedContainerDataSource::New(names.size(), names.data(),
+                                           sources.data());
     return prim;
 }
 
