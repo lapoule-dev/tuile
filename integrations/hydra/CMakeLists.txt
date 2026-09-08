@@ -82,6 +82,19 @@ else()
     target_link_options(tuileHydra PRIVATE "LINKER:--exclude-libs,ALL")
 endif()
 
+# ----------------------------------------------------------------- probe ----
+# The only way to exercise the C++ half without a renderer: cook N frames and
+# report what each cook did. Off unless asked for, because it links the same
+# heavy USD libraries as the plugin and most builds do not need it.
+option(TUILE_BUILD_PROBE "build the frame probe" OFF)
+if(TUILE_BUILD_PROBE)
+    add_executable(frameProbe tests/frameProbe.cpp)
+    add_dependencies(frameProbe tuileHydra)
+    target_link_libraries(frameProbe PRIVATE
+        hd hdGp usdImaging usd sdf tf gf vt
+        ${CMAKE_DL_LIBS} Threads::Threads)
+endif()
+
 # OpenUSD's plugin discovery reads `LibraryPath` from plugInfo.json literally,
 # so the file name below and the one configured into it must agree. The `lib`
 # prefix CMake would add is dropped to match OpenUSD's own convention.
