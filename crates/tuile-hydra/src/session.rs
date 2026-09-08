@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use glam::DVec3;
-use tuile_core::content::DecodedTileContent;
-use tuile_core::drive::drive_until_complete;
+use tuile_core::content::{DecodedTileContent, TileContent};
+use tuile_core::drive::SceneState;
+use tuile_core::protocol::{ClientMessage, GeometryStream, ServerMessage, StreamError};
 use tuile_core::runtime::in_process_with;
 use tuile_core::source::{TileId, TileLoader, TileTree};
 use tuile_core::traversal::{Config, ViewState, ViewStateParams};
@@ -81,6 +82,14 @@ pub enum FrameError {
     ServerGone,
     #[error("{count} tile(s) failed to load; first: {first}")]
     TilesFailed { count: usize, first: String },
+    /// The selection named tiles whose content the session never received.
+    ///
+    /// Unreachable while the eager contract holds, and loud on purpose if it
+    /// ever stops: the server sends a tile's `Content` **once per residency**,
+    /// so a consumer that keeps its own residency and drops a tile has no way
+    /// to ask for it again — it would simply render a hole.
+    #[error("{count} selected tile(s) had no content; first: {first:?}")]
+    MissingContent { count: usize, first: TileId },
     #[error("encoding a texture: {0}")]
     TextureEncode(String),
     /// A thread panicked while holding the frame's encode map. Only reachable
@@ -236,7 +245,7 @@ pub struct Frame {
     /// order is seeded per process, so a consumer that walked it would emit
     /// prims in a different order on every run — and a farm comparing two
     /// renders of the same frame would see a difference that is not there.
-    pub tiles: Vec<TileGeometry>,
+    pub tiles: Vec<Arc<TileGeometry>>,
     /// Textures encoded so far, keyed by (tile index, texture index).
     ///
     /// Filled on demand and never evicted, because the C boundary hands out
@@ -262,14 +271,14 @@ impl std::fmt::Debug for Frame {
 
 impl Frame {
     /// Builds a frame from its tiles, with nothing encoded yet.
-    pub fn new(dataset: impl Into<Arc<str>>, tiles: Vec<TileGeometry>) -> Self {
+    pub fn new(dataset: impl Into<Arc<str>>, tiles: Vec<Arc<TileGeometry>>) -> Self {
         Self::with_memo(dataset, tiles, Arc::new(TextureMemo::default()))
     }
 
     /// Builds a frame that shares a session's texture memo.
     pub(crate) fn with_memo(
         dataset: impl Into<Arc<str>>,
-        tiles: Vec<TileGeometry>,
+        tiles: Vec<Arc<TileGeometry>>,
         memo: Arc<TextureMemo>,
     ) -> Self {
         Self {
@@ -412,6 +421,22 @@ pub struct Session {
     imagery_detail: Option<tuile_planetary::ImageryDetail>,
     /// Baked, encoded textures kept across frames. See [`TextureMemo`].
     textures: Arc<TextureMemo>,
+    /// What the consumer holds, tile by tile.
+    ///
+    /// The server sends a tile's `Content` **once per residency** and never
+    /// again — the invariant the whole streaming protocol is built on. A
+    /// consumer that threw its tiles away after each frame (as this one used
+    /// to, by rebuilding the session) simply never saw them a second time. So
+    /// residency is kept here, exactly as the interactive viewer keeps it:
+    /// filled by `Content`, emptied by `Evict`, everything else survives.
+    resident: HashMap<TileId, Arc<TileGeometry>>,
+    /// The consumer's view of the selection, rebuilt from the server's
+    /// messages and **kept across frames**.
+    scene: SceneState,
+    /// Monotone, one per frame. Echoed back on every `Select`, which is how a
+    /// selection is known to answer the current camera rather than the
+    /// previous one.
+    generation: u64,
     /// Kept alive for as long as the session: dropping it ends the server.
     _server: std::thread::JoinHandle<()>,
 }
@@ -465,6 +490,9 @@ impl Session {
             config,
             imagery_detail: None,
             textures: Arc::new(TextureMemo::default()),
+            resident: HashMap::new(),
+            scene: SceneState::default(),
+            generation: 0,
             _server: server_thread,
         })
     }
@@ -494,50 +522,96 @@ impl Session {
         }
         let views: Vec<ViewState> = views.into_iter().map(Into::into).collect();
 
+        // One camera, one generation. The server echoes it on every `Select`,
+        // and until the echo catches up a selection may still describe the
+        // previous camera — it keeps traversing as tiles land, so a stale
+        // `Select` can arrive *and* look complete.
+        self.generation += 1;
+        let generation = self.generation;
+        if self
+            .stream
+            .send(ClientMessage::ViewerState { views, generation })
+            .is_err()
+        {
+            return Err(FrameError::ServerGone);
+        }
+
         let timeout = self.config.frame_timeout;
-        let stream = &mut self.stream;
+        let bake_max_size = self.config.bake_max_size;
+        // Destructured so the pump can borrow the pieces it needs while the
+        // runtime is borrowed too.
+        let Self {
+            stream,
+            runtime,
+            textures,
+            resident,
+            scene,
+            ..
+        } = self;
+        let mut errors: Vec<(Option<TileId>, String)> = Vec::new();
 
-        let bulk = self.runtime.block_on(async {
-            tokio::time::timeout(timeout, drive_until_complete(stream, views)).await
+        let pumped = runtime.block_on(async {
+            tokio::time::timeout(
+                timeout,
+                converge(
+                    stream,
+                    scene,
+                    resident,
+                    textures,
+                    bake_max_size,
+                    generation,
+                    &mut errors,
+                ),
+            )
+            .await
         });
-
-        let bulk = match bulk {
-            Ok(Ok(frame)) => frame,
+        match pumped {
+            Ok(Ok(())) => {}
             Ok(Err(_closed)) => return Err(FrameError::ServerGone),
             Err(_elapsed) => return Err(FrameError::TimedOut(timeout)),
-        };
+        }
 
-        if self.config.fail_on_tile_errors && !bulk.errors.is_empty() {
-            let first = bulk
-                .errors
+        if self.config.fail_on_tile_errors && !errors.is_empty() {
+            let first = errors
                 .first()
-                .map(|(_, message): &(Option<TileId>, String)| message.clone())
+                .map(|(_, message)| message.clone())
                 .unwrap_or_default();
             return Err(FrameError::TilesFailed {
-                count: bulk.errors.len(),
+                count: errors.len(),
                 first,
             });
         }
 
-        let mut contents = bulk.contents;
-        let bake_max_size = self.config.bake_max_size;
-        let tiles = bulk
-            .selected
+        // The selection, resolved against what we hold. A selected tile with
+        // no content is not a tile to skip — it is the eager contract broken,
+        // and the server will never send it again.
+        let mut missing: Option<TileId> = None;
+        let mut missing_count = 0usize;
+        let tiles: Vec<Arc<TileGeometry>> = self
+            .scene
+            .selected()
             .iter()
-            .filter_map(|(tile, _sse)| {
-                let content = contents.remove(tile)?;
-                let tuile_core::content::TileContent::Decoded(decoded) = content else {
-                    // The in-process binding always decodes; raw bytes here
-                    // would mean the server was misconfigured.
-                    return None;
-                };
-                Some(finish_tile(&self.textures, *tile, decoded, bake_max_size))
+            .filter_map(|(tile, _sse)| match self.resident.get(tile) {
+                Some(held) => Some(Arc::clone(held)),
+                None => {
+                    missing_count += 1;
+                    missing.get_or_insert(*tile);
+                    None
+                }
             })
-            .collect::<Vec<_>>();
+            .collect();
+        if let Some(first) = missing {
+            return Err(FrameError::MissingContent {
+                count: missing_count,
+                first,
+            });
+        }
+
         let reused = tiles.iter().filter(|t| t.memoized.is_some()).count();
         tracing::info!(
             tiles = tiles.len(),
             reused,
+            resident = self.resident.len(),
             "frame resolved (reused = drapes already baked by an earlier frame)"
         );
 
@@ -546,6 +620,54 @@ impl Session {
             tiles,
             Arc::clone(&self.textures),
         ))
+    }
+}
+
+/// Drives one frame to convergence on a stream that outlives it.
+///
+/// Two conditions, both necessary: the server reports no outstanding loads,
+/// **and** the selection it reports answers the camera just sent. Waiting only
+/// on the first renders the previous camera's ground whenever a stale `Select`
+/// lands first.
+#[allow(clippy::too_many_arguments)]
+async fn converge(
+    stream: &mut tuile_core::protocol::InProcessStream,
+    scene: &mut SceneState,
+    resident: &mut HashMap<TileId, Arc<TileGeometry>>,
+    memo: &TextureMemo,
+    bake_max_size: u32,
+    generation: u64,
+    errors: &mut Vec<(Option<TileId>, String)>,
+) -> Result<(), StreamError> {
+    loop {
+        if scene.generation() >= generation && scene.is_complete() {
+            return Ok(());
+        }
+        let Some(message) = stream.next_message().await else {
+            return Err(StreamError::Closed);
+        };
+        scene.apply(&message);
+        match message {
+            // Once per residency, and never again — so this is the only
+            // moment a tile can be taken in.
+            ServerMessage::Content {
+                tile,
+                content: TileContent::Decoded(decoded),
+                ..
+            } => {
+                resident.insert(
+                    tile,
+                    Arc::new(finish_tile(memo, tile, decoded, bake_max_size)),
+                );
+            }
+            ServerMessage::Evict { tiles } => {
+                for tile in tiles {
+                    resident.remove(&tile);
+                }
+            }
+            ServerMessage::Error { tile, message } => errors.push((tile, message)),
+            _ => {}
+        }
     }
 }
 
@@ -719,7 +841,7 @@ mod tests {
     fn frame_with_a_texture() -> Frame {
         Frame::new(
             "ion-1-2",
-            vec![TileGeometry {
+            vec![Arc::new(TileGeometry {
                 tile: TileId(7),
                 origin_ecef: DVec3::ZERO,
                 content: DecodedTileContent {
@@ -735,7 +857,7 @@ mod tests {
                 },
                 baked: None,
                 memoized: None,
-            }],
+            })],
         )
     }
 
@@ -942,6 +1064,101 @@ mod tests {
         );
     }
 
+    /// A tree of two tiles with content — no file, no network, no GPU. Enough
+    /// to exercise what the streaming protocol guarantees.
+    struct TwoTiles;
+
+    impl TileTree for TwoTiles {
+        fn roots(&self) -> Vec<TileId> {
+            vec![TileId(0)]
+        }
+        fn children(&self, id: TileId) -> Vec<TileId> {
+            if id == TileId(0) {
+                vec![TileId(1)]
+            } else {
+                Vec::new()
+            }
+        }
+        fn parent(&self, id: TileId) -> Option<TileId> {
+            (id == TileId(1)).then_some(TileId(0))
+        }
+        fn properties(&self, id: TileId) -> tuile_core::source::TileProperties {
+            use tuile_core::math::{BoundingVolume, Sphere};
+            tuile_core::source::TileProperties {
+                bounding_volume: BoundingVolume::Sphere(Sphere {
+                    center: DVec3::ZERO,
+                    radius: if id == TileId(0) { 100.0 } else { 30.0 },
+                }),
+                geometric_error: if id == TileId(0) { 50.0 } else { 0.0 },
+                refine: tuile_core::tileset::Refine::Replace,
+                has_content: true,
+            }
+        }
+    }
+
+    /// Counts loads, so a test can say "the server never fetched it twice".
+    struct CountingLoader(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl TileLoader for CountingLoader {
+        async fn load(
+            &self,
+            _id: TileId,
+        ) -> Result<tuile_core::source::Loaded, tuile_core::source::LoadError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(tuile_core::source::Loaded::Content(draped_content()))
+        }
+    }
+
+    fn a_view() -> ViewStateParams {
+        ViewStateParams {
+            position: DVec3::new(0.0, 0.0, 200.0),
+            direction: DVec3::new(0.0, 0.0, -1.0),
+            up: DVec3::new(0.0, 1.0, 0.0),
+            viewport_px: glam::DVec2::new(960.0, 720.0),
+            fovy_rad: 45f64.to_radians(),
+        }
+    }
+
+    /// The reason this session keeps a residency at all.
+    ///
+    /// The server sends a tile's `Content` **once per residency** and never
+    /// again. A consumer that rebuilt its state each frame — which is what
+    /// happened while Blender rebuilt the whole scene index — saw the tiles on
+    /// the first frame and nothing afterwards. Revert the residency and the
+    /// second frame comes back empty, which is exactly what this pins.
+    #[test]
+    fn a_second_frame_still_sees_tiles_whose_content_came_once() {
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut session = Session::new(
+            Box::new(TwoTiles),
+            Arc::new(CountingLoader(Arc::clone(&loads))),
+            SessionConfig::default(),
+        )
+        .expect("session");
+
+        let first = session.frame(vec![a_view()]).expect("frame 1");
+        assert!(!first.tiles.is_empty(), "the first frame has ground");
+        let loaded_once = loads.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(loaded_once > 0, "something was actually fetched");
+
+        let second = session.frame(vec![a_view()]).expect("frame 2");
+        assert_eq!(
+            second.tiles.len(),
+            first.tiles.len(),
+            "the second frame sees the same ground"
+        );
+        assert_eq!(
+            loads.load(std::sync::atomic::Ordering::Relaxed),
+            loaded_once,
+            "and nothing was fetched a second time"
+        );
+        assert!(
+            Arc::ptr_eq(&first.tiles[0], &second.tiles[0]),
+            "it is the same tile, not a copy of it"
+        );
+    }
+
     /// The fix for sixty seconds a frame: a tile whose drape has already been
     /// baked and encoded is not composed again, and the second frame hands out
     /// the very same bytes rather than an identical copy.
@@ -953,7 +1170,7 @@ mod tests {
         let first = finish_tile(&memo, TileId(7), draped_content(), 256);
         assert!(first.memoized.is_none(), "nothing to reuse yet");
         assert_eq!(first.content.textures.len(), 1, "frame 1 composes");
-        let frame1 = Frame::with_memo("ion-1-2", vec![first], Arc::clone(&memo));
+        let frame1 = Frame::with_memo("ion-1-2", vec![Arc::new(first)], Arc::clone(&memo));
         let png1 = frame1
             .texture_png(0, 0)
             .expect("encoding")
@@ -971,7 +1188,7 @@ mod tests {
             Some(0),
             "the material still points at texture 0, served from the memo"
         );
-        let frame2 = Frame::with_memo("ion-1-2", vec![second], Arc::clone(&memo));
+        let frame2 = Frame::with_memo("ion-1-2", vec![Arc::new(second)], Arc::clone(&memo));
         let png2 = frame2
             .texture_png(0, 0)
             .expect("encoding")
@@ -1001,11 +1218,11 @@ mod tests {
         // A budget of one byte evicts on every insert.
         let memo = Arc::new(TextureMemo::new(1));
         let tile = finish_tile(&memo, TileId(7), draped_content(), 256);
-        let frame = Frame::with_memo("ion-1-2", vec![tile], Arc::clone(&memo));
+        let frame = Frame::with_memo("ion-1-2", vec![Arc::new(tile)], Arc::clone(&memo));
         let png = frame.texture_png(0, 0).expect("encoding").expect("present");
         // Push another texture through; the first is evicted from the memo.
         let other = finish_tile(&memo, TileId(9), draped_content(), 256);
-        let other_frame = Frame::with_memo("ion-1-2", vec![other], Arc::clone(&memo));
+        let other_frame = Frame::with_memo("ion-1-2", vec![Arc::new(other)], Arc::clone(&memo));
         let _ = other_frame.texture_png(0, 0).expect("encoding");
         // The first frame still answers, from its own map.
         let again = frame.texture_png(0, 0).expect("encoding").expect("present");
