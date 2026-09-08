@@ -15,6 +15,7 @@
 # kernels are paid once (persistent_data), only the camera moves.
 
 import argparse
+import pathlib
 import sys
 import time
 
@@ -25,6 +26,10 @@ def parse_args():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     p = argparse.ArgumentParser()
     p.add_argument("--stage", required=True, help="OpenUSD stage to render")
+    p.add_argument("--engine", choices=["native", "hydra"], default="native",
+                   help="native = Cycles/EEVEE on imported geometry; hydra = "
+                        "HYDRA_STORM over the exported stage, generative "
+                        "procedurals cook (the manifest path)")
     p.add_argument("--tier", choices=["cycles", "eevee"], default="cycles")
     p.add_argument("--frames", default="1:48", help="A:B inclusive")
     p.add_argument("--width", type=int, default=1920)
@@ -66,12 +71,116 @@ def gpu_only(prefs, kinds):
     return None
 
 
+def setup_hydra_manifest(scene, stage_path, first, last):
+    """The manifest path: HYDRA_STORM over the exported stage.
+
+    The manifest's camera is rebuilt as a keyframed Blender camera straight
+    from pxr rather than through `usd_import` — the importer's animation
+    support is a bet, and a silently static camera renders 1440 identical
+    frames. The Globe prim cannot survive an import at all (no Blender object
+    maps to it), so a USDHook references the manifest into the exported stage
+    — the composition route proven by the proctest — and retargets the
+    procedural's camera rel onto the exported Blender camera, which carries
+    the *current frame's* pose (the export path evaluates at Default time).
+    """
+    import mathutils
+    from pxr import Usd, UsdGeom
+
+    bpy.ops.preferences.addon_enable(module="hydra_storm")
+    scene.render.engine = "HYDRA_STORM"
+    scene.hydra.export_method = "USD"
+
+    manifest = str(pathlib.Path(stage_path).resolve())
+    source = Usd.Stage.Open(manifest)
+    cam_prim = next(
+        (p for p in source.Traverse() if p.IsA(UsdGeom.Camera)), None)
+    if cam_prim is None:
+        print("FATAL: the manifest has no camera", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+    usd_cam = UsdGeom.Camera(cam_prim)
+    cam_data = bpy.data.cameras.new("shot")
+    cam = bpy.data.objects.new("shot", cam_data)
+    scene.collection.objects.link(cam)
+    scene.camera = cam
+
+    aperture = usd_cam.GetVerticalApertureAttr().Get(float(first)) or 24.0
+    cam_data.sensor_fit = "VERTICAL"
+    cam_data.sensor_height = aperture
+    cam_data.lens = usd_cam.GetFocalLengthAttr().Get(float(first)) or 35.0
+    clip = usd_cam.GetClippingRangeAttr().Get(float(first))
+    if clip:
+        cam_data.clip_start = max(clip[0], 0.01)
+        cam_data.clip_end = clip[1]
+
+    # One keyframe per frame, straight from the time samples: the tape wrote
+    # them exact, the render reads them exact.
+    xf_cache = UsdGeom.XformCache()
+    for f in range(first, last + 1):
+        xf_cache.SetTime(float(f))
+        m = xf_cache.GetLocalToWorldTransform(cam_prim)
+        # USD is row-major with row vectors; Blender's Matrix applies to
+        # column vectors — the transpose is the whole conversion.
+        cam.matrix_world = mathutils.Matrix(
+            [[m[0][0], m[1][0], m[2][0], m[3][0]],
+             [m[0][1], m[1][1], m[2][1], m[3][1]],
+             [m[0][2], m[1][2], m[2][2], m[3][2]],
+             [0.0, 0.0, 0.0, 1.0]])
+        cam.keyframe_insert("location", frame=f)
+        cam.keyframe_insert("rotation_euler", frame=f)
+
+    # The look is scene-side composition, as always: a sky dome and a sun,
+    # exported with the scene. The manifest carries geometry and config only.
+    world = bpy.data.worlds.new("Sky")
+    world.use_nodes = True
+    bg = world.node_tree.nodes["Background"]
+    bg.inputs[0].default_value = (0.45, 0.58, 0.78, 1.0)
+    bg.inputs[1].default_value = 0.6
+    scene.world = world
+    sun = bpy.data.objects.new("sun", bpy.data.lights.new("s", "SUN"))
+    sun.data.energy = 4.0
+    scene.collection.objects.link(sun)
+    sun.rotation_euler = (0.7, 0.2, 0.3)
+
+    class TuileManifestHook(bpy.types.USDHook):
+        bl_idname = "tuile_manifest_hook"
+        bl_label = "tuile manifest"
+
+        @staticmethod
+        def on_export(ctx):
+            stage = ctx.get_stage()
+            holder = stage.DefinePrim("/TuileManifest")
+            holder.GetReferences().AddReference(manifest)
+            # The referenced Globe's camera rel points at the manifest's own
+            # camera — static under the export path's Default-time
+            # evaluation. Retarget it onto the exported Blender camera,
+            # which holds this frame's pose.
+            exported_cam = next(
+                (p for p in stage.Traverse()
+                 if p.IsA(UsdGeom.Camera)
+                 and not str(p.GetPath()).startswith("/TuileManifest")),
+                None)
+            globe = next(
+                (p for p in Usd.PrimRange(holder)
+                 if p.GetTypeName() == "GenerativeProcedural"), None)
+            if exported_cam is None or globe is None:
+                print("HOOK-MISSING-PIECES", flush=True)
+                return True
+            rel = globe.CreateRelationship("primvars:tuile:cameras")
+            rel.SetTargets([exported_cam.GetPath()])
+            print("MANIFEST-HOOK-FIRED", flush=True)
+            return True
+
+    bpy.utils.register_class(TuileManifestHook)
+
+
 def main():
     args = parse_args()
     first, last = (int(x) for x in args.frames.split(":"))
 
     bpy.ops.wm.read_factory_settings(use_empty=True)
-    bpy.ops.wm.usd_import(filepath=args.stage, import_all_materials=True)
+    if args.engine == "native":
+        bpy.ops.wm.usd_import(filepath=args.stage, import_all_materials=True)
 
     scene = bpy.context.scene
     scene.render.resolution_x = args.width
@@ -79,12 +188,16 @@ def main():
     scene.render.fps = args.fps
     scene.render.use_persistent_data = True
 
-    cameras = [o for o in bpy.data.objects if o.type == "CAMERA"]
-    scene.camera = (bpy.data.objects[args.camera] if args.camera else cameras[0])
+    if args.engine == "hydra":
+        setup_hydra_manifest(scene, args.stage, first, last)
+    else:
+        cameras = [o for o in bpy.data.objects if o.type == "CAMERA"]
+        scene.camera = (
+            bpy.data.objects[args.camera] if args.camera else cameras[0])
 
-    if args.no_dof:
-        for cam in cameras:
-            cam.data.dof.use_dof = False
+        if args.no_dof:
+            for cam in cameras:
+                cam.data.dof.use_dof = False
 
     if args.demo_fixups:
         # The importer maps neither DomeLight to a world nor USD light
@@ -104,7 +217,11 @@ def main():
             if name in bpy.data.objects and mat in bpy.data.materials:
                 bpy.data.objects[name].data.materials.append(bpy.data.materials[mat])
 
-    if args.tier == "cycles":
+    if args.engine == "hydra":
+        # Engine set by setup_hydra_manifest; Storm has neither samplers nor
+        # denoisers to configure, its cost lives in the procedural cook.
+        print("hydra (HYDRA_STORM), manifest camera keyframed", flush=True)
+    elif args.tier == "cycles":
         scene.render.engine = "CYCLES"
         prefs = bpy.context.preferences.addons["cycles"].preferences
         kind = gpu_only(prefs, ("OPTIX", "CUDA", "METAL", "HIP"))
