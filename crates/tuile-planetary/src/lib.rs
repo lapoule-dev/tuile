@@ -312,6 +312,19 @@ impl LayerBudget {
         );
     }
 
+    /// Declares that a drape may carry as many layers as its mosaic needs.
+    ///
+    /// For consumers that COMPOSE on the CPU (the bake path behind the Hydra
+    /// boundary): there is no per-fragment fetch there, so the 5×5 shading
+    /// ceiling that [`LayerBudget::set_from_device`] enforces would only
+    /// coarsen the mosaic back — measured as an exposure checkerboard, one
+    /// imagery level per terrain level. A GPU viewer must never call this:
+    /// its ceiling is a real per-fragment cost.
+    pub fn set_unbounded(&self) {
+        self.0
+            .store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn get(&self) -> u32 {
         self.0.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -410,7 +423,7 @@ impl ImageryCache {
 /// `tuile_core::raster::CachedImagery`), which is where the bytes and their
 /// stated lifetimes actually are — this crate composes what the host hands it
 /// and adds no tier of its own.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GlobeOptions {
     /// When true, terrain only (no imagery) — the geometry debug view.
     pub no_imagery: bool,
@@ -427,6 +440,27 @@ pub struct GlobeOptions {
     /// A handle rather than a number because the renderer usually does not
     /// exist yet when the loader is built — see [`LayerBudget`].
     pub imagery_slots: LayerBudget,
+    /// How many levels finer than the terrain a drape may go.
+    ///
+    /// The camera-distance rule, made per-tile without the loader knowing the
+    /// camera: under a distance-proportional terrain selection, a tile's
+    /// terrain level already encodes its distance, so "imagery at the level
+    /// the camera distance asks for" is `terrain_level + boost` — near tiles
+    /// go deep, far tiles stay proportionally coarse, and neighbours at one
+    /// terrain level share one imagery level instead of quantising into an
+    /// exposure checkerboard. `u32::MAX` (the default) leaves the layer
+    /// budget as the only limit, which is today's behaviour.
+    pub imagery_boost_cap: u32,
+}
+
+impl Default for GlobeOptions {
+    fn default() -> Self {
+        Self {
+            no_imagery: false,
+            imagery_slots: LayerBudget::default(),
+            imagery_boost_cap: u32::MAX,
+        }
+    }
 }
 
 /// Loads a terrain tile and drapes the imagery covering it, by reference.
@@ -767,7 +801,8 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
             Some(texel) => scheme.level_for_texel_spacing(texel, lat).max(base),
             None => base,
         }
-        .min(scheme.maximum_level);
+        .min(scheme.maximum_level)
+        .min(base.saturating_add(self.opts.imagery_boost_cap));
         // One slot is reserved for a coarse layer underneath everything else.
         //
         // What **one draw** binds, not what the passes could carry.

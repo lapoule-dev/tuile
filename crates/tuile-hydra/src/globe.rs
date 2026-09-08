@@ -20,9 +20,18 @@ use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
 use tuile_native_fetchers::NativeHttp;
 use tuile_core::offload;
-use tuile_planetary::{globe_on, GlobeOptions, ImageryDetail};
+use tuile_planetary::{globe_on, GlobeOptions, ImageryDetail, LayerBudget};
 
 use crate::session::{Session, SessionConfig};
+
+/// How many levels finer than the terrain the baked imagery may go.
+///
+/// Four levels is a 16×16 sub-mosaic per terrain tile — deep zoom where the
+/// camera is close (its terrain is fine), proportionally coarse where it is
+/// far, and one imagery level per terrain level everywhere: the
+/// checkerboard's actual cure. The old effective value was +2, imposed
+/// silently by the GPU shading ceiling this path does not have.
+const IMAGERY_BOOST_CAP: u32 = 4;
 
 /// ion's asset id for Cesium World Terrain.
 pub const CESIUM_WORLD_TERRAIN: i64 = 1;
@@ -181,6 +190,14 @@ async fn resolve(
     ),
     GlobeError,
 > {
+    // Not a budget — the count of imagery layers one drape may CARRY. The
+    // loader silently drops layers past it and the ground reverts to the
+    // coarse capture exactly where tiles straddle worst: measured as an
+    // exposure checkerboard across the whole frame, absent from the viewer
+    // over the same data. The bake runs on the CPU, where a layer costs a
+    // loop iteration and not a per-fragment fetch, so the ceiling applies.
+    let imagery_slots = LayerBudget::default();
+    imagery_slots.set_unbounded();
     // One pooled, cached transport drives ion and Bing both, so they share a
     // connection pool and a cache rather than competing for sockets.
     let http = Arc::new(
@@ -213,7 +230,8 @@ async fn resolve(
             layer,
             GlobeOptions {
                 no_imagery: true,
-                ..Default::default()
+                imagery_slots: imagery_slots.clone(),
+                imagery_boost_cap: IMAGERY_BOOST_CAP,
             },
             offload::threaded(),
         );
@@ -252,7 +270,8 @@ async fn resolve(
         layer,
         GlobeOptions {
             no_imagery: false,
-            ..Default::default()
+            imagery_slots,
+            imagery_boost_cap: IMAGERY_BOOST_CAP,
         },
         offload::threaded(),
     );

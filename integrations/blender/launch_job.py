@@ -77,6 +77,9 @@ def main():
     p.add_argument("--procs-per-gpu", type=int, default=4)
     p.add_argument("--cuda-min", default="13.2",
                    help="versions CUDA hôte acceptées, à partir de celle-ci")
+    p.add_argument("--cuda-any", action="store_true",
+                   help="aucune contrainte CUDA (Storm/GL s'en moque) — "
+                        "élargit les hôtes disponibles")
     p.add_argument("--cloud", default="COMMUNITY", choices=["COMMUNITY", "SECURE"])
     p.add_argument("--disk", type=int, default=30)
     p.add_argument("--engine", default="native", choices=["native", "hydra"],
@@ -163,12 +166,14 @@ def main():
         env["TUILE_ION_TOKEN"] = token
         env["TUILE_CACHE_DIR"] = "/tmp/tuile-cache"
 
+    gpu = {"id": args.gpu_type, "count": args.gpu_count}
+    if not args.cuda_any:
+        gpu["allowedCudaVersions"] = cuda
     pod = call(key, "POST", "/pods", {
         "name": args.name,
         "image": args.image,
         "registry": reg["id"],
-        "gpu": {"id": args.gpu_type, "count": args.gpu_count,
-                "allowedCudaVersions": cuda},
+        "gpu": gpu,
         "cloud": args.cloud,
         "disk": args.disk,
         "ports": ["22/tcp"] if args.ssh_pubkey else [],
