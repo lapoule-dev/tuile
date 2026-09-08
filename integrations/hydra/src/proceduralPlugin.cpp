@@ -9,6 +9,8 @@
 #include <pxr/base/tf/type.h>
 #include <pxr/imaging/hdGp/generativeProceduralPluginRegistry.h>
 
+#include <atomic>
+
 PXR_NAMESPACE_OPEN_SCOPE
 
 namespace {
@@ -48,6 +50,20 @@ TuileGlobeProceduralPlugin::Construct(const SdfPath &proceduralPrimPath)
             "and libtuile_hydra.a are out of step. Refusing to construct.");
         return nullptr;
     }
+    // The metric everything else is measured against, and it had none.
+    //
+    // hdGp constructs one procedural per (resolver, prim path) and reuses it
+    // for every cook — `previousResult` only means something because of that.
+    // A host that rebuilds its scene index per frame gets a new instance per
+    // frame instead, silently, and the only visible symptom is that rendering
+    // is slow. So say it out loud: TF_DEBUG=TUILE_HYDRA_PROCEDURAL prints a
+    // count, and anything above 1 for a whole sequence is the bug.
+    static std::atomic<uint64_t> constructions{0};
+    const uint64_t nth = constructions.fetch_add(1) + 1;
+    TF_DEBUG(TUILE_HYDRA_PROCEDURAL)
+        .Msg("[tuile] Construct #%llu for %s (expect exactly 1 per render)\n",
+             static_cast<unsigned long long>(nth), proceduralPrimPath.GetText());
+
     return new TuileGlobeProcedural(proceduralPrimPath);
 }
 
