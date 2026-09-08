@@ -99,6 +99,14 @@ pub enum FrameError {
     Poisoned,
 }
 
+impl TextureKey {
+    /// The drape's fingerprint. Zero for a texture the tile owns rather than
+    /// one we composed.
+    pub(crate) fn drape(&self) -> u64 {
+        self.drape
+    }
+}
+
 /// One tile's geometry, ready to hand to a renderer.
 ///
 /// Positions are f32 **relative to `origin_ecef`** — the anti-jitter protocol.
@@ -119,6 +127,18 @@ pub struct TileGeometry {
     /// evicts, and a frame that promised a texture must be able to hand out
     /// its bytes however long it lives.
     pub(crate) memoized: Option<Arc<EncodedTexture>>,
+}
+
+impl TileGeometry {
+    /// What the baked mosaic on this tile was composed from, or `0` when the
+    /// tile carries no drape of ours.
+    ///
+    /// Crossing the boundary so the consumer can tell "the same tile, redraped"
+    /// from "the same tile, unchanged" with an integer compare — the one
+    /// distinction that decides whether a kept prim needs its material dirtied.
+    pub(crate) fn drape(&self) -> u64 {
+        self.baked.map_or(0, |key| key.drape())
+    }
 }
 
 /// A texture, as the renderer will ask for it.
@@ -318,8 +338,25 @@ impl Frame {
     /// identical data, and a comparison would report a difference that is not
     /// there. Same reason `BulkFrame.selected` is iterated rather than its
     /// `HashMap`.
-    pub fn texture_uri(dataset: &str, tile: TileId, texture: usize) -> String {
-        format!("tuile://{dataset}/tile/{}/texture/{texture}.png", tile.0)
+    /// # Why the drape is in the name
+    ///
+    /// A tile keeps its id when the camera moves, but its imagery does not: it
+    /// is re-draped at another level and the pixels change underneath. With a
+    /// name that ignored that, every asset cache between here and the renderer
+    /// would go on serving the picture it already had — the tile would render,
+    /// plausibly, at yesterday's sharpness. Naming the bytes rather than the
+    /// slot makes a re-drape a different asset, which is the only way a cache
+    /// can be right by construction.
+    pub fn texture_uri(
+        dataset: &str,
+        tile: TileId,
+        texture: usize,
+        drape: u64,
+    ) -> String {
+        format!(
+            "tuile://{dataset}/tile/{}/texture/{texture}.{drape:016x}.png",
+            tile.0
+        )
     }
 
     /// The PNG for one tile's texture, encoding it on first request.
@@ -376,7 +413,12 @@ impl Frame {
         .map_err(|e| FrameError::TextureEncode(e.to_string()))?;
 
         let entry = Arc::new(EncodedTexture {
-            uri: Self::texture_uri(&self.dataset, tile.tile, texture_index),
+            uri: Self::texture_uri(
+                &self.dataset,
+                tile.tile,
+                texture_index,
+                tile.drape(),
+            ),
             png,
         });
 
@@ -866,8 +908,38 @@ mod tests {
     #[test]
     fn the_texture_uri_is_stable_and_scheme_qualified() {
         assert_eq!(
-            Frame::texture_uri("ion-1-2", TileId(7), 0),
-            "tuile://ion-1-2/tile/7/texture/0.png"
+            Frame::texture_uri("ion-1-2", TileId(7), 0, 0),
+            "tuile://ion-1-2/tile/7/texture/0.0000000000000000.png"
+        );
+    }
+
+    /// The same tile re-draped is a different picture, so it must be a
+    /// different asset: any cache between here and the renderer keys on this
+    /// name, and one that did not change would keep serving the old pixels.
+    #[test]
+    fn a_redraped_tile_gets_a_new_asset_name() {
+        assert_ne!(
+            Frame::texture_uri("ion-1-2", TileId(7), 0, 0xdead),
+            Frame::texture_uri("ion-1-2", TileId(7), 0, 0xbeef)
+        );
+    }
+
+    /// And the name a frame hands out is the one built from the drape it
+    /// actually baked — not a guess made at the boundary.
+    #[test]
+    fn the_encoded_uri_carries_the_tile_s_own_drape() {
+        let memo = Arc::new(TextureMemo::default());
+        let tile = finish_tile(&memo, TileId(7), draped_content(), 256);
+        let drape = tile.drape();
+        assert_ne!(drape, 0, "a draped tile is keyed by its drape");
+        let frame = Frame::with_memo("ion-1-2", vec![Arc::new(tile)], memo);
+        let texture = frame
+            .texture_png(0, 0)
+            .expect("encoding")
+            .expect("present");
+        assert_eq!(
+            texture.uri,
+            Frame::texture_uri("ion-1-2", TileId(7), 0, drape)
         );
     }
 
@@ -878,8 +950,8 @@ mod tests {
     #[test]
     fn two_datasets_never_collide_on_a_tile_id() {
         assert_ne!(
-            Frame::texture_uri("ion-1-2", TileId(7), 0),
-            Frame::texture_uri("ion-1-3812", TileId(7), 0)
+            Frame::texture_uri("ion-1-2", TileId(7), 0, 0),
+            Frame::texture_uri("ion-1-3812", TileId(7), 0, 0)
         );
     }
 
@@ -890,7 +962,10 @@ mod tests {
             .texture_png(0, 0)
             .expect("encoding")
             .expect("the texture exists");
-        assert_eq!(texture.uri, "tuile://ion-1-2/tile/7/texture/0.png");
+        assert_eq!(
+            texture.uri,
+            "tuile://ion-1-2/tile/7/texture/0.0000000000000000.png"
+        );
         // The PNG signature, so this is decodable bytes rather than the raw
         // RGBA the host's image plugin cannot read.
         assert_eq!(&texture.png[..8], b"\x89PNG\r\n\x1a\n");

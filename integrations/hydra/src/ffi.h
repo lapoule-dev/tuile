@@ -55,6 +55,12 @@ struct TuileTile
     uint32_t index_count;
     float base_color_factor[4];
     int32_t base_color_texture;
+    /// What the tile's imagery was composed from, or 0 when it carries none.
+    /// A tile keeps its id across frames; its imagery does not — it is
+    /// re-draped at another level as the camera moves. Comparing this is how a
+    /// consumer that keeps prims tells "unchanged" from "same tile, new
+    /// pixels" without rebuilding a URI to look at.
+    uint64_t drape;
 };
 
 /// Mirrors `TuileTexture`. `uri` is UTF-8 and is NOT null-terminated — build a
