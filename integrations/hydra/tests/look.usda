@@ -1,30 +1,13 @@
 #usda 1.0
 (
     """
-    Le look « terrain » par composition pure : ce layer SUBLAYE un manifeste
-    TuileGlobe (place ou symlinke le tien sous ./manifest.usda) et compose
-    par-dessus — sans toucher au procédural, qui n'émet que la géométrie.
-
-    Ce qu'il ajoute :
-      - un DomeLight avec un VRAI ciel HDRI (./sky.exr, non commité — un
-        panorama équirect CC0 fait l'affaire, ex. Poly Haven « kiara_1_dawn »),
-        orienté pour que son zénith soit le zénith LOCAL du terrain ;
-      - un DistantLight solaire BAS (élévation ~18°) : c'est l'angle rasant
-        qui fait exister le relief — le soleil au zénith aplatit tout ;
-      - un over caméra : focale doublée (24 → 47 mm équiv.) — la compression
-        de perspective est ce qui fait « photo aérienne » plutôt que « jeu ».
-
-    Orientation : la scène est rebasée (primvars:tuile:renderOrigin) mais PAS
-    réorientée — le haut local du terrain est le zénith ECEF, pas +Z monde.
-    Un DistantLight laissé par défaut éclaire un pôle (mesuré : image noire).
-    Les deux matrices ci-dessous alignent les lumières sur le zénith local du
-    manifeste d'orbite (Ariège) ; un autre manifeste veut ses matrices —
-    recalcule-les depuis son renderOrigin normalisé.
-
-    Rendu :
-      usdrecord --camera /World/ShotCam --frames 1:1 look.usda out.#.png
-    (avec l'environnement TuileGlobe habituel : PXR_PLUGINPATH_NAME,
-     HDGP_INCLUDE_DEFAULT_RESOLVER=1, TUILE_ION_TOKEN, TUILE_CACHE_DIR.)
+    Look « terrain » généré par make_look.py — NE PAS éditer les matrices à
+    la main, régénérer.
+    Manifeste : ./manifest.usda (place ou symlinke le tien)
+    Site : lat 42.5200°, lon 2.1700°
+    Soleil : 2026-06-21T10:00 (UTC+2.0) → azimut 92.5°,
+    élévation 38.7°
+    Rendu : usdrecord --disableCameraLight --camera /World/ShotCam …
     """
     subLayers = [
         @./manifest.usda@
@@ -35,11 +18,7 @@ over "World"
 {
     over "ShotCam"
     {
-        # Focale longue : l'aperture reste 24, le champ vertical passe de 90°
-        # à ~29°. La sélection suit (view.cpp lit aperture/focal), donc les
-        # tuiles se raffinent pour ce cadrage serré — cohérent par
-        # construction.
-        float focalLength = 47
+        float focalLength = 47.0
     }
 
     def DomeLight "Sky"
@@ -55,7 +34,7 @@ over "World"
         float inputs:intensity = 5.0
         color3f inputs:color = (1.0, 0.98, 0.94)
         float inputs:angle = 0.53
-        matrix4d xformOp:transform = ( (0.6038136894729326, -0.47747925188469065, -0.6382966335683756, 0), (0.7781936292585871, 0.5265753665160334, 0.3422470726826655, 0), (0.17269540754297322, -0.7033718414879438, 0.6895247267614303, 0), (0, 0, 0, 1) )
+        matrix4d xformOp:transform = ( (-0.6763691622087216, 0.01772293709823368, 0.7363495460130903, 0), (0.579889931179323, -0.6035890923403135, 0.5471817571197313, 0), (0.4541502219859771, 0.7970985542004254, 0.3979716959303503, 0), (0, 0, 0, 1) )
         uniform token[] xformOpOrder = ["xformOp:transform"]
     }
 }

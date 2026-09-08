@@ -12,9 +12,12 @@ manifeste et rien d'autre.
   sans texture est INERTE sur Storm, warning mesuré). Panorama CC0
   Poly Haven ; le « dawn » stylisé teinte tout en mauve (jugé moche), le
   « partly cloudy puresky » neutre remplit les ombres sans les salir.
-- **DistantLight orienté** : l'élévation est LE levier de relief — 18° sculpte
-  fort mais assombrit des vallées entières, 35° est le compromis jour.
-  Rendre avec `--disableCameraLight`, sinon le headlamp écrase tout.
+- **DistantLight orienté par l'HEURE** : `make_look.py` calcule azimut et
+  élévation solaires (NOAA) pour une date-heure configurable au-dessus du
+  site du manifeste (lat/lon dérivés du renderOrigin) et refuse la nuit.
+  Mesuré : 10 h éclaire les versants de l'orbite, 17 h 30 (az 249°, él 29°)
+  laisse les faces est dans l'ombre — physiquement juste, l'heure est LE
+  bouton. Rendre avec `--disableCameraLight`, sinon le headlamp écrase tout.
 - **Over caméra à travers le sublayer** : `focalLength` doublé sans toucher
   aux timeSamples du transform — la compression de perspective fait « photo
   aérienne ». La sélection suit (view.cpp lit aperture/focal).
@@ -23,7 +26,9 @@ manifeste et rien d'autre.
   portent une matrice qui aligne leur +Z dessus ; un DistantLight par défaut
   éclaire un pôle (mesuré : image noire). Les matrices de `look.usda` valent
   pour le manifeste d'orbite ; autre manifeste ⇒ recalcul depuis son
-  renderOrigin.
+  renderOrigin — c'est exactement ce que fait `make_look.py`, qui est la
+  voie normale : le fichier `look.usda` commité n'est qu'une sortie
+  d'exemple du script (10 h, solstice).
 
 ## Altérer la TEXTURE elle-même (bruit, grain, mordant)
 
