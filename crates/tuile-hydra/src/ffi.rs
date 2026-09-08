@@ -17,7 +17,7 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use glam::{DVec2, DVec3};
-use tuile_core::traversal::{ViewState, ViewStateParams};
+use tuile_core::traversal::ViewStateParams;
 
 use crate::session::{Frame, FrameError, Session};
 
@@ -287,17 +287,14 @@ pub unsafe extern "C" fn tuile_session_frame(
         let session = unsafe { &mut *session };
         let views = unsafe { std::slice::from_raw_parts(views, view_count) };
 
-        let views: Vec<ViewState> = views
+        let views: Vec<ViewStateParams> = views
             .iter()
-            .map(|v| {
-                ViewStateParams {
-                    position: DVec3::from_array(v.position),
-                    direction: DVec3::from_array(v.direction),
-                    up: DVec3::from_array(v.up),
-                    viewport_px: DVec2::from_array(v.viewport_px),
-                    fovy_rad: v.fovy_rad,
-                }
-                .into()
+            .map(|v| ViewStateParams {
+                position: DVec3::from_array(v.position),
+                direction: DVec3::from_array(v.direction),
+                up: DVec3::from_array(v.up),
+                viewport_px: DVec2::from_array(v.viewport_px),
+                fovy_rad: v.fovy_rad,
             })
             .collect();
 

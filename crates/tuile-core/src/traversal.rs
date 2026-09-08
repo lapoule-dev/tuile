@@ -200,6 +200,21 @@ pub struct Config {
     /// A consumer that ignores [`crate::protocol::ServerMessage::Fill`] is
     /// unaffected: it keeps climbing, exactly as before.
     pub stand_ins: bool,
+    /// Refine every visible tile as finely as the **nearest** one.
+    ///
+    /// Off (the default) is the interactive contract: detail follows distance,
+    /// so a device's budget goes where the eye is. On is the batch-render
+    /// contract: the whole frame is equally close to the viewer of the
+    /// *image*, and a distance-graded frame shows its LOD boundaries — mesh
+    /// density steps, imagery capture seams — as visible walls across the
+    /// ground.
+    ///
+    /// Implemented by pricing every tile's screen-space error at one shared
+    /// distance: the distance to the nearest existing content under the
+    /// camera, found by a greedy root-to-leaf descent before the traversal.
+    /// The cost grows with the view's reach — that is the point, and the
+    /// caller turning this on has declared its budget infinite.
+    pub uniform_detail: bool,
     /// Whether to drop tiles no view can see. Off is a diagnostic, not a mode.
     ///
     /// A culled tile is reported *ready* so that it never holds up an ancestor's
@@ -345,6 +360,7 @@ impl Default for Config {
             maximum_screen_space_error: 16.0,
             forbid_holes: true,
             stand_ins: true,
+            uniform_detail: false,
             cull: true,
             loading_descendant_limit: 20,
             resident_budget_bytes: 512 * 1024 * 1024,
@@ -472,6 +488,10 @@ pub fn traverse(
         return;
     }
 
+    let uniform_distance = config
+        .uniform_detail
+        .then(|| nearest_content_distance(tree, views));
+
     let mut requested = HashMap::new();
     for root in roots {
         visit(
@@ -480,6 +500,7 @@ pub fn traverse(
             views,
             config,
             rendered_last,
+            uniform_distance,
             root,
             0,
             out,
@@ -573,6 +594,60 @@ impl Visit {
     }
 }
 
+/// The distance from the nearest view to the nearest *existing* content: a
+/// greedy root-to-leaf descent, always into the child closest to the eye.
+///
+/// This is what [`Config::uniform_detail`] prices every tile at. Greedy is
+/// exact enough here — the descent follows the ground under the camera, and
+/// availability stops it at the finest level the source actually has, which is
+/// precisely the level the decree replicates outward. Clamped away from zero:
+/// a camera inside the nearest leaf's bounding sphere means "as fine as the
+/// source can go", not a division by nothing.
+fn nearest_content_distance(tree: &dyn TileTree, views: &[ViewState]) -> f64 {
+    let mut best = f64::INFINITY;
+    for view in views {
+        for root in tree.roots() {
+            let mut id = root;
+            // The DEEPEST content on the path, not the closest: an ancestor's
+            // huge bounding volume usually *contains* the camera (a globe's
+            // root always does), so its distance is near zero and pricing at
+            // it would refine the whole frustum to the source's maximum. The
+            // finest tile under the camera is the one whose level the decree
+            // replicates, so its distance is the price.
+            let mut deepest: Option<f64> = None;
+            loop {
+                let props = tree.properties(id);
+                if props.has_content {
+                    deepest =
+                        Some(props.bounding_volume.distance_to_point(view.position()));
+                }
+                let next = tree
+                    .children(id)
+                    .into_iter()
+                    .min_by(|&a, &b| {
+                        let da = tree
+                            .properties(a)
+                            .bounding_volume
+                            .distance_to_point(view.position());
+                        let db = tree
+                            .properties(b)
+                            .bounding_volume
+                            .distance_to_point(view.position());
+                        da.total_cmp(&db)
+                    });
+                match next {
+                    Some(child) => id = child,
+                    None => break,
+                }
+            }
+            if let Some(d) = deepest {
+                best = best.min(d);
+            }
+        }
+    }
+    best.max(1.0)
+}
+
 /// Recursive visit over the abstract [`TileTree`].
 #[allow(clippy::too_many_arguments)]
 fn visit(
@@ -581,6 +656,7 @@ fn visit(
     views: &[ViewState],
     config: &Config,
     rendered_last: &HashSet<TileId>,
+    uniform_distance: Option<f64>,
     id: TileId,
     depth: u32,
     out: &mut TraversalOutput,
@@ -640,7 +716,11 @@ fn visit(
     let sse = views
         .iter()
         .map(|v| {
-            let d = props.bounding_volume.distance_to_point(v.position());
+            // Uniform detail: every tile is priced as if it stood where the
+            // nearest one does, so the whole frame refines to one level.
+            let d = uniform_distance.unwrap_or_else(|| {
+                props.bounding_volume.distance_to_point(v.position())
+            });
             v.screen_space_error(props.geometric_error, d)
         })
         .fold(0.0, f64::max);
@@ -731,6 +811,7 @@ fn visit(
                     views,
                     config,
                     rendered_last,
+                    uniform_distance,
                     child,
                     depth + 1,
                     out,
@@ -765,6 +846,7 @@ fn visit(
                     views,
                     config,
                     rendered_last,
+                    uniform_distance,
                     child,
                     depth + 1,
                     out,
@@ -1357,6 +1439,137 @@ mod tests {
 
     fn ids(sel: &[(TileId, f64)]) -> Vec<TileId> {
         sel.iter().map(|(t, _)| *t).collect()
+    }
+
+    /// The uniform-detail decree: with the flag on, a branch thousands of
+    /// units away refines exactly as deep as the one under the camera. With
+    /// it off (the default), the far branch holds at its coarse level — the
+    /// interactive contract, unchanged.
+    #[test]
+    fn uniform_detail_refines_the_far_branch_like_the_near_one() {
+        let branch = |x: f64, name: &str| {
+            format!(
+                r#"{{ "boundingVolume": {{ "sphere": [{x}, 0, 0, 30] }},
+                     "geometricError": 20, "refine": "REPLACE",
+                     "content": {{ "uri": "{name}.glb" }},
+                     "children": [{{
+                       "boundingVolume": {{ "sphere": [{x}, 0, 0, 10] }},
+                       "geometricError": 0,
+                       "content": {{ "uri": "{name}_leaf.glb" }}
+                     }}] }}"#
+            )
+        };
+        let json = format!(
+            r#"{{ "asset": {{ "version": "1.1" }}, "geometricError": 400,
+                 "root": {{
+                   "boundingVolume": {{ "sphere": [2000, 0, 0, 5000] }},
+                   "geometricError": 200, "refine": "REPLACE",
+                   "children": [{}, {}]
+                 }} }}"#,
+            branch(0.0, "near"),
+            branch(4000.0, "far"),
+        );
+        let base = Url::parse("file:///t/tileset.json").expect("url");
+        let ts = Tileset::from_json_bytes(json.as_bytes(), &base).expect("tileset");
+
+        let near_leaf = ts.tile(ts.tile(ts.root()).children[0]).children[0];
+        let far_leaf = ts.tile(ts.tile(ts.root()).children[1]).children[0];
+
+        // Above the near branch, tilted so BOTH branches are inside the
+        // frustum — a culled branch never reaches the SSE decision at all,
+        // which is correct and not what this test is about.
+        let view = ViewState::perspective(
+            dvec3(0.0, 0.0, 300.0),
+            dvec3(0.8, 0.0, -0.6),
+            dvec3(0.0, 0.0, 1.0),
+            dvec2(1000.0, 1000.0),
+            100f64.to_radians(),
+        );
+        let residency = ResidencyView::default();
+        let last = HashSet::new();
+
+        let wants = |config: &Config| -> Vec<TileId> {
+            let out = run_with(&ts, &residency, &[view], config, &last);
+            out.requests.iter().map(|r| r.tile).collect()
+        };
+
+        let default_wants = wants(&Config::default());
+        assert!(default_wants.contains(&near_leaf), "near refines by default");
+        assert!(
+            !default_wants.contains(&far_leaf),
+            "the far branch holds coarse by default"
+        );
+
+        let mut uniform = Config::default();
+        uniform.uniform_detail = true;
+        let uniform_wants = wants(&uniform);
+        assert!(uniform_wants.contains(&near_leaf));
+        assert!(
+            uniform_wants.contains(&far_leaf),
+            "uniform detail refines the far branch like the near one"
+        );
+    }
+
+    /// The distance the decree prices everything at is the one to the finest
+    /// existing content under the camera — the greedy descent must reach the
+    /// leaf, not stop at the first content it meets.
+    #[test]
+    fn nearest_content_distance_descends_to_the_finest_leaf() {
+        let ts = mini_tileset();
+        // 200 above a leaf (radius 30): the root sphere (radius 100) contains
+        // the camera vertically? No — camera at z=200 is outside both. The
+        // root surface is 100 away, the leaf under the corner is farther from
+        // this off-corner camera than the root surface — so a descent that
+        // stopped at the root would report the ROOT's distance. The decree
+        // wants the LEAF's.
+        let view = ViewState::perspective(
+            dvec3(-50.0, -50.0, 200.0),
+            dvec3(0.0, 0.0, -1.0),
+            dvec3(0.0, 1.0, 0.0),
+            dvec2(1000.0, 1000.0),
+            60f64.to_radians(),
+        );
+        let d = nearest_content_distance(&ts, &[view]);
+        // Leaf "a" is centred at (-50,-50,0) with radius 30: 170 exactly.
+        assert!((d - 170.0).abs() < 1.0, "got {d}");
+    }
+
+    /// A camera inside the nearest leaf's sphere means "as fine as the source
+    /// goes", not a division by nothing.
+    #[test]
+    fn nearest_content_distance_clamps_at_contact() {
+        let ts = mini_tileset();
+        let view = ViewState::perspective(
+            dvec3(-50.0, -50.0, 5.0),
+            dvec3(0.0, 0.0, -1.0),
+            dvec3(0.0, 1.0, 0.0),
+            dvec2(1000.0, 1000.0),
+            60f64.to_radians(),
+        );
+        assert_eq!(nearest_content_distance(&ts, &[view]), 1.0);
+    }
+
+    /// Uniform detail refines what is VISIBLE to one level; it must not
+    /// resurrect what the frustum culled. A tile behind the camera stays out,
+    /// flag or no flag.
+    #[test]
+    fn uniform_detail_does_not_override_culling() {
+        let ts = mini_tileset();
+        // At a leaf's altitude, looking straight down at corner "a": the
+        // other three corners are outside even the widened frustum.
+        let view = ViewState::perspective(
+            dvec3(-50.0, -50.0, 60.0),
+            dvec3(0.0, 0.0, -1.0),
+            dvec3(0.0, 1.0, 0.0),
+            dvec2(1000.0, 1000.0),
+            40f64.to_radians(),
+        );
+        let residency = ResidencyView::default();
+        let last = HashSet::new();
+        let mut uniform = Config::default();
+        uniform.uniform_detail = true;
+        let out = run_with(&ts, &residency, &[view], &uniform, &last);
+        assert!(out.stats.culled > 0, "the far corners are culled");
     }
 
     #[test]
