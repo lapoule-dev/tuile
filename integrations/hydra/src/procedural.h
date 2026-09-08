@@ -96,6 +96,12 @@ private:
     bool _ViewForCook(const HdSceneIndexBaseRefPtr &inputScene,
                       TuileViewState *out) const;
 
+    /// Builds one tile's mesh prim, copying everything it needs out of the
+    /// frame. Called once per tile per *appearance*, not once per cook.
+    HdSceneIndexPrim _BuildTilePrim(const TuileTile &tile,
+                                    bool textured,
+                                    const SdfPath &materialPath) const;
+
     SdfPath _primPath;
     /// Cached between `UpdateDependencies` and `Update` so both agree on which
     /// camera this cook is about.
@@ -109,27 +115,46 @@ private:
     /// than by this instance — see `_SharedSession` in the implementation.
     /// Null until the first cook resolves it.
     struct _SharedSession *_shared = nullptr;
-    /// The converged frame the current children read from. Freed at the start
-    /// of the next cook — `GetChildPrim` copies into retained data sources, so
-    /// nothing outlives it.
+    /// The frame being read, alive only for the duration of one `Update`.
+    ///
+    /// Freed before that cook returns: everything it lends is copied into the
+    /// prims below and into the resolver's texture store first. It used to
+    /// survive until the *next* cook, because `GetChildPrim` read from it —
+    /// which was safe only as long as nothing was ever kept.
     TuileFrame *_frame = nullptr;
 
     GfVec3d _renderOrigin = GfVec3d(0.0);
     double _fallbackViewportPx[2] = {1920.0, 1440.0};
 
-    /// One entry per selected tile, in traversal order — the order the frame
-    /// hands them out, which is the order every farm node agrees on.
+    /// The render origin the prims below were built against.
+    ///
+    /// It is authored per trajectory, not per frame, so it almost never
+    /// changes — but every child's transform is `origin − renderOrigin`, so
+    /// when it does, every one of them is stale and has to be rebuilt.
+    GfVec3d _builtOrigin = GfVec3d(0.0);
+    bool _haveBuilt = false;
+
+    /// One tile, **built**, kept across cooks.
+    ///
+    /// This is what makes a cook incremental. hdGp emits nothing at all for a
+    /// child re-declared with the same path and type — it does not even call
+    /// `GetChildPrim` again — so a tile that stays in the selection costs
+    /// exactly nothing, provided its prim is still here to be handed back.
     struct _Tile
     {
-        size_t index = 0;
         uint64_t id = 0;
-        /// The first texture's `tuile://` URI, empty when untextured. Held
-        /// here because the material child needs it after the textures were
-        /// already pushed into the resolver's store.
+        /// What its imagery was composed from. The same tile re-draped keeps
+        /// its path and needs new pixels: the only change a kept prim can
+        /// undergo, and the reason this is remembered.
+        uint64_t drape = 0;
+        bool textured = false;
+        /// The first texture's `tuile://` URI, empty when untextured.
         std::string textureUri;
+        /// Built once, handed out unchanged afterwards.
+        HdSceneIndexPrim prim;
     };
     std::map<SdfPath, _Tile> _tilesByPath;
-    /// Material child path -> the tile whose texture it binds.
+    /// Material child path -> its built prim. Same lifetime rules.
     std::map<SdfPath, _Tile> _materialsByPath;
 };
 
