@@ -64,11 +64,31 @@ fn is_retryable_status(status: u16) -> bool {
 /// of a long render; a malformed URL or a body-decode failure will fail
 /// identically forever.
 fn is_retryable_transport(error: &reqwest_middleware::Error) -> bool {
-    let reqwest_middleware::Error::Reqwest(e) = error else {
-        // A middleware error is ours, not the network's.
-        return false;
-    };
-    e.is_timeout() || e.is_connect() || e.is_request()
+    match error {
+        reqwest_middleware::Error::Reqwest(e) => {
+            e.is_timeout() || e.is_connect() || e.is_request()
+        }
+        // A middleware error is NOT "ours rather than the network's" — that
+        // reading cost a whole render.
+        //
+        // The cache middleware wraps the request, so a dropped connection
+        // comes back through it, dressed as `Cache error: error sending
+        // request for url ...`. Classified as internal, it was never retried:
+        // three sockets lost out of six hundred issued at once ended the frame,
+        // and the procedural emitted nothing rather than a partial globe —
+        // a black image, in a video nobody was going to inspect frame by frame
+        // (measured, 2026-09-08).
+        //
+        // So: look through the chain for the transport error the middleware is
+        // carrying and classify that. And when there is none to find, retry
+        // anyway. A GET is idempotent, the attempt count is small, and the two
+        // ways of being wrong are not comparable — a needless retry costs a
+        // round trip, a missing one costs the frame.
+        reqwest_middleware::Error::Middleware(e) => e
+            .chain()
+            .find_map(|source| source.downcast_ref::<reqwest::Error>())
+            .is_none_or(|e| e.is_timeout() || e.is_connect() || e.is_request()),
+    }
 }
 
 /// How hard to try before giving up on a request.
@@ -484,6 +504,49 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(CACHE_CONTROL, HeaderValue::from_str(value).expect("header"));
         h
+    }
+
+    /// The exact shape that ended a 48-frame render: a dropped connection,
+    /// wrapped by the cache middleware, reported as a middleware error.
+    #[test]
+    fn a_dropped_connection_wearing_the_cache_s_coat_is_retried() {
+        let error = reqwest_middleware::Error::Middleware(anyhow::anyhow!(
+            "Cache error: error sending request for url \
+             (https://ecn.t2.tiles.virtualearth.net/tiles/a111.jpeg)"
+        ));
+        assert!(
+            is_retryable_transport(&error),
+            "a transport failure is a transport failure whoever hands it over"
+        );
+    }
+
+    #[test]
+    fn a_middleware_error_carrying_a_connect_failure_is_retried() {
+        // A real reqwest error, made by connecting to a port nothing listens
+        // on — no network, no fixture, and genuinely the variant we classify.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let inner = runtime.block_on(async {
+            reqwest::Client::new()
+                .get("http://127.0.0.1:1/")
+                .send()
+                .await
+                .expect_err("nothing listens on port 1")
+        });
+        assert!(inner.is_connect(), "the fixture must be a connect error");
+        assert!(is_retryable_transport(&reqwest_middleware::Error::Reqwest(
+            inner
+        )));
+    }
+
+    #[test]
+    fn an_unrecognisable_middleware_error_is_retried_anyway() {
+        // Fail open: a GET is idempotent, and a needless round trip is not
+        // comparable to a lost frame.
+        let error = reqwest_middleware::Error::Middleware(anyhow::anyhow!("cache is on fire"));
+        assert!(is_retryable_transport(&error));
     }
 
     #[test]
