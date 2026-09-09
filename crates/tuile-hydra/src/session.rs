@@ -806,16 +806,29 @@ async fn converge(
 /// when no view says anything usable.
 ///
 /// The classic screen-density formula — `2·altitude·tan(fovy/2) /
-/// viewport_height` — over a spherical-Earth altitude: this sizes texels, not
-/// geometry, and the sphere/ellipsoid difference vanishes into the level
-/// quantisation. The minimum across views, because a union selection must
-/// satisfy its most demanding eye.
+/// viewport_height` — over the camera's height above the **ellipsoid**. The
+/// minimum across views, because a union selection must satisfy its most
+/// demanding eye.
+///
+/// The height used to be `|position| − equatorial radius`, with a comment
+/// saying the sphere/ellipsoid difference vanished into the level
+/// quantisation. It does not: at 42.5° N the ellipsoid's radius is 9.7 km
+/// *smaller* than the equatorial one, so that subtraction is 9.7 km short —
+/// and for any camera below that it goes **negative**, where the `.max()` used
+/// to hide it. A camera 5 km up came out at 1 metre, asking for a texel
+/// spacing of 0.86 mm: the finest imagery the source has, everywhere in the
+/// frame, which took a container to its memory ceiling (measured 2026-09-09).
+///
+/// It stayed hidden while the trajectory generator had its own spherical bug
+/// and flew three times too high — two errors of the same family, the second
+/// making the first look plausible.
 fn target_texel_spacing(views: &[ViewStateParams]) -> Option<f64> {
-    const EARTH_RADIUS: f64 = 6_378_137.0;
     views
         .iter()
         .filter_map(|v| {
-            let altitude = (v.position.length() - EARTH_RADIUS).max(1.0);
+            let altitude = tuile_core::geo::ecef_to_geodetic(v.position)
+                .height
+                .max(1.0);
             let height_px = v.viewport_px.y;
             if height_px <= 0.0
                 || height_px.is_nan()
@@ -887,7 +900,30 @@ fn exact_traversal(mut config: Config) -> Config {
     //
     // A bulk frame has no "while". It converges or it fails, and what it
     // converges on must not depend on how fast the tiles came.
-    config.loading_descendant_limit = u32::MAX;
+    //
+    // TUILE_DESCENDANT_LIMIT restores a finite threshold for a comparison —
+    // it is the switch that makes the defect above reappear on demand, which
+    // is the only honest way to show a fix is doing something.
+    config.loading_descendant_limit = env_knob("TUILE_DESCENDANT_LIMIT", u32::MAX).max(1);
+    // TUILE_CULL=0 keeps every tile the traversal reaches, however far off
+    // screen. Expensive and not a mode to render in — it exists to answer one
+    // question: whether ground that is missing was culled.
+    config.cull = env_knob("TUILE_CULL", 1u32) != 0;
+    // TUILE_MAX_SSE overrides the manifest's `tuile:maxSse` for a machine-side
+    // sweep. The stage stays the authority; this is the knob that says what a
+    // different threshold would have selected, without rewriting the stage and
+    // rebuilding an image for each value.
+    let sse: f64 = env_knob("TUILE_MAX_SSE", 0.0);
+    if sse > 0.0 {
+        config.maximum_screen_space_error = sse;
+    }
+    // TUILE_PINNED_LEVEL sizes the coarse pyramid every session primes: it is
+    // the floor under the globe, and 2730 tiles of it is most of a cold
+    // frame's cost.
+    let pinned: i64 = env_knob("TUILE_PINNED_LEVEL", -1);
+    if pinned >= 0 {
+        config.pinned_level = u32::try_from(pinned).ok();
+    }
     // The USD decree: the whole frame as fine as its nearest tile, meshes
     // and imagery both — LOD boundaries are walls across a rendered image.
     // TUILE_UNIFORM_RADIUS sizes the uniform disc (multiples of the nearest
@@ -990,6 +1026,36 @@ fn drape_key(
 
 #[cfg(test)]
 mod tests {
+
+    /// The imagery level follows the camera's height above the **ellipsoid**.
+    ///
+    /// It followed `|position| − equatorial radius`, which at 42.5° N is 9.7 km
+    /// short — negative for any camera below that, where `.max(1.0)` turned it
+    /// into one metre. A camera 5 km up therefore asked for a texel spacing of
+    /// 0.86 mm: the finest imagery the source has, over every tile in the
+    /// frame. Measured 2026-09-09, it took a container to its 6 GB ceiling.
+    #[test]
+    fn the_texel_target_follows_the_height_above_the_ellipsoid() {
+        let camera = tuile_core::geo::geodetic_to_ecef(tuile_core::geo::Geodetic {
+            lon: 2.17_f64.to_radians(),
+            lat: 42.52_f64.to_radians(),
+            height: 5_000.0,
+        });
+        let view = ViewStateParams {
+            position: camera,
+            direction: -camera.normalize(),
+            up: glam::DVec3::Z,
+            viewport_px: glam::DVec2::new(1280.0, 960.0),
+            fovy_rad: 45f64.to_radians(),
+        };
+        let spacing = target_texel_spacing(&[view]).expect("a view says something");
+        // 2 · 5000 · tan(22.5°) / 960 ≈ 4.31 m per texel.
+        assert!(
+            (spacing - 4.31).abs() < 0.05,
+            "texel target is {spacing} m — a camera five kilometres up wants \
+             metres per texel, not fractions of a millimetre"
+        );
+    }
     use super::*;
     use tuile_core::content::DecodedTexture;
 

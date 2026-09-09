@@ -132,10 +132,16 @@ fn matrix_literal(rows: &[[f64; 4]; 4]) -> String {
     )
 }
 
-/// WGS84 equatorial radius, metres. Used only to estimate altitude for the
-/// clipping range — a camera position, never geometry — so the sphere/ellipsoid
-/// difference (≤ 21 km) is absorbed by the clamp below.
-const EARTH_RADIUS: f64 = 6_378_137.0;
+/// A number a job can override without a rebuild.
+///
+/// Same shape as `tuile-hydra`'s: unset or unparseable keeps the default, so a
+/// typo degrades to the built-in rather than to zero.
+fn env_knob<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<T>().ok())
+        .unwrap_or(default)
+}
 
 /// The camera's near/far for one frame, from its height over the ellipsoid.
 ///
@@ -146,13 +152,26 @@ const EARTH_RADIUS: f64 = 6_378_137.0;
 /// visible limb from geostationary, once, for every frame — it costs nothing
 /// and never truncates a horizon.
 fn clipping_range(position: [f64; 3]) -> (f64, f64) {
-    let r = (position[0] * position[0]
-        + position[1] * position[1]
-        + position[2] * position[2])
-        .sqrt();
-    let altitude = (r - EARTH_RADIUS).max(10.0);
-    let near = (0.05 * altitude).clamp(0.5, 100_000.0);
-    (near, 60_000_000.0)
+    // Height above the ELLIPSOID, not above a sphere of the equatorial radius.
+    //
+    // The constant that stood here came with a comment saying the
+    // sphere/ellipsoid difference was "absorbed by the clamp below". It was
+    // absorbed the way a fuse absorbs a short circuit: at 42.5° N the
+    // ellipsoid's radius is 9.7 km smaller than the equatorial one, so the
+    // subtraction is 9.7 km short and goes negative for any camera below that.
+    // The clamp then returned 10 m for a camera 5 km up, and near came out at
+    // 0.5 m against a far of 60 000 km — a ratio of 1.2e8, which is precisely
+    // the depth-buffer collapse the note below is about.
+    let altitude = tuile_core::geo::ecef_to_geodetic(glam::DVec3::from_array(position))
+        .height
+        .max(10.0);
+    // Both ends are knobs, because both have been suspected of the black band
+    // and neither could be tested without regenerating a manifest and
+    // rebuilding an image. A number nobody can vary is a number nobody can
+    // rule out.
+    let fraction = env_knob("TUILE_CLIP_NEAR_FRACTION", 0.05);
+    let near = (fraction * altitude).clamp(0.5, 100_000.0);
+    (near, env_knob("TUILE_CLIP_FAR", 60_000_000.0))
 }
 
 /// The focal length (mm) that reproduces a vertical field of view on a 24 mm
@@ -326,6 +345,46 @@ pub fn write_manifest(
 
 #[cfg(test)]
 mod tests {
+
+    /// A camera five kilometres up gets a near plane sized for five
+    /// kilometres, not for ten metres.
+    ///
+    /// It did not. The altitude came from `|position| − equatorial radius`,
+    /// which at 42.5° N is 9.7 km short and therefore **negative** for this
+    /// camera; the `.max(10.0)` turned that into ten metres, and near into
+    /// 0.5 m against a far of 60 000 km. A near/far ratio of 1.2e8 is the
+    /// depth-buffer collapse this function exists to avoid — it was producing
+    /// the very thing it was written to prevent, and the clamp made it look
+    /// deliberate.
+    #[test]
+    fn the_near_plane_follows_the_height_above_the_ellipsoid() {
+        // 5 km over the Pyrenees, where the two radii differ most sharply.
+        let camera = tuile_core::geo::geodetic_to_ecef(tuile_core::geo::Geodetic {
+            lon: 2.17_f64.to_radians(),
+            lat: 42.52_f64.to_radians(),
+            height: 5_000.0,
+        });
+        let (near, far) = clipping_range([camera.x, camera.y, camera.z]);
+        assert!(
+            (near - 250.0).abs() < 1.0,
+            "near is {near} m — 5 % of five kilometres is 250"
+        );
+        assert!(
+            far / near < 1.0e6,
+            "near/far is {:.0e}, back in the range where an f32 depth buffer \
+             collapses and every LOD boundary z-fights",
+            far / near
+        );
+
+        // And the spherical reading, kept as a measurement: it is how far off
+        // the old one was that makes this worth a test.
+        let spherical = camera.length() - 6_378_137.0;
+        assert!(
+            spherical < 0.0,
+            "the equatorial radius no longer overshoots here ({spherical:.0} m) \
+             — this test is no longer about anything"
+        );
+    }
     use super::*;
 
     fn looking_down_x(position: [f64; 3]) -> Frame {
