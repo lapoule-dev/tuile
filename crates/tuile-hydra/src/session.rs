@@ -515,8 +515,40 @@ impl Session {
         loader: Arc<dyn TileLoader>,
         config: SessionConfig,
     ) -> std::io::Result<Self> {
-        let (stream, server) =
-            in_process_with(tree, loader, exact_traversal(config.traversal.clone()));
+        let traversal = exact_traversal(config.traversal.clone());
+        // Every knob that can move a selection, once, at the top of the
+        // stream. A run that differs because it was configured differently is
+        // not the bug worth chasing, and this is what tells the two apart
+        // before any time is spent.
+        tuile_core::det!(
+            "config",
+            max_sse = traversal.maximum_screen_space_error,
+            cull = traversal.cull,
+            horizon = traversal.horizon_culling,
+            uniform = traversal.uniform_detail,
+            uniform_radius = traversal.uniform_detail_radius,
+            forbid_holes = traversal.forbid_holes,
+            stand_ins = traversal.stand_ins,
+            pinned_level = traversal.pinned_level,
+            budget = traversal.resident_budget_bytes,
+            fetches = traversal.maximum_simultaneous_fetches,
+            descendant_limit = traversal.loading_descendant_limit,
+            preload_siblings = traversal.preload_siblings,
+            occluder = tree.occluder().map(|o| o.radius),
+            bake_max = config.bake_max_size,
+        );
+        // Said once per session, because both halves of a cull can be right on
+        // their own and still not be joined: the traversal can be told to cull
+        // against an occluder the tree never offers, and the only symptom is a
+        // selection that reaches the far side of the planet with nothing in
+        // the logs to say why.
+        tracing::info!(
+            cull = traversal.cull,
+            horizon_culling = traversal.horizon_culling,
+            occluder = ?tree.occluder(),
+            "traversal culling"
+        );
+        let (stream, server) = in_process_with(tree, loader, traversal);
 
         // The server runs on its own runtime handle so a frame call can block
         // the calling thread — which is what Hydra's cook wants — without
@@ -561,6 +593,32 @@ impl Session {
                 tracing::info!(spacing, forced = forced.is_some(), "imagery texel target");
                 detail.set_target_texel_spacing(spacing);
             }
+        }
+        // The view this frame is a function of, printed before anything reads
+        // it and in a form that round-trips. When two runs disagree about an
+        // image, the first thing to rule out is that they were handed
+        // different cameras — and ruling it out by argument rather than by
+        // measurement is how a whole afternoon went into the wrong suspect.
+        for v in &views {
+            // Component by component rather than as one Debug string: a
+            // camera that drifted in its third decimal is a different camera,
+            // and a diff should say which axis moved.
+            tuile_core::det!(
+                "view",
+                gen = self.generation + 1,
+                pos_x = v.position.x,
+                pos_y = v.position.y,
+                pos_z = v.position.z,
+                dir_x = v.direction.x,
+                dir_y = v.direction.y,
+                dir_z = v.direction.z,
+                up_x = v.up.x,
+                up_y = v.up.y,
+                up_z = v.up.z,
+                fovy = v.fovy_rad,
+                vp_w = v.viewport_px.x,
+                vp_h = v.viewport_px.y,
+            );
         }
         let views: Vec<ViewState> = views.into_iter().map(Into::into).collect();
 
@@ -609,10 +667,29 @@ impl Session {
         });
         match pumped {
             Ok(Ok(())) => {}
+            // The stream closing on us is normally "the server went away", and
+            // was reported as exactly that — which is useless when the server
+            // has just told us, in the message before it stopped, which tile it
+            // could not load and why. A tile failure now ENDS the session (see
+            // `GeometryServer::fail`), so this is the ordinary path for it, and
+            // the reason has to survive the closure.
+            Ok(Err(_closed)) if !errors.is_empty() => {}
             Ok(Err(_closed)) => return Err(FrameError::ServerGone),
             Err(_elapsed) => return Err(FrameError::TimedOut(timeout)),
         }
 
+        tuile_core::det!(
+            "converged",
+            gen = generation,
+            selected = self.scene.selected().len(),
+            sel_digest = tuile_core::determinism::digest(
+                self.scene.selected().iter().map(|(t, _)| t.0)
+            ),
+            resident = self.resident.len(),
+            errors = errors.len(),
+            deferred = self.scene.stats().deferred_subtrees,
+            gaps = self.scene.stats().gaps,
+        );
         if self.config.fail_on_tile_errors && !errors.is_empty() {
             let first = errors
                 .first()
@@ -689,6 +766,18 @@ async fn converge(
             return Err(StreamError::Closed);
         };
         scene.apply(&message);
+        // The pump's own view of convergence, message by message. `complete`
+        // is the condition that ENDS a frame, so a run that saw it one message
+        // earlier than another kept a different selection — and that is
+        // invisible from anywhere else.
+        tuile_core::det!(
+            "pump",
+            gen_seen = scene.generation(),
+            gen_want = generation,
+            complete = scene.is_complete(),
+            selected = scene.selected().len(),
+            resident = resident.len(),
+        );
         match message {
             // Once per residency, and never again — so this is the only
             // moment a tile can be taken in.
@@ -780,10 +869,35 @@ fn exact_traversal(mut config: Config) -> Config {
     // client (keep-alive per host, HTTP/2 multiplexing) rather than dribble
     // tiles 64 at a time through a knob sized for a viewer's frame budget.
     config.maximum_simultaneous_fetches = env_knob("TUILE_FETCHES", 256).max(1);
+    // Never give up on a subtree, however long it takes.
+    //
+    // The last interactive kindness in this list, and the one that cost the
+    // most. A hold waiting on more than `loading_descendant_limit`
+    // not-yet-drawable descendants cancels the whole subtree's requests and
+    // asks for one coarse ancestor instead — the right trade for a viewer,
+    // where a coarse picture now beats a sharp one in seven seconds.
+    //
+    // It is a decision taken on `waiting`, which counts what has not arrived
+    // *yet*: the network chooses. And because cancelling those requests can
+    // take the pass's request count to zero, it does not merely coarsen the
+    // frame — it can END it, on the coarse answer, reporting a clean
+    // convergence with no gaps and no errors. Measured on 2026-09-08: six runs
+    // of one frame on one pod, same binary, same warm cache, five selecting 106
+    // tiles and one selecting 7, indistinguishable from the outside.
+    //
+    // A bulk frame has no "while". It converges or it fails, and what it
+    // converges on must not depend on how fast the tiles came.
+    config.loading_descendant_limit = u32::MAX;
     // The USD decree: the whole frame as fine as its nearest tile, meshes
     // and imagery both — LOD boundaries are walls across a rendered image.
     // TUILE_UNIFORM_RADIUS sizes the uniform disc (multiples of the nearest
     // content distance); 0 disables uniform detail, plain concentric SSE.
+    // TUILE_NO_HORIZON_CULL=1 keeps the far side of the planet, the same
+    // escape hatch the viewer carries. When ground goes missing, each of the
+    // two things that can remove it without being asked has to be switchable
+    // off on its own — and it is also the only way to measure what the cull is
+    // actually worth on a real frame.
+    config.horizon_culling = std::env::var("TUILE_NO_HORIZON_CULL").is_err();
     let radius: f64 = env_knob("TUILE_UNIFORM_RADIUS", 8.0);
     config.uniform_detail = radius > 0.0;
     if config.uniform_detail {
