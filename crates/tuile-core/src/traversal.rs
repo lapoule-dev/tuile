@@ -9,7 +9,7 @@
 //! streaming sessions share one immutable tile arena (see
 //! `docs/10-crate-core.md`, « Décisions tranchées »).
 
-use crate::math::Frustum;
+use crate::math::{Frustum, Occluder};
 use crate::source::{TileId, TileTree};
 use crate::tileset::Refine;
 use glam::{DMat4, DVec2, DVec3};
@@ -236,6 +236,14 @@ pub struct Config {
     /// the first thing to rule out when geometry goes missing, and ruling it out
     /// by measurement rather than by reading the frustum test is worth a flag.
     pub cull: bool,
+    /// Whether to drop tiles the dataset's own occluder hides — the far side of
+    /// a planet, in practice. Ignored by a tree that has no occluder.
+    ///
+    /// A flag for the same reason `cull` is one: when ground goes missing, the
+    /// two things that can make ground disappear without anyone asking must be
+    /// switchable off, one at a time, so the answer comes from a measurement
+    /// rather than from re-reading the geometry.
+    pub horizon_culling: bool,
     /// How many not-yet-drawable descendants a held REPLACE will wait for
     /// before giving up on them and asking for itself instead.
     ///
@@ -375,6 +383,7 @@ impl Default for Config {
             uniform_detail: false,
             uniform_detail_radius: 8.0,
             cull: true,
+            horizon_culling: true,
             loading_descendant_limit: 20,
             resident_budget_bytes: 512 * 1024 * 1024,
             maximum_simultaneous_fetches: 20,
@@ -407,6 +416,14 @@ impl ResidencyView {
     }
     pub fn iter(&self) -> impl Iterator<Item = TileId> + '_ {
         self.resident.iter().copied()
+    }
+    /// How much content is held. Read by the pass trace, where the residency
+    /// at the moment of a traversal is half the explanation of its outcome.
+    pub fn len(&self) -> usize {
+        self.resident.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.resident.is_empty()
     }
 }
 
@@ -504,6 +521,18 @@ pub fn traverse(
     let uniform_distance = config
         .uniform_detail
         .then(|| nearest_content_distance(tree, views));
+    let occluder = config.horizon_culling.then(|| tree.occluder()).flatten();
+    // The two scene-wide numbers every per-tile decision below is measured
+    // against. `d_near` walks the tree to find the deepest content on the
+    // greedy path, so it moves as availability arrives — and it scales the
+    // whole uniform disc, which makes it a single number capable of changing
+    // every SSE in the pass at once.
+    crate::det!(
+        "traverse",
+        roots = roots.len(),
+        d_near = uniform_distance,
+        occluder = occluder.map(|o| o.radius),
+    );
 
     let mut requested = HashMap::new();
     for root in roots {
@@ -514,6 +543,7 @@ pub fn traverse(
             config,
             rendered_last,
             uniform_distance,
+            occluder.as_ref(),
             root,
             0,
             out,
@@ -670,6 +700,7 @@ fn visit(
     config: &Config,
     rendered_last: &HashSet<TileId>,
     uniform_distance: Option<f64>,
+    occluder: Option<&Occluder>,
     id: TileId,
     depth: u32,
     out: &mut TraversalOutput,
@@ -679,14 +710,28 @@ fn visit(
     out.stats.visited += 1;
     out.stats.max_depth = out.stats.max_depth.max(depth);
 
-    // Frustum culling: a tile invisible in every view contributes nothing
-    // and never blocks an ancestor's REPLACE.
+    // Culling: a tile invisible in every view contributes nothing and never
+    // blocks an ancestor's REPLACE.
+    //
+    // Invisible in two ways, and both are needed. Outside the frustum is the
+    // obvious one. Behind the planet is the one that was missing, and on a
+    // globe it is the larger of the two by far: a frustum from near the ground
+    // passes through the planet and comes out the other side, so the far
+    // hemisphere is *inside* it and passes the first test. See [`Occluder`].
     if config.cull
-        && !views
-            .iter()
-            .any(|v| props.bounding_volume.intersects_frustum(v.frustum()))
+        && !views.iter().any(|v| {
+            props.bounding_volume.intersects_frustum(v.frustum())
+                && !occluder
+                    .is_some_and(|o| o.hides(&props.bounding_volume, v.position()))
+        })
     {
         out.stats.culled += 1;
+        crate::det!(
+            "tile",
+            id = id.0,
+            depth = depth,
+            act = "cull",
+        );
         // A tile just outside the frustum is what a pan or a rotation brings in
         // next. Loading it now is the difference between turning onto ground
         // that is already there and turning onto ground that starts arriving.
@@ -747,6 +792,24 @@ fn visit(
     let children = tree.children(id);
     let has_content = props.has_content;
     let has_children = !children.is_empty();
+    // Everything the decision below is a function of, per tile.
+    //
+    // `children` is the field this exists for: it is answered by the terrain
+    // availability, which GROWS as tiles land. A tile that reported no
+    // children on one pass and four on the next is the tree changing shape
+    // under the traversal — the whole reason two runs of one frame can
+    // disagree — and nothing else in the trace can show it.
+    crate::det!(
+        "tile",
+        id = id.0,
+        depth = depth,
+        act = "look",
+        sse = sse,
+        ge = props.geometric_error,
+        children = children.len(),
+        content = has_content,
+        resident = residency.is_resident(id),
+    );
     // Refine when too coarse — or when there is nothing to render here
     // (structural empty tiles always descend).
     let refines = has_children && (sse > config.maximum_screen_space_error || !has_content);
@@ -787,6 +850,7 @@ fn visit(
             // frame without reading anything; the line is what says which
             // ground, when someone is looking at a hole and wants to know.
             out.stats.gaps += 1;
+            crate::det!("tile", id = id.0, depth = depth, act = "bare");
             tracing::debug!(
                 ?id,
                 depth,
@@ -795,6 +859,7 @@ fn visit(
             return Visit::READY_BUT_BARE;
         }
         if residency.is_resident(id) {
+            crate::det!("tile", id = id.0, depth = depth, act = "select", sse = sse);
             out.selected.push((id, sse));
             return if rendered_last.contains(&id) {
                 Visit::drawn()
@@ -802,6 +867,7 @@ fn visit(
                 Visit::READY
             };
         }
+        crate::det!("tile", id = id.0, depth = depth, act = "want", sse = sse);
         request(out, requested, id, PriorityGroup::Urgent, priority);
         return Visit::waiting_on_one();
     }
@@ -831,6 +897,7 @@ fn visit(
                     config,
                     rendered_last,
                     uniform_distance,
+                    occluder,
                     child,
                     depth + 1,
                     out,
@@ -866,6 +933,7 @@ fn visit(
                     config,
                     rendered_last,
                     uniform_distance,
+                    occluder,
                     child,
                     depth + 1,
                     out,
@@ -1049,6 +1117,122 @@ mod tests {
     use crate::tileset::Tileset;
     use glam::{dvec2, dvec3};
     use url::Url;
+
+    /// Two leaves on a planet: one under the eye, one on the far side. Both
+    /// inside the frustum, only one of them visible.
+    struct PlanetTree {
+        radius: f64,
+    }
+
+    impl PlanetTree {
+        /// A tile centred at `angle` round the equator from the sub-eye point.
+        fn at(&self, angle_deg: f64) -> crate::math::BoundingVolume {
+            let a = angle_deg.to_radians();
+            crate::math::BoundingVolume::Sphere(crate::math::Sphere {
+                center: dvec3(self.radius * a.cos(), self.radius * a.sin(), 0.0),
+                radius: 1_000.0,
+            })
+        }
+    }
+
+    impl crate::source::TileTree for PlanetTree {
+        fn roots(&self) -> Vec<TileId> {
+            vec![TileId(0), TileId(1)]
+        }
+        fn children(&self, _id: TileId) -> Vec<TileId> {
+            Vec::new()
+        }
+        fn properties(&self, id: TileId) -> crate::source::TileProperties {
+            crate::source::TileProperties {
+                bounding_volume: self.at(if id == TileId(0) { 0.0 } else { 150.0 }),
+                geometric_error: 0.0,
+                refine: crate::tileset::Refine::Replace,
+                has_content: true,
+            }
+        }
+        fn occluder(&self) -> Option<Occluder> {
+            Some(Occluder {
+                center: DVec3::ZERO,
+                radius: self.radius,
+            })
+        }
+    }
+
+    /// Ground behind the planet is not selected, and the traversal has to be
+    /// *told* about the planet for that to happen.
+    ///
+    /// This is the test that was missing when the cull was written. The maths
+    /// had its own tests and they passed; the cull still did nothing on a real
+    /// frame, because nothing checked that the two ends were joined. A unit
+    /// test of a predicate is not a test of a decision.
+    #[test]
+    fn the_far_side_of_the_planet_is_not_selected() {
+        const R: f64 = 6_356_752.0;
+        let tree = PlanetTree { radius: R };
+        // Both resident: a tile that is not resident is *requested*, never
+        // selected, and the question here is which ground gets drawn.
+        let mut residency = ResidencyView::default();
+        residency.insert(TileId(0));
+        residency.insert(TileId(1));
+        // Eye 5 km up, looking straight down through the planet, so that BOTH
+        // tiles are inside the frustum — otherwise the frustum alone would
+        // drop the far one and the test would prove nothing.
+        let views = vec![ViewState::perspective(
+            dvec3(R + 5_000.0, 0.0, 0.0),
+            dvec3(-1.0, 0.0, 0.0),
+            dvec3(0.0, 0.0, 1.0),
+            dvec2(1024.0, 1024.0),
+            60.0f64.to_radians(),
+        )];
+        let far = tree.properties(TileId(1)).bounding_volume;
+        assert!(
+            far.intersects_frustum(views[0].frustum()),
+            "the fixture is wrong: the far tile has to be inside the frustum"
+        );
+
+        let rendered_last = HashSet::new();
+        let mut out = TraversalOutput::default();
+        traverse(
+            &tree,
+            &residency,
+            &views,
+            &Config::default(),
+            0,
+            &rendered_last,
+            &mut out,
+        );
+        let selected: HashSet<TileId> = out.selected.iter().map(|(t, _)| *t).collect();
+        assert!(
+            selected.contains(&TileId(0)),
+            "the ground under the camera has to be selected"
+        );
+        assert!(
+            !selected.contains(&TileId(1)),
+            "ground on the far side of the planet was selected"
+        );
+
+        // And with the cull switched off it comes back, which is what makes
+        // the assertion above about the cull rather than about the fixture.
+        let mut out = TraversalOutput::default();
+        traverse(
+            &tree,
+            &residency,
+            &views,
+            &Config {
+                horizon_culling: false,
+                ..Config::default()
+            },
+            0,
+            &rendered_last,
+            &mut out,
+        );
+        let selected: HashSet<TileId> = out.selected.iter().map(|(t, _)| *t).collect();
+        assert!(
+            selected.contains(&TileId(1)),
+            "with horizon culling off the far side must come back, or this \
+             test is measuring something else"
+        );
+    }
 
     /// Root sphere (radius 100) with four leaf children (radius 30) laid out
     /// in the Z=0 plane. REPLACE refinement, leaves have geometricError 0.
@@ -1337,6 +1521,104 @@ mod tests {
         assert_eq!(
             out.requests[0].tile, cheapest.tile,
             "the first request must be the cheapest by the heuristic"
+        );
+    }
+
+    /// Drives a session to a fixed point the way the server does, and returns
+    /// what it settled on.
+    ///
+    /// Traverse, "load" some of what was asked for, traverse again with that
+    /// pass as `rendered_last`, and stop when a pass asks for nothing — which
+    /// is exactly `SceneState::is_complete` (`drive.rs`: `pending == 0`, and
+    /// `pending` is the pass's `requests.len()`).
+    ///
+    /// `per_round` is the network: how many of the wanted tiles land between
+    /// two passes. A fast link delivers more per pass than a slow one, and a
+    /// loaded farm node less than an idle one. Nothing about the *frame*
+    /// changes with it.
+    #[allow(clippy::panic, reason = "a fixture that never settles is a bug")]
+    fn converge_like_the_server(
+        ts: &Tileset,
+        views: &[ViewState],
+        config: &Config,
+        per_round: usize,
+    ) -> Vec<TileId> {
+        let mut residency = ResidencyView::default();
+        let mut rendered_last: HashSet<TileId> = HashSet::new();
+        for _ in 0..2000 {
+            let out = run_with(ts, &residency, views, config, &rendered_last);
+            if out.requests.is_empty() {
+                return ids(&out.selected);
+            }
+            rendered_last = out.selected.iter().map(|(t, _)| *t).collect();
+            for req in out.requests.iter().take(per_round) {
+                residency.insert(req.tile);
+            }
+        }
+        panic!("the session never reached a fixed point");
+    }
+
+    /// **The same frame must select the same ground however fast the tiles
+    /// arrive.**
+    ///
+    /// This is the contract `docs/15` rests on — a frame is a function of
+    /// (stage, time), which is what lets a farm split one shot across sixteen
+    /// processes and expect one film back. It was false. Measured on 2026-09-08
+    /// over six runs of one frame on one pod, same binary, same warm cache:
+    /// five selected 106 tiles, one selected 7, and every one of them reported
+    /// a clean convergence — no gaps, no errors, nothing downstream able to
+    /// tell them apart.
+    ///
+    /// The cause is `loading_descendant_limit`, a few lines above. A hold
+    /// waiting on more than N not-yet-drawable descendants cancels its whole
+    /// subtree's requests and asks for one coarse ancestor instead. `waiting`
+    /// counts what has not arrived *yet*, so the decision is a function of the
+    /// network — and cancelling those requests can drop `requests.len()` to
+    /// zero, ending the frame on the coarse answer. Both outcomes are
+    /// self-consistent, which is why nothing caught it.
+    ///
+    /// Here it costs a factor of sixty: four tiles per round settles on 960,
+    /// sixteen per round settles on 16, from one tileset and one camera.
+    ///
+    /// That trade is right for a viewer and wrong for a render, which is why
+    /// `exact_traversal` turns it off with the other interactive kindnesses.
+    #[test]
+    fn the_same_frame_selects_the_same_ground_however_fast_tiles_arrive() {
+        let ts = deep_tileset(5);
+        let views = [camera_at(120.0)];
+
+        // The render's settings: a bulk frame has no "while", so it never
+        // trades sharpness for speed and never lets the network choose.
+        let exact = Config {
+            loading_descendant_limit: u32::MAX,
+            ..Config::default()
+        };
+        let slow = converge_like_the_server(&ts, &views, &exact, 4);
+        let fast = converge_like_the_server(&ts, &views, &exact, 16);
+        assert_eq!(
+            crate::determinism::digest(slow.iter().map(|t| t.0)),
+            crate::determinism::digest(fast.iter().map(|t| t.0)),
+            "the network chose the ground: {} tiles at four per round against \
+             {} at sixteen",
+            slow.len(),
+            fast.len(),
+        );
+
+        // And the fixture has to actually exercise the trade, or the assertion
+        // above is about nothing: with the interactive limit the two rates must
+        // still disagree. If this ever stops holding, the test has gone quiet
+        // rather than green.
+        let interactive = Config {
+            loading_descendant_limit: 20,
+            ..Config::default()
+        };
+        let slow_i = converge_like_the_server(&ts, &views, &interactive, 4);
+        let fast_i = converge_like_the_server(&ts, &views, &interactive, 16);
+        assert_ne!(
+            crate::determinism::digest(slow_i.iter().map(|t| t.0)),
+            crate::determinism::digest(fast_i.iter().map(|t| t.0)),
+            "the interactive limit no longer makes arrival rate matter — this \
+             test can no longer tell whether the render's setting does anything"
         );
     }
 

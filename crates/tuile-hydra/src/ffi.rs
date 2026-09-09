@@ -239,10 +239,28 @@ pub unsafe extern "C" fn tuile_session_new(
         static LOGGING: std::sync::Once = std::sync::Once::new();
         LOGGING.call_once(|| {
             if let Ok(filter) = std::env::var("TUILE_LOG") {
-                let _ = tracing_subscriber::fmt()
+                let json = std::env::var("TUILE_LOG_FORMAT")
+                    .map(|f| f.eq_ignore_ascii_case("json"))
+                    .unwrap_or(false);
+                let base = tracing_subscriber::fmt()
                     .with_env_filter(filter)
-                    .with_writer(std::io::stderr)
-                    .try_init();
+                    .with_writer(std::io::stderr);
+                // A real JSON *formatter*, not JSON hand-rolled into the
+                // message. The determinism trace exists to be compared by a
+                // program (see `tuile_core::determinism`), and a program
+                // should not have to grep an object back out of a log line —
+                // which is what the first version made it do, and which fails
+                // the moment any other message contains a brace.
+                if json {
+                    let _ = base
+                        .json()
+                        .with_current_span(false)
+                        .with_span_list(false)
+                        .flatten_event(true)
+                        .try_init();
+                } else {
+                    let _ = base.try_init();
+                }
             }
         });
         unsafe { *out = std::ptr::null_mut() };
