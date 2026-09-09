@@ -27,9 +27,6 @@ const FRAMES: usize = 96;
 const RADIUS: f64 = 8_000.0;
 const ALTITUDE: f64 = 5_000.0;
 
-/// WGS84 equatorial radius. Sphere rather than ellipsoid: this positions a
-/// camera, and the difference never reaches a pixel.
-const EARTH: f64 = 6_378_137.0;
 
 fn normalize(v: [f64; 3]) -> [f64; 3] {
     let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-12);
@@ -61,11 +58,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The local frame at the target: zenith, then east/north on the tangent
     // plane. Everything the orbit does is a rotation in that plane.
-    let target = [
-        EARTH * lat.cos() * lon.cos(),
-        EARTH * lat.cos() * lon.sin(),
-        EARTH * lat.sin(),
-    ];
+    // On the ellipsoid, at the latitude and longitude that were asked for.
+    //
+    // This used to place the target on a SPHERE of the equatorial radius,
+    // with the geodetic latitude used as if it were geocentric. Both are
+    // wrong, and not by a little: the equatorial radius is 9.7 km larger than
+    // the ellipsoid's radius at 42.52° N, and using the geodetic latitude as a
+    // geocentric one moves the point 0.19° — about 21 km — north. Together they
+    // put the orbit centre 14.8 km above the ground (measured on the manifest,
+    // 2026-09-09), so a camera asked to fly 5 km over the Pyrenees flew at
+    // 14.8 km over somewhere else — and every screen-space error in the frame
+    // was computed from that altitude.
+    let target = {
+        let p = tuile_core::geo::geodetic_to_ecef(tuile_core::geo::Geodetic {
+            lon,
+            lat,
+            height: 0.0,
+        });
+        [p.x, p.y, p.z]
+    };
     let zenith = normalize(target);
     let east = normalize(cross([0.0, 0.0, 1.0], zenith));
     let north = cross(zenith, east);
@@ -101,4 +112,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         lat.to_degrees()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use tuile_core::geo::{ecef_to_geodetic, geodetic_to_ecef, Geodetic};
+
+    /// The camera flies where the command line said, on the ellipsoid.
+    ///
+    /// It did not. The target was placed on a sphere of the equatorial radius
+    /// with the geodetic latitude used as a geocentric one, so
+    /// `orbit-tape … 2.17 42.52 8000 5000` — five kilometres over the
+    /// Pyrenees — produced a camera at **14 799 m** over a point **0.19°**
+    /// further north. Nothing downstream could notice: the manifest is exact,
+    /// the render is exact, and the shot is simply of somewhere else, three
+    /// times too high. Every screen-space error in the frame was computed from
+    /// that altitude.
+    #[test]
+    fn the_orbit_centre_sits_on_the_ellipsoid_where_it_was_asked_to() {
+        let (lon_deg, lat_deg) = (2.17_f64, 42.52_f64);
+        let target = geodetic_to_ecef(Geodetic {
+            lon: lon_deg.to_radians(),
+            lat: lat_deg.to_radians(),
+            height: 0.0,
+        });
+        let back = ecef_to_geodetic(target);
+        assert!(
+            back.height.abs() < 1.0,
+            "the orbit centre is {:.1} m off the surface",
+            back.height
+        );
+        assert!(
+            (back.lat.to_degrees() - lat_deg).abs() < 1e-6,
+            "latitude drifted to {:.4}",
+            back.lat.to_degrees()
+        );
+
+        // The size of the old error, measured rather than described: the
+        // ellipsoid's own radius at this latitude, against the equatorial one
+        // the sphere used.
+        const EQUATORIAL: f64 = 6_378_137.0;
+        let radius_here =
+            (target.x * target.x + target.y * target.y + target.z * target.z).sqrt();
+        let lifted = EQUATORIAL - radius_here;
+        assert!(
+            lifted > 9_000.0,
+            "the sphere lifted the target {lifted:.0} m, not the 9.7 km measured"
+        );
+    }
 }
