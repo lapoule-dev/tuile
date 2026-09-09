@@ -24,6 +24,8 @@
 #   JOB_OUT            final video path          (default /out/render.mp4)
 #   JOB_UPLOAD_PUT_URL if set: curl -T the finished video to this presigned
 #                      URL (no credential ever reaches the pod)
+#   JOB_TRACE_PUT_URL  if set: the per-process determinism traces, gathered
+#                      into one trace.tar.gz and shipped the same way
 #   JOB_SSH_PUBKEY     if set: start sshd with this authorized key
 #
 # Contract, exact-or-die: the GPU probe must match JOB_GPUS or the job bails
@@ -128,7 +130,8 @@ for i in $(seq 0 $((jobs - 1))); do
         --frames "$a:$b" --width "$JOB_WIDTH" \
         --samples "$JOB_SAMPLES" --adaptive-threshold "$JOB_THRESHOLD" \
         --batch-frames "$JOB_BATCH_FRAMES" $JOB_EXTRA_ARGS \
-        --out "$outdir/s$i" --video "$outdir/seg$i.mp4" 2>&1 \
+        --out "$outdir/s$i" --video "$outdir/seg$i.mp4" \
+        2> "$outdir/trace-s$i.jsonl" \
         | grep --line-buffered -vE '^(Fra:|Saved:|Time:|Append frame)' \
         | sed -u "s/^/[gpu$gpu-j$i] /" &
 done
@@ -145,6 +148,24 @@ for i in $(seq 0 $((jobs - 1))); do
             "$outdir/seg$i.mp4" > /dev/null 2>&1 && rm -f "$outdir/s$i".*.png
     fi
 done
+# The determinism traces, gathered before anything is cleaned up.
+#
+# One file per process, so a comparison can look at one segment at a time.
+# Compressed because the tile-level trace runs 250-355 MB per frame in the
+# clear, and shipped only when asked for — the whole thing exists to answer
+# "why did these two runs of one frame disagree", which cannot be answered
+# once the pod is gone (measured the hard way, 2026-09-08).
+if [ -n "${JOB_TRACE_PUT_URL:-}" ] && ls "$outdir"/trace-s*.jsonl > /dev/null 2>&1; then
+    if tar czf "$outdir/trace.tar.gz" -C "$outdir" $(cd "$outdir" && ls trace-s*.jsonl); then
+        echo "trace: $(du -h "$outdir/trace.tar.gz" | cut -f1)"
+        if curl -fsS -T "$outdir/trace.tar.gz" "$JOB_TRACE_PUT_URL" > /dev/null; then
+            echo TRACE-UPLOAD-DONE
+        else
+            echo TRACE-UPLOAD-FAILED
+        fi
+    fi
+fi
+
 n=$(ls "$outdir"/seg*.mp4 2>/dev/null | wc -l)
 if [ "$n" = "$jobs" ]; then
     for i in $(seq 0 $((jobs - 1))); do echo "file '$outdir/seg$i.mp4'"; done > "$outdir/list.txt"

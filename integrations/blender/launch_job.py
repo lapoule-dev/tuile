@@ -21,8 +21,12 @@ import gzip
 import json
 import os
 import pathlib
+import secrets
+import subprocess
+import sys
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 
 API = "https://api.runpod.io/v2"
 
@@ -62,6 +66,153 @@ def call(key, method, path, body=None):
 # reste la source de vérité de la pile ; ECR est le miroir de livraison, et
 # c'est lui que tire un job.
 ECR_HOST = "057321054380.dkr.ecr.us-west-1.amazonaws.com"
+
+
+# ---------------------------------------------------------------- archive --
+# Un run qui ne laisse rien derrière lui ne se compare pas.
+#
+# Le 2026-09-08, six exécutions de la même frame sur un pod ont donné cinq fois
+# 106 tuiles et une fois 7 ; le pod a été supprimé et les 500 Mo de traces qui
+# contenaient la réponse sont partis avec lui. Depuis, chaque run dépose sous
+# un préfixe qui lui est propre :
+#
+#   renders/<run-id>/config.json     tout ce qui décide de l'image
+#   renders/<run-id>/render.mp4      le résultat
+#   renders/<run-id>/trace.tar.gz    la trace de déterminisme (avec --trace)
+#
+# Les identifiants ne quittent jamais le poste : le pod ne reçoit que des URL
+# présignées, comme le fait déjà `JOB_UPLOAD_PUT_URL` (voir render_job.sh).
+R2_BUCKET = os.environ.get("TUILE_R2_BUCKET", "stl-track-data")
+R2_ACCOUNT = os.environ.get("TUILE_R2_ACCOUNT", "a6d1085ef359ebcbdc45526c710912a4")
+R2_PREFIX = "renders"
+
+
+def git_state():
+    """Le commit de tuile et si l'arbre était sale — sans quoi `config.json`
+    ne dit pas quel code a produit l'image."""
+    root = pathlib.Path(__file__).resolve().parents[2]
+    def git(*a):
+        try:
+            return subprocess.run(["git", "-C", str(root), *a],
+                                  capture_output=True, text=True,
+                                  timeout=10).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    return {"commit": git("rev-parse", "HEAD"),
+            "short": git("rev-parse", "--short", "HEAD"),
+            "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+            "dirty": bool(git("status", "--porcelain"))}
+
+
+def run_id(git_info):
+    """Trié par ordre alphabétique = trié par date, et le commit se lit dans
+    le nom. Le suffixe aléatoire sépare deux runs de la même seconde."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    sha = git_info.get("short") or "nogit"
+    dirty = "-dirty" if git_info.get("dirty") else ""
+    return f"{stamp}-{sha}{dirty}-{secrets.token_hex(2)}"
+
+
+def image_digest(image):
+    """Le digest de l'image, pas seulement son tag — un tag bouge, et deux runs
+    du même tag peuvent être deux binaires. Au mieux : l'absence de digest
+    n'empêche pas de lancer, elle est dite."""
+    if ".dkr.ecr." not in image:
+        return None
+    repo, _, tag = image.partition(":")
+    repo = repo.split("/", 1)[1] if "/" in repo else repo
+    region = image.split(".dkr.ecr.", 1)[1].split(".", 1)[0]
+    try:
+        out = subprocess.run(
+            ["aws", "ecr", "describe-images",
+             "--profile", os.environ.get("TUILE_AWS_PROFILE", "sportstracklive"),
+             "--region", region, "--repository-name", repo,
+             "--image-ids", f"imageTag={tag or 'latest'}"],
+            capture_output=True, text=True, timeout=30)
+        if out.returncode != 0:
+            return None
+        return json.loads(out.stdout)["imageDetails"][0]["imageDigest"]
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError):
+        return None
+
+
+def r2_credentials():
+    """L'environnement d'abord, Pulumi ensuite — la même source que
+    `sportstracklive-rails/infra/ansible/run.sh`. Rien n'est écrit ni affiché."""
+    key = os.environ.get("R2_ACCESS_KEY_ID", "")
+    secret = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+    if key and secret:
+        return key, secret
+    pulumi_dir = os.environ.get("TUILE_PULUMI_DIR", "")
+    if pulumi_dir:
+        def cfg(name):
+            try:
+                out = subprocess.run(
+                    ["pulumi", "config", "get", "--stack", "prod",
+                     "-C", pulumi_dir, name],
+                    capture_output=True, text=True, timeout=30)
+                return out.stdout.strip() if out.returncode == 0 else ""
+            except (OSError, subprocess.SubprocessError):
+                return ""
+        key = key or cfg("r2_access_key_id")
+        secret = secret or cfg("r2_secret_access_key")
+    return key, secret
+
+
+def archive_urls(run, want_trace):
+    """Les URL présignées où le pod déposera, et le client pour y écrire
+    nous-mêmes le manifeste.
+
+    Échoue AVANT de créer le pod quand les identifiants manquent : payer une
+    heure de GPU pour découvrir que le résultat ne peut pas être déposé est
+    exactement ce que cette fonction existe pour empêcher."""
+    try:
+        import boto3
+        from botocore.config import Config as BotoConfig
+    except ImportError:
+        raise SystemExit(
+            "boto3 absent — il porte la présignature R2. `pip install boto3`, "
+            "ou --no-archive pour un run jetable dont rien ne sera gardé.")
+    key, secret = r2_credentials()
+    if not key or not secret:
+        raise SystemExit(
+            "identifiants R2 introuvables — exporte R2_ACCESS_KEY_ID et "
+            "R2_SECRET_ACCESS_KEY (ou TUILE_PULUMI_DIR pour les lire depuis "
+            "Pulumi comme le fait infra/ansible/run.sh), ou --no-archive.")
+    client = boto3.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT}.r2.cloudflarestorage.com",
+        aws_access_key_id=key, aws_secret_access_key=secret,
+        region_name="auto", config=BotoConfig(signature_version="s3v4"))
+    def put(name):
+        return client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": R2_BUCKET, "Key": f"{R2_PREFIX}/{run}/{name}"},
+            ExpiresIn=7 * 24 * 3600)
+    urls = {"video": put("render.mp4")}
+    if want_trace:
+        urls["trace"] = put("trace.tar.gz")
+    return client, urls
+
+
+SECRET_KEYS = ("TUILE_ION_TOKEN", "RUNPOD_API_KEY", "AWS_SECRET_ACCESS_KEY",
+               "R2_SECRET_ACCESS_KEY")
+
+
+def redacted(env):
+    """L'archive est durable et partagée : un jeton qui y entre n'en sort plus.
+
+    Les URL présignées sont expurgées aussi — elles portent une signature qui
+    autorise l'écriture, donc ce sont des secrets à durée limitée."""
+    out = {}
+    for k, v in env.items():
+        if k in SECRET_KEYS:
+            out[k] = "<expurgé>"
+        elif k.endswith("_PUT_URL") or k.endswith("_URL") and "X-Amz-Signature" in v:
+            out[k] = v.split("?", 1)[0] + "?<signature expurgée>"
+        else:
+            out[k] = v
+    return out
 
 
 def main():
@@ -118,6 +269,14 @@ def main():
     p.add_argument("--extra", default="", help="args supplémentaires de render_usd.py")
     p.add_argument("--ssh-pubkey", default="",
                    help="clé publique à autoriser (rapatriement scp)")
+    p.add_argument("--trace", action="store_true",
+                   help="active la trace de déterminisme sur le pod et la "
+                        "dépose en trace.tar.gz — 250-355 Mo par frame en "
+                        "clair, donc un instrument de diagnostic et non un "
+                        "réglage de production")
+    p.add_argument("--no-archive", action="store_true",
+                   help="ne rien déposer sur R2 : run jetable, dont ni la "
+                        "vidéo ni la configuration ne seront gardées")
     args = p.parse_args()
     if args.engine == "hydra" and args.image == p.get_default("image"):
         args.image = ECR_HOST + "/stl/blender-globe:5.1-su"
@@ -169,6 +328,10 @@ def main():
         env["JOB_SSH_PUBKEY"] = args.ssh_pubkey
     if args.upload_url:
         env["JOB_UPLOAD_PUT_URL"] = args.upload_url
+    if args.trace:
+        # Champs structurés + formateur JSON : voir tuile_core::determinism.
+        env["TUILE_LOG"] = "tuile_det=info"
+        env["TUILE_LOG_FORMAT"] = "json"
     if args.engine == "hydra":
         # The ion token travels env-to-env and is never printed; same .env
         # discipline as the API key.
@@ -193,6 +356,28 @@ def main():
         if not k or not v:
             raise SystemExit(f"--env attend K=V, reçu: {pair}")
         env[k] = v
+
+    # --- l'archive, avant toute création de pod ---------------------------
+    run, manifest_client, manifest = "", None, None
+    if not args.no_archive:
+        git_info = git_state()
+        run = run_id(git_info)
+        manifest_client, urls = archive_urls(run, args.trace)
+        if not args.upload_url:
+            env["JOB_UPLOAD_PUT_URL"] = urls["video"]
+        if args.trace:
+            env["JOB_TRACE_PUT_URL"] = urls["trace"]
+        manifest = {
+            "run_id": run,
+            "launched_utc": datetime.now(timezone.utc).isoformat(),
+            "argv": sys.argv[1:],
+            "git": git_info,
+            "image": args.image,
+            "image_digest": image_digest(args.image),
+            "pod_env": redacted(env),
+            "params": {k: v for k, v in vars(args).items()
+                       if k not in ("ssh_pubkey",)},
+        }
 
     gpu = {"id": args.gpu_type, "count": args.gpu_count}
     if not args.cuda_any:
@@ -226,6 +411,17 @@ def main():
             raise
     print(f"pod: {pod['id']}  {args.gpu_count}x {args.gpu_type} ({args.cloud})"
           f"  {pod.get('cost')} $/h")
+
+    if manifest is not None:
+        # Écrit APRÈS la création du pod, pour porter son identité : sans elle
+        # on ne peut pas relier une archive aux journaux du pod.
+        manifest["pod"] = {"id": pod["id"], "cost_per_hour": pod.get("cost"),
+                           "cloud": args.cloud}
+        manifest_client.put_object(
+            Bucket=R2_BUCKET, Key=f"{R2_PREFIX}/{run}/config.json",
+            Body=json.dumps(manifest, indent=2, sort_keys=True).encode(),
+            ContentType="application/json")
+        print(f"archive: s3://{R2_BUCKET}/{R2_PREFIX}/{run}/")
 
 
 if __name__ == "__main__":
