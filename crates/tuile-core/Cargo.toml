@@ -38,6 +38,9 @@ reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures-executor = { workspace = true }
+# Proving that the determinism trace really is machine-readable: a JSON
+# subscriber is installed in a test and its output parsed back.
+tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
