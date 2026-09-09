@@ -148,6 +148,9 @@ private:
         /// undergo, and the reason this is remembered.
         uint64_t drape = 0;
         bool textured = false;
+        /// Where the tile sits, in ECEF. Kept for the diagnostic that says how
+        /// far the selection actually reaches from the eye.
+        GfVec3d originEcef = GfVec3d(0.0);
         /// The first texture's `tuile://` URI, empty when untextured.
         std::string textureUri;
         /// Built once, handed out unchanged afterwards.
