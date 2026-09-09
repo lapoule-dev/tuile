@@ -856,6 +856,8 @@ TuileGlobeProcedural::Update(
     // was read that way once, and the wrong conclusion followed.
     double reach = 0.0;
     size_t beyondHorizon = 0;
+    // <5, <10, <20, <50, <100, <500, >=500 km from the eye.
+    size_t bands[7] = {0, 0, 0, 0, 0, 0, 0};
     {
         const GfVec3d eye(view.position[0], view.position[1], view.position[2]);
         // Distance from the eye to the horizon of a sphere inscribed in the
@@ -874,6 +876,22 @@ TuileGlobeProcedural::Update(
             if (distance > horizon) {
                 ++beyondHorizon;
             }
+            // Which ground was selected, by distance from the eye.
+            //
+            // The one question a count of tiles cannot answer: when a band of
+            // the frame is black, is that ground missing from the SELECTION,
+            // or selected and not drawn? Everything else — reach, tile counts,
+            // gaps — is blind to it, and three wrong causes were argued for
+            // before anyone measured this.
+            const double km = distance / 1000.0;
+            size_t band = 0;
+            for (const double edge : {5.0, 10.0, 20.0, 50.0, 100.0, 500.0}) {
+                if (km < edge) {
+                    break;
+                }
+                ++band;
+            }
+            ++bands[band];
         }
     }
 
@@ -884,11 +902,11 @@ TuileGlobeProcedural::Update(
     TF_DEBUG(TUILE_HYDRA_PROCEDURAL).Msg(
         "[tuile] Update: cook #%llu on this instance, camera=%s tiles=%zu "
         "kept=%zu built=%zu redraped=%zu dropped=%zu textured=%zu "
-        "reach=%.1fkm beyondHorizon=%zu origin=(%g, %g, %g)\n",
+        "reach=%.1fkm beyondHorizon=%zu "
+        "km<5=%zu <10=%zu <20=%zu <50=%zu <100=%zu <500=%zu >=500=%zu\n",
         static_cast<unsigned long long>(_cooks), _cameraPath.GetText(), count,
         kept, built, redraped, dropped, textured, reach / 1000.0, beyondHorizon,
-        _renderOrigin[0],
-        _renderOrigin[1], _renderOrigin[2]);
+        bands[0], bands[1], bands[2], bands[3], bands[4], bands[5], bands[6]);
 
     return result;
 }

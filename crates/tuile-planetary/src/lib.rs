@@ -427,6 +427,13 @@ impl ImageryCache {
 pub struct GlobeOptions {
     /// When true, terrain only (no imagery) — the geometry debug view.
     pub no_imagery: bool,
+    /// How deep the quadtree may divide, or `None` for "as deep as the imagery
+    /// provider goes".
+    ///
+    /// A ceiling on refinement, not on reach. Set it to see what a shallower
+    /// globe would have selected without regenerating anything — and to bound
+    /// a diagnostic run whose tile count would otherwise be the source's.
+    pub max_level: Option<u32>,
     /// How many imagery layers one drape may carry.
     ///
     /// This is a **consumer** limit and the loader cannot know it: it is how
@@ -457,6 +464,7 @@ impl Default for GlobeOptions {
     fn default() -> Self {
         Self {
             no_imagery: false,
+            max_level: None,
             imagery_slots: LayerBudget::default(),
             imagery_boost_cap: u32::MAX,
         }
@@ -1368,7 +1376,9 @@ where
     // This belongs here rather than in the tree because it is the one place that
     // holds both: the tree knows nothing about imagery, and the imagery provider
     // knows nothing about the quadtree it drapes.
-    let deepest_useful = imagery.tiling_scheme().maximum_level;
+    let deepest_useful = opts
+        .max_level
+        .unwrap_or_else(|| imagery.tiling_scheme().maximum_level);
     let tree: Box<dyn TileTree> = Box::new(
         TerrainTree::with_availability(layer, Arc::clone(&availability))
             .with_max_level(deepest_useful),
