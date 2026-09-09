@@ -166,10 +166,38 @@ if [ -n "${JOB_TRACE_PUT_URL:-}" ] && ls "$outdir"/trace-s*.jsonl > /dev/null 2>
     fi
 fi
 
-n=$(ls "$outdir"/seg*.mp4 2>/dev/null | wc -l)
+# Segments are counted by SIZE, not by existence.
+#
+# `render_usd.py` creates its output file up front, so a process that dies
+# leaves a 48-byte container behind — which `ls | wc -l` counts as a segment.
+# Five of sixteen died once (all sixteen had landed on one GPU and run it out
+# of VRAM); `ffmpeg concat -c copy` stopped at the first empty file, and the
+# job reported RENDER-DONE with 180 frames of 1440. Nobody could tell from the
+# outside: the video played, it was simply four fifths shorter than asked for.
+n=0
+missing=""
+for i in $(seq 0 $((jobs - 1))); do
+    if [ "$(stat -c%s "$outdir/seg$i.mp4" 2>/dev/null || echo 0)" -gt 1000 ]; then
+        n=$((n + 1))
+    else
+        missing="$missing $i"
+    fi
+done
+if [ -n "$missing" ]; then
+    echo "SEGMENTS-MISSING:$missing"
+fi
 if [ "$n" = "$jobs" ]; then
     for i in $(seq 0 $((jobs - 1))); do echo "file '$outdir/seg$i.mp4'"; done > "$outdir/list.txt"
-    ffmpeg -y -f concat -safe 0 -i "$outdir/list.txt" -c copy "$JOB_OUT" > /dev/null 2>&1
+    ffmpeg -y -f concat -safe 0 -i "$outdir/list.txt" -c copy "$JOB_OUT" 2>&1 | tail -3
+    # And the result must carry every frame that was asked for. A concat that
+    # silently drops a segment produces a shorter film, not an error.
+    got=$(ffprobe -v error -count_frames -select_streams v:0 \
+              -show_entries stream=nb_read_frames -of csv=p=0 "$JOB_OUT" 2>/dev/null)
+    if [ -n "$got" ] && [ "$got" != "$total" ]; then
+        echo "FRAME-COUNT-MISMATCH: $got frames dans la vidéo, $total demandées"
+    else
+        echo "frames: ${got:-inconnu}/$total"
+    fi
 fi
 if [ -s "$JOB_OUT" ]; then
     ls -la "$JOB_OUT"
