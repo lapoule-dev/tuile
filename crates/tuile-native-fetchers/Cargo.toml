@@ -25,3 +25,9 @@ reqwest-middleware = { workspace = true }
 http-cache-reqwest = { workspace = true }
 http-cache = { workspace = true }
 foyer = { workspace = true }
+
+[dev-dependencies]
+# Constructing the middleware error the cache layer actually produces, and a
+# real transport error to hide inside it.
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
