@@ -4606,6 +4606,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "tuile-core",
 ]
 
 [[package]]
@@ -4638,6 +4639,8 @@ dependencies = [
 name = "tuile-usd"
 version = "0.0.1"
 dependencies = [
+ "glam",
+ "tuile-core",
  "tuile-tape",
 ]
 

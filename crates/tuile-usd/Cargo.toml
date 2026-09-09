@@ -10,6 +10,10 @@ rust-version.workspace = true
 
 [dependencies]
 tuile-tape = { path = "../tuile-tape" }
+# For `geo::ecef_to_geodetic`. The clipping range is derived from the camera's
+# height, and deriving that from a sphere put the near plane at 0.5 m.
+tuile-core = { version = "0.0.1", path = "../tuile-core" }
+glam = { workspace = true }
 
 [lints]
 workspace = true

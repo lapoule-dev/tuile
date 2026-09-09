@@ -8,6 +8,10 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# For `geo::geodetic_to_ecef`. A tape places a camera on the Earth, and
+# placing it on a sphere instead of the ellipsoid put one 14.8 km above the
+# ground it was meant to be 5 km above.
+tuile-core = { version = "0.0.1", path = "../tuile-core" }
 mcap = "0.25"
 image = { workspace = true }
 thiserror = { workspace = true }
