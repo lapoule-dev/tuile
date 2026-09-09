@@ -33,6 +33,19 @@ use crate::session::{Session, SessionConfig};
 /// boost outright — imagery exactly matches the terrain level — and a farm
 /// job raises it to taste, where the RAM is real. Whatever the value, it
 /// stays proportional per tile: one imagery level per terrain level, the
+/// How deep the quadtree may divide, from `TUILE_MAX_LEVEL`.
+///
+/// Unset means "as deep as the imagery provider goes", which is the right
+/// answer for a render. It is a knob because a diagnostic run wants to ask
+/// what a shallower globe would have selected, and because a number nobody
+/// can vary is a number nobody can rule out.
+fn max_level() -> Option<u32> {
+    std::env::var("TUILE_MAX_LEVEL")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|level| *level > 0)
+}
+
 /// checkerboard's cure.
 fn imagery_boost_cap() -> u32 {
     std::env::var("TUILE_IMAGERY_BOOST")
@@ -238,6 +251,7 @@ async fn resolve(
             layer,
             GlobeOptions {
                 no_imagery: true,
+                max_level: max_level(),
                 imagery_slots: imagery_slots.clone(),
                 imagery_boost_cap: imagery_boost_cap(),
             },
@@ -278,6 +292,7 @@ async fn resolve(
         layer,
         GlobeOptions {
             no_imagery: false,
+            max_level: max_level(),
             imagery_slots,
             imagery_boost_cap: imagery_boost_cap(),
         },
