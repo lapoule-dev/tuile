@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 
@@ -400,6 +401,24 @@ _TheSessions()
     return registry;
 }
 
+/// The ABI's status code, spelled out — a bare "status 4" in a farm log costs
+/// a trip to the header every time.
+const char *
+_StatusName(TuileStatus status)
+{
+    switch (status) {
+    case TuileStatus_Ok: return "ok";
+    case TuileStatus_BadArgument: return "bad argument";
+    case TuileStatus_TimedOut: return "timed out";
+    case TuileStatus_ServerGone: return "the streaming session ended";
+    case TuileStatus_TilesFailed: return "a tile could not be loaded";
+    case TuileStatus_InternalError: return "internal error";
+    case TuileStatus_EncodeFailed: return "texture encoding failed";
+    case TuileStatus_NotFound: return "not found";
+    }
+    return "unknown status";
+}
+
 }  // namespace
 
 TuileGlobeProcedural::TuileGlobeProcedural(const SdfPath &proceduralPrimPath)
@@ -618,26 +637,35 @@ TuileGlobeProcedural::Update(
 
     TuileViewState view = {};
     if (!_ViewForCook(inputScene, &view)) {
-        TF_RUNTIME_ERROR(
+        // Fatal, not a warning with an empty globe behind it: see below.
+        TF_FATAL_ERROR(
             "tuile: no camera resolves and no render origin is authored — "
             "there is no view to select tiles for.");
-        return result;
     }
 
     // Eager and fatal: this blocks until every selected tile is resident, or
-    // reports why not. A frame that lost tiles must be a loud failure, never a
-    // plausible image at the wrong level of detail.
+    // ends the process.
+    //
+    // FATAL, and deliberately so. This used to post a runtime error and return
+    // an empty map, which reads like caution and is the opposite: hdGp emits no
+    // children, the renderer draws nothing, `usdrecord` writes a transparent
+    // frame and exits 0, and ffmpeg encodes it as black. Nobody downstream can
+    // tell that apart from a frame that legitimately had nothing in it — so a
+    // farm job shipped a 48-frame video, every frame black, and reported
+    // success. The Rust side has already retried the transport and has already
+    // logged which tile and why; there is nothing left to recover, and the only
+    // useful thing left to do is to stop where the fault is, with a non-zero
+    // exit, so the segment fails instead of being delivered.
     TuileStatus status;
     {
         std::lock_guard<std::mutex> frameLock(_shared->frameLock);
         status = tuile_session_frame(_shared->session, &view, 1, &_frame);
     }
     if (status != TuileStatus_Ok || !_frame) {
-        TF_RUNTIME_ERROR(
-            "tuile: the frame did not converge (status %d) — nothing is "
-            "emitted rather than a partial globe.",
-            static_cast<int>(status));
-        return result;
+        TF_FATAL_ERROR(
+            "tuile: the frame did not converge (status %d, %s) — see the "
+            "error logged above for the tile and the reason.",
+            static_cast<int>(status), _StatusName(status));
     }
 
     size_t count = 0;
@@ -724,6 +752,8 @@ TuileGlobeProcedural::Update(
         _Tile entry;
         entry.id = tile.tile_id;
         entry.drape = tile.drape;
+        entry.originEcef = GfVec3d(tile.origin_ecef[0], tile.origin_ecef[1],
+                                   tile.origin_ecef[2]);
         entry.textureUri = textureUri;
         entry.textured = tile.base_color_texture >= 0 && !textureUri.empty() &&
                          tile.uvs.len ==
@@ -812,6 +842,41 @@ TuileGlobeProcedural::Update(
     tuile_frame_free(_frame);
     _frame = nullptr;
 
+    // How far the selection actually reaches, in kilometres from the eye.
+    //
+    // The question this answers is "is that black band sky, or ground nobody
+    // selected?" — and it is not answerable from a picture: a ridge occludes,
+    // and missing ground looks exactly like a horizon. The top ray of a frame
+    // meets the ground at a distance geometry can state exactly; if the
+    // selection stops short of it, the black is ours.
+    //
+    // Reported next to the count of tiles PAST THE HORIZON, because the reach
+    // on its own is a maximum and a maximum lies about volume: one coarse tile
+    // on the far side of the planet reads the same as six hundred of them. It
+    // was read that way once, and the wrong conclusion followed.
+    double reach = 0.0;
+    size_t beyondHorizon = 0;
+    {
+        const GfVec3d eye(view.position[0], view.position[1], view.position[2]);
+        // Distance from the eye to the horizon of a sphere inscribed in the
+        // ellipsoid: sqrt(|eye|^2 - r^2). Ground further off than this is
+        // behind the planet, whatever the frustum says about it.
+        constexpr double kInscribedRadius = 6356752.0;
+        const double eyeLengthSq = eye.GetLengthSq();
+        const double horizon =
+            eyeLengthSq > kInscribedRadius * kInscribedRadius
+                ? std::sqrt(eyeLengthSq - kInscribedRadius * kInscribedRadius)
+                : std::numeric_limits<double>::infinity();
+        for (const auto &entry : _tilesByPath) {
+            const GfVec3d origin = entry.second.originEcef;
+            const double distance = (origin - eye).GetLength();
+            reach = std::max(reach, distance);
+            if (distance > horizon) {
+                ++beyondHorizon;
+            }
+        }
+    }
+
     // Cooks on THIS instance. Read next to the plugin's construction count:
     // one construction and N cooks is hdGp working as designed; N of each is
     // the host rebuilding its scene index every frame.
@@ -819,9 +884,10 @@ TuileGlobeProcedural::Update(
     TF_DEBUG(TUILE_HYDRA_PROCEDURAL).Msg(
         "[tuile] Update: cook #%llu on this instance, camera=%s tiles=%zu "
         "kept=%zu built=%zu redraped=%zu dropped=%zu textured=%zu "
-        "origin=(%g, %g, %g)\n",
+        "reach=%.1fkm beyondHorizon=%zu origin=(%g, %g, %g)\n",
         static_cast<unsigned long long>(_cooks), _cameraPath.GetText(), count,
-        kept, built, redraped, dropped, textured, _renderOrigin[0],
+        kept, built, redraped, dropped, textured, reach / 1000.0, beyondHorizon,
+        _renderOrigin[0],
         _renderOrigin[1], _renderOrigin[2]);
 
     return result;
