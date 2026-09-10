@@ -157,7 +157,7 @@ WITH_CYCLES_HYDRA_RENDER_DELEGATE produced nothing"; \
 r = Plug.Registry(); r.RegisterPlugins([os.environ['PXR_PLUGINPATH_NAME']]); \
 names = sorted(p.name for p in r.GetAllPlugins()); \
 print('hydra plugins:', [n for n in names if 'ycles' in n or n.startswith('hd')]); \
-assert any('ycles' in n for n in names), 'the delegate registers no plugin'"
+assert 'hdCycles' in names, f'HdCyclesPlugin is not registered: {names[:20]}'"
 RUN ldd /opt/blender/blender | grep -q libusd_ \
     && blender -b --factory-startup --python-exit-code 1 --python-expr \
         "import bpy; from pxr import Usd; v = Usd.GetVersion(); print('usd', v); assert v[1] == 25 and v[2] == 8" \
