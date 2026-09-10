@@ -114,20 +114,25 @@ def setup_hydra_manifest(scene, stage_path, first, last, delegate="storm"):
     from pxr import Usd, UsdGeom
 
     module, engine = HYDRA_DELEGATES[delegate]
+    if delegate == "cycles":
+        # The delegate is installed inside the `cycles` addon, and enabling
+        # `cycles` first is what puts its directory where ours looks.
+        bpy.ops.preferences.addon_enable(module="cycles")
     bpy.ops.preferences.addon_enable(module=module)
-    available = {
-        item.identifier
-        for item in scene.render.bl_rna.properties["engine"].enum_items
-    }
-    if engine not in available:
-        # Loud, and naming what IS there. A silent fall back to Storm would
-        # render — on one GPU, at a different look — and the only symptom
-        # would be the bill and a picture nobody could account for.
-        print(f"FATAL: the {delegate} Hydra delegate is not registered; "
-              f"engines available: {sorted(available)}",
+    try:
+        # By ASSIGNMENT, not by reading `enum_items`. That property answered
+        # `['BLENDER_EEVEE']` in the image while `CYCLES` and `HYDRA_CYCLES`
+        # were both perfectly settable — a check on it would have aborted
+        # every job for a delegate that was there. Blender's own TypeError
+        # names the engines that really exist, which is the diagnosis anyway.
+        scene.render.engine = engine
+    except TypeError as e:
+        # Loud. A silent fall back to Storm would render — on one GPU, at a
+        # different look — and the only symptoms would be the bill and a
+        # picture nobody could account for.
+        print(f"FATAL: the {delegate} Hydra delegate is not registered: {e}",
               file=sys.stderr, flush=True)
         sys.exit(1)
-    scene.render.engine = engine
     scene.hydra.export_method = "USD"
 
     manifest = str(pathlib.Path(stage_path).resolve())
