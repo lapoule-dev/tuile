@@ -544,3 +544,56 @@ mod tests {
         assert!(matches!(pack.frame(2), Err(PackError::NoSuchFrame(2))));
     }
 }
+
+/// A stable name for the scene a pack is the bake of.
+///
+/// FNV-1a over whatever the caller declares the scene to be — the camera path,
+/// the asset ids, the viewport, the settings that move a selection. Stable
+/// across processes and architectures, which `DefaultHasher` explicitly is
+/// not, and a digest that changed for its own reasons would be worse than none.
+///
+/// It exists so the two halves of a split pipeline can disagree **loudly**.
+/// A bake writes it; a render computes it from the scene it was asked for and
+/// refuses a pack that answers differently. Without it, rendering last week's
+/// bake of a different trajectory is a silent success.
+pub fn scene_digest(parts: &[&[u8]]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (i, part) in parts.iter().enumerate() {
+        // The separator is what stops ("ab", "c") and ("a", "bc") colliding.
+        for byte in part.iter().copied().chain(std::iter::once(0xff)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash ^= i as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// The pack format is little-endian, and the payloads are handed back to a C
+/// ABI as raw memory.
+///
+/// Stated as a compile error rather than left implicit: on a big-endian target
+/// a reader would hand a renderer byte-swapped vertices, which does not fail —
+/// it draws a scrambled globe. Every target this ships to is little-endian, so
+/// this is a guard against a surprise, not a limitation anyone is living with.
+#[cfg(target_endian = "big")]
+compile_error!("tuile-pack payloads are little-endian; add a conversion first");
+
+#[cfg(test)]
+mod digest_tests {
+    use super::*;
+
+    #[test]
+    fn the_digest_is_the_same_string_every_run() {
+        // Pinned: the whole point is that two processes agree.
+        assert_eq!(scene_digest(&[b"orbit", b"1:48"]), "ef3ab95ffe76ab43");
+    }
+
+    #[test]
+    fn the_parts_cannot_be_reshuffled_into_the_same_name() {
+        assert_ne!(scene_digest(&[b"ab", b"c"]), scene_digest(&[b"a", b"bc"]));
+        assert_ne!(scene_digest(&[b"a", b"b"]), scene_digest(&[b"b", b"a"]));
+        assert_ne!(scene_digest(&[b"a"]), scene_digest(&[b"a", b""]));
+    }
+}
