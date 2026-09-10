@@ -168,11 +168,25 @@ RUN cd /opt/src/blender \
 # Blender that configures cleanly, links cleanly, and enumerates zero GPUs at
 # run time — which is exactly the state that cost two pods. Counting the
 # artefacts is the only check that cannot be satisfied by good intentions.
+#
+# Globs with a trailing `*`, because Blender ships them zstd-compressed:
+# `kernel_optix_osl.ptx.zst`, `kernel_sm_120.cubin.zst`. The first version of
+# this assertion looked for bare `.ptx` and `.cubin`, found zero after a build
+# that had generated all twelve, and failed a good image.
+#
+# And the two names are checked, not just the count: `sm_120` because an RTX
+# 5090 cannot load anything else, and `optix` because Cycles turns OptiX off
+# with a warning rather than an error — CUDA-only would pass a bare count while
+# being exactly the slower renderer this build exists to stop shipping.
 RUN set -eu; \
-    n=$(find /opt/blender -name '*.cubin' -o -name '*.ptx' | wc -l); \
-    echo "cycles gpu kernels: $n"; \
-    test "$n" -gt 0 || { find /opt/blender -maxdepth 4 -name 'lib' -o -name '*.so' | head -20; \
-                         echo "no CUDA/OptiX kernels were built"; exit 1; }
+    found=$(find /opt/blender \( -name '*.cubin*' -o -name '*.ptx*' \) -printf '%f\n'); \
+    n=$(echo "$found" | grep -c . || true); \
+    echo "cycles gpu kernels: $n"; echo "$found" | sort | sed 's/^/  /'; \
+    test "$n" -gt 0 || { echo "no CUDA/OptiX kernels were installed"; exit 1; }; \
+    echo "$found" | grep -q 'sm_120' \
+        || { echo "no sm_120 kernel: an RTX 5090 could not load any of these"; exit 1; }; \
+    echo "$found" | grep -q 'optix' \
+        || { echo "CUDA kernels but no OptiX: find_package(OptiX) was silently skipped"; exit 1; }
 
 # ---------------------------------------------------------------- runtime
 FROM ubuntu:24.04
