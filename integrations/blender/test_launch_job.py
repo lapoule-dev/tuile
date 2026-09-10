@@ -84,6 +84,30 @@ class Archive(unittest.TestCase):
             self.assertTrue(found.endswith("sportstracklive-rails/infra"))
 
 
+class DepositAsYouGo(unittest.TestCase):
+    """Un pod repris en cours de route doit avoir déjà déposé ce qu'il a fait."""
+
+    def test_one_url_per_segment_so_nothing_waits_for_the_concat(self):
+        """Attendre le montage, c'est ce qui a fait perdre 1440 frames déjà
+        rendues : le pod a été repris et le téléversement n'avait pas eu lieu."""
+        script = (pathlib.Path(launch_job.__file__).parent
+                  / "render_job.sh").read_text()
+        self.assertIn("JOB_SEG_PUT_URL_", script)
+        # Le chemin de RÉUSSITE, pas seulement le mot : `SEG-UP-FAILED`
+        # contient « SEG-UP », et un test qui s'en contente passe même si le
+        # téléversement a été retiré.
+        self.assertIn('curl -fsS -T "$outdir/seg$i.mp4" "$url"', script)
+
+    def test_the_logs_go_up_while_it_runs_not_only_at_the_end(self):
+        """Le `trap` couvre toutes les façons dont ce script décide de
+        s'arrêter. Il ne couvre pas celle dont un pod meurt vraiment :
+        SIGKILL, pas de trap, rien d'écrit."""
+        script = (pathlib.Path(launch_job.__file__).parent
+                  / "render_job.sh").read_text()
+        self.assertIn("flush_logs", script)
+        self.assertIn("JOB_ARCHIVE_EVERY", script)
+
+
 class PackedRender(unittest.TestCase):
     """Un rendu nourri par un pack ne doit porter aucun jeton."""
 

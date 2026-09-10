@@ -198,7 +198,7 @@ def r2_credentials():
 ARCHIVE_OBJECTS = ("render.mp4", "logs.tar.gz", "trace.tar.gz", "profile.tar.gz")
 
 
-def archive_urls(run):
+def archive_urls(run, segments=0):
     """Les URL présignées où le pod déposera, et le client pour y écrire
     nous-mêmes le manifeste.
 
@@ -232,7 +232,13 @@ def archive_urls(run):
     # Les quatre, toujours. Une URL présignée ne coûte rien tant que personne
     # n'écrit dessus, et conditionner la trace à un drapeau signifiait que la
     # seule fois où on la voulait, elle n'existait pas.
-    return client, {name: put(name) for name in ARCHIVE_OBJECTS}
+    urls = {name: put(name) for name in ARCHIVE_OBJECTS}
+    # Plus une par segment, pour qu'un segment parte dès qu'il existe au lieu
+    # d'attendre le montage. Attendre, c'est ce qui a fait perdre 1440 frames
+    # déjà rendues à un pod repris en cours de route.
+    for i in range(segments):
+        urls[f"seg{i}"] = put(f"seg{i}.mp4")
+    return client, urls
 
 
 def presigned_get(key, hours=24):
@@ -454,12 +460,15 @@ def main():
     # qui ne laisse rien n'a pas de raison d'exister.
     git_info = git_state()
     run = run_id(git_info)
-    manifest_client, urls = archive_urls(run)
+    segments = args.gpu_count * args.procs_per_gpu
+    manifest_client, urls = archive_urls(run, segments)
     if not args.upload_url:
         env["JOB_UPLOAD_PUT_URL"] = urls["render.mp4"]
     env["JOB_LOGS_PUT_URL"] = urls["logs.tar.gz"]
     env["JOB_TRACE_PUT_URL"] = urls["trace.tar.gz"]
     env["JOB_PROFILE_PUT_URL"] = urls["profile.tar.gz"]
+    for i in range(segments):
+        env[f"JOB_SEG_PUT_URL_{i}"] = urls[f"seg{i}"]
     if args.profile:
         env["TUILE_PROFILE"] = args.profile
         env["TUILE_PROFILE_DIR"] = "/out/profile"
