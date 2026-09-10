@@ -103,6 +103,29 @@ class PackedRender(unittest.TestCase):
         self.assertIn("unset TUILE_ION_TOKEN", script)
 
 
+class FourGpus(unittest.TestCase):
+    """Storm ne peut pas utiliser quatre GPU, et le job doit le savoir."""
+
+    def test_the_job_probes_optix_devices_for_the_cycles_path(self):
+        """Compter les cartes que le pilote voit n'est pas la même question
+        que « sur combien le moteur sait poser du travail ». Répondre à la
+        question facile est ce qui a laissé seize processus se partager un
+        seul GPU pendant que la sonde en annonçait quatre."""
+        script = (pathlib.Path(launch_job.__file__).parent
+                  / "render_job.sh").read_text()
+        # Le comptage de cartes ne survit que pour Storm, qui dessine en GL.
+        self.assertIn('[ "$JOB_DELEGATE" = "storm" ]', script)
+        self.assertIn("compute_device_type = 'OPTIX'", script)
+
+    def test_the_job_reports_whether_the_gpus_actually_worked(self):
+        """Un run qui n'a utilisé qu'un GPU sur quatre n'est pas un run lent,
+        c'est un run cassé — et ça ne doit pas demander qu'un humain regarde
+        une capture d'écran."""
+        script = (pathlib.Path(launch_job.__file__).parent
+                  / "render_job.sh").read_text()
+        self.assertIn("GPU-UNDERUSED", script)
+
+
 class RunIdentity(unittest.TestCase):
     def test_sorting_by_name_sorts_by_date_and_shows_the_commit(self):
         early = launch_job.run_id({"short": "abc1234", "dirty": False})

@@ -308,6 +308,12 @@ def main():
                         "CESIUM_ION_TOKEN local requis, passé au pod sans "
                         "jamais être affiché)")
     p.add_argument("--tier", default="cycles", choices=["cycles", "eevee"])
+    p.add_argument("--delegate", default="cycles", choices=["storm", "cycles"],
+                   help="le délégué Hydra (--engine hydra). storm est un "
+                        "rasteriseur OpenGL : il n'appelle jamais CUDA, donc "
+                        "CUDA_VISIBLE_DEVICES ne pilote rien et quatre "
+                        "processus ont été mesurés sur un seul GPU. cycles "
+                        "passe par OptiX.")
     p.add_argument("--upload-url", default="",
                    help="URL PUT présignée : le pod y dépose la vidéo finie")
     p.add_argument("--env", action="append", default=[],
@@ -379,6 +385,7 @@ def main():
     env = {
         "JOB_FRAMES": args.frames,
         "JOB_ENGINE": args.engine,
+        "JOB_DELEGATE": args.delegate,
         "JOB_TIER": args.tier,
         "JOB_WIDTH": str(args.width),
         "JOB_SAMPLES": str(args.samples),
