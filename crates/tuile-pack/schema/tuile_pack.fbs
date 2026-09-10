@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) lapoule.dev
+//
+// The pre-baked scene container: what a render needs, and nothing a render
+// would have to compute.
+//
+// Regenerate the Rust with:
+//
+//     flatc --rust --gen-all -o crates/tuile-pack/src schema/tuile_pack.fbs
+//
+// and commit the result. `flatc` is deliberately NOT a build dependency: the
+// image's Rust stage is a bare `rust:1-bookworm`, and a generator nobody has
+// is a build that nobody can reproduce. `the_generated_code_matches_the_schema`
+// is what keeps the two in step.
+
+namespace tuile.pack;
+
+/// One payload, as a run of LZ4 bytes in the blob region that follows the
+/// table.
+///
+/// Compression and zero-copy do not contradict each other once they are
+/// separated: the structure is read in place, and each payload is an
+/// independent block decompressed only if something asks for it.
+struct Block {
+  /// From the start of the blob region, not from the start of the file.
+  offset: uint64;
+  /// Bytes on disk.
+  stored: uint32;
+  /// Bytes after decompression. Known in advance, so a reader allocates once.
+  raw: uint32;
+}
+
+enum TextureFormat : byte {
+  None = 0,
+  Png = 1,
+}
+
+/// One tile, deduplicated across the whole frame range.
+///
+/// The identity is `(id, drape)`, never `id` alone: a tile keeps its id from
+/// one frame to the next but is re-draped as the camera moves, and two
+/// drapings of one tile are two different pictures. A tile visible over forty
+/// frames at one draping is stored once.
+table Tile {
+  id: uint64;
+  drape: uint64;
+  /// ECEF, f64 — positions below are f32 RELATIVE to this. Narrowing that
+  /// subtraction is the one thing not to do.
+  origin_ecef: [double];
+  vertex_count: uint32;
+  index_count: uint32;
+  base_color_factor: [float];
+  positions: Block;
+  normals: Block;
+  uvs: Block;
+  indices: Block;
+  texture: Block;
+  texture_format: TextureFormat;
+}
+
+/// What one frame selected, as indices into `Pack.tiles`.
+table Frame {
+  frame: uint32;
+  tiles: [uint32];
+}
+
+table Pack {
+  /// Bumped when the layout changes in a way an old reader would misread.
+  version: uint32;
+  /// The digest of the scene this is the bake of. A reader that computes a
+  /// different one is holding the wrong pack, and must say so rather than
+  /// render it.
+  scene_digest: string;
+  first_frame: uint32;
+  last_frame: uint32;
+  render_origin: [double];
+  /// How the selection was culled when this was baked — "full" or "disabled".
+  ///
+  /// A pack freezes its selection: a hole baked in is a hole for ever, and it
+  /// is invisible in the output. This is the admission, carried with the data,
+  /// so a pack made under a known-imperfect cull can never pass for a good one.
+  culling: string;
+  /// The deduplicated pool, sorted by (id, drape).
+  tiles: [Tile];
+  /// One entry per frame in `[first_frame, last_frame]`, in order.
+  frames: [Frame];
+}
+
+root_type Pack;
+file_identifier "TUIL";
