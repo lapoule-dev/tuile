@@ -30,8 +30,13 @@
 #                      URL (no credential ever reaches the pod)
 #   JOB_LOGS_PUT_URL   if set: every process's stdout, gathered into
 #                      logs.tar.gz and shipped the same way — ON EVERY EXIT
-#                      PATH, because a job that failed is the one whose logs
-#                      are worth having
+#                      PATH and every JOB_ARCHIVE_EVERY seconds while it runs,
+#                      because a job that failed is the one whose logs are
+#                      worth having and a pod that is killed runs no trap
+#   JOB_SEG_PUT_URL_<i> if set: segment i goes to R2 THE MOMENT it is encoded,
+#                      not at the end. A pod reclaimed at frame 900 of 1440
+#                      has still deposited the nine hundred.
+#   JOB_ARCHIVE_EVERY  seconds between log flushes while rendering (default 300)
 #   JOB_TRACE_PUT_URL  if set: the per-process determinism traces, gathered
 #                      into one trace.tar.gz and shipped the same way
 #   JOB_PROFILE_PUT_URL if set: TUILE_PROFILE_DIR's flamegraphs, likewise
@@ -93,6 +98,20 @@ ship() {
     fi
 }
 
+# Flushes the logs while the job is still running.
+#
+# The trap below covers every way this script can decide to stop. It does not
+# cover the way a pod actually dies: reclaimed, SIGKILL, no trap, nothing
+# written. So the logs go up periodically as well — the cost is one upload of a
+# few hundred kilobytes every five minutes, and what it buys is knowing what a
+# machine was doing at the moment it was taken away.
+flush_logs() {
+    [ -n "${JOB_LOGS_PUT_URL:-}" ] || return 0
+    while sleep "${JOB_ARCHIVE_EVERY:-300}"; do
+        ship logs.tar.gz "$JOB_LOGS_PUT_URL" 'log-s*.txt' 'job.log' > /dev/null 2>&1
+    done
+}
+
 # Called on EVERY exit, successful or not. This is the whole point: three
 # measurements died with their machine in two days, and the last one was a
 # 60-second render whose pod was reclaimed mid-flight.
@@ -105,6 +124,8 @@ archive_everything() {
     exit $status
 }
 trap archive_everything EXIT
+flush_logs &
+log_flusher=$!
 
 first="${JOB_FRAMES%%:*}"; last="${JOB_FRAMES##*:}"
 total=$((last - first + 1))
@@ -214,7 +235,7 @@ if command -v nvidia-smi > /dev/null 2>&1; then
         done
     ) &
     gpu_watch=$!
-    trap 'kill "$gpu_watch" 2>/dev/null; archive_everything' EXIT
+    trap 'kill "$gpu_watch" "${log_flusher:-0}" 2>/dev/null; archive_everything' EXIT
 fi
 
 for i in $(seq 0 $((jobs - 1))); do
@@ -247,7 +268,7 @@ for i in $(seq 0 $((jobs - 1))); do
         | tee -a "$outdir/log-s$i.txt" &
 done
 wait
-kill "${gpu_watch:-0}" 2>/dev/null || true
+kill "${gpu_watch:-0}" "${log_flusher:-0}" 2>/dev/null || true
 echo "WALL: $(($(date +%s) - t0))s pour $total frames en $jobs processus / $JOB_GPUS GPU"
 # The verdict, in one line, from the samples above. A run that used one GPU of
 # four is not a slow run, it is a broken one, and it must not need a human to
@@ -263,12 +284,26 @@ fi
 
 # Blender 5.x has no built-in encoder: the driver leaves PNG sequences and
 # each range is encoded here with the static ffmpeg.
+#
+# Each segment leaves for R2 the moment it exists, rather than waiting for the
+# concat. Waiting is how a reclaimed pod loses everything it had already made:
+# the last 60-second job died at its own pace with 1440 frames rendered and
+# nothing deposited. A segment that is already on R2 is a segment nobody has to
+# render again.
 for i in $(seq 0 $((jobs - 1))); do
     if [ ! -s "$outdir/seg$i.mp4" ] && ls "$outdir/s$i".*.png > /dev/null 2>&1; then
         a=$((first + i * span))
         ffmpeg -y -framerate "$JOB_FPS" -start_number "$a" \
             -i "$outdir/s$i.%d.png" -c:v libx264 -pix_fmt yuv420p -crf 18 \
             "$outdir/seg$i.mp4" > /dev/null 2>&1 && rm -f "$outdir/s$i".*.png
+    fi
+    eval "url=\${JOB_SEG_PUT_URL_$i:-}"
+    if [ -n "$url" ] && [ -s "$outdir/seg$i.mp4" ]; then
+        if curl -fsS -T "$outdir/seg$i.mp4" "$url" > /dev/null; then
+            echo "SEG-UP $i ($(du -h "$outdir/seg$i.mp4" | cut -f1))"
+        else
+            echo "SEG-UP-FAILED $i"
+        fi
     fi
 done
 # Segments are counted by SIZE, not by existence.
