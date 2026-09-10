@@ -357,7 +357,18 @@ def main():
                    default="harbor.sportstracklive.com/stl/blender-render:5.1")
     p.add_argument("--registry-name", default="ecr-usw1-stl",
                    help="credential registre déjà enregistré chez RunPod")
-    p.add_argument("--gpu-type", default="NVIDIA GeForce RTX 5090")
+    p.add_argument("--gpu-type", action="append", default=[],
+                   metavar="NAME",
+                   help="répétable, par ordre de préférence. La capacité est "
+                        "une loterie et une seule carte demandée, c'est une "
+                        "file d'attente ; plusieurs, c'est un choix. "
+                        "ATTENTION : les noyaux Cycles de l'image sont "
+                        "compilés pour sm_120 seulement, donc toute carte "
+                        "listée doit être Blackwell (5080, 5090, PRO 5000/6000, "
+                        "B200). Une 4090 démarrerait et ne trouverait aucun "
+                        "noyau à charger. Défaut : 5080 puis 5090 — la 5080 "
+                        "est à 0,39 $/h contre 0,69, et 16 Go suffisent à ce "
+                        "que ce job rend.")
     p.add_argument("--gpu-count", type=int, default=1)
     p.add_argument("--procs-per-gpu", type=int, default=4)
     p.add_argument("--cuda-min", default="13.2",
@@ -428,6 +439,8 @@ def main():
                    help="TUILE_PROFILE du pod (ex: cpu,heap) — les "
                         "flamegraphs remontent dans profile.tar.gz")
     args = p.parse_args()
+    if not args.gpu_type:
+        args.gpu_type = ["NVIDIA GeForce RTX 5080", "NVIDIA GeForce RTX 5090"]
     if args.engine == "hydra" and args.image == p.get_default("image"):
         args.image = ECR_HOST + "/stl/blender-globe:5.1-su"
 
@@ -549,14 +562,17 @@ def main():
                    if k not in ("ssh_pubkey",)},
     }
 
-    gpu = {"id": args.gpu_type, "count": args.gpu_count}
-    if not args.cuda_any:
-        gpu["allowedCudaVersions"] = cuda
+    def gpu_spec(kind):
+        gpu = {"id": kind, "count": args.gpu_count}
+        if not args.cuda_any:
+            gpu["allowedCudaVersions"] = cuda
+        return gpu
+
     body = {
         "name": args.name,
         "image": args.image,
         "registry": reg["id"],
-        "gpu": gpu,
+        "gpu": gpu_spec(args.gpu_type[0]),
         "cloud": args.cloud,
         "disk": args.disk,
         "ports": ["22/tcp"] if args.ssh_pubkey else [],
@@ -564,25 +580,42 @@ def main():
         "args": "bash /opt/render/render_job.sh",
     }
     def take_a_pod():
-        """Un pod, en restant dans la file de capacité s'il le faut."""
+        """Un pod, en essayant chaque carte demandée avant de patienter.
+
+        L'ordre compte : la liste est par préférence, et on ne s'endort que
+        lorsque AUCUNE d'elles n'est libre. Une seule carte demandée, c'est
+        une file d'attente ; plusieurs, c'est un choix — et ce soir la 4×5090
+        a fait attendre sept essais pendant que d'autres Blackwell étaient
+        disponibles."""
         attempt = 0
         while True:
             attempt += 1
-            try:
-                return call(key, "POST", "/pods", body)
-            except SystemExit as e:
-                # The capacity lottery answers 400 "no instances available";
-                # every other error is real and must not be retried into a bill.
-                if args.wait and "no longer any instances" in str(e):
-                    print(f"essai {attempt}: pas d'instance libre, on reste "
-                          "dans la file (45 s)", flush=True)
-                    import time
-                    time.sleep(45)
-                    continue
-                raise
+            unavailable = []
+            for kind in args.gpu_type:
+                body["gpu"] = gpu_spec(kind)
+                try:
+                    pod = call(key, "POST", "/pods", body)
+                    body["gpu"] = gpu_spec(kind)  # celle qu'on a vraiment eue
+                    return pod, kind
+                except SystemExit as e:
+                    # The capacity lottery answers 400 "no instances
+                    # available"; every other error is real and must not be
+                    # retried into a bill.
+                    if "no longer any instances" in str(e):
+                        unavailable.append(kind)
+                        continue
+                    raise
+            if not args.wait:
+                raise SystemExit(
+                    "aucune des cartes demandées n'est libre : "
+                    + ", ".join(unavailable))
+            print(f"essai {attempt}: rien de libre en {', '.join(unavailable)}"
+                  " — on reste dans la file (45 s)", flush=True)
+            import time
+            time.sleep(45)
 
-    pod = take_a_pod()
-    print(f"pod: {pod['id']}  {args.gpu_count}x {args.gpu_type} ({args.cloud})"
+    pod, kind = take_a_pod()
+    print(f"pod: {pod['id']}  {args.gpu_count}x {kind} ({args.cloud})"
           f"  {pod.get('cost')} $/h", flush=True)
 
     # Un hôte qui ne sait pas démarrer CUDA n'est pas une impasse : c'est une
@@ -602,8 +635,8 @@ def main():
         if left == 1:
             raise SystemExit("aucun hôte utilisable — relance plus tard, ou "
                              "essaie --cloud SECURE / --gpu-count 1")
-        pod = take_a_pod()
-        print(f"pod: {pod['id']}  {args.gpu_count}x {args.gpu_type} "
+        pod, kind = take_a_pod()
+        print(f"pod: {pod['id']}  {args.gpu_count}x {kind} "
               f"({args.cloud})  {pod.get('cost')} $/h", flush=True)
 
     # Écrit APRÈS la création du pod, pour porter son identité : sans elle on

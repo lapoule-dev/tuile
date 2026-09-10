@@ -95,6 +95,30 @@ class Archive(unittest.TestCase):
             self.assertTrue(found.endswith("sportstracklive-rails/infra"))
 
 
+class BlackwellOnly(unittest.TestCase):
+    """Les noyaux de l'image sont sm_120 : toute carte par défaut doit être
+    Blackwell, sinon le pod démarre et ne trouve rien à charger."""
+
+    #: Ce que sm_120 sait faire tourner. Une 4090 est Ada, pas Blackwell.
+    BLACKWELL = ("5080", "5090", "PRO 5000", "PRO 6000", "B200", "B300")
+
+    def test_the_default_cards_can_run_the_kernels_we_built(self):
+        import argparse
+        p = argparse.ArgumentParser()
+        # On lit le défaut là où il est appliqué, pas là où il est déclaré :
+        # argparse le laisse vide et main() le remplit.
+        source = pathlib.Path(launch_job.__file__).read_text()
+        line = next(l for l in source.splitlines()
+                    if "args.gpu_type = [" in l)
+        for name in ("5080", "5090"):
+            self.assertIn(name, line, f"la carte {name} n'est plus le défaut")
+        self.assertTrue(
+            any(b in line for b in self.BLACKWELL),
+            "aucune carte Blackwell par défaut, alors que l'image ne porte "
+            "que des noyaux sm_120")
+        del p
+
+
 class HostLottery(unittest.TestCase):
     """Un hôte où cuInit échoue n'est pas une impasse, c'est un tirage."""
 
