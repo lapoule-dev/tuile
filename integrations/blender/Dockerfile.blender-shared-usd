@@ -47,6 +47,10 @@ ARG CUDA_VERSION=12-8
 # this whole image. The farm rents 5090s; anything else can be added the day it
 # is rented, and paying hours for kernels nobody runs is not thrift.
 ARG CUDA_ARCH=sm_120
+# OptiX headers. `find_package(OptiX 8.0.0)` in `intern/cycles/CMakeLists.txt`
+# is the floor; 8.1 satisfies it and the ABI is what a driver implements, so a
+# Blackwell driver serves these headers to a 5090 perfectly well.
+ARG OPTIX_VERSION=8.1.0
 
 # ---------------------------------------------------------------- sources
 FROM ubuntu:24.04 AS sources
@@ -113,13 +117,25 @@ RUN curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2
     && apt-get install -y --no-install-recommends cuda-toolkit-${CUDA_VERSION} \
     && rm -rf /var/lib/apt/lists/* \
     && /usr/local/cuda/bin/nvcc --version | tail -2
-# OptiX is headers only, and Blender ships them in its own precompiled libs —
-# so there is nothing to download and no click-through to defeat. Asserted
-# rather than assumed: without it cmake would quietly build a Blender with
-# CUDA and no OptiX, which is a slower renderer that looks like a working one.
-RUN test -d /opt/src/blender/lib/linux_x64/optix \
-    || { echo "no OptiX SDK in Blender's libs:"; \
-         ls /opt/src/blender/lib/linux_x64; exit 1; }
+# OptiX headers, from NVIDIA's own repository.
+#
+# Blender's precompiled libs do NOT carry them — checked, and the listing is
+# `hiprt`, `dpcpp`, `level-zero` and no `optix`: NVIDIA's licence does not
+# allow redistribution, which is why the SDK download has a click-through.
+# `NVIDIA/optix-dev` exists for exactly this problem — headers only, no
+# samples, no form.
+#
+# This matters more than a missing dependency usually does, because of how
+# Cycles fails without it: `set_and_warn_library_found` **turns OptiX off and
+# carries on**. The build succeeds, and what comes out is a slower renderer
+# that looks like a working one.
+ARG OPTIX_VERSION
+RUN curl -fsL "https://github.com/NVIDIA/optix-dev/archive/refs/tags/v${OPTIX_VERSION}.tar.gz" \
+        -o /tmp/optix.tar.gz \
+    && mkdir -p /opt/optix \
+    && tar -xzf /tmp/optix.tar.gz -C /opt/optix --strip-components=1 \
+    && rm /tmp/optix.tar.gz \
+    && grep -m1 "define OPTIX_VERSION" /opt/optix/include/optix.h
 COPY --from=usdpy /opt/usd /opt/usd
 # The build-fork's one source patch: scene-index population with the hdGp
 # resolver (generative procedurals cook). Whole-file replacement of a
@@ -140,7 +156,7 @@ RUN cd /opt/src/blender \
         -DCYCLES_CUDA_BINARIES_ARCH=${CUDA_ARCH} \
         -DWITH_CYCLES_DEVICE_CUDA=ON \
         -DWITH_CYCLES_DEVICE_OPTIX=ON \
-        -DOPTIX_ROOT_DIR=/opt/src/blender/lib/linux_x64/optix \
+        -DOPTIX_ROOT_DIR=/opt/optix \
         -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda \
         -DCMAKE_INSTALL_PREFIX=/opt/blender \
     && cmake --build /opt/build -j ${BUILD_JOBS} \
