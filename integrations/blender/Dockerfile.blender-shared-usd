@@ -30,6 +30,23 @@ ARG USD_VERSION=25.08
 # builder). Changing one must not invalidate the other's cached layer.
 ARG BUILD_JOBS=2
 ARG USD_BUILD_JOBS=8
+# The GPU backends, and why each number is what it is.
+#
+# Measured 2026-09-10 on stl/blender-globe:5.1-su: NOT ONE `.cubin` or `.ptx`
+# in the whole install, `compute_device_type` offering only
+# ('NONE','CUDA','HIP','ONEAPI') and CUDA enumerating zero devices on a machine
+# with four RTX 5090s. This Blender had no GPU backend at all — which is why
+# the farm had been on Storm, and why four processes told to take four GPUs
+# were only ever going to share one.
+#
+# 12.8 is a floor, not a preference: an RTX 5090 is Blackwell, compute
+# capability 12.0, and no earlier CUDA can emit sm_120.
+ARG CUDA_VERSION=12-8
+# ONE architecture, deliberately. Blender's default list spans a decade of
+# cards and each one is a full kernel compilation — the single longest step in
+# this whole image. The farm rents 5090s; anything else can be added the day it
+# is rented, and paying hours for kernels nobody runs is not thrift.
+ARG CUDA_ARCH=sm_120
 
 # ---------------------------------------------------------------- sources
 FROM ubuntu:24.04 AS sources
@@ -76,12 +93,33 @@ RUN PYBIN=$(ls /opt/blender-python/bin/python3* | head -1) \
 FROM sources AS build
 ENV DEBIAN_FRONTEND=noninteractive
 ARG BUILD_JOBS
+ARG CUDA_VERSION
+ARG CUDA_ARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential gcc-14 g++-14 cmake ninja-build \
         libx11-dev libxxf86vm-dev libxcursor-dev libxi-dev libxrandr-dev \
         libxinerama-dev libegl-dev libwayland-dev wayland-protocols \
         libxkbcommon-dev libdbus-1-dev libdecor-0-dev libvulkan-dev \
     && rm -rf /var/lib/apt/lists/*
+# The CUDA toolkit, from NVIDIA rather than from Ubuntu.
+#
+# Ubuntu 24.04 ships CUDA 12.0, which cannot emit sm_120 — it would build,
+# report success, and produce kernels no 5090 can load. Only nvcc and the
+# runtime headers are wanted; the driver belongs to the host and the container
+# runtime injects it.
+RUN curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
+    && dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends cuda-toolkit-${CUDA_VERSION} \
+    && rm -rf /var/lib/apt/lists/* \
+    && /usr/local/cuda/bin/nvcc --version | tail -2
+# OptiX is headers only, and Blender ships them in its own precompiled libs —
+# so there is nothing to download and no click-through to defeat. Asserted
+# rather than assumed: without it cmake would quietly build a Blender with
+# CUDA and no OptiX, which is a slower renderer that looks like a working one.
+RUN test -d /opt/src/blender/lib/linux_x64/optix \
+    || { echo "no OptiX SDK in Blender's libs:"; \
+         ls /opt/src/blender/lib/linux_x64; exit 1; }
 COPY --from=usdpy /opt/usd /opt/usd
 # The build-fork's one source patch: scene-index population with the hdGp
 # resolver (generative procedurals cook). Whole-file replacement of a
@@ -98,9 +136,27 @@ RUN cd /opt/src/blender \
         -DUSD_ROOT_DIR=/opt/usd \
         -DWITH_HYDRA=ON \
         -DWITH_CYCLES_HYDRA_RENDER_DELEGATE=ON \
+        -DWITH_CYCLES_CUDA_BINARIES=ON \
+        -DCYCLES_CUDA_BINARIES_ARCH=${CUDA_ARCH} \
+        -DWITH_CYCLES_DEVICE_CUDA=ON \
+        -DWITH_CYCLES_DEVICE_OPTIX=ON \
+        -DOPTIX_ROOT_DIR=/opt/src/blender/lib/linux_x64/optix \
+        -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda \
         -DCMAKE_INSTALL_PREFIX=/opt/blender \
     && cmake --build /opt/build -j ${BUILD_JOBS} \
     && cmake --install /opt/build
+
+# The kernels, or the build lied.
+#
+# `WITH_CYCLES_CUDA_BINARIES=ON` with a toolkit cmake could not find produces a
+# Blender that configures cleanly, links cleanly, and enumerates zero GPUs at
+# run time — which is exactly the state that cost two pods. Counting the
+# artefacts is the only check that cannot be satisfied by good intentions.
+RUN set -eu; \
+    n=$(find /opt/blender -name '*.cubin' -o -name '*.ptx' | wc -l); \
+    echo "cycles gpu kernels: $n"; \
+    test "$n" -gt 0 || { find /opt/blender -maxdepth 4 -name 'lib' -o -name '*.so' | head -20; \
+                         echo "no CUDA/OptiX kernels were built"; exit 1; }
 
 # ---------------------------------------------------------------- runtime
 FROM ubuntu:24.04
@@ -137,6 +193,19 @@ ENV PATH=/opt/blender:$PATH \
 # add-on that exposes it postdates Blender 5.1.2, so the check belongs where
 # the add-on is, which is `Dockerfile.globe`. Asserting it here would test
 # Blender's packaging rather than our own.
+# 4. Cycles can actually name a GPU backend.
+#
+# By ASSIGNMENT and not by reading `enum_items`, which answers `[]` in this
+# Blender while the values are perfectly settable — a lesson that cost two pods
+# in one afternoon. There is no GPU at build time, so the device COUNT cannot
+# be checked here; what can be, and what was silently false until today, is
+# that the build knows what OptiX is at all.
+RUN blender -b --factory-startup --python-exit-code 1 --python-expr \
+        "import bpy; \
+p = bpy.context.preferences.addons['cycles'].preferences; \
+p.compute_device_type = 'OPTIX'; \
+print('optix accepted')" \
+    && echo "blender-shared-usd verified: Cycles knows OptiX"
 RUN ldd /opt/blender/blender | grep -q libusd_ \
     && blender -b --factory-startup --python-exit-code 1 --python-expr \
         "import bpy; from pxr import Usd; v = Usd.GetVersion(); print('usd', v); assert v[1] == 25 and v[2] == 8" \
