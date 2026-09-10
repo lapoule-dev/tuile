@@ -152,6 +152,18 @@ class SeeingWhatIsRunning(unittest.TestCase):
             launch_job.all_pods("k")
 
 
+class EmptyBodies(unittest.TestCase):
+    """Un 204 sans corps n'est pas une erreur."""
+
+    def test_a_delete_that_returns_nothing_is_a_success(self):
+        """`--kill-all` a supprimé le pod puis a planté en essayant de parser
+        un corps vide. Le verbe qui doit marcher quand tout le reste est
+        cassé ne peut pas être le premier à tomber."""
+        source = pathlib.Path(launch_job.__file__).read_text()
+        self.assertIn("if body.strip() else {}", source,
+                      "call() reparse un corps vide en JSON")
+
+
 class NoPythonInTheImage(unittest.TestCase):
     """Le job ne doit pas appeler python3 : l'image n'en a pas.
 
