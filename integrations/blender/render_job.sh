@@ -11,8 +11,12 @@
 #   JOB_STAGE_B64_GZ   gzip+base64 of the .usda (or JOB_STAGE=path in image)
 #   JOB_FRAMES         "1:1440" (inclusive)
 #   JOB_ENGINE         native | hydra            (default native; hydra = the
-#                      manifest path, HYDRA_STORM, procedurals cook — needs
-#                      TUILE_ION_TOKEN in the pod env)
+#                      manifest path, procedurals cook — needs a pack
+#                      (JOB_PACK_URL) or TUILE_ION_TOKEN in the pod env)
+#   JOB_DELEGATE       storm | cycles            (hydra only; default cycles.
+#                      Storm is an OpenGL rasteriser and never calls CUDA, so
+#                      CUDA_VISIBLE_DEVICES steers nothing and four processes
+#                      told to take four GPUs were measured all on GPU 2.)
 #   JOB_TIER           cycles | eevee            (default cycles; native only)
 #   JOB_WIDTH          pixels                    (default 1920)
 #   JOB_SAMPLES        max samples               (default 128)
@@ -54,6 +58,7 @@ set -uo pipefail
 
 JOB_FRAMES="${JOB_FRAMES:?JOB_FRAMES requis (ex: 1:1440)}"
 JOB_ENGINE="${JOB_ENGINE:-native}"
+JOB_DELEGATE="${JOB_DELEGATE:-cycles}"
 JOB_TIER="${JOB_TIER:-cycles}"
 JOB_WIDTH="${JOB_WIDTH:-1920}"
 JOB_SAMPLES="${JOB_SAMPLES:-128}"
@@ -107,9 +112,15 @@ jobs=$((JOB_GPUS * JOB_PROCS_PER_GPU))
 span=$((total / jobs))
 [ "$span" -ge 1 ] || { echo "plage trop courte pour $jobs processus" >&2; exit 1; }
 
-# GPU probe first: never a silent CPU render. Storm draws through GL, not
-# OptiX, so the hydra engine probes the driver itself.
-if [ "$JOB_ENGINE" = "hydra" ]; then
+# GPU probe first: never a silent CPU render.
+#
+# What is counted matters, and it was wrong. `nvidia-smi -L | grep -c GPU`
+# counts cards the driver can see, which is not the same question as "how many
+# devices can the renderer put work on" — and answering the easy question is
+# how sixteen processes ended up sharing one GPU while the probe reported four.
+# Only a Storm render, which draws through GL and never touches OptiX, has any
+# business counting cards.
+if [ "$JOB_ENGINE" = "hydra" ] && [ "$JOB_DELEGATE" = "storm" ]; then
     probe="NGPU $(nvidia-smi -L 2>/dev/null | grep -c '^GPU')"
 else
     probe=$(blender -b --python-expr "import bpy; p = bpy.context.preferences.addons['cycles'].preferences; p.compute_device_type = 'OPTIX'; p.get_devices(); print('NGPU', sum(1 for d in p.devices if d.type == 'OPTIX'))" 2>&1 | grep -oE 'NGPU [0-9]+' | head -1)
@@ -180,6 +191,32 @@ fi
 [ -s "$STAGE" ] || { echo "stage absente: $STAGE" >&2; exit 1; }
 
 t0=$(date +%s)
+
+# Are the GPUs actually all working?
+#
+# The question that was never asked, and the answer was no: four processes,
+# one CUDA_VISIBLE_DEVICES each, all four measured on GPU 2. Nothing in the
+# job said so — the probe counted cards the driver could see, the render
+# finished, and the only trace of it was a screenshot somebody happened to
+# take. This samples utilisation per device while the render runs, so the
+# log answers it whether or not anyone is watching.
+if command -v nvidia-smi > /dev/null 2>&1; then
+    (
+        while sleep "${JOB_GPU_SAMPLE:-30}"; do
+            line=$(nvidia-smi --query-gpu=index,utilization.gpu,memory.used \
+                       --format=csv,noheader,nounits 2>/dev/null \
+                   | awk -F', ' '{printf "gpu%s=%s%%/%sMiB ", $1, $2, $3}')
+            [ -n "$line" ] || break
+            busy=$(nvidia-smi --query-gpu=utilization.gpu \
+                       --format=csv,noheader,nounits 2>/dev/null \
+                   | awk '$1 > 5' | wc -l)
+            echo "GPU-USE $busy/$JOB_GPUS actifs  $line"
+        done
+    ) &
+    gpu_watch=$!
+    trap 'kill "$gpu_watch" 2>/dev/null; archive_everything' EXIT
+fi
+
 for i in $(seq 0 $((jobs - 1))); do
     gpu=$((i / JOB_PROCS_PER_GPU))
     a=$((first + i * span))
@@ -199,6 +236,7 @@ for i in $(seq 0 $((jobs - 1))); do
     CUDA_VISIBLE_DEVICES=$gpu TUILE_CACHE_DIR="$proc_cache" \
         stdbuf -oL blender -b -P /opt/render/render_usd.py -- \
         --stage "$STAGE" --engine "$JOB_ENGINE" --tier "$JOB_TIER" \
+        --delegate "$JOB_DELEGATE" \
         --frames "$a:$b" --width "$JOB_WIDTH" \
         --samples "$JOB_SAMPLES" --adaptive-threshold "$JOB_THRESHOLD" \
         --batch-frames "$JOB_BATCH_FRAMES" $JOB_EXTRA_ARGS \
@@ -209,7 +247,19 @@ for i in $(seq 0 $((jobs - 1))); do
         | tee -a "$outdir/log-s$i.txt" &
 done
 wait
+kill "${gpu_watch:-0}" 2>/dev/null || true
 echo "WALL: $(($(date +%s) - t0))s pour $total frames en $jobs processus / $JOB_GPUS GPU"
+# The verdict, in one line, from the samples above. A run that used one GPU of
+# four is not a slow run, it is a broken one, and it must not need a human to
+# notice.
+if [ -s "$JOB_LOG" ]; then
+    peak=$(grep -o 'GPU-USE [0-9]*' "$JOB_LOG" | awk '{print $2}' | sort -rn | head -1)
+    if [ -n "$peak" ] && [ "$peak" -lt "$JOB_GPUS" ]; then
+        echo "GPU-UNDERUSED: au mieux $peak GPU sur $JOB_GPUS ont travaillé"
+    else
+        echo "GPU-OK: ${peak:-?}/$JOB_GPUS"
+    fi
+fi
 
 # Blender 5.x has no built-in encoder: the driver leaves PNG sequences and
 # each range is encoded here with the static ffmpeg.

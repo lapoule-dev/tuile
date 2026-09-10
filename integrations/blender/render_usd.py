@@ -30,6 +30,13 @@ def parse_args():
                    help="native = Cycles/EEVEE on imported geometry; hydra = "
                         "HYDRA_STORM over the exported stage, generative "
                         "procedurals cook (the manifest path)")
+    p.add_argument("--delegate", choices=["storm", "cycles"], default="storm",
+                   help="quel délégué Hydra cuit la scène (--engine hydra). "
+                        "storm est un rasteriseur OpenGL : il n'appelle jamais "
+                        "CUDA, donc CUDA_VISIBLE_DEVICES ne pilote rien et "
+                        "quatre processus atterrissent sur un seul GPU. cycles "
+                        "en délégué passe par OptiX, en aval du resolver hdGp "
+                        "— le procédural cuit exactement pareil.")
     p.add_argument("--tier", choices=["cycles", "eevee"], default="cycles")
     p.add_argument("--frames", default="1:48", help="A:B inclusive")
     p.add_argument("--width", type=int, default=1920)
@@ -71,8 +78,22 @@ def gpu_only(prefs, kinds):
     return None
 
 
-def setup_hydra_manifest(scene, stage_path, first, last):
-    """The manifest path: HYDRA_STORM over the exported stage.
+# Which Blender render engine drives which Hydra delegate.
+#
+# Storm is what the manifest path has always used and it is an OpenGL
+# rasteriser: it never calls CUDA. That is the whole reason
+# CUDA_VISIBLE_DEVICES steers nothing on this path and four processes told to
+# take four GPUs were measured all running on GPU 2. Cycles as a delegate sits
+# downstream of the hdGp resolver — the procedural cooks identically — and
+# renders through OptiX, so the device arithmetic means something again.
+HYDRA_DELEGATES = {
+    "storm": ("hydra_storm", "HYDRA_STORM"),
+    "cycles": ("cycles", "CYCLES_HYDRA"),
+}
+
+
+def setup_hydra_manifest(scene, stage_path, first, last, delegate="storm"):
+    """The manifest path: a Hydra delegate over the exported stage.
 
     The manifest's camera is rebuilt as a keyframed Blender camera straight
     from pxr rather than through `usd_import` — the importer's animation
@@ -86,8 +107,21 @@ def setup_hydra_manifest(scene, stage_path, first, last):
     import mathutils
     from pxr import Usd, UsdGeom
 
-    bpy.ops.preferences.addon_enable(module="hydra_storm")
-    scene.render.engine = "HYDRA_STORM"
+    module, engine = HYDRA_DELEGATES[delegate]
+    bpy.ops.preferences.addon_enable(module=module)
+    available = {
+        item.identifier
+        for item in scene.render.bl_rna.properties["engine"].enum_items
+    }
+    if engine not in available:
+        # Loud, and naming what IS there. A silent fall back to Storm would
+        # render — on one GPU, at a different look — and the only symptom
+        # would be the bill and a picture nobody could account for.
+        print(f"FATAL: the {delegate} Hydra delegate is not registered; "
+              f"engines available: {sorted(available)}",
+              file=sys.stderr, flush=True)
+        sys.exit(1)
+    scene.render.engine = engine
     scene.hydra.export_method = "USD"
 
     manifest = str(pathlib.Path(stage_path).resolve())
@@ -189,7 +223,7 @@ def main():
     scene.render.use_persistent_data = True
 
     if args.engine == "hydra":
-        setup_hydra_manifest(scene, args.stage, first, last)
+        setup_hydra_manifest(scene, args.stage, first, last, args.delegate)
     else:
         cameras = [o for o in bpy.data.objects if o.type == "CAMERA"]
         scene.camera = (
@@ -220,7 +254,8 @@ def main():
     if args.engine == "hydra":
         # Engine set by setup_hydra_manifest; Storm has neither samplers nor
         # denoisers to configure, its cost lives in the procedural cook.
-        print("hydra (HYDRA_STORM), manifest camera keyframed", flush=True)
+        print(f"hydra ({scene.render.engine}), manifest camera keyframed",
+              flush=True)
     elif args.tier == "cycles":
         scene.render.engine = "CYCLES"
         prefs = bpy.context.preferences.addons["cycles"].preferences
