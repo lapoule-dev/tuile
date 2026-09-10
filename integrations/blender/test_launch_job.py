@@ -95,28 +95,39 @@ class Archive(unittest.TestCase):
             self.assertTrue(found.endswith("sportstracklive-rails/infra"))
 
 
-class BlackwellOnly(unittest.TestCase):
-    """Les noyaux de l'image sont sm_120 : toute carte par défaut doit être
-    Blackwell, sinon le pod démarre et ne trouve rien à charger."""
+class CardsTheImageCanRun(unittest.TestCase):
+    """Ce que l'image sait faire tourner, et sur quelle carte.
 
-    #: Ce que sm_120 sait faire tourner. Une 4090 est Ada, pas Blackwell.
+    Deux backends, deux règles, et les confondre coûte un pod :
+    - OptiX charge du PTX, que le pilote compile à la volée — n'importe quelle
+      carte assez récente, 4090 comprise ;
+    - CUDA charge `kernel_sm_120.cubin` — Blackwell et rien d'autre.
+
+    Donc la liste par défaut peut contenir de l'Ada, mais elle DOIT contenir
+    au moins une Blackwell : sinon le seul chemin restant est OptiX, et si
+    OptiX se dérobe il n'y a pas de repli."""
+
     BLACKWELL = ("5080", "5090", "PRO 5000", "PRO 6000", "B200", "B300")
 
-    def test_the_default_cards_can_run_the_kernels_we_built(self):
-        import argparse
-        p = argparse.ArgumentParser()
-        # On lit le défaut là où il est appliqué, pas là où il est déclaré :
-        # argparse le laisse vide et main() le remplit.
+    def _default_line(self):
         source = pathlib.Path(launch_job.__file__).read_text()
-        line = next(l for l in source.splitlines()
-                    if "args.gpu_type = [" in l)
-        for name in ("5080", "5090"):
-            self.assertIn(name, line, f"la carte {name} n'est plus le défaut")
+        start = source.index("args.gpu_type = [")
+        return source[start:source.index("]", start)]
+
+    def test_at_least_one_default_card_can_load_the_cuda_kernel(self):
+        line = self._default_line()
         self.assertTrue(
             any(b in line for b in self.BLACKWELL),
-            "aucune carte Blackwell par défaut, alors que l'image ne porte "
-            "que des noyaux sm_120")
-        del p
+            "aucune carte Blackwell par défaut : sans elle il ne reste que "
+            "OptiX, et aucun repli s'il se dérobe")
+
+    def test_the_defaults_are_ordered_cheapest_first(self):
+        """La liste est essayée dans l'ordre avant d'attendre ; l'ordre EST le
+        choix économique."""
+        line = self._default_line()
+        order = [line.index(n) for n in ("4090", "5080", "5090") if n in line]
+        self.assertEqual(order, sorted(order),
+                         "les cartes ne sont plus du moins cher au plus cher")
 
 
 class HostLottery(unittest.TestCase):

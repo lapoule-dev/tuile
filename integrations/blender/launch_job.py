@@ -362,13 +362,16 @@ def main():
                    help="répétable, par ordre de préférence. La capacité est "
                         "une loterie et une seule carte demandée, c'est une "
                         "file d'attente ; plusieurs, c'est un choix. "
-                        "ATTENTION : les noyaux Cycles de l'image sont "
-                        "compilés pour sm_120 seulement, donc toute carte "
-                        "listée doit être Blackwell (5080, 5090, PRO 5000/6000, "
-                        "B200). Une 4090 démarrerait et ne trouverait aucun "
-                        "noyau à charger. Défaut : 5080 puis 5090 — la 5080 "
-                        "est à 0,39 $/h contre 0,69, et 16 Go suffisent à ce "
-                        "que ce job rend.")
+                        "Ce que l'image sait faire tourner, précisément : "
+                        "les noyaux OptiX sont du PTX, que le pilote compile "
+                        "à la volée, donc ils marchent sur n'importe quelle "
+                        "carte assez récente — 4090 comprise. Le noyau CUDA, "
+                        "lui, est un cubin sm_120 : Blackwell uniquement. La "
+                        "sonde essaie OptiX d'abord et annonce le backend "
+                        "retenu, donc une carte Ada rend par OptiX ou ne rend "
+                        "pas du tout, et le job le dit en quelques secondes. "
+                        "Défaut : 4090 (0,34 $/h), puis 5080 (0,39), puis "
+                        "5090 (0,69).")
     p.add_argument("--gpu-count", type=int, default=1)
     p.add_argument("--procs-per-gpu", type=int, default=4)
     p.add_argument("--cuda-min", default="13.2",
@@ -440,7 +443,13 @@ def main():
                         "flamegraphs remontent dans profile.tar.gz")
     args = p.parse_args()
     if not args.gpu_type:
-        args.gpu_type = ["NVIDIA GeForce RTX 5080", "NVIDIA GeForce RTX 5090"]
+        # Du moins cher au plus cher. La 4090 n'est pas Blackwell : elle rendra
+        # par OptiX (PTX compilé par le pilote) et jamais par le backend CUDA
+        # (cubin sm_120). La sonde annonce lequel des deux a été retenu, donc
+        # l'essai coûte quelques secondes et se lit dans le journal.
+        args.gpu_type = ["NVIDIA GeForce RTX 4090",
+                         "NVIDIA GeForce RTX 5080",
+                         "NVIDIA GeForce RTX 5090"]
     if args.engine == "hydra" and args.image == p.get_default("image"):
         args.image = ECR_HOST + "/stl/blender-globe:5.1-su"
 
