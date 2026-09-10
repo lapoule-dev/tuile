@@ -21,14 +21,19 @@
 # still carries the cubeProc spike probe, which constructed a TestCube
 # procedural on every populate — 240 lines of noise in a 48-frame job.
 #
-# It also already carries the Cycles Hydra delegate — `hdCycles.so` and its
-# `plugInfo.json` under `addons_core/cycles/hydra/`, from
-# `WITH_CYCLES_HYDRA_RENDER_DELEGATE=ON`. What it does NOT carry is the python
-# add-on that exposes it as a render engine: upstream's
+# 2510 is the first Blender in this project with a GPU backend at all. 2509
+# had `WITH_CYCLES_HYDRA_RENDER_DELEGATE=ON` above a build with no CUDA
+# toolkit and no OptiX headers: not one kernel, `compute_device_type` offering
+# no OPTIX, and zero CUDA devices enumerated on a machine with four RTX 5090s.
+# That one fact is why the farm was on Storm and why four processes told to
+# take four GPUs were only ever going to share one.
+#
+# It also carries the Cycles Hydra delegate — `hdCycles.so` and its
+# `plugInfo.json` under `addons_core/cycles/hydra/`. What it does NOT carry is
+# the python add-on that exposes it as a render engine: upstream's
 # `intern/cycles/hydra/addon` postdates Blender 5.1.2, so only `hydra_storm`
-# is installed. Ours goes in below, and it was tested against this very image:
-# `scene.render.engine = 'HYDRA_CYCLES'` takes. No base rebuild needed.
-ARG BASE=harbor.sportstracklive.com/stl/blender-shared-usd:5.1-2509
+# is installed. Ours goes in below.
+ARG BASE=harbor.sportstracklive.com/stl/blender-shared-usd:5.1-2510
 
 # ----------------------------------------------------------------- rustlib --
 FROM rust:1-bookworm AS rustlib
