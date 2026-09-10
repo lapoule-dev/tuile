@@ -262,6 +262,460 @@ impl<'a> Block {
 
 }
 
+/// The camera one frame was baked for. Twelve doubles, exactly the shape the
+/// ABI's `TuileViewState` carries.
+///
+/// It is here because a render has no frame number to ask with: the host cooks
+/// at a timecode and hands the session a camera. So a pack is addressed by the
+/// camera it was baked for, and a camera that matches nothing in the pack is
+/// the stage and the pack disagreeing — which must be an error, not a guess.
+// struct View, aligned to 8
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq)]
+pub struct View(pub [u8; 96]);
+impl Default for View { 
+  fn default() -> Self { 
+    Self([0; 96])
+  }
+}
+impl ::core::fmt::Debug for View {
+  fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+    f.debug_struct("View")
+      .field("px", &self.px())
+      .field("py", &self.py())
+      .field("pz", &self.pz())
+      .field("dx", &self.dx())
+      .field("dy", &self.dy())
+      .field("dz", &self.dz())
+      .field("ux", &self.ux())
+      .field("uy", &self.uy())
+      .field("uz", &self.uz())
+      .field("vw", &self.vw())
+      .field("vh", &self.vh())
+      .field("fovy", &self.fovy())
+      .finish()
+  }
+}
+
+impl ::flatbuffers::SimpleToVerifyInSlice for View {}
+impl<'a> ::flatbuffers::Follow<'a> for View {
+  type Inner = &'a View;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    unsafe { <&'a View>::follow(buf, loc) }
+  }
+}
+impl<'a> ::flatbuffers::Follow<'a> for &'a View {
+  type Inner = &'a View;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    unsafe { ::flatbuffers::follow_cast_ref::<View>(buf, loc) }
+  }
+}
+impl<'b> ::flatbuffers::Push for View {
+    type Output = View;
+    #[inline]
+    unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
+        let src = unsafe { ::core::slice::from_raw_parts(self as *const View as *const u8, <Self as ::flatbuffers::Push>::size()) };
+        dst.copy_from_slice(src);
+    }
+    #[inline]
+    fn alignment() -> ::flatbuffers::PushAlignment {
+        ::flatbuffers::PushAlignment::new(8)
+    }
+}
+
+impl<'a> ::flatbuffers::Verifiable for View {
+  #[inline]
+  fn run_verifier(
+    v: &mut ::flatbuffers::Verifier, pos: usize
+  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+    v.in_buffer::<Self>(pos)
+  }
+}
+
+impl<'a> View {
+  #[allow(clippy::too_many_arguments)]
+  pub fn new(
+    px: f64,
+    py: f64,
+    pz: f64,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    ux: f64,
+    uy: f64,
+    uz: f64,
+    vw: f64,
+    vh: f64,
+    fovy: f64,
+  ) -> Self {
+    let mut s = Self([0; 96]);
+    s.set_px(px);
+    s.set_py(py);
+    s.set_pz(pz);
+    s.set_dx(dx);
+    s.set_dy(dy);
+    s.set_dz(dz);
+    s.set_ux(ux);
+    s.set_uy(uy);
+    s.set_uz(uz);
+    s.set_vw(vw);
+    s.set_vh(vh);
+    s.set_fovy(fovy);
+    s
+  }
+
+  pub fn px(&self) -> f64 {
+    let mut mem = ::core::mem::MaybeUninit::<<f64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[0..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_px(&mut self, x: f64) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[0..].as_mut_ptr(),
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn py(&self) -> f64 {
+    let mut mem = ::core::mem::MaybeUninit::<<f64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[8..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_py(&mut self, x: f64) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[8..].as_mut_ptr(),
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn pz(&self) -> f64 {
+    let mut mem = ::core::mem::MaybeUninit::<<f64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[16..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_pz(&mut self, x: f64) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[16..].as_mut_ptr(),
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn dx(&self) -> f64 {
+    let mut mem = ::core::mem::MaybeUninit::<<f64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[24..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_dx(&mut self, x: f64) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[24..].as_mut_ptr(),
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn dy(&self) -> f64 {
+    let mut mem = ::core::mem::MaybeUninit::<<f64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[32..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_dy(&mut self, x: f64) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[32..].as_mut_ptr(),
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn dz(&self) -> f64 {
+    let mut mem = ::core::mem::MaybeUninit::<<f64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[40..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_dz(&mut self, x: f64) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[40..].as_mut_ptr(),
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn ux(&self) -> f64 {
+    let mut mem = ::core::mem::MaybeUninit::<<f64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[48..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_ux(&mut self, x: f64) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[48..].as_mut_ptr(),
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn uy(&self) -> f64 {
+    let mut mem = ::core::mem::MaybeUninit::<<f64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[56..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_uy(&mut self, x: f64) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[56..].as_mut_ptr(),
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn uz(&self) -> f64 {
+    let mut mem = ::core::mem::MaybeUninit::<<f64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[64..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_uz(&mut self, x: f64) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[64..].as_mut_ptr(),
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn vw(&self) -> f64 {
+    let mut mem = ::core::mem::MaybeUninit::<<f64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[72..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_vw(&mut self, x: f64) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[72..].as_mut_ptr(),
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn vh(&self) -> f64 {
+    let mut mem = ::core::mem::MaybeUninit::<<f64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[80..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_vh(&mut self, x: f64) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[80..].as_mut_ptr(),
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn fovy(&self) -> f64 {
+    let mut mem = ::core::mem::MaybeUninit::<<f64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[88..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_fovy(&mut self, x: f64) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[88..].as_mut_ptr(),
+        ::core::mem::size_of::<<f64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+}
+
 pub enum TileOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -572,6 +1026,7 @@ impl<'a> ::flatbuffers::Follow<'a> for Frame<'a> {
 impl<'a> Frame<'a> {
   pub const VT_FRAME: ::flatbuffers::VOffsetT = 4;
   pub const VT_TILES: ::flatbuffers::VOffsetT = 6;
+  pub const VT_VIEW: ::flatbuffers::VOffsetT = 8;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -583,6 +1038,7 @@ impl<'a> Frame<'a> {
     args: &'args FrameArgs<'args>
   ) -> ::flatbuffers::WIPOffset<Frame<'bldr>> {
     let mut builder = FrameBuilder::new(_fbb);
+    if let Some(x) = args.view { builder.add_view(x); }
     if let Some(x) = args.tiles { builder.add_tiles(x); }
     builder.add_frame(args.frame);
     builder.finish()
@@ -603,6 +1059,13 @@ impl<'a> Frame<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u32>>>(Frame::VT_TILES, None)}
   }
+  #[inline]
+  pub fn view(&self) -> Option<&'a View> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<View>(Frame::VT_VIEW, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for Frame<'_> {
@@ -613,6 +1076,7 @@ impl ::flatbuffers::Verifiable for Frame<'_> {
     v.visit_table(pos)?
      .visit_field::<u32>("frame", Self::VT_FRAME, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u32>>>("tiles", Self::VT_TILES, false)?
+     .visit_field::<View>("view", Self::VT_VIEW, false)?
      .finish();
     Ok(())
   }
@@ -620,6 +1084,7 @@ impl ::flatbuffers::Verifiable for Frame<'_> {
 pub struct FrameArgs<'a> {
     pub frame: u32,
     pub tiles: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u32>>>,
+    pub view: Option<&'a View>,
 }
 impl<'a> Default for FrameArgs<'a> {
   #[inline]
@@ -627,6 +1092,7 @@ impl<'a> Default for FrameArgs<'a> {
     FrameArgs {
       frame: 0,
       tiles: None,
+      view: None,
     }
   }
 }
@@ -643,6 +1109,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> FrameBuilder<'a, 'b, A> {
   #[inline]
   pub fn add_tiles(&mut self, tiles: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , u32>>) {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Frame::VT_TILES, tiles);
+  }
+  #[inline]
+  pub fn add_view(&mut self, view: &View) {
+    self.fbb_.push_slot_always::<&View>(Frame::VT_VIEW, view);
   }
   #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> FrameBuilder<'a, 'b, A> {
@@ -664,6 +1134,7 @@ impl ::core::fmt::Debug for Frame<'_> {
     let mut ds = f.debug_struct("Frame");
       ds.field("frame", &self.frame());
       ds.field("tiles", &self.tiles());
+      ds.field("view", &self.view());
       ds.finish()
   }
 }
@@ -688,9 +1159,10 @@ impl<'a> Pack<'a> {
   pub const VT_FIRST_FRAME: ::flatbuffers::VOffsetT = 8;
   pub const VT_LAST_FRAME: ::flatbuffers::VOffsetT = 10;
   pub const VT_RENDER_ORIGIN: ::flatbuffers::VOffsetT = 12;
-  pub const VT_CULLING: ::flatbuffers::VOffsetT = 14;
-  pub const VT_TILES: ::flatbuffers::VOffsetT = 16;
-  pub const VT_FRAMES: ::flatbuffers::VOffsetT = 18;
+  pub const VT_BLOB_DIGEST: ::flatbuffers::VOffsetT = 14;
+  pub const VT_CULLING: ::flatbuffers::VOffsetT = 16;
+  pub const VT_TILES: ::flatbuffers::VOffsetT = 18;
+  pub const VT_FRAMES: ::flatbuffers::VOffsetT = 20;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -702,6 +1174,7 @@ impl<'a> Pack<'a> {
     args: &'args PackArgs<'args>
   ) -> ::flatbuffers::WIPOffset<Pack<'bldr>> {
     let mut builder = PackBuilder::new(_fbb);
+    builder.add_blob_digest(args.blob_digest);
     if let Some(x) = args.frames { builder.add_frames(x); }
     if let Some(x) = args.tiles { builder.add_tiles(x); }
     if let Some(x) = args.culling { builder.add_culling(x); }
@@ -753,6 +1226,21 @@ impl<'a> Pack<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, f64>>>(Pack::VT_RENDER_ORIGIN, None)}
   }
+  /// FNV-1a over the whole blob region, taken at write time.
+  ///
+  /// A pack travels: written on one machine, pushed to R2, pulled onto a pod,
+  /// read by sixteen processes. A payload that arrives bent does not
+  /// necessarily fail to decompress — it can hand back plausible bytes, and a
+  /// renderer then draws slightly wrong ground and reports success. Checked at
+  /// open, once, because that is the only moment at which the answer is still
+  /// cheap and still actionable.
+  #[inline]
+  pub fn blob_digest(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(Pack::VT_BLOB_DIGEST, Some(0)).unwrap()}
+  }
   /// How the selection was culled when this was baked — "full" or "disabled".
   ///
   /// A pack freezes its selection: a hole baked in is a hole for ever, and it
@@ -794,6 +1282,7 @@ impl ::flatbuffers::Verifiable for Pack<'_> {
      .visit_field::<u32>("first_frame", Self::VT_FIRST_FRAME, false)?
      .visit_field::<u32>("last_frame", Self::VT_LAST_FRAME, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, f64>>>("render_origin", Self::VT_RENDER_ORIGIN, false)?
+     .visit_field::<u64>("blob_digest", Self::VT_BLOB_DIGEST, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("culling", Self::VT_CULLING, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<Tile>>>>("tiles", Self::VT_TILES, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<Frame>>>>("frames", Self::VT_FRAMES, false)?
@@ -807,6 +1296,7 @@ pub struct PackArgs<'a> {
     pub first_frame: u32,
     pub last_frame: u32,
     pub render_origin: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, f64>>>,
+    pub blob_digest: u64,
     pub culling: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub tiles: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Tile<'a>>>>>,
     pub frames: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Frame<'a>>>>>,
@@ -820,6 +1310,7 @@ impl<'a> Default for PackArgs<'a> {
       first_frame: 0,
       last_frame: 0,
       render_origin: None,
+      blob_digest: 0,
       culling: None,
       tiles: None,
       frames: None,
@@ -851,6 +1342,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> PackBuilder<'a, 'b, A> {
   #[inline]
   pub fn add_render_origin(&mut self, render_origin: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , f64>>) {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Pack::VT_RENDER_ORIGIN, render_origin);
+  }
+  #[inline]
+  pub fn add_blob_digest(&mut self, blob_digest: u64) {
+    self.fbb_.push_slot::<u64>(Pack::VT_BLOB_DIGEST, blob_digest, 0);
   }
   #[inline]
   pub fn add_culling(&mut self, culling: ::flatbuffers::WIPOffset<&'b  str>) {
@@ -887,6 +1382,7 @@ impl ::core::fmt::Debug for Pack<'_> {
       ds.field("first_frame", &self.first_frame());
       ds.field("last_frame", &self.last_frame());
       ds.field("render_origin", &self.render_origin());
+      ds.field("blob_digest", &self.blob_digest());
       ds.field("culling", &self.culling());
       ds.field("tiles", &self.tiles());
       ds.field("frames", &self.frames());

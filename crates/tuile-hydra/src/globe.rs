@@ -254,6 +254,7 @@ async fn resolve(
                 max_level: max_level(),
                 imagery_slots: imagery_slots.clone(),
                 imagery_boost_cap: imagery_boost_cap(),
+                deterministic_floor: true,
             },
             offload::threaded(),
         );
@@ -295,6 +296,14 @@ async fn resolve(
             max_level: max_level(),
             imagery_slots,
             imagery_boost_cap: imagery_boost_cap(),
+            // On, and not a knob. Everything else in this crate is exact by
+            // construction — `exact_traversal` refuses stand-ins and forbids
+            // holes for the same reason — and a coarse layer chosen from
+            // whatever a bounded cache happens to hold is the last decision
+            // here that depends on how fast tiles arrived. It was measured
+            // re-draping 16 of 80 identically selected tiles between two runs
+            // of one frame.
+            deterministic_floor: true,
         },
         offload::threaded(),
     );

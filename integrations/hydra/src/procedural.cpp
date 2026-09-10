@@ -475,11 +475,23 @@ TuileGlobeProcedural::_EnsureSession(const HdSceneIndexBaseRefPtr &inputScene)
         return false;
     }
 
+    // A pre-baked pack, if the job was given one. It is the whole scene —
+    // selection, geometry and imagery, decided once by `tuile-bake` — so with
+    // one in hand this process never opens a socket and needs no token at all.
+    //
+    // From the environment rather than from the stage, and for the same reason
+    // the token is: a manifest describes a shot, not the machine rendering it.
+    // Two nodes may legitimately read the same stage with the pack in
+    // different places, or one of them from the network.
+    const std::string packPath = TfGetenv("TUILE_PACK");
+    const std::string sceneDigest = TfGetenv("TUILE_SCENE");
+
     const std::string token = TfGetenv("TUILE_ION_TOKEN");
-    if (token.empty()) {
+    if (packPath.empty() && token.empty()) {
         TF_RUNTIME_ERROR(
-            "tuile: TUILE_ION_TOKEN is not set — the globe cannot stream. "
-            "The token deliberately never lives in a stage.");
+            "tuile: neither TUILE_PACK nor TUILE_ION_TOKEN is set — there is "
+            "nothing to read the globe from. The token deliberately never "
+            "lives in a stage, and neither does the pack's path.");
         return false;
     }
     const std::string cacheDir = TfGetenv("TUILE_CACHE_DIR");
@@ -489,7 +501,8 @@ TuileGlobeProcedural::_EnsureSession(const HdSceneIndexBaseRefPtr &inputScene)
     // the token selects permission, not data, and keeping it out means it can
     // never surface in a diagnostic that prints a key.
     const std::string key = TfStringPrintf(
-        "%lld|%lld|%g|%s",
+        "%s|%lld|%lld|%g|%s",
+        packPath.c_str(),
         static_cast<long long>(
             _DoubleArg(inputScene, _primPath, _tokens->terrainAssetId, 0.0)),
         static_cast<long long>(
@@ -511,6 +524,11 @@ TuileGlobeProcedural::_EnsureSession(const HdSceneIndexBaseRefPtr &inputScene)
         return false;
     }
 
+    config.pack_path = {reinterpret_cast<const uint8_t *>(packPath.data()),
+                        packPath.size()};
+    config.scene_digest = {
+        reinterpret_cast<const uint8_t *>(sceneDigest.data()),
+        sceneDigest.size()};
     config.ion_token = {reinterpret_cast<const uint8_t *>(token.data()),
                         token.size()};
     config.cache_dir = {reinterpret_cast<const uint8_t *>(cacheDir.data()),
@@ -532,12 +550,29 @@ TuileGlobeProcedural::_EnsureSession(const HdSceneIndexBaseRefPtr &inputScene)
     const TuileStatus status = tuile_session_new(&config, &_shared->session);
     if (status != TuileStatus_Ok || !_shared->session) {
         _shared->failed = true;
-        TF_RUNTIME_ERROR(
-            "tuile: opening the globe failed (status %d) — check the token, "
-            "the asset ids and the network. Nothing will be emitted.",
-            static_cast<int>(status));
+        if (!packPath.empty()) {
+            TF_RUNTIME_ERROR(
+                "tuile: opening the pack %s failed (status %d) — it is "
+                "missing, truncated, or a bake of another scene. Nothing will "
+                "be emitted.",
+                packPath.c_str(), static_cast<int>(status));
+        } else {
+            TF_RUNTIME_ERROR(
+                "tuile: opening the globe failed (status %d) — check the "
+                "token, the asset ids and the network. Nothing will be "
+                "emitted.",
+                static_cast<int>(status));
+        }
         return false;
     }
+    // Which of the two this process is reading, said once and unmistakably.
+    // A pod that was meant to read a pack and quietly fell back to the network
+    // would still render — slower, and possibly a different picture — and the
+    // only symptom would be the bill.
+    const std::string source =
+        packPath.empty() ? std::string("network") : "pack " + packPath;
+    printf("SOURCE %s\n", source.c_str());
+    fflush(stdout);
     return true;
 }
 

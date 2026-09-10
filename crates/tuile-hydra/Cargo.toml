@@ -43,6 +43,9 @@ tuile-cesium-ion = { version = "0.0.1", path = "../tuile-cesium-ion" }
 tuile-bing = { version = "0.0.1", path = "../tuile-bing" }
 tuile-planetary = { version = "0.0.1", path = "../tuile-planetary" }
 tuile-native-fetchers = { version = "0.0.1", path = "../tuile-native-fetchers" }
+# The pre-baked container. A render that reads one needs no ion token, no
+# network and no traversal; see `packed`.
+tuile-pack = { version = "0.0.1", path = "../tuile-pack" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -4565,6 +4565,7 @@ dependencies = [
  "tuile-cesium-ion",
  "tuile-core",
  "tuile-native-fetchers",
+ "tuile-pack",
  "tuile-planetary",
 ]
 
