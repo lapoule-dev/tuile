@@ -17,16 +17,18 @@
 #       -f integrations/blender/Dockerfile.globe \
 #       -t harbor.sportstracklive.com/stl/blender-globe:5.1-su --push .
 
-# 5.1-2510 adds the assertion that the Cycles Hydra delegate is really there.
-# `WITH_CYCLES_HYDRA_RENDER_DELEGATE=ON` had been set in that build for a while
-# and nothing ever checked it produced anything — which mattered the day the
-# render had to leave Storm, because Storm is an OpenGL rasteriser that never
-# calls CUDA and four processes told to take four GPUs all landed on one.
-#
 # 2509 recompiled Blender from the current patch: 2508 predates c2ab384 and
 # still carries the cubeProc spike probe, which constructed a TestCube
 # procedural on every populate — 240 lines of noise in a 48-frame job.
-ARG BASE=harbor.sportstracklive.com/stl/blender-shared-usd:5.1-2510
+#
+# It also already carries the Cycles Hydra delegate — `hdCycles.so` and its
+# `plugInfo.json` under `addons_core/cycles/hydra/`, from
+# `WITH_CYCLES_HYDRA_RENDER_DELEGATE=ON`. What it does NOT carry is the python
+# add-on that exposes it as a render engine: upstream's
+# `intern/cycles/hydra/addon` postdates Blender 5.1.2, so only `hydra_storm`
+# is installed. Ours goes in below, and it was tested against this very image:
+# `scene.render.engine = 'HYDRA_CYCLES'` takes. No base rebuild needed.
+ARG BASE=harbor.sportstracklive.com/stl/blender-shared-usd:5.1-2509
 
 # ----------------------------------------------------------------- rustlib --
 FROM rust:1-bookworm AS rustlib
@@ -150,6 +152,13 @@ RUN curl -fsL -o /tmp/ffmpeg.tar.xz \
     && rm -rf /tmp/ffmpeg* \
     && ffmpeg -version | sed -n 1p \
     && ffprobe -version | sed -n 1p
+# The add-on that turns the bundled Cycles Hydra delegate into a render
+# engine. Blender 5.1.2 ships the delegate and not the add-on; without this
+# the manifest path can only be Storm, and Storm is an OpenGL rasteriser that
+# never calls CUDA — which is why four processes told to take four GPUs were
+# measured all running on one.
+COPY integrations/blender/addons/hydra_cycles \
+     /opt/blender/5.1/scripts/addons_core/hydra_cycles
 COPY integrations/blender/render_usd.py /opt/render/render_usd.py
 COPY integrations/blender/render_job.sh /opt/render/render_job.sh
 COPY --from=rustlib /src/target/release/orbit-tape \
@@ -179,5 +188,16 @@ RUN out=$(TF_DEBUG=PLUG_REGISTRATION blender -b --factory-startup \
     else \
         echo "$out" | tail -40; exit 1; \
     fi
+
+# And that the Cycles Hydra delegate is a render engine this Blender will
+# accept. That is what puts the render on OptiX instead of Storm, and therefore
+# what puts it on four GPUs instead of one.
+#
+# By ASSIGNMENT, not by reading `enum_items`. Measured in 5.1-2509: that
+# property answered `['BLENDER_EEVEE']` while `CYCLES` and `HYDRA_CYCLES` were
+# both perfectly settable, so a check on it would have failed a delegate that
+# was there. Blender's own TypeError names the engines that really exist, which
+# is the diagnosis anyway.
+RUN blender -b --factory-startup --python-exit-code 1 --python-expr         "import bpy; sc = bpy.context.scene; bpy.ops.preferences.addon_enable(module='cycles'); bpy.ops.preferences.addon_enable(module='hydra_cycles'); sc.render.engine = 'HYDRA_CYCLES'; assert sc.render.engine == 'HYDRA_CYCLES'"     && echo "blender-globe verified: HYDRA_CYCLES is settable"
 
 CMD ["bash", "/opt/render/render_job.sh"]

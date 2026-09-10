@@ -130,34 +130,13 @@ ENV PATH=/opt/blender:$PATH \
 #    resolvable by plugins — the official build's wall, inverted.
 # 2. The python pxr bindings work (the USDHook injection path).
 # 3. The built-in video encoder actually encodes.
-# 4. The Cycles Hydra render delegate is really here, and where.
 #
-# The fourth is new and it is the one that unblocks OptiX. Storm is an OpenGL
-# rasteriser: it never calls CUDA, which is why CUDA_VISIBLE_DEVICES steers
-# nothing today and why four processes told to take four GPUs all landed on
-# GPU 2. Cycles as a Hydra *delegate* sits downstream of the hdGp resolver, so
-# the procedural cooks exactly as it does now and the render goes through
-# OptiX — CUDA_VISIBLE_DEVICES means something again.
-#
-# `WITH_CYCLES_HYDRA_RENDER_DELEGATE=ON` has been set in the build above for a
-# while and nothing ever checked that it produced anything. The assertion also
-# PRINTS the path, because where Blender installs it is the fact nobody here
-# knows, and a build log that answers it is worth more than a guess in a
-# comment.
-RUN set -eu; \
-    found=$(find /opt/blender -name plugInfo.json -path '*ycles*' | head -1); \
-    test -n "$found" || { \
-        echo "no Cycles Hydra delegate under /opt/blender — \
-WITH_CYCLES_HYDRA_RENDER_DELEGATE produced nothing"; \
-        find /opt/blender -name plugInfo.json | head -40; exit 1; }; \
-    echo "cycles hydra delegate: $found"; \
-    PXR_PLUGINPATH_NAME="$(dirname "$found")" \
-    blender -b --factory-startup --python-exit-code 1 --python-expr \
-        "from pxr import Plug; import os; \
-r = Plug.Registry(); r.RegisterPlugins([os.environ['PXR_PLUGINPATH_NAME']]); \
-names = sorted(p.name for p in r.GetAllPlugins()); \
-print('hydra plugins:', [n for n in names if 'ycles' in n or n.startswith('hd')]); \
-assert 'hdCycles' in names, f'HdCyclesPlugin is not registered: {names[:20]}'"
+# What is deliberately NOT asserted here: that the Cycles Hydra delegate is
+# usable as a render engine. It is present in this image — `hdCycles.so` and
+# its `plugInfo.json` under `addons_core/cycles/hydra/` — but the python
+# add-on that exposes it postdates Blender 5.1.2, so the check belongs where
+# the add-on is, which is `Dockerfile.globe`. Asserting it here would test
+# Blender's packaging rather than our own.
 RUN ldd /opt/blender/blender | grep -q libusd_ \
     && blender -b --factory-startup --python-exit-code 1 --python-expr \
         "import bpy; from pxr import Usd; v = Usd.GetVersion(); print('usd', v); assert v[1] == 25 and v[2] == 8" \
