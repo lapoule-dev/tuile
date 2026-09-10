@@ -181,6 +181,26 @@ print('BACKENDS', ' '.join(why))
 fi
 echo "probe: $probe backend=$CYCLES_BACKEND (attendu: NGPU $JOB_GPUS)"
 if [ "$probe" != "NGPU $JOB_GPUS" ]; then
+    # Everything a person would ask for next, gathered before the pod is gone.
+    #
+    # A bail that only says "no GPU" costs another pod to diagnose, and this
+    # one has already cost three. The build side and the driver side fail
+    # identically from the outside — Cycles reports zero devices either way —
+    # so both are printed: what the driver can see, whether its libraries are
+    # reachable, and what Blender was offered.
+    echo "--- what the driver sees ---"
+    nvidia-smi -L 2>&1 | head -8 || echo "nvidia-smi absent"
+    nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>&1 | head -4
+    echo "--- driver libraries in the container ---"
+    ldconfig -p 2>/dev/null | grep -E "libcuda\.so|libnvoptix|libnvidia-ml" \
+        | sed 's/^\s*/  /' | head -6 || echo "  none"
+    echo "  NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-<unset>}"
+    echo "  NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-<unset>}"
+    echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+    echo "--- what Blender was built with ---"
+    ls /opt/blender/*/scripts/addons_core/cycles/lib/ 2>/dev/null | head -8 \
+        || find /opt/blender -name '*.cubin*' -o -name '*.ptx*' 2>/dev/null \
+           | sed 's/.*\//  /' | head -8
     echo NO-GPU-BAIL
     sleep "${JOB_BAIL_SLEEP:-600}"
     exit 1
