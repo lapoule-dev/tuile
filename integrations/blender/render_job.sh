@@ -197,6 +197,20 @@ if [ "$probe" != "NGPU $JOB_GPUS" ]; then
     echo "  NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-<unset>}"
     echo "  NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-<unset>}"
     echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+    echo "--- device nodes ---"
+    ls /dev/nvidia* 2>&1 | tr '\n' ' ' | sed 's/^/  /'; echo
+    echo "--- what Cycles says when asked to explain itself ---"
+    blender -b --debug-cycles --python-expr "
+import bpy
+p = bpy.context.preferences.addons['cycles'].preferences
+for b in ('OPTIX', 'CUDA'):
+    try:
+        p.compute_device_type = b
+    except TypeError:
+        continue
+    p.get_devices()
+    print('DEVICES', b, [(d.type, d.name) for d in p.devices])
+" 2>&1 | grep -iE "DEVICES|cuda|optix|device" | head -20
     echo "--- what Blender was built with ---"
     ls /opt/blender/*/scripts/addons_core/cycles/lib/ 2>/dev/null | head -8 \
         || find /opt/blender -name '*.cubin*' -o -name '*.ptx*' 2>/dev/null \
