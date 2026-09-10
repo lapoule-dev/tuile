@@ -241,6 +241,12 @@ enum Job {
     Inspect(std::path::PathBuf),
     /// Compare two packs and say what they disagree about.
     Diff(std::path::PathBuf, std::path::PathBuf),
+    /// Open one frame through the render's own path and lay its contents out
+    /// on disk, so a person can look at them.
+    Dump {
+        pack: std::path::PathBuf,
+        frame: u32,
+    },
     /// Bake the same scene live, again, and compare it against a pack tile
     /// for tile and byte for byte.
     Verify {
@@ -263,6 +269,7 @@ usage: tuile-bake --tape <path.mcap> --frames <first>:<last> --out <path.tuilepa
                   [--viewport <w>x<h>]
        tuile-bake --inspect <path.tuilepack>
        tuile-bake --diff <a.tuilepack> <b.tuilepack>
+       tuile-bake --dump <path.tuilepack> --frame <n>
        tuile-bake --verify <path.tuilepack> --tape <path.mcap> [--viewport <w>x<h>]
 
 environment:
@@ -280,12 +287,16 @@ fn parse_args() -> Result<Job, String> {
     let mut frames = None;
     let mut viewport = (1280.0, 960.0);
     let mut verify: Option<std::path::PathBuf> = None;
+    let mut dump: Option<std::path::PathBuf> = None;
+    let mut frame: u32 = 1;
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         let mut value = || argv.next().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
             "--inspect" => return Ok(Job::Inspect(value()?.into())),
             "--verify" => verify = Some(std::path::PathBuf::from(value()?)),
+            "--dump" => dump = Some(std::path::PathBuf::from(value()?)),
+            "--frame" => frame = value()?.parse().map_err(|_| "--frame wants a number")?,
             "--diff" => {
                 let a = std::path::PathBuf::from(value()?);
                 let b = std::path::PathBuf::from(value()?);
@@ -305,6 +316,9 @@ fn parse_args() -> Result<Job, String> {
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
         }
+    }
+    if let Some(pack) = dump {
+        return Ok(Job::Dump { pack, frame });
     }
     if let Some(pack) = verify {
         return Ok(Job::Verify {
@@ -420,6 +434,7 @@ fn run() -> Result<(), String> {
     match parse_args()? {
         Job::Inspect(path) => inspect(&path),
         Job::Diff(a, b) => diff(&a, &b),
+        Job::Dump { pack, frame } => dump_frame(&pack, frame),
         Job::Verify {
             pack,
             tape,
@@ -610,6 +625,128 @@ fn bake(args: Args) -> Result<(), String> {
     // On stdout, and parseable, because the launcher turns it into an object
     // key: `packs/<scene>/<first>-<last>.tuilepack`.
     println!("BAKE-KEY packs/{scene}/{}-{wanted}.tuilepack", args.first);
+    Ok(())
+}
+
+/// Lays one frame out on disk, through the path a render actually takes.
+///
+/// Not a reader of its own: it opens the pack with `Session::from_pack` and
+/// asks for the frame, so what lands on disk is exactly what a renderer is
+/// handed — the same decode, the same texture files, the same URIs. A dump
+/// that went round the render path would be a third implementation to keep
+/// honest.
+fn dump_frame(path: &std::path::Path, number: u32) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let pack = tuile_pack::Pack::open(&bytes).map_err(|e| e.to_string())?;
+    let view = pack.view_of(number).map_err(|e| e.to_string())?;
+
+    let mut session = tuile_hydra::Session::from_pack(path, None).map_err(|e| e.to_string())?;
+    let out = session
+        .frame(vec![tuile_core::traversal::ViewStateParams {
+            position: glam::DVec3::from_array(view.position),
+            direction: glam::DVec3::from_array(view.direction),
+            up: glam::DVec3::from_array(view.up),
+            viewport_px: glam::dvec2(view.viewport_px[0], view.viewport_px[1]),
+            fovy_rad: view.fovy_rad,
+        }])
+        .map_err(|e| format!("frame {number}: {e}"))?;
+
+    let eye = glam::DVec3::from_array(view.position);
+    let mut vertices = 0usize;
+    let mut triangles = 0usize;
+    let mut texture_bytes = 0usize;
+    let mut sizes: std::collections::BTreeMap<(u32, u32), usize> = std::collections::BTreeMap::new();
+    let mut nearest = f64::INFINITY;
+    let mut farthest: f64 = 0.0;
+    let mut first_uri = String::new();
+
+    for (index, tile) in out.tiles.iter().enumerate() {
+        let mesh = tile
+            .content
+            .meshes
+            .first()
+            .ok_or_else(|| format!("tile {} carries no mesh", tile.tile.0))?;
+        vertices += mesh.positions.len();
+        triangles += mesh.indices.len() / 3;
+        let km = (tile.origin_ecef - eye).length() / 1000.0;
+        nearest = nearest.min(km);
+        farthest = farthest.max(km);
+        if let Some(texture) = out
+            .texture_png(index, 0)
+            .map_err(|e| format!("tile {}: {e}", tile.tile.0))?
+        {
+            texture_bytes += texture.png.len();
+            if first_uri.is_empty() {
+                first_uri = texture.uri.clone();
+            }
+            // The PNG header carries the dimensions: bytes 16..24, big-endian.
+            if texture.png.len() > 24 {
+                let w = u32::from_be_bytes([
+                    texture.png[16],
+                    texture.png[17],
+                    texture.png[18],
+                    texture.png[19],
+                ]);
+                let h = u32::from_be_bytes([
+                    texture.png[20],
+                    texture.png[21],
+                    texture.png[22],
+                    texture.png[23],
+                ]);
+                *sizes.entry((w, h)).or_default() += 1;
+            }
+        }
+    }
+
+    println!("frame     {number} of {:?}", pack.frame_range());
+    println!("tiles     {}", out.tiles.len());
+    println!("distance  {nearest:.2} km .. {farthest:.2} km from the eye");
+    // The histogram, not just the extremes. A single far tile and a hundred of
+    // them are the same two numbers and completely different bugs — and the
+    // far side of a planet is exactly what horizon culling exists to remove.
+    let edges = [5.0, 10.0, 20.0, 50.0, 100.0, 500.0, 2000.0, f64::INFINITY];
+    let mut buckets = [0usize; 8];
+    for tile in &out.tiles {
+        let km = (tile.origin_ecef - eye).length() / 1000.0;
+        buckets[edges.iter().position(|&e| km < e).unwrap_or(7)] += 1;
+    }
+    let mut low = 0.0;
+    print!("          ");
+    for (i, &high) in edges.iter().enumerate() {
+        if buckets[i] > 0 {
+            print!("[{low:.0}-{high:.0}km]={} ", buckets[i]);
+        }
+        low = high;
+    }
+    println!();
+    // …and by LEVEL, because the distance above is to a tile's rebasing
+    // ORIGIN, not to its nearest surface. A level-1 tile spans a quarter of
+    // the planet: its origin can sit eleven thousand kilometres away while the
+    // tile itself covers the camera. Reading the first histogram alone would
+    // report the far side of the world where there is only a coarse ancestor
+    // doing its job — and asserting a cause from a proxy is the mistake this
+    // whole investigation has been paying for.
+    let mut levels: std::collections::BTreeMap<u32, (usize, f64)> =
+        std::collections::BTreeMap::new();
+    for tile in &out.tiles {
+        let (level, _, _) = tile.tile.terrain_coord();
+        let km = (tile.origin_ecef - eye).length() / 1000.0;
+        let entry = levels.entry(level).or_insert((0, 0.0));
+        entry.0 += 1;
+        entry.1 = entry.1.max(km);
+    }
+    println!("by level  (count, farthest origin km)");
+    for (level, (n, km)) in &levels {
+        println!("   z{level:<3} {n:>4}   {km:>10.1}");
+    }
+    println!("geometry  {vertices} vertices, {triangles} triangles");
+    println!(
+        "imagery   {:.1} MB of PNG, sizes {:?}",
+        texture_bytes as f64 / 1024.0 / 1024.0,
+        sizes
+    );
+    println!("textures  {first_uri}");
+    println!("          (and {} more beside it)", out.tiles.len().saturating_sub(1));
     Ok(())
 }
 
