@@ -178,24 +178,29 @@ nvidia-smi -L 2>&1 | head -8 || echo "  nvidia-smi absent (CPU host?)"
 # A pod given a subset of a machine's GPUs without a filtered procfs is a pod
 # where UVM refuses to open, and the only cure is a different host.
 if command -v nvidia-smi > /dev/null 2>&1; then
-    # stderr kept and a sentinel on failure: an EMPTY answer here read as
-    # "cuInit returned  on this host", which is a diagnostic that diagnoses
-    # nothing. The bail was right for the wrong reason.
-    cuda_ok=$(python3 -c '
-import ctypes
-try:
-    print(ctypes.CDLL("libcuda.so.1").cuInit(0))
-except Exception as e:
-    print("no-libcuda:", e)
-' 2>&1 | tail -1)
-    [ -n "$cuda_ok" ] || cuda_ok="no-python"
-    in_proc=$(ls /proc/driver/nvidia/gpus 2>/dev/null | wc -l)
-    in_dev=$(ls /dev/nvidia[0-9]* 2>/dev/null | wc -l)
-    echo "cuda: cuInit=$cuda_ok  gpus in procfs=$in_proc  device nodes=$in_dev"
-    if [ "$cuda_ok" != "0" ]; then
-        echo "GPU-HOST-BROKEN: cuInit returned $cuda_ok on this host."
-        [ "$in_proc" != "$in_dev" ] && echo             "  the driver advertises $in_proc GPUs and this container has $in_dev"             "device nodes — the pod holds a subset of the machine without a"             "filtered procfs, and UVM refuses to open. Retry on another host."
-        ls /dev/nvidia[0-9]* 2>/dev/null | tr '\n' ' ' | sed 's/^/  nodes: /'; echo
+    # Counted, not computed — and deliberately without an interpreter.
+    #
+    # The first version ran a ctypes cuInit, and this image has no python3:
+    # Blender bundles its own and nothing else is installed. So the check
+    # printed a shell error where a number belonged, and the bail fired on a
+    # non-empty string. Right answer, wrong reason, twice.
+    #
+    # Two `ls` are enough, because the fault IS structural. Every broken host
+    # so far advertised more GPUs in /proc than it handed out device nodes:
+    # the pod holds a subset of the machine without a filtered procfs, UVM
+    # refuses to open, and cuInit returns 999. Comparing two counts needs no
+    # CUDA, no interpreter, and no guess about what an error code means.
+    in_proc=$(ls /proc/driver/nvidia/gpus 2>/dev/null | wc -l | tr -d " ")
+    in_dev=$(ls /dev/nvidia[0-9]* 2>/dev/null | wc -l | tr -d " ")
+    echo "gpus: $in_proc advertised in procfs, $in_dev device nodes"
+    if [ "$in_proc" != "$in_dev" ]; then
+        echo "GPU-HOST-BROKEN: the driver advertises $in_proc GPUs and this"
+        echo "  container has $in_dev device nodes. The pod holds a subset of"
+        echo "  the machine without a filtered procfs; UVM refuses to open and"
+        echo "  cuInit returns 999. Nothing in the image can help — another host."
+        ls /dev/nvidia[0-9]* 2>/dev/null | tr "\n" " " | sed "s/^/  nodes: /"; echo
+        nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null \
+            | sed "s/^/  uuid: /"
         sleep "${JOB_BAIL_SLEEP:-600}"
         exit 1
     fi
@@ -268,23 +273,22 @@ if [ "$probe" != "NGPU $JOB_GPUS" ]; then
     echo "--- device nodes ---"
     ls /dev/nvidia* 2>&1 | tr '\n' ' ' | sed 's/^/  /'; echo
     echo "--- cuInit, with its number ---"
-    python3 - <<'CUDA' 2>&1 | sed 's/^/  /'
+    # Blender's python, because the image has no other one.
+    blender -b --python-expr "
 import ctypes, os
 try:
-    lib = ctypes.CDLL("libcuda.so.1")
+    lib = ctypes.CDLL('libcuda.so.1')
 except OSError as e:
-    print("libcuda.so.1 will not load:", e); raise SystemExit
-# The numeric code is the diagnosis. 100 = no device, 304 = OS call failed,
-# 802 = system not yet initialised, 999 = unknown — four different faults that
-# Cycles prints identically as "Unknown error".
-for label, env in (("as the job runs", None), ("with one device", "0")):
-    if env is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = env
-    rc = lib.cuInit(0)
-    n = ctypes.c_int(-1)
-    rc2 = lib.cuDeviceGetCount(ctypes.byref(n))
-    print(f"{label}: cuInit={rc} cuDeviceGetCount={rc2} devices={n.value}")
-CUDA
+    print('libcuda.so.1 will not load:', e)
+else:
+    for label, env in (('as the job runs', None), ('with one device', '0')):
+        if env is not None:
+            os.environ['CUDA_VISIBLE_DEVICES'] = env
+        rc = lib.cuInit(0)
+        n = ctypes.c_int(-1)
+        rc2 = lib.cuDeviceGetCount(ctypes.byref(n))
+        print(f'{label}: cuInit={rc} cuDeviceGetCount={rc2} devices={n.value}')
+" 2>&1 | grep -E "cuInit=|will not load" | sed 's/^/  /'
     echo "--- what Cycles says when asked to explain itself ---"
     blender -b --debug-cycles --python-expr "
 import bpy
