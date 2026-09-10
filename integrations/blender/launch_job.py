@@ -235,6 +235,27 @@ def archive_urls(run):
     return client, {name: put(name) for name in ARCHIVE_OBJECTS}
 
 
+def presigned_get(key, hours=24):
+    """Une URL GET à durée limitée pour un objet R2 déjà déposé.
+
+    Le pod lit le pack et n'écrit rien : il reçoit exactement ce droit-là, et
+    pas les identifiants qui le donnent."""
+    import boto3
+    from botocore.config import Config as BotoConfig
+    access, secret = r2_credentials()
+    if not access or not secret:
+        raise SystemExit("identifiants R2 introuvables — impossible de "
+                         f"présigner la lecture de {key}")
+    client = boto3.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT}.r2.cloudflarestorage.com",
+        aws_access_key_id=access, aws_secret_access_key=secret,
+        region_name="auto", config=BotoConfig(signature_version="s3v4"))
+    return client.generate_presigned_url(
+        "get_object", Params={"Bucket": R2_BUCKET, "Key": key},
+        ExpiresIn=hours * 3600)
+
+
 SECRET_KEYS = ("TUILE_ION_TOKEN", "RUNPOD_API_KEY", "AWS_SECRET_ACCESS_KEY",
                "R2_SECRET_ACCESS_KEY")
 
@@ -314,6 +335,18 @@ def main():
                         "Mo par frame en clair, donc un instrument de "
                         "diagnostic et non un réglage de production. "
                         "L'archive, elle, est déposée dans tous les cas.")
+    p.add_argument("--pack", default="",
+                   help="clé R2 d'un pack pré-cuit (ex: "
+                        "packs/<scene>/1-48.tuilepack) — le pod le télécharge "
+                        "une fois et rend sans jeton, sans réseau et sans "
+                        "traversée. C'est la forme normale d'un rendu ; le "
+                        "chemin streaming est ce qui tourne quand personne "
+                        "n'a cuit.")
+    p.add_argument("--scene", default="",
+                   help="le digest de scène que le pack doit annoncer. Un "
+                        "pack d'un autre tournage rend le mauvais sol et "
+                        "déclare une réussite : c'est la seule panne que le "
+                        "découpage en deux jobs ajoute.")
     p.add_argument("--profile", default="",
                    help="TUILE_PROFILE du pod (ex: cpu,heap) — les "
                         "flamegraphs remontent dans profile.tar.gz")
@@ -372,7 +405,16 @@ def main():
         # Champs structurés + formateur JSON : voir tuile_core::determinism.
         env["TUILE_LOG"] = "tuile_det=info"
         env["TUILE_LOG_FORMAT"] = "json"
-    if args.engine == "hydra":
+    if args.engine == "hydra" and args.pack:
+        # A pack carries the whole scene. Nothing here needs a token, and the
+        # pod is deliberately given none: a credential that never travels is
+        # the only one that cannot leak from a machine somebody else rents out
+        # after us.
+        env["JOB_PACK_URL"] = presigned_get(args.pack)
+        if args.scene:
+            env["JOB_SCENE"] = args.scene
+        env["TUILE_RESIDENT_BUDGET_GB"] = str(args.resident_gb)
+    elif args.engine == "hydra":
         # The ion token travels env-to-env and is never printed; same .env
         # discipline as the API key.
         token = os.environ.get("CESIUM_ION_TOKEN", "")
