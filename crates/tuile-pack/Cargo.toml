@@ -1,0 +1,33 @@
+[package]
+name = "tuile-pack"
+description = "The pre-baked scene container: FlatBuffers structure, LZ4 payloads"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Deliberately NOT `[lints] workspace = true` for `unsafe_code`. The workspace
+# denies it, which is right everywhere else and impossible here: the
+# FlatBuffers-generated accessors read a buffer in place, and reading in place
+# is the whole point of the format. The exception is confined to the generated
+# module, which is why it is `#[allow]`ed there and nowhere else.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "warn"
+panic = "warn"
+
+[dependencies]
+flatbuffers = "25"
+# LZ4 over zstd, and not because it compresses better — it does not. This is
+# read on the critical path of a render and written once on a machine with
+# time: several GB/s decompressed is what makes "load instead of fetch" true.
+lz4_flex = { version = "0.14", default-features = false, features = ["std"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tuile-core = { version = "0.0.1", path = "../tuile-core" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
