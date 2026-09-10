@@ -162,6 +162,42 @@ fi
 echo "--- driver wake-up ---"
 nvidia-smi -L 2>&1 | head -8 || echo "  nvidia-smi absent (CPU host?)"
 
+# Can CUDA start at all on this host?
+#
+# Asked before Blender, because it is cheaper and because it separates two
+# faults that look identical from the outside: an image with no GPU backend,
+# and a host whose driver will not initialise. Measured on a community-cloud
+# 4x5090 node — every ioctl on /dev/nvidia* succeeding, the base driver fine,
+# and `open("/dev/nvidia-uvm")` returning EIO with the correct major, correct
+# minor and 0666. libcuda is the HOST's, injected by the container runtime, so
+# nothing in our image can cause or cure it; `nvidia-modprobe` cannot load a
+# module from inside a container.
+#
+# The tell is printed with it: that host listed FIVE GPUs in
+# /proc/driver/nvidia/gpus while /dev held four nodes with a gap at nvidia3.
+# A pod given a subset of a machine's GPUs without a filtered procfs is a pod
+# where UVM refuses to open, and the only cure is a different host.
+if command -v nvidia-smi > /dev/null 2>&1; then
+    cuda_ok=$(python3 - <<'CUDA' 2>/dev/null
+import ctypes
+try:
+    print(ctypes.CDLL("libcuda.so.1").cuInit(0))
+except OSError:
+    print(-1)
+CUDA
+)
+    in_proc=$(ls /proc/driver/nvidia/gpus 2>/dev/null | wc -l)
+    in_dev=$(ls /dev/nvidia[0-9]* 2>/dev/null | wc -l)
+    echo "cuda: cuInit=$cuda_ok  gpus in procfs=$in_proc  device nodes=$in_dev"
+    if [ "$cuda_ok" != "0" ]; then
+        echo "GPU-HOST-BROKEN: cuInit returned $cuda_ok on this host."
+        [ "$in_proc" != "$in_dev" ] && echo             "  the driver advertises $in_proc GPUs and this container has $in_dev"             "device nodes — the pod holds a subset of the machine without a"             "filtered procfs, and UVM refuses to open. Retry on another host."
+        ls /dev/nvidia[0-9]* 2>/dev/null | tr '\n' ' ' | sed 's/^/  nodes: /'; echo
+        sleep "${JOB_BAIL_SLEEP:-600}"
+        exit 1
+    fi
+fi
+
 # GPU probe first: never a silent CPU render.
 #
 # What is counted matters, and it was wrong twice.
