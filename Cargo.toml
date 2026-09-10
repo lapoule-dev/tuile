@@ -7,6 +7,7 @@ members = [
     "crates/tuile-cesium-ion",
     "crates/tuile-camera",
     "crates/tuile-native-fetchers",
+    "crates/tuile-pack",
     "crates/tuile-core",
     "crates/tuile-hydra",
     "crates/tuile-metrics",
