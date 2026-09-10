@@ -133,6 +133,20 @@ jobs=$((JOB_GPUS * JOB_PROCS_PER_GPU))
 span=$((total / jobs))
 [ "$span" -ge 1 ] || { echo "plage trop courte pour $jobs processus" >&2; exit 1; }
 
+# Wake the driver before asking anything about it.
+#
+# `nvidia_uvm` is not initialised inside a container until some NVIDIA
+# application triggers it, and until then `cuInit` returns CUDA_ERROR_UNKNOWN
+# — nvidia-smi works throughout, because NVML is a different path. Documented
+# on NVIDIA's own forum for containers and sandboxes, and reproduced here
+# exactly: this job ran Blender first and called nvidia-smi only afterwards,
+# in the bail diagnostic, so the wake-up always came one step too late.
+#
+# Costs a fraction of a second. Its output is kept, because "which GPUs did
+# this pod actually have" is the first question of any post-mortem.
+echo "--- driver wake-up ---"
+nvidia-smi -L 2>&1 | head -8 || echo "  nvidia-smi absent (CPU host?)"
+
 # GPU probe first: never a silent CPU render.
 #
 # What is counted matters, and it was wrong twice.
