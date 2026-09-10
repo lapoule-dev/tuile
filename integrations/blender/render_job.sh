@@ -178,14 +178,17 @@ nvidia-smi -L 2>&1 | head -8 || echo "  nvidia-smi absent (CPU host?)"
 # A pod given a subset of a machine's GPUs without a filtered procfs is a pod
 # where UVM refuses to open, and the only cure is a different host.
 if command -v nvidia-smi > /dev/null 2>&1; then
-    cuda_ok=$(python3 - <<'CUDA' 2>/dev/null
+    # stderr kept and a sentinel on failure: an EMPTY answer here read as
+    # "cuInit returned  on this host", which is a diagnostic that diagnoses
+    # nothing. The bail was right for the wrong reason.
+    cuda_ok=$(python3 -c '
 import ctypes
 try:
     print(ctypes.CDLL("libcuda.so.1").cuInit(0))
-except OSError:
-    print(-1)
-CUDA
-)
+except Exception as e:
+    print("no-libcuda:", e)
+' 2>&1 | tail -1)
+    [ -n "$cuda_ok" ] || cuda_ok="no-python"
     in_proc=$(ls /proc/driver/nvidia/gpus 2>/dev/null | wc -l)
     in_dev=$(ls /dev/nvidia[0-9]* 2>/dev/null | wc -l)
     echo "cuda: cuInit=$cuda_ok  gpus in procfs=$in_proc  device nodes=$in_dev"
