@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/tuile-atmosphere",
+    "crates/tuile-bake",
     "crates/tuile-b3dm",
     "crates/tuile-bing",
     "crates/tuile-cesium-ion",
