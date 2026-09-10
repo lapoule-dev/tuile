@@ -137,9 +137,28 @@ class FourGpus(unittest.TestCase):
         seul GPU pendant que la sonde en annonçait quatre."""
         script = (pathlib.Path(launch_job.__file__).parent
                   / "render_job.sh").read_text()
-        # Le comptage de cartes ne survit que pour Storm, qui dessine en GL.
-        self.assertIn('[ "$JOB_DELEGATE" = "storm" ]', script)
-        self.assertIn("compute_device_type = 'OPTIX'", script)
+        # Sur des présences, pas sur le fichier entier : un assertIn qui échoue
+        # imprime son conteneur, et 400 lignes de bash dans un message d'erreur
+        # cachent le message.
+        for needle in (
+            # Le comptage de cartes ne survit que pour Storm, qui dessine en GL.
+            '[ "$JOB_DELEGATE" = "storm" ]',
+            # On demande à Cycles, on ne lit pas une énumération : dans cette
+            # image `enum_items` répond [] pendant que CUDA est bien là.
+            "prefs.compute_device_type = backend",
+            "except TypeError",
+        ):
+            self.assertTrue(needle in script, f"absent du job : {needle}")
+
+    def test_the_delegate_is_told_which_device_or_it_renders_on_the_cpu(self):
+        """hdCycles lit son device dans CYCLES_DEVICE et retombe en silence
+        sur le CPU si personne ne parle. Quatre RTX 5090 inertes pendant que
+        seize processus font du path tracing sur l'hôte, ça ressemble
+        exactement à un job lent."""
+        script = (pathlib.Path(launch_job.__file__).parent
+                  / "render_job.sh").read_text()
+        self.assertTrue('CYCLES_DEVICE="$CYCLES_BACKEND"' in script,
+                        "le délégué n'est pas informé de son device")
 
     def test_the_job_reports_whether_the_gpus_actually_worked(self):
         """Un run qui n'a utilisé qu'un GPU sur quatre n'est pas un run lent,
