@@ -40,6 +40,17 @@ RUN cargo --version \
 RUN cargo build --release -p tuile-tape -p tuile-usd --bins \
     && for b in orbit-tape zoom-tape tape-to-stage; do \
         test -x "target/release/$b" && strip "target/release/$b"; done
+# The bake, with its profiler compiled in.
+#
+# It is the same binary a pod runs and the one a diagnosis runs: a build that
+# cannot be profiled is one nobody can fix, and shipping two binaries means the
+# numbers come from the one that was not the problem. `prof_active:false`
+# leaves it costing a branch until TUILE_PROFILE arms it.
+#
+# NOT stripped, and that is the point. Stripping is exactly what made a live
+# profile come back with every Rust frame as `???`.
+RUN cargo build --release -p tuile-bake --features profiling \
+    && test -x target/release/tuile-bake
 
 # ------------------------------------------------------------------ plugin --
 FROM ${BASE} AS plugin
@@ -139,6 +150,7 @@ COPY integrations/blender/render_job.sh /opt/render/render_job.sh
 COPY --from=rustlib /src/target/release/orbit-tape \
                     /src/target/release/zoom-tape \
                     /src/target/release/tape-to-stage \
+                    /src/target/release/tuile-bake \
                     /opt/tuile/bin/
 
 ENV PATH=/opt/blender:$PATH \

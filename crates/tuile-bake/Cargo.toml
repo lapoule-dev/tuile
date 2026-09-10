@@ -7,12 +7,27 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-[lints]
-workspace = true
+# Deliberately NOT `[lints] workspace = true` for `unsafe_code`. The workspace
+# denies it, which is right everywhere else and impossible in one place here:
+# jemalloc is configured through a `malloc_conf` symbol the linker resolves, and
+# exporting a symbol by name is `unsafe` by construction. The exception is that
+# one static and is confined to the `profiling` module.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "warn"
+panic = "warn"
 
 [[bin]]
 name = "tuile-bake"
 path = "src/main.rs"
+
+[features]
+# Off by default and not merely "optional": arming a heap profiler changes the
+# global allocator of the process, and a bake is the process whose numbers we
+# are trying to trust. It is built when someone is measuring, not always.
+profiling = ["dep:pprof", "dep:tikv-jemallocator", "dep:jemalloc_pprof"]
 
 [dependencies]
 glam = { workspace = true }
@@ -24,3 +39,17 @@ tuile-hydra = { version = "0.0.1", path = "../tuile-hydra" }
 tuile-core = { version = "0.0.1", path = "../tuile-core" }
 tuile-pack = { version = "0.0.1", path = "../tuile-pack" }
 tuile-tape = { version = "0.0.1", path = "../tuile-tape" }
+
+# --- profiling, behind the feature ------------------------------------------
+# Signal sampling across EVERY thread, without `perf` and without privileges.
+# That is the decisive property here: the work is spread over three families of
+# threads — the decode pool, the tokio workers, and the thread that encodes
+# PNG — so a single-threaded profiler would miss two thirds of it.
+pprof = { version = "0.15", features = ["flamegraph"], optional = true }
+# `prof:true,prof_active:false`: near-zero cost until something arms it, and a
+# flamegraph produced directly rather than through a conversion step.
+tikv-jemallocator = { version = "0.7", features = [
+    "profiling",
+    "unprefixed_malloc_on_supported_platforms",
+], optional = true }
+jemalloc_pprof = { version = "0.9", features = ["flamegraph"], optional = true }

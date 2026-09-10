@@ -37,6 +37,201 @@ use std::time::Instant;
 
 use tuile_pack::{BakedTile, PackWriter, TextureFormat};
 
+
+/// CPU and heap profiling, when the build asked for it.
+///
+/// # Why this lives here and not in the plugin
+///
+/// Because of the split. What is worth profiling — fetch, decode, resample,
+/// drape, bake, PNG — used to run inside Blender, where the plugin is stripped
+/// and the allocator belongs to somebody else. It now runs in this binary,
+/// which we own end to end, so a heap profiler governs exactly the code it is
+/// meant to and nothing else.
+///
+/// # Driving it
+///
+/// ```text
+/// TUILE_PROFILE=cpu,heap TUILE_PROFILE_DIR=/out/profile tuile-bake …
+/// ```
+///
+/// Both flamegraphs are written when the bake ends **and when it fails**. The
+/// profile of a failure is the interesting one, and a dump that only runs on
+/// the success path is a dump that is never there when it is wanted.
+#[cfg(feature = "profiling")]
+mod profiling {
+    use std::io::Write;
+
+    /// jemalloc, with profiling compiled in and switched off.
+    ///
+    /// `prof_active:false` is what makes this affordable to ship: the machinery
+    /// is present, costs a branch, and records nothing until `TUILE_PROFILE`
+    /// asks. Turning it on at build time and leaving it running would tax every
+    /// allocation in the process being measured.
+    #[global_allocator]
+    static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+    /// What jemalloc reads at init, before `main` exists to say anything.
+    ///
+    /// This works where `tikv-jemallocator`'s
+    /// `unprefixed_malloc_on_supported_platforms` applies — Linux, which is
+    /// the farm — and is **silently ignored on macOS**, where the symbols stay
+    /// prefixed and Mach-O does not interpose this one. Measured: the same
+    /// binary that produced a heap flamegraph on Linux answered "no jemalloc
+    /// profiling compiled in" here until `_RJEM_MALLOC_CONF` was set in the
+    /// environment.
+    ///
+    /// So the static stays (it is the zero-ceremony path on the machine that
+    /// matters) and [`start`] names the environment variable when it finds the
+    /// profiler unarmed, rather than shrugging.
+    #[allow(non_upper_case_globals, reason = "the name jemalloc reads")]
+    #[export_name = "malloc_conf"]
+    pub static malloc_conf: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
+
+    /// What to set when the static above did not take.
+    const MALLOC_CONF_HINT: &str = "\
+        jemalloc was not built for profiling in this process. On Linux the \
+        `malloc_conf` static handles it; elsewhere set \
+        _RJEM_MALLOC_CONF=prof:true,prof_active:false in the environment \
+        before launching.";
+
+    pub struct Session {
+        cpu: Option<pprof::ProfilerGuard<'static>>,
+        heap: bool,
+        dir: std::path::PathBuf,
+    }
+
+    /// Starts whatever `TUILE_PROFILE` named. `None` when it named nothing.
+    pub fn start() -> Option<Session> {
+        let asked = std::env::var("TUILE_PROFILE").ok()?;
+        let wants = |what: &str| asked.split(',').any(|p| p.trim() == what);
+        let dir = std::path::PathBuf::from(
+            std::env::var("TUILE_PROFILE_DIR").unwrap_or_else(|_| "profile".into()),
+        );
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(dir = %dir.display(), "cannot profile into this directory: {e}");
+            return None;
+        }
+        let cpu = wants("cpu")
+            .then(|| {
+                pprof::ProfilerGuardBuilder::default()
+                    // 199 Hz rather than 200: a prime rate cannot beat against
+                    // a periodic workload and report a phantom hot spot.
+                    .frequency(199)
+                    // The three families of threads this exists to see at once.
+                    .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+                    .build()
+                    .map_err(|e| tracing::warn!("cpu profiler: {e}"))
+                    .ok()
+            })
+            .flatten();
+        let heap = wants("heap");
+        if heap {
+            if let Err(e) = arm_heap() {
+                tracing::warn!("heap profiler: {e}");
+            }
+        }
+        if cpu.is_none() && !heap {
+            return None;
+        }
+        tracing::info!(
+            cpu = cpu.is_some(),
+            heap,
+            dir = %dir.display(),
+            "profiling"
+        );
+        Some(Session { cpu, heap, dir })
+    }
+
+    /// Arms jemalloc's profiler without a tokio runtime.
+    ///
+    /// `jemalloc_pprof` guards its control block with a **tokio** mutex, and
+    /// this binary's own work is synchronous — the session owns the runtime,
+    /// not `main`. `blocking_lock` is the documented way in, and it is
+    /// uncontended here: nothing else has touched this before the first frame.
+    fn arm_heap() -> Result<(), String> {
+        let ctl = jemalloc_pprof::PROF_CTL.as_ref().ok_or(MALLOC_CONF_HINT)?;
+        ctl.blocking_lock()
+            .activate()
+            .map_err(|e| e.to_string())
+    }
+
+    impl Session {
+        /// Writes what was collected. Called on the way out, whichever way out
+        /// that is.
+        pub fn dump(self) {
+            if let Some(cpu) = self.cpu {
+                match cpu.report().build() {
+                    Ok(report) => write_flamegraph(&self.dir.join("cpu.svg"), |w| {
+                        report.flamegraph(w).map_err(|e| e.to_string())
+                    }),
+                    Err(e) => tracing::warn!("cpu report: {e}"),
+                }
+            }
+            if self.heap {
+                match jemalloc_pprof::PROF_CTL.as_ref() {
+                    Some(ctl) => {
+                        let mut ctl = ctl.blocking_lock();
+                        // SVG directly, not a pprof protobuf someone has to
+                        // convert: the thing that answers "where did the
+                        // memory go" is a picture, and a step between the run
+                        // and the picture is a step that does not happen on a
+                        // farm at two in the morning.
+                        match ctl.dump_flamegraph() {
+                            Ok(bytes) => {
+                                let path = self.dir.join("heap.svg");
+                                if let Err(e) = std::fs::write(&path, bytes) {
+                                    tracing::warn!(path = %path.display(), "heap dump: {e}");
+                                } else {
+                                    tracing::info!(path = %path.display(), "heap profile");
+                                }
+                            }
+                            Err(e) => tracing::warn!("heap dump: {e}"),
+                        }
+                    }
+                    None => tracing::warn!("jemalloc profiling was not armed"),
+                }
+            }
+        }
+    }
+
+    fn write_flamegraph(
+        path: &std::path::Path,
+        render: impl FnOnce(&mut dyn Write) -> Result<(), String>,
+    ) {
+        let mut buffer = Vec::new();
+        if let Err(e) = render(&mut buffer) {
+            tracing::warn!("flamegraph: {e}");
+            return;
+        }
+        match std::fs::write(path, &buffer) {
+            Ok(()) => tracing::info!(path = %path.display(), bytes = buffer.len(), "cpu profile"),
+            Err(e) => tracing::warn!(path = %path.display(), "flamegraph: {e}"),
+        }
+    }
+}
+
+/// The same surface with the feature off: one `None`, and every call site reads
+/// identically in both builds.
+#[cfg(not(feature = "profiling"))]
+mod profiling {
+    pub struct Session;
+    pub fn start() -> Option<Session> {
+        if std::env::var_os("TUILE_PROFILE").is_some() {
+            // Silence here would be the worst answer: a farm job asked to
+            // profile, found no flamegraphs, and had no way to know the binary
+            // simply could not.
+            eprintln!(
+                "TUILE_PROFILE is set but this build has no profiling — \
+                 rebuild with `--features profiling`"
+            );
+        }
+        None
+    }
+    impl Session {
+        pub fn dump(self) {}
+    }
+}
+
 /// What one run was asked to do.
 enum Job {
     Bake(Args),
@@ -203,7 +398,14 @@ fn main() -> std::process::ExitCode {
         )
         .init();
 
-    match run() {
+    // Started before anything and dumped on both ways out. A profile that only
+    // exists when the run succeeded is missing exactly when it is wanted.
+    let profile = profiling::start();
+    let outcome = run();
+    if let Some(profile) = profile {
+        profile.dump();
+    }
+    match outcome {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(message) => {
             // Loud and on stderr: a bake that half-worked and exited zero would
