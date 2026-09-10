@@ -12,7 +12,18 @@ et c'est ce qui la rend dangereuse. Un jeton qui y entre n'en sort plus.
 
 import importlib.util
 import pathlib
+import sys
 import unittest
+
+# Jamais de bytecode pour ce que ce fichier teste.
+#
+# `importlib` réutilise un `.pyc` quand la source a la même taille ET la même
+# seconde de mtime. Mesuré ici : remplacer `GPU-HOST-BROKEN` par
+# `GPU-HOST-BORKED` — six lettres contre six lettres, dans la même seconde —
+# laissait le test lire l'ancien bytecode et affirmer le contraire de ce que
+# le fichier disait. Un test qui lit une version périmée de ce qu'il teste est
+# pire que pas de test : il rassure.
+sys.dont_write_bytecode = True
 
 # Chargé par chemin : `launch_job.py` est un script, pas un paquet.
 _spec = importlib.util.spec_from_file_location(
@@ -82,6 +93,29 @@ class Archive(unittest.TestCase):
         self.assertIsInstance(found, str)
         if found:
             self.assertTrue(found.endswith("sportstracklive-rails/infra"))
+
+
+class HostLottery(unittest.TestCase):
+    """Un hôte où cuInit échoue n'est pas une impasse, c'est un tirage."""
+
+    def test_the_markers_match_what_the_job_actually_prints(self):
+        """Un marqueur qui a dérivé, c'est un retry qui ne se déclenche
+        jamais — et sept pods dépensés à la main pour s'en apercevoir."""
+        script = (pathlib.Path(launch_job.__file__).parent
+                  / "render_job.sh").read_text()
+        for marker in launch_job.BAD_HOST:
+            self.assertTrue(marker in script,
+                            f"le job n'imprime jamais {marker}")
+        # Au moins un signe de démarrage réel doit exister aussi, sinon on
+        # supprimerait un pod parfaitement sain au bout de la patience.
+        self.assertTrue(any(m.strip() in script for m in launch_job.STARTED),
+                        "aucun marqueur de démarrage n'est produit par le job")
+
+    def test_a_bad_host_is_deleted_and_not_left_billing(self):
+        """Le bail dort avant de sortir. Un pod écarté qu'on ne supprime pas
+        facture pendant qu'il dort."""
+        source = pathlib.Path(launch_job.__file__).read_text()
+        self.assertIn('call(key, "DELETE", f"/pods/{pod[\'id\']}")', source)
 
 
 class DepositAsYouGo(unittest.TestCase):

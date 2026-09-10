@@ -282,6 +282,64 @@ def redacted(env):
     return out
 
 
+# Ce qu'un pod dit quand l'hôte, et non le job, est en cause.
+#
+# Sept pods ont été dépensés en un après-midi sur des hôtes où `cuInit` rend
+# 999 : le conteneur reçoit un sous-ensemble des GPU de la machine sans procfs
+# filtré, UVM refuse de s'ouvrir, et rien dans l'image ne peut y remédier. Ce
+# n'est pas une impasse, c'est une loterie — un autre hôte marche. Reprendre à
+# la main coûtait cinq minutes d'attention par essai.
+BAD_HOST = ("GPU-HOST-BROKEN", "NO-GPU-BAIL")
+#: Et ce qu'il dit quand il a démarré pour de bon.
+STARTED = ("pack: ", "SOURCE ", "WALL:", "GPU-USE")
+
+
+def pod_logs(key, pod_id, tail=400):
+    """Le journal conteneur d'un pod, en clair.
+
+    L'API le sert en Server-Sent Events ; on lit une tranche bornée et on rend
+    les lignes. Pas de streaming ici : on veut décider, pas suivre."""
+    req = urllib.request.Request(
+        f"{API}/pods/{pod_id}/logs?source=container&tail={tail}",
+        headers={"Authorization": f"Bearer {key}",
+                 "Accept": "text/event-stream",
+                 "User-Agent": "tuile-render-farm/0.1"})
+    lines = []
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            for raw in r:
+                raw = raw.decode(errors="replace")
+                if not raw.startswith("data: "):
+                    continue
+                try:
+                    lines.append(json.loads(raw[6:]).get("line", ""))
+                except ValueError:
+                    pass
+    except (urllib.error.URLError, OSError, TimeoutError):
+        pass
+    return lines
+
+
+def wait_until_it_renders(key, pod_id, patience=900):
+    """Regarde un pod démarrer et dit ce qui s'est passé.
+
+    Rend "started", "bad-host" ou "timeout". La patience par défaut couvre le
+    tirage de l'image, qui a été mesuré à plus de dix minutes sur un hôte
+    froid — un pod lent n'est pas un pod cassé."""
+    import time
+    deadline = time.time() + patience
+    while time.time() < deadline:
+        lines = pod_logs(key, pod_id)
+        joined = "\n".join(lines)
+        for line in lines:
+            if any(m in line for m in BAD_HOST):
+                return "bad-host", joined
+        if any(m in joined for m in STARTED):
+            return "started", joined
+        time.sleep(15)
+    return "timeout", ""
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--stage", default="", help=".usda à rendre (embarquée gzip+b64)")
@@ -327,6 +385,13 @@ def main():
                    help="variable d'env supplémentaire pour le pod "
                         "(répétable) — le réglage machine du chemin USD "
                         "(TUILE_IMAGERY_BOOST, TUILE_FETCHES, ...) passe ici")
+    p.add_argument("--retries", type=int, default=0, metavar="N",
+                   help="jusqu'à N hôtes de plus si celui qu'on obtient ne "
+                        "sait pas démarrer CUDA. Le pod est supprimé avant "
+                        "d'en reprendre un autre — un hôte où cuInit échoue "
+                        "n'est pas une impasse, c'est une loterie, et "
+                        "recommencer à la main coûtait cinq minutes "
+                        "d'attention par essai.")
     p.add_argument("--wait", action="store_true",
                    help="reboucle tant que RunPod n'a pas d'instance libre "
                         "(45 s entre essais) — la loterie des 4x5090 se gagne "
@@ -498,24 +563,48 @@ def main():
         "env": env,
         "args": "bash /opt/render/render_job.sh",
     }
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            pod = call(key, "POST", "/pods", body)
-            break
-        except SystemExit as e:
-            # The capacity lottery answers 400 "no instances available"; every
-            # other error is real and must not be retried into a bill.
-            if args.wait and "no longer any instances" in str(e):
-                print(f"essai {attempt}: pas d'instance libre, on reste dans "
-                      "la file (45 s)", flush=True)
-                import time
-                time.sleep(45)
-                continue
-            raise
+    def take_a_pod():
+        """Un pod, en restant dans la file de capacité s'il le faut."""
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return call(key, "POST", "/pods", body)
+            except SystemExit as e:
+                # The capacity lottery answers 400 "no instances available";
+                # every other error is real and must not be retried into a bill.
+                if args.wait and "no longer any instances" in str(e):
+                    print(f"essai {attempt}: pas d'instance libre, on reste "
+                          "dans la file (45 s)", flush=True)
+                    import time
+                    time.sleep(45)
+                    continue
+                raise
+
+    pod = take_a_pod()
     print(f"pod: {pod['id']}  {args.gpu_count}x {args.gpu_type} ({args.cloud})"
-          f"  {pod.get('cost')} $/h")
+          f"  {pod.get('cost')} $/h", flush=True)
+
+    # Un hôte qui ne sait pas démarrer CUDA n'est pas une impasse : c'est une
+    # loterie, et le pod suivant marche. Ce qu'il ne faut surtout pas, c'est
+    # le laisser tourner — il facture en dormant dans son `sleep` de bail.
+    for left in range(args.retries, 0, -1):
+        verdict, log = wait_until_it_renders(key, pod["id"])
+        if verdict == "started":
+            print("le pod rend.", flush=True)
+            break
+        for line in log.splitlines():
+            if any(m in line for m in BAD_HOST) or line.startswith(("cuda:", "probe:")):
+                print(f"  {line}", flush=True)
+        call(key, "DELETE", f"/pods/{pod['id']}")
+        print(f"hôte écarté ({verdict}), {left - 1} essai(s) restant(s)",
+              flush=True)
+        if left == 1:
+            raise SystemExit("aucun hôte utilisable — relance plus tard, ou "
+                             "essaie --cloud SECURE / --gpu-count 1")
+        pod = take_a_pod()
+        print(f"pod: {pod['id']}  {args.gpu_count}x {args.gpu_type} "
+              f"({args.cloud})  {pod.get('cost')} $/h", flush=True)
 
     # Écrit APRÈS la création du pod, pour porter son identité : sans elle on
     # ne peut pas relier une archive aux journaux du pod.
