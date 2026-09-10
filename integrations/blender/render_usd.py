@@ -15,6 +15,7 @@
 # kernels are paid once (persistent_data), only the camera moves.
 
 import argparse
+import os
 import pathlib
 import sys
 import time
@@ -263,8 +264,24 @@ def main():
                 bpy.data.objects[name].data.materials.append(bpy.data.materials[mat])
 
     if args.engine == "hydra":
-        # Engine set by setup_hydra_manifest; Storm has neither samplers nor
-        # denoisers to configure, its cost lives in the procedural cook.
+        # Engine set by setup_hydra_manifest. Storm has neither samplers nor
+        # denoisers to configure — its cost lives in the procedural cook — but
+        # the Cycles delegate is a path tracer and needs a sample count. It
+        # reads it through the add-on's `get_render_settings`, which reads
+        # `scene.cycles.samples`, so the flag has to land there.
+        if args.delegate == "cycles":
+            scene.cycles.samples = args.samples or 128
+            scene.cycles.use_adaptive_sampling = True
+            scene.cycles.adaptive_threshold = args.adaptive_threshold
+            # Said out loud, because the delegate takes its device from
+            # CYCLES_DEVICE and falls back to CPU in silence when nothing sets
+            # it (cycles/src/hydra/render_delegate.cpp). A job path-tracing on
+            # the host CPU looks exactly like a slow job.
+            print(f"hydra cycles: CYCLES_DEVICE="
+                  f"{os.environ.get('CYCLES_DEVICE', '<unset — CPU!>')}, "
+                  f"CUDA_VISIBLE_DEVICES="
+                  f"{os.environ.get('CUDA_VISIBLE_DEVICES', '<all>')}, "
+                  f"{scene.cycles.samples} samples", flush=True)
         print(f"hydra ({scene.render.engine}), manifest camera keyframed",
               flush=True)
     elif args.tier == "cycles":
