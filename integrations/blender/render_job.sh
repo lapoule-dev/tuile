@@ -173,10 +173,10 @@ nvidia-smi -L 2>&1 | head -8 || echo "  nvidia-smi absent (CPU host?)"
 # nothing in our image can cause or cure it; `nvidia-modprobe` cannot load a
 # module from inside a container.
 #
-# The tell is printed with it: that host listed FIVE GPUs in
-# /proc/driver/nvidia/gpus while /dev held four nodes with a gap at nvidia3.
-# A pod given a subset of a machine's GPUs without a filtered procfs is a pod
-# where UVM refuses to open, and the only cure is a different host.
+# Measured on four different hosts, and the ratio is the whole story:
+# 8 GPUs advertised / 1 node, 5 / 4, 5 / 1, 5 / 1. Never equal, never working.
+# This is not a broken machine to retry past — it is what taking a SHARE of a
+# machine looks like, so the cure is to take all of it.
 if command -v nvidia-smi > /dev/null 2>&1; then
     # Counted, not computed — and deliberately without an interpreter.
     #
@@ -194,10 +194,14 @@ if command -v nvidia-smi > /dev/null 2>&1; then
     in_dev=$(ls /dev/nvidia[0-9]* 2>/dev/null | wc -l | tr -d " ")
     echo "gpus: $in_proc advertised in procfs, $in_dev device nodes"
     if [ "$in_proc" != "$in_dev" ]; then
-        echo "GPU-HOST-BROKEN: the driver advertises $in_proc GPUs and this"
-        echo "  container has $in_dev device nodes. The pod holds a subset of"
-        echo "  the machine without a filtered procfs; UVM refuses to open and"
-        echo "  cuInit returns 999. Nothing in the image can help — another host."
+        echo "GPU-PARTIAL-HOST: the driver advertises $in_proc GPUs and this"
+        echo "  container has $in_dev device nodes. UVM initialises across every"
+        echo "  GPU the driver knows about, cannot reach the ones this pod was"
+        echo "  not given, and refuses to open — cuInit then returns 999."
+        echo "  Nothing in the image can help, and retrying is not the answer:"
+        echo "  four different hosts have done this (8/1, 5/4, 5/1, 5/1), so it"
+        echo "  is how a partial machine is handed out, not a broken machine."
+        echo "  Ask for --gpu-count equal to the host's full complement."
         ls /dev/nvidia[0-9]* 2>/dev/null | tr "\n" " " | sed "s/^/  nodes: /"; echo
         nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null \
             | sed "s/^/  uuid: /"
