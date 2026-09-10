@@ -17,11 +17,16 @@
 #       -f integrations/blender/Dockerfile.globe \
 #       -t harbor.sportstracklive.com/stl/blender-globe:5.1-su --push .
 
-# 5.1-2509 recompiles Blender from the current patch. The 2508 build predates
-# c2ab384 and still carries the cubeProc spike probe, which constructed a
-# TestCube procedural on every populate and printed five lines per frame — 240
-# lines of noise in a 48-frame job, and a procedural cooked for nothing.
-ARG BASE=harbor.sportstracklive.com/stl/blender-shared-usd:5.1-2509
+# 5.1-2510 adds the assertion that the Cycles Hydra delegate is really there.
+# `WITH_CYCLES_HYDRA_RENDER_DELEGATE=ON` had been set in that build for a while
+# and nothing ever checked it produced anything — which mattered the day the
+# render had to leave Storm, because Storm is an OpenGL rasteriser that never
+# calls CUDA and four processes told to take four GPUs all landed on one.
+#
+# 2509 recompiled Blender from the current patch: 2508 predates c2ab384 and
+# still carries the cubeProc spike probe, which constructed a TestCube
+# procedural on every populate — 240 lines of noise in a 48-frame job.
+ARG BASE=harbor.sportstracklive.com/stl/blender-shared-usd:5.1-2510
 
 # ----------------------------------------------------------------- rustlib --
 FROM rust:1-bookworm AS rustlib
