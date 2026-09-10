@@ -35,9 +35,11 @@
 
 mod ffi;
 mod globe;
+pub mod packed;
 mod session;
 
 pub use globe::{GlobeConfig, GlobeError, BING_AERIAL, CESIUM_WORLD_TERRAIN};
+pub use packed::PackedError;
 pub use session::{
     exact_traversal, EncodedTexture, Frame, FrameError, Session, SessionConfig, TileGeometry,
 };

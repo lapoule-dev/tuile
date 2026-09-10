@@ -130,6 +130,35 @@ pub struct TileGeometry {
 }
 
 impl TileGeometry {
+    /// One tile as a pack hands it over: geometry already decoded, texture
+    /// already encoded, nothing left to bake.
+    ///
+    /// The drape travels through a `TextureKey` rather than a field of its
+    /// own, because that is what the key *is* — (tile, drape, index) — and a
+    /// second place to put it is a second place for the two to disagree. The
+    /// texture is `memoized`, which is exactly the path a live session takes
+    /// for a drape an earlier frame already baked: `Frame::texture_png` hands
+    /// it back untouched and nothing is re-encoded.
+    pub(crate) fn packed(
+        tile: TileId,
+        origin_ecef: DVec3,
+        content: DecodedTileContent,
+        drape: u64,
+        memoized: Option<Arc<EncodedTexture>>,
+    ) -> Self {
+        Self {
+            tile,
+            origin_ecef,
+            content,
+            baked: Some(TextureKey {
+                tile,
+                drape,
+                texture_index: 0,
+            }),
+            memoized,
+        }
+    }
+
     /// What the baked mosaic on this tile was composed from, or `0` when the
     /// tile carries no drape of ours.
     ///
@@ -442,19 +471,19 @@ impl Frame {
 }
 
 impl std::fmt::Debug for Session {
-    /// Deliberately says almost nothing. A session owns a tokio runtime, a
-    /// server thread and a live stream, none of which have a useful textual
-    /// form — and its configuration can carry an ion token, which must not end
-    /// up in a log line because someone printed a `Result`.
+    /// Deliberately says almost nothing. A live session owns a tokio runtime,
+    /// a server thread and a stream, none of which have a useful textual form
+    /// — and its configuration can carry an ion token, which must not end up
+    /// in a log line because someone printed a `Result`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
-            .field("frame_timeout", &self.config.frame_timeout)
+            .field("source", &if self.is_packed() { "pack" } else { "live" })
             .finish_non_exhaustive()
     }
 }
 
-/// A live session over one tile source.
-pub struct Session {
+/// A live session over one tile source: the streaming half.
+pub(crate) struct Live {
     stream: tuile_core::protocol::InProcessStream,
     runtime: tokio::runtime::Runtime,
     config: SessionConfig,
@@ -488,7 +517,90 @@ pub struct Session {
     _server: std::thread::JoinHandle<()>,
 }
 
+/// A session over one scene, from one of two places.
+///
+/// The split is the whole architecture in one type. A **live** session
+/// resolves ion and Bing, traverses, loads, drapes, bakes and encodes — the
+/// CPU work that is 89 % of a farm job's cost and the reason a render job was
+/// paying for a globe it could have been handed. A **packed** session opens a
+/// file.
+///
+/// What a packed session does not have is the point of it: no network, no ion
+/// token, no traversal, no convergence. A frame it answers is not reproducible
+/// because a race was stabilised; there is no race.
+pub struct Session(Source);
+
+enum Source {
+    Live(Box<Live>),
+    Packed(crate::packed::Packed),
+}
+
 impl Session {
+    /// Reads a scene from a pack instead of from the network.
+    ///
+    /// `scene` is the digest the caller believes it is rendering. A pack that
+    /// answers a different one is refused here rather than rendered: that is
+    /// the one failure a split pipeline adds and a live one does not have —
+    /// rendering last week's bake of another trajectory, successfully.
+    pub fn from_pack(
+        path: &std::path::Path,
+        scene: Option<&str>,
+    ) -> Result<Self, crate::packed::PackedError> {
+        Ok(Self(Source::Packed(crate::packed::Packed::open(path, scene)?)))
+    }
+
+    /// Whether this session reads a pack rather than the network.
+    pub fn is_packed(&self) -> bool {
+        matches!(self.0, Source::Packed(_))
+    }
+
+    /// Starts a live session over an already-resolved tree and loader.
+    pub fn new(
+        tree: Box<dyn TileTree>,
+        loader: Arc<dyn TileLoader>,
+        config: SessionConfig,
+    ) -> std::io::Result<Self> {
+        Ok(Self(Source::Live(Box::new(Live::new(tree, loader, config)?))))
+    }
+
+    pub(crate) fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+        Live::runtime()
+    }
+
+    pub(crate) fn from_parts(
+        runtime: tokio::runtime::Runtime,
+        tree: Box<dyn TileTree>,
+        loader: Arc<dyn TileLoader>,
+        config: SessionConfig,
+    ) -> std::io::Result<Self> {
+        Ok(Self(Source::Live(Box::new(Live::from_parts(
+            runtime, tree, loader, config,
+        )?))))
+    }
+
+    pub(crate) fn set_imagery_detail(&mut self, detail: tuile_planetary::ImageryDetail) {
+        if let Source::Live(live) = &mut self.0 {
+            live.set_imagery_detail(detail);
+        }
+    }
+
+    /// Resolves one frame for the given views.
+    ///
+    /// The two sources answer the same question by opposite means: one
+    /// converges a traversal against a network, the other looks up the camera
+    /// in a table. Which is why the packed side takes the *views* rather than
+    /// a frame number — a Hydra host cooks at a timecode and hands a session a
+    /// camera, and asking it for a frame number would mean changing the ABI
+    /// and the procedural for a fact the camera already carries.
+    pub fn frame(&mut self, views: Vec<ViewStateParams>) -> Result<Frame, FrameError> {
+        match &mut self.0 {
+            Source::Live(live) => live.frame(views),
+            Source::Packed(packed) => packed.frame(&views),
+        }
+    }
+}
+
+impl Live {
     /// Starts a session over an already-resolved tree and loader.
     ///
     /// The host resolves its own sources — this crate knows nothing about ion,

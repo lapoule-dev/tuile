@@ -181,6 +181,22 @@ pub struct TuileGlobeConfig {
     /// the output is kept: a failed tile leaves no hole, its ancestor stands
     /// in, and the frame renders plausibly at the wrong level of detail.
     pub fail_on_tile_errors: bool,
+    /// A pre-baked pack to read instead of the network. Empty means the
+    /// network.
+    ///
+    /// When it is set, **nothing else in this struct is consulted**: not the
+    /// token, not the asset ids, not the cache, not the screen-space error.
+    /// All of those were decided by the bake and are recorded in the pack —
+    /// honouring them here would let a render silently ask for a level of
+    /// detail nobody baked, and get whatever was there.
+    pub pack_path: TuileStr,
+    /// The scene digest the host believes it is rendering, or empty to accept
+    /// whatever pack it is given.
+    ///
+    /// Worth setting on a farm. A pack of another shot renders the wrong
+    /// ground and reports success — the one failure a pre-baked pipeline adds
+    /// that a live one does not have.
+    pub scene_digest: TuileStr,
 }
 
 /// One camera, as the traversal needs it: twelve doubles and nothing else.
@@ -265,6 +281,24 @@ pub unsafe extern "C" fn tuile_session_new(
         });
         unsafe { *out = std::ptr::null_mut() };
         let config = unsafe { &*config };
+
+        // A pack short-circuits everything below. There is no token to check,
+        // no source to resolve and no network to reach: the session opens a
+        // file, and every field that would have shaped a traversal was already
+        // consumed by the bake.
+        if let Some(path) = unsafe { config.pack_path.as_str() }.filter(|p| !p.is_empty()) {
+            let scene = unsafe { config.scene_digest.as_str() }.filter(|s| !s.is_empty());
+            return match Session::from_pack(std::path::Path::new(path), scene) {
+                Ok(session) => {
+                    unsafe { *out = Box::into_raw(Box::new(session)) };
+                    TuileStatus::Ok
+                }
+                Err(error) => {
+                    tracing::error!(%error, "opening the pack");
+                    TuileStatus::BadArgument
+                }
+            };
+        }
 
         let Some(token) = (unsafe { config.ion_token.as_str() }) else {
             return TuileStatus::BadArgument;
@@ -637,6 +671,8 @@ mod tests {
             maximum_screen_space_error: 0.0,
             frame_timeout_seconds: 0.0,
             fail_on_tile_errors: true,
+            pack_path: as_str(""),
+            scene_digest: as_str(""),
         };
         assert_eq!(
             unsafe { tuile_session_new(&config, &mut out) },
@@ -649,6 +685,76 @@ mod tests {
             unsafe { tuile_session_new(&config, std::ptr::null_mut()) },
             TuileStatus::BadArgument
         );
+    }
+
+    /// A pack that is not there fails at open, not at the first frame.
+    ///
+    /// And it fails without a token, which is the whole point of the packed
+    /// path: it must not be possible to reach the network from it, so an
+    /// empty `ion_token` must stop being an error the moment `pack_path` is
+    /// set. A test, because the short-circuit is one `if` and putting it
+    /// after the token check would silently restore the requirement.
+    #[test]
+    fn a_packed_session_needs_no_token_and_refuses_a_pack_that_is_not_there() {
+        let missing = std::env::temp_dir().join("tuile-no-such-pack.tuilepack");
+        let _ = std::fs::remove_file(&missing);
+        let path = missing.display().to_string();
+        let config = TuileGlobeConfig {
+            ion_token: as_str(""),
+            terrain_asset_id: 0,
+            imagery_asset_id: 0,
+            cache_dir: as_str(""),
+            maximum_screen_space_error: 0.0,
+            frame_timeout_seconds: 0.0,
+            fail_on_tile_errors: true,
+            pack_path: as_str(&path),
+            scene_digest: as_str(""),
+        };
+        let mut out: *mut Session = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { tuile_session_new(&config, &mut out) },
+            TuileStatus::BadArgument,
+            "a pack that does not exist must fail at open"
+        );
+        assert!(out.is_null());
+    }
+
+    /// A real pack opens, with no token and no network.
+    #[test]
+    fn a_packed_session_opens_a_pack_and_says_it_is_packed() {
+        let pack = tuile_pack::PackWriter::new("scene-under-test", [0.0; 3]).finish();
+        let path = std::env::temp_dir().join("tuile-ffi-open.tuilepack");
+        std::fs::write(&path, &pack).expect("write the pack");
+        let shown = path.display().to_string();
+        let config = TuileGlobeConfig {
+            ion_token: as_str(""),
+            terrain_asset_id: 0,
+            imagery_asset_id: 0,
+            cache_dir: as_str(""),
+            maximum_screen_space_error: 0.0,
+            frame_timeout_seconds: 0.0,
+            fail_on_tile_errors: true,
+            pack_path: as_str(&shown),
+            scene_digest: as_str("scene-under-test"),
+        };
+        let mut out: *mut Session = std::ptr::null_mut();
+        assert_eq!(unsafe { tuile_session_new(&config, &mut out) }, TuileStatus::Ok);
+        assert!(!out.is_null());
+        assert!(unsafe { &*out }.is_packed());
+        unsafe { tuile_session_free(out) };
+
+        // …and a pack of another scene is refused rather than rendered.
+        let wrong = TuileGlobeConfig {
+            scene_digest: as_str("some-other-scene"),
+            ..config
+        };
+        let mut out: *mut Session = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { tuile_session_new(&wrong, &mut out) },
+            TuileStatus::BadArgument
+        );
+        assert!(out.is_null());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -58,10 +58,26 @@ table Tile {
   texture_format: TextureFormat;
 }
 
+/// The camera one frame was baked for. Twelve doubles, exactly the shape the
+/// ABI's `TuileViewState` carries.
+///
+/// It is here because a render has no frame number to ask with: the host cooks
+/// at a timecode and hands the session a camera. So a pack is addressed by the
+/// camera it was baked for, and a camera that matches nothing in the pack is
+/// the stage and the pack disagreeing — which must be an error, not a guess.
+struct View {
+  px: double; py: double; pz: double;
+  dx: double; dy: double; dz: double;
+  ux: double; uy: double; uz: double;
+  vw: double; vh: double;
+  fovy: double;
+}
+
 /// What one frame selected, as indices into `Pack.tiles`.
 table Frame {
   frame: uint32;
   tiles: [uint32];
+  view: View;
 }
 
 table Pack {
@@ -74,6 +90,15 @@ table Pack {
   first_frame: uint32;
   last_frame: uint32;
   render_origin: [double];
+  /// FNV-1a over the whole blob region, taken at write time.
+  ///
+  /// A pack travels: written on one machine, pushed to R2, pulled onto a pod,
+  /// read by sixteen processes. A payload that arrives bent does not
+  /// necessarily fail to decompress — it can hand back plausible bytes, and a
+  /// renderer then draws slightly wrong ground and reports success. Checked at
+  /// open, once, because that is the only moment at which the answer is still
+  /// cheap and still actionable.
+  blob_digest: uint64;
   /// How the selection was culled when this was baked — "full" or "disabled".
   ///
   /// A pack freezes its selection: a hole baked in is a hole for ever, and it
