@@ -38,4 +38,6 @@ mod globe;
 mod session;
 
 pub use globe::{GlobeConfig, GlobeError, BING_AERIAL, CESIUM_WORLD_TERRAIN};
-pub use session::{EncodedTexture, Frame, Session, SessionConfig, TileGeometry};
+pub use session::{
+    exact_traversal, EncodedTexture, Frame, FrameError, Session, SessionConfig, TileGeometry,
+};

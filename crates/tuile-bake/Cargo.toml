@@ -1,0 +1,26 @@
+[package]
+name = "tuile-bake"
+description = "Bakes a scene's frame range into a pack, once, on a machine with time"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tuile-bake"
+path = "src/main.rs"
+
+[dependencies]
+glam = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# The session, the globe, and the sources behind it. This is the one place that
+# holds an ion token in the whole split pipeline.
+tuile-hydra = { version = "0.0.1", path = "../tuile-hydra" }
+tuile-core = { version = "0.0.1", path = "../tuile-core" }
+tuile-pack = { version = "0.0.1", path = "../tuile-pack" }
+tuile-tape = { version = "0.0.1", path = "../tuile-tape" }
