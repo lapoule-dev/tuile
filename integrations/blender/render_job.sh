@@ -135,18 +135,51 @@ span=$((total / jobs))
 
 # GPU probe first: never a silent CPU render.
 #
-# What is counted matters, and it was wrong. `nvidia-smi -L | grep -c GPU`
-# counts cards the driver can see, which is not the same question as "how many
-# devices can the renderer put work on" — and answering the easy question is
-# how sixteen processes ended up sharing one GPU while the probe reported four.
-# Only a Storm render, which draws through GL and never touches OptiX, has any
+# What is counted matters, and it was wrong twice.
+#
+# `nvidia-smi -L | grep -c GPU` counts cards the driver can see, which is not
+# the same question as "how many devices can the renderer put work on" — and
+# answering the easy question is how sixteen processes ended up sharing one GPU
+# while the probe reported four. Only Storm, which draws through GL, has any
 # business counting cards.
+#
+# And OPTIX is not a given. Measured 2026-09-10 on stl/blender-globe:5.1-su:
+# `compute_device_type` accepts only ('NONE','CUDA','HIP','ONEAPI') — this
+# Blender was built without OptiX. So the probe asks the build what it has,
+# preferring OPTIX and settling for CUDA, and SAYS WHICH. A backend chosen
+# silently is a render that is slower than it should be with nothing to say so.
 if [ "$JOB_ENGINE" = "hydra" ] && [ "$JOB_DELEGATE" = "storm" ]; then
     probe="NGPU $(nvidia-smi -L 2>/dev/null | grep -c '^GPU')"
+    CYCLES_BACKEND=none
 else
-    probe=$(blender -b --python-expr "import bpy; p = bpy.context.preferences.addons['cycles'].preferences; p.compute_device_type = 'OPTIX'; p.get_devices(); print('NGPU', sum(1 for d in p.devices if d.type == 'OPTIX'))" 2>&1 | grep -oE 'NGPU [0-9]+' | head -1)
+    probe_out=$(blender -b --python-expr "
+import bpy
+prefs = bpy.context.preferences.addons['cycles'].preferences
+why = []
+for backend in ('OPTIX', 'CUDA'):
+    try:
+        prefs.compute_device_type = backend
+    except TypeError as e:
+        # Blender's own message names what this build really offers, and it is
+        # the only reliable source: reading enum_items answers [] here.
+        why.append(str(e).split('not found in')[-1].strip())
+        continue
+    prefs.get_devices()
+    n = sum(1 for d in prefs.devices if d.type == backend)
+    why.append('%s:%d' % (backend, n))
+    if n:
+        print('NGPU', n, backend)
+        break
+else:
+    print('NGPU 0 none')
+print('BACKENDS', ' '.join(why))
+" 2>&1)
+    echo "$probe_out" | grep -oE '^BACKENDS .*' | head -1
+    probe_out=$(echo "$probe_out" | grep -oE 'NGPU [0-9]+ [A-Za-z]+' | head -1)
+    probe="${probe_out% *}"
+    CYCLES_BACKEND="${probe_out##* }"
 fi
-echo "probe: $probe (attendu: NGPU $JOB_GPUS)"
+echo "probe: $probe backend=$CYCLES_BACKEND (attendu: NGPU $JOB_GPUS)"
 if [ "$probe" != "NGPU $JOB_GPUS" ]; then
     echo NO-GPU-BAIL
     sleep "${JOB_BAIL_SLEEP:-600}"
@@ -254,7 +287,18 @@ for i in $(seq 0 $((jobs - 1))); do
         mkdir -p "$proc_cache"
         cp -a "$seed"/foyer-* "$proc_cache"/ 2>/dev/null || true
     fi
+    # CYCLES_DEVICE is not decoration. The Cycles Hydra delegate reads its
+    # device from a render setting, then from this variable, and **falls back
+    # to CPU** when neither says anything (`cycles/src/hydra/
+    # render_delegate.cpp`). Without it four RTX 5090s would sit idle while
+    # sixteen processes path-traced on the host CPU, and the only symptom would
+    # be a job that took all night.
+    #
+    # Combined with one CUDA_VISIBLE_DEVICES per process it is also what places
+    # the work: the delegate takes every visible device of its type, and each
+    # process is shown exactly one.
     CUDA_VISIBLE_DEVICES=$gpu TUILE_CACHE_DIR="$proc_cache" \
+        CYCLES_DEVICE="$CYCLES_BACKEND" \
         stdbuf -oL blender -b -P /opt/render/render_usd.py -- \
         --stage "$STAGE" --engine "$JOB_ENGINE" --tier "$JOB_TIER" \
         --delegate "$JOB_DELEGATE" \
