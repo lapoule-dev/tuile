@@ -294,6 +294,27 @@ BAD_HOST = ("GPU-HOST-BROKEN", "NO-GPU-BAIL")
 STARTED = ("pack: ", "SOURCE ", "WALL:", "GPU-USE")
 
 
+def all_pods(key):
+    """Tous les pods, ou une exception — jamais une liste vide par erreur.
+
+    L'API rend `{"pods": [...]}` ici et `{"items": [...]}` ailleurs, et un
+    parseur qui cherchait `items` et se rabattait sur `[]` a répondu « aucun
+    pod » pendant que six tournaient. Six fois 0,69 $/h, invisibles, parce
+    qu'une lecture ratée avait exactement la même tête qu'un compte à zéro.
+
+    Alors on ne se rabat sur rien : une réponse d'une forme inconnue est une
+    erreur, pas un vide."""
+    data = call(key, "GET", "/pods")
+    for field in ("pods", "items", "data"):
+        if isinstance(data.get(field), list):
+            return data[field]
+    if isinstance(data, list):
+        return data
+    raise SystemExit(
+        f"réponse /pods de forme inattendue (clés: {sorted(data)}) — "
+        "refus de conclure qu'il n'y a aucun pod")
+
+
 def pod_logs(key, pod_id, tail=400):
     """Le journal conteneur d'un pod, en clair.
 
@@ -341,6 +362,27 @@ def wait_until_it_renders(key, pod_id, patience=900):
 
 
 def main():
+    # Deux verbes avant tout le reste, parce qu'ils doivent marcher même quand
+    # le lancement est cassé : voir ce qui tourne, et tout arrêter.
+    if len(sys.argv) > 1 and sys.argv[1] in ("--list", "--kill-all"):
+        key = api_key()
+        pods = all_pods(key)
+        if not pods:
+            print("aucun pod")
+            return
+        for pod in pods:
+            gpu = (pod.get("gpu") or {})
+            print(f"{pod['id']}  {pod.get('name','')}  "
+                  f"{gpu.get('count','?')}x {gpu.get('id','?')}  "
+                  f"{pod.get('cost','?')} $/h  {pod.get('status','')}")
+        if sys.argv[1] == "--kill-all":
+            for pod in pods:
+                call(key, "DELETE", f"/pods/{pod['id']}")
+                print(f"supprimé {pod['id']}")
+            left = all_pods(key)
+            print(f"restants: {len(left)}")
+        return
+
     p = argparse.ArgumentParser()
     p.add_argument("--stage", default="", help=".usda à rendre (embarquée gzip+b64)")
     p.add_argument("--stage-url", default="",
