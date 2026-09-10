@@ -133,6 +133,21 @@ jobs=$((JOB_GPUS * JOB_PROCS_PER_GPU))
 span=$((total / jobs))
 [ "$span" -ge 1 ] || { echo "plage trop courte pour $jobs processus" >&2; exit 1; }
 
+# sshd first, when one was asked for.
+#
+# It sat after the GPU probe, which is precisely backwards: ssh exists to
+# diagnose a job that went wrong, and the probe is the thing that goes wrong.
+# A bail exits before this line ever ran, so the one pod launched WITH a key
+# was the one pod with no sshd on it.
+if [ -n "${JOB_SSH_PUBKEY:-}" ]; then
+    apt-get update -qq && apt-get install -y -qq openssh-server > /dev/null
+    mkdir -p /root/.ssh /run/sshd
+    echo "$JOB_SSH_PUBKEY" > /root/.ssh/authorized_keys
+    chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+    /usr/sbin/sshd -p 22
+    echo "sshd up"
+fi
+
 # Wake the driver before asking anything about it.
 #
 # `nvidia_uvm` is not initialised inside a container until some NVIDIA
@@ -213,6 +228,24 @@ if [ "$probe" != "NGPU $JOB_GPUS" ]; then
     echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
     echo "--- device nodes ---"
     ls /dev/nvidia* 2>&1 | tr '\n' ' ' | sed 's/^/  /'; echo
+    echo "--- cuInit, with its number ---"
+    python3 - <<'CUDA' 2>&1 | sed 's/^/  /'
+import ctypes, os
+try:
+    lib = ctypes.CDLL("libcuda.so.1")
+except OSError as e:
+    print("libcuda.so.1 will not load:", e); raise SystemExit
+# The numeric code is the diagnosis. 100 = no device, 304 = OS call failed,
+# 802 = system not yet initialised, 999 = unknown — four different faults that
+# Cycles prints identically as "Unknown error".
+for label, env in (("as the job runs", None), ("with one device", "0")):
+    if env is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = env
+    rc = lib.cuInit(0)
+    n = ctypes.c_int(-1)
+    rc2 = lib.cuDeviceGetCount(ctypes.byref(n))
+    print(f"{label}: cuInit={rc} cuDeviceGetCount={rc2} devices={n.value}")
+CUDA
     echo "--- what Cycles says when asked to explain itself ---"
     blender -b --debug-cycles --python-expr "
 import bpy
@@ -257,14 +290,6 @@ if [ "$JOB_ENGINE" = "hydra" ] && [ -z "${TUILE_PACK:-}" ] \
     echo NO-SOURCE-BAIL
     sleep "${JOB_BAIL_SLEEP:-600}"
     exit 1
-fi
-
-if [ -n "${JOB_SSH_PUBKEY:-}" ]; then
-    apt-get update -qq && apt-get install -y -qq openssh-server > /dev/null
-    mkdir -p /root/.ssh /run/sshd
-    echo "$JOB_SSH_PUBKEY" > /root/.ssh/authorized_keys
-    chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
-    /usr/sbin/sshd -p 22
 fi
 
 STAGE="${JOB_STAGE:-/tmp/job-stage.usda}"
