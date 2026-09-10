@@ -91,6 +91,43 @@ type MeshFuture<'a> = std::pin::Pin<
 /// never sharper, and never nothing. This is what the reference implementation
 /// does when a tile's own imagery has not arrived — it walks up to the closest
 /// ready ancestor rather than to a level chosen in advance.
+impl GlobeOptions {
+    /// Which coarse tile goes under a drape.
+    ///
+    /// The choice lives here, on the options, rather than inline at the one
+    /// call site — so it can be exercised on its own. Testing `fixed_floor`
+    /// and `coarse_floor` separately proves each does what it says and proves
+    /// nothing about which one a bulk render gets, and that dispatch is the
+    /// whole of the behaviour.
+    fn floor_under(
+        &self,
+        scheme: &raster::TilingScheme,
+        rect: &GeoRect,
+        cache: &Mutex<ImageryCache>,
+    ) -> ImageryCoord {
+        if self.deterministic_floor {
+            fixed_floor(scheme, rect)
+        } else {
+            coarse_floor(scheme, rect, cache)
+        }
+    }
+}
+
+/// The floor a rectangle always gets, whatever any cache holds.
+///
+/// A pure function of the geometry, which is the whole point: see
+/// [`GlobeOptions::deterministic_floor`].
+fn fixed_floor(scheme: &raster::TilingScheme, rect: &GeoRect) -> ImageryCoord {
+    let deepest = scheme.containing_tile(rect);
+    let level = FLOOR_LEVEL.max(scheme.minimum_level).min(deepest.level);
+    let up = deepest.level - level;
+    ImageryCoord {
+        level,
+        x: deepest.x >> up,
+        y: deepest.y >> up,
+    }
+}
+
 fn coarse_floor(
     scheme: &raster::TilingScheme,
     rect: &GeoRect,
@@ -458,6 +495,28 @@ pub struct GlobeOptions {
     /// exposure checkerboard. `u32::MAX` (the default) leaves the layer
     /// budget as the only limit, which is today's behaviour.
     pub imagery_boost_cap: u32,
+    /// Whether the coarse layer under a drape is chosen by geometry alone.
+    ///
+    /// **This is the difference between a render that reproduces and one that
+    /// does not.** [`coarse_floor`] normally lays down the sharpest ancestor
+    /// that happens to be decoded already, which is right for a viewer — it
+    /// spends what is in hand rather than blurring ground it could show. But
+    /// "what happens to be decoded" is a function of the order concurrent
+    /// loads finished and of what a bounded LRU evicted, so the same tile in
+    /// the same frame gets a different floor from one run to the next, the
+    /// drape key changes with it, and the composed pixels change.
+    ///
+    /// Measured, 2026-09-10: two bakes of one scene, one warm cache, identical
+    /// settings, selected **exactly the same 80 and 60 tiles** — and 16 of the
+    /// 80 came out draped differently. The ground was never in doubt; the
+    /// imagery was.
+    ///
+    /// On, the floor is always the tile's [`FLOOR_LEVEL`] ancestor: pinned,
+    /// therefore always available, and a pure function of the rectangle. It
+    /// costs sharpness only where the sharp mosaic has a hole, and a converged
+    /// bulk frame has none — so a batch render pays approximately nothing for
+    /// being reproducible.
+    pub deterministic_floor: bool,
 }
 
 impl Default for GlobeOptions {
@@ -467,6 +526,9 @@ impl Default for GlobeOptions {
             max_level: None,
             imagery_slots: LayerBudget::default(),
             imagery_boost_cap: u32::MAX,
+            // Off by default: the interactive contract is the default, and a
+            // viewer showing blur it did not have to show is a regression.
+            deterministic_floor: false,
         }
     }
 }
@@ -861,7 +923,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // spanning a whole region is shared by every terrain tile inside it, so
         // it is fetched once and drawn by hundreds. It is also, for the same
         // reason, the tile most likely to be resident already.
-        let floor = coarse_floor(&scheme, rect, &self.cache);
+        let floor = self.opts.floor_under(&scheme, rect, &self.cache);
         match self.fetch_imagery(floor).await {
             Ok((served, texture)) => {
                 // The floor covers the whole tile on its own, so there is no
@@ -1406,6 +1468,95 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The floor a bulk render uses depends on the ground, and on nothing else.
+    ///
+    /// This is the property a batch render is reproducible *because of*.
+    /// `coarse_floor` deliberately consults the imagery cache — a viewer should
+    /// spend the sharpest ancestor it already holds rather than blur ground it
+    /// could show — and "what it already holds" is a function of the order
+    /// concurrent loads finished and of what a bounded LRU evicted. The floor
+    /// then changes between runs, the drape key changes with it, and the
+    /// composed pixels change underneath an identical selection.
+    ///
+    /// Measured before this existed, 2026-09-10: two bakes of one scene, one
+    /// warm cache, identical settings, selecting exactly the same 80 and 60
+    /// tiles — and 16 of the 80 draped differently. Afterwards the two packs
+    /// were byte-identical.
+    ///
+    /// What this does **not** cover: that `drape` calls `floor_under` at all.
+    /// That single call site is held only by the end-to-end measurement above
+    /// (`tuile-bake` twice, then `cmp`), because covering it in a unit test
+    /// would mean a `PlanetaryLoader` over fake quantized-mesh and imagery
+    /// sources, which does not exist here yet.
+    #[test]
+    fn the_bulk_floor_is_a_function_of_the_ground_and_nothing_else() {
+        let scheme = raster::TilingScheme::web_mercator();
+        let rect = inset(
+            &scheme,
+            ImageryCoord {
+                level: 12,
+                x: 2100,
+                y: 1500,
+            },
+        );
+
+        let fixed = fixed_floor(&scheme, &rect);
+        assert_eq!(
+            fixed.level,
+            FLOOR_LEVEL.max(scheme.minimum_level),
+            "the bulk floor is the pinned level, which is always resident"
+        );
+        // An empty cache and a full one must answer the same, because the
+        // cache is not consulted at all.
+        assert_eq!(fixed, fixed_floor(&scheme, &rect));
+
+        // …and it is an ancestor of the tile, not some other patch of Earth.
+        let deepest = scheme.containing_tile(&rect);
+        let up = deepest.level - fixed.level;
+        assert_eq!((deepest.x >> up, deepest.y >> up), (fixed.x, fixed.y));
+
+        // The interactive floor is the one that moves: given a cache holding a
+        // deeper ancestor it answers differently, which is exactly why a bake
+        // must not use it.
+        let cache = Mutex::new(ImageryCache::new(8));
+        let empty_answer = coarse_floor(&scheme, &rect, &cache);
+        assert_eq!(empty_answer, fixed, "with nothing cached, both agree");
+        let deeper = ImageryCoord {
+            level: fixed.level + 3,
+            x: deepest.x >> (deepest.level - (fixed.level + 3)),
+            y: deepest.y >> (deepest.level - (fixed.level + 3)),
+        };
+        cache.lock().expect("cache").put(
+            deeper,
+            Arc::new(DecodedTexture {
+                width: 1,
+                height: 1,
+                rgba8: vec![255, 255, 255, 255],
+            }),
+        );
+        assert_eq!(
+            coarse_floor(&scheme, &rect, &cache),
+            deeper,
+            "the interactive floor follows the cache — the behaviour a viewer \
+             wants and a bake cannot have"
+        );
+        assert_eq!(
+            fixed_floor(&scheme, &rect),
+            fixed,
+            "and the bulk floor does not move when the cache does"
+        );
+
+        // The dispatch, which is the behaviour. Proving the two functions do
+        // what they say proves nothing about which one a bulk render gets.
+        let bulk = GlobeOptions {
+            deterministic_floor: true,
+            ..GlobeOptions::default()
+        };
+        let interactive = GlobeOptions::default();
+        assert_eq!(bulk.floor_under(&scheme, &rect, &cache), fixed);
+        assert_eq!(interactive.floor_under(&scheme, &rect, &cache), deeper);
+    }
 
     /// Draping asks for the mosaic at a level and gets back at most the layer
     /// budget, whatever the level asked for — the coarsening is what keeps the
