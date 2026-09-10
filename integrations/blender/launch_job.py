@@ -284,12 +284,13 @@ def redacted(env):
 
 # Ce qu'un pod dit quand l'hôte, et non le job, est en cause.
 #
-# Sept pods ont été dépensés en un après-midi sur des hôtes où `cuInit` rend
-# 999 : le conteneur reçoit un sous-ensemble des GPU de la machine sans procfs
-# filtré, UVM refuse de s'ouvrir, et rien dans l'image ne peut y remédier. Ce
-# n'est pas une impasse, c'est une loterie — un autre hôte marche. Reprendre à
-# la main coûtait cinq minutes d'attention par essai.
-BAD_HOST = ("GPU-HOST-BROKEN", "NO-GPU-BAIL")
+# Un pod qui reçoit une PART d'une machine voit tous ses GPU dans procfs et
+# n'en obtient qu'une partie dans /dev ; UVM refuse de s'ouvrir et cuInit rend
+# 999. Mesuré sur quatre hôtes : 8/1, 5/4, 5/1, 5/1. Ce n'est donc pas une
+# loterie d'hôtes cassés — c'est la forme d'un partage — et réessayer ailleurs
+# ne converge pas. Le retry reste utile pour les pannes qui, elles, sont
+# passagères, mais la sortie est de demander la machine entière.
+BAD_HOST = ("GPU-PARTIAL-HOST", "NO-GPU-BAIL")
 #: Et ce qu'il dit quand il a démarré pour de bon.
 STARTED = ("pack: ", "SOURCE ", "WALL:", "GPU-USE")
 
