@@ -136,7 +136,12 @@ impl TileGeometry {
     /// Crossing the boundary so the consumer can tell "the same tile, redraped"
     /// from "the same tile, unchanged" with an integer compare — the one
     /// distinction that decides whether a kept prim needs its material dirtied.
-    pub(crate) fn drape(&self) -> u64 {
+    ///
+    /// Public because a bake needs it for the same reason a renderer does, and
+    /// for one more: it is half of a tile's identity in a pre-baked pack. A
+    /// pack that deduplicated on the id alone would hand the last frame of a
+    /// shot the imagery of the first.
+    pub fn drape(&self) -> u64 {
         self.baked.map_or(0, |key| key.drape())
     }
 }
@@ -872,7 +877,14 @@ fn env_knob<T: std::str::FromStr + PartialOrd>(name: &str, default: T) -> T {
 /// alongside a renderer took the whole machine down (measured the hard way,
 /// 2026-09-08). Generous enough for every local gate render so far, bounded
 /// enough to fail a frame instead of the host.
-fn exact_traversal(mut config: Config) -> Config {
+///
+/// Public because a **bake** has to be able to name what it baked. A pack is
+/// the bake of the settings it was made with, not of the defaults, so the
+/// scene digest is computed over the config this returns — the resolved one,
+/// after every knob above has been read. Computing it over the config before
+/// resolution would give two packs made with different maximum screen-space
+/// errors the same name, and they would answer for each other.
+pub fn exact_traversal(mut config: Config) -> Config {
     config.stand_ins = false;
     config.forbid_holes = true;
     let budget_gb: usize = env_knob("TUILE_RESIDENT_BUDGET_GB", 4).max(1);
@@ -1192,10 +1204,11 @@ mod tests {
     /// no stand-in surface may reach a kept frame, and holes stay forbidden.
     #[test]
     fn bulk_traversal_is_exact_whatever_the_caller_asked() {
-        let mut config = Config::default();
-        config.stand_ins = true;
-        config.forbid_holes = false;
-        let exact = exact_traversal(config);
+        let exact = exact_traversal(Config {
+            stand_ins: true,
+            forbid_holes: false,
+            ..Config::default()
+        });
         assert!(!exact.stand_ins);
         assert!(exact.forbid_holes);
     }
