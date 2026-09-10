@@ -145,17 +145,31 @@ def r2_credentials():
         return key, secret
     pulumi_dir = os.environ.get("TUILE_PULUMI_DIR", "")
     if pulumi_dir:
+        # The same three things `host-app/infra/ansible/run.sh`
+        # needs, and all three are easy to get wrong on their own: the state
+        # lives in an S3 backend that must be named, that backend is reached
+        # through a specific AWS profile, and the keys carry the `host:`
+        # namespace. Missing any one of them answers "not found" rather than
+        # "not authorised", which reads like the key does not exist.
+        env = dict(os.environ)
+        env.setdefault(
+            "PULUMI_BACKEND_URL",
+            "s3://host-state-bucket"
+            "?region=eu-west-3&awssdk=v2&profile=host")
+        env.setdefault("AWS_PROFILE", os.environ.get(
+            "TUILE_AWS_PROFILE", "host"))
+
         def cfg(name):
             try:
                 out = subprocess.run(
                     ["pulumi", "config", "get", "--stack", "prod",
                      "-C", pulumi_dir, name],
-                    capture_output=True, text=True, timeout=30)
+                    capture_output=True, text=True, timeout=60, env=env)
                 return out.stdout.strip() if out.returncode == 0 else ""
             except (OSError, subprocess.SubprocessError):
                 return ""
-        key = key or cfg("r2_access_key_id")
-        secret = secret or cfg("r2_secret_access_key")
+        key = key or cfg("host:r2_access_key_id")
+        secret = secret or cfg("host:r2_secret_access_key")
     return key, secret
 
 
