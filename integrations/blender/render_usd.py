@@ -86,9 +86,15 @@ def gpu_only(prefs, kinds):
 # take four GPUs were measured all running on GPU 2. Cycles as a delegate sits
 # downstream of the hdGp resolver — the procedural cooks identically — and
 # renders through OptiX, so the device arithmetic means something again.
+# Read off Blender's own source rather than guessed, because a wrong
+# identifier here is a pod that boots, fails and is billed:
+# `intern/cycles/hydra/addon/__init__.py` declares
+# `bl_idname = 'HYDRA_CYCLES'` and `bl_delegate_id = 'HdCyclesPlugin'`, and
+# `intern/cycles/hydra/CMakeLists.txt` installs that addon as `hydra_cycles`
+# beside the `cycles` one, with the delegate under `cycles/hydra/`.
 HYDRA_DELEGATES = {
     "storm": ("hydra_storm", "HYDRA_STORM"),
-    "cycles": ("cycles", "CYCLES_HYDRA"),
+    "cycles": ("hydra_cycles", "HYDRA_CYCLES"),
 }
 
 
