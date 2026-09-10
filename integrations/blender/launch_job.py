@@ -136,6 +136,21 @@ def image_digest(image):
         return None
 
 
+def default_pulumi_dir():
+    """Le checkout d'infra voisin, s'il est là.
+
+    Lire les identifiants ne doit demander aucun export : un lancement qui
+    exige qu'on pense à une variable est un lancement qu'on finit par faire
+    sans elle — et c'est ce qui a coûté les 60 secondes de rendu, parties avec
+    leur pod sans rien laisser."""
+    here = pathlib.Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent.parent / "sportstracklive-rails" / "infra"
+        if candidate.is_dir():
+            return str(candidate)
+    return ""
+
+
 def r2_credentials():
     """L'environnement d'abord, Pulumi ensuite — la même source que
     `sportstracklive-rails/infra/ansible/run.sh`. Rien n'est écrit ni affiché."""
@@ -143,7 +158,7 @@ def r2_credentials():
     secret = os.environ.get("R2_SECRET_ACCESS_KEY", "")
     if key and secret:
         return key, secret
-    pulumi_dir = os.environ.get("TUILE_PULUMI_DIR", "")
+    pulumi_dir = os.environ.get("TUILE_PULUMI_DIR", "") or default_pulumi_dir()
     if pulumi_dir:
         # The same three things `sportstracklive-rails/infra/ansible/run.sh`
         # needs, and all three are easy to get wrong on their own: the state
@@ -173,7 +188,17 @@ def r2_credentials():
     return key, secret
 
 
-def archive_urls(run, want_trace):
+#: Ce qu'un run dépose, sans condition.
+#
+# Aucun de ces quatre n'est optionnel, et le plus important n'est pas la
+# vidéo. Un run qui échoue est celui dont on a le plus besoin des journaux, et
+# c'est précisément celui qui n'en déposait aucun : le stdout des processus
+# n'était écrit dans aucun fichier, et le téléversement était gardé derrière la
+# réussite. Trois mesures sont mortes avec leur machine en deux jours.
+ARCHIVE_OBJECTS = ("render.mp4", "logs.tar.gz", "trace.tar.gz", "profile.tar.gz")
+
+
+def archive_urls(run):
     """Les URL présignées où le pod déposera, et le client pour y écrire
     nous-mêmes le manifeste.
 
@@ -185,14 +210,15 @@ def archive_urls(run, want_trace):
         from botocore.config import Config as BotoConfig
     except ImportError:
         raise SystemExit(
-            "boto3 absent — il porte la présignature R2. `pip install boto3`, "
-            "ou --no-archive pour un run jetable dont rien ne sera gardé.")
+            "boto3 absent — il porte la présignature R2, et sans elle un run "
+            "ne laisse rien derrière lui. `pip install boto3`.")
     key, secret = r2_credentials()
     if not key or not secret:
         raise SystemExit(
-            "identifiants R2 introuvables — exporte R2_ACCESS_KEY_ID et "
-            "R2_SECRET_ACCESS_KEY (ou TUILE_PULUMI_DIR pour les lire depuis "
-            "Pulumi comme le fait infra/ansible/run.sh), ou --no-archive.")
+            "identifiants R2 introuvables — ni dans l'environnement "
+            "(R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY) ni dans Pulumi. "
+            "TUILE_PULUMI_DIR pointe le checkout d'infra ; par défaut c'est "
+            "../sportstracklive-rails/infra à côté de ce dépôt.")
     client = boto3.client(
         "s3",
         endpoint_url=f"https://{R2_ACCOUNT}.r2.cloudflarestorage.com",
@@ -203,10 +229,10 @@ def archive_urls(run, want_trace):
             "put_object",
             Params={"Bucket": R2_BUCKET, "Key": f"{R2_PREFIX}/{run}/{name}"},
             ExpiresIn=7 * 24 * 3600)
-    urls = {"video": put("render.mp4")}
-    if want_trace:
-        urls["trace"] = put("trace.tar.gz")
-    return client, urls
+    # Les quatre, toujours. Une URL présignée ne coûte rien tant que personne
+    # n'écrit dessus, et conditionner la trace à un drapeau signifiait que la
+    # seule fois où on la voulait, elle n'existait pas.
+    return client, {name: put(name) for name in ARCHIVE_OBJECTS}
 
 
 SECRET_KEYS = ("TUILE_ION_TOKEN", "RUNPOD_API_KEY", "AWS_SECRET_ACCESS_KEY",
@@ -284,13 +310,13 @@ def main():
     p.add_argument("--ssh-pubkey", default="",
                    help="clé publique à autoriser (rapatriement scp)")
     p.add_argument("--trace", action="store_true",
-                   help="active la trace de déterminisme sur le pod et la "
-                        "dépose en trace.tar.gz — 250-355 Mo par frame en "
-                        "clair, donc un instrument de diagnostic et non un "
-                        "réglage de production")
-    p.add_argument("--no-archive", action="store_true",
-                   help="ne rien déposer sur R2 : run jetable, dont ni la "
-                        "vidéo ni la configuration ne seront gardées")
+                   help="active la trace de déterminisme sur le pod — 250-355 "
+                        "Mo par frame en clair, donc un instrument de "
+                        "diagnostic et non un réglage de production. "
+                        "L'archive, elle, est déposée dans tous les cas.")
+    p.add_argument("--profile", default="",
+                   help="TUILE_PROFILE du pod (ex: cpu,heap) — les "
+                        "flamegraphs remontent dans profile.tar.gz")
     args = p.parse_args()
     if args.engine == "hydra" and args.image == p.get_default("image"):
         args.image = ECR_HOST + "/stl/blender-globe:5.1-su"
@@ -372,26 +398,33 @@ def main():
         env[k] = v
 
     # --- l'archive, avant toute création de pod ---------------------------
-    run, manifest_client, manifest = "", None, None
-    if not args.no_archive:
-        git_info = git_state()
-        run = run_id(git_info)
-        manifest_client, urls = archive_urls(run, args.trace)
-        if not args.upload_url:
-            env["JOB_UPLOAD_PUT_URL"] = urls["video"]
-        if args.trace:
-            env["JOB_TRACE_PUT_URL"] = urls["trace"]
-        manifest = {
-            "run_id": run,
-            "launched_utc": datetime.now(timezone.utc).isoformat(),
-            "argv": sys.argv[1:],
-            "git": git_info,
-            "image": args.image,
-            "image_digest": image_digest(args.image),
-            "pod_env": redacted(env),
-            "params": {k: v for k, v in vars(args).items()
-                       if k not in ("ssh_pubkey",)},
-        }
+    #
+    # Sans condition et sans drapeau pour l'éteindre. `--no-archive` a existé,
+    # et c'est lui qui a coûté un rendu de 60 secondes : le pod a été repris
+    # quand le solde s'est épuisé, et 1440 frames sont parties avec lui. Un run
+    # qui ne laisse rien n'a pas de raison d'exister.
+    git_info = git_state()
+    run = run_id(git_info)
+    manifest_client, urls = archive_urls(run)
+    if not args.upload_url:
+        env["JOB_UPLOAD_PUT_URL"] = urls["render.mp4"]
+    env["JOB_LOGS_PUT_URL"] = urls["logs.tar.gz"]
+    env["JOB_TRACE_PUT_URL"] = urls["trace.tar.gz"]
+    env["JOB_PROFILE_PUT_URL"] = urls["profile.tar.gz"]
+    if args.profile:
+        env["TUILE_PROFILE"] = args.profile
+        env["TUILE_PROFILE_DIR"] = "/out/profile"
+    manifest = {
+        "run_id": run,
+        "launched_utc": datetime.now(timezone.utc).isoformat(),
+        "argv": sys.argv[1:],
+        "git": git_info,
+        "image": args.image,
+        "image_digest": image_digest(args.image),
+        "pod_env": redacted(env),
+        "params": {k: v for k, v in vars(args).items()
+                   if k not in ("ssh_pubkey",)},
+    }
 
     gpu = {"id": args.gpu_type, "count": args.gpu_count}
     if not args.cuda_any:
@@ -426,16 +459,15 @@ def main():
     print(f"pod: {pod['id']}  {args.gpu_count}x {args.gpu_type} ({args.cloud})"
           f"  {pod.get('cost')} $/h")
 
-    if manifest is not None:
-        # Écrit APRÈS la création du pod, pour porter son identité : sans elle
-        # on ne peut pas relier une archive aux journaux du pod.
-        manifest["pod"] = {"id": pod["id"], "cost_per_hour": pod.get("cost"),
-                           "cloud": args.cloud}
-        manifest_client.put_object(
-            Bucket=R2_BUCKET, Key=f"{R2_PREFIX}/{run}/config.json",
-            Body=json.dumps(manifest, indent=2, sort_keys=True).encode(),
-            ContentType="application/json")
-        print(f"archive: s3://{R2_BUCKET}/{R2_PREFIX}/{run}/")
+    # Écrit APRÈS la création du pod, pour porter son identité : sans elle on
+    # ne peut pas relier une archive aux journaux du pod.
+    manifest["pod"] = {"id": pod["id"], "cost_per_hour": pod.get("cost"),
+                       "cloud": args.cloud}
+    manifest_client.put_object(
+        Bucket=R2_BUCKET, Key=f"{R2_PREFIX}/{run}/config.json",
+        Body=json.dumps(manifest, indent=2, sort_keys=True).encode(),
+        ContentType="application/json")
+    print(f"archive: s3://{R2_BUCKET}/{R2_PREFIX}/{run}/")
 
 
 if __name__ == "__main__":

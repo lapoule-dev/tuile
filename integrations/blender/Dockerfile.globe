@@ -122,13 +122,18 @@ COPY --from=plugin /opt/blender/5.1 /opt/blender/5.1
 COPY --from=plugin /opt/blender/license /opt/blender/license
 COPY --from=plugin /opt/plugins/tuileHydra /opt/plugins/tuileHydra
 # Static ffmpeg for per-range encodes and the concat, same recipe as
-# stl/blender-render:5.1.
+# stl/blender-render:5.1 — and ffprobe beside it. Without ffprobe the job's
+# frame-count check, the one that tells a 1440-frame render that only carried
+# 180 from a good one, could never run: it failed silently and printed
+# "frames: inconnu".
 RUN curl -fsL -o /tmp/ffmpeg.tar.xz \
         "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" \
     && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp \
     && mv /tmp/ffmpeg-*-static/ffmpeg /usr/local/bin/ffmpeg \
+    && mv /tmp/ffmpeg-*-static/ffprobe /usr/local/bin/ffprobe \
     && rm -rf /tmp/ffmpeg* \
-    && ffmpeg -version | sed -n 1p
+    && ffmpeg -version | sed -n 1p \
+    && ffprobe -version | sed -n 1p
 COPY integrations/blender/render_usd.py /opt/render/render_usd.py
 COPY integrations/blender/render_job.sh /opt/render/render_job.sh
 COPY --from=rustlib /src/target/release/orbit-tape \

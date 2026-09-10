@@ -24,13 +24,24 @@
 #   JOB_OUT            final video path          (default /out/render.mp4)
 #   JOB_UPLOAD_PUT_URL if set: curl -T the finished video to this presigned
 #                      URL (no credential ever reaches the pod)
+#   JOB_LOGS_PUT_URL   if set: every process's stdout, gathered into
+#                      logs.tar.gz and shipped the same way — ON EVERY EXIT
+#                      PATH, because a job that failed is the one whose logs
+#                      are worth having
 #   JOB_TRACE_PUT_URL  if set: the per-process determinism traces, gathered
 #                      into one trace.tar.gz and shipped the same way
+#   JOB_PROFILE_PUT_URL if set: TUILE_PROFILE_DIR's flamegraphs, likewise
 #   JOB_SSH_PUBKEY     if set: start sshd with this authorized key
 #
 # Contract, exact-or-die: the GPU probe must match JOB_GPUS or the job bails
 # (NO-GPU-BAIL) without rendering a single CPU frame; every segment must
 # exist or the job ends VIDEO-MISSING with a nonzero exit.
+#
+# And whatever happens, the archive is shipped. That is a trap, not a line at
+# the end: the one run whose logs anyone wants is the one that did not finish,
+# and the previous shape of this script uploaded nothing on the VIDEO-MISSING
+# path, uploaded nothing on a bail, and wrote no process stdout to any file at
+# all — it lived only in the RunPod console, which the launcher never reads.
 
 set -uo pipefail
 
@@ -46,6 +57,42 @@ JOB_BATCH_FRAMES="${JOB_BATCH_FRAMES:-60}"
 JOB_FPS="${JOB_FPS:-24}"
 JOB_EXTRA_ARGS="${JOB_EXTRA_ARGS:-}"
 JOB_OUT="${JOB_OUT:-/out/render.mp4}"
+outdir="$(dirname "$JOB_OUT")"
+mkdir -p "$outdir"
+
+# Everything this job says about itself, in a file rather than only in a
+# console nobody will read once the pod is gone.
+JOB_LOG="$outdir/job.log"
+exec > >(tee -a "$JOB_LOG") 2>&1
+
+# Ships one tarball to one presigned URL. Quiet about a URL that is not set;
+# loud about one that is and fails.
+ship() {
+    local name="$1" url="$2"; shift 2
+    [ -n "$url" ] || return 0
+    ls "$@" > /dev/null 2>&1 || return 0
+    tar czf "$outdir/$name" -C "$outdir" $(cd "$outdir" && ls "$@" 2>/dev/null) \
+        || { echo "ARCHIVE-TAR-FAILED $name"; return 1; }
+    echo "$name: $(du -h "$outdir/$name" | cut -f1)"
+    if curl -fsS -T "$outdir/$name" "$url" > /dev/null; then
+        echo "ARCHIVE-UP $name"
+    else
+        echo "ARCHIVE-UP-FAILED $name"
+    fi
+}
+
+# Called on EVERY exit, successful or not. This is the whole point: three
+# measurements died with their machine in two days, and the last one was a
+# 60-second render whose pod was reclaimed mid-flight.
+archive_everything() {
+    local status=$?
+    trap - EXIT
+    ship logs.tar.gz    "${JOB_LOGS_PUT_URL:-}"    'log-s*.txt' 'job.log'
+    ship trace.tar.gz   "${JOB_TRACE_PUT_URL:-}"   'trace-s*.jsonl'
+    ship profile.tar.gz "${JOB_PROFILE_PUT_URL:-}" 'profile'
+    exit $status
+}
+trap archive_everything EXIT
 
 first="${JOB_FRAMES%%:*}"; last="${JOB_FRAMES##*:}"
 total=$((last - first + 1))
@@ -105,8 +152,6 @@ elif [ -n "${JOB_TRAJECTORY:-}" ]; then
 fi
 [ -s "$STAGE" ] || { echo "stage absente: $STAGE" >&2; exit 1; }
 
-outdir="$(dirname "$JOB_OUT")"
-mkdir -p "$outdir"
 t0=$(date +%s)
 for i in $(seq 0 $((jobs - 1))); do
     gpu=$((i / JOB_PROCS_PER_GPU))
@@ -133,7 +178,8 @@ for i in $(seq 0 $((jobs - 1))); do
         --out "$outdir/s$i" --video "$outdir/seg$i.mp4" \
         2> "$outdir/trace-s$i.jsonl" \
         | grep --line-buffered -vE '^(Fra:|Saved:|Time:|Append frame)' \
-        | sed -u "s/^/[gpu$gpu-j$i] /" &
+        | sed -u "s/^/[gpu$gpu-j$i] /" \
+        | tee -a "$outdir/log-s$i.txt" &
 done
 wait
 echo "WALL: $(($(date +%s) - t0))s pour $total frames en $jobs processus / $JOB_GPUS GPU"
@@ -148,24 +194,6 @@ for i in $(seq 0 $((jobs - 1))); do
             "$outdir/seg$i.mp4" > /dev/null 2>&1 && rm -f "$outdir/s$i".*.png
     fi
 done
-# The determinism traces, gathered before anything is cleaned up.
-#
-# One file per process, so a comparison can look at one segment at a time.
-# Compressed because the tile-level trace runs 250-355 MB per frame in the
-# clear, and shipped only when asked for — the whole thing exists to answer
-# "why did these two runs of one frame disagree", which cannot be answered
-# once the pod is gone (measured the hard way, 2026-09-08).
-if [ -n "${JOB_TRACE_PUT_URL:-}" ] && ls "$outdir"/trace-s*.jsonl > /dev/null 2>&1; then
-    if tar czf "$outdir/trace.tar.gz" -C "$outdir" $(cd "$outdir" && ls trace-s*.jsonl); then
-        echo "trace: $(du -h "$outdir/trace.tar.gz" | cut -f1)"
-        if curl -fsS -T "$outdir/trace.tar.gz" "$JOB_TRACE_PUT_URL" > /dev/null; then
-            echo TRACE-UPLOAD-DONE
-        else
-            echo TRACE-UPLOAD-FAILED
-        fi
-    fi
-fi
-
 # Segments are counted by SIZE, not by existence.
 #
 # `render_usd.py` creates its output file up front, so a process that dies
@@ -211,7 +239,10 @@ if [ -s "$JOB_OUT" ]; then
         fi
     fi
     echo RENDER-DONE
-    sleep "${JOB_DONE_SLEEP:-7200}"
+    # Two hours sat here, from when the only way to get anything off a pod was
+    # to be there while it lived. Everything now leaves through the archive, so
+    # this is a courtesy window for an ssh session, not a lifeline.
+    sleep "${JOB_DONE_SLEEP:-60}"
 else
     echo VIDEO-MISSING
     exit 1

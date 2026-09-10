@@ -49,6 +49,41 @@ class Redaction(unittest.TestCase):
         self.assertNotIn("deadbeef", out["JOB_UPLOAD_PUT_URL"])
 
 
+class Archive(unittest.TestCase):
+    """Ce qu'un run dépose, et pourquoi rien n'est optionnel."""
+
+    def test_four_objects_are_named_and_the_logs_are_among_them(self):
+        """Le run dont on a le plus besoin des journaux est celui qui a
+        échoué — donc les journaux ne peuvent pas dépendre de la réussite,
+        ni d'un drapeau."""
+        self.assertEqual(
+            set(launch_job.ARCHIVE_OBJECTS),
+            {"render.mp4", "logs.tar.gz", "trace.tar.gz", "profile.tar.gz"})
+
+    def test_nothing_can_switch_the_archive_off(self):
+        """`--no-archive` a coûté un rendu de 60 secondes : le pod a été
+        repris quand le solde s'est épuisé et 1440 frames sont parties avec
+        lui. Un run qui ne laisse rien n'a pas de raison d'exister."""
+        source = pathlib.Path(launch_job.__file__).read_text()
+        # Sur la ligne où il est, pas le fichier entier : un assertNotIn qui
+        # échoue imprime son conteneur, et un lanceur de 440 lignes dans un
+        # message d'erreur cache le message.
+        offending = [line.strip() for line in source.splitlines()
+                     if '"--no-archive"' in line or "args.no_archive" in line]
+        self.assertEqual(offending, [], "l'archive ne se désactive pas")
+
+    def test_the_credentials_are_found_without_exporting_anything(self):
+        """Un lancement qui exige qu'on pense à une variable est un lancement
+        qu'on finit par faire sans elle."""
+        found = launch_job.default_pulumi_dir()
+        # Le checkout voisin n'est pas garanti sur toute machine ; ce qui est
+        # garanti, c'est qu'on le cherche au bon endroit et qu'on répond une
+        # chaîne, jamais une exception.
+        self.assertIsInstance(found, str)
+        if found:
+            self.assertTrue(found.endswith("sportstracklive-rails/infra"))
+
+
 class RunIdentity(unittest.TestCase):
     def test_sorting_by_name_sorts_by_date_and_shows_the_commit(self):
         early = launch_job.run_id({"short": "abc1234", "dirty": False})
