@@ -130,6 +130,28 @@ class CardsTheImageCanRun(unittest.TestCase):
                          "les cartes ne sont plus du moins cher au plus cher")
 
 
+class SeeingWhatIsRunning(unittest.TestCase):
+    """« Aucun pod » doit vouloir dire aucun pod."""
+
+    def test_an_unknown_response_shape_is_an_error_not_an_empty_list(self):
+        """Six pods ont tourné pendant que le compte annonçait zéro : l'API
+        rend `{"pods": [...]}` et le parseur cherchait `items`, se rabattant
+        sur `[]`. Une lecture ratée avait exactement la même tête qu'un
+        compte à zéro — et coûtait 0,69 $/h chacun, invisibles."""
+        seen = {}
+        launch_job.call = lambda key, method, path, body=None: seen.setdefault(
+            "r", {"pods": [{"id": "a"}]})
+        self.assertEqual(launch_job.all_pods("k"), [{"id": "a"}])
+
+        launch_job.call = lambda key, method, path, body=None: {"items": [1, 2]}
+        self.assertEqual(launch_job.all_pods("k"), [1, 2])
+
+        # Et la forme inconnue : refus de conclure.
+        launch_job.call = lambda key, method, path, body=None: {"surprise": []}
+        with self.assertRaises(SystemExit):
+            launch_job.all_pods("k")
+
+
 class NoPythonInTheImage(unittest.TestCase):
     """Le job ne doit pas appeler python3 : l'image n'en a pas.
 
