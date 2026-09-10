@@ -130,6 +130,24 @@ class CardsTheImageCanRun(unittest.TestCase):
                          "les cartes ne sont plus du moins cher au plus cher")
 
 
+class NoPythonInTheImage(unittest.TestCase):
+    """Le job ne doit pas appeler python3 : l'image n'en a pas.
+
+    Blender embarque le sien et rien d'autre n'est installé. Deux contrôles
+    successifs ont appelé `python3`, n'ont rien produit, et ont quand même
+    fait échouer le pod — pour la bonne conclusion et la mauvaise raison.
+    C'est le genre de chance qui cesse exactement quand elle compte."""
+
+    def test_the_job_never_calls_a_python_that_is_not_there(self):
+        script = (pathlib.Path(launch_job.__file__).parent
+                  / "render_job.sh").read_text()
+        offending = [l.strip() for l in script.splitlines()
+                     if "python3" in l and not l.strip().startswith("#")]
+        self.assertEqual(offending, [],
+                         "l'image n'a pas de python3 ; utilise `blender "
+                         "--python-expr`, ou pas d'interpréteur du tout")
+
+
 class HostLottery(unittest.TestCase):
     """Un hôte où cuInit échoue n'est pas une impasse, c'est un tirage."""
 
