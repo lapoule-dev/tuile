@@ -84,6 +84,25 @@ class Archive(unittest.TestCase):
             self.assertTrue(found.endswith("sportstracklive-rails/infra"))
 
 
+class PackedRender(unittest.TestCase):
+    """Un rendu nourri par un pack ne doit porter aucun jeton."""
+
+    def test_the_presigned_read_url_is_redacted_like_any_other(self):
+        url = ("https://acct.r2.cloudflarestorage.com/bucket/packs/abc/1-48.tuilepack"
+               "?X-Amz-Signature=cafebabe&X-Amz-Expires=86400")
+        out = launch_job.redacted({"JOB_PACK_URL": url})
+        self.assertIn("packs/abc/1-48.tuilepack", out["JOB_PACK_URL"],
+                      "on doit pouvoir dire quel pack un run a lu")
+        self.assertNotIn("cafebabe", out["JOB_PACK_URL"])
+
+    def test_the_job_script_drops_the_token_once_a_pack_is_in_hand(self):
+        """Un jeton posé à côté d'un pack est un jeton qu'on peut encore
+        atteindre. Le retirer est ce qui transforme une intention en fait."""
+        script = (pathlib.Path(launch_job.__file__).parent
+                  / "render_job.sh").read_text()
+        self.assertIn("unset TUILE_ION_TOKEN", script)
+
+
 class RunIdentity(unittest.TestCase):
     def test_sorting_by_name_sorts_by_date_and_shows_the_commit(self):
         early = launch_job.run_id({"short": "abc1234", "dirty": False})

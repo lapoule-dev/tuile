@@ -31,6 +31,13 @@
 #   JOB_TRACE_PUT_URL  if set: the per-process determinism traces, gathered
 #                      into one trace.tar.gz and shipped the same way
 #   JOB_PROFILE_PUT_URL if set: TUILE_PROFILE_DIR's flamegraphs, likewise
+#   JOB_PACK_URL       if set: a presigned GET for a pre-baked pack. The job
+#                      downloads it ONCE and every process reads it — no ion
+#                      token, no network, no traversal. This is the normal
+#                      shape of a render now; the streaming path is what runs
+#                      when nobody baked.
+#   JOB_SCENE          the scene digest the pack must answer, or empty to
+#                      accept whatever pack it is given
 #   JOB_SSH_PUBKEY     if set: start sshd with this authorized key
 #
 # Contract, exact-or-die: the GPU probe must match JOB_GPUS or the job bails
@@ -113,8 +120,28 @@ if [ "$probe" != "NGPU $JOB_GPUS" ]; then
     sleep "${JOB_BAIL_SLEEP:-600}"
     exit 1
 fi
-if [ "$JOB_ENGINE" = "hydra" ] && [ -z "${TUILE_ION_TOKEN:-}" ]; then
-    echo NO-TOKEN-BAIL
+# One download for the whole pod. Sixteen processes then read the same file,
+# which the page cache is already holding — as against sixteen cold globes,
+# each of which cost about 500 s and 89 % of a 48-frame job.
+if [ -n "${JOB_PACK_URL:-}" ]; then
+    PACK="${JOB_PACK:-/tmp/scene.tuilepack}"
+    if ! curl -fsS -o "$PACK" "$JOB_PACK_URL"; then
+        echo PACK-FETCH-FAILED
+        exit 1
+    fi
+    export TUILE_PACK="$PACK"
+    [ -n "${JOB_SCENE:-}" ] && export TUILE_SCENE="$JOB_SCENE"
+    echo "pack: $(du -h "$PACK" | cut -f1) -> $PACK"
+    # A pack carries its own imagery, and a token in the environment beside it
+    # is a token that can still be reached. Nothing should want it; unsetting
+    # it is what makes that a fact rather than an intention.
+    unset TUILE_ION_TOKEN
+fi
+
+# Streaming needs a token; a pack needs nothing.
+if [ "$JOB_ENGINE" = "hydra" ] && [ -z "${TUILE_PACK:-}" ] \
+       && [ -z "${TUILE_ION_TOKEN:-}" ]; then
+    echo NO-SOURCE-BAIL
     sleep "${JOB_BAIL_SLEEP:-600}"
     exit 1
 fi
