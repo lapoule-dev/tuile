@@ -54,7 +54,12 @@ def call(key, method, path, body=None):
                  "User-Agent": "tuile-render-farm/0.1"})
     try:
         with urllib.request.urlopen(req) as r:
-            return json.load(r)
+            # A DELETE answers 204 with no body, and json.load on nothing
+            # raises — which is how `--kill-all`, the one verb that has to work
+            # when everything else is broken, crashed on its first real use
+            # after successfully deleting the pod.
+            body = r.read()
+            return json.loads(body) if body.strip() else {}
     except urllib.error.HTTPError as e:
         raise SystemExit(f"{method} {path} -> {e.code}: {e.read().decode()[:300]}")
 
