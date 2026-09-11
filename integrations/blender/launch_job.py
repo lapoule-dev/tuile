@@ -300,6 +300,27 @@ BAD_HOST = ("GPU-PARTIAL-HOST", "NO-GPU-BAIL")
 STARTED = ("pack: ", "SOURCE ", "WALL:", "GPU-USE")
 
 
+def available_cards(key, count=1):
+    """Les cartes réellement libres, du moins cher au plus cher.
+
+    Demander vaut mieux que deviner : un balayage aveugle POSTe douze cartes
+    sur deux clouds pour apprendre ce qu'une requête dit d'un coup. Et la
+    disponibilité est volatile — « LOW » veut dire qu'elle peut disparaître
+    entre la question et la réponse — donc on prend tout de suite ce qu'on
+    apprend, sans repasser par la case attente."""
+    out = []
+    for cloud in ("COMMUNITY", "SECURE"):
+        data = call(key, "GET",
+                    f"/catalog/gpus?include=AVAILABILITY&product=POD"
+                    f"&count={count}&cloud={cloud}")
+        for g in data.get("gpus", []):
+            if g.get("availability") in (None, "NONE"):
+                continue
+            price = (g.get("price") or {}).get(cloud.lower()) or 99
+            out.append((price, cloud, g.get("id"), g.get("memory") or 0))
+    return sorted(out)
+
+
 def all_pods(key):
     """Tous les pods, ou une exception — jamais une liste vide par erreur.
 
@@ -476,6 +497,12 @@ def main():
                    help="variable d'env supplémentaire pour le pod "
                         "(répétable) — le réglage machine du chemin USD "
                         "(TUILE_IMAGERY_BOOST, TUILE_FETCHES, ...) passe ici")
+    p.add_argument("--cheapest-available", action="store_true",
+                   help="interroger le catalogue à chaque tour et prendre la "
+                        "carte la moins chère réellement libre, au lieu de "
+                        "POSTer une liste fixe à l'aveugle. Ignore "
+                        "--gpu-type. Un minimum de VRAM est imposé : 16 Go, "
+                        "sous quoi un path trace à 1280x960 n'a pas la place.")
     p.add_argument("--retries", type=int, default=0, metavar="N",
                    help="jusqu'à N hôtes de plus si celui qu'on obtient ne "
                         "sait pas démarrer CUDA. Le pod est supprimé avant "
@@ -677,6 +704,29 @@ def main():
         while True:
             attempt += 1
             unavailable = []
+            if args.cheapest_available:
+                free = [(c, k) for _, c, k, mem
+                        in available_cards(key, args.gpu_count) if mem >= 16]
+                if free:
+                    print("libre : " + ", ".join(f"{k} ({c})" for c, k in free[:4]),
+                          flush=True)
+                for cloud, kind in free:
+                    body["gpu"] = gpu_spec(kind)
+                    body["cloud"] = cloud
+                    try:
+                        return call(key, "POST", "/pods", body), kind
+                    except SystemExit as e:
+                        if "no longer any instances" in str(e):
+                            unavailable.append(kind)
+                            continue
+                        raise
+                if not args.wait:
+                    raise SystemExit("aucune carte libre")
+                print(f"essai {attempt}: la capacité a filé entre la question "
+                      "et la réponse — on redemande (20 s)", flush=True)
+                import time
+                time.sleep(20)
+                continue
             for kind in args.gpu_type:
                 body["gpu"] = gpu_spec(kind)
                 try:
