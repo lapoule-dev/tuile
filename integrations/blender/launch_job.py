@@ -370,6 +370,35 @@ def wait_until_it_renders(key, pod_id, patience=900):
 def main():
     # Deux verbes avant tout le reste, parce qu'ils doivent marcher même quand
     # le lancement est cassé : voir ce qui tourne, et tout arrêter.
+    if len(sys.argv) > 1 and sys.argv[1] == "--capacity":
+        # Ce que la console montre sur son écran de déploiement, en une
+        # commande rejouable. La capacité a coûté plus de temps que n'importe
+        # quel bug cette semaine, et « réessaie » n'est pas une réponse quand
+        # on peut regarder.
+        key = api_key()
+        count = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+        rows = []
+        for cloud in ("COMMUNITY", "SECURE"):
+            # `/catalog/gpus`, trouvé dans l'openapi plutôt que deviné :
+            # /gputypes, /gpuTypes, /gpu-types et /gpus rendent tous 404.
+            data = call(key, "GET",
+                        f"/catalog/gpus?include=AVAILABILITY&product=POD"
+                        f"&count={count}&cloud={cloud}")
+            for g in data.get("gpus", []):
+                if g.get("availability") in (None, "NONE"):
+                    continue
+                price = (g.get("price") or {}).get(cloud.lower())
+                rows.append((price or 99, cloud, g.get("id", "?"),
+                             g.get("memory"), g.get("availability")))
+        if not rows:
+            print(f"aucune carte disponible à {count} GPU, sur aucun cloud")
+            return
+        print(f"disponible à {count} GPU, du moins cher au plus cher :")
+        for price, cloud, name, mem, avail in sorted(rows):
+            print(f"  {price:6.2f} $/h  {cloud:<9} {avail:<7} "
+                  f"{mem:>4} Go  {name}")
+        return
+
     if len(sys.argv) > 1 and sys.argv[1] in ("--list", "--kill-all"):
         key = api_key()
         pods = all_pods(key)
