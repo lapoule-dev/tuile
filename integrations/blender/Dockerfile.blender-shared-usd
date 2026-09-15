@@ -42,11 +42,27 @@ ARG USD_BUILD_JOBS=8
 # 12.8 is a floor, not a preference: an RTX 5090 is Blackwell, compute
 # capability 12.0, and no earlier CUDA can emit sm_120.
 ARG CUDA_VERSION=12-8
-# ONE architecture, deliberately. Blender's default list spans a decade of
-# cards and each one is a full kernel compilation — the single longest step in
-# this whole image. The farm rents 5090s; anything else can be added the day it
-# is rented, and paying hours for kernels nobody runs is not thrift.
-ARG CUDA_ARCH=sm_120
+# Two cubins and one PTX, copied from what Blender itself ships.
+#
+# `sm_120` alone was too few, and that was learned the expensive way: the CUDA
+# backend then exists only on Blackwell, leaving OptiX as the single path on
+# every other card. A single path that declines has no fallback.
+#
+# The list is upstream's, minus the decade of cards we will never rent — see
+# `CYCLES_CUDA_BINARIES_ARCH` in Blender's top-level CMakeLists, which is
+# `sm_50 … sm_75 sm_86 sm_120 compute_75`. Note what is NOT there: `sm_89`.
+# CUDA cubins are compatible across minor revisions of one major version, so
+# an `sm_86` cubin loads on an Ada 8.9 device — which is why upstream ships
+# 86 and not 89, and why asking for both would have paid for a kernel twice.
+#
+#   sm_86       A10G (8.6), L4 (8.9), RTX 4090 (8.9) — one cubin, three cards
+#   sm_120      RTX 5090 — Blackwell
+#   compute_75  PTX, compiled by the driver: the fallback for anything else
+#
+# Each entry is a full kernel compilation, the longest step in this image, so
+# the list is short on purpose. The OptiX kernels are PTX and were never the
+# arch-bound half; these cubins are.
+ARG CUDA_ARCH="sm_86;sm_120;compute_75"
 # OptiX headers. `find_package(OptiX 8.0.0)` in `intern/cycles/CMakeLists.txt`
 # is the floor; 8.1 satisfies it and the ABI is what a driver implements, so a
 # Blackwell driver serves these headers to a 5090 perfectly well.
@@ -153,7 +169,7 @@ RUN cd /opt/src/blender \
         -DWITH_HYDRA=ON \
         -DWITH_CYCLES_HYDRA_RENDER_DELEGATE=ON \
         -DWITH_CYCLES_CUDA_BINARIES=ON \
-        -DCYCLES_CUDA_BINARIES_ARCH=${CUDA_ARCH} \
+        -DCYCLES_CUDA_BINARIES_ARCH="${CUDA_ARCH}" \
         -DWITH_CYCLES_DEVICE_CUDA=ON \
         -DWITH_CYCLES_DEVICE_OPTIX=ON \
         -DOPTIX_ROOT_DIR=/opt/optix \
@@ -174,17 +190,26 @@ RUN cd /opt/src/blender \
 # this assertion looked for bare `.ptx` and `.cubin`, found zero after a build
 # that had generated all twelve, and failed a good image.
 #
-# And the two names are checked, not just the count: `sm_120` because an RTX
-# 5090 cannot load anything else, and `optix` because Cycles turns OptiX off
-# with a warning rather than an error — CUDA-only would pass a bare count while
-# being exactly the slower renderer this build exists to stop shipping.
+# And the names are checked, not just the count.
+#
+# EVERY architecture in CUDA_ARCH must be present, not merely one of them: a
+# card whose cubin is missing enumerates fine and then refuses every kernel,
+# which is indistinguishable from a GPU that does not work. Asking for the list
+# and checking the list is what stops a silent partial build.
+#
+# `optix` too, because Cycles turns OptiX off with a warning rather than an
+# error — a CUDA-only build passes any bare count while being exactly the
+# slower renderer this whole change exists to stop shipping.
 RUN set -eu; \
     found=$(find /opt/blender \( -name '*.cubin*' -o -name '*.ptx*' \) -printf '%f\n'); \
     n=$(echo "$found" | grep -c . || true); \
     echo "cycles gpu kernels: $n"; echo "$found" | sort | sed 's/^/  /'; \
     test "$n" -gt 0 || { echo "no CUDA/OptiX kernels were installed"; exit 1; }; \
-    echo "$found" | grep -q 'sm_120' \
-        || { echo "no sm_120 kernel: an RTX 5090 could not load any of these"; exit 1; }; \
+    for arch in $(echo "$CUDA_ARCH" | tr ';' ' '); do \
+        echo "$found" | grep -q "$arch" \
+            || { echo "no $arch kernel: a card of that architecture would"; \
+                 echo "  enumerate and then refuse every kernel"; exit 1; }; \
+    done; \
     echo "$found" | grep -q 'optix' \
         || { echo "CUDA kernels but no OptiX: find_package(OptiX) was silently skipped"; exit 1; }
 
