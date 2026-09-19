@@ -10,18 +10,11 @@
 //! consumes — one frame at a time, fully resolved, with buffers laid out the
 //! way Hydra wants to read them.
 //!
-//! # Why bulk and not streaming
-//!
-//! The rest of the project streams: tiles arrive progressively and the picture
-//! sharpens. That is right for a viewer and wrong for a renderer. In
-//! progressive mode the selection depends on *which tiles happened to arrive*,
-//! so two machines rendering the same frame can disagree — and a farm would
-//! show it as flicker between frames rendered on different nodes, a defect that
-//! is close to impossible to diagnose after the fact.
-//!
-//! So a frame here is one blocking, converged answer
-//! ([`tuile_core::drive::drive_until_complete`]): the selection is a function of
-//! the camera and the sources, not of the network's mood.
+//! The work itself lives in [`tuile_bake`], which knows nothing about OpenUSD.
+//! That separation is not tidiness: `tuile-bake` produces a container any
+//! renderer can read, and while the session lived here, the binary that wrote
+//! that container linked a crate named after one particular host. The format is
+//! neutral; the dependency graph said otherwise.
 //!
 //! # Rules at the boundary
 //!
@@ -34,12 +27,10 @@
 //!   from them must be too.
 
 mod ffi;
-mod globe;
-pub mod packed;
-mod session;
 
-pub use globe::{GlobeConfig, GlobeError, BING_AERIAL, CESIUM_WORLD_TERRAIN};
-pub use packed::PackedError;
-pub use session::{
-    exact_traversal, EncodedTexture, Frame, FrameError, Session, SessionConfig, TileGeometry,
+// Re-exported so the plugin side has one crate to name, and so an existing
+// `tuile_hydra::Session` keeps resolving.
+pub use tuile_bake::{
+    exact_traversal, packed, EncodedTexture, Frame, FrameError, GlobeConfig, GlobeError,
+    PackedError, Session, SessionConfig, TileGeometry, BING_AERIAL, CESIUM_WORLD_TERRAIN,
 };

@@ -47,7 +47,7 @@ fn max_level() -> Option<u32> {
 }
 
 /// checkerboard's cure.
-fn imagery_boost_cap() -> u32 {
+pub fn imagery_boost_cap() -> u32 {
     std::env::var("TUILE_IMAGERY_BOOST")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
@@ -315,7 +315,7 @@ async fn resolve(
 /// Non-finite and non-positive both mean "the caller did not choose", which is
 /// different from "the caller chose zero" — a zero timeout would fail every
 /// frame instantly, and that is never what someone means.
-pub(crate) fn duration_or(seconds: f64, fallback: Duration) -> Duration {
+pub fn duration_or(seconds: f64, fallback: Duration) -> Duration {
     if seconds.is_finite() && seconds > 0.0 {
         Duration::from_secs_f64(seconds)
     } else {

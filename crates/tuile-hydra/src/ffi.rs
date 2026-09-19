@@ -4,7 +4,7 @@
 //! The `extern "C"` surface, and nothing else.
 //!
 //! Every function here obeys the same three rules, and they are the reason this
-//! module is separate from [`crate::session`]:
+//! module is separate from [`tuile_bake::Session`]:
 //!
 //! 1. **Nothing unwinds.** A panic crossing `extern "C"` aborts the process, so
 //!    each entry point catches and returns a [`TuileStatus`].
@@ -19,7 +19,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use glam::{DVec2, DVec3};
 use tuile_core::traversal::ViewStateParams;
 
-use crate::session::{Frame, FrameError, Session};
+use tuile_bake::{Frame, FrameError, Session};
 
 /// The outcome of a call. Zero is success; everything else is a reason.
 #[repr(i32)]
@@ -224,7 +224,7 @@ pub struct TuileViewState {
 fn imagery_asset(id: i64) -> Option<i64> {
     match id {
         id if id < 0 => None,
-        0 => Some(crate::globe::BING_AERIAL),
+        0 => Some(tuile_bake::BING_AERIAL),
         id => Some(id),
     }
 }
@@ -304,7 +304,7 @@ pub unsafe extern "C" fn tuile_session_new(
             return TuileStatus::BadArgument;
         };
 
-        let mut globe = crate::globe::GlobeConfig::new(token);
+        let mut globe = tuile_bake::GlobeConfig::new(token);
         if config.terrain_asset_id != 0 {
             globe.terrain_asset_id = config.terrain_asset_id;
         }
@@ -316,7 +316,7 @@ pub unsafe extern "C" fn tuile_session_new(
             globe.session.traversal.maximum_screen_space_error = config.maximum_screen_space_error;
         }
         globe.session.frame_timeout =
-            crate::globe::duration_or(config.frame_timeout_seconds, globe.session.frame_timeout);
+            tuile_bake::duration_or(config.frame_timeout_seconds, globe.session.frame_timeout);
         globe.session.fail_on_tile_errors = config.fail_on_tile_errors;
 
         match Session::globe(globe) {
@@ -615,7 +615,7 @@ mod tests {
     /// inverted, and inverting it means silently rendering an untextured globe.
     #[test]
     fn the_imagery_asset_id_encodes_three_things() {
-        assert_eq!(imagery_asset(0), Some(crate::globe::BING_AERIAL));
+        assert_eq!(imagery_asset(0), Some(tuile_bake::BING_AERIAL));
         assert_eq!(imagery_asset(3812), Some(3812));
         assert_eq!(imagery_asset(-1), None, "negative disables imagery");
         assert_eq!(imagery_asset(i64::MIN), None);
