@@ -18,7 +18,11 @@ claude.session
 # reproductible : le pack et la trajectoire sont dans R2 et dans le code, ce
 # qui est la vraie sauvegarde. Ce répertoire existe pour ne pas les perdre
 # entre deux sessions, pas pour les versionner.
-videos/
+videos/*
+# `videos/*` et non `videos/` : git ne descend pas dans un répertoire exclu,
+# donc une négation à l'intérieur ne peut rien rattraper. Exclure le CONTENU
+# laisse la porte ouverte pour la ligne suivante.
+#
 # Sauf son index : il porte, pour chaque film, de quoi le refaire — la
 # trajectoire, la clef du pack, le digest de scène, l'imagerie, le viewport,
 # le nombre d'échantillons. Un mp4 sans ses paramètres ne se compare à rien,
