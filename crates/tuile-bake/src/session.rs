@@ -61,7 +61,32 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             traversal: Config::default(),
-            frame_timeout: Duration::from_secs(120),
+            // The only bound there is, now that the patience has none.
+            //
+            // `RetryConfig::patient()` never gives up on a tile: a bake is
+            // all-or-nothing and nobody is watching, so there is no number of
+            // attempts after which renouncing is better than waiting. That
+            // moves the whole decision here — this is what separates "the
+            // origin had a bad ten minutes" from "the shot is lost", and
+            // nothing else will end the wait.
+            //
+            // Fifteen minutes, and each half of that is deliberate. Long
+            // enough that the unlimited patience can actually be spent — at a
+            // thirty-second ceiling it buys about thirty attempts, so a real
+            // outage is survived rather than converted into a thrown-away
+            // bake, which was the entire point. Short enough to stay a bound:
+            // the job itself is capped at 7200 s for 2880 frames, so one stuck
+            // frame costs an eighth of the run and then *reports*, instead of
+            // sitting in `wait` until the platform kills it with no reason
+            // attached.
+            //
+            // It used to be 120 s flat beside a retry profile that budgeted
+            // 182 s, so the chain could never finish inside a frame at all.
+            // Measured 19 September 2026: `in_flight=1` for ninety seconds,
+            // `selected` frozen at 230, then `frame did not converge within
+            // 120s` — and not one line saying a retry was underway, because
+            // they logged at `debug`.
+            frame_timeout: Duration::from_secs(900),
             fail_on_tile_errors: true,
             // Deliberately not "" — an empty dataset would collapse the URI to
             // `tuile:///tile/...`, which resolves but scopes nothing.
@@ -1007,10 +1032,33 @@ pub fn exact_traversal(mut config: Config) -> Config {
     let budget_gb: usize = env_knob("TUILE_RESIDENT_BUDGET_GB", 4).max(1);
     config.resident_budget_bytes = budget_gb.saturating_mul(1024 * 1024 * 1024);
     config.resident_tile_limit = usize::MAX;
-    // Bulk, not trickle: a converging frame should saturate the pooled HTTP
-    // client (keep-alive per host, HTTP/2 multiplexing) rather than dribble
-    // tiles 64 at a time through a knob sized for a viewer's frame budget.
-    config.maximum_simultaneous_fetches = env_knob("TUILE_FETCHES", 256).max(1);
+    // Micro-batches, not one bulk flood: the wave is sized to the connection
+    // pool, because beyond it nothing goes any faster.
+    //
+    // It fired 256 while the client keeps
+    // [`tuile_native_fetchers::CONNECTIONS_PER_HOST`] = 64 keep-alive
+    // connections per host. What the surplus costs depends on the protocol,
+    // and it costs something either way:
+    //
+    // - over HTTP/2 — one connection per host, multiplexed — concurrency is
+    //   bounded by the server's `SETTINGS_MAX_CONCURRENT_STREAMS`, commonly
+    //   100 to 128. Requests past it queue inside the client, holding their
+    //   buffers and burning their share of the request timeout while they wait
+    //   for a stream. That is not bandwidth; it is a queue, and it makes every
+    //   timeout measure the queue rather than the server.
+    // - over HTTP/1.1 the pool figure is an *idle* limit, not a concurrency
+    //   cap: 256 requests open up to 256 connections and only 64 are kept for
+    //   reuse, so the rest is handshake churn against the origin.
+    //
+    // Which of the two applies here has not been measured. 64 is the right
+    // answer under both.
+    //
+    // Over-subscribing also makes the origin answer worse: a bake died at frame
+    // 2807 on an HTTP 500 from ion, which is what a flood gets. The wave now
+    // matches what can actually be in flight, and stays saturated because a
+    // finished request frees its connection immediately.
+    config.maximum_simultaneous_fetches =
+        env_knob("TUILE_FETCHES", tuile_native_fetchers::CONNECTIONS_PER_HOST).max(1);
     // Never give up on a subtree, however long it takes.
     //
     // The last interactive kindness in this list, and the one that cost the
@@ -1310,6 +1358,25 @@ mod tests {
         );
     }
 
+    /// The fetch wave may not exceed what can be on the wire.
+    ///
+    /// The two numbers live in different crates and drifted apart: the wave
+    /// said 256 while the client held 64 connections per host, so three
+    /// requests in four were queued inside the process rather than issued. The
+    /// symptom is not a failure — it is memory held, timeouts that measure the
+    /// queue, and an origin answering 500 to a flood.
+    #[test]
+    fn the_fetch_wave_fits_the_connection_pool() {
+        let config = exact_traversal(Config::default());
+        assert!(
+            config.maximum_simultaneous_fetches
+                <= tuile_native_fetchers::CONNECTIONS_PER_HOST,
+            "{} requests in flight against {} connections — the surplus only queues",
+            config.maximum_simultaneous_fetches,
+            tuile_native_fetchers::CONNECTIONS_PER_HOST,
+        );
+    }
+
     /// The same tile re-draped is a different picture, so it must be a
     /// different asset: any cache between here and the renderer keys on this
     /// name, and one that did not change would keep serving the old pixels.
@@ -1392,6 +1459,42 @@ mod tests {
         let frame = frame_with_a_texture();
         assert!(frame.texture_png(0, 1).expect("no error").is_none());
         assert!(frame.texture_png(9, 0).expect("no error").is_none());
+    }
+
+    /// A frame must give the patience room to work.
+    ///
+    /// The two numbers live in different crates and contradicted each other:
+    /// 182 s of retry budget against a 120 s frame, so the chain could never
+    /// finish inside a frame. Nothing failed loudly — the retries logged at
+    /// `debug` — so the bake reported only that frame 1 had not converged,
+    /// which is true and says nothing.
+    ///
+    /// Both shapes have to stay sound, because the profile is a knob:
+    ///
+    /// - bounded patience — the frame must outlast it, or the retries are
+    ///   decoration;
+    /// - unlimited patience — the frame is the sole bound, so it must be
+    ///   finite *and* long enough for the waiting to amount to something. A
+    ///   frame shorter than a handful of backoffs gives up after two attempts
+    ///   and the word "patient" means nothing.
+    #[test]
+    fn a_frame_gives_the_patience_room_to_work() {
+        let retry = tuile_native_fetchers::RetryConfig::patient();
+        let frame = SessionConfig::default().frame_timeout;
+        match retry.budget() {
+            Some(budget) => assert!(
+                frame > budget,
+                "a tile may wait {budget:?} and the frame gives up at {frame:?}: \
+                 the retry chain can never finish inside a frame"
+            ),
+            None => assert!(
+                frame >= retry.max_backoff * 10,
+                "unlimited patience inside a {frame:?} frame is {} attempts at \
+                 a {:?} ceiling — not patience, decoration",
+                frame.as_secs_f64() / retry.max_backoff.as_secs_f64(),
+                retry.max_backoff
+            ),
+        }
     }
 
     #[test]
