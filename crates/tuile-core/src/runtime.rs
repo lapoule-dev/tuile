@@ -1214,6 +1214,7 @@ mod tests {
             }
             fn fill(&self, _id: TileId) -> Option<crate::content::DecodedTileContent> {
                 Some(crate::content::DecodedTileContent {
+                    withheld_drape: None,
                     meshes: Vec::new(),
                     textures: Vec::new(),
                     imagery: Vec::new(),
@@ -1313,6 +1314,7 @@ mod tests {
             }
             fn fill(&self, _id: TileId) -> Option<crate::content::DecodedTileContent> {
                 Some(crate::content::DecodedTileContent {
+                    withheld_drape: None,
                     meshes: Vec::new(),
                     textures: Vec::new(),
                     imagery: Vec::new(),
@@ -1422,6 +1424,7 @@ mod tests {
             }
             fn fill(&self, _id: TileId) -> Option<crate::content::DecodedTileContent> {
                 Some(crate::content::DecodedTileContent {
+                    withheld_drape: None,
                     meshes: Vec::new(),
                     textures: Vec::new(),
                     imagery: Vec::new(),

@@ -1191,6 +1191,7 @@ mod tests {
                 tile: TileId(7),
                 origin_ecef: DVec3::ZERO,
                 content: DecodedTileContent {
+                    withheld_drape: None,
                     meshes: Vec::new(),
                     textures: vec![DecodedTexture {
                         width: 2,
@@ -1350,6 +1351,7 @@ mod tests {
         let positions = vec![[0.0f32; 3]; 3];
         let uvs = uvs_geographic(&positions, origin, &rect);
         DecodedTileContent {
+            withheld_drape: None,
             meshes: vec![DecodedMesh {
                 positions,
                 normals: None,
@@ -1403,6 +1405,7 @@ mod tests {
         let positions = vec![[0.0f32; 3]; 3];
         let uvs = uvs_geographic(&positions, origin, &rect);
         let decoded = DecodedTileContent {
+            withheld_drape: None,
             meshes: vec![DecodedMesh {
                 positions,
                 normals: None,
