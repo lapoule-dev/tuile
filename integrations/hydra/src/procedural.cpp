@@ -3,6 +3,7 @@
 
 #include "procedural.h"
 
+#include "hostpaths.h"
 #include "tiles.h"
 #include "view.h"
 
@@ -13,6 +14,7 @@
 #include <pxr/base/tf/debug.h>
 #include <pxr/base/tf/diagnostic.h>
 #include <pxr/base/tf/getenv.h>
+#include <pxr/base/tf/fileUtils.h>
 #include <pxr/base/tf/registryManager.h>
 #include <pxr/base/tf/staticTokens.h>
 #include <pxr/base/tf/stringUtils.h>
@@ -82,11 +84,16 @@ TF_DEFINE_PRIVATE_TOKENS(
     (wrapS)
     (wrapT)
     ((clampWrap, "clamp"))
+    (extension)
     (UsdPreviewSurface)
     (UsdUVTexture)
+    ((cyclesImageTexture, "cycles_image_texture"))
+    (filename)
+    (vector)
+    (color)
     (UsdPrimvarReader_float2)
     (PreviewSurface)
-    (Texture)
+    ((Texture, "TuileTexture"))
     (StReader)
 );
 
@@ -153,6 +160,31 @@ _PathArg(const HdSceneIndexBaseRefPtr &scene,
         const auto &paths = v.UncheckedGet<VtArray<SdfPath>>();
         return paths.empty() ? SdfPath() : paths[0];
     }
+    // A path carried as text, which is how a stage can carry one at all.
+    //
+    // USD has no `SdfPath`-valued attribute, and hdGp hands its arguments over
+    // as primvars — which are attributes. A manifest that wanted to name the
+    // camera therefore had only one honest option, `string`, and this function
+    // did not accept it: it authored `rel primvars:tuile:cameras` instead, a
+    // relationship wearing a primvar's prefix, which never reached here.
+    //
+    // The cost was silent and total. `_ResolveCamera` fell through all four
+    // rungs to the fixed view above the render origin — the centre of the
+    // orbit — and every frame of a 1440-frame pack was then equidistant from
+    // it: "the nearest is frame 1108, 8000.000 m away", 8000 m being the
+    // orbit's radius to the millimetre.
+    if (v.IsHolding<std::string>()) {
+        const std::string &text = v.UncheckedGet<std::string>();
+        if (!text.empty() && SdfPath::IsValidPathString(text)) {
+            return SdfPath(text);
+        }
+    }
+    if (v.IsHolding<TfToken>()) {
+        const std::string text = v.UncheckedGet<TfToken>().GetString();
+        if (!text.empty() && SdfPath::IsValidPathString(text)) {
+            return SdfPath(text);
+        }
+    }
     return SdfPath();
 }
 
@@ -218,9 +250,9 @@ _Vec2dArg(const HdSceneIndexBaseRefPtr &scene,
 /// not every host inserts, so a settings prim that does not claim to be active
 /// is still worth reading rather than treating as absent.
 SdfPath
-_RenderSettingsCamera(const HdSceneIndexBaseRefPtr &scene)
+_RenderSettingsCamera(const HdSceneIndexBaseRefPtr &scene, const SdfPath &anchor)
 {
-    HdSceneGlobalsSchema globals = HdSceneGlobalsSchema::GetFromSceneIndex(scene);
+    HdSceneGlobalsSchema globals = TuileSceneGlobals(scene, anchor);
     if (!globals) {
         return SdfPath();
     }
@@ -240,7 +272,7 @@ _RenderSettingsCamera(const HdSceneIndexBaseRefPtr &scene)
         return SdfPath();
     }
 #if PXR_VERSION >= 2608
-    // The settings-level camera only exists from 26.08; on 25.08 (the
+    // The settings-level camera only exists from 26.08; on 26.03 (the
     // Blender fork's USD) rung 2 reads the per-product camera below.
     if (HdPathDataSourceHandle camera = rs.GetCamera()) {
         const SdfPath path = camera->GetTypedValue(0.0f);
@@ -305,39 +337,105 @@ _MaterialNetwork(const std::string &textureUri)
                 .Build()))
         .Build();
 
+    // Le nœud natif Cycles, et pourquoi pas `UsdUVTexture`.
+    //
+    // `UsdUVTexture` est la forme portable, et c'est celle qui était écrite
+    // ici. Le hdCycles livré avec ce Blender la refuse : « Could not create
+    // node 'Texture' », suivi de « Ignoring connection from 'Texture.rgb' to
+    // 'PreviewSurface.diffuseColor' ». Le terrain sortait alors en aplat rose
+    // — la couleur d'un matériau dont la texture n'a pas été branchée — avec
+    // un relief parfaitement correct par ailleurs.
+    //
+    // Ce n'est pas nous : relu sur le schéma lui-même au moment de l'écrire,
+    // l'identifiant était bien `UsdUVTexture` et le chemin pointait un PNG
+    // existant. Les deux autres nœuds du réseau, bâtis par le même Builder,
+    // passent sans un mot.
+    //
+    // `PopulateShaderGraph` traite à part tout identifiant préfixé `cycles_` :
+    // il court-circuite la table de correspondance USD et va directement à
+    // `NodeType::find`. On emprunte cette porte-là. Le coût est la portabilité
+    // — un délégué qui n'est pas Cycles ne texturera pas — et il est assumé
+    // tant que la cible est Cycles ; le jour où Storm compte, le choix devra
+    // dépendre du délégué et non être figé ici.
+    //
+    // Les noms changent avec le nœud : `filename` au lieu de `file`, l'entrée
+    // `vector` au lieu de `st`, la sortie `color` au lieu de `rgb`. Et
+    // `extension` au lieu de wrapS/wrapT — un seul socket pour les deux axes.
     HdContainerDataSourceHandle texture = HdMaterialNodeSchema::Builder()
         .SetNodeIdentifier(HdRetainedTypedSampledDataSource<TfToken>::New(
-            _tokens->UsdUVTexture))
+            _tokens->cyclesImageTexture))
+        // Pas de `colorspace` : `auto` est mesuré juste.
+        //
+        // Le socket vaut `u_colorspace_auto` par défaut — une ustring vide
+        // (`intern/cycles/util/colorspace.cpp`) — qui laisse OIIO déduire
+        // l'espace du fichier. On a soupçonné cette déduction d'être fausse,
+        // et on l'a testée le 17 septembre 2026 en écrivant
+        // `colorspace = "__builtin_srgb"` : l'image est passée de 22 % de
+        // pixels écrêtés à 99,84 %, un blanc uniforme. Un double décodage
+        // ASSOMBRIT ; celui-ci blanchit, donc la valeur n'est pas reçue comme
+        // on le croyait. `auto` reste, et la sur-exposition qu'on chassait
+        // venait de l'éclairage.
         .SetParameters(HdRetainedContainerDataSource::New(
-            _tokens->file,
-            HdMaterialNodeParameterSchema::Builder()
-                .SetValue(HdRetainedTypedSampledDataSource<SdfAssetPath>::New(
-                    SdfAssetPath(textureUri, textureUri)))
-                .Build(),
-            _tokens->wrapS,
+            // `clamp`, et surtout pas le défaut.
+            //
+            // Le défaut de Cycles est `EXTENSION_REPEAT`
+            // (`intern/cycles/scene/shader_nodes.cpp:275`), avec un filtre
+            // bilinéaire. Nos UV vont exactement de 0 à 1
+            // (`tuile-terrain/src/mesh.rs:98-104`) et le drapage n'a AUCUNE
+            // gouttière — `tuile-core/src/raster.rs:919-934` documente ce choix
+            // et note qu'aucune des deux implémentations de référence n'en a.
+            // Échantillonner en `u=0` demande donc le texel −0,5, que REPEAT
+            // fait boucler sur la colonne opposée de la même tuile : une bande
+            // d'un demi-texel de la mauvaise couleur, sur chaque bord, en
+            // grille.
+            //
+            // Les jupes transforment ce sous-pixel en ligne franche : leur UV
+            // entier est épinglé au bord (`mesh.rs:224`, délibérément, pour
+            // qu'un mur visible porte la texture de son bord), donc le mur
+            // censé masquer les fissures se peint de la couleur du bord d'en
+            // face.
+            //
+            // `UsdUVTexture` portait `wrapS`/`wrapT = "clamp"`, que hdCycles
+            // remappait vers ce socket (`hydra/material.cpp:129-152`). Ce
+            // remappage ne s'applique pas à un identifiant préfixé `cycles_`
+            // (`material.cpp:440-462` puis `findCycles()` qui rend `nullptr`),
+            // donc le socket s'écrit ici, directement, avec le vocabulaire de
+            // Cycles — où « répéter » se dit `periodic` et « borner »,
+            // `clamp`.
+            _tokens->extension,
             HdMaterialNodeParameterSchema::Builder()
                 .SetValue(HdRetainedTypedSampledDataSource<TfToken>::New(
                     _tokens->clampWrap))
                 .Build(),
-            _tokens->wrapT,
+            _tokens->filename,
             HdMaterialNodeParameterSchema::Builder()
-                .SetValue(HdRetainedTypedSampledDataSource<TfToken>::New(
-                    _tokens->clampWrap))
+                // Une chaîne, pas un `SdfAssetPath`.
+                //
+                // Le socket Cycles est `SOCKET_STRING(filename, ...)`, et la
+                // conversion depuis un asset path n'a pas lieu : le rendu
+                // s'est plaint de « Image file  does not exist » — deux
+                // espaces, parce que le nom était vide — pendant que le
+                // fichier, lui, existait bel et bien sur le disque (vérifié
+                // par `TfIsFile` au moment même de l'écrire).
+                .SetValue(HdRetainedTypedSampledDataSource<std::string>::New(
+                    textureUri))
                 .Build()))
-        .SetInputConnections([] {
-            const HdDataSourceBaseHandle connection =
-                HdMaterialConnectionSchema::Builder()
-                    .SetUpstreamNodePath(
-                        HdRetainedTypedSampledDataSource<TfToken>::New(
-                            _tokens->StReader))
-                    .SetUpstreamNodeOutputName(
-                        HdRetainedTypedSampledDataSource<TfToken>::New(
-                            _tokens->result))
-                    .Build();
-            return HdRetainedContainerDataSource::New(
-                _tokens->st,
-                HdRetainedSmallVectorDataSource::New(1, &connection));
-        }())
+        // Pas de connexion entrante, et pas de lecteur de primvar.
+        //
+        // Le socket Cycles est déclaré
+        // `SOCKET_IN_POINT(vector, "Vector", zero_float3(), LINK_TEXTURE_UV)`,
+        // et ce drapeau dit à Cycles de brancher lui-même les UV par défaut
+        // quand rien n'est connecté. Le `UsdPrimvarReader_float2` ne servait
+        // donc qu'à répéter ce que le moteur fait seul.
+        //
+        // Il servait surtout à autre chose sans le vouloir : il faisait de ce
+        // nœud le SEUL du réseau à être à la fois cible et source d'une
+        // connexion — `StReader → Texture → PreviewSurface` — et c'est
+        // exactement le seul nœud que hdCycles refusait de créer, quel que
+        // soit son identifiant (`UsdUVTexture` comme `cycles_image_texture`,
+        // les deux essayés, le même « Could not create node »). Les deux
+        // autres, chacun d'un seul côté d'une connexion, passaient sans un
+        // mot.
         .Build();
 
     HdContainerDataSourceHandle previewSurface = HdMaterialNodeSchema::Builder()
@@ -356,7 +454,7 @@ _MaterialNetwork(const std::string &textureUri)
                             _tokens->Texture))
                     .SetUpstreamNodeOutputName(
                         HdRetainedTypedSampledDataSource<TfToken>::New(
-                            _tokens->rgb))
+                            _tokens->color))
                     .Build();
             return HdRetainedContainerDataSource::New(
                 _tokens->diffuseColor,
@@ -364,11 +462,43 @@ _MaterialNetwork(const std::string &textureUri)
         }())
         .Build();
 
+    HdContainerDataSourceHandle nodes = HdRetainedContainerDataSource::New(
+        _tokens->StReader, stReader,
+        _tokens->Texture, texture,
+        _tokens->PreviewSurface, previewSurface);
+
+    // Le réseau tel qu'il part, relu une fois comme hdCycles le lira.
+    //
+    // hdCycles refuse le nœud de texture — « Could not create node » — et son
+    // code ne peut le faire que si `NodeType::find` échoue, c'est-à-dire si
+    // l'identifiant qu'il lit est vide ou inconnu. Or la table de ce fork
+    // contient bien `UsdUVTexture`, et son `PopulateShaderGraph` accepte le
+    // préfixe `cycles_` : les deux formes ont été essayées, les deux ont
+    // échoué, pendant que les deux autres nœuds du même réseau passaient.
+    //
+    // Alors on regarde les trois ensemble. Si les trois portent leur
+    // identifiant ici, la perte est en aval de nous.
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        for (const TfToken &name : {_tokens->StReader, _tokens->Texture,
+                                    _tokens->PreviewSurface}) {
+            HdMaterialNodeSchema node(
+                HdContainerDataSource::Cast(nodes->Get(name)));
+            const TfToken identifier =
+                node.GetNodeIdentifier()
+                    ? node.GetNodeIdentifier()->GetTypedValue(0.0f)
+                    : TfToken();
+            printf("MATERIAL-NODE %-14s identifier='%s'\n",
+                   name.GetText(), identifier.GetText());
+        }
+        printf("MATERIAL-URI %s (%s)\n", textureUri.c_str(),
+               TfIsFile(textureUri) ? "EXISTS" : "MISSING");
+        fflush(stdout);
+    }
+
     HdContainerDataSourceHandle network = HdMaterialNetworkSchema::Builder()
-        .SetNodes(HdRetainedContainerDataSource::New(
-            _tokens->StReader, stReader,
-            _tokens->Texture, texture,
-            _tokens->PreviewSurface, previewSurface))
+        .SetNodes(nodes)
         .SetTerminals(HdRetainedContainerDataSource::New(
             _tokens->surface,
             HdMaterialConnectionSchema::Builder()
@@ -439,22 +569,49 @@ TuileGlobeProcedural::~TuileGlobeProcedural()
 SdfPath
 TuileGlobeProcedural::_ResolveCamera(const HdSceneIndexBaseRefPtr &inputScene) const
 {
-    // 1. Authored on this prim: the only choice a pipeline can pin.
-    if (SdfPath explicitCamera = _PathArg(inputScene, _primPath, _tokens->cameras);
-        !explicitCamera.IsEmpty()) {
-        return explicitCamera;
+    // 1. The camera the host renders THROUGH, then the one authored on this
+    //    prim. `TuileSelectCamera` holds the order between the two; see
+    //    `cameraRungTest.cpp` for what that order is and why.
+    //
+    // The authored path is the only choice a pipeline can pin, but it reaches
+    // us through the host's namespace, not the stage's — it is the rung that
+    // carries its path as text, so it is the one prefixing cannot rewrite (see
+    // `hostpaths.h`).
+    //
+    // The render camera comes first because it is the one the image is made
+    // by. Blender re-exports its camera into the stage every frame as
+    // `/usd_scene/.../shot`, but renders through `/freeCamera`, which it moves
+    // without rebuilding anything. Selecting tiles for the exported copy means
+    // selecting for a camera that is only usually the right one — and it is
+    // the re-export we are about to stop doing.
+    const SdfPath authoredCamera = _PathArg(inputScene, _primPath, _tokens->cameras);
+    if (const SdfPath chosen = TuileSelectCamera(inputScene, _primPath, authoredCamera);
+        !chosen.IsEmpty()) {
+        if (!authoredCamera.IsEmpty() && chosen != authoredCamera) {
+            printf("CAMERA-REROOTED authored=%s host=%s\n",
+                   authoredCamera.GetText(), chosen.GetText());
+            fflush(stdout);
+        }
+        return chosen;
+    }
+    if (!authoredCamera.IsEmpty()) {
+        // Authored and absent. Saying so beats falling through in silence to a
+        // rung that answers a different question.
+        printf("CAMERA-AUTHORED-MISSING %s — no prim there, nor under any "
+               "ancestor of %s\n",
+               authoredCamera.GetText(), _primPath.GetText());
+        fflush(stdout);
     }
 
     // 2. The camera this render product renders through.
-    if (SdfPath fromSettings = _RenderSettingsCamera(inputScene);
+    if (SdfPath fromSettings = _RenderSettingsCamera(inputScene, _primPath);
         !fromSettings.IsEmpty()) {
         return fromSettings;
     }
 
     // 3. Whatever the host calls primary — a viewport's free camera, in an
     //    interactive session, so useful but not reproducible.
-    if (HdSceneGlobalsSchema globals =
-            HdSceneGlobalsSchema::GetFromSceneIndex(inputScene)) {
+    if (HdSceneGlobalsSchema globals = TuileSceneGlobals(inputScene, _primPath)) {
         if (HdPathDataSourceHandle primary = globals.GetPrimaryCameraPrim()) {
             return primary->GetTypedValue(0.0f);
         }
@@ -583,11 +740,25 @@ TuileGlobeProcedural::_ViewForCook(const HdSceneIndexBaseRefPtr &inputScene,
     const double origin[3] = {_renderOrigin[0], _renderOrigin[1],
                               _renderOrigin[2]};
     if (!_cameraPath.IsEmpty() &&
-        TuileViewFromCamera::Read(inputScene, _cameraPath, origin,
+        TuileViewFromCamera::Read(inputScene, _cameraPath, _primPath, origin,
                                   _fallbackViewportPx, out))
     {
         return true;
     }
+
+    // Said out loud, because the fallback below is indistinguishable from a
+    // working render until something downstream refuses the view it produces.
+    //
+    // With a pack in hand it is never right: a baked frame answers a camera
+    // that was on the trajectory, and this one is at its centre. The error a
+    // reader then gets — "no baked frame answers this camera, the nearest is
+    // 8000 m away" — describes the symptom and hides the cause, which is that
+    // the camera never arrived.
+    printf("CAMERA-FALLBACK path=%s read=%s — view-independent, straight down "
+           "from the render origin\n",
+           _cameraPath.IsEmpty() ? "(none)" : _cameraPath.GetText(),
+           _cameraPath.IsEmpty() ? "n/a" : "failed");
+    fflush(stdout);
 
     // View-independent fallback: straight down from the render origin, which a
     // manifest places on the trajectory — above the ground it flies over. With
@@ -617,7 +788,14 @@ HdGpGenerativeProcedural::DependencyMap
 TuileGlobeProcedural::UpdateDependencies(const HdSceneIndexBaseRefPtr &inputScene)
 {
     DependencyMap result;
+    const SdfPath previous = _cameraPath;
     _cameraPath = _ResolveCamera(inputScene);
+    if (_cameraPath != previous) {
+        printf("CAMERA-RESOLVED %s\n",
+               _cameraPath.IsEmpty() ? "(none — all four rungs empty)"
+                                     : _cameraPath.GetText());
+        fflush(stdout);
+    }
 
     if (!_cameraPath.IsEmpty()) {
         // The transform is what changes as the shot moves; the camera schema
@@ -774,9 +952,27 @@ TuileGlobeProcedural::Update(
             if (t == 0) {
                 textureUri = uri;
             }
+            // La table ne sert que les URI `tuile://`, donc on ne remplit
+            // que celles-là.
+            //
+            // Elle était remplie pour TOUTE URI. Sur le chemin pack, où le
+            // `materialise` du lecteur écrit un vrai fichier et rend son
+            // chemin, Ar résout par le système de fichiers et n'ouvre jamais
+            // cette table : chaque texture y était donc recopiée pour
+            // personne. Et `TuileSpikeTiles` n'a aucune éviction — seulement
+            // `Clear` — si bien que cette copie inutile grandissait jusqu'à
+            // contenir l'intégralité des textures du pack, dans la mémoire
+            // d'un job qui en a 32 Gio et écrit déjà les mêmes octets dans un
+            // `/tmp` qui est lui aussi de la RAM.
+            //
+            // Le préfixe est le bon test parce que c'est exactement celui que
+            // le resolver déclare : un URI resolver ne voit que son schéma
+            // (`resolver.h`), et tout le reste appartient au resolver de
+            // fichiers.
+            //
             // The URI carries the drape, so a re-drape is a different asset
             // and this never serves stale pixels under a name it already has.
-            if (!TuileSpikeTiles::Has(uri)) {
+            if (uri.rfind("tuile://", 0) == 0 && !TuileSpikeTiles::Has(uri)) {
                 TuileSpikeTiles::Put(
                     uri,
                     std::vector<uint8_t>(texture.png.data,

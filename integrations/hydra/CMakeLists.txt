@@ -43,6 +43,8 @@ add_custom_target(tuile_hydra_rust ALL
 
 # ---------------------------------------------------------------- plugin ----
 add_library(tuileHydra SHARED
+    src/hostpaths.cpp
+    src/manifest.cpp
     src/procedural.cpp
     src/proceduralPlugin.cpp
     src/resolver.cpp
@@ -54,7 +56,7 @@ add_dependencies(tuileHydra tuile_hydra_rust)
 target_include_directories(tuileHydra PRIVATE src)
 
 target_link_libraries(tuileHydra PRIVATE
-    ar hd hdGp hf gf plug pxOsd sdf tf vt
+    ar hd hdGp hf gf plug pxOsd sdf tf usd usdImaging vt
     ${CMAKE_DL_LIBS} Threads::Threads)
 
 # A Rust staticlib carries its whole runtime, including symbols from crates that
@@ -80,6 +82,34 @@ if(APPLE)
 else()
     target_link_libraries(tuileHydra PRIVATE "${TUILE_STATICLIB}")
     target_link_options(tuileHydra PRIVATE "LINKER:--exclude-libs,ALL")
+endif()
+
+# ----------------------------------------------------------------- tests ----
+# Pure logic on a scene index: no renderer, no GPU, no network, no pack. It
+# builds by default, unlike the probe below, because it costs one translation
+# unit and it is the only thing standing between a wrong camera and a farm
+# render that looks plausible — the two candidate cameras almost always agree,
+# so picking the wrong one shows up on no counter.
+option(TUILE_BUILD_TESTS "build the plugin's unit tests" ON)
+if(TUILE_BUILD_TESTS)
+    enable_testing()
+    add_executable(cameraRungTest tests/cameraRungTest.cpp src/hostpaths.cpp)
+    target_include_directories(cameraRungTest PRIVATE src)
+    target_link_libraries(cameraRungTest PRIVATE
+        hd sdf tf gf vt ${CMAKE_DL_LIBS} Threads::Threads)
+    add_test(NAME cameraRung COMMAND cameraRungTest)
+
+    # Celui-ci charge le greffon comme le ferait un hôte : par la registry, par
+    # dlopen, à travers plugInfo.json. Il dépend donc du greffon CONSTRUIT et de
+    # son plugInfo configuré, et il a besoin qu'on lui dise où regarder — les
+    # deux variables ci-dessous sont exactement celles que l'image de rendu pose.
+    add_executable(manifestRungTest tests/manifestRungTest.cpp)
+    add_dependencies(manifestRungTest tuileHydra)
+    target_link_libraries(manifestRungTest PRIVATE
+        hd sdf tf gf vt ${CMAKE_DL_LIBS} Threads::Threads)
+    add_test(NAME manifestRung COMMAND manifestRungTest)
+    set_tests_properties(manifestRung PROPERTIES ENVIRONMENT
+        "PXR_PLUGINPATH_NAME=${CMAKE_BINARY_DIR}/plugin/tuileHydra/resources;HDGP_INCLUDE_DEFAULT_RESOLVER=1")
 endif()
 
 # ----------------------------------------------------------------- probe ----

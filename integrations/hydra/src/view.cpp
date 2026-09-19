@@ -3,6 +3,8 @@
 
 #include "view.h"
 
+#include "hostpaths.h"
+
 #include <pxr/base/gf/matrix4d.h>
 #include <pxr/base/gf/vec3d.h>
 #include <pxr/imaging/hd/cameraSchema.h>
@@ -15,10 +17,70 @@
 
 PXR_NAMESPACE_OPEN_SCOPE
 
+namespace {
+
+/// The camera's transform in world space, accumulated up the prim tree.
+///
+/// `HdXformSchema::GetMatrix()` gives a prim's **local** transform, and a scene
+/// index is only flattened if somebody put an `HdFlatteningSceneIndex` in the
+/// chain. Blender's USD export writes a camera as an Xform holding a Camera —
+/// `/shot/shot` — so the pose lives on the parent and the camera prim itself is
+/// identity.
+///
+/// What that cost: `Read` saw an identity matrix, correctly concluded that
+/// nothing had been authored, and returned false. The procedural then fell back
+/// to its view-independent mode — straight down from the render origin, at the
+/// centre of the orbit — and every baked frame was 8000 m away, that being the
+/// orbit's radius. The camera had arrived; only its pose had been left behind.
+///
+/// `resetXformStack` stops the climb, which is what it is for: a prim that
+/// declares it is expressed in world space already.
+GfMatrix4d
+_WorldTransform(const HdSceneIndexBaseRefPtr &scene,
+                const SdfPath &path,
+                const HdMatrixDataSourceHandle &localDs,
+                const HdXformSchema &localXform)
+{
+    GfMatrix4d accumulated(1.0);
+    if (localDs) {
+        accumulated = localDs->GetTypedValue(0.0f);
+    }
+    if (localXform) {
+        if (HdBoolDataSourceHandle reset = localXform.GetResetXformStack()) {
+            if (reset->GetTypedValue(0.0f)) {
+                return accumulated;
+            }
+        }
+    }
+    for (SdfPath at = path.GetParentPath(); !at.IsEmpty() && at != SdfPath::AbsoluteRootPath();
+         at = at.GetParentPath())
+    {
+        HdSceneIndexPrim prim = scene->GetPrim(at);
+        HdXformSchema xform = HdXformSchema::GetFromParent(prim.dataSource);
+        if (!xform) {
+            continue;
+        }
+        if (HdMatrixDataSourceHandle ds = xform.GetMatrix()) {
+            // Row-vector convention, as the rest of this file reads it: a child
+            // is expressed in its parent, so local comes first.
+            accumulated = accumulated * ds->GetTypedValue(0.0f);
+        }
+        if (HdBoolDataSourceHandle reset = xform.GetResetXformStack()) {
+            if (reset->GetTypedValue(0.0f)) {
+                break;
+            }
+        }
+    }
+    return accumulated;
+}
+
+}  // namespace
+
 bool
 TuileViewFromCamera::Read(
     const HdSceneIndexBaseRefPtr &scene,
     const SdfPath &cameraPath,
+    const SdfPath &anchor,
     const double renderOrigin[3],
     const double fallbackViewportPx[2],
     TuileViewState *out)
@@ -28,15 +90,24 @@ TuileViewFromCamera::Read(
     }
     HdSceneIndexPrim camera = scene->GetPrim(cameraPath);
 
+    // Pas de xform SUR la caméra ? Ce n'est pas une panne : c'est le cas
+    // normal.
+    //
+    // Blender exporte une caméra comme un Xform contenant une Camera —
+    // `/shot/shot`, vu le 16 septembre 2026 — et la pose est sur le parent. La
+    // prim caméra elle-même n'a rien du tout : type `camera`, dataSource
+    // présent, aucun xform. La version qui abandonnait ici retombait sur la
+    // vue indépendante au centre de l'orbite, et le pack répondait « the
+    // nearest is frame 1108, 8000.000 m away » — le rayon de l'orbite, parce
+    // que la caméra était à son centre.
+    //
+    // On part donc de l'identité et on laisse `_WorldTransform` remonter
+    // l'arbre. Si personne n'a rien écrit nulle part, le test d'identité plus
+    // bas le dira — c'est lui qui distingue « rien d'écrit » de « écrit et
+    // lu ».
     HdXformSchema xform = HdXformSchema::GetFromParent(camera.dataSource);
-    if (!xform) {
-        return false;
-    }
-    HdMatrixDataSourceHandle matrixDs = xform.GetMatrix();
-    if (!matrixDs) {
-        return false;
-    }
-    const GfMatrix4d m = matrixDs->GetTypedValue(0.0f);
+    HdMatrixDataSourceHandle matrixDs = xform ? xform.GetMatrix() : nullptr;
+    const GfMatrix4d m = _WorldTransform(scene, cameraPath, matrixDs, xform);
 
     // The camera's basis, read out of the matrix rather than assumed: rows are
     // the local axes in world space (row-vector convention). USD cameras look
@@ -53,10 +124,15 @@ TuileViewFromCamera::Read(
     if (translation == GfVec3d(0.0) && right == GfVec3d(1.0, 0.0, 0.0) &&
         up == GfVec3d(0.0, 1.0, 0.0))
     {
+        printf("CAMERA-READ-FAILED %s: transform is identity — nothing was "
+               "authored on it, nor on any ancestor\n", cameraPath.GetText());
+        fflush(stdout);
         return false;
     }
     const GfVec3d direction = -back;
     if (direction.GetLength() < 1e-12 || up.GetLength() < 1e-12) {
+        printf("CAMERA-READ-FAILED %s: degenerate basis\n", cameraPath.GetText());
+        fflush(stdout);
         return false;
     }
 
@@ -78,8 +154,11 @@ TuileViewFromCamera::Read(
     }
 
     double viewport[2] = {fallbackViewportPx[0], fallbackViewportPx[1]};
-    ResolutionFromRenderSettings(scene, viewport);
+    ResolutionFromRenderSettings(scene, anchor, viewport);
     if (!(viewport[0] > 0.0) || !(viewport[1] > 0.0)) {
+        printf("CAMERA-READ-FAILED %s: viewport is %gx%g\n",
+               cameraPath.GetText(), viewport[0], viewport[1]);
+        fflush(stdout);
         return false;
     }
 
@@ -99,9 +178,10 @@ TuileViewFromCamera::Read(
 bool
 TuileViewFromCamera::ResolutionFromRenderSettings(
     const HdSceneIndexBaseRefPtr &scene,
+    const SdfPath &anchor,
     double out[2])
 {
-    HdSceneGlobalsSchema globals = HdSceneGlobalsSchema::GetFromSceneIndex(scene);
+    HdSceneGlobalsSchema globals = TuileSceneGlobals(scene, anchor);
     if (!globals) {
         return false;
     }
