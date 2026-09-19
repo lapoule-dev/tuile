@@ -35,7 +35,25 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # The session, the globe, and the sources behind it. This is the one place that
 # holds an ion token in the whole split pipeline.
-tuile-hydra = { version = "0.0.1", path = "../tuile-hydra" }
+#
+# The globe's sources. A session is source-agnostic; assembling *this* globe is
+# not, and somebody has to do it — see `globe.rs`.
+#
+# None of this used to be here: the session lived in `tuile-hydra`, so a bake
+# linked a crate named after one particular OpenUSD host to produce a container
+# that no host is named in. The dependency graph said the pack was a Hydra
+# artefact. It is not.
+tuile-cesium-ion = { version = "0.0.1", path = "../tuile-cesium-ion" }
+tuile-bing = { version = "0.0.1", path = "../tuile-bing" }
+tuile-planetary = { version = "0.0.1", path = "../tuile-planetary" }
+tuile-native-fetchers = { version = "0.0.1", path = "../tuile-native-fetchers" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+image = { workspace = true }
+# `time` for the frame deadline: a bulk frame blocks, and an unbounded block
+# on a farm node is indistinguishable from a hang.
+tokio = { workspace = true, features = ["time"] }
+thiserror = { workspace = true }
 tuile-core = { version = "0.0.1", path = "../tuile-core" }
 tuile-pack = { version = "0.0.1", path = "../tuile-pack" }
 tuile-tape = { version = "0.0.1", path = "../tuile-tape" }
@@ -53,3 +71,6 @@ tikv-jemallocator = { version = "0.7", features = [
     "unprefixed_malloc_on_supported_platforms",
 ], optional = true }
 jemalloc_pprof = { version = "0.9", features = ["flamegraph"], optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

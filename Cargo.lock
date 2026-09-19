@@ -5077,15 +5077,24 @@ dependencies = [
 name = "tuile-bake"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
+ "bytes",
  "glam",
+ "image",
  "jemalloc_pprof",
  "pprof",
+ "tempfile",
+ "thiserror 2.0.18",
  "tikv-jemallocator",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "tuile-bing",
+ "tuile-cesium-ion",
  "tuile-core",
- "tuile-hydra",
+ "tuile-native-fetchers",
  "tuile-pack",
+ "tuile-planetary",
  "tuile-tape",
 ]
 
@@ -5157,21 +5166,13 @@ dependencies = [
 name = "tuile-hydra"
 version = "0.0.1"
 dependencies = [
- "async-trait",
- "bytes",
  "glam",
- "image",
  "tempfile",
- "thiserror 2.0.18",
- "tokio",
  "tracing",
  "tracing-subscriber",
- "tuile-bing",
- "tuile-cesium-ion",
+ "tuile-bake",
  "tuile-core",
- "tuile-native-fetchers",
  "tuile-pack",
- "tuile-planetary",
 ]
 
 [[package]]
