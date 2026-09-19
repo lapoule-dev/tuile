@@ -568,7 +568,18 @@ fn bake(args: Args) -> Result<(), String> {
     // each tile's own ECEF origin, so this is carried for the consumer that
     // rebases, not used to move anything here.
     let origin = poses[args.first.max(1) as usize - 1].position;
-    let mut writer = PackWriter::new(&scene, origin).culling(culling);
+    // Le blob part sur disque au fil de la cuisson, à côté du pack.
+    //
+    // Sans ça, une cuisson tient les tuiles décompressées, puis le blob
+    // compressé, puis une troisième copie concaténant table et blob — trois
+    // fois le pack fini, vivants au même instant, sur une machine qui porte
+    // aussi le cache de tuiles. Une minute de film ne passait pas. Le déversoir
+    // rend le pic indépendant de la longueur : 1440 frames coûtent ce que
+    // coûtent 48.
+    let spill = args.out.with_extension("blob.part");
+    let mut writer = PackWriter::new(&scene, origin, &spill)
+        .map_err(|e| format!("opening {}: {e}", spill.display()))?
+        .culling(culling);
 
     for number in args.first..=(wanted as u32) {
         let pose = &poses[number as usize - 1];
@@ -611,14 +622,14 @@ fn bake(args: Args) -> Result<(), String> {
         );
     }
 
-    let bytes = writer.finish();
-    std::fs::write(&args.out, &bytes)
+    let bytes = writer
+        .finish_to(&args.out)
         .map_err(|e| format!("writing {}: {e}", args.out.display()))?;
     tracing::info!(
         scene,
         culling,
         path = %args.out.display(),
-        bytes = bytes.len(),
+        bytes,
         seconds = began.elapsed().as_secs_f64(),
         "BAKE-DONE"
     );

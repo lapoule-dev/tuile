@@ -765,9 +765,14 @@ mod tests {
     /// A real pack opens, with no token and no network.
     #[test]
     fn a_packed_session_opens_a_pack_and_says_it_is_packed() {
-        let pack = tuile_pack::PackWriter::new("scene-under-test", [0.0; 3]).finish();
-        let path = std::env::temp_dir().join("tuile-ffi-open.tuilepack");
-        std::fs::write(&path, &pack).expect("write the pack");
+        // Le writer déverse son blob sur disque en cuisant : il lui faut un
+        // chemin, et le pack est écrit là où il le déverse.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tuile-ffi-open.tuilepack");
+        tuile_pack::PackWriter::new("scene-under-test", [0.0; 3], dir.path().join("blob.part"))
+            .expect("opening the spill")
+            .finish_to(&path)
+            .expect("write the pack");
         let shown = path.display().to_string();
         let config = TuileGlobeConfig {
             ion_token: as_str(""),
