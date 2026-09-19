@@ -25,6 +25,7 @@
 #   JOB_PROCS_PER_GPU  concurrent renders/GPU    (default 4)
 #   JOB_BATCH_FRAMES   progress log granularity  (default 60)
 #   JOB_EXTRA_ARGS     extra render_usd.py args  (e.g. "--demo-fixups --no-dof")
+#   JOB_BLENDER_ARGS   extra blender args, before -P  (e.g. "--debug-cycles")
 #   JOB_OUT            final video path          (default /out/render.mp4)
 #   JOB_UPLOAD_PUT_URL if set: curl -T the finished video to this presigned
 #                      URL (no credential ever reaches the pod)
@@ -33,9 +34,39 @@
 #                      PATH and every JOB_ARCHIVE_EVERY seconds while it runs,
 #                      because a job that failed is the one whose logs are
 #                      worth having and a pod that is killed runs no trap
+#   Les erreurs de stderr remontent AUSSI sur stdout, donc dans les journaux
+#   du fournisseur, pendant que la tâche tourne. Elles n'y étaient pas : stderr
+#   partait dans trace-s<i>.jsonl et ce fichier n'arrive qu'à la fin, dans une
+#   archive. Le 16 septembre, un comptage fait sur les journaux en ligne a
+#   conclu « zéro erreur » alors que la trace en portait cent quatre-vingt-dix
+#   — deux flux, deux destinations, et la mauvaise interrogée. La trace
+#   complète reste dans le fichier ; seules les lignes qui portent une erreur
+#   sont dupliquées.
 #   JOB_SEG_PUT_URL_<i> if set: segment i goes to R2 THE MOMENT it is encoded,
 #                      not at the end. A pod reclaimed at frame 900 of 1440
 #                      has still deposited the nine hundred.
+#                      With several tasks, <i> is the GLOBAL segment number:
+#                      task t owns t*jobs .. (t+1)*jobs-1, so the launcher can
+#                      concatenate them in order without knowing who made what.
+#   CLOUD_RUN_TASK_INDEX / _COUNT   set by Cloud Run Jobs, not by us. When
+#                      COUNT > 1 this script renders only its own slice of
+#                      JOB_FRAMES and does NOT concatenate: no task sees every
+#                      segment, so the film is assembled from R2 afterwards
+#                      (`launch_job.py --assemble <run-id>`).
+#   JOB_LOGS_PUT_URL_<t> / JOB_TRACE_PUT_URL_<t> / JOB_PROFILE_PUT_URL_<t>
+#                      per-task variants, preferred over the unsuffixed ones
+#                      when present. Without them N tasks would overwrite one
+#                      another's logs.tar.gz and the survivor would be whoever
+#                      finished last — which is never the one that failed.
+#   JOB_OPTIX_CACHE_GET_URL / _PUT_URL  presigned GET/PUT for the OptiX disk
+#                      cache. Without it every process pays the driver's
+#                      PTX-to-machine-code compilation again: **338 seconds**,
+#                      measured on an L4 on 16 September 2026, against 0.17 s
+#                      for the frame that follows it. The PTX itself is already
+#                      precompiled and shipped in the image — this is the step
+#                      after it, and it cannot be done at build time because
+#                      the builder has no NVIDIA card and the result is
+#                      specific to the card and driver anyway.
 #   JOB_ARCHIVE_EVERY  seconds between log flushes while rendering (default 300)
 #   JOB_TRACE_PUT_URL  if set: the per-process determinism traces, gathered
 #                      into one trace.tar.gz and shipped the same way
@@ -73,13 +104,47 @@ JOB_PROCS_PER_GPU="${JOB_PROCS_PER_GPU:-4}"
 JOB_BATCH_FRAMES="${JOB_BATCH_FRAMES:-60}"
 JOB_FPS="${JOB_FPS:-24}"
 JOB_EXTRA_ARGS="${JOB_EXTRA_ARGS:-}"
+# Des drapeaux pour BLENDER lui-même, avant `-P`, là où `JOB_EXTRA_ARGS` va au
+# script Python d'après `--`. La distinction a coûté une soirée : Cycles ne
+# journalise que si Blender le lui demande en ligne de commande, et sans ça un
+# rendu qui ne démarre pas reste parfaitement muet — CPU à 0,6 %, GPU à 0 %, et
+# rien à lire nulle part. Typiquement `--debug-cycles` ou `--log "*cycles*"`.
+JOB_BLENDER_ARGS="${JOB_BLENDER_ARGS:-}"
 JOB_OUT="${JOB_OUT:-/out/render.mp4}"
 outdir="$(dirname "$JOB_OUT")"
 mkdir -p "$outdir"
 
+# Which of how many.
+#
+# Cloud Run Jobs sets these; a pod sets neither, and a lone container reads as
+# task 0 of 1 — the behaviour this script had before tasks existed.
+#
+# It is resolved HERE, above the archive helpers, because it is an identity and
+# not a division of labour. The tarballs are named from it: N tasks sharing one
+# JOB_LOGS_PUT_URL overwrite each other, and the survivor is whoever finished
+# last — which is never the one that failed.
+task_index="${CLOUD_RUN_TASK_INDEX:-0}"
+task_count="${CLOUD_RUN_TASK_COUNT:-1}"
+for var in JOB_LOGS_PUT_URL JOB_TRACE_PUT_URL JOB_PROFILE_PUT_URL; do
+    eval "mine=\${${var}_${task_index}:-}"
+    [ -n "$mine" ] && eval "$var=\$mine"
+done
+
 # Everything this job says about itself, in a file rather than only in a
 # console nobody will read once the pod is gone.
 JOB_LOG="$outdir/job.log"
+# Les descripteurs d'origine, gardés ouverts.
+#
+# Tout ce qui suit passe par `tee`, qui est un PROCESSUS : ce qu'on lui écrit
+# vit dans un tampon jusqu'à ce qu'il l'écrive. Un shell qui sort tout de suite
+# après avoir signalé une erreur est tué avec lui, et le message n'atteint ni
+# le fichier ni la console. Mesuré le 17 septembre 2026 : deux tâches mortes
+# sur « plage trop courte pour 4 processus », zéro ligne dans Cloud Logging,
+# zéro `logs.tar.gz` dans l'archive — une heure passée à soupçonner l'image.
+#
+# `archive_everything` referme le tuyau sur ces descripteurs-là avant de
+# ranger, ce qui donne à `tee` son EOF et donc son vidage.
+exec 3>&1 4>&2
 exec > >(tee -a "$JOB_LOG") 2>&1
 
 # Ships one tarball to one presigned URL. Quiet about a URL that is not set;
@@ -87,14 +152,48 @@ exec > >(tee -a "$JOB_LOG") 2>&1
 ship() {
     local name="$1" url="$2"; shift 2
     [ -n "$url" ] || return 0
-    ls "$@" > /dev/null 2>&1 || return 0
-    tar czf "$outdir/$name" -C "$outdir" $(cd "$outdir" && ls "$@" 2>/dev/null) \
-        || { echo "ARCHIVE-TAR-FAILED $name"; return 1; }
+
+    # Les motifs arrivent ici NON développés ('log-s*.txt'), et rien ne les
+    # développait. Deux causes, toutes deux silencieuses :
+    #
+    #   * `ls "$@"` ne fait pas de glob. Le mot est entre guillemets, donc le
+    #     shell ne l'étend pas, et `ls` reçoit `log-s*.txt` au pied de la
+    #     lettre — un fichier qui n'existe pas.
+    #   * l'image n'a pas de WORKDIR, donc le répertoire courant est `/`, où
+    #     aucun journal ne se trouve de toute façon.
+    #
+    # La garde rendait donc 0 à tous les coups et `ship` sortait sans rien
+    # faire. Mesuré le 15 septembre sur les dix runs archivés depuis le début
+    # du projet : **zéro archive déposée, jamais**. C'est exactement le
+    # mécanisme censé empêcher que trois mesures meurent avec leur machine —
+    # et il n'a pas manqué son but une fois, il ne l'a jamais visé.
+    #
+    # C'est au shell de développer, et dans $outdir.
+    local files pat f
+    files=$(cd "$outdir" 2>/dev/null && for pat in "$@"; do
+                for f in $pat; do [ -e "$f" ] && printf '%s\n' "$f"; done
+            done)
+    [ -n "$files" ] || return 0
+
+    # `tar` rend 1 — pas 2 — quand un fichier a changé pendant qu'il le lisait,
+    # et l'archive produite reste complète et lisible. Le traiter comme fatal
+    # condamnait le flush périodique, qui existe précisément pour tourner
+    # pendant que `tee` écrit dans job.log. Seul un code >= 2, ou une archive
+    # vide, est une vraie panne.
+    local status=0
+    tar czf "$outdir/$name" -C "$outdir" $files 2> "$outdir/.tar-$name.err" \
+        || status=$?
+    if [ "$status" -ge 2 ] || [ ! -s "$outdir/$name" ]; then
+        echo "ARCHIVE-TAR-FAILED $name (tar=$status)"
+        sed 's/^/  /' "$outdir/.tar-$name.err" 2>/dev/null | head -3
+        return 1
+    fi
     echo "$name: $(du -h "$outdir/$name" | cut -f1)"
     if curl -fsS -T "$outdir/$name" "$url" > /dev/null; then
         echo "ARCHIVE-UP $name"
     else
         echo "ARCHIVE-UP-FAILED $name"
+        return 1
     fi
 }
 
@@ -108,7 +207,12 @@ ship() {
 flush_logs() {
     [ -n "${JOB_LOGS_PUT_URL:-}" ] || return 0
     while sleep "${JOB_ARCHIVE_EVERY:-300}"; do
-        ship logs.tar.gz "$JOB_LOGS_PUT_URL" 'log-s*.txt' 'job.log' > /dev/null 2>&1
+        # Discret quand ça marche, bruyant quand ça rate. Tout envoyer dans
+        # /dev/null a caché pendant une demi-heure que rien ne partait — et
+        # c'est exactement le genre de panne qu'un flush est censé survivre,
+        # pas commettre.
+        out=$(ship logs.tar.gz "$JOB_LOGS_PUT_URL" 'log-s*.txt' 'job.log' 2>&1)
+        case "$out" in *FAILED*) echo "$out" ;; esac
     done
 }
 
@@ -116,22 +220,76 @@ flush_logs() {
 # measurements died with their machine in two days, and the last one was a
 # 60-second render whose pod was reclaimed mid-flight.
 archive_everything() {
-    local status=$?
+    # Le code de sortie est passé en argument, pas lu dans `$?`.
+    #
+    # Il était lu — `local status=$?` — et le piège de sortie exécute un `kill`
+    # juste avant d'appeler cette fonction. `$?` était donc le code de ce
+    # `kill`, qui échoue dès que l'échantillonneur GPU s'est déjà arrêté seul.
+    # Mesuré le 16 septembre 2026 : `TASK-DONE 2/3`, suivi immédiatement de
+    # `Container called exit(1)`. Les trois tâches d'une minute de film ont
+    # rendu leurs frames, déposé leurs segments, et se sont déclarées en
+    # échec — après quoi le montage automatique, gardé derrière « aucune tâche
+    # en échec », ne s'est pas lancé.
+    local status="${1:-$?}"
     trap - EXIT
+    # Rendre la sortie directe AVANT de ranger : `tee` voit alors la fin de son
+    # entrée, vide son tampon dans job.log et s'arrête. Sans ça on empaquette
+    # un fichier que personne n'a fini d'écrire.
+    exec 1>&3 2>&4
+    # Le temps que `tee` voie l'EOF et écrive. Attendre les tâches de fond
+    # serait faux : l'échantillonneur GPU et le flush tournent en boucle, et on
+    # les attendrait toujours.
+    sleep 0.3
     ship logs.tar.gz    "${JOB_LOGS_PUT_URL:-}"    'log-s*.txt' 'job.log'
     ship trace.tar.gz   "${JOB_TRACE_PUT_URL:-}"   'trace-s*.jsonl'
     ship profile.tar.gz "${JOB_PROFILE_PUT_URL:-}" 'profile'
     exit $status
 }
-trap archive_everything EXIT
+trap 'rc=$?; archive_everything "$rc"' EXIT
 flush_logs &
 log_flusher=$!
 
 first="${JOB_FRAMES%%:*}"; last="${JOB_FRAMES##*:}"
+
+# JOB_FRAMES is the range of the WHOLE render, identical in every task's
+# environment — the launcher sends one env to N tasks and cannot address them
+# individually. So each task cuts its own slice out of it here.
+#
+# The remainder is spread one frame at a time over the first `rem` tasks rather
+# than dumped on the last one: with 48 frames over 5 tasks that is 10,10,10,9,9
+# instead of 9,9,9,9,12, and the slowest task sets the wall clock. Contiguous
+# and exhaustive by construction — start(t+1) is exactly end(t)+1, so the
+# concatenated film has no gap and no repeat.
+if [ "$task_count" -gt 1 ]; then
+    all=$((last - first + 1))
+    base=$((all / task_count))
+    rem=$((all % task_count))
+    [ "$task_index" -lt "$rem" ] && extra=1 || extra=0
+    ahead=$task_index
+    [ "$ahead" -gt "$rem" ] && ahead=$rem
+    first=$((first + task_index * base + ahead))
+    last=$((first + base + extra - 1))
+    echo "task $task_index/$task_count: frames $first:$last"
+fi
+
 total=$((last - first + 1))
 jobs=$((JOB_GPUS * JOB_PROCS_PER_GPU))
+# Moins de frames que de processus n'est pas une erreur, c'est un petit rendu.
+#
+# Ce cas sortait en code 1 sur « plage trop courte ». C'est défendable pour une
+# ferme de production et faux pour tout le reste : les rendus de vérification
+# — deux frames pour regarder une texture — sont précisément ceux qu'on lance
+# le plus souvent, et un job qui refuse de rendre deux frames sur quatre
+# processus refuse de faire moins que ce qu'on lui a permis.
+if [ "$jobs" -gt "$total" ]; then
+    echo "frames $first:$last — $total frame(s) pour $jobs processus," \
+         "donc $total processus"
+    jobs=$total
+fi
+# Segments are numbered globally, so `--assemble` can order them across tasks
+# without asking who produced which.
+seg_base=$((task_index * jobs))
 span=$((total / jobs))
-[ "$span" -ge 1 ] || { echo "plage trop courte pour $jobs processus" >&2; exit 1; }
 
 # sshd first, when one was asked for.
 #
@@ -348,13 +506,16 @@ elif [ -n "${JOB_STAGE_URL:-}" ]; then
     curl -fsS -o "$STAGE" "$JOB_STAGE_URL" || { echo STAGE-FETCH-FAILED; exit 1; }
 elif [ -n "${JOB_TRAJECTORY:-}" ]; then
     # The generative road: the pod builds its own manifest from parameters.
-    #   orbit:frames:lon:lat:radius_m:alt_m   (defaults after the kind)
+    #   orbit:frames:lon:lat:radius_m:alt_m     (defaults after the kind)
+    #   pyrenees:minutes:fps:alt_m:offset_deg   (boucle nadir autour du massif)
     #   zoom:frames_each_way
     IFS=: read -r kind p1 p2 p3 p4 p5 <<< "$JOB_TRAJECTORY"
     case "$kind" in
         orbit) /opt/tuile/bin/orbit-tape /tmp/traj.mcap \
                    "${p1:-1440}" "${p2:-2.17}" "${p3:-42.52}" \
                    "${p4:-8000}" "${p5:-5000}" ;;
+        pyrenees) /opt/tuile/bin/pyrenees-tape /tmp/traj.mcap \
+                      "${p1:-2}" "${p2:-24}" "${p3:-50000}" "${p4:-0.40}" ;;
         zoom)  /opt/tuile/bin/zoom-tape /tmp/traj.mcap "${p1:-64}" ;;
         *) echo "TRAJECTORY-UNKNOWN: $kind"; exit 1 ;;
     esac
@@ -363,6 +524,28 @@ elif [ -n "${JOB_TRAJECTORY:-}" ]; then
         --fps "$JOB_FPS" || { echo MANIFEST-GEN-FAILED; exit 1; }
 fi
 [ -s "$STAGE" ] || { echo "stage absente: $STAGE" >&2; exit 1; }
+
+# Le cache OptiX, tiré avant le premier rendu.
+#
+# OptiX compile le PTX en code machine pour la carte au premier chargement et
+# garde le résultat dans un cache disque — `OPTIX_CACHE_PATH`, par défaut
+# /var/tmp/OptixCache_$USER, qui ne survit pas à un conteneur. Mesuré sur L4 :
+# 338 s pour la première frame, 0,17 s pour la suivante. Sur trois tâches c'est
+# dix-sept minutes de compilation pour une minute de film.
+#
+# Le tirage est facultatif par construction : une clef absente est le cas
+# normal la première fois, et un cache illisible vaut un cache vide. Ce qu'on
+# ne veut pas, c'est qu'un cache manquant fasse échouer un rendu.
+export OPTIX_CACHE_PATH="${OPTIX_CACHE_PATH:-$outdir/optix-cache}"
+mkdir -p "$OPTIX_CACHE_PATH"
+if [ -n "${JOB_OPTIX_CACHE_GET_URL:-}" ]; then
+    if curl -fsS -o "$outdir/optix-cache.tar.gz" "$JOB_OPTIX_CACHE_GET_URL" \
+       && tar xzf "$outdir/optix-cache.tar.gz" -C "$OPTIX_CACHE_PATH" 2>/dev/null; then
+        echo "OPTIX-CACHE-HIT ($(du -sh "$OPTIX_CACHE_PATH" | cut -f1))"
+    else
+        echo "OPTIX-CACHE-MISS — la première frame paiera la compilation"
+    fi
+fi
 
 t0=$(date +%s)
 
@@ -388,8 +571,20 @@ if command -v nvidia-smi > /dev/null 2>&1; then
         done
     ) &
     gpu_watch=$!
-    trap 'kill "$gpu_watch" "${log_flusher:-0}" 2>/dev/null; archive_everything' EXIT
+    # `rc` d'abord, le ménage ensuite : un `kill` qui rate ne doit pas devenir
+    # le verdict de la tâche.
+    trap 'rc=$?; kill "$gpu_watch" "${log_flusher:-0}" 2>/dev/null || true; archive_everything "$rc"' EXIT
 fi
+
+# Les PID des rendus, et d'eux seuls.
+#
+# `wait` sans argument attend TOUS les enfants — dont le sampler GPU et le
+# flush de journaux, qui sont des boucles infinies. Le script ne pouvait donc
+# jamais franchir cette ligne, même une fois tous les rendus morts : mesuré le
+# 16 septembre, un Blender a crashé au bout de dix secondes et la tâche a
+# continué d'échantillonner un GPU inactif jusqu'au délai d'une heure. Elle
+# facturait, et de l'extérieur elle avait l'air de travailler.
+renders=()
 
 for i in $(seq 0 $((jobs - 1))); do
     gpu=$((i / JOB_PROCS_PER_GPU))
@@ -419,21 +614,49 @@ for i in $(seq 0 $((jobs - 1))); do
     # process is shown exactly one.
     CUDA_VISIBLE_DEVICES=$gpu TUILE_CACHE_DIR="$proc_cache" \
         CYCLES_DEVICE="$CYCLES_BACKEND" \
-        stdbuf -oL blender -b -P /opt/render/render_usd.py -- \
+        stdbuf -oL blender -b $JOB_BLENDER_ARGS -P /opt/render/render_usd.py -- \
         --stage "$STAGE" --engine "$JOB_ENGINE" --tier "$JOB_TIER" \
         --delegate "$JOB_DELEGATE" \
         --frames "$a:$b" --width "$JOB_WIDTH" \
         --samples "$JOB_SAMPLES" --adaptive-threshold "$JOB_THRESHOLD" \
         --batch-frames "$JOB_BATCH_FRAMES" $JOB_EXTRA_ARGS \
         --out "$outdir/s$i" --video "$outdir/seg$i.mp4" \
-        2> "$outdir/trace-s$i.jsonl" \
+        2> >(tee "$outdir/trace-s$i.jsonl" \
+             | grep --line-buffered -E 'ERROR|Error|error:|Could not|FATAL|Warning:' \
+             | sed -u "s/^/[err$i] /") \
         | grep --line-buffered -vE '^(Fra:|Saved:|Time:|Append frame)' \
         | sed -u "s/^/[gpu$gpu-j$i] /" \
         | tee -a "$outdir/log-s$i.txt" &
+    # Le PID du dernier maillon du pipeline : il se termine quand le rendu qui
+    # l'alimente se termine, quelle qu'en soit la manière.
+    renders+=($!)
 done
-wait
+wait "${renders[@]}"
 kill "${gpu_watch:-0}" "${log_flusher:-0}" 2>/dev/null || true
 echo "WALL: $(($(date +%s) - t0))s pour $total frames en $jobs processus / $JOB_GPUS GPU"
+
+# Le cache OptiX repart, pour que la prochaine exécution ne recompile pas.
+#
+# Seule la tâche 0 dépose : le contenu est équivalent d'une tâche à l'autre —
+# même carte, même pilote, mêmes noyaux — donc écrire à plusieurs ne gagnerait
+# rien et ferait dépendre le résultat de l'ordre d'arrivée.
+#
+# Le dépôt a lieu APRÈS le rendu, et c'est une limite assumée : les tâches d'un
+# même run démarrent à quelques minutes d'intervalle (20:47, 20:48, 20:51 le
+# 16 septembre) et compilent donc toutes les trois. Elles le font en parallèle,
+# soit cinq minutes au total et non quinze, et le gain du cache est entre runs.
+# Déposer plus tôt demanderait de savoir quand la compilation finit, ce que
+# rien ici ne dit.
+if [ -n "${JOB_OPTIX_CACHE_PUT_URL:-}" ] && [ "$task_index" = "0" ] \
+   && [ -d "$OPTIX_CACHE_PATH" ]; then
+    if tar czf "$outdir/optix-cache-out.tar.gz" -C "$OPTIX_CACHE_PATH" . \
+       && curl -fsS -T "$outdir/optix-cache-out.tar.gz" \
+               "$JOB_OPTIX_CACHE_PUT_URL" > /dev/null; then
+        echo "OPTIX-CACHE-UP ($(du -h "$outdir/optix-cache-out.tar.gz" | cut -f1))"
+    else
+        echo "OPTIX-CACHE-UP-FAILED"
+    fi
+fi
 # The verdict, in one line, from the samples above. A run that used one GPU of
 # four is not a slow run, it is a broken one, and it must not need a human to
 # notice.
@@ -461,12 +684,13 @@ for i in $(seq 0 $((jobs - 1))); do
             -i "$outdir/s$i.%d.png" -c:v libx264 -pix_fmt yuv420p -crf 18 \
             "$outdir/seg$i.mp4" > /dev/null 2>&1 && rm -f "$outdir/s$i".*.png
     fi
-    eval "url=\${JOB_SEG_PUT_URL_$i:-}"
+    g=$((seg_base + i))
+    eval "url=\${JOB_SEG_PUT_URL_$g:-}"
     if [ -n "$url" ] && [ -s "$outdir/seg$i.mp4" ]; then
         if curl -fsS -T "$outdir/seg$i.mp4" "$url" > /dev/null; then
-            echo "SEG-UP $i ($(du -h "$outdir/seg$i.mp4" | cut -f1))"
+            echo "SEG-UP $g ($(du -h "$outdir/seg$i.mp4" | cut -f1))"
         else
-            echo "SEG-UP-FAILED $i"
+            echo "SEG-UP-FAILED $g"
         fi
     fi
 done
@@ -490,6 +714,22 @@ done
 if [ -n "$missing" ]; then
     echo "SEGMENTS-MISSING:$missing"
 fi
+# With several tasks, this one is done.
+#
+# No task holds every segment, so concatenating here would produce N films of
+# one Nth each and upload them over one another at JOB_UPLOAD_PUT_URL. The
+# assembly moves to the launcher, which reads them back from R2
+# (`launch_job.py --assemble <run-id>`) — and can do it long after every task
+# has exited, which is the point: nobody has to be watching at the end.
+if [ "$task_count" -gt 1 ]; then
+    if [ "$n" = "$jobs" ]; then
+        echo "TASK-DONE $task_index/$task_count ($n segments, frames $first:$last)"
+        exit 0
+    fi
+    echo "TASK-INCOMPLETE $task_index/$task_count ($n/$jobs segments)"
+    exit 1
+fi
+
 if [ "$n" = "$jobs" ]; then
     for i in $(seq 0 $((jobs - 1))); do echo "file '$outdir/seg$i.mp4'"; done > "$outdir/list.txt"
     ffmpeg -y -f concat -safe 0 -i "$outdir/list.txt" -c copy "$JOB_OUT" 2>&1 | tail -3
@@ -517,8 +757,11 @@ if [ -s "$JOB_OUT" ]; then
     echo RENDER-DONE
     # Two hours sat here, from when the only way to get anything off a pod was
     # to be there while it lived. Everything now leaves through the archive, so
-    # this is a courtesy window for an ssh session, not a lifeline.
-    sleep "${JOB_DONE_SLEEP:-60}"
+    # this is a courtesy window for an ssh session, not a lifeline — and it is
+    # only opened when someone asked for ssh. Cloud Run bills the GPU by the
+    # second, so an unconditional minute of sleep is a minute of L4 bought to
+    # watch a finished job do nothing.
+    [ -n "${JOB_SSH_PUBKEY:-}" ] && sleep "${JOB_DONE_SLEEP:-60}" || true
 else
     echo VIDEO-MISSING
     exit 1
