@@ -85,6 +85,13 @@ pub struct GlobeConfig {
     /// on a shot whose frames overlap heavily that is the dominant cost long
     /// before the renderer is.
     pub cache_dir: Option<std::path::PathBuf>,
+    /// What the caller already holds, so its layers are never fetched.
+    ///
+    /// A bake writing a pack is the caller that has one: after the first frame
+    /// an orbit re-selects almost the same ground, and every one of those tiles
+    /// is already stored. See [`tuile_planetary::HeldDrape`], and
+    /// [`tuile_core::raster::drape_identity`] for what an identity is.
+    pub held_drape: Option<tuile_planetary::HeldDrape>,
     pub session: SessionConfig,
 }
 
@@ -96,6 +103,7 @@ impl GlobeConfig {
             terrain_asset_id: CESIUM_WORLD_TERRAIN,
             imagery_asset_id: Some(BING_AERIAL),
             cache_dir: None,
+            held_drape: None,
             session: SessionConfig::default(),
         }
     }
@@ -274,8 +282,8 @@ async fn resolve(
                 imagery_slots: imagery_slots.clone(),
                 imagery_boost_cap: imagery_boost_cap(),
                 deterministic_floor: true,
-                held_drape: None,
-                composed_at: 0,
+                held_drape: config.held_drape.clone(),
+                composed_at: config.session.bake_max_size,
             },
             offload::threaded(),
         );
@@ -305,8 +313,8 @@ async fn resolve(
         // re-draping 16 of 80 identically selected tiles between two runs
         // of one frame.
         deterministic_floor: true,
-        held_drape: None,
-        composed_at: 0,
+        held_drape: config.held_drape.clone(),
+        composed_at: config.session.bake_max_size,
     };
 
     // Ce que l'endpoint est, et non ce qu'on espère qu'il soit.
