@@ -11,15 +11,12 @@ et c'est ce qui la rend dangereuse. Un jeton qui y entre n'en sort plus.
 """
 
 import importlib.util
-import io
 import pathlib
 import re
 import subprocess
 import sys
 import types
-import urllib.error
 import unittest
-import unittest.mock
 
 # Jamais de bytecode pour ce que ce fichier teste.
 #
@@ -1220,8 +1217,13 @@ class OneInvocationFromSceneToFilm(unittest.TestCase):
         main = src[src.index("def main():"):]
         watch = main.index("ok, bad = gcp_watch(name, token=token)")
         after = main[watch:watch + 900]
-        self.assertIn("assemble(run)", after,
+        # `assemble(run` plutôt que `assemble(run)` : le montage reçoit
+        # désormais la cadence, qui ne peut plus valoir 24 en dur.
+        self.assertIn("assemble(run", after,
                       "le montage n'est pas enchaîné au rendu")
+        self.assertIn("fps=", after,
+                      "le montage monterait à 24 i/s quelle que soit la "
+                      "cadence de la trajectoire")
         self.assertIn("bad == 0", after,
                       "on monterait des segments d'un rendu qui a échoué")
 
@@ -1376,4 +1378,107 @@ class TheBakeIsToldHowMuchMemoryItMayUse(unittest.TestCase):
         # au cache de fetch ni au pack — qui vivent tous à côté, et dont les
         # deux derniers sont en tmpfs, donc en RAM eux aussi.
         self.assertLess(int(self._env()["TUILE_RESIDENT_BUDGET_GB"]), 32)
+
+
+class TheCadenceIsConfigurableAndNamed(unittest.TestCase):
+    """La cadence se règle, et elle change le nom du pack.
+
+    Elle ne se réglait pas : `render_job.sh` tenait `JOB_FPS` pour 24, en dur,
+    et s'en servait deux fois — pour calculer les poses du manifeste, et pour
+    le `-framerate` de ffmpeg sur chaque segment. Une trajectoire à 60 aurait
+    donc produit des poses introuvables dans le pack (échec bruyant) et, si
+    elle y avait survécu, un film de cinq minutes pour deux minutes de vol
+    (échec muet).
+
+    Elle vit dans la chaîne de trajectoire et nulle part ailleurs. Un drapeau
+    `--fps` à côté serait un second endroit pour le même nombre, donc un
+    second endroit pour qu'ils divergent.
+    """
+
+    def _args(self, trajectory, frames="1:7200"):
+        return types.SimpleNamespace(
+            frames=frames, trajectory=trajectory, viewport="1920x1440",
+            sse=3.0, imagery=3954, terrain=0, imagery_boost=1, resident_gb=16)
+
+    def test_the_cadence_comes_from_the_trajectory(self):
+        self.assertEqual(launch_job.fps_of("pyrenees:2:60:10000:0.10"), 60)
+        self.assertEqual(launch_job.fps_of("pyrenees:2:24:20000:0.20"), 24)
+
+    def test_a_whole_cadence_stays_whole(self):
+        # `render_usd.py --fps` est `type=int` : "60.0" y lève. Mesuré le
+        # 19 septembre 2026 — le pod a reçu `JOB_FPS=60.0`, seul le générateur
+        # de manifeste l'a lu (il accepte les flottants), et Blender a gardé sa
+        # cadence de scène par défaut. Les 7200 poses étaient justes, le
+        # conteneur était estampillé 24, et le film durait cinq minutes.
+        self.assertIsInstance(launch_job.fps_of("pyrenees:2:60:10000:0.10"), int)
+        self.assertEqual(str(launch_job.fps_of("pyrenees:2:60:10000:0.10")), "60")
+
+    def test_the_renderer_is_given_the_cadence_too(self):
+        # Le manifeste ET le rendu. `JOB_FPS` n'atteignait que le premier :
+        # les poses étaient à 60, l'encodage à 24.
+        script = (pathlib.Path(__file__).with_name("render_job.sh")).read_text()
+        # L'invocation, pas la mention en commentaire plus haut.
+        blender = script[script.index("-P /opt/render/render_usd.py"):]
+        self.assertIn('--fps "$JOB_FPS"', blender[:600],
+                      "Blender garderait scene.render.fps à 24")
+
+    def test_a_trajectory_that_states_none_keeps_the_default(self):
+        # `orbit` compte des frames, pas des minutes ; `zoom` non plus.
+        self.assertEqual(launch_job.fps_of("orbit:1440:2.17:42.52:8000:5000"), 24)
+        self.assertEqual(launch_job.fps_of("zoom:64"), 24)
+        self.assertEqual(launch_job.fps_of(""), 24)
+        self.assertEqual(launch_job.fps_of("pyrenees:2"), 24)
+        self.assertEqual(launch_job.fps_of("pyrenees:2:pas-un-nombre"), 24)
+
+    def test_the_key_changes_with_the_cadence(self):
+        # Sans ça, deux films de cadences différentes partageraient un pack et
+        # le second lirait les poses du premier.
+        slow = launch_job.pack_key(self._args("pyrenees:2:24:10000:0.10"))
+        fast = launch_job.pack_key(self._args("pyrenees:2:60:10000:0.10"))
+        self.assertNotEqual(slow, fast)
+
+    def test_the_render_is_told_the_cadence(self):
+        src = (pathlib.Path(__file__).with_name("launch_job.py")).read_text()
+        self.assertIn('env["JOB_FPS"] = str(fps_of(args.trajectory))', src,
+                      "le job de rendu retomberait sur son défaut de 24")
+
+
+class TheFrameRangeMatchesTheTrajectory(unittest.TestCase):
+    """`--frames` et la trajectoire décrivent le même film, ou on le dit.
+
+    Les deux sont des arguments séparés et rien ne les obligeait à s'accorder.
+    Dans le sens long c'est une erreur — la bande n'a pas ces poses. Dans le
+    sens court c'est légitime (on cuit une tranche exprès) et c'est là qu'est
+    le danger : 7200 frames cuites `1:2880`, ce sont quarante-huit secondes
+    livrées pour deux minutes demandées, sans qu'aucun compteur ne s'en plaigne.
+    """
+
+    def test_a_cadence_change_changes_the_count(self):
+        self.assertEqual(launch_job.frames_of("pyrenees:2:24:10000:0.10"), 2880)
+        self.assertEqual(launch_job.frames_of("pyrenees:2:60:10000:0.10"), 7200)
+
+    def test_orbit_states_its_own_count(self):
+        self.assertEqual(
+            launch_job.frames_of("orbit:1440:2.17:42.52:8000:5000"), 1440)
+
+    def test_a_trajectory_that_states_nothing_is_not_guessed(self):
+        self.assertIsNone(launch_job.frames_of("zoom:64"))
+
+    def test_asking_past_the_end_of_the_tape_is_refused(self):
+        with self.assertRaises(SystemExit):
+            launch_job.check_frames("pyrenees:2:24:10000:0.10", "1:7200")
+
+    def test_a_partial_bake_is_allowed_and_said(self):
+        said = []
+        launch_job.check_frames("pyrenees:2:60:10000:0.10", "1:2880",
+                                say=said.append)
+        self.assertTrue(said, "une cuisson amputée passerait en silence")
+        self.assertIn("2880", said[0])
+        self.assertIn("7200", said[0])
+
+    def test_the_whole_film_says_nothing(self):
+        said = []
+        launch_job.check_frames("pyrenees:2:60:10000:0.10", "1:7200",
+                                say=said.append)
+        self.assertEqual(said, [])
 
