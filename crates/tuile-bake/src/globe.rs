@@ -274,6 +274,8 @@ async fn resolve(
                 imagery_slots: imagery_slots.clone(),
                 imagery_boost_cap: imagery_boost_cap(),
                 deterministic_floor: true,
+                held_drape: None,
+                composed_at: 0,
             },
             offload::threaded(),
         );
@@ -303,6 +305,8 @@ async fn resolve(
         // re-draping 16 of 80 identically selected tiles between two runs
         // of one frame.
         deterministic_floor: true,
+        held_drape: None,
+        composed_at: 0,
     };
 
     // Ce que l'endpoint est, et non ce qu'on espère qu'il soit.
