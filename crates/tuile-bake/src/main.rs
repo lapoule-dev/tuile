@@ -251,6 +251,10 @@ enum Job {
     /// for tile and byte for byte.
     Verify {
         pack: std::path::PathBuf,
+        /// Les mêmes sources que la cuisson, sinon la comparaison porte sur
+        /// une autre scène et le digest la refusera avant même de comparer.
+        imagery: Option<i64>,
+        terrain: Option<i64>,
         tape: std::path::PathBuf,
         viewport: (f64, f64),
     },
@@ -262,11 +266,27 @@ struct Args {
     first: u32,
     last: u32,
     viewport: (f64, f64),
+    /// L'erreur d'écran maximale de la sélection, ou `None` pour le défaut.
+    ///
+    /// Un pack EST la cuisson des réglages qui l'ont produit, et celui-ci
+    /// décide combien de tuiles y entrent — donc leur finesse, et par
+    /// ricochet celle de l'imagerie, qui est choisie à partir du niveau de
+    /// terrain. Il était le seul paramètre de cuisson que le lanceur savait
+    /// nommer sans pouvoir le transmettre : `JOB_SSE` traversait
+    /// `bake_job.sh`, s'y faisait afficher, et n'allait pas plus loin. Les
+    /// packs de septembre 2026 ont tous été cuits à 16 pendant que la clé qui
+    /// les nomme annonçait 3.
+    sse: Option<f64>,
+    /// L'asset d'imagerie ion, ou `None` pour le défaut (Bing Aerial).
+    imagery: Option<i64>,
+    /// L'asset de terrain ion, ou `None` pour le défaut (World Terrain).
+    terrain: Option<i64>,
 }
 
 const USAGE: &str = "\
 usage: tuile-bake --tape <path.mcap> --frames <first>:<last> --out <path.tuilepack>
-                  [--viewport <w>x<h>]
+                  [--viewport <w>x<h>] [--sse <error>]
+                  [--imagery <ion asset>] [--terrain <ion asset>]
        tuile-bake --inspect <path.tuilepack>
        tuile-bake --diff <a.tuilepack> <b.tuilepack>
        tuile-bake --dump <path.tuilepack> --frame <n>
@@ -276,6 +296,10 @@ environment:
   TUILE_ION_TOKEN    required
   TUILE_CACHE_DIR    where to keep the tile cache (strongly advised: a bake is
                      the one process that pays for a cold one)
+  TUILE_MAX_SSE      a le dernier mot sur --sse, et c'est voulu : c'est le
+                     bouton d'un balayage machine, qui doit pouvoir répondre
+                     « ce qu'un autre seuil aurait sélectionné » sans qu'on
+                     reconstruise une image pour chaque valeur
   TUILE_*            every traversal knob the render honours is honoured here,
                      because they are read by the same code — and a pack is the
                      bake of the settings it was made with, not of the defaults
@@ -289,6 +313,9 @@ fn parse_args() -> Result<Job, String> {
     let mut verify: Option<std::path::PathBuf> = None;
     let mut dump: Option<std::path::PathBuf> = None;
     let mut frame: u32 = 1;
+    let mut sse: Option<f64> = None;
+    let mut imagery: Option<i64> = None;
+    let mut terrain: Option<i64> = None;
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         let mut value = || argv.next().ok_or(format!("{arg} needs a value"));
@@ -305,6 +332,24 @@ fn parse_args() -> Result<Job, String> {
             "--tape" => tape = Some(std::path::PathBuf::from(value()?)),
             "--out" => out = Some(std::path::PathBuf::from(value()?)),
             "--frames" => frames = Some(value()?),
+            "--imagery" => {
+                imagery =
+                    Some(value()?.parse().map_err(|_| "--imagery wants an ion asset id")?)
+            }
+            "--terrain" => {
+                terrain =
+                    Some(value()?.parse().map_err(|_| "--terrain wants an ion asset id")?)
+            }
+            "--sse" => {
+                let v: f64 = value()?.parse().map_err(|_| "--sse wants a number")?;
+                // Fini ET positif : `NaN` passerait un simple `<= 0.0`, et un
+                // seuil `NaN` ne compare vrai avec rien — la traversée ne
+                // raffinerait plus jamais, sans rien dire.
+                if !v.is_finite() || v <= 0.0 {
+                    return Err("--sse wants a finite, positive error".into());
+                }
+                sse = Some(v);
+            }
             "--viewport" => {
                 let v = value()?;
                 let (w, h) = v.split_once('x').ok_or("--viewport wants <w>x<h>")?;
@@ -323,6 +368,8 @@ fn parse_args() -> Result<Job, String> {
     if let Some(pack) = verify {
         return Ok(Job::Verify {
             pack,
+            imagery,
+            terrain,
             // Required, and this is the point of the mode. Comparing a pack
             // against itself proves nothing: the first version of this read
             // the pack twice — once through the render's session, once
@@ -349,6 +396,9 @@ fn parse_args() -> Result<Job, String> {
         first,
         last,
         viewport,
+        sse,
+        imagery,
+        terrain,
     }))
 }
 
@@ -395,12 +445,77 @@ fn u32_le(values: &[u32]) -> Vec<u8> {
 /// different ranges of the same scene, and they must agree on the name of the
 /// scene or nothing can tell a mismatched pack from a neighbouring one. The
 /// range is in the object key beside the digest, which is where it belongs.
-fn digest_of_scene(tape_bytes: &[u8], viewport: (f64, f64), traversal: &str) -> String {
+///
+/// # The camera path, not the file that carried it
+///
+/// This used to hash the raw bytes of the `.mcap`, on the argument that a tape
+/// re-recorded one bit differently is a different scene — the cautious
+/// direction. The argument mistakes the envelope for the letter.
+///
+/// A container has its own reasons to change that have nothing to do with the
+/// scene: the writer's version, whether records are repeated in the summary,
+/// the compression level, the order a `HashMap` happened to iterate in. All of
+/// those renamed every scene in the world without a single camera moving —
+/// measured on 16 September 2026, when two bakes of one trajectory landed
+/// under `fb45fe68fb26e559` and `05274f175b83df6a`, and both were right.
+///
+/// So the digest is taken over the **poses**, canonically: ten little-endian
+/// `f64` per frame, in order. Two tapes that replay the same path name the same
+/// scene, whatever wrote them; two paths that differ anywhere — one frame, one
+/// bit of one coordinate — do not.
+///
+/// # Ce que `settings` doit porter
+///
+/// Tout ce qui décide du contenu sans être dans la trajectoire : la traversée
+/// résolue, **et les sources**. Ce paramètre s'appelait `traversal` et ne
+/// portait que la première, ce qui laissait passer deux collisions mesurées le
+/// 17 septembre 2026 sur la même orbite :
+///
+/// * boost d'imagerie 1 et 2 → même digest `9fb2b0f3559debc6`. Le plafond de
+///   boost est une option du chargeur, pas de la traversée, donc
+///   `exact_traversal` ne le voit pas.
+/// * asset d'imagerie 2 (Bing) et 3954 (Sentinel) → même digest, pour la même
+///   raison.
+///
+/// Un digest qui ne distingue pas deux packs les autorise à se répondre l'un
+/// pour l'autre : `--scene` accepterait le mauvais globe en silence. C'est la
+/// seule barrière entre un pack et une scène, et elle doit tout porter.
+/// Tout ce qui décide du contenu d'un pack hors trajectoire, en une chaîne.
+///
+/// Composée en UN endroit pour les deux chemins — la cuisson et `--verify` —
+/// parce que deux compositions séparées finissent par diverger, et qu'un
+/// `--verify` qui compare contre une autre scène ne vérifie rien.
+fn bake_settings(config: &tuile_bake::GlobeConfig, resolved: &tuile_core::traversal::Config) -> String {
+    format!(
+        "{resolved:?}\nterrain={}\nimagery={:?}\nimagery_boost={}",
+        config.terrain_asset_id,
+        config.imagery_asset_id,
+        tuile_bake::imagery_boost_cap(),
+    )
+}
+
+fn digest_of_scene(
+    poses: &[tuile_tape::Frame],
+    viewport: (f64, f64),
+    settings: &str,
+) -> String {
+    let mut path = Vec::with_capacity(poses.len() * 10 * 8);
+    for pose in poses {
+        for value in pose
+            .position
+            .iter()
+            .chain(&pose.direction)
+            .chain(&pose.up)
+            .chain(std::slice::from_ref(&pose.fovy))
+        {
+            path.extend_from_slice(&value.to_le_bytes());
+        }
+    }
     tuile_pack::scene_digest(&[
-        tape_bytes,
+        &path,
         &viewport.0.to_le_bytes(),
         &viewport.1.to_le_bytes(),
-        traversal.as_bytes(),
+        settings.as_bytes(),
     ])
 }
 
@@ -439,7 +554,9 @@ fn run() -> Result<(), String> {
             pack,
             tape,
             viewport,
-        } => verify(&pack, &tape, viewport),
+            imagery,
+            terrain,
+        } => verify(&pack, &tape, viewport, imagery, terrain),
         Job::Bake(args) => bake(args),
     }
 }
@@ -462,6 +579,15 @@ fn inspect(path: &std::path::Path) -> Result<(), String> {
 
     let mut total_selected = 0usize;
     let mut payload_bytes = 0usize;
+    // Ce que la compression achète, PAR NATURE de charge utile.
+    //
+    // Le total seul ne répond pas à la question qui compte : un PNG est déjà
+    // du DEFLATE, et le compresser une seconde fois peut très bien ne rien
+    // gagner tout en coûtant du temps aux deux bouts. Des sommets en f32, eux,
+    // sont pleins de motifs. Mélanger les deux dans un seul pourcentage cache
+    // exactement ce qu'on voudrait décider.
+    let mut by_kind: std::collections::BTreeMap<&'static str, (usize, usize, usize)> =
+        std::collections::BTreeMap::new();
     for frame in first..=last {
         let tiles = pack.frame(frame).map_err(|e| e.to_string())?;
         total_selected += tiles.len();
@@ -475,10 +601,20 @@ fn inspect(path: &std::path::Path) -> Result<(), String> {
                 (tile.texture(), "texture"),
             ] {
                 if let Some(block) = block {
-                    payload_bytes += pack
-                        .payload(block, what)
-                        .map_err(|e| format!("frame {frame}: {e}"))?
-                        .len();
+                    // La texture passe par `Pack::texture`, qui sait que son
+                    // format porte déjà sa compression ; la décompresser
+                    // ici échouerait sur un pack parfaitement sain.
+                    let decoded = if what == "texture" {
+                        pack.texture(tile)
+                    } else {
+                        pack.payload(block, what)
+                    }
+                    .map_err(|e| format!("frame {frame}: {e}"))?;
+                    payload_bytes += decoded.len();
+                    let e = by_kind.entry(what).or_default();
+                    e.0 += 1;
+                    e.1 += block.raw() as usize;
+                    e.2 += block.stored() as usize;
                     if what == "texture" {
                         textured += 1;
                     }
@@ -504,6 +640,15 @@ fn inspect(path: &std::path::Path) -> Result<(), String> {
         "payloads {payload_bytes} bytes raw, {:.0}% of it stored",
         100.0 * bytes.len() as f64 / payload_bytes.max(1) as f64
     );
+    println!("what        selections        raw       stored   saved");
+    for (what, (count, raw, stored)) in &by_kind {
+        println!(
+            "  {what:<10} {count:>10} {:>10.1} Mo {:>8.1} Mo {:>6.1}%",
+            *raw as f64 / 1e6,
+            *stored as f64 / 1e6,
+            100.0 * (1.0 - *stored as f64 / (*raw).max(1) as f64)
+        );
+    }
     Ok(())
 }
 
@@ -511,13 +656,12 @@ fn bake(args: Args) -> Result<(), String> {
     let token = std::env::var("TUILE_ION_TOKEN")
         .map_err(|_| "TUILE_ION_TOKEN is not set; a bake is the one job that needs it")?;
 
-    // The tape is read twice on purpose: once as bytes, which is what names the
-    // scene, and once as frames. Naming the scene from the file rather than
-    // from the poses re-derived out of it means a re-recorded tape that lands
-    // one bit differently is a different scene, which is the safe direction.
-    let tape_bytes = std::fs::read(&args.tape)
-        .map_err(|e| format!("reading {}: {e}", args.tape.display()))?;
-
+    // La tape n'est lue qu'une fois, et pour ce qu'elle contient.
+    //
+    // Elle l'était deux fois : en octets, pour nommer la scène, et en frames,
+    // pour la cuire. Nommer d'après le fichier faisait dépendre le nom de
+    // l'emballage — version du writer, répétition des schémas, ordre d'un
+    // HashMap — et non de la trajectoire. Voir `digest_of_scene`.
     let mut tape = tuile_tape::Tape::replaying(&args.tape)
         .map_err(|e| format!("opening {}: {e}", args.tape.display()))?;
     let mut poses = Vec::new();
@@ -541,12 +685,29 @@ fn bake(args: Args) -> Result<(), String> {
     if let Ok(dir) = std::env::var("TUILE_CACHE_DIR") {
         config.cache_dir = Some(dir.into());
     }
+    // Posé AVANT la résolution, donc avant le digest.
+    //
+    // `Session::from_parts` re-résout la traversée par `exact_traversal`
+    // (`session.rs:635`) : mettre la valeur ici la fait passer par le même
+    // chemin que celui dont le digest est pris, et les deux ne peuvent pas
+    // diverger. Posée après, elle serait dans le pack et absente de son nom.
+    if let Some(sse) = args.sse {
+        config.session.traversal.maximum_screen_space_error = sse;
+    }
     // The settings a pack is the bake of. **Resolved** first: every TUILE_*
     // knob the session honours is read by `exact_traversal`, and a digest
     // taken before that would give two packs baked at different screen-space
     // errors the same name — after which they answer for each other.
+    if let Some(id) = args.terrain {
+        config.terrain_asset_id = id;
+    }
+    if let Some(id) = args.imagery {
+        // Négatif = pas d'imagerie du tout, la vue de débogage géométrique,
+        // même convention que le C ABI (`ffi.rs:244`).
+        config.imagery_asset_id = if id < 0 { None } else { Some(id) };
+    }
     let resolved = tuile_bake::exact_traversal(config.session.traversal.clone());
-    let scene = digest_of_scene(&tape_bytes, args.viewport, &format!("{resolved:?}"));
+    let scene = digest_of_scene(&poses, args.viewport, &bake_settings(&config, &resolved));
     let culling = if resolved.cull {
         "full"
     } else {
@@ -555,6 +716,7 @@ fn bake(args: Args) -> Result<(), String> {
     tracing::info!(
         scene,
         culling,
+        sse = resolved.maximum_screen_space_error,
         frames = format!("{}:{}", args.first, wanted),
         viewport = format!("{}x{}", args.viewport.0, args.viewport.1),
         "BAKE-BEGIN"
@@ -601,8 +763,10 @@ fn bake(args: Args) -> Result<(), String> {
         }
         let selected = tiles.len();
         // The camera goes in beside the tiles, because that is what a render
-        // will address this frame by: a Hydra host cooks at a timecode and
-        // hands the session a camera, never a frame number.
+        // will address this frame by. A renderer cooks at a timecode and hands
+        // the session a camera, never a frame number — so a pack that could
+        // only be looked up by index would be unusable by the very thing it is
+        // baked for.
         writer.frame(
             number,
             tuile_pack::BakedView {
@@ -872,6 +1036,8 @@ fn verify(
     path: &std::path::Path,
     tape_path: &std::path::Path,
     viewport: (f64, f64),
+    imagery: Option<i64>,
+    terrain: Option<i64>,
 ) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let pack = tuile_pack::Pack::open(&bytes).map_err(|e| e.to_string())?;
@@ -879,14 +1045,25 @@ fn verify(
 
     let token = std::env::var("TUILE_ION_TOKEN")
         .map_err(|_| "TUILE_ION_TOKEN is not set; --verify bakes the scene again")?;
-    let tape_bytes = std::fs::read(tape_path)
-        .map_err(|e| format!("reading {}: {e}", tape_path.display()))?;
+    // Les poses, pas le fichier : `digest_of_scene` nomme la trajectoire.
+    let mut replay = tuile_tape::Tape::replaying(tape_path)
+        .map_err(|e| format!("opening {}: {e}", tape_path.display()))?;
+    let mut poses = Vec::new();
+    while let Some(frame) = replay.next_frame() {
+        poses.push(frame);
+    }
     let mut config = tuile_bake::GlobeConfig::new(&token);
     if let Ok(dir) = std::env::var("TUILE_CACHE_DIR") {
         config.cache_dir = Some(dir.into());
     }
+    if let Some(id) = terrain {
+        config.terrain_asset_id = id;
+    }
+    if let Some(id) = imagery {
+        config.imagery_asset_id = if id < 0 { None } else { Some(id) };
+    }
     let resolved = tuile_bake::exact_traversal(config.session.traversal.clone());
-    let scene = digest_of_scene(&tape_bytes, viewport, &format!("{resolved:?}"));
+    let scene = digest_of_scene(&poses, viewport, &bake_settings(&config, &resolved));
     if scene != pack.scene_digest() {
         return Err(format!(
             "this pack is a bake of scene {}, and the tape and settings given \
@@ -1081,15 +1258,109 @@ mod tests {
     /// The range belongs in the object key, never in the digest: a pack of
     /// frames 49–96 that called itself a different scene from the pack of 1–48
     /// would make a mismatched pack indistinguishable from a neighbouring one.
+    fn a_path(n: usize) -> Vec<tuile_tape::Frame> {
+        (0..n)
+            .map(|i| {
+                let t = i as f64;
+                tuile_tape::Frame {
+                    position: [t, t * 2.0, t * 3.0],
+                    direction: [0.0, 0.0, -1.0],
+                    up: [0.0, 1.0, 0.0],
+                    fovy: std::f64::consts::FRAC_PI_4,
+                }
+            })
+            .collect()
+    }
+
+    /// Deux sources différentes, deux noms de scène différents.
+    ///
+    /// Mesuré le 17 septembre 2026 : deux cuissons de la même orbite, l'une à
+    /// `--imagery-boost 1` et l'autre à 2, ont porté le même digest
+    /// `9fb2b0f3559debc6`. Le digest ne hachait que la traversée résolue, et
+    /// ni le plafond de boost ni l'asset n'en font partie — l'un est une
+    /// option du chargeur, l'autre une propriété de la session. Deux packs qui
+    /// portent le même nom de scène se répondent l'un pour l'autre : le
+    /// contrôle `--scene` du rendu aurait accepté le mauvais globe sans un mot.
+    ///
+    /// Ce test tient sur `bake_settings`, qui est la composition réelle, et
+    /// non sur une chaîne inventée pour l'occasion.
+    #[test]
+    fn two_sources_are_two_scenes() {
+        let path = a_path(8);
+        let resolved = tuile_core::traversal::Config::default();
+        let mut bing = tuile_bake::GlobeConfig::new("jeton");
+        let mut sentinel = tuile_bake::GlobeConfig::new("jeton");
+        sentinel.imagery_asset_id = Some(3954);
+        let mut sans = tuile_bake::GlobeConfig::new("jeton");
+        sans.imagery_asset_id = None;
+        let mut autre_terrain = tuile_bake::GlobeConfig::new("jeton");
+        autre_terrain.terrain_asset_id = 2767062;
+
+        let name = |c: &tuile_bake::GlobeConfig| {
+            digest_of_scene(&path, (1280.0, 960.0), &bake_settings(c, &resolved))
+        };
+        let reference = name(&bing);
+        assert_ne!(reference, name(&sentinel), "Bing et Sentinel doivent différer");
+        assert_ne!(reference, name(&sans), "avec et sans imagerie doivent différer");
+        assert_ne!(reference, name(&autre_terrain), "deux terrains doivent différer");
+        // Et la même configuration donne toujours le même nom.
+        bing.cache_dir = Some("/ailleurs".into());
+        assert_eq!(reference, name(&bing), "le cache n'est pas une propriété de la scène");
+    }
+
     #[test]
     fn the_scene_name_does_not_depend_on_which_frames_were_baked() {
-        let tape = b"a tape";
-        let a = digest_of_scene(tape, (1280.0, 960.0), "cfg");
-        let b = digest_of_scene(tape, (1280.0, 960.0), "cfg");
+        let path = a_path(8);
+        let a = digest_of_scene(&path, (1280.0, 960.0), "cfg");
+        let b = digest_of_scene(&path, (1280.0, 960.0), "cfg");
         assert_eq!(a, b);
         // …but everything that changes what a frame contains does.
-        assert_ne!(a, digest_of_scene(b"another tape", (1280.0, 960.0), "cfg"));
-        assert_ne!(a, digest_of_scene(tape, (1920.0, 960.0), "cfg"));
-        assert_ne!(a, digest_of_scene(tape, (1280.0, 960.0), "other cfg"));
+        assert_ne!(a, digest_of_scene(&a_path(9), (1280.0, 960.0), "cfg"));
+        assert_ne!(a, digest_of_scene(&path, (1920.0, 960.0), "cfg"));
+        assert_ne!(a, digest_of_scene(&path, (1280.0, 960.0), "other cfg"));
+    }
+
+    /// Le nom décrit la trajectoire, pas le fichier qui l'a transportée.
+    ///
+    /// Un conteneur change pour ses propres raisons — version du writer,
+    /// répétition des schémas dans le résumé, niveau de compression, ordre
+    /// d'itération d'un `HashMap`. Aucune ne déplace une caméra, et toutes
+    /// renommaient la scène : le 16 septembre 2026, deux cuissons d'une même
+    /// trajectoire se sont rangées sous `fb45fe68fb26e559` et
+    /// `05274f175b83df6a`, et les deux avaient raison.
+    #[test]
+    fn the_same_path_names_the_same_scene_whatever_carried_it() {
+        // Deux relectures indépendantes de la même trajectoire : ce que
+        // `Tape::replaying` rend, quel que soit l'octet-à-octet du fichier.
+        let from_one_file = a_path(64);
+        let from_another: Vec<_> = a_path(64).into_iter().collect();
+        assert_eq!(
+            digest_of_scene(&from_one_file, (1280.0, 960.0), "cfg"),
+            digest_of_scene(&from_another, (1280.0, 960.0), "cfg"),
+        );
+    }
+
+    /// Et un chemin qui diffère d'un bit est une autre scène.
+    ///
+    /// La prudence de l'ancienne version est gardée là où elle a un sens : sur
+    /// le contenu. Un pack d'une trajectoire voisine ne doit jamais pouvoir
+    /// passer pour celui d'à côté.
+    #[test]
+    fn one_different_bit_of_one_coordinate_is_another_scene() {
+        let path = a_path(64);
+        let mut nudged = path.clone();
+        nudged[37].position[1] = f64::from_bits(nudged[37].position[1].to_bits() ^ 1);
+        assert_ne!(
+            digest_of_scene(&path, (1280.0, 960.0), "cfg"),
+            digest_of_scene(&nudged, (1280.0, 960.0), "cfg"),
+        );
+        // Et l'ordre compte : la même caméra passée dans l'autre sens n'est
+        // pas le même plan.
+        let mut reversed = path.clone();
+        reversed.reverse();
+        assert_ne!(
+            digest_of_scene(&path, (1280.0, 960.0), "cfg"),
+            digest_of_scene(&reversed, (1280.0, 960.0), "cfg"),
+        );
     }
 }
