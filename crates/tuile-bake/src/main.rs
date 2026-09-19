@@ -747,6 +747,31 @@ fn bake(args: Args) -> Result<(), String> {
         "BAKE-BEGIN"
     );
 
+    // The memory line, on a beat, from here to the end of the process.
+    //
+    // A bake that dies of memory dies without saying so: status 137 arrives
+    // from outside, the logs stop mid-sentence, and nothing in them says
+    // whether it was the working set, the fetch cache or the pack. Started
+    // before the session so the climb has a baseline, and watching the two
+    // directories that are RAM on a container with no disk.
+    tuile_bake::memory::watch(
+        std::time::Duration::from_secs(
+            std::env::var("TUILE_MEMORY_EVERY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15),
+        ),
+        [
+            std::env::var("TUILE_CACHE_DIR")
+                .ok()
+                .map(std::path::PathBuf::from),
+            args.out.parent().map(std::path::Path::to_path_buf),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    );
+
     let began = Instant::now();
     let mut session = tuile_bake::Session::globe(config)
         .map_err(|e| format!("opening the globe: {e}"))?;

@@ -43,6 +43,7 @@
 //! the camera and the sources, not of the network's mood.
 
 mod globe;
+pub mod memory;
 pub mod packed;
 mod session;
 
