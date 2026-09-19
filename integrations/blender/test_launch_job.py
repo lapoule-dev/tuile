@@ -11,12 +11,15 @@ et c'est ce qui la rend dangereuse. Un jeton qui y entre n'en sort plus.
 """
 
 import importlib.util
+import io
 import pathlib
 import re
 import subprocess
 import sys
 import types
+import urllib.error
 import unittest
+import unittest.mock
 
 # Jamais de bytecode pour ce que ce fichier teste.
 #
@@ -1482,3 +1485,66 @@ class TheFrameRangeMatchesTheTrajectory(unittest.TestCase):
                                 say=said.append)
         self.assertEqual(said, [])
 
+
+class AnExpiredTokenIsRenewedNotFatal(unittest.TestCase):
+    """Un 401 se rattrape une fois, avec un jeton neuf.
+
+    `gcp_watch` en renouvelle un toutes les 45 minutes, ce qui suppose que
+    celui de départ en avait 60 — faux dès qu'il sort d'un cache déjà entamé.
+    Mesuré le 19 septembre 2026 : le lanceur est mort en dix minutes sur
+    `401: Request had invalid authentication credentials`.
+
+    Sur une cuisson c'est bénin — le job dépose son pack tout seul, c'est le
+    sens de l'URL présignée. Sur un rendu le lanceur est ce qui **monte les
+    segments** : sa mort laisse douze morceaux sur R2 et aucun film, et ce
+    n'est pas rattrapable sans relancer la main.
+    """
+
+    def _urlopen(self, codes):
+        """Rend un urlopen qui échoue selon `codes`, puis répond `{}`."""
+        seen = []
+
+        class Answer:
+            def __enter__(self_inner): return self_inner
+            def __exit__(self_inner, *a): return False
+            def read(self_inner): return b"{}"
+
+        def fake(req, *a, **kw):
+            seen.append(req.headers.get("Authorization"))
+            if len(seen) <= len(codes):
+                raise urllib.error.HTTPError(
+                    req.full_url, codes[len(seen) - 1], "nope", {},
+                    io.BytesIO(b'{"error":{"message":"expired"}}'))
+            return Answer()
+
+        return fake, seen
+
+    def _run(self, codes, tokens):
+        fake, seen = self._urlopen(codes)
+        minted = iter(tokens)
+        with unittest.mock.patch.object(launch_job.urllib.request, "urlopen", fake), \
+             unittest.mock.patch.object(launch_job, "gcp_token",
+                                        lambda: next(minted)):
+            return launch_job.gcp_call("GET", "whatever"), seen
+
+    def test_a_401_is_retried_with_a_fresh_token(self):
+        out, seen = self._run([401], ["vieux", "neuf"])
+        self.assertEqual(out, {})
+        self.assertEqual(seen, ["Bearer vieux", "Bearer neuf"],
+                         "le réessai doit porter un jeton renouvelé")
+
+    def test_a_second_401_is_not_retried(self):
+        # Un jeton qu'on vient de renouveler et qui est refusé, c'est un
+        # problème de droits : le réessayer en boucle le rendrait illisible.
+        with self.assertRaises(SystemExit):
+            self._run([401, 401], ["vieux", "neuf", "encore"])
+
+    def test_other_failures_are_not_retried(self):
+        # Un 403 ou un 404 ne se soigne pas avec un jeton neuf, et masquer
+        # l'erreur derrière un second appel ne ferait que la retarder.
+        fake, seen = self._urlopen([403])
+        with unittest.mock.patch.object(launch_job.urllib.request, "urlopen", fake), \
+             unittest.mock.patch.object(launch_job, "gcp_token", lambda: "x"):
+            with self.assertRaises(SystemExit):
+                launch_job.gcp_call("GET", "whatever")
+        self.assertEqual(len(seen), 1, "un 403 a été réessayé pour rien")

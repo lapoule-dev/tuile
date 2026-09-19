@@ -492,11 +492,23 @@ def gcp_token():
     return out.stdout.strip()
 
 
-def gcp_call(method, path, body=None, token=None):
+def gcp_call(method, path, body=None, token=None, _retried=False):
     """Un appel à l'API Cloud Run. Même discipline que `call` côté RunPod :
     une erreur est une phrase lisible, pas une trace.
 
-    une erreur est une phrase lisible, pas une trace."""
+    Un 401 est réessayé **une fois**, avec un jeton neuf. `gcp_watch` en
+    renouvelle un toutes les 45 minutes, ce qui suppose que celui de départ en
+    avait 60 — faux dès qu'il vient d'un cache déjà entamé. Mesuré le
+    19 septembre 2026 : le lanceur est mort en dix minutes sur
+    `401: Request had invalid authentication credentials`. Sur une cuisson
+    c'est bénin, le job dépose son pack tout seul ; sur un rendu le lanceur est
+    ce qui **monte les segments**, et sa mort laisse douze morceaux sur R2 et
+    aucun film.
+
+    Une fois, pas en boucle : un jeton qu'on vient de renouveler et qui est
+    refusé à nouveau, c'est un problème de droits, et le réessayer ne ferait que
+    le rendre illisible.
+    """
     minted = token or gcp_token()
     url = path if path.startswith("http") else f"{RUN_API}/{path.lstrip('/')}"
     data = json.dumps(body).encode() if body is not None else None
@@ -509,6 +521,8 @@ def gcp_call(method, path, body=None, token=None):
         with urllib.request.urlopen(req) as r:
             raw = r.read()
     except urllib.error.HTTPError as e:
+        if e.code == 401 and not _retried:
+            return gcp_call(method, path, body, token=gcp_token(), _retried=True)
         detail = e.read().decode(errors="replace")
         try:
             detail = json.loads(detail)["error"]["message"]
