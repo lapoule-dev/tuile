@@ -28,6 +28,8 @@ use url::Url;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RasterError {
+    #[error("imagery provider: {0}")]
+    Provider(String),
     #[error("fetch: {0}")]
     Fetch(#[from] FetchError),
     #[error("image decode: {0}")]
@@ -121,7 +123,7 @@ impl Projection {
 }
 
 /// A quadtree tiling scheme over a projection.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TilingScheme {
     pub projection: Projection,
     /// Tiles across at level 0 (1 for WebMercator, 2 for Geographic).

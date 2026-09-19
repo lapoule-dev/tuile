@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tuile_bing::{BingImageryProvider, BingMetadata};
-use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
+use tuile_cesium_ion::{tms::TmsImagery, AssetEndpoint, IonClient, IonTerrainSource};
 use tuile_native_fetchers::NativeHttp;
 use tuile_core::offload;
 use tuile_planetary::{globe_on, GlobeOptions, ImageryDetail, LayerBudget};
@@ -47,6 +47,16 @@ fn max_level() -> Option<u32> {
 }
 
 /// checkerboard's cure.
+///
+/// Publique parce que le digest de scène doit la lire.
+///
+/// Ce plafond décide de combien de niveaux l'imagerie descend sous le terrain,
+/// donc il décide du CONTENU d'un pack. Il n'entrait pourtant pas dans le
+/// digest : mesuré le 17 septembre 2026, deux cuissons de la même trajectoire
+/// à boost 1 et boost 2 portaient le même nom de scène, `9fb2b0f3559debc6`, et
+/// se seraient donc répondu l'une pour l'autre. Il n'est pas lu par
+/// `exact_traversal` — c'est une option du chargeur, pas de la traversée — donc
+/// il fallait aller le chercher ici.
 pub fn imagery_boost_cap() -> u32 {
     std::env::var("TUILE_IMAGERY_BOOST")
         .ok()
@@ -110,6 +120,15 @@ pub enum GlobeError {
     NotImagery(i64),
     #[error("bing: {0}")]
     Bing(String),
+    /// ion proxies an imagery provider this crate has no connector for.
+    ///
+    /// Named rather than mistreated: every imagery endpoint used to be handed
+    /// to the Bing path, so an Azure or Google asset failed with "endpoint has
+    /// no key" — a message about Bing, for an asset that is not Bing.
+    #[error("ion asset {asset} is {kind} imagery, and this build has no connector for it")]
+    UnsupportedImagery { asset: i64, kind: String },
+    #[error("ion imagery: {0}")]
+    Imagery(String),
 }
 
 impl Session {
@@ -271,42 +290,59 @@ async fn resolve(
         _ => return Err(GlobeError::NotImagery(imagery_asset_id)),
     };
 
-    let options = &endpoint.options;
-    let metadata_url = BingMetadata::metadata_url(
-        options
-            .url
-            .as_deref()
-            .ok_or_else(|| GlobeError::Bing("endpoint has no url".into()))?,
-        options.map_style.as_deref().unwrap_or("Aerial"),
-        options
-            .key
-            .as_deref()
-            .ok_or_else(|| GlobeError::Bing("endpoint has no key".into()))?,
-    );
-    let bing = BingImageryProvider::from_metadata_url(Arc::clone(&http), &metadata_url)
-        .await
-        .map_err(|e| GlobeError::Bing(e.to_string()))?;
+    let options = GlobeOptions {
+        no_imagery: false,
+        max_level: max_level(),
+        imagery_slots,
+        imagery_boost_cap: imagery_boost_cap(),
+        // On, and not a knob. Everything else in this crate is exact by
+        // construction — `exact_traversal` refuses stand-ins and forbids
+        // holes for the same reason — and a coarse layer chosen from
+        // whatever a bounded cache happens to hold is the last decision
+        // here that depends on how fast tiles arrived. It was measured
+        // re-draping 16 of 80 identically selected tiles between two runs
+        // of one frame.
+        deterministic_floor: true,
+    };
 
-    let (tree, loader, detail, _heights) = globe_on(
-        terrain,
-        bing,
-        layer,
-        GlobeOptions {
-            no_imagery: false,
-            max_level: max_level(),
-            imagery_slots,
-            imagery_boost_cap: imagery_boost_cap(),
-            // On, and not a knob. Everything else in this crate is exact by
-            // construction — `exact_traversal` refuses stand-ins and forbids
-            // holes for the same reason — and a coarse layer chosen from
-            // whatever a bounded cache happens to hold is the last decision
-            // here that depends on how fast tiles arrived. It was measured
-            // re-draping 16 of 80 identically selected tiles between two runs
-            // of one frame.
-            deterministic_floor: true,
-        },
-        offload::threaded(),
-    );
+    // Ce que l'endpoint est, et non ce qu'on espère qu'il soit.
+    //
+    // Toute imagerie partait au chemin Bing, qui exige `options.key` : viser
+    // un asset hébergé par ion — Sentinel-2, 3954 — ne donnait pas une image
+    // douteuse, ça donnait « endpoint has no key », un message sur Bing pour
+    // un asset qui n'est pas Bing. `externalType` absent veut dire
+    // TileMapService, exactement la branche par défaut de cesium-native
+    // (`IonRasterOverlay.cpp`, le `else` après `BING`).
+    let (tree, loader, detail, _heights) = match endpoint.external_type.as_deref() {
+        None => {
+            let tms = TmsImagery::from_endpoint(ion, imagery_asset_id as u64, endpoint)
+                .await
+                .map_err(|e| GlobeError::Imagery(e.to_string()))?;
+            globe_on(terrain, tms, layer, options, offload::threaded())
+        }
+        Some("BING") => {
+            let o = &endpoint.options;
+            let metadata_url = BingMetadata::metadata_url(
+                o.url
+                    .as_deref()
+                    .ok_or_else(|| GlobeError::Bing("endpoint has no url".into()))?,
+                o.map_style.as_deref().unwrap_or("Aerial"),
+                o.key
+                    .as_deref()
+                    .ok_or_else(|| GlobeError::Bing("endpoint has no key".into()))?,
+            );
+            let bing = BingImageryProvider::from_metadata_url(Arc::clone(&http), &metadata_url)
+                .await
+                .map_err(|e| GlobeError::Bing(e.to_string()))?;
+            globe_on(terrain, bing, layer, options, offload::threaded())
+        }
+        Some(kind) => {
+            return Err(GlobeError::UnsupportedImagery {
+                asset: imagery_asset_id,
+                kind: kind.to_string(),
+            })
+        }
+    };
     Ok((tree, loader, detail))
 }
 
@@ -315,6 +351,10 @@ async fn resolve(
 /// Non-finite and non-positive both mean "the caller did not choose", which is
 /// different from "the caller chose zero" — a zero timeout would fail every
 /// frame instantly, and that is never what someone means.
+///
+/// Public because the ABI is what carries seconds as a bare `f64`, and the ABI
+/// now lives in another crate. The rule it encodes belongs beside the session
+/// it defends, not beside the boundary that happens to invoke it.
 pub fn duration_or(seconds: f64, fallback: Duration) -> Duration {
     if seconds.is_finite() && seconds > 0.0 {
         Duration::from_secs_f64(seconds)
