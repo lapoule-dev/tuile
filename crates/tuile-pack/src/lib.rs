@@ -67,7 +67,7 @@ pub use generated::tuile::pack as fb;
 pub const MAGIC: &[u8; 8] = b"TUILEPK\0";
 
 /// The layout version. Bumped when an old reader would misread a new file.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PackError {
@@ -208,14 +208,154 @@ pub struct PackWriter {
     render_origin: [f64; 3],
     /// The deduplicated pool, in insertion order; `index` maps identity to
     /// position so a tile seen on forty frames is stored once.
-    tiles: Vec<BakedTile>,
+    ///
+    /// **Metadata only.** The pixels and the vertices are compressed on the
+    /// way in and pushed straight into `blob`; what survives here is five
+    /// [`fb::Block`]s and a handful of scalars — sixty-odd bytes a tile,
+    /// whatever the tile weighs.
+    tiles: Vec<StoredTile>,
     index: std::collections::HashMap<(u64, u64), u32>,
     frames: Vec<(u32, BakedView, Vec<u32>)>,
+    blob: BlobSink,
+    /// La première erreur d'écriture du blob, gardée pour être rendue par
+    /// `finish_to`. Voir [`PackWriter::put`].
+    spill_error: Option<std::io::Error>,
+}
+
+/// One tile, once its payloads are already in the blob.
+struct StoredTile {
+    id: u64,
+    drape: u64,
+    origin_ecef: [f64; 3],
+    vertex_count: u32,
+    index_count: u32,
+    base_color_factor: [f32; 4],
+    positions: fb::Block,
+    normals: fb::Block,
+    uvs: fb::Block,
+    indices: fb::Block,
+    texture: Option<fb::Block>,
+    texture_format: TextureFormat,
+}
+
+/// The compressed payloads, written to a file as they are produced.
+///
+/// # Why there is only one of these
+///
+/// The blob used to be built in one go at the end, and the cost of that was
+/// not one copy but three, all live at the same instant: every tile held
+/// **decompressed** until `finish`, then the whole blob compressed beside it,
+/// then a third buffer concatenating table and blob before a single
+/// `fs::write`. The peak was roughly three times the finished pack, on a
+/// machine that has to hold the tile cache as well; a minute of film did not
+/// fit in sixteen gigabytes.
+///
+/// The offsets a [`fb::Block`] carries are relative to the start of the blob,
+/// so they never depended on the table's size — nothing ever required the blob
+/// to be in memory. Writing it out as it is produced makes the peak
+/// independent of how long the bake is: 1440 frames cost the resident bytes
+/// that 48 cost.
+///
+/// An in-memory variant existed beside this one for a few minutes and was
+/// removed on purpose. Two paths mean the short one is the one the tests
+/// exercise and the long one is the one that runs in anger — which is the
+/// arrangement that let the peak go unnoticed in the first place.
+struct BlobSink {
+    file: std::io::BufWriter<std::fs::File>,
+    path: std::path::PathBuf,
+    len: u64,
+    /// FNV-1a folded in as the bytes go past, because `blob_digest` is over
+    /// the whole blob and there is no longer a whole blob to hash.
+    digest: u64,
+}
+
+impl BlobSink {
+    fn create(path: std::path::PathBuf) -> std::io::Result<Self> {
+        let file =
+            std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&path)?);
+        Ok(Self {
+            file,
+            path,
+            len: 0,
+            digest: FNV_OFFSET,
+        })
+    }
+
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        self.file.write_all(bytes)?;
+        self.len += bytes.len() as u64;
+        self.digest = fnv1a_fold(self.digest, bytes);
+        Ok(())
+    }
+
+    fn digest(&self) -> u64 {
+        self.digest
+    }
+
+    /// Hands the blob to `out` and gives up its storage.
+    ///
+    /// Read back a megabyte at a time and removed. Never mapped, never
+    /// slurped: the point of spilling was to stop holding the blob, and
+    /// slurping it here would give every byte back at the worst moment.
+    fn drain_into(mut self, out: &mut dyn std::io::Write) -> std::io::Result<u64> {
+        use std::io::Write as _;
+        self.file.flush()?;
+        drop(self.file);
+        let mut source =
+            std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(&self.path)?);
+        let copied = std::io::copy(&mut source, out)?;
+        drop(source);
+        // Best effort: a leftover temporary is untidy; a failed bake that also
+        // fails to clean up is not worse than the failure.
+        let _ = std::fs::remove_file(&self.path);
+        if copied != self.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("blob spill is {copied} bytes, expected {}", self.len),
+            ));
+        }
+        Ok(copied)
+    }
+}
+
+/// Une texture de ce format porte-t-elle déjà sa propre compression ?
+///
+/// La seule fonction qui décide, lue par l'écriture ET par la lecture. Il n'y
+/// a pas de champ pour redire ce que `Tile.texture_format` dit déjà : un
+/// second champ serait une valeur en double, donc deux choses à garder
+/// d'accord.
+///
+/// Mesuré sur une cuisson de 24 frames en septembre 2026 : le LZ4 sur des PNG
+/// rend le pack **plus gros** de 0,2 %, et les textures y font 94 % des
+/// octets. On payait donc une compression à la cuisson et une décompression à
+/// chaque lecture pour perdre de la place. La géométrie, elle, garde de la
+/// structure à exploiter : 26 % sur les indices, 48 % sur les normales.
+fn carries_its_own_compression(format: TextureFormat) -> bool {
+    match format {
+        // PNG, c'est-à-dire du DEFLATE.
+        TextureFormat::Png => true,
+        _ => false,
+    }
 }
 
 impl PackWriter {
-    pub fn new(scene_digest: impl Into<String>, render_origin: [f64; 3]) -> Self {
-        Self {
+    /// A writer that keeps its blob in `blob_path` while it fills.
+    ///
+    /// The path is required, not optional: see [`BlobSink`]. It is removed by
+    /// [`PackWriter::finish_to`]; a bake that dies before then leaves it
+    /// behind, which is the right trade — a stray temporary is cheap, and a
+    /// crashed bake is worth inspecting.
+    pub fn new(
+        scene_digest: impl Into<String>,
+        render_origin: [f64; 3],
+        blob_path: impl Into<std::path::PathBuf>,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
             scene_digest: scene_digest.into(),
             // The honest default. A writer that says nothing about how it
             // culled has to be assumed to have culled the usual way, and
@@ -225,7 +365,9 @@ impl PackWriter {
             tiles: Vec::new(),
             index: std::collections::HashMap::new(),
             frames: Vec::new(),
-        }
+            blob: BlobSink::create(blob_path.into())?,
+            spill_error: None,
+        })
     }
 
     /// States how the selection was culled while this was baked.
@@ -258,7 +400,30 @@ impl PackWriter {
                 None => {
                     let at = self.tiles.len() as u32;
                     self.index.insert(key, at);
-                    self.tiles.push(tile);
+                    // Compressé et déversé ICI, pas à la fin. C'est ce qui
+                    // rend le pic indépendant de la longueur du film : une
+                    // tuile qui vient d'entrer ne pèse plus que ses cinq
+                    // blocs dès la ligne suivante.
+                    let stored = StoredTile {
+                        id: tile.id,
+                        drape: tile.drape,
+                        origin_ecef: tile.origin_ecef,
+                        vertex_count: tile.vertex_count,
+                        index_count: tile.index_count,
+                        base_color_factor: tile.base_color_factor,
+                        // La géométrie garde de la structure à exploiter —
+                        // 26 à 48 % mesurés. L'image, elle, porte déjà son
+                        // propre codec.
+                        positions: self.put(&tile.positions, true),
+                        normals: self.put(&tile.normals, true),
+                        uvs: self.put(&tile.uvs, true),
+                        indices: self.put(&tile.indices, true),
+                        texture: tile.texture.as_deref().map(|t| {
+                            self.put(t, !carries_its_own_compression(tile.texture_format))
+                        }),
+                        texture_format: tile.texture_format,
+                    };
+                    self.tiles.push(stored);
                     at
                 }
             };
@@ -267,37 +432,68 @@ impl PackWriter {
         self.frames.push((frame, view, refs));
     }
 
-    /// Serialises the whole container.
+    /// Compresses one payload into the blob and describes where it landed.
+    ///
+    /// An I/O error is recorded rather than returned, so that `frame` keeps
+    /// its infallible signature: a bake that cannot write its blob is going to
+    /// fail, but it should fail once, at [`PackWriter::finish_to`], with the
+    /// error that caused it — not by poisoning every call that follows.
+    fn put(&mut self, bytes: &[u8], compress: bool) -> fb::Block {
+        let offset = self.blob.len();
+        let compressed;
+        let stored: &[u8] = if compress {
+            compressed = lz4_flex::block::compress(bytes);
+            &compressed
+        } else {
+            bytes
+        };
+        let block = fb::Block::new(offset, stored.len() as u32, bytes.len() as u32);
+        if let Err(e) = self.blob.push(stored) {
+            if self.spill_error.is_none() {
+                self.spill_error = Some(e);
+            }
+        }
+        block
+    }
+
+    /// Writes the pack to `path`, streaming the blob rather than copying it.
     ///
     /// Two passes by construction: the blob region is built first, because a
     /// [`fb::Block`] cannot be written until its offset and its compressed
     /// length are known.
-    pub fn finish(self) -> Vec<u8> {
-        let mut blobs: Vec<u8> = Vec::new();
-        let put = |bytes: &[u8], blobs: &mut Vec<u8>| -> fb::Block {
-            let offset = blobs.len() as u64;
-            let stored = lz4_flex::block::compress(bytes);
-            let block = fb::Block::new(offset, stored.len() as u32, bytes.len() as u32);
-            blobs.extend_from_slice(&stored);
-            block
-        };
+    ///
+    /// The table is small — identities, offsets, and one `u32` per tile per
+    /// frame — so it is built in memory as before. The blob is not: it is
+    /// handed straight from wherever it was accumulated to the output file, a
+    /// megabyte at a time. Nothing ever holds two copies.
+    pub fn finish_to(self, path: impl AsRef<std::path::Path>) -> std::io::Result<u64> {
+        let path = path.as_ref();
+        let mut file = std::io::BufWriter::with_capacity(
+            1 << 20,
+            std::fs::File::create(path)?,
+        );
+        let written = self.write(&mut file)?;
+        use std::io::Write as _;
+        file.flush()?;
+        Ok(written)
+    }
 
-        let mut built = Vec::with_capacity(self.tiles.len());
-        for tile in &self.tiles {
-            built.push((
-                tile,
-                put(&tile.positions, &mut blobs),
-                put(&tile.normals, &mut blobs),
-                put(&tile.uvs, &mut blobs),
-                put(&tile.indices, &mut blobs),
-                tile.texture.as_ref().map(|t| put(t, &mut blobs)),
-            ));
+    /// The one serialiser. `finish` and `finish_to` are the two ways to point
+    /// it somewhere.
+    fn write(mut self, out: &mut dyn std::io::Write) -> std::io::Result<u64> {
+        // A blob that could not be written is a pack with holes in it, and it
+        // would pass every check a reader makes — the table would describe
+        // payloads that are not there. It fails here, once, with the error
+        // that actually happened.
+        if let Some(e) = self.spill_error.take() {
+            return Err(e);
         }
 
         let mut fbb = flatbuffers::FlatBufferBuilder::with_capacity(1 << 20);
-        let tiles: Vec<_> = built
+        let tiles: Vec<_> = self
+            .tiles
             .iter()
-            .map(|(tile, pos, nrm, uv, idx, tex)| {
+            .map(|tile| {
                 let origin = fbb.create_vector(&tile.origin_ecef);
                 let factor = fbb.create_vector(&tile.base_color_factor);
                 let mut b = fb::TileBuilder::new(&mut fbb);
@@ -307,11 +503,11 @@ impl PackWriter {
                 b.add_vertex_count(tile.vertex_count);
                 b.add_index_count(tile.index_count);
                 b.add_base_color_factor(factor);
-                b.add_positions(pos);
-                b.add_normals(nrm);
-                b.add_uvs(uv);
-                b.add_indices(idx);
-                if let Some(tex) = tex {
+                b.add_positions(&tile.positions);
+                b.add_normals(&tile.normals);
+                b.add_uvs(&tile.uvs);
+                b.add_indices(&tile.indices);
+                if let Some(tex) = tile.texture.as_ref() {
                     b.add_texture(tex);
                 }
                 b.add_texture_format(tile.texture_format);
@@ -335,7 +531,7 @@ impl PackWriter {
             .collect();
         let frames = fbb.create_vector(&frames);
 
-        let blob_digest = fnv1a(&blobs);
+        let blob_digest = self.blob.digest();
         let digest = fbb.create_string(&self.scene_digest);
         let culling = fbb.create_string(&self.culling);
         let origin = fbb.create_vector(&self.render_origin);
@@ -355,12 +551,11 @@ impl PackWriter {
         fbb.finish(root, Some("TUIL"));
         let table = fbb.finished_data();
 
-        let mut out = Vec::with_capacity(MAGIC.len() + 8 + table.len() + blobs.len());
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&(table.len() as u64).to_le_bytes());
-        out.extend_from_slice(table);
-        out.extend_from_slice(&blobs);
-        out
+        out.write_all(MAGIC)?;
+        out.write_all(&(table.len() as u64).to_le_bytes())?;
+        out.write_all(table)?;
+        let blob_len = self.blob.drain_into(out)?;
+        Ok(MAGIC.len() as u64 + 8 + table.len() as u64 + blob_len)
     }
 }
 
@@ -399,12 +594,62 @@ impl<'a> Pack<'a> {
         // draws slightly wrong ground and reports success. Byte-for-byte
         // comparison downstream cannot see it either, because both sides of
         // such a comparison read the same damaged file.
+        //
+        // **Once really does mean once.** FNV-1a is a byte-at-a-time fold with
+        // a carried dependency: it does not vectorise, and it costs seconds per
+        // gigabyte. Charging it again on every frame is a toll that grows with
+        // the pack — see [`Pack::reopen`], which exists because that toll was
+        // being paid 24 times a second.
         let expected = root.blob_digest();
         let found = fnv1a(blobs);
         if found != expected {
             return Err(PackError::Corrupt { found, expected });
         }
         Ok(Self { root, blobs })
+    }
+
+    /// Reopens bytes this process has already verified.
+    ///
+    /// Same parsing and the same version check — the table is read in place,
+    /// so this is a handful of bounds checks — but **no digest**. It is for
+    /// the caller who verified the very same buffer with [`Pack::open`] and
+    /// has held it, unmodified, ever since.
+    ///
+    /// # Why it exists
+    ///
+    /// A packed render opened the pack once per frame, and every one of those
+    /// opens re-folded FNV-1a over the whole blob. On a 2.4 GB pack that is
+    /// seconds of pure CPU per frame, spent proving again what was proved at
+    /// startup about bytes nobody could have touched. Integrity is a property
+    /// of the bytes when they arrive, not of how often they are looked at.
+    ///
+    /// Never point this at a file that could have changed, at a mapping shared
+    /// with a writer, or at bytes that have crossed a wire since they were
+    /// checked: use [`Pack::open`] for those, which is why it is the one with
+    /// the plain name.
+    pub fn reopen(bytes: &'a [u8]) -> Result<Self, PackError> {
+        if bytes.len() < MAGIC.len() + 8 || &bytes[..MAGIC.len()] != MAGIC {
+            return Err(PackError::NotAPack);
+        }
+        let mut len = [0u8; 8];
+        len.copy_from_slice(&bytes[MAGIC.len()..MAGIC.len() + 8]);
+        let table_len = u64::from_le_bytes(len) as usize;
+        let start = MAGIC.len() + 8;
+        let end = start
+            .checked_add(table_len)
+            .filter(|e| *e <= bytes.len())
+            .ok_or(PackError::Truncated { what: "table" })?;
+        let root = fb::root_as_pack(&bytes[start..end])
+            .map_err(|e| PackError::Malformed(e.to_string()))?;
+        if root.version() != VERSION {
+            return Err(PackError::Version {
+                found: root.version(),
+            });
+        }
+        Ok(Self {
+            root,
+            blobs: &bytes[end..],
+        })
     }
 
     /// Fails unless this pack is the bake of the scene the caller means.
@@ -529,13 +774,37 @@ impl<'a> Pack<'a> {
 
     /// Decompresses one payload. The only copy a pack ever makes.
     pub fn payload(&self, block: &fb::Block, what: &'static str) -> Result<Vec<u8>, PackError> {
+        let stored = self.stored(block, what)?;
+        lz4_flex::block::decompress(stored, block.raw() as usize)
+            .map_err(|source| PackError::Decompress { what, source })
+    }
+
+    /// The bytes of a block, still as they lie in the blob region.
+    fn stored(&self, block: &fb::Block, what: &'static str) -> Result<&[u8], PackError> {
         let at = block.offset() as usize;
         let end = at
             .checked_add(block.stored() as usize)
             .filter(|e| *e <= self.blobs.len())
             .ok_or(PackError::Truncated { what })?;
-        lz4_flex::block::decompress(&self.blobs[at..end], block.raw() as usize)
-            .map_err(|source| PackError::Decompress { what, source })
+        Ok(&self.blobs[at..end])
+    }
+
+    /// A tile's texture, decoded according to what its format already carries.
+    ///
+    /// The one place the rule is applied on the read side, mirroring
+    /// [`carries_its_own_compression`] on the write side. Callers must not
+    /// reach for [`Self::payload`] on a texture block: it would decompress
+    /// something that was never compressed, and the PNG that came out of the
+    /// bake would come back as a decoder error nobody would connect to a pack
+    /// that is perfectly intact.
+    pub fn texture(&self, tile: &fb::Tile<'a>) -> Result<Vec<u8>, PackError> {
+        let Some(block) = tile.texture() else {
+            return Ok(Vec::new());
+        };
+        if carries_its_own_compression(tile.texture_format()) {
+            return Ok(self.stored(block, "texture")?.to_vec());
+        }
+        self.payload(block, "texture")
     }
 
     /// Everything one tile carries, back in the shape it was baked from.
@@ -570,7 +839,9 @@ impl<'a> Pack<'a> {
             index_count: tile.index_count(),
             base_color_factor: factor,
             texture: match tile.texture() {
-                Some(b) => Some(self.payload(b, "texture")?),
+                // Par `texture`, pas par `payload` : c'est elle qui sait si
+                // ce format porte déjà sa compression.
+                Some(_) => Some(self.texture(tile)?),
                 None => None,
             },
             texture_format: tile.texture_format(),
@@ -580,6 +851,202 @@ impl<'a> Pack<'a> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Rouvrir ne doit pas reprendre le prix de l'intégrité.
+    ///
+    /// Un rendu depuis un pack rouvre le conteneur à chaque image. Tant que
+    /// `open` était le seul chemin, chacune de ces ouvertures repliait FNV-1a
+    /// sur tout le blob : sur 2,4 Go, des secondes de CPU par image, pour
+    /// reprouver ce qui avait été prouvé au démarrage sur des octets que
+    /// personne n'avait pu toucher.
+    ///
+    /// Le test compare les deux sur le même tampon. Le rapport exact dépend de
+    /// la machine ; ce qui est vrai partout, c'est que `reopen` ne parcourt pas
+    /// le blob et que `open` le parcourt entièrement.
+    #[test]
+    fn reopening_does_not_re_fold_the_whole_blob() {
+        let mut w = Bake::new("s", [0.0; 3]);
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut heavy = a_tile(7, 100);
+        heavy.positions = (0..8_000_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state & 0xff) as u8
+            })
+            .collect();
+        w.frame(1, a_view(0.0), [heavy]);
+        let bytes = w.finish();
+        assert!(bytes.len() > 4 << 20, "le pack de test est trop petit pour mesurer");
+
+        let checked = std::time::Instant::now();
+        Pack::open(&bytes).expect("opens");
+        let checked = checked.elapsed();
+
+        let trusted = std::time::Instant::now();
+        Pack::reopen(&bytes).expect("reopens");
+        let trusted = trusted.elapsed();
+
+        assert!(
+            trusted * 4 < checked,
+            "reopen a coûté {trusted:?} contre {checked:?} pour open : \
+             la vérification n'a pas été retirée du chemin par image"
+        );
+    }
+
+    /// Ce que `reopen` refuse quand même.
+    ///
+    /// Sauter le digest n'est pas sauter la lecture. Un fichier qui n'est pas
+    /// un pack, une table tronquée ou une version étrangère restent des
+    /// erreurs — ce sont des pannes de forme, et elles ne coûtent rien à voir.
+    #[test]
+    fn reopening_still_refuses_what_is_not_a_pack() {
+        let bytes = Bake::new("s", [0.0; 3]).finish();
+        assert!(matches!(
+            Pack::reopen(b"pas un pack du tout"),
+            Err(PackError::NotAPack)
+        ));
+        assert!(matches!(
+            Pack::reopen(&bytes[..MAGIC.len() + 4]),
+            Err(PackError::NotAPack)
+        ));
+        let mut short = bytes.clone();
+        short.truncate(MAGIC.len() + 16);
+        assert!(matches!(
+            Pack::reopen(&short),
+            Err(PackError::Truncated { .. }) | Err(PackError::Malformed(_))
+        ));
+    }
+
+    /// Le blob est sur disque AVANT la fin, pas retenu jusque-là.
+    ///
+    /// C'est toute la propriété : le pic cesse de dépendre de la longueur du
+    /// film. Une cuisson d'une minute tenait trois fois le pack fini —
+    /// tuiles décompressées, blob compressé, puis une copie concaténant table
+    /// et blob — et ne rentrait pas dans seize gigaoctets.
+    ///
+    /// Le tampon d'écriture fait un mégaoctet, donc la charge utile ici est
+    /// plus grosse que lui : une tuile minuscule resterait légitimement dans
+    /// le tampon et le test ne prouverait rien.
+    #[test]
+    fn the_payloads_reach_the_disk_before_the_pack_is_finished() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spill = dir.path().join("blob.part");
+        let mut w = PackWriter::new("s", [0.0; 3], &spill).expect("spill");
+
+        let mut fat = a_tile(7, 100);
+        // Incompressible, et vraiment.
+        //
+        // Première tentative : `(i * K).to_le_bytes()[0]`, qui a l'air
+        // désordonné et ne l'est pas — l'octet de poids faible d'une
+        // multiplication par un impair boucle toutes les 256 valeurs. LZ4 a
+        // ramené trois mégaoctets sous le mégaoctet du tampon d'écriture, le
+        // fichier est resté à zéro, et le test a accusé le writer. Un
+        // xorshift n'a pas cette période.
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        fat.positions = (0..3_000_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state & 0xff) as u8
+            })
+            .collect();
+        w.frame(1, a_view(0.0), [fat]);
+
+        let on_disk = std::fs::metadata(&spill).expect("stat").len();
+        assert!(
+            on_disk > 1 << 20,
+            "le blob n'a que {on_disk} octets sur disque : le writer le retient \
+             encore, et le pic est reparti pour croître avec le film"
+        );
+    }
+
+    /// Une tuile en attente ne coûte que ses métadonnées.
+    ///
+    /// Si quelqu'un remet un `Vec<u8>` dans `StoredTile`, la structure grossit
+    /// et le pic redevient proportionnel au nombre de tuiles uniques —
+    /// silencieusement, parce que tout continue de marcher sur un pack court.
+    #[test]
+    fn a_pending_tile_is_metadata_and_nothing_else() {
+        let size = std::mem::size_of::<StoredTile>();
+        assert!(
+            size <= 200,
+            "StoredTile fait {size} octets : quelque chose y porte à nouveau \
+             des données, et non cinq Blocks et des scalaires"
+        );
+    }
+
+    /// Le digest incrémental est le digest tout court.
+    ///
+    /// `blob_digest` couvre le blob entier, et il n'y a plus de blob entier à
+    /// hacher : il est replié morceau par morceau. Un repli qui diverge du
+    /// calcul en une fois ferait échouer l'ouverture de chaque pack, avec un
+    /// message parlant de corruption.
+    #[test]
+    fn folding_the_digest_in_pieces_matches_hashing_it_whole() {
+        let bytes: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let whole = fnv1a(&bytes);
+        let mut folded = FNV_OFFSET;
+        for chunk in bytes.chunks(7) {
+            folded = fnv1a_fold(folded, chunk);
+        }
+        assert_eq!(folded, whole);
+    }
+
+    /// Un writer jetable, et les octets qu'il finit par produire.
+    ///
+    /// Chaque test écrit deux vrais fichiers — le déversoir et le pack — parce
+    /// qu'il n'y a plus qu'un chemin. Un raccourci en mémoire pour les tests
+    /// remettrait exactement l'asymétrie qu'on vient de retirer : le court
+    /// éprouvé, le long exécuté pour de bon. C'est ainsi qu'un pic de mémoire
+    /// trois fois trop gros a tenu jusqu'à ce qu'une cuisson d'une minute le
+    /// rencontre.
+    struct Bake {
+        dir: tempfile::TempDir,
+        writer: Option<PackWriter>,
+    }
+
+    impl Bake {
+        fn new(scene: &str, origin: [f64; 3]) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let writer = PackWriter::new(scene, origin, dir.path().join("blob.part"))
+                .expect("opening the spill");
+            Self {
+                dir,
+                writer: Some(writer),
+            }
+        }
+
+        fn with(mut self, f: impl FnOnce(PackWriter) -> PackWriter) -> Self {
+            self.writer = Some(f(self.writer.take().expect("writer")));
+            self
+        }
+
+        fn frame(
+            &mut self,
+            frame: u32,
+            view: BakedView,
+            tiles: impl IntoIterator<Item = BakedTile>,
+        ) {
+            self.writer
+                .as_mut()
+                .expect("writer")
+                .frame(frame, view, tiles);
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            let out = self.dir.path().join("pack.tuilepack");
+            self.writer
+                .take()
+                .expect("writer")
+                .finish_to(&out)
+                .expect("finish_to");
+            std::fs::read(&out).expect("reading the pack back")
+        }
+    }
+
     use super::*;
 
     fn a_view(km_east: f64) -> BakedView {
@@ -620,7 +1087,7 @@ mod tests {
     /// match the one it was supposed to reproduce. Byte for byte, or nothing.
     #[test]
     fn a_tile_survives_the_round_trip_byte_for_byte() {
-        let mut w = PackWriter::new("scene-abc", [1.0, 2.0, 3.0]);
+        let mut w = Bake::new("scene-abc", [1.0, 2.0, 3.0]);
         let a = a_tile(7, 100);
         let b = a_tile(9, 200);
         w.frame(1, a_view(0.0), [a.clone(), b.clone()]);
@@ -640,7 +1107,7 @@ mod tests {
     /// long shot is not the sum of its frames.
     #[test]
     fn the_same_tile_at_the_same_draping_is_stored_once() {
-        let mut w = PackWriter::new("s", [0.0; 3]);
+        let mut w = Bake::new("s", [0.0; 3]);
         for frame in 1..=40u32 {
             w.frame(frame, a_view(f64::from(frame)), [a_tile(7, 100)]);
         }
@@ -660,7 +1127,7 @@ mod tests {
     /// Deduplicating on the id alone would hand frame 40 the pixels of frame 1.
     #[test]
     fn a_redraped_tile_is_a_different_tile() {
-        let mut w = PackWriter::new("s", [0.0; 3]);
+        let mut w = Bake::new("s", [0.0; 3]);
         w.frame(1, a_view(0.0), [a_tile(7, 100)]);
         w.frame(2, a_view(1.0), [a_tile(7, 200)]);
         let bytes = w.finish();
@@ -672,7 +1139,7 @@ mod tests {
 
     #[test]
     fn the_wrong_scene_is_refused_rather_than_rendered() {
-        let bytes = PackWriter::new("scene-abc", [0.0; 3]).finish();
+        let bytes = Bake::new("scene-abc", [0.0; 3]).finish();
         let pack = Pack::open(&bytes).expect("opens");
         assert!(pack.expect_scene("scene-abc").is_ok());
         assert!(matches!(
@@ -683,11 +1150,65 @@ mod tests {
 
     /// A pack baked under a known-imperfect cull must never pass for a good
     /// one: the admission travels with the data.
+    /// Une image n'est pas recompressée, la géométrie l'est.
+    ///
+    /// Mesuré sur une cuisson de 24 frames en septembre 2026 : le LZ4 rend les
+    /// PNG **plus gros** de 0,2 %, et ils font 94 % des octets d'un pack. On
+    /// payait donc une compression à la cuisson et une décompression à chaque
+    /// lecture pour perdre de la place. La géométrie, elle, gagne 26 à 48 %.
+    ///
+    /// Le test porte sur les deux moitiés de la règle : retirer la première
+    /// referait grossir le pack, retirer la seconde le ferait doubler.
+    #[test]
+    fn an_already_compressed_payload_is_not_compressed_again() {
+        let mut w = Bake::new("s", [0.0; 3]);
+        w.frame(1, a_view(0.0), [a_tile(1, 1)]);
+        let bytes = w.finish();
+        let pack = Pack::open(&bytes).expect("opens");
+        let tiles = pack.frame(1).expect("the frame");
+        let tile = tiles.first().expect("one tile");
+
+        let texture = tile.texture().expect("a textured tile");
+        assert_eq!(
+            texture.stored(),
+            texture.raw(),
+            "un PNG est déjà compressé : stocké tel quel, les deux longueurs \
+             sont la même"
+        );
+
+        // La géométrie, elle, passe bien par LZ4 — vérifié en la décodant,
+        // pas en mesurant un ratio : les octets de cette fixture sont
+        // synthétiques et ne se compressent pas, si bien qu'un test sur la
+        // taille ne dirait rien du code. Le gain réel (26 à 48 %) se mesure
+        // sur un vrai pack, et c'est la mesure citée en tête de
+        // `carries_its_own_compression`.
+        let source = a_tile(1, 1);
+        for (block, what, want) in [
+            (tile.positions(), "positions", &source.positions),
+            (tile.normals(), "normals", &source.normals),
+            (tile.uvs(), "uvs", &source.uvs),
+            (tile.indices(), "indices", &source.indices),
+        ] {
+            let block = block.expect(what);
+            assert_eq!(
+                &pack.payload(block, "geometry").expect("décode"),
+                want,
+                "{what} doit se décoder par LZ4 et rendre ses octets"
+            );
+        }
+
+        // Et le tour complet reste exact : une règle d'écriture ne vaut que si
+        // la lecture applique la même.
+        let baked = pack.baked(tile).expect("decodes");
+        assert_eq!(baked.texture.as_deref(), source.texture.as_deref());
+        assert_eq!(baked.positions, source.positions);
+    }
+
     #[test]
     fn the_pack_carries_how_it_was_culled() {
-        let bytes = PackWriter::new("s", [0.0; 3]).culling("disabled").finish();
+        let bytes = Bake::new("s", [0.0; 3]).with(|w| w.culling("disabled")).finish();
         assert_eq!(Pack::open(&bytes).expect("opens").culling(), "disabled");
-        let bytes = PackWriter::new("s", [0.0; 3]).finish();
+        let bytes = Bake::new("s", [0.0; 3]).finish();
         assert_eq!(Pack::open(&bytes).expect("opens").culling(), "full");
     }
 
@@ -699,7 +1220,7 @@ mod tests {
     /// corrupt byte agree perfectly.
     #[test]
     fn a_payload_damaged_in_transit_is_caught_at_open() {
-        let mut w = PackWriter::new("s", [0.0; 3]);
+        let mut w = Bake::new("s", [0.0; 3]);
         w.frame(1, a_view(0.0), [a_tile(1, 1)]);
         let mut bytes = w.finish();
         assert!(Pack::open(&bytes).is_ok());
@@ -717,7 +1238,7 @@ mod tests {
             Pack::open(b"not a pack at all"),
             Err(PackError::NotAPack)
         ));
-        let mut bytes = PackWriter::new("s", [0.0; 3]).finish();
+        let mut bytes = Bake::new("s", [0.0; 3]).finish();
         bytes.truncate(MAGIC.len() + 4);
         assert!(matches!(Pack::open(&bytes), Err(PackError::NotAPack)));
     }
@@ -727,7 +1248,7 @@ mod tests {
     /// through Hydra decomposed.
     #[test]
     fn a_camera_that_drifted_in_its_last_bits_still_finds_its_frame() {
-        let mut w = PackWriter::new("s", [0.0; 3]);
+        let mut w = Bake::new("s", [0.0; 3]);
         w.frame(1, a_view(0.0), [a_tile(1, 1)]);
         w.frame(2, a_view(1.0), [a_tile(2, 1)]);
         w.frame(3, a_view(2.0), [a_tile(3, 1)]);
@@ -747,7 +1268,7 @@ mod tests {
     /// rendering the wrong ground, successfully.
     #[test]
     fn a_camera_from_another_shot_is_refused_not_approximated() {
-        let mut w = PackWriter::new("s", [0.0; 3]);
+        let mut w = Bake::new("s", [0.0; 3]);
         w.frame(1, a_view(0.0), [a_tile(1, 1)]);
         let bytes = w.finish();
         let pack = Pack::open(&bytes).expect("opens");
@@ -766,7 +1287,7 @@ mod tests {
 
     #[test]
     fn a_frame_the_pack_does_not_hold_is_an_error_not_an_empty_selection() {
-        let mut w = PackWriter::new("s", [0.0; 3]);
+        let mut w = Bake::new("s", [0.0; 3]);
         w.frame(1, a_view(0.0), [a_tile(1, 1)]);
         let bytes = w.finish();
         let pack = Pack::open(&bytes).expect("opens");
@@ -777,8 +1298,20 @@ mod tests {
 /// FNV-1a over a byte run. Stable across processes and architectures, which is
 /// the only property that matters for something written on one machine and
 /// checked on another.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
 fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    fnv1a_fold(FNV_OFFSET, bytes)
+}
+
+/// FNV-1a continued from a running state.
+///
+/// The blob no longer exists as one slice — it is written as it is produced —
+/// so `blob_digest` is folded in chunk by chunk. FNV-1a is a pure fold over
+/// bytes, so this is the same number the one-shot version gives for the same
+/// stream; [`fnv1a`] is now that fold started from the offset basis, and the
+/// tests hold the two against each other.
+fn fnv1a_fold(mut hash: u64, bytes: &[u8]) -> u64 {
     for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);

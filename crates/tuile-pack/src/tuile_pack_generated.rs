@@ -94,12 +94,11 @@ impl<'a> ::flatbuffers::Verifiable for TextureFormat {
 }
 
 impl ::flatbuffers::SimpleToVerifyInSlice for TextureFormat {}
-/// One payload, as a run of LZ4 bytes in the blob region that follows the
-/// table.
+/// One payload in the blob region that follows the table.
 ///
 /// Compression and zero-copy do not contradict each other once they are
 /// separated: the structure is read in place, and each payload is an
-/// independent block decompressed only if something asks for it.
+/// independent block, decoded only if something asks for it.
 // struct Block, aligned to 8
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq)]
@@ -230,7 +229,9 @@ impl<'a> Block {
     }
   }
 
-  /// Bytes after decompression. Known in advance, so a reader allocates once.
+  /// Bytes once decoded. Known in advance, so a reader allocates once. Equal
+  /// to `stored` for a payload stored as produced — see `Tile.texture_format`,
+  /// which is what says whether the texture block was compressed at all.
   pub fn raw(&self) -> u32 {
     let mut mem = ::core::mem::MaybeUninit::<<u32 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
     // Safety:
