@@ -709,14 +709,16 @@ fn bake(args: Args) -> Result<(), String> {
     // What the pack already holds, shared with the loader so it never fetches
     // a drape twice.
     //
-    // The pack is the authority; this mirrors it for the one caller that has
-    // to know the answer *before* the request goes out. A mirror rather than
-    // the index itself because the loader asks from a worker thread, deep
-    // inside a fetch, while the writer is borrowed mutably by the frame loop.
+    // The pack is the authority — `FrameWriter::push_known` reads its real
+    // index — and this mirrors it for the one caller that has to know the
+    // answer *before* the request goes out. It is a mirror rather than the
+    // index itself because the loader asks from a worker thread, deep inside a
+    // fetch, while the writer is being borrowed mutably by the frame loop.
     //
     // A divergence cannot pass silently: a tile the loader withheld arrives
-    // with no imagery, and `baked_tile` refuses a drape with no texture
-    // rather than storing bare ground.
+    // with no imagery, so if `push_known` then fails to find it, `baked_tile`
+    // is called and refuses a drape with no texture rather than storing bare
+    // ground.
     let already_packed: std::sync::Arc<
         std::sync::Mutex<std::collections::HashSet<(u64, u64)>>,
     > = std::sync::Arc::default();
@@ -780,20 +782,12 @@ fn bake(args: Args) -> Result<(), String> {
             .frame(vec![view])
             .map_err(|e| format!("frame {number}: {e}"))?;
 
-        let mut tiles = Vec::with_capacity(frame.tiles.len());
-        for (index, tile) in frame.tiles.iter().enumerate() {
-            tiles.push(baked_tile(&frame, index, tile)?);
-            if let Ok(mut held) = already_packed.lock() {
-                held.insert((tile.tile.0, tile.drape()));
-            }
-        }
-        let selected = tiles.len();
         // The camera goes in beside the tiles, because that is what a render
         // will address this frame by. A renderer cooks at a timecode and hands
         // the session a camera, never a frame number — so a pack that could
         // only be looked up by index would be unusable by the very thing it is
         // baked for.
-        writer.frame(
+        let mut open = writer.begin_frame(
             number,
             tuile_pack::BakedView {
                 position: pose.position,
@@ -802,11 +796,37 @@ fn bake(args: Args) -> Result<(), String> {
                 viewport_px: [args.viewport.0, args.viewport.1],
                 fovy_rad: pose.fovy,
             },
-            tiles,
         );
+        // One tile at a time, and only the ones the pack does not already
+        // hold.
+        //
+        // Both halves of this used to be waste. The frame's tiles were built
+        // into a vector first — every PNG and every geometry buffer of the
+        // selection alive at once, on top of the frame they came from — and
+        // handed to a writer that compresses and spills them one by one
+        // anyway. And an orbit re-selects almost the same ground every frame,
+        // so most of what was built was immediately dropped as a duplicate:
+        // after frame 1 this skips the PNG clone and the four buffer
+        // conversions for every tile already stored, and touches nothing but
+        // the index.
+        let mut selected = 0usize;
+        let mut reused = 0usize;
+        for (index, tile) in frame.tiles.iter().enumerate() {
+            selected += 1;
+            if open.push_known(tile.tile.0, tile.drape()) {
+                reused += 1;
+                continue;
+            }
+            open.push(baked_tile(&frame, index, tile)?);
+            if let Ok(mut held) = already_packed.lock() {
+                held.insert((tile.tile.0, tile.drape()));
+            }
+        }
+        open.end();
         tracing::info!(
             frame = number,
             selected,
+            reused,
             seconds = at.elapsed().as_secs_f64(),
             "BAKE-FRAME"
         );

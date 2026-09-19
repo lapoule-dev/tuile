@@ -384,6 +384,37 @@ impl PackWriter {
         self
     }
 
+    /// Whether this identity is already stored, and so needs no bytes.
+    ///
+    /// A camera orbit re-selects nearly the same tiles every frame, and every
+    /// one of them arrives here already held. Asking first lets a caller skip
+    /// building the tile at all — the PNG, the four geometry buffers — instead
+    /// of building it so that [`PackWriter::frame`] can drop it. See
+    /// [`FrameWriter::push_known`].
+    pub fn holds(&self, id: u64, drape: u64) -> bool {
+        self.index.contains_key(&(id, drape))
+    }
+
+    /// Opens a frame that takes its tiles **one at a time**.
+    ///
+    /// [`PackWriter::frame`] wants every tile of the frame at once, so a caller
+    /// builds them all into a vector first: for one frame that is every PNG and
+    /// every geometry buffer of the selection, alive together, on top of the
+    /// frame they were built from. The writer does not need them together — it
+    /// compresses and spills each one as it arrives — so this hands them over
+    /// as they are made and the peak becomes one tile.
+    ///
+    /// It also lets the caller propagate an error from the middle of a frame,
+    /// which an `IntoIterator<Item = BakedTile>` cannot.
+    pub fn begin_frame(&mut self, frame: u32, view: BakedView) -> FrameWriter<'_> {
+        FrameWriter {
+            writer: self,
+            frame,
+            view,
+            refs: Vec::new(),
+        }
+    }
+
     /// Adds one frame's selection, deduplicating tiles against every frame
     /// already added.
     pub fn frame(
@@ -392,8 +423,16 @@ impl PackWriter {
         view: BakedView,
         tiles: impl IntoIterator<Item = BakedTile>,
     ) {
-        let mut refs = Vec::new();
+        let mut open = self.begin_frame(frame, view);
         for tile in tiles {
+            open.push(tile);
+        }
+        open.end();
+    }
+
+    /// Stores one tile if it is new, and says where it landed.
+    fn intern(&mut self, tile: BakedTile) -> u32 {
+        {
             let key = (tile.id, tile.drape);
             let at = match self.index.get(&key) {
                 Some(&at) => at,
@@ -427,9 +466,8 @@ impl PackWriter {
                     at
                 }
             };
-            refs.push(at);
+            at
         }
-        self.frames.push((frame, view, refs));
     }
 
     /// Compresses one payload into the blob and describes where it landed.
@@ -478,6 +516,57 @@ impl PackWriter {
         Ok(written)
     }
 
+}
+
+/// One frame being filled, tile by tile.
+///
+/// Dropping it without calling [`FrameWriter::end`] discards the frame rather
+/// than recording a half one: a pack whose frame is missing tiles renders bare
+/// ground and reports success, which is the single thing this format must never
+/// do.
+pub struct FrameWriter<'a> {
+    writer: &'a mut PackWriter,
+    frame: u32,
+    view: BakedView,
+    refs: Vec<u32>,
+}
+
+impl FrameWriter<'_> {
+    /// Whether this identity is already stored. See [`PackWriter::holds`].
+    pub fn holds(&self, id: u64, drape: u64) -> bool {
+        self.writer.holds(id, drape)
+    }
+
+    /// Records a tile the pack already holds, carrying no bytes for it.
+    ///
+    /// Returns `false` — and records nothing — when the identity is not there,
+    /// which can only mean the caller asked [`FrameWriter::holds`] about one
+    /// tile and pushed another. Silently dropping it would leave a frame short
+    /// of ground, so the caller is told.
+    #[must_use]
+    pub fn push_known(&mut self, id: u64, drape: u64) -> bool {
+        match self.writer.index.get(&(id, drape)) {
+            Some(&at) => {
+                self.refs.push(at);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Adds one tile, compressing and spilling it now.
+    pub fn push(&mut self, tile: BakedTile) {
+        let at = self.writer.intern(tile);
+        self.refs.push(at);
+    }
+
+    /// Closes the frame and records it.
+    pub fn end(self) {
+        self.writer.frames.push((self.frame, self.view, self.refs));
+    }
+}
+
+impl PackWriter {
     /// The one serialiser. `finish` and `finish_to` are the two ways to point
     /// it somewhere.
     fn write(mut self, out: &mut dyn std::io::Write) -> std::io::Result<u64> {
@@ -1036,6 +1125,10 @@ mod tests {
                 .frame(frame, view, tiles);
         }
 
+        fn writer(&mut self) -> &mut PackWriter {
+            self.writer.as_mut().expect("writer")
+        }
+
         fn finish(mut self) -> Vec<u8> {
             let out = self.dir.path().join("pack.tuilepack");
             self.writer
@@ -1048,6 +1141,57 @@ mod tests {
     }
 
     use super::*;
+
+    /// A tile the pack already holds costs nothing to reference.
+    ///
+    /// The point is not the bytes on disk — `frame` already deduplicated those
+    /// — it is that the caller never has to BUILD the duplicate. An orbit
+    /// re-selects almost the same ground every frame, and every one of those
+    /// tiles was being encoded to PNG, converted to four little-endian buffers
+    /// and then dropped by the writer as a duplicate.
+    ///
+    /// So the pack produced by referencing must be byte-identical to the pack
+    /// produced by building the tile again and letting the writer throw it
+    /// away. Anything less and this is a shortcut, not a saving.
+    #[test]
+    fn referencing_a_held_tile_builds_the_same_pack_as_rebuilding_it() {
+        let mut rebuilt = Bake::new("s", [0.0; 3]);
+        rebuilt.frame(1, a_view(0.0), [a_tile(7, 100)]);
+        rebuilt.frame(2, a_view(1.0), [a_tile(7, 100), a_tile(9, 100)]);
+        let rebuilt = rebuilt.finish();
+
+        let mut referenced = Bake::new("s", [0.0; 3]);
+        referenced.frame(1, a_view(0.0), [a_tile(7, 100)]);
+        {
+            let mut open = referenced.writer().begin_frame(2, a_view(1.0));
+            assert!(open.holds(7, 100), "frame 1 stored it");
+            assert!(open.push_known(7, 100), "and it can be referenced");
+            assert!(!open.holds(9, 100), "this one is new");
+            open.push(a_tile(9, 100));
+            open.end();
+        }
+        let referenced = referenced.finish();
+
+        assert_eq!(rebuilt, referenced, "the two packs differ");
+    }
+
+    /// And an identity the pack does not hold is refused rather than dropped.
+    ///
+    /// Recording nothing would leave that frame one tile short of its ground,
+    /// and a pack with a hole renders bare terrain and reports success — the
+    /// one failure this format must not have.
+    #[test]
+    fn an_unheld_identity_cannot_be_referenced() {
+        let mut bake = Bake::new("s", [0.0; 3]);
+        let mut open = bake.writer().begin_frame(1, a_view(0.0));
+        assert!(!open.push_known(7, 100), "nothing was ever stored");
+        // The same tile under a different drape is a different picture, and
+        // holding one must not answer for the other.
+        open.push(a_tile(7, 100));
+        assert!(!open.push_known(7, 101), "a redrape is not the same tile");
+        assert!(open.push_known(7, 100), "the one that was stored");
+        open.end();
+    }
 
     fn a_view(km_east: f64) -> BakedView {
         BakedView {
