@@ -227,6 +227,29 @@ pub struct Config {
     /// select for minutes of fetching on one frame. `f64::INFINITY` restores
     /// the unbounded decree.
     pub uniform_detail_radius: f64,
+    /// The width of the deadband around [`Self::maximum_screen_space_error`],
+    /// as a fraction of it. Default 0.15; zero restores the bare comparison.
+    ///
+    /// **Why a bare comparison is not enough.** `sse > τ` has no memory, so a
+    /// tile whose error sits at τ splits on one frame, merges on the next, and
+    /// splits again — for as long as the camera keeps it there. Two levels of
+    /// the same ground carry two different mosaics, so the surface changes
+    /// colour every frame. Seen on the Mediterranean, 19 September 2026: a
+    /// staircase of tiles along the coast, each a slightly different blue,
+    /// flickering. Over water it is glaring because the ground is otherwise
+    /// featureless and nothing hides the step.
+    ///
+    /// The cure is to make the decision sticky. A tile drawn at this level last
+    /// frame must get clearly *worse* than τ before it splits; a tile already
+    /// split must get clearly *better* before it merges back. Between the two
+    /// thresholds nothing moves, which is the whole point — the band has to be
+    /// wider than the frame-to-frame jitter of the error, and 15 % is.
+    ///
+    /// The previous frame is read from `rendered_last`. On the first frame that
+    /// set is empty and there is nothing to be sticky about, so the bare
+    /// comparison is used — otherwise every first frame would select one level
+    /// finer than every subsequent one.
+    pub refine_hysteresis: f64,
     /// Whether to drop tiles no view can see. Off is a diagnostic, not a mode.
     ///
     /// A culled tile is reported *ready* so that it never holds up an ancestor's
@@ -378,6 +401,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             maximum_screen_space_error: 16.0,
+            refine_hysteresis: 0.15,
             forbid_holes: true,
             stand_ins: true,
             uniform_detail: false,
@@ -823,7 +847,18 @@ fn visit(
     );
     // Refine when too coarse — or when there is nothing to render here
     // (structural empty tiles always descend).
-    let refines = has_children && (sse > config.maximum_screen_space_error || !has_content);
+    // La bande morte : voir `Config::refine_hysteresis`. Sans mémoire de la
+    // frame précédente il n'y a rien à stabiliser, et le seuil nu s'applique.
+    let threshold = if config.refine_hysteresis <= 0.0 || rendered_last.is_empty() {
+        config.maximum_screen_space_error
+    } else if rendered_last.contains(&id) {
+        // Dessinée ici la dernière fois : il faut nettement pire pour la couper.
+        config.maximum_screen_space_error * (1.0 + config.refine_hysteresis)
+    } else {
+        // Déjà coupée : il faut nettement mieux pour la recoller.
+        config.maximum_screen_space_error / (1.0 + config.refine_hysteresis)
+    };
+    let refines = has_children && (sse > threshold || !has_content);
 
     // Coarse ground over the whole visible region, held ready for a zoom-out.
     //
@@ -1731,6 +1766,98 @@ mod tests {
         );
     }
 
+    /// La bande morte, éprouvée là où elle sert : une caméra placée pour que
+    /// l'erreur de la racine tombe pile sur le seuil.
+    ///
+    /// Sans mémoire, `sse > τ` bascule au moindre frémissement — la tuile se
+    /// coupe une frame, se recolle la suivante, et comme deux niveaux portent
+    /// deux mosaïques différentes, le sol change de couleur à chaque image. Vu
+    /// sur la Méditerranée le 19 septembre 2026 : un escalier de tuiles le long
+    /// de la côte, chacune d'un bleu légèrement différent, clignotant.
+    ///
+    /// Ce que le test épingle, c'est la STABILITÉ, pas un compte : à erreur
+    /// égale, la décision doit dépendre de ce qui était dessiné avant, et
+    /// s'y tenir.
+    #[test]
+    fn a_tile_sitting_on_the_threshold_does_not_flip_flop() {
+        let ts = mini_tileset();
+        let root = ts.root();
+        let children = ts.tile(root).children.clone();
+        let mut residency = ResidencyView::default();
+        residency.insert(root);
+        for child in &children {
+            residency.insert(*child);
+        }
+
+        // La distance qui met l'erreur de la racine exactement au seuil : on la
+        // cherche, plutôt que de la coder en dur, pour que le test survive à un
+        // changement de géométrie du jeu d'essai.
+        let config = Config::default();
+        let tau = config.maximum_screen_space_error;
+        let sse_at = |d: f64| {
+            let v = camera_at(d);
+            v.screen_space_error(ts.tile(root).geometric_error, d)
+        };
+        let (mut lo, mut hi) = (1.0_f64, 100_000.0_f64);
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if sse_at(mid) > tau { lo = mid } else { hi = mid }
+        }
+        let on_threshold = 0.5 * (lo + hi);
+
+        // Dessinée à ce niveau la frame d'avant : elle doit y rester.
+        let was_drawn: HashSet<TileId> = std::iter::once(root).collect();
+        let kept = run_with(&ts, &residency, &[camera_at(on_threshold)], &config, &was_drawn);
+        assert!(
+            ids(&kept.selected).contains(&root),
+            "une tuile déjà dessinée à ce niveau s'est coupée sur un seuil frôlé"
+        );
+
+        // Déjà coupée la frame d'avant : elle doit le rester.
+        let was_split: HashSet<TileId> = children.iter().copied().collect();
+        let split = run_with(&ts, &residency, &[camera_at(on_threshold)], &config, &was_split);
+        assert!(
+            !ids(&split.selected).contains(&root),
+            "une tuile déjà coupée s'est recollée sur le même seuil frôlé"
+        );
+    }
+
+    /// Et la bande morte se débranche : à zéro, c'est la comparaison nue, donc
+    /// la même décision des deux côtés. C'est la preuve que le test précédent
+    /// mesure bien l'hystérésis et non un artefact du jeu d'essai.
+    #[test]
+    fn without_the_deadband_the_two_histories_agree() {
+        let ts = mini_tileset();
+        let root = ts.root();
+        let children = ts.tile(root).children.clone();
+        let mut residency = ResidencyView::default();
+        residency.insert(root);
+        for child in &children {
+            residency.insert(*child);
+        }
+        let config = Config {
+            refine_hysteresis: 0.0,
+            ..Config::default()
+        };
+        let tau = config.maximum_screen_space_error;
+        let sse_at = |d: f64| camera_at(d).screen_space_error(ts.tile(root).geometric_error, d);
+        let (mut lo, mut hi) = (1.0_f64, 100_000.0_f64);
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if sse_at(mid) > tau { lo = mid } else { hi = mid }
+        }
+        let d = 0.5 * (lo + hi);
+        let a = run_with(&ts, &residency, &[camera_at(d)], &config,
+                         &std::iter::once(root).collect());
+        let b = run_with(&ts, &residency, &[camera_at(d)], &config,
+                         &children.iter().copied().collect());
+        assert_eq!(
+            ids(&a.selected).contains(&root),
+            ids(&b.selected).contains(&root),
+            "sans bande morte, l'histoire ne devrait rien changer"
+        );
+    }
+
     fn run(ts: &Tileset, residency: &ResidencyView, views: &[ViewState]) -> TraversalOutput {
         run_with(ts, residency, views, &Config::default(), &HashSet::new())
     }
@@ -1812,9 +1939,11 @@ mod tests {
             "the far branch holds coarse by default"
         );
 
-        let mut uniform = Config::default();
-        uniform.uniform_detail = true;
-        uniform.uniform_detail_radius = f64::INFINITY;
+        let mut uniform = Config {
+            uniform_detail: true,
+            uniform_detail_radius: f64::INFINITY,
+            ..Config::default()
+        };
         let uniform_wants = wants(&uniform);
         assert!(uniform_wants.contains(&near_leaf));
         assert!(
@@ -1894,8 +2023,10 @@ mod tests {
         );
         let residency = ResidencyView::default();
         let last = HashSet::new();
-        let mut uniform = Config::default();
-        uniform.uniform_detail = true;
+        let uniform = Config {
+            uniform_detail: true,
+            ..Config::default()
+        };
         let out = run_with(&ts, &residency, &[view], &uniform, &last);
         assert!(out.stats.culled > 0, "the far corners are culled");
     }
