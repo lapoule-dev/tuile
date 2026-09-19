@@ -55,9 +55,14 @@ struct TuileViewFromCamera
     /// usable transform, which is the one case a caller must not paper over: a
     /// view built from an identity matrix selects tiles at the centre of the
     /// Earth.
+    /// `anchor` is the reading prim's own path, which is how the scene
+    /// globals are found in a host that prefixed the stage — see
+    /// `hostpaths.h`. `cameraPath` is expected to be in the host's namespace
+    /// already, because the caller resolved it there.
     static bool Read(
         const HdSceneIndexBaseRefPtr &scene,
         const SdfPath &cameraPath,
+        const SdfPath &anchor,
         const double renderOrigin[3],
         const double fallbackViewportPx[2],
         TuileViewState *out);
@@ -70,6 +75,7 @@ struct TuileViewFromCamera
     /// detail, so it is worth knowing which happened.
     static bool ResolutionFromRenderSettings(
         const HdSceneIndexBaseRefPtr &scene,
+        const SdfPath &anchor,
         double out[2]);
 };
 
