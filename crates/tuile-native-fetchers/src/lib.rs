@@ -64,18 +64,44 @@ fn is_retryable_status(status: u16) -> bool {
 /// of a long render; a malformed URL or a body-decode failure will fail
 /// identically forever.
 fn is_retryable_transport(error: &reqwest_middleware::Error) -> bool {
-    let reqwest_middleware::Error::Reqwest(e) = error else {
-        // A middleware error is ours, not the network's.
-        return false;
-    };
-    e.is_timeout() || e.is_connect() || e.is_request()
+    match error {
+        reqwest_middleware::Error::Reqwest(e) => {
+            e.is_timeout() || e.is_connect() || e.is_request()
+        }
+        // A middleware error is NOT "ours rather than the network's" — that
+        // reading cost a whole render.
+        //
+        // The cache middleware wraps the request, so a dropped connection
+        // comes back through it, dressed as `Cache error: error sending
+        // request for url ...`. Classified as internal, it was never retried:
+        // three sockets lost out of six hundred issued at once ended the frame,
+        // and the procedural emitted nothing rather than a partial globe —
+        // a black image, in a video nobody was going to inspect frame by frame
+        // (measured, 2026-09-08).
+        //
+        // So: look through the chain for the transport error the middleware is
+        // carrying and classify that. And when there is none to find, retry
+        // anyway. A GET is idempotent, the attempt count is small, and the two
+        // ways of being wrong are not comparable — a needless retry costs a
+        // round trip, a missing one costs the frame.
+        reqwest_middleware::Error::Middleware(e) => e
+            .chain()
+            .find_map(|source| source.downcast_ref::<reqwest::Error>())
+            .is_none_or(|e| e.is_timeout() || e.is_connect() || e.is_request()),
+    }
 }
 
 /// How hard to try before giving up on a request.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
-    /// Total attempts, including the first. `1` disables retrying.
-    pub attempts: u32,
+    /// Total attempts, including the first. `Some(1)` disables retrying.
+    ///
+    /// `None` is **unlimited**: keep trying until the caller's own deadline
+    /// stops us. It is not a way to hang — an unbounded retry still sleeps its
+    /// backoff between attempts, so the caller's timeout cuts it — but it does
+    /// move the bound out of this struct and into whoever set that deadline. A
+    /// caller that has none must not ask for it.
+    pub attempts: Option<u32>,
     /// Delay before the second attempt; doubles thereafter.
     pub initial_backoff: Duration,
     /// Ceiling on that doubling.
@@ -87,7 +113,7 @@ impl Default for RetryConfig {
         Self {
             // Three attempts covers the single dropped connection and the brief
             // 503 without turning a genuinely dead endpoint into a long wait.
-            attempts: 3,
+            attempts: Some(3),
             initial_backoff: Duration::from_millis(200),
             max_backoff: Duration::from_secs(5),
         }
@@ -98,8 +124,50 @@ impl RetryConfig {
     /// No retrying — one attempt, and its answer is the answer.
     pub fn none() -> Self {
         Self {
-            attempts: 1,
+            attempts: Some(1),
             ..Self::default()
+        }
+    }
+
+    /// For work that is offline, long, and all-or-nothing.
+    ///
+    /// The default's three attempts are sized for a viewer, where a tile that
+    /// will not come is better skipped than waited for: a person is watching,
+    /// and the next frame is in sixteen milliseconds. A bake is the opposite on
+    /// every count. Nobody is watching, the frame it is resolving must be exact
+    /// — a pack with a hole in it is a film with a hole in it — and giving up
+    /// throws away everything already baked.
+    ///
+    /// Measured, 19 September 2026: a two-minute bake died at **frame 2807 of
+    /// 2880**, twenty-seven minutes in, on a single `http status 500` for one
+    /// imagery tile. The origin was fine moments later. Three attempts spanning
+    /// about five seconds were simply not patient enough for a blip.
+    ///
+    /// Ten attempts doubling to a thirty-second ceiling is just over two
+    /// minutes of insistence on one tile — 0,5 + 1 + 2 + 4 + 8 + 16 + 30 + 30 +
+    /// 30 secondes. That is nothing against the twenty-seven it protects, and it
+    /// is still bounded: an endpoint that is genuinely down still fails, just
+    /// not on its first bad second. The fetches are concurrent, so this is the
+    /// worst case for the bake as a whole, not per tile.
+    pub fn patient() -> Self {
+        Self {
+            // Unlimited, and the bound moves to the frame.
+            //
+            // Ten attempts was the first answer and it was the wrong shape: it
+            // put a ceiling here, in a struct that knows nothing about how long
+            // the work is allowed to take, and that ceiling then contradicted
+            // the one that did know. 182 s of budget against a 120 s frame —
+            // the chain could never finish, and frame 1 died every time.
+            //
+            // A bake is all-or-nothing and nobody is watching: there is no
+            // number of attempts after which giving up is *better*, because
+            // giving up throws away every frame already cooked. So this keeps
+            // trying, and the frame's own deadline decides when the shot is
+            // genuinely lost. One bound, held by the one place that knows what
+            // it is bounding.
+            attempts: None,
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(30),
         }
     }
 
@@ -110,6 +178,26 @@ impl RetryConfig {
     /// same purpose as jitter — a thousand tiles that failed together must not
     /// retry together — while leaving a single request's timing reproducible,
     /// which is what a farm comparing two renders needs.
+    /// The longest this profile can spend on one request before giving up,
+    /// counting only the waiting.
+    ///
+    /// **Whoever bounds a frame has to know this number.** A retry profile and a
+    /// frame timeout written apart from each other will contradict each other,
+    /// and the contradiction is invisible until a tile actually needs its
+    /// patience: measured 19 September 2026, `patient()` budgets 121 s of
+    /// backoff — 182 s once the spread is counted — against a frame timeout of
+    /// exactly 120 s. The retry chain could never finish inside a frame, so one
+    /// unlucky tile failed frame 1 of a 2880-frame bake, every time, with no
+    /// line in the log to say why.
+    ///
+    /// The spread is taken at its maximum (+50 %), because a bound that holds
+    /// on average is not a bound. What this cannot cover is `Retry-After`: that
+    /// delay belongs to the origin and has no ceiling we get to choose.
+    pub fn budget(&self) -> Option<Duration> {
+        let attempts = self.attempts?;
+        Some((1..attempts).map(|a| self.backoff(a, 499)).sum())
+    }
+
     fn backoff(&self, attempt: u32, spread: u64) -> Duration {
         let doublings = attempt.saturating_sub(1).min(16);
         let base = self
@@ -170,6 +258,22 @@ pub fn default_cache_dir() -> PathBuf {
 #[error("native fetcher setup: {0}")]
 pub struct NativeFetchError(String);
 
+/// Keep-alive connections held per host.
+///
+/// Public because it is half of a pair: it is the figure a caller's fetch wave
+/// should be sized against. Over HTTP/2 this host opens one multiplexed
+/// connection and the server's stream limit — commonly 100 to 128 — decides
+/// what is really in flight, so a larger wave only builds a queue inside the
+/// client. Over HTTP/1.1 this is an *idle* limit rather than a concurrency cap,
+/// so a larger wave opens connections that are used once and dropped. Neither
+/// buys bandwidth; both cost memory, and the second costs handshakes.
+///
+/// The bulk path fired 256 against this 64, four times over-subscribed.
+///
+/// [`tuile_bake`]'s fetch wave defaults to this number for that reason; see the
+/// `TUILE_FETCHES` knob.
+pub const CONNECTIONS_PER_HOST: usize = 64;
+
 /// Capacities for the hybrid cache backing a [`NativeHttp`].
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
@@ -182,14 +286,35 @@ pub struct CacheConfig {
 }
 
 impl CacheConfig {
-    /// Defaults rooted at `dir`: 256 MiB RAM, 4 GiB disk.
+    /// Defaults rooted at `dir`: 256 MiB RAM, 4 GiB disk, each overridable.
+    ///
+    /// **`TUILE_CACHE_DISK_MB` exists because a disk is not always a disk.**
+    /// On Cloud Run the whole filesystem is a tmpfs, so this tier is RAM — but
+    /// RAM the process cannot see, cannot weigh and cannot evict, charged
+    /// against the container limit all the same. Four gibibytes of it is four
+    /// gibibytes the working set does not get, and a bake that has to hold
+    /// every tile of a frame at once notices. Where the tier is really backed
+    /// by a disk, leave it alone; where it is not, spend the bytes on
+    /// `TUILE_CACHE_MEMORY_MB` instead, which foyer bounds exactly.
     pub fn at(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
-            memory_bytes: 256 << 20,
-            disk_bytes: 4 << 30,
+            memory_bytes: mib("TUILE_CACHE_MEMORY_MB", 256),
+            disk_bytes: mib("TUILE_CACHE_DISK_MB", 4096),
         }
     }
+}
+
+/// A size in mebibytes from the environment, as bytes. Never zero: foyer wants
+/// a positive capacity, and a cache of nothing is better asked for by pointing
+/// it somewhere small than by tripping an assertion inside the engine.
+fn mib(name: &str, default_mib: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default_mib)
+        .max(1)
+        << 20
 }
 
 /// Everything a [`NativeHttp`] needs: where to cache, how long to wait, how
@@ -264,8 +389,9 @@ impl NativeHttp {
         let mut builder = reqwest::Client::builder()
             .user_agent(concat!("tuile/", env!("CARGO_PKG_VERSION")))
             // Saturate the fiber: keep many keep-alive connections per host so
-            // parallel tile/imagery requests don't serialize on the pool.
-            .pool_max_idle_per_host(32)
+            // parallel tile/imagery requests don't serialize on the pool —
+            // fewer and every wave pays reconnects between bursts.
+            .pool_max_idle_per_host(CONNECTIONS_PER_HOST)
             .cookie_store(true);
         if let Some(timeout) = cfg.request_timeout {
             builder = builder.timeout(timeout);
@@ -322,7 +448,7 @@ impl NativeHttp {
         let mut attempt = 1;
         loop {
             let outcome = self.get_once(url, bearer).await;
-            let last = attempt >= self.retry.attempts;
+            let last = self.retry.attempts.is_some_and(|max| attempt >= max);
 
             let wait = match &outcome {
                 Ok(response) => {
@@ -330,7 +456,7 @@ impl NativeHttp {
                     if !is_retryable_status(status) {
                         return outcome;
                     }
-                    tracing::debug!(%url, status, attempt, "retryable status");
+                    tracing::warn!(%url, status, attempt, "retryable status");
                     // The origin's own pacing wins over ours when it states one.
                     retry_after(response.headers())
                         .unwrap_or_else(|| self.retry.backoff(attempt, spread))
@@ -339,7 +465,7 @@ impl NativeHttp {
                     if !is_retryable_transport(error) {
                         return outcome;
                     }
-                    tracing::debug!(%url, attempt, %error, "retryable transport failure");
+                    tracing::warn!(%url, attempt, %error, "retryable transport failure");
                     self.retry.backoff(attempt, spread)
                 }
             };
@@ -484,6 +610,49 @@ mod tests {
         h
     }
 
+    /// The exact shape that ended a 48-frame render: a dropped connection,
+    /// wrapped by the cache middleware, reported as a middleware error.
+    #[test]
+    fn a_dropped_connection_wearing_the_cache_s_coat_is_retried() {
+        let error = reqwest_middleware::Error::Middleware(anyhow::anyhow!(
+            "Cache error: error sending request for url \
+             (https://ecn.t2.tiles.virtualearth.net/tiles/a111.jpeg)"
+        ));
+        assert!(
+            is_retryable_transport(&error),
+            "a transport failure is a transport failure whoever hands it over"
+        );
+    }
+
+    #[test]
+    fn a_middleware_error_carrying_a_connect_failure_is_retried() {
+        // A real reqwest error, made by connecting to a port nothing listens
+        // on — no network, no fixture, and genuinely the variant we classify.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let inner = runtime.block_on(async {
+            reqwest::Client::new()
+                .get("http://127.0.0.1:1/")
+                .send()
+                .await
+                .expect_err("nothing listens on port 1")
+        });
+        assert!(inner.is_connect(), "the fixture must be a connect error");
+        assert!(is_retryable_transport(&reqwest_middleware::Error::Reqwest(
+            inner
+        )));
+    }
+
+    #[test]
+    fn an_unrecognisable_middleware_error_is_retried_anyway() {
+        // Fail open: a GET is idempotent, and a needless round trip is not
+        // comparable to a lost frame.
+        let error = reqwest_middleware::Error::Middleware(anyhow::anyhow!("cache is on fire"));
+        assert!(is_retryable_transport(&error));
+    }
+
     #[test]
     fn max_age_is_read_from_cache_control() {
         assert_eq!(
@@ -533,10 +702,51 @@ mod tests {
         }
     }
 
+    /// Une cuisson n'abandonne pas d'elle-même ; un viewport, si.
+    ///
+    /// Compter les tentatives était la mauvaise mesure et l'a prouvé : dix
+    /// tentatives faisaient 182 s de budget dans une frame qui en accordait
+    /// 120, donc la chaîne ne pouvait jamais aboutir. La patience n'a plus de
+    /// plafond du tout — c'est la frame qui borne — et ce qui se teste ici est
+    /// que les deux profils disent bien des choses opposées.
+    #[test]
+    fn a_bake_never_gives_up_and_a_viewport_does() {
+        assert_eq!(
+            RetryConfig::patient().budget(),
+            None,
+            "une cuisson qui renonce jette tout ce qui est déjà cuit"
+        );
+        let default = RetryConfig::default()
+            .budget()
+            .expect("le défaut doit rester borné");
+        assert!(
+            default < Duration::from_secs(10),
+            "le défaut doit rester court pour un viewport: {default:?}"
+        );
+    }
+
+    /// Et l'infini n'est tenable que parce que l'attente a un plancher.
+    ///
+    /// Des tentatives illimitées avec un backoff qui s'effondre, ce n'est pas
+    /// de la patience, c'est un marteau sur l'origine — la façon exacte dont
+    /// une ferme se fait révoquer sa clef. Le plafond du doublement est ce qui
+    /// transforme « sans limite » en un goutte-à-goutte de trente secondes.
+    #[test]
+    fn unlimited_patience_still_waits_between_attempts() {
+        let patient = RetryConfig::patient();
+        assert_eq!(patient.attempts, None);
+        assert_eq!(
+            patient.backoff(u32::MAX, 0),
+            patient.max_backoff,
+            "une tentative très tardive doit encore attendre le plafond"
+        );
+        assert!(patient.max_backoff >= Duration::from_secs(30));
+    }
+
     #[test]
     fn backoff_doubles_and_then_stops() {
         let retry = RetryConfig {
-            attempts: 10,
+            attempts: Some(10),
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_millis(400),
         };
@@ -556,7 +766,7 @@ mod tests {
     #[test]
     fn backoff_survives_an_absurd_attempt_count() {
         let retry = RetryConfig {
-            attempts: u32::MAX,
+            attempts: Some(u32::MAX),
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(5),
         };
@@ -585,7 +795,7 @@ mod tests {
     #[test]
     fn the_spread_stays_within_half() {
         let retry = RetryConfig {
-            attempts: 3,
+            attempts: Some(3),
             initial_backoff: Duration::from_millis(200),
             max_backoff: Duration::from_secs(5),
         };
@@ -621,7 +831,7 @@ mod tests {
 
     #[test]
     fn retrying_can_be_switched_off() {
-        assert_eq!(RetryConfig::none().attempts, 1);
+        assert_eq!(RetryConfig::none().attempts, Some(1));
     }
 
     /// A farm node must be able to state its own deadline; the default is a

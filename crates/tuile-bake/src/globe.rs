@@ -17,11 +17,52 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tuile_bing::{BingImageryProvider, BingMetadata};
-use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
-use tuile_native_fetchers::NativeHttp;
-use tuile_planetary::{globe, GlobeOptions};
+use tuile_cesium_ion::{tms::TmsImagery, AssetEndpoint, IonClient, IonTerrainSource};
+use tuile_native_fetchers::{NativeHttp, RetryConfig, TransportConfig};
+use tuile_core::offload;
+use tuile_planetary::{globe_on, GlobeOptions, ImageryDetail, LayerBudget};
 
 use crate::session::{Session, SessionConfig};
+
+/// How many levels finer than the terrain the baked imagery may go.
+///
+/// Default +1, and that number is a MEMORY decision as much as a sharpness
+/// one: each extra level quadruples the imagery held per terrain tile (+4
+/// run locally ballooned to 60 GB allocated on a frame that never
+/// converged; measured the hard way). `TUILE_IMAGERY_BOOST=0` disables the
+/// boost outright — imagery exactly matches the terrain level — and a farm
+/// job raises it to taste, where the RAM is real. Whatever the value, it
+/// stays proportional per tile: one imagery level per terrain level, the
+/// How deep the quadtree may divide, from `TUILE_MAX_LEVEL`.
+///
+/// Unset means "as deep as the imagery provider goes", which is the right
+/// answer for a render. It is a knob because a diagnostic run wants to ask
+/// what a shallower globe would have selected, and because a number nobody
+/// can vary is a number nobody can rule out.
+fn max_level() -> Option<u32> {
+    std::env::var("TUILE_MAX_LEVEL")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|level| *level > 0)
+}
+
+/// checkerboard's cure.
+///
+/// Publique parce que le digest de scène doit la lire.
+///
+/// Ce plafond décide de combien de niveaux l'imagerie descend sous le terrain,
+/// donc il décide du CONTENU d'un pack. Il n'entrait pourtant pas dans le
+/// digest : mesuré le 17 septembre 2026, deux cuissons de la même trajectoire
+/// à boost 1 et boost 2 portaient le même nom de scène, `9fb2b0f3559debc6`, et
+/// se seraient donc répondu l'une pour l'autre. Il n'est pas lu par
+/// `exact_traversal` — c'est une option du chargeur, pas de la traversée — donc
+/// il fallait aller le chercher ici.
+pub fn imagery_boost_cap() -> u32 {
+    std::env::var("TUILE_IMAGERY_BOOST")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1)
+}
 
 /// ion's asset id for Cesium World Terrain.
 pub const CESIUM_WORLD_TERRAIN: i64 = 1;
@@ -44,6 +85,13 @@ pub struct GlobeConfig {
     /// on a shot whose frames overlap heavily that is the dominant cost long
     /// before the renderer is.
     pub cache_dir: Option<std::path::PathBuf>,
+    /// What the caller already holds, so its layers are never fetched.
+    ///
+    /// A bake writing a pack is the caller that has one: after the first frame
+    /// an orbit re-selects almost the same ground, and every one of those tiles
+    /// is already stored. See [`tuile_planetary::HeldDrape`], and
+    /// [`tuile_core::raster::drape_identity`] for what an identity is.
+    pub held_drape: Option<tuile_planetary::HeldDrape>,
     pub session: SessionConfig,
 }
 
@@ -55,6 +103,7 @@ impl GlobeConfig {
             terrain_asset_id: CESIUM_WORLD_TERRAIN,
             imagery_asset_id: Some(BING_AERIAL),
             cache_dir: None,
+            held_drape: None,
             session: SessionConfig::default(),
         }
     }
@@ -79,6 +128,15 @@ pub enum GlobeError {
     NotImagery(i64),
     #[error("bing: {0}")]
     Bing(String),
+    /// ion proxies an imagery provider this crate has no connector for.
+    ///
+    /// Named rather than mistreated: every imagery endpoint used to be handed
+    /// to the Bing path, so an Azure or Google asset failed with "endpoint has
+    /// no key" — a message about Bing, for an asset that is not Bing.
+    #[error("ion asset {asset} is {kind} imagery, and this build has no connector for it")]
+    UnsupportedImagery { asset: i64, kind: String },
+    #[error("ion imagery: {0}")]
+    Imagery(String),
 }
 
 impl Session {
@@ -96,11 +154,16 @@ impl Session {
         // Sources resolve on the session's own runtime rather than a temporary
         // one, so the connection pool and cache that serve this call are the
         // same ones that will serve every tile afterwards.
-        let (tree, loader) = runtime.block_on(resolve(&config))?;
+        let (tree, loader, detail) = runtime.block_on(resolve(&config))?;
 
         let mut session_config = config.session.clone();
         session_config.dataset = config.dataset_name();
-        Ok(Session::from_parts(runtime, tree, loader, session_config)?)
+        let mut session = Session::from_parts(runtime, tree, loader, session_config)?;
+        // The session drives imagery resolution from the camera each frame —
+        // decoupled from terrain LOD, so exposure seams between imagery
+        // capture batches stop lining up with terrain level boundaries.
+        session.set_imagery_detail(detail);
+        Ok(session)
     }
 }
 
@@ -171,17 +234,39 @@ async fn resolve(
     (
         Box<dyn tuile_core::source::TileTree>,
         Arc<dyn tuile_core::source::TileLoader>,
+        ImageryDetail,
     ),
     GlobeError,
 > {
+    // Not a budget — the count of imagery layers one drape may CARRY. The
+    // loader silently drops layers past it and the ground reverts to the
+    // coarse capture exactly where tiles straddle worst: measured as an
+    // exposure checkerboard across the whole frame, absent from the viewer
+    // over the same data. The bake runs on the CPU, where a layer costs a
+    // loop iteration and not a per-fragment fetch, so the ceiling applies.
+    let imagery_slots = LayerBudget::default();
+    imagery_slots.set_unbounded();
     // One pooled, cached transport drives ion and Bing both, so they share a
     // connection pool and a cache rather than competing for sockets.
-    let http = Arc::new(
-        match &config.cache_dir {
-            Some(dir) => NativeHttp::new(dir).await,
-            None => NativeHttp::shared().await,
+    // Patient, parce qu'une cuisson est tout-ou-rien.
+    //
+    // Le défaut — trois tentatives, cinq secondes — est dimensionné pour un
+    // viewport, où une tuile qui ne vient pas vaut mieux sautée qu'attendue.
+    // Ici c'est l'inverse : personne ne regarde, la frame doit être exacte, et
+    // abandonner jette tout ce qui est déjà cuit. Le 19 septembre 2026 une
+    // cuisson est morte à la frame 2807 sur 2880, après vingt-sept minutes, sur
+    // un unique `http status 500`. Voir `RetryConfig::patient`.
+    let transport = TransportConfig {
+        retry: RetryConfig::patient(),
+        ..match &config.cache_dir {
+            Some(dir) => TransportConfig::at(dir),
+            None => TransportConfig::at(tuile_native_fetchers::default_cache_dir()),
         }
-        .map_err(|e| GlobeError::Transport(e.to_string()))?,
+    };
+    let http = Arc::new(
+        NativeHttp::with_transport(transport)
+            .await
+            .map_err(|e| GlobeError::Transport(e.to_string()))?,
     );
 
     let terrain = IonTerrainSource::new(
@@ -196,16 +281,26 @@ async fn resolve(
     // Terrain only: a valid mode, and the one to reach for when the geometry
     // looks wrong and a texture is the last thing you want on top of it.
     let Some(imagery_asset_id) = config.imagery_asset_id else {
-        let (tree, loader, _detail, _heights) = globe(
+        // Decode and resample on a real pool: the bulk driver blocks one
+        // thread polling the server, and `globe()`'s inline offload would put
+        // every tile's decode on that same thread — measured at sixty-four
+        // loads in flight and one core busy.
+        let (tree, loader, detail, _heights) = globe_on(
             terrain,
             NoImagery,
             layer,
             GlobeOptions {
                 no_imagery: true,
-                ..Default::default()
+                max_level: max_level(),
+                imagery_slots: imagery_slots.clone(),
+                imagery_boost_cap: imagery_boost_cap(),
+                deterministic_floor: true,
+                held_drape: config.held_drape.clone(),
+                composed_at: config.session.bake_max_size,
             },
+            offload::threaded(),
         );
-        return Ok((tree, loader));
+        return Ok((tree, loader, detail));
     };
 
     let ion = IonClient::new(Arc::clone(&http), config.ion_token.clone());
@@ -218,32 +313,62 @@ async fn resolve(
         _ => return Err(GlobeError::NotImagery(imagery_asset_id)),
     };
 
-    let options = &endpoint.options;
-    let metadata_url = BingMetadata::metadata_url(
-        options
-            .url
-            .as_deref()
-            .ok_or_else(|| GlobeError::Bing("endpoint has no url".into()))?,
-        options.map_style.as_deref().unwrap_or("Aerial"),
-        options
-            .key
-            .as_deref()
-            .ok_or_else(|| GlobeError::Bing("endpoint has no key".into()))?,
-    );
-    let bing = BingImageryProvider::from_metadata_url(Arc::clone(&http), &metadata_url)
-        .await
-        .map_err(|e| GlobeError::Bing(e.to_string()))?;
+    let options = GlobeOptions {
+        no_imagery: false,
+        max_level: max_level(),
+        imagery_slots,
+        imagery_boost_cap: imagery_boost_cap(),
+        // On, and not a knob. Everything else in this crate is exact by
+        // construction — `exact_traversal` refuses stand-ins and forbids
+        // holes for the same reason — and a coarse layer chosen from
+        // whatever a bounded cache happens to hold is the last decision
+        // here that depends on how fast tiles arrived. It was measured
+        // re-draping 16 of 80 identically selected tiles between two runs
+        // of one frame.
+        deterministic_floor: true,
+        held_drape: config.held_drape.clone(),
+        composed_at: config.session.bake_max_size,
+    };
 
-    let (tree, loader, _detail, _heights) = globe(
-        terrain,
-        bing,
-        layer,
-        GlobeOptions {
-            no_imagery: false,
-            ..Default::default()
-        },
-    );
-    Ok((tree, loader))
+    // Ce que l'endpoint est, et non ce qu'on espère qu'il soit.
+    //
+    // Toute imagerie partait au chemin Bing, qui exige `options.key` : viser
+    // un asset hébergé par ion — Sentinel-2, 3954 — ne donnait pas une image
+    // douteuse, ça donnait « endpoint has no key », un message sur Bing pour
+    // un asset qui n'est pas Bing. `externalType` absent veut dire
+    // TileMapService, exactement la branche par défaut de cesium-native
+    // (`IonRasterOverlay.cpp`, le `else` après `BING`).
+    let (tree, loader, detail, _heights) = match endpoint.external_type.as_deref() {
+        None => {
+            let tms = TmsImagery::from_endpoint(ion, imagery_asset_id as u64, endpoint)
+                .await
+                .map_err(|e| GlobeError::Imagery(e.to_string()))?;
+            globe_on(terrain, tms, layer, options, offload::threaded())
+        }
+        Some("BING") => {
+            let o = &endpoint.options;
+            let metadata_url = BingMetadata::metadata_url(
+                o.url
+                    .as_deref()
+                    .ok_or_else(|| GlobeError::Bing("endpoint has no url".into()))?,
+                o.map_style.as_deref().unwrap_or("Aerial"),
+                o.key
+                    .as_deref()
+                    .ok_or_else(|| GlobeError::Bing("endpoint has no key".into()))?,
+            );
+            let bing = BingImageryProvider::from_metadata_url(Arc::clone(&http), &metadata_url)
+                .await
+                .map_err(|e| GlobeError::Bing(e.to_string()))?;
+            globe_on(terrain, bing, layer, options, offload::threaded())
+        }
+        Some(kind) => {
+            return Err(GlobeError::UnsupportedImagery {
+                asset: imagery_asset_id,
+                kind: kind.to_string(),
+            })
+        }
+    };
+    Ok((tree, loader, detail))
 }
 
 /// Seconds, as a C ABI carries a duration, into a `Duration`.
@@ -251,7 +376,11 @@ async fn resolve(
 /// Non-finite and non-positive both mean "the caller did not choose", which is
 /// different from "the caller chose zero" — a zero timeout would fail every
 /// frame instantly, and that is never what someone means.
-pub(crate) fn duration_or(seconds: f64, fallback: Duration) -> Duration {
+///
+/// Public because the ABI is what carries seconds as a bare `f64`, and the ABI
+/// now lives in another crate. The rule it encodes belongs beside the session
+/// it defends, not beside the boundary that happens to invoke it.
+pub fn duration_or(seconds: f64, fallback: Duration) -> Duration {
     if seconds.is_finite() && seconds > 0.0 {
         Duration::from_secs_f64(seconds)
     } else {

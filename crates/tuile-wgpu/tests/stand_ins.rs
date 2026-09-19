@@ -74,6 +74,7 @@ impl GeometryStream for Scripted {
 /// thirty thousand.
 fn surface() -> DecodedTileContent {
     DecodedTileContent {
+        withheld_drape: None,
         meshes: vec![DecodedMesh {
             positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
             normals: Some(vec![[0.0, 0.0, 1.0]; 3]),
@@ -127,6 +128,7 @@ fn missing_neighbour() -> Vec<ServerMessage> {
             tiles: selected(&[here(), neighbour()]),
             ancestry: tree_shape(&[here(), neighbour()]),
             stats: TraversalStats::default(),
+            generation: 0,
         },
         ServerMessage::Content {
             tile: here(),
@@ -222,6 +224,7 @@ fn the_real_tile_replaces_its_stand_in_without_a_gap() {
             tiles: selected(&[neighbour()]),
             ancestry: tree_shape(&[neighbour()]),
             stats: TraversalStats::default(),
+            generation: 0,
         },
         ServerMessage::Fill {
             tile: neighbour(),

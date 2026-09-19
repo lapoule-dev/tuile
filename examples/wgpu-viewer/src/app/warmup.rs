@@ -43,10 +43,33 @@ impl App {
             return;
         }
         self.warmup.holding = false;
+        self.paint_before_showing();
         if let Some(active) = self.active.as_ref() {
             active.window.set_visible(true);
             active.window.request_redraw();
         }
+    }
+
+    /// Draws one frame into the surface while the window is still hidden.
+    ///
+    /// Without this the window was **white and empty** for as long as its first
+    /// frame took. `set_visible(true)` puts it on screen at once; the redraw
+    /// that fills it only arrives on the next turn of the event loop, and the
+    /// first frame after a warmup is the most expensive one the session will
+    /// ever draw — every pipeline compiled on demand, the whole coarse pyramid
+    /// drawn for the first time. Until it lands the window shows the platform's
+    /// own blank fill, which is indistinguishable from an application that has
+    /// hung, and is exactly what the hold was supposed to prevent. Holding the
+    /// window shut and then showing an empty one gives away everything the hold
+    /// was for.
+    ///
+    /// The occlusion guard is lifted for this one frame: a window that has never
+    /// been shown reports itself occluded on macOS, and that is the state this
+    /// is *for*. One frame is not the repeated drawing the guard exists to stop.
+    fn paint_before_showing(&mut self) {
+        let occluded = std::mem::replace(&mut self.occluded, false);
+        self.render();
+        self.occluded = occluded;
     }
 
     /// Whether to keep the window hidden.

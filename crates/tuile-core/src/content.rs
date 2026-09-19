@@ -85,6 +85,22 @@ pub struct DecodedTileContent {
     /// Imagery draped over this tile, referenced rather than owned. Empty for
     /// content that carries its own texturing.
     pub imagery: Vec<crate::raster::ImageryLayer>,
+    /// The drape this tile would have carried, when its layers were
+    /// deliberately **not** fetched because the consumer already holds the
+    /// composed result.
+    ///
+    /// `None` is the ordinary case and means nothing was withheld — an empty
+    /// [`DecodedTileContent::imagery`] then means what it always meant: this
+    /// content carries no draped imagery.
+    ///
+    /// `Some(identity)` is a promise and a demand at once. The promise: the
+    /// pixels exist, under this identity, wherever the consumer keeps them, and
+    /// they are the same pixels the layers would have composed into — see
+    /// [`crate::raster::drape_identity`]. The demand: a consumer that set this
+    /// must resolve it. Treating `Some` as "no imagery" would drape nothing
+    /// over real terrain and report success, which is bare ground nobody is
+    /// told about.
+    pub withheld_drape: Option<u64>,
     /// The rebasing origin, f64 ECEF.
     pub local_origin_ecef: DVec3,
     /// Residual transform to apply at render time (identity: everything is
@@ -245,6 +261,7 @@ fn decode_glb(
     }
 
     Ok(DecodedTileContent {
+        withheld_drape: None,
         meshes,
         textures,
         // glTF content carries its own texturing; draping happens above.

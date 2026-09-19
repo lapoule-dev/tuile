@@ -29,6 +29,7 @@
 
 pub mod cache;
 pub mod content;
+pub mod determinism;
 pub mod drive;
 pub mod fetch;
 pub mod geo;

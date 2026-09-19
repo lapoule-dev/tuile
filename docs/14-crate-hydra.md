@@ -2,6 +2,13 @@
 
 Streams tiles into any OpenUSD scene, so a scripted-camera flight can be rendered on a farm and, later, so anyone can drop a prim into a stage and get a streaming globe.
 
+> **Doc 15 carries the vision and trajectory** (`docs/15-usd-scene-index.md`):
+> the procedural below is the asset-portable facade over a Hydra 2.0
+> scene-index-shaped core (`tuileGlobeSceneIndex`) — in 2.0 a generative
+> procedural's children already are scene-index data sources, so the two are
+> one piece of work. Everything in this document (the prim, the camera
+> ladder, the environment traps, the Dockerfiles) stands unchanged.
+
 Two halves, deliberately separate:
 
 | Where | What | Language |

@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# Image du test décisif procédural, ABI pxrBlender : le plugin est compilé
+# contre le SDK USD des deps précompilées de Blender (namespace pxrBlender,
+# libs partagées — celui que le Blender du build-fork linke réellement),
+# embarqué dans l'image 3 sous /opt/usd-blender.
+FROM harbor.sportstracklive.com/stl/blender-shared-usd:5.1-2508 AS sdk
+
+FROM ubuntu:24.04 AS plugin
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=sdk /opt/usd-blender /opt/usd-blender
+COPY --from=sdk /opt/tbb-blender /opt/tbb-blender
+COPY --from=sdk /opt/python-blender-include /opt/python-blender-include
+COPY proctest/cubeProc /opt/src/cubeProc
+# Le SDK de Blender peut être monolithique (libusd_ms) ou éclaté ; le lien
+# s'adapte. Les headers TBB viennent des mêmes deps quand présents.
+RUN set -e; \
+    SDK=/opt/usd-blender; \
+    TBB_INC=""; \
+    [ -d /opt/tbb-blender/include ] && TBB_INC="-I/opt/tbb-blender/include"; \
+    if ls "$SDK"/lib/libusd_ms.so* > /dev/null 2>&1; then \
+        LIBS="-lusd_ms"; \
+    else \
+        LIBS="-lusd_hdGp -lusd_hd -lusd_sdf -lusd_tf -lusd_vt -lusd_gf"; \
+    fi; \
+    mkdir -p /opt/plugins/cubeProc/plugin/resources; \
+    g++ -std=c++17 -fPIC -shared /opt/src/cubeProc/cubeProc.cpp \
+        -I"$SDK/include" $TBB_INC -I$(ls -d /opt/python-blender-include/python3* | head -1) -L"$SDK/lib" $LIBS \
+        -Wl,-rpath,'$ORIGIN/../../usd-blender-lib' \
+        -o /opt/plugins/cubeProc/plugin/libcubeProc.so; \
+    cp /opt/src/cubeProc/plugInfo.json /opt/plugins/cubeProc/plugin/resources/; \
+    test -f /opt/plugins/cubeProc/plugin/libcubeProc.so
+
+FROM harbor.sportstracklive.com/stl/blender-shared-usd:5.1-2508
+COPY --from=plugin /opt/plugins/cubeProc /opt/plugins/cubeProc
+COPY proctest/proc_driver.py /opt/proc/proc_driver.py
+COPY proctest/proc_run.sh /opt/proc/proc_run.sh
+COPY proctest/proc_video.py /opt/proc/proc_video.py
+
+# Les libs du SDK doivent être résolubles au chargement du plugin dans le
+# process Blender (déjà présentes via /opt/blender/lib si bundlées ; le SDK
+# fournit la garantie).
+ENV LD_LIBRARY_PATH=/opt/blender/lib:/opt/usd-blender/lib:/opt/usd/lib
+
+CMD ["bash", "/opt/proc/proc_run.sh"]

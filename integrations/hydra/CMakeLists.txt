@@ -43,17 +43,20 @@ add_custom_target(tuile_hydra_rust ALL
 
 # ---------------------------------------------------------------- plugin ----
 add_library(tuileHydra SHARED
+    src/hostpaths.cpp
+    src/manifest.cpp
     src/procedural.cpp
     src/proceduralPlugin.cpp
     src/resolver.cpp
-    src/tiles.cpp)
+    src/tiles.cpp
+    src/view.cpp)
 
 add_dependencies(tuileHydra tuile_hydra_rust)
 
 target_include_directories(tuileHydra PRIVATE src)
 
 target_link_libraries(tuileHydra PRIVATE
-    ar hd hdGp hf gf plug pxOsd sdf tf vt
+    ar hd hdGp hf gf plug pxOsd sdf tf usd usdImaging vt
     ${CMAKE_DL_LIBS} Threads::Threads)
 
 # A Rust staticlib carries its whole runtime, including symbols from crates that
@@ -66,9 +69,60 @@ if(APPLE)
     # which is why the staticlib is linked here rather than above.
     target_link_options(tuileHydra PRIVATE
         "LINKER:-load_hidden,${TUILE_STATICLIB}")
+    # A link OPTION is not a link DEPENDENCY: without this, a fresh cargo
+    # build leaves the dylib stale, and every render quietly runs yesterday's
+    # Rust — measured, and maddening.
+    set_target_properties(tuileHydra PROPERTIES LINK_DEPENDS "${TUILE_STATICLIB}")
+    # The Rust side's TLS stack (native HTTP to ion and Bing) resolves against
+    # the system frameworks; a staticlib carries the references, not the link.
+    target_link_libraries(tuileHydra PRIVATE
+        "-framework Security"
+        "-framework CoreFoundation"
+        "-framework SystemConfiguration")
 else()
     target_link_libraries(tuileHydra PRIVATE "${TUILE_STATICLIB}")
     target_link_options(tuileHydra PRIVATE "LINKER:--exclude-libs,ALL")
+endif()
+
+# ----------------------------------------------------------------- tests ----
+# Pure logic on a scene index: no renderer, no GPU, no network, no pack. It
+# builds by default, unlike the probe below, because it costs one translation
+# unit and it is the only thing standing between a wrong camera and a farm
+# render that looks plausible — the two candidate cameras almost always agree,
+# so picking the wrong one shows up on no counter.
+option(TUILE_BUILD_TESTS "build the plugin's unit tests" ON)
+if(TUILE_BUILD_TESTS)
+    enable_testing()
+    add_executable(cameraRungTest tests/cameraRungTest.cpp src/hostpaths.cpp)
+    target_include_directories(cameraRungTest PRIVATE src)
+    target_link_libraries(cameraRungTest PRIVATE
+        hd sdf tf gf vt ${CMAKE_DL_LIBS} Threads::Threads)
+    add_test(NAME cameraRung COMMAND cameraRungTest)
+
+    # Celui-ci charge le greffon comme le ferait un hôte : par la registry, par
+    # dlopen, à travers plugInfo.json. Il dépend donc du greffon CONSTRUIT et de
+    # son plugInfo configuré, et il a besoin qu'on lui dise où regarder — les
+    # deux variables ci-dessous sont exactement celles que l'image de rendu pose.
+    add_executable(manifestRungTest tests/manifestRungTest.cpp)
+    add_dependencies(manifestRungTest tuileHydra)
+    target_link_libraries(manifestRungTest PRIVATE
+        hd sdf tf gf vt ${CMAKE_DL_LIBS} Threads::Threads)
+    add_test(NAME manifestRung COMMAND manifestRungTest)
+    set_tests_properties(manifestRung PROPERTIES ENVIRONMENT
+        "PXR_PLUGINPATH_NAME=${CMAKE_BINARY_DIR}/plugin/tuileHydra/resources;HDGP_INCLUDE_DEFAULT_RESOLVER=1")
+endif()
+
+# ----------------------------------------------------------------- probe ----
+# The only way to exercise the C++ half without a renderer: cook N frames and
+# report what each cook did. Off unless asked for, because it links the same
+# heavy USD libraries as the plugin and most builds do not need it.
+option(TUILE_BUILD_PROBE "build the frame probe" OFF)
+if(TUILE_BUILD_PROBE)
+    add_executable(frameProbe tests/frameProbe.cpp)
+    add_dependencies(frameProbe tuileHydra)
+    target_link_libraries(frameProbe PRIVATE
+        hd hdGp usdImaging usd sdf tf gf vt
+        ${CMAKE_DL_LIBS} Threads::Threads)
 endif()
 
 # OpenUSD's plugin discovery reads `LibraryPath` from plugInfo.json literally,

@@ -180,6 +180,68 @@ impl Frustum {
     }
 }
 
+/// A sphere that hides whatever is behind it. For a globe, the planet.
+///
+/// # Why this exists
+///
+/// The culling frustum of a ground-level camera is a cone that goes straight
+/// through the planet and out the far side, and everything it meets on the way
+/// out is inside it. Without this, a camera 5 km up selected 617 tiles reaching
+/// 11 205 km — almost antipodal ground, fetched, decoded, draped, encoded and
+/// handed to a renderer that could never draw a pixel of it, while the horizon
+/// from that altitude is 252 km away (measured, 2026-09-08). Frustum culling
+/// cannot see this: those tiles really are inside the frustum. Only occlusion
+/// can.
+///
+/// # Why a sphere for an ellipsoid
+///
+/// Take the ellipsoid's *smallest* radius. A sphere inscribed in the planet
+/// hides strictly less than the planet does, so every tile this culls is one
+/// the real planet also hides — which is the only direction in which being
+/// wrong is acceptable. Black ground is a bug; a tile drawn that need not have
+/// been is a rounding error in the bill.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Occluder {
+    pub center: DVec3,
+    pub radius: f64,
+}
+
+impl Occluder {
+    /// Whether `volume` is *certainly* hidden behind this sphere, seen from
+    /// `eye`.
+    ///
+    /// Conservative on purpose, twice over: the sphere is inscribed in the real
+    /// occluder, and the occludee is tested as a whole rather than as a point.
+    /// The whole-volume part is done by shrinking the occluder by the
+    /// occludee's radius — the shadow of the smaller sphere is contained in the
+    /// shadow of the real one, eroded by that radius, so a volume whose centre
+    /// falls inside it has all of itself inside the real shadow. A tile bigger
+    /// than the planet is therefore never culled, which is right: a coarse tile
+    /// straddling the horizon must be visited so its children can be judged
+    /// one by one.
+    pub fn hides(&self, volume: &BoundingVolume, eye: DVec3) -> bool {
+        let (center, radius) = volume.bounding_sphere();
+        let shrunk = self.radius - radius;
+        if shrunk <= 0.0 {
+            return false;
+        }
+        // Eye to planet centre, and the squared length of the tangent from the
+        // eye to the shrunken sphere — the "horizon distance", squared.
+        let to_eye = eye - self.center;
+        let horizon_sq = to_eye.length_squared() - shrunk * shrunk;
+        if horizon_sq <= 0.0 {
+            // Inside the sphere: there is no horizon and nothing is behind it.
+            return false;
+        }
+        // Eye to the occludee, and how far along the eye→centre axis it sits.
+        let to_volume = center - eye;
+        let depth = -to_volume.dot(to_eye);
+        // Beyond the horizon plane, and inside the shadow cone. Both, or the
+        // test would hide ground that is merely far away off to one side.
+        depth > horizon_sq && depth * depth > horizon_sq * to_volume.length_squared()
+    }
+}
+
 /// A bounding volume in world (ECEF) coordinates.
 ///
 /// 3D Tiles `region` volumes are converted to an [`Obb`] at load time
@@ -212,6 +274,26 @@ impl BoundingVolume {
         }
     }
 
+    /// The volume as a centre and a radius that contains it.
+    ///
+    /// Exact for a sphere. For a box, the distance to the farthest of its eight
+    /// corners — four sign combinations, the other four being their mirrors.
+    /// Not the tightest enclosing sphere, which would need an optimisation; it
+    /// is an upper bound, which is what a conservative test wants.
+    pub fn bounding_sphere(&self) -> (DVec3, f64) {
+        match self {
+            Self::Sphere(s) => (s.center, s.radius),
+            Self::Obb(b) => {
+                let (x, y, z) = (b.half_axes.col(0), b.half_axes.col(1), b.half_axes.col(2));
+                let radius = [x + y + z, x + y - z, x - y + z, x - y - z]
+                    .into_iter()
+                    .map(|corner| corner.length())
+                    .fold(0.0, f64::max);
+                (b.center, radius)
+            }
+        }
+    }
+
     pub fn transformed(&self, m: &DMat4) -> Self {
         match self {
             Self::Obb(b) => Self::Obb(b.transformed(m)),
@@ -232,6 +314,152 @@ impl BoundingVolume {
 
 #[cfg(test)]
 mod tests {
+    /// Ground truth, computed a completely different way: does the straight
+    /// line from the eye to the point pass through the sphere before reaching
+    /// it? If it does, the sphere is in the way. `Occluder::hides` must agree
+    /// with this for a point-sized occludee, and never claim more than it for
+    /// one with size.
+    /// `None` where the answer is a tangent — the line of sight grazes the
+    /// sphere within a millimetre, and neither this nor the test under test can
+    /// be held to an answer at that distance in f64 over 6 000 km. Saying so is
+    /// better than picking a side and calling the disagreement a bug.
+    fn segment_meets_sphere(
+        eye: DVec3,
+        point: DVec3,
+        center: DVec3,
+        radius: f64,
+    ) -> Option<bool> {
+        let d = point - eye;
+        let len = d.length();
+        if len == 0.0 {
+            return Some(false);
+        }
+        let dir = d / len;
+        let to_centre = center - eye;
+        // Where along the segment the closest approach happens, clamped to it.
+        let t = to_centre.dot(dir).clamp(0.0, len);
+        let closest = (eye + dir * t).distance(center);
+        ((closest - radius).abs() > 1e-3).then_some(closest < radius)
+    }
+
+    fn earth() -> Occluder {
+        Occluder {
+            center: DVec3::ZERO,
+            radius: 6_356_752.0,
+        }
+    }
+
+    fn point_volume(p: DVec3) -> BoundingVolume {
+        BoundingVolume::Sphere(Sphere {
+            center: p,
+            radius: 0.0,
+        })
+    }
+
+    /// A grid of places to look at, from the sub-eye point round to the
+    /// antipode, at several heights — surface, aircraft, orbit.
+    fn sample_points(radius: f64) -> Vec<DVec3> {
+        let mut out = Vec::new();
+        for step in 0..=72 {
+            let angle = f64::from(step) * std::f64::consts::PI / 72.0;
+            // Never exactly 0: a point ON the occluder is a tangent, and a
+            // tangent has no answer. Terrain is never on the reference sphere
+            // either — it is the sphere the ellipsoid was inscribed in.
+            for height in [1.0, 3_000.0, 400_000.0, 2.0 * radius] {
+                let r = radius + height;
+                out.push(DVec3::new(r * angle.cos(), r * angle.sin(), 0.0));
+                out.push(DVec3::new(r * angle.cos(), 0.0, r * angle.sin()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_horizon_test_agrees_with_the_line_of_sight() {
+        let planet = earth();
+        for altitude in [5_000.0, 250_000.0, 35_786_000.0] {
+            let eye = DVec3::new(planet.radius + altitude, 0.0, 0.0);
+            let mut decided = 0;
+            for p in sample_points(planet.radius) {
+                let Some(truth) = segment_meets_sphere(eye, p, planet.center, planet.radius)
+                else {
+                    continue;
+                };
+                decided += 1;
+                assert_eq!(
+                    planet.hides(&point_volume(p), eye),
+                    truth,
+                    "at {altitude} m over {p:?}"
+                );
+            }
+            assert!(decided > 500, "only {decided} samples were decidable");
+        }
+    }
+
+    #[test]
+    fn ground_this_side_of_the_horizon_is_never_hidden() {
+        let planet = earth();
+        let eye = DVec3::new(planet.radius + 5_000.0, 0.0, 0.0);
+        // The horizon from 5 km sits 2.27° round the curve; 1° is short of it.
+        let near = 1.0f64.to_radians();
+        let visible = DVec3::new(planet.radius * near.cos(), planet.radius * near.sin(), 0.0);
+        assert!(!planet.hides(&point_volume(visible), eye));
+        // And 5° is well past it — the ground that was costing 617 tiles.
+        let far = 5.0f64.to_radians();
+        let beyond = DVec3::new(planet.radius * far.cos(), planet.radius * far.sin(), 0.0);
+        assert!(planet.hides(&point_volume(beyond), eye));
+    }
+
+    #[test]
+    fn size_only_ever_makes_the_test_more_cautious() {
+        let planet = earth();
+        let eye = DVec3::new(planet.radius + 5_000.0, 0.0, 0.0);
+        for p in sample_points(planet.radius) {
+            let as_point = planet.hides(&point_volume(p), eye);
+            for radius in [1.0, 10_000.0, 500_000.0] {
+                let sized = BoundingVolume::Sphere(Sphere { center: p, radius });
+                assert!(
+                    !planet.hides(&sized, eye) || as_point,
+                    "a volume of radius {radius} at {p:?} was culled where its \
+                     own centre was not — culling ground that may be visible"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_bigger_than_the_planet_is_ever_hidden() {
+        let planet = earth();
+        let eye = DVec3::new(planet.radius + 5_000.0, 0.0, 0.0);
+        // A root tile of a global quadtree, on the far side, enclosing more
+        // than the occluder: it has to be visited so its children can be judged.
+        let huge = BoundingVolume::Sphere(Sphere {
+            center: DVec3::new(-planet.radius, 0.0, 0.0),
+            radius: planet.radius * 1.1,
+        });
+        assert!(!planet.hides(&huge, eye));
+    }
+
+    #[test]
+    fn an_eye_inside_the_planet_hides_nothing() {
+        let planet = earth();
+        let eye = DVec3::new(planet.radius * 0.5, 0.0, 0.0);
+        for p in sample_points(planet.radius) {
+            assert!(!planet.hides(&point_volume(p), eye));
+        }
+    }
+
+    #[test]
+    fn a_box_reports_a_radius_that_contains_its_corners() {
+        let b = Obb {
+            center: DVec3::new(1.0, 2.0, 3.0),
+            half_axes: DMat3::from_diagonal(DVec3::new(2.0, 3.0, 6.0)),
+        };
+        let (center, radius) = BoundingVolume::Obb(b).bounding_sphere();
+        assert_eq!(center, b.center);
+        assert!((radius - 7.0).abs() < 1e-9, "{radius}");
+    }
+
     use super::*;
     use glam::dvec3;
 

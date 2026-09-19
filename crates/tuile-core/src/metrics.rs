@@ -295,6 +295,14 @@ pub struct Metrics {
     /// Tiles drawn with no imagery covering them at all — painted in marker
     /// green so the fault is visible rather than argued about.
     pub tiles_without_imagery: Counter,
+    /// Drapes the consumer already held, so their layers were never requested:
+    /// no download, no decode, no reprojection, no compose.
+    ///
+    /// Its own counter rather than a store hit. A store hit means the bytes
+    /// came from the cache instead of the network, which still pays the decode;
+    /// this means nothing happened at all. Adding the two together would make
+    /// the hit rate say the cache is working when the work was simply skipped.
+    pub drapes_withheld: Counter,
     /// Imagery the provider does not have at all. Expected over ocean and past
     /// the poles at coarse levels, and remembered rather than re-asked — see
     /// [`crate::storage::ABSENT`].

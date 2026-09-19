@@ -1,0 +1,633 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# Image 3: Blender built from source against a SHARED OpenUSD — the "build
+# fork". No source patches: this is the configuration Debian/Arch already
+# ship. What it buys over the official binaries (probed 2026-09-07): a USD
+# runtime with exported pxr symbols, so third-party USD plugins (hdGp
+# generative procedurals — cubeProc today, TuileGlobe tomorrow) load into
+# the very runtime Blender renders with.
+#
+# Multi-stage, deliberately non-monolithic:
+#   sources  — Blender source + its precompiled linux libs (~10 GB, changes
+#              only per Blender version; cached).
+#   usdpy    — shared USD 26.03 built WITH python, against Blender's own
+#              python 3.13 (the USDHook API hands python pxr objects to
+#              addons; without matching bindings the injection path dies).
+#              Le plugin se compile ensuite contre ce même /opt/usd, copié
+#              dans l'image finale : un seul USD dans toute la chaîne, donc un
+#              seul ABI. `stl/usd-shared:25.08` reste la base de compilation de
+#              l'ancien chemin Blender 5.1 stock, et n'a rien à voir ici.
+#   build    — Blender cmake'd with USD_ROOT_DIR pointing at usdpy.
+#   runtime  — thin: Blender + /opt/usd + runtime libs. No toolchain.
+#
+#   docker buildx build --builder stl-builder-k8s --platform linux/amd64 \
+#       -f integrations/blender/Dockerfile.blender-shared-usd \
+#       -t harbor.sportstracklive.com/stl/blender-shared-usd:5.2-2603 --push .
+
+# 5.2, et la raison tient en une ligne de hdCycles.
+#
+# En 5.1, `HdCyclesMaterial::Sync` prend son réseau par
+# `sceneDelegate->GetMaterialResource(id)` : un `HdMaterialNetworkMap` — donc
+# Hydra 1.0 — reconverti ensuite par `HdConvertToHdMaterialNetwork2`. Deux
+# traductions, et notre nœud de texture en ressortait sans identifiant :
+# « Could not create node », un globe en aplat rose, un relief par ailleurs
+# parfait. Mesuré et éliminé point par point le 16 septembre 2026 — le type
+# existe, le nom n'est pas réservé, le fichier est là, l'identifiant est correct
+# à l'émission, et les deux autres nœuds du même réseau passent.
+#
+# En 5.2, le même code lit `HdMaterialSchema::GetFromParent(primDs)` puis
+# `GetMaterialNetwork(...)`, et `PopulateShaderGraph` prend un
+# `HdMaterialNetworkSchema`. Le pont a disparu. On ne contourne pas le bug : on
+# retire le chemin qui le produit.
+ARG BLENDER_VERSION=5.2.2
+# 26.03, la version que Blender 5.2 attend.
+#
+# Ce n'est pas un alignement de confort. `intern/cycles/hydra` de 5.2 est écrit
+# contre USD ≥ 25.11 — `mesh.cpp:66` compare le retour de
+# `ComputeTriangulatedFaceVaryingPrimvar` à `HdMeshComputationResult::Error`,
+# `plugin.h:18` redéfinit `IsSupported(HdRendererCreateArgs const &)` — et les
+# libs précompilées de la release portent 26.03
+# (`pxrBlender_v26_03__pxrReserved__`). Construire contre 25.08 compilait
+# silencieusement les branches `#if PXR_VERSION >= 2511` en creux : un délégué
+# Cycles amputé des surcharges que son propre Hydra appelle.
+#
+# 26.03 plutôt que 26.05 ou 26.08 : c'est la version que porte la release, donc
+# celle contre laquelle son code a été écrit. On suit Blender, on ne le devance
+# pas.
+ARG USD_VERSION=26.03
+# Two knobs on purpose: the usdpy stage is cache-hot at 8 and memory-light;
+# the Blender ninja stage is the memory hog (8×cc1plus thrashes a 12Gi
+# builder). Changing one must not invalidate the other's cached layer.
+#
+# Quatre.
+#
+# Deux donnait 566 objets sur 6971 en dix minutes — près de deux heures pour le
+# reste, sur un builder qui a huit cœurs. Quatre a divisé ce temps par deux.
+#
+# Le plafond n'est pas le CPU mais la RAM : `cc1plus` sur les gros fichiers C++
+# de Blender prend un à deux Gio, et c'est pour ça que l'original disait deux
+# sur un pod de 12 Gio.
+#
+# Monter ce nombre demande de monter le pod d'abord, et ce n'est pas gratuit :
+# essayé le 16 septembre 2026, porter la limite à 24 Gio a fait passer la
+# *requête* à 12 Gio du même geste, et le nouveau pod n'a plus été
+# ordonnançable — « 0/4 nodes are available: Insufficient memory », l'ancien
+# tenant sa réservation pendant que le nouveau l'attendait. Les limites ne se
+# réservent pas, les requêtes si ; ne toucher qu'à la limite, et vérifier que
+# le cluster a la place avant de lancer le rollout.
+ARG BUILD_JOBS=4
+ARG USD_BUILD_JOBS=8
+# The GPU backends, and why each number is what it is.
+#
+# Measured 2026-09-10 on stl/blender-globe:5.1-su: NOT ONE `.cubin` or `.ptx`
+# in the whole install, `compute_device_type` offering only
+# ('NONE','CUDA','HIP','ONEAPI') and CUDA enumerating zero devices on a machine
+# with four RTX 5090s. This Blender had no GPU backend at all — which is why
+# the farm had been on Storm, and why four processes told to take four GPUs
+# were only ever going to share one.
+#
+# 12.8 is a floor, not a preference: an RTX 5090 is Blackwell, compute
+# capability 12.0, and no earlier CUDA can emit sm_120.
+ARG CUDA_VERSION=12-8
+# Two cubins and one PTX, copied from what Blender itself ships.
+#
+# `sm_120` alone was too few, and that was learned the expensive way: the CUDA
+# backend then exists only on Blackwell, leaving OptiX as the single path on
+# every other card. A single path that declines has no fallback.
+#
+# The list is upstream's, minus the decade of cards we will never rent — see
+# `CYCLES_CUDA_BINARIES_ARCH` in Blender's top-level CMakeLists, which is
+# `sm_50 … sm_75 sm_86 sm_120 compute_75`. Note what is NOT there: `sm_89`.
+# CUDA cubins are compatible across minor revisions of one major version, so
+# an `sm_86` cubin loads on an Ada 8.9 device — which is why upstream ships
+# 86 and not 89, and why asking for both would have paid for a kernel twice.
+#
+#   sm_86       A10G (8.6), L4 (8.9), RTX 4090 (8.9) — one cubin, three cards
+#   sm_120      RTX 5090 — Blackwell
+#   compute_75  PTX, compiled by the driver: the fallback for anything else
+#
+# Each entry is a full kernel compilation, the longest step in this image, so
+# the list is short on purpose. The OptiX kernels are PTX and were never the
+# arch-bound half; these cubins are.
+ARG CUDA_ARCH="sm_86;sm_120;compute_75"
+# OptiX headers. `find_package(OptiX 8.0.0)` in `intern/cycles/CMakeLists.txt`
+# is the floor; 8.1 satisfies it and the ABI is what a driver implements, so a
+# Blackwell driver serves these headers to a 5090 perfectly well.
+# Ni Intel ni AMD dans cette ferme.
+#
+# `blender_release.cmake` active oneAPI et HIP, et oneAPI compile ses noyaux
+# SYCL par `ocloc`, hors-ligne, **mono-thread**. Mesuré le 17 septembre 2026 en
+# lisant le procfs du builder pendant que la construction semblait figée : onze
+# minutes sur un seul cœur, huit cœurs disponibles, pour des noyaux destinés à
+# des GPU Intel que la ferme n'aura jamais. HIP a le même profil pour AMD.
+#
+# Le rendu est sur L4 en OptiX, avec des cubins CUDA en repli. Les deux autres
+# backends sont du temps de construction pur.
+ARG OPTIX_VERSION=8.1.0
+
+# ---------------------------------------------------------------- sources
+FROM ubuntu:24.04 AS sources
+ENV DEBIAN_FRONTEND=noninteractive
+ARG BLENDER_VERSION
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git git-lfs ca-certificates curl python3 \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch v${BLENDER_VERSION} \
+        https://projects.blender.org/blender/blender.git /opt/src/blender
+# Matching precompiled dependencies (python 3.13 included) — the supported
+# way to build the exact official feature set without packaging 40 deps.
+RUN cd /opt/src/blender \
+    && python3 build_files/utils/make_update.py --use-linux-libraries --no-blender
+
+# ------------------------------------------------------------------ usdpy
+FROM ubuntu:24.04 AS usdpy
+ENV DEBIAN_FRONTEND=noninteractive
+ARG USD_VERSION
+ARG USD_BUILD_JOBS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake python3 git curl ca-certificates xz-utils \
+        libx11-dev libxt-dev libgl1-mesa-dev libglu1-mesa-dev libglvnd-dev \
+        libegl1-mesa-dev zlib1g-dev libbz2-dev liblzma-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=sources /opt/src/blender/lib/linux_x64/python /opt/blender-python
+RUN curl -fsL -o /tmp/usd.tar.gz \
+        "https://github.com/PixarAnimationStudios/OpenUSD/archive/refs/tags/v${USD_VERSION}.tar.gz" \
+    && tar -xzf /tmp/usd.tar.gz -C /opt
+# Build WITH python bindings against Blender's own interpreter, so the
+# python pxr modules and the shared libs come from one build.
+RUN PYBIN=$(ls /opt/blender-python/bin/python3* | head -1) \
+    && "$PYBIN" -m ensurepip 2>/dev/null || true \
+    && "$PYBIN" -m pip install --quiet jinja2 pyside6 2>/dev/null || true \
+    && "$PYBIN" /opt/OpenUSD-${USD_VERSION}/build_scripts/build_usd.py \
+        --python --no-tools --no-tests --no-docs --no-python-docs --no-tutorials \
+        --examples \
+        --no-materialx --no-opencolorio --no-openimageio --no-openvdb \
+        --no-alembic --no-draco --no-ptex --no-usdview --no-prman --no-vulkan \
+        -j ${USD_BUILD_JOBS} /opt/usd \
+    && rm -rf /opt/usd/build /opt/usd/src /tmp/usd.tar.gz
+
+# ------------------------------------------------------------------ build
+FROM sources AS build
+ENV DEBIAN_FRONTEND=noninteractive
+ARG BUILD_JOBS
+ARG CUDA_VERSION
+ARG CUDA_ARCH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential gcc-14 g++-14 cmake ninja-build \
+        libx11-dev libxxf86vm-dev libxcursor-dev libxi-dev libxrandr-dev \
+        libxinerama-dev libegl-dev libwayland-dev wayland-protocols \
+        libxkbcommon-dev libdbus-1-dev libdecor-0-dev libvulkan-dev \
+    && rm -rf /var/lib/apt/lists/*
+# The CUDA toolkit, from NVIDIA rather than from Ubuntu.
+#
+# Ubuntu 24.04 ships CUDA 12.0, which cannot emit sm_120 — it would build,
+# report success, and produce kernels no 5090 can load. Only nvcc and the
+# runtime headers are wanted; the driver belongs to the host and the container
+# runtime injects it.
+RUN curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
+    && dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends cuda-toolkit-${CUDA_VERSION} \
+    && rm -rf /var/lib/apt/lists/* \
+    && /usr/local/cuda/bin/nvcc --version | tail -2
+# OptiX headers, from NVIDIA's own repository.
+#
+# Blender's precompiled libs do NOT carry them — checked, and the listing is
+# `hiprt`, `dpcpp`, `level-zero` and no `optix`: NVIDIA's licence does not
+# allow redistribution, which is why the SDK download has a click-through.
+# `NVIDIA/optix-dev` exists for exactly this problem — headers only, no
+# samples, no form.
+#
+# This matters more than a missing dependency usually does, because of how
+# Cycles fails without it: `set_and_warn_library_found` **turns OptiX off and
+# carries on**. The build succeeds, and what comes out is a slower renderer
+# that looks like a working one.
+ARG OPTIX_VERSION
+RUN curl -fsL "https://github.com/NVIDIA/optix-dev/archive/refs/tags/v${OPTIX_VERSION}.tar.gz" \
+        -o /tmp/optix.tar.gz \
+    && mkdir -p /opt/optix \
+    && tar -xzf /tmp/optix.tar.gz -C /opt/optix --strip-components=1 \
+    && rm /tmp/optix.tar.gz \
+    && grep -m1 "define OPTIX_VERSION" /opt/optix/include/optix.h
+COPY --from=usdpy /opt/usd /opt/usd
+# Plus de patch hdGp : OpenUSD livre le resolver, et il suffit de le demander.
+#
+# On a porté ici, pendant des semaines, un remplacement intégral de
+# `usd_scene_index.cc` dont le seul contenu propre était un
+# `overridesSceneIndexCallback` insérant
+# `HdGpGenerativeProceduralResolvingSceneIndex`. Cent-six lignes d'amont
+# recopiées autour d'une, à re-dériver à chaque version de Blender.
+#
+# `pxr/imaging/hdGp/sceneIndexPlugin.cpp` fait déjà exactement ça :
+#
+#     TF_DEFINE_ENV_SETTING(HDGP_INCLUDE_DEFAULT_RESOLVER, false, ...);
+#     ... RegisterSceneIndexForRenderer(TfToken(), ...)  // tous les moteurs
+#
+# et `hd/renderIndex.cpp` applique cette chaîne de plugins en aval du merging
+# scene index, donc en aval de ce que l'hôte insère. `HDGP_INCLUDE_DEFAULT_RESOLVER=1`
+# est posé dans `Dockerfile.globe`, et il y était déjà.
+#
+# Pourquoi ça ne marchait pas en 5.1 : l'hôte y passait par un scene delegate
+# Hydra 1.0, et un delegate n'émet jamais de prim de type
+# `generativeProcedural` — ce type n'existe pas dans son vocabulaire. Le
+# resolver était branché et n'avait rien à résoudre. 5.2 construit une vraie
+# chaîne de scene indices, donc le prim arrive avec son type intact.
+#
+# Contrepartie assumée : le resolver est maintenant en aval du préfixage de
+# l'hôte (`/usd_scene`), ce que `src/hostpaths.cpp` gère côté plugin.
+
+# Celui-ci précède la construction, et ce n'est pas un choix de commodité :
+# sans lui Blender ne compile pas du tout. Il touche `intern/cycles/device/device.h`,
+# donc il fait recompiler large — mais il ne change qu'avec la version de Blender.
+
+# Le champ que le délégué Hydra de Cycles utilise et que 5.2.2 n'a pas.
+#
+# `intern/cycles/hydra/render_delegate.cpp:101` filtre les devices sur
+# `info.meets_driver_requirement`, et `intern/cycles/device/device.h` de la même
+# release ne le déclare pas :
+#
+#   error: 'const class ccl::DeviceInfo' has no member named
+#          'meets_driver_requirement'
+#
+# Ce n'est pas notre configuration : le délégué Hydra de Cycles est derrière
+# `WITH_CYCLES_HYDRA_RENDER_DELEGATE`, qui n'est pas dans la CI de Blender, donc
+# la release est sortie sans que ce code soit jamais compilé. Le champ existe
+# dans `main` (device.h:106, `bool meets_driver_requirement = true`) — on
+# reprend cette ligne telle quelle, ce qui rétablit la sémantique amont sans
+# changer le comportement : tous les devices passent le filtre, comme avant que
+# le filtre existe.
+RUN set -eu; \
+    f=/opt/src/blender/intern/cycles/device/device.h; \
+    grep -q 'has_execution_optimization' "$f"; \
+    if ! grep -q 'meets_driver_requirement' "$f"; then \
+        sed -i 's|^\(\s*\)bool has_execution_optimization = true;|\1bool has_execution_optimization = true;\n\1/* Backported from main: 5.2.2 ships hydra code that reads this. */\n\1bool meets_driver_requirement = true;|' "$f"; \
+    fi; \
+    grep -q 'meets_driver_requirement' "$f" \
+        || { echo "le rétroportage de meets_driver_requirement a manqué sa cible"; exit 1; }
+
+# Blender vanilla, compilé une fois — et cette couche-là ne bouge plus.
+#
+# Les patchs viennent APRÈS, délibérément. Blender n'est pas un monolithe : sa
+# construction produit une centaine de bibliothèques statiques, et un patch dans
+# `render/hydra` ou dans `intern/cycles/scene` n'en concerne qu'une. Mais si les
+# patchs sont appliqués avant la configuration, toucher une ligne de l'un d'eux
+# invalide la couche de construction entière, et ninja repart d'un répertoire
+# vide : quelques milliers d'unités recompilées pour un fichier changé.
+#
+# Coupé en deux, Docker garde le gros. Cette couche-ci ne dépend que de la
+# version de Blender et des drapeaux de configuration ; elle est réutilisée
+# telle quelle tant que ni l'une ni les autres ne changent. La couche d'après
+# applique les patchs et rappelle ninja, qui recompile le module touché, ses
+# dépendants directs, et relie — l'affaire de quelques minutes.
+#
+# `/opt/build` reste un vrai répertoire, pas un montage de cache : c'est ce qui
+# le rend réutilisable comme une couche, poussable avec le reste, et visible.
+# Ce stage est intermédiaire — seul `/opt/blender` part dans l'image finale —
+# donc son poids ne coûte que du disque sur le builder.
+#
+# Pas d'installation ici : elle a lieu une seule fois, après les patchs.
+RUN cd /opt/src/blender \
+    && cmake -S . -B /opt/build -G Ninja \
+        -C build_files/cmake/config/blender_release.cmake \
+        -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DWITH_USD=ON \
+        -DUSD_ROOT_DIR=/opt/usd \
+        -DWITH_HYDRA=ON \
+        -DWITH_CYCLES_HYDRA_RENDER_DELEGATE=ON \
+        -DWITH_CYCLES_CUDA_BINARIES=ON \
+        -DCYCLES_CUDA_BINARIES_ARCH="${CUDA_ARCH}" \
+        -DWITH_CYCLES_DEVICE_CUDA=ON \
+        -DWITH_CYCLES_DEVICE_OPTIX=ON \
+        -DWITH_CYCLES_DEVICE_ONEAPI=OFF \
+        -DWITH_CYCLES_DEVICE_HIP=OFF \
+        -DOPTIX_ROOT_DIR=/opt/optix \
+        -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda \
+        -DCMAKE_INSTALL_PREFIX=/opt/blender \
+    && cmake --build /opt/build -j ${BUILD_JOBS}
+
+# Lire une image sans passer par un fichier.
+#
+# Cycles résout toute texture en chemin : `ImageManager::add_image` enveloppe un
+# nom dans un `OIIOImageLoader`, et `ImageMetaData::oiio_load_metadata` refuse
+# d'avance ce que `OIIO::Filesystem::exists()` ne reconnaît pas
+# (`util/image_metadata.cpp`). Une application qui tient déjà les octets encodés
+# — nous, avec un tuilepack — doit donc écrire chaque texture dans un fichier
+# temporaire d'abord ; et sur Cloud Run, où `/tmp` est un tmpfs, c'est un second
+# exemplaire de chaque texture en RAM, pour un job qui en a 32 Gio.
+#
+# Le correctif tient en trois retouches et un fichier, parce qu'OIIO sait déjà
+# tout faire :
+#
+#   1. les deux fonctions de chargement acceptent un `IOProxy` optionnel et,
+#      quand il est là, sautent le `exists()` et lisent la mémoire ;
+#   2. `add_image` demande d'abord un chargeur externe ;
+#   3. `scene/image_external.cpp` implémente ce chargeur au-dessus d'une
+#      bibliothèque nommée par `CYCLES_EXTERNAL_IMAGE_LIB`.
+#
+# Rien ne décode ici : le format reste choisi par l'extension du nom, donc une
+# image externe est exactement l'image qu'elle aurait été sur le disque. Sans la
+# variable, sans la bibliothèque, ou si elle décline le nom, Cycles ouvre le
+# fichier comme avant — c'est la même image par le même lecteur.
+COPY integrations/blender/blender-patches/image_external.cpp \
+     integrations/blender/blender-patches/image_external.h \
+     /opt/src/blender/intern/cycles/scene/
+RUN set -eu; \
+    cd /opt/src/blender/intern/cycles; \
+    h=util/image_metadata.h; c=util/image_metadata.cpp; \
+    i=scene/image.cpp; l=scene/CMakeLists.txt; \
+    \
+    sed -i 's|bool oiio_load_metadata(OIIO::string_view filepath, OIIO::ImageSpec \*r_spec = nullptr);|bool oiio_load_metadata(OIIO::string_view filepath, OIIO::ImageSpec *r_spec = nullptr, OIIO::Filesystem::IOProxy *proxy = nullptr);|' "$h"; \
+    sed -i 's|bool oiio_load_pixels(OIIO::string_view filepath, void \*pixels, const bool flip_y = true) const;|bool oiio_load_pixels(OIIO::string_view filepath, void *pixels, const bool flip_y = true, OIIO::Filesystem::IOProxy *proxy = nullptr) const;|' "$h"; \
+    sed -i 's|#include <OpenImageIO/string_view.h>|#include <OpenImageIO/filesystem.h>\n#include <OpenImageIO/string_view.h>|' "$h"; \
+    \
+    # `create` aussi, pas seulement `open`.
+    #
+    # Mesuré le 17 septembre 2026 : avec le proxy passé au seul `open`, le
+    # rendu sortait rose et la trace disait « Image file … failed to load » —
+    # le message de `create` rendant nul, pas celui d'un fichier absent. C'est
+    # que `ImageInput::create(nom)` ouvre le fichier pour renifler son format,
+    # donc il échoue avant qu'`open` n'ait jamais vu le proxy. Sa surcharge
+    # complète le prend : (nom, do_open, config, ioproxy).
+    sed -i 's|std::unique_ptr<ImageInput> in(ImageInput::create(filepath));|std::unique_ptr<ImageInput> in(ImageInput::create(filepath, false, nullptr, proxy));|' "$c"; \
+    sed -i 's|std::unique_ptr<ImageInput> in = ImageInput::create(filepath);|std::unique_ptr<ImageInput> in = ImageInput::create(filepath, false, nullptr, proxy);|' "$c"; \
+    \
+    sed -i 's|bool ImageMetaData::oiio_load_metadata(OIIO::string_view filepath, OIIO::ImageSpec \*r_spec)|bool ImageMetaData::oiio_load_metadata(OIIO::string_view filepath, OIIO::ImageSpec *r_spec, OIIO::Filesystem::IOProxy *proxy)|' "$c"; \
+    perl -0pi -e 's/(  \/\* Perform preliminary checks, with meaningful logging\. \*\/\n)(  if \(!OIIO::Filesystem::exists\(filepath\)\))/$1  \/* Un proxy porte ses octets : il n.y a pas de fichier a stater. *\/\n  if (proxy == nullptr \&\& !OIIO::Filesystem::exists(filepath))/' "$c"; \
+    perl -0pi -e 's/(  \/\* Load without automatic OIIO alpha conversion\. \*\/\n  config\.attribute\("oiio:UnassociatedAlpha", 1\);)/$1\n  if (proxy != nullptr) {\n    config.attribute("oiio:ioproxy", OIIO::TypeDesc::PTR, \&proxy);\n  }/' "$c"; \
+    \
+    perl -0pi -e 's/(bool ImageMetaData::oiio_load_pixels\(OIIO::string_view filepath,\n                                     void \*pixels,\n                                     const bool flip_y\) const)/bool ImageMetaData::oiio_load_pixels(OIIO::string_view filepath,\n                                     void *pixels,\n                                     const bool flip_y,\n                                     OIIO::Filesystem::IOProxy *proxy) const/' "$c"; \
+    perl -0pi -e 's/(   \* much precision loss when we load it as half float to do a color-space transform\. \*\/\n  config\.attribute\("oiio:UnassociatedAlpha", 1\);)/$1\n  if (proxy != nullptr) {\n    config.attribute("oiio:ioproxy", OIIO::TypeDesc::PTR, \&proxy);\n  }/' "$c"; \
+    \
+    sed -i 's|#include "scene/image.h"|#include "scene/image.h"\n#include "scene/image_external.h"|' "$i"; \
+    perl -0pi -e 's/(ImageHandle ImageManager::add_image\(const string \&filename, const ImageParams \&params\)\n\{\n)(  ImageSingle \*image = add_image_texture\(make_unique<OIIOImageLoader>\(filename\), params, false\);)/$1  \/* Un fournisseur externe d.abord : il repond null pour tout nom qui n.est pas a lui. *\/\n  unique_ptr<ImageLoader> loader = external_image_loader(filename);\n  if (!loader) {\n    loader = make_unique<OIIOImageLoader>(filename);\n  }\n  ImageSingle *image = add_image_texture(std::move(loader), params, false);/' "$i"; \
+    \
+    sed -i 's|  image_oiio.cpp|  image_external.cpp\n  image_oiio.cpp|' "$l"; \
+    sed -i 's|  image_oiio.h|  image_external.h\n  image_oiio.h|' "$l"; \
+    \
+    for probe in "util/image_metadata.h:IOProxy *proxy" \
+                 "util/image_metadata.cpp:proxy == nullptr && !OIIO::Filesystem::exists" \
+                 "util/image_metadata.cpp:oiio:ioproxy" \
+                 "scene/image.cpp:external_image_loader(filename)" \
+                 "util/image_metadata.cpp:create(filepath, false, nullptr, proxy)" \
+                 "scene/CMakeLists.txt:image_external.cpp"; do \
+        f="${probe%%:*}"; want="${probe#*:}"; \
+        grep -qF "$want" "$f" || { \
+            echo "le patch image externe a manqué sa cible: $want dans $f"; exit 1; }; \
+    done; \
+    echo "blender-shared-usd: external image source patched in"
+
+# Le globe entre sans passer par un export de stage.
+#
+# Blender a deux chemins vers Hydra. Le rapide construit un scene index natif et
+# ne pousse que le delta d'une frame à l'autre ; l'autre exporte toute la scène
+# en USD et reconstruit la chaîne d'imaging à chaque frame — sa propre source
+# l'appelle « Slow USD export for reference ». Mesuré ici : 9,7 s par frame sur
+# un pack qui avait tout précalculé, parce que le procédural est reconstruit à
+# chaque frame et repart d'un état vide (444 tuiles rebâties, huit fois de
+# suite).
+#
+# Seul le chemin lent offre une prise à du contenu extérieur : un
+# `USDHook.on_export` peut composer une référence dans la stage exportée. Une
+# prim procédurale n'ayant aucun équivalent en objet Blender, elle n'entrait que
+# par là — et payait la reconstruction complète pour ce privilège.
+#
+# Ce patch ajoute UNE prise au chemin rapide : au moment où le moteur construit
+# son render index, une bibliothèque nommée par `TUILE_HYDRA_LIB` peut y
+# insérer un scene index. Le fork ne sait rien du contenu ; il passe le pointeur
+# et c'est tout. Sans la variable, sans la bibliothèque, ou si elle décline, le
+# moteur fait exactement ce qu'il faisait.
+#
+# Pourquoi un patch plutôt que la registry de greffons d'OpenUSD, qui est faite
+# pour ça : parce qu'elle exige que la bibliothèque soit inscrite avant que le
+# render index existe, et que depuis Blender ce moment n'est pas atteignable —
+# la fonction de registre ne part qu'à l'abonnement au tag, qui a lieu à la
+# construction de ce render index ; s'inscrire au chargement interbloque contre
+# le mutex de `PlugRegistry` ; et l'appel explicite depuis Python interbloque
+# aussi. Les trois ont été mesurés. Le détail est dans
+# `integrations/hydra/src/manifest.cpp`.
+#
+# L'appel est dans `FinalEngine::render()`, juste après
+# `free_camera_delegate_->SetCamera()`, et l'endroit n'est pas indifférent.
+#
+# Insérer un scene index émet des notices ; hdGp résout les procéduraux dessus,
+# donc la cuisson part immédiatement — et un procédural qui choisit sa géométrie
+# d'après la caméra a besoin que la caméra ait déjà sa pose. Or `Engine::sync()`
+# ne la pose PAS : `CameraDelegate::sync()` ne met à jour que des propriétés
+# d'ID, et la matrice n'arrive que par `SetCamera`, appelé au début de
+# `render()`. Deux emplacements ont été essayés avant celui-ci — à la
+# construction du scene index de l'hôte, puis à la fin de `Engine::sync` — et
+# les deux ont donné la même chose : « CAMERA-READ-FAILED /freeCamera:
+# transform is identity », une sélection de tuiles au centre de la Terre, et un
+# job mort sur une tuile introuvable (18 septembre 2026).
+COPY integrations/blender/blender-patches/tuile_manifest.cc \
+     integrations/blender/blender-patches/tuile_manifest.hh \
+     /opt/src/blender/source/blender/render/hydra/
+RUN set -eu; \
+    cd /opt/src/blender/source/blender/render/hydra; \
+    sed -i 's|^  render_task_delegate.cc$|  render_task_delegate.cc\n  tuile_manifest.cc|' CMakeLists.txt; \
+    sed -i 's|^  render_task_delegate.hh$|  render_task_delegate.hh\n  tuile_manifest.hh|' CMakeLists.txt; \
+    sed -i 's|#include "camera.hh"|#include "camera.hh"\n#include "tuile_manifest.hh"|' final_engine.cc; \
+    perl -0pi -e 's/(  free_camera_delegate_->SetCamera\(camera\);\n)/$1  tuile_insert_manifest(render_index_.get());\n/' final_engine.cc; \
+    for probe in "CMakeLists.txt:tuile_manifest.cc" \
+                 "CMakeLists.txt:tuile_manifest.hh" \
+                 "final_engine.cc:#include \"tuile_manifest.hh\"" \
+                 "final_engine.cc:tuile_insert_manifest(render_index_.get());"; do \
+        f="${probe%%:*}"; want="${probe#*:}"; \
+        grep -qF "$want" "$f" || { \
+            echo "le patch du manifeste a manqué sa cible: $want dans $f"; exit 1; }; \
+    done; \
+    # Et l'ORDRE, qui est toute la correction : l'insertion doit suivre
+    # immédiatement la pose de la caméra, pas la précéder.
+    grep -A1 'free_camera_delegate_->SetCamera(camera);' final_engine.cc \
+        | grep -q 'tuile_insert_manifest' || { \
+            echo "l'insertion ne suit pas SetCamera : le procédural cuirait"; \
+            echo "  sur une caméra à l'identité"; exit 1; }; \
+    echo "blender-shared-usd: manifest scene index seam patched in"
+
+
+# L'aperçu que personne ne regarde, et qui étouffe le rendu en haute résolution.
+#
+# `FinalEngine::render()` boucle sans pause, et chaque tour appelle
+# `update_render_result()` : allocation d'un `RenderResult` de la taille de
+# l'image, relecture de tous les AOV depuis les tampons Hydra, recopie,
+# libération. En 1920x1440 c'est 55 Mo par tour et personne ne le remarque. En
+# 7680x5760 c'est ~880 Mo alloués, copiés et libérés par tour, sur un thread.
+#
+# Mesuré sur un L4 le 18 septembre 2026 : CPU plat à 13,1 % (un cœur sur huit),
+# GPU compute à 0 %, VRAM figée à 1,5 Gio, et dix-huit minutes sans terminer une
+# frame à UN échantillon — alors que la même scène sort en onze secondes en
+# 1920. La cuisson, elle, se terminait en deux secondes : le procédural n'y
+# était pour rien.
+#
+# Et comme c'est le coût de cette recopie qui cadence la boucle, la supprimer
+# seule en ferait un spin. D'où les deux moitiés : rafraîchir au plus toutes les
+# `TUILE_PREVIEW_INTERVAL` secondes, et dormir un peu sur les tours sautés.
+#
+# Variable absente : comportement d'amont, au tour près.
+COPY integrations/blender/blender-patches/tuile_preview.cc \
+     integrations/blender/blender-patches/tuile_preview.hh \
+     /opt/src/blender/source/blender/render/hydra/
+RUN set -eu; \
+    cd /opt/src/blender/source/blender/render/hydra; \
+    sed -i 's|^  render_task_delegate.cc$|  render_task_delegate.cc\n  tuile_preview.cc|' CMakeLists.txt; \
+    sed -i 's|^  render_task_delegate.hh$|  render_task_delegate.hh\n  tuile_preview.hh|' CMakeLists.txt; \
+    sed -i 's|#include "tuile_manifest.hh"|#include "tuile_manifest.hh"\n#include "tuile_preview.hh"|' final_engine.cc; \
+    perl -0pi -e 's/(  float percent_done = 0\.0;\n)/$1  double tuile_last_preview = 0.0;\n  const double tuile_interval = tuile_preview_interval();\n/' final_engine.cc; \
+    perl -0pi -e 's/(    update_render_result\(width, height, view_layer->name\);\n  \}\n)/    if (tuile_preview_due(BLI_time_now_seconds(), \&tuile_last_preview, tuile_interval)) {\n      update_render_result(width, height, view_layer->name);\n    }\n    else {\n      BLI_time_sleep_ms(50);\n    }\n  }\n/' final_engine.cc; \
+    for probe in "CMakeLists.txt:tuile_preview.cc" \
+                 "final_engine.cc:#include \"tuile_preview.hh\"" \
+                 "final_engine.cc:tuile_preview_due(BLI_time_now_seconds()" \
+                 "final_engine.cc:BLI_time_sleep_ms(50);"; do \
+        f="${probe%%:*}"; want="${probe#*:}"; \
+        grep -qF "$want" "$f" || { \
+            echo "le patch de l'aperçu a manqué sa cible: $want dans $f"; exit 1; }; \
+    done; \
+    # L'appel APRÈS la boucle doit rester inconditionnel : c'est lui qui produit
+    # l'image finale, et le brider donnerait une frame vide ou périmée.
+    grep -c 'update_render_result(width, height, view_layer->name);' final_engine.cc \
+        | grep -qx 2 || { echo "l'appel final a disparu ou a été dupliqué"; exit 1; }; \
+    echo "blender-shared-usd: preview throttle patched in"
+
+# Et ce patch-là est testé, ici, avant même la recompilation.
+#
+# Le pont ne dépend ni d'USD ni de Blender — il passe un pointeur opaque — donc
+# il se teste avec le seul fichier sous test et une bibliothèque bouchon qui
+# compte ses appels. Trois secondes, contre une recompilation puis un rendu de
+# ferme pour apprendre la même chose.
+#
+# Ce qu'il vérifie, c'est ce qu'un patch dans le moteur de rendu de Blender doit
+# promettre : inerte sans sa variable, inoffensif si elle pointe à côté, et une
+# seule insertion par processus — deux mettraient le globe deux fois dans la
+# scène, soit deux surfaces coplanaires sur toute la Terre.
+COPY integrations/blender/tests/tuile_manifest_test.cc \
+     integrations/blender/tests/tuile_manifest_stub.cc \
+     integrations/blender/tests/tuile_preview_test.cc \
+     /opt/src/tuile-tests/
+RUN set -eu; \
+    cd /opt/src/tuile-tests; \
+    h=/opt/src/blender/source/blender/render/hydra; \
+    g++ -std=c++17 -shared -fPIC tuile_manifest_stub.cc -o libtuilestub.so; \
+    g++ -std=c++17 -I"$h" tuile_manifest_test.cc "$h/tuile_manifest.cc" \
+        -ldl -o tuile_manifest_test; \
+    ./tuile_manifest_test "$PWD/libtuilestub.so"; \
+    g++ -std=c++17 -I"$h" tuile_preview_test.cc "$h/tuile_preview.cc" \
+        -o tuile_preview_test; \
+    ./tuile_preview_test
+
+# Et la recompilation partielle : seuls les modules patchés y passent.
+#
+# `cmake --build` relance la configuration si un `CMakeLists.txt` a changé — les
+# deux patchs en ajoutent un fichier chacun — puis ninja fait ce qu'il sait
+# faire : les unités touchées, leurs dépendants, l'édition de liens. Le reste de
+# la centaine de bibliothèques statiques est déjà là, dans la couche d'avant.
+RUN cd /opt/src/blender \
+    && cmake --build /opt/build -j ${BUILD_JOBS} \
+    && cmake --install /opt/build
+
+
+# The kernels, or the build lied.
+#
+# `WITH_CYCLES_CUDA_BINARIES=ON` with a toolkit cmake could not find produces a
+# Blender that configures cleanly, links cleanly, and enumerates zero GPUs at
+# run time — which is exactly the state that cost two pods. Counting the
+# artefacts is the only check that cannot be satisfied by good intentions.
+#
+# Globs with a trailing `*`, because Blender ships them zstd-compressed:
+# `kernel_optix_osl.ptx.zst`, `kernel_sm_120.cubin.zst`. The first version of
+# this assertion looked for bare `.ptx` and `.cubin`, found zero after a build
+# that had generated all twelve, and failed a good image.
+#
+# And the names are checked, not just the count.
+#
+# EVERY architecture in CUDA_ARCH must be present, not merely one of them: a
+# card whose cubin is missing enumerates fine and then refuses every kernel,
+# which is indistinguishable from a GPU that does not work. Asking for the list
+# and checking the list is what stops a silent partial build.
+#
+# `optix` too, because Cycles turns OptiX off with a warning rather than an
+# error — a CUDA-only build passes any bare count while being exactly the
+# slower renderer this whole change exists to stop shipping.
+RUN set -eu; \
+    found=$(find /opt/blender \( -name '*.cubin*' -o -name '*.ptx*' \) -printf '%f\n'); \
+    n=$(echo "$found" | grep -c . || true); \
+    echo "cycles gpu kernels: $n"; echo "$found" | sort | sed 's/^/  /'; \
+    test "$n" -gt 0 || { echo "no CUDA/OptiX kernels were installed"; exit 1; }; \
+    for arch in $(echo "$CUDA_ARCH" | tr ';' ' '); do \
+        echo "$found" | grep -q "$arch" \
+            || { echo "no $arch kernel: a card of that architecture would"; \
+                 echo "  enumerate and then refuse every kernel"; exit 1; }; \
+    done; \
+    echo "$found" | grep -q 'optix' \
+        || { echo "CUDA kernels but no OptiX: find_package(OptiX) was silently skipped"; exit 1; }
+
+# ---------------------------------------------------------------- runtime
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl xz-utils \
+        libglvnd0 libgl1 libegl1 libgles2 \
+        libx11-6 libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 \
+        libsm6 libice6 libxrandr2 libxinerama1 libxcursor1 libdbus-1-3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /opt/blender /opt/blender
+COPY --from=usdpy /opt/usd /opt/usd
+# Blender's own precompiled USD SDK (pxrBlender namespace, shared libs):
+# revealed by the build to be what Blender actually links — therefore the
+# ABI a loadable plugin must target. Shipped for plugin compile stages.
+COPY --from=sources /opt/src/blender/lib/linux_x64/usd /opt/usd-blender
+COPY --from=sources /opt/src/blender/lib/linux_x64/tbb /opt/tbb-blender
+COPY --from=sources /opt/src/blender/lib/linux_x64/python/include /opt/python-blender-include
+
+ENV PATH=/opt/blender:$PATH \
+    LD_LIBRARY_PATH=/opt/blender/lib:/opt/usd/lib \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+
+# The assertions that define this image's existence:
+# 1. Blender links the SHARED USD (ldd shows libusd_*), i.e. pxr symbols
+#    resolvable by plugins — the official build's wall, inverted.
+# 2. The python pxr bindings work (the USDHook injection path).
+# 3. The built-in video encoder actually encodes.
+#
+# What is deliberately NOT asserted here: that the Cycles Hydra delegate is
+# usable as a render engine. It is present in this image — `hdCycles.so` and
+# its `plugInfo.json` under `addons_core/cycles/hydra/` — but the python
+# add-on that exposes it postdates Blender 5.1.2, so the check belongs where
+# the add-on is, which is `Dockerfile.globe`. Asserting it here would test
+# Blender's packaging rather than our own.
+# 4. Cycles can actually name a GPU backend.
+#
+# By ASSIGNMENT and not by reading `enum_items`, which answers `[]` in this
+# Blender while the values are perfectly settable — a lesson that cost two pods
+# in one afternoon. There is no GPU at build time, so the device COUNT cannot
+# be checked here; what can be, and what was silently false until today, is
+# that the build knows what OptiX is at all.
+RUN blender -b --factory-startup --python-exit-code 1 --python-expr \
+        "import bpy; \
+p = bpy.context.preferences.addons['cycles'].preferences; \
+p.compute_device_type = 'OPTIX'; \
+print('optix accepted')" \
+    && echo "blender-shared-usd verified: Cycles knows OptiX"
+# 5. Le Blender installé est lié à NOTRE USD, et c'est la version demandée.
+#
+# L'assertion se déduit de `USD_VERSION` au lieu de la répéter. La version
+# écrite en dur a fait exactement ce qu'une valeur dupliquée finit toujours par
+# faire : le 17 septembre 2026, le passage à 26.03 a laissé `v[1] == 25 and
+# v[2] == 8` derrière lui, et une heure de compilation s'est arrêtée ici, sur
+# un Blender parfaitement bon. L'assertion avait raison — c'est sa source qui
+# était fausse. Une seule déclaration, en haut du fichier, désormais.
+ARG USD_VERSION
+RUN ldd /opt/blender/blender | grep -q libusd_ \
+    && blender -b --factory-startup --python-exit-code 1 --python-expr \
+        "import bpy; from pxr import Usd; \
+v = Usd.GetVersion(); \
+want = tuple(int(p) for p in '${USD_VERSION}'.split('.')); \
+print('usd', v, 'want', want); \
+assert (v[1], v[2]) == want, v" \
+    && blender -b --factory-startup --python-exit-code 1 --python-expr "import bpy; sc = bpy.context.scene; sc.render.engine = 'CYCLES'; sc.cycles.samples = 1; sc.render.resolution_x = 64; sc.render.resolution_y = 48; sc.frame_start = 1; sc.frame_end = 2; sc.render.image_settings.media_type = 'VIDEO'; sc.render.image_settings.file_format = 'FFMPEG'; sc.render.ffmpeg.format = 'MPEG4'; sc.render.ffmpeg.codec = 'H264'; sc.render.filepath = '/tmp/e.mp4'; bpy.ops.render.render(animation=True)" \
+    && test -s /tmp/e*.mp4 && rm -f /tmp/e* \
+    && echo "blender-shared-usd verified: shared USD linked, pxr python OK, encoder OK"
+
+CMD ["blender", "--version"]

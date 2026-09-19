@@ -302,6 +302,7 @@ fn ground_under_the_camera_is_never_black() {
             tiles: selected(&[here, neighbour]),
             ancestry: tree_shape(&[here, neighbour]),
             stats: TraversalStats::default(),
+            generation: 0,
         },
         ServerMessage::Content {
             tile: here,

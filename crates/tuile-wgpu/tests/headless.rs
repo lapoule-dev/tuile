@@ -27,6 +27,7 @@ fn gpu() -> Option<GpuContext> {
 /// textured with a 2×2 checker: red, green / blue, white.
 fn quad_content(origin: DVec3) -> DecodedTileContent {
     DecodedTileContent {
+        withheld_drape: None,
         meshes: vec![DecodedMesh {
             positions: vec![
                 [-1.0, 1.0, 0.0],

@@ -165,7 +165,7 @@ impl WorkerEngine {
             fovy,
         );
         self.stream
-            .send(ClientMessage::ViewerState { views: vec![view] })
+            .send(ClientMessage::ViewerState { views: vec![view], generation: 0 })
             .map_err(|e| JsError::new(&e.to_string()))
     }
 

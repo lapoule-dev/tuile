@@ -55,6 +55,12 @@ struct TuileTile
     uint32_t index_count;
     float base_color_factor[4];
     int32_t base_color_texture;
+    /// What the tile's imagery was composed from, or 0 when it carries none.
+    /// A tile keeps its id across frames; its imagery does not — it is
+    /// re-draped at another level as the camera moves. Comparing this is how a
+    /// consumer that keeps prims tells "unchanged" from "same tile, new
+    /// pixels" without rebuilding a URI to look at.
+    uint64_t drape;
 };
 
 /// Mirrors `TuileTexture`. `uri` is UTF-8 and is NOT null-terminated — build a
@@ -97,6 +103,22 @@ struct TuileGlobeConfig
     /// kept: a failed tile leaves no hole — its ancestor stands in — so the
     /// frame renders plausibly at the wrong level of detail.
     bool fail_on_tile_errors;
+    /// A pre-baked pack to read instead of the network. Empty means the
+    /// network.
+    ///
+    /// When it is set, NOTHING else in this struct is consulted: not the
+    /// token, not the asset ids, not the cache, not the screen-space error.
+    /// All of those were decided by the bake and are recorded in the pack, and
+    /// honouring them here would let a render ask for a level of detail nobody
+    /// baked and get whatever happened to be there.
+    ///
+    /// A session opened this way makes no network request at all, which is
+    /// what lets a render pod run with no ion token in its environment.
+    TuileStr pack_path;
+    /// The scene digest the host believes it is rendering, or empty to accept
+    /// whatever pack it is given. Worth setting on a farm: a pack of another
+    /// shot renders the wrong ground and reports success.
+    TuileStr scene_digest;
 };
 
 /// Mirrors `TuileViewState`: one camera, twelve doubles.
@@ -114,7 +136,10 @@ struct TuileViewState
     double fovy_rad;
 };
 
-/// Opens a session on an ion globe. BLOCKS while resolving sources.
+/// Opens a session, on an ion globe or on a pre-baked pack.
+///
+/// With `pack_path` set this touches no network and needs no token; without
+/// it, it BLOCKS while resolving sources.
 /// On success *out owns a session to release with tuile_session_free;
 /// on failure *out is left null.
 TuileStatus tuile_session_new(const TuileGlobeConfig *config, TuileSession **out);

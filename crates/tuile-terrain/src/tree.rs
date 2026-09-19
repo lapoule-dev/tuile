@@ -148,6 +148,22 @@ impl TerrainTree {
 }
 
 impl TileTree for TerrainTree {
+    /// The planet, as the largest sphere that fits inside it.
+    ///
+    /// A quadtree over the whole ellipsoid is the one dataset where most of
+    /// what a frustum contains is on the other side of the world. The semi-minor
+    /// axis, not the semi-major: a sphere inscribed in the ellipsoid hides
+    /// strictly less than the ellipsoid does, so nothing this culls could have
+    /// been drawn. Terrain relief needs no allowance here — it is inside each
+    /// tile's own bounding volume, and `Occluder::hides` accounts for the whole
+    /// volume rather than its centre.
+    fn occluder(&self) -> Option<tuile_core::math::Occluder> {
+        Some(tuile_core::math::Occluder {
+            center: glam::DVec3::ZERO,
+            radius: tuile_core::geo::WGS84_B,
+        })
+    }
+
     fn roots(&self) -> Vec<TileId> {
         let mut out = Vec::new();
         for x in 0..self.scheme.root_tiles_x {
@@ -250,6 +266,27 @@ impl TileTree for TerrainTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The occluder has to survive the trip through `dyn TileTree`.
+    ///
+    /// Written after the cull silently did nothing on a real frame: the test
+    /// that was missing is not "does the maths work" — that one existed and
+    /// passed — but "does the traversal ever get told there is a planet".
+    #[test]
+    fn the_tree_offers_its_planet_as_an_occluder() {
+        let tree = TerrainTree::new(cwt_layer());
+        let occluder = tree.occluder().expect("a global terrain has a planet");
+        assert_eq!(occluder.center, glam::DVec3::ZERO);
+        assert!(
+            (occluder.radius - tuile_core::geo::WGS84_B).abs() < 1.0,
+            "{} is not the inscribed radius",
+            occluder.radius
+        );
+        // Through the trait object, which is how the runtime holds it — the
+        // one thing a direct call cannot prove.
+        let boxed: Box<dyn TileTree> = Box::new(TerrainTree::new(cwt_layer()));
+        assert_eq!(boxed.occluder(), Some(occluder));
+    }
 
     fn cwt_layer() -> LayerJson {
         // Cesium-World-Terrain-like: 2 roots, maxzoom 4, full availability.

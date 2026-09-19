@@ -1,0 +1,351 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# The farm image for the generative globe: the scene-index Blender fork plus
+# the TuileGlobe hdGp procedural — C++ compiled against the fork's own USD SDK
+# (pxrBlender namespace, /opt/usd-blender), Rust streaming core linked in as a
+# staticlib. One image, three procedural pieces that must share one ABI.
+#
+# Non-monolithic on purpose:
+#   rustlib — the tuile-hydra staticlib, built once per Rust change (the
+#             workspace context is source-only; .dockerignore keeps target/,
+#             references/ and .git out of the transfer).
+#   plugin  — the .so, linked against the SDK the base image ships.
+#   final   — base + plugin + farm scripts; nothing else.
+#
+#   docker buildx build --builder stl-builder-k8s --platform linux/amd64 \
+#       -f integrations/blender/Dockerfile.globe \
+#       -t harbor.sportstracklive.com/stl/blender-globe:5.1-su --push .
+
+# 2509 recompiled Blender from the current patch: 2508 predates c2ab384 and
+# still carries the cubeProc spike probe, which constructed a TestCube
+# procedural on every populate — 240 lines of noise in a 48-frame job.
+#
+# 2510 is the first Blender in this project with a GPU backend at all. 2509
+# had `WITH_CYCLES_HYDRA_RENDER_DELEGATE=ON` above a build with no CUDA
+# toolkit and no OptiX headers: not one kernel, `compute_device_type` offering
+# no OPTIX, and zero CUDA devices enumerated on a machine with four RTX 5090s.
+# That one fact is why the farm was on Storm and why four processes told to
+# take four GPUs were only ever going to share one.
+#
+# It also carries the Cycles Hydra delegate — `hdCycles.so` and its
+# `plugInfo.json` under `addons_core/cycles/hydra/` — and, since 5.2, the
+# python add-on that exposes it as a render engine, under
+# `addons_core/hydra_cycles`. We used to carry that add-on ourselves because
+# 5.1.2 shipped the delegate without it; the assertion further down is what
+# replaced the copy.
+ARG BASE=harbor.sportstracklive.com/stl/blender-shared-usd:5.2-2605
+# La série, parce que Blender range ses ressources sous un répertoire qui porte
+# sa version — `/opt/blender/5.2/scripts`, `/opt/blender/5.2/python`.
+#
+# Écrite une fois et dérivée partout. Recopiée, elle fait ce que toute valeur
+# dupliquée finit par faire : le 17 septembre 2026, la bascule en 5.2 a laissé
+# trois `/opt/blender/5.1` derrière elle, et le dégraissage a tué la
+# construction sur un `find` d'un répertoire absent — après la compilation du
+# plugin, donc au prix fort.
+ARG BLENDER_SERIES=5.2
+
+# ----------------------------------------------------------------- rustlib --
+FROM rust:1-bookworm AS rustlib
+WORKDIR /src
+# The whole workspace manifest set: cargo refuses to parse a workspace with
+# absent members, and the members ARE the context (sources only, few MiB).
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY examples ./examples
+RUN cargo --version \
+    && cargo build --release -p tuile-hydra \
+    && test -f target/release/libtuile_hydra.a
+# The trajectory generators and the manifest writer: a generative farm job
+# carries six numbers, not fourteen hundred baked camera matrices. Baked
+# samples remain the road for REAL recorded tracks (JOB_STAGE_URL).
+RUN cargo build --release -p tuile-tape -p tuile-usd --bins \
+    && for b in orbit-tape pyrenees-tape zoom-tape tape-to-stage; do \
+        test -x "target/release/$b" && strip "target/release/$b"; done
+# The bake, with its profiler compiled in.
+#
+# It is the same binary a pod runs and the one a diagnosis runs: a build that
+# cannot be profiled is one nobody can fix, and shipping two binaries means the
+# numbers come from the one that was not the problem. `prof_active:false`
+# leaves it costing a branch until TUILE_PROFILE arms it.
+#
+# NOT stripped, and that is the point. Stripping is exactly what made a live
+# profile come back with every Rust frame as `???`.
+RUN cargo build --release -p tuile-bake --features profiling \
+    && test -x target/release/tuile-bake
+
+# ------------------------------------------------------------------ plugin --
+FROM ${BASE} AS plugin
+ENV DEBIAN_FRONTEND=noninteractive
+# `zlib1g-dev` pour les tests seulement : ils lient le python STATIQUE de
+# Blender, et une archive statique traîne ses propres dépendances derrière elle.
+# Le greffon, lui, est une bibliothèque partagée et n'en a pas besoin.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY integrations/hydra/src /opt/src/tuileHydra/src
+COPY integrations/hydra/tests /opt/src/tuileHydra/tests
+COPY integrations/hydra/resources/plugInfo.json /opt/src/tuileHydra/plugInfo.json.in
+COPY --from=rustlib /src/target/release/libtuile_hydra.a /opt/src/tuileHydra/
+# The exact ELF recipe of integrations/hydra/CMakeLists.txt, transposed to the
+# SDK the base image ships: the monolith libusd_ms carries every pxr lib the
+# CMake build names individually, and --exclude-libs,ALL keeps the Rust
+# runtime's symbols out of the dynamic table — a plugin must never resolve its
+# host's calls into its own copy of a common crate.
+#
+# Le répertoire est la liste, pas une copie de la liste.
+#
+# Cette recette énumérait les cinq `.cpp` à la main, en double de
+# `CMakeLists.txt`. Le 17 septembre 2026, `hostpaths.cpp` a été ajouté au
+# CMakeLists et pas ici : le plugin s'est construit, l'image a été poussée, les
+# assertions sont passées — et il s'est cassé au chargement, dans le job, sur
+# `undefined symbol: TuileSceneGlobals`. Un glob ne peut pas diverger d'un
+# répertoire. Les tests vivent dans `integrations/hydra/tests`, hors de `src`,
+# donc rien d'indésirable n'entre par là.
+RUN set -e; SDK=/opt/usd-blender; \
+    PYINC=$(ls -d /opt/python-blender-include/python3* | head -1); \
+    mkdir -p /opt/plugins/tuileHydra/resources; \
+    set -- /opt/src/tuileHydra/src/*.cpp; \
+    test -e "$1" || { echo "aucun .cpp dans src/"; exit 1; }; \
+    echo "plugin: $# unités — $(basename -a "$@" | tr '\n' ' ')"; \
+    g++ -std=c++17 -fPIC -shared \
+        "$@" \
+        -I/opt/src/tuileHydra/src \
+        -I"$SDK/include" -I/opt/tbb-blender/include -I"$PYINC" \
+        -L"$SDK/lib" -lusd_ms \
+        /opt/src/tuileHydra/libtuile_hydra.a \
+        -Wl,--exclude-libs,ALL \
+        -lpthread -ldl -lm \
+        -o /opt/plugins/tuileHydra/tuileHydra.so; \
+    sed -e 's|@PLUG_INFO_LIBRARY_PATH@|tuileHydra.so|' \
+        -e 's|@PLUG_INFO_RESOURCE_PATH@|resources|' \
+        -e 's|@PLUG_INFO_ROOT@|..|' \
+        /opt/src/tuileHydra/plugInfo.json.in \
+        > /opt/plugins/tuileHydra/resources/plugInfo.json; \
+    strip --strip-debug /opt/plugins/tuileHydra/tuileHydra.so; \
+    test -s /opt/plugins/tuileHydra/tuileHydra.so
+# Les tests unitaires du greffon, joués dans l'image qui rendra.
+#
+# Ils tournent aussi sous CTest chez le développeur, et ce n'est pas la même
+# assertion. Ici le `plugInfo.json` n'est pas celui que CMake configure : c'est
+# un `sed` à trois substitutions, dans un autre fichier, sur une autre machine.
+# `manifestRungTest` charge le greffon comme le fera Blender — par la registry,
+# par `dlopen`, à travers CE plugInfo — et vérifie l'ordre d'insertion, c'est-à-
+# dire la seule propriété dont ni un rendu ni un compteur ne sait rien dire : un
+# manifeste fusionné après le resolver hdGp donne une image sans globe, sans
+# erreur, sans trace.
+#
+# Le `-rdynamic` et le libpython ne sont pas décoratifs. `libusd_ms.so` laisse
+# ses symboles Python indéfinis : c'est légal pour une bibliothèque partagée, et
+# c'est le binaire `blender` qui les fournit — il lie le python statique et
+# réexporte sa table. Notre greffon vit sous ce toit ; un exécutable de test,
+# non. Sans ces deux drapeaux, l'édition de liens échoue sur trois cents
+# `undefined reference to PyDict_New` et consorts.
+RUN set -e; SDK=/opt/usd-blender; \
+    PYINC=$(ls -d /opt/python-blender-include/python3* | head -1); \
+    PYA=$(find /opt/blender -name 'libpython3*.a' | head -1); \
+    test -n "$PYA" || { echo "pas de libpython statique sous /opt/blender"; exit 1; }; \
+    PYDIR=$(dirname "$PYA"); PYL=$(basename "$PYA" .a); PYL=${PYL#lib}; \
+    echo "tests: python $PYL depuis $PYDIR"; \
+    # `$LD_LIBRARY_PATH` est ÉTENDU, pas remplacé : `libusd_ms.so` tire
+    # openvdb, MaterialX et OpenEXR depuis le répertoire de Blender, que l'image
+    # de base a déjà mis dans le chemin. L'écraser donne un
+    # `libopenvdb.so.13.0: cannot open shared object file` à l'exécution, soit
+    # un code 127 qui se lit comme « binaire introuvable ».
+    for t in cameraRung manifestRung; do \
+        g++ -std=c++17 -fPIC -rdynamic \
+            /opt/src/tuileHydra/tests/${t}Test.cpp \
+            /opt/src/tuileHydra/src/hostpaths.cpp \
+            -I/opt/src/tuileHydra/src \
+            -I"$SDK/include" -I/opt/tbb-blender/include -I"$PYINC" \
+            -L"$SDK/lib" -lusd_ms \
+            -L"$PYDIR" -l"$PYL" \
+            -lpthread -ldl -lm -lutil -lz \
+            -o /tmp/$t; \
+    done; \
+    LIBS="$SDK/lib:$LD_LIBRARY_PATH"; \
+    LD_LIBRARY_PATH="$LIBS" /tmp/cameraRung; \
+    PXR_PLUGINPATH_NAME=/opt/plugins/tuileHydra/resources \
+    HDGP_INCLUDE_DEFAULT_RESOLVER=1 \
+    LD_LIBRARY_PATH="$LIBS" /tmp/manifestRung
+
+# The staticlib must not leak: no Rust ABI symbol may be dynamically visible.
+RUN ! nm -D /opt/plugins/tuileHydra/tuileHydra.so | grep -qE "tuile_session_new|rust_eh_personality" \
+    && echo "plugin: rust symbols hidden"
+
+# Celui-là, en revanche, DOIT sortir : c'est par lui que le fork de Blender
+# insère le manifeste dans son render index. `--exclude-libs,ALL` et `strip`
+# passent juste à côté, et s'il disparaissait le rendu sortirait d'un bleu
+# uniforme sans une ligne d'erreur.
+RUN nm -D /opt/plugins/tuileHydra/tuileHydra.so | grep -q " T tuile_insert_manifest" \
+    && echo "plugin: tuile_insert_manifest exported"
+# Prune Blender IN the compile stage so the final copies only what a
+# headless farm render reads. Measured: python tests/__pycache__/wheels and
+# the symbol tables of the binary and the dep libs are ~250 MB that no
+# render ever touches. Locale, asset library and studiolights are UI food.
+ARG BLENDER_SERIES
+RUN set -e; \
+    RES=/opt/blender/${BLENDER_SERIES}; \
+    test -d "$RES" || { \
+        echo "pas de $RES — la base a changé de série:"; \
+        ls -d /opt/blender/[0-9]*.[0-9]* 2>/dev/null; exit 1; }; \
+    strip --strip-unneeded /opt/blender/blender 2>/dev/null || true; \
+    find /opt/blender/lib -name "*.so*" -type f \
+        -exec strip --strip-debug {} + 2>/dev/null || true; \
+    PY="$RES"/python; \
+    find "$PY" -type d -name __pycache__ -prune -exec rm -rf {} +; \
+    find "$PY" -type d \( -name tests -o -name test \) -prune -exec rm -rf {} +; \
+    rm -rf "$PY"/lib/python3*/ensurepip "$PY"/lib/python3*/idlelib \
+           "$PY"/lib/python3*/tkinter "$PY"/lib/python3*/distutils; \
+    rm -rf "$RES"/datafiles/locale \
+           "$RES"/datafiles/assets \
+           "$RES"/datafiles/studiolights; \
+    du -m -s /opt/blender /opt/blender/lib "$RES"
+
+# ------------------------------------------------------------------- final --
+# A fresh runtime, NOT the base: the base's runtime doubles as a compile SDK
+# (usd-blender headers, a second shared USD, TBB and python headers) and a
+# farm pull pays for all of it on every cold host. Measured on the fat image:
+# /opt/usd 231 MB is unused at runtime (Blender ships its own pxr python —
+# proven by running the export with it removed), the compile SDK is 99 MB,
+# datafiles/locale is 76 MB of translations no headless render reads, and
+# the unstripped Rust debuginfo added ~90 MB more. Re-layering also splits
+# the one 478 MB layer into parallel pulls.
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl xz-utils \
+        libglvnd0 libgl1 libegl1 libgles2 \
+        libx11-6 libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 \
+        libsm6 libice6 libxrandr2 libxinerama1 libxcursor1 libdbus-1-3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=plugin /opt/blender/lib /opt/blender/lib
+COPY --from=plugin /opt/blender/blender /opt/blender/blender
+ARG BLENDER_SERIES
+COPY --from=plugin /opt/blender/${BLENDER_SERIES} /opt/blender/${BLENDER_SERIES}
+COPY --from=plugin /opt/blender/license /opt/blender/license
+COPY --from=plugin /opt/plugins/tuileHydra /opt/plugins/tuileHydra
+# Static ffmpeg for per-range encodes and the concat, same recipe as
+# stl/blender-render:5.1 — and ffprobe beside it. Without ffprobe the job's
+# frame-count check, the one that tells a 1440-frame render that only carried
+# 180 from a good one, could never run: it failed silently and printed
+# "frames: inconnu".
+RUN curl -fsL -o /tmp/ffmpeg.tar.xz \
+        "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" \
+    && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp \
+    && mv /tmp/ffmpeg-*-static/ffmpeg /usr/local/bin/ffmpeg \
+    && mv /tmp/ffmpeg-*-static/ffprobe /usr/local/bin/ffprobe \
+    && rm -rf /tmp/ffmpeg* \
+    && ffmpeg -version | sed -n 1p \
+    && ffprobe -version | sed -n 1p
+# L'add-on qui expose le délégué Hydra de Cycles comme moteur de rendu, et qui
+# vient désormais d'amont.
+#
+# Sans lui, `scene.render.engine` ne connaît que `HYDRA_STORM` — un rasteriseur
+# OpenGL qui n'appelle jamais CUDA, ce qui est la raison pour laquelle quatre
+# processus censés prendre quatre GPU ont été mesurés tous les quatre sur un
+# seul. Il n'est donc pas optionnel.
+#
+# Nous en portions une copie parce que Blender 5.1.2 livrait le délégué sans
+# l'add-on. 5.2 livre les deux : `intern/cycles/hydra/CMakeLists.txt` l'installe
+# sous `addons_core/hydra_cycles` dès que `WITH_CYCLES_BLENDER` est actif. La
+# copie amont fait tout ce que faisait la nôtre et une chose de plus —
+# `bpy.utils.expose_bundled_modules()` avant d'importer `pxr.Plug` — donc la
+# garder ne serait pas la préserver, ce serait masquer la sienne.
+#
+# Vérifié plutôt que supposé : une version qui cesserait de le livrer doit
+# arrêter la construction ici, pas rendre sur Storm en silence.
+RUN test -f /opt/blender/${BLENDER_SERIES}/scripts/addons_core/hydra_cycles/__init__.py \
+    && echo "blender-globe verified: upstream hydra_cycles add-on is installed"
+COPY integrations/blender/render_usd.py /opt/render/render_usd.py
+COPY integrations/blender/render_job.sh /opt/render/render_job.sh
+# L'autre moitié de la paire. Une seule image porte les deux jobs : le binaire
+# qui cuit et celui qui lit sont alors le même digest, donc un pack et le rendu
+# qui le consomme ne peuvent pas venir de deux versions du code.
+COPY integrations/blender/bake_job.sh /opt/render/bake_job.sh
+COPY --from=rustlib /src/target/release/orbit-tape \
+                    /src/target/release/pyrenees-tape \
+                    /src/target/release/zoom-tape \
+                    /src/target/release/tape-to-stage \
+                    /src/target/release/tuile-bake \
+                    /opt/tuile/bin/
+
+ENV PATH=/opt/blender:$PATH \
+    LD_LIBRARY_PATH=/opt/blender/lib \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+    PXR_PLUGINPATH_NAME=/opt/plugins/tuileHydra/resources \
+    HDGP_INCLUDE_DEFAULT_RESOLVER=1 \
+    CYCLES_EXTERNAL_IMAGE_LIB=/opt/plugins/tuileHydra/tuileHydra.so \
+    TUILE_HYDRA_LIB=/opt/plugins/tuileHydra/tuileHydra.so \
+    TUILE_PREVIEW_INTERVAL=86400
+# Une journée, c'est-à-dire jamais.
+#
+# L'aperçu intermédiaire d'un rendu de ferme n'a aucun spectateur, et c'est
+# l'appel d'APRÈS la boucle qui produit l'image. Le laisser tourner coûtait, en
+# 8K, quelque 880 Mo alloués, recopiés et libérés à chaque tour de boucle, sur
+# un seul thread : dix-huit minutes sans terminer une frame à un échantillon,
+# CPU à 13,1 % et GPU à 0 %. Le détail est dans `Dockerfile.blender-shared-usd`.
+
+# Pourquoi le greffon d'images externes est le plugin lui-même.
+#
+# Le fork de Cycles charge la bibliothèque nommée par
+# `CYCLES_EXTERNAL_IMAGE_LIB` et y résout deux symboles C. Elle pourrait être
+# une bibliothèque à part ; elle n'a pas à l'être. Quand Cycles demande une
+# image, le procédural a déjà cuit la frame, donc `tuileHydra.so` est chargée
+# depuis longtemps : un `dlopen` sur son propre chemin rend le même handle, et
+# donc le même magasin statique — celui où les octets viennent d'être déversés.
+# Une seconde bibliothèque n'aurait fait qu'ajouter un objet à construire, une
+# ABI à tenir, et une occasion d'avoir deux magasins au lieu d'un.
+#
+# Un nom que le magasin ne connaît pas rend 0, et Cycles ouvre le fichier comme
+# avant : le chemin natif, lui, n'a pas changé.
+
+# The assertion that defines this image: the procedural plugin REGISTERS in
+# the very Blender that will render (cooking needs a token, registration does
+# not). Blender's internal USD only scans PXR_PLUGINPATH_NAME once its own
+# plug registry wakes up, and `import bpy` does not wake it — a real USD
+# export does. dash has no pipefail, so capture-then-grep, and dump the log
+# when the grep misses so the failure is diagnosable from the build output.
+RUN out=$(TF_DEBUG=PLUG_REGISTRATION blender -b --factory-startup \
+        --python-exit-code 1 --python-expr \
+        "import bpy; bpy.ops.wm.usd_export(filepath='/tmp/probe.usda')" 2>&1); \
+    if echo "$out" | grep -m1 "plugin 'tuileHydra'"; then \
+        echo "blender-globe verified: tuileHydra registers"; \
+    else \
+        echo "$out" | tail -40; exit 1; \
+    fi
+
+# Et qu'il se CHARGE, ce qui n'est pas la même question.
+#
+# L'enregistrement ne lit que `plugInfo.json` : un `.so` auquel il manque une
+# définition s'enregistre sans broncher. Le 17 septembre 2026, une recette de
+# compilation qui avait oublié `hostpaths.cpp` a produit une image dont toutes
+# les assertions passaient, et qui mourait dans le job sur
+# `undefined symbol: TuileSceneGlobals` — après la poussée, après le
+# démarrage du L4, après le téléchargement de deux gigaoctets de pack.
+#
+# `Load()` résout les symboles. C'est la seule question dont la réponse ne peut
+# pas être satisfaite par de bonnes intentions.
+RUN blender -b --factory-startup --python-exit-code 1 --python-expr \
+        "import bpy; \
+bpy.ops.wm.usd_export(filepath='/tmp/probe.usda'); \
+import pxr.Plug; \
+p = pxr.Plug.Registry().GetPluginWithName('tuileHydra'); \
+assert p, 'tuileHydra ne s\'enregistre pas'; \
+assert p.Load(), 'tuileHydra s\'enregistre mais refuse de se charger'; \
+print('tuileHydra loaded')" \
+    && echo "blender-globe verified: tuileHydra loads, symbols resolve"
+
+# And that the Cycles Hydra delegate is a render engine this Blender will
+# accept. That is what puts the render on OptiX instead of Storm, and therefore
+# what puts it on four GPUs instead of one.
+#
+# By ASSIGNMENT, not by reading `enum_items`. Measured in 5.1-2509: that
+# property answered `['BLENDER_EEVEE']` while `CYCLES` and `HYDRA_CYCLES` were
+# both perfectly settable, so a check on it would have failed a delegate that
+# was there. Blender's own TypeError names the engines that really exist, which
+# is the diagnosis anyway.
+RUN blender -b --factory-startup --python-exit-code 1 --python-expr         "import bpy; sc = bpy.context.scene; bpy.ops.preferences.addon_enable(module='cycles'); bpy.ops.preferences.addon_enable(module='hydra_cycles'); sc.render.engine = 'HYDRA_CYCLES'; assert sc.render.engine == 'HYDRA_CYCLES'"     && echo "blender-globe verified: HYDRA_CYCLES is settable"
+
+CMD ["bash", "/opt/render/render_job.sh"]

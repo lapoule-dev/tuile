@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# Image 1 of the render stack: a SHARED OpenUSD build, alone. The compile
+# base for every USD plugin (cubeProc, TuileGlobe) and the USD that the
+# from-source Blender (image 3) links against — which is the whole point:
+# shared libs with exported pxr symbols are what let plugins load into the
+# same runtime, the exact thing the official Blender's static USD forbids
+# (probed 2026-09-07: nm -D blender | pxrInternal = 0).
+#
+# Version discipline: this tag must match the Blender that links it
+# (Blender 5.1 bundles USD 25.08). A :26.08 sibling serves our own stack.
+#
+#   docker buildx build --builder stl-builder-k8s --platform linux/amd64 \
+#       -f integrations/blender/Dockerfile.usd-shared \
+#       -t harbor.sportstracklive.com/stl/usd-shared:25.08 --push .
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ARG BUILD_JOBS=2
+ARG USD_VERSION=25.08
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake python3 git curl ca-certificates xz-utils \
+        libx11-dev libxt-dev libgl1-mesa-dev libglu1-mesa-dev libglvnd-dev \
+        libegl1-mesa-dev zlib1g-dev libbz2-dev liblzma-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Minimal build, SHARED (build_usd.py's default linkage), with --examples.
+# Headers, libs and the source tree stay: this image is a compile base.
+RUN curl -fsL -o /tmp/usd.tar.gz \
+        "https://github.com/PixarAnimationStudios/OpenUSD/archive/refs/tags/v${USD_VERSION}.tar.gz" \
+    && tar -xzf /tmp/usd.tar.gz -C /opt \
+    && python3 /opt/OpenUSD-${USD_VERSION}/build_scripts/build_usd.py \
+        --no-python --no-tests --no-docs --no-python-docs --no-tutorials \
+        --examples \
+        --no-materialx --no-opencolorio --no-openimageio --no-openvdb \
+        --no-alembic --no-draco --no-ptex --no-usdview --no-prman --no-vulkan \
+        -j ${BUILD_JOBS} /opt/usd \
+    && rm -rf /opt/usd/build /opt/usd/src /tmp/usd.tar.gz \
+    && ln -s /opt/OpenUSD-${USD_VERSION} /opt/openusd-src
+
+# Assertions: the libs are SHARED (the raison d'être), hdGp is compilable
+# against, and its symbols are exported.
+RUN test -f /opt/usd/lib/libusd_hdGp.so \
+    && test -f /opt/usd/include/pxr/imaging/hdGp/generativeProceduralPluginRegistry.h \
+    && nm -D /opt/usd/lib/libusd_usd.so | grep -qm1 pxrInternal \
+    && echo "usd-shared verified: ${USD_VERSION}, shared libs, exported pxr symbols, hdGp present"
+
+CMD ["/bin/bash"]

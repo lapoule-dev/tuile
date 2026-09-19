@@ -1,0 +1,104 @@
+#usda 1.0
+(
+    defaultPrim = "Overlay"
+    metersPerUnit = 1
+    upAxis = "Z"
+    startTimeCode = 1
+    endTimeCode = 2
+    timeCodesPerSecond = 24
+    doc = """Prototype de la couche de vol STL (docs/16) : track BasisCurves
+rebasée, rideau au sol en dégradé d'opacité, carte-label billboardée, et le
+curseur importé PAR RÉFÉRENCE (cursor.usda en doublure d'un glTF converti)
+puis manipulé par composition — xform animé + over de matériau, sans éditer
+l'asset. Toutes les positions sont rebasées sur le renderOrigin du manifeste
+hôte (ici des petites valeurs de démonstration)."""
+)
+
+def Xform "Overlay"
+{
+    # ------------------------------------------------------------ track ----
+    # type=linear, largeur en mètres (le writer réel anime widths par frame
+    # pour la constance à l'écran), fondu de queue par displayOpacity varying.
+    def BasisCurves "Track"
+    {
+        uniform token type = "linear"
+        int[] curveVertexCounts = [5]
+        point3f[] points = [(-120, -40, 260), (-60, -18, 275), (0, 0, 290), (55, 22, 300), (110, 45, 308)]
+        float[] widths = [6, 6, 6, 6, 6] (interpolation = "vertex")
+        color3f[] primvars:displayColor = [(1.0, 0.42, 0.1)] (interpolation = "constant")
+        float[] primvars:displayOpacity = [0.05, 0.3, 0.7, 1.0, 1.0] (interpolation = "vertex")
+    }
+
+    # ------------------------------------------------- rideau (« ombre ») ----
+    # Paires (sol, aérien) le long de la queue, alpha 1→0 : la « trace
+    # verticale » du client Unity, pas une ombre projetée. Les hauteurs sol
+    # viennent de TerrainHeights à la génération.
+    def Mesh "Curtain"
+    {
+        int[] faceVertexCounts = [4, 4]
+        int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 5, 4]
+        point3f[] points = [(0, 0, 190), (0, 0, 290), (55, 22, 195), (55, 22, 300), (110, 45, 198), (110, 45, 308)]
+        uniform token subdivisionScheme = "none"
+        uniform bool doubleSided = 1
+        color3f[] primvars:displayColor = [(1.0, 0.42, 0.1)] (interpolation = "constant")
+        float[] primvars:displayOpacity = [0.35, 0.35, 0.2, 0.2, 0.0, 0.0] (interpolation = "vertex")
+    }
+
+    # ------------------------------------------------------- carte-label ----
+    # Un quad billboardé : l'orientation est CUITE par frame (le writer
+    # connaît la caméra de la tape), ici deux samples de démonstration. La
+    # texture (badge/label PNG généré) se branche par UsdUVTexture ; le
+    # prototype reste autoporté avec un displayColor.
+    def Mesh "Label"
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-9, 0, -2.5), (9, 0, -2.5), (9, 0, 2.5), (-9, 0, 2.5)]
+        texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (interpolation = "faceVarying")
+        uniform token subdivisionScheme = "none"
+        uniform bool doubleSided = 1
+        color3f[] primvars:displayColor = [(1.0, 0.42, 0.1)] (interpolation = "constant")
+        matrix4d xformOp:transform.timeSamples = {
+            1: ( (0.94, 0.342, 0, 0), (-0.342, 0.94, 0, 0), (0, 0, 1, 0), (110, 45, 326, 1) ),
+            2: ( (0.985, 0.174, 0, 0), (-0.174, 0.985, 0, 0), (0, 0, 1, 0), (112, 46, 327, 1) ),
+        }
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+    }
+
+    # Le jalon sol → label des localités.
+    def BasisCurves "LabelStake"
+    {
+        uniform token type = "linear"
+        int[] curveVertexCounts = [2]
+        point3f[] points = [(110, 45, 198), (110, 45, 322)]
+        float[] widths = [1.2, 1.2] (interpolation = "vertex")
+        color3f[] primvars:displayColor = [(1, 1, 1)] (interpolation = "constant")
+        float[] primvars:displayOpacity = [0.6, 0.6] (interpolation = "vertex")
+    }
+
+    # ------------------------------------- curseur : référence + overs ----
+    # Le pattern glTF-par-composition (docs/16 §2 bis) : l'asset est
+    # référencé, placé/animé par timeSamples, recoloré par over. cursor.usda
+    # tient lieu de .usdc issu de `assets/convert-gltf.sh`.
+    def Xform "Cursor" (
+        prepend references = @./cursor.usda@
+    )
+    {
+        matrix4d xformOp:transform.timeSamples = {
+            1: ( (0.94, 0.342, 0, 0), (-0.342, 0.94, 0, 0), (0, 0, 1, 0), (110, 45, 308, 1) ),
+            2: ( (0.985, 0.174, 0, 0), (-0.174, 0.985, 0, 0), (0, 0, 1, 0), (112.5, 46, 308.4, 1) ),
+        }
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+
+        over "Materials"
+        {
+            over "Wing"
+            {
+                over "Preview"
+                {
+                    color3f inputs:diffuseColor = (1.0, 0.42, 0.1)
+                }
+            }
+        }
+    }
+}
