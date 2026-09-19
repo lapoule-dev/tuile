@@ -88,18 +88,47 @@ impl Availability {
     /// existing tiles at level `base_level + offset + 1` (quantized-mesh
     /// `metadata` extension convention).
     pub fn add_descendant_ranges(&self, base_level: u32, ranges: &[Vec<AvailabilityRange>]) {
-        let mut levels = self.levels.write().expect("availability");
-        let mut seen = self.seen.write().expect("availability");
-        for (offset, at_level) in ranges.iter().enumerate() {
-            let level = base_level as usize + offset + 1;
-            if level >= levels.len() {
-                levels.resize_with(level + 1, Vec::new);
-            }
-            for range in at_level {
-                if seen.insert(key(level as u32, range)) {
-                    levels[level].push(*range);
+        let before = {
+            let levels = self.levels.read().expect("availability");
+            levels.iter().map(Vec::len).sum::<usize>()
+        };
+        let mut deepest = 0u32;
+        {
+            let mut levels = self.levels.write().expect("availability");
+            let mut seen = self.seen.write().expect("availability");
+            for (offset, at_level) in ranges.iter().enumerate() {
+                let level = base_level as usize + offset + 1;
+                if level >= levels.len() {
+                    levels.resize_with(level + 1, Vec::new);
+                }
+                for range in at_level {
+                    if seen.insert(key(level as u32, range)) {
+                        levels[level].push(*range);
+                        deepest = deepest.max(level as u32);
+                    }
                 }
             }
+        }
+        let after = {
+            let levels = self.levels.read().expect("availability");
+            levels.iter().map(Vec::len).sum::<usize>()
+        };
+        // The shape of the tree changing UNDER the traversal.
+        //
+        // This is not bookkeeping: `TileTree::children` asks this structure
+        // what exists, so every range folded in here is a place the next
+        // traversal may descend where the last one could not. A selection is
+        // therefore a function of (view, config, residency) *and of how much
+        // of this had arrived when the pass ran* — which is how the same stage
+        // rendered 106 tiles on one run and 7 on the next.
+        if after != before {
+            tuile_core::det!(
+                "avail",
+                base_level = base_level,
+                added = after - before,
+                total = after,
+                deepest = deepest,
+            );
         }
     }
 }

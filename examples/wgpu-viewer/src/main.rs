@@ -79,6 +79,12 @@ fn main() -> anyhow::Result<()> {
         // off screen. Expensive and not a mode anyone should run in — it exists
         // to answer one question: whether geometry that is missing was culled.
         cull: std::env::var("TUILE_NO_CULL").is_err(),
+        // And TUILE_NO_HORIZON_CULL=1 keeps the far side of the planet, which
+        // the frustum alone cannot drop: from near the ground the frustum runs
+        // straight through the Earth. Same purpose as the flag above — when
+        // ground is missing, each of the two things that can remove it has to
+        // be switchable off on its own.
+        horizon_culling: std::env::var("TUILE_NO_HORIZON_CULL").is_err(),
         ..Config::interactive_globe(settings::pinned_level())
     };
     let (stream, server) = in_process_with(tree, loader, config);

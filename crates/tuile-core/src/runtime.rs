@@ -86,7 +86,6 @@ pub fn in_process_with(
             cache,
             residency: ResidencyView::default(),
             in_flight: HashMap::new(),
-            failed: HashSet::new(),
             acked: HashSet::new(),
             filled: HashSet::new(),
             priming: Vec::new(),
@@ -94,6 +93,7 @@ pub fn in_process_with(
             priming_state: Priming::default(),
             priming_reported: None,
             views: Vec::new(),
+            view_generation: 0,
             out: TraversalOutput::default(),
             selected: HashSet::new(),
             rendered_last: HashSet::new(),
@@ -114,7 +114,6 @@ pub struct GeometryServer {
     cache: ResidentCache,
     residency: ResidencyView,
     in_flight: HashMap<TileId, AbortHandle>,
-    failed: HashSet<TileId>,
     /// Tiles the consumer has confirmed it holds, from `ClientMessage::Ack`.
     ///
     /// The server's residency is not the consumer's: content is sent, then
@@ -130,6 +129,7 @@ pub struct GeometryServer {
     priming_state: Priming,
     priming_reported: Option<Priming>,
     views: Vec<ViewState>,
+    view_generation: u64,
     out: TraversalOutput,
     selected: HashSet<TileId>,
     rendered_last: HashSet<TileId>,
@@ -153,12 +153,12 @@ impl GeometryServer {
             cache: &mut self.cache,
             residency: &mut self.residency,
             in_flight: &mut self.in_flight,
-            failed: &mut self.failed,
             priming: &mut self.priming,
             priming_outstanding: &mut self.priming_outstanding,
             priming_state: &mut self.priming_state,
             priming_reported: &mut self.priming_reported,
             views: &mut self.views,
+            view_generation: &mut self.view_generation,
             out: &mut self.out,
             selected: &mut self.selected,
             rendered_last: &mut self.rendered_last,
@@ -227,7 +227,7 @@ impl GeometryServer {
             // sending into a channel nobody reads (`let _ = stream.send(..)`).
             // A whole afternoon went into deciding, from the outside, whether
             // this loop was still turning. It says so now.
-            let ended = match event {
+            let ended: Option<String> = match event {
                 Event::Client(first) => {
                     let mut dirty = session.on_client(first);
                     // Coalesce the burst: a viewer sends a state per frame, and
@@ -235,24 +235,25 @@ impl GeometryServer {
                     while let Ok(more) = rx.try_recv() {
                         dirty |= session.on_client(more);
                     }
-                    if dirty && session.retraverse(&tx, &mut loads).is_err() {
-                        Some("the consumer went away while answering a camera move")
+                    if dirty {
+                        session
+                            .retraverse(&tx, &mut loads)
+                            .err()
+                            .map(|stop| stop.why("answering a camera move"))
                     } else {
                         None
                     }
                 }
-                Event::Load(Ok(msg)) => {
-                    if session.on_load_done(msg, &tx).is_err() {
-                        Some("the consumer went away while delivering a tile")
-                    } else if session.retraverse(&tx, &mut loads).is_err() {
-                        Some("the consumer went away while answering an arrival")
-                    } else {
-                        None
-                    }
-                }
+                Event::Load(Ok(msg)) => match session.on_load_done(msg, &tx) {
+                    Err(stop) => Some(stop.why("delivering a tile")),
+                    Ok(()) => session
+                        .retraverse(&tx, &mut loads)
+                        .err()
+                        .map(|stop| stop.why("answering an arrival")),
+                },
                 // Cancelled load: cleaned up at abort time.
                 Event::Load(Err(Aborted)) => None,
-                Event::Closed => Some("the client hung up"),
+                Event::Closed => Some("the client hung up".to_string()),
             };
             if let Some(why) = ended {
                 tracing::error!(
@@ -274,7 +275,6 @@ struct Session<'a> {
     cache: &'a mut ResidentCache,
     residency: &'a mut ResidencyView,
     in_flight: &'a mut HashMap<TileId, AbortHandle>,
-    failed: &'a mut HashSet<TileId>,
     /// Coarse tiles asked for once at startup; drained as fetch slots free up.
     priming: &'a mut Vec<TileId>,
     /// Every primed tile that has not yet been answered — still queued above,
@@ -289,6 +289,7 @@ struct Session<'a> {
     priming_state: &'a mut Priming,
     priming_reported: &'a mut Option<Priming>,
     views: &'a mut Vec<ViewState>,
+    view_generation: &'a mut u64,
     out: &'a mut TraversalOutput,
     /// What this pass touched: the frontier, every ancestor of it, and
     /// everything it asked for. Never a victim — the reference implementation's
@@ -307,15 +308,36 @@ struct Session<'a> {
     primed: &'a mut bool,
 }
 
-/// Consumer went away; unwind the run loop.
-struct Gone;
+/// Why the run loop unwinds. Both end the session; only the reason differs,
+/// and only the reason is worth a log line.
+enum Stop {
+    /// The consumer went away: nothing left to send to.
+    Gone,
+    /// A tile could not be loaded, after the transport had already retried it.
+    LoadFailed { tile: TileId, message: String },
+}
+
+impl Stop {
+    /// What to say about it, given what the session was doing at the time.
+    fn why(&self, during: &str) -> String {
+        match self {
+            Self::Gone => format!("the consumer went away while {during}"),
+            Self::LoadFailed { tile, message } => format!(
+                "tile {tile:?} could not be loaded and the transport had \
+                 already retried it, so the session ends here rather than \
+                 serving ground with a hole in it: {message}"
+            ),
+        }
+    }
+}
 
 impl Session<'_> {
     /// Returns true when a re-traversal is needed.
     fn on_client(&mut self, msg: ClientMessage) -> bool {
         match msg {
-            ClientMessage::ViewerState { views } => {
+            ClientMessage::ViewerState { views, generation } => {
                 *self.views = views;
+                *self.view_generation = generation;
                 // A new camera position: the traversal it triggers starts a new
                 // generation, and the one it displaces becomes history rather
                 // than being forgotten.
@@ -363,7 +385,7 @@ impl Session<'_> {
     /// A stand-in is *not* evicted when the real content arrives: the consumer
     /// files both under the same id, so the real one simply replaces it. The set
     /// is bounded by the selection, so a session cannot accumulate them.
-    fn fill_the_gaps(&mut self, tx: &UnboundedSender<ServerMessage>) -> Result<(), Gone> {
+    fn fill_the_gaps(&mut self, tx: &UnboundedSender<ServerMessage>) -> Result<(), Stop> {
         let mut sent = Vec::new();
         for (tile, _) in self.out.selected.iter() {
             if self.acked.contains(tile) || self.filled.contains(tile) {
@@ -384,7 +406,7 @@ impl Session<'_> {
                 ancestry: self.ancestry(tile),
                 content,
             })
-            .map_err(|_| Gone)?;
+            .map_err(|_| Stop::Gone)?;
         }
 
         // Ground the camera has left: take those stand-ins back, so the
@@ -419,7 +441,7 @@ impl Session<'_> {
                 "stand-ins retired"
             );
             tx.unbounded_send(ServerMessage::Retire { tiles: stale })
-                .map_err(|_| Gone)?;
+                .map_err(|_| Stop::Gone)?;
         }
         if just_sent > 0 {
             tracing::debug!(just_sent, held = self.filled.len(), "stand-in surfaces");
@@ -445,7 +467,7 @@ impl Session<'_> {
         &mut self,
         tx: &UnboundedSender<ServerMessage>,
         loads: &mut FuturesUnordered<LoadFuture>,
-    ) -> Result<(), Gone> {
+    ) -> Result<(), Stop> {
         // Whether this pass was provoked by the camera or by a tile arriving.
         // It decides one thing only: whether in-flight loads may be cancelled
         // below. Consumed here, so a pass provoked by an arrival does not
@@ -473,6 +495,41 @@ impl Session<'_> {
         self.rendered_last.clear();
         self.rendered_last
             .extend(self.out.selected.iter().map(|(tile, _)| *tile));
+        // Every pass, with everything that decided it.
+        //
+        // A selection is meant to be a function of (stage, time). It is not,
+        // and this is the trace that shows why: the passes of one render are
+        // printed in order, so two runs of the SAME frame can be diffed pass
+        // by pass and the exact pass where they part company can be named.
+        // Without it the only observable was the final tile count, which says
+        // that two runs disagreed but never where.
+        crate::det!(
+            "pass",
+            n = *self.frame,
+            selected = self.out.selected.len(),
+            sel_digest = crate::determinism::digest(
+                self.out.selected.iter().map(|(t, _)| t.0)
+            ),
+            requested = self.out.requests.len(),
+            req_digest = crate::determinism::digest(
+                self.out.requests.iter().map(|r| r.tile.0)
+            ),
+            visited = self.out.stats.visited,
+            culled = self.out.stats.culled,
+            gaps = self.out.stats.gaps,
+            // The two counters that say the traversal answered the CLOCK
+            // rather than the scene. `deferred_subtrees` above zero means a
+            // hold cancelled its subtree because the network was slow, which
+            // is how one frame selected 106 tiles on five runs and 7 on the
+            // sixth. Untraced, it took an afternoon to find; traced, it is one
+            // line of the diff.
+            deferred = self.out.stats.deferred_subtrees,
+            held_but_drawn = self.out.stats.held_but_drawn,
+            resident = self.residency.len(),
+            in_flight = self.in_flight.len(),
+            priming_left = self.priming.len(),
+            camera_moved = camera_moved,
+        );
         let m = crate::metrics::metrics();
         m.traversals.inc();
         m.traversal_seconds.record(started.elapsed());
@@ -487,15 +544,6 @@ impl Session<'_> {
         m.queued_by_level.clear();
         for req in &self.out.requests {
             m.queued_by_level.inc(self.tree.level(req.tile));
-        }
-
-        // Drop tiles we've given up on from the request set, so the reported
-        // request count converges to zero (a failed REPLACE child stays
-        // requested forever otherwise) — what lets bulk drivers terminate.
-        if !self.failed.is_empty() {
-            let failed = &*self.failed;
-            self.out.requests.retain(|r| !failed.contains(&r.tile));
-            self.out.stats.requested = self.out.requests.len() as u32;
         }
 
         // `selected` is the *protected* set: what the budget may not evict.
@@ -594,11 +642,12 @@ impl Session<'_> {
                 .map(|tile| (*tile, self.ancestry(*tile)))
                 .collect(),
             stats: self.out.stats,
+            generation: *self.view_generation,
         })
-        .map_err(|_| Gone)?;
+        .map_err(|_| Stop::Gone)?;
         if !reclaimed.is_empty() {
             tx.unbounded_send(ServerMessage::Evict { tiles: reclaimed })
-                .map_err(|_| Gone)?;
+                .map_err(|_| Stop::Gone)?;
         }
         if self.config.stand_ins {
             self.fill_the_gaps(tx)?;
@@ -652,16 +701,11 @@ impl Session<'_> {
                 break;
             }
             self.priming.pop();
-            // Answered before its turn came round: the traversal asked for it
-            // first, or the session already gave up on it. Either way it is
-            // resolved here rather than left outstanding for a load that will
-            // never be started.
+            // Answered before its turn came round: the traversal asked for
+            // it first. Resolved here rather than left outstanding for a load
+            // that will never be started.
             if self.residency.is_resident(tile) {
                 self.resolve_primed(tile, true);
-                continue;
-            }
-            if self.failed.contains(&tile) {
-                self.resolve_primed(tile, false);
                 continue;
             }
             if self.in_flight.contains_key(&tile) {
@@ -691,10 +735,7 @@ impl Session<'_> {
                 break;
             }
             let tile = req.tile;
-            if self.residency.is_resident(tile)
-                || self.in_flight.contains_key(&tile)
-                || self.failed.contains(&tile)
-            {
+            if self.residency.is_resident(tile) || self.in_flight.contains_key(&tile) {
                 continue;
             }
             let loader = Arc::clone(self.loader);
@@ -763,6 +804,16 @@ impl Session<'_> {
             }
             frontier = next;
         }
+        // The coarse pyramid is the floor the whole selection stands on, and
+        // its membership depends on `tree.children()` — which is exactly the
+        // thing that changes shape as availability arrives. A pyramid that
+        // differs between two runs is a selection that will differ too.
+        crate::det!(
+            "prime",
+            through_level = level,
+            tiles = wanted.len(),
+            digest = crate::determinism::digest(wanted.iter().map(|t| t.0)),
+        );
         tracing::info!(
             through_level = level,
             tiles = wanted.len(),
@@ -790,7 +841,7 @@ impl Session<'_> {
     }
 
     /// Sends the coarse-pyramid count when it has moved.
-    fn report_priming(&mut self, tx: &UnboundedSender<ServerMessage>) -> Result<(), Gone> {
+    fn report_priming(&mut self, tx: &UnboundedSender<ServerMessage>) -> Result<(), Stop> {
         self.priming_state.outstanding = self.priming_outstanding.len() as u32;
         let m = crate::metrics::metrics();
         m.priming_pending
@@ -802,20 +853,21 @@ impl Session<'_> {
         }
         *self.priming_reported = Some(*self.priming_state);
         tx.unbounded_send(ServerMessage::Priming(*self.priming_state))
-            .map_err(|_| Gone)
+            .map_err(|_| Stop::Gone)
     }
 
     fn on_load_done(
         &mut self,
         (tile, result): LoadMsg,
         tx: &UnboundedSender<ServerMessage>,
-    ) -> Result<(), Gone> {
+    ) -> Result<(), Stop> {
         self.in_flight.remove(&tile);
         let m = crate::metrics::metrics();
         m.loads_in_flight.set(self.in_flight.len() as u64);
         match result {
             Err(e) => {
                 m.loads_failed.inc();
+                crate::det!("load_err", tile = tile.0, level = self.tree.level(tile));
                 self.fail(tile, e.to_string(), tx)
             }
             // Topology grew in place (external tileset grafted): the graft
@@ -859,42 +911,68 @@ impl Session<'_> {
                     self.filled.remove(e);
                 }
                 if !evicted.is_empty() {
+                    crate::det!(
+                        "evict",
+                        count = evicted.len(),
+                        digest = crate::determinism::digest(
+                            evicted.iter().map(|t| t.0)
+                        ),
+                    );
                     tx.unbounded_send(ServerMessage::Evict { tiles: evicted })
-                        .map_err(|_| Gone)?;
+                        .map_err(|_| Stop::Gone)?;
                 }
                 self.residency.insert(tile);
                 self.resolve_primed(tile, true);
+                // Arrivals are genuinely unordered — the network decides. On
+                // its own event name so a comparison can drop it and still
+                // compare every decision that was taken.
+                crate::det!(
+                    "load_ok",
+                    tile = tile.0,
+                    level = self.tree.level(tile),
+                    resident = self.residency.len(),
+                );
                 tx.unbounded_send(ServerMessage::Content {
                     tile,
                     ancestry: self.ancestry(tile),
                     content: TileContent::Decoded(decoded),
                 })
-                .map_err(|_| Gone)?;
+                .map_err(|_| Stop::Gone)?;
                 Ok(())
             }
         }
     }
 
+    /// A tile that could not be loaded ends the session.
+    ///
+    /// There used to be a set of given-up-on tiles here instead, and it was the
+    /// most expensive twelve lines in the repository. It was never emptied, so
+    /// a tile lost to one dropped socket was lost for as long as the process
+    /// lived; it was consulted by the traversal, so the shape of the ground
+    /// silently depended on which requests had happened to fail; and it let the
+    /// session carry on pretending, which is how a render shipped forty-eight
+    /// black frames instead of stopping on the first one. Two nodes rendering
+    /// the same frame would not even agree with each other — the reproducibility
+    /// the whole design is for, traded away for a hidden mutable set.
+    ///
+    /// So the tile is not remembered: the transport has already retried (see
+    /// `is_retryable_transport`), and a failure that survives that is not a
+    /// hiccup. The consumer is told which tile and why, and then the stream
+    /// closes under it, which is a thing a caller cannot ignore.
     fn fail(
         &mut self,
         tile: TileId,
         message: String,
         tx: &UnboundedSender<ServerMessage>,
-    ) -> Result<(), Gone> {
-        self.failed.insert(tile);
-        // Given up on, so the coarse pyramid stops counting it as pending. This
-        // is the whole of the hang: 64 tiles of a 682-tile pyramid failed, the
-        // queue emptied, and the host went on waiting for them to reach a GPU
-        // they were never going to reach.
-        self.resolve_primed(tile, false);
+    ) -> Result<(), Stop> {
+        // Sent before unwinding: a bare closed channel says a tile is missing
+        // without ever saying which, and that was a whole afternoon once.
         tx.unbounded_send(ServerMessage::Error {
             tile: Some(tile),
-            message,
+            message: message.clone(),
         })
-        .map_err(|_| Gone)?;
-        // A failed tile may have been holding a REPLACE; the caller's traversal
-        // will re-evaluate.
-        Ok(())
+        .map_err(|_| Stop::Gone)?;
+        Err(Stop::LoadFailed { tile, message })
     }
 }
 
@@ -942,20 +1020,23 @@ mod tests {
         url
     }
 
-    /// The coarse pyramid must settle on a count a host can actually reach.
+    /// A tile the source cannot serve ends the session, loudly.
     ///
-    /// The window of the viewer is held shut until every primed tile is on the
-    /// GPU, and a tile the source does not serve can never be: the session gave
-    /// up on it, stopped asking, and the wait went on for ever — 618 of 682
-    /// tiles held, an empty queue, and Ctrl-C. So a tile given up on must count
-    /// as **resolved**, and be named, so the gate closes on a condition that is
-    /// guaranteed to be met.
+    /// This asserted the opposite until 2026-09-08, and the opposite was a
+    /// disaster. The session used to write the tile down in a `failed` set,
+    /// stop asking for it, and carry on: the pyramid settled, the gate opened,
+    /// and the ground simply had a hole in it that nothing downstream could
+    /// see. On the farm that hole reached the procedural as "the frame did not
+    /// converge", which emits nothing at all — forty-eight black frames, shipped
+    /// as a video, because one endpoint dropped three connections.
     ///
-    /// What this does not cover: the consumer side of the gate (uploading the
-    /// delivered tiles and comparing against `expected`) lives in the viewer,
-    /// which needs a window and a GPU.
+    /// The transport retries a transient failure before we ever hear about it
+    /// (`is_retryable_transport`), so a failure that reaches here is real. The
+    /// contract is now: say which tile, say why, and stop. A caller that is
+    /// waiting on a stream gets a closed stream, which it cannot mistake for
+    /// success.
     #[test]
-    fn a_primed_tile_the_source_cannot_serve_is_resolved_not_awaited() {
+    fn a_tile_the_source_cannot_serve_ends_the_session() {
         let dir = tempfile::tempdir().expect("tempdir");
         let url = write_fixture_missing_one_child(dir.path());
         let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
@@ -973,61 +1054,46 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![near_view()],
+                generation: 0,
             })
             .expect("send");
 
         const MAX_STEPS: usize = 2_000;
-        const QUIET_STEPS: usize = 8;
         let waker = futures_util::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
-        let mut delivered: HashSet<TileId> = HashSet::new();
-        let mut priming: Option<crate::protocol::Priming> = None;
-        let mut quiet = 0;
+        let mut reported: Option<(Option<TileId>, String)> = None;
+        let mut stopped = false;
         for _ in 0..MAX_STEPS {
-            let _ = server.as_mut().poll(&mut cx);
-            let mut got = false;
+            if !stopped && server.as_mut().poll(&mut cx).is_ready() {
+                stopped = true;
+            }
             while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
-                got = true;
-                match msg {
-                    ServerMessage::Content { tile, .. } => {
-                        delivered.insert(tile);
-                    }
-                    ServerMessage::Evict { tiles } => {
-                        for t in tiles {
-                            delivered.remove(&t);
-                        }
-                    }
-                    ServerMessage::Priming(p) => priming = Some(p),
-                    _ => {}
+                if let ServerMessage::Error { tile, message } = msg {
+                    reported.get_or_insert((tile, message));
                 }
             }
-            quiet = if got { 0 } else { quiet + 1 };
-            if quiet > QUIET_STEPS {
+            if stopped {
                 break;
             }
         }
 
-        let p = priming.expect("the session reported its coarse pyramid");
-        assert_eq!(p.total, 3, "root plus two children were primed");
-        // The hang itself: the session has stopped asking for anything, so a
-        // tile still counted as outstanding here is one that is waited on for
-        // ever.
         assert!(
-            p.settled(),
-            "the pyramid never settled: {} of {} tiles still outstanding with \
-             nothing left in flight, and a host waiting on them waits for ever",
-            p.outstanding,
-            p.total,
+            stopped,
+            "the session kept running after a tile it can never serve"
         );
-        assert_eq!(
-            p.unavailable, 1,
-            "the child with no content on disk is one the source will never serve"
+        let (tile, message) = reported.expect(
+            "the session stopped without ever saying which tile it could not load",
         );
+        assert!(tile.is_some(), "an unattributed failure is not actionable");
         assert!(
-            delivered.len() as u32 >= p.expected(),
-            "the gate cannot be reached: {} tiles delivered against {} expected",
-            delivered.len(),
-            p.expected(),
+            !message.is_empty(),
+            "the reason has to travel with the failure"
+        );
+        // And the stream is closed under the consumer, so nothing downstream
+        // can read the truncated selection as a finished one.
+        assert!(
+            matches!(stream.poll_message(&mut cx), Poll::Ready(None)),
+            "the stream stayed open after the session ended"
         );
     }
 
@@ -1148,6 +1214,7 @@ mod tests {
             }
             fn fill(&self, _id: TileId) -> Option<crate::content::DecodedTileContent> {
                 Some(crate::content::DecodedTileContent {
+                    withheld_drape: None,
                     meshes: Vec::new(),
                     textures: Vec::new(),
                     imagery: Vec::new(),
@@ -1180,7 +1247,7 @@ mod tests {
         // taken back.
         for view in [near_view(), far_view()] {
             stream
-                .send(ClientMessage::ViewerState { views: vec![view] })
+                .send(ClientMessage::ViewerState { views: vec![view], generation: 0 })
                 .expect("send");
             for _ in 0..256 {
                 let _ = server.as_mut().poll(&mut cx);
@@ -1247,6 +1314,7 @@ mod tests {
             }
             fn fill(&self, _id: TileId) -> Option<crate::content::DecodedTileContent> {
                 Some(crate::content::DecodedTileContent {
+                    withheld_drape: None,
                     meshes: Vec::new(),
                     textures: Vec::new(),
                     imagery: Vec::new(),
@@ -1279,7 +1347,7 @@ mod tests {
         // of a real consumer is exactly this window, held open.
         for view in [near_view(), far_view()] {
             stream
-                .send(ClientMessage::ViewerState { views: vec![view] })
+                .send(ClientMessage::ViewerState { views: vec![view], generation: 0 })
                 .expect("send");
             for _ in 0..256 {
                 let _ = server.as_mut().poll(&mut cx);
@@ -1356,6 +1424,7 @@ mod tests {
             }
             fn fill(&self, _id: TileId) -> Option<crate::content::DecodedTileContent> {
                 Some(crate::content::DecodedTileContent {
+                    withheld_drape: None,
                     meshes: Vec::new(),
                     textures: Vec::new(),
                     imagery: Vec::new(),
@@ -1383,6 +1452,7 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![near_view()],
+                generation: 0,
             })
             .expect("send");
 
@@ -1438,6 +1508,7 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![near_view()],
+                generation: 0,
             })
             .expect("send");
         let near_selection = selection_after(&mut server, &mut stream);
@@ -1449,6 +1520,7 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![far_view()],
+                generation: 0,
             })
             .expect("send");
         let (_, evicted) = settle(&mut server, &mut stream).expect("far view settles");
@@ -1570,6 +1642,7 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![near_view()],
+                generation: 0,
             })
             .expect("send");
         settle(&mut server, &mut stream).expect("a still camera settles");
@@ -1608,7 +1681,7 @@ mod tests {
 
         for view in [near_view(), far_view(), near_view(), far_view()] {
             stream
-                .send(ClientMessage::ViewerState { views: vec![view] })
+                .send(ClientMessage::ViewerState { views: vec![view], generation: 0 })
                 .expect("send");
             settle(&mut server, &mut stream).expect("settles");
         }
@@ -1641,6 +1714,7 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![near_view()],
+                generation: 0,
             })
             .expect("send");
         let (loaded, _) = settle(&mut server, &mut stream).expect("first view settles");
@@ -1658,6 +1732,7 @@ mod tests {
             stream
                 .send(ClientMessage::ViewerState {
                     views: vec![far_view()],
+                    generation: 0,
                 })
                 .expect("send");
             let (_, dropped) = settle(&mut server, &mut stream).expect("far view settles");
@@ -1711,6 +1786,7 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![near_view()],
+                generation: 0,
             })
             .expect("send");
         settle(&mut server, &mut stream).expect("the near view settles");
@@ -1718,6 +1794,7 @@ mod tests {
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![far_view()],
+                generation: 0,
             })
             .expect("send");
         let (_, evicted) = settle(&mut server, &mut stream).expect("the far view settles");
@@ -1782,6 +1859,7 @@ mod tests {
             stream
                 .send(ClientMessage::ViewerState {
                     views: vec![near_view()],
+                    generation: 0,
                 })
                 .expect("send");
 
@@ -1861,6 +1939,7 @@ mod tests {
             stream
                 .send(ClientMessage::ViewerState {
                     views: vec![near_view()],
+                    generation: 0,
                 })
                 .expect("send");
             while let Some(msg) = stream.next_message().await {
@@ -1906,6 +1985,7 @@ mod tests {
             stream
                 .send(ClientMessage::ViewerState {
                     views: vec![near_view()],
+                    generation: 0,
                 })
                 .expect("send");
             while let Some(msg) = stream.next_message().await {

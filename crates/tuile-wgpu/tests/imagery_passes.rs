@@ -63,6 +63,7 @@ fn gpu() -> Option<GpuContext> {
 /// its own reprojection into a question that has nothing to do with any of them.
 fn quad() -> DecodedTileContent {
     DecodedTileContent {
+        withheld_drape: None,
         meshes: vec![DecodedMesh {
             positions: vec![
                 [-1.0, -1.0, 0.0],

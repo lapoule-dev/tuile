@@ -41,15 +41,29 @@ PXR_NAMESPACE_OPEN_SCOPE
 /// Everything is f64 and ECEF. The camera transform is already a `GfMatrix4d`,
 /// so nothing is narrowed on the way in — narrowing a position on the globe to
 /// float is what jitter is made of.
+///
+/// # The render origin
+///
+/// A manifest stage authors its camera **rebased** — raw ECEF in a stage would
+/// jitter in every f32 renderer — and states the origin on the Globe prim.
+/// `renderOrigin` is added back to the extracted translation here, in double,
+/// so the traversal always sees the true ECEF view. A stage authored in ECEF
+/// passes zero.
 struct TuileViewFromCamera
 {
     /// Reads `cameraPath` out of `scene`. Returns false when the prim has no
     /// usable transform, which is the one case a caller must not paper over: a
     /// view built from an identity matrix selects tiles at the centre of the
     /// Earth.
+    /// `anchor` is the reading prim's own path, which is how the scene
+    /// globals are found in a host that prefixed the stage — see
+    /// `hostpaths.h`. `cameraPath` is expected to be in the host's namespace
+    /// already, because the caller resolved it there.
     static bool Read(
         const HdSceneIndexBaseRefPtr &scene,
         const SdfPath &cameraPath,
+        const SdfPath &anchor,
+        const double renderOrigin[3],
         const double fallbackViewportPx[2],
         TuileViewState *out);
 
@@ -61,6 +75,7 @@ struct TuileViewFromCamera
     /// detail, so it is worth knowing which happened.
     static bool ResolutionFromRenderSettings(
         const HdSceneIndexBaseRefPtr &scene,
+        const SdfPath &anchor,
         double out[2]);
 };
 

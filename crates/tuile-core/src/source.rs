@@ -134,6 +134,22 @@ pub trait TileTree: Send + Sync {
         None
     }
 
+    /// A sphere that hides what is behind it, if this dataset has one.
+    ///
+    /// `None` for a tileset that is just a building or a mesh: nothing occludes
+    /// anything, and the frustum is the whole of visibility. A global terrain
+    /// answers with its planet, and that changes the arithmetic completely — a
+    /// camera near the ground has a frustum that runs through the planet and
+    /// selects the far side of it, which no amount of frustum culling can see.
+    ///
+    /// It lives on the tree rather than in the consumer's [`crate::traversal::Config`]
+    /// because it is a fact about the data, not a preference: a consumer that
+    /// forgot to set it would quietly pay for ground it can never see, which is
+    /// exactly what happened while it did not exist.
+    fn occluder(&self) -> Option<crate::math::Occluder> {
+        None
+    }
+
     /// How deep this tile sits, roots at 0.
     ///
     /// **Only the tree can answer this, and that is the whole point.** A
@@ -256,6 +272,19 @@ impl CompositeTileTree {
 }
 
 impl TileTree for CompositeTileTree {
+    /// The occluder the sources agree on, or none.
+    ///
+    /// Unanimity is the only safe rule: culling against a planet that only one
+    /// source lives on would hide the other's ground. Sources that agree —
+    /// terrain and imagery over the same globe, the usual case — keep it.
+    fn occluder(&self) -> Option<crate::math::Occluder> {
+        let mut sources = self.sources.iter();
+        let first = sources.next()?.occluder()?;
+        sources
+            .all(|s| s.occluder() == Some(first))
+            .then_some(first)
+    }
+
     fn roots(&self) -> Vec<TileId> {
         self.sources
             .iter()
@@ -419,6 +448,7 @@ mod tests {
     impl TileLoader for StubLoader {
         async fn load(&self, _id: TileId) -> Result<Loaded, LoadError> {
             Ok(Loaded::Content(DecodedTileContent {
+                withheld_drape: None,
                 meshes: Vec::new(),
                 textures: Vec::new(),
                 imagery: Vec::new(),

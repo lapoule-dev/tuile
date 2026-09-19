@@ -1,0 +1,20 @@
+{
+    "Plugins": [
+        {
+            "Info": {
+                "Types": {
+                    "CubeProceduralPlugin": {
+                        "bases": ["HdGpGenerativeProceduralPlugin"],
+                        "displayName": "TestCube",
+                        "priority": 0
+                    }
+                }
+            },
+            "LibraryPath": "libcubeProc.so",
+            "Name": "cubeProc",
+            "ResourcePath": "resources",
+            "Root": "..",
+            "Type": "library"
+        }
+    ]
+}

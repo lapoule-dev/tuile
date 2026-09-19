@@ -10,6 +10,14 @@
                         "displayName": "tuileGlobe",
                         "priority": 0
                     },
+                    "TuileManifestSceneIndexPlugin": {
+                        "bases": [
+                            "HdSceneIndexPlugin"
+                        ],
+                        "displayName": "tuileManifest",
+                        "loadWithRenderer": "",
+                        "priority": 0
+                    },
                     "Tuile_SpikeResolver": {
                         "bases": [
                             "ArResolver"

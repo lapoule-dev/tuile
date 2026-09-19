@@ -17,9 +17,9 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use glam::{DVec2, DVec3};
-use tuile_core::traversal::{ViewState, ViewStateParams};
+use tuile_core::traversal::ViewStateParams;
 
-use crate::session::{Frame, FrameError, Session};
+use tuile_bake::{Frame, FrameError, Session};
 
 /// The outcome of a call. Zero is success; everything else is a reason.
 #[repr(i32)]
@@ -100,6 +100,33 @@ pub struct TuileTile {
     /// Index into **this tile's** textures, or `-1` for an untextured tile.
     /// Pass it back to [`tuile_frame_texture`] along with the tile's own index.
     pub base_color_texture: i32,
+    /// What the tile's imagery was composed from, or `0` when it carries none.
+    ///
+    /// A tile keeps its id across frames; its imagery does not, because the
+    /// camera moves and it is re-draped at another level. A consumer that
+    /// keeps prims between frames needs to tell those two cases apart, and
+    /// this makes it an integer compare instead of a string rebuild.
+    pub drape: u64,
+}
+
+/// The filter the engine logs through, given whatever `TUILE_LOG` said.
+///
+/// **A default, always.** The subscriber used to be installed only when
+/// `TUILE_LOG` was set, and the farm job sets it only under `--trace`. So a
+/// normal render ran with the engine entirely mute — including its failures.
+///
+/// What that cost, precisely: a frame died with `status 4, a tile could not be
+/// loaded`, whose own message ends *"see the error logged above for the tile
+/// and the reason"*. The reason was logged, through `tracing`, into a
+/// subscriber that did not exist. Two days were spent guessing at a sentence
+/// the program had already written.
+///
+/// `warn` is the floor: silent when all is well, and never silent about a
+/// failure. `TUILE_LOG` still overrides it in both directions.
+fn log_filter(configured: Option<String>) -> String {
+    configured
+        .filter(|f| !f.trim().is_empty())
+        .unwrap_or_else(|| "warn".into())
 }
 
 impl From<&FrameError> for TuileStatus {
@@ -108,6 +135,9 @@ impl From<&FrameError> for TuileStatus {
             FrameError::TimedOut(_) => TuileStatus::TimedOut,
             FrameError::ServerGone => TuileStatus::ServerGone,
             FrameError::TilesFailed { .. } => TuileStatus::TilesFailed,
+            // A selected tile with no content is the same class of failure as
+            // a tile that failed to load: the frame is not the one asked for.
+            FrameError::MissingContent { .. } => TuileStatus::TilesFailed,
             FrameError::TextureEncode(_) => TuileStatus::EncodeFailed,
             FrameError::Poisoned => TuileStatus::InternalError,
         }
@@ -171,6 +201,22 @@ pub struct TuileGlobeConfig {
     /// the output is kept: a failed tile leaves no hole, its ancestor stands
     /// in, and the frame renders plausibly at the wrong level of detail.
     pub fail_on_tile_errors: bool,
+    /// A pre-baked pack to read instead of the network. Empty means the
+    /// network.
+    ///
+    /// When it is set, **nothing else in this struct is consulted**: not the
+    /// token, not the asset ids, not the cache, not the screen-space error.
+    /// All of those were decided by the bake and are recorded in the pack —
+    /// honouring them here would let a render silently ask for a level of
+    /// detail nobody baked, and get whatever was there.
+    pub pack_path: TuileStr,
+    /// The scene digest the host believes it is rendering, or empty to accept
+    /// whatever pack it is given.
+    ///
+    /// Worth setting on a farm. A pack of another shot renders the wrong
+    /// ground and reports success — the one failure a pre-baked pipeline adds
+    /// that a live one does not have.
+    pub scene_digest: TuileStr,
 }
 
 /// One camera, as the traversal needs it: twelve doubles and nothing else.
@@ -198,7 +244,7 @@ pub struct TuileViewState {
 fn imagery_asset(id: i64) -> Option<i64> {
     match id {
         id if id < 0 => None,
-        0 => Some(crate::globe::BING_AERIAL),
+        0 => Some(tuile_bake::BING_AERIAL),
         id => Some(id),
     }
 }
@@ -224,14 +270,62 @@ pub unsafe extern "C" fn tuile_session_new(
         return TuileStatus::BadArgument;
     }
     guard(|| {
+        // The host is a render process with no Rust logging of its own:
+        // TUILE_LOG turns the crate's tracing into stderr lines, once.
+        static LOGGING: std::sync::Once = std::sync::Once::new();
+        LOGGING.call_once(|| {
+            {
+                let filter = log_filter(std::env::var("TUILE_LOG").ok());
+                let json = std::env::var("TUILE_LOG_FORMAT")
+                    .map(|f| f.eq_ignore_ascii_case("json"))
+                    .unwrap_or(false);
+                let base = tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(std::io::stderr);
+                // A real JSON *formatter*, not JSON hand-rolled into the
+                // message. The determinism trace exists to be compared by a
+                // program (see `tuile_core::determinism`), and a program
+                // should not have to grep an object back out of a log line —
+                // which is what the first version made it do, and which fails
+                // the moment any other message contains a brace.
+                if json {
+                    let _ = base
+                        .json()
+                        .with_current_span(false)
+                        .with_span_list(false)
+                        .flatten_event(true)
+                        .try_init();
+                } else {
+                    let _ = base.try_init();
+                }
+            }
+        });
         unsafe { *out = std::ptr::null_mut() };
         let config = unsafe { &*config };
+
+        // A pack short-circuits everything below. There is no token to check,
+        // no source to resolve and no network to reach: the session opens a
+        // file, and every field that would have shaped a traversal was already
+        // consumed by the bake.
+        if let Some(path) = unsafe { config.pack_path.as_str() }.filter(|p| !p.is_empty()) {
+            let scene = unsafe { config.scene_digest.as_str() }.filter(|s| !s.is_empty());
+            return match Session::from_pack(std::path::Path::new(path), scene) {
+                Ok(session) => {
+                    unsafe { *out = Box::into_raw(Box::new(session)) };
+                    TuileStatus::Ok
+                }
+                Err(error) => {
+                    tracing::error!(%error, "opening the pack");
+                    TuileStatus::BadArgument
+                }
+            };
+        }
 
         let Some(token) = (unsafe { config.ion_token.as_str() }) else {
             return TuileStatus::BadArgument;
         };
 
-        let mut globe = crate::globe::GlobeConfig::new(token);
+        let mut globe = tuile_bake::GlobeConfig::new(token);
         if config.terrain_asset_id != 0 {
             globe.terrain_asset_id = config.terrain_asset_id;
         }
@@ -243,7 +337,7 @@ pub unsafe extern "C" fn tuile_session_new(
             globe.session.traversal.maximum_screen_space_error = config.maximum_screen_space_error;
         }
         globe.session.frame_timeout =
-            crate::globe::duration_or(config.frame_timeout_seconds, globe.session.frame_timeout);
+            tuile_bake::duration_or(config.frame_timeout_seconds, globe.session.frame_timeout);
         globe.session.fail_on_tile_errors = config.fail_on_tile_errors;
 
         match Session::globe(globe) {
@@ -287,17 +381,14 @@ pub unsafe extern "C" fn tuile_session_frame(
         let session = unsafe { &mut *session };
         let views = unsafe { std::slice::from_raw_parts(views, view_count) };
 
-        let views: Vec<ViewState> = views
+        let views: Vec<ViewStateParams> = views
             .iter()
-            .map(|v| {
-                ViewStateParams {
-                    position: DVec3::from_array(v.position),
-                    direction: DVec3::from_array(v.direction),
-                    up: DVec3::from_array(v.up),
-                    viewport_px: DVec2::from_array(v.viewport_px),
-                    fovy_rad: v.fovy_rad,
-                }
-                .into()
+            .map(|v| ViewStateParams {
+                position: DVec3::from_array(v.position),
+                direction: DVec3::from_array(v.direction),
+                up: DVec3::from_array(v.up),
+                viewport_px: DVec2::from_array(v.viewport_px),
+                fovy_rad: v.fovy_rad,
             })
             .collect();
 
@@ -414,6 +505,7 @@ pub unsafe extern "C" fn tuile_frame_tile(
                     .base_color_texture
                     .and_then(|i| i32::try_from(i).ok())
                     .unwrap_or(-1),
+                drape: tile.drape(),
             }
         };
         TuileStatus::Ok
@@ -474,6 +566,28 @@ pub unsafe extern "C" fn tuile_frame_texture(
 
 #[cfg(test)]
 mod tests {
+
+    /// Le moteur n'est jamais muet sur ses pannes.
+    ///
+    /// Le souscripteur n'était installé que si `TUILE_LOG` existait, et le job
+    /// de ferme ne le définit que sous `--trace`. Un rendu normal tournait donc
+    /// avec le moteur entièrement silencieux — y compris sur l'erreur fatale
+    /// dont le message dit d'aller lire l'erreur précédente.
+    #[test]
+    fn a_missing_log_setting_still_lets_failures_through() {
+        assert_eq!(log_filter(None), "warn");
+        assert_eq!(log_filter(Some(String::new())), "warn");
+        assert_eq!(log_filter(Some("   ".into())), "warn");
+    }
+
+    /// Et ce qui est demandé est respecté, dans les deux sens.
+    #[test]
+    fn an_explicit_setting_wins_over_the_floor() {
+        assert_eq!(log_filter(Some("debug".into())), "debug");
+        assert_eq!(log_filter(Some("tuile_det=info".into())), "tuile_det=info");
+        assert_eq!(log_filter(Some("error".into())), "error");
+    }
+
     use super::*;
 
     /// The boundary must survive a panic, because the alternative is aborting
@@ -544,7 +658,7 @@ mod tests {
     /// inverted, and inverting it means silently rendering an untextured globe.
     #[test]
     fn the_imagery_asset_id_encodes_three_things() {
-        assert_eq!(imagery_asset(0), Some(crate::globe::BING_AERIAL));
+        assert_eq!(imagery_asset(0), Some(tuile_bake::BING_AERIAL));
         assert_eq!(imagery_asset(3812), Some(3812));
         assert_eq!(imagery_asset(-1), None, "negative disables imagery");
         assert_eq!(imagery_asset(i64::MIN), None);
@@ -600,6 +714,8 @@ mod tests {
             maximum_screen_space_error: 0.0,
             frame_timeout_seconds: 0.0,
             fail_on_tile_errors: true,
+            pack_path: as_str(""),
+            scene_digest: as_str(""),
         };
         assert_eq!(
             unsafe { tuile_session_new(&config, &mut out) },
@@ -612,6 +728,81 @@ mod tests {
             unsafe { tuile_session_new(&config, std::ptr::null_mut()) },
             TuileStatus::BadArgument
         );
+    }
+
+    /// A pack that is not there fails at open, not at the first frame.
+    ///
+    /// And it fails without a token, which is the whole point of the packed
+    /// path: it must not be possible to reach the network from it, so an
+    /// empty `ion_token` must stop being an error the moment `pack_path` is
+    /// set. A test, because the short-circuit is one `if` and putting it
+    /// after the token check would silently restore the requirement.
+    #[test]
+    fn a_packed_session_needs_no_token_and_refuses_a_pack_that_is_not_there() {
+        let missing = std::env::temp_dir().join("tuile-no-such-pack.tuilepack");
+        let _ = std::fs::remove_file(&missing);
+        let path = missing.display().to_string();
+        let config = TuileGlobeConfig {
+            ion_token: as_str(""),
+            terrain_asset_id: 0,
+            imagery_asset_id: 0,
+            cache_dir: as_str(""),
+            maximum_screen_space_error: 0.0,
+            frame_timeout_seconds: 0.0,
+            fail_on_tile_errors: true,
+            pack_path: as_str(&path),
+            scene_digest: as_str(""),
+        };
+        let mut out: *mut Session = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { tuile_session_new(&config, &mut out) },
+            TuileStatus::BadArgument,
+            "a pack that does not exist must fail at open"
+        );
+        assert!(out.is_null());
+    }
+
+    /// A real pack opens, with no token and no network.
+    #[test]
+    fn a_packed_session_opens_a_pack_and_says_it_is_packed() {
+        // Le writer déverse son blob sur disque en cuisant : il lui faut un
+        // chemin, et le pack est écrit là où il le déverse.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tuile-ffi-open.tuilepack");
+        tuile_pack::PackWriter::new("scene-under-test", [0.0; 3], dir.path().join("blob.part"))
+            .expect("opening the spill")
+            .finish_to(&path)
+            .expect("write the pack");
+        let shown = path.display().to_string();
+        let config = TuileGlobeConfig {
+            ion_token: as_str(""),
+            terrain_asset_id: 0,
+            imagery_asset_id: 0,
+            cache_dir: as_str(""),
+            maximum_screen_space_error: 0.0,
+            frame_timeout_seconds: 0.0,
+            fail_on_tile_errors: true,
+            pack_path: as_str(&shown),
+            scene_digest: as_str("scene-under-test"),
+        };
+        let mut out: *mut Session = std::ptr::null_mut();
+        assert_eq!(unsafe { tuile_session_new(&config, &mut out) }, TuileStatus::Ok);
+        assert!(!out.is_null());
+        assert!(unsafe { &*out }.is_packed());
+        unsafe { tuile_session_free(out) };
+
+        // …and a pack of another scene is refused rather than rendered.
+        let wrong = TuileGlobeConfig {
+            scene_digest: as_str("some-other-scene"),
+            ..config
+        };
+        let mut out: *mut Session = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { tuile_session_new(&wrong, &mut out) },
+            TuileStatus::BadArgument
+        );
+        assert!(out.is_null());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

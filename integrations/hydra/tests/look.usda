@@ -1,0 +1,40 @@
+#usda 1.0
+(
+    """
+    Look « terrain » généré par make_look.py — NE PAS éditer les matrices à
+    la main, régénérer.
+    Manifeste : ./manifest.usda (place ou symlinke le tien)
+    Site : lat 42.5200°, lon 2.1700°
+    Soleil : 2026-06-21T10:00 (UTC+2.0) → azimut 92.5°,
+    élévation 38.7°
+    Rendu : usdrecord --disableCameraLight --camera /World/ShotCam …
+    """
+    subLayers = [
+        @./manifest.usda@
+    ]
+)
+
+over "World"
+{
+    over "ShotCam"
+    {
+        float focalLength = 47.0
+    }
+
+    def DomeLight "Sky"
+    {
+        float inputs:intensity = 1.0
+        asset inputs:texture:file = @./sky-day.exr@
+        matrix4d xformOp:transform = ( (-0.03786459100977573, 0.999282879242741, 0.0, 0), (-0.6753628605029083, -0.025590690111206172, 0.737041466427067, 0), (0.7365129186925315, 0.02790777368350624, 0.6758475247916785, 0), (0, 0, 0, 1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+    }
+
+    def DistantLight "Sun"
+    {
+        float inputs:intensity = 5.0
+        color3f inputs:color = (1.0, 0.98, 0.94)
+        float inputs:angle = 0.53
+        matrix4d xformOp:transform = ( (-0.6763691622087216, 0.01772293709823368, 0.7363495460130903, 0), (0.579889931179323, -0.6035890923403135, 0.5471817571197313, 0), (0.4541502219859771, 0.7970985542004254, 0.3979716959303503, 0), (0, 0, 0, 1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+    }
+}

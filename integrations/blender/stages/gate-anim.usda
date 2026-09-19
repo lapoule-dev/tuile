@@ -1,0 +1,187 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+    startTimeCode = 1
+    endTimeCode = 48
+    timeCodesPerSecond = 24
+)
+
+def Xform "World"
+{
+    def Xform "Rig"
+    {
+        float3 xformOp:rotateXYZ.timeSamples = {
+            1: (0, 0.000, 0),
+            2: (0, 7.500, 0),
+            3: (0, 15.000, 0),
+            4: (0, 22.500, 0),
+            5: (0, 30.000, 0),
+            6: (0, 37.500, 0),
+            7: (0, 45.000, 0),
+            8: (0, 52.500, 0),
+            9: (0, 60.000, 0),
+            10: (0, 67.500, 0),
+            11: (0, 75.000, 0),
+            12: (0, 82.500, 0),
+            13: (0, 90.000, 0),
+            14: (0, 97.500, 0),
+            15: (0, 105.000, 0),
+            16: (0, 112.500, 0),
+            17: (0, 120.000, 0),
+            18: (0, 127.500, 0),
+            19: (0, 135.000, 0),
+            20: (0, 142.500, 0),
+            21: (0, 150.000, 0),
+            22: (0, 157.500, 0),
+            23: (0, 165.000, 0),
+            24: (0, 172.500, 0),
+            25: (0, 180.000, 0),
+            26: (0, 187.500, 0),
+            27: (0, 195.000, 0),
+            28: (0, 202.500, 0),
+            29: (0, 210.000, 0),
+            30: (0, 217.500, 0),
+            31: (0, 225.000, 0),
+            32: (0, 232.500, 0),
+            33: (0, 240.000, 0),
+            34: (0, 247.500, 0),
+            35: (0, 255.000, 0),
+            36: (0, 262.500, 0),
+            37: (0, 270.000, 0),
+            38: (0, 277.500, 0),
+            39: (0, 285.000, 0),
+            40: (0, 292.500, 0),
+            41: (0, 300.000, 0),
+            42: (0, 307.500, 0),
+            43: (0, 315.000, 0),
+            44: (0, 322.500, 0),
+            45: (0, 330.000, 0),
+            46: (0, 337.500, 0),
+            47: (0, 345.000, 0),
+            48: (0, 352.500, 0)
+        }
+        uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
+
+    def Camera "Cam"
+    {
+        float focalLength = 35
+        float focusDistance = 10
+        float fStop = 4
+        double3 xformOp:translate = (0, 1.9, 10.5)
+        float3 xformOp:rotateXYZ = (-8, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+    }
+
+    def Mesh "Floor" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 3, 2, 1]
+        point3f[] points = [(-12, 0, -12), (12, 0, -12), (12, 0, 12), (-12, 0, 12)]
+        normal3f[] normals = [(0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0)]
+        rel material:binding = </World/Materials/FloorMat>
+    }
+
+    def Sphere "Chrome" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.8
+        double3 xformOp:translate = (-1.9, 0.8, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Materials/ChromeMat>
+    }
+
+    def Sphere "Clay" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.8
+        double3 xformOp:translate = (0, 0.8, 0.4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Materials/ClayMat>
+    }
+
+    def Sphere "Lacquer" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.8
+        double3 xformOp:translate = (1.9, 0.8, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Materials/LacquerMat>
+    }
+
+    def Scope "Materials"
+    {
+        def Material "FloorMat"
+        {
+            token outputs:surface.connect = </World/Materials/FloorMat/S.outputs:surface>
+            def Shader "S"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.55, 0.53, 0.5)
+                float inputs:roughness = 0.7
+                token outputs:surface
+            }
+        }
+        def Material "ChromeMat"
+        {
+            token outputs:surface.connect = </World/Materials/ChromeMat/S.outputs:surface>
+            def Shader "S"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.9, 0.9, 0.92)
+                float inputs:metallic = 1.0
+                float inputs:roughness = 0.06
+                token outputs:surface
+            }
+        }
+        def Material "ClayMat"
+        {
+            token outputs:surface.connect = </World/Materials/ClayMat/S.outputs:surface>
+            def Shader "S"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.72, 0.32, 0.22)
+                float inputs:roughness = 0.85
+                token outputs:surface
+            }
+        }
+        def Material "LacquerMat"
+        {
+            token outputs:surface.connect = </World/Materials/LacquerMat/S.outputs:surface>
+            def Shader "S"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.05, 0.25, 0.6)
+                float inputs:roughness = 0.12
+                float inputs:clearcoat = 1.0
+                float inputs:clearcoatRoughness = 0.04
+                token outputs:surface
+            }
+        }
+    }
+
+    def Scope "Lights"
+    {
+        def RectLight "Key"
+        {
+            float inputs:intensity = 12
+            float inputs:width = 4
+            float inputs:height = 3
+            double3 xformOp:translate = (-3.5, 4.5, 3.5)
+            float3 xformOp:rotateXYZ = (-40, -40, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        }
+        def DomeLight "Sky"
+        {
+            float inputs:intensity = 0.35
+            color3f inputs:color = (0.55, 0.65, 0.85)
+        }
+    }
+}
