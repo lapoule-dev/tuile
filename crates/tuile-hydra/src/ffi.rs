@@ -4,7 +4,7 @@
 //! The `extern "C"` surface, and nothing else.
 //!
 //! Every function here obeys the same three rules, and they are the reason this
-//! module is separate from [`tuile_bake::Session`]:
+//! module is separate from [`crate::session`]:
 //!
 //! 1. **Nothing unwinds.** A panic crossing `extern "C"` aborts the process, so
 //!    each entry point catches and returns a [`TuileStatus`].
@@ -107,6 +107,26 @@ pub struct TuileTile {
     /// keeps prims between frames needs to tell those two cases apart, and
     /// this makes it an integer compare instead of a string rebuild.
     pub drape: u64,
+}
+
+/// The filter the engine logs through, given whatever `TUILE_LOG` said.
+///
+/// **A default, always.** The subscriber used to be installed only when
+/// `TUILE_LOG` was set, and the farm job sets it only under `--trace`. So a
+/// normal render ran with the engine entirely mute — including its failures.
+///
+/// What that cost, precisely: a frame died with `status 4, a tile could not be
+/// loaded`, whose own message ends *"see the error logged above for the tile
+/// and the reason"*. The reason was logged, through `tracing`, into a
+/// subscriber that did not exist. Two days were spent guessing at a sentence
+/// the program had already written.
+///
+/// `warn` is the floor: silent when all is well, and never silent about a
+/// failure. `TUILE_LOG` still overrides it in both directions.
+fn log_filter(configured: Option<String>) -> String {
+    configured
+        .filter(|f| !f.trim().is_empty())
+        .unwrap_or_else(|| "warn".into())
 }
 
 impl From<&FrameError> for TuileStatus {
@@ -251,10 +271,11 @@ pub unsafe extern "C" fn tuile_session_new(
     }
     guard(|| {
         // The host is a render process with no Rust logging of its own:
-        // TUILE_LOG=debug turns the crate's tracing into stderr lines, once.
+        // TUILE_LOG turns the crate's tracing into stderr lines, once.
         static LOGGING: std::sync::Once = std::sync::Once::new();
         LOGGING.call_once(|| {
-            if let Ok(filter) = std::env::var("TUILE_LOG") {
+            {
+                let filter = log_filter(std::env::var("TUILE_LOG").ok());
                 let json = std::env::var("TUILE_LOG_FORMAT")
                     .map(|f| f.eq_ignore_ascii_case("json"))
                     .unwrap_or(false);
@@ -545,6 +566,28 @@ pub unsafe extern "C" fn tuile_frame_texture(
 
 #[cfg(test)]
 mod tests {
+
+    /// Le moteur n'est jamais muet sur ses pannes.
+    ///
+    /// Le souscripteur n'était installé que si `TUILE_LOG` existait, et le job
+    /// de ferme ne le définit que sous `--trace`. Un rendu normal tournait donc
+    /// avec le moteur entièrement silencieux — y compris sur l'erreur fatale
+    /// dont le message dit d'aller lire l'erreur précédente.
+    #[test]
+    fn a_missing_log_setting_still_lets_failures_through() {
+        assert_eq!(log_filter(None), "warn");
+        assert_eq!(log_filter(Some(String::new())), "warn");
+        assert_eq!(log_filter(Some("   ".into())), "warn");
+    }
+
+    /// Et ce qui est demandé est respecté, dans les deux sens.
+    #[test]
+    fn an_explicit_setting_wins_over_the_floor() {
+        assert_eq!(log_filter(Some("debug".into())), "debug");
+        assert_eq!(log_filter(Some("tuile_det=info".into())), "tuile_det=info");
+        assert_eq!(log_filter(Some("error".into())), "error");
+    }
+
     use super::*;
 
     /// The boundary must survive a panic, because the alternative is aborting
