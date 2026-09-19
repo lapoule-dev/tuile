@@ -23,28 +23,14 @@ unwrap_used = "warn"
 panic = "warn"
 
 [dependencies]
-async-trait = { workspace = true }
-bytes = { workspace = true }
 glam = { workspace = true }
-image = { workspace = true }
-# `time` for the frame deadline: a bulk frame blocks, and an unbounded block
-# on a farm node is indistinguishable from a hang.
-tokio = { workspace = true, features = ["time"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-thiserror = { workspace = true }
 tuile-core = { version = "0.0.1", path = "../tuile-core" }
-# The host is OpenUSD, which has no way to resolve tile sources for itself: a
-# C++ plugin cannot call `tuile_planetary::globe`. So this facade — specialised
-# for its host, per docs/01-architecture.md — assembles the globe behind the
-# boundary. That is why a crate whose session is source-agnostic nonetheless
-# depends on ion, Bing and a native transport.
-tuile-cesium-ion = { version = "0.0.1", path = "../tuile-cesium-ion" }
-tuile-bing = { version = "0.0.1", path = "../tuile-bing" }
-tuile-planetary = { version = "0.0.1", path = "../tuile-planetary" }
-tuile-native-fetchers = { version = "0.0.1", path = "../tuile-native-fetchers" }
-# The pre-baked container. A render that reads one needs no ion token, no
-# network and no traversal; see `packed`.
+# Le travail : session, globe, traversée, lecture de pack. Rien d'OpenUSD
+# là-dedans, et c'est exactement pourquoi il est ailleurs — voir lib.rs.
+tuile-bake = { version = "0.0.1", path = "../tuile-bake" }
+# Le conteneur pré-cuit, pour les types que l'ABI expose.
 tuile-pack = { version = "0.0.1", path = "../tuile-pack" }
 
 [dev-dependencies]

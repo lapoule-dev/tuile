@@ -537,7 +537,7 @@ fn bake(args: Args) -> Result<(), String> {
         ));
     }
 
-    let mut config = tuile_hydra::GlobeConfig::new(&token);
+    let mut config = tuile_bake::GlobeConfig::new(&token);
     if let Ok(dir) = std::env::var("TUILE_CACHE_DIR") {
         config.cache_dir = Some(dir.into());
     }
@@ -545,7 +545,7 @@ fn bake(args: Args) -> Result<(), String> {
     // knob the session honours is read by `exact_traversal`, and a digest
     // taken before that would give two packs baked at different screen-space
     // errors the same name — after which they answer for each other.
-    let resolved = tuile_hydra::exact_traversal(config.session.traversal.clone());
+    let resolved = tuile_bake::exact_traversal(config.session.traversal.clone());
     let scene = digest_of_scene(&tape_bytes, args.viewport, &format!("{resolved:?}"));
     let culling = if resolved.cull {
         "full"
@@ -561,7 +561,7 @@ fn bake(args: Args) -> Result<(), String> {
     );
 
     let began = Instant::now();
-    let mut session = tuile_hydra::Session::globe(config)
+    let mut session = tuile_bake::Session::globe(config)
         .map_err(|e| format!("opening the globe: {e}"))?;
 
     // The render origin the pack's positions are relative to. The pack stores
@@ -640,7 +640,7 @@ fn dump_frame(path: &std::path::Path, number: u32) -> Result<(), String> {
     let pack = tuile_pack::Pack::open(&bytes).map_err(|e| e.to_string())?;
     let view = pack.view_of(number).map_err(|e| e.to_string())?;
 
-    let mut session = tuile_hydra::Session::from_pack(path, None).map_err(|e| e.to_string())?;
+    let mut session = tuile_bake::Session::from_pack(path, None).map_err(|e| e.to_string())?;
     let out = session
         .frame(vec![tuile_core::traversal::ViewStateParams {
             position: glam::DVec3::from_array(view.position),
@@ -870,11 +870,11 @@ fn verify(
         .map_err(|_| "TUILE_ION_TOKEN is not set; --verify bakes the scene again")?;
     let tape_bytes = std::fs::read(tape_path)
         .map_err(|e| format!("reading {}: {e}", tape_path.display()))?;
-    let mut config = tuile_hydra::GlobeConfig::new(&token);
+    let mut config = tuile_bake::GlobeConfig::new(&token);
     if let Ok(dir) = std::env::var("TUILE_CACHE_DIR") {
         config.cache_dir = Some(dir.into());
     }
-    let resolved = tuile_hydra::exact_traversal(config.session.traversal.clone());
+    let resolved = tuile_bake::exact_traversal(config.session.traversal.clone());
     let scene = digest_of_scene(&tape_bytes, viewport, &format!("{resolved:?}"));
     if scene != pack.scene_digest() {
         return Err(format!(
@@ -884,9 +884,9 @@ fn verify(
         ));
     }
 
-    let mut live = tuile_hydra::Session::globe(config)
+    let mut live = tuile_bake::Session::globe(config)
         .map_err(|e| format!("opening the globe: {e}"))?;
-    let mut packed = tuile_hydra::Session::from_pack(path, Some(&scene))
+    let mut packed = tuile_bake::Session::from_pack(path, Some(&scene))
         .map_err(|e| e.to_string())?;
 
     let mut checked = 0usize;
@@ -999,9 +999,9 @@ fn first_difference(a: &BakedTile, b: &BakedTile) -> String {
 /// field: a pack is a substitute for a live session, and a substitute that
 /// reshapes the data is a second implementation.
 fn baked_tile(
-    frame: &tuile_hydra::Frame,
+    frame: &tuile_bake::Frame,
     index: usize,
-    tile: &Arc<tuile_hydra::TileGeometry>,
+    tile: &Arc<tuile_bake::TileGeometry>,
 ) -> Result<BakedTile, String> {
     // One prim per tile, as the consumer expects; terrain produces one mesh.
     let mesh = tile
