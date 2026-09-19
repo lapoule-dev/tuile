@@ -1034,6 +1034,7 @@ mod coverage_tests {
     fn a_retire_spares_queued_real_content() {
         fn empty() -> tuile_core::content::DecodedTileContent {
             tuile_core::content::DecodedTileContent {
+                withheld_drape: None,
                 meshes: Vec::new(),
                 textures: Vec::new(),
                 imagery: Vec::new(),

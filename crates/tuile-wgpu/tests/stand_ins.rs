@@ -74,6 +74,7 @@ impl GeometryStream for Scripted {
 /// thirty thousand.
 fn surface() -> DecodedTileContent {
     DecodedTileContent {
+            withheld_drape: None,
         meshes: vec![DecodedMesh {
             positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
             normals: Some(vec![[0.0, 0.0, 1.0]; 3]),

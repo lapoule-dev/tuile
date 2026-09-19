@@ -28,14 +28,21 @@ use url::Url;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RasterError {
-    #[error("imagery provider: {0}")]
-    Provider(String),
     #[error("fetch: {0}")]
     Fetch(#[from] FetchError),
     #[error("image decode: {0}")]
     Image(String),
     #[error("invalid imagery url: {0}")]
     InvalidUrl(#[from] url::ParseError),
+    /// The provider could not address or serve this tile, and the reason is
+    /// neither a transport failure nor a decode failure.
+    ///
+    /// Asking for a level a provider does not publish, or a token it refused,
+    /// is not an "image decode" problem — and reporting it as one sends the
+    /// reader to the wrong half of the system. Bing's connector predates this
+    /// variant and still folds such cases into `Image`.
+    #[error("imagery provider: {0}")]
+    Provider(String),
 }
 
 /// Address of an imagery tile in its provider's quadtree.
@@ -44,6 +51,38 @@ pub struct ImageryCoord {
     pub level: u32,
     pub x: u64,
     pub y: u64,
+}
+
+/// What makes one composed drape different from another: the imagery that went
+/// into it, in order, and the size it was composed at.
+///
+/// **The identity has to be computable from both sides of the fetch.** A
+/// consumer that already holds a composed drape wants to skip downloading and
+/// decoding its layers, and it can only decide that before asking for them —
+/// from the coords it is *about* to request. The same function, run afterwards
+/// over the layers that actually arrived, has to produce the same number, or
+/// the two halves would never recognise each other.
+///
+/// The two agree whenever every requested tile was served as requested. They
+/// differ when a layer was substituted by a coarser one, or dropped as
+/// invisible — and that difference is safe in one direction only, which is the
+/// direction it happens in: the before-key simply fails to match anything, so
+/// the layers are fetched as they always were. It can never name a drape that
+/// was composed from different pixels, because a stored identity was itself
+/// produced by this function over the layers that composed it.
+pub fn drape_identity(
+    coords: impl IntoIterator<Item = ImageryCoord>,
+    composed_at: u32,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    composed_at.hash(&mut hasher);
+    for coord in coords {
+        coord.level.hash(&mut hasher);
+        coord.x.hash(&mut hasher);
+        coord.y.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// A geographic rectangle, radians, WGS84. No antimeridian crossing in v1
@@ -1775,6 +1814,45 @@ mod mosaic_coverage_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The identity is the stack, in order — not the set.
+    ///
+    /// Layers blend in order and each paints over what is already there, so two
+    /// drapes built from the same tiles in a different order are two different
+    /// pictures. An identity blind to order would let one answer for the other,
+    /// and the wrong ground would be served with no error anywhere.
+    #[test]
+    fn the_drape_identity_is_ordered() {
+        use super::{drape_identity, ImageryCoord};
+        let a = ImageryCoord { level: 4, x: 1, y: 2 };
+        let b = ImageryCoord { level: 4, x: 2, y: 1 };
+        assert_ne!(
+            drape_identity([a, b], 2048),
+            drape_identity([b, a], 2048),
+            "two stacking orders share a name"
+        );
+        assert_eq!(
+            drape_identity([a, b], 2048),
+            drape_identity([a, b], 2048),
+            "the same stack must always give the same name"
+        );
+    }
+
+    /// And the size it was composed at is part of it: the same layers composed
+    /// into 1024² and into 2048² are different pixels.
+    #[test]
+    fn the_composed_size_is_part_of_the_drape_identity() {
+        use super::{drape_identity, ImageryCoord};
+        let only = ImageryCoord { level: 4, x: 1, y: 2 };
+        assert_ne!(drape_identity([only], 1024), drape_identity([only], 2048));
+    }
+
+    /// No layers is still a name, and it must not collide with one layer.
+    #[test]
+    fn an_empty_stack_has_its_own_name() {
+        use super::{drape_identity, ImageryCoord};
+        let only = ImageryCoord { level: 0, x: 0, y: 0 };
+        assert_ne!(drape_identity([], 2048), drape_identity([only], 2048));
+    }
     use super::*;
     use crate::content::{DecodedMesh, MaterialDesc};
     use crate::geo::geodetic_to_ecef;
@@ -1828,6 +1906,7 @@ mod tests {
             [e.x as f32, e.y as f32, e.z as f32]
         };
         let mut content = DecodedTileContent {
+            withheld_drape: None,
             meshes: vec![DecodedMesh {
                 positions: vec![p(0.009, 0.011), p(0.011, 0.011), p(0.009, 0.009)],
                 normals: None,
@@ -2695,6 +2774,7 @@ mod tests {
         let positions = vec![[0.0f32; 3]; 3];
         let uvs = uvs_geographic(&positions, origin, &rect);
         let mut content = DecodedTileContent {
+            withheld_drape: None,
             meshes: vec![DecodedMesh {
                 positions,
                 normals: None,
@@ -2730,7 +2810,7 @@ mod tests {
             [-0.1, -0.1, 1.1, 1.1],
         )];
         bake_imagery(&mut sharp, 128);
-        assert_eq!(sharp.textures.last().unwrap().width, 128);
+        assert_eq!(sharp.textures.last().expect("baked").width, 128);
 
         // No imagery: untouched.
         let mut plain = content.clone();

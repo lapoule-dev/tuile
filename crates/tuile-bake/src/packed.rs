@@ -291,6 +291,7 @@ impl Packed {
             id,
             origin,
             DecodedTileContent {
+                withheld_drape: None,
                 meshes: vec![mesh],
                 textures: Vec::new(),
                 imagery: Vec::new(),
