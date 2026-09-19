@@ -4470,6 +4470,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "splines"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b882be9bf6b37258bfba80ed5b5eeccccd6700bfbaca202bbd53e4c13bf3daa7"
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5260,6 +5266,7 @@ version = "0.0.1"
 dependencies = [
  "image",
  "mcap",
+ "splines",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
