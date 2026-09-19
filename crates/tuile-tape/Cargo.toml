@@ -13,6 +13,14 @@ rust-version.workspace = true
 # ground it was meant to be 5 km above.
 tuile-core = { version = "0.0.1", path = "../tuile-core" }
 mcap = "0.25"
+# Catmull–Rom, plutôt qu'écrit à la main.
+#
+# La construction — points de contrôle au tiers de la corde des voisins — tient
+# en six lignes, et c'est exactement pour ça qu'on la recopie mal : elle est
+# assez simple pour qu'on croie la connaître, et assez subtile pour que le
+# raccord de la couture d'une boucle soit faux sans que ça se voie sur une
+# figure. BSD-3-Clause, un million de téléchargements.
+splines = "5.0"
 image = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
