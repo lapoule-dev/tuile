@@ -206,6 +206,7 @@ mod tests {
             },
         };
         let content = DecodedTileContent {
+            withheld_drape: None,
             meshes: vec![mesh],
             textures: vec![DecodedTexture {
                 width: 256,
