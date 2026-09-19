@@ -1090,7 +1090,20 @@ fn finish_tile(
             "draped imagery before bake"
         );
     }
-    let baked = drape_key(tile, &decoded, bake_max_size);
+    // A drape the loader withheld names itself; nothing else can name it,
+    // because its layers were never fetched and `drape_key` reads the layers.
+    //
+    // This is the demand side of `withheld_drape`'s contract. Ignoring it here
+    // would give the tile a drape of zero, which the pack would store as "this
+    // tile has no imagery" — real terrain, no picture, no error anywhere.
+    let withheld = decoded.withheld_drape;
+    let baked = withheld
+        .map(|drape| TextureKey {
+            tile,
+            drape,
+            texture_index: 0,
+        })
+        .or_else(|| drape_key(tile, &decoded, bake_max_size));
     let memoized = baked.and_then(|key| memo.get(key));
     match &memoized {
         // The same tile under the same drape was baked and encoded by an
@@ -1100,6 +1113,14 @@ fn finish_tile(
         // whole cost of a frame the GPU draws in milliseconds.
         Some(_) => {
             decoded.imagery.clear();
+            for mesh in &mut decoded.meshes {
+                mesh.material.base_color_texture = Some(0);
+            }
+        }
+        // Withheld: there is nothing to compose — the layers were never
+        // fetched — but the material must still point at texture 0, because
+        // that is where the drape the consumer holds will be bound.
+        None if withheld.is_some() => {
             for mesh in &mut decoded.meshes {
                 mesh.material.base_color_texture = Some(0);
             }
@@ -1133,17 +1154,16 @@ fn drape_key(
     {
         return None;
     }
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bake_max_size.hash(&mut hasher);
-    for layer in &content.imagery {
-        layer.coord.level.hash(&mut hasher);
-        layer.coord.x.hash(&mut hasher);
-        layer.coord.y.hash(&mut hasher);
-    }
+    // The same function the loader runs over the coords it is ABOUT to
+    // request, and it has to be the same one: the loader withholds a drape by
+    // recognising the identity this produces. Two implementations of one hash
+    // would agree until the day one of them was edited.
     Some(TextureKey {
         tile,
-        drape: hasher.finish(),
+        drape: tuile_core::raster::drape_identity(
+            content.imagery.iter().map(|layer| layer.coord),
+            bake_max_size,
+        ),
         texture_index: 0,
     })
 }
@@ -1231,6 +1251,11 @@ mod tests {
 
     /// And the name a frame hands out is the one built from the drape it
     /// actually baked — not a guess made at the boundary.
+    ///
+    /// The dataset is given to `finish_tile`, not only to the frame, because
+    /// the name is now stamped when the mosaic is encoded — which is on
+    /// arrival, so that the raw pixels can be dropped. In a session the two are
+    /// the same string (`config.dataset`); here they have to be written twice.
     #[test]
     fn the_encoded_uri_carries_the_tile_s_own_drape() {
         let memo = Arc::new(TextureMemo::default());
@@ -1324,6 +1349,30 @@ mod tests {
         });
         assert!(!exact.stand_ins);
         assert!(exact.forbid_holes);
+    }
+
+    /// Une erreur d'écran posée par l'appelant survit à la résolution.
+    ///
+    /// C'est la moitié utile du correctif de septembre 2026 : le lanceur
+    /// savait nommer `--sse 3` et le bake cuisait à 16, parce que la valeur
+    /// n'arrivait jamais jusqu'ici. Elle arrive maintenant par
+    /// `config.session.traversal`, et ce test dit que `exact_traversal` —
+    /// qui écrase délibérément `stand_ins` et `forbid_holes` — ne l'écrase
+    /// PAS au passage. Il ne couvre pas la plomberie du shell : que
+    /// `bake_job.sh` passe bien `--sse` ne se vérifie qu'en lisant la ligne
+    /// `BAKE-BEGIN` d'une vraie cuisson.
+    #[test]
+    fn an_explicit_screen_space_error_survives_resolution() {
+        let exact = exact_traversal(Config {
+            maximum_screen_space_error: 3.0,
+            ..Config::default()
+        });
+        assert_eq!(exact.maximum_screen_space_error, 3.0);
+        // Et le défaut reste le défaut quand personne ne demande rien.
+        assert_eq!(
+            exact_traversal(Config::default()).maximum_screen_space_error,
+            Config::default().maximum_screen_space_error
+        );
     }
 
     /// A tile with draped imagery must cross the boundary as one owned
@@ -1438,12 +1487,73 @@ mod tests {
 
         let memo = TextureMemo::default();
         let tile = finish_tile(&memo, TileId(7), decoded, 256);
-        assert_eq!(tile.content.textures.len(), 1, "the mosaic is owned");
         assert!(tile.content.imagery.is_empty(), "the layers are consumed");
         assert_eq!(
             tile.content.meshes[0].material.base_color_texture,
             Some(0),
             "the material points at the baked texture"
+        );
+        assert_eq!(tile.content.textures.len(), 1, "the mosaic is owned");
+    }
+
+    /// A withheld drape keeps its identity, so the pack can reference it.
+    ///
+    /// The loader skips fetching a tile's imagery when the consumer already
+    /// holds the composed drape, and hands back content with no layers and
+    /// `withheld_drape` set. If `finish_tile` read that as "no imagery", the
+    /// tile would get a drape of zero — and a drape of zero is what a pack
+    /// stores for terrain that has no picture at all. Real ground, no texture,
+    /// and every counter green.
+    #[test]
+    fn a_withheld_drape_survives_into_the_tile_s_identity() {
+        let memo = TextureMemo::default();
+        let mut content = draped_content();
+        // What the loader produces: the identity, and none of the layers.
+        let identity = tuile_core::raster::drape_identity(
+            content.imagery.iter().map(|layer| layer.coord),
+            256,
+        );
+        content.imagery.clear();
+        content.withheld_drape = Some(identity);
+
+        let tile = finish_tile(&memo, TileId(7), content, 256);
+        assert_eq!(
+            tile.drape(),
+            identity,
+            "the tile forgot which drape it stands for"
+        );
+        assert!(
+            tile.content.textures.is_empty(),
+            "nothing was fetched, so nothing can have been composed"
+        );
+        assert_eq!(
+            tile.content.meshes[0].material.base_color_texture,
+            Some(0),
+            "the material must still point where the held drape will bind"
+        );
+    }
+
+    /// And the identity it keeps is the one the layers would have produced.
+    ///
+    /// This is the whole contract between the two sides: the loader hashes the
+    /// coords it is about to request, the consumer hashes the layers that
+    /// arrived, and a drape is only withheld when those two numbers match. If
+    /// they could differ for the same coords, a bake would skip a fetch and
+    /// then fail to find what it skipped it for.
+    #[test]
+    fn the_withheld_identity_is_the_one_the_layers_would_have_given() {
+        let memo = TextureMemo::default();
+        let fetched = finish_tile(&memo, TileId(7), draped_content(), 256);
+
+        let content = draped_content();
+        let before = tuile_core::raster::drape_identity(
+            content.imagery.iter().map(|layer| layer.coord),
+            256,
+        );
+        assert_eq!(
+            before,
+            fetched.drape(),
+            "the loader and the consumer disagree on what this drape is called"
         );
     }
 
