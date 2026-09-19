@@ -51,6 +51,9 @@ pub use globe::{
     CESIUM_WORLD_TERRAIN,
 };
 pub use packed::PackedError;
+/// What a caller already holds, so a bake never fetches it twice. See
+/// [`GlobeConfig::held_drape`].
+pub use tuile_planetary::HeldDrape;
 pub use session::{
     exact_traversal, EncodedTexture, Frame, FrameError, Session, SessionConfig, TileGeometry,
 };

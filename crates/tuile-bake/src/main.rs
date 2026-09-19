@@ -706,6 +706,29 @@ fn bake(args: Args) -> Result<(), String> {
         // même convention que le C ABI (`ffi.rs:244`).
         config.imagery_asset_id = if id < 0 { None } else { Some(id) };
     }
+    // What the pack already holds, shared with the loader so it never fetches
+    // a drape twice.
+    //
+    // The pack is the authority; this mirrors it for the one caller that has
+    // to know the answer *before* the request goes out. A mirror rather than
+    // the index itself because the loader asks from a worker thread, deep
+    // inside a fetch, while the writer is borrowed mutably by the frame loop.
+    //
+    // A divergence cannot pass silently: a tile the loader withheld arrives
+    // with no imagery, and `baked_tile` refuses a drape with no texture
+    // rather than storing bare ground.
+    let already_packed: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashSet<(u64, u64)>>,
+    > = std::sync::Arc::default();
+    config.held_drape = Some(tuile_bake::HeldDrape::new({
+        let packed = std::sync::Arc::clone(&already_packed);
+        move |id, drape| {
+            packed
+                .lock()
+                .is_ok_and(|held| held.contains(&(id, drape)))
+        }
+    }));
+
     let resolved = tuile_bake::exact_traversal(config.session.traversal.clone());
     let scene = digest_of_scene(&poses, args.viewport, &bake_settings(&config, &resolved));
     let culling = if resolved.cull {
@@ -760,6 +783,9 @@ fn bake(args: Args) -> Result<(), String> {
         let mut tiles = Vec::with_capacity(frame.tiles.len());
         for (index, tile) in frame.tiles.iter().enumerate() {
             tiles.push(baked_tile(&frame, index, tile)?);
+            if let Ok(mut held) = already_packed.lock() {
+                held.insert((tile.tile.0, tile.drape()));
+            }
         }
         let selected = tiles.len();
         // The camera goes in beside the tiles, because that is what a render
@@ -1181,6 +1207,21 @@ fn first_difference(a: &BakedTile, b: &BakedTile) -> String {
     }
 }
 
+/// Whether a tile can be stored, given the drape it names and what it carries.
+///
+/// Pulled out of [`baked_tile`] so the decision can be read and tested on its
+/// own: it is two booleans, and it is the last thing standing between a
+/// withheld drape and bare ground in the film.
+///
+/// - drape 0, no texture — terrain with no imagery. Legitimate: the geometry
+///   debug view, and any tile the provider covers with nothing.
+/// - drape 0, a texture — a texture the tile owns rather than one we composed.
+/// - a drape, a texture — the ordinary draped tile.
+/// - **a drape, no texture** — the pixels are nowhere. Refused.
+fn drape_has_its_pixels(drape: u64, has_texture: bool) -> bool {
+    drape == 0 || has_texture
+}
+
 /// One tile, in the shape the pack stores and the ABI hands out.
 ///
 /// The mapping is deliberately the same one `tuile_frame_tile` makes, field for
@@ -1215,6 +1256,22 @@ fn baked_tile(
         ));
     }
 
+    // A tile that names a drape and carries no texture is bare ground.
+    //
+    // It happens exactly one way: the loader withheld the imagery because the
+    // pack was said to hold this drape, and then the pack did not hold it. The
+    // pixels are nowhere. Storing it would put real terrain in the film under
+    // no picture at all, and every counter downstream would read green — the
+    // tile is present, the frame is complete, the bake succeeds.
+    if !drape_has_its_pixels(tile.drape(), texture.is_some()) {
+        return Err(format!(
+            "tile {} names drape {:016x} and carries no texture: its imagery was \
+             withheld for a pack that does not hold it",
+            tile.tile.0,
+            tile.drape()
+        ));
+    }
+
     Ok(BakedTile {
         id: tile.tile.0,
         drape: tile.drape(),
@@ -1237,6 +1294,24 @@ fn baked_tile(
 
 #[cfg(test)]
 mod tests {
+    /// The four cases, and the one that must be refused.
+    ///
+    /// A tile naming a drape with no texture can only come from one place: the
+    /// loader withheld its imagery for a pack that turned out not to hold it.
+    /// Stored, it is real terrain under no picture — and the pack has no way to
+    /// tell later that anything was missing, because "no texture" is also how a
+    /// legitimately bare tile is recorded.
+    #[test]
+    fn a_drape_with_no_pixels_is_refused_and_nothing_else_is() {
+        assert!(super::drape_has_its_pixels(0, false), "bare terrain is fine");
+        assert!(super::drape_has_its_pixels(0, true), "an owned texture is fine");
+        assert!(super::drape_has_its_pixels(0xdead, true), "the ordinary tile");
+        assert!(
+            !super::drape_has_its_pixels(0xdead, false),
+            "a drape whose pixels are nowhere must not be stored"
+        );
+    }
+
     use super::*;
 
     /// The encoding is the file's, not this machine's.
