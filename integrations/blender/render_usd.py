@@ -53,6 +53,31 @@ def parse_args():
                    help="with --video: also write the PNG sequence (default: direct-to-video, no frames touch disk)")
     p.add_argument("--batch-frames", type=int, default=60,
                    help="progress log granularity (frames per batch; 0 = quiet)")
+    p.add_argument("--view-transform", default="Standard",
+                   help="transformation de vue OCIO — le look, épinglé plutôt "
+                        "qu'hérité. Blender change son défaut entre versions "
+                        "(Filmic avant 4.0, AgX depuis) et un rendu dont le "
+                        "look dépend de la version installée n'est pas "
+                        "reproductible. 'Standard' pour un encodage sRGB "
+                        "direct, sans courbe.\n"
+                        "Standard par défaut, et c'est un choix : la texture "
+                        "est DÉJÀ une photographie. AgX la re-étalonne — "
+                        "mesuré sur la même frame, chroma moyenne 5,4 contre "
+                        "10,9 et écart-type 11,5 contre 22,3. Pour de "
+                        "l'imagerie aérienne, fidèle vaut mieux que "
+                        "cinématographique.")
+    p.add_argument("--exposure", type=float, default=-1.5,
+                   help="exposition en diaphragmes, appliquée au film. Le "
+                        "soleil et le ciel de la scène sont une composition, "
+                        "pas une mesure ; ce réglage-ci est la mesure.\n"
+                        "-1,5 par défaut, mesuré le 17 septembre 2026 sur la "
+                        "frame 1 de l'orbite pyrénéenne, en Standard : à 0 "
+                        "diaph 22,33 % des pixels sont écrêtés à 255, à -1,5 "
+                        "il en reste 0,06 %, à -2,5 l'image est propre mais "
+                        "terne (écart-type 16,7 contre 22,3). Le soleil de la "
+                        "scène est à 4 W/m², ce qui est une composition, pas "
+                        "une erreur — on la corrige au film plutôt que de "
+                        "changer l'équilibre des sources.")
     p.add_argument("--no-dof", action="store_true", help="disable depth of field")
     p.add_argument("--demo-fixups", action="store_true",
                    help="gate-stage repairs: world sky, light energy, sphere-prim rebinding")
@@ -100,16 +125,30 @@ HYDRA_DELEGATES = {
 
 
 def setup_hydra_manifest(scene, stage_path, first, last, delegate="storm"):
-    """The manifest path: a Hydra delegate over the exported stage.
+    """The manifest path: a Hydra delegate over Blender's own scene.
 
     The manifest's camera is rebuilt as a keyframed Blender camera straight
     from pxr rather than through `usd_import` — the importer's animation
     support is a bet, and a silently static camera renders 1440 identical
-    frames. The Globe prim cannot survive an import at all (no Blender object
-    maps to it), so a USDHook references the manifest into the exported stage
-    — the composition route proven by the proctest — and retargets the
-    procedural's camera rel onto the exported Blender camera, which carries
-    the *current frame's* pose (the export path evaluates at Default time).
+    frames.
+
+    The Globe prim cannot survive an import at all: no Blender object maps to
+    a `GenerativeProcedural`. It is composed into the render instead, by the
+    scene index plugin in `integrations/hydra/src/manifest.cpp`, which merges
+    the manifest into the chain one insertion phase ahead of hdGp's resolver.
+    All this side has to do is name the file.
+
+    That replaces a `USDHook.on_export`, which only fired on Blender's USD
+    export path — the one Blender's own source calls "Slow USD export for
+    reference", and which tears the scene down and rebuilds it once per frame
+    (`USDSceneIndex::populate`, read at v5.2.2). That teardown is why a frame
+    cost 9.7 s with a pack that had precomputed everything: our procedural is
+    an instance member, so a procedural rebuilt every frame starts from an
+    empty state and rebuilds all 444 tiles — measured, 8 frames, `cook #1 ...
+    kept=0 built=444` eight times over.
+
+    The fast path keeps its scene index across frames and populates the delta.
+    It exports nothing, so nothing here may depend on an export.
     """
     import mathutils
     from pxr import Usd, UsdGeom
@@ -134,9 +173,20 @@ def setup_hydra_manifest(scene, stage_path, first, last, delegate="storm"):
         print(f"FATAL: the {delegate} Hydra delegate is not registered: {e}",
               file=sys.stderr, flush=True)
         sys.exit(1)
-    scene.hydra.export_method = "USD"
+    # The fast path, and the only one on which the globe is incremental.
+    # Blender's own enum describes the other as "for accurate comparison with
+    # USD file export"; it is a reference path, not a production one.
+    scene.hydra.export_method = "HYDRA"
 
     manifest = str(pathlib.Path(stage_path).resolve())
+    # Lue par `tuile_insert_manifest` quand le moteur construit son render
+    # index — le fork de Blender l'appelle par `TUILE_HYDRA_LIB`, et c'est tout
+    # ce que ce côté-ci a à faire pour que le globe entre dans la scène.
+    #
+    # Posée avant le premier rendu, et elle reste posée : la lecture se fait à
+    # chaque construction de chaîne plutôt qu'une fois pour toutes.
+    os.environ["TUILE_MANIFEST"] = manifest
+
     source = Usd.Stage.Open(manifest)
     cam_prim = next(
         (p for p in source.Traverse() if p.IsA(UsdGeom.Camera)), None)
@@ -176,7 +226,7 @@ def setup_hydra_manifest(scene, stage_path, first, last, delegate="storm"):
         cam.keyframe_insert("rotation_euler", frame=f)
 
     # The look is scene-side composition, as always: a sky dome and a sun,
-    # exported with the scene. The manifest carries geometry and config only.
+    # built as Blender data. The manifest carries geometry and config only.
     world = bpy.data.worlds.new("Sky")
     world.use_nodes = True
     bg = world.node_tree.nodes["Background"]
@@ -187,37 +237,6 @@ def setup_hydra_manifest(scene, stage_path, first, last, delegate="storm"):
     sun.data.energy = 4.0
     scene.collection.objects.link(sun)
     sun.rotation_euler = (0.7, 0.2, 0.3)
-
-    class TuileManifestHook(bpy.types.USDHook):
-        bl_idname = "tuile_manifest_hook"
-        bl_label = "tuile manifest"
-
-        @staticmethod
-        def on_export(ctx):
-            stage = ctx.get_stage()
-            holder = stage.DefinePrim("/TuileManifest")
-            holder.GetReferences().AddReference(manifest)
-            # The referenced Globe's camera rel points at the manifest's own
-            # camera — static under the export path's Default-time
-            # evaluation. Retarget it onto the exported Blender camera,
-            # which holds this frame's pose.
-            exported_cam = next(
-                (p for p in stage.Traverse()
-                 if p.IsA(UsdGeom.Camera)
-                 and not str(p.GetPath()).startswith("/TuileManifest")),
-                None)
-            globe = next(
-                (p for p in Usd.PrimRange(holder)
-                 if p.GetTypeName() == "GenerativeProcedural"), None)
-            if exported_cam is None or globe is None:
-                print("HOOK-MISSING-PIECES", flush=True)
-                return True
-            rel = globe.CreateRelationship("primvars:tuile:cameras")
-            rel.SetTargets([exported_cam.GetPath()])
-            print("MANIFEST-HOOK-FIRED", flush=True)
-            return True
-
-    bpy.utils.register_class(TuileManifestHook)
 
 
 def main():
@@ -233,6 +252,24 @@ def main():
     scene.render.resolution_y = args.height or (args.width * 3 // 4)
     scene.render.fps = args.fps
     scene.render.use_persistent_data = True
+    # Le look, nommé.
+    #
+    # Lu plutôt que supposé : sans cette ligne, 5.2 applique AgX, dont la
+    # signature — noirs relevés, blancs arrêtés sous 255, contraste écrasé —
+    # est difficile à distinguer à l'œil d'une texture sRGB lue comme
+    # linéaire. Mesuré sur un rendu du 17 septembre 2026 : min 88, moyenne
+    # 187, max 229, zéro pixel écrêté.
+    try:
+        scene.view_settings.view_transform = args.view_transform
+    except TypeError:
+        print(f"view transform inconnue: {args.view_transform!r} — celles de "
+              f"ce Blender: "
+              f"{[i.identifier for i in scene.view_settings.bl_rna.properties['view_transform'].enum_items]}",
+              flush=True)
+        raise
+    scene.view_settings.exposure = args.exposure
+    print(f"view transform: {scene.view_settings.view_transform}, "
+          f"exposition {args.exposure:+g} diaph", flush=True)
 
     if args.engine == "hydra":
         setup_hydra_manifest(scene, args.stage, first, last, args.delegate)
@@ -333,6 +370,27 @@ def main():
             batch["t"] = now
 
     bpy.app.handlers.render_write.append(batch_log)
+
+    # Et une ligne quand une frame COMMENCE.
+    #
+    # `render_write` ne parle qu'une fois la frame écrite, donc tout ce qui se
+    # passe avant la première image est un silence indistinguable d'un blocage.
+    # Mesuré le 15 septembre sur Cloud Run : vingt-sept minutes entre
+    # `SOURCE pack` et rien du tout, sans aucun moyen de dire si Cycles
+    # travaillait, si le procédural cuisait encore, ou si le process était
+    # mort. Une ligne par frame entamée coûte un `print` et répond à la
+    # question.
+    started = {"t": time.time()}
+
+    def frame_begin(scene_arg, *_):
+        now = time.time()
+        n = getattr(scene_arg, "frame_current", "?")
+        print(f"frame {n}: début (+{now - started['t']:.1f}s)", flush=True)
+        started["t"] = now
+
+    bpy.app.handlers.render_pre.append(frame_begin)
+    print(f"rendu: {expected} frames {first}:{last}, "
+          f"moteur {scene.render.engine}", flush=True)
 
     if args.video and not args.keep_frames:
         # Direct-to-video: no frame ever touches the disk. 4.5 LTS carries
