@@ -93,7 +93,7 @@ exporté, l'`export_method` cesse de nous concerner — Blender peut reprendre s
 chemin rapide pour sa propre scène pendant que le globe vit dans notre scene
 index persistant.
 
-Notre patch `usd_scene_delegate.cc::populate()` est appelé par frame et fait
+`USDSceneIndex::populate()` est appelé par frame et fait
 `RemoveSceneIndex` puis reconstruit toute la chaîne. Le resolver meurt, sa
 carte `_procedurals` meurt, le `shared_ptr` lâche l'instance. Frame suivante :
 instance neuve, `previousResult` vide, **250 tuiles re-déclarées comme
@@ -143,26 +143,42 @@ Le bake et l'encodage PNG d'un drapage ne sont plus refaits. Nécessaire dans
 toutes les architectures, insuffisant à lui seul : il supprime le coût le plus
 lourd, pas la reconstruction.
 
-### É2 — Un scene index à nous, persistant, alimenté par dirty
+### É2 — Un scene index à nous, persistant (fait)
 
 Le cœur du correctif, et le seul moyen de garder Blender.
 
-Aujourd'hui, notre prim Globe voyage dans le stage que Blender ré-exporte, donc
-il subit le resync. Demain, il n'y voyage plus :
+La forme retenue est plus simple que celle envisagée ici, et elle ne demande
+**aucun patch Blender** : `TuileManifestSceneIndexPlugin`
+(`integrations/hydra/src/manifest.{h,cpp}`) est un `HdSceneIndexPlugin`
+enregistré pour tous les renderers, qui fusionne la stage du manifeste dans la
+chaîne que le render index construit. C'est le mécanisme par lequel hdGp
+s'insère lui-même.
 
-- à la **construction** du délégué (une fois), créer un `HdRetainedSceneIndex`
-  contenant le prim `Globe` (type `hydraGenerativeProcedural`, ses primvars de
-  config) et un prim caméra miroir ; l'envelopper dans le
-  `HdGpGenerativeProceduralResolvingSceneIndex` ; l'insérer dans le render
-  index. **Jamais retiré.**
-- à chaque `populate()`, ne pas y toucher sauf pour **dirtier le locator xform
-  de la caméra miroir** avec la matrice de la frame courante (et le temps).
-  C'est un dirty de propriété : aucun resync, l'instance survit.
-- Blender continue d'exporter sa scène (lumières, sol) dans son propre scene
-  index, fusionné par le render index comme aujourd'hui.
+**La phase d'insertion est toute la conception.** `HdGpSceneIndexPlugin` est en
+phase 2 et son en-tête dit explicitement de laisser la place avant et après
+lui. On prend la phase 1 : le manifeste est fusionné en amont de la résolution
+des procéduraux, donc le procédural est visible par ce qui le cuit. Fusionné
+après, l'image sort sans globe — sans erreur, sans trace. C'est la seule
+propriété de tout ce document qu'aucun rendu ne sait signaler, et elle est
+épinglée par `integrations/hydra/tests/manifestRungTest.cpp`, qui charge le
+greffon par la registry et lit l'ordre d'exécution.
 
-Le resolver appelle alors `Update` avec `dirtiedDependencies` = la caméra, sur
-**la même instance**, avec `previousResult` intact.
+Le prim procédural ne voyageant plus dans un stage exporté, `export_method`
+repasse à `HYDRA` — la fast path de Blender, qui garde son scene index d'une
+frame à l'autre et n'y pousse que le delta (`HydraSceneIndex::populate`, lu à
+`v5.2.2`). Et `use_persistent_data` étant posé et le délégué Cycles déclarant
+`bl_use_gpu_context = False`, `RE_engine_use_persistent_data` est vrai : le
+moteur, son render index et notre instance de procédural survivent à toute la
+séquence.
+
+**Pas de caméra miroir.** Elle était prévue ici parce qu'on lisait la caméra
+*exportée*. La fast path n'exporte rien, mais Blender rend déjà par
+`/freeCamera` — un `HdRetainedSceneIndex` inséré à la racine, qu'il met à jour
+d'un simple `DirtyPrims`, sans rien reconstruire. C'est exactement le prim que
+le miroir aurait dupliqué. Le procédural le lit désormais en premier
+(`hostpaths.cpp::TuileSelectCamera`, testé par `cameraRungTest.cpp`) et
+`UpdateDependencies` le déclare, donc un mouvement de caméra est un dirty de
+propriété : aucun resync, l'instance survit.
 
 ### É3 — Rendre `Update` incrémental
 

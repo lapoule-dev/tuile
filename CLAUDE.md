@@ -61,6 +61,37 @@ Note also that any instrument counting "did every *selected* tile draw
 something" is blind to ground that was never selected. A green counter is not a
 covered globe.
 
+## Every render gets opened
+
+**When a render finishes, fetch the video and open it.** Not a frame count, not
+a byte size, not a green log line — the film itself, on screen.
+
+A render is a picture, and every instrument that stands in for looking at it has
+already lied here. `RENDER-DONE` was printed over four-fifths of a missing film
+because `ffmpeg concat` stopped at the first empty segment. A frame counter said
+2/2 while the whole globe came out flat pink, textures silently unbound. A
+"green" job had never rendered a frame at all: it had crashed in ten seconds and
+the script sat in `wait` for the remaining hour.
+
+```bash
+# after any run that produced renders/<run>/render.mp4
+open <the downloaded mp4>
+```
+
+The cost is two seconds. What it buys is the one check no counter can fake.
+
+## Renders live in `./videos`, never in `/tmp`
+
+A film that only exists in `/tmp` is a film one reboot away from gone, and a
+two-minute render costs twelve minutes of three L4s. Move it to `videos/` as
+soon as it is assembled — the directory is gitignored, because seven hundred
+megabytes has no place in the history.
+
+Name it for what it *is*, and add its entry to `videos/README.md` with **what
+it would take to make it again**: the trajectory string, the pack key, the
+scene digest, the imagery asset, the viewport, the sample count. An mp4 without
+its parameters compares to nothing, and comparing renders is most of the work.
+
 ## Expected workflow
 
 - Implement milestone by milestone in the order of `docs/03-roadmap.md`. Do not start M2 until the M1 acceptance criteria pass.

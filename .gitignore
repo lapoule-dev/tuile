@@ -13,3 +13,14 @@ __pycache__/
 # Session scratch.
 claude.session
 /integrations/hydra/build/
+
+# Les rendus. Un film de deux minutes pèse sept cents mégaoctets, et il est
+# reproductible : le pack et la trajectoire sont dans R2 et dans le code, ce
+# qui est la vraie sauvegarde. Ce répertoire existe pour ne pas les perdre
+# entre deux sessions, pas pour les versionner.
+videos/
+# Sauf son index : il porte, pour chaque film, de quoi le refaire — la
+# trajectoire, la clef du pack, le digest de scène, l'imagerie, le viewport,
+# le nombre d'échantillons. Un mp4 sans ses paramètres ne se compare à rien,
+# et comparer des rendus est l'essentiel du travail.
+!videos/README.md

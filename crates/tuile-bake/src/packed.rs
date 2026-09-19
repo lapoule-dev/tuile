@@ -26,26 +26,26 @@
 //! change the header, the procedural, and every host that ever links this —
 //! the pack records the camera each frame was baked for, and a lookup finds it.
 //!
-//! # Why the textures become files
+//! # Pourquoi les textures ne deviennent plus des fichiers
 //!
-//! Because the renderer this exists to reach cannot read them any other way.
+//! Elles le sont devenues parce que le moteur visé ne savait pas les lire
+//! autrement. L'imagerie d'une tuile est publiée sous une URI `tuile://`, et
+//! notre resolver Ar y répond depuis la mémoire ; Storm demande à Ar et les
+//! obtient. Cycles ne demande pas à Ar : son délégué Hydra passe la chaîne
+//! telle quelle comme nom de fichier, et `fopen("tuile://…")` échoue — un
+//! globe sans texture, sans erreur que personne ne relie à la cause.
 //!
-//! A tile's imagery is published today as a `tuile://` URI, and our Ar
-//! resolver answers it from memory: `_Resolve` hands back the URI as its own
-//! resolved path and `_OpenAsset` produces the bytes. Storm asks Ar and gets
-//! them.
+//! Alors chaque drape était écrit dans un vrai fichier. Le prix, mesuré : sur
+//! Cloud Run `/tmp` est un tmpfs, donc ces fichiers sont de la RAM, et un pack
+//! d'imagerie de deux gigaoctets en dépliait autant à côté de lui — dans un
+//! job qui en a trente-deux.
 //!
-//! Cycles does not ask Ar. Its Hydra delegate takes `SdfAssetPath::
-//! GetResolvedPath()` and hands the string straight to Cycles as a filename
-//! (`cycles/src/hydra/node_util.cpp`), which then opens it with ordinary file
-//! I/O. `fopen("tuile://…")` fails, and the globe renders untextured — with no
-//! error anyone would connect to the cause.
-//!
-//! So a packed session writes each drape once to a real file and publishes
-//! that path. It costs the pod the disk it already spent downloading the pack,
-//! and it takes our resolver off the render's critical path entirely: the
-//! render job now needs no network, no token, no traversal **and** no
-//! plugin-provided asset resolution.
+//! Le fork de Blender lit désormais ces octets là où ils sont. Le patch tient
+//! en trois retouches (`intern/cycles/util/image_metadata.{h,cpp}` acceptent
+//! un `IOProxy`, `scene/image.cpp` demande d'abord un chargeur externe) et le
+//! décodage reste celui d'OIIO, choisi par l'extension du nom. Ce module ne
+//! fait donc plus que **nommer** : les octets traversent l'ABI comme sur le
+//! chemin streaming, et vivent une seule fois.
 //!
 //! # Nothing is approximated
 //!
@@ -78,23 +78,6 @@ pub enum PackedError {
     Pack(#[from] PackError),
 }
 
-/// Where a packed session materialises its textures.
-///
-/// Beside the pack by default, so a pod that was given one file ends up with
-/// one directory next to it and nothing to clean up elsewhere.
-/// `TUILE_PACK_TEXTURES` overrides it — on a farm the pack may sit on a
-/// read-only mount.
-fn texture_dir(pack: &std::path::Path) -> std::path::PathBuf {
-    match std::env::var_os("TUILE_PACK_TEXTURES") {
-        Some(dir) => std::path::PathBuf::from(dir),
-        None => {
-            let mut dir = pack.as_os_str().to_os_string();
-            dir.push(".textures");
-            std::path::PathBuf::from(dir)
-        }
-    }
-}
-
 /// A pack, held open for the life of the session.
 pub struct Packed {
     /// The whole file. Read once; the table is walked in place inside it and
@@ -107,8 +90,6 @@ pub struct Packed {
     /// rather than an error) for a saving that does not exist here.
     bytes: Vec<u8>,
     dataset: Arc<str>,
-    /// Where the drapes are written. See the module note on why they are files.
-    textures: std::path::PathBuf,
 }
 
 impl Packed {
@@ -148,53 +129,25 @@ impl Packed {
         // it or a material resolves to nothing. The scene digest is the one
         // name that identifies exactly these bytes.
         let dataset = format!("pack-{}", pack.scene_digest()).into();
-        let textures = texture_dir(path);
-        std::fs::create_dir_all(&textures).map_err(|source| PackedError::Io {
-            path: textures.display().to_string(),
-            source,
-        })?;
-        tracing::info!(dir = %textures.display(), "drapes are materialised here");
         Ok(Self {
             bytes,
             dataset,
-            textures,
         })
     }
 
-    /// Writes one drape to a file, once, and returns its path.
+    /// The URI a tile's drape is published under. It names bytes, it does not
+    /// move them.
     ///
-    /// Named by `(tile, drape)` — the same pair that identifies it in the pack
-    /// — so sixteen processes on one pod converge on one file per drape rather
-    /// than sixteen copies of each.
+    /// The same form the live session publishes (`Frame::texture_uri`), so a
+    /// host resolves a packed texture exactly as it resolves a streamed one —
+    /// one scheme, one resolver, one code path on the other side.
     ///
-    /// Written to a per-process temporary and renamed into place, because they
-    /// race: `rename` is atomic on POSIX, so a reader sees either no file or a
-    /// whole one. Writing in place would let one process open a half-written
-    /// PNG, and a half-written PNG is a tile that decodes to nothing.
-    fn materialise(&self, tile: TileId, drape: u64, png: &[u8]) -> Result<String, FrameError> {
-        let path = self
-            .textures
-            .join(format!("{}.{drape:016x}.png", tile.0));
-        if path.is_file() {
-            return Ok(path.display().to_string());
-        }
-        let temp = self.textures.join(format!(
-            "{}.{drape:016x}.{}.tmp",
-            tile.0,
-            std::process::id()
-        ));
-        let write = std::fs::write(&temp, png).and_then(|()| std::fs::rename(&temp, &path));
-        if let Err(e) = write {
-            let _ = std::fs::remove_file(&temp);
-            // A texture that cannot be written is a tile that will render
-            // untextured, which looks like a rendering fault and is reported by
-            // nothing. It fails the frame instead.
-            return Err(FrameError::TilesFailed {
-                count: 1,
-                first: format!("writing {}: {e}", path.display()),
-            });
-        }
-        Ok(path.display().to_string())
+    /// It used to write a file here, once per `(tile, drape)`, because Cycles
+    /// could only open paths. The fork's `scene/image_external.cpp` now reads
+    /// the bytes where they already are, so the write is gone and with it the
+    /// second copy of every texture in a `/tmp` that is RAM.
+    fn texture_uri(&self, tile: TileId, drape: u64) -> String {
+        Frame::texture_uri(&self.dataset, tile, 0, drape)
     }
 
     /// The frame baked for this camera.
@@ -211,7 +164,12 @@ impl Packed {
                 ),
             });
         };
-        let pack = Pack::open(&self.bytes).map_err(pack_failed)?;
+        // `reopen`, pas `open` : ces octets ont été vérifiés à l'ouverture de
+        // la session et n'ont pas bougé depuis. `open` refolderait FNV-1a sur
+        // tout le blob — des secondes de CPU par image sur un pack de
+        // plusieurs gigaoctets, pour reprouver ce qui a été prouvé au
+        // démarrage.
+        let pack = Pack::reopen(&self.bytes).map_err(pack_failed)?;
         let wanted = BakedView {
             position: view.position.to_array(),
             direction: view.direction.to_array(),
@@ -282,7 +240,7 @@ impl Packed {
 
         let memoized = match baked.texture {
             Some(png) => {
-                let uri = self.materialise(id, baked.drape, &png)?;
+                let uri = self.texture_uri(id, baked.drape);
                 Some(Arc::new(EncodedTexture { uri, png }))
             }
             None => None,
@@ -348,65 +306,49 @@ fn u32s(bytes: &[u8]) -> Vec<u32> {
 mod tests {
     use super::*;
 
-    /// A drape becomes a real file, and two sessions agree on which one.
+    /// Un drape est nommé par ce qui fait ses pixels, et deux sessions
+    /// s'accordent sur ce nom.
     ///
-    /// The name is the thing under test, not the writing: sixteen processes on
-    /// one pod must converge on one file per drape. Named by `(tile, drape)` —
-    /// the same pair that identifies it in the pack — because naming by tile
-    /// alone would have the second frame's imagery overwrite the first's under
-    /// a path the first is still pointing at.
+    /// C'est le nom qui est sous test. Nommer par la tuile seule ferait que
+    /// l'imagerie de la deuxième frame répondrait sous le nom que la première
+    /// désigne encore : le même sol, à la netteté d'une frame qui n'existe
+    /// plus. La paire `(tuile, drape)` est celle qui identifie les octets dans
+    /// le pack, donc c'est elle qui les identifie dehors.
     #[test]
     fn a_drape_is_named_by_what_makes_its_pixels() {
-        let dir = std::env::temp_dir().join("tuile-materialise-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
         let packed = Packed {
             bytes: Vec::new(),
             dataset: "d".into(),
-            textures: dir.clone(),
         };
+        let a = packed.texture_uri(TileId(7), 0x1234);
+        let b = packed.texture_uri(TileId(7), 0x1234);
+        assert_eq!(a, b, "un drape, un nom");
 
-        let a = packed.materialise(TileId(7), 0x1234, b"first").expect("written");
-        let b = packed.materialise(TileId(7), 0x1234, b"first").expect("already there");
-        assert_eq!(a, b, "one drape, one file");
-        assert_eq!(std::fs::read(&a).expect("readable"), b"first");
-
-        // The same tile, re-draped, is a different picture and a different file.
-        let c = packed.materialise(TileId(7), 0x5678, b"second").expect("written");
-        assert_ne!(a, c);
-        assert_eq!(std::fs::read(&c).expect("readable"), b"second");
-
-        // Nothing half-written is left behind for a neighbour to open.
-        let leftovers: Vec<_> = std::fs::read_dir(&dir)
-            .expect("dir")
-            .filter_map(Result::ok)
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".tmp"))
-            .collect();
-        assert!(leftovers.is_empty(), "temporaries left: {leftovers:?}");
-        let _ = std::fs::remove_dir_all(&dir);
+        // La même tuile, re-drapée, est une autre image et un autre nom.
+        assert_ne!(a, packed.texture_uri(TileId(7), 0x5678));
+        // Une autre tuile au même drape aussi.
+        assert_ne!(a, packed.texture_uri(TileId(8), 0x1234));
     }
 
-    /// The path is a path, not a URI — which is the whole point.
+    /// Ce qui est publié est la MÊME forme que sur le chemin streaming.
     ///
-    /// Cycles' Hydra delegate hands `SdfAssetPath::GetResolvedPath()` straight
-    /// to Cycles as a filename. A `tuile://` string there is an `fopen` that
-    /// fails and a globe that renders untextured, with nothing in any log to
-    /// connect the two.
+    /// Les deux chemins publiaient deux choses différentes — une URI `tuile://`
+    /// en direct, un chemin de fichier depuis un pack — parce que Cycles ne
+    /// savait ouvrir que des fichiers. Le fork lit maintenant les octets là où
+    /// ils sont (`scene/image_external.cpp`), donc il n'y a plus qu'une forme,
+    /// et un hôte n'a plus qu'un resolver à brancher.
     #[test]
-    fn what_is_published_is_openable_by_a_renderer_that_does_not_know_us() {
-        let dir = std::env::temp_dir().join("tuile-materialise-uri");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
+    fn a_packed_texture_is_published_like_a_streamed_one() {
         let packed = Packed {
             bytes: Vec::new(),
-            dataset: "d".into(),
-            textures: dir.clone(),
+            dataset: "pack-abc".into(),
         };
-        let uri = packed.materialise(TileId(1), 2, b"png").expect("written");
-        assert!(!uri.contains("://"), "{uri} is a URI, not a path");
-        assert!(std::path::Path::new(&uri).is_file());
-        let _ = std::fs::remove_dir_all(&dir);
+        let uri = packed.texture_uri(TileId(1), 2);
+        assert_eq!(uri, Frame::texture_uri("pack-abc", TileId(1), 0, 2));
+        assert!(uri.starts_with("tuile://"), "{uri}");
+        // L'extension décide du décodeur côté OIIO : la perdre, c'est une
+        // image que personne ne sait lire.
+        assert!(uri.ends_with(".png"), "{uri}");
     }
 
     #[test]
