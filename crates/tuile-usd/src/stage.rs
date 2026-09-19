@@ -313,9 +313,25 @@ pub fn write_manifest(
         out,
         "        token proceduralSystem = \"hydraGenerativeProcedural\""
     )?;
+    // Un ATTRIBUT, pas une relation.
+    //
+    // C'était `rel primvars:tuile:cameras = </World/ShotCam>`, et le
+    // procédural ne l'a jamais vu. hdGp passe ses arguments par les primvars
+    // de la prim, et un primvar EST un attribut : une relation préfixée
+    // `primvars:` n'en est pas une, et USD n'a pas de type d'attribut pour un
+    // chemin. Le manifeste nommait donc la caméra dans une forme que le
+    // lecteur ne lit pas.
+    //
+    // Ce que ça coûtait, précisément : `_ResolveCamera` descendait ses quatre
+    // échelons sans rien trouver et retombait sur une vue fixe au-dessus de
+    // l'origine de rendu — c'est-à-dire au centre de l'orbite. Mesuré le
+    // 16 septembre 2026 sur un pack de 1440 frames : « no baked frame answers
+    // this camera: the nearest is frame 1108, 8000.000 m away », 8000 m étant
+    // le rayon de l'orbite au millimètre près. Toutes les poses étaient
+    // équidistantes parce que la caméra était au centre de leur cercle.
     writeln!(
         out,
-        "        rel primvars:tuile:cameras = </World/ShotCam>"
+        "        string primvars:tuile:cameras = \"/World/ShotCam\""
     )?;
     writeln!(
         out,
@@ -409,14 +425,12 @@ mod tests {
         ];
         let origin = render_origin(&frames);
         for f in &frames {
-            for axis in 0..3 {
-                let rebased = f.position[axis] - origin[axis];
-                let recovered = rebased + origin[axis];
+            for (axis, (&coordinate, &about)) in f.position.iter().zip(&origin).enumerate() {
+                let rebased = coordinate - about;
+                let recovered = rebased + about;
                 assert!(
-                    (recovered - f.position[axis]).abs() < 1e-6,
-                    "axis {axis}: {} vs {}",
-                    recovered,
-                    f.position[axis]
+                    (recovered - coordinate).abs() < 1e-6,
+                    "axis {axis}: {recovered} vs {coordinate}"
                 );
             }
         }
@@ -483,7 +497,7 @@ mod tests {
             "prepend apiSchemas = [\"HydraGenerativeProceduralAPI\"]",
             "token primvars:hdGp:proceduralType = \"tuileGlobe\"",
             "token proceduralSystem = \"hydraGenerativeProcedural\"",
-            "rel primvars:tuile:cameras = </World/ShotCam>",
+            "string primvars:tuile:cameras = \"/World/ShotCam\"",
             "double3 primvars:tuile:renderOrigin = (150, 0, 0)",
             "int primvars:tuile:terrainAssetId = 0",
             "int primvars:tuile:imageryAssetId = 0",
@@ -492,6 +506,45 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
         }
+    }
+
+    /// La caméra est nommée par un ATTRIBUT, jamais par une relation.
+    ///
+    /// hdGp passe ses arguments par les primvars de la prim, et un primvar est
+    /// un attribut. `rel primvars:tuile:cameras` était un relationship portant
+    /// le préfixe d'un primvar : USD l'accepte à l'écriture, le procédural ne
+    /// le voit pas, et personne ne se plaint.
+    ///
+    /// Ce que ça coûtait : la résolution de caméra descendait ses quatre
+    /// échelons sans rien trouver et retombait sur une vue fixe au-dessus de
+    /// l'origine de rendu — le centre de l'orbite. Le 16 septembre 2026, un
+    /// pack de 1440 frames a répondu « no baked frame answers this camera: the
+    /// nearest is frame 1108, 8000.000 m away » : 8000 m est le rayon de
+    /// l'orbite, et 1108 un tirage arbitraire parmi 1440 poses toutes
+    /// équidistantes du centre.
+    #[test]
+    fn the_camera_is_named_by_an_attribute_not_a_relationship() {
+        let frames = [
+            looking_down_x([200.0, 0.0, 0.0]),
+            looking_down_x([100.0, 0.0, 0.0]),
+        ];
+        let mut out = Vec::new();
+        write_manifest(&frames, &ManifestConfig::default(), &mut out)
+            .expect("writing");
+        let usda = String::from_utf8(out).expect("utf-8");
+        let line = usda
+            .lines()
+            .find(|l| l.contains("tuile:cameras"))
+            .expect("le manifeste ne nomme aucune caméra");
+        assert!(
+            !line.trim_start().starts_with("rel "),
+            "la caméra est déclarée par une relation, que hdGp ne lira pas: {line}"
+        );
+        assert!(
+            line.contains("string ") || line.contains("token "),
+            "la caméra doit être un attribut textuel: {line}"
+        );
+        assert!(line.contains("/World/ShotCam"), "{line}");
     }
 
     /// An empty tape is a usage error worth naming, not an empty file that a
