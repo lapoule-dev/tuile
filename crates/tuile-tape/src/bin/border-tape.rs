@@ -22,6 +22,7 @@
 //! thousand pictures — tens of gigabytes. Replay it, watch it, and trace only
 //! the stretch that misbehaves.
 
+use tuile_tape::path::{geodetic_to_ecef, ClosedPath};
 use tuile_tape::{Frame, Tape};
 
 /// Metres **above the ellipsoid**, which is what the viewer reads back.
@@ -45,17 +46,6 @@ const FPS: f64 = 60.0;
 
 const MINUTES: f64 = 6.0;
 
-/// WGS84. `A` is the equatorial radius; `E2` the first eccentricity squared,
-/// which is the flattening the sphere above ignored.
-const A: f64 = 6_378_137.0;
-const E2: f64 = 6.694_379_990_141_32e-3;
-
-/// The border of mainland France, clockwise from Dunkerque: the Channel, the
-/// Atlantic, the Pyrenees, the Mediterranean, the Alps, the Rhine, the north.
-///
-/// Coarse on purpose — a few dozen points, interpolated along great circles.
-/// The path has to *cover* the country's edge, not survey it, and a denser
-/// outline would buy nothing a tile is large enough to notice.
 const BORDER: [(f64, f64); 27] = [
     (2.38, 51.03),  // Dunkerque
     (1.85, 50.95),  // Calais
@@ -86,60 +76,6 @@ const BORDER: [(f64, f64); 27] = [
     (3.06, 50.63),  // Lille
 ];
 
-/// Geodetic to ECEF on the WGS84 ellipsoid.
-///
-/// The prime vertical radius `n` is what a sphere leaves out, and leaving it
-/// out costs ten kilometres of altitude at French latitudes — which is a fifth
-/// of the height this path is flown at.
-fn geodetic_to_ecef(lon: f64, lat: f64, height: f64) -> [f64; 3] {
-    let (s, c) = (lat.sin(), lat.cos());
-    let n = A / (1.0 - E2 * s * s).sqrt();
-    [
-        (n + height) * c * lon.cos(),
-        (n + height) * c * lon.sin(),
-        (n * (1.0 - E2) + height) * s,
-    ]
-}
-
-/// Great-circle distance in radians between two points given in radians.
-fn arc(a: (f64, f64), b: (f64, f64)) -> f64 {
-    let (lon1, lat1) = a;
-    let (lon2, lat2) = b;
-    let d =
-        (lat1.sin() * lat2.sin() + lat1.cos() * lat2.cos() * (lon2 - lon1).cos()).clamp(-1.0, 1.0);
-    d.acos()
-}
-
-/// A point `t` of the way along the great circle from `a` to `b`.
-///
-/// Spherical interpolation rather than linear on longitude and latitude: linear
-/// drifts off the shortest path and, near the poles, moves at a wildly
-/// different speed for the same `t`. France is not near a pole, and doing it
-/// properly costs four trigonometric calls.
-fn along(a: (f64, f64), b: (f64, f64), t: f64) -> (f64, f64) {
-    let d = arc(a, b);
-    if d < 1e-12 {
-        return a;
-    }
-    let (sa, sb) = (((1.0 - t) * d).sin() / d.sin(), (t * d).sin() / d.sin());
-    let x = sa * a.1.cos() * a.0.cos() + sb * b.1.cos() * b.0.cos();
-    let y = sa * a.1.cos() * a.0.sin() + sb * b.1.cos() * b.0.sin();
-    let z = sa * a.1.sin() + sb * b.1.sin();
-    (y.atan2(x), z.atan2((x * x + y * y).sqrt()))
-}
-
-/// The local east-north-up frame at a point.
-fn frame_at(lon: f64, lat: f64) -> ([f64; 3], [f64; 3], [f64; 3]) {
-    let east = [-lon.sin(), lon.cos(), 0.0];
-    let up = [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()];
-    let north = [
-        up[1] * east[2] - up[2] * east[1],
-        up[2] * east[0] - up[0] * east[2],
-        up[0] * east[1] - up[1] * east[0],
-    ];
-    (east, north, up)
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
@@ -149,65 +85,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_or(Ok(MINUTES), |a| a.parse())
         .map_err(|_| "usage: border-tape <path> [minutes]")?;
 
-    let points: Vec<(f64, f64)> = BORDER
-        .iter()
-        .map(|(lon, lat)| (lon.to_radians(), lat.to_radians()))
-        .collect();
-    // Closed loop, and each leg gets frames in proportion to its length so the
-    // camera flies at a constant speed rather than sprinting across the short
-    // legs and crawling along the Atlantic.
-    let legs: Vec<f64> = (0..points.len())
-        .map(|i| arc(points[i], points[(i + 1) % points.len()]))
-        .collect();
-    let perimeter: f64 = legs.iter().sum();
+    let path_around = ClosedPath::from_degrees(&BORDER);
     let total = (minutes * 60.0 * FPS) as usize;
 
     let mut tape = Tape::recording(&path)?;
     let pitch = PITCH.to_radians();
     for n in 0..total {
-        // How far around the loop, in radians of arc.
-        let travelled = perimeter * (n as f64 / total as f64);
-        let mut remaining = travelled;
-        let mut leg = 0;
-        while leg < legs.len() && remaining > legs[leg] {
-            remaining -= legs[leg];
-            leg += 1;
-        }
-        let leg = leg.min(legs.len() - 1);
-        let t = if legs[leg] > 1e-12 {
-            remaining / legs[leg]
-        } else {
-            0.0
-        };
-        let here = along(points[leg], points[(leg + 1) % points.len()], t);
-        // A little further on, to take the bearing from — the camera faces the
-        // way it is going, which is what makes this a flight rather than a
-        // sequence of stills.
-        let ahead = along(
-            points[leg],
-            points[(leg + 1) % points.len()],
-            (t + 0.01).min(1.0),
-        );
-
-        let (east, north, up) = frame_at(here.0, here.1);
-        let bearing = {
-            let (dlon, dlat) = (ahead.0 - here.0, ahead.1 - here.1);
-            (dlon * here.1.cos()).atan2(dlat)
-        };
-        // Forward along the bearing, tipped down by the pitch.
-        let (cb, sb) = (bearing.cos(), bearing.sin());
-        let (cp, sp) = (pitch.cos(), pitch.sin());
-        let direction = [
-            (north[0] * cb + east[0] * sb) * cp - up[0] * sp,
-            (north[1] * cb + east[1] * sb) * cp - up[1] * sp,
-            (north[2] * cb + east[2] * sb) * cp - up[2] * sp,
-        ];
+        let step = path_around.at(n as f64 / total as f64);
         tape.push(Frame {
-            position: geodetic_to_ecef(here.0, here.1, ALTITUDE),
-            direction,
+            position: geodetic_to_ecef(step.here.0, step.here.1, ALTITUDE),
+            direction: step.look(pitch),
             // The local vertical as screen-up: it is never parallel to a
             // direction tipped 50° off it, and it keeps the horizon level.
-            up,
+            up: step.up,
             fovy: 45f64.to_radians(),
         });
     }
@@ -216,7 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{path}: {written} frames — {minutes:.0} min around {:.0} km of border at {:.0} km, \
          pitched {PITCH:.0}° below horizontal",
-        perimeter * A / 1000.0,
+        path_around.length_m() / 1000.0,
         ALTITUDE / 1000.0
     );
     Ok(())

@@ -19,4 +19,6 @@ tuile-core = { version = "0.0.1", path = "../tuile-core" }
 tuile-terrain = { version = "0.0.1", path = "../tuile-terrain" }
 
 [dev-dependencies]
+bytes = { workspace = true }
+futures-executor = { workspace = true }
 glam = { workspace = true }

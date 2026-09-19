@@ -61,18 +61,21 @@ const HIGH: f64 = 35_786_000.0;
 /// Gentler has been measured and provokes nothing.
 const FRAMES: usize = 32;
 
-/// WGS84 equatorial radius. Sphere rather than ellipsoid: this positions a
-/// camera, and the difference never reaches a pixel.
-const RADIUS: f64 = 6_378_137.0;
-
+/// Geodetic → ECEF on the WGS84 ellipsoid.
+///
+/// The comment that stood here said a sphere was enough because this only
+/// positions a camera and "the difference never reaches a pixel". Measured at
+/// 42.52° N, the difference is **14.8 km of altitude and 21 km of ground**:
+/// the equatorial radius is 9.7 km larger than the ellipsoid's radius at that
+/// latitude, and using a geodetic latitude as a geocentric one moves the point
+/// 0.19° north. It reaches rather more than a pixel.
 fn geodetic_to_ecef(lon: f64, lat: f64, height: f64) -> [f64; 3] {
-    let r = RADIUS + height;
-    let (lon, lat) = (lon.to_radians(), lat.to_radians());
-    [
-        r * lat.cos() * lon.cos(),
-        r * lat.cos() * lon.sin(),
-        r * lat.sin(),
-    ]
+    let p = tuile_core::geo::geodetic_to_ecef(tuile_core::geo::Geodetic {
+        lon: lon.to_radians(),
+        lat: lat.to_radians(),
+        height,
+    });
+    [p.x, p.y, p.z]
 }
 
 fn looking_down(altitude: f64) -> Frame {

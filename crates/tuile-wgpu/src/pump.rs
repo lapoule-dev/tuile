@@ -30,6 +30,16 @@ pub struct ContentPump {
     fills: HashSet<TileId>,
     /// Current selection, as sent by the geometry server.
     pub selection: Vec<(TileId, f64)>,
+    /// How many `Select` messages this pump has applied.
+    selects_seen: u64,
+    /// The generation this pump last sent with a `ViewerState` — monotone,
+    /// one per send.
+    generation_sent: u64,
+    /// The generation the current selection answers, echoed by the server.
+    /// `generation_selected() >= generation_sent()` is the correlation a
+    /// deterministic consumer renders on: the selection is for the LAST
+    /// camera this pump sent — by construction, not by heuristic.
+    generation_selected: u64,
     /// What the server has said about the shape of the tree, accumulated.
     ///
     /// **The consumer cannot derive this and must not try.** A `TileId` is an
@@ -66,6 +76,11 @@ pub struct ContentPump {
 /// real content.
 pub const UPLOADS_PER_FRAME: usize = 8;
 
+/// How many levels the sharpest draped imagery may sit above a tile before
+/// the tile counts as smeared in [`Resolution::smeared_drawn`]. Two levels is
+/// a 4× stretch per axis — visibly soft; beyond it is a flat wall.
+pub const SMEAR_GAP: u32 = 2;
+
 impl ContentPump {
     pub fn new(render_origin: DVec3) -> Self {
         Self {
@@ -74,6 +89,9 @@ impl ContentPump {
             pending: VecDeque::new(),
             fills: HashSet::new(),
             selection: Vec::new(),
+            selects_seen: 0,
+            generation_sent: 0,
+            generation_selected: 0,
             ancestry: HashMap::new(),
             stats: TraversalStats::default(),
             gpu_bytes: 0,
@@ -192,9 +210,31 @@ impl ContentPump {
         view: ViewState,
         render_origin: DVec3,
     ) -> usize {
+        self.advance_with(stream, gpu, &[view], render_origin)
+    }
+
+    /// [`Self::advance`] with several views at once.
+    ///
+    /// The traversal's multi-view contract does the work: selection is the
+    /// **union** over views, refinement depth is the max, fetch priority the
+    /// best view per tile (see `tuile_core::traversal`). That is what lets a
+    /// headless consumer load a whole slice of camera path eagerly — send the
+    /// slice's views together and [`Self::missing`] gates on all of them —
+    /// while the previous slice is still being rendered from residency.
+    pub fn advance_with<S: GeometryStream>(
+        &mut self,
+        stream: &mut S,
+        gpu: &crate::context::GpuContext,
+        views: &[ViewState],
+        render_origin: DVec3,
+    ) -> usize {
         // Best effort: a closed stream means the session is over, and a frame is
         // not the place to discover it.
-        let _ = stream.send(ClientMessage::ViewerState { views: vec![view] });
+        self.generation_sent += 1;
+        let _ = stream.send(ClientMessage::ViewerState {
+            views: views.to_vec(),
+            generation: self.generation_sent,
+        });
         let uploaded = self.pump(stream, gpu, UPLOADS_PER_FRAME);
         self.rebase(&gpu.queue, render_origin);
         uploaded
@@ -240,10 +280,13 @@ impl ContentPump {
                 tiles,
                 ancestry,
                 stats,
+                generation,
             } => {
                 self.ancestry.extend(ancestry);
                 self.selection = tiles;
                 self.stats = stats;
+                self.selects_seen += 1;
+                self.generation_selected = generation;
             }
             ServerMessage::Content {
                 tile,
@@ -423,6 +466,19 @@ impl ContentPump {
             }
             false
         };
+        // The smear count: a drawn surface whose sharpest imagery sits more
+        // than SMEAR_GAP levels above its own level is one texel stretched
+        // over its whole ground — the flat-colour wall a recorder must refuse.
+        let smeared_drawn = exact
+            .iter()
+            .chain(fallback.iter())
+            .filter(|id| {
+                self.prepared.get(id).is_some_and(|p| {
+                    p.sharpest_imagery_level
+                        .is_none_or(|sharpest| self.level(**id).saturating_sub(sharpest) > SMEAR_GAP)
+                })
+            })
+            .count();
         let coplanar = fallback
             .iter()
             .flat_map(|f| {
@@ -434,6 +490,7 @@ impl ContentPump {
         let counts = Resolution {
             stand_ins,
             coplanar,
+            smeared_drawn,
             ..counts
         };
         let drawn = Drawn {
@@ -455,6 +512,38 @@ impl ContentPump {
         self.selection
             .iter()
             .filter(|(t, _)| !self.prepared.contains_key(t))
+            .count()
+    }
+
+    /// Selected tiles whose ground is not the real thing yet: absent
+    /// entirely, or held by a stand-in.
+    ///
+    /// [`Self::missing`] cannot see a stand-in — a stand-in **is** prepared;
+    /// covering the ground while the real tile travels is its whole job, and
+    /// an interactive viewer wants exactly that. A recorder does not: its
+    /// eager gate must refuse to encode while any selected ground is a flat
+    /// approximation, and this is the count it gates on.
+    /// See the field: the Select counter a consumer correlates on.
+    pub fn selects_seen(&self) -> u64 {
+        self.selects_seen
+    }
+
+    /// The generation of the last `ViewerState` this pump sent.
+    pub fn generation_sent(&self) -> u64 {
+        self.generation_sent
+    }
+
+    /// The generation the current selection answers. When this has caught up
+    /// with [`Self::generation_sent`], the selection is the last camera's —
+    /// the render-purity property, by construction.
+    pub fn generation_selected(&self) -> u64 {
+        self.generation_selected
+    }
+
+    pub fn provisional(&self) -> usize {
+        self.selection
+            .iter()
+            .filter(|(t, _)| !self.prepared.contains_key(t) || self.fills.contains(t))
             .count()
     }
 
@@ -561,6 +650,11 @@ pub struct Drawn<'a> {
 pub struct Resolution {
     /// Drawn at the level the traversal chose.
     pub exact: usize,
+    /// Drawn surfaces whose sharpest draped imagery sits more than
+    /// [`SMEAR_GAP`] levels above the tile — one texel stretched over the
+    /// ground: the flat-colour smear, counted at the only honest place, the
+    /// draw list itself. Tiles with no imagery at all count too.
+    pub smeared_drawn: usize,
     /// Drawn by a coarser ancestor while the chosen tile streams in.
     pub coarser: usize,
     /// Drawn by nothing.
@@ -940,6 +1034,7 @@ mod coverage_tests {
     fn a_retire_spares_queued_real_content() {
         fn empty() -> tuile_core::content::DecodedTileContent {
             tuile_core::content::DecodedTileContent {
+                withheld_drape: None,
                 meshes: Vec::new(),
                 textures: Vec::new(),
                 imagery: Vec::new(),

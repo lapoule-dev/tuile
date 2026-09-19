@@ -394,6 +394,7 @@ fn an_ancestor_drawn_for_a_late_sibling_does_not_show_over_the_others() {
         tiles: selected(&children),
         ancestry: tree_shape(&children),
         stats: TraversalStats::default(),
+        generation: 0,
     }];
     // Coarse: two quads across the whole ancestor, which is what makes its
     // surface disagree with the children's.

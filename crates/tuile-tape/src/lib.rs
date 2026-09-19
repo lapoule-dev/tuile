@@ -69,6 +69,8 @@ pub enum TapeError {
     #[error("not a camera path: {0}")]
     NotAPath(String),
 }
+pub mod path;
+
 
 /// One frame's camera. ECEF metres; `direction` and `up` are unit vectors;
 /// `fovy` is the vertical field of view in radians.
@@ -178,7 +180,14 @@ enum Inner {
         destination: std::path::PathBuf,
         writer: mcap::Writer<BufWriter<File>>,
         camera_channel: u16,
-        image_channel: u16,
+        /// Déclaré à la première image écrite, et pas avant.
+        ///
+        /// Une tape de trajectoire n'écrit que des poses. Annoncer un canal
+        /// d'images qu'elle n'utilisera jamais coûtait un second schéma dans
+        /// le résumé, et donc un ordre d'itération à deux éléments — que
+        /// `mcap` tire d'un `HashMap`. Avec un seul canal, l'ordre est celui
+        /// qu'il y a, et le fichier est le même à chaque génération.
+        image_channel: Option<u16>,
         /// The crash journal: raw, append-only, readable at any byte offset.
         /// Camera only — it is what a replay needs, and it is the part that has
         /// to survive a kill.
@@ -196,6 +205,39 @@ enum Inner {
         frames: Vec<Frame>,
         at: usize,
     },
+}
+
+/// A writer whose bytes depend only on what is written, not on when.
+///
+/// # The unordered part, and why it is not fixed here
+///
+/// `mcap` builds its summary section from `HashMap<u16, _>` and writes the
+/// repeated schema and channel records in iteration order — which Rust
+/// randomises per process. Two tapes generated from the same six parameters
+/// therefore differed in their last 1300 bytes: in one, `tuile.Camera` came
+/// first; in the other, `foxglove.CompressedImage` did. The 121808 bytes of
+/// poses before them were identical.
+///
+/// The cost was real. A bake names its pack after a digest that includes the
+/// tape, so the same scene baked twice landed under two different names —
+/// measured on 16 September 2026, when a Cloud Run bake announced
+/// `05274f175b83df6a` for the trajectory a local bake had called
+/// `fb45fe68fb26e559`.
+///
+/// The fix belongs upstream and is two lines — sort `all_schemas` and
+/// `all_channels` by id before writing them (`mcap-0.25.0/src/write.rs:1298`
+/// and `:1312`). Dropping the repetition instead would make the file
+/// deterministic by making it poorer: a reader that seeks to the summary could
+/// no longer learn the schemas without streaming the data section.
+///
+/// So the records stay, and the ambiguity is removed at the other end: a tape
+/// declares a channel when it first writes to one (see [`Tape::push_image`]),
+/// and a trajectory tape writes only camera poses. One schema and one channel
+/// iterate in one order.
+fn deterministic_writer<W: std::io::Write + std::io::Seek>(
+    w: W,
+) -> Result<mcap::Writer<W>, TapeError> {
+    Ok(mcap::Writer::new(w)?)
 }
 
 impl Tape {
@@ -220,7 +262,7 @@ impl Tape {
     /// [`Tape::recover`] still yields every frame that reached the disk.
     pub fn recording(path: impl AsRef<Path>) -> Result<Self, TapeError> {
         let destination = path.as_ref().to_path_buf();
-        let mut writer = mcap::Writer::new(BufWriter::new(File::create(&destination)?))?;
+        let mut writer = deterministic_writer(BufWriter::new(File::create(&destination)?))?;
         let camera_schema =
             writer.add_schema(CAMERA_SCHEMA, "jsonschema", CAMERA_JSON_SCHEMA.as_bytes())?;
         let camera_channel = writer.add_channel(
@@ -229,20 +271,13 @@ impl Tape {
             "json",
             &std::collections::BTreeMap::new(),
         )?;
-        let image_schema =
-            writer.add_schema(IMAGE_SCHEMA, "jsonschema", IMAGE_JSON_SCHEMA.as_bytes())?;
-        let image_channel = writer.add_channel(
-            image_schema,
-            IMAGE_TOPIC,
-            "json",
-            &std::collections::BTreeMap::new(),
-        )?;
         Ok(Self(Inner::Recording {
             journal: BufWriter::new(File::create(journal_path(&destination))?),
             destination,
             writer,
             camera_channel,
-            image_channel,
+            // Déclaré au premier usage, pas d'avance : voir `push_image`.
+            image_channel: None,
             pending: Vec::with_capacity(BATCH),
             open: None,
             written: 0,
@@ -388,7 +423,32 @@ impl Tape {
         // wrong in the fast movement a trace is opened to explain. A test holds
         // this.
         let frame_index = written.saturating_sub(1);
-        if let Err(e) = write_image(writer, *image_channel, rgba, width, height, frame_index) {
+        // Le canal naît ici, à la première image. MCAP autorise un schéma et
+        // un canal à apparaître n'importe où dans la section de données, tant
+        // que c'est avant le premier message qui s'y réfère.
+        let channel = match image_channel {
+            Some(id) => *id,
+            None => {
+                let declared = writer
+                    .add_schema(IMAGE_SCHEMA, "jsonschema", IMAGE_JSON_SCHEMA.as_bytes())
+                    .and_then(|schema| {
+                        writer.add_channel(
+                            schema,
+                            IMAGE_TOPIC,
+                            "json",
+                            &std::collections::BTreeMap::new(),
+                        )
+                    });
+                match declared {
+                    Ok(id) => *image_channel.insert(id),
+                    Err(e) => {
+                        tracing::error!("cannot declare the trace channel: {e}");
+                        return;
+                    }
+                }
+            }
+        };
+        if let Err(e) = write_image(writer, channel, rgba, width, height, frame_index) {
             tracing::error!("cannot write a trace frame: {e}");
         }
     }
@@ -667,7 +727,7 @@ fn base64(bytes: &[u8]) -> String {
 /// can then read it without a schema registry, and a path nobody can inspect is
 /// a path nobody trusts.
 fn write_mcap(path: &Path, runs: &[Run]) -> Result<(), TapeError> {
-    let mut writer = mcap::Writer::new(BufWriter::new(File::create(path)?))?;
+    let mut writer = deterministic_writer(BufWriter::new(File::create(path)?))?;
     let schema_id =
         writer.add_schema(CAMERA_SCHEMA, "jsonschema", CAMERA_JSON_SCHEMA.as_bytes())?;
     let channel_id = writer.add_channel(
@@ -716,6 +776,79 @@ fn write_mcap(path: &Path, runs: &[Run]) -> Result<(), TapeError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Deux tapes des mêmes paramètres sont le même fichier.
+    ///
+    /// Ce n'est pas une élégance : le digest de scène d'un pack porte sur les
+    /// octets de la tape, donc une tape qui varie fait qu'une même scène cuite
+    /// deux fois se range sous deux noms. Mesuré le 16 septembre 2026 — une
+    /// cuisson Cloud Run a annoncé `05274f175b83df6a` pour la trajectoire
+    /// qu'une cuisson locale appelait `fb45fe68fb26e559`, et les deux avaient
+    /// raison.
+    ///
+    /// La cause était l'ordre d'itération d'un `HashMap` dans `mcap`, qui
+    /// décide de l'ordre des schémas répétés dans le résumé. Elle ne mordait
+    /// que parce qu'une tape déclarait deux canaux là où elle n'en écrit
+    /// qu'un.
+    #[test]
+    fn two_tapes_of_the_same_path_are_the_same_bytes() {
+        fn write(path: &std::path::Path) {
+            let mut tape = Tape::recording(path).expect("recording");
+            for i in 0..64 {
+                let t = f64::from(i);
+                tape.push(Frame {
+                    position: [t, t * 2.0, t * 3.0],
+                    direction: [0.0, 0.0, -1.0],
+                    up: [0.0, 1.0, 0.0],
+                    fovy: std::f64::consts::FRAC_PI_4,
+                });
+            }
+            tape.finish().expect("close");
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a.mcap");
+        let b = dir.path().join("b.mcap");
+        write(&a);
+        write(&b);
+        let (a, b) = (
+            std::fs::read(&a).expect("read a"),
+            std::fs::read(&b).expect("read b"),
+        );
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "deux tapes de même contenu n'ont pas la même taille"
+        );
+        let differing = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+        assert_eq!(
+            differing, 0,
+            "{differing} octets diffèrent entre deux tapes identiques — \
+             la construction du fichier dépend d'autre chose que son contenu"
+        );
+    }
+
+    /// Une tape qui n'écrit pas d'image n'en déclare pas le canal.
+    #[test]
+    fn a_trajectory_tape_declares_only_what_it_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.mcap");
+        let mut tape = Tape::recording(&path).expect("recording");
+        tape.push(Frame {
+            position: [1.0, 2.0, 3.0],
+            direction: [0.0, 0.0, -1.0],
+            up: [0.0, 1.0, 0.0],
+            fovy: 1.0,
+        });
+        tape.finish().expect("close");
+        let bytes = std::fs::read(&path).expect("read");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains(CAMERA_SCHEMA), "le schéma caméra manque");
+        assert!(
+            !text.contains(IMAGE_SCHEMA),
+            "le canal d'images est déclaré alors que rien ne l'utilise"
+        );
+    }
+
     use super::*;
 
     fn frame(n: f64) -> Frame {

@@ -1,0 +1,76 @@
+[package]
+name = "tuile-bake"
+description = "Bakes a scene's frame range into a pack, once, on a machine with time"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Deliberately NOT `[lints] workspace = true` for `unsafe_code`. The workspace
+# denies it, which is right everywhere else and impossible in one place here:
+# jemalloc is configured through a `malloc_conf` symbol the linker resolves, and
+# exporting a symbol by name is `unsafe` by construction. The exception is that
+# one static and is confined to the `profiling` module.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "warn"
+panic = "warn"
+
+[[bin]]
+name = "tuile-bake"
+path = "src/main.rs"
+
+[features]
+# Off by default and not merely "optional": arming a heap profiler changes the
+# global allocator of the process, and a bake is the process whose numbers we
+# are trying to trust. It is built when someone is measuring, not always.
+profiling = ["dep:pprof", "dep:tikv-jemallocator", "dep:jemalloc_pprof"]
+
+[dependencies]
+glam = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# The session, the globe, and the sources behind it. This is the one place that
+# holds an ion token in the whole split pipeline.
+#
+# The globe's sources. A session is source-agnostic; assembling *this* globe is
+# not, and somebody has to do it — see `globe.rs`.
+#
+# None of this used to be here: the session lived in `tuile-hydra`, so a bake
+# linked a crate named after one particular OpenUSD host to produce a container
+# that no host is named in. The dependency graph said the pack was a Hydra
+# artefact. It is not.
+tuile-cesium-ion = { version = "0.0.1", path = "../tuile-cesium-ion" }
+tuile-bing = { version = "0.0.1", path = "../tuile-bing" }
+tuile-planetary = { version = "0.0.1", path = "../tuile-planetary" }
+tuile-native-fetchers = { version = "0.0.1", path = "../tuile-native-fetchers" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+image = { workspace = true }
+# `time` for the frame deadline: a bulk frame blocks, and an unbounded block
+# on a farm node is indistinguishable from a hang.
+tokio = { workspace = true, features = ["time"] }
+thiserror = { workspace = true }
+tuile-core = { version = "0.0.1", path = "../tuile-core" }
+tuile-pack = { version = "0.0.1", path = "../tuile-pack" }
+tuile-tape = { version = "0.0.1", path = "../tuile-tape" }
+
+# --- profiling, behind the feature ------------------------------------------
+# Signal sampling across EVERY thread, without `perf` and without privileges.
+# That is the decisive property here: the work is spread over three families of
+# threads — the decode pool, the tokio workers, and the thread that encodes
+# PNG — so a single-threaded profiler would miss two thirds of it.
+pprof = { version = "0.15", features = ["flamegraph"], optional = true }
+# `prof:true,prof_active:false`: near-zero cost until something arms it, and a
+# flamegraph produced directly rather than through a conversion step.
+tikv-jemallocator = { version = "0.7", features = [
+    "profiling",
+    "unprefixed_malloc_on_supported_platforms",
+], optional = true }
+jemalloc_pprof = { version = "0.9", features = ["flamegraph"], optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

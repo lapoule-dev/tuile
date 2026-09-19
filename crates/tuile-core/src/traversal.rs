@@ -9,7 +9,7 @@
 //! streaming sessions share one immutable tile arena (see
 //! `docs/10-crate-core.md`, « Décisions tranchées »).
 
-use crate::math::Frustum;
+use crate::math::{Frustum, Occluder};
 use crate::source::{TileId, TileTree};
 use crate::tileset::Refine;
 use glam::{DMat4, DVec2, DVec3};
@@ -200,6 +200,56 @@ pub struct Config {
     /// A consumer that ignores [`crate::protocol::ServerMessage::Fill`] is
     /// unaffected: it keeps climbing, exactly as before.
     pub stand_ins: bool,
+    /// Refine every visible tile as finely as the **nearest** one.
+    ///
+    /// Off (the default) is the interactive contract: detail follows distance,
+    /// so a device's budget goes where the eye is. On is the batch-render
+    /// contract: the whole frame is equally close to the viewer of the
+    /// *image*, and a distance-graded frame shows its LOD boundaries — mesh
+    /// density steps, imagery capture seams — as visible walls across the
+    /// ground.
+    ///
+    /// Implemented by pricing every tile's screen-space error at one shared
+    /// distance: the distance to the nearest existing content under the
+    /// camera, found by a greedy root-to-leaf descent before the traversal.
+    /// Bounded by [`Config::uniform_detail_radius`].
+    pub uniform_detail: bool,
+    /// How far the uniform zone reaches, as a multiple of the nearest-content
+    /// distance.
+    ///
+    /// Threshold precision, not concentric and not boundless: within
+    /// `radius × d_near` every tile is priced at `d_near` — uniformly fine
+    /// where the eye is, no LOD wall anywhere in the foreground. Beyond, the
+    /// effective distance is `d − (radius − 1)·d_near`: continuous at the
+    /// threshold (no visible ring), concentric degradation past it, so the
+    /// cost is a disc around the camera instead of the whole frustum to the
+    /// horizon — pricing the entire horizon at the near level was measured to
+    /// select for minutes of fetching on one frame. `f64::INFINITY` restores
+    /// the unbounded decree.
+    pub uniform_detail_radius: f64,
+    /// The width of the deadband around [`Self::maximum_screen_space_error`],
+    /// as a fraction of it. Default 0.15; zero restores the bare comparison.
+    ///
+    /// **Why a bare comparison is not enough.** `sse > τ` has no memory, so a
+    /// tile whose error sits at τ splits on one frame, merges on the next, and
+    /// splits again — for as long as the camera keeps it there. Two levels of
+    /// the same ground carry two different mosaics, so the surface changes
+    /// colour every frame. Seen on the Mediterranean, 19 September 2026: a
+    /// staircase of tiles along the coast, each a slightly different blue,
+    /// flickering. Over water it is glaring because the ground is otherwise
+    /// featureless and nothing hides the step.
+    ///
+    /// The cure is to make the decision sticky. A tile drawn at this level last
+    /// frame must get clearly *worse* than τ before it splits; a tile already
+    /// split must get clearly *better* before it merges back. Between the two
+    /// thresholds nothing moves, which is the whole point — the band has to be
+    /// wider than the frame-to-frame jitter of the error, and 15 % is.
+    ///
+    /// The previous frame is read from `rendered_last`. On the first frame that
+    /// set is empty and there is nothing to be sticky about, so the bare
+    /// comparison is used — otherwise every first frame would select one level
+    /// finer than every subsequent one.
+    pub refine_hysteresis: f64,
     /// Whether to drop tiles no view can see. Off is a diagnostic, not a mode.
     ///
     /// A culled tile is reported *ready* so that it never holds up an ancestor's
@@ -209,6 +259,14 @@ pub struct Config {
     /// the first thing to rule out when geometry goes missing, and ruling it out
     /// by measurement rather than by reading the frustum test is worth a flag.
     pub cull: bool,
+    /// Whether to drop tiles the dataset's own occluder hides — the far side of
+    /// a planet, in practice. Ignored by a tree that has no occluder.
+    ///
+    /// A flag for the same reason `cull` is one: when ground goes missing, the
+    /// two things that can make ground disappear without anyone asking must be
+    /// switchable off, one at a time, so the answer comes from a measurement
+    /// rather than from re-reading the geometry.
+    pub horizon_culling: bool,
     /// How many not-yet-drawable descendants a held REPLACE will wait for
     /// before giving up on them and asking for itself instead.
     ///
@@ -343,9 +401,13 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             maximum_screen_space_error: 16.0,
+            refine_hysteresis: 0.15,
             forbid_holes: true,
             stand_ins: true,
+            uniform_detail: false,
+            uniform_detail_radius: 8.0,
             cull: true,
+            horizon_culling: true,
             loading_descendant_limit: 20,
             resident_budget_bytes: 512 * 1024 * 1024,
             maximum_simultaneous_fetches: 20,
@@ -378,6 +440,14 @@ impl ResidencyView {
     }
     pub fn iter(&self) -> impl Iterator<Item = TileId> + '_ {
         self.resident.iter().copied()
+    }
+    /// How much content is held. Read by the pass trace, where the residency
+    /// at the moment of a traversal is half the explanation of its outcome.
+    pub fn len(&self) -> usize {
+        self.resident.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.resident.is_empty()
     }
 }
 
@@ -472,6 +542,22 @@ pub fn traverse(
         return;
     }
 
+    let uniform_distance = config
+        .uniform_detail
+        .then(|| nearest_content_distance(tree, views));
+    let occluder = config.horizon_culling.then(|| tree.occluder()).flatten();
+    // The two scene-wide numbers every per-tile decision below is measured
+    // against. `d_near` walks the tree to find the deepest content on the
+    // greedy path, so it moves as availability arrives — and it scales the
+    // whole uniform disc, which makes it a single number capable of changing
+    // every SSE in the pass at once.
+    crate::det!(
+        "traverse",
+        roots = roots.len(),
+        d_near = uniform_distance,
+        occluder = occluder.map(|o| o.radius),
+    );
+
     let mut requested = HashMap::new();
     for root in roots {
         visit(
@@ -480,6 +566,8 @@ pub fn traverse(
             views,
             config,
             rendered_last,
+            uniform_distance,
+            occluder.as_ref(),
             root,
             0,
             out,
@@ -573,6 +661,60 @@ impl Visit {
     }
 }
 
+/// The distance from the nearest view to the nearest *existing* content: a
+/// greedy root-to-leaf descent, always into the child closest to the eye.
+///
+/// This is what [`Config::uniform_detail`] prices every tile at. Greedy is
+/// exact enough here — the descent follows the ground under the camera, and
+/// availability stops it at the finest level the source actually has, which is
+/// precisely the level the decree replicates outward. Clamped away from zero:
+/// a camera inside the nearest leaf's bounding sphere means "as fine as the
+/// source can go", not a division by nothing.
+fn nearest_content_distance(tree: &dyn TileTree, views: &[ViewState]) -> f64 {
+    let mut best = f64::INFINITY;
+    for view in views {
+        for root in tree.roots() {
+            let mut id = root;
+            // The DEEPEST content on the path, not the closest: an ancestor's
+            // huge bounding volume usually *contains* the camera (a globe's
+            // root always does), so its distance is near zero and pricing at
+            // it would refine the whole frustum to the source's maximum. The
+            // finest tile under the camera is the one whose level the decree
+            // replicates, so its distance is the price.
+            let mut deepest: Option<f64> = None;
+            loop {
+                let props = tree.properties(id);
+                if props.has_content {
+                    deepest =
+                        Some(props.bounding_volume.distance_to_point(view.position()));
+                }
+                let next = tree
+                    .children(id)
+                    .into_iter()
+                    .min_by(|&a, &b| {
+                        let da = tree
+                            .properties(a)
+                            .bounding_volume
+                            .distance_to_point(view.position());
+                        let db = tree
+                            .properties(b)
+                            .bounding_volume
+                            .distance_to_point(view.position());
+                        da.total_cmp(&db)
+                    });
+                match next {
+                    Some(child) => id = child,
+                    None => break,
+                }
+            }
+            if let Some(d) = deepest {
+                best = best.min(d);
+            }
+        }
+    }
+    best.max(1.0)
+}
+
 /// Recursive visit over the abstract [`TileTree`].
 #[allow(clippy::too_many_arguments)]
 fn visit(
@@ -581,6 +723,8 @@ fn visit(
     views: &[ViewState],
     config: &Config,
     rendered_last: &HashSet<TileId>,
+    uniform_distance: Option<f64>,
+    occluder: Option<&Occluder>,
     id: TileId,
     depth: u32,
     out: &mut TraversalOutput,
@@ -590,14 +734,35 @@ fn visit(
     out.stats.visited += 1;
     out.stats.max_depth = out.stats.max_depth.max(depth);
 
-    // Frustum culling: a tile invisible in every view contributes nothing
-    // and never blocks an ancestor's REPLACE.
+    // Culling: a tile invisible in every view contributes nothing and never
+    // blocks an ancestor's REPLACE.
+    //
+    // Invisible in two ways, and both are needed. Outside the frustum is the
+    // obvious one. Behind the planet is the one that was missing, and on a
+    // globe it is the larger of the two by far: a frustum from near the ground
+    // passes through the planet and comes out the other side, so the far
+    // hemisphere is *inside* it and passes the first test. See [`Occluder`].
     if config.cull
-        && !views
-            .iter()
-            .any(|v| props.bounding_volume.intersects_frustum(v.frustum()))
+        && !views.iter().any(|v| {
+            props.bounding_volume.intersects_frustum(v.frustum())
+                && !occluder
+                    .is_some_and(|o| o.hides(&props.bounding_volume, v.position()))
+        })
     {
         out.stats.culled += 1;
+        // With the distance, because "culled at depth 10" says nothing on its
+        // own: ground 20 km away and ground behind the planet are both depth
+        // 10, and only one of them is a bug.
+        crate::det!(
+            "tile",
+            id = id.0,
+            depth = depth,
+            act = "cull",
+            dist = views
+                .iter()
+                .map(|v| props.bounding_volume.distance_to_point(v.position()))
+                .fold(f64::INFINITY, f64::min),
+        );
         // A tile just outside the frustum is what a pan or a rotation brings in
         // next. Loading it now is the difference between turning onto ground
         // that is already there and turning onto ground that starts arriving.
@@ -640,7 +805,17 @@ fn visit(
     let sse = views
         .iter()
         .map(|v| {
-            let d = props.bounding_volume.distance_to_point(v.position());
+            // Uniform detail by threshold: inside `radius × d_near` every
+            // tile is priced at d_near (one level, no LOD wall in the
+            // foreground); beyond, the shifted true distance takes over,
+            // continuously.
+            let d = match uniform_distance {
+                Some(near) => {
+                    let d = props.bounding_volume.distance_to_point(v.position());
+                    near.max(d - (config.uniform_detail_radius - 1.0).max(0.0) * near)
+                }
+                None => props.bounding_volume.distance_to_point(v.position()),
+            };
             v.screen_space_error(props.geometric_error, d)
         })
         .fold(0.0, f64::max);
@@ -648,9 +823,42 @@ fn visit(
     let children = tree.children(id);
     let has_content = props.has_content;
     let has_children = !children.is_empty();
+    // Everything the decision below is a function of, per tile.
+    //
+    // `children` is the field this exists for: it is answered by the terrain
+    // availability, which GROWS as tiles land. A tile that reported no
+    // children on one pass and four on the next is the tree changing shape
+    // under the traversal — the whole reason two runs of one frame can
+    // disagree — and nothing else in the trace can show it.
+    crate::det!(
+        "tile",
+        id = id.0,
+        depth = depth,
+        act = "look",
+        dist = views
+            .iter()
+            .map(|v| props.bounding_volume.distance_to_point(v.position()))
+            .fold(f64::INFINITY, f64::min),
+        sse = sse,
+        ge = props.geometric_error,
+        children = children.len(),
+        content = has_content,
+        resident = residency.is_resident(id),
+    );
     // Refine when too coarse — or when there is nothing to render here
     // (structural empty tiles always descend).
-    let refines = has_children && (sse > config.maximum_screen_space_error || !has_content);
+    // La bande morte : voir `Config::refine_hysteresis`. Sans mémoire de la
+    // frame précédente il n'y a rien à stabiliser, et le seuil nu s'applique.
+    let threshold = if config.refine_hysteresis <= 0.0 || rendered_last.is_empty() {
+        config.maximum_screen_space_error
+    } else if rendered_last.contains(&id) {
+        // Dessinée ici la dernière fois : il faut nettement pire pour la couper.
+        config.maximum_screen_space_error * (1.0 + config.refine_hysteresis)
+    } else {
+        // Déjà coupée : il faut nettement mieux pour la recoller.
+        config.maximum_screen_space_error / (1.0 + config.refine_hysteresis)
+    };
+    let refines = has_children && (sse > threshold || !has_content);
 
     // Coarse ground over the whole visible region, held ready for a zoom-out.
     //
@@ -688,6 +896,7 @@ fn visit(
             // frame without reading anything; the line is what says which
             // ground, when someone is looking at a hole and wants to know.
             out.stats.gaps += 1;
+            crate::det!("tile", id = id.0, depth = depth, act = "bare");
             tracing::debug!(
                 ?id,
                 depth,
@@ -696,6 +905,7 @@ fn visit(
             return Visit::READY_BUT_BARE;
         }
         if residency.is_resident(id) {
+            crate::det!("tile", id = id.0, depth = depth, act = "select", sse = sse);
             out.selected.push((id, sse));
             return if rendered_last.contains(&id) {
                 Visit::drawn()
@@ -703,6 +913,7 @@ fn visit(
                 Visit::READY
             };
         }
+        crate::det!("tile", id = id.0, depth = depth, act = "want", sse = sse);
         request(out, requested, id, PriorityGroup::Urgent, priority);
         return Visit::waiting_on_one();
     }
@@ -731,6 +942,8 @@ fn visit(
                     views,
                     config,
                     rendered_last,
+                    uniform_distance,
+                    occluder,
                     child,
                     depth + 1,
                     out,
@@ -765,6 +978,8 @@ fn visit(
                     views,
                     config,
                     rendered_last,
+                    uniform_distance,
+                    occluder,
                     child,
                     depth + 1,
                     out,
@@ -948,6 +1163,122 @@ mod tests {
     use crate::tileset::Tileset;
     use glam::{dvec2, dvec3};
     use url::Url;
+
+    /// Two leaves on a planet: one under the eye, one on the far side. Both
+    /// inside the frustum, only one of them visible.
+    struct PlanetTree {
+        radius: f64,
+    }
+
+    impl PlanetTree {
+        /// A tile centred at `angle` round the equator from the sub-eye point.
+        fn at(&self, angle_deg: f64) -> crate::math::BoundingVolume {
+            let a = angle_deg.to_radians();
+            crate::math::BoundingVolume::Sphere(crate::math::Sphere {
+                center: dvec3(self.radius * a.cos(), self.radius * a.sin(), 0.0),
+                radius: 1_000.0,
+            })
+        }
+    }
+
+    impl crate::source::TileTree for PlanetTree {
+        fn roots(&self) -> Vec<TileId> {
+            vec![TileId(0), TileId(1)]
+        }
+        fn children(&self, _id: TileId) -> Vec<TileId> {
+            Vec::new()
+        }
+        fn properties(&self, id: TileId) -> crate::source::TileProperties {
+            crate::source::TileProperties {
+                bounding_volume: self.at(if id == TileId(0) { 0.0 } else { 150.0 }),
+                geometric_error: 0.0,
+                refine: crate::tileset::Refine::Replace,
+                has_content: true,
+            }
+        }
+        fn occluder(&self) -> Option<Occluder> {
+            Some(Occluder {
+                center: DVec3::ZERO,
+                radius: self.radius,
+            })
+        }
+    }
+
+    /// Ground behind the planet is not selected, and the traversal has to be
+    /// *told* about the planet for that to happen.
+    ///
+    /// This is the test that was missing when the cull was written. The maths
+    /// had its own tests and they passed; the cull still did nothing on a real
+    /// frame, because nothing checked that the two ends were joined. A unit
+    /// test of a predicate is not a test of a decision.
+    #[test]
+    fn the_far_side_of_the_planet_is_not_selected() {
+        const R: f64 = 6_356_752.0;
+        let tree = PlanetTree { radius: R };
+        // Both resident: a tile that is not resident is *requested*, never
+        // selected, and the question here is which ground gets drawn.
+        let mut residency = ResidencyView::default();
+        residency.insert(TileId(0));
+        residency.insert(TileId(1));
+        // Eye 5 km up, looking straight down through the planet, so that BOTH
+        // tiles are inside the frustum — otherwise the frustum alone would
+        // drop the far one and the test would prove nothing.
+        let views = vec![ViewState::perspective(
+            dvec3(R + 5_000.0, 0.0, 0.0),
+            dvec3(-1.0, 0.0, 0.0),
+            dvec3(0.0, 0.0, 1.0),
+            dvec2(1024.0, 1024.0),
+            60.0f64.to_radians(),
+        )];
+        let far = tree.properties(TileId(1)).bounding_volume;
+        assert!(
+            far.intersects_frustum(views[0].frustum()),
+            "the fixture is wrong: the far tile has to be inside the frustum"
+        );
+
+        let rendered_last = HashSet::new();
+        let mut out = TraversalOutput::default();
+        traverse(
+            &tree,
+            &residency,
+            &views,
+            &Config::default(),
+            0,
+            &rendered_last,
+            &mut out,
+        );
+        let selected: HashSet<TileId> = out.selected.iter().map(|(t, _)| *t).collect();
+        assert!(
+            selected.contains(&TileId(0)),
+            "the ground under the camera has to be selected"
+        );
+        assert!(
+            !selected.contains(&TileId(1)),
+            "ground on the far side of the planet was selected"
+        );
+
+        // And with the cull switched off it comes back, which is what makes
+        // the assertion above about the cull rather than about the fixture.
+        let mut out = TraversalOutput::default();
+        traverse(
+            &tree,
+            &residency,
+            &views,
+            &Config {
+                horizon_culling: false,
+                ..Config::default()
+            },
+            0,
+            &rendered_last,
+            &mut out,
+        );
+        let selected: HashSet<TileId> = out.selected.iter().map(|(t, _)| *t).collect();
+        assert!(
+            selected.contains(&TileId(1)),
+            "with horizon culling off the far side must come back, or this \
+             test is measuring something else"
+        );
+    }
 
     /// Root sphere (radius 100) with four leaf children (radius 30) laid out
     /// in the Z=0 plane. REPLACE refinement, leaves have geometricError 0.
@@ -1239,6 +1570,104 @@ mod tests {
         );
     }
 
+    /// Drives a session to a fixed point the way the server does, and returns
+    /// what it settled on.
+    ///
+    /// Traverse, "load" some of what was asked for, traverse again with that
+    /// pass as `rendered_last`, and stop when a pass asks for nothing — which
+    /// is exactly `SceneState::is_complete` (`drive.rs`: `pending == 0`, and
+    /// `pending` is the pass's `requests.len()`).
+    ///
+    /// `per_round` is the network: how many of the wanted tiles land between
+    /// two passes. A fast link delivers more per pass than a slow one, and a
+    /// loaded farm node less than an idle one. Nothing about the *frame*
+    /// changes with it.
+    #[allow(clippy::panic, reason = "a fixture that never settles is a bug")]
+    fn converge_like_the_server(
+        ts: &Tileset,
+        views: &[ViewState],
+        config: &Config,
+        per_round: usize,
+    ) -> Vec<TileId> {
+        let mut residency = ResidencyView::default();
+        let mut rendered_last: HashSet<TileId> = HashSet::new();
+        for _ in 0..2000 {
+            let out = run_with(ts, &residency, views, config, &rendered_last);
+            if out.requests.is_empty() {
+                return ids(&out.selected);
+            }
+            rendered_last = out.selected.iter().map(|(t, _)| *t).collect();
+            for req in out.requests.iter().take(per_round) {
+                residency.insert(req.tile);
+            }
+        }
+        panic!("the session never reached a fixed point");
+    }
+
+    /// **The same frame must select the same ground however fast the tiles
+    /// arrive.**
+    ///
+    /// This is the contract `docs/15` rests on — a frame is a function of
+    /// (stage, time), which is what lets a farm split one shot across sixteen
+    /// processes and expect one film back. It was false. Measured on 2026-09-08
+    /// over six runs of one frame on one pod, same binary, same warm cache:
+    /// five selected 106 tiles, one selected 7, and every one of them reported
+    /// a clean convergence — no gaps, no errors, nothing downstream able to
+    /// tell them apart.
+    ///
+    /// The cause is `loading_descendant_limit`, a few lines above. A hold
+    /// waiting on more than N not-yet-drawable descendants cancels its whole
+    /// subtree's requests and asks for one coarse ancestor instead. `waiting`
+    /// counts what has not arrived *yet*, so the decision is a function of the
+    /// network — and cancelling those requests can drop `requests.len()` to
+    /// zero, ending the frame on the coarse answer. Both outcomes are
+    /// self-consistent, which is why nothing caught it.
+    ///
+    /// Here it costs a factor of sixty: four tiles per round settles on 960,
+    /// sixteen per round settles on 16, from one tileset and one camera.
+    ///
+    /// That trade is right for a viewer and wrong for a render, which is why
+    /// `exact_traversal` turns it off with the other interactive kindnesses.
+    #[test]
+    fn the_same_frame_selects_the_same_ground_however_fast_tiles_arrive() {
+        let ts = deep_tileset(5);
+        let views = [camera_at(120.0)];
+
+        // The render's settings: a bulk frame has no "while", so it never
+        // trades sharpness for speed and never lets the network choose.
+        let exact = Config {
+            loading_descendant_limit: u32::MAX,
+            ..Config::default()
+        };
+        let slow = converge_like_the_server(&ts, &views, &exact, 4);
+        let fast = converge_like_the_server(&ts, &views, &exact, 16);
+        assert_eq!(
+            crate::determinism::digest(slow.iter().map(|t| t.0)),
+            crate::determinism::digest(fast.iter().map(|t| t.0)),
+            "the network chose the ground: {} tiles at four per round against \
+             {} at sixteen",
+            slow.len(),
+            fast.len(),
+        );
+
+        // And the fixture has to actually exercise the trade, or the assertion
+        // above is about nothing: with the interactive limit the two rates must
+        // still disagree. If this ever stops holding, the test has gone quiet
+        // rather than green.
+        let interactive = Config {
+            loading_descendant_limit: 20,
+            ..Config::default()
+        };
+        let slow_i = converge_like_the_server(&ts, &views, &interactive, 4);
+        let fast_i = converge_like_the_server(&ts, &views, &interactive, 16);
+        assert_ne!(
+            crate::determinism::digest(slow_i.iter().map(|t| t.0)),
+            crate::determinism::digest(fast_i.iter().map(|t| t.0)),
+            "the interactive limit no longer makes arrival rate matter — this \
+             test can no longer tell whether the render's setting does anything"
+        );
+    }
+
     /// A held REPLACE with nothing of its own on screen must stop asking for its
     /// whole subtree and ask for itself instead.
     ///
@@ -1337,6 +1766,98 @@ mod tests {
         );
     }
 
+    /// La bande morte, éprouvée là où elle sert : une caméra placée pour que
+    /// l'erreur de la racine tombe pile sur le seuil.
+    ///
+    /// Sans mémoire, `sse > τ` bascule au moindre frémissement — la tuile se
+    /// coupe une frame, se recolle la suivante, et comme deux niveaux portent
+    /// deux mosaïques différentes, le sol change de couleur à chaque image. Vu
+    /// sur la Méditerranée le 19 septembre 2026 : un escalier de tuiles le long
+    /// de la côte, chacune d'un bleu légèrement différent, clignotant.
+    ///
+    /// Ce que le test épingle, c'est la STABILITÉ, pas un compte : à erreur
+    /// égale, la décision doit dépendre de ce qui était dessiné avant, et
+    /// s'y tenir.
+    #[test]
+    fn a_tile_sitting_on_the_threshold_does_not_flip_flop() {
+        let ts = mini_tileset();
+        let root = ts.root();
+        let children = ts.tile(root).children.clone();
+        let mut residency = ResidencyView::default();
+        residency.insert(root);
+        for child in &children {
+            residency.insert(*child);
+        }
+
+        // La distance qui met l'erreur de la racine exactement au seuil : on la
+        // cherche, plutôt que de la coder en dur, pour que le test survive à un
+        // changement de géométrie du jeu d'essai.
+        let config = Config::default();
+        let tau = config.maximum_screen_space_error;
+        let sse_at = |d: f64| {
+            let v = camera_at(d);
+            v.screen_space_error(ts.tile(root).geometric_error, d)
+        };
+        let (mut lo, mut hi) = (1.0_f64, 100_000.0_f64);
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if sse_at(mid) > tau { lo = mid } else { hi = mid }
+        }
+        let on_threshold = 0.5 * (lo + hi);
+
+        // Dessinée à ce niveau la frame d'avant : elle doit y rester.
+        let was_drawn: HashSet<TileId> = std::iter::once(root).collect();
+        let kept = run_with(&ts, &residency, &[camera_at(on_threshold)], &config, &was_drawn);
+        assert!(
+            ids(&kept.selected).contains(&root),
+            "une tuile déjà dessinée à ce niveau s'est coupée sur un seuil frôlé"
+        );
+
+        // Déjà coupée la frame d'avant : elle doit le rester.
+        let was_split: HashSet<TileId> = children.iter().copied().collect();
+        let split = run_with(&ts, &residency, &[camera_at(on_threshold)], &config, &was_split);
+        assert!(
+            !ids(&split.selected).contains(&root),
+            "une tuile déjà coupée s'est recollée sur le même seuil frôlé"
+        );
+    }
+
+    /// Et la bande morte se débranche : à zéro, c'est la comparaison nue, donc
+    /// la même décision des deux côtés. C'est la preuve que le test précédent
+    /// mesure bien l'hystérésis et non un artefact du jeu d'essai.
+    #[test]
+    fn without_the_deadband_the_two_histories_agree() {
+        let ts = mini_tileset();
+        let root = ts.root();
+        let children = ts.tile(root).children.clone();
+        let mut residency = ResidencyView::default();
+        residency.insert(root);
+        for child in &children {
+            residency.insert(*child);
+        }
+        let config = Config {
+            refine_hysteresis: 0.0,
+            ..Config::default()
+        };
+        let tau = config.maximum_screen_space_error;
+        let sse_at = |d: f64| camera_at(d).screen_space_error(ts.tile(root).geometric_error, d);
+        let (mut lo, mut hi) = (1.0_f64, 100_000.0_f64);
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if sse_at(mid) > tau { lo = mid } else { hi = mid }
+        }
+        let d = 0.5 * (lo + hi);
+        let a = run_with(&ts, &residency, &[camera_at(d)], &config,
+                         &std::iter::once(root).collect());
+        let b = run_with(&ts, &residency, &[camera_at(d)], &config,
+                         &children.iter().copied().collect());
+        assert_eq!(
+            ids(&a.selected).contains(&root),
+            ids(&b.selected).contains(&root),
+            "sans bande morte, l'histoire ne devrait rien changer"
+        );
+    }
+
     fn run(ts: &Tileset, residency: &ResidencyView, views: &[ViewState]) -> TraversalOutput {
         run_with(ts, residency, views, &Config::default(), &HashSet::new())
     }
@@ -1357,6 +1878,157 @@ mod tests {
 
     fn ids(sel: &[(TileId, f64)]) -> Vec<TileId> {
         sel.iter().map(|(t, _)| *t).collect()
+    }
+
+    /// The uniform-detail decree: with the flag on, a branch thousands of
+    /// units away refines exactly as deep as the one under the camera. With
+    /// it off (the default), the far branch holds at its coarse level — the
+    /// interactive contract, unchanged.
+    #[test]
+    fn uniform_detail_refines_the_far_branch_like_the_near_one() {
+        let branch = |x: f64, name: &str| {
+            format!(
+                r#"{{ "boundingVolume": {{ "sphere": [{x}, 0, 0, 30] }},
+                     "geometricError": 20, "refine": "REPLACE",
+                     "content": {{ "uri": "{name}.glb" }},
+                     "children": [{{
+                       "boundingVolume": {{ "sphere": [{x}, 0, 0, 10] }},
+                       "geometricError": 0,
+                       "content": {{ "uri": "{name}_leaf.glb" }}
+                     }}] }}"#
+            )
+        };
+        let json = format!(
+            r#"{{ "asset": {{ "version": "1.1" }}, "geometricError": 400,
+                 "root": {{
+                   "boundingVolume": {{ "sphere": [2000, 0, 0, 5000] }},
+                   "geometricError": 200, "refine": "REPLACE",
+                   "children": [{}, {}]
+                 }} }}"#,
+            branch(0.0, "near"),
+            branch(4000.0, "far"),
+        );
+        let base = Url::parse("file:///t/tileset.json").expect("url");
+        let ts = Tileset::from_json_bytes(json.as_bytes(), &base).expect("tileset");
+
+        let near_leaf = ts.tile(ts.tile(ts.root()).children[0]).children[0];
+        let far_leaf = ts.tile(ts.tile(ts.root()).children[1]).children[0];
+
+        // Above the near branch, tilted so BOTH branches are inside the
+        // frustum — a culled branch never reaches the SSE decision at all,
+        // which is correct and not what this test is about.
+        let view = ViewState::perspective(
+            dvec3(0.0, 0.0, 300.0),
+            dvec3(0.8, 0.0, -0.6),
+            dvec3(0.0, 0.0, 1.0),
+            dvec2(1000.0, 1000.0),
+            100f64.to_radians(),
+        );
+        let residency = ResidencyView::default();
+        let last = HashSet::new();
+
+        let wants = |config: &Config| -> Vec<TileId> {
+            let out = run_with(&ts, &residency, &[view], config, &last);
+            out.requests.iter().map(|r| r.tile).collect()
+        };
+
+        let default_wants = wants(&Config::default());
+        assert!(default_wants.contains(&near_leaf), "near refines by default");
+        assert!(
+            !default_wants.contains(&far_leaf),
+            "the far branch holds coarse by default"
+        );
+
+        let mut uniform = Config {
+            uniform_detail: true,
+            uniform_detail_radius: f64::INFINITY,
+            ..Config::default()
+        };
+        let uniform_wants = wants(&uniform);
+        assert!(uniform_wants.contains(&near_leaf));
+        assert!(
+            uniform_wants.contains(&far_leaf),
+            "unbounded uniform detail refines the far branch like the near one"
+        );
+
+        // Threshold precision: with a radius that reaches the far branch it
+        // refines; with one that stops short, it holds — the disc is the
+        // whole point (pricing the horizon at the near level was measured to
+        // fetch for minutes on one frame).
+        uniform.uniform_detail_radius = 20.0;
+        assert!(
+            wants(&uniform).contains(&far_leaf),
+            "a radius that covers the far branch refines it"
+        );
+        uniform.uniform_detail_radius = 2.0;
+        assert!(
+            !wants(&uniform).contains(&far_leaf),
+            "past the threshold, concentric degradation resumes"
+        );
+    }
+
+    /// The distance the decree prices everything at is the one to the finest
+    /// existing content under the camera — the greedy descent must reach the
+    /// leaf, not stop at the first content it meets.
+    #[test]
+    fn nearest_content_distance_descends_to_the_finest_leaf() {
+        let ts = mini_tileset();
+        // 200 above a leaf (radius 30): the root sphere (radius 100) contains
+        // the camera vertically? No — camera at z=200 is outside both. The
+        // root surface is 100 away, the leaf under the corner is farther from
+        // this off-corner camera than the root surface — so a descent that
+        // stopped at the root would report the ROOT's distance. The decree
+        // wants the LEAF's.
+        let view = ViewState::perspective(
+            dvec3(-50.0, -50.0, 200.0),
+            dvec3(0.0, 0.0, -1.0),
+            dvec3(0.0, 1.0, 0.0),
+            dvec2(1000.0, 1000.0),
+            60f64.to_radians(),
+        );
+        let d = nearest_content_distance(&ts, &[view]);
+        // Leaf "a" is centred at (-50,-50,0) with radius 30: 170 exactly.
+        assert!((d - 170.0).abs() < 1.0, "got {d}");
+    }
+
+    /// A camera inside the nearest leaf's sphere means "as fine as the source
+    /// goes", not a division by nothing.
+    #[test]
+    fn nearest_content_distance_clamps_at_contact() {
+        let ts = mini_tileset();
+        let view = ViewState::perspective(
+            dvec3(-50.0, -50.0, 5.0),
+            dvec3(0.0, 0.0, -1.0),
+            dvec3(0.0, 1.0, 0.0),
+            dvec2(1000.0, 1000.0),
+            60f64.to_radians(),
+        );
+        assert_eq!(nearest_content_distance(&ts, &[view]), 1.0);
+    }
+
+    /// Uniform detail refines what is VISIBLE to one level; it must not
+    /// resurrect what the frustum culled. A tile behind the camera stays out,
+    /// flag or no flag.
+    #[test]
+    fn uniform_detail_does_not_override_culling() {
+        let ts = mini_tileset();
+        // At a leaf's altitude, looking straight down at corner "a": the
+        // other three corners are outside even the widened frustum.
+        let view = ViewState::perspective(
+            dvec3(-50.0, -50.0, 60.0),
+            dvec3(0.0, 0.0, -1.0),
+            dvec3(0.0, 1.0, 0.0),
+            dvec2(1000.0, 1000.0),
+            40f64.to_radians(),
+        );
+        let residency = ResidencyView::default();
+        let last = HashSet::new();
+        let uniform = Config {
+            uniform_detail: true,
+            ..Config::default()
+        };
+        let out = run_with(&ts, &residency, &[view], &uniform, &last);
+        assert!(out.stats.culled > 0, "the far corners are culled");
     }
 
     #[test]
@@ -1673,4 +2345,56 @@ mod tests {
         let sse_b = back.screen_space_error(10.0, 100.0);
         assert!((sse_a - sse_b).abs() < 1e-9);
     }
+/// Ground inside the frame is never culled.
+///
+/// The measurement that sent a day sideways: a render selected 337 tiles, of
+/// which 331 lay within ten kilometres and **none at all** between ten and
+/// five hundred — for a frame whose ground runs from 3.6 km to 30 km. Two
+/// thirds of the picture was black, `gaps` was zero, no error was raised, and
+/// `TUILE_CULL=0` filled the frame. Nothing in the suite asked whether ground
+/// that is plainly in view survives the cull.
+///
+/// The real camera, and terrain volumes built the way `TerrainTree` builds
+/// them: a lat/lon rectangle extruded −1000..9000 m.
+#[test]
+fn ground_inside_the_frame_survives_the_cull() {
+    use crate::math::BoundingVolume;
+    use glam::dvec2;
+
+    let cam = crate::geo::geodetic_to_ecef(crate::geo::Geodetic {
+        lon: 2.2673_f64.to_radians(),
+        lat: 42.5198_f64.to_radians(),
+        height: 5005.0,
+    });
+    let target = crate::geo::geodetic_to_ecef(crate::geo::Geodetic {
+        lon: 2.17_f64.to_radians(),
+        lat: 42.52_f64.to_radians(),
+        height: 0.0,
+    });
+    let up = cam.normalize();
+    let dir = (target - cam).normalize();
+    let view = ViewState::perspective(cam, dir, up, dvec2(1280.0, 960.0), 45f64.to_radians());
+    let horizontal = (dir - up * dir.dot(up)).normalize();
+
+    // 5 km is just inside the bottom of the frame; 30 km is just inside the
+    // top. Every one of them is ground the camera can see.
+    for km in [5.0_f64, 10.0, 15.0, 20.0, 30.0] {
+        let g = crate::geo::ecef_to_geodetic(cam + horizontal * (km * 1000.0));
+        let half = 0.02_f64.to_radians();
+        let tile = BoundingVolume::Obb(crate::geo::obb_from_rectangle(
+            g.lon - half,
+            g.lat - half,
+            g.lon + half,
+            g.lat + half,
+            -1000.0,
+            9000.0,
+        ));
+        assert!(
+            tile.intersects_frustum(view.frustum()),
+            "ground {km} km ahead was culled — it is inside the frame, and \
+             culling it punches a hole nothing downstream reports"
+        );
+    }
+}
+
 }

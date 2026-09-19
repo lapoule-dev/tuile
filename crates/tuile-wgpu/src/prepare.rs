@@ -92,6 +92,12 @@ pub struct PreparedTile {
     /// texture twenty tiles share is not twenty textures. Ask
     /// `ImageryTextures::live` for that side of the total.
     pub gpu_bytes: usize,
+    /// The deepest imagery level draped over this tile, if any — the measure
+    /// of how sharp its ground can look. A tile whose sharpest layer sits
+    /// several levels above its own is a smear: one texel stretched over the
+    /// whole surface. A recorder gates on the gap; a viewer tolerates it for
+    /// the frames the drape needs to catch up.
+    pub sharpest_imagery_level: Option<u32>,
 }
 
 impl PreparedTile {
@@ -231,6 +237,7 @@ pub fn prepare(
         .collect::<Vec<_>>();
 
     PreparedTile {
+        sharpest_imagery_level: content.imagery.iter().map(|l| l.coord.level).max(),
         meshes,
         tile_bg,
         tile_buf,
