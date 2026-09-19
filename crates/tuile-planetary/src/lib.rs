@@ -517,6 +517,54 @@ pub struct GlobeOptions {
     /// bulk frame has none — so a batch render pays approximately nothing for
     /// being reproducible.
     pub deterministic_floor: bool,
+    /// What the consumer already holds, asked **before** any imagery is
+    /// requested.
+    ///
+    /// Given `(tile id, drape identity)` it answers whether the composed drape
+    /// is already in hand. When it says yes, the layers are neither downloaded
+    /// nor decoded nor reprojected nor composed: the content comes back with no
+    /// imagery and [`tuile_core::DecodedTileContent::withheld_drape`] set to
+    /// the identity it would have had.
+    ///
+    /// A camera orbit re-selects nearly the same ground every frame, so on a
+    /// long shot this is most of the imagery work. The HTTP cache already
+    /// spares the *network* for a second look at the same tile; it does not
+    /// spare the JPEG decode, the reprojection to geographic spacing, or the
+    /// mosaic compose — which are the expensive halves, and the ones that hold
+    /// megabytes while they run.
+    ///
+    /// Left `None`, nothing changes and nothing is withheld.
+    pub held_drape: Option<HeldDrape>,
+    /// The size a drape is composed at, which is part of its identity.
+    ///
+    /// The loader does not compose anything — that happens in the consumer —
+    /// but it cannot ask [`GlobeOptions::held_drape`] about an identity without
+    /// it. Ignored when `held_drape` is `None`.
+    pub composed_at: u32,
+}
+
+/// The consumer's answer to "do you already hold this drape?".
+///
+/// A named type rather than a bare `Arc<dyn Fn>` so [`GlobeOptions`] can keep
+/// its `Debug`, which every option struct here has and which is worth more than
+/// the closure's identity.
+#[derive(Clone)]
+pub struct HeldDrape(pub std::sync::Arc<dyn Fn(u64, u64) -> bool + Send + Sync>);
+
+impl HeldDrape {
+    pub fn new(f: impl Fn(u64, u64) -> bool + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(f))
+    }
+
+    fn holds(&self, tile: u64, drape: u64) -> bool {
+        (self.0)(tile, drape)
+    }
+}
+
+impl std::fmt::Debug for HeldDrape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HeldDrape(..)")
+    }
 }
 
 impl Default for GlobeOptions {
@@ -529,6 +577,8 @@ impl Default for GlobeOptions {
             // Off by default: the interactive contract is the default, and a
             // viewer showing blur it did not have to show is a regression.
             deterministic_floor: false,
+            held_drape: None,
+            composed_at: 0,
         }
     }
 }
@@ -853,6 +903,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         content: &mut tuile_core::DecodedTileContent,
         rect: &GeoRect,
         terrain_level: u32,
+        id: TileId,
     ) -> Result<(), LoadError> {
         let scheme = self.imagery.tiling_scheme();
         // Start from the imagery level whose texel spacing matches the terrain
@@ -902,6 +953,37 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
             "imagery level"
         );
         let coords = mosaic.tiles();
+
+        // The floor of the stack, decided before anything is asked for.
+        //
+        // It was chosen further down, between the mosaic's fetch and its own —
+        // which was fine while every layer was going to be fetched anyway. It
+        // has to move up here because it is part of what identifies the drape,
+        // and the identity has to exist before the first request.
+        let floor = self.opts.floor_under(&scheme, rect, &self.cache);
+
+        // Already composed by the consumer: fetch nothing, decode nothing.
+        //
+        // The identity is taken over the coords about to be REQUESTED, in the
+        // order the layers would be stacked — floor first, then the mosaic —
+        // because that is the order the consumer hashed them in when it
+        // composed the drape it is holding. See `raster::drape_identity` for
+        // why the two agree, and for the one direction in which they may not.
+        if let Some(held) = &self.opts.held_drape {
+            let identity = tuile_core::raster::drape_identity(
+                std::iter::once(floor).chain(coords.iter().copied()),
+                self.opts.composed_at,
+            );
+            if held.holds(id.0, identity) {
+                // `withheld_drape` is what stops an empty `imagery` from being
+                // read as "this ground has no picture". The consumer must
+                // resolve it; there is no fallback here, deliberately.
+                content.withheld_drape = Some(identity);
+                tuile_core::metrics::metrics().drapes_withheld.inc();
+                return Ok(());
+            }
+        }
+
         let fetched =
             futures_util::future::join_all(coords.iter().map(|c| self.fetch_imagery(*c))).await;
 
@@ -923,7 +1005,6 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // spanning a whole region is shared by every terrain tile inside it, so
         // it is fetched once and drawn by hundreds. It is also, for the same
         // reason, the tile most likely to be resident already.
-        let floor = self.opts.floor_under(&scheme, rect, &self.cache);
         match self.fetch_imagery(floor).await {
             Ok((served, texture)) => {
                 // The floor covers the whole tile on its own, so there is no
@@ -1357,7 +1438,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
                 east: rect.east,
                 north: rect.north,
             };
-            self.drape(&mut content, &georect, z).await?;
+            self.drape(&mut content, &georect, z, id).await?;
         }
         tuile_core::metrics::metrics()
             .load_seconds
@@ -1468,6 +1549,132 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An imagery provider that refuses everything and counts being asked.
+    ///
+    /// Refusing rather than serving is deliberate: this test's whole claim is
+    /// that nothing is requested, so a provider that could satisfy a request
+    /// would let the test pass for the wrong reason.
+    struct CountingImagery(std::sync::atomic::AtomicUsize);
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl raster::ImageryProvider for CountingImagery {
+        fn tiling_scheme(&self) -> raster::TilingScheme {
+            raster::TilingScheme::web_mercator()
+        }
+
+        async fn fetch_tile_bytes(
+            &self,
+            coord: ImageryCoord,
+        ) -> Result<tuile_core::fetch::Fetched<bytes::Bytes>, raster::RasterError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(raster::RasterError::Image(format!("{coord:?} was requested")))
+        }
+    }
+
+    /// A terrain source that is never reached: `drape` does not touch it.
+    struct NoTerrain;
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl tuile_terrain::TerrainSource for NoTerrain {
+        async fn fetch_tile(
+            &self,
+            _coord: TileCoord,
+        ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError> {
+            unreachable!("drape never asks for terrain")
+        }
+    }
+
+    fn a_loader(held: Option<HeldDrape>) -> PlanetaryLoader<NoTerrain, CountingImagery> {
+        let scheme = GeographicTilingScheme::default();
+        PlanetaryLoader {
+            terrain: NoTerrain,
+            imagery: CountingImagery(std::sync::atomic::AtomicUsize::new(0)),
+            scheme,
+            opts: GlobeOptions {
+                deterministic_floor: true,
+                composed_at: 2048,
+                held_drape: held,
+                ..GlobeOptions::default()
+            },
+            cache: Mutex::new(ImageryCache::new(8)),
+            meshes: Mutex::new(MeshCache::new(8)),
+            fill_meshes: Mutex::new(MeshCache::new(8)),
+            availability: Arc::new(tuile_terrain::Availability::default()),
+            detail: ImageryDetail::default(),
+            heights: Arc::new(TerrainHeights::new(scheme)),
+            offload: offload::inline(),
+        }
+    }
+
+    fn some_ground() -> GeoRect {
+        let scheme = GeographicTilingScheme::default();
+        let rect = scheme.tile_rect(TileCoord::new(8, 130, 90));
+        GeoRect {
+            west: rect.west,
+            south: rect.south,
+            east: rect.east,
+            north: rect.north,
+        }
+    }
+
+    fn drape_once(loader: &PlanetaryLoader<NoTerrain, CountingImagery>) -> tuile_core::DecodedTileContent {
+        let mut content = tuile_core::DecodedTileContent {
+            withheld_drape: None,
+            meshes: Vec::new(),
+            textures: Vec::new(),
+            imagery: Vec::new(),
+            local_origin_ecef: glam::DVec3::ZERO,
+            transform_local: glam::Mat4::IDENTITY,
+        };
+        let _ = futures_executor::block_on(loader.drape(
+            &mut content,
+            &some_ground(),
+            8,
+            TileId(7),
+        ));
+        content
+    }
+
+    /// A drape the consumer already holds costs **nothing**: no request leaves.
+    ///
+    /// Not "is served from the cache" — not asked for at all. The HTTP cache
+    /// already spares the network for a second look at the same imagery tile,
+    /// and it still pays the JPEG decode, the reprojection and the mosaic
+    /// compose every time. Those are the expensive halves, and on an orbit that
+    /// re-selects nearly the same ground every frame they are almost all of the
+    /// imagery work.
+    #[test]
+    fn a_held_drape_is_never_requested() {
+        let loader = a_loader(Some(HeldDrape::new(|_, _| true)));
+        let content = drape_once(&loader);
+        assert_eq!(
+            loader.imagery.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the loader asked for imagery it was told the consumer holds"
+        );
+        assert!(
+            content.withheld_drape.is_some(),
+            "nothing was fetched and nothing says why — this is bare ground"
+        );
+        assert!(content.imagery.is_empty(), "no layers were attached");
+    }
+
+    /// And the same ground, unheld, does ask — otherwise the test above would
+    /// pass over a drape that was never going to fetch anything anyway.
+    #[test]
+    fn an_unheld_drape_is_requested_as_it_always_was() {
+        let loader = a_loader(Some(HeldDrape::new(|_, _| false)));
+        let content = drape_once(&loader);
+        assert!(
+            loader.imagery.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "nothing was requested for a drape nobody holds"
+        );
+        assert!(
+            content.withheld_drape.is_none(),
+            "nothing was withheld, so the field must stay clear"
+        );
+    }
 
     /// The floor a bulk render uses depends on the ground, and on nothing else.
     ///

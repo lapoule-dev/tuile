@@ -5238,6 +5238,8 @@ name = "tuile-planetary"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "bytes",
+ "futures-executor",
  "futures-util",
  "glam",
  "serde",
