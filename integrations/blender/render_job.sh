@@ -617,7 +617,7 @@ for i in $(seq 0 $((jobs - 1))); do
         stdbuf -oL blender -b $JOB_BLENDER_ARGS -P /opt/render/render_usd.py -- \
         --stage "$STAGE" --engine "$JOB_ENGINE" --tier "$JOB_TIER" \
         --delegate "$JOB_DELEGATE" \
-        --frames "$a:$b" --width "$JOB_WIDTH" \
+        --frames "$a:$b" --width "$JOB_WIDTH" --fps "$JOB_FPS" \
         --samples "$JOB_SAMPLES" --adaptive-threshold "$JOB_THRESHOLD" \
         --batch-frames "$JOB_BATCH_FRAMES" $JOB_EXTRA_ARGS \
         --out "$outdir/s$i" --video "$outdir/seg$i.mp4" \

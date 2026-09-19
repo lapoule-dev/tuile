@@ -850,6 +850,81 @@ def bake(args, token=None):
             f"la cuisson a échoué — journaux dans "
             f"s3://{R2_BUCKET}/{R2_PREFIX}/{run}/logs.tar.gz")
 
+def fps_of(trajectory, default=24):
+    """La cadence que cette trajectoire décrit.
+
+    Elle est déjà dans la chaîne — `pyrenees:minutes:fps:alt:offset` — et c'est
+    la seule raison pour laquelle il n'y a pas de drapeau `--fps` à côté. Deux
+    endroits pour le même nombre, c'est deux endroits qui finiront par ne plus
+    dire la même chose, et le désaccord serait muet : les segments seraient
+    encodés à une cadence et les poses calculées à une autre, ce qui donne un
+    film de la bonne longueur en frames et de la mauvaise en secondes.
+
+    Les autres genres ne portent pas de cadence — `orbit` compte des frames,
+    `zoom` aussi — donc ils prennent le défaut.
+    """
+    parts = (trajectory or "").split(":")
+    if parts[0] != "pyrenees" or len(parts) < 3 or not parts[2]:
+        return default
+    try:
+        fps = float(parts[2])
+    except ValueError:
+        return default
+    if fps <= 0:
+        return default
+    # Entier quand c'est un entier : le pod le passe à `render_usd.py --fps`,
+    # qui est `type=int`, et `int("60.0")` lève. Une cadence fractionnaire —
+    # 23.976 — reste un flottant et échouera là-bas, bruyamment, ce qui est la
+    # bonne façon de découvrir que ce chemin ne la porte pas encore.
+    return int(fps) if fps == int(fps) else fps
+
+
+def frames_of(trajectory):
+    """Combien de frames cette trajectoire décrit, quand elle le dit.
+
+    `None` pour les genres qui ne l'énoncent pas — on ne devine pas. Sert à
+    confronter `--frames`, qui est un argument séparé : rien n'obligeait les
+    deux à s'accorder, et le désaccord dans le sens court est muet. Une bande
+    de 7200 frames cuite `1:2880`, ce sont quarante-huit secondes de film
+    livrées pour deux minutes demandées, sans qu'aucun compteur ne s'en plaigne.
+    """
+    parts = (trajectory or "").split(":")
+    try:
+        if parts[0] == "pyrenees":
+            minutes = float(parts[1]) if len(parts) > 1 and parts[1] else 2.0
+            return round(minutes * 60.0 * fps_of(trajectory))
+        if parts[0] == "orbit":
+            return int(parts[1]) if len(parts) > 1 and parts[1] else 1440
+    except (ValueError, IndexError):
+        return None
+    return None
+
+
+def check_frames(trajectory, frames, say=print):
+    """Confronte `--frames` à ce que la trajectoire décrit.
+
+    Trop loin est une erreur : la bande n'a pas ces poses. Trop court est
+    légitime — on cuit une tranche exprès — mais doit se dire, parce que c'est
+    la seule différence entre une tranche voulue et un film amputé.
+    """
+    expected = frames_of(trajectory)
+    if expected is None:
+        return
+    last = frames.partition(":")[2] or frames
+    try:
+        last = int(last)
+    except ValueError:
+        return
+    if last > expected:
+        raise SystemExit(
+            f"--frames va jusqu'à {last} et la trajectoire n'en décrit que "
+            f"{expected} : la bande n'a pas ces poses")
+    if last < expected:
+        fps = fps_of(trajectory)
+        say(f"cuisson partielle: {last} frames sur {expected} "
+            f"({last / fps:.1f} s de film sur {expected / fps:.1f} s)")
+
+
 def assemble(run, fps=24):
     """Monte le film depuis les segments déposés sur R2.
 
@@ -1210,8 +1285,12 @@ def main():
         if not args.trajectory:
             raise SystemExit("--bake veut --trajectory (ex: "
                              "orbit:1440:2.17:42.52:8000:5000)")
+        check_frames(args.trajectory, args.frames)
         bake(args)
         return
+
+    if args.trajectory:
+        check_frames(args.trajectory, args.frames)
 
     # Pas de pack ? On le cuit, puis on rend ce qu'on vient de cuire.
     #
@@ -1316,6 +1395,15 @@ def main():
         env["JOB_TRAJECTORY"] = args.trajectory
         env["JOB_SSE"] = str(args.sse)
         env["JOB_VIEWPORT"] = args.viewport
+        # La cadence, tirée de la trajectoire — voir `fps_of`.
+        #
+        # `render_job.sh` la tenait pour 24, en dur, et s'en sert deux fois :
+        # pour générer les poses du manifeste, et pour le `-framerate` de
+        # ffmpeg sur chaque segment. Une trajectoire à 60 aurait donc produit
+        # des poses qui ne correspondent à aucune frame du pack — échec
+        # bruyant — et, si elle y avait survécu, un film de cinq minutes pour
+        # deux minutes de vol. Le second se serait appelé une réussite.
+        env["JOB_FPS"] = str(fps_of(args.trajectory))
     if args.ssh_pubkey:
         env["JOB_SSH_PUBKEY"] = args.ssh_pubkey
     if args.upload_url:
@@ -1454,7 +1542,7 @@ def main():
             # que le montage est ici et non dans le job — mais « ailleurs que
             # dans le job » ne veut pas dire « à la main ».
             print("montage des segments…", flush=True)
-            assemble(run)
+            assemble(run, fps=fps_of(args.trajectory))
         if bad:
             raise SystemExit(
                 "des tâches ont échoué — les journaux de chacune sont dans "
