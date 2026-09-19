@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_cesium_ion::{tms::TmsImagery, AssetEndpoint, IonClient, IonTerrainSource};
-use tuile_native_fetchers::NativeHttp;
+use tuile_native_fetchers::{NativeHttp, RetryConfig, TransportConfig};
 use tuile_core::offload;
 use tuile_planetary::{globe_on, GlobeOptions, ImageryDetail, LayerBudget};
 
@@ -248,12 +248,25 @@ async fn resolve(
     imagery_slots.set_unbounded();
     // One pooled, cached transport drives ion and Bing both, so they share a
     // connection pool and a cache rather than competing for sockets.
-    let http = Arc::new(
-        match &config.cache_dir {
-            Some(dir) => NativeHttp::new(dir).await,
-            None => NativeHttp::shared().await,
+    // Patient, parce qu'une cuisson est tout-ou-rien.
+    //
+    // Le défaut — trois tentatives, cinq secondes — est dimensionné pour un
+    // viewport, où une tuile qui ne vient pas vaut mieux sautée qu'attendue.
+    // Ici c'est l'inverse : personne ne regarde, la frame doit être exacte, et
+    // abandonner jette tout ce qui est déjà cuit. Le 19 septembre 2026 une
+    // cuisson est morte à la frame 2807 sur 2880, après vingt-sept minutes, sur
+    // un unique `http status 500`. Voir `RetryConfig::patient`.
+    let transport = TransportConfig {
+        retry: RetryConfig::patient(),
+        ..match &config.cache_dir {
+            Some(dir) => TransportConfig::at(dir),
+            None => TransportConfig::at(tuile_native_fetchers::default_cache_dir()),
         }
-        .map_err(|e| GlobeError::Transport(e.to_string()))?,
+    };
+    let http = Arc::new(
+        NativeHttp::with_transport(transport)
+            .await
+            .map_err(|e| GlobeError::Transport(e.to_string()))?,
     );
 
     let terrain = IonTerrainSource::new(
