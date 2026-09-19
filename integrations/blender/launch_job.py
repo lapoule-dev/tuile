@@ -1,29 +1,49 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # Copyright (c) lapoule.dev
-"""Launch a parametric render job on a RunPod GPU pod.
+"""Launch a parametric render job on rented GPUs.
 
-The seed of the farm submitter: one invocation = one pod = one video. Every
-render parameter and every sizing knob is a flag; the job itself is
-render_job.sh baked into the image, driven purely by environment.
+The farm submitter: one invocation = one render. Every render parameter and
+every sizing knob is a flag; the job itself is render_job.sh baked into the
+image, driven purely by environment.
 
-    ./launch_job.py --stage gate-anim-60s.usda --frames 1:1440 \
-        --gpu-type "NVIDIA GeForce RTX 5090" --gpu-count 4 \
-        --samples 128 --threshold 0.05 --extra "--demo-fixups"
+Two backends, and the difference between them is where the work is placed:
+
+**gcp** (default) — Cloud Run Jobs, N tasks, one whole L4 per task. The job is
+a durable resource described by Pulumi in `sportstracklive-rails/infra/
+render_farm.py`; this script only asks for *executions* of it. Chosen after
+RunPod handed out four hosts in a row with a partial machine — a driver procfs
+advertising GPUs the container had not been given, `cuInit` answering 999, and
+no line of ours able to cause it or cure it. Cloud Run's documentation is
+explicit where it matters: *"the GPU can only be attached to one container"*.
+
+    ./launch_job.py --frames 1:48 --engine hydra --tasks 3 \
+        --pack packs/019210eb75587aea/1-48.tuilepack --scene <digest>
+    ./launch_job.py --assemble <run-id>       # le montage, après coup
+
+**runpod** — one pod, N GPUs, M processes per GPU. Kept because it works, it
+is tested, and it becomes useful again the day their capacity and their GPU
+partitioning change.
+
+    ./launch_job.py --backend runpod --stage gate-anim-60s.usda \
+        --frames 1:1440 --gpu-type "NVIDIA GeForce RTX 5090" --gpu-count 4
 
 Credentials: RUNPOD_API_KEY from the environment or a .env file next to the
-repo root. Never printed.
+repo root; `gcloud auth login` for the Google side. Never printed.
 """
 
 import argparse
 import base64
 import gzip
+import hashlib
 import json
 import os
 import pathlib
+import re
 import secrets
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -118,10 +138,40 @@ def run_id(git_info):
     return f"{stamp}-{sha}{dirty}-{secrets.token_hex(2)}"
 
 
+def _gcloud_env():
+    """L'environnement d'un appel gcloud, avec un python qui existe.
+
+    Un terminal ouvert avant une mise à jour de Homebrew exporte encore un
+    `CLOUDSDK_PYTHON` supprimé depuis, et gcloud meurt sur
+    `exec: cannot execute` — une phrase qui ne parle pas d'authentification et
+    qu'on met dix minutes à relier à la bonne cause."""
+    env = dict(os.environ)
+    cloudsdk = env.get("CLOUDSDK_PYTHON", "")
+    if not cloudsdk or not os.access(cloudsdk, os.X_OK):
+        for candidate in ("/opt/homebrew/bin/python3.13", sys.executable):
+            if candidate and os.access(candidate, os.X_OK):
+                env["CLOUDSDK_PYTHON"] = candidate
+                break
+    return env
+
+
 def image_digest(image):
     """Le digest de l'image, pas seulement son tag — un tag bouge, et deux runs
     du même tag peuvent être deux binaires. Au mieux : l'absence de digest
     n'empêche pas de lancer, elle est dite."""
+    if "-docker.pkg.dev/" in image:
+        # Artifact Registry. Même raison qu'en dessous : le tag `5.1-su` a
+        # déjà désigné trois binaires différents cette semaine.
+        try:
+            out = subprocess.run(
+                ["gcloud", "artifacts", "docker", "images", "describe", image,
+                 "--format=value(image_summary.digest)"],
+                capture_output=True, text=True, timeout=60,
+                env=_gcloud_env())
+            digest = out.stdout.strip()
+            return digest if out.returncode == 0 and digest else None
+        except (OSError, subprocess.SubprocessError):
+            return None
     if ".dkr.ecr." not in image:
         return None
     repo, _, tag = image.partition(":")
@@ -203,8 +253,8 @@ def r2_credentials():
 ARCHIVE_OBJECTS = ("render.mp4", "logs.tar.gz", "trace.tar.gz", "profile.tar.gz")
 
 
-def archive_urls(run, segments=0):
-    """Les URL présignées où le pod déposera, et le client pour y écrire
+def archive_urls(run, segments=0, tasks=1):
+    """Les URL présignées où le job déposera, et le client pour y écrire
     nous-mêmes le manifeste.
 
     Échoue AVANT de créer le pod quand les identifiants manquent : payer une
@@ -243,6 +293,12 @@ def archive_urls(run, segments=0):
     # déjà rendues à un pod repris en cours de route.
     for i in range(segments):
         urls[f"seg{i}"] = put(f"seg{i}.mp4")
+    # Et une archive de journaux par tâche. Sans ça, N tâches écrivent sur la
+    # même clé et la survivante est celle qui a fini en dernier — jamais celle
+    # qui a échoué, qui est pourtant la seule qu'on voulait lire.
+    for t in range(tasks if tasks > 1 else 0):
+        for kind in ("logs", "trace", "profile"):
+            urls[f"{kind}-t{t}"] = put(f"{kind}-t{t}.tar.gz")
     return client, urls
 
 
@@ -388,9 +444,528 @@ def wait_until_it_renders(key, pod_id, patience=900):
     return "timeout", ""
 
 
+# -------------------------------------------------------------------- gcp --
+#
+# Cloud Run Jobs. Le job est une ressource durable, décrite par Pulumi
+# (`sportstracklive-rails/infra/render_farm.py`) ; ce qui suit n'en demande que
+# des *exécutions*. C'est le modèle natif du service, et il place la frontière
+# au bon endroit : Pulumi possède la forme d'une machine à rendre, le lanceur
+# en demande une instance avec l'environnement d'un run particulier.
+#
+# Par REST plutôt que par `gcloud run jobs execute` : le drapeau
+# `--update-env-vars` sépare ses variables par des virgules. Nos URL présignées
+# n'en contiennent pas aujourd'hui — R2 signe en hexadécimal — mais faire
+# dépendre un lancement de cette propriété-là est le genre de pari qui se perd
+# un mardi. Ce fichier parle déjà REST.
+
+GCP_PROJECT = os.environ.get("TUILE_GCP_PROJECT", "first-parser-498510-a4")
+GCP_REGION = os.environ.get("TUILE_GCP_REGION", "europe-west1")
+GCP_JOB = os.environ.get("TUILE_GCP_JOB", "tuile-render")
+GCP_BAKE_JOB = os.environ.get("TUILE_GCP_BAKE_JOB", "tuile-bake")
+RUN_API = "https://run.googleapis.com/v2"
+
+
+def gcp_token():
+    """Le jeton d'accès de l'utilisateur, par gcloud.
+
+    Plutôt que `google-auth` : rien à installer, et le compte est déjà celui
+    qui s'est authentifié dans un navigateur. Le jeton vit une heure, n'est
+    stocké nulle part et ne traverse jamais l'environnement d'une tâche —
+    Cloud Run tire l'image avec l'identité du job, pas avec celle-ci.
+
+    `CLOUDSDK_PYTHON` est forcé quand celui de l'environnement ne s'exécute
+    pas : un terminal ouvert avant une mise à jour de Homebrew exporte encore
+    un python qui n'existe plus, et gcloud meurt sur `exec: cannot execute`
+    dans une phrase qui ne parle pas d'authentification.
+    """
+    try:
+        out = subprocess.run(["gcloud", "auth", "print-access-token"],
+                             capture_output=True, text=True, timeout=60,
+                             env=_gcloud_env())
+    except (OSError, subprocess.SubprocessError) as e:
+        raise SystemExit(f"gcloud injoignable: {e}")
+    if out.returncode != 0:
+        raise SystemExit(
+            "gcloud ne rend pas de jeton — `gcloud auth login` puis "
+            f"`gcloud config set project {GCP_PROJECT}`.\n"
+            + out.stderr.strip())
+    return out.stdout.strip()
+
+
+def gcp_call(method, path, body=None, token=None):
+    """Un appel à l'API Cloud Run. Même discipline que `call` côté RunPod :
+    une erreur est une phrase lisible, pas une trace.
+
+    une erreur est une phrase lisible, pas une trace."""
+    minted = token or gcp_token()
+    url = path if path.startswith("http") else f"{RUN_API}/{path.lstrip('/')}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Authorization": f"Bearer {minted}",
+                 "Content-Type": "application/json",
+                 "User-Agent": "tuile-launch-job/1.0"})
+    try:
+        with urllib.request.urlopen(req) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")
+        try:
+            detail = json.loads(detail)["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            pass
+        raise SystemExit(f"{method} {url} → {e.code}: {detail}")
+    # Un 200 sans corps est une réussite, pas un JSON tronqué : `:cancel`
+    # répond parfois vide, et json.loads("") a déjà fait passer un
+    # `--kill-all` réussi pour une panne.
+    return json.loads(raw) if raw.strip() else {}
+
+
+def gcp_job_path(job=None):
+    job = job or GCP_JOB
+    return f"projects/{GCP_PROJECT}/locations/{GCP_REGION}/jobs/{job}"
+
+
+def gcp_image_of_job(token=None):
+    """L'image que le job lancera vraiment.
+
+    Demandée au job plutôt que reconstruite ici. Le manifeste d'un run doit
+    dire ce qui a tourné, et une chaîne fabriquée côté lanceur dit seulement ce
+    que le lanceur croyait. Les deux ont divergé le jour où le tag a changé
+    dans Pulumi et pas dans le script."""
+    job = gcp_call("GET", gcp_job_path(), token=token)
+    containers = (((job.get("template") or {}).get("template") or {})
+                  .get("containers") or [])
+    if not containers or not containers[0].get("image"):
+        raise SystemExit(
+            f"le job {GCP_JOB} ne déclare pas d'image — "
+            "`pulumi up` dans sportstracklive-rails/infra a-t-il abouti ?")
+    return containers[0]["image"]
+
+
+def gcp_executions(token=None, job=None):
+    """Les exécutions du job, de la plus récente à la plus ancienne.
+
+    Lève sur une forme inattendue plutôt que de rendre une liste vide. Un
+    `--list` qui a répondu « aucun pod » pendant que six tournaient a coûté
+    dix-huit dollars et une nuit : une réponse qu'on ne sait pas lire n'est
+    pas une absence."""
+    data = gcp_call("GET", f"{gcp_job_path(job)}/executions?pageSize=50", token=token)
+    if not isinstance(data, dict):
+        raise SystemExit(f"réponse inattendue de executions.list: {data!r:.200}")
+    if "executions" not in data:
+        # Une liste vide est légitime ; une clé absente peut l'être aussi
+        # (l'API omet le champ quand il n'y a rien). On distingue les deux par
+        # la présence d'autre chose que la pagination.
+        unexpected = set(data) - {"nextPageToken"}
+        if unexpected:
+            raise SystemExit(
+                "executions.list a répondu une forme inconnue "
+                f"({sorted(data)}) — refus de conclure au vide")
+        return []
+    rows = data["executions"]
+    if not isinstance(rows, list):
+        raise SystemExit(f"executions n'est pas une liste: {type(rows)}")
+    return rows
+
+
+def gcp_execution_line(ex):
+    """Une exécution en une ligne lisible."""
+    short = ex.get("name", "?").rsplit("/", 1)[-1]
+    done = ex.get("completionTime")
+    state = "terminée" if done else ("en cours" if ex.get("runningCount")
+                                     else "en attente")
+    return (f"{short}  {state}  "
+            f"{ex.get('succeededCount', 0)}✓ "
+            f"{ex.get('failedCount', 0)}✗ "
+            f"{ex.get('runningCount', 0)}⟳ "
+            f"de {ex.get('taskCount', '?')}  "
+            f"{ex.get('createTime', '')[:19]}")
+
+
+def gcp_run(env, tasks, dry_run=False, token=None, job=None):
+    """Demande une exécution du job, avec l'environnement de ce run.
+
+    `env` est fusionné avec celui de l'image, pas substitué — le job n'en
+    définit aucun, donc c'est équivalent, mais c'est la sémantique de l'API et
+    il vaut mieux la connaître que la découvrir.
+
+    Toutes les tâches reçoivent le MÊME environnement : l'API n'a pas de
+    surcharge par tâche. C'est pour ça que `render_job.sh` calcule sa tranche
+    à partir de `CLOUD_RUN_TASK_INDEX` au lieu de la recevoir."""
+    body = {
+        "overrides": {
+            "containerOverrides": [
+                {"env": [{"name": k, "value": str(v)} for k, v in env.items()]}
+            ],
+            "taskCount": tasks,
+        }
+    }
+    if dry_run:
+        body["validateOnly"] = True
+    op = gcp_call("POST", f"{gcp_job_path(job)}:run", body, token=token)
+    if dry_run:
+        return None
+    # La réponse est une Operation ; l'exécution en cours de création est dans
+    # ses métadonnées. On ne l'attend pas : elle existe déjà, et ce qu'on veut
+    # est son nom pour la suivre.
+    name = (op.get("metadata") or {}).get("name") or op.get("name", "")
+    if not name:
+        raise SystemExit(f"executions:run n'a pas nommé d'exécution: {op!r:.300}")
+    return name
+
+
+def gcp_watch(execution, token=None, every=20):
+    """Suit une exécution jusqu'à ce qu'elle finisse, en disant ce qui bouge.
+
+    Ne rend la main que sur un état terminal : une tâche qui tourne encore est
+    une tâche qui facture, et sortir d'ici sans le dire laisserait croire que
+    c'est fini."""
+    import time
+    last = ""
+    minted = time.time()
+    while True:
+        # Le jeton vit une heure, un rendu peut vivre plus longtemps.
+        #
+        # Il était pris une fois au lancement et réutilisé pour tout le suivi.
+        # Mesuré le 16 septembre 2026 : au bout d'une heure, « 401: Request had
+        # invalid authentication credentials » a tué le lanceur en plein
+        # rendu — et avec lui le montage qui devait suivre, alors que les
+        # trois tâches travaillaient encore.
+        if time.time() - minted > 45 * 60:
+            token = gcp_token()
+            minted = time.time()
+        ex = gcp_call("GET", execution, token=token)
+        line = gcp_execution_line(ex)
+        if line != last:
+            print(f"  {line}", flush=True)
+            last = line
+        if ex.get("completionTime"):
+            ok = ex.get("succeededCount", 0)
+            bad = ex.get("failedCount", 0) + ex.get("cancelledCount", 0)
+            if ex.get("logUri"):
+                print(f"  journaux: {ex['logUri']}", flush=True)
+            return ok, bad
+        time.sleep(every)
+
+
+def pack_key(args):
+    """Où le pack sera déposé, calculé AVANT de lancer quoi que ce soit.
+
+    Le nom vient des **paramètres de cuisson** — la trajectoire, la plage, le
+    viewport, la tolérance — et de rien d'autre. Ils sont connus du lanceur et
+    du job, à l'identique, avant que le premier octet soit tiré.
+
+    # Pourquoi pas le digest de scène
+
+    Le digest que `tuile-bake` calcule décrit les poses **et les réglages
+    résolus**, donc il n'existe qu'une fois le job démarré. Nommer l'objet avec
+    lui obligeait à déposer ailleurs, lire `BAKE-KEY` dans les journaux, puis
+    copier — trois étapes dont les deux dernières vivaient dans le processus
+    du lanceur. Mesuré le 16 septembre : le lanceur s'est arrêté entre la
+    cuisson et la copie, et un pack de deux gigaoctets parfaitement valide est
+    resté sous une clef que personne ne cherche. Un rangement qui dépend qu'une
+    fenêtre de terminal reste ouverte n'est pas un rangement.
+
+    Le digest ne disparaît pas pour autant : il reste **dans** le pack, et
+    c'est lui que `--scene` vérifie à l'ouverture. Le nom dit où ranger, le
+    digest dit ce que c'est — deux questions, deux réponses.
+    """
+    first, _, last = args.frames.partition(":")
+    canonical = "\n".join([
+        f"trajectory={args.trajectory}",
+        f"frames={args.frames}",
+        f"viewport={args.viewport}",
+        f"sse={args.sse}",
+        # Le boost d'imagerie change le CONTENU cuit — il décide de combien de
+        # niveaux l'imagerie peut descendre sous le terrain — donc il doit
+        # changer le nom. Une clé qui ignore un paramètre de cuisson finit par
+        # servir un pack pour un autre.
+        f"imagery_boost={args.imagery_boost}",
+        # Les sources. Deux packs de la même trajectoire drapés d'imageries
+        # différentes ne sont pas le même pack, et doivent porter deux noms.
+        f"imagery={args.imagery}",
+        f"terrain={args.terrain}",
+    ])
+    name = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+    return f"packs/{name}/{first}-{last}.tuilepack"
+
+
+def pack_exists(key):
+    """Un pack déjà cuit sous cette clef ?"""
+    import boto3
+    from botocore.config import Config as BotoConfig
+    access, secret = r2_credentials()
+    if not access or not secret:
+        return False
+    client = boto3.client(
+        "s3", endpoint_url=f"https://{R2_ACCOUNT}.r2.cloudflarestorage.com",
+        aws_access_key_id=access, aws_secret_access_key=secret,
+        region_name="auto", config=BotoConfig(signature_version="s3v4"))
+    try:
+        client.head_object(Bucket=R2_BUCKET, Key=key)
+        return True
+    except Exception:
+        return False
+
+
+def scene_digest_of(key):
+    """Le digest de scène déposé par la cuisson, à côté du pack.
+
+    Il ne se déduit pas des paramètres : il couvre aussi les réglages de
+    traversée **résolus**, que seul le job qui cuit connaît. Sans lui, un rendu
+    ne peut pas vérifier qu'on lui donne le bon globe — et c'est la seule
+    barrière entre un pack et une autre scène."""
+    import boto3
+    from botocore.config import Config as BotoConfig
+    access, secret = r2_credentials()
+    if not access or not secret:
+        return ""
+    client = boto3.client(
+        "s3", endpoint_url=f"https://{R2_ACCOUNT}.r2.cloudflarestorage.com",
+        aws_access_key_id=access, aws_secret_access_key=secret,
+        region_name="auto", config=BotoConfig(signature_version="s3v4"))
+    try:
+        body = client.get_object(Bucket=R2_BUCKET, Key=key + ".scene")["Body"]
+        return body.read().decode().strip()
+    except Exception:
+        return ""
+
+
+def bake_env(args, ion, pack_url, scene_url, logs_url):
+    """Tout ce que le job de cuisson lit dans son environnement.
+
+    Une fonction de ses arguments, parce que l'alternative est que le seul
+    moyen de voir ce qu'on dit à une cuisson soit d'en lancer une.
+    `--resident-gb` était accepté, recopié dans le manifeste, et abandonné
+    en silence sur ce chemin — précisément pour cette raison : rien ne
+    pouvait regarder.
+    """
+    return {
+        "JOB_FRAMES": args.frames,
+        "JOB_TRAJECTORY": args.trajectory,
+        "JOB_VIEWPORT": args.viewport,
+        "JOB_SSE": str(args.sse),
+        "TUILE_IMAGERY_BOOST": str(args.imagery_boost),
+        "JOB_IMAGERY_ASSET": str(args.imagery) if args.imagery else "",
+        "JOB_TERRAIN_ASSET": str(args.terrain) if args.terrain else "",
+        "JOB_PACK_PUT_URL": pack_url,
+        # Le digest de scène, déposé à côté du pack par le job.
+        #
+        # Il ne se déduit pas des paramètres : il porte aussi les réglages de
+        # traversée résolus, que seul le job connaît. Sans ce fichier, un rendu
+        # ne pourrait pas passer `--scene`, et on perdrait la seule barrière
+        # entre un pack et le mauvais globe.
+        "JOB_SCENE_PUT_URL": scene_url,
+        "JOB_LOGS_PUT_URL": logs_url,
+        "TUILE_ION_TOKEN": ion,
+        # Le budget de tuiles résidentes, que la cuisson ne recevait pas.
+        #
+        # `--resident-gb` n'était posé que dans les deux branches `--engine
+        # hydra`, c'est-à-dire pour le rendu : une cuisson tournait donc au
+        # défaut du code, 4 GiB, dans un conteneur qui en a 32. Mesuré le
+        # 19 septembre 2026 — `resident_gib=3.76` collé au plafond pendant que
+        # `loads_started` montait à 134 720 pour 234 tuiles sélectionnées. Le
+        # cache évinçait ce dont la frame avait besoin et la traversée le
+        # redemandait, quarante-cinq fois par tuile, sans jamais converger.
+        "TUILE_RESIDENT_BUDGET_GB": str(args.resident_gb),
+    }
+
+def bake(args, token=None):
+    """Lance le job A : cuire une trajectoire en un pack, déposé sur R2.
+
+    La moitié qui produit l'archive. Elle porte le jeton, parle au réseau, et
+    n'a aucun usage d'un GPU — c'est pour ça qu'elle est un job à part, sans
+    carte, et non une phase du rendu.
+
+    Le pack est déposé par le job lui-même, sur une URL présignée calculée
+    d'avance : aucun identifiant R2 n'atteint jamais la machine, et rien ne
+    reste à faire une fois la tâche finie. Le lanceur peut mourir à tout
+    moment après le lancement sans que le résultat en souffre.
+    """
+    token = token or gcp_token()
+
+    # Le jeton ion, depuis l'environnement ou le .env du dépôt. Il voyage
+    # d'environnement à environnement et n'est jamais imprimé — même
+    # discipline que partout ailleurs ici.
+    ion = os.environ.get("CESIUM_ION_TOKEN", "")
+    if not ion:
+        root = pathlib.Path(__file__).resolve()
+        for parent in root.parents:
+            dotenv = parent / ".env"
+            if dotenv.is_file():
+                for line in dotenv.read_text().splitlines():
+                    if line.startswith("CESIUM_ION_TOKEN="):
+                        ion = line.split("=", 1)[1].strip()
+                break
+    if not ion:
+        raise SystemExit("CESIUM_ION_TOKEN introuvable (env ou .env) — "
+                         "une cuisson ne cuit pas sans")
+
+    git_info = git_state()
+    run = run_id(git_info)
+    client, urls = archive_urls(run, 0, 1)
+    key = pack_key(args)
+
+    def put(name):
+        return client.generate_presigned_url(
+            "put_object", Params={"Bucket": R2_BUCKET, "Key": name},
+            ExpiresIn=7 * 24 * 3600)
+
+    env = bake_env(args, ion, put(key), put(key + ".scene"),
+                   urls["logs.tar.gz"])
+    for pair in args.env:
+        k, _, v = pair.partition("=")
+        if not k or not v:
+            raise SystemExit(f"--env attend K=V, reçu: {pair}")
+        env[k] = v
+
+    manifest = {
+        "run_id": run,
+        "launched_utc": datetime.now(timezone.utc).isoformat(),
+        "argv": sys.argv[1:],
+        "git": git_info,
+        "kind": "bake",
+        "pack_key": key,
+        "job_env": redacted(env),
+    }
+    client.put_object(
+        Bucket=R2_BUCKET, Key=f"{R2_PREFIX}/{run}/config.json",
+        Body=json.dumps(manifest, indent=2, sort_keys=True).encode(),
+        ContentType="application/json")
+    print(f"archive: s3://{R2_BUCKET}/{R2_PREFIX}/{run}/", flush=True)
+    print(f"pack:    s3://{R2_BUCKET}/{key}", flush=True)
+
+    name = gcp_run(env, 1, dry_run=args.dry_run, token=token, job=GCP_BAKE_JOB)
+    if name is None:
+        print("validateOnly: la demande est acceptée, rien n'a tourné.")
+        return
+    print(f"exécution: {name.rsplit('/', 1)[-1]}  cuisson {args.frames}",
+          flush=True)
+    print(f"rendre avec: --pack {key}", flush=True)
+    ok, bad = gcp_watch(name, token=token)
+    print(f"{ok} réussie(s), {bad} en échec", flush=True)
+    if bad:
+        raise SystemExit(
+            f"la cuisson a échoué — journaux dans "
+            f"s3://{R2_BUCKET}/{R2_PREFIX}/{run}/logs.tar.gz")
+
+def assemble(run, fps=24):
+    """Monte le film depuis les segments déposés sur R2.
+
+    Hors du job, et c'est délibéré : avec plusieurs tâches, aucune ne voit tous
+    les segments. Les concaténer dans la tâche produirait N films d'un N-ième
+    chacun, déposés les uns sur les autres. Ici on les relit, dans l'ordre de
+    leur numéro global — celui que `render_job.sh` leur donne — et le montage
+    peut se faire longtemps après que la dernière tâche a rendu la main. C'est
+    le point : personne n'a besoin de regarder à la fin."""
+    import boto3
+    from botocore.config import Config as BotoConfig
+    key, secret = r2_credentials()
+    if not key or not secret:
+        raise SystemExit("identifiants R2 introuvables — rien à monter")
+    client = boto3.client(
+        "s3", endpoint_url=f"https://{R2_ACCOUNT}.r2.cloudflarestorage.com",
+        aws_access_key_id=key, aws_secret_access_key=secret,
+        region_name="auto", config=BotoConfig(signature_version="s3v4"))
+    prefix = f"{R2_PREFIX}/{run}/"
+    found = {}
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            name = obj["Key"][len(prefix):]
+            m = re.fullmatch(r"seg(\d+)\.mp4", name)
+            if m and obj["Size"] > 1000:
+                found[int(m.group(1))] = obj["Key"]
+    if not found:
+        raise SystemExit(f"aucun segment dans s3://{R2_BUCKET}/{prefix}")
+    # Un trou dans la numérotation est un rendu incomplet. On le dit et on
+    # monte quand même ce qu'on a : un film court dont on connaît le défaut
+    # vaut mieux qu'un refus, et infiniment mieux qu'un film court qu'on croit
+    # entier.
+    order = sorted(found)
+    gaps = [i for i in range(order[0], order[-1] + 1) if i not in found]
+    if gaps:
+        print(f"SEGMENTS-MANQUANTS: {gaps} — le film sera incomplet")
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix=f"tuile-assemble-{run}-"))
+    listing = tmp / "list.txt"
+    with listing.open("w") as fh:
+        for i in order:
+            local = tmp / f"seg{i}.mp4"
+            client.download_file(R2_BUCKET, found[i], str(local))
+            fh.write(f"file '{local}'\n")
+    print(f"{len(order)} segments récupérés dans {tmp}")
+    out = tmp / "render.mp4"
+    done = subprocess.run(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listing),
+         "-c", "copy", str(out)], capture_output=True, text=True)
+    if done.returncode != 0 or not out.exists():
+        raise SystemExit("ffmpeg concat a échoué:\n" + done.stderr[-2000:])
+    frames = subprocess.run(
+        ["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+         "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(out)],
+        capture_output=True, text=True).stdout.strip()
+    size_mb = out.stat().st_size / 1e6
+    print(f"film: {frames or '?'} frames, {size_mb:.1f} Mo")
+    client.upload_file(str(out), R2_BUCKET, f"{prefix}render.mp4",
+                       ExtraArgs={"ContentType": "video/mp4"})
+    print(f"déposé: s3://{R2_BUCKET}/{prefix}render.mp4")
+
+    # Et on la regarde.
+    #
+    # Voir CLAUDE.md : un rendu est une image, et tous les instruments qui
+    # remplacent le fait de la regarder ont déjà menti ici — `RENDER-DONE` sur
+    # quatre cinquièmes de film manquant, `frames: 2/2` sur un globe
+    # entièrement rose, un journal vert sur une texture jamais branchée.
+    try:
+        subprocess.run(["open", str(out)], check=False, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return out
+
+
+def segment_count(backend, tasks, gpu_count, procs_per_gpu):
+    """Combien de segments un run produira, tous processus et toutes tâches
+    confondus.
+
+    Les deux fournisseurs comptent différemment, et c'est la seule chose qui
+    les distingue ici :
+
+      runpod   un pod, N GPU, M processus par GPU      → N × M
+      gcp      T tâches, UN GPU chacune, M processus   → T × M
+
+    Le nombre importe parce qu'il fixe le nombre d'URL présignées. Une de trop
+    ne coûte rien ; une de moins et le dernier processus rend un segment qu'il
+    ne peut déposer nulle part, ce qui ne se voit qu'au montage."""
+    per_task = procs_per_gpu if backend == "gcp" else gpu_count * procs_per_gpu
+    return per_task * (tasks if backend == "gcp" else 1)
+
+
+def backend_of(argv):
+    """Le fournisseur, lu avant argparse.
+
+    `--list` et `--kill-all` sont traités avant le parseur — ils doivent
+    marcher même quand le lancement est cassé — et ils ont pourtant besoin de
+    savoir à qui parler."""
+    for i, a in enumerate(argv):
+        if a == "--backend" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--backend="):
+            return a.split("=", 1)[1]
+    return "gcp"
+
+
 def main():
+    # Le montage, séparé du rendu : aucune tâche ne voit tous les segments, et
+    # celui-ci peut tourner des heures après que la dernière a rendu la main.
+    if len(sys.argv) > 2 and sys.argv[1] == "--assemble":
+        assemble(sys.argv[2])
+        return
+
     # Deux verbes avant tout le reste, parce qu'ils doivent marcher même quand
     # le lancement est cassé : voir ce qui tourne, et tout arrêter.
+    #
+    # (`--bake` est parsé plus bas, avec le reste : il prend des paramètres.)
     if len(sys.argv) > 1 and sys.argv[1] == "--capacity":
         # Ce que la console montre sur son écran de déploiement, en une
         # commande rejouable. La capacité a coûté plus de temps que n'importe
@@ -421,6 +996,38 @@ def main():
         return
 
     if len(sys.argv) > 1 and sys.argv[1] in ("--list", "--kill-all"):
+        if backend_of(sys.argv) == "gcp":
+            token = gcp_token()
+            rows = gcp_executions(token)
+            live = [e for e in rows if not e.get("completionTime")]
+            if not rows:
+                # « Aucune exécution » et « aucun job » se ressemblent trop :
+                # executions.list sur un job absent répond une liste vide, pas
+                # un 404. La confusion inverse a coûté dix-huit dollars côté
+                # RunPod, où six pods tournaient pendant qu'on lisait zéro.
+                # Un appel de plus, dans le seul cas où il est gratuit.
+                try:
+                    gcp_call("GET", gcp_job_path(), token=token)
+                except SystemExit:
+                    print(f"le job {GCP_JOB} n'existe pas dans "
+                          f"{GCP_PROJECT}/{GCP_REGION} — `pulumi up` dans "
+                          "sportstracklive-rails/infra")
+                    return
+                print("aucune exécution")
+                return
+            for ex in rows[:20]:
+                print(gcp_execution_line(ex))
+            if sys.argv[1] == "--kill-all":
+                if not live:
+                    print("rien en cours — aucune seconde de GPU en jeu")
+                    return
+                for ex in live:
+                    gcp_call("POST", f"{ex['name']}:cancel", {}, token=token)
+                    print(f"annulée {ex['name'].rsplit('/', 1)[-1]}")
+                still = [e for e in gcp_executions(token)
+                         if not e.get("completionTime")]
+                print(f"encore en cours: {len(still)}")
+            return
         key = api_key()
         pods = all_pods(key)
         if not pods:
@@ -440,6 +1047,28 @@ def main():
         return
 
     p = argparse.ArgumentParser()
+    p.add_argument("--backend", default="gcp", choices=["gcp", "runpod"],
+                   help="où le rendu a lieu. gcp = Cloud Run Jobs, une tâche "
+                        "= un L4 entier, facturé à la seconde ; l'image et la "
+                        "taille de machine viennent du job décrit par Pulumi, "
+                        "pas d'ici. runpod = un pod, N GPU, M processus par "
+                        "GPU — conservé parce qu'il marche, et parce que leur "
+                        "découpage GPU finira par changer.")
+    p.add_argument("--tasks", type=int, default=1, metavar="N",
+                   help="(gcp) tâches parallèles, un GPU chacune. Le quota "
+                        "accordé d'office est de 3 GPU ; au-delà il faut le "
+                        "demander. Chaque tâche calcule sa tranche de "
+                        "--frames depuis CLOUD_RUN_TASK_INDEX, et le montage "
+                        "se fait après coup par --assemble.")
+    p.add_argument("--bake", action="store_true",
+                   help="lance le job A — cuire --trajectory en un pack et le "
+                        "déposer sur R2 — au lieu de rendre. Pas de GPU : "
+                        "cette moitié traverse le globe et tire les tuiles, "
+                        "l'autre ne fait que lire ce qu'elle a laissé. "
+                        "--scene donne le digest sous lequel déposer.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="(gcp) valide la demande sans exécuter — validateOnly. "
+                        "Une erreur de forme se paie zéro seconde de L4.")
     p.add_argument("--stage", default="", help=".usda à rendre (embarquée gzip+b64)")
     p.add_argument("--stage-url", default="",
                    help="URL GET (présignée) du .usda — la voie des vraies "
@@ -448,6 +1077,26 @@ def main():
                    help="la voie générative : le pod fabrique son manifeste "
                         "(ex: orbit:1440:2.17:42.52:8000:5000, zoom:64)")
     p.add_argument("--sse", type=float, default=3.0)
+    p.add_argument("--imagery", type=int, default=0, metavar="ASSET",
+                   help="l'asset ion d'imagerie. 0 = le défaut du bake (2, "
+                        "Bing Aerial) ; 3954 = Sentinel-2 cloudless d'EOX, "
+                        "dont le descripteur plafonne au niveau 13 ; négatif = "
+                        "pas d'imagerie du tout, la vue géométrique. La valeur "
+                        "entre dans la clé du pack et dans le digest de scène.")
+    p.add_argument("--terrain", type=int, default=0, metavar="ASSET",
+                   help="l'asset ion de terrain. 0 = le défaut du bake (1, "
+                        "Cesium World Terrain).")
+    p.add_argument("--imagery-boost", type=int, default=1, metavar="N",
+                   help="de combien de niveaux l'imagerie peut descendre sous "
+                        "le terrain, à la cuisson. Le défaut du code est 1, "
+                        "choisi pour une machine de bureau : le commentaire de "
+                        "`globe.rs` raconte un essai local monté à 60 Go. Un "
+                        "job de ferme a 32 Gio — mais mesuré le 17 septembre "
+                        "2026, 2 fait tuer la cuisson (SIGKILL) sauf à baisser "
+                        "TUILE_PINNED_LEVEL, et coûte alors 65 min et 11,3 Go "
+                        "pour une minute de film, contre 32 min et 2,1 Go. "
+                        "Chaque niveau quadruple l'imagerie par tuile, et la "
+                        "valeur entre dans la clé du pack.")
     p.add_argument("--viewport", default="1280x960")
     p.add_argument("--frames", required=True, help="A:B inclus")
     p.add_argument("--name", default="render-job")
@@ -523,6 +1172,12 @@ def main():
     p.add_argument("--threshold", type=float, default=0.05)
     p.add_argument("--batch-frames", type=int, default=60)
     p.add_argument("--extra", default="", help="args supplémentaires de render_usd.py")
+    p.add_argument("--blender-args", default="",
+                   help="args supplémentaires de BLENDER, avant -P — pas du "
+                        "script. C'est par là que passe `--debug-cycles` : "
+                        "Cycles ne journalise que si la ligne de commande le "
+                        "demande, et un rendu qui ne démarre pas est sinon "
+                        "parfaitement muet.")
     p.add_argument("--ssh-pubkey", default="",
                    help="clé publique à autoriser (rapatriement scp)")
     p.add_argument("--trace", action="store_true",
@@ -546,6 +1201,44 @@ def main():
                    help="TUILE_PROFILE du pod (ex: cpu,heap) — les "
                         "flamegraphs remontent dans profile.tar.gz")
     args = p.parse_args()
+
+    # Cuire est un autre job, pas une option du rendu : autre point d'entrée,
+    # autre machine, aucune carte. Rien de ce qui suit ne le concerne.
+    if args.bake:
+        if args.backend != "gcp":
+            raise SystemExit("--bake n'existe que sur gcp")
+        if not args.trajectory:
+            raise SystemExit("--bake veut --trajectory (ex: "
+                             "orbit:1440:2.17:42.52:8000:5000)")
+        bake(args)
+        return
+
+    # Pas de pack ? On le cuit, puis on rend ce qu'on vient de cuire.
+    #
+    # La chaîne va des paramètres de scène au mp4 sur R2, en une invocation :
+    #
+    #     paramètres → bake (job A) → tuilepack sur R2
+    #                → render (job B) → segments → montage → mp4 sur R2
+    #
+    # Le pack est nommé d'après les paramètres de cuisson, donc la clef est
+    # connue d'avance et une scène déjà cuite est réutilisée telle quelle —
+    # recuire 1440 frames pour rendre deux fois le même plan serait treize
+    # minutes et une poignée de dollars jetés.
+    if args.backend == "gcp" and args.engine == "hydra" and not args.pack:
+        if not args.trajectory:
+            raise SystemExit(
+                "--engine hydra sur gcp veut --trajectory (la scène) ou "
+                "--pack (une scène déjà cuite)")
+        key = pack_key(args)
+        if pack_exists(key):
+            print(f"pack déjà cuit: {key}", flush=True)
+        else:
+            print(f"pack absent, cuisson d'abord: {key}", flush=True)
+            bake(args)
+        args.pack = key
+        if not args.scene:
+            args.scene = scene_digest_of(key)
+
     if not args.gpu_type:
         # Du moins cher au plus cher. La 4090 n'est pas Blackwell : elle rendra
         # par OptiX (PTX compilé par le pilote) et jamais par le backend CUDA
@@ -557,13 +1250,30 @@ def main():
     if args.engine == "hydra" and args.image == p.get_default("image"):
         args.image = ECR_HOST + "/stl/blender-globe:5.1-su"
 
-    key = api_key()
-    regs = call(key, "GET", "/registries")
-    reg = next((r for r in regs.get("registries", [])
-                if r.get("name") == args.registry_name), None)
-    if reg is None:
-        raise SystemExit(f"credential registre '{args.registry_name}' absent — "
-                         "à créer une fois (secret hors conversation)")
+    key = reg = None
+    if args.backend == "runpod":
+        key = api_key()
+        regs = call(key, "GET", "/registries")
+        reg = next((r for r in regs.get("registries", [])
+                    if r.get("name") == args.registry_name), None)
+        if reg is None:
+            raise SystemExit(
+                f"credential registre '{args.registry_name}' absent — "
+                "à créer une fois (secret hors conversation)")
+    else:
+        # Une tâche Cloud Run reçoit un GPU entier, par contrat. Le reste des
+        # drapeaux de dimensionnement décrit la machine, et la machine est
+        # décrite par Pulumi : les accepter ici ferait croire qu'ils agissent.
+        if args.gpu_count != 1:
+            raise SystemExit(
+                "--gpu-count n'a pas de sens sur gcp : une tâche = un GPU. "
+                "C'est --tasks qui donne le parallélisme.")
+        if args.tasks < 1:
+            raise SystemExit("--tasks doit valoir au moins 1")
+        # `containerOverrides` ne porte pas d'image : celle qui tourne est
+        # celle du job, poussée par build-push.sh --gcp dans le dépôt que
+        # render_farm.py nomme. Le dire plutôt que de laisser croire.
+        args.image = gcp_image_of_job()
 
     if not args.stage and not args.stage_url and not args.trajectory:
         raise SystemExit("--stage, --stage-url ou --trajectory requis")
@@ -587,10 +1297,15 @@ def main():
         "JOB_WIDTH": str(args.width),
         "JOB_SAMPLES": str(args.samples),
         "JOB_THRESHOLD": str(args.threshold),
-        "JOB_GPUS": str(args.gpu_count),
+        # Sur gcp, une tâche voit exactement un GPU — c'est le contrat du
+        # service, et la sonde `probe: NGPU 1` doit le confirmer. Sur runpod
+        # c'est ce qu'on a demandé, et la même sonde a passé quatre soirées à
+        # dire non.
+        "JOB_GPUS": "1" if args.backend == "gcp" else str(args.gpu_count),
         "JOB_PROCS_PER_GPU": str(args.procs_per_gpu),
         "JOB_BATCH_FRAMES": str(args.batch_frames),
         "JOB_EXTRA_ARGS": args.extra,
+        "JOB_BLENDER_ARGS": args.blender_args,
         "JOB_OUT": "/out/render.mp4",
     }
     if stage_b64:
@@ -651,15 +1366,41 @@ def main():
     # qui ne laisse rien n'a pas de raison d'exister.
     git_info = git_state()
     run = run_id(git_info)
-    segments = args.gpu_count * args.procs_per_gpu
-    manifest_client, urls = archive_urls(run, segments)
+    manifest_digest = image_digest(args.image)
+    tasks = args.tasks if args.backend == "gcp" else 1
+    # Un segment par processus, sur toutes les tâches. Leur numéro est global :
+    # la tâche t produit t*procs .. (t+1)*procs-1, et c'est ce qui permet à
+    # --assemble de les remettre dans l'ordre sans demander qui a fait quoi.
+    segments = segment_count(args.backend, tasks, args.gpu_count,
+                             args.procs_per_gpu)
+    manifest_client, urls = archive_urls(run, segments, tasks)
     if not args.upload_url:
         env["JOB_UPLOAD_PUT_URL"] = urls["render.mp4"]
     env["JOB_LOGS_PUT_URL"] = urls["logs.tar.gz"]
     env["JOB_TRACE_PUT_URL"] = urls["trace.tar.gz"]
     env["JOB_PROFILE_PUT_URL"] = urls["profile.tar.gz"]
+    for t in range(tasks if tasks > 1 else 0):
+        env[f"JOB_LOGS_PUT_URL_{t}"] = urls[f"logs-t{t}"]
+        env[f"JOB_TRACE_PUT_URL_{t}"] = urls[f"trace-t{t}"]
+        env[f"JOB_PROFILE_PUT_URL_{t}"] = urls[f"profile-t{t}"]
     for i in range(segments):
         env[f"JOB_SEG_PUT_URL_{i}"] = urls[f"seg{i}"]
+    # Le cache OptiX, partagé entre exécutions.
+    #
+    # La clef porte la carte ET le digest de l'image : un changement de noyaux
+    # ou de carte doit invalider le cache, pas le réutiliser de travers. Le GET
+    # peut échouer — la première fois, il n'y a rien — et le job le traite comme
+    # un cache vide, ce qui est exactement ce que c'est.
+    accel = "nvidia-l4" if args.backend == "gcp" else "runpod"
+    digest = (manifest_digest or "nodigest").replace(":", "-")[:19]
+    optix_key = f"cache/optix/{accel}-{digest}.tar.gz"
+    env["JOB_OPTIX_CACHE_GET_URL"] = manifest_client.generate_presigned_url(
+        "get_object", Params={"Bucket": R2_BUCKET, "Key": optix_key},
+        ExpiresIn=7 * 24 * 3600)
+    env["JOB_OPTIX_CACHE_PUT_URL"] = manifest_client.generate_presigned_url(
+        "put_object", Params={"Bucket": R2_BUCKET, "Key": optix_key},
+        ExpiresIn=7 * 24 * 3600)
+
     if args.profile:
         env["TUILE_PROFILE"] = args.profile
         env["TUILE_PROFILE_DIR"] = "/out/profile"
@@ -669,11 +1410,59 @@ def main():
         "argv": sys.argv[1:],
         "git": git_info,
         "image": args.image,
-        "image_digest": image_digest(args.image),
+        "image_digest": manifest_digest,
         "pod_env": redacted(env),
         "params": {k: v for k, v in vars(args).items()
                    if k not in ("ssh_pubkey",)},
     }
+
+    if args.backend == "gcp":
+        token = gcp_token()
+        manifest["backend"] = {
+            "kind": "gcp", "project": GCP_PROJECT, "region": GCP_REGION,
+            "job": GCP_JOB, "tasks": tasks, "segments": segments,
+        }
+        # Le manifeste part AVANT l'exécution.
+        #
+        # Côté RunPod il attendait la création du pod, pour porter son
+        # identité. Ici il n'y a rien à attendre : la forme de la machine est
+        # dans Pulumi, pas dans la réponse. Et un manifeste déposé d'abord est
+        # un manifeste qui existe même quand la demande est refusée — ce qui
+        # est exactement le moment où on veut lire ce qu'on avait demandé.
+        manifest_client.put_object(
+            Bucket=R2_BUCKET, Key=f"{R2_PREFIX}/{run}/config.json",
+            Body=json.dumps(manifest, indent=2, sort_keys=True).encode(),
+            ContentType="application/json")
+        print(f"archive: s3://{R2_BUCKET}/{R2_PREFIX}/{run}/", flush=True)
+
+        name = gcp_run(env, tasks, dry_run=args.dry_run, token=token)
+        if name is None:
+            print("validateOnly: la demande est acceptée, rien n'a tourné "
+                  "et rien n'est facturé.")
+            return
+        print(f"exécution: {name.rsplit('/', 1)[-1]}  "
+              f"{tasks} tâche(s) × 1 L4  frames {args.frames}", flush=True)
+        ok, bad = gcp_watch(name, token=token)
+        print(f"{ok} tâche(s) réussie(s), {bad} en échec", flush=True)
+        if bad == 0 and tasks > 1:
+            # Le montage suit le rendu, sans qu'on le demande.
+            #
+            # Il a été une commande à taper pendant quelques heures, et c'est
+            # une faute : la chaîne va des paramètres de scène au mp4 sur R2,
+            # et une étape qui attend qu'un humain la lance n'est pas une
+            # chaîne. Aucune tâche ne voit tous les segments — c'est pour ça
+            # que le montage est ici et non dans le job — mais « ailleurs que
+            # dans le job » ne veut pas dire « à la main ».
+            print("montage des segments…", flush=True)
+            assemble(run)
+        if bad:
+            raise SystemExit(
+                "des tâches ont échoué — les journaux de chacune sont dans "
+                f"s3://{R2_BUCKET}/{R2_PREFIX}/{run}/logs-t*.tar.gz, et le "
+                "premier mot à y chercher est GPU-PARTIAL-HOST : c'est lui "
+                "qui a disqualifié quatre hôtes RunPod, et sur Cloud Run il "
+                "doit dire « 1 advertised, 1 device node ».")
+        return
 
     def gpu_spec(kind):
         gpu = {"id": kind, "count": args.gpu_count}

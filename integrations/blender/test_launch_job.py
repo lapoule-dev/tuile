@@ -11,9 +11,15 @@ et c'est ce qui la rend dangereuse. Un jeton qui y entre n'en sort plus.
 """
 
 import importlib.util
+import io
 import pathlib
+import re
+import subprocess
 import sys
+import types
+import urllib.error
 import unittest
+import unittest.mock
 
 # Jamais de bytecode pour ce que ce fichier teste.
 #
@@ -313,3 +319,1061 @@ class RunIdentity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TasksSplitTheRange(unittest.TestCase):
+    """La tranche d'une tâche, exécutée et non relue.
+
+    Un test qui cherche `task_index * base` dans le texte du script prouve
+    qu'une chaîne y figure. Ce qui compte est ailleurs : que les N tranches
+    recouvrent exactement la plage demandée, sans trou ni recouvrement. Un trou
+    est une vidéo plus courte que ce qu'on a payé, un recouvrement est une
+    frame rendue deux fois et montée deux fois. Alors on extrait le bloc du
+    vrai script et on le fait tourner sous bash.
+    """
+
+    JOB = pathlib.Path(__file__).with_name("render_job.sh")
+
+    def _slice(self, task_index, task_count, first, last):
+        """Ce que render_job.sh calcule pour une tâche, réellement exécuté."""
+        text = self.JOB.read_text()
+        start = text.index('if [ "$task_count" -gt 1 ]; then')
+        end = text.index("\nfi\n", start) + len("\nfi\n")
+        block = text[start:end]
+        self.assertIn("task_index * base", block,
+                      "le bloc extrait n'est pas celui de la découpe")
+        script = (
+            "task_index=$1; task_count=$2; first=$3; last=$4\n"
+            + block
+            + 'printf "%s %s\\n" "$first" "$last"\n'
+        )
+        out = subprocess.run(
+            ["bash", "-c", script, "bash",
+             str(task_index), str(task_count), str(first), str(last)],
+            capture_output=True, text=True, check=True)
+        a, b = out.stdout.strip().splitlines()[-1].split()
+        return int(a), int(b)
+
+    def test_the_slices_cover_the_range_exactly_and_never_overlap(self):
+        for first, last in ((1, 48), (1, 1440), (100, 107), (7, 7 + 96)):
+            for n in (1, 2, 3, 5, 7):
+                covered = []
+                for t in range(n):
+                    a, b = self._slice(t, n, first, last)
+                    self.assertLessEqual(a, b,
+                                         f"tâche {t}/{n} sur {first}:{last} "
+                                         "a une tranche vide")
+                    covered.extend(range(a, b + 1))
+                self.assertEqual(
+                    covered, list(range(first, last + 1)),
+                    f"{n} tâches sur {first}:{last} ne recouvrent pas la plage")
+
+    def test_the_remainder_is_spread_not_dumped_on_the_last_task(self):
+        # 48 sur 5 : 10,10,10,9,9 — et non 9,9,9,9,12. L'écart maximal entre
+        # deux tranches est d'une frame, donc la tâche la plus lente, qui fixe
+        # le temps de mur et la facture, ne porte pas tout le reste.
+        sizes = [b - a + 1 for a, b in
+                 (self._slice(t, 5, 1, 48) for t in range(5))]
+        self.assertEqual(sizes, [10, 10, 10, 9, 9])
+        self.assertLessEqual(max(sizes) - min(sizes), 1)
+
+    def test_a_lone_container_renders_the_whole_range(self):
+        # Sans CLOUD_RUN_TASK_COUNT, un pod lit 0 sur 1 et se comporte comme
+        # avant que les tâches existent.
+        text = self.JOB.read_text()
+        self.assertIn('task_count="${CLOUD_RUN_TASK_COUNT:-1}"', text)
+        self.assertIn('task_index="${CLOUD_RUN_TASK_INDEX:-0}"', text)
+        self.assertEqual(self._slice(0, 1, 1, 48), (1, 48))
+
+    def test_segments_are_numbered_globally_so_assembly_can_order_them(self):
+        # Deux tâches de 4 processus produisent les segments 0-3 et 4-7, pas
+        # 0-3 deux fois : sinon la seconde écrase les dépôts de la première.
+        text = self.JOB.read_text()
+        self.assertIn("seg_base=$((task_index * jobs))", text)
+        self.assertIn('eval "url=\\${JOB_SEG_PUT_URL_$g:-}"', text)
+
+    def test_each_task_ships_its_own_logs(self):
+        # Une seule JOB_LOGS_PUT_URL pour N tâches, et le survivant est celui
+        # qui a fini en dernier — jamais celui qui a échoué.
+        text = self.JOB.read_text()
+        self.assertIn("for var in JOB_LOGS_PUT_URL JOB_TRACE_PUT_URL "
+                      "JOB_PROFILE_PUT_URL; do", text)
+
+    def test_only_a_lone_task_concatenates_and_uploads_the_film(self):
+        text = self.JOB.read_text()
+        concat = text.index("ffmpeg -y -f concat")
+        guard = text.rindex('if [ "$task_count" -gt 1 ]; then', 0, concat)
+        self.assertIn("TASK-DONE", text[guard:concat],
+                      "le montage n'est pas gardé par le nombre de tâches")
+
+
+class TheGoogleSide(unittest.TestCase):
+    """Ce qu'on envoie à Cloud Run, sans réseau.
+
+    Chaque erreur de forme ici se paie en secondes de L4 et en aller-retours
+    d'une minute. `validateOnly` existe pour ça, mais encore faut-il que le
+    corps soit juste avant de le valider.
+    """
+
+    def _capture(self, fn, reply=None):
+        """Appelle `fn` en interceptant gcp_call, et rend ce qui est parti."""
+        sent = []
+
+        def fake(method, path, body=None, token=None):
+            sent.append((method, path, body))
+            return reply if reply is not None else {}
+
+        original = launch_job.gcp_call
+        launch_job.gcp_call = fake
+        try:
+            result = fn()
+        finally:
+            launch_job.gcp_call = original
+        return sent, result
+
+    def test_the_env_travels_as_name_value_pairs_not_a_comma_list(self):
+        # La raison de parler REST plutôt que `gcloud run jobs execute` :
+        # --update-env-vars sépare par des virgules, et une URL présignée qui
+        # en contiendrait une couperait le lancement en deux variables.
+        env = {"JOB_FRAMES": "1:48", "JOB_PACK_URL": "https://x/y?a=1,b=2"}
+        sent, name = self._capture(
+            lambda: launch_job.gcp_run(env, 3, token="t"),
+            reply={"metadata": {"name": "projects/p/locations/l/jobs/j/"
+                                        "executions/tuile-render-abcde"}})
+        (method, path, body), = sent
+        self.assertEqual(method, "POST")
+        self.assertTrue(path.endswith(":run"), path)
+        pairs = body["overrides"]["containerOverrides"][0]["env"]
+        self.assertEqual(
+            sorted(pairs, key=lambda d: d["name"]),
+            [{"name": "JOB_FRAMES", "value": "1:48"},
+             {"name": "JOB_PACK_URL", "value": "https://x/y?a=1,b=2"}])
+        self.assertEqual(body["overrides"]["taskCount"], 3)
+        self.assertNotIn("validateOnly", body)
+        self.assertEqual(name.rsplit("/", 1)[-1], "tuile-render-abcde")
+
+    def test_a_dry_run_asks_for_validation_and_returns_nothing(self):
+        sent, name = self._capture(
+            lambda: launch_job.gcp_run({"A": "1"}, 1, dry_run=True, token="t"))
+        self.assertTrue(sent[0][2]["validateOnly"])
+        self.assertIsNone(name, "un dry-run ne doit pas prétendre à une "
+                                "exécution qui n'existe pas")
+
+    def test_an_answer_we_cannot_read_is_not_an_empty_list(self):
+        # La panne du 10 septembre, transposée : `d.get('items', [])` a rendu
+        # zéro pendant que six pods facturaient. Une forme inconnue est une
+        # erreur, jamais une absence.
+        original = launch_job.gcp_call
+        launch_job.gcp_call = lambda *a, **k: {"jobExecutions": [{"name": "x"}]}
+        try:
+            with self.assertRaises(SystemExit):
+                launch_job.gcp_executions(token="t")
+        finally:
+            launch_job.gcp_call = original
+
+    def test_an_empty_body_really_is_no_executions(self):
+        original = launch_job.gcp_call
+        launch_job.gcp_call = lambda *a, **k: {}
+        try:
+            self.assertEqual(launch_job.gcp_executions(token="t"), [])
+        finally:
+            launch_job.gcp_call = original
+
+    def test_an_execution_with_no_completion_time_is_still_billing(self):
+        running = {"name": "p/l/j/executions/e1", "taskCount": 3,
+                   "runningCount": 2, "succeededCount": 1,
+                   "createTime": "2026-09-15T10:00:00Z"}
+        done = dict(running, name="p/l/j/executions/e2",
+                    completionTime="2026-09-15T10:30:00Z")
+        self.assertIn("en cours", launch_job.gcp_execution_line(running))
+        self.assertIn("terminée", launch_job.gcp_execution_line(done))
+
+    def test_the_image_comes_from_the_job_not_from_a_string_we_built(self):
+        original = launch_job.gcp_call
+        launch_job.gcp_call = lambda *a, **k: {
+            "template": {"template": {"containers": [{"image": "gar/x:tag"}]}}}
+        try:
+            self.assertEqual(launch_job.gcp_image_of_job(token="t"), "gar/x:tag")
+        finally:
+            launch_job.gcp_call = original
+
+    def test_a_job_without_an_image_says_so_instead_of_launching(self):
+        original = launch_job.gcp_call
+        launch_job.gcp_call = lambda *a, **k: {"template": {"template": {}}}
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                launch_job.gcp_image_of_job(token="t")
+        finally:
+            launch_job.gcp_call = original
+        self.assertIn("pulumi up", str(caught.exception))
+
+    def test_the_backend_is_readable_before_argparse_runs(self):
+        # --list et --kill-all sont traités avant le parseur : ils doivent
+        # marcher quand le lancement est cassé, et savoir quand même à qui
+        # parler.
+        self.assertEqual(launch_job.backend_of(["--list"]), "gcp")
+        self.assertEqual(
+            launch_job.backend_of(["--list", "--backend", "runpod"]), "runpod")
+        self.assertEqual(
+            launch_job.backend_of(["--kill-all", "--backend=runpod"]), "runpod")
+
+
+class OneArchivePerTask(unittest.TestCase):
+    """N tâches, N jeux de journaux.
+
+    Une seule clé partagée et le survivant est celui qui a fini en dernier —
+    jamais celui qui a échoué, qui est pourtant le seul qu'on voulait lire.
+    """
+
+    def _urls(self, segments, tasks):
+        made = []
+
+        class FakeClient:
+            def generate_presigned_url(self, op, Params, ExpiresIn):
+                made.append(Params["Key"])
+                return "https://r2/" + Params["Key"]
+
+        original = launch_job.r2_credentials
+        launch_job.r2_credentials = lambda: ("k", "s")
+        import boto3
+        original_client = boto3.client
+        boto3.client = lambda *a, **k: FakeClient()
+        try:
+            _, urls = launch_job.archive_urls("run-1", segments, tasks)
+        finally:
+            launch_job.r2_credentials = original
+            boto3.client = original_client
+        return urls
+
+    def test_a_lone_task_needs_no_suffixed_archive(self):
+        urls = self._urls(4, 1)
+        self.assertIn("logs.tar.gz", urls)
+        self.assertNotIn("logs-t0", urls)
+
+    def test_every_task_gets_its_own_logs_trace_and_profile(self):
+        urls = self._urls(12, 3)
+        for t in range(3):
+            for kind in ("logs", "trace", "profile"):
+                self.assertIn(f"{kind}-t{t}", urls,
+                              f"la tâche {t} n'a pas d'archive {kind}")
+        self.assertNotIn("logs-t3", urls)
+
+    def test_there_is_one_url_per_segment_across_every_task(self):
+        # Trois tâches de quatre processus font douze segments, numérotés 0..11
+        # d'un bout à l'autre — et non 0..3 trois fois, qui se recouvriraient.
+        urls = self._urls(12, 3)
+        self.assertEqual([f"seg{i}" for i in range(12)],
+                         [k for k in urls if k.startswith("seg")])
+
+
+class HowManySegments(unittest.TestCase):
+    """Le compte des segments, qui fixe le compte des URL présignées.
+
+    Une URL de trop ne coûte rien. Une de moins, et le dernier processus rend
+    un segment qu'il ne peut déposer nulle part — ce qui ne se voit qu'au
+    montage, quand le film est plus court que demandé.
+    """
+
+    def test_gcp_counts_tasks_because_a_task_owns_exactly_one_gpu(self):
+        self.assertEqual(launch_job.segment_count("gcp", 3, 1, 4), 12)
+        self.assertEqual(launch_job.segment_count("gcp", 1, 1, 4), 4)
+
+    def test_runpod_counts_gpus_because_a_pod_owns_several(self):
+        self.assertEqual(launch_job.segment_count("runpod", 1, 4, 4), 16)
+
+    def test_the_task_count_is_ignored_on_a_pod(self):
+        # --tasks est un drapeau gcp. S'il comptait aussi côté runpod, un
+        # oubli donnerait quatre fois trop d'URL et aucun symptôme.
+        self.assertEqual(launch_job.segment_count("runpod", 7, 2, 3),
+                         launch_job.segment_count("runpod", 1, 2, 3))
+
+
+class TheImagePathIsOneString(unittest.TestCase):
+    """Le chemin poussé et le chemin déclaré doivent être le même.
+
+    Deux fichiers, deux dépôts, une seule chaîne — et Cloud Run **valide
+    l'existence de l'image au moment de créer le job**, pas au lancement. Un
+    caractère d'écart et la création répond `Error code 5: Image … not found`,
+    ce qui se lit comme un problème de droits.
+
+    S'abstient quand le checkout d'infra n'est pas là : ce test dit quelque
+    chose quand il peut, et rien quand il ne peut pas — jamais une réussite
+    qu'il n'a pas vérifiée.
+    """
+
+    FARM = (pathlib.Path(__file__).resolve().parents[3]
+            / "sportstracklive-rails" / "infra" / "render_farm.py")
+
+    def setUp(self):
+        if not self.FARM.is_file():
+            self.skipTest(f"{self.FARM} absent — projet Pulumi non présent")
+        self.farm = self.FARM.read_text()
+        self.push = (pathlib.Path(__file__).with_name("build-push.sh")
+                     .read_text())
+
+    def test_the_registry_host_and_repository_agree(self):
+        for needle in ("-docker.pkg.dev", "/tuile/"):
+            self.assertIn(needle, self.farm)
+        self.assertIn('GAR_HOST="${GCP_REGION}-docker.pkg.dev"', self.push)
+        self.assertIn('GCP_REPO="${TUILE_GCP_REPO:-tuile}"', self.push)
+
+    def test_the_region_is_the_same_on_both_sides(self):
+        # La région n'est plus une constante : elle est dérivée de la carte,
+        # parce que chaque accélérateur n'existe que dans certaines régions et
+        # qu'un couple invalide est refusé à la création du job. Ce qui doit
+        # rester vrai, c'est que la région par défaut de la carte par défaut
+        # soit celle où le script pousse l'image — sinon chaque démarrage à
+        # froid traverse une frontière, facturé en egress.
+        self.assertIn('_accelerator = _config.get("accelerator") or "nvidia-l4"',
+                      self.farm, "la carte par défaut a changé")
+        l4 = self.farm[self.farm.index('"nvidia-l4": {'):]
+        l4 = l4[:l4.index("},")]
+        self.assertIn('"europe-west1"', l4,
+                      "europe-west1 n'est plus la première région du L4")
+        self.assertIn('GCP_REGION="${TUILE_GCP_REGION:-europe-west1}"',
+                      self.push)
+
+    def test_the_tag_is_the_same_on_both_sides(self):
+        # Le tag vit dans le job Pulumi ET dans la cible `globe` du script.
+        # Quand ils divergent, le job tire une image que personne n'a poussée.
+        self.assertIn('_image_tag = _config.get("image_tag") or "5.1-su"',
+                      self.farm)
+        globe = self.push[self.push.index("    globe)"):]
+        self.assertIn("TAG=5.1-su", globe[:globe.index(";;")])
+
+    def test_the_stl_prefix_is_dropped_under_artifact_registry(self):
+        # `stl/` est un espace de noms chez ECR et Harbor ; chez Google c'est
+        # le dépôt qui l'est, et un `stl/` de trop donne un chemin à quatre
+        # segments que le job ne trouvera jamais.
+        self.assertIn('${REPO#*/}', self.push)
+        self.assertIn("/tuile/blender-globe:", self.farm)
+
+
+class ArchivingWhileItWrites(unittest.TestCase):
+    """Le flush périodique doit survivre à un fichier qui bouge.
+
+    Il existe pour ça et pour rien d'autre : téléverser les journaux PENDANT
+    le rendu, parce qu'une tâche tuée n'exécute aucun piège. `tar` rend 1 —
+    pas 2 — quand un fichier a changé pendant la lecture, et l'archive produite
+    est complète. Traiter ce 1 comme fatal rendait le flush inopérant à chaque
+    tour. Mesuré le 15 septembre : vingt-sept minutes de rendu Cloud Run, zéro
+    archive, diagnostic perdu avec la tâche.
+
+    Ce test exécute vraiment `ship`, avec un fichier qu'un autre processus
+    allonge pendant l'archivage.
+    """
+
+    JOB = pathlib.Path(__file__).with_name("render_job.sh")
+
+    def _ship(self, grow):
+        """Extrait `ship` du vrai script et l'exécute. Rend son stdout."""
+        text = self.JOB.read_text()
+        start = text.index("ship() {")
+        end = text.index("\n}\n", start) + len("\n}\n")
+        body = text[start:end]
+        self.assertIn("tar czf", body)
+        import tempfile as _tempfile
+        with _tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp)
+            (out / "log-s0.txt").write_text("une ligne\n" * 100)
+            (out / "job.log").write_text("x" * 100_000)
+            grower = ""
+            if grow:
+                # Un écrivain qui allonge job.log pendant que tar le lit :
+                # c'est `tee` dans le vrai script.
+                grower = ('( for k in $(seq 1 400); do '
+                          'printf "%s" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" '
+                          '>> "$outdir/job.log"; done ) & ')
+            script = (
+                f'outdir="{tmp}"\n'
+                'curl() { echo "CURL $*" >> "$outdir/curl.log"; return 0; }\n'
+                + body
+                + grower
+                + "ship logs.tar.gz https://example/put 'log-s*.txt' 'job.log'\n"
+                "wait\n")
+            done = subprocess.run(["bash", "-c", script],
+                                  capture_output=True, text=True)
+            return done.stdout, (out / "logs.tar.gz").exists()
+
+    def test_a_file_growing_under_tar_still_ships(self):
+        stdout, made = self._ship(grow=True)
+        self.assertTrue(made, "aucune archive produite")
+        self.assertIn("ARCHIVE-UP logs.tar.gz", stdout,
+                      f"rien n'a été téléversé — sortie: {stdout!r}")
+        self.assertNotIn("ARCHIVE-TAR-FAILED", stdout)
+
+    def test_a_quiet_directory_ships_too(self):
+        stdout, made = self._ship(grow=False)
+        self.assertTrue(made)
+        self.assertIn("ARCHIVE-UP logs.tar.gz", stdout)
+
+    def test_a_failure_is_no_longer_swallowed_by_dev_null(self):
+        # Le flush envoyait tout dans /dev/null : la panne était muette.
+        text = self.JOB.read_text()
+        flush = text[text.index("flush_logs() {"):]
+        flush = flush[:flush.index("\n}\n")]
+        self.assertNotIn("> /dev/null 2>&1", flush)
+        self.assertIn("*FAILED*", flush)
+
+
+class DyingRendersMustNotBillAnHour(unittest.TestCase):
+    """Un rendu mort doit rendre la main tout de suite.
+
+    `wait` sans argument attend TOUS les enfants du shell, et le job en garde
+    deux qui ne finissent jamais : l'échantillonneur GPU et le flush de
+    journaux, tous deux en boucle. La ligne était donc infranchissable même
+    quand chaque rendu était mort.
+
+    Mesuré le 16 septembre : Blender a crashé après dix secondes
+    (`the frame did not converge`), et la tâche a continué d'échantillonner un
+    GPU inactif jusqu'au délai d'une heure. Elle facturait un L4 tout du long,
+    et de l'extérieur — `GPU-USE` toutes les trente secondes — elle avait
+    l'air de travailler. C'est ce qu'on a pris pour un calcul lent pendant
+    deux jours.
+    """
+
+    def test_a_crashed_render_does_not_hold_the_script_open(self):
+        # La vraie forme du script : deux boucles sans fin, des « rendus » qui
+        # meurent, et un wait. Sans les PID, ce script ne se termine jamais.
+        script = """
+        sampler() { while true; do sleep 0.05; done; }
+        flusher() { while true; do sleep 0.05; done; }
+        sampler & gpu_watch=$!
+        flusher & log_flusher=$!
+        renders=()
+        for i in 0 1; do
+            ( exit 134 ) | cat | cat &
+            renders+=($!)
+        done
+        wait "${renders[@]}"
+        kill "$gpu_watch" "$log_flusher" 2>/dev/null || true
+        echo LIBRE
+        """
+        done = subprocess.run(["bash", "-c", script], capture_output=True,
+                              text=True, timeout=15)
+        self.assertIn("LIBRE", done.stdout,
+                      "le script n'a pas repris la main après la mort des rendus")
+
+    def test_the_job_waits_on_the_render_pids_and_not_on_everything(self):
+        text = (pathlib.Path(__file__).with_name("render_job.sh")).read_text()
+        self.assertIn('wait "${renders[@]}"', text)
+        self.assertNotIn("\nwait\n", text,
+                         "un `wait` nu subsiste : il attendrait aussi les "
+                         "boucles infinies")
+        self.assertIn("renders+=($!)", text)
+
+
+class ThePackNameComesFromTheParameters(unittest.TestCase):
+    """Le nom du pack se calcule avant que quoi que ce soit démarre.
+
+    La version d'avant nommait l'objet d'après le digest de scène, que seul le
+    job calcule — il couvre les réglages de traversée résolus. Le pack partait
+    donc sous une clef neutre, le lanceur lisait `BAKE-KEY` dans les journaux,
+    puis copiait. Deux des trois étapes vivaient dans le processus du lanceur.
+
+    Mesuré le 16 septembre 2026 : le lanceur s'est arrêté entre la cuisson et
+    la copie, et deux gigaoctets parfaitement valides sont restés sous une clef
+    que personne ne cherche. Un rangement qui exige qu'une fenêtre de terminal
+    reste ouverte n'est pas un rangement.
+    """
+
+    def _args(self, **over):
+        base = dict(trajectory="orbit:1440:2.17:42.52:8000:5000",
+                    frames="1:1440", viewport="1280x960", sse=3.0,
+                    imagery_boost=1, imagery=0, terrain=0)
+        base.update(over)
+        return types.SimpleNamespace(**base)
+
+    def test_the_same_parameters_always_give_the_same_key(self):
+        a = launch_job.pack_key(self._args())
+        b = launch_job.pack_key(self._args())
+        self.assertEqual(a, b)
+        self.assertTrue(a.startswith("packs/"), a)
+        self.assertTrue(a.endswith("/1-1440.tuilepack"), a)
+
+    def test_every_baking_parameter_changes_the_key(self):
+        base = launch_job.pack_key(self._args())
+        for field, value in (("trajectory", "orbit:1440:2.18:42.52:8000:5000"),
+                             ("frames", "1:720"),
+                             ("viewport", "1920x1080"),
+                             ("sse", 2.0),
+                             # De combien de niveaux l'imagerie descend sous le
+                             # terrain : deux packs qui n'en ont pas la même
+                             # valeur ne portent pas la même imagerie.
+                             ("imagery_boost", 3),
+                             # Les sources : Sentinel-2 n'est pas Bing Aerial,
+                             # et un pack de l'un ne peut pas servir pour
+                             # l'autre.
+                             ("imagery", 3954),
+                             ("terrain", 2767062)):
+            self.assertNotEqual(
+                base, launch_job.pack_key(self._args(**{field: value})),
+                f"changer {field} ne change pas la clef : deux cuissons "
+                "différentes s'écraseraient l'une l'autre")
+
+    def test_the_range_is_in_the_name_not_in_the_hash(self):
+        # Deux tranches d'un même plan partagent le répertoire et se
+        # distinguent par le fichier — c'est ce qui permettra de cuire en
+        # parallèle sans que les morceaux se perdent.
+        whole = launch_job.pack_key(self._args())
+        half = launch_job.pack_key(self._args(frames="1:720"))
+        self.assertNotEqual(whole.rsplit("/", 1)[0], half.rsplit("/", 1)[0])
+        self.assertEqual(half.rsplit("/", 1)[1], "1-720.tuilepack")
+
+    def test_nothing_is_left_for_the_launcher_to_do_afterwards(self):
+        source = (pathlib.Path(__file__).with_name("launch_job.py")).read_text()
+        # Depuis `bake_env`, pas depuis `bake` : l'environnement du job est
+        # sorti en fonction pure pour être testable sans lancer de cuisson, et
+        # les clefs de dépôt vivent désormais là. La tranche doit couvrir les
+        # deux, sinon elle affirme une absence qui n'est qu'un déménagement.
+        bake = source[source.index("def bake_env("):source.index("def assemble(")]
+        self.assertNotIn("copy_object", bake,
+                         "le lanceur range encore le pack après coup")
+        self.assertNotIn("bake_key_of", bake)
+        self.assertIn("JOB_PACK_PUT_URL", bake)
+        self.assertIn("JOB_SCENE_PUT_URL", bake,
+                      "le digest de scène n'est plus déposé : un rendu ne "
+                      "pourrait plus vérifier qu'on lui donne le bon globe")
+
+
+class HowManySegments(unittest.TestCase):
+    """Le compte des segments, qui fixe le compte des URL présignées.
+
+    Une URL de trop ne coûte rien. Une de moins, et le dernier processus rend
+    un segment qu'il ne peut déposer nulle part — ce qui ne se voit qu'au
+    montage, quand le film est plus court que demandé.
+    """
+
+    def test_gcp_counts_tasks_because_a_task_owns_exactly_one_gpu(self):
+        self.assertEqual(launch_job.segment_count("gcp", 3, 1, 4), 12)
+        self.assertEqual(launch_job.segment_count("gcp", 1, 1, 4), 4)
+
+    def test_runpod_counts_gpus_because_a_pod_owns_several(self):
+        self.assertEqual(launch_job.segment_count("runpod", 1, 4, 4), 16)
+
+    def test_the_task_count_is_ignored_on_a_pod(self):
+        # --tasks est un drapeau gcp. S'il comptait aussi côté runpod, un
+        # oubli donnerait quatre fois trop d'URL et aucun symptôme.
+        self.assertEqual(launch_job.segment_count("runpod", 7, 2, 3),
+                         launch_job.segment_count("runpod", 1, 2, 3))
+
+
+class TheImagePathIsOneString(unittest.TestCase):
+    """Le chemin poussé et le chemin déclaré doivent être le même.
+
+    Deux fichiers, deux dépôts, une seule chaîne — et Cloud Run **valide
+    l'existence de l'image au moment de créer le job**, pas au lancement. Un
+    caractère d'écart et la création répond `Error code 5: Image … not found`,
+    ce qui se lit comme un problème de droits.
+
+    S'abstient quand le checkout d'infra n'est pas là : ce test dit quelque
+    chose quand il peut, et rien quand il ne peut pas — jamais une réussite
+    qu'il n'a pas vérifiée.
+    """
+
+    FARM = (pathlib.Path(__file__).resolve().parents[3]
+            / "sportstracklive-rails" / "infra" / "render_farm.py")
+
+    def setUp(self):
+        if not self.FARM.is_file():
+            self.skipTest(f"{self.FARM} absent — projet Pulumi non présent")
+        self.farm = self.FARM.read_text()
+        self.push = (pathlib.Path(__file__).with_name("build-push.sh")
+                     .read_text())
+
+    def test_the_registry_host_and_repository_agree(self):
+        for needle in ("-docker.pkg.dev", "/tuile/"):
+            self.assertIn(needle, self.farm)
+        self.assertIn('GAR_HOST="${GCP_REGION}-docker.pkg.dev"', self.push)
+        self.assertIn('GCP_REPO="${TUILE_GCP_REPO:-tuile}"', self.push)
+
+    def test_the_region_is_the_same_on_both_sides(self):
+        # La région n'est plus une constante : elle est dérivée de la carte,
+        # parce que chaque accélérateur n'existe que dans certaines régions et
+        # qu'un couple invalide est refusé à la création du job. Ce qui doit
+        # rester vrai, c'est que la région par défaut de la carte par défaut
+        # soit celle où le script pousse l'image — sinon chaque démarrage à
+        # froid traverse une frontière, facturé en egress.
+        self.assertIn('_accelerator = _config.get("accelerator") or "nvidia-l4"',
+                      self.farm, "la carte par défaut a changé")
+        l4 = self.farm[self.farm.index('"nvidia-l4": {'):]
+        l4 = l4[:l4.index("},")]
+        self.assertIn('"europe-west1"', l4,
+                      "europe-west1 n'est plus la première région du L4")
+        self.assertIn('GCP_REGION="${TUILE_GCP_REGION:-europe-west1}"',
+                      self.push)
+
+    def test_the_tag_is_the_same_on_both_sides(self):
+        # Le tag vit dans le job Pulumi ET dans la cible `globe` du script.
+        # Quand ils divergent, le job tire une image que personne n'a poussée.
+        self.assertIn('_image_tag = _config.get("image_tag") or "5.1-su"',
+                      self.farm)
+        globe = self.push[self.push.index("    globe)"):]
+        self.assertIn("TAG=5.1-su", globe[:globe.index(";;")])
+
+    def test_the_stl_prefix_is_dropped_under_artifact_registry(self):
+        # `stl/` est un espace de noms chez ECR et Harbor ; chez Google c'est
+        # le dépôt qui l'est, et un `stl/` de trop donne un chemin à quatre
+        # segments que le job ne trouvera jamais.
+        self.assertIn('${REPO#*/}', self.push)
+        self.assertIn("/tuile/blender-globe:", self.farm)
+
+
+class ArchivingWhileItWrites(unittest.TestCase):
+    """Le flush périodique doit survivre à un fichier qui bouge.
+
+    Il existe pour ça et pour rien d'autre : téléverser les journaux PENDANT
+    le rendu, parce qu'une tâche tuée n'exécute aucun piège. `tar` rend 1 —
+    pas 2 — quand un fichier a changé pendant la lecture, et l'archive produite
+    est complète. Traiter ce 1 comme fatal rendait le flush inopérant à chaque
+    tour. Mesuré le 15 septembre : vingt-sept minutes de rendu Cloud Run, zéro
+    archive, diagnostic perdu avec la tâche.
+
+    Ce test exécute vraiment `ship`, avec un fichier qu'un autre processus
+    allonge pendant l'archivage.
+    """
+
+    JOB = pathlib.Path(__file__).with_name("render_job.sh")
+
+    def _ship(self, grow):
+        """Extrait `ship` du vrai script et l'exécute. Rend son stdout."""
+        text = self.JOB.read_text()
+        start = text.index("ship() {")
+        end = text.index("\n}\n", start) + len("\n}\n")
+        body = text[start:end]
+        self.assertIn("tar czf", body)
+        import tempfile as _tempfile
+        with _tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp)
+            (out / "log-s0.txt").write_text("une ligne\n" * 100)
+            (out / "job.log").write_text("x" * 100_000)
+            grower = ""
+            if grow:
+                # Un écrivain qui allonge job.log pendant que tar le lit :
+                # c'est `tee` dans le vrai script.
+                grower = ('( for k in $(seq 1 400); do '
+                          'printf "%s" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" '
+                          '>> "$outdir/job.log"; done ) & ')
+            script = (
+                f'outdir="{tmp}"\n'
+                'curl() { echo "CURL $*" >> "$outdir/curl.log"; return 0; }\n'
+                + body
+                + grower
+                + "ship logs.tar.gz https://example/put 'log-s*.txt' 'job.log'\n"
+                "wait\n")
+            done = subprocess.run(["bash", "-c", script],
+                                  capture_output=True, text=True)
+            return done.stdout, (out / "logs.tar.gz").exists()
+
+    def test_a_file_growing_under_tar_still_ships(self):
+        stdout, made = self._ship(grow=True)
+        self.assertTrue(made, "aucune archive produite")
+        self.assertIn("ARCHIVE-UP logs.tar.gz", stdout,
+                      f"rien n'a été téléversé — sortie: {stdout!r}")
+        self.assertNotIn("ARCHIVE-TAR-FAILED", stdout)
+
+    def test_a_quiet_directory_ships_too(self):
+        stdout, made = self._ship(grow=False)
+        self.assertTrue(made)
+        self.assertIn("ARCHIVE-UP logs.tar.gz", stdout)
+
+    def test_a_failure_is_no_longer_swallowed_by_dev_null(self):
+        # Le flush envoyait tout dans /dev/null : la panne était muette.
+        text = self.JOB.read_text()
+        flush = text[text.index("flush_logs() {"):]
+        flush = flush[:flush.index("\n}\n")]
+        self.assertNotIn("> /dev/null 2>&1", flush)
+        self.assertIn("*FAILED*", flush)
+
+
+class DyingRendersMustNotBillAnHour(unittest.TestCase):
+    """Un rendu mort doit rendre la main tout de suite.
+
+    `wait` sans argument attend TOUS les enfants du shell, et le job en garde
+    deux qui ne finissent jamais : l'échantillonneur GPU et le flush de
+    journaux, tous deux en boucle. La ligne était donc infranchissable même
+    quand chaque rendu était mort.
+
+    Mesuré le 16 septembre : Blender a crashé après dix secondes
+    (`the frame did not converge`), et la tâche a continué d'échantillonner un
+    GPU inactif jusqu'au délai d'une heure. Elle facturait un L4 tout du long,
+    et de l'extérieur — `GPU-USE` toutes les trente secondes — elle avait
+    l'air de travailler. C'est ce qu'on a pris pour un calcul lent pendant
+    deux jours.
+    """
+
+    def test_a_crashed_render_does_not_hold_the_script_open(self):
+        # La vraie forme du script : deux boucles sans fin, des « rendus » qui
+        # meurent, et un wait. Sans les PID, ce script ne se termine jamais.
+        script = """
+        sampler() { while true; do sleep 0.05; done; }
+        flusher() { while true; do sleep 0.05; done; }
+        sampler & gpu_watch=$!
+        flusher & log_flusher=$!
+        renders=()
+        for i in 0 1; do
+            ( exit 134 ) | cat | cat &
+            renders+=($!)
+        done
+        wait "${renders[@]}"
+        kill "$gpu_watch" "$log_flusher" 2>/dev/null || true
+        echo LIBRE
+        """
+        done = subprocess.run(["bash", "-c", script], capture_output=True,
+                              text=True, timeout=15)
+        self.assertIn("LIBRE", done.stdout,
+                      "le script n'a pas repris la main après la mort des rendus")
+
+    def test_the_job_waits_on_the_render_pids_and_not_on_everything(self):
+        text = (pathlib.Path(__file__).with_name("render_job.sh")).read_text()
+        self.assertIn('wait "${renders[@]}"', text)
+        self.assertNotIn("\nwait\n", text,
+                         "un `wait` nu subsiste : il attendrait aussi les "
+                         "boucles infinies")
+        self.assertIn("renders+=($!)", text)
+
+
+
+
+class TheTwoJobsAgreeOnTheTrajectory(unittest.TestCase):
+    """Cuire et rendre doivent fabriquer la MÊME trajectoire.
+
+    Les deux jobs lisent la même chaîne `JOB_TRAJECTORY` et la donnent chacun à
+    son générateur, avec ses propres valeurs par défaut écrites en dur. Rien ne
+    les tient ensemble : ajouter un genre d'un côté produit un rendu qui meurt
+    sur `TRAJECTORY-UNKNOWN`, et — bien pire — changer un défaut d'un seul côté
+    produit un pack qui décrit un tournage et une image qui en montre un autre,
+    les deux jobs annonçant une réussite.
+    """
+
+    @staticmethod
+    def _kinds(name):
+        """Les genres et leurs défauts, lus dans le `case` du script."""
+        text = (pathlib.Path(__file__).with_name(name)).read_text()
+        block = text[text.index("IFS=: read -r kind"):]
+        block = block[:block.index("esac")]
+        kinds = {}
+        for line in block.splitlines():
+            line = line.strip()
+            if ")" not in line or line.startswith("#") or line.startswith("*"):
+                continue
+            kind = line.split(")")[0].strip()
+            if kind and kind.isidentifier():
+                kinds[kind] = re.findall(r'\$\{p\d:-([^}]*)\}', block[block.index(line):])
+        return kinds
+
+    def test_both_scripts_know_the_same_kinds(self):
+        bake = set(self._kinds("bake_job.sh"))
+        render = set(self._kinds("render_job.sh"))
+        self.assertEqual(bake, render,
+                         f"genres divergents — cuisson {sorted(bake)}, "
+                         f"rendu {sorted(render)}")
+
+    def test_the_defaults_are_the_same_on_both_sides(self):
+        bake = self._kinds("bake_job.sh")
+        render = self._kinds("render_job.sh")
+        for kind in sorted(set(bake) & set(render)):
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    bake[kind][:4], render[kind][:4],
+                    f"{kind}: la cuisson prend {bake[kind][:4]} et le rendu "
+                    f"{render[kind][:4]} — le pack et l'image ne décriraient "
+                    "pas le même tournage")
+
+
+class TheCameraCrossesTheBoundary(unittest.TestCase):
+    """La caméra doit atteindre le procédural, et elle ne l'a jamais fait.
+
+    hdGp passe ses arguments par les primvars de la prim, et un primvar est un
+    **attribut**. Les deux écrivains de ce projet produisaient pourtant des
+    *relationships* préfixés `primvars:` — `tuile-usd` dans le manifeste, et un
+    hook d'export dans `render_usd.py` au moment de retargeter sur la caméra
+    Blender. USD accepte les deux sans broncher ; le procédural n'en voit
+    aucun.
+
+    Conséquence, mesurée le 16 septembre 2026 : `_ResolveCamera` descendait ses
+    quatre échelons sans rien trouver et retombait sur la vue fixe au-dessus de
+    l'origine de rendu — le centre de l'orbite. Le pack répondait « no baked
+    frame answers this camera: the nearest is frame 1108, 8000.000 m away » :
+    8000 m est le rayon de l'orbite au millimètre, et 1108 un tirage arbitraire
+    parmi 1440 poses toutes équidistantes de ce centre.
+
+    Le hook d'export n'existe plus : le rendu passe par la fast path de
+    Blender, qui n'exporte aucun stage. Ce que le procédural lit maintenant est
+    `/freeCamera`, la caméra par laquelle l'image est réellement faite, et ce
+    barreau est testé en C++ (`integrations/hydra/tests/cameraRungTest.cpp`).
+    Ce qui reste ici, c'est le câblage côté pilote : la fast path et le chemin
+    du manifeste. Les deux sont des chaînes dans un fichier Python, invisibles
+    au compilateur, et chacune casse en silence — la première en faisant
+    reconstruire toute la scène à chaque frame, la seconde en rendant sans
+    globe.
+    """
+
+    def test_the_driver_asks_for_the_fast_path(self):
+        source = (pathlib.Path(__file__).with_name("render_usd.py")).read_text()
+        code = "\n".join(l for l in source.splitlines()
+                         if not l.lstrip().startswith("#"))
+        # `assertTrue` sur un booléen plutôt qu'`assertIn` sur le fichier :
+        # unittest imprime la valeur comparée, et un `assertIn` raté crachait
+        # les dix kilo-octets du pilote au milieu du rapport.
+        self.assertTrue('scene.hydra.export_method = "HYDRA"' in code,
+                        "le pilote demande encore l'export USD : Blender "
+                        "démolit et reconstruit la scène entière à chaque "
+                        "frame, et le procédural repart d'un état vide")
+        self.assertFalse('export_method = "USD"' in code,
+                         "l'export USD subsiste quelque part dans le pilote")
+
+    def test_the_driver_names_the_manifest_for_the_plugin(self):
+        # La fast path n'exporte rien, donc plus aucun hook ne peut y glisser
+        # la prim Globe. Elle entre par le greffon de scene index, qui lit
+        # cette variable — non posée, il rend la scène de l'hôte inchangée et
+        # le globe est simplement absent, sans erreur nulle part.
+        source = (pathlib.Path(__file__).with_name("render_usd.py")).read_text()
+        code = "\n".join(l for l in source.splitlines()
+                         if not l.lstrip().startswith("#"))
+        self.assertTrue('os.environ["TUILE_MANIFEST"]' in code,
+                        "le pilote ne nomme pas le manifeste : le rendu "
+                        "sortira sans globe et rien ne le dira")
+
+    def test_the_manifest_authors_an_attribute_too(self):
+        # L'autre écrivain. Les deux doivent s'accorder, sinon USD refuse
+        # l'export — ce qui vaut mieux que de s'accorder dans l'erreur.
+        stage = (pathlib.Path(__file__).resolve().parents[2]
+                 / "crates" / "tuile-usd" / "src" / "stage.rs")
+        if not stage.is_file():
+            self.skipTest("crates/tuile-usd/src/stage.rs absent")
+        text = stage.read_text()
+        authored = [l for l in text.splitlines()
+                    if "tuile:cameras" in l and "writeln" not in l
+                    and l.strip().startswith('"')]
+        self.assertTrue(authored, "le manifeste ne nomme plus de caméra")
+        for line in authored:
+            self.assertNotIn("rel primvars:tuile:cameras", line, line)
+
+
+class TheDriverCompilesOnce(unittest.TestCase):
+    """338 secondes, puis 0,17 — et le premier chiffre ne doit se payer qu'une fois.
+
+    Le PTX OptiX est déjà précompilé et livré dans l'image ; ce que le pilote
+    fait ensuite, c'est le traduire en code machine pour la carte présente.
+    Mesuré sur un L4 le 16 septembre 2026 : `lot 1/2: 322.49 s/frame`, puis
+    `lot 2/2: 0.17 s/frame`. Sur trois tâches, c'est dix-sept minutes de
+    compilation pour une minute de film.
+
+    Ça ne peut pas être fait à la construction de l'image — le builder n'a pas
+    de carte NVIDIA, et le résultat dépend de la carte et du pilote. OptiX sait
+    en revanche le garder sur disque (`OPTIX_CACHE_PATH`), et ce disque-là ne
+    survit pas à un conteneur. On le transporte donc.
+    """
+
+    JOB = pathlib.Path(__file__).with_name("render_job.sh")
+
+    def test_the_cache_is_pulled_before_the_first_render(self):
+        text = self.JOB.read_text()
+        pull = text.index("JOB_OPTIX_CACHE_GET_URL")
+        render = text.index("stdbuf -oL blender")
+        self.assertLess(pull, render,
+                        "le cache est tiré après le rendu : il ne sert à rien")
+        self.assertIn('export OPTIX_CACHE_PATH=', text)
+
+    def test_a_missing_cache_is_not_a_failure(self):
+        # La première fois, il n'y a rien. Un rendu ne doit pas en mourir.
+        text = self.JOB.read_text()
+        block = text[text.index("OPTIX-CACHE-MISS") - 600:
+                     text.index("OPTIX-CACHE-MISS") + 120]
+        self.assertIn("OPTIX-CACHE-MISS", block)
+        self.assertNotIn("exit 1", block)
+
+    def test_only_one_task_writes_the_cache_back(self):
+        text = self.JOB.read_text()
+        put = text[text.index("JOB_OPTIX_CACHE_PUT_URL"):]
+        put = put[:put.index("\nfi\n") + 4]
+        self.assertIn('"$task_index" = "0"', put,
+                      "toutes les tâches réécrivent le même cache : le "
+                      "résultat dépendrait de l'ordre d'arrivée")
+
+    def test_the_key_changes_with_the_image(self):
+        source = (pathlib.Path(__file__).with_name("launch_job.py")).read_text()
+        self.assertIn("cache/optix/", source)
+        block = source[source.index("optix_key ="):source.index("optix_key =") + 200]
+        self.assertIn("digest", block,
+                      "la clef ne dépend pas de l'image : des noyaux changés "
+                      "réutiliseraient un cache périmé")
+
+
+class OneInvocationFromSceneToFilm(unittest.TestCase):
+    """Des paramètres de scène au mp4, sans étape à taper.
+
+        paramètres → bake (job A) → tuilepack sur R2
+                   → render (job B) → segments → montage → mp4 sur R2
+
+    Le montage a été une commande manuelle pendant quelques heures, et c'était
+    une faute : aucune tâche ne voit tous les segments — voilà pourquoi il est
+    hors du job — mais « hors du job » ne veut pas dire « à la main ».
+    """
+
+    def _source(self):
+        return (pathlib.Path(__file__).with_name("launch_job.py")).read_text()
+
+    def test_a_multi_task_render_assembles_itself(self):
+        src = self._source()
+        main = src[src.index("def main():"):]
+        watch = main.index("ok, bad = gcp_watch(name, token=token)")
+        after = main[watch:watch + 900]
+        self.assertIn("assemble(run)", after,
+                      "le montage n'est pas enchaîné au rendu")
+        self.assertIn("bad == 0", after,
+                      "on monterait des segments d'un rendu qui a échoué")
+
+    def test_a_missing_pack_is_baked_first(self):
+        src = self._source()
+        main = src[src.index("def main():"):]
+        self.assertIn("pack absent, cuisson d'abord", main)
+        self.assertIn("args.pack = key", main,
+                      "le rendu ne reprend pas le pack qui vient d'être cuit")
+
+    def test_an_existing_pack_is_reused(self):
+        # Recuire 1440 frames pour rendre deux fois le même plan, c'est treize
+        # minutes et quelques dollars jetés.
+        src = self._source()
+        self.assertIn("def pack_exists(", src)
+        main = src[src.index("def main():"):]
+        self.assertIn("pack déjà cuit", main)
+
+    def test_the_finished_film_is_opened(self):
+        # CLAUDE.md : un rendu est une image, et chaque instrument qui remplace
+        # le fait de la regarder a déjà menti ici.
+        src = self._source()
+        asm = src[src.index("def assemble("):]
+        asm = asm[:asm.index("\ndef ")]
+        self.assertIn('"open"', asm)
+
+
+class ASuccessfulTaskExitsZero(unittest.TestCase):
+    """Un `kill` qui rate ne doit pas transformer une réussite en échec.
+
+    Le piège de sortie faisait `kill …; archive_everything`, et
+    `archive_everything` lisait le code dans `$?` — c'est-à-dire celui du
+    `kill`, pas celui du script. Dès que l'échantillonneur GPU s'était arrêté
+    seul, `kill` échouait et la tâche se déclarait en erreur.
+
+    Mesuré le 16 septembre 2026 sur une minute de film : `TASK-DONE 2/3
+    (1 segments, frames 961:1440)` immédiatement suivi de `Container called
+    exit(1)`. Les trois tâches avaient rendu leurs 1440 frames et déposé leurs
+    segments ; l'exécution s'est déclarée `2✗`, et le montage automatique —
+    gardé derrière « aucune tâche en échec » — ne s'est jamais lancé.
+    """
+
+    def test_a_dead_sampler_does_not_fail_the_task(self):
+        # La forme exacte du script : un piège qui tue des processus déjà
+        # morts, puis archive.
+        script = """
+        archive_everything() {
+            local status="${1:-$?}"
+            trap - EXIT
+            exit $status
+        }
+        sampler() { sleep 0.01; }
+        sampler & gpu_watch=$!
+        wait "$gpu_watch" 2>/dev/null || true
+        trap 'rc=$?; kill "$gpu_watch" 2>/dev/null || true; archive_everything "$rc"' EXIT
+        true
+        """
+        done = subprocess.run(["bash", "-c", script], capture_output=True,
+                              text=True, timeout=15)
+        self.assertEqual(done.returncode, 0,
+                         "une tâche réussie sort en erreur parce que le kill "
+                         "d'un processus déjà mort a écrasé le code de sortie")
+
+    def test_a_real_failure_still_fails(self):
+        # Et l'inverse : un vrai échec ne doit pas être blanchi.
+        script = """
+        archive_everything() {
+            local status="${1:-$?}"
+            trap - EXIT
+            exit $status
+        }
+        sampler() { sleep 30; }
+        sampler & gpu_watch=$!
+        trap 'rc=$?; kill "$gpu_watch" 2>/dev/null || true; archive_everything "$rc"' EXIT
+        exit 3
+        """
+        done = subprocess.run(["bash", "-c", script], capture_output=True,
+                              text=True, timeout=15)
+        self.assertEqual(done.returncode, 3)
+
+    def test_the_job_captures_rc_before_the_kill(self):
+        text = (pathlib.Path(__file__).with_name("render_job.sh")).read_text()
+        for line in text.splitlines():
+            if "trap" in line and "archive_everything" in line:
+                self.assertIn("rc=$?", line,
+                              f"le code de sortie n'est pas capturé avant le "
+                              f"ménage: {line}")
+                if "kill" in line:
+                    self.assertLess(line.index("rc=$?"), line.index("kill"),
+                                    "le kill précède la capture du code")
+
+
+class TheWatchOutlivesItsToken(unittest.TestCase):
+    """Un rendu peut durer plus d'une heure ; un jeton Google, non.
+
+    Le jeton était pris une fois au lancement et réutilisé pour tout le suivi.
+    Mesuré le 16 septembre 2026 : « 401: Request had invalid authentication
+    credentials » au bout d'une heure, en plein rendu d'une minute de film. Le
+    lanceur est mort, et avec lui le montage automatique qui devait suivre —
+    pendant que les trois tâches travaillaient toujours.
+    """
+
+    def test_the_watch_re_mints_before_the_hour(self):
+        src = (pathlib.Path(__file__).with_name("launch_job.py")).read_text()
+        watch = src[src.index("def gcp_watch("):]
+        watch = watch[:watch.index("\ndef ")]
+        self.assertIn("gcp_token()", watch,
+                      "le suivi ne renouvelle jamais son jeton")
+        self.assertIn("45 * 60", watch,
+                      "le renouvellement doit précéder l'expiration à 60 min")
+
+
+class TheBakeIsToldHowMuchMemoryItMayUse(unittest.TestCase):
+    """`--resident-gb` doit atteindre la cuisson, pas seulement le rendu.
+
+    Il ne l'atteignait pas. Le drapeau n'était posé que dans les deux branches
+    `--engine hydra`, c'est-à-dire sur le chemin du rendu ; une cuisson tournait
+    donc au défaut du code — 4 GiB — dans un conteneur qui en a 32.
+
+    Et la panne ne ressemblait pas à une panne de configuration. Mesuré le
+    19 septembre 2026 : `resident_gib=3.76` collé au plafond, et
+    `loads_started=134720` pour 234 tuiles sélectionnées — quarante-cinq
+    chargements par tuile. Le cache évinçait ce dont la frame avait besoin, la
+    traversée le redemandait, et la frame ne convergeait jamais. Ce qui
+    remontait, c'était « frame did not converge within 120s », qui accuse la
+    traversée et tait la seule ligne qui comptait.
+    """
+
+    def _args(self, **over):
+        base = dict(frames="1:2880", trajectory="pyrenees:2:24:20000:0.20",
+                    viewport="1920x1440", sse=3.0, imagery=3954, terrain=0,
+                    imagery_boost=1, resident_gb=16)
+        base.update(over)
+        return types.SimpleNamespace(**base)
+
+    def _env(self, **over):
+        return launch_job.bake_env(self._args(**over), "jeton",
+                                   "https://put/pack", "https://put/scene",
+                                   "https://put/logs")
+
+    def test_the_budget_travels(self):
+        self.assertEqual(self._env()["TUILE_RESIDENT_BUDGET_GB"], "16")
+
+    def test_the_flag_is_what_decides_it(self):
+        # Sinon le test ci-dessus passerait sur une constante en dur, qui est
+        # exactement l'erreur d'avant sous un autre nom.
+        self.assertEqual(
+            self._env(resident_gb=24)["TUILE_RESIDENT_BUDGET_GB"], "24")
+
+    def test_the_budget_is_not_the_container_s(self):
+        # Un budget égal à la mémoire du conteneur ne laisse rien au décodage,
+        # au cache de fetch ni au pack — qui vivent tous à côté, et dont les
+        # deux derniers sont en tmpfs, donc en RAM eux aussi.
+        self.assertLess(int(self._env()["TUILE_RESIDENT_BUDGET_GB"]), 32)
+
