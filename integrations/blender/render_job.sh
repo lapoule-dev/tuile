@@ -522,21 +522,42 @@ elif [ -n "${JOB_STAGE_URL:-}" ]; then
     # A real recorded track (thousands of exact f64 camera samples) is
     # irreducible data; it travels as a presigned GET.
     curl -fsS -o "$STAGE" "$JOB_STAGE_URL" || { echo STAGE-FETCH-FAILED; exit 1; }
-elif [ -n "${JOB_TRAJECTORY:-}" ]; then
-    # The generative road: the pod builds its own manifest from parameters.
-    #   orbit:frames:lon:lat:radius_m:alt_m     (defaults after the kind)
-    #   pyrenees:minutes:fps:alt_m:offset_deg   (boucle nadir autour du massif)
-    #   zoom:frames_each_way
-    IFS=: read -r kind p1 p2 p3 p4 p5 <<< "$JOB_TRAJECTORY"
-    case "$kind" in
-        orbit) /opt/tuile/bin/orbit-tape /tmp/traj.mcap \
-                   "${p1:-1440}" "${p2:-2.17}" "${p3:-42.52}" \
-                   "${p4:-8000}" "${p5:-5000}" ;;
-        pyrenees) /opt/tuile/bin/pyrenees-tape /tmp/traj.mcap \
-                      "${p1:-2}" "$JOB_FPS" "${p3:-50000}" "${p4:-0.40}" ;;
-        zoom)  /opt/tuile/bin/zoom-tape /tmp/traj.mcap "${p1:-64}" ;;
-        *) echo "TRAJECTORY-UNKNOWN: $kind"; exit 1 ;;
-    esac
+elif [ -n "${JOB_TAPE_URL:-}" ] || [ -n "${JOB_TRAJECTORY:-}" ]; then
+    # A supplied tape wins over a generated one — the same rule as the bake,
+    # and for the same reason, except that here it is not a convenience but a
+    # correctness condition.
+    #
+    # A pack answers a camera by pose: the frame it holds must match the one
+    # the stage asks for within a metre and a milliradian, or the tile does
+    # not exist and the render fails loudly. The generators move — today's
+    # `pyrenees-tape` tilts 20 degrees off nadir where the one that shot the
+    # first films looked straight down — so regenerating from the same
+    # argument string describes a different flight. Measured on 20 September
+    # 2026: position right to six millimetres, orientation off by 0.349066 rad,
+    # every task dead in nine seconds.
+    #
+    # The bake leaves its tape beside the pack (`<pack>.mcap`) precisely so
+    # that the render can fly it again. Tape, pack and film are one shot.
+    if [ -n "${JOB_TAPE_URL:-}" ]; then
+        curl -fsS -o /tmp/traj.mcap "$JOB_TAPE_URL" \
+            || { echo TAPE-DOWNLOAD-FAILED; exit 1; }
+        echo "bande: fournie ($(du -h /tmp/traj.mcap | cut -f1)), trajectoire ignorée"
+    else
+        # The generative road: the pod builds its own manifest from parameters.
+        #   orbit:frames:lon:lat:radius_m:alt_m     (defaults after the kind)
+        #   pyrenees:minutes:fps:alt_m:offset_deg   (boucle nadir autour du massif)
+        #   zoom:frames_each_way
+        IFS=: read -r kind p1 p2 p3 p4 p5 <<< "$JOB_TRAJECTORY"
+        case "$kind" in
+            orbit) /opt/tuile/bin/orbit-tape /tmp/traj.mcap \
+                       "${p1:-1440}" "${p2:-2.17}" "${p3:-42.52}" \
+                       "${p4:-8000}" "${p5:-5000}" ;;
+            pyrenees) /opt/tuile/bin/pyrenees-tape /tmp/traj.mcap \
+                          "${p1:-2}" "$JOB_FPS" "${p3:-50000}" "${p4:-0.40}" ;;
+            zoom)  /opt/tuile/bin/zoom-tape /tmp/traj.mcap "${p1:-64}" ;;
+            *) echo "TRAJECTORY-UNKNOWN: $kind"; exit 1 ;;
+        esac
+    fi
     /opt/tuile/bin/tape-to-stage /tmp/traj.mcap "$STAGE" \
         --viewport "${JOB_VIEWPORT:-1280x960}" --sse "${JOB_SSE:-3}" \
         --fps "$JOB_FPS" || { echo MANIFEST-GEN-FAILED; exit 1; }

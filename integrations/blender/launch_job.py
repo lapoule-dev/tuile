@@ -777,6 +777,25 @@ def scene_digest_of(key):
         return ""
 
 
+def tape_beside(pack, exists, presign):
+    """L'URL de la bande que la cuisson a laissée à côté de ce pack, s'il y en
+    a une.
+
+    Un pack répond à une caméra **par la pose** : la frame qu'il détient doit
+    tomber à un mètre et un milliradian de celle que l'étape demande, sinon la
+    tuile n'existe pas et le rendu meurt. Or les générateurs bougent —
+    `pyrenees-tape` sortait une visée nadir quand les premiers films ont été
+    tournés et penche de 20° aujourd'hui — donc régénérer depuis la même
+    chaîne d'arguments décrit un autre vol. Mesuré le 20 septembre 2026 :
+    position juste à six millimètres, orientation fausse de 0,349066 rad, les
+    trois tâches mortes en neuf secondes.
+
+    La cuisson dépose sa bande sous `<pack>.mcap` exactement pour ça. Le pack
+    porte donc son propre tracé, et le rendu n'a rien à redemander."""
+    key = pack + ".mcap"
+    return presign(key) if exists(key) else None
+
+
 def bake_env(args, ion, pack_url, scene_url, logs_url, tape_url=None,
              tape_put_url=""):
     """Tout ce que le job de cuisson lit dans son environnement.
@@ -1542,6 +1561,15 @@ def main():
         env["JOB_PACK_URL"] = presigned_get(args.pack)
         if args.scene:
             env["JOB_SCENE"] = args.scene
+        # …et la bande qui l'a cuit, quand elle est là. Sans elle le pod
+        # refabrique une trajectoire depuis --trajectory, et un générateur qui
+        # a évolué depuis la cuisson donne un vol que le pack ne connaît pas.
+        tape = tape_beside(args.pack, pack_exists, presigned_get)
+        if tape:
+            env["JOB_TAPE_URL"] = tape
+            env["JOB_SSE"] = str(args.sse)
+            env["JOB_VIEWPORT"] = args.viewport
+            print("bande:   celle du pack, rejouée telle quelle", flush=True)
         env["TUILE_RESIDENT_BUDGET_GB"] = str(args.resident_gb)
     elif args.engine == "hydra":
         # The ion token travels env-to-env and is never printed; same .env
