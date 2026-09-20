@@ -585,6 +585,27 @@ pub fn traverse(
     });
     out.stats.selected = out.selected.len() as u32;
     out.stats.requested = out.requests.len() as u32;
+
+    // Which gate turned the pass away.
+    //
+    // A selection that falls from ~263 tiles to ~26 between two frames of one
+    // continuous flight has been refused by something, and `selected` alone
+    // does not say by what. `max_depth` separates "the traversal never went
+    // deep" from "it went deep and kept little"; `deferred_subtrees` is the
+    // one gate that deliberately trades a sharp picture for a coarse one, and
+    // in a bulk bake — where nobody is waiting — that trade should never be
+    // taken.
+    tracing::debug!(
+        target: "gates",
+        selected = out.stats.selected,
+        visited = out.stats.visited,
+        culled = out.stats.culled,
+        requested = out.stats.requested,
+        max_depth = out.stats.max_depth,
+        deferred = out.stats.deferred_subtrees,
+        held_but_drawn = out.stats.held_but_drawn,
+        "pass"
+    );
 }
 
 /// What a subtree reported back to the tile above it.
@@ -672,6 +693,12 @@ impl Visit {
 /// source can go", not a division by nothing.
 fn nearest_content_distance(tree: &dyn TileTree, views: &[ViewState]) -> f64 {
     let mut best = f64::INFINITY;
+    // What the number came from, for the probe below. `d_near` scales every
+    // screen-space error in the pass, so when it moves the whole frame moves —
+    // and knowing it moved says nothing about why.
+    let mut witness_level: Option<u32> = None;
+    let mut witness_depth: Option<u32> = None;
+    let mut starved = 0usize;
     for view in views {
         for root in tree.roots() {
             let mut id = root;
@@ -682,37 +709,73 @@ fn nearest_content_distance(tree: &dyn TileTree, views: &[ViewState]) -> f64 {
             // finest tile under the camera is the one whose level the decree
             // replicates, so its distance is the price.
             let mut deepest: Option<f64> = None;
+            let mut deepest_at: u32 = 0;
             loop {
                 let props = tree.properties(id);
                 if props.has_content {
                     deepest =
                         Some(props.bounding_volume.distance_to_point(view.position()));
+                    deepest_at = tree.level(id);
                 }
                 let next = tree
                     .children(id)
                     .into_iter()
                     .min_by(|&a, &b| {
-                        let da = tree
-                            .properties(a)
-                            .bounding_volume
-                            .distance_to_point(view.position());
-                        let db = tree
-                            .properties(b)
-                            .bounding_volume
-                            .distance_to_point(view.position());
-                        da.total_cmp(&db)
+                        let off = |id| {
+                            let to_centre =
+                                tree.properties(id).bounding_volume.center() - view.position();
+                            let along = to_centre.dot(view.direction());
+                            (to_centre - along * view.direction()).length()
+                        };
+                        off(a).total_cmp(&off(b))
                     });
                 match next {
-                    Some(child) => id = child,
+                    Some(child) => {
+                        id = child;
+                    }
                     None => break,
                 }
             }
-            if let Some(d) = deepest {
-                best = best.min(d);
+            match deepest {
+                Some(d) => {
+                    if d < best {
+                        best = d;
+                        witness_level = Some(deepest_at);
+                        witness_depth = Some(tree.level(id));
+                    }
+                }
+                // A root the greedy path found no content under at all. Over
+                // open water that is the ordinary case, and it is the shape
+                // this probe exists to catch.
+                None => starved += 1,
             }
         }
     }
-    best.max(1.0)
+    let clamped = best.max(1.0);
+    // The disc's radius, and where it came from.
+    //
+    // A collapse here is a collapse of the whole frame: 52 frames of a
+    // 2880-frame shot fell from ~263 selected tiles to ~26, all of them at the
+    // loop's seam over the Atlantic. `d_near` is the one number capable of
+    // doing that to every tile at once, and the existing `det!` reports its
+    // value without reporting what produced it.
+    //
+    // `clamped` is the suspicion: the descent takes the nearest child at each
+    // level and keeps the deepest node WITH content on that single path. Where
+    // the path runs out of content early, the deepest such node is a coarse
+    // tile whose bounding volume contains the camera — distance near zero,
+    // floored to one metre, and a uniform disc eight metres wide.
+    tracing::debug!(
+        target: "dnear",
+        d_near = clamped,
+        raw = best,
+        clamped = best < 1.0,
+        content_level = witness_level,
+        descended_to = witness_depth,
+        roots_without_content = starved,
+        "uniform disc"
+    );
+    clamped
 }
 
 /// Recursive visit over the abstract [`TileTree`].
@@ -1993,6 +2056,119 @@ mod tests {
 
     /// A camera inside the nearest leaf's sphere means "as fine as the source
     /// goes", not a division by nothing.
+    /// `d_near` doit être continue : une distance ne saute pas.
+    ///
+    /// C'est une distance d'un point à un ensemble, donc 1-lipschitzienne — le
+    /// point bouge de δ, la distance varie d'au plus δ. La descente gloutonne
+    /// casse cette propriété, et c'est ce qui effondre la sélection.
+    ///
+    /// **Mesuré sur un vrai plan**, le tour des Pyrénées à 50 km, 20 septembre
+    /// 2026 : 317 mètres de déplacement de caméra entre deux frames font
+    /// passer `d_near` de 41,0 à 133,9 km. Le disque uniforme tarifant toutes
+    /// les erreurs écran à cette distance, la passe perd 1,7 niveau d'un coup
+    /// et la sélection tombe de 270 tuiles à 26 — 52 frames sur 2880, toutes à
+    /// la couture de la boucle au-dessus de l'Atlantique.
+    ///
+    /// La cause est au sommet de la descente. La caméra est *à l'intérieur*
+    /// des volumes des premiers niveaux, donc toutes les distances candidates
+    /// sont sous-métriques : `min_by` compare du bruit. Les barreaux relevés
+    /// disent `0, 0, 0` puis divergent à `61806` contre `13820`.
+    ///
+    /// Ici la même configuration, en petit : deux sphères que la caméra frôle
+    /// à quelques centimètres près, et dont les distances se croisent quand
+    /// elle avance d'un mètre. Chacune mène à un contenu très différemment
+    /// éloigné.
+    #[test]
+    fn nearest_content_distance_does_not_jump_when_the_camera_barely_moves() {
+        // Deux branches que la caméra frôle : à x = 0 la gauche est la plus
+        // proche d'un cheveu, à x = 2 c'est la droite. Sous la gauche, du
+        // contenu tout près ; sous la droite, du contenu très loin.
+        // La forme que produit vraiment un arbre de terrain : des OBB issues
+        // de **régions lat/lon**, avec du contenu à *tous* les niveaux — voir
+        // `TerrainTree::properties`, qui appelle `region_to_obb` sur
+        // `[ouest, sud, est, nord, min_h, max_h]`.
+        //
+        // C'est cette forme qui produit le défaut, et aucune scène cartésienne
+        // ne l'imite : pour une région large, l'OBB qui borne la calotte est
+        // grasse et **contient** une caméra à 50 km — donc `distance_to_point`
+        // rend zéro. Elle ne se resserre qu'en bas. En volant, la caméra sort
+        // du volume d'un frère puis de l'autre, et le départage bascule entre
+        // des distances qui frôlent zéro.
+        //
+        // Subdivision en longitude seulement : le basculement se joue entre
+        // frères, et deux dimensions ne prouveraient rien de plus pour quatre
+        // fois plus de JSON.
+        fn node(west: f64, east: f64, depth: u32) -> String {
+            let region = format!("[{west}, 0.60, {east}, 0.90, -1000, 9000]");
+            let error = 4000.0 / f64::from(1 << depth);
+            if depth == 5 {
+                return format!(
+                    r#"{{ "boundingVolume": {{ "region": {region} }},
+                         "geometricError": 0,
+                         "content": {{ "uri": "g{west}.glb" }} }}"#
+                );
+            }
+            let middle = 0.5 * (west + east);
+            format!(
+                r#"{{ "boundingVolume": {{ "region": {region} }},
+                     "geometricError": {error}, "refine": "REPLACE",
+                     "content": {{ "uri": "n{west}.glb" }},
+                     "children": [{}, {}] }}"#,
+                node(west, middle, depth + 1),
+                node(middle, east, depth + 1),
+            )
+        }
+        let json = format!(
+            r#"{{ "asset": {{ "version": "1.1" }}, "geometricError": 8000,
+                 "root": {} }}"#,
+            node(-0.80, 0.20, 0)
+        );
+        let base = Url::parse("file:///t/tileset.json").expect("url");
+        let ts = Tileset::from_json_bytes(json.as_bytes(), &base).expect("tileset");
+
+        let look = |lon: f64| {
+            let g = |height| {
+                crate::geo::geodetic_to_ecef(crate::geo::Geodetic {
+                    lon,
+                    lat: 0.74,
+                    height,
+                })
+            };
+            let (eye, ground) = (g(50_000.0), g(0.0));
+            ViewState::perspective(
+                eye,
+                (ground - eye).normalize(),
+                dvec3(0.0, 0.0, 1.0),
+                dvec2(3840.0, 2880.0),
+                45f64.to_radians(),
+            )
+        };
+
+        // Dix microradians de longitude, soit environ 47 m au sol à cette
+        // latitude — l'ordre de grandeur d'une frame du vrai plan (317 m).
+        let step = 1.0e-5;
+        let ground_step = 47.0;
+        let mut previous = nearest_content_distance(&ts, &[look(-0.31)]);
+        let mut worst = (0.0f64, 0.0f64, 0.0f64);
+        for i in 1..=2000 {
+            let x = -0.31 + f64::from(i) * step;
+            let d = nearest_content_distance(&ts, &[look(x)]);
+            if (d - previous).abs() > (worst.2 - worst.1).abs() {
+                worst = (x, previous, d);
+            }
+            previous = d;
+        }
+        let (x, before, after) = worst;
+        // Une marge d'un mètre absorbe l'écrêtage et l'arithmétique flottante ;
+        // ce qu'on refuse, c'est le saut de plusieurs ordres de grandeur.
+        assert!(
+            (after - before).abs() <= ground_step + 1.0,
+            "à lon = {x:.5} rad la caméra avance de {ground_step} m et d_near passe de \
+             {before} à {after} : une distance ne saute pas, et ce saut divise \
+             toutes les erreurs écran de la passe d'un coup"
+        );
+    }
+
     #[test]
     fn nearest_content_distance_clamps_at_contact() {
         let ts = mini_tileset();
