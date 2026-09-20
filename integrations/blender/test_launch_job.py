@@ -1548,3 +1548,77 @@ class AnExpiredTokenIsRenewedNotFatal(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 launch_job.gcp_call("GET", "whatever")
         self.assertEqual(len(seen), 1, "un 403 a été réessayé pour rien")
+
+
+class TheFilmIsMeasuredNotAssumed(unittest.TestCase):
+    """Le montage vérifie la cadence qu'il ne règle pas.
+
+    `assemble` concatène en `-c copy` : il hérite de la cadence des segments et
+    n'en impose aucune. Il recevait pourtant un paramètre `fps` qu'il n'utilisait
+    nulle part — un réglage qui ne règle rien, donc l'impression que la question
+    était traitée. Elle ne l'était pas : 7200 images étiquetées 24 i/s ont donné
+    un film de 300 secondes pour deux minutes de vol, et rien dans la chaîne ne
+    l'a remarqué. Il a fallu un ffprobe à la main, après coup.
+    """
+
+    def test_a_film_at_the_right_cadence_passes(self):
+        self.assertAlmostEqual(
+            launch_job.check_cadence(7200, "120.000", 60), 120.0, places=3)
+
+    def test_the_container_s_rounding_is_tolerated(self):
+        # Mesuré sur un remux : 25 ms de bourrage d'horodatages, une image et
+        # demie. Un film juste ne doit pas échouer là-dessus.
+        self.assertIsNotNone(launch_job.check_cadence(7200, "120.025", 60))
+
+    def test_a_film_two_and_a_half_times_too_long_is_refused(self):
+        with self.assertRaises(SystemExit) as caught:
+            launch_job.check_cadence(7200, "300.000", 60)
+        # Le message doit dire où chercher, pas seulement qu'il y a un écart.
+        self.assertIn("JOB_FPS", str(caught.exception))
+
+    def test_unreadable_numbers_do_not_fail_the_run(self):
+        # ffprobe qui ne rend rien est un instrument cassé, pas un film cassé :
+        # refuser ici perdrait un montage valide.
+        self.assertIsNone(launch_job.check_cadence("", "", 60))
+        self.assertIsNone(launch_job.check_cadence(0, "120.0", 60))
+
+
+class TheTwoJobsAgreeOnTheCadence(unittest.TestCase):
+    """Cuisson et rendu doivent échantillonner la même bande.
+
+    Sinon le pack décrit un tournage et l'image en montre un autre, et les deux
+    jobs annoncent une réussite. Le rendu avait DEUX sources — `$JOB_FPS` pour
+    la scène et l'encodage, `${p2:-24}` pour la bande — et la cuisson n'avait
+    pas `JOB_FPS` du tout.
+    """
+
+    def _scripts(self):
+        here = pathlib.Path(__file__).parent
+        return ((here / "bake_job.sh").read_text(),
+                (here / "render_job.sh").read_text())
+
+    def test_both_derive_the_cadence_the_same_way(self):
+        bake, render = self._scripts()
+        block = 'pyrenees) JOB_FPS="${_p2:-24}" ;;'
+        self.assertIn(block, bake)
+        self.assertIn(block, render)
+
+    def test_neither_reads_the_cadence_from_a_second_place(self):
+        # `${p2:-24}` sur l'appel au générateur de bande était la seconde
+        # source : elle ne s'accordait avec `$JOB_FPS` que par coïncidence.
+        for name, script in zip(("bake_job.sh", "render_job.sh"), self._scripts()):
+            self.assertNotIn('"${p2:-24}"', script, name)
+
+    def test_the_tape_is_built_at_that_cadence(self):
+        for name, script in zip(("bake_job.sh", "render_job.sh"), self._scripts()):
+            line = [l for l in script.splitlines() if "pyrenees-tape" in l]
+            self.assertTrue(line, name)
+            nxt = script.splitlines()[script.splitlines().index(line[0]) + 1]
+            self.assertIn('"$JOB_FPS"', nxt, f"{name}: {nxt}")
+
+    def test_the_launcher_tells_both_jobs(self):
+        src = (pathlib.Path(__file__).with_name("launch_job.py")).read_text()
+        self.assertEqual(src.count('"JOB_FPS": str(fps_of(args.trajectory))'), 1,
+                         "la cuisson ne reçoit pas la cadence")
+        self.assertEqual(src.count('env["JOB_FPS"] = str(fps_of(args.trajectory))'), 1,
+                         "le rendu ne reçoit pas la cadence")
