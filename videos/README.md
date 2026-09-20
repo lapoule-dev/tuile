@@ -11,6 +11,14 @@ faire office d'archive.
 Chaque entrée dit **de quoi refaire le film**, parce qu'un mp4 sans ses
 paramètres ne se compare à rien.
 
+**Bande, pack, film : les trois vont ensemble.** La cuisson dépose désormais
+sa trajectoire à côté du pack — `packs/<digest>/<plage>.mcap` — parce que
+c'est elle qui définit les deux autres. Les films d'avant le 19 septembre 2026
+n'en ont pas : leur bande a été fabriquée dans le conteneur et jetée, et la
+seule façon de retrouver leur tracé est de rejouer les caméras du pack avec
+`tuile-bake --tape-from`. Les générateurs évoluent, donc recuire la même
+chaîne d'arguments ne donne plus le même vol.
+
 ## `pyrenees-2min-nadir-50km.mp4`
 
 2880 frames, 1920×1440, 120,000000 s, 632 Mo. Le premier tour des Pyrénées.

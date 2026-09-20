@@ -746,7 +746,8 @@ def scene_digest_of(key):
         return ""
 
 
-def bake_env(args, ion, pack_url, scene_url, logs_url, tape_url=None):
+def bake_env(args, ion, pack_url, scene_url, logs_url, tape_url=None,
+             tape_put_url=""):
     """Tout ce que le job de cuisson lit dans son environnement.
 
     Une fonction de ses arguments, parce que l'alternative est que le seul
@@ -771,6 +772,11 @@ def bake_env(args, ion, pack_url, scene_url, logs_url, tape_url=None):
         # ne pourrait pas passer `--scene`, et on perdrait la seule barrière
         # entre un pack et le mauvais globe.
         "JOB_SCENE_PUT_URL": scene_url,
+        # La bande va avec le pack, parce qu'elle le définit. Les trois — bande,
+        # pack, film — doivent se retrouver ensemble : sans la première, recuire
+        # un pack sur son propre tracé demande de redescendre le gigaoctet et
+        # d'en extraire les caméras.
+        "JOB_TAPE_PUT_URL": tape_put_url,
         "JOB_LOGS_PUT_URL": logs_url,
         "TUILE_ION_TOKEN": ion,
         # Le budget de tuiles résidentes, que la cuisson ne recevait pas.
@@ -852,7 +858,7 @@ def bake(args, token=None):
             ExpiresIn=7 * 24 * 3600)
         print(f"bande:   {len(blob) / 1024:.0f} Ko, cuite telle quelle", flush=True)
     env = bake_env(args, ion, put(key), put(key + ".scene"),
-                   urls["logs.tar.gz"], tape_url)
+                   urls["logs.tar.gz"], tape_url, put(key + ".mcap"))
     for pair in args.env:
         k, _, v = pair.partition("=")
         if not k or not v:

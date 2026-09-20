@@ -16,6 +16,9 @@
 #                      the bake of the viewport it was made for)
 #   JOB_SSE            screen-space error target (default 3)
 #   JOB_PACK_PUT_URL   presigned PUT: where the finished pack goes
+#   JOB_TAPE_PUT_URL   presigned PUT: the tape this pack was baked from, beside
+#                      it. Without it a pack cannot be re-cooked on its own
+#                      path — see below.
 #   JOB_SCENE_PUT_URL  presigned PUT: the scene digest, as one line, beside the
 #                      pack. It cannot be derived from the parameters — it also
 #                      covers the RESOLVED traversal settings, which only this
@@ -227,6 +230,28 @@ if [ -n "${JOB_PACK_PUT_URL:-}" ]; then
         # machine s'en va avec, et personne ne peut la rejouer.
         echo PACK-UP-FAILED
         exit 1
+    fi
+fi
+
+# La bande, à côté du pack, parce que c'est elle qui le définit.
+#
+# Elle n'était conservée nulle part : le job la fabriquait dans le conteneur,
+# cuisait avec, et la jetait. Le pack, le digest et le film étaient archivés ;
+# le tracé, non — alors qu'il est la seule chose dont les trois découlent.
+#
+# Ce que ça a coûté : pour recuire le premier film sur son propre tracé, il a
+# fallu redescendre un gigaoctet de pack et en extraire les caméras une à une
+# (`tuile-bake --tape-from`). Ça a marché parce que le pack enregistre la
+# caméra de chaque frame — mais ça n'aurait pas dû être nécessaire, et ça ne
+# marcherait pas pour un tracé dont aucun pack n'a survécu.
+#
+# Déposée même quand elle a été FOURNIE : un pack recuit doit porter son tracé
+# comme les autres, sinon le trou se rouvre au coup d'après.
+if [ -n "${JOB_TAPE_PUT_URL:-}" ]; then
+    if curl -fsS -T "$tape" "$JOB_TAPE_PUT_URL" > /dev/null; then
+        echo "TAPE-UP ($(du -h "$tape" | cut -f1))"
+    else
+        echo TAPE-UP-FAILED
     fi
 fi
 
