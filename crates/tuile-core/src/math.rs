@@ -50,6 +50,50 @@ impl Obb {
         ]
     }
 
+    /// Whether a ray starting at `origin` along `direction` enters this box.
+    ///
+    /// The slab method, in the box's own frame: each pair of parallel faces
+    /// gives an interval of ray parameters, and the box is hit when the three
+    /// intervals overlap at a parameter that is not behind the origin.
+    ///
+    /// A ray that starts INSIDE counts as a hit, which is the case that
+    /// matters: it is precisely where a distance-to-surface saturates at zero
+    /// and stops telling volumes apart.
+    ///
+    /// `direction` is assumed normalised.
+    pub fn hit_by_ray(&self, origin: DVec3, direction: DVec3) -> bool {
+        let to_centre = self.center - origin;
+        let (mut near, mut far) = (f64::NEG_INFINITY, f64::INFINITY);
+        for i in 0..3 {
+            let axis = self.half_axes.col(i);
+            let half = axis.length();
+            if half <= 0.0 {
+                // A degenerate axis is a slab of no thickness: the ray has to
+                // lie in its plane, and missing that plane misses the box.
+                continue;
+            }
+            let unit = axis / half;
+            let along = direction.dot(unit);
+            let offset = to_centre.dot(unit);
+            if along.abs() <= f64::EPSILON {
+                // Parallel to this slab: either inside it for the whole ray,
+                // or outside it for the whole ray.
+                if offset.abs() > half {
+                    return false;
+                }
+                continue;
+            }
+            let (a, b) = ((offset - half) / along, (offset + half) / along);
+            near = near.max(a.min(b));
+            far = far.min(a.max(b));
+            if near > far {
+                return false;
+            }
+        }
+        // Behind the origin entirely is a miss; straddling it is a hit.
+        far >= 0.0
+    }
+
     /// Transforms the box by an affine matrix.
     pub fn transformed(&self, m: &DMat4) -> Self {
         Self {
@@ -105,6 +149,20 @@ pub struct Sphere {
 }
 
 impl Sphere {
+    /// Whether a ray starting at `origin` along `direction` enters this
+    /// sphere. See [`Obb::hit_by_ray`]; a ray starting inside counts.
+    ///
+    /// `direction` is assumed normalised.
+    pub fn hit_by_ray(&self, origin: DVec3, direction: DVec3) -> bool {
+        let to_centre = self.center - origin;
+        let along = to_centre.dot(direction);
+        // The closest approach, squared, from the right triangle whose
+        // hypotenuse is `to_centre`. Clamping `along` at zero keeps a centre
+        // behind the origin measured from the origin itself.
+        let closest = to_centre.length_squared() - along.max(0.0).powi(2);
+        closest <= self.radius * self.radius
+    }
+
     /// Distance from a point to the surface of the sphere (0 if inside).
     pub fn distance_to_point(&self, p: DVec3) -> f64 {
         ((p - self.center).length() - self.radius).max(0.0)
@@ -264,6 +322,14 @@ impl BoundingVolume {
         match self {
             Self::Obb(b) => f.intersects_obb(b),
             Self::Sphere(s) => f.intersects_sphere(s),
+        }
+    }
+
+    /// Whether the ray enters this volume. See [`Obb::hit_by_ray`].
+    pub fn hit_by_ray(&self, origin: DVec3, direction: DVec3) -> bool {
+        match self {
+            Self::Obb(b) => b.hit_by_ray(origin, direction),
+            Self::Sphere(s) => s.hit_by_ray(origin, direction),
         }
     }
 
@@ -558,5 +624,95 @@ mod tests {
         assert!(f.intersects_obb(&visible));
         assert!(!f.intersects_obb(&outside));
         assert!(f.intersects_obb(&enclosing));
+    }
+
+    #[test]
+    fn a_ray_aimed_at_a_box_hits_it_and_one_aimed_away_misses() {
+        let b = Obb {
+            center: dvec3(0.0, 0.0, -10.0),
+            half_axes: DMat3::IDENTITY,
+        };
+        assert!(b.hit_by_ray(DVec3::ZERO, dvec3(0.0, 0.0, -1.0)));
+        // Same line, opposite way: a ray is a half-line, not a line. This is
+        // the case that elected the antipode when the descent ranked tiles by
+        // their offset from the view axis.
+        assert!(!b.hit_by_ray(DVec3::ZERO, dvec3(0.0, 0.0, 1.0)));
+        assert!(!b.hit_by_ray(DVec3::ZERO, dvec3(0.0, 1.0, 0.0)));
+    }
+
+    #[test]
+    fn a_ray_starting_inside_a_box_hits_it_whichever_way_it_points() {
+        let b = unit_obb();
+        for direction in [
+            dvec3(1.0, 0.0, 0.0),
+            dvec3(-1.0, 0.0, 0.0),
+            dvec3(0.0, 0.0, -1.0),
+            dvec3(0.577, 0.577, 0.577).normalize(),
+        ] {
+            assert!(b.hit_by_ray(dvec3(0.2, -0.3, 0.1), direction));
+        }
+    }
+
+    #[test]
+    fn a_ray_grazing_past_a_box_corner_misses() {
+        let b = Obb {
+            center: dvec3(0.0, 0.0, -10.0),
+            half_axes: DMat3::IDENTITY,
+        };
+        // Offset by more than the half-extent on one axis, aimed straight
+        // down the other: the slabs never overlap.
+        assert!(!b.hit_by_ray(dvec3(1.5, 0.0, 0.0), dvec3(0.0, 0.0, -1.0)));
+        assert!(b.hit_by_ray(dvec3(0.5, 0.0, 0.0), dvec3(0.0, 0.0, -1.0)));
+    }
+
+    #[test]
+    fn a_ray_parallel_to_a_slab_hits_only_from_within_it() {
+        let b = Obb {
+            center: DVec3::ZERO,
+            half_axes: DMat3::from_diagonal(dvec3(1.0, 1.0, 100.0)),
+        };
+        assert!(b.hit_by_ray(dvec3(0.5, 0.0, -1000.0), dvec3(0.0, 0.0, 1.0)));
+        assert!(!b.hit_by_ray(dvec3(2.0, 0.0, -1000.0), dvec3(0.0, 0.0, 1.0)));
+    }
+
+    #[test]
+    fn a_rotated_box_is_hit_in_its_own_frame() {
+        let b = Obb {
+            center: dvec3(0.0, 0.0, -10.0),
+            half_axes: DMat3::from_rotation_z(std::f64::consts::FRAC_PI_4)
+                * DMat3::from_diagonal(dvec3(4.0, 0.5, 1.0)),
+        };
+        // The long axis now runs diagonally; a point 2.5 up and 2.5 across
+        // from the centre is inside it, the same offset the other way is not.
+        assert!(b.hit_by_ray(dvec3(2.5, 2.5, 0.0), dvec3(0.0, 0.0, -1.0)));
+        assert!(!b.hit_by_ray(dvec3(2.5, -2.5, 0.0), dvec3(0.0, 0.0, -1.0)));
+    }
+
+    #[test]
+    fn a_ray_and_a_sphere_agree_with_the_closest_approach() {
+        let s = Sphere {
+            center: dvec3(0.0, 0.0, -10.0),
+            radius: 2.0,
+        };
+        assert!(s.hit_by_ray(DVec3::ZERO, dvec3(0.0, 0.0, -1.0)));
+        assert!(!s.hit_by_ray(DVec3::ZERO, dvec3(0.0, 0.0, 1.0)));
+        // Closest approach exactly on the surface, and just outside it.
+        assert!(s.hit_by_ray(dvec3(1.9, 0.0, 0.0), dvec3(0.0, 0.0, -1.0)));
+        assert!(!s.hit_by_ray(dvec3(2.1, 0.0, 0.0), dvec3(0.0, 0.0, -1.0)));
+        // Starting inside, aimed outward.
+        assert!(s.hit_by_ray(dvec3(0.0, 0.0, -10.5), dvec3(0.0, 0.0, 1.0)));
+    }
+
+    #[test]
+    fn the_volume_dispatches_the_ray_to_its_shape() {
+        let eye = dvec3(0.0, 0.0, 100.0);
+        let down = dvec3(0.0, 0.0, -1.0);
+        assert!(BoundingVolume::Sphere(Sphere {
+            center: DVec3::ZERO,
+            radius: 1.0,
+        })
+        .hit_by_ray(eye, down));
+        assert!(BoundingVolume::Obb(unit_obb()).hit_by_ray(eye, down));
+        assert!(!BoundingVolume::Obb(unit_obb()).hit_by_ray(eye, -down));
     }
 }
