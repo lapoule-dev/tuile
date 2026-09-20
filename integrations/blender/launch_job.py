@@ -663,6 +663,23 @@ def gcp_watch(execution, token=None, every=20):
         time.sleep(every)
 
 
+def tape_digest(path):
+    """Le contenu d'une bande fournie, en seize hexas, ou `None`.
+
+    `None` et pas une valeur littérale : le terme ne doit apparaître dans la
+    clef QUE s'il y a une bande. L'ajouter au cas ordinaire renommerait tous
+    les packs déjà déposés — vérifié, `03eb228f774ab939` devenait
+    `6488c3831e9c5445`, et chaque film du répertoire `videos/` aurait pointé
+    vers un objet qui n'existe pas.
+
+    Par le contenu et non par le chemin : deux fichiers identiques sont la même
+    cuisson, quel que soit l'endroit d'où on les a pris.
+    """
+    if not path:
+        return None
+    return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()[:16]
+
+
 def pack_key(args):
     """Où le pack sera déposé, calculé AVANT de lancer quoi que ce soit.
 
@@ -700,7 +717,21 @@ def pack_key(args):
         # différentes ne sont pas le même pack, et doivent porter deux noms.
         f"imagery={args.imagery}",
         f"terrain={args.terrain}",
+        # La bande fournie, par son contenu.
+        #
+        # Quand elle est là, c'est ELLE qui décide les poses : la chaîne de
+        # trajectoire ne décrit plus rien. Sans ce terme, recuire un ancien
+        # pack sur son propre tracé retomberait sur sa clef et l'écraserait —
+        # mesuré au dry-run du 20 septembre 2026, où la recuisson visait
+        # exactement `packs/03eb228f774ab939/`, le pack qu'on voulait garder
+        # comme référence. Le nom aurait survécu, la référence non.
+        #
+        # Par le contenu et non par le chemin : deux fichiers identiques sont
+        # la même cuisson, quel que soit l'endroit d'où on les a pris.
     ])
+    supplied = tape_digest(getattr(args, "tape", None))
+    if supplied:
+        canonical += f"\ntape={supplied}"
     name = hashlib.sha256(canonical.encode()).hexdigest()[:16]
     return f"packs/{name}/{first}-{last}.tuilepack"
 
