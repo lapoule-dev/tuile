@@ -1670,3 +1670,52 @@ class ASuppliedTapeWinsOverAGeneratedOne(unittest.TestCase):
         # Une bande fournie court-circuite le générateur, pas l'encodage : la
         # cadence sert encore à ffmpeg et à la scène côté rendu.
         self.assertEqual(self._env()["JOB_FPS"], "24")
+
+
+class TheTapeIsKeptBesideThePack(unittest.TestCase):
+    """Bande, pack, film : les trois doivent se retrouver ensemble.
+
+    La bande n'était conservée nulle part. Le job la fabriquait dans le
+    conteneur, cuisait avec, et la jetait — pack, digest et film archivés, le
+    tracé non, alors qu'il est la seule chose dont les trois découlent.
+
+    Mesuré le 19 septembre 2026 : recuire le premier film sur son propre tracé
+    a demandé de redescendre un gigaoctet de pack et d'en extraire les caméras
+    frame par frame. Ça a marché parce qu'un pack enregistre la caméra de
+    chaque frame ; ça n'aurait pas dû être nécessaire, et ça ne marcherait pas
+    pour un tracé dont aucun pack n'a survécu.
+    """
+
+    def _args(self, **over):
+        base = dict(frames="1:2880", trajectory="pyrenees:2:24:50000:0.40",
+                    viewport="3840x2880", sse=3.0, imagery=0, terrain=0,
+                    imagery_boost=1, resident_gb=16, tape=None)
+        base.update(over)
+        return types.SimpleNamespace(**base)
+
+    def test_the_job_is_told_where_to_put_it(self):
+        env = launch_job.bake_env(self._args(), "jeton", "https://put/pack",
+                                  "https://put/scene", "https://put/logs",
+                                  None, "https://put/mcap")
+        self.assertEqual(env["JOB_TAPE_PUT_URL"], "https://put/mcap")
+
+    def test_it_lands_next_to_the_pack(self):
+        src = (pathlib.Path(__file__).with_name("launch_job.py")).read_text()
+        self.assertIn('put(key + ".mcap")', src,
+                      "la bande doit partager la clef du pack, pas celle du run")
+
+    def test_the_job_deposits_it(self):
+        script = (pathlib.Path(__file__).with_name("bake_job.sh")).read_text()
+        self.assertIn('-T "$tape" "$JOB_TAPE_PUT_URL"', script)
+        # Après la cuisson : déposer une bande alors que le pack a échoué
+        # laisserait un tracé sans rien à quoi le rattacher.
+        self.assertGreater(script.index("JOB_TAPE_PUT_URL:-"),
+                           script.index('-T "$pack" "$JOB_PACK_PUT_URL"'))
+
+    def test_a_supplied_tape_is_deposited_too(self):
+        # Sinon le trou se rouvre au coup d'après : un pack recuit n'aurait pas
+        # son tracé, et le suivant devrait à nouveau l'extraire à la main.
+        script = (pathlib.Path(__file__).with_name("bake_job.sh")).read_text()
+        deposit = script[script.index("JOB_TAPE_PUT_URL:-"):]
+        self.assertNotIn("JOB_TAPE_URL", deposit.split("fi")[0],
+                         "le dépôt ne doit pas dépendre de l'origine de la bande")
