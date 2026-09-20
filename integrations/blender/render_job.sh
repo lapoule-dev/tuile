@@ -102,7 +102,25 @@ JOB_THRESHOLD="${JOB_THRESHOLD:-0.05}"
 JOB_GPUS="${JOB_GPUS:-1}"
 JOB_PROCS_PER_GPU="${JOB_PROCS_PER_GPU:-4}"
 JOB_BATCH_FRAMES="${JOB_BATCH_FRAMES:-60}"
-JOB_FPS="${JOB_FPS:-24}"
+# La cadence, une seule valeur pour tout le job.
+#
+# `JOB_FPS` fait autorité. À défaut elle se lit dans la trajectoire, qui la
+# porte en deuxième position — et pour le seul genre `pyrenees` : `orbit` met
+# une longitude à cette place, et la lire comme une cadence donnerait un film
+# à deux images par seconde sans que rien ne s'en plaigne.
+#
+# Le lanceur pose la même valeur, calculée par `fps_of`. Deux endroits pour un
+# même nombre, c'est deux endroits pour qu'ils divergent : un test tient les
+# deux dérivations ensemble, et les deux jobs portent celle-ci mot pour mot —
+# une cuisson et un rendu qui n'échantillonnent pas la même bande décrivent
+# deux tournages différents, et les deux annoncent une réussite.
+if [ -z "${JOB_FPS:-}" ]; then
+    IFS=: read -r _kind _p1 _p2 _rest <<< "${JOB_TRAJECTORY:-}"
+    case "$_kind" in
+        pyrenees) JOB_FPS="${_p2:-24}" ;;
+        *)        JOB_FPS=24 ;;
+    esac
+fi
 JOB_EXTRA_ARGS="${JOB_EXTRA_ARGS:-}"
 # Des drapeaux pour BLENDER lui-même, avant `-P`, là où `JOB_EXTRA_ARGS` va au
 # script Python d'après `--`. La distinction a coûté une soirée : Cycles ne
@@ -515,7 +533,7 @@ elif [ -n "${JOB_TRAJECTORY:-}" ]; then
                    "${p1:-1440}" "${p2:-2.17}" "${p3:-42.52}" \
                    "${p4:-8000}" "${p5:-5000}" ;;
         pyrenees) /opt/tuile/bin/pyrenees-tape /tmp/traj.mcap \
-                      "${p1:-2}" "${p2:-24}" "${p3:-50000}" "${p4:-0.40}" ;;
+                      "${p1:-2}" "$JOB_FPS" "${p3:-50000}" "${p4:-0.40}" ;;
         zoom)  /opt/tuile/bin/zoom-tape /tmp/traj.mcap "${p1:-64}" ;;
         *) echo "TRAJECTORY-UNKNOWN: $kind"; exit 1 ;;
     esac

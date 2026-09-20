@@ -109,13 +109,33 @@ echo "bake: frames $JOB_FRAMES, viewport $JOB_VIEWPORT, sse $JOB_SSE"
 # cuisson et le rendu doivent produire EXACTEMENT la même trajectoire, sinon le
 # pack décrit un tournage et l'image en montre un autre — et les deux jobs
 # annoncent une réussite.
+# La cadence, une seule valeur pour tout le job.
+#
+# `JOB_FPS` fait autorité. À défaut elle se lit dans la trajectoire, qui la
+# porte en deuxième position — et pour le seul genre `pyrenees` : `orbit` met
+# une longitude à cette place, et la lire comme une cadence donnerait un film
+# à deux images par seconde sans que rien ne s'en plaigne.
+#
+# Le lanceur pose la même valeur, calculée par `fps_of`. Deux endroits pour un
+# même nombre, c'est deux endroits pour qu'ils divergent : un test tient les
+# deux dérivations ensemble, et les deux jobs portent celle-ci mot pour mot —
+# une cuisson et un rendu qui n'échantillonnent pas la même bande décrivent
+# deux tournages différents, et les deux annoncent une réussite.
+if [ -z "${JOB_FPS:-}" ]; then
+    IFS=: read -r _kind _p1 _p2 _rest <<< "${JOB_TRAJECTORY:-}"
+    case "$_kind" in
+        pyrenees) JOB_FPS="${_p2:-24}" ;;
+        *)        JOB_FPS=24 ;;
+    esac
+fi
+
 IFS=: read -r kind p1 p2 p3 p4 p5 <<< "$JOB_TRAJECTORY"
 case "$kind" in
     orbit) /opt/tuile/bin/orbit-tape "$tape" \
                "${p1:-1440}" "${p2:-2.17}" "${p3:-42.52}" \
                "${p4:-8000}" "${p5:-5000}" ;;
     pyrenees) /opt/tuile/bin/pyrenees-tape "$tape" \
-                  "${p1:-2}" "${p2:-24}" "${p3:-50000}" "${p4:-0.40}" ;;
+                  "${p1:-2}" "$JOB_FPS" "${p3:-50000}" "${p4:-0.40}" ;;
     zoom)  /opt/tuile/bin/zoom-tape "$tape" "${p1:-64}" ;;
     *) echo "TRAJECTORY-UNKNOWN: $kind"; exit 1 ;;
 esac
