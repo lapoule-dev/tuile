@@ -746,7 +746,7 @@ def scene_digest_of(key):
         return ""
 
 
-def bake_env(args, ion, pack_url, scene_url, logs_url):
+def bake_env(args, ion, pack_url, scene_url, logs_url, tape_url=None):
     """Tout ce que le job de cuisson lit dans son environnement.
 
     Une fonction de ses arguments, parce que l'alternative est que le seul
@@ -791,6 +791,10 @@ def bake_env(args, ion, pack_url, scene_url, logs_url):
         # demandera jamais. Elle la dérivait de la chaîne, le rendu la
         # recevait ici : deux chemins pour un même nombre.
         "JOB_FPS": str(fps_of(args.trajectory)),
+        # Vide quand la trajectoire suffit : le job ne lit cette variable que
+        # si elle porte quelque chose, et une bande fournie l'emporte alors sur
+        # la chaîne d'arguments.
+        "JOB_TAPE_URL": tape_url or "",
     }
 
 def bake(args, token=None):
@@ -834,8 +838,21 @@ def bake(args, token=None):
             "put_object", Params={"Bucket": R2_BUCKET, "Key": name},
             ExpiresIn=7 * 24 * 3600)
 
+    tape_url = None
+    if getattr(args, "tape", None):
+        # Déposée dans l'archive du run, pas à côté du pack : c'est une entrée
+        # de CE lancement, et la garder avec ses journaux est ce qui permet de
+        # refaire exactement la même cuisson six mois plus tard.
+        blob = pathlib.Path(args.tape).read_bytes()
+        client.put_object(Bucket=R2_BUCKET, Key=f"{R2_PREFIX}/{run}/traj.mcap",
+                          Body=blob, ContentType="application/octet-stream")
+        tape_url = client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": R2_BUCKET, "Key": f"{R2_PREFIX}/{run}/traj.mcap"},
+            ExpiresIn=7 * 24 * 3600)
+        print(f"bande:   {len(blob) / 1024:.0f} Ko, cuite telle quelle", flush=True)
     env = bake_env(args, ion, put(key), put(key + ".scene"),
-                   urls["logs.tar.gz"])
+                   urls["logs.tar.gz"], tape_url)
     for pair in args.env:
         k, _, v = pair.partition("=")
         if not k or not v:
@@ -1213,6 +1230,9 @@ def main():
     p.add_argument("--stage-url", default="",
                    help="URL GET (présignée) du .usda — la voie des vraies "
                         "tracks enregistrées")
+    p.add_argument("--tape", help="une bande .mcap à cuire telle quelle, au lieu "
+                   "de la générer depuis --trajectory. Sert à recuire un pack sur "
+                   "son propre tracé : `tuile-bake --tape-from <pack> <mcap>`")
     p.add_argument("--trajectory", default="",
                    help="la voie générative : le pod fabrique son manifeste "
                         "(ex: orbit:1440:2.17:42.52:8000:5000, zoom:64)")
