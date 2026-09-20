@@ -1,0 +1,8 @@
+# Build output and dependencies.
+dist/
+node_modules/
+.astro/
+
+# Generated rustdoc. `npm run docs:api` rebuilds it from the workspace;
+# 200 MB of machine-written HTML has no place in the history.
+public/docs/api/

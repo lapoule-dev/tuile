@@ -1,0 +1,21 @@
+{
+  "name": "tuile-site",
+  "version": "0.0.1",
+  "private": true,
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "start": "node ./dist/server/entry.mjs",
+    "preview": "node ./dist/server/entry.mjs",
+    "docs:api": "node ./scripts/rustdoc.mjs",
+    "docs:api:stage": "node ./scripts/rustdoc.mjs --stage-only",
+    "build:all": "npm run docs:api && npm run build",
+    "check": "astro check"
+  },
+  "dependencies": {
+    "@astrojs/node": "^9.5.5",
+    "astro": "^5.18.2"
+  }
+}
