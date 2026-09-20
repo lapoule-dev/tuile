@@ -1,0 +1,153 @@
+---
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) lapoule.dev
+
+import Base from '../layouts/Base.astro';
+---
+
+<Base
+  title="Tuile — an OGC 3D Tiles engine and geometry server in Rust"
+  description="Tuile is an open-source Rust workspace that consumes and serves the OGC 3D Tiles Community Standard: a render-agnostic core that compiles to WebAssembly, a wgpu renderer, streaming geometry, a planetary terrain and imagery globe, and USD output."
+  kicker="OGC 3D Tiles · Rust · MIT OR Apache-2.0"
+  heading="A 3D Tiles engine that both consumes and serves."
+  lede="Tuile is a Cargo workspace implementing the OGC 3D Tiles Community Standard end to end, in Rust. The core holds the whole standard — parsing, screen-space-error traversal, scheduling, decoding — and knows nothing about renderers, HTTP frameworks or async runtimes. Everything else is a binding."
+>
+  <div class="cta">
+    <a class="solid" href="/getting-started">Getting started</a>
+    <a href="/architecture">Architecture</a>
+    <a href="/docs/api">API reference</a>
+  </div>
+
+  <h2>Why it exists</h2>
+
+  <p>
+    3D Tiles is the dominant format for streaming large geospatial 3D scenes, and its
+    ecosystem is lopsided. Producing tilesets is a solved problem: several mature,
+    independent tilers write static trees of <code>tileset.json</code> and glTF payloads.
+    Consuming them is concentrated in a small number of clients, each welded to the
+    ecosystem it was written for.
+  </p>
+
+  <p>
+    <strong>Serving is the hole.</strong> In practice a tileset is either a directory of
+    files behind a static web server or a content delivery network, or it is a hosted
+    subscription. There is no lightweight dynamic server for 3D Tiles — one binary, several
+    sources, a cache you can swap or remove, deployable from a laptop to an edge worker.
+    The two-dimensional map world solved exactly this problem years ago and has been the
+    better for it. Nobody has done it in three dimensions.
+  </p>
+
+  <p>
+    The second hole is native rendering. No mature Rust engine consumes 3D Tiles, and none
+    consumes streamed terrain meshes draped with raster imagery to draw a globe. Tuile is
+    both halves, because they are the same code seen from two ends: the traversal that
+    decides which tiles a camera needs is the same whether it runs inside the renderer or
+    inside the server.
+  </p>
+
+  <h2>What is in the box</h2>
+
+  <div class="grid">
+    <div>
+      <span class="name">tuile-core</span>
+      <p>
+        The whole standard, render-agnostic, no async runtime, no HTTP client. Compiles to
+        <code>wasm32-unknown-unknown</code>, and CI enforces it.
+      </p>
+    </div>
+    <div>
+      <span class="name">GeometryStream</span>
+      <p>
+        The streaming protocol as a core trait, not a network API. Three bindings —
+        in-process, over a socket, and plain HTTP pull — and one renderer that cannot tell
+        them apart.
+      </p>
+    </div>
+    <div>
+      <span class="name">tuile-wgpu</span>
+      <p>
+        The reference renderer, native and in the browser. It proves the core end to end
+        and it is the first consumer of every seam.
+      </p>
+    </div>
+    <div>
+      <span class="name">Planetary globe</span>
+      <p>
+        Quantized-mesh terrain and raster imagery assembled into the same tile tree the
+        3D Tiles traversal already walks — one selection algorithm, two data shapes.
+      </p>
+    </div>
+    <div>
+      <span class="name">USD output</span>
+      <p>
+        A tileset region written out as USD text and USDZ packages, in pure Rust with no
+        C++ dependency, plus a scene-index integration that streams tiles into an offline
+        renderer.
+      </p>
+    </div>
+    <div>
+      <span class="name">Bake and replay</span>
+      <p>
+        Freeze a camera path's worth of geometry into a single container, then render it
+        again on a farm, deterministically, without touching the network.
+      </p>
+    </div>
+  </div>
+
+  <h2>The rules it is built under</h2>
+
+  <p>
+    These are not style preferences. Each one is load-bearing, and each one has cost
+    something to learn.
+  </p>
+
+  <ol class="rule-list">
+    <li>
+      <strong>The core depends on no backend.</strong> No renderer, no async runtime, no
+      HTTP framework, no filesystem on production paths. Input and output cross named
+      traits — <code>TileFetcher</code>, <code>PrepareRenderResources</code>,
+      <code>TileCache</code>. Wanting to add a heavy dependency to the core is the signal
+      that an abstraction is in the wrong place.
+    </li>
+    <li>
+      <strong>The core compiles to WebAssembly.</strong> Checked on every change. It is the
+      cheapest possible proof that rule one still holds.
+    </li>
+    <li>
+      <strong>All geospatial arithmetic is 64-bit until rebasing.</strong> Earth-centred
+      coordinates run to about 6.4 million metres; 32-bit floats resolve roughly half a
+      metre there, which is visible jitter. Positions are rebased onto a local origin in
+      f64 and only then handed to the GPU as f32.
+    </li>
+    <li>
+      <strong>What crosses a wire is standard 3D Tiles.</strong> Geometry is serialised as
+      glb — never a private binary format — so any conforming client can read what Tuile
+      serves, and Tuile can read what any conforming producer writes. The decoded form
+      exists only in memory, on the consumer's side.
+    </li>
+    <li>
+      <strong>The project defines itself by the standard.</strong> Not against any product.
+      The normative reference is
+      <a href="https://docs.ogc.org/cs/22-025r4/22-025r4.html" rel="noopener">OGC 3D Tiles 1.1</a>.
+    </li>
+  </ol>
+
+  <h2>Who it is for</h2>
+
+  <ul>
+    <li>
+      Someone holding a tileset out of a tiler or a photogrammetry pipeline who wants to
+      serve it cleanly, from one binary, with a cache they choose.
+    </li>
+    <li>
+      A Rust developer who wants a tileset or a terrain globe drawn inside their own
+      wgpu application without embedding a C++ engine.
+    </li>
+    <li>
+      Anyone who needs a geographic area as USD or USDZ — for an offline render farm, or
+      for an augmented-reality viewer that reads that packaging.
+    </li>
+  </ul>
+
+  <p class="next">Next → <a href="/architecture">Architecture: the crates and the seams</a></p>
+</Base>

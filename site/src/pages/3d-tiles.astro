@@ -1,0 +1,163 @@
+---
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) lapoule.dev
+
+import Base from '../layouts/Base.astro';
+
+const sse = `sse = (geometricError * viewportHeight)
+      / (distanceToCamera * 2 * tan(fovY / 2))`;
+
+const states = `Unloaded → Loading → Decoded → Resident → (Evicted)`;
+
+const pitfalls = [
+  ['The Y-up to Z-up rotation on glTF content', 'Forget it and every model lies on its side. Classic mistake number one.'],
+  ['A geometric error of zero on a leaf', 'Means never attempt to refine further. Not "refine infinitely".'],
+  ['Refinement inherited from the parent', 'When a tile omits refine, it takes the parent’s, not the default.'],
+  ['Regions are in radians', 'Not degrees. The bounding-region variant is the only one that is angular.'],
+  ['transform is column-major', 'Same convention as glTF. Compose root to leaf.'],
+  ['The legacy container carries a centre offset', 'Read it from the feature table and compose it into the transform, or the tile lands kilometres away.'],
+  ['f64 everywhere before rebasing', 'The single rule that decides whether the render jitters.'],
+  ['External tilesets graft at the referencing tile’s error', 'Not at their own root error.'],
+];
+---
+
+<Base
+  title="3D Tiles, condensed — Tuile"
+  description="What the OGC 3D Tiles standard actually asks an implementation to do: the tile tree, the content formats, screen-space error traversal, and the pitfalls that cost the most time."
+  kicker="The standard"
+  heading="3D Tiles, condensed."
+  lede="A working summary of what the standard asks an implementation to do, written from the notes the engine was built against. The normative reference is OGC 3D Tiles 1.1; where the specification leaves grey areas, the behaviour of the established open-source implementations settles them."
+>
+  <h2>The tile tree</h2>
+
+  <p>
+    A tileset is a JSON document describing a tree. The root carries an asset version and a
+    geometric error; every tile carries a bounding volume, its own geometric error, an
+    optional refinement mode, an optional transform, an optional content URI, and children.
+  </p>
+
+  <ul>
+    <li>
+      <strong>Bounding volumes</strong> come in three shapes: an oriented box (a centre plus
+      three half-axes), a geographic region (west, south, east, north in radians, plus a
+      height range), and a sphere.
+    </li>
+    <li>
+      <strong>Refinement</strong> is either <code>REPLACE</code> — the children stand in for
+      the parent — or <code>ADD</code>, where the children are drawn on top of a parent that
+      stays visible. Absent, it is inherited.
+    </li>
+    <li>
+      <strong>Transforms</strong> are column-major 4×4 matrices that compose from the root
+      down: a tile's world transform is its parent's, times its own.
+    </li>
+    <li>
+      <strong>External tilesets.</strong> A content URI may point at another
+      <code>tileset.json</code>, grafting a second tree in at load time. This is extremely
+      common, and an engine that does not handle it handles very little real data.
+    </li>
+    <li>
+      <strong>Implicit tiling</strong> (introduced in 1.1) replaces the explicit tree with a
+      subdivision rule — quadtree or octree — plus URI templates and binary subtree files
+      holding availability bitstreams. The tree stops being written down and starts being
+      computed.
+    </li>
+  </ul>
+
+  <h2>Content</h2>
+
+  <p>
+    In 1.1 a tile's content is simply a glb: the binary form of glTF, read straight through.
+    The 1.0 legacy container wraps that same glb behind a 28-byte header and two optional
+    tables, one of which may carry a relative-to-centre translation that must be composed
+    into the tile's transform.
+  </p>
+
+  <p>
+    The glTF payload may itself be compressed — mesh compression, a compact vertex encoding,
+    or a supercompressed texture format. Because geometry is carried as glb all the way to
+    the consumer, those compressions survive the whole journey instead of being decoded and
+    re-encoded in the middle.
+  </p>
+
+  <p>
+    Instanced models, point clouds and composite tiles are out of scope for the first
+    version. They return a typed unsupported-content error — not a panic.
+  </p>
+
+  <h2>Coordinates</h2>
+
+  <p>
+    A tileset lives in Earth-centred, Earth-fixed coordinates, Z-up, in metres. glTF is
+    Y-up. The standard therefore mandates an implicit quarter-turn about X applied to glTF
+    content, and forgetting it is the single most recognisable bug in the field. Converting
+    between geodetic coordinates and the Earth-centred frame — needed for bounding regions
+    and for any export — is standard ellipsoid arithmetic, done in f64.
+  </p>
+
+  <h2>Screen-space error: the heart of it</h2>
+
+  <p>
+    Everything a 3D Tiles engine does for a living comes down to one number per tile per
+    frame: how large, in pixels, the tile's geometric error would appear on screen.
+  </p>
+
+  <pre><code>{sse}</code></pre>
+
+  <ul>
+    <li>
+      The distance is measured to the <em>bounding volume</em>, not to its centre, and is
+      clamped when the camera is inside it.
+    </li>
+    <li>
+      If the error exceeds the budget — sixteen pixels by default — the tile is too coarse
+      and the traversal descends into its children.
+    </li>
+    <li>
+      Frustum culling happens against the bounding volume before any of this is computed.
+    </li>
+    <li>
+      Under <code>REPLACE</code>, the parent may only be hidden once <em>every</em> selected
+      child is resident. Hide it early and holes open in the surface. "Hold until children
+      are ready" is not an optimisation; it is the correctness condition.
+    </li>
+    <li>
+      The traversal emits two things: the tiles to draw, and a list of content requests
+      sorted by priority group and then by camera distance. A request for a tile that has
+      left the selection must be cancellable.
+    </li>
+  </ul>
+
+  <h2>Lifecycle and memory</h2>
+
+  <pre><code>{states}</code></pre>
+
+  <p>
+    Residency is a least-recently-used cache bounded by a byte budget. The one rule that
+    cannot be broken: a tile currently selected for drawing is never evicted. Everything
+    else is fair game.
+  </p>
+
+  <h2>Beyond the standard: the terrain globe</h2>
+
+  <p>
+    A planetary globe is not 3D Tiles — terrain arrives as quantized meshes indexed by a
+    geographic quadtree with availability described separately, and imagery arrives as
+    raster tiles that have to be draped onto it. Tuile folds both into the same machinery
+    rather than growing a second engine: a terrain tile decodes into the <em>same</em>
+    decoded content type a glTF tile does, and both are reached through one tile-source
+    abstraction, so the screen-space-error traversal refines terrain with no terrain-specific
+    selection code anywhere in it.
+  </p>
+
+  <h2>The pitfalls, as a checklist</h2>
+
+  <table>
+    <thead><tr><th>Trap</th><th>Why it bites</th></tr></thead>
+    <tbody>
+      {pitfalls.map(([a, b]) => (<tr><td>{a}</td><td>{b}</td></tr>))}
+    </tbody>
+  </table>
+
+  <p class="next">Next → <a href="/roadmap">The roadmap</a></p>
+</Base>
