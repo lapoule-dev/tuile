@@ -1081,6 +1081,48 @@ class TheTwoJobsAgreeOnTheTrajectory(unittest.TestCase):
                     "pas le même tournage")
 
 
+class ThePackCarriesItsOwnFlight(unittest.TestCase):
+    """Le rendu doit rejouer la bande qui a cuit le pack, pas la refabriquer.
+
+    Un pack répond à une caméra par la pose, à un mètre et un milliradian. Le
+    20 septembre 2026, un rendu lancé avec la même chaîne `pyrenees:...` que la
+    cuisson est mort en neuf secondes sur les trois tâches : `pyrenees-tape`
+    penche désormais de 20° sur la verticale, la cuisson avait reçu une bande
+    nadir archivée, et l'écart lu était 0,349066 rad — vingt degrés, à six
+    millimètres près sur la position."""
+
+    def test_the_tape_beside_the_pack_is_what_gets_flown(self):
+        seen = []
+        url = launch_job.tape_beside(
+            "packs/abc/1-60.tuilepack",
+            lambda k: (seen.append(k), True)[1],
+            lambda k: f"https://r2/{k}?signed")
+        self.assertEqual(seen, ["packs/abc/1-60.tuilepack.mcap"])
+        self.assertEqual(url, "https://r2/packs/abc/1-60.tuilepack.mcap?signed")
+
+    def test_a_pack_without_its_tape_falls_back_to_the_trajectory(self):
+        self.assertIsNone(launch_job.tape_beside(
+            "packs/abc/1-60.tuilepack", lambda k: False,
+            lambda k: self.fail("rien à présigner si la bande n'existe pas")))
+
+    def test_the_render_script_prefers_the_tape_over_the_trajectory(self):
+        script = (pathlib.Path(__file__).parent / "render_job.sh").read_text()
+        tape = script.index('curl -fsS -o /tmp/traj.mcap "$JOB_TAPE_URL"')
+        generated = script.index("/opt/tuile/bin/pyrenees-tape /tmp/traj.mcap")
+        self.assertLess(tape, generated,
+                        "la bande fournie doit l'emporter sur la générée")
+        # Et une seule étape en sort, quelle que soit la source.
+        self.assertEqual(script.count("/opt/tuile/bin/tape-to-stage"), 1)
+
+    def test_both_scripts_take_a_supplied_tape(self):
+        here = pathlib.Path(__file__).parent
+        for name in ("bake_job.sh", "render_job.sh"):
+            with self.subTest(script=name):
+                self.assertIn("JOB_TAPE_URL", (here / name).read_text(),
+                              f"{name} ignore une bande fournie — le pack et "
+                              "l'image ne décriraient pas le même tournage")
+
+
 class TheCameraCrossesTheBoundary(unittest.TestCase):
     """La caméra doit atteindre le procédural, et elle ne l'a jamais fait.
 
