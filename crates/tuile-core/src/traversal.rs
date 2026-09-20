@@ -662,76 +662,111 @@ impl Visit {
     }
 }
 
-/// The distance from the nearest view to the nearest *existing* content: a
-/// greedy root-to-leaf descent, always into the child closest to the eye.
+/// The distance from the nearest view to the nearest *existing* content:
+/// a branching descent along the line of sight, taking the minimum over the
+/// branches the ray actually enters.
 ///
-/// This is what [`Config::uniform_detail`] prices every tile at. Greedy is
-/// exact enough here — the descent follows the ground under the camera, and
-/// availability stops it at the finest level the source actually has, which is
-/// precisely the level the decree replicates outward. Clamped away from zero:
-/// a camera inside the nearest leaf's bounding sphere means "as fine as the
-/// source can go", not a division by nothing.
+/// This is what [`Config::uniform_detail`] prices every tile at. What is
+/// wanted is the DEEPEST content under the camera, not the closest: an
+/// ancestor's huge bounding volume usually *contains* the eye (a globe's root
+/// always does), so its distance is near zero, and pricing at it would refine
+/// the whole frustum to the source's maximum. The finest tile the ray reaches
+/// is the one whose level the decree replicates outward, so its distance is
+/// the price. Clamped away from zero: an eye inside the finest leaf means "as
+/// fine as the source can go", not a division by nothing.
 fn nearest_content_distance(tree: &dyn TileTree, views: &[ViewState]) -> f64 {
     let mut best = f64::INFINITY;
     for view in views {
         for root in tree.roots() {
-            let mut id = root;
-            // The DEEPEST content on the path, not the closest: an ancestor's
-            // huge bounding volume usually *contains* the camera (a globe's
-            // root always does), so its distance is near zero and pricing at
-            // it would refine the whole frustum to the source's maximum. The
-            // finest tile under the camera is the one whose level the decree
-            // replicates, so its distance is the price.
-            let mut deepest: Option<f64> = None;
-            loop {
-                let props = tree.properties(id);
-                if props.has_content {
-                    deepest =
-                        Some(props.bounding_volume.distance_to_point(view.position()));
-                }
-                // Toward what the camera is aimed through, by the child's
-                // offset from the VIEW AXIS — not by its distance.
-                //
-                // `distance_to_point` rend zéro pour tout volume contenant
-                // l'œil, et près du sommet d'un arbre planétaire l'œil est
-                // dans chacun d'eux : la clé ne discrimine plus rien et le
-                // « plus proche » est décidé par du bruit flottant. Mesuré le
-                // 20 septembre 2026 sur le tour des Pyrénées — les trois
-                // premiers barreaux de la descente lisaient tous zéro, puis
-                // les chemins divergeaient, l'un se posant à 16 km de l'axe,
-                // l'autre s'immobilisant 166 km de côté. `d_near` basculait
-                // entre 41,0 et 133,9 km pour 317 m de vol, et comme le disque
-                // uniforme tarife TOUTES les erreurs écran de la passe à cette
-                // distance, la sélection tombait de 270 tuiles à 26 : 52 frames
-                // sur 2880, toutes au-dessus de l'Atlantique.
-                //
-                // L'écart à l'axe garde du sens à l'intérieur du volume, donc
-                // la descente reste sous ce que la caméra regarde. Deux autres
-                // clés ont été essayées et mesurées : la distance au centre
-                // rend la valeur continue mais fausse — le centre d'une tuile
-                // de niveau 0 est enfoui dans la Terre, elle annonce 153 km sur
-                // chaque frame et effondre le film entier ; ne suivre que les
-                // enfants contenant l'œil saute dès que l'un d'eux sort du jeu.
-                let next = tree.children(id).into_iter().min_by(|&a, &b| {
-                    let off = |id| {
-                        let to_centre =
-                            tree.properties(id).bounding_volume.center() - view.position();
-                        let along = to_centre.dot(view.direction());
-                        (to_centre - along * view.direction()).length()
-                    };
-                    off(a).total_cmp(&off(b))
-                });
-                match next {
-                    Some(child) => id = child,
-                    None => break,
-                }
-            }
-            if let Some(d) = deepest {
+            if let Some(d) = deepest_content_along(tree, view, root, DESCENT_DEPTH) {
                 best = best.min(d);
             }
         }
     }
     best.max(1.0)
+}
+
+/// How far the descent will follow a ray before giving up. Deeper than any
+/// real tileset; it exists so a cyclic or pathological tree cannot recurse
+/// without end.
+const DESCENT_DEPTH: u32 = 64;
+
+/// The distance to the deepest content under `id` that the view ray reaches,
+/// or `None` when this subtree holds no content at all.
+///
+/// Why branching, and not a single "closest child" at each rung. The eye at
+/// altitude is INSIDE the bounding volume of every tile near the root, and
+/// [`BoundingVolume::distance_to_point`] returns zero for a volume containing
+/// the point. A key built on that distance is therefore comparing zeros, and
+/// "the closest child" is decided by floating-point noise. Measured on the
+/// Pyrenees tour on 20 September 2026: the first three rungs all read zero,
+/// then the paths diverged — one landing 16 km from the axis, the other
+/// stalling 166 km to the side. `d_near` flipped between 41.0 and 133.9 km for
+/// 317 m of flight, and since the uniform disc prices EVERY screen-space error
+/// of the pass at that distance, selection fell from 270 tiles to 26 on 52 of
+/// 2880 frames, all above the Atlantic.
+///
+/// Following every branch the ray enters removes the comparison: nothing is
+/// ranked while the numbers are degenerate, and the `min` at the end is taken
+/// over answers that are real distances to real content. It is the shape of
+/// cesium-native's `TilesetHeightQuery::findCandidateTiles`, which likewise
+/// recurses into every child a ray intersects rather than electing one.
+///
+/// Two ranking keys were tried before this and both were measured wrong: the
+/// distance to the volume's CENTRE is continuous but untrue — a level-0 tile's
+/// centre is buried inside the Earth, so it reads 153 km on every frame and
+/// flattens the whole film; the offset from the view AXIS elects the antipode,
+/// which sits exactly on the line of sight 12 783 km away.
+///
+/// When the ray enters no child at all — a camera aimed away from the ground,
+/// and the flat toy scenes of the tests — the distances are all strictly
+/// positive, so they discriminate, and the classic nearest child is followed
+/// alone. The degenerate case and the ranked case are disjoint by
+/// construction: an eye inside a volume is always a ray hit.
+fn deepest_content_along(
+    tree: &dyn TileTree,
+    view: &ViewState,
+    id: TileId,
+    budget: u32,
+) -> Option<f64> {
+    let props = tree.properties(id);
+    let here = props
+        .has_content
+        .then(|| props.bounding_volume.distance_to_point(view.position()));
+    let children = tree.children(id);
+    if children.is_empty() || budget == 0 {
+        return here;
+    }
+
+    let hit = |&id: &TileId| {
+        tree.properties(id)
+            .bounding_volume
+            .hit_by_ray(view.position(), view.direction())
+    };
+    let on_the_ray: Vec<TileId> = children.iter().copied().filter(hit).collect();
+
+    let below = if on_the_ray.is_empty() {
+        children
+            .into_iter()
+            .min_by(|&a, &b| {
+                let to = |id| {
+                    tree.properties(id)
+                        .bounding_volume
+                        .distance_to_point(view.position())
+                };
+                to(a).total_cmp(&to(b))
+            })
+            .and_then(|child| deepest_content_along(tree, view, child, budget - 1))
+    } else {
+        on_the_ray
+            .into_iter()
+            .filter_map(|child| deepest_content_along(tree, view, child, budget - 1))
+            .reduce(f64::min)
+    };
+
+    // The deeper answer wins when there is one; this tile's own content is the
+    // floor, for a subtree whose ray leads nowhere with content.
+    below.or(here)
 }
 
 /// Recursive visit over the abstract [`TileTree`].
