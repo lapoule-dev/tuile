@@ -783,6 +783,14 @@ def bake_env(args, ion, pack_url, scene_url, logs_url):
         # cache évinçait ce dont la frame avait besoin et la traversée le
         # redemandait, quarante-cinq fois par tuile, sans jamais converger.
         "TUILE_RESIDENT_BUDGET_GB": str(args.resident_gb),
+        # La cadence, sur les deux jobs et pas seulement sur le rendu.
+        #
+        # La cuisson en a besoin pour fabriquer sa bande : une cuisson et un
+        # rendu qui n'échantillonnent pas la même trajectoire décrivent deux
+        # tournages, et le pack répond alors à des caméras que le rendu ne
+        # demandera jamais. Elle la dérivait de la chaîne, le rendu la
+        # recevait ici : deux chemins pour un même nombre.
+        "JOB_FPS": str(fps_of(args.trajectory)),
     }
 
 def bake(args, token=None):
@@ -939,6 +947,44 @@ def check_frames(trajectory, frames, say=print):
             f"({last / fps:.1f} s de film sur {expected / fps:.1f} s)")
 
 
+def check_cadence(frames, duration, fps, tolerance_frames=2.0):
+    """Le film dure-t-il ce que ses images et sa cadence annoncent ?
+
+    Le montage concatène en `-c copy`, donc il n'impose aucune cadence : il
+    hérite de celle des segments. Un paramètre `fps` qui ne servirait qu'à être
+    passé serait pire qu'absent — il donnerait l'impression que le montage
+    gère la cadence, ce qui est exactement la fausse confiance qui a laissé
+    passer un film de cinq minutes pour deux minutes de vol.
+
+    Alors il vérifie. Les deux nombres sont là, sous la main, à l'endroit exact
+    où le mensonge apparaît : 7200 images étiquetées 24 i/s font 300 secondes,
+    et rien d'autre dans la chaîne ne le remarque.
+
+    Forcer la cadence ici serait la mauvaise correction : réencoder ou
+    ré-étiqueter masquerait le défaut amont au lieu de le signaler.
+
+    La tolérance est en IMAGES, pas en pourcentage : un conteneur arrondit ses
+    horodatages, et on a mesuré 25 ms de bourrage sur un remux — une image et
+    demie. Un pourcentage serait trop lâche sur un plan long et trop strict sur
+    un plan court.
+    """
+    try:
+        frames, duration, fps = int(frames), float(duration), float(fps)
+    except (TypeError, ValueError):
+        return None
+    if frames <= 0 or fps <= 0:
+        return None
+    expected = frames / fps
+    drift = abs(duration - expected) * fps
+    if drift > tolerance_frames:
+        raise SystemExit(
+            f"le film dure {duration:.3f} s pour {frames} images à {fps:g} i/s, "
+            f"soit {expected:.3f} s attendues — {drift:.1f} images d'écart. "
+            f"Les images sont bonnes ; c'est la cadence du conteneur qui ment, "
+            f"et elle vient des segments (JOB_FPS n'a pas atteint le rendu).")
+    return expected
+
+
 def assemble(run, fps=24):
     """Monte le film depuis les segments déposés sur R2.
 
@@ -996,6 +1042,11 @@ def assemble(run, fps=24):
         capture_output=True, text=True).stdout.strip()
     size_mb = out.stat().st_size / 1e6
     print(f"film: {frames or '?'} frames, {size_mb:.1f} Mo")
+    duration = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(out)], capture_output=True, text=True).stdout.strip()
+    check_cadence(frames, duration, fps)
+
     client.upload_file(str(out), R2_BUCKET, f"{prefix}render.mp4",
                        ExtraArgs={"ContentType": "video/mp4"})
     print(f"déposé: s3://{R2_BUCKET}/{prefix}render.mp4")
