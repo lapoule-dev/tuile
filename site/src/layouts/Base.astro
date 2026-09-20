@@ -1,0 +1,80 @@
+---
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) lapoule.dev
+
+import { ClientRouter } from 'astro:transitions';
+import '../styles/global.css';
+
+interface Props {
+  title: string;
+  description: string;
+  kicker?: string;
+  heading?: string;
+  lede?: string;
+}
+
+const { title, description, kicker, heading, lede } = Astro.props;
+
+const nav = [
+  { href: '/', label: 'overview' },
+  { href: '/architecture', label: 'architecture' },
+  { href: '/3d-tiles', label: '3d tiles' },
+  { href: '/roadmap', label: 'roadmap' },
+  { href: '/getting-started', label: 'getting started' },
+  { href: '/docs/api', label: 'api' },
+];
+
+// `/architecture` and `/architecture/` are the same page; `/` matches only itself.
+const here = Astro.url.pathname.replace(/\/+$/, '') || '/';
+const current = (href: string) => (here === href ? 'page' : undefined);
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="color-scheme" content="light dark" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M9 6h18l-4 20H5z' fill='%23a8451f'/%3E%3C/svg%3E"
+    />
+    <ClientRouter />
+  </head>
+  <body>
+    <header class="masthead">
+      <div class="shell masthead-inner">
+        <a class="wordmark" href="/">tuile</a>
+        <nav class="primary" aria-label="Primary">
+          {nav.map((i) => <a href={i.href} aria-current={current(i.href)}>{i.label}</a>)}
+        </nav>
+        <span class="masthead-spacer"></span>
+        <span class="repo-link">MIT OR Apache-2.0</span>
+      </div>
+    </header>
+
+    <main>
+      <div class="shell">
+        {kicker && <p class="page-kicker">{kicker}</p>}
+        {heading && <h1>{heading}</h1>}
+        {lede && <p class="lede">{lede}</p>}
+        <slot />
+      </div>
+    </main>
+
+    <footer class="site">
+      <div class="shell">
+        <p>
+          Tuile — an independent implementation of the
+          <a href="https://www.ogc.org/standard/3dtiles/" rel="noopener">OGC 3D Tiles</a>
+          Community Standard. Unaffiliated with any vendor.
+        </p>
+        <p>Copyright (c) lapoule.dev — dual licensed MIT OR Apache-2.0.</p>
+      </div>
+    </footer>
+  </body>
+</html>
