@@ -241,6 +241,23 @@ enum Job {
     Inspect(std::path::PathBuf),
     /// Compare two packs and say what they disagree about.
     Diff(std::path::PathBuf, std::path::PathBuf),
+    /// Write a pack's own cameras back out as a tape.
+    ///
+    /// A pack records the camera each frame was baked for, which makes it the
+    /// only exact record of a trajectory that the generator no longer
+    /// produces. `pyrenees-tape` emitted a polyline when the first films were
+    /// shot and emits a spline now: re-baking the same argument string gives a
+    /// different path, so a pack cooked from it cannot be compared with the one
+    /// before it. Replaying the poses removes the generator from the question.
+    ///
+    /// It is the right instrument for re-cooking a pack that is suspected of
+    /// carrying the defect — the selection is frozen in the pack, so the only
+    /// way to ask whether today's traversal still collapses over the same
+    /// ground is to fly exactly the same ground.
+    TapeFrom {
+        pack: std::path::PathBuf,
+        out: std::path::PathBuf,
+    },
     /// Open one frame through the render's own path and lay its contents out
     /// on disk, so a person can look at them.
     Dump {
@@ -324,6 +341,11 @@ fn parse_args() -> Result<Job, String> {
             "--verify" => verify = Some(std::path::PathBuf::from(value()?)),
             "--dump" => dump = Some(std::path::PathBuf::from(value()?)),
             "--frame" => frame = value()?.parse().map_err(|_| "--frame wants a number")?,
+            "--tape-from" => {
+                let pack = std::path::PathBuf::from(value()?);
+                let out = std::path::PathBuf::from(value()?);
+                return Ok(Job::TapeFrom { pack, out });
+            }
             "--diff" => {
                 let a = std::path::PathBuf::from(value()?);
                 let b = std::path::PathBuf::from(value()?);
@@ -550,6 +572,7 @@ fn run() -> Result<(), String> {
         Job::Inspect(path) => inspect(&path),
         Job::Diff(a, b) => diff(&a, &b),
         Job::Dump { pack, frame } => dump_frame(&pack, frame),
+        Job::TapeFrom { pack, out } => tape_from(&pack, &out),
         Job::Verify {
             pack,
             tape,
@@ -566,6 +589,54 @@ fn run() -> Result<(), String> {
 /// Deliberately reads the payloads rather than only the table: a pack whose
 /// blocks do not decompress is a pack that fails on a farm node at 3 a.m., and
 /// the cost of finding that out here is seconds.
+/// Writes a pack's own cameras back out as a tape.
+///
+/// The exact poses, in frame order, so a re-bake flies the ground the pack was
+/// cooked for rather than whatever the generator produces today. The viewport
+/// travels in the pack too and is printed rather than written: it is a bake
+/// argument, not a pose, and passing the wrong one changes the texel target
+/// and therefore the selection — which would defeat the whole point.
+fn tape_from(pack: &std::path::Path, out: &std::path::Path) -> Result<(), String> {
+    let bytes = std::fs::read(pack)
+        .map_err(|e| format!("reading {}: {e}", pack.display()))?;
+    let opened = tuile_pack::Pack::open(&bytes).map_err(|e| format!("{e}"))?;
+    let (first, last) = opened.frame_range();
+
+    let mut tape = tuile_tape::Tape::recording(out)
+        .map_err(|e| format!("opening {}: {e}", out.display()))?;
+    let mut viewport: Option<[f64; 2]> = None;
+    for number in first..=last {
+        let view = opened
+            .view_of(number)
+            .map_err(|e| format!("frame {number}: {e}"))?;
+        // Every frame of one shot shares a viewport; a pack whose frames
+        // disagree was cooked by two different runs, and replaying it would
+        // hand the re-bake a texel target that belongs to neither.
+        match viewport {
+            None => viewport = Some(view.viewport_px),
+            Some(seen) if seen != view.viewport_px => {
+                return Err(format!(
+                    "frame {number} was baked at {:?} and an earlier one at {seen:?}: \
+                     this pack does not describe one shot",
+                    view.viewport_px
+                ))
+            }
+            Some(_) => {}
+        }
+        tape.push(tuile_tape::Frame {
+            position: view.position,
+            direction: view.direction,
+            up: view.up,
+            fovy: view.fovy_rad,
+        });
+    }
+    let written = tape.finish().map_err(|e| format!("{e}"))?;
+    let [w, h] = viewport.unwrap_or([0.0, 0.0]);
+    println!("{}: {written} frames ({first}..{last})", out.display());
+    println!("rebake with: --viewport {w:.0}x{h:.0} --frames {first}:{last}");
+    Ok(())
+}
+
 fn inspect(path: &std::path::Path) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let pack = tuile_pack::Pack::open(&bytes).map_err(|e| e.to_string())?;
@@ -1339,6 +1410,80 @@ fn baked_tile(
 
 #[cfg(test)]
 mod tests {
+    /// Une trajectoire rejouée depuis un pack est la trajectoire du pack.
+    ///
+    /// C'est le seul enregistrement exact d'un tracé que le générateur ne
+    /// produit plus : `pyrenees-tape` sortait une polyligne quand les premiers
+    /// films ont été tournés et sort une spline aujourd'hui, donc recuire la
+    /// même chaîne d'arguments donne un autre chemin. Pour demander « la
+    /// traversée d'aujourd'hui s'effondre-t-elle encore au-dessus de la même
+    /// mer », il faut survoler exactement la même mer.
+    #[test]
+    fn a_tape_replayed_from_a_pack_carries_its_cameras() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut writer = tuile_pack::PackWriter::new(
+            "scene", [0.0; 3], dir.path().join("blob.part"))
+            .expect("writer");
+        let views: Vec<tuile_pack::BakedView> = (0..3)
+            .map(|i| tuile_pack::BakedView {
+                position: [1.0 + i as f64, 2.0, 3.0],
+                direction: [0.0, 0.0, -1.0],
+                up: [0.0, 1.0, 0.0],
+                viewport_px: [3840.0, 2880.0],
+                fovy_rad: std::f64::consts::FRAC_PI_4,
+            })
+            .collect();
+        for (i, view) in views.iter().enumerate() {
+            writer.frame(i as u32 + 1, *view, []);
+        }
+        let pack = dir.path().join("p.tuilepack");
+        writer.finish_to(&pack).expect("pack");
+
+        let tape = dir.path().join("t.mcap");
+        super::tape_from(&pack, &tape).expect("replay");
+
+        let mut replay = tuile_tape::Tape::replaying(&tape).expect("open");
+        let mut read = Vec::new();
+        while let Some(f) = replay.next_frame() {
+            read.push(f);
+        }
+        assert_eq!(read.len(), views.len(), "une pose par frame");
+        for (got, want) in read.iter().zip(&views) {
+            assert_eq!(got.position, want.position);
+            assert_eq!(got.direction, want.direction);
+            assert_eq!(got.up, want.up);
+            assert_eq!(got.fovy, want.fovy_rad);
+        }
+    }
+
+    /// Un pack dont les frames ne partagent pas un viewport n'est pas un plan.
+    ///
+    /// Le viewport décide la cible texel, donc la sélection. Rejouer un pack
+    /// bricolé de deux runs donnerait une bande valide et une recuisson qui ne
+    /// correspond à aucun des deux — c'est exactement le genre de résultat qui
+    /// se lit comme une réussite.
+    #[test]
+    fn a_pack_stitched_from_two_shots_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut writer = tuile_pack::PackWriter::new(
+            "scene", [0.0; 3], dir.path().join("blob.part"))
+            .expect("writer");
+        for (i, px) in [[3840.0, 2880.0], [1920.0, 1440.0]].iter().enumerate() {
+            writer.frame(i as u32 + 1, tuile_pack::BakedView {
+                position: [1.0, 2.0, 3.0],
+                direction: [0.0, 0.0, -1.0],
+                up: [0.0, 1.0, 0.0],
+                viewport_px: *px,
+                fovy_rad: std::f64::consts::FRAC_PI_4,
+            }, []);
+        }
+        let pack = dir.path().join("p.tuilepack");
+        writer.finish_to(&pack).expect("pack");
+        let err = super::tape_from(&pack, &dir.path().join("t.mcap"))
+            .expect_err("deux viewports doivent être refusés");
+        assert!(err.contains("one shot"), "{err}");
+    }
+
     /// The four cases, and the one that must be refused.
     ///
     /// A tile naming a drape with no texture can only come from one place: the
