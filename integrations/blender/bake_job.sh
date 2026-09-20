@@ -129,6 +129,24 @@ if [ -z "${JOB_FPS:-}" ]; then
     esac
 fi
 
+# Une bande fournie l'emporte sur une bande générée.
+#
+# `JOB_TAPE_URL` sert à recuire un pack **sur son propre tracé**. Les
+# générateurs évoluent — `pyrenees-tape` sortait une polyligne quand les
+# premiers films ont été tournés et sort une spline aujourd'hui — donc la même
+# chaîne d'arguments ne décrit plus le même vol. Pour demander si la traversée
+# d'aujourd'hui s'effondre encore au-dessus de la même mer, il faut survoler
+# exactement la même mer, et seul l'ancien pack sait laquelle : il enregistre
+# la caméra de chaque frame. `tuile-bake --tape-from` les rejoue en bande.
+#
+# La bande, pas le pack : quelques centaines de kilooctets au lieu du
+# gigaoctet, dans un conteneur dont le système de fichiers est de la RAM.
+if [ -n "${JOB_TAPE_URL:-}" ]; then
+    if ! curl -fsS -o "$tape" "$JOB_TAPE_URL"; then
+        echo TAPE-DOWNLOAD-FAILED; exit 1
+    fi
+    echo "tape: fournie ($(du -h "$tape" | cut -f1)), trajectoire ignorée"
+else
 IFS=: read -r kind p1 p2 p3 p4 p5 <<< "$JOB_TRAJECTORY"
 case "$kind" in
     orbit) /opt/tuile/bin/orbit-tape "$tape" \
@@ -139,6 +157,7 @@ case "$kind" in
     zoom)  /opt/tuile/bin/zoom-tape "$tape" "${p1:-64}" ;;
     *) echo "TRAJECTORY-UNKNOWN: $kind"; exit 1 ;;
 esac
+fi
 [ -s "$tape" ] || { echo TAPE-MISSING; exit 1; }
 
 t0=$(date +%s)

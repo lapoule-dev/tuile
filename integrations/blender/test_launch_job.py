@@ -1611,7 +1611,9 @@ class TheTwoJobsAgreeOnTheCadence(unittest.TestCase):
 
     def test_the_tape_is_built_at_that_cadence(self):
         for name, script in zip(("bake_job.sh", "render_job.sh"), self._scripts()):
-            line = [l for l in script.splitlines() if "pyrenees-tape" in l]
+            # L'invocation, pas les commentaires qui la nomment.
+            line = [l for l in script.splitlines()
+                    if "/opt/tuile/bin/pyrenees-tape" in l]
             self.assertTrue(line, name)
             nxt = script.splitlines()[script.splitlines().index(line[0]) + 1]
             self.assertIn('"$JOB_FPS"', nxt, f"{name}: {nxt}")
@@ -1622,3 +1624,49 @@ class TheTwoJobsAgreeOnTheCadence(unittest.TestCase):
                          "la cuisson ne reçoit pas la cadence")
         self.assertEqual(src.count('env["JOB_FPS"] = str(fps_of(args.trajectory))'), 1,
                          "le rendu ne reçoit pas la cadence")
+
+
+class ASuppliedTapeWinsOverAGeneratedOne(unittest.TestCase):
+    """Recuire un pack sur son propre tracé.
+
+    Les générateurs évoluent : `pyrenees-tape` sortait une polyligne quand les
+    premiers films ont été tournés et sort une spline aujourd'hui. La même
+    chaîne d'arguments ne décrit donc plus le même vol, et un pack recuit
+    depuis elle ne se compare pas à celui d'avant. Or le suspect EST le pack —
+    la sélection y est figée — donc la seule question qui se pose demande de
+    survoler exactement la même mer.
+    """
+
+    def _args(self, **over):
+        base = dict(frames="1:2880", trajectory="pyrenees:2:24:50000:0.40",
+                    viewport="3840x2880", sse=3.0, imagery=0, terrain=0,
+                    imagery_boost=1, resident_gb=16, tape=None)
+        base.update(over)
+        return types.SimpleNamespace(**base)
+
+    def _env(self, tape_url=None, **over):
+        return launch_job.bake_env(self._args(**over), "jeton", "https://put/pack",
+                                   "https://put/scene", "https://put/logs", tape_url)
+
+    def test_without_a_tape_the_variable_is_empty(self):
+        # Vide et non absente : le job teste son contenu, et une variable qui
+        # n'existe pas et une variable vide doivent se comporter pareil.
+        self.assertEqual(self._env()["JOB_TAPE_URL"], "")
+
+    def test_a_supplied_tape_travels(self):
+        self.assertEqual(self._env("https://get/traj.mcap")["JOB_TAPE_URL"],
+                         "https://get/traj.mcap")
+
+    def test_the_job_prefers_it_over_the_trajectory(self):
+        script = (pathlib.Path(__file__).with_name("bake_job.sh")).read_text()
+        head = script[script.index('if [ -n "${JOB_TAPE_URL:-}"'):]
+        # La bande fournie doit être testée AVANT la génération, sinon elle ne
+        # l'emporte sur rien.
+        self.assertLess(head.index("curl"), head.index("pyrenees-tape"))
+        self.assertIn("TAPE-DOWNLOAD-FAILED", head,
+                      "un téléchargement raté cuirait une bande vide")
+
+    def test_the_cadence_still_reaches_the_job(self):
+        # Une bande fournie court-circuite le générateur, pas l'encodage : la
+        # cadence sert encore à ffmpeg et à la scène côté rendu.
+        self.assertEqual(self._env()["JOB_FPS"], "24")
