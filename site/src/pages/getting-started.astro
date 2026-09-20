@@ -1,0 +1,125 @@
+---
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) lapoule.dev
+
+import Base from '../layouts/Base.astro';
+
+const build = `cargo check --workspace                                     # quick build
+cargo check --target wasm32-unknown-unknown -p tuile-core   # the wasm guardrail
+cargo test --workspace
+cargo clippy --workspace -- -D warnings`;
+
+const tests = `cargo test --workspace > /tmp/tests.log 2>&1
+grep -E "(test result|FAILED|panicked)" /tmp/tests.log`;
+
+const viewer = `cargo run -p wgpu-viewer -- fixtures/tileset-simple/tileset.json`;
+
+const doc = `cargo doc --workspace --no-deps`;
+
+const site = `cd site
+npm install
+npm run docs:api     # cargo doc --workspace --no-deps, staged under /docs/api
+npm run build        # Astro SSR build → dist/
+node ./dist/server/entry.mjs`;
+---
+
+<Base
+  title="Getting started — Tuile"
+  description="Build, test and run the Tuile workspace: the real cargo commands, the WebAssembly guardrail, and how to build and serve this site."
+  kicker="Getting started"
+  heading="Build it, check it, run it."
+  lede="Tuile is a plain Cargo workspace. Rust 1.91 or newer, edition 2021, no build system on top, no code generation step to remember."
+>
+  <h2>Build and check</h2>
+
+  <pre><code>{build}</code></pre>
+
+  <p>
+    The second line is the one that matters most. <code>tuile-core</code> compiling to
+    <code>wasm32-unknown-unknown</code> is the cheapest available proof that no renderer, no
+    async runtime and no HTTP framework has crept into the core. Add the target once with
+    <code>rustup target add wasm32-unknown-unknown</code>.
+  </p>
+
+  <p>
+    The workspace denies <code>unsafe</code> outright and warns on <code>unwrap</code> and
+    <code>panic</code>, so a clean clippy run means something here.
+  </p>
+
+  <h2>Reading test output</h2>
+
+  <p>
+    One local convention worth adopting, because it has already cost time: never pipe a
+    test, build or lint run through <code>head</code> or <code>tail</code>.
+    <code>head</code> closes the pipe as soon as it has its lines and kills the run partway
+    through, so the summary line never arrives and a truncated run is indistinguishable from
+    a hang. <code>tail</code> shows nothing at all until the process exits. Redirect the
+    whole thing and search it afterwards.
+  </p>
+
+  <pre><code>{tests}</code></pre>
+
+  <p class="note">
+    And a green suite is not proof. Write the test in the same change as the behaviour, then
+    revert the behaviour and watch the test fail. Say plainly what a test does
+    <em>not</em> cover, rather than letting a passing run imply coverage it does not have.
+  </p>
+
+  <h2>Running a viewer</h2>
+
+  <pre><code>{viewer}</code></pre>
+
+  <p class="note">
+    <strong>Two honest caveats.</strong> That is the command the repository's contributor
+    guide documents, and it is the shape the viewer is meant to settle on. Today the
+    <code>wgpu-viewer</code> example in the workspace is the streaming <em>globe</em>
+    viewer: it takes no path argument and instead reads a data-provider credential from the
+    environment, so it will refuse to start without one. And the <code>fixtures/</code>
+    directory named above is not committed yet. The viewer's own module documentation, in
+    the <a href="/docs/api">API reference</a>, carries the current controls and environment
+    variables — including the ones that record a camera path and fly it again exactly.
+  </p>
+
+  <p>
+    Drag to orbit, right-drag to pan, wheel to zoom. The browser builds of the same engine
+    live under <code>examples/wasm-globe</code> and <code>examples/web-viewer</code>; the
+    headless harnesses — bulk pre-fetching, cache warming, and a probe that reports what a
+    traversal actually selected — live beside them.
+  </p>
+
+  <h2>Generating the API documentation</h2>
+
+  <pre><code>{doc}</code></pre>
+
+  <p>
+    That writes rustdoc for every crate in the workspace into <code>target/doc</code>. The
+    <a href="/docs/api">API reference</a> page explains how this site serves it.
+  </p>
+
+  <h2>Building this site</h2>
+
+  <p>
+    The site is an Astro application configured for server-side rendering with the Node
+    adapter, so the build produces a real server rather than a folder of files.
+  </p>
+
+  <pre><code>{site}</code></pre>
+
+  <p>
+    <code>npm run docs:api</code> runs the rustdoc build above and stages the output where
+    the site can serve it; it is not part of <code>npm run build</code>, because a
+    documentation build of the whole workspace takes minutes and a copy edit should not pay
+    for it. <code>npm run build:all</code> runs both in order. Nothing generated is
+    committed.
+  </p>
+
+  <h2>Licence</h2>
+
+  <p>
+    Dual licensed <strong>MIT OR Apache-2.0</strong>, at your option; copyright
+    lapoule.dev. Every source file carries an SPDX header. Tuile is an independent
+    implementation of an open community standard and is unaffiliated with any vendor.
+  </p>
+
+  <p class="next">Next → <a href="/docs/api">The API reference</a></p>
+</Base>
