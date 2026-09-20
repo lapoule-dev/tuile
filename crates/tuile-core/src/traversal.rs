@@ -586,26 +586,6 @@ pub fn traverse(
     out.stats.selected = out.selected.len() as u32;
     out.stats.requested = out.requests.len() as u32;
 
-    // Which gate turned the pass away.
-    //
-    // A selection that falls from ~263 tiles to ~26 between two frames of one
-    // continuous flight has been refused by something, and `selected` alone
-    // does not say by what. `max_depth` separates "the traversal never went
-    // deep" from "it went deep and kept little"; `deferred_subtrees` is the
-    // one gate that deliberately trades a sharp picture for a coarse one, and
-    // in a bulk bake — where nobody is waiting — that trade should never be
-    // taken.
-    tracing::debug!(
-        target: "gates",
-        selected = out.stats.selected,
-        visited = out.stats.visited,
-        culled = out.stats.culled,
-        requested = out.stats.requested,
-        max_depth = out.stats.max_depth,
-        deferred = out.stats.deferred_subtrees,
-        held_but_drawn = out.stats.held_but_drawn,
-        "pass"
-    );
 }
 
 /// What a subtree reported back to the tile above it.
@@ -693,12 +673,6 @@ impl Visit {
 /// source can go", not a division by nothing.
 fn nearest_content_distance(tree: &dyn TileTree, views: &[ViewState]) -> f64 {
     let mut best = f64::INFINITY;
-    // What the number came from, for the probe below. `d_near` scales every
-    // screen-space error in the pass, so when it moves the whole frame moves —
-    // and knowing it moved says nothing about why.
-    let mut witness_level: Option<u32> = None;
-    let mut witness_depth: Option<u32> = None;
-    let mut starved = 0usize;
     for view in views {
         for root in tree.roots() {
             let mut id = root;
@@ -709,73 +683,55 @@ fn nearest_content_distance(tree: &dyn TileTree, views: &[ViewState]) -> f64 {
             // finest tile under the camera is the one whose level the decree
             // replicates, so its distance is the price.
             let mut deepest: Option<f64> = None;
-            let mut deepest_at: u32 = 0;
             loop {
                 let props = tree.properties(id);
                 if props.has_content {
                     deepest =
                         Some(props.bounding_volume.distance_to_point(view.position()));
-                    deepest_at = tree.level(id);
                 }
-                let next = tree
-                    .children(id)
-                    .into_iter()
-                    .min_by(|&a, &b| {
-                        let off = |id| {
-                            let to_centre =
-                                tree.properties(id).bounding_volume.center() - view.position();
-                            let along = to_centre.dot(view.direction());
-                            (to_centre - along * view.direction()).length()
-                        };
-                        off(a).total_cmp(&off(b))
-                    });
+                // Toward what the camera is aimed through, by the child's
+                // offset from the VIEW AXIS — not by its distance.
+                //
+                // `distance_to_point` rend zéro pour tout volume contenant
+                // l'œil, et près du sommet d'un arbre planétaire l'œil est
+                // dans chacun d'eux : la clé ne discrimine plus rien et le
+                // « plus proche » est décidé par du bruit flottant. Mesuré le
+                // 20 septembre 2026 sur le tour des Pyrénées — les trois
+                // premiers barreaux de la descente lisaient tous zéro, puis
+                // les chemins divergeaient, l'un se posant à 16 km de l'axe,
+                // l'autre s'immobilisant 166 km de côté. `d_near` basculait
+                // entre 41,0 et 133,9 km pour 317 m de vol, et comme le disque
+                // uniforme tarife TOUTES les erreurs écran de la passe à cette
+                // distance, la sélection tombait de 270 tuiles à 26 : 52 frames
+                // sur 2880, toutes au-dessus de l'Atlantique.
+                //
+                // L'écart à l'axe garde du sens à l'intérieur du volume, donc
+                // la descente reste sous ce que la caméra regarde. Deux autres
+                // clés ont été essayées et mesurées : la distance au centre
+                // rend la valeur continue mais fausse — le centre d'une tuile
+                // de niveau 0 est enfoui dans la Terre, elle annonce 153 km sur
+                // chaque frame et effondre le film entier ; ne suivre que les
+                // enfants contenant l'œil saute dès que l'un d'eux sort du jeu.
+                let next = tree.children(id).into_iter().min_by(|&a, &b| {
+                    let off = |id| {
+                        let to_centre =
+                            tree.properties(id).bounding_volume.center() - view.position();
+                        let along = to_centre.dot(view.direction());
+                        (to_centre - along * view.direction()).length()
+                    };
+                    off(a).total_cmp(&off(b))
+                });
                 match next {
-                    Some(child) => {
-                        id = child;
-                    }
+                    Some(child) => id = child,
                     None => break,
                 }
             }
-            match deepest {
-                Some(d) => {
-                    if d < best {
-                        best = d;
-                        witness_level = Some(deepest_at);
-                        witness_depth = Some(tree.level(id));
-                    }
-                }
-                // A root the greedy path found no content under at all. Over
-                // open water that is the ordinary case, and it is the shape
-                // this probe exists to catch.
-                None => starved += 1,
+            if let Some(d) = deepest {
+                best = best.min(d);
             }
         }
     }
-    let clamped = best.max(1.0);
-    // The disc's radius, and where it came from.
-    //
-    // A collapse here is a collapse of the whole frame: 52 frames of a
-    // 2880-frame shot fell from ~263 selected tiles to ~26, all of them at the
-    // loop's seam over the Atlantic. `d_near` is the one number capable of
-    // doing that to every tile at once, and the existing `det!` reports its
-    // value without reporting what produced it.
-    //
-    // `clamped` is the suspicion: the descent takes the nearest child at each
-    // level and keeps the deepest node WITH content on that single path. Where
-    // the path runs out of content early, the deepest such node is a coarse
-    // tile whose bounding volume contains the camera — distance near zero,
-    // floored to one metre, and a uniform disc eight metres wide.
-    tracing::debug!(
-        target: "dnear",
-        d_near = clamped,
-        raw = best,
-        clamped = best < 1.0,
-        content_level = witness_level,
-        descended_to = witness_depth,
-        roots_without_content = starved,
-        "uniform disc"
-    );
-    clamped
+    best.max(1.0)
 }
 
 /// Recursive visit over the abstract [`TileTree`].
