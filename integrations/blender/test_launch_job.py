@@ -1719,3 +1719,58 @@ class TheTapeIsKeptBesideThePack(unittest.TestCase):
         deposit = script[script.index("JOB_TAPE_PUT_URL:-"):]
         self.assertNotIn("JOB_TAPE_URL", deposit.split("fi")[0],
                          "le dépôt ne doit pas dépendre de l'origine de la bande")
+
+
+class ASuppliedTapeNamesItsOwnPack(unittest.TestCase):
+    """Une bande fournie décide les poses, donc elle décide le nom.
+
+    Sans ce terme, recuire un ancien pack sur son propre tracé retombe sur sa
+    clef et l'écrase. Mesuré au dry-run du 20 septembre 2026 : la recuisson du
+    film nadir-50 km visait exactement `packs/03eb228f774ab939/`, le pack qu'on
+    voulait garder comme référence. Le nom aurait survécu, la référence non.
+
+    Et le terme ne doit apparaître QUE s'il y a une bande. Ajouté au cas
+    ordinaire, il renomme tout : vérifié, `03eb228f774ab939` devenait
+    `6488c3831e9c5445`, et chaque film de `videos/` aurait pointé vers un
+    objet qui n'existe pas.
+    """
+
+    def _args(self, tape=None):
+        return types.SimpleNamespace(
+            frames="1:2880", trajectory="pyrenees:2:24:50000:0.40",
+            viewport="3840x2880", sse=3.0, imagery=0, terrain=0,
+            imagery_boost=1, resident_gb=16, tape=tape)
+
+    def test_the_historical_key_is_unchanged(self):
+        # Le pack du premier film, tel qu'il est déposé sur R2 et cité dans
+        # videos/README.md. Ce test est ce qui interdit de le renommer.
+        self.assertEqual(launch_job.pack_key(self._args()),
+                         "packs/03eb228f774ab939/1-2880.tuilepack")
+
+    def test_a_tape_moves_the_key(self):
+        import tempfile, pathlib as pl
+        with tempfile.TemporaryDirectory() as d:
+            mcap = pl.Path(d) / "t.mcap"
+            mcap.write_bytes(b"des poses")
+            moved = launch_job.pack_key(self._args(str(mcap)))
+        self.assertNotEqual(moved, launch_job.pack_key(self._args()),
+                            "la recuisson écraserait sa propre référence")
+
+    def test_two_identical_tapes_are_one_bake(self):
+        # Par le CONTENU, pas par le chemin : la même bande copiée ailleurs
+        # décrit la même cuisson, et refaire deux fois le même travail sous
+        # deux noms est ce que la clef existe pour empêcher.
+        import tempfile, pathlib as pl
+        with tempfile.TemporaryDirectory() as d:
+            a, b = pl.Path(d) / "a.mcap", pl.Path(d) / "b.mcap"
+            a.write_bytes(b"des poses"); b.write_bytes(b"des poses")
+            self.assertEqual(launch_job.pack_key(self._args(str(a))),
+                             launch_job.pack_key(self._args(str(b))))
+
+    def test_different_tapes_are_different_bakes(self):
+        import tempfile, pathlib as pl
+        with tempfile.TemporaryDirectory() as d:
+            a, b = pl.Path(d) / "a.mcap", pl.Path(d) / "b.mcap"
+            a.write_bytes(b"un vol"); b.write_bytes(b"un autre vol")
+            self.assertNotEqual(launch_job.pack_key(self._args(str(a))),
+                                launch_job.pack_key(self._args(str(b))))
