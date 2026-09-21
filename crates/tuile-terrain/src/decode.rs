@@ -285,7 +285,9 @@ fn read_edge(r: &mut Reader<'_>, wide: bool, what: &'static str) -> Result<Vec<u
 /// `x/255 → snorm [-1,1]`, reconstruct z, fold if negative, normalize.
 fn decode_oct_normals(payload: &[u8]) -> Vec<[f32; 3]> {
     payload
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| oct_decode(c[0], c[1]))
         .collect()
 }

@@ -399,7 +399,7 @@ impl App {
                 near,
                 far / 1000.0,
             );
-            let errors = active.pump.errors.drain(..).collect::<Vec<_>>();
+            let errors = std::mem::take(&mut active.pump.errors);
             self.stats.errors += errors.len() as u64;
             for err in errors {
                 tracing::warn!("server: {err}");
