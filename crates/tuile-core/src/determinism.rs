@@ -142,7 +142,7 @@ pub fn dbg<T: std::fmt::Debug>(value: T) -> tracing::field::DebugValue<T> {
 /// structured trace in appearance only, and unparseable the moment a message
 /// contained a brace.
 ///
-/// Anything that is not a `tracing` primitive goes through [`dbg`].
+/// Anything that is not a `tracing` primitive goes through [`macro@dbg`].
 #[macro_export]
 macro_rules! det {
     ($event:expr) => {
@@ -234,8 +234,8 @@ mod tests {
 
         let raw = String::from_utf8(sink.0.lock().expect("buffer").clone()).expect("utf8");
         let line = raw.lines().next().expect("one record");
-        let v: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("not JSON: {e}\n{line}"));
+        let v: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("not JSON: {e}\n{line}"));
         assert_eq!(v["event"], "pass");
         assert_eq!(v["selected"], 106, "a count must arrive as a number");
         assert_eq!(v["camera_moved"], true, "a flag must arrive as a bool");

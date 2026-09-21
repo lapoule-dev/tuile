@@ -65,9 +65,7 @@ fn is_retryable_status(status: u16) -> bool {
 /// identically forever.
 fn is_retryable_transport(error: &reqwest_middleware::Error) -> bool {
     match error {
-        reqwest_middleware::Error::Reqwest(e) => {
-            e.is_timeout() || e.is_connect() || e.is_request()
-        }
+        reqwest_middleware::Error::Reqwest(e) => e.is_timeout() || e.is_connect() || e.is_request(),
         // A middleware error is NOT "ours rather than the network's" — that
         // reading cost a whole render.
         //
@@ -270,7 +268,7 @@ pub struct NativeFetchError(String);
 ///
 /// The bulk path fired 256 against this 64, four times over-subscribed.
 ///
-/// [`tuile_bake`]'s fetch wave defaults to this number for that reason; see the
+/// `tuile_bake`'s fetch wave defaults to this number for that reason; see the
 /// `TUILE_FETCHES` knob.
 pub const CONNECTIONS_PER_HOST: usize = 64;
 

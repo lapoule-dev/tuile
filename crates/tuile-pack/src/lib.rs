@@ -143,10 +143,17 @@ pub struct BakedView {
 impl BakedView {
     fn to_fb(self) -> fb::View {
         fb::View::new(
-            self.position[0], self.position[1], self.position[2],
-            self.direction[0], self.direction[1], self.direction[2],
-            self.up[0], self.up[1], self.up[2],
-            self.viewport_px[0], self.viewport_px[1],
+            self.position[0],
+            self.position[1],
+            self.position[2],
+            self.direction[0],
+            self.direction[1],
+            self.direction[2],
+            self.up[0],
+            self.up[1],
+            self.up[2],
+            self.viewport_px[0],
+            self.viewport_px[1],
             self.fovy_rad,
         )
     }
@@ -180,11 +187,17 @@ impl BakedView {
     fn radians_from(&self, other: &Self) -> f64 {
         let norm = |v: [f64; 3]| {
             let m = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-            if m > 0.0 { [v[0] / m, v[1] / m, v[2] / m] } else { v }
+            if m > 0.0 {
+                [v[0] / m, v[1] / m, v[2] / m]
+            } else {
+                v
+            }
         };
         let a = norm(self.direction);
         let b = norm(other.direction);
-        (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).clamp(-1.0, 1.0).acos()
+        (a[0] * b[0] + a[1] * b[1] + a[2] * b[2])
+            .clamp(-1.0, 1.0)
+            .acos()
     }
 }
 
@@ -271,8 +284,7 @@ struct BlobSink {
 
 impl BlobSink {
     fn create(path: std::path::PathBuf) -> std::io::Result<Self> {
-        let file =
-            std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&path)?);
+        let file = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&path)?);
         Ok(Self {
             file,
             path,
@@ -346,7 +358,7 @@ fn carries_its_own_compression(format: TextureFormat) -> bool {
 impl PackWriter {
     /// A writer that keeps its blob in `blob_path` while it fills.
     ///
-    /// The path is required, not optional: see [`BlobSink`]. It is removed by
+    /// The path is required, not optional: see `BlobSink`. It is removed by
     /// [`PackWriter::finish_to`]; a bake that dies before then leaves it
     /// behind, which is the right trade — a stray temporary is cheap, and a
     /// crashed bake is worth inspecting.
@@ -506,16 +518,12 @@ impl PackWriter {
     /// megabyte at a time. Nothing ever holds two copies.
     pub fn finish_to(self, path: impl AsRef<std::path::Path>) -> std::io::Result<u64> {
         let path = path.as_ref();
-        let mut file = std::io::BufWriter::with_capacity(
-            1 << 20,
-            std::fs::File::create(path)?,
-        );
+        let mut file = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
         let written = self.write(&mut file)?;
         use std::io::Write as _;
         file.flush()?;
         Ok(written)
     }
-
 }
 
 /// One frame being filled, tile by tile.
@@ -881,7 +889,7 @@ impl<'a> Pack<'a> {
     /// A tile's texture, decoded according to what its format already carries.
     ///
     /// The one place the rule is applied on the read side, mirroring
-    /// [`carries_its_own_compression`] on the write side. Callers must not
+    /// `carries_its_own_compression` on the write side. Callers must not
     /// reach for [`Self::payload`] on a texture block: it would decompress
     /// something that was never compressed, and the PNG that came out of the
     /// bake would come back as a decoder error nobody would connect to a pack
@@ -967,7 +975,10 @@ mod tests {
             .collect();
         w.frame(1, a_view(0.0), [heavy]);
         let bytes = w.finish();
-        assert!(bytes.len() > 4 << 20, "le pack de test est trop petit pour mesurer");
+        assert!(
+            bytes.len() > 4 << 20,
+            "le pack de test est trop petit pour mesurer"
+        );
 
         let checked = std::time::Instant::now();
         Pack::open(&bytes).expect("opens");
@@ -1207,12 +1218,20 @@ mod tests {
         BakedTile {
             id,
             drape,
-            origin_ecef: [4_700_959.945_556_212, 186_133.405_820_756_92, 4_314_027.341_856_181],
+            origin_ecef: [
+                4_700_959.945_556_212,
+                186_133.405_820_756_92,
+                4_314_027.341_856_181,
+            ],
             // Deliberately not round numbers and not compressible: a payload
             // that happens to compress to nothing proves nothing about the
             // block plumbing.
-            positions: (0..1024u32).flat_map(|i| (i.wrapping_mul(2_654_435_761)).to_le_bytes()).collect(),
-            normals: (0..512u32).flat_map(|i| (i ^ 0xdead_beef).to_le_bytes()).collect(),
+            positions: (0..1024u32)
+                .flat_map(|i| (i.wrapping_mul(2_654_435_761)).to_le_bytes())
+                .collect(),
+            normals: (0..512u32)
+                .flat_map(|i| (i ^ 0xdead_beef).to_le_bytes())
+                .collect(),
             uvs: (0..256u32).flat_map(|i| i.to_le_bytes()).collect(),
             indices: (0..300u32).flat_map(|i| (i % 97).to_le_bytes()).collect(),
             vertex_count: 341,
@@ -1350,7 +1369,9 @@ mod tests {
 
     #[test]
     fn the_pack_carries_how_it_was_culled() {
-        let bytes = Bake::new("s", [0.0; 3]).with(|w| w.culling("disabled")).finish();
+        let bytes = Bake::new("s", [0.0; 3])
+            .with(|w| w.culling("disabled"))
+            .finish();
         assert_eq!(Pack::open(&bytes).expect("opens").culling(), "disabled");
         let bytes = Bake::new("s", [0.0; 3]).finish();
         assert_eq!(Pack::open(&bytes).expect("opens").culling(), "full");
@@ -1420,7 +1441,10 @@ mod tests {
         // A kilometre away: closer than any two frames of a slow shot, and
         // still nothing this pack was baked for.
         let err = pack.frame_for_view(&a_view(1.0)).expect_err("refused");
-        assert!(matches!(err, PackError::NoSuchView { frame: 1, .. }), "{err}");
+        assert!(
+            matches!(err, PackError::NoSuchView { frame: 1, .. }),
+            "{err}"
+        );
 
         // Right place, wrong way round.
         let mut turned = a_view(0.0);
