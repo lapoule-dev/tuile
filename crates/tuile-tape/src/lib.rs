@@ -291,7 +291,9 @@ impl Tape {
     pub fn recover(journal: impl AsRef<Path>, into: impl AsRef<Path>) -> Result<u64, TapeError> {
         let bytes = std::fs::read(journal.as_ref())?;
         let runs: Vec<Run> = bytes
-            .chunks_exact(JOURNAL_ROW)
+            .as_chunks::<JOURNAL_ROW>()
+            .0
+            .iter()
             .map(|row| {
                 let at = |n: usize| {
                     let mut b = [0u8; 8];

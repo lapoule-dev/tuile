@@ -165,7 +165,7 @@ pub fn upsample(
 
     let mut kept: Vec<Vertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
-    for triangle in ancestor.indices.chunks_exact(3) {
+    for triangle in ancestor.indices.as_chunks::<3>().0 {
         let mut polygon = vec![
             source(triangle[0] as usize),
             source(triangle[1] as usize),

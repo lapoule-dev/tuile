@@ -113,7 +113,7 @@ impl App {
         };
         let held = active.pump.prepared_through_level(level) as u32;
         let priming = active.pump.priming;
-        let errors: Vec<String> = active.pump.errors.drain(..).collect();
+        let errors: Vec<String> = std::mem::take(&mut active.pump.errors);
         self.stats.errors += errors.len() as u64;
         for err in errors.iter().take(QUOTE_ERRORS) {
             tracing::warn!("server: {err}");

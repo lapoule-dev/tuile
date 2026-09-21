@@ -273,7 +273,9 @@ fn pack_failed(e: PackError) -> FrameError {
 
 fn f32x3(bytes: &[u8]) -> Vec<[f32; 3]> {
     bytes
-        .chunks_exact(12)
+        .as_chunks::<12>()
+        .0
+        .iter()
         .map(|c| {
             [
                 f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
@@ -286,7 +288,9 @@ fn f32x3(bytes: &[u8]) -> Vec<[f32; 3]> {
 
 fn f32x2(bytes: &[u8]) -> Vec<[f32; 2]> {
     bytes
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|c| {
             [
                 f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
@@ -298,7 +302,9 @@ fn f32x2(bytes: &[u8]) -> Vec<[f32; 2]> {
 
 fn u32s(bytes: &[u8]) -> Vec<u32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
