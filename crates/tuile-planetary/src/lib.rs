@@ -358,8 +358,7 @@ impl LayerBudget {
     /// imagery level per terrain level. A GPU viewer must never call this:
     /// its ceiling is a real per-fragment cost.
     pub fn set_unbounded(&self) {
-        self.0
-            .store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.0.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn get(&self) -> u32 {
@@ -498,7 +497,7 @@ pub struct GlobeOptions {
     /// Whether the coarse layer under a drape is chosen by geometry alone.
     ///
     /// **This is the difference between a render that reproduces and one that
-    /// does not.** [`coarse_floor`] normally lays down the sharpest ancestor
+    /// does not.** `coarse_floor` normally lays down the sharpest ancestor
     /// that happens to be decoded already, which is right for a viewer — it
     /// spends what is in hand rather than blurring ground it could show. But
     /// "what happens to be decoded" is a function of the order concurrent
@@ -511,7 +510,7 @@ pub struct GlobeOptions {
     /// 80 came out draped differently. The ground was never in doubt; the
     /// imagery was.
     ///
-    /// On, the floor is always the tile's [`FLOOR_LEVEL`] ancestor: pinned,
+    /// On, the floor is always the tile's `FLOOR_LEVEL` ancestor: pinned,
     /// therefore always available, and a pure function of the rectangle. It
     /// costs sharpness only where the sharp mosaic has a hole, and a converged
     /// bulk frame has none — so a batch render pays approximately nothing for
@@ -1568,7 +1567,9 @@ mod tests {
             coord: ImageryCoord,
         ) -> Result<tuile_core::fetch::Fetched<bytes::Bytes>, raster::RasterError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(raster::RasterError::Image(format!("{coord:?} was requested")))
+            Err(raster::RasterError::Image(format!(
+                "{coord:?} was requested"
+            )))
         }
     }
 
@@ -1580,7 +1581,8 @@ mod tests {
         async fn fetch_tile(
             &self,
             _coord: TileCoord,
-        ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError> {
+        ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError>
+        {
             unreachable!("drape never asks for terrain")
         }
     }
@@ -1618,7 +1620,9 @@ mod tests {
         }
     }
 
-    fn drape_once(loader: &PlanetaryLoader<NoTerrain, CountingImagery>) -> tuile_core::DecodedTileContent {
+    fn drape_once(
+        loader: &PlanetaryLoader<NoTerrain, CountingImagery>,
+    ) -> tuile_core::DecodedTileContent {
         let mut content = tuile_core::DecodedTileContent {
             withheld_drape: None,
             meshes: Vec::new(),
@@ -1627,12 +1631,8 @@ mod tests {
             local_origin_ecef: glam::DVec3::ZERO,
             transform_local: glam::Mat4::IDENTITY,
         };
-        let _ = futures_executor::block_on(loader.drape(
-            &mut content,
-            &some_ground(),
-            8,
-            TileId(7),
-        ));
+        let _ =
+            futures_executor::block_on(loader.drape(&mut content, &some_ground(), 8, TileId(7)));
         content
     }
 

@@ -474,8 +474,9 @@ impl ContentPump {
             .chain(fallback.iter())
             .filter(|id| {
                 self.prepared.get(id).is_some_and(|p| {
-                    p.sharpest_imagery_level
-                        .is_none_or(|sharpest| self.level(**id).saturating_sub(sharpest) > SMEAR_GAP)
+                    p.sharpest_imagery_level.is_none_or(|sharpest| {
+                        self.level(**id).saturating_sub(sharpest) > SMEAR_GAP
+                    })
                 })
             })
             .count();
@@ -651,7 +652,7 @@ pub struct Resolution {
     /// Drawn at the level the traversal chose.
     pub exact: usize,
     /// Drawn surfaces whose sharpest draped imagery sits more than
-    /// [`SMEAR_GAP`] levels above the tile — one texel stretched over the
+    /// `SMEAR_GAP` levels above the tile — one texel stretched over the
     /// ground: the flat-colour smear, counted at the only honest place, the
     /// draw list itself. Tiles with no imagery at all count too.
     pub smeared_drawn: usize,

@@ -39,8 +39,9 @@
 //! ## Why not `TileFetcher`
 //!
 //! Because an ion tile needs `Authorization: Bearer <asset token>` and
-//! [`TileFetcher::fetch`] takes a URL and nothing else. The seam that carries a
-//! bearer is [`IonHttp`], which the same transport also implements — this is
+//! [`tuile_core::fetch::TileFetcher::fetch`] takes a URL and nothing else. The
+//! seam that carries a bearer is [`IonHttp`], which the same transport also
+//! implements — this is
 //! not a second HTTP client, it is the other trait on the same object. Terrain
 //! already goes this way (`terrain.rs`), including re-resolving the endpoint
 //! once on 401/403, and so does this.
@@ -324,7 +325,7 @@ impl<H: IonHttp> ImageryProvider for TmsImagery<H> {
                     return Ok(Fetched {
                         value: response.body,
                         ttl: response.max_age,
-                    })
+                    });
                 }
                 401 | 403 if attempt == 0 => {
                     token = self
@@ -467,9 +468,10 @@ mod tests {
     /// coastline.
     #[test]
     fn an_unknown_projection_is_refused_by_name() {
-        let odd = SENTINEL
-            .replace("EPSG:4326", "EPSG:27700")
-            .replace(r#"profile="global-geodetic""#, r#"profile="british-national-grid""#);
+        let odd = SENTINEL.replace("EPSG:4326", "EPSG:27700").replace(
+            r#"profile="global-geodetic""#,
+            r#"profile="british-national-grid""#,
+        );
         let err = TileMapResource::parse(odd.as_bytes()).expect_err("refuses");
         let text = err.to_string();
         assert!(text.contains("british-national-grid"), "{text}");
