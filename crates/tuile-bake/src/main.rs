@@ -866,16 +866,9 @@ fn bake(args: Args) -> Result<(), String> {
 
     for number in args.first..=(wanted as u32) {
         let pose = &poses[number as usize - 1];
-        let view = tuile_core::traversal::ViewStateParams {
-            position: glam::DVec3::from_array(pose.position),
-            direction: glam::DVec3::from_array(pose.direction),
-            up: glam::DVec3::from_array(pose.up),
-            viewport_px: glam::dvec2(args.viewport.0, args.viewport.1),
-            fovy_rad: pose.fovy,
-        };
         let at = Instant::now();
         let frame = session
-            .frame(vec![view])
+            .frame_for_pose(pose, args.viewport)
             .map_err(|e| format!("frame {number}: {e}"))?;
 
         // The camera goes in beside the tiles, because that is what a render
