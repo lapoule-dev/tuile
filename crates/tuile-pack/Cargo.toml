@@ -27,7 +27,7 @@ flatbuffers = "25"
 lz4_flex = { version = "0.14", default-features = false, features = ["std"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tuile-core = { version = "0.0.1", path = "../tuile-core" }
+tuile-core = { version = "0.1.0", path = "../tuile-core" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

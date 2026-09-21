@@ -26,12 +26,12 @@ panic = "warn"
 glam = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tuile-core = { version = "0.0.1", path = "../tuile-core" }
+tuile-core = { version = "0.1.0", path = "../tuile-core" }
 # Le travail : session, globe, traversée, lecture de pack. Rien d'OpenUSD
 # là-dedans, et c'est exactement pourquoi il est ailleurs — voir lib.rs.
-tuile-bake = { version = "0.0.1", path = "../tuile-bake" }
+tuile-bake = { version = "0.1.0", path = "../tuile-bake" }
 # Le conteneur pré-cuit, pour les types que l'ABI expose.
-tuile-pack = { version = "0.0.1", path = "../tuile-pack" }
+tuile-pack = { version = "0.1.0", path = "../tuile-pack" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

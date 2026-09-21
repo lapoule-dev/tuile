@@ -43,10 +43,10 @@ tracing-subscriber = { workspace = true }
 # linked a crate named after one particular OpenUSD host to produce a container
 # that no host is named in. The dependency graph said the pack was a Hydra
 # artefact. It is not.
-tuile-cesium-ion = { version = "0.0.1", path = "../tuile-cesium-ion" }
-tuile-bing = { version = "0.0.1", path = "../tuile-bing" }
-tuile-planetary = { version = "0.0.1", path = "../tuile-planetary" }
-tuile-native-fetchers = { version = "0.0.1", path = "../tuile-native-fetchers" }
+tuile-cesium-ion = { version = "0.1.0", path = "../tuile-cesium-ion" }
+tuile-bing = { version = "0.1.0", path = "../tuile-bing" }
+tuile-planetary = { version = "0.1.0", path = "../tuile-planetary" }
+tuile-native-fetchers = { version = "0.1.0", path = "../tuile-native-fetchers" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 image = { workspace = true }
@@ -54,9 +54,9 @@ image = { workspace = true }
 # on a farm node is indistinguishable from a hang.
 tokio = { workspace = true, features = ["time"] }
 thiserror = { workspace = true }
-tuile-core = { version = "0.0.1", path = "../tuile-core" }
-tuile-pack = { version = "0.0.1", path = "../tuile-pack" }
-tuile-tape = { version = "0.0.1", path = "../tuile-tape" }
+tuile-core = { version = "0.1.0", path = "../tuile-core" }
+tuile-pack = { version = "0.1.0", path = "../tuile-pack" }
+tuile-tape = { version = "0.1.0", path = "../tuile-tape" }
 
 # --- profiling, behind the feature ------------------------------------------
 # Signal sampling across EVERY thread, without `perf` and without privileges.

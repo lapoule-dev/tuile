@@ -15,8 +15,8 @@ async-trait = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
-tuile-core = { version = "0.0.1", path = "../tuile-core" }
-tuile-terrain = { version = "0.0.1", path = "../tuile-terrain" }
+tuile-core = { version = "0.1.0", path = "../tuile-core" }
+tuile-terrain = { version = "0.1.0", path = "../tuile-terrain" }
 
 [dev-dependencies]
 bytes = { workspace = true }

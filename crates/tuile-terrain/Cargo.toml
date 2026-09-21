@@ -21,7 +21,7 @@ glam = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tuile-core = { version = "0.0.1", path = "../tuile-core" }
+tuile-core = { version = "0.1.0", path = "../tuile-core" }
 
 [dev-dependencies]
 futures-executor = { workspace = true }

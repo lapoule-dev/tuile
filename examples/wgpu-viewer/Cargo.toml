@@ -19,14 +19,14 @@ pollster = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tuile-atmosphere = { version = "0.0.1", path = "../../crates/tuile-atmosphere" }
-tuile-camera = { version = "0.0.1", path = "../../crates/tuile-camera" }
-tuile-core = { version = "0.0.1", path = "../../crates/tuile-core" }
-tuile-cesium-ion = { version = "0.0.1", path = "../../crates/tuile-cesium-ion" }
-tuile-bing = { version = "0.0.1", path = "../../crates/tuile-bing" }
-tuile-planetary = { version = "0.0.1", path = "../../crates/tuile-planetary" }
-tuile-storage-foyer = { version = "0.0.1", path = "../../crates/tuile-storage-foyer" }
-tuile-tape = { version = "0.0.1", path = "../../crates/tuile-tape" }
+tuile-atmosphere = { version = "0.1.0", path = "../../crates/tuile-atmosphere" }
+tuile-camera = { version = "0.1.0", path = "../../crates/tuile-camera" }
+tuile-core = { version = "0.1.0", path = "../../crates/tuile-core" }
+tuile-cesium-ion = { version = "0.1.0", path = "../../crates/tuile-cesium-ion" }
+tuile-bing = { version = "0.1.0", path = "../../crates/tuile-bing" }
+tuile-planetary = { version = "0.1.0", path = "../../crates/tuile-planetary" }
+tuile-storage-foyer = { version = "0.1.0", path = "../../crates/tuile-storage-foyer" }
+tuile-tape = { version = "0.1.0", path = "../../crates/tuile-tape" }
 # Ctrl-C, SIGTERM and SIGHUP have to end the *session*, not the process: a
 # recording is most valuable in exactly the run that ends badly. A safe wrapper
 # rather than raw `libc::signal`, because the workspace denies `unsafe_code`.
@@ -34,10 +34,10 @@ ctrlc = { version = "3.5", features = ["termination"] }
 # The Prometheus bridge. It lives in its own crate rather than here because
 # nothing about publishing the engine's counters is specific to a wgpu window:
 # the headless probes and the warm-up job want exactly the same endpoint.
-tuile-metrics = { version = "0.0.1", path = "../../crates/tuile-metrics" }
-tuile-terrain = { version = "0.0.1", path = "../../crates/tuile-terrain" }
-tuile-native-fetchers = { version = "0.0.1", path = "../../crates/tuile-native-fetchers" }
-tuile-ui = { version = "0.0.1", path = "../../crates/tuile-ui", features = ["statusbar"] }
-tuile-wgpu = { version = "0.0.1", path = "../../crates/tuile-wgpu" }
+tuile-metrics = { version = "0.1.0", path = "../../crates/tuile-metrics" }
+tuile-terrain = { version = "0.1.0", path = "../../crates/tuile-terrain" }
+tuile-native-fetchers = { version = "0.1.0", path = "../../crates/tuile-native-fetchers" }
+tuile-ui = { version = "0.1.0", path = "../../crates/tuile-ui", features = ["statusbar"] }
+tuile-wgpu = { version = "0.1.0", path = "../../crates/tuile-wgpu" }
 wgpu = { workspace = true }
 winit = { workspace = true }
