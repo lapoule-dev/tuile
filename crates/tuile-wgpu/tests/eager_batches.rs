@@ -122,9 +122,8 @@ fn settle(
     for _ in 0..2_000 {
         let _ = server.as_mut().poll(&mut cx);
         let uploaded = pump.pump(stream, gpu, tuile_wgpu::UPLOADS_PER_FRAME);
-        let done = !pump.selection.is_empty()
-            && pump.provisional() == 0
-            && pump.pending_uploads() == 0;
+        let done =
+            !pump.selection.is_empty() && pump.provisional() == 0 && pump.pending_uploads() == 0;
         quiet = if uploaded == 0 && done { quiet + 1 } else { 0 };
         if quiet > 8 {
             break;
@@ -174,10 +173,20 @@ fn a_second_view_loads_its_ground_too() {
 
     // A single view first: only its own half refines below the pin — the
     // baseline that proves the union assertion below is not vacuous.
-    settle(&mut server, &mut stream, &mut pump, &gpu, &[west_view], origin);
+    settle(
+        &mut server,
+        &mut stream,
+        &mut pump,
+        &gpu,
+        &[west_view],
+        origin,
+    );
     let (west, east) = fine_halves(&pump);
     assert!(west, "the west view refined its own ground");
-    assert!(!east, "nothing east of the pin was asked for by a west view");
+    assert!(
+        !east,
+        "nothing east of the pin was asked for by a west view"
+    );
 
     // Both views together: the union loads the east eagerly as well, and the
     // pump's own gate (`missing == 0`) now covers both.

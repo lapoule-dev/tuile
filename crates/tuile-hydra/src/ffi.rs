@@ -786,7 +786,10 @@ mod tests {
             scene_digest: as_str("scene-under-test"),
         };
         let mut out: *mut Session = std::ptr::null_mut();
-        assert_eq!(unsafe { tuile_session_new(&config, &mut out) }, TuileStatus::Ok);
+        assert_eq!(
+            unsafe { tuile_session_new(&config, &mut out) },
+            TuileStatus::Ok
+        );
         assert!(!out.is_null());
         assert!(unsafe { &*out }.is_packed());
         unsafe { tuile_session_free(out) };

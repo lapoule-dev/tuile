@@ -507,13 +507,9 @@ impl Session<'_> {
             "pass",
             n = *self.frame,
             selected = self.out.selected.len(),
-            sel_digest = crate::determinism::digest(
-                self.out.selected.iter().map(|(t, _)| t.0)
-            ),
+            sel_digest = crate::determinism::digest(self.out.selected.iter().map(|(t, _)| t.0)),
             requested = self.out.requests.len(),
-            req_digest = crate::determinism::digest(
-                self.out.requests.iter().map(|r| r.tile.0)
-            ),
+            req_digest = crate::determinism::digest(self.out.requests.iter().map(|r| r.tile.0)),
             visited = self.out.stats.visited,
             culled = self.out.stats.culled,
             gaps = self.out.stats.gaps,
@@ -914,9 +910,7 @@ impl Session<'_> {
                     crate::det!(
                         "evict",
                         count = evicted.len(),
-                        digest = crate::determinism::digest(
-                            evicted.iter().map(|t| t.0)
-                        ),
+                        digest = crate::determinism::digest(evicted.iter().map(|t| t.0)),
                     );
                     tx.unbounded_send(ServerMessage::Evict { tiles: evicted })
                         .map_err(|_| Stop::Gone)?;
@@ -1081,9 +1075,8 @@ mod tests {
             stopped,
             "the session kept running after a tile it can never serve"
         );
-        let (tile, message) = reported.expect(
-            "the session stopped without ever saying which tile it could not load",
-        );
+        let (tile, message) =
+            reported.expect("the session stopped without ever saying which tile it could not load");
         assert!(tile.is_some(), "an unattributed failure is not actionable");
         assert!(
             !message.is_empty(),
@@ -1247,7 +1240,10 @@ mod tests {
         // taken back.
         for view in [near_view(), far_view()] {
             stream
-                .send(ClientMessage::ViewerState { views: vec![view], generation: 0 })
+                .send(ClientMessage::ViewerState {
+                    views: vec![view],
+                    generation: 0,
+                })
                 .expect("send");
             for _ in 0..256 {
                 let _ = server.as_mut().poll(&mut cx);
@@ -1347,7 +1343,10 @@ mod tests {
         // of a real consumer is exactly this window, held open.
         for view in [near_view(), far_view()] {
             stream
-                .send(ClientMessage::ViewerState { views: vec![view], generation: 0 })
+                .send(ClientMessage::ViewerState {
+                    views: vec![view],
+                    generation: 0,
+                })
                 .expect("send");
             for _ in 0..256 {
                 let _ = server.as_mut().poll(&mut cx);
@@ -1681,7 +1680,10 @@ mod tests {
 
         for view in [near_view(), far_view(), near_view(), far_view()] {
             stream
-                .send(ClientMessage::ViewerState { views: vec![view], generation: 0 })
+                .send(ClientMessage::ViewerState {
+                    views: vec![view],
+                    generation: 0,
+                })
                 .expect("send");
             settle(&mut server, &mut stream).expect("settles");
         }
