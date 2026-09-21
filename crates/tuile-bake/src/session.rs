@@ -623,6 +623,59 @@ impl Session {
             Source::Packed(packed) => packed.frame(&views),
         }
     }
+
+    /// One frame of a camera path: **one pose, one convergence**.
+    ///
+    /// This is how an offline consumer drives a session, and the fact that it
+    /// is *one* view is the whole content of the method. [`Self::frame`] takes
+    /// a vector because a stereo rig or a cube map genuinely has several eyes
+    /// looking at once; a film does not. A film has one eye that moves, and
+    /// the temptation — converging a whole stretch of a path at once, on the
+    /// theory that frusta which overlap by 99% ought to cost about as much as
+    /// one — is a trap.
+    ///
+    /// It is a trap because a traversal keeps re-running as tiles land, and
+    /// every re-run evaluates every view it was given. The work goes as
+    /// *arrivals × views*, not as tiles. Measured over Cesium World Terrain at
+    /// 3840×2160 and SSE 3, from cold:
+    ///
+    /// | views in one convergence | tiles selected | wall clock |
+    /// |---|---|---|
+    /// | 6 | 1711 | 28.6 s |
+    /// | 60 | 3401 | 365 s |
+    /// | 300 | — | did not converge in 900 s |
+    ///
+    /// Ten times the views buys twice the tiles and thirteen times the wait,
+    /// and enough of them buys nothing at all. Frame by frame costs nothing
+    /// extra in exchange, because residency carries: a camera moves a few
+    /// metres between frames and re-selects almost the same ground.
+    ///
+    /// The viewport belongs to the call rather than to the pose because a pack
+    /// is the bake of the viewport it was made for, while a tape of poses is
+    /// not: the same path can be filmed at two sizes, and they are two packs.
+    pub fn frame_for_pose(
+        &mut self,
+        pose: &tuile_tape::Frame,
+        viewport: (f64, f64),
+    ) -> Result<Frame, FrameError> {
+        self.frame(vec![pose_view(pose, viewport)])
+    }
+}
+
+/// A tape pose as the traversal's own camera.
+///
+/// One conversion, in one place. It was written out by hand at every call
+/// site, and a consumer that transcribes four vectors is a consumer that can
+/// transcribe them wrongly — the failure being a pack that answers no camera,
+/// which costs a whole execution to discover.
+pub fn pose_view(pose: &tuile_tape::Frame, viewport: (f64, f64)) -> ViewStateParams {
+    ViewStateParams {
+        position: glam::DVec3::from_array(pose.position),
+        direction: glam::DVec3::from_array(pose.direction),
+        up: glam::DVec3::from_array(pose.up),
+        viewport_px: glam::dvec2(viewport.0, viewport.1),
+        fovy_rad: pose.fovy,
+    }
 }
 
 impl Live {
