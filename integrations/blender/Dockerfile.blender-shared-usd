@@ -447,48 +447,118 @@ RUN set -eu; \
     echo "blender-shared-usd: manifest scene index seam patched in"
 
 
-# L'aperçu que personne ne regarde, et qui étouffe le rendu en haute résolution.
+# L'aperçu que personne ne regarde, et qui étouffait le rendu en haute
+# résolution. Supprimé, pas espacé.
 #
-# `FinalEngine::render()` boucle sans pause, et chaque tour appelle
+# `FinalEngine::render()` boucle sans pause, et chaque tour appelait
 # `update_render_result()` : allocation d'un `RenderResult` de la taille de
 # l'image, relecture de tous les AOV depuis les tampons Hydra, recopie,
 # libération. En 1920x1440 c'est 55 Mo par tour et personne ne le remarque. En
-# 7680x5760 c'est ~880 Mo alloués, copiés et libérés par tour, sur un thread.
+# 3840x2160 c'est ~166 Mo, en 7680x5760 ~880 Mo, sur un thread.
 #
-# Mesuré sur un L4 le 18 septembre 2026 : CPU plat à 13,1 % (un cœur sur huit),
-# GPU compute à 0 %, VRAM figée à 1,5 Gio, et dix-huit minutes sans terminer une
-# frame à UN échantillon — alors que la même scène sort en onze secondes en
-# 1920. La cuisson, elle, se terminait en deux secondes : le procédural n'y
-# était pour rien.
+# Mesuré sur un L4 : CPU plat à 13,1 % (un cœur sur huit), GPU compute à 0 %, et
+# vingt-quatre minutes sans finir une frame que la même scène rend en secondes
+# au dixième de la résolution.
 #
-# Et comme c'est le coût de cette recopie qui cadence la boucle, la supprimer
-# seule en ferait un spin. D'où les deux moitiés : rafraîchir au plus toutes les
-# `TUILE_PREVIEW_INTERVAL` secondes, et dormir un peu sur les tours sautés.
+# Une première version espaçait la recopie par `TUILE_PREVIEW_INTERVAL` et
+# dormait sur les tours sautés. Ça marchait et c'était laid : il restait une
+# recopie complète PAR FRAME — le premier tour rafraîchit toujours, et
+# `render()` tourne une fois par frame — soit ~1,3 Tio alloués, copiés et
+# libérés sur un film de huit mille frames, pour personne. Et « jamais »
+# s'écrivait `86400`, par convention.
 #
-# Variable absente : comportement d'amont, au tour près.
-COPY integrations/blender/blender-patches/tuile_preview.cc \
-     integrations/blender/blender-patches/tuile_preview.hh \
+# La forme juste est celle du chemin natif. `BlenderSession::render()` ne sonde
+# rien :
+#
+#     session->start();
+#     session->wait();                                   // variable de condition
+#     session->progress.set_update_callback([this] { tag_redraw(); });
+#
+# `Session::wait()` bloque jusqu'à ce que le fil de rendu notifie. Ce qui
+# manquait, c'est un chemin jusqu'à lui : `FinalEngine` parle à Hydra, et le
+# délégué pourrait être Storm.
+#
+# Hydra a le point d'extension prévu pour ça — `InvokeCommand`. Les deux
+# moitiés de ce patch sont donc :
+#
+#   * le délégué Cycles annonce `cycles:waitForConvergence` et y répond par
+#     `session->wait()`, dans le style exact de son `Pause()` voisin ;
+#   * la boucle de Blender demande cette attente en mode `-b`, et ne rafraîchit
+#     plus rien du tout.
+#
+# Un viewer ouvert (`G.background` faux) garde le comportement d'amont, au tour
+# près : c'est la distinction que Cycles trace lui-même partout dans
+# `BlenderSession`.
+
+# ── moitié 1 : le délégué Cycles sait attendre ───────────────────────────────
+RUN set -eu; \
+    cd /opt/src/blender/intern/cycles/hydra; \
+    sed -i 's|^#include <pxr/base/tf/getenv.h>$|#include <pxr/base/tf/getenv.h>\n#include <pxr/imaging/hd/command.h>|' render_delegate.cpp; \
+    sed -i 's|^    (openvdbAsset)$|    (openvdbAsset)\n    ((waitForConvergence, "cycles:waitForConvergence"))|' render_delegate.cpp; \
+    sed -i 's|^  bool Resume() override;$|  bool Resume() override;\n\n  PXR_NS::HdCommandDescriptors GetCommandDescriptors() const override;\n  bool InvokeCommand(const PXR_NS::TfToken \&command,\n                     const PXR_NS::HdCommandArgs \&args) override;|' render_delegate.h; \
+    printf '%s\n' '' \
+      'HdCommandDescriptors HdCyclesDelegate::GetCommandDescriptors() const' \
+      '{' \
+      '  /* The wait the native path takes: `Session::wait()` blocks on the' \
+      '   * condition variable the render thread notifies. Advertised so a' \
+      '   * consumer can ask for it instead of polling, and so a consumer of' \
+      '   * another delegate can find out there is none. */' \
+      '  return {HdCommandDescriptor(_tokens->waitForConvergence,' \
+      '                              "Block until the frame has converged")};' \
+      '}' \
+      '' \
+      'bool HdCyclesDelegate::InvokeCommand(const TfToken &command, const HdCommandArgs &)' \
+      '{' \
+      '  if (command != _tokens->waitForConvergence) {' \
+      '    return false;' \
+      '  }' \
+      '  if (!_renderParam) {' \
+      '    return false;' \
+      '  }' \
+      '  _renderParam->session->wait();' \
+      '  return true;' \
+      '}' >> render_delegate.cpp; \
+    for probe in "render_delegate.cpp:pxr/imaging/hd/command.h" \
+                 "render_delegate.cpp:cycles:waitForConvergence" \
+                 "render_delegate.cpp:_renderParam->session->wait();" \
+                 "render_delegate.h:GetCommandDescriptors() const override;" \
+                 "render_delegate.h:bool InvokeCommand("; do \
+        f="${probe%%:*}"; want="${probe#*:}"; \
+        grep -qF "$want" "$f" || { \
+            echo "le patch de l'attente a manqué sa cible: $want dans $f"; exit 1; }; \
+    done; \
+    echo "blender-shared-usd: the Cycles delegate can be waited on"
+
+# ── moitié 2 : la boucle attend au lieu de recopier ──────────────────────────
+COPY integrations/blender/blender-patches/tuile_wait.cc \
+     integrations/blender/blender-patches/tuile_wait.hh \
      /opt/src/blender/source/blender/render/hydra/
 RUN set -eu; \
     cd /opt/src/blender/source/blender/render/hydra; \
-    sed -i 's|^  render_task_delegate.cc$|  render_task_delegate.cc\n  tuile_preview.cc|' CMakeLists.txt; \
-    sed -i 's|^  render_task_delegate.hh$|  render_task_delegate.hh\n  tuile_preview.hh|' CMakeLists.txt; \
-    sed -i 's|#include "tuile_manifest.hh"|#include "tuile_manifest.hh"\n#include "tuile_preview.hh"|' final_engine.cc; \
-    perl -0pi -e 's/(  float percent_done = 0\.0;\n)/$1  double tuile_last_preview = 0.0;\n  const double tuile_interval = tuile_preview_interval();\n/' final_engine.cc; \
-    perl -0pi -e 's/(    update_render_result\(width, height, view_layer->name\);\n  \}\n)/    if (tuile_preview_due(BLI_time_now_seconds(), \&tuile_last_preview, tuile_interval)) {\n      update_render_result(width, height, view_layer->name);\n    }\n    else {\n      BLI_time_sleep_ms(50);\n    }\n  }\n/' final_engine.cc; \
-    for probe in "CMakeLists.txt:tuile_preview.cc" \
-                 "final_engine.cc:#include \"tuile_preview.hh\"" \
-                 "final_engine.cc:tuile_preview_due(BLI_time_now_seconds()" \
-                 "final_engine.cc:BLI_time_sleep_ms(50);"; do \
+    sed -i 's|^  render_task_delegate.cc$|  render_task_delegate.cc\n  tuile_wait.cc|' CMakeLists.txt; \
+    sed -i 's|^  render_task_delegate.hh$|  render_task_delegate.hh\n  tuile_wait.hh|' CMakeLists.txt; \
+    sed -i 's|#include "tuile_manifest.hh"|#include "tuile_manifest.hh"\n#include "tuile_wait.hh"|' final_engine.cc; \
+    perl -0pi -e 's/(    update_render_result\(width, height, view_layer->name\);\n  \}\n)/    if (tuile_wait_for_frame(render_index_.get())) {\n      continue;\n    }\n$1/' final_engine.cc; \
+    for probe in "CMakeLists.txt:tuile_wait.cc" \
+                 "CMakeLists.txt:tuile_wait.hh" \
+                 "final_engine.cc:#include \"tuile_wait.hh\"" \
+                 "final_engine.cc:tuile_wait_for_frame(render_index_.get())"; do \
         f="${probe%%:*}"; want="${probe#*:}"; \
         grep -qF "$want" "$f" || { \
-            echo "le patch de l'aperçu a manqué sa cible: $want dans $f"; exit 1; }; \
+            echo "le patch de la boucle a manqué sa cible: $want dans $f"; exit 1; }; \
     done; \
     # L'appel APRÈS la boucle doit rester inconditionnel : c'est lui qui produit
-    # l'image finale, et le brider donnerait une frame vide ou périmée.
+    # l'image finale, et le brider donnerait une frame vide ou périmée. Deux
+    # occurrences, ni une ni trois.
     grep -c 'update_render_result(width, height, view_layer->name);' final_engine.cc \
         | grep -qx 2 || { echo "l'appel final a disparu ou a été dupliqué"; exit 1; }; \
-    echo "blender-shared-usd: preview throttle patched in"
+    # Et l'attente doit PRÉCÉDER la recopie, sans quoi le mode batch paierait
+    # quand même l'aperçu avant de bloquer.
+    # -B4 : l'appel est trois lignes au-dessus (le `if`, le `continue`, l'accolade).
+    grep -B4 'update_render_result(width, height, view_layer->name);' final_engine.cc \
+        | grep -q 'tuile_wait_for_frame' || { \
+            echo "l'attente ne précède pas la recopie"; exit 1; }; \
+    echo "blender-shared-usd: the render loop waits instead of copying"
 
 # Et ce patch-là est testé, ici, avant même la recompilation.
 #
@@ -501,9 +571,17 @@ RUN set -eu; \
 # promettre : inerte sans sa variable, inoffensif si elle pointe à côté, et une
 # seule insertion par processus — deux mettraient le globe deux fois dans la
 # scène, soit deux surfaces coplanaires sur toute la Terre.
+#
+# `tuile_wait` n'en a pas, et c'est une conséquence et non un oubli : sa
+# décision tient en trois questions — sommes-nous en `-b`, le délégué
+# annonce-t-il l'attente, a-t-elle réussi — dont aucune n'est de l'arithmétique.
+# Elles portent toutes sur des types d'USD et de Blender, qu'un test compilé
+# avec un simple `g++` et un bouchon ne peut pas fabriquer. Ce qui le couvre est
+# plus bas : les sondes de motif ci-dessus, l'ordre vérifié (l'attente AVANT la
+# recopie), le compte des deux `update_render_result`, et le contrôle de symbole
+# après l'édition de liens.
 COPY integrations/blender/tests/tuile_manifest_test.cc \
      integrations/blender/tests/tuile_manifest_stub.cc \
-     integrations/blender/tests/tuile_preview_test.cc \
      /opt/src/tuile-tests/
 RUN set -eu; \
     cd /opt/src/tuile-tests; \
@@ -511,10 +589,7 @@ RUN set -eu; \
     g++ -std=c++17 -shared -fPIC tuile_manifest_stub.cc -o libtuilestub.so; \
     g++ -std=c++17 -I"$h" tuile_manifest_test.cc "$h/tuile_manifest.cc" \
         -ldl -o tuile_manifest_test; \
-    ./tuile_manifest_test "$PWD/libtuilestub.so"; \
-    g++ -std=c++17 -I"$h" tuile_preview_test.cc "$h/tuile_preview.cc" \
-        -o tuile_preview_test; \
-    ./tuile_preview_test
+    ./tuile_manifest_test "$PWD/libtuilestub.so"
 
 # Et la recompilation partielle : seuls les modules patchés y passent.
 #
@@ -525,6 +600,27 @@ RUN set -eu; \
 RUN cd /opt/src/blender \
     && cmake --build /opt/build -j ${BUILD_JOBS} \
     && cmake --install /opt/build
+
+# Et les deux moitiés du patch d'attente ont VRAIMENT été compilées et liées.
+#
+# Les sondes plus haut lisent la source : elles prouvent que le motif a mordu,
+# pas que le résultat existe dans le binaire. La distinction n'est pas
+# théorique — le 17 septembre 2026 une recette qui avait oublié un `.cpp` a
+# produit une image dont toutes les assertions passaient et qui mourait dans le
+# job sur `undefined symbol`, après la poussée, après le démarrage du L4 et le
+# téléchargement de deux gigaoctets de pack.
+#
+# `--defined-only` parce qu'un symbole simplement *référencé* est exactement la
+# panne qu'on cherche à empêcher.
+RUN set -eu; \
+    bin=$(find /opt/blender -maxdepth 1 -name blender -type f); \
+    test -n "$bin" || { echo "pas de binaire blender installé"; exit 1; }; \
+    for want in tuile_wait_for_frame InvokeCommand; do \
+        nm --defined-only -C "$bin" 2>/dev/null | grep -q "$want" || { \
+            echo "le binaire ne définit pas $want — le patch n'a pas été compilé"; \
+            exit 1; }; \
+    done; \
+    echo "blender-shared-usd verified: the wait is in the binary, not only in the source"
 
 
 # The kernels, or the build lied.
