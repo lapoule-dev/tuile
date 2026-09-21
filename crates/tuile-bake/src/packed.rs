@@ -129,10 +129,7 @@ impl Packed {
         // it or a material resolves to nothing. The scene digest is the one
         // name that identifies exactly these bytes.
         let dataset = format!("pack-{}", pack.scene_digest()).into();
-        Ok(Self {
-            bytes,
-            dataset,
-        })
+        Ok(Self { bytes, dataset })
     }
 
     /// The URI a tile's drape is published under. It names bytes, it does not
@@ -189,7 +186,11 @@ impl Packed {
             selected = out.len(),
             sel_digest = tuile_core::determinism::digest(out.iter().map(|t| t.tile.0)),
         );
-        tracing::info!(frame = number, tiles = out.len(), "frame read from the pack");
+        tracing::info!(
+            frame = number,
+            tiles = out.len(),
+            "frame read from the pack"
+        );
         Ok(Frame::new(Arc::clone(&self.dataset), out))
     }
 

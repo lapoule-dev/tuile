@@ -70,10 +70,7 @@ pub struct ImageryCoord {
 /// the layers are fetched as they always were. It can never name a drape that
 /// was composed from different pixels, because a stored identity was itself
 /// produced by this function over the layers that composed it.
-pub fn drape_identity(
-    coords: impl IntoIterator<Item = ImageryCoord>,
-    composed_at: u32,
-) -> u64 {
+pub fn drape_identity(coords: impl IntoIterator<Item = ImageryCoord>, composed_at: u32) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     composed_at.hash(&mut hasher);
@@ -1823,8 +1820,16 @@ mod tests {
     #[test]
     fn the_drape_identity_is_ordered() {
         use super::{drape_identity, ImageryCoord};
-        let a = ImageryCoord { level: 4, x: 1, y: 2 };
-        let b = ImageryCoord { level: 4, x: 2, y: 1 };
+        let a = ImageryCoord {
+            level: 4,
+            x: 1,
+            y: 2,
+        };
+        let b = ImageryCoord {
+            level: 4,
+            x: 2,
+            y: 1,
+        };
         assert_ne!(
             drape_identity([a, b], 2048),
             drape_identity([b, a], 2048),
@@ -1842,7 +1847,11 @@ mod tests {
     #[test]
     fn the_composed_size_is_part_of_the_drape_identity() {
         use super::{drape_identity, ImageryCoord};
-        let only = ImageryCoord { level: 4, x: 1, y: 2 };
+        let only = ImageryCoord {
+            level: 4,
+            x: 1,
+            y: 2,
+        };
         assert_ne!(drape_identity([only], 1024), drape_identity([only], 2048));
     }
 
@@ -1850,7 +1859,11 @@ mod tests {
     #[test]
     fn an_empty_stack_has_its_own_name() {
         use super::{drape_identity, ImageryCoord};
-        let only = ImageryCoord { level: 0, x: 0, y: 0 };
+        let only = ImageryCoord {
+            level: 0,
+            x: 0,
+            y: 0,
+        };
         assert_ne!(drape_identity([], 2048), drape_identity([only], 2048));
     }
     use super::*;
@@ -2723,7 +2736,11 @@ mod tests {
 
     fn layer(texture: Arc<DecodedTexture>, coverage: [f32; 4]) -> ImageryLayer {
         ImageryLayer {
-            coord: ImageryCoord { level: 0, x: 0, y: 0 },
+            coord: ImageryCoord {
+                level: 0,
+                x: 0,
+                y: 0,
+            },
             texture,
             coverage,
             translation: [0.0, 0.0],

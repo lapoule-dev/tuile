@@ -20,8 +20,7 @@ fn field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 }
 
 fn base64_decode(text: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut table = [255u8; 256];
     for (i, c) in ALPHABET.iter().enumerate() {
         table[*c as usize] = i as u8;
@@ -49,8 +48,12 @@ fn base64_decode(text: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let path = args.next().ok_or("usage: trace-dump <trace.mcap> <out-prefix> [every-n]")?;
-    let prefix = args.next().ok_or("usage: trace-dump <trace.mcap> <out-prefix> [every-n]")?;
+    let path = args
+        .next()
+        .ok_or("usage: trace-dump <trace.mcap> <out-prefix> [every-n]")?;
+    let prefix = args
+        .next()
+        .ok_or("usage: trace-dump <trace.mcap> <out-prefix> [every-n]")?;
     let every: usize = args.next().map_or(Ok(1), |s| s.parse())?;
 
     let bytes = std::fs::read(&path)?;

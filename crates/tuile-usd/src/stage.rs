@@ -236,10 +236,7 @@ pub fn write_manifest(
         "        float horizontalAperture = {}",
         VERTICAL_APERTURE * aspect
     )?;
-    writeln!(
-        out,
-        "        float verticalAperture = {VERTICAL_APERTURE}"
-    )?;
+    writeln!(out, "        float verticalAperture = {VERTICAL_APERTURE}")?;
     if fovy_constant {
         writeln!(
             out,
@@ -277,23 +274,14 @@ pub fn write_manifest(
     writeln!(out, "    def DomeLight \"Sky\"")?;
     writeln!(out, "    {{")?;
     writeln!(out, "        float inputs:intensity = 0.8")?;
-    writeln!(
-        out,
-        "        color3f inputs:color = (0.9, 0.95, 1.0)"
-    )?;
+    writeln!(out, "        color3f inputs:color = (0.9, 0.95, 1.0)")?;
     writeln!(out, "    }}")?;
     writeln!(out)?;
     writeln!(out, "    def DistantLight \"Sun\"")?;
     writeln!(out, "    {{")?;
     writeln!(out, "        float inputs:intensity = 2.5")?;
-    writeln!(
-        out,
-        "        color3f inputs:color = (1.0, 0.98, 0.92)"
-    )?;
-    writeln!(
-        out,
-        "        float inputs:angle = 0.53"
-    )?;
+    writeln!(out, "        color3f inputs:color = (1.0, 0.98, 0.92)")?;
+    writeln!(out, "        float inputs:angle = 0.53")?;
     writeln!(out, "    }}")?;
     writeln!(out)?;
     writeln!(out, "    def GenerativeProcedural \"Globe\" (")?;
@@ -348,7 +336,11 @@ pub fn write_manifest(
         "        int primvars:tuile:imageryAssetId = {}",
         config.imagery_asset_id
     )?;
-    writeln!(out, "        double primvars:tuile:maxSse = {}", config.max_sse)?;
+    writeln!(
+        out,
+        "        double primvars:tuile:maxSse = {}",
+        config.max_sse
+    )?;
     writeln!(
         out,
         "        double2 primvars:tuile:viewportPx = ({}, {})",
@@ -472,8 +464,7 @@ mod tests {
             looking_down_x([100.0, 0.0, 0.0]),
         ];
         let mut out = Vec::new();
-        write_manifest(&frames, &ManifestConfig::default(), &mut out)
-            .expect("writing");
+        write_manifest(&frames, &ManifestConfig::default(), &mut out).expect("writing");
         let text = String::from_utf8(out).expect("utf-8");
 
         for needle in [
@@ -529,8 +520,7 @@ mod tests {
             looking_down_x([100.0, 0.0, 0.0]),
         ];
         let mut out = Vec::new();
-        write_manifest(&frames, &ManifestConfig::default(), &mut out)
-            .expect("writing");
+        write_manifest(&frames, &ManifestConfig::default(), &mut out).expect("writing");
         let usda = String::from_utf8(out).expect("utf-8");
         let line = usda
             .lines()

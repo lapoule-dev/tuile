@@ -389,12 +389,7 @@ mod tests {
     /// sphere within a millimetre, and neither this nor the test under test can
     /// be held to an answer at that distance in f64 over 6 000 km. Saying so is
     /// better than picking a side and calling the disagreement a bug.
-    fn segment_meets_sphere(
-        eye: DVec3,
-        point: DVec3,
-        center: DVec3,
-        radius: f64,
-    ) -> Option<bool> {
+    fn segment_meets_sphere(eye: DVec3, point: DVec3, center: DVec3, radius: f64) -> Option<bool> {
         let d = point - eye;
         let len = d.length();
         if len == 0.0 {
@@ -447,8 +442,7 @@ mod tests {
             let eye = DVec3::new(planet.radius + altitude, 0.0, 0.0);
             let mut decided = 0;
             for p in sample_points(planet.radius) {
-                let Some(truth) = segment_meets_sphere(eye, p, planet.center, planet.radius)
-                else {
+                let Some(truth) = segment_meets_sphere(eye, p, planet.center, planet.radius) else {
                     continue;
                 };
                 decided += 1;
