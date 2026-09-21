@@ -17,8 +17,8 @@ workspace = true
 statusbar = ["dep:tray-icon", "dep:muda"]
 
 [dependencies]
-tuile-camera = { version = "0.0.1", path = "../tuile-camera" }
-tuile-core = { version = "0.0.1", path = "../tuile-core" }
+tuile-camera = { version = "0.1.0", path = "../tuile-camera" }
+tuile-core = { version = "0.1.0", path = "../tuile-core" }
 # macOS-only in practice; the crates are a no-op elsewhere, so a host that asks
 # for the feature still builds on other platforms.
 tray-icon = { version = "0.24", optional = true }

@@ -1,6 +1,6 @@
 [package]
 name = "tuile-web"
-version = "0.0.1"
+version.workspace = true
 description = "Browser transport and in-worker geometry server for tuile-core (wasm32)"
 edition.workspace = true
 rust-version.workspace = true
@@ -22,10 +22,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 
-tuile-core = { version = "0.0.1", path = "../tuile-core" }
-tuile-cesium-ion = { version = "0.0.1", path = "../tuile-cesium-ion" }
-tuile-bing = { version = "0.0.1", path = "../tuile-bing" }
-tuile-planetary = { version = "0.0.1", path = "../tuile-planetary" }
+tuile-core = { version = "0.1.0", path = "../tuile-core" }
+tuile-cesium-ion = { version = "0.1.0", path = "../tuile-cesium-ion" }
+tuile-bing = { version = "0.1.0", path = "../tuile-bing" }
+tuile-planetary = { version = "0.1.0", path = "../tuile-planetary" }
 glam = { workspace = true }
 
 # The browser is the only target this crate has: everything below exists solely

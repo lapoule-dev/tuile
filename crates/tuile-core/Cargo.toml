@@ -30,7 +30,7 @@ thiserror = { workspace = true }
 # crate was built is worse than no log line, and the flag bought nothing —
 # it was declared and never used.
 tracing = { workspace = true }
-tuile-b3dm = { version = "0.0.1", path = "../tuile-b3dm" }
+tuile-b3dm = { version = "0.1.0", path = "../tuile-b3dm" }
 url = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

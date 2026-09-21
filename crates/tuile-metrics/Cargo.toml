@@ -17,4 +17,4 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tuile-core = { version = "0.0.1", path = "../tuile-core" }
+tuile-core = { version = "0.1.0", path = "../tuile-core" }
