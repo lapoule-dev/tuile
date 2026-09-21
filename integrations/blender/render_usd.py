@@ -46,6 +46,8 @@ def parse_args():
     p.add_argument("--samples", type=int, default=0, help="0 = tier default")
     p.add_argument("--adaptive-threshold", type=float, default=0.05,
                    help="cycles adaptive sampling noise threshold (lower = higher quality)")
+    p.add_argument("--no-denoise", action="store_true",
+                   help="leave the sample noise in, for judging the sampler itself")
     p.add_argument("--camera", default="", help="object name; default: first camera")
     p.add_argument("--out", required=True, help="frame path prefix")
     p.add_argument("--video", default="", help="encode this mp4 (H.264)")
@@ -310,6 +312,40 @@ def main():
             scene.cycles.samples = args.samples or 128
             scene.cycles.use_adaptive_sampling = True
             scene.cycles.adaptive_threshold = args.adaptive_threshold
+            # The third leg of the batch recipe, and the one that was missing.
+            #
+            # "Adaptive + a cap + one final denoise" is what the header of this
+            # file calls the batch recipe, and two of the three were here. The
+            # denoiser is what lets the cap come down: a path tracer's noise
+            # falls as the square root of the samples, so buying the last of it
+            # with samples costs four times as much for each halving. One pass
+            # of the OptiX denoiser at the end of a frame costs milliseconds on
+            # the card that just traced it.
+            #
+            # It matters most for exactly this kind of shot — diffuse ground
+            # under one sun, no glass, no volumetrics, no depth of field —
+            # where what remains at low sample counts is even grain rather than
+            # fireflies, which is what a denoiser is good at.
+            #
+            # `--no-denoise` exists to judge the sampler itself: comparing two
+            # sample counts through a denoiser compares the denoiser.
+            scene.cycles.use_denoising = not args.no_denoise
+            if scene.cycles.use_denoising:
+                # OptiX where the card can, and never a hard failure: a build
+                # or a device without it falls back to OpenImageDenoise, which
+                # is slower and correct. A render that dies because it could
+                # not pick a denoiser would be worse than a noisy one.
+                try:
+                    scene.cycles.denoiser = "OPTIX"
+                except TypeError:
+                    print("denoiser: OPTIX unavailable, falling back", flush=True)
+                try:
+                    scene.cycles.denoising_use_gpu = True
+                except AttributeError:
+                    pass
+            print(f"denoise: {scene.cycles.use_denoising}"
+                  f"{' (' + scene.cycles.denoiser + ')' if scene.cycles.use_denoising else ''}",
+                  flush=True)
             # Said out loud, because the delegate takes its device from
             # CYCLES_DEVICE and falls back to CPU in silence when nothing sets
             # it (cycles/src/hydra/render_delegate.cpp). A job path-tracing on
