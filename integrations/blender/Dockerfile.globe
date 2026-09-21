@@ -277,16 +277,7 @@ ENV PATH=/opt/blender:$PATH \
     PXR_PLUGINPATH_NAME=/opt/plugins/tuileHydra/resources \
     HDGP_INCLUDE_DEFAULT_RESOLVER=1 \
     CYCLES_EXTERNAL_IMAGE_LIB=/opt/plugins/tuileHydra/tuileHydra.so \
-    TUILE_HYDRA_LIB=/opt/plugins/tuileHydra/tuileHydra.so \
-    TUILE_PREVIEW_INTERVAL=86400
-# Une journée, c'est-à-dire jamais.
-#
-# L'aperçu intermédiaire d'un rendu de ferme n'a aucun spectateur, et c'est
-# l'appel d'APRÈS la boucle qui produit l'image. Le laisser tourner coûtait, en
-# 8K, quelque 880 Mo alloués, recopiés et libérés à chaque tour de boucle, sur
-# un seul thread : dix-huit minutes sans terminer une frame à un échantillon,
-# CPU à 13,1 % et GPU à 0 %. Le détail est dans `Dockerfile.blender-shared-usd`.
-
+    TUILE_HYDRA_LIB=/opt/plugins/tuileHydra/tuileHydra.so
 # Pourquoi le greffon d'images externes est le plugin lui-même.
 #
 # Le fork de Cycles charge la bibliothèque nommée par
