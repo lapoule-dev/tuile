@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_cesium_ion::{tms::TmsImagery, AssetEndpoint, IonClient, IonTerrainSource};
-use tuile_native_fetchers::{NativeHttp, RetryConfig, TransportConfig};
 use tuile_core::offload;
+use tuile_native_fetchers::{NativeHttp, RetryConfig, TransportConfig};
 use tuile_planetary::{globe_on, GlobeOptions, ImageryDetail, LayerBudget};
 
 use crate::session::{Session, SessionConfig};

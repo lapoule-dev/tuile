@@ -254,7 +254,11 @@ impl ClosedPath {
         } else {
             0.0
         };
-        along(self.points[leg], self.points[(leg + 1) % self.points.len()], t)
+        along(
+            self.points[leg],
+            self.points[(leg + 1) % self.points.len()],
+            t,
+        )
     }
 
     /// Where the camera is `fraction` of the way round, in `[0, 1)`.
@@ -338,7 +342,10 @@ mod tests {
         let step = path.at(0.1);
         let look = step.look(std::f64::consts::FRAC_PI_2);
         let dot: f64 = (0..3).map(|i| look[i] * step.up[i]).sum();
-        assert!(dot < -0.999, "la visée nadir n'est pas l'opposé de up: {dot}");
+        assert!(
+            dot < -0.999,
+            "la visée nadir n'est pas l'opposé de up: {dot}"
+        );
         let with_forward: f64 = (0..3).map(|i| look[i] * step.forward()[i]).sum();
         assert!(
             with_forward.abs() < 1e-9,
@@ -370,9 +377,19 @@ mod tests {
     /// chose — sans lui, un seuil généreux passerait dans les deux cas.
     #[test]
     fn a_polyline_turns_abruptly_at_its_vertices() {
-        let loop_ = [(0.0, 43.0), (1.0, 43.2), (2.0, 43.0), (2.0, 42.5), (1.0, 42.3), (0.0, 42.5)];
+        let loop_ = [
+            (0.0, 43.0),
+            (1.0, 43.2),
+            (2.0, 43.0),
+            (2.0, 42.5),
+            (1.0, 42.3),
+            (0.0, 42.5),
+        ];
         let worst = worst_turn(&ClosedPath::from_degrees(&loop_), 720);
-        assert!(worst > 30.0, "une polyligne devrait avoir des coudes: {worst:.1}°");
+        assert!(
+            worst > 30.0,
+            "une polyligne devrait avoir des coudes: {worst:.1}°"
+        );
     }
 
     /// Et la courbe ne doit pas en avoir : « sans coude » au sens
@@ -388,7 +405,14 @@ mod tests {
     /// d'essai a des virages serrés.
     #[test]
     fn a_spline_has_no_corner_anywhere() {
-        let loop_ = [(0.0, 43.0), (1.0, 43.2), (2.0, 43.0), (2.0, 42.5), (1.0, 42.3), (0.0, 42.5)];
+        let loop_ = [
+            (0.0, 43.0),
+            (1.0, 43.2),
+            (2.0, 43.0),
+            (2.0, 42.5),
+            (1.0, 42.3),
+            (0.0, 42.5),
+        ];
         let polyline = worst_turn(&ClosedPath::from_degrees(&loop_), 720);
         let spline = worst_turn(&ClosedSpline::from_degrees(&loop_, 64), 720);
         assert!(
@@ -402,14 +426,24 @@ mod tests {
     /// qu'on lui a donnée — c'est ce qui distingue Catmull–Rom d'une B-spline.
     #[test]
     fn a_spline_goes_through_its_waypoints() {
-        let loop_ = [(0.0, 43.0), (1.0, 43.2), (2.0, 43.0), (2.0, 42.5), (1.0, 42.3), (0.0, 42.5)];
+        let loop_ = [
+            (0.0, 43.0),
+            (1.0, 43.2),
+            (2.0, 43.0),
+            (2.0, 42.5),
+            (1.0, 42.3),
+            (0.0, 42.5),
+        ];
         let path = ClosedSpline::from_degrees(&loop_, 64);
         for &(lon, lat) in &loop_ {
             let target = (lon.to_radians(), lat.to_radians());
             let nearest = (0..2000)
                 .map(|i| arc(path.at(i as f64 / 2000.0).here, target) * A)
                 .fold(f64::INFINITY, f64::min);
-            assert!(nearest < 2_000.0, "le point ({lon}, {lat}) est à {nearest:.0} m de la courbe");
+            assert!(
+                nearest < 2_000.0,
+                "le point ({lon}, {lat}) est à {nearest:.0} m de la courbe"
+            );
         }
     }
 
@@ -421,6 +455,9 @@ mod tests {
         let step = path.at(0.1);
         let look = step.look(50f64.to_radians());
         let dot: f64 = (0..3).map(|i| look[i] * step.up[i]).sum();
-        assert!(dot.abs() < 0.95, "visée et verticale trop colinéaires: {dot}");
+        assert!(
+            dot.abs() < 0.95,
+            "visée et verticale trop colinéaires: {dot}"
+        );
     }
 }

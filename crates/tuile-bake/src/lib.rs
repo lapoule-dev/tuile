@@ -48,13 +48,12 @@ pub mod packed;
 mod session;
 
 pub use globe::{
-    duration_or, imagery_boost_cap, GlobeConfig, GlobeError, BING_AERIAL,
-    CESIUM_WORLD_TERRAIN,
+    duration_or, imagery_boost_cap, GlobeConfig, GlobeError, BING_AERIAL, CESIUM_WORLD_TERRAIN,
 };
 pub use packed::PackedError;
-/// What a caller already holds, so a bake never fetches it twice. See
-/// [`GlobeConfig::held_drape`].
-pub use tuile_planetary::HeldDrape;
 pub use session::{
     exact_traversal, EncodedTexture, Frame, FrameError, Session, SessionConfig, TileGeometry,
 };
+/// What a caller already holds, so a bake never fetches it twice. See
+/// [`GlobeConfig::held_drape`].
+pub use tuile_planetary::HeldDrape;

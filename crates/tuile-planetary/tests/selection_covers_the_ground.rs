@@ -126,11 +126,7 @@ fn hit_ground(origin: DVec3, dir: DVec3) -> Option<DVec3> {
     let s = WGS84_A / WGS84_B;
     let o = DVec3::new(origin.x, origin.y, origin.z * s);
     let d = DVec3::new(dir.x, dir.y, dir.z * s);
-    let (a, b, c) = (
-        d.dot(d),
-        2.0 * o.dot(d),
-        o.dot(o) - WGS84_A * WGS84_A,
-    );
+    let (a, b, c) = (d.dot(d), 2.0 * o.dot(d), o.dot(o) - WGS84_A * WGS84_A);
     let disc = b * b - 4.0 * a * c;
     if disc < 0.0 {
         return None;
@@ -196,8 +192,11 @@ fn every_visible_ground_point_is_selected() {
             &mut out,
         );
         rendered_last = out.selected.iter().map(|(t, _)| *t).collect();
-        let selected: HashSet<(u32, u64, u64)> =
-            out.selected.iter().map(|(t, _)| t.terrain_coord()).collect();
+        let selected: HashSet<(u32, u64, u64)> = out
+            .selected
+            .iter()
+            .map(|(t, _)| t.terrain_coord())
+            .collect();
         let max_level = selected.iter().map(|&(z, _, _)| z).max().unwrap_or(0);
 
         // A grid of view rays over the full frustum.

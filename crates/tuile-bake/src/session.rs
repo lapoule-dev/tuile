@@ -406,12 +406,7 @@ impl Frame {
     /// plausibly, at yesterday's sharpness. Naming the bytes rather than the
     /// slot makes a re-drape a different asset, which is the only way a cache
     /// can be right by construction.
-    pub fn texture_uri(
-        dataset: &str,
-        tile: TileId,
-        texture: usize,
-        drape: u64,
-    ) -> String {
+    pub fn texture_uri(dataset: &str, tile: TileId, texture: usize, drape: u64) -> String {
         format!(
             "tuile://{dataset}/tile/{}/texture/{texture}.{drape:016x}.png",
             tile.0
@@ -472,12 +467,7 @@ impl Frame {
         .map_err(|e| FrameError::TextureEncode(e.to_string()))?;
 
         let entry = Arc::new(EncodedTexture {
-            uri: Self::texture_uri(
-                &self.dataset,
-                tile.tile,
-                texture_index,
-                tile.drape(),
-            ),
+            uri: Self::texture_uri(&self.dataset, tile.tile, texture_index, tile.drape()),
             png,
         });
 
@@ -571,7 +561,9 @@ impl Session {
         path: &std::path::Path,
         scene: Option<&str>,
     ) -> Result<Self, crate::packed::PackedError> {
-        Ok(Self(Source::Packed(crate::packed::Packed::open(path, scene)?)))
+        Ok(Self(Source::Packed(crate::packed::Packed::open(
+            path, scene,
+        )?)))
     }
 
     /// Whether this session reads a pack rather than the network.
@@ -585,7 +577,9 @@ impl Session {
         loader: Arc<dyn TileLoader>,
         config: SessionConfig,
     ) -> std::io::Result<Self> {
-        Ok(Self(Source::Live(Box::new(Live::new(tree, loader, config)?))))
+        Ok(Self(Source::Live(Box::new(Live::new(
+            tree, loader, config,
+        )?))))
     }
 
     pub(crate) fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
@@ -881,9 +875,8 @@ impl Live {
             "converged",
             gen = generation,
             selected = self.scene.selected().len(),
-            sel_digest = tuile_core::determinism::digest(
-                self.scene.selected().iter().map(|(t, _)| t.0)
-            ),
+            sel_digest =
+                tuile_core::determinism::digest(self.scene.selected().iter().map(|(t, _)| t.0)),
             resident = self.resident.len(),
             errors = errors.len(),
             deferred = self.scene.stats().deferred_subtrees,
@@ -1186,8 +1179,7 @@ fn finish_tile(
     bake_max_size: u32,
 ) -> TileGeometry {
     if tracing::enabled!(tracing::Level::DEBUG) && !decoded.imagery.is_empty() {
-        let mut levels: Vec<u32> =
-            decoded.imagery.iter().map(|l| l.coord.level).collect();
+        let mut levels: Vec<u32> = decoded.imagery.iter().map(|l| l.coord.level).collect();
         levels.sort_unstable();
         levels.dedup();
         tracing::debug!(
@@ -1316,11 +1308,7 @@ fn encode_baked(
 /// tile must own no texture of its own, so the baked mosaic is unambiguously
 /// texture 0 — which is what lets a memo hit stand in for content that was
 /// never composed at all.
-fn drape_key(
-    tile: TileId,
-    content: &DecodedTileContent,
-    bake_max_size: u32,
-) -> Option<TextureKey> {
+fn drape_key(tile: TileId, content: &DecodedTileContent, bake_max_size: u32) -> Option<TextureKey> {
     if content.imagery.is_empty()
         || !content.textures.is_empty()
         || content.meshes.iter().any(|m| m.uvs.is_none())
@@ -1422,8 +1410,7 @@ mod tests {
     fn the_fetch_wave_fits_the_connection_pool() {
         let config = exact_traversal(Config::default());
         assert!(
-            config.maximum_simultaneous_fetches
-                <= tuile_native_fetchers::CONNECTIONS_PER_HOST,
+            config.maximum_simultaneous_fetches <= tuile_native_fetchers::CONNECTIONS_PER_HOST,
             "{} requests in flight against {} connections — the surplus only queues",
             config.maximum_simultaneous_fetches,
             tuile_native_fetchers::CONNECTIONS_PER_HOST,
@@ -1455,10 +1442,7 @@ mod tests {
         let drape = tile.drape();
         assert_ne!(drape, 0, "a draped tile is keyed by its drape");
         let frame = Frame::with_memo("ion-1-2", vec![Arc::new(tile)], memo);
-        let texture = frame
-            .texture_png(0, 0)
-            .expect("encoding")
-            .expect("present");
+        let texture = frame.texture_png(0, 0).expect("encoding").expect("present");
         assert_eq!(
             texture.uri,
             Frame::texture_uri("ion-1-2", TileId(7), 0, drape)
@@ -1611,9 +1595,7 @@ mod tests {
     fn draped_content() -> DecodedTileContent {
         use tuile_core::content::{DecodedMesh, MaterialDesc};
         use tuile_core::geo::{geodetic_to_ecef, Geodetic};
-        use tuile_core::raster::{
-            uvs_geographic, GeoRect, ImageryCoord, ImageryLayer,
-        };
+        use tuile_core::raster::{uvs_geographic, GeoRect, ImageryCoord, ImageryLayer};
         let rect = GeoRect {
             west: 0.0,
             south: 0.0,
@@ -1664,9 +1646,7 @@ mod tests {
     fn a_finished_tile_owns_its_mosaic() {
         use tuile_core::content::{DecodedMesh, MaterialDesc};
         use tuile_core::geo::{geodetic_to_ecef, Geodetic};
-        use tuile_core::raster::{
-            uvs_geographic, GeoRect, ImageryCoord, ImageryLayer,
-        };
+        use tuile_core::raster::{uvs_geographic, GeoRect, ImageryCoord, ImageryLayer};
 
         let rect = GeoRect {
             west: 0.0,
@@ -1803,14 +1783,14 @@ mod tests {
     fn a_baked_tile_holds_no_raw_mosaic() {
         let memo = TextureMemo::default();
         let tile = finish_tile(&memo, "test", TileId(7), draped_content(), 256);
-        let raw: usize = tile
-            .content
-            .textures
-            .iter()
-            .map(|t| t.rgba8.len())
-            .sum();
+        let raw: usize = tile.content.textures.iter().map(|t| t.rgba8.len()).sum();
         assert_eq!(raw, 0, "{raw} bytes of raw mosaic stayed resident");
-        let png = tile.memoized.as_ref().expect("encoded on arrival").png.len();
+        let png = tile
+            .memoized
+            .as_ref()
+            .expect("encoded on arrival")
+            .png
+            .len();
         // The header alone is 8 bytes; anything this small is not a picture.
         assert!(png > 32, "the PNG is {png} bytes — nothing was encoded");
     }

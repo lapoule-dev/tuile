@@ -585,7 +585,6 @@ pub fn traverse(
     });
     out.stats.selected = out.selected.len() as u32;
     out.stats.requested = out.requests.len() as u32;
-
 }
 
 /// What a subtree reported back to the tile above it.
@@ -799,8 +798,7 @@ fn visit(
     if config.cull
         && !views.iter().any(|v| {
             props.bounding_volume.intersects_frustum(v.frustum())
-                && !occluder
-                    .is_some_and(|o| o.hides(&props.bounding_volume, v.position()))
+                && !occluder.is_some_and(|o| o.hides(&props.bounding_volume, v.position()))
         })
     {
         out.stats.culled += 1;
@@ -1855,13 +1853,23 @@ mod tests {
         let (mut lo, mut hi) = (1.0_f64, 100_000.0_f64);
         for _ in 0..200 {
             let mid = 0.5 * (lo + hi);
-            if sse_at(mid) > tau { lo = mid } else { hi = mid }
+            if sse_at(mid) > tau {
+                lo = mid
+            } else {
+                hi = mid
+            }
         }
         let on_threshold = 0.5 * (lo + hi);
 
         // Dessinée à ce niveau la frame d'avant : elle doit y rester.
         let was_drawn: HashSet<TileId> = std::iter::once(root).collect();
-        let kept = run_with(&ts, &residency, &[camera_at(on_threshold)], &config, &was_drawn);
+        let kept = run_with(
+            &ts,
+            &residency,
+            &[camera_at(on_threshold)],
+            &config,
+            &was_drawn,
+        );
         assert!(
             ids(&kept.selected).contains(&root),
             "une tuile déjà dessinée à ce niveau s'est coupée sur un seuil frôlé"
@@ -1869,7 +1877,13 @@ mod tests {
 
         // Déjà coupée la frame d'avant : elle doit le rester.
         let was_split: HashSet<TileId> = children.iter().copied().collect();
-        let split = run_with(&ts, &residency, &[camera_at(on_threshold)], &config, &was_split);
+        let split = run_with(
+            &ts,
+            &residency,
+            &[camera_at(on_threshold)],
+            &config,
+            &was_split,
+        );
         assert!(
             !ids(&split.selected).contains(&root),
             "une tuile déjà coupée s'est recollée sur le même seuil frôlé"
@@ -1898,13 +1912,27 @@ mod tests {
         let (mut lo, mut hi) = (1.0_f64, 100_000.0_f64);
         for _ in 0..200 {
             let mid = 0.5 * (lo + hi);
-            if sse_at(mid) > tau { lo = mid } else { hi = mid }
+            if sse_at(mid) > tau {
+                lo = mid
+            } else {
+                hi = mid
+            }
         }
         let d = 0.5 * (lo + hi);
-        let a = run_with(&ts, &residency, &[camera_at(d)], &config,
-                         &std::iter::once(root).collect());
-        let b = run_with(&ts, &residency, &[camera_at(d)], &config,
-                         &children.iter().copied().collect());
+        let a = run_with(
+            &ts,
+            &residency,
+            &[camera_at(d)],
+            &config,
+            &std::iter::once(root).collect(),
+        );
+        let b = run_with(
+            &ts,
+            &residency,
+            &[camera_at(d)],
+            &config,
+            &children.iter().copied().collect(),
+        );
         assert_eq!(
             ids(&a.selected).contains(&root),
             ids(&b.selected).contains(&root),
@@ -1987,7 +2015,10 @@ mod tests {
         };
 
         let default_wants = wants(&Config::default());
-        assert!(default_wants.contains(&near_leaf), "near refines by default");
+        assert!(
+            default_wants.contains(&near_leaf),
+            "near refines by default"
+        );
         assert!(
             !default_wants.contains(&far_leaf),
             "the far branch holds coarse by default"
@@ -2512,56 +2543,55 @@ mod tests {
         let sse_b = back.screen_space_error(10.0, 100.0);
         assert!((sse_a - sse_b).abs() < 1e-9);
     }
-/// Ground inside the frame is never culled.
-///
-/// The measurement that sent a day sideways: a render selected 337 tiles, of
-/// which 331 lay within ten kilometres and **none at all** between ten and
-/// five hundred — for a frame whose ground runs from 3.6 km to 30 km. Two
-/// thirds of the picture was black, `gaps` was zero, no error was raised, and
-/// `TUILE_CULL=0` filled the frame. Nothing in the suite asked whether ground
-/// that is plainly in view survives the cull.
-///
-/// The real camera, and terrain volumes built the way `TerrainTree` builds
-/// them: a lat/lon rectangle extruded −1000..9000 m.
-#[test]
-fn ground_inside_the_frame_survives_the_cull() {
-    use crate::math::BoundingVolume;
-    use glam::dvec2;
+    /// Ground inside the frame is never culled.
+    ///
+    /// The measurement that sent a day sideways: a render selected 337 tiles, of
+    /// which 331 lay within ten kilometres and **none at all** between ten and
+    /// five hundred — for a frame whose ground runs from 3.6 km to 30 km. Two
+    /// thirds of the picture was black, `gaps` was zero, no error was raised, and
+    /// `TUILE_CULL=0` filled the frame. Nothing in the suite asked whether ground
+    /// that is plainly in view survives the cull.
+    ///
+    /// The real camera, and terrain volumes built the way `TerrainTree` builds
+    /// them: a lat/lon rectangle extruded −1000..9000 m.
+    #[test]
+    fn ground_inside_the_frame_survives_the_cull() {
+        use crate::math::BoundingVolume;
+        use glam::dvec2;
 
-    let cam = crate::geo::geodetic_to_ecef(crate::geo::Geodetic {
-        lon: 2.2673_f64.to_radians(),
-        lat: 42.5198_f64.to_radians(),
-        height: 5005.0,
-    });
-    let target = crate::geo::geodetic_to_ecef(crate::geo::Geodetic {
-        lon: 2.17_f64.to_radians(),
-        lat: 42.52_f64.to_radians(),
-        height: 0.0,
-    });
-    let up = cam.normalize();
-    let dir = (target - cam).normalize();
-    let view = ViewState::perspective(cam, dir, up, dvec2(1280.0, 960.0), 45f64.to_radians());
-    let horizontal = (dir - up * dir.dot(up)).normalize();
+        let cam = crate::geo::geodetic_to_ecef(crate::geo::Geodetic {
+            lon: 2.2673_f64.to_radians(),
+            lat: 42.5198_f64.to_radians(),
+            height: 5005.0,
+        });
+        let target = crate::geo::geodetic_to_ecef(crate::geo::Geodetic {
+            lon: 2.17_f64.to_radians(),
+            lat: 42.52_f64.to_radians(),
+            height: 0.0,
+        });
+        let up = cam.normalize();
+        let dir = (target - cam).normalize();
+        let view = ViewState::perspective(cam, dir, up, dvec2(1280.0, 960.0), 45f64.to_radians());
+        let horizontal = (dir - up * dir.dot(up)).normalize();
 
-    // 5 km is just inside the bottom of the frame; 30 km is just inside the
-    // top. Every one of them is ground the camera can see.
-    for km in [5.0_f64, 10.0, 15.0, 20.0, 30.0] {
-        let g = crate::geo::ecef_to_geodetic(cam + horizontal * (km * 1000.0));
-        let half = 0.02_f64.to_radians();
-        let tile = BoundingVolume::Obb(crate::geo::obb_from_rectangle(
-            g.lon - half,
-            g.lat - half,
-            g.lon + half,
-            g.lat + half,
-            -1000.0,
-            9000.0,
-        ));
-        assert!(
-            tile.intersects_frustum(view.frustum()),
-            "ground {km} km ahead was culled — it is inside the frame, and \
+        // 5 km is just inside the bottom of the frame; 30 km is just inside the
+        // top. Every one of them is ground the camera can see.
+        for km in [5.0_f64, 10.0, 15.0, 20.0, 30.0] {
+            let g = crate::geo::ecef_to_geodetic(cam + horizontal * (km * 1000.0));
+            let half = 0.02_f64.to_radians();
+            let tile = BoundingVolume::Obb(crate::geo::obb_from_rectangle(
+                g.lon - half,
+                g.lat - half,
+                g.lon + half,
+                g.lat + half,
+                -1000.0,
+                9000.0,
+            ));
+            assert!(
+                tile.intersects_frustum(view.frustum()),
+                "ground {km} km ahead was culled — it is inside the frame, and \
              culling it punches a hole nothing downstream reports"
-        );
+            );
+        }
     }
-}
-
 }

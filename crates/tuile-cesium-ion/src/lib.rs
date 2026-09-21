@@ -25,10 +25,10 @@ use std::sync::Arc;
 use tuile_core::fetch::{FetchError, TileFetcher};
 use url::Url;
 
-pub mod tms;
 mod terrain;
 #[cfg(test)]
 mod tests_support;
+pub mod tms;
 
 pub use terrain::IonTerrainSource;
 

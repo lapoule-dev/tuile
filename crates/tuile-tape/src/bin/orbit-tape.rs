@@ -27,7 +27,6 @@ const FRAMES: usize = 96;
 const RADIUS: f64 = 8_000.0;
 const ALTITUDE: f64 = 5_000.0;
 
-
 fn normalize(v: [f64; 3]) -> [f64; 3] {
     let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-12);
     [v[0] / n, v[1] / n, v[2] / n]
@@ -152,8 +151,7 @@ mod tests {
         // ellipsoid's own radius at this latitude, against the equatorial one
         // the sphere used.
         const EQUATORIAL: f64 = 6_378_137.0;
-        let radius_here =
-            (target.x * target.x + target.y * target.y + target.z * target.z).sqrt();
+        let radius_here = (target.x * target.x + target.y * target.y + target.z * target.z).sqrt();
         let lifted = EQUATORIAL - radius_here;
         assert!(
             lifted > 9_000.0,

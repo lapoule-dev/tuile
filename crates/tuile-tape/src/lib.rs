@@ -71,7 +71,6 @@ pub enum TapeError {
 }
 pub mod path;
 
-
 /// One frame's camera. ECEF metres; `direction` and `up` are unit vectors;
 /// `fovy` is the vertical field of view in radians.
 #[derive(Debug, Clone, Copy, PartialEq)]

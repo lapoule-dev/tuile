@@ -125,10 +125,13 @@ fn no_level_of_the_chain_culls_ground_the_camera_can_see() {
     let tree = offline_terrain();
     let view = farm_view();
     let occluder = tree.occluder().expect("a global terrain has a planet");
-    assert_eq!(occluder, Occluder {
-        center: glam::DVec3::ZERO,
-        radius: tuile_core::geo::WGS84_B,
-    });
+    assert_eq!(
+        occluder,
+        Occluder {
+            center: glam::DVec3::ZERO,
+            radius: tuile_core::geo::WGS84_B,
+        }
+    );
     let scheme = GeographicTilingScheme::default();
 
     // 5 km is near the bottom of the frame, 19 km near the top. 25 km is past
@@ -218,7 +221,10 @@ fn every_sample_of_visible_ground_is_covered_by_something_selected() {
         "did not converge in {rounds} rounds, {} still wanted",
         out.requests.len()
     );
-    assert_eq!(out.stats.gaps, 0, "a terrain traversal must reach no empty leaf");
+    assert_eq!(
+        out.stats.gaps, 0,
+        "a terrain traversal must reach no empty leaf"
+    );
 
     let rects: Vec<_> = out
         .selected
@@ -233,9 +239,9 @@ fn every_sample_of_visible_ground_is_covered_by_something_selected() {
         .into_iter()
         .filter(|km| {
             let g = ground_ahead(&view, *km);
-            !rects.iter().any(|r| {
-                g.lon >= r.west && g.lon < r.east && g.lat >= r.south && g.lat < r.north
-            })
+            !rects
+                .iter()
+                .any(|r| g.lon >= r.west && g.lon < r.east && g.lat >= r.south && g.lat < r.north)
         })
         .collect();
     assert!(

@@ -37,7 +37,6 @@ use std::time::Instant;
 
 use tuile_pack::{BakedTile, PackWriter, TextureFormat};
 
-
 /// CPU and heap profiling, when the build asked for it.
 ///
 /// # Why this lives here and not in the plugin
@@ -150,9 +149,7 @@ mod profiling {
     /// uncontended here: nothing else has touched this before the first frame.
     fn arm_heap() -> Result<(), String> {
         let ctl = jemalloc_pprof::PROF_CTL.as_ref().ok_or(MALLOC_CONF_HINT)?;
-        ctl.blocking_lock()
-            .activate()
-            .map_err(|e| e.to_string())
+        ctl.blocking_lock().activate().map_err(|e| e.to_string())
     }
 
     impl Session {
@@ -355,12 +352,18 @@ fn parse_args() -> Result<Job, String> {
             "--out" => out = Some(std::path::PathBuf::from(value()?)),
             "--frames" => frames = Some(value()?),
             "--imagery" => {
-                imagery =
-                    Some(value()?.parse().map_err(|_| "--imagery wants an ion asset id")?)
+                imagery = Some(
+                    value()?
+                        .parse()
+                        .map_err(|_| "--imagery wants an ion asset id")?,
+                )
             }
             "--terrain" => {
-                terrain =
-                    Some(value()?.parse().map_err(|_| "--terrain wants an ion asset id")?)
+                terrain = Some(
+                    value()?
+                        .parse()
+                        .map_err(|_| "--terrain wants an ion asset id")?,
+                )
             }
             "--sse" => {
                 let v: f64 = value()?.parse().map_err(|_| "--sse wants a number")?;
@@ -406,7 +409,9 @@ fn parse_args() -> Result<Job, String> {
         });
     }
     let frames = frames.ok_or("--frames is required")?;
-    let (first, last) = frames.split_once(':').ok_or("--frames wants <first>:<last>")?;
+    let (first, last) = frames
+        .split_once(':')
+        .ok_or("--frames wants <first>:<last>")?;
     let first: u32 = first.parse().map_err(|_| "--frames first")?;
     let last: u32 = last.parse().map_err(|_| "--frames last")?;
     if last < first {
@@ -507,7 +512,10 @@ fn u32_le(values: &[u32]) -> Vec<u8> {
 /// Composée en UN endroit pour les deux chemins — la cuisson et `--verify` —
 /// parce que deux compositions séparées finissent par diverger, et qu'un
 /// `--verify` qui compare contre une autre scène ne vérifie rien.
-fn bake_settings(config: &tuile_bake::GlobeConfig, resolved: &tuile_core::traversal::Config) -> String {
+fn bake_settings(
+    config: &tuile_bake::GlobeConfig,
+    resolved: &tuile_core::traversal::Config,
+) -> String {
     format!(
         "{resolved:?}\nterrain={}\nimagery={:?}\nimagery_boost={}",
         config.terrain_asset_id,
@@ -516,11 +524,7 @@ fn bake_settings(config: &tuile_bake::GlobeConfig, resolved: &tuile_core::traver
     )
 }
 
-fn digest_of_scene(
-    poses: &[tuile_tape::Frame],
-    viewport: (f64, f64),
-    settings: &str,
-) -> String {
+fn digest_of_scene(poses: &[tuile_tape::Frame], viewport: (f64, f64), settings: &str) -> String {
     let mut path = Vec::with_capacity(poses.len() * 10 * 8);
     for pose in poses {
         for value in pose
@@ -597,13 +601,12 @@ fn run() -> Result<(), String> {
 /// argument, not a pose, and passing the wrong one changes the texel target
 /// and therefore the selection — which would defeat the whole point.
 fn tape_from(pack: &std::path::Path, out: &std::path::Path) -> Result<(), String> {
-    let bytes = std::fs::read(pack)
-        .map_err(|e| format!("reading {}: {e}", pack.display()))?;
+    let bytes = std::fs::read(pack).map_err(|e| format!("reading {}: {e}", pack.display()))?;
     let opened = tuile_pack::Pack::open(&bytes).map_err(|e| format!("{e}"))?;
     let (first, last) = opened.frame_range();
 
-    let mut tape = tuile_tape::Tape::recording(out)
-        .map_err(|e| format!("opening {}: {e}", out.display()))?;
+    let mut tape =
+        tuile_tape::Tape::recording(out).map_err(|e| format!("opening {}: {e}", out.display()))?;
     let mut viewport: Option<[f64; 2]> = None;
     for number in first..=last {
         let view = opened
@@ -790,25 +793,16 @@ fn bake(args: Args) -> Result<(), String> {
     // with no imagery, so if `push_known` then fails to find it, `baked_tile`
     // is called and refuses a drape with no texture rather than storing bare
     // ground.
-    let already_packed: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashSet<(u64, u64)>>,
-    > = std::sync::Arc::default();
+    let already_packed: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(u64, u64)>>> =
+        std::sync::Arc::default();
     config.held_drape = Some(tuile_bake::HeldDrape::new({
         let packed = std::sync::Arc::clone(&already_packed);
-        move |id, drape| {
-            packed
-                .lock()
-                .is_ok_and(|held| held.contains(&(id, drape)))
-        }
+        move |id, drape| packed.lock().is_ok_and(|held| held.contains(&(id, drape)))
     }));
 
     let resolved = tuile_bake::exact_traversal(config.session.traversal.clone());
     let scene = digest_of_scene(&poses, args.viewport, &bake_settings(&config, &resolved));
-    let culling = if resolved.cull {
-        "full"
-    } else {
-        "disabled"
-    };
+    let culling = if resolved.cull { "full" } else { "disabled" };
     tracing::info!(
         scene,
         culling,
@@ -844,8 +838,8 @@ fn bake(args: Args) -> Result<(), String> {
     );
 
     let began = Instant::now();
-    let mut session = tuile_bake::Session::globe(config)
-        .map_err(|e| format!("opening the globe: {e}"))?;
+    let mut session =
+        tuile_bake::Session::globe(config).map_err(|e| format!("opening the globe: {e}"))?;
 
     // The render origin the pack's positions are relative to. The pack stores
     // each tile's own ECEF origin, so this is carried for the consumer that
@@ -965,7 +959,8 @@ fn dump_frame(path: &std::path::Path, number: u32) -> Result<(), String> {
     let mut vertices = 0usize;
     let mut triangles = 0usize;
     let mut texture_bytes = 0usize;
-    let mut sizes: std::collections::BTreeMap<(u32, u32), usize> = std::collections::BTreeMap::new();
+    let mut sizes: std::collections::BTreeMap<(u32, u32), usize> =
+        std::collections::BTreeMap::new();
     let mut nearest = f64::INFINITY;
     let mut farthest: f64 = 0.0;
     let mut first_uri = String::new();
@@ -1056,7 +1051,10 @@ fn dump_frame(path: &std::path::Path, number: u32) -> Result<(), String> {
         sizes
     );
     println!("textures  {first_uri}");
-    println!("          (and {} more beside it)", out.tiles.len().saturating_sub(1));
+    println!(
+        "          (and {} more beside it)",
+        out.tiles.len().saturating_sub(1)
+    );
     Ok(())
 }
 
@@ -1207,10 +1205,10 @@ fn verify(
         ));
     }
 
-    let mut live = tuile_bake::Session::globe(config)
-        .map_err(|e| format!("opening the globe: {e}"))?;
-    let mut packed = tuile_bake::Session::from_pack(path, Some(&scene))
-        .map_err(|e| e.to_string())?;
+    let mut live =
+        tuile_bake::Session::globe(config).map_err(|e| format!("opening the globe: {e}"))?;
+    let mut packed =
+        tuile_bake::Session::from_pack(path, Some(&scene)).map_err(|e| e.to_string())?;
 
     let mut checked = 0usize;
     for number in first..=last {
@@ -1259,7 +1257,10 @@ fn verify(
             }
             checked += 1;
         }
-        println!("VERIFY-FRAME {number} {} tiles identical", from_pack.tiles.len());
+        println!(
+            "VERIFY-FRAME {number} {} tiles identical",
+            from_pack.tiles.len()
+        );
     }
     println!(
         "VERIFY-OK {checked} tiles over frames {first}..={last} are byte for \
@@ -1310,8 +1311,12 @@ fn first_difference(a: &BakedTile, b: &BakedTile) -> String {
         (None, Some(y)) => format!("bare in the pack, textured live ({} bytes)", y.len()),
         _ => format!(
             "counts or material: {}/{} vertices, {}/{} indices, factor {:?}/{:?}",
-            a.vertex_count, b.vertex_count, a.index_count, b.index_count,
-            a.base_color_factor, b.base_color_factor
+            a.vertex_count,
+            b.vertex_count,
+            a.index_count,
+            b.index_count,
+            a.base_color_factor,
+            b.base_color_factor
         ),
     }
 }
@@ -1386,7 +1391,11 @@ fn baked_tile(
         drape: tile.drape(),
         origin_ecef: tile.origin_ecef.to_array(),
         positions: f32x3_le(&mesh.positions),
-        normals: mesh.normals.as_ref().map(|n| f32x3_le(n)).unwrap_or_default(),
+        normals: mesh
+            .normals
+            .as_ref()
+            .map(|n| f32x3_le(n))
+            .unwrap_or_default(),
         uvs: mesh.uvs.as_ref().map(|u| f32x2_le(u)).unwrap_or_default(),
         indices: u32_le(&mesh.indices),
         vertex_count: mesh.positions.len() as u32,
@@ -1414,9 +1423,9 @@ mod tests {
     #[test]
     fn a_tape_replayed_from_a_pack_carries_its_cameras() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut writer = tuile_pack::PackWriter::new(
-            "scene", [0.0; 3], dir.path().join("blob.part"))
-            .expect("writer");
+        let mut writer =
+            tuile_pack::PackWriter::new("scene", [0.0; 3], dir.path().join("blob.part"))
+                .expect("writer");
         let views: Vec<tuile_pack::BakedView> = (0..3)
             .map(|i| tuile_pack::BakedView {
                 position: [1.0 + i as f64, 2.0, 3.0],
@@ -1458,17 +1467,21 @@ mod tests {
     #[test]
     fn a_pack_stitched_from_two_shots_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut writer = tuile_pack::PackWriter::new(
-            "scene", [0.0; 3], dir.path().join("blob.part"))
-            .expect("writer");
+        let mut writer =
+            tuile_pack::PackWriter::new("scene", [0.0; 3], dir.path().join("blob.part"))
+                .expect("writer");
         for (i, px) in [[3840.0, 2880.0], [1920.0, 1440.0]].iter().enumerate() {
-            writer.frame(i as u32 + 1, tuile_pack::BakedView {
-                position: [1.0, 2.0, 3.0],
-                direction: [0.0, 0.0, -1.0],
-                up: [0.0, 1.0, 0.0],
-                viewport_px: *px,
-                fovy_rad: std::f64::consts::FRAC_PI_4,
-            }, []);
+            writer.frame(
+                i as u32 + 1,
+                tuile_pack::BakedView {
+                    position: [1.0, 2.0, 3.0],
+                    direction: [0.0, 0.0, -1.0],
+                    up: [0.0, 1.0, 0.0],
+                    viewport_px: *px,
+                    fovy_rad: std::f64::consts::FRAC_PI_4,
+                },
+                [],
+            );
         }
         let pack = dir.path().join("p.tuilepack");
         writer.finish_to(&pack).expect("pack");
@@ -1486,9 +1499,18 @@ mod tests {
     /// legitimately bare tile is recorded.
     #[test]
     fn a_drape_with_no_pixels_is_refused_and_nothing_else_is() {
-        assert!(super::drape_has_its_pixels(0, false), "bare terrain is fine");
-        assert!(super::drape_has_its_pixels(0, true), "an owned texture is fine");
-        assert!(super::drape_has_its_pixels(0xdead, true), "the ordinary tile");
+        assert!(
+            super::drape_has_its_pixels(0, false),
+            "bare terrain is fine"
+        );
+        assert!(
+            super::drape_has_its_pixels(0, true),
+            "an owned texture is fine"
+        );
+        assert!(
+            super::drape_has_its_pixels(0xdead, true),
+            "the ordinary tile"
+        );
         assert!(
             !super::drape_has_its_pixels(0xdead, false),
             "a drape whose pixels are nowhere must not be stored"
@@ -1558,12 +1580,28 @@ mod tests {
             digest_of_scene(&path, (1280.0, 960.0), &bake_settings(c, &resolved))
         };
         let reference = name(&bing);
-        assert_ne!(reference, name(&sentinel), "Bing et Sentinel doivent différer");
-        assert_ne!(reference, name(&sans), "avec et sans imagerie doivent différer");
-        assert_ne!(reference, name(&autre_terrain), "deux terrains doivent différer");
+        assert_ne!(
+            reference,
+            name(&sentinel),
+            "Bing et Sentinel doivent différer"
+        );
+        assert_ne!(
+            reference,
+            name(&sans),
+            "avec et sans imagerie doivent différer"
+        );
+        assert_ne!(
+            reference,
+            name(&autre_terrain),
+            "deux terrains doivent différer"
+        );
         // Et la même configuration donne toujours le même nom.
         bing.cache_dir = Some("/ailleurs".into());
-        assert_eq!(reference, name(&bing), "le cache n'est pas une propriété de la scène");
+        assert_eq!(
+            reference,
+            name(&bing),
+            "le cache n'est pas une propriété de la scène"
+        );
     }
 
     #[test]
