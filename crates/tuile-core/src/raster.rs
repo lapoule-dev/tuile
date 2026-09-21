@@ -2544,7 +2544,7 @@ mod tests {
             rgba8: [40u8, 90, 200, 255].repeat(4 * 4),
         };
         for level in mip_chain(&src) {
-            for texel in level.rgba8.chunks_exact(4) {
+            for texel in level.rgba8.as_chunks::<4>().0 {
                 assert_eq!(texel, &[40, 90, 200, 255]);
             }
         }

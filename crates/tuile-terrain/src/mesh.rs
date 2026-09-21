@@ -487,7 +487,9 @@ mod tests {
         // A segment is `[top0, top1, bot0, bot0, top1, bot1]` — two triangles,
         // and only the first names both of the tile's own vertices.
         m.indices[surface_indices..]
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .map(|s| Segment {
                 top0: s[0],
                 top1: s[1],

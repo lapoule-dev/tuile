@@ -161,7 +161,7 @@ fn uv_bounds(uvs: &[[f32; 2]]) -> ([f32; 2], [f32; 2]) {
 
 fn degenerate_triangles(positions: &[[f32; 3]], indices: &[u32]) -> usize {
     let mut n = 0;
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
         if i0 == i1 || i1 == i2 || i0 == i2 {
             n += 1;

@@ -431,7 +431,7 @@ fn prepare_mesh(
 /// Area-weighted vertex normals for meshes that ship without them.
 fn compute_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
     let mut acc = vec![Vec3::ZERO; positions.len()];
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let [a, b, c] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
         let (pa, pb, pc) = (
             Vec3::from(positions[a]),
