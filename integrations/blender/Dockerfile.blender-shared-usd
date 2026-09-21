@@ -76,7 +76,20 @@ ARG USD_VERSION=26.03
 # tenant sa réservation pendant que le nouveau l'attendait. Les limites ne se
 # réservent pas, les requêtes si ; ne toucher qu'à la limite, et vérifier que
 # le cluster a la place avant de lancer le rollout.
-ARG BUILD_JOBS=4
+# Deux, et c'est la mémoire qui le fixe, pas les cœurs.
+#
+# Le pod builder a 8 CPU pour **12 Gio**. Une unité lourde de Blender demande
+# trois à quatre gibioctets à `cc1plus` ; quatre en parallèle dépassent la
+# limite et le noyau tue le compilateur — ce qui se lit `Killed signal
+# terminated program cc1plus` et ressemble à une erreur de code, alors que
+# c'est le noyau qui a tranché.
+#
+# Avec mantaflow coupé ci-dessous, quatre passeraient peut-être. On ne le
+# saura pas, et c'est le choix : la marge coûte du temps de builder, une
+# compilation morte à l'objet 649 sur 8197 coûte treize minutes ET le temps de
+# comprendre pourquoi. Six cœurs qui dorment valent mieux qu'un build qu'il
+# faut relancer.
+ARG BUILD_JOBS=2
 ARG USD_BUILD_JOBS=8
 # The GPU backends, and why each number is what it is.
 #
@@ -286,6 +299,21 @@ RUN set -eu; \
 # Ce stage est intermédiaire — seul `/opt/blender` part dans l'image finale —
 # donc son poids ne coûte que du disque sur le builder.
 #
+# Et deux modules coupés, dont un pour une raison mesurée.
+#
+# La configuration part de `blender_release.cmake`, qui allume ce qu'une
+# application de modélisation interactive embarque. `WITH_MOD_FLUID` compile
+# mantaflow, dont les unités préprocessées sont les plus lourdes de tout
+# l'arbre : `levelset.cpp` a tué `cc1plus` le 21 septembre 2026 sur ce builder,
+# à quatre compilations en parallèle dans 12 Gio —
+# `g++-14: fatal error: Killed signal terminated program cc1plus`, à l'objet
+# 649 sur 8197, après treize minutes.
+#
+# Une image de ferme n'a pas de simulation de fluides, ni d'océan. Les couper
+# supprime la cause au lieu de la contourner, et raccourcit la compilation. Ce
+# qu'on garde, c'est ce dont le rendu dépend : USD, Hydra, le délégué Cycles,
+# OpenVDB pour les volumes.
+#
 # Pas d'installation ici : elle a lieu une seule fois, après les patchs.
 RUN cd /opt/src/blender \
     && cmake -S . -B /opt/build -G Ninja \
@@ -302,6 +330,8 @@ RUN cd /opt/src/blender \
         -DWITH_CYCLES_DEVICE_OPTIX=ON \
         -DWITH_CYCLES_DEVICE_ONEAPI=OFF \
         -DWITH_CYCLES_DEVICE_HIP=OFF \
+        -DWITH_MOD_FLUID=OFF \
+        -DWITH_MOD_OCEANSIM=OFF \
         -DOPTIX_ROOT_DIR=/opt/optix \
         -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda \
         -DCMAKE_INSTALL_PREFIX=/opt/blender \
