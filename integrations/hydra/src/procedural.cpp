@@ -14,11 +14,13 @@
 #include <pxr/base/tf/debug.h>
 #include <pxr/base/tf/diagnostic.h>
 #include <pxr/base/tf/getenv.h>
-#include <pxr/base/tf/fileUtils.h>
 #include <pxr/base/tf/registryManager.h>
 #include <pxr/base/tf/staticTokens.h>
 #include <pxr/base/tf/stringUtils.h>
 #include <pxr/base/vt/array.h>
+#include <pxr/usd/ar/asset.h>
+#include <pxr/usd/ar/resolvedPath.h>
+#include <pxr/usd/ar/resolver.h>
 #include <pxr/imaging/hd/cameraSchema.h>
 #include <pxr/imaging/hd/materialBindingSchema.h>
 #include <pxr/imaging/hd/materialBindingsSchema.h>
@@ -492,8 +494,28 @@ _MaterialNetwork(const std::string &textureUri)
             printf("MATERIAL-NODE %-14s identifier='%s'\n",
                    name.GetText(), identifier.GetText());
         }
-        printf("MATERIAL-URI %s (%s)\n", textureUri.c_str(),
-               TfIsFile(textureUri) ? "EXISTS" : "MISSING");
+        // Et l'URI, demandee au resolveur et non au systeme de fichiers.
+        //
+        // `TfIsFile` etait ici, et il mentait a tous les coups : c'est un
+        // `stat`, il prend un chemin, et `tuile://pack-.../texture/0.....png`
+        // n'en est pas un. Il repondait donc « MISSING » quoi que le resolveur
+        // sache faire — et c'est le greffon `tuile://` qui va chercher la
+        // texture au rendu, pas lui. Un diagnostic qui crie au loup a chaque
+        // rendu reussi coute plus cher que pas de diagnostic : on a cherche
+        // une texture absente deux fois avant de lire cette ligne.
+        //
+        // Resoudre PUIS ouvrir, parce que les deux echouent differemment :
+        // une URI que le resolveur ne reconnait pas n'a pas de chemin resolu,
+        // tandis qu'une URI bien formee dont l'octet ne vient pas se resout
+        // et ne s'ouvre pas. La seconde est la panne qu'on veut voir.
+        ArResolver &resolver = ArGetResolver();
+        const ArResolvedPath resolved = resolver.Resolve(textureUri);
+        const char *verdict = "UNRESOLVED";
+        if (resolved) {
+            verdict = resolver.OpenAsset(resolved) ? "READABLE"
+                                                   : "RESOLVED-BUT-UNREADABLE";
+        }
+        printf("MATERIAL-URI %s (%s)\n", textureUri.c_str(), verdict);
         fflush(stdout);
     }
 
