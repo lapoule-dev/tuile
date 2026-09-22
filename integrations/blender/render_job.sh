@@ -128,6 +128,58 @@ JOB_EXTRA_ARGS="${JOB_EXTRA_ARGS:-}"
 # rendu qui ne démarre pas reste parfaitement muet — CPU à 0,6 %, GPU à 0 %, et
 # rien à lire nulle part. Typiquement `--debug-cycles` ou `--log "*cycles*"`.
 JOB_BLENDER_ARGS="${JOB_BLENDER_ARGS:-}"
+
+# Et allumé par défaut, parce que l'avoir sans s'en servir revient au même.
+#
+# Le 22 septembre 2026, un rendu 4K s'est arrêté net — CPU conteneur à zéro,
+# GPU à zéro, 6,3 Go résidents sur la carte — et le journal n'avait rien à en
+# dire entre « frame 1 : début » et le silence. Le drapeau existait déjà, avec
+# le commentaire ci-dessus qui raconte la soirée qu'il avait coûtée la première
+# fois. Il n'était pas mis.
+#
+# Sans jokers : `--log cycles` prend déjà toute catégorie COMMENÇANT par
+# « cycles » (lu dans `creator_args.cc`), et un `*cycles*` non quoté se ferait
+# développer par le shell contre le répertoire courant avant d'arriver à Blender.
+#
+# `JOB_TRACE=0` pour un film long, où le journal coûte plus qu'il ne rapporte.
+# The batch-render configuration, as defaults any job can override.
+#
+# Measured 22 September 2026 on one pack, eight renders a side (videos/README.md):
+#
+#   CYCLES_BACKGROUND=1   hdCycles hardcodes an interactive session, in which
+#                         the render thread parks in `pause_cond_.wait()` still
+#                         flagged as rendering; waiting on it never returned.
+#   CYCLES_AUTO_TILE=0    above one 2048x2048 tile Cycles renders to disk and
+#                         hands the frame back through a callback hdCycles never
+#                         wires: every render above 4.19 Mpx looped forever,
+#                         2560x1440 passed and 2880x1620 spun.
+#   TUILE_WAIT_MODE       `command` blocks once per frame on the session; `poll`
+#                         sleeps 50 ms per turn. Same images, same times; the
+#                         blocking wait is one turn a frame instead of dozens.
+#
+# Here and not in each launcher, because tuile's jobs and STL's (which ends by
+# exec'ing this script) must not drift apart on the one thing that decides
+# whether a render ends at all.
+export CYCLES_BACKGROUND="${CYCLES_BACKGROUND:-1}"
+export CYCLES_AUTO_TILE="${CYCLES_AUTO_TILE:-0}"
+export TUILE_WAIT_MODE="${TUILE_WAIT_MODE:-command}"
+echo "batch config: CYCLES_BACKGROUND=$CYCLES_BACKGROUND CYCLES_AUTO_TILE=$CYCLES_AUTO_TILE TUILE_WAIT_MODE=$TUILE_WAIT_MODE"
+
+JOB_TRACE="${JOB_TRACE:-1}"
+if [ "$JOB_TRACE" = "1" ] && [ -z "$JOB_BLENDER_ARGS" ]; then
+    JOB_BLENDER_ARGS="--debug-cycles --log cycles,render,usd,hydra,depsgraph,wm --log-level 2 --log-show-source"
+fi
+
+# Le côté USD, qui a son propre système et n'écoute pas celui de Blender.
+#
+# Laissé vide : les jetons `TF_DEBUG` se nomment un par un et un nom inventé ne
+# produit rien de visible, donc il se met à la main quand on sait ce qu'on
+# cherche — par exemple `JOB_TF_DEBUG="HD_SAFE_MODE HDGP_PLUGIN_DISCOVERY"`.
+# `TF_DEBUG='*'` existe et noie tout ; il dépanne une fois, jamais deux.
+if [ -n "${JOB_TF_DEBUG:-}" ]; then
+    export TF_DEBUG="$JOB_TF_DEBUG"
+    echo "TF_DEBUG=$TF_DEBUG"
+fi
 JOB_OUT="${JOB_OUT:-/out/render.mp4}"
 outdir="$(dirname "$JOB_OUT")"
 mkdir -p "$outdir"
@@ -401,6 +453,19 @@ fi
 # Blender was built without OptiX. So the probe asks the build what it has,
 # preferring OPTIX and settling for CUDA, and SAYS WHICH. A backend chosen
 # silently is a render that is slower than it should be with nothing to say so.
+# Et l'ordre de préférence se force, parce qu'un backend se soupçonne.
+#
+# La sonde prend OptiX quand il est là et c'est le bon défaut. Mais le
+# 22 septembre 2026 un rendu s'est immobilisé — zéro CPU, zéro GPU — et
+# distinguer « OptiX est en cause » de « le chemin Cycles l'est » demandait de
+# rendre la même image sur CUDA. Sans ce réglage il fallait recompiler l'image
+# pour poser la question.
+#
+#   JOB_CYCLES_BACKENDS="CUDA"        force CUDA, ignore OptiX
+#   JOB_CYCLES_BACKENDS="CUDA OPTIX"  essaie CUDA d'abord
+JOB_CYCLES_BACKENDS="${JOB_CYCLES_BACKENDS:-OPTIX CUDA}"
+_py_backends="('$(echo "$JOB_CYCLES_BACKENDS" | sed "s/  */','/g")',)"
+
 if [ "$JOB_ENGINE" = "hydra" ] && [ "$JOB_DELEGATE" = "storm" ]; then
     probe="NGPU $(nvidia-smi -L 2>/dev/null | grep -c '^GPU')"
     CYCLES_BACKEND=none
@@ -409,7 +474,7 @@ else
 import bpy
 prefs = bpy.context.preferences.addons['cycles'].preferences
 why = []
-for backend in ('OPTIX', 'CUDA'):
+for backend in ${_py_backends}:
     try:
         prefs.compute_device_type = backend
     except TypeError as e:

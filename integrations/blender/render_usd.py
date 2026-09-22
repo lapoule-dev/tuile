@@ -16,6 +16,8 @@
 
 import argparse
 import os
+import resource
+import threading
 import pathlib
 import sys
 import time
@@ -425,6 +427,45 @@ def main():
         started["t"] = now
 
     bpy.app.handlers.render_pre.append(frame_begin)
+
+    # Le veilleur, et ce qu'il mesure vraiment.
+    #
+    # Le 22 septembre 2026, un rendu 4K s'est arrete net : zero pour cent de
+    # CPU conteneur, zero pour cent de GPU, 6,3 Go residents sur la carte,
+    # apres « frame 1 : debut » et avant toute autre ligne. Pendant sept
+    # minutes j'ai soutenu que Cycles compilait ses noyaux OptiX, parce que le
+    # journal disait OPTIX-CACHE-MISS — et le graphique de CPU l'a dementi : une
+    # compilation sature un coeur, elle ne le laisse pas a zero.
+    #
+    # Le silence, lui, ne distingue pas les deux. Le temps CPU du processus, si.
+    # Il monte quand on calcule, il reste fige quand on attend un verrou, un
+    # descripteur ou une variable de condition — et c'est la seule mesure qui
+    # separe « lent » de « bloque » sans avoir a deviner. On y joint la memoire
+    # resident, parce qu'un cuisson qui avance la fait croitre.
+    #
+    # Toutes les WATCHDOG_S secondes, sur un fil demon : le processus peut
+    # mourir avec lui, et une sonde qui empeche la sortie est pire que pas de
+    # sonde.
+    watchdog_s = float(os.environ.get("TUILE_WATCHDOG_S", "10"))
+    if watchdog_s > 0:
+        def watchdog():
+            t0 = time.time()
+            prev_cpu = 0.0
+            while True:
+                time.sleep(watchdog_s)
+                ru = resource.getrusage(resource.RUSAGE_SELF)
+                cpu = ru.ru_utime + ru.ru_stime
+                rss_mb = ru.ru_maxrss / (1024 if sys.platform != "darwin" else 1048576)
+                busy = (cpu - prev_cpu) / watchdog_s
+                prev_cpu = cpu
+                print(f"WATCHDOG +{time.time() - t0:7.1f}s  cpu={cpu:8.1f}s"
+                      f"  charge={busy:5.2f}coeur  rss={rss_mb:7.0f}Mio"
+                      f"  fils={threading.active_count()}"
+                      f"  {'CALCULE' if busy > 0.05 else 'ATTEND'}", flush=True)
+
+        threading.Thread(target=watchdog, daemon=True, name="tuile-watchdog").start()
+        print(f"watchdog: une ligne toutes les {watchdog_s:g}s", flush=True)
+
     print(f"rendu: {expected} frames {first}:{last}, "
           f"moteur {scene.render.engine}", flush=True)
 
