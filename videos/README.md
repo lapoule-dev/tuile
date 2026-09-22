@@ -159,3 +159,28 @@ chaîne a tenu — manifeste entré par le pont Blender, procédural cuisant pou
 - pack `packs/62fed640f2d6a36a/1-24.tuilepack`, orbite à 8 km
 - c'est le run qui a mesuré la cuisson incrémentale : `cook #1 built=444`,
   puis `kept=444 built=0`, contre 444 reconstruites à chaque frame avant.
+
+## `testA-poll-960-render.mp4`, `testB-wait-960-render.mp4`
+
+1 frame chacun, 960×720, 22 septembre 2026. La paire qui a clos l'interblocage
+de la boucle de rendu Hydra — **pixel pour pixel identiques** (écart moyen
+0,00/255), seule la façon d'attendre diffère.
+
+- trajectoire `orbit:64:2.17:42.52:8000:5000`, frame 1
+- pack `packs/ab87620af91e0549/1-64.tuilepack`, scène `0f766ae6c728c202`
+  (cuit en 3840×2160, sse 64)
+- imagerie Bing (défaut), `--width 960`, 16 échantillons, un processus par GPU
+- image `tuile/blender-globe:5.1-su@sha256:3abc6f19…`, base
+  `blender-shared-usd:5.2-2605@sha256:f1c512fb…`
+- les deux avec `--env CYCLES_BACKGROUND=1`, puis :
+  - **A** `--env TUILE_WAIT_MODE=poll` — 36 tours de 50 ms, `Render Time 2.57 s`
+  - **B** `--env TUILE_WAIT_MODE=command` — **un** tour,
+    `WAIT[1] returned from wait, converged 2.487s`, `Render Time 2.51 s`
+
+Sans `CYCLES_BACKGROUND=1`, B bloque à jamais : hdCycles écrit
+`params.background = false` en dur, `run_wait_for_work` gare alors le fil de
+rendu dans `pause_cond_.wait()` en le laissant à l'état `SESSION_THREAD_RENDER`,
+et `Session::wait()` attend une transition qui n'arrive pas — zéro CPU, zéro
+GPU, mesuré sept minutes durant sur le même pack. `Done:` reste faux dans les
+deux modes (`-2147483648%` puis `0%`) : c'est `renderer_percent_done()`, non
+bloquant, à regarder à part.
