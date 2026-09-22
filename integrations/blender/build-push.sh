@@ -186,6 +186,17 @@ if [ -n "$BASE_OVERRIDE" ]; then
     BUILD_ARGS+=(--build-arg "BASE=${HARBOR_HOST}/stl/blender-shared-usd:${BASE_OVERRIDE}")
     echo "   base forcée: ${BASE_OVERRIDE}"
 fi
+# Extra `--build-arg` pairs, because the job counts belong to the machine and
+# not to the recipe.
+#
+# `BUILD_JOBS` and `USD_BUILD_JOBS` default to what fits `stl-builder-k8s` —
+# 8 cores for 12 GiB, where four parallel compilers already reached the ceiling.
+# On a 32-core builder those defaults leave 28 cores idle, so `build-on-gcp.sh`
+# raises them here. Space-separated `name=value`, forwarded verbatim.
+for pair in ${TUILE_EXTRA_BUILD_ARGS:-}; do
+    BUILD_ARGS+=(--build-arg "$pair")
+    echo "   build-arg: $pair"
+done
 docker buildx build --builder "$BUILDER" --platform linux/amd64 \
     -f "$DOCKERFILE" "${TAGS[@]}" "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}" \
     --push "$CONTEXT"
