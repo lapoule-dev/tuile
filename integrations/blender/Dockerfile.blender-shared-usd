@@ -76,21 +76,44 @@ ARG USD_VERSION=26.03
 # tenant sa réservation pendant que le nouveau l'attendait. Les limites ne se
 # réservent pas, les requêtes si ; ne toucher qu'à la limite, et vérifier que
 # le cluster a la place avant de lancer le rollout.
-# Deux, et c'est la mémoire qui le fixe, pas les cœurs.
+# Trois, parce que la mémoire fixe le plafond et les cœurs ne le fixent pas.
 #
 # Le pod builder a 8 CPU pour **12 Gio**. Une unité lourde de Blender demande
-# trois à quatre gibioctets à `cc1plus` ; quatre en parallèle dépassent la
-# limite et le noyau tue le compilateur — ce qui se lit `Killed signal
-# terminated program cc1plus` et ressemble à une erreur de code, alors que
-# c'est le noyau qui a tranché.
+# trois à quatre gibioctets à `cc1plus` ; quatre en parallèle ont déjà
+# dépassé la limite une fois, et le noyau a tué le compilateur — ce qui se lit
+# `Killed signal terminated program cc1plus` et ressemble à une erreur de code,
+# alors que c'est le noyau qui a tranché.
 #
-# Avec mantaflow coupé ci-dessous, quatre passeraient peut-être. On ne le
-# saura pas, et c'est le choix : la marge coûte du temps de builder, une
-# compilation morte à l'objet 649 sur 8197 coûte treize minutes ET le temps de
-# comprendre pourquoi. Six cœurs qui dorment valent mieux qu'un build qu'il
-# faut relancer.
-ARG BUILD_JOBS=2
-ARG USD_BUILD_JOBS=8
+# Ce jour-là, le pic était mantaflow, coupé ci-dessous depuis. Mesuré le
+# 21 septembre 2026 avec mantaflow absent : à deux, 1000 objets en 890 s ; à
+# quatre, les mêmes en 502 s et 4000 en 785 s, le cgroup à 7,4 Gio sur 12, sans
+# un seul `oom_kill` — mais la course s'arrête au début de Cycles, là où
+# arrivent les unités lourdes, et personne n'a vu la suite.
+#
+# Trois est ce qui reste quand on veut la moitié du gain sans parier la
+# compilation entière sur le dernier gibioctet. Si `Killed signal terminated
+# program cc1plus` apparaît quand même, c'est le noyau et non le code :
+# redescendre à deux, ou monter la limite du pod — mais lire d'abord le
+# paragraphe ci-dessus, le 16 septembre la monter a rendu le pod non
+# ordonnançable.
+#
+# Et après toute annulation, vérifier le pod : buildkit laisse ses `cc1plus`
+# tourner. Il en restait vingt-deux dix secondes après l'arrêt du client.
+ARG BUILD_JOBS=3
+
+# OpenUSD compile dans le même pod, sous le même plafond, et huit étaient trop.
+#
+# Mesuré le 22 septembre 2026 : à huit, la compilation d'`usdImaging` a porté
+# le cgroup à 11 945 Mio sur 12 288 et le noyau a tué un compilateur —
+# `Killed signal terminated program cc1plus`, que BuildKit rapporte en
+# `ResourceExhausted`. Cela fait environ 1,5 Gio par compilateur, le même ordre
+# de grandeur que Blender, sur des unités de traduction lourdes en gabarits
+# (`usdSkelImaging`, `usdVolImaging`, `usdImagingGL`).
+#
+# Quatre tient dans la moitié du plafond et laisse la place au reste. Ce nombre
+# vaut pour CE pod : il n'est pas déduit de la limite, donc changer la taille du
+# builder demande de le relire.
+ARG USD_BUILD_JOBS=4
 # The GPU backends, and why each number is what it is.
 #
 # Measured 2026-09-10 on stl/blender-globe:5.1-su: NOT ONE `.cubin` or `.ptx`
@@ -525,6 +548,8 @@ RUN set -eu; \
     cd /opt/src/blender/intern/cycles/hydra; \
     sed -i 's|^#include <pxr/base/tf/getenv.h>$|#include <pxr/base/tf/getenv.h>\n#include <pxr/imaging/hd/command.h>|' render_delegate.cpp; \
     sed -i 's|^    (openvdbAsset)$|    (openvdbAsset)\n    ((waitForConvergence, "cycles:waitForConvergence"))|' render_delegate.cpp; \
+    sed -i 's|^  params.background = false;$|  /* Offline when told so -- hdCycles hardcodes interactive, and in an\n   * interactive session `run_wait_for_work` parks the render thread in\n   * `pause_cond_.wait()` while it stays in SESSION_THREAD_RENDER. Waiting on\n   * that session then never returns: measured 22 September 2026, zero percent\n   * CPU and zero percent GPU for seven minutes on a batch render. */\n  params.background = PXR_NS::TfGetenvBool("CYCLES_BACKGROUND", false);|' render_delegate.cpp; \
+    sed -i 's|^  params.use_resolution_divider = false;$|  params.use_resolution_divider = false;\n  /* Untiled when told so -- above one 2048x2048 tile Cycles renders tiles to\n   * disk and hands the full frame back only through full_buffer_written_cb,\n   * which hdCycles never wires. write_render_tile is then never called, no\n   * render buffer is marked converged, and the Hydra loop never ends: measured\n   * 22 September 2026, every 3840x2160 render spun while 960x540 passed. */\n  params.use_auto_tile = PXR_NS::TfGetenvBool("CYCLES_AUTO_TILE", true);|' render_delegate.cpp; \
     sed -i 's|^  bool Resume() override;$|  bool Resume() override;\n\n  PXR_NS::HdCommandDescriptors GetCommandDescriptors() const override;\n  bool InvokeCommand(const PXR_NS::TfToken \&command,\n                     const PXR_NS::HdCommandArgs \&args) override;|' render_delegate.h; \
     printf '%s\n' '' \
       'HdCommandDescriptors HdCyclesDelegate::GetCommandDescriptors() const' \
@@ -547,8 +572,12 @@ RUN set -eu; \
       '  }' \
       '  _renderParam->session->wait();' \
       '  return true;' \
-      '}' >> render_delegate.cpp; \
+      '}' > /tmp/wait_command.inc; \
+    awk 'FNR==NR { block[++n] = $0; next } /^HDCYCLES_NAMESPACE_CLOSE_SCOPE$/ && !placed { for (i = 1; i <= n; i++) print block[i]; placed = 1 } { print } END { if (!placed) exit 1 }' /tmp/wait_command.inc render_delegate.cpp > /tmp/render_delegate.cpp; \
+    mv /tmp/render_delegate.cpp render_delegate.cpp; \
     for probe in "render_delegate.cpp:pxr/imaging/hd/command.h" \
+                 "render_delegate.cpp:TfGetenvBool(\"CYCLES_BACKGROUND\"" \
+                 "render_delegate.cpp:TfGetenvBool(\"CYCLES_AUTO_TILE\"" \
                  "render_delegate.cpp:cycles:waitForConvergence" \
                  "render_delegate.cpp:_renderParam->session->wait();" \
                  "render_delegate.h:GetCommandDescriptors() const override;" \
@@ -557,6 +586,10 @@ RUN set -eu; \
         grep -qF "$want" "$f" || { \
             echo "le patch de l'attente a manqué sa cible: $want dans $f"; exit 1; }; \
     done; \
+    w=$(grep -n '_renderParam->session->wait();' render_delegate.cpp | cut -d: -f1 | head -1); \
+    c=$(grep -n '^HDCYCLES_NAMESPACE_CLOSE_SCOPE$' render_delegate.cpp | cut -d: -f1 | tail -1); \
+    [ -n "$w" ] && [ -n "$c" ] && [ "$w" -lt "$c" ] || { \
+        echo "les commandes sont tombées hors du namespace ($w vs $c)"; exit 1; }; \
     echo "blender-shared-usd: the Cycles delegate can be waited on"
 
 # ── moitié 2 : la boucle attend au lieu de recopier ──────────────────────────
@@ -642,15 +675,31 @@ RUN cd /opt/src/blender \
 #
 # `--defined-only` parce qu'un symbole simplement *référencé* est exactement la
 # panne qu'on cherche à empêcher.
+# Et chaque symbole dans SON binaire. `tuile_wait_for_frame` est compilé dans
+# `bf_render_hydra`, donc lié dans l'exécutable ; `HdCyclesDelegate::InvokeCommand`
+# appartient au délégué Cycles, qui est un greffon Hydra chargé à l'exécution et
+# vit dans `hdCycles.so`. Les chercher tous deux dans l'exécutable a fait échouer
+# le 22 septembre 2026 une image dont les deux greffes avaient pourtant compilé.
 RUN set -eu; \
     bin=$(find /opt/blender -maxdepth 1 -name blender -type f); \
     test -n "$bin" || { echo "pas de binaire blender installé"; exit 1; }; \
-    for want in tuile_wait_for_frame InvokeCommand; do \
-        nm --defined-only -C "$bin" 2>/dev/null | grep -q "$want" || { \
-            echo "le binaire ne définit pas $want — le patch n'a pas été compilé"; \
-            exit 1; }; \
-    done; \
-    echo "blender-shared-usd verified: the wait is in the binary, not only in the source"
+    plugin=$(find / -xdev -name 'hdCycles*.so' -type f 2>/dev/null | head -1); \
+    test -n "$plugin" || { \
+        echo "greffon hdCycles introuvable ; bibliothèques hydra présentes :"; \
+        find / -xdev -name 'hd*.so' -type f 2>/dev/null | head -20; \
+        exit 1; }; \
+    echo "greffon: $plugin"; \
+    defines() { \
+        { nm --defined-only -C "$1" 2>/dev/null; \
+          nm -D --defined-only -C "$1" 2>/dev/null; } | grep -q "$2"; \
+    }; \
+    defines "$bin" tuile_wait_for_frame || { \
+        echo "l'exécutable ne définit pas tuile_wait_for_frame — la greffe n'a pas été compilée"; \
+        exit 1; }; \
+    defines "$plugin" 'HdCyclesDelegate::InvokeCommand' || { \
+        echo "$plugin ne définit pas HdCyclesDelegate::InvokeCommand — la greffe n'a pas été compilée"; \
+        exit 1; }; \
+    echo "blender-shared-usd verified: the wait is in the binaries, not only in the source"
 
 
 # The kernels, or the build lied.

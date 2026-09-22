@@ -46,9 +46,23 @@
 
 #pragma once
 
-namespace pxr {
-class HdRenderIndex;
-}
+/* L'en-tête réel, et non une déclaration anticipée.
+ *
+ * `pxr` n'est pas le namespace où vivent les classes d'OpenUSD : c'est un
+ * namespace qui les importe. `pxr/pxr.h` écrit
+ *
+ *     namespace pxrInternal_v0_26_8__pxrReserved__ { }
+ *     namespace pxr { using namespace pxrInternal_v0_26_8__pxrReserved__; }
+ *
+ * Or un membre déclaré *directement* dans `pxr` masque celui qu'une directive
+ * `using` y rend visible. Un `namespace pxr { class HdRenderIndex; }` ne
+ * déclare donc pas la classe d'OpenUSD par anticipation : il en crée une
+ * seconde, vide, qui prend la place de la vraie. Le compilateur dit alors
+ * « invalid use of incomplete type » sur le premier appel de méthode, et
+ * refuse `render_index_.get()` au site d'appel, les deux pointeurs ne
+ * désignant plus le même type. C'est pourquoi les en-têtes hydra de Blender
+ * incluent et ne déclarent jamais par anticipation. */
+#include <pxr/imaging/hd/renderIndex.h>
 
 namespace blender::render::hydra {
 
