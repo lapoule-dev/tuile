@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # Copyright (c) lapoule.dev
 #
-# Job A: bakes a camera path into ONE pack and deposits it on R2.
+# Job A: bakes a camera path into ONE pack and deposits it in the bucket.
 #
 # The other half of the pair. This job is the only one that holds a Cesium ion
 # token, the only one that talks to the network at length, and the only one
@@ -15,17 +15,19 @@
 #   JOB_VIEWPORT       "1280x960"   (the selection depends on it: a pack is
 #                      the bake of the viewport it was made for)
 #   JOB_SSE            screen-space error target (default 3)
-#   JOB_PACK_PUT_URL   presigned PUT: where the finished pack goes
-#   JOB_TAPE_PUT_URL   presigned PUT: the tape this pack was baked from, beside
-#                      it. Without it a pack cannot be re-cooked on its own
-#                      path — see below.
-#   JOB_SCENE_PUT_URL  presigned PUT: the scene digest, as one line, beside the
-#                      pack. It cannot be derived from the parameters — it also
-#                      covers the RESOLVED traversal settings, which only this
-#                      job knows — and a render needs it to check that the pack
-#                      it was handed is a bake of the globe it means to draw.
-#   JOB_LOGS_PUT_URL   presigned PUT: logs.tar.gz, on every exit path and
-#                      every JOB_ARCHIVE_EVERY seconds while it runs
+#   JOB_PACK_KEY       where the finished pack goes, uploaded multipart by
+#                      `tuile-farm` with the job's own credentials
+#                      (TUILE_STORE_*, set in the job's definition). Beside it:
+#     <key>.mcap       the tape this pack was baked from. Without it a pack
+#                      cannot be re-cooked on its own path — see below.
+#     <key>.scene      the scene digest, as one line. It cannot be derived from
+#                      the parameters — it also covers the RESOLVED traversal
+#                      settings, which only this job knows — and a render needs
+#                      it to check that the pack it was handed is a bake of the
+#                      globe it means to draw.
+#   JOB_TAPE_KEY       a tape to re-bake on, instead of generating one
+#   JOB_RUN_PREFIX     where logs.tar.gz goes, on every exit path and every
+#                      JOB_ARCHIVE_EVERY seconds while it runs
 #   TUILE_ION_TOKEN    required, never printed
 #   TUILE_*            every traversal knob, honoured by the same code the
 #                      render honours — a pack is the bake of its settings
@@ -53,6 +55,8 @@ exec > >(tee -a "$JOB_LOG") 2>&1
 # processus.
 pack="$outdir/scene.tuilepack"
 tape="$outdir/traj.mcap"
+FARM="${TUILE_FARM:-/opt/tuile/bin/tuile-farm}"
+JOB_RUN_PREFIX="${JOB_RUN_PREFIX%/}"
 
 # Le même expéditeur que le job de rendu, et les mêmes raisons.
 #
@@ -61,8 +65,8 @@ tape="$outdir/traj.mcap"
 # WORKDIR. Onze runs de rendu n'ont déposé aucune archive avant que ce soit
 # compris ; ce job naît avec la version qui marche.
 ship() {
-    local name="$1" url="$2"; shift 2
-    [ -n "$url" ] || return 0
+    local name="$1"; shift
+    [ -n "$JOB_RUN_PREFIX" ] || return 0
     local files pat f
     files=$(cd "$outdir" 2>/dev/null && for pat in "$@"; do
                 for f in $pat; do [ -e "$f" ] && printf '%s\n' "$f"; done
@@ -76,7 +80,7 @@ ship() {
         echo "ARCHIVE-TAR-FAILED $name (tar=$status)"
         return 1
     fi
-    if curl -fsS -T "$outdir/$name" "$url" > /dev/null; then
+    if "$FARM" put "$outdir/$name" "$JOB_RUN_PREFIX/$name"; then
         echo "ARCHIVE-UP $name ($(du -h "$outdir/$name" | cut -f1))"
     else
         echo "ARCHIVE-UP-FAILED $name"
@@ -85,9 +89,9 @@ ship() {
 }
 
 flush_logs() {
-    [ -n "${JOB_LOGS_PUT_URL:-}" ] || return 0
+    [ -n "$JOB_RUN_PREFIX" ] || return 0
     while sleep "${JOB_ARCHIVE_EVERY:-300}"; do
-        out=$(ship logs.tar.gz "$JOB_LOGS_PUT_URL" 'job.log' 2>&1)
+        out=$(ship logs.tar.gz 'job.log' 2>&1)
         case "$out" in *FAILED*) echo "$out" ;; esac
     done
 }
@@ -95,7 +99,7 @@ flush_logs() {
 archive_everything() {
     local status=$?
     trap - EXIT
-    ship logs.tar.gz "${JOB_LOGS_PUT_URL:-}" 'job.log' 'profile'
+    ship logs.tar.gz 'job.log' 'profile'
     exit $status
 }
 trap archive_everything EXIT
@@ -134,7 +138,7 @@ fi
 
 # Une bande fournie l'emporte sur une bande générée.
 #
-# `JOB_TAPE_URL` sert à recuire un pack **sur son propre tracé**. Les
+# `JOB_TAPE_KEY` sert à recuire un pack **sur son propre tracé**. Les
 # générateurs évoluent — `pyrenees-tape` sortait une polyligne quand les
 # premiers films ont été tournés et sort une spline aujourd'hui — donc la même
 # chaîne d'arguments ne décrit plus le même vol. Pour demander si la traversée
@@ -144,8 +148,8 @@ fi
 #
 # La bande, pas le pack : quelques centaines de kilooctets au lieu du
 # gigaoctet, dans un conteneur dont le système de fichiers est de la RAM.
-if [ -n "${JOB_TAPE_URL:-}" ]; then
-    if ! curl -fsS -o "$tape" "$JOB_TAPE_URL"; then
+if [ -n "${JOB_TAPE_KEY:-}" ]; then
+    if ! "$FARM" get "$JOB_TAPE_KEY" "$tape"; then
         echo TAPE-DOWNLOAD-FAILED; exit 1
     fi
     echo "tape: fournie ($(du -h "$tape" | cut -f1)), trajectoire ignorée"
@@ -222,8 +226,9 @@ echo "pack: $(du -h "$pack" | cut -f1)"
 # qu'elle survive dans le journal du job, et non seulement dans son stdout.
 grep -E '^BAKE-KEY ' "$outdir/bake-out.txt" || echo "BAKE-KEY-MISSING"
 
-if [ -n "${JOB_PACK_PUT_URL:-}" ]; then
-    if curl -fsS -T "$pack" "$JOB_PACK_PUT_URL" > /dev/null; then
+if [ -n "${JOB_PACK_KEY:-}" ]; then
+    # Multipart: a single PUT stops at 5 GB, and a long 4K flight bakes more.
+    if "$FARM" put "$pack" "$JOB_PACK_KEY"; then
         echo PACK-UP
     else
         # Un pack cuit et non déposé est une cuisson qui n'a pas eu lieu : la
@@ -247,8 +252,8 @@ fi
 #
 # Déposée même quand elle a été FOURNIE : un pack recuit doit porter son tracé
 # comme les autres, sinon le trou se rouvre au coup d'après.
-if [ -n "${JOB_TAPE_PUT_URL:-}" ]; then
-    if curl -fsS -T "$tape" "$JOB_TAPE_PUT_URL" > /dev/null; then
+if [ -n "${JOB_PACK_KEY:-}" ]; then
+    if "$FARM" put "$tape" "$JOB_PACK_KEY.mcap"; then
         echo "TAPE-UP ($(du -h "$tape" | cut -f1))"
     else
         echo TAPE-UP-FAILED
@@ -265,9 +270,9 @@ fi
 # rangement, et deux gigaoctets valides sont restés sous une clef que personne
 # ne cherche.
 scene=$(sed -n 's|^BAKE-KEY packs/\([^/]*\)/.*|\1|p' "$outdir/bake-out.txt" | head -n 1)
-if [ -n "${JOB_SCENE_PUT_URL:-}" ] && [ -n "$scene" ]; then
+if [ -n "${JOB_PACK_KEY:-}" ] && [ -n "$scene" ]; then
     printf '%s\n' "$scene" > "$outdir/scene.txt"
-    if curl -fsS -T "$outdir/scene.txt" "$JOB_SCENE_PUT_URL" > /dev/null; then
+    if "$FARM" put "$outdir/scene.txt" "$JOB_PACK_KEY.scene"; then
         echo "SCENE-UP $scene"
     else
         echo "SCENE-UP-FAILED $scene"

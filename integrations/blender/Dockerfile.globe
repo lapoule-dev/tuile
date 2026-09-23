@@ -73,6 +73,12 @@ RUN cargo build --release -p tuile-tape -p tuile-usd --bins \
 # profile come back with every Rust frame as `???`.
 RUN cargo build --release -p tuile-bake --features profiling \
     && test -x target/release/tuile-bake
+# Every byte the job moves: the pack in by parallel ranged reads, segments,
+# logs and the film out by multipart upload, the film assembled by whichever
+# task finishes last. Talks to the bucket with the job's own key — nothing is
+# presigned any more.
+RUN cargo build --release -p tuile-farm \
+    && strip target/release/tuile-farm
 
 # ------------------------------------------------------------------ plugin --
 FROM ${BASE} AS plugin
@@ -225,19 +231,10 @@ ARG BLENDER_SERIES
 COPY --from=plugin /opt/blender/${BLENDER_SERIES} /opt/blender/${BLENDER_SERIES}
 COPY --from=plugin /opt/blender/license /opt/blender/license
 COPY --from=plugin /opt/plugins/tuileHydra /opt/plugins/tuileHydra
-# Static ffmpeg for per-range encodes and the concat, same recipe as
-# stl/blender-render:5.1 — and ffprobe beside it. Without ffprobe the job's
-# frame-count check, the one that tells a 1440-frame render that only carried
-# 180 from a good one, could never run: it failed silently and printed
-# "frames: inconnu".
-RUN curl -fsL -o /tmp/ffmpeg.tar.xz \
-        "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" \
-    && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp \
-    && mv /tmp/ffmpeg-*-static/ffmpeg /usr/local/bin/ffmpeg \
-    && mv /tmp/ffmpeg-*-static/ffprobe /usr/local/bin/ffprobe \
-    && rm -rf /tmp/ffmpeg* \
-    && ffmpeg -version | sed -n 1p \
-    && ffprobe -version | sed -n 1p
+# No ffmpeg. Blender encodes each segment itself (its encoder is asserted in
+# blender-shared-usd), and the join and the frame count are `tuile-farm`'s,
+# in Rust. A static ffmpeg and ffprobe sat here for both; they were two large
+# binaries in every pull for work nothing did any more.
 # L'add-on qui expose le délégué Hydra de Cycles comme moteur de rendu, et qui
 # vient désormais d'amont.
 #
@@ -268,7 +265,18 @@ COPY --from=rustlib /src/target/release/orbit-tape \
                     /src/target/release/zoom-tape \
                     /src/target/release/tape-to-stage \
                     /src/target/release/tuile-bake \
+                    /src/target/release/tuile-farm \
                     /opt/tuile/bin/
+# It runs, and on a directory store it answers the way a job script expects:
+# 2 on a typo, 1 on an absent key, 0 on a round trip. An image whose I/O
+# binary is missing a library would otherwise fail on the first GPU minute.
+RUN d=$(mktemp -d) && echo farm > "$d/in" \
+    && { /opt/tuile/bin/tuile-farm 2>/dev/null; test $? -eq 2; } \
+    && { TUILE_STORE_DIR="$d/s" /opt/tuile/bin/tuile-farm exists nothing; test $? -eq 1; } \
+    && TUILE_STORE_DIR="$d/s" /opt/tuile/bin/tuile-farm put "$d/in" a/b \
+    && TUILE_STORE_DIR="$d/s" /opt/tuile/bin/tuile-farm get a/b "$d/out" \
+    && cmp "$d/in" "$d/out" && rm -rf "$d" \
+    && echo "blender-globe verified: tuile-farm round-trips"
 
 ENV PATH=/opt/blender:$PATH \
     LD_LIBRARY_PATH=/opt/blender/lib \
