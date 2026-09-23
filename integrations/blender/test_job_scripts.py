@@ -463,6 +463,58 @@ class ArchivingWhileItWrites(unittest.TestCase):
         self.assertIn("*FAILED*", flush)
 
 
+class EveryCrashReportComesBack(unittest.TestCase):
+    """Chaque processus Blender a son rapport de plantage, et il remonte.
+
+    Blender écrit sa pile dans `<tmp>/blender.crash.txt` — un seul chemin pour
+    tous les processus de la machine — et rien ne l'envoyait. Mesuré le 23
+    septembre : deux processus sur quatre ont planté sur leur deuxième frame,
+    et il n'est revenu que la ligne « Writing: /tmp/blender.crash.txt ».
+
+    Ce test exécute le vrai `ship` avec les motifs exacts de l'archivage de
+    sortie, et ouvre l'archive arrivée dans le store.
+    """
+
+    JOB = pathlib.Path(__file__).with_name("render_job.sh")
+
+    def test_each_process_writes_its_crash_report_under_outdir(self):
+        text = self.JOB.read_text()
+        self.assertIn('TMPDIR="$outdir/tmp-s$i"', text)
+        self.assertIn('mkdir -p "$outdir/tmp-s$i"', text)
+
+    def test_the_crash_reports_travel_with_the_logs(self):
+        import tarfile
+        import tempfile as _tempfile
+        text = self.JOB.read_text()
+        start = text.index("ship() {")
+        body = text[start:text.index("\n}\n", start) + len("\n}\n")]
+        exit_body = text[text.index("archive_everything() {"):]
+        call = next(line.strip() for line in exit_body.splitlines()
+                    if line.strip().startswith("ship logs.tar.gz"))
+        with _tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp)
+            (out / "log-s0.txt").write_text("frame 3991: début\n")
+            (out / "job.log").write_text("job\n")
+            (out / "tmp-s1").mkdir()
+            (out / "tmp-s1" / "blender.crash.txt").write_text("# backtrace\n")
+            script = (
+                f'outdir="{tmp}"\n'
+                f'FARM="{farm_binary()}"\n'
+                f'export TUILE_STORE_DIR="{tmp}/store"\n'
+                'JOB_RUN_PREFIX=renders/r1\n'
+                'task_tag=""\n'
+                "run_key() { printf '%s/%s' \"$JOB_RUN_PREFIX\" \"$1\"; }\n"
+                + body + call + "\n")
+            done = subprocess.run(["bash", "-c", script],
+                                  capture_output=True, text=True)
+            landed = out / "store" / "renders" / "r1" / "logs.tar.gz"
+            self.assertTrue(landed.exists(), done.stdout + done.stderr)
+            with tarfile.open(landed) as tar:
+                names = tar.getnames()
+            self.assertIn("tmp-s1/blender.crash.txt", names)
+            self.assertIn("log-s0.txt", names)
+
+
 class DyingRendersMustNotBillAnHour(unittest.TestCase):
     """Un rendu mort doit rendre la main tout de suite.
 

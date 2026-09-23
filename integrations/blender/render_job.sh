@@ -290,7 +290,7 @@ flush_logs() {
         # /dev/null a caché pendant une demi-heure que rien ne partait — et
         # c'est exactement le genre de panne qu'un flush est censé survivre,
         # pas commettre.
-        out=$(ship logs.tar.gz 'log-s*.txt' 'job.log' 2>&1)
+        out=$(ship logs.tar.gz 'log-s*.txt' 'job.log' 'tmp-s*/blender.crash.txt' 2>&1)
         case "$out" in *FAILED*) echo "$out" ;; esac
     done
 }
@@ -319,7 +319,7 @@ archive_everything() {
     # serait faux : l'échantillonneur GPU et le flush tournent en boucle, et on
     # les attendrait toujours.
     sleep 0.3
-    ship logs.tar.gz    'log-s*.txt' 'job.log'
+    ship logs.tar.gz    'log-s*.txt' 'job.log' 'tmp-s*/blender.crash.txt'
     ship trace.tar.gz   'trace-s*.jsonl'
     ship profile.tar.gz 'profile'
     exit $status
@@ -725,7 +725,15 @@ for i in $(seq 0 $((jobs - 1))); do
     # Combined with one CUDA_VISIBLE_DEVICES per process it is also what places
     # the work: the delegate takes every visible device of its type, and each
     # process is shown exactly one.
-    CUDA_VISIBLE_DEVICES=$gpu TUILE_CACHE_DIR="$proc_cache" \
+    # Its own TMPDIR, under $outdir: Blender writes its crash report to
+    # `<tmp>/blender.crash.txt`, one path for every process of the machine,
+    # and nothing shipped it. On 23 September two processes out of four
+    # crashed on their second frame and all that came back was the line
+    # "Writing: /tmp/blender.crash.txt" — the stack stayed in a container
+    # that no longer existed. Now each report is its process's, and goes up
+    # with the logs.
+    mkdir -p "$outdir/tmp-s$i"
+    CUDA_VISIBLE_DEVICES=$gpu TUILE_CACHE_DIR="$proc_cache" TMPDIR="$outdir/tmp-s$i" \
         CYCLES_DEVICE="$CYCLES_BACKEND" \
         stdbuf -oL blender -b $JOB_BLENDER_ARGS -P /opt/render/render_usd.py -- \
         --stage "$STAGE" --engine "$JOB_ENGINE" --tier "$JOB_TIER" \
