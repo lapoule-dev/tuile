@@ -12,7 +12,7 @@
 #   JOB_FRAMES         "1:1440" (inclusive)
 #   JOB_ENGINE         native | hydra            (default native; hydra = the
 #                      manifest path, procedurals cook — needs a pack
-#                      (JOB_PACK_URL) or TUILE_ION_TOKEN in the pod env)
+#                      (JOB_PACK_KEY) or TUILE_ION_TOKEN in the pod env)
 #   JOB_DELEGATE       storm | cycles            (hydra only; default cycles.
 #                      Storm is an OpenGL rasteriser and never calls CUDA, so
 #                      CUDA_VISIBLE_DEVICES steers nothing and four processes
@@ -27,13 +27,25 @@
 #   JOB_EXTRA_ARGS     extra render_usd.py args  (e.g. "--demo-fixups --no-dof")
 #   JOB_BLENDER_ARGS   extra blender args, before -P  (e.g. "--debug-cycles")
 #   JOB_OUT            final video path          (default /out/render.mp4)
-#   JOB_UPLOAD_PUT_URL if set: curl -T the finished video to this presigned
-#                      URL (no credential ever reaches the pod)
-#   JOB_LOGS_PUT_URL   if set: every process's stdout, gathered into
-#                      logs.tar.gz and shipped the same way — ON EVERY EXIT
-#                      PATH and every JOB_ARCHIVE_EVERY seconds while it runs,
-#                      because a job that failed is the one whose logs are
-#                      worth having and a pod that is killed runs no trap
+#
+# # Object storage: keys, not URLs
+#
+# Every byte in and out goes through `/opt/tuile/bin/tuile-farm`, with the
+# job's own credentials (TUILE_STORE_ENDPOINT, TUILE_STORE_BUCKET,
+# TUILE_STORE_ACCESS_KEY_ID, TUILE_STORE_SECRET_ACCESS_KEY — set in the job's
+# DEFINITION, never in an execution's overrides, which anyone reading the
+# execution can see). Downloads are parallel ranged reads and uploads are
+# multipart: a presigned URL was one TCP stream, and a 2.3 GB pack took 88 s
+# of every task before a single frame.
+#
+#   JOB_RUN_PREFIX     where this run's outputs go, e.g. `renders/<run-id>`:
+#                      seg<g>.mp4 as each is encoded, logs[-t<t>].tar.gz,
+#                      trace[-t<t>].tar.gz, profile[-t<t>].tar.gz — ON EVERY
+#                      EXIT PATH and every JOB_ARCHIVE_EVERY seconds while it
+#                      runs, because a job that failed is the one whose logs
+#                      are worth having and a pod that is killed runs no trap —
+#                      then tasks/<t>.json, and finally render.mp4.
+#                      Unset: nothing leaves the machine (a local run).
 #   Les erreurs de stderr remontent AUSSI sur stdout, donc dans les journaux
 #   du fournisseur, pendant que la tâche tourne. Elles n'y étaient pas : stderr
 #   partait dans trace-s<i>.jsonl et ce fichier n'arrive qu'à la fin, dans une
@@ -42,40 +54,28 @@
 #   — deux flux, deux destinations, et la mauvaise interrogée. La trace
 #   complète reste dans le fichier ; seules les lignes qui portent une erreur
 #   sont dupliquées.
-#   JOB_SEG_PUT_URL_<i> if set: segment i goes to R2 THE MOMENT it is encoded,
-#                      not at the end. A pod reclaimed at frame 900 of 1440
-#                      has still deposited the nine hundred.
-#                      With several tasks, <i> is the GLOBAL segment number:
-#                      task t owns t*jobs .. (t+1)*jobs-1, so the launcher can
-#                      concatenate them in order without knowing who made what.
 #   CLOUD_RUN_TASK_INDEX / _COUNT   set by Cloud Run Jobs, not by us. When
 #                      COUNT > 1 this script renders only its own slice of
-#                      JOB_FRAMES and does NOT concatenate: no task sees every
-#                      segment, so the film is assembled from R2 afterwards
-#                      (`launch_job.py --assemble <run-id>`).
-#   JOB_LOGS_PUT_URL_<t> / JOB_TRACE_PUT_URL_<t> / JOB_PROFILE_PUT_URL_<t>
-#                      per-task variants, preferred over the unsuffixed ones
-#                      when present. Without them N tasks would overwrite one
-#                      another's logs.tar.gz and the survivor would be whoever
-#                      finished last — which is never the one that failed.
-#   JOB_OPTIX_CACHE_GET_URL / _PUT_URL  presigned GET/PUT for the OptiX disk
-#                      cache. Without it every process pays the driver's
-#                      PTX-to-machine-code compilation again: **338 seconds**,
-#                      measured on an L4 on 16 September 2026, against 0.17 s
-#                      for the frame that follows it. The PTX itself is already
-#                      precompiled and shipped in the image — this is the step
-#                      after it, and it cannot be done at build time because
-#                      the builder has no NVIDIA card and the result is
-#                      specific to the card and driver anyway.
+#                      JOB_FRAMES. Segments are numbered globally — task t owns
+#                      t*jobs .. (t+1)*jobs-1 — and each task, once its
+#                      segments are up, leaves a receipt and asks for the film:
+#                      the one that finds every receipt assembles it
+#                      (`tuile-farm assemble`). Nobody has to be watching at
+#                      the end.
+#   JOB_OPTIX_CACHE_KEY  the OptiX disk cache, read before the first render
+#                      and written back by task 0. Without it every process
+#                      pays the driver's PTX-to-machine-code compilation again:
+#                      **338 seconds**, measured on an L4 on 16 September 2026,
+#                      against 0.17 s for the frame that follows it. It cannot
+#                      be done at build time: the builder has no NVIDIA card
+#                      and the result is specific to the card and driver.
 #   JOB_ARCHIVE_EVERY  seconds between log flushes while rendering (default 300)
-#   JOB_TRACE_PUT_URL  if set: the per-process determinism traces, gathered
-#                      into one trace.tar.gz and shipped the same way
-#   JOB_PROFILE_PUT_URL if set: TUILE_PROFILE_DIR's flamegraphs, likewise
-#   JOB_PACK_URL       if set: a presigned GET for a pre-baked pack. The job
-#                      downloads it ONCE and every process reads it — no ion
-#                      token, no network, no traversal. This is the normal
-#                      shape of a render now; the streaming path is what runs
-#                      when nobody baked.
+#   JOB_PACK_KEY       a pre-baked pack. The job downloads it ONCE and every
+#                      process reads it — no ion token, no network, no
+#                      traversal. This is the normal shape of a render now; the
+#                      streaming path is what runs when nobody baked.
+#   JOB_STAGE_KEY      a stage too large for JOB_STAGE_B64_GZ
+#   JOB_TAPE_KEY       the tape the pack was baked from (`<pack>.mcap`)
 #   JOB_SCENE          the scene digest the pack must answer, or empty to
 #                      accept whatever pack it is given
 #   JOB_SSH_PUBKEY     if set: start sshd with this authorized key
@@ -195,10 +195,16 @@ mkdir -p "$outdir"
 # last — which is never the one that failed.
 task_index="${CLOUD_RUN_TASK_INDEX:-0}"
 task_count="${CLOUD_RUN_TASK_COUNT:-1}"
-for var in JOB_LOGS_PUT_URL JOB_TRACE_PUT_URL JOB_PROFILE_PUT_URL; do
-    eval "mine=\${${var}_${task_index}:-}"
-    [ -n "$mine" ] && eval "$var=\$mine"
-done
+# One suffix per task on everything a task archives: N tasks writing one
+# logs.tar.gz overwrite each other, and the survivor is whoever finished last —
+# which is never the one that failed.
+task_tag=""
+[ "$task_count" -gt 1 ] && task_tag="-t$task_index"
+
+FARM="${TUILE_FARM:-/opt/tuile/bin/tuile-farm}"
+JOB_RUN_PREFIX="${JOB_RUN_PREFIX%/}"
+# Where a name of this run lives in the bucket.
+run_key() { printf '%s/%s' "$JOB_RUN_PREFIX" "$1"; }
 
 # Everything this job says about itself, in a file rather than only in a
 # console nobody will read once the pod is gone.
@@ -217,11 +223,13 @@ JOB_LOG="$outdir/job.log"
 exec 3>&1 4>&2
 exec > >(tee -a "$JOB_LOG") 2>&1
 
-# Ships one tarball to one presigned URL. Quiet about a URL that is not set;
-# loud about one that is and fails.
+# Ships one tarball to `<run>/<name>` (with the task's suffix). Quiet when the
+# run has no prefix; loud when it has one and the upload fails.
 ship() {
-    local name="$1" url="$2"; shift 2
-    [ -n "$url" ] || return 0
+    local name="$1"; shift
+    [ -n "$JOB_RUN_PREFIX" ] || return 0
+    local key
+    key=$(run_key "${name%.tar.gz}${task_tag}.tar.gz")
 
     # Les motifs arrivent ici NON développés ('log-s*.txt'), et rien ne les
     # développait. Deux causes, toutes deux silencieuses :
@@ -259,9 +267,10 @@ ship() {
         return 1
     fi
     echo "$name: $(du -h "$outdir/$name" | cut -f1)"
-    if curl -fsS -T "$outdir/$name" "$url" > /dev/null; then
-        echo "ARCHIVE-UP $name"
+    if "$FARM" put "$outdir/$name" "$key" 2> "$outdir/.put-$name.err"; then
+        echo "ARCHIVE-UP $key"
     else
+        sed 's/^/  /' "$outdir/.put-$name.err" | tail -3
         echo "ARCHIVE-UP-FAILED $name"
         return 1
     fi
@@ -275,13 +284,13 @@ ship() {
 # few hundred kilobytes every five minutes, and what it buys is knowing what a
 # machine was doing at the moment it was taken away.
 flush_logs() {
-    [ -n "${JOB_LOGS_PUT_URL:-}" ] || return 0
+    [ -n "$JOB_RUN_PREFIX" ] || return 0
     while sleep "${JOB_ARCHIVE_EVERY:-300}"; do
         # Discret quand ça marche, bruyant quand ça rate. Tout envoyer dans
         # /dev/null a caché pendant une demi-heure que rien ne partait — et
         # c'est exactement le genre de panne qu'un flush est censé survivre,
         # pas commettre.
-        out=$(ship logs.tar.gz "$JOB_LOGS_PUT_URL" 'log-s*.txt' 'job.log' 2>&1)
+        out=$(ship logs.tar.gz 'log-s*.txt' 'job.log' 2>&1)
         case "$out" in *FAILED*) echo "$out" ;; esac
     done
 }
@@ -310,9 +319,9 @@ archive_everything() {
     # serait faux : l'échantillonneur GPU et le flush tournent en boucle, et on
     # les attendrait toujours.
     sleep 0.3
-    ship logs.tar.gz    "${JOB_LOGS_PUT_URL:-}"    'log-s*.txt' 'job.log'
-    ship trace.tar.gz   "${JOB_TRACE_PUT_URL:-}"   'trace-s*.jsonl'
-    ship profile.tar.gz "${JOB_PROFILE_PUT_URL:-}" 'profile'
+    ship logs.tar.gz    'log-s*.txt' 'job.log'
+    ship trace.tar.gz   'trace-s*.jsonl'
+    ship profile.tar.gz 'profile'
     exit $status
 }
 trap 'rc=$?; archive_everything "$rc"' EXIT
@@ -557,9 +566,9 @@ fi
 # One download for the whole pod. Sixteen processes then read the same file,
 # which the page cache is already holding — as against sixteen cold globes,
 # each of which cost about 500 s and 89 % of a 48-frame job.
-if [ -n "${JOB_PACK_URL:-}" ]; then
+if [ -n "${JOB_PACK_KEY:-}" ]; then
     PACK="${JOB_PACK:-/tmp/scene.tuilepack}"
-    if ! curl -fsS -o "$PACK" "$JOB_PACK_URL"; then
+    if ! "$FARM" get "$JOB_PACK_KEY" "$PACK"; then
         echo PACK-FETCH-FAILED
         exit 1
     fi
@@ -583,11 +592,11 @@ fi
 STAGE="${JOB_STAGE:-/tmp/job-stage.usda}"
 if [ -n "${JOB_STAGE_B64_GZ:-}" ]; then
     echo "$JOB_STAGE_B64_GZ" | base64 -d | gunzip > "$STAGE"
-elif [ -n "${JOB_STAGE_URL:-}" ]; then
+elif [ -n "${JOB_STAGE_KEY:-}" ]; then
     # A real recorded track (thousands of exact f64 camera samples) is
-    # irreducible data; it travels as a presigned GET.
-    curl -fsS -o "$STAGE" "$JOB_STAGE_URL" || { echo STAGE-FETCH-FAILED; exit 1; }
-elif [ -n "${JOB_TAPE_URL:-}" ] || [ -n "${JOB_TRAJECTORY:-}" ]; then
+    # irreducible data; it travels as an object.
+    "$FARM" get "$JOB_STAGE_KEY" "$STAGE" || { echo STAGE-FETCH-FAILED; exit 1; }
+elif [ -n "${JOB_TAPE_KEY:-}" ] || [ -n "${JOB_TRAJECTORY:-}" ]; then
     # A supplied tape wins over a generated one — the same rule as the bake,
     # and for the same reason, except that here it is not a convenience but a
     # correctness condition.
@@ -603,8 +612,8 @@ elif [ -n "${JOB_TAPE_URL:-}" ] || [ -n "${JOB_TRAJECTORY:-}" ]; then
     #
     # The bake leaves its tape beside the pack (`<pack>.mcap`) precisely so
     # that the render can fly it again. Tape, pack and film are one shot.
-    if [ -n "${JOB_TAPE_URL:-}" ]; then
-        curl -fsS -o /tmp/traj.mcap "$JOB_TAPE_URL" \
+    if [ -n "${JOB_TAPE_KEY:-}" ]; then
+        "$FARM" get "$JOB_TAPE_KEY" /tmp/traj.mcap \
             || { echo TAPE-DOWNLOAD-FAILED; exit 1; }
         echo "bande: fournie ($(du -h /tmp/traj.mcap | cut -f1)), trajectoire ignorée"
     else
@@ -642,8 +651,8 @@ fi
 # ne veut pas, c'est qu'un cache manquant fasse échouer un rendu.
 export OPTIX_CACHE_PATH="${OPTIX_CACHE_PATH:-$outdir/optix-cache}"
 mkdir -p "$OPTIX_CACHE_PATH"
-if [ -n "${JOB_OPTIX_CACHE_GET_URL:-}" ]; then
-    if curl -fsS -o "$outdir/optix-cache.tar.gz" "$JOB_OPTIX_CACHE_GET_URL" \
+if [ -n "${JOB_OPTIX_CACHE_KEY:-}" ]; then
+    if "$FARM" get "$JOB_OPTIX_CACHE_KEY" "$outdir/optix-cache.tar.gz" 2>/dev/null \
        && tar xzf "$outdir/optix-cache.tar.gz" -C "$OPTIX_CACHE_PATH" 2>/dev/null; then
         echo "OPTIX-CACHE-HIT ($(du -sh "$OPTIX_CACHE_PATH" | cut -f1))"
     else
@@ -751,11 +760,10 @@ echo "WALL: $(($(date +%s) - t0))s pour $total frames en $jobs processus / $JOB_
 # soit cinq minutes au total et non quinze, et le gain du cache est entre runs.
 # Déposer plus tôt demanderait de savoir quand la compilation finit, ce que
 # rien ici ne dit.
-if [ -n "${JOB_OPTIX_CACHE_PUT_URL:-}" ] && [ "$task_index" = "0" ] \
+if [ -n "${JOB_OPTIX_CACHE_KEY:-}" ] && [ "$task_index" = "0" ] \
    && [ -d "$OPTIX_CACHE_PATH" ]; then
     if tar czf "$outdir/optix-cache-out.tar.gz" -C "$OPTIX_CACHE_PATH" . \
-       && curl -fsS -T "$outdir/optix-cache-out.tar.gz" \
-               "$JOB_OPTIX_CACHE_PUT_URL" > /dev/null; then
+       && "$FARM" put "$outdir/optix-cache-out.tar.gz" "$JOB_OPTIX_CACHE_KEY"; then
         echo "OPTIX-CACHE-UP ($(du -h "$outdir/optix-cache-out.tar.gz" | cut -f1))"
     else
         echo "OPTIX-CACHE-UP-FAILED"
@@ -773,25 +781,24 @@ if [ -s "$JOB_LOG" ]; then
     fi
 fi
 
-# Blender 5.x has no built-in encoder: the driver leaves PNG sequences and
-# each range is encoded here with the static ffmpeg.
+# Blender writes each segment's MP4 itself (`render_usd.py`, "direct video"):
+# the base image is built with its encoder and asserts it at build time. A
+# static ffmpeg used to sit here to encode PNG sequences, for a Blender without
+# one; no job has taken that road on this image, and it cost the image two
+# large binaries. A process that left frames and no film is now said aloud.
 #
-# Each segment leaves for R2 the moment it exists, rather than waiting for the
-# concat. Waiting is how a reclaimed pod loses everything it had already made:
-# the last 60-second job died at its own pace with 1440 frames rendered and
-# nothing deposited. A segment that is already on R2 is a segment nobody has to
-# render again.
+# Each segment leaves for the bucket the moment it exists, rather than waiting
+# for the concat. Waiting is how a reclaimed pod loses everything it had
+# already made: the last 60-second job died at its own pace with 1440 frames
+# rendered and nothing deposited. A segment that is already up is a segment
+# nobody has to render again.
 for i in $(seq 0 $((jobs - 1))); do
     if [ ! -s "$outdir/seg$i.mp4" ] && ls "$outdir/s$i".*.png > /dev/null 2>&1; then
-        a=$((first + i * span))
-        ffmpeg -y -framerate "$JOB_FPS" -start_number "$a" \
-            -i "$outdir/s$i.%d.png" -c:v libx264 -pix_fmt yuv420p -crf 18 \
-            "$outdir/seg$i.mp4" > /dev/null 2>&1 && rm -f "$outdir/s$i".*.png
+        echo "NO-ENCODER j$i: frames rendered as PNG and no video — this Blender has no built-in encoder"
     fi
     g=$((seg_base + i))
-    eval "url=\${JOB_SEG_PUT_URL_$g:-}"
-    if [ -n "$url" ] && [ -s "$outdir/seg$i.mp4" ]; then
-        if curl -fsS -T "$outdir/seg$i.mp4" "$url" > /dev/null; then
+    if [ -n "$JOB_RUN_PREFIX" ] && [ -s "$outdir/seg$i.mp4" ]; then
+        if "$FARM" put "$outdir/seg$i.mp4" "$(run_key "seg$g.mp4")"; then
             echo "SEG-UP $g ($(du -h "$outdir/seg$i.mp4" | cut -f1))"
         else
             echo "SEG-UP-FAILED $g"
@@ -818,55 +825,58 @@ done
 if [ -n "$missing" ]; then
     echo "SEGMENTS-MISSING:$missing"
 fi
-# With several tasks, this one is done.
+# The film.
 #
-# No task holds every segment, so concatenating here would produce N films of
-# one Nth each and upload them over one another at JOB_UPLOAD_PUT_URL. The
-# assembly moves to the launcher, which reads them back from R2
-# (`launch_job.py --assemble <run-id>`) — and can do it long after every task
-# has exited, which is the point: nobody has to be watching at the end.
-if [ "$task_count" -gt 1 ]; then
-    if [ "$n" = "$jobs" ]; then
-        echo "TASK-DONE $task_index/$task_count ($n segments, frames $first:$last)"
-        exit 0
-    fi
+# With a run prefix, every task — one or many — leaves a receipt naming its
+# frames and its segments, then asks for the film. The task that finds every
+# receipt assembles it from the bucket: segments read back in parallel,
+# concatenated in frame order, the frame count checked against the receipts,
+# the film uploaded multipart. The others say TASK-DONE and leave. The launcher
+# used to do this once every task had exited, which meant somebody had to be
+# watching at the end — and a launcher that returned early made no film.
+#
+# Without a prefix nothing leaves the machine, and a lone task concatenates
+# locally into JOB_OUT as it always did.
+if [ "$n" != "$jobs" ]; then
     echo "TASK-INCOMPLETE $task_index/$task_count ($n/$jobs segments)"
+    echo VIDEO-MISSING
     exit 1
 fi
-
-if [ "$n" = "$jobs" ]; then
-    for i in $(seq 0 $((jobs - 1))); do echo "file '$outdir/seg$i.mp4'"; done > "$outdir/list.txt"
-    ffmpeg -y -f concat -safe 0 -i "$outdir/list.txt" -c copy "$JOB_OUT" 2>&1 | tail -3
-    # And the result must carry every frame that was asked for. A concat that
-    # silently drops a segment produces a shorter film, not an error.
-    got=$(ffprobe -v error -count_frames -select_streams v:0 \
-              -show_entries stream=nb_read_frames -of csv=p=0 "$JOB_OUT" 2>/dev/null)
-    if [ -n "$got" ] && [ "$got" != "$total" ]; then
-        echo "FRAME-COUNT-MISMATCH: $got frames dans la vidéo, $total demandées"
-    else
-        echo "frames: ${got:-inconnu}/$total"
+if [ -n "$JOB_RUN_PREFIX" ]; then
+    segs=$(seq -s, "$seg_base" $((seg_base + jobs - 1)))
+    "$FARM" receipt "$JOB_RUN_PREFIX" "$task_index" "$first" "$last" "$segs" \
+        || { echo RECEIPT-FAILED; exit 1; }
+    verdict=$("$FARM" assemble "$JOB_RUN_PREFIX" "$task_count" "$outdir/assemble" "$JOB_FPS")
+    rc=$?
+    echo "$verdict"
+    [ "$rc" = 0 ] || exit 1
+    case "$verdict" in
+        FILM-UP*) echo RENDER-DONE ;;
+        *) echo "TASK-DONE $task_index/$task_count ($n segments, frames $first:$last)"
+           exit 0 ;;
+    esac
+elif [ "$task_count" -gt 1 ]; then
+    echo "TASK-DONE $task_index/$task_count — no JOB_RUN_PREFIX, so no film: the segments never left"
+    exit 1
+else
+    # Joined in Rust — samples copied, nothing decoded — and counted from the
+    # film written, because a concat that silently drops a segment produces a
+    # shorter film, not an error.
+    verdict=$("$FARM" concat "$JOB_OUT" $(for i in $(seq 0 $((jobs - 1))); do echo "$outdir/seg$i.mp4"; done))
+    echo "$verdict"
+    got=$(echo "$verdict" | awk '$1 == "FILM" {print $3}')
+    if [ "$got" != "$total" ]; then
+        echo "FRAME-COUNT-MISMATCH: ${got:-?} frames dans la vidéo, $total demandées"
+        exit 1
     fi
-fi
-if [ -s "$JOB_OUT" ]; then
+    echo "frames: $got/$total"
     ls -la "$JOB_OUT"
-    if [ -n "${JOB_UPLOAD_PUT_URL:-}" ]; then
-        # Presigned PUT: the pod ships its own result home and no credential
-        # ever reaches it.
-        if curl -fsS -T "$JOB_OUT" "$JOB_UPLOAD_PUT_URL" > /dev/null; then
-            echo UPLOAD-DONE
-        else
-            echo UPLOAD-FAILED
-        fi
-    fi
     echo RENDER-DONE
-    # Two hours sat here, from when the only way to get anything off a pod was
+fi
+# Two hours sat here, from when the only way to get anything off a pod was
     # to be there while it lived. Everything now leaves through the archive, so
     # this is a courtesy window for an ssh session, not a lifeline — and it is
     # only opened when someone asked for ssh. Cloud Run bills the GPU by the
     # second, so an unconditional minute of sleep is a minute of L4 bought to
     # watch a finished job do nothing.
-    [ -n "${JOB_SSH_PUBKEY:-}" ] && sleep "${JOB_DONE_SLEEP:-60}" || true
-else
-    echo VIDEO-MISSING
-    exit 1
-fi
+[ -n "${JOB_SSH_PUBKEY:-}" ] && sleep "${JOB_DONE_SLEEP:-60}" || true
