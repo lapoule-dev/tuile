@@ -1,0 +1,58 @@
+[package]
+name = "tuile-farm"
+description = "A render farm's object storage: parallel ranged reads, multipart writes, film assembly"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tuile-farm"
+path = "src/main.rs"
+
+[[bin]]
+name = "launch-job"
+path = "src/bin/launch-job.rs"
+
+[dependencies]
+# One client for every byte a job moves, and one we did not write.
+#
+# `aws` is the S3 protocol, which every bucket the farm talks to speaks; `fs`
+# is the same interface on a directory, for tests and for the workstation. The
+# `aws` feature brings rustls on aws-lc-rs, which is the provider the rest of
+# the workspace already resolves to — one crypto provider in the process, so
+# rustls never has to guess.
+object_store = { version = "0.14.2", default-features = false, features = ["aws", "fs"] }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "process", "time", "sync"] }
+# The job service's API and the OAuth token exchange. Same client and same
+# rustls provider (aws-lc-rs) as the rest of the workspace.
+reqwest = { workspace = true }
+url = { workspace = true }
+# A service account key signs its own token request: RS256 on aws-lc-rs, the
+# provider already in the tree — no second crypto stack.
+jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+# The launchers: their command lines (the same verbs and shared flags for
+# every product), the pack key's hash, a run's timestamp and random suffix, a
+# small stage embedded gzip+base64.
+clap = { version = "4.6", features = ["derive"] }
+sha2 = "0.11"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rand = "0.9"
+flate2 = { workspace = true }
+base64 = "0.22"
+# The film is put together in Rust: samples copied from each segment into one
+# container, nothing decoded, no ffmpeg in the loop.
+mp4 = "0.14.0"
+# For `assert_run_store_contract`, which is public so the bucket test can run
+# the same contract as the unit tests.
+tempfile = { workspace = true }
