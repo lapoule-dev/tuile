@@ -255,7 +255,8 @@ COPY --from=plugin /opt/plugins/tuileHydra /opt/plugins/tuileHydra
 RUN test -f /opt/blender/${BLENDER_SERIES}/scripts/addons_core/hydra_cycles/__init__.py \
     && echo "blender-globe verified: upstream hydra_cycles add-on is installed"
 COPY integrations/blender/render_usd.py /opt/render/render_usd.py
-COPY integrations/blender/render_job.sh /opt/render/render_job.sh
+# The render job is `tuile-farm render` (crates/tuile-farm/src/job): the
+# shell script it replaces is not in this image.
 # L'autre moitié de la paire. Une seule image porte les deux jobs : le binaire
 # qui cuit et celui qui lit sont alors le même digest, donc un pack et le rendu
 # qui le consomme ne peuvent pas venir de deux versions du code.
@@ -276,7 +277,10 @@ RUN d=$(mktemp -d) && echo farm > "$d/in" \
     && TUILE_STORE_DIR="$d/s" /opt/tuile/bin/tuile-farm put "$d/in" a/b \
     && TUILE_STORE_DIR="$d/s" /opt/tuile/bin/tuile-farm get a/b "$d/out" \
     && cmp "$d/in" "$d/out" && rm -rf "$d" \
-    && echo "blender-globe verified: tuile-farm round-trips"
+    && echo "blender-globe verified: tuile-farm round-trips" \
+    && { out=$(/opt/tuile/bin/tuile-farm render 2>&1); test $? -eq 2; } \
+    && echo "$out" | grep -q "JOB-CONFIG-INVALID JOB_FRAMES is required" \
+    && echo "blender-globe verified: tuile-farm render is the job, and refuses an empty environment"
 
 ENV PATH=/opt/blender:$PATH \
     LD_LIBRARY_PATH=/opt/blender/lib \
@@ -347,4 +351,4 @@ print('tuileHydra loaded')" \
 # is the diagnosis anyway.
 RUN blender -b --factory-startup --python-exit-code 1 --python-expr         "import bpy; sc = bpy.context.scene; bpy.ops.preferences.addon_enable(module='cycles'); bpy.ops.preferences.addon_enable(module='hydra_cycles'); sc.render.engine = 'HYDRA_CYCLES'; assert sc.render.engine == 'HYDRA_CYCLES'"     && echo "blender-globe verified: HYDRA_CYCLES is settable"
 
-CMD ["bash", "/opt/render/render_job.sh"]
+CMD ["/opt/tuile/bin/tuile-farm", "render"]
