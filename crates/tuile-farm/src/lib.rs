@@ -43,6 +43,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub mod assemble;
 pub mod concat;
+pub mod job;
 pub mod jobs;
 pub mod launch;
 
