@@ -11,6 +11,7 @@
 //! tuile-farm receipt <run> <task> <first> <last> <seg>[,<seg>…]
 //! tuile-farm assemble <run> <task-count> <workdir> [fps]
 //! tuile-farm concat <out> <segment>…           join locally, print the frames
+//! tuile-farm render                            the render job itself (`job`)
 //! ```
 //!
 //! The store comes from the environment: `TUILE_STORE_DIR` for a directory,
@@ -36,7 +37,7 @@ use tuile_farm::{ObjectRunStore, RunStore};
 
 const USAGE: &str = "usage: tuile-farm get <key> <dest> | put <src> <key> | exists <key> | \
 list <prefix> | receipt <run> <task> <first> <last> <seg,…> | assemble <run> <task-count> <workdir> [fps] | \
-concat <out> <segment>…";
+concat <out> <segment>… | render";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -52,6 +53,10 @@ fn main() -> ExitCode {
 
 async fn run(args: &[String]) -> ExitCode {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    // The render job: everything it needs is in its environment.
+    if a.as_slice() == ["render"] {
+        return ExitCode::from(tuile_farm::job::main(&|k| std::env::var(k).ok()).await);
+    }
     // The one command that touches no store, so it needs no credentials.
     if let ["concat", out, segments @ ..] = a.as_slice() {
         if segments.is_empty() {
@@ -127,10 +132,7 @@ async fn run(args: &[String]) -> ExitCode {
 
 /// Which render of the run this process belongs to.
 fn render_id() -> String {
-    ["TUILE_RENDER_ID", "CLOUD_RUN_EXECUTION"]
-        .iter()
-        .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
-        .unwrap_or_else(|| "local".into())
+    tuile_farm::job::render_id(&|k| std::env::var(k).ok())
 }
 
 async fn receipt(
