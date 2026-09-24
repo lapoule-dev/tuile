@@ -19,6 +19,21 @@ seule façon de retrouver leur tracé est de rejouer les caméras du pack avec
 `tuile-bake --tape-from`. Les générateurs évoluent, donc recuire la même
 chaîne d'arguments ne donne plus le même vol.
 
+## `pyrenees-2min-nadir-50km-tilestore-sse6.mp4`
+
+Le même plan à **SSE 6** au lieu de 3, cuit à travers le store (projections,
+pool de finition).
+
+- pack `packs/24cd8199f4c13cfa/1-2880.tuilepack` (bucket `stl-track-data`),
+  scène `ef5dd4813ae33cbb`, **888 Mo** (1,73 Go à SSE 3)
+- cuisson `tuile-bake-9s6b9` : **2 min 44 s** (3 min 02 s à SSE 3)
+- rendu `tuile-render-nqpb5` : 3 × L4, **9 min 52 s** (10 min 32 s à SSE 3) ;
+  2880 frames, 1920×1440, 624 Mo
+
+À l'œil : un peu plus doux, et plus de tuiles d'imagerie grossières restent à
+l'écran — donc plus de pavés de couleur (un bloc vert franc à 60 s, absent à
+SSE 3). Le pack est deux fois plus léger, le rendu gagne 40 s.
+
 ## `pyrenees-2min-nadir-50km-tilestore-projection-v4.mp4`
 
 Cinquième passe : tuiles finies sur un pool d'un thread par cœur, et zone
