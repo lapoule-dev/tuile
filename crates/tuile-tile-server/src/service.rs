@@ -8,18 +8,40 @@
 //! authentication, and asks this for bytes. A tile is served from the store
 //! when present; otherwise it is fetched from the layer's upstream **once**,
 //! however many requests ask for it at the same moment, stored, and served.
+//!
+//! In front of the store, the tiles served last are kept in memory, with their
+//! validator already computed: a map a thousand people look at asks for the
+//! same few hundred tiles, and those must not cost a lookup each. A source's
+//! "no such tile" is remembered too — in memory and in the layer's absence
+//! sibling in the store — so a hole over the sea is asked of the source once,
+//! not on every request.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use serde::Serialize;
 
+use crate::catalog::{ABSENT_MARKER, ABSENT_SUFFIX};
 use crate::grid::Grid;
+use crate::lru::Lru;
 use crate::store::TileStore;
 use crate::upstream::Upstream;
 use crate::StoreError;
+
+const MIB: u64 = 1 << 20;
+
+/// Default for [`ServiceConfig::hot_bytes`].
+pub const DEFAULT_HOT_BYTES: u64 = 256 * MIB;
+/// Default for [`ServiceConfig::hot_ttl`]: a tile changes only when its
+/// source is asked again, which a store hit never does; this only bounds how
+/// long another instance's newer copy stays unseen.
+pub const DEFAULT_HOT_TTL: Duration = Duration::from_secs(10 * 60);
+/// What an absence weighs in the hot budget: its key and bookkeeping.
+const ABSENCE_WEIGHT: u64 = 64;
 
 /// A failure while serving a tile.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -44,6 +66,28 @@ impl From<StoreError> for ServiceError {
     }
 }
 
+/// Where a served tile came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Source {
+    /// The hot tiles kept in memory.
+    Memory,
+    /// The store: its buffer, a local copy, or the bucket.
+    Store,
+    /// Fetched from the layer's source just now.
+    Upstream,
+}
+
+impl Source {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Source::Memory => "memory",
+            Source::Store => "store",
+            Source::Upstream => "upstream",
+        }
+    }
+}
+
 /// A tile, ready for an adapter to answer with.
 #[derive(Debug, Clone)]
 pub struct TileResponse {
@@ -52,8 +96,19 @@ pub struct TileResponse {
     /// A strong validator derived from the bytes: the same tile always has
     /// the same one, on every instance and across restarts.
     pub etag: String,
-    /// Served from the store rather than fetched just now.
+    /// Served without asking the source (memory or store).
     pub hit: bool,
+    pub source: Source,
+}
+
+impl TileResponse {
+    /// Whether an `If-None-Match` header value names this tile.
+    pub fn matches(&self, if_none_match: &str) -> bool {
+        if_none_match.split(',').any(|t| {
+            let t = t.trim();
+            t == "*" || t == self.etag || t.strip_prefix("W/") == Some(self.etag.as_str())
+        })
+    }
 }
 
 /// What a client needs to address a layer.
@@ -65,23 +120,88 @@ pub struct LayerMeta {
     pub content_type: String,
 }
 
+/// How much the service keeps in memory.
+#[derive(Debug, Clone)]
+pub struct ServiceConfig {
+    /// Bytes of hot tiles kept; `0` keeps none.
+    pub hot_bytes: u64,
+    /// How long a hot tile, or a remembered absence, is served without
+    /// asking the store again.
+    pub hot_ttl: Duration,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self { hot_bytes: DEFAULT_HOT_BYTES, hot_ttl: DEFAULT_HOT_TTL }
+    }
+}
+
+/// Where served tiles came from, since the service started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ServiceStats {
+    pub memory: u64,
+    pub store: u64,
+    pub upstream: u64,
+    /// Answered "no such tile" without asking the source.
+    pub absent: u64,
+}
+
+#[derive(Default)]
+struct Counters {
+    memory: AtomicU64,
+    store: AtomicU64,
+    upstream: AtomicU64,
+    absent: AtomicU64,
+}
+
 type Key = (String, u8, u32, u32);
 type Flight = Shared<BoxFuture<'static, Result<Option<Bytes>, ServiceError>>>;
+
+/// A hot entry: a tile with its validator, or a remembered absence.
+#[derive(Clone)]
+struct Hot {
+    tile: Option<(Bytes, String)>,
+    at: Instant,
+}
 
 /// The store plus an upstream per layer.
 pub struct TileService {
     store: Arc<TileStore>,
     upstreams: HashMap<String, Arc<dyn Upstream>>,
     inflight: Arc<Mutex<HashMap<Key, Flight>>>,
+    cfg: ServiceConfig,
+    hot: Mutex<Lru<Key, Hot>>,
+    counters: Counters,
 }
 
 impl TileService {
     pub fn new(store: Arc<TileStore>, upstreams: HashMap<String, Arc<dyn Upstream>>) -> Self {
-        Self { store, upstreams, inflight: Arc::default() }
+        Self::with_config(store, upstreams, ServiceConfig::default())
+    }
+
+    pub fn with_config(store: Arc<TileStore>, upstreams: HashMap<String, Arc<dyn Upstream>>, cfg: ServiceConfig) -> Self {
+        Self {
+            store,
+            upstreams,
+            inflight: Arc::default(),
+            hot: Mutex::new(Lru::new(cfg.hot_bytes)),
+            cfg,
+            counters: Counters::default(),
+        }
     }
 
     pub fn store(&self) -> &Arc<TileStore> {
         &self.store
+    }
+
+    pub fn stats(&self) -> ServiceStats {
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        ServiceStats {
+            memory: g(&self.counters.memory),
+            store: g(&self.counters.store),
+            upstream: g(&self.counters.upstream),
+            absent: g(&self.counters.absent),
+        }
     }
 
     pub fn meta(&self, layer: &str) -> Result<LayerMeta, ServiceError> {
@@ -98,11 +218,83 @@ impl TileService {
     pub async fn tile(&self, layer: &str, level: u8, x: u32, y: u32) -> Result<Option<TileResponse>, ServiceError> {
         let l = self.store.layer(layer)?;
         let content_type = l.content_type.clone();
-        if let Some(bytes) = self.store.get(layer, level, x, y).await? {
-            return Ok(Some(respond(bytes, content_type, true)));
+        l.grid.check(level, x, y).map_err(|e| ServiceError::OutOfGrid(e.to_string()))?;
+        let key: Key = (layer.to_string(), level, x, y);
+
+        if let Some(hot) = self.hot_get(&key) {
+            return Ok(match hot {
+                Some((bytes, etag)) => {
+                    self.counters.memory.fetch_add(1, Ordering::Relaxed);
+                    Some(TileResponse { bytes, content_type, etag, hit: true, source: Source::Memory })
+                }
+                None => {
+                    self.counters.absent.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+            });
         }
+
+        // The tile and its absence are looked up together: on a miss, the
+        // second lookup costs no extra wait.
+        let absence = format!("{layer}{ABSENT_SUFFIX}");
+        let (stored, absent) = if self.store.layer(&absence).is_ok() {
+            let (t, a) = futures_util::join!(self.store.get(layer, level, x, y), self.store.get(&absence, level, x, y));
+            // A failed absence lookup is only a lost shortcut.
+            (t?, a.ok().flatten().is_some())
+        } else {
+            (self.store.get(layer, level, x, y).await?, false)
+        };
+        if let Some(bytes) = stored {
+            self.counters.store.fetch_add(1, Ordering::Relaxed);
+            let etag = etag_of(&bytes);
+            self.hot_put(key, Some((bytes.clone(), etag.clone())));
+            return Ok(Some(TileResponse { bytes, content_type, etag, hit: true, source: Source::Store }));
+        }
+        if absent {
+            self.counters.absent.fetch_add(1, Ordering::Relaxed);
+            self.hot_put(key, None);
+            return Ok(None);
+        }
+
         let fetched = self.fetch_once(layer, level, x, y).await?;
-        Ok(fetched.map(|b| respond(b, content_type, false)))
+        self.counters.upstream.fetch_add(1, Ordering::Relaxed);
+        match fetched {
+            Some(bytes) => {
+                let etag = etag_of(&bytes);
+                self.hot_put(key, Some((bytes.clone(), etag.clone())));
+                Ok(Some(TileResponse { bytes, content_type, etag, hit: false, source: Source::Upstream }))
+            }
+            None => {
+                self.hot_put(key, None);
+                Ok(None)
+            }
+        }
+    }
+
+    /// `Some(entry)` when a fresh hot entry exists; the entry itself is
+    /// `None` for a remembered absence.
+    #[allow(clippy::option_option)]
+    fn hot_get(&self, key: &Key) -> Option<Option<(Bytes, String)>> {
+        if self.cfg.hot_bytes == 0 {
+            return None;
+        }
+        let mut hot = self.hot.lock().ok()?;
+        let entry = hot.get(key)?;
+        if entry.at.elapsed() >= self.cfg.hot_ttl {
+            hot.remove(key);
+            return None;
+        }
+        Some(entry.tile)
+    }
+
+    fn hot_put(&self, key: Key, tile: Option<(Bytes, String)>) {
+        if self.cfg.hot_bytes == 0 {
+            return;
+        }
+        let weight = tile.as_ref().map_or(ABSENCE_WEIGHT, |(b, _)| b.len() as u64 + ABSENCE_WEIGHT);
+        if let Ok(mut hot) = self.hot.lock() {
+            hot.insert(key, Hot { tile, at: Instant::now() }, weight);
+        }
     }
 
     fn fetch_once(&self, layer: &str, level: u8, x: u32, y: u32) -> Flight {
@@ -123,8 +315,16 @@ impl TileService {
                 let upstream = upstream.ok_or_else(|| ServiceError::UnknownLayer(k.0.clone()))?;
                 metrics::counter!("tuile_tiles_upstream_total", "layer" => k.0.clone()).increment(1);
                 let got = upstream.fetch(k.1, k.2, k.3).await.map_err(|e| ServiceError::Upstream(e.0))?;
-                if let Some(bytes) = &got {
-                    store.put(&k.0, k.1, k.2, k.3, bytes.clone()).await?;
+                match &got {
+                    Some(bytes) => store.put(&k.0, k.1, k.2, k.3, bytes.clone()).await?,
+                    None => {
+                        // The source's own "no such tile" is data: remembered
+                        // in the absence sibling when the layer has one.
+                        let absence = format!("{}{ABSENT_SUFFIX}", k.0);
+                        if store.layer(&absence).is_ok() {
+                            store.put(&absence, k.1, k.2, k.3, Bytes::from_static(ABSENT_MARKER)).await?;
+                        }
+                    }
                 }
                 Ok(got)
             }
@@ -141,9 +341,9 @@ impl TileService {
     }
 }
 
-fn respond(bytes: Bytes, content_type: String, hit: bool) -> TileResponse {
-    let etag = format!("\"{:016x}\"", fnv1a(&bytes));
-    TileResponse { bytes, content_type, etag, hit }
+/// The strong validator of a tile's bytes.
+pub fn etag_of(bytes: &[u8]) -> String {
+    format!("\"{:016x}\"", fnv1a(bytes))
 }
 
 /// FNV-1a, 64 bits: stable across builds, unlike the standard hasher.

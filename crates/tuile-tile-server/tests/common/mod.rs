@@ -103,6 +103,7 @@ pub fn eager() -> StoreConfig {
         max_buffered_bytes: usize::MAX,
         flush_age: Duration::MAX,
         manifest_ttl: Duration::ZERO,
+        manifest_max_stale: Duration::ZERO,
         // Many writers on one zone in the tests: let them all get through.
         publish_attempts: 1000,
         ..StoreConfig::default()
@@ -135,6 +136,93 @@ pub async fn archives(objects: &dyn ObjectStore, prefix: &str) -> Vec<String> {
         listed.into_iter().map(|m| m.location.to_string()).filter(|k| k.ends_with(".pmtiles")).collect();
     keys.sort();
     keys
+}
+
+/// An object store that counts the reads made of it: every `get` (whole or
+/// ranged), and the ones of manifests among them.
+#[derive(Debug)]
+pub struct Counting {
+    pub inner: Arc<dyn ObjectStore>,
+    pub gets: AtomicU64,
+    pub manifest_gets: AtomicU64,
+}
+
+impl Counting {
+    pub fn over(inner: Arc<dyn ObjectStore>) -> Arc<Self> {
+        Arc::new(Self { inner, gets: AtomicU64::new(0), manifest_gets: AtomicU64::new(0) })
+    }
+    pub fn gets(&self) -> u64 {
+        self.gets.load(Ordering::SeqCst)
+    }
+    pub fn manifest_gets(&self) -> u64 {
+        self.manifest_gets.load(Ordering::SeqCst)
+    }
+}
+
+impl std::fmt::Display for Counting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Counting({})", self.inner)
+    }
+}
+
+type OsPath = object_store::path::Path;
+type OsStream<T> = futures_util::stream::BoxStream<'static, object_store::Result<T>>;
+
+#[async_trait::async_trait]
+impl ObjectStore for Counting {
+    async fn put_opts(
+        &self,
+        location: &OsPath,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &OsPath,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &OsPath,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        if location.as_ref().ends_with("manifest.json") {
+            self.manifest_gets.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(&self, location: &OsPath, ranges: &[std::ops::Range<u64>]) -> object_store::Result<Vec<Bytes>> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(&self, locations: OsStream<OsPath>) -> OsStream<OsPath> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&OsPath>) -> OsStream<object_store::ObjectMeta> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(&self, prefix: Option<&OsPath>, offset: &OsPath) -> OsStream<object_store::ObjectMeta> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&OsPath>) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &OsPath, to: &OsPath, options: object_store::CopyOptions) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
 }
 
 /// The catalog the test layers come from.
