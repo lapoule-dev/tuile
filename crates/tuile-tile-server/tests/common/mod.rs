@@ -100,6 +100,7 @@ impl TestClock {
 pub fn eager() -> StoreConfig {
     StoreConfig {
         flush_bytes: usize::MAX,
+        max_buffered_bytes: usize::MAX,
         flush_age: Duration::MAX,
         manifest_ttl: Duration::ZERO,
         // Many writers on one zone in the tests: let them all get through.

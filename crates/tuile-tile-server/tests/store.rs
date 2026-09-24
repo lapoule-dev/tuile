@@ -71,6 +71,23 @@ async fn a_full_buffer_freezes_into_a_delta_by_itself() {
 }
 
 #[tokio::test]
+async fn many_small_zones_past_the_global_cap_flush_the_largest() {
+    let clock = TestClock::new();
+    let objects = memory();
+    let mut cfg = eager();
+    cfg.max_buffered_bytes = 2048;
+    let s = store_on(objects.clone(), &clock, cfg);
+    // One tile per zone, across a row of zones: no zone ever fills up.
+    let mut zone_x = ZONE_X;
+    while archives(objects.as_ref(), IMAGERY).await.is_empty() {
+        let x = zone_x * ZONE_SIDE;
+        s.put(IMAGERY, LEVEL, x, Y0, body(LEVEL, x, Y0, 1)).await.expect("put");
+        zone_x += 1;
+        assert!(zone_x < ZONE_X + 200, "the global cap never flushed anything");
+    }
+}
+
+#[tokio::test]
 async fn an_old_buffer_is_flushed_by_flush_due() {
     let clock = TestClock::new();
     let objects = memory();

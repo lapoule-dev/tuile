@@ -56,6 +56,9 @@ const MIB: usize = 1 << 20;
 /// A zone's buffer at this size is frozen: large enough that deltas are few,
 /// small enough that a crash loses little and memory stays modest.
 pub const DEFAULT_FLUSH_BYTES: usize = 32 * MIB;
+/// All buffers together never hold more than this: past it, the largest zone
+/// is frozen. A bake touches many zones, none of which may fill up on its own.
+pub const DEFAULT_MAX_BUFFERED_BYTES: usize = 256 * MIB;
 /// A buffer this old is frozen even if small, so a quiet zone is not left in
 /// memory only.
 pub const DEFAULT_FLUSH_AGE: Duration = Duration::from_secs(30);
@@ -97,6 +100,8 @@ const BACKOFF_MAX_DOUBLINGS: usize = 6;
 pub struct StoreConfig {
     /// A zone's buffer is frozen once it holds this many bytes.
     pub flush_bytes: usize,
+    /// …and the largest one once all of them together hold this many.
+    pub max_buffered_bytes: usize,
     /// …or once its oldest tile is this old (see [`TileStore::flush_due`]).
     pub flush_age: Duration,
     /// How long a manifest read is trusted. This bounds how late one instance
@@ -119,6 +124,7 @@ impl Default for StoreConfig {
     fn default() -> Self {
         Self {
             flush_bytes: DEFAULT_FLUSH_BYTES,
+            max_buffered_bytes: DEFAULT_MAX_BUFFERED_BYTES,
             flush_age: DEFAULT_FLUSH_AGE,
             manifest_ttl: DEFAULT_MANIFEST_TTL,
             tiering: Tiering {
@@ -364,7 +370,7 @@ impl TileStore {
     pub async fn put(&self, layer: &str, level: u8, x: u32, y: u32, bytes: Bytes) -> Result<(), StoreError> {
         let (l, zone, id) = self.locate(layer, level, x, y)?;
         let key = (l.name.clone(), zone);
-        let full = {
+        let to_flush = {
             let mut buffers = self.buffers.lock().map_err(|_| StoreError::Poisoned)?;
             let b = buffers.entry(key.clone()).or_default();
             b.bytes += bytes.len();
@@ -372,10 +378,16 @@ impl TileStore {
                 b.bytes -= old.len();
             }
             b.since.get_or_insert_with(Instant::now);
-            b.bytes >= self.cfg.flush_bytes
+            if b.bytes >= self.cfg.flush_bytes {
+                Some(key.clone())
+            } else if buffers.values().map(|b| b.bytes).sum::<usize>() >= self.cfg.max_buffered_bytes {
+                buffers.iter().max_by_key(|(_, b)| b.bytes).map(|(k, _)| k.clone())
+            } else {
+                None
+            }
         };
-        if full {
-            self.flush_zone(&key).await?;
+        if let Some(zone) = to_flush {
+            self.flush_zone(&zone).await?;
         }
         Ok(())
     }
