@@ -19,6 +19,22 @@ seule façon de retrouver leur tracé est de rejouer les caméras du pack avec
 `tuile-bake --tape-from`. Les générateurs évoluent, donc recuire la même
 chaîne d'arguments ne donne plus le même vol.
 
+## `pyrenees-2min-nadir-50km-tilestore-projection-v3.mp4`
+
+Quatrième passe : les zones de cellule atteintes projetées entières.
+
+- pack W4 : `tile-store-test/W4/1-2880.tuilepack`, scène `90baed1a239165d4`,
+  4 251 tuiles ; cuisson `tuile-bake-pgjkq`, rendu 3 × L4, 2880 frames, 663 Mo
+- **5 min 30 s** au total ; cuisson 234 s (frame 1 105 s, les autres 128 s) ;
+  projection 7,6 s, 377 Mo en 320 requêtes
+- lectures : 18 756 dans les projections, 21 842 replis — inchangés, ce qui a
+  désigné `top` : la cuisson épingle une pyramide grossière du globe entier
+  (niveaux 0 à 5), que le filtre par distance coupait. Corrigé ensuite
+  (`top` gardée entière, commit `9a7404e`)
+- image `blender-globe:5.1-su` (commit `9a8ea20`)
+
+Toujours transparent : 4 127 tuiles communes avec B0, identiques.
+
 ## `pyrenees-2min-nadir-50km-tilestore-projection-v2.mp4`
 
 Troisième passe à travers le store : une requête par archive, imagerie
