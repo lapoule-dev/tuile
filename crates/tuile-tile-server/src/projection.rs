@@ -6,11 +6,14 @@
 //! A bake reads the same ground hundreds of times, frame after frame. Reading
 //! it from the bucket costs several round trips per tile; reading it from a
 //! local file costs nothing. So before the first frame, every remote zone the
-//! scene can see is **projected**: its directories are read, the entries the
-//! scene can use are kept, their bytes are fetched by coalesced ranges (tiles
-//! are in Hilbert order, so neighbours on the ground are neighbours in the
-//! file), and one local PMTiles archive per zone is written. The `top` zone —
-//! the coarse tiles every flight shares — is filtered like any other.
+//! scene can see is **projected**: each of the zone's archives is fetched in
+//! **one request**, the tiles the scene can use are kept, and one local
+//! PMTiles archive per zone is written. The `top` zone — the coarse tiles
+//! every flight shares — is filtered like any other.
+//!
+//! One whole-object request per archive rather than coalesced byte ranges: a
+//! zone is a few megabytes, and the latency of each request is what a
+//! projection pays for, not the bytes.
 //!
 //! # Which tiles a scene can use
 //!
@@ -22,23 +25,20 @@
 //! the projection left out is not an error: the store falls back to the
 //! bucket, then the source, and counts it, which is how the factor is tuned.
 
-use std::collections::{BTreeMap, HashMap};
-use std::ops::Range;
+use std::collections::BTreeMap;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
-use object_store::path::Path;
-use object_store::ObjectStore;
 use pmtiles::TileCoord;
 
 use crate::archive;
 use crate::grid::Grid;
 use crate::layer::{Layer, Zone};
 use crate::manifest;
-use crate::store::TileStore;
+use crate::store::{download, TileStore};
 use crate::StoreError;
 
 /// Mean Earth radius, for great-circle distances and the horizon.
@@ -54,10 +54,6 @@ pub const HIGHEST_GROUND_M: f64 = 4_800.0;
 pub const DEFAULT_TILE_FACTOR: f64 = 12.0;
 /// Camera positions closer than this to one already kept add nothing.
 const EYE_SPACING_M: f64 = 500.0;
-/// Two tile ranges this close are fetched as one request.
-const COALESCE_GAP: u64 = 64 * 1024;
-/// …as long as the request stays under this size.
-const MAX_RANGE: u64 = 16 * 1024 * 1024;
 /// Zones projected at once.
 const ZONES_IN_FLIGHT: usize = 16;
 
@@ -75,6 +71,11 @@ pub struct Footprint {
     eyes: Vec<Eye>,
     /// A tile is kept within this many of its widths from an eye.
     pub tile_factor: f64,
+    /// A different factor for some layers (by name; a layer's absence
+    /// sibling follows its layer). Imagery needs more than terrain: a drape
+    /// composes imagery tiles several levels finer than the terrain tile it
+    /// covers, so at a given distance the imagery in use is much smaller.
+    layer_factors: Vec<(String, f64)>,
 }
 
 /// A tile's extent in degrees: west, south, east, north.
@@ -116,19 +117,36 @@ impl Footprint {
                 kept.push(e);
             }
         }
-        Self { eyes: kept, tile_factor }
+        Self { eyes: kept, tile_factor, layer_factors: Vec::new() }
+    }
+
+    /// Uses `factor` for the layer `name` (and its absence sibling).
+    pub fn with_layer_factor(mut self, name: impl Into<String>, factor: f64) -> Self {
+        self.layer_factors.push((name.into(), factor));
+        self
+    }
+
+    /// The factor a layer is filtered with.
+    pub fn factor_for(&self, layer: &str) -> f64 {
+        let base = layer.strip_suffix(crate::catalog::ABSENT_SUFFIX).unwrap_or(layer);
+        self.layer_factors.iter().find(|(n, _)| n == base).map_or(self.tile_factor, |(_, f)| *f)
     }
 
     pub fn eyes(&self) -> &[Eye] {
         &self.eyes
     }
 
-    /// Whether some eye can use this tile.
+    /// Whether some eye can use this tile, at the default factor.
     pub fn keeps(&self, grid: Grid, level: u8, x: u32, y: u32) -> bool {
+        self.keeps_with(self.tile_factor, grid, level, x, y)
+    }
+
+    /// Whether some eye can use this tile, within `factor` of its widths.
+    pub fn keeps_with(&self, factor: f64, grid: Grid, level: u8, x: u32, y: u32) -> bool {
         let [w, s, e, n] = bounds(grid, level, x, y);
         let mid_lat = ((s + n) / 2.0).to_radians();
         let width = ((e - w) * M_PER_DEG * mid_lat.cos()).max((n - s) * M_PER_DEG);
-        let reach = self.tile_factor * width;
+        let reach = factor * width;
         self.eyes.iter().any(|eye| {
             // Nearest point of the tile to the eye's ground position.
             let lon = eye.lon.clamp(w, e);
@@ -164,34 +182,10 @@ pub struct ProjectionReport {
     /// Tiles listed by the remote archives, and kept.
     pub tiles_listed: u64,
     pub tiles_kept: u64,
-    /// Bytes fetched, and range requests made.
+    /// Bytes fetched, and requests made: one per archive.
     pub bytes: u64,
     pub requests: u64,
     pub millis: u64,
-}
-
-/// A kept tile: which archive, where in it.
-#[derive(Clone, Copy)]
-struct Located {
-    archive: usize,
-    start: u64,
-    length: u64,
-}
-
-fn coalesce(mut spans: Vec<(u64, u64)>) -> Vec<Range<u64>> {
-    spans.sort_unstable();
-    spans.dedup();
-    let mut out: Vec<Range<u64>> = Vec::new();
-    for (start, length) in spans {
-        let end = start + length;
-        match out.last_mut() {
-            Some(last) if start <= last.end + COALESCE_GAP && end - last.start <= MAX_RANGE => {
-                last.end = last.end.max(end);
-            }
-            _ => out.push(start..end),
-        }
-    }
-    out
 }
 
 /// Where a zone's projection lives under `dir`.
@@ -242,60 +236,43 @@ impl TileStore {
         let m = manifest::read(self.object_store().as_ref(), &layer.zone_prefix(zone)).await?.manifest;
         let archives: Vec<_> = m.archives.iter().filter(|a| !layer.is_expired(&a.epoch, now)).cloned().collect();
 
-        // Newest first: the first archive to list a tile wins it.
-        let mut chosen: HashMap<u64, Located> = HashMap::new();
+        // Newest first: the first archive to hold a tile wins it. Each archive
+        // comes down in one request, then is read locally.
+        let factor = footprint.factor_for(&layer.name);
+        let scratch = tempfile::tempdir()?;
+        let mut tiles: BTreeMap<u64, Bytes> = BTreeMap::new();
         for (i, a) in archives.iter().enumerate().rev() {
-            let reader = match archive::open_remote(self.object_store().clone(), &a.key).await {
-                Ok(r) => Arc::new(r),
+            let local = scratch.path().join(format!("{i}.pmtiles"));
+            match download(self.object_store().as_ref(), &a.key, &local).await {
+                Ok(()) => {}
                 // Vanished under us (expired, compacted): nothing to project.
-                Err(_) => continue,
-            };
-            let data_offset = reader.get_header().data_offset();
+                Err(StoreError::ObjectStore(object_store::Error::NotFound { .. })) => continue,
+                Err(e) => return Err(e),
+            }
+            report.requests += 1;
+            report.bytes += std::fs::metadata(&local)?.len();
+            let reader = Arc::new(archive::open_local(&local).await?);
             let mut entries = reader.clone().entries();
             while let Some(entry) = entries.try_next().await? {
                 for tid in entry.iter_coords() {
                     let id = tid.value();
                     report.tiles_listed += 1;
-                    if chosen.contains_key(&id) {
+                    if tiles.contains_key(&id) {
                         continue;
                     }
                     let Some((level, x, y)) = layer.grid.from_archive(TileCoord::from(tid)) else { continue };
-                    if footprint.keeps(layer.grid, level, x, y) {
-                        chosen.insert(
-                            id,
-                            Located { archive: i, start: data_offset + entry.offset(), length: u64::from(entry.length()) },
-                        );
+                    if !footprint.keeps_with(factor, layer.grid, level, x, y) {
+                        continue;
+                    }
+                    if let Some(bytes) = reader.get_tile(tid).await? {
+                        tiles.insert(id, bytes);
                     }
                 }
             }
         }
-        if chosen.is_empty() {
+        if tiles.is_empty() {
             return Ok(report);
         }
-
-        // Fetch by coalesced ranges, archive by archive.
-        let mut fetched: HashMap<(usize, u64), Bytes> = HashMap::new();
-        let mut by_archive: BTreeMap<usize, Vec<(u64, u64)>> = BTreeMap::new();
-        for l in chosen.values() {
-            by_archive.entry(l.archive).or_default().push((l.start, l.length));
-        }
-        for (i, spans) in by_archive {
-            let ranges = coalesce(spans.clone());
-            let path = Path::from(archives[i].key.as_str());
-            let blobs = self.object_store().get_ranges(&path, &ranges).await?;
-            report.requests += ranges.len() as u64;
-            for (range, blob) in ranges.iter().zip(blobs) {
-                report.bytes += blob.len() as u64;
-                for &(start, length) in spans.iter().filter(|(s, _)| range.contains(s)) {
-                    let at = (start - range.start) as usize;
-                    fetched.insert((i, start), blob.slice(at..at + length as usize));
-                }
-            }
-        }
-        let tiles: BTreeMap<u64, Bytes> = chosen
-            .iter()
-            .filter_map(|(id, l)| fetched.get(&(l.archive, l.start)).map(|b| (*id, b.clone())))
-            .collect();
         report.tiles_kept = tiles.len() as u64;
         report.zones_projected = 1;
 
@@ -336,14 +313,6 @@ mod tests {
     }
 
     #[test]
-    fn nearby_ranges_are_fetched_together_and_far_ones_apart() {
-        let r = coalesce(vec![(0, 10), (10, 10), (100, 5), (10_000_000, 10)]);
-        assert_eq!(r, vec![0..105, 10_000_000..10_000_010]);
-        let far = coalesce(vec![(0, 10), (COALESCE_GAP + 11, 10)]);
-        assert_eq!(far.len(), 2);
-    }
-
-    #[test]
     fn fine_tiles_are_kept_only_near_the_eye() {
         // An eye 1 km above the Pyrenees near Luchon.
         let fp = Footprint::from_eyes([Eye { lon: 0.6, lat: 42.8, height: 5_800.0 }], DEFAULT_TILE_FACTOR);
@@ -360,6 +329,22 @@ mod tests {
         let (x, y) = tile(10, 1.6, 42.8);
         assert!(fp.keeps(Grid::WebMercator, 10, x, y), "a z10 tile 80 km away");
         assert!(fp.keeps(Grid::WebMercator, 0, 0, 0), "the whole world at z0");
+    }
+
+    #[test]
+    fn a_layer_can_have_its_own_factor_and_its_absences_follow_it() {
+        let fp = Footprint::from_eyes([Eye { lon: 0.6, lat: 42.8, height: 5_800.0 }], 12.0)
+            .with_layer_factor("imagery", 96.0);
+        assert_eq!(fp.factor_for("terrain"), 12.0);
+        assert_eq!(fp.factor_for("imagery"), 96.0);
+        assert_eq!(fp.factor_for("imagery.absent"), 96.0);
+        // A z17 tile ~20 km away: out at 12 widths (~2.4 km each), in at 96.
+        let n = f64::from(1u32 << 17);
+        let lat = 42.8f64.to_radians();
+        let x = ((0.85 + 180.0) / 360.0 * n) as u32;
+        let y = ((1.0 - (lat.tan() + 1.0 / lat.cos()).ln() / std::f64::consts::PI) / 2.0 * n) as u32;
+        assert!(!fp.keeps_with(fp.factor_for("terrain"), Grid::WebMercator, 17, x, y));
+        assert!(fp.keeps_with(fp.factor_for("imagery"), Grid::WebMercator, 17, x, y));
     }
 
     #[test]
