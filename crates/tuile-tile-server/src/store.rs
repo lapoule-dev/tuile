@@ -421,15 +421,25 @@ impl TileStore {
         let now = (self.clock)();
         let manifest = self.manifest(&key, l).await?;
         let live: Vec<&ArchiveRef> = manifest.archives.iter().rev().filter(|a| !l.is_expired(&a.epoch, now)).collect();
-        let all_local = live.iter().all(|a| self.disk_reader(&a.key).is_some());
-        // Every archive is asked at once: a tile held only by the oldest of
-        // several archives costs one round trip, not one per archive. Local
-        // copies answer in microseconds either way.
-        let results = futures_util::future::join_all(live.iter().map(|a| self.read_archive(&a.key, id))).await;
-        if !all_local {
-            // First read of this zone from the bucket: copy it whole, so the
-            // next read of any of its tiles is local.
-            self.copy_zone(l, zone, &live, now);
+        if !live.iter().all(|a| self.disk_reader(&a.key).is_some()) {
+            // A read of this zone from the bucket: copy it whole, so the next
+            // read of any of its tiles is local — and this one too, when the
+            // archives are small enough to be worth waiting for.
+            let waits = self.copy_zone(l, zone, &live, now);
+            if !waits.is_empty() {
+                futures_util::future::join_all(waits).await;
+            }
+        }
+        // The newest archive first, as it usually holds the tile; on a miss,
+        // all the older ones at once, so a tile held only by the oldest costs
+        // two round trips, not one per archive — without asking every
+        // archive for every tile. Local copies answer in microseconds.
+        let mut results = Vec::with_capacity(live.len());
+        if let Some(newest) = live.first() {
+            results.push(self.read_archive(&newest.key, id).await);
+        }
+        if !matches!(results.first(), Some(Ok((Some(_), _)))) && live.len() > 1 {
+            results.extend(futures_util::future::join_all(live[1..].iter().map(|a| self.read_archive(&a.key, id))).await);
         }
         for (archive, result) in live.iter().zip(results) {
             match result {
@@ -480,13 +490,19 @@ impl TileStore {
         Ok((self.read_tile(archive_key, id).await?, false))
     }
 
-    /// Schedules local copies of a zone's archives and, if configured, of
-    /// the zones around it.
-    fn copy_zone(&self, layer: &Layer, zone: Zone, live: &[&ArchiveRef], now: SystemTime) {
-        let Some(disk) = &self.disk else { return };
+    /// Starts local copies of a zone's archives and, if configured, of the
+    /// zones around it. Returns the copies worth waiting for.
+    fn copy_zone(&self, layer: &Layer, zone: Zone, live: &[&ArchiveRef], now: SystemTime) -> Vec<crate::disk::ArchiveCopy> {
+        let Some(disk) = &self.disk else { return Vec::new() };
+        let mut waits = Vec::new();
         for a in live {
-            if disk.schedule(self.store.clone(), &a.key, a.bytes) {
-                self.stats.copies.fetch_add(1, Ordering::Relaxed);
+            if let Some((copy, started)) = disk.copy(self.store.clone(), &a.key, a.bytes) {
+                if started {
+                    self.stats.copies.fetch_add(1, Ordering::Relaxed);
+                }
+                if a.bytes <= disk.cfg.await_copy_bytes {
+                    waits.push(copy);
+                }
             }
         }
         let key = (layer.name.clone(), zone);
@@ -494,12 +510,12 @@ impl TileStore {
             Ok(mut seen) => !seen.contains(&key) && seen.insert(key, (), 1).is_empty(),
             Err(_) => false,
         };
-        if !first || !disk.cfg.prefetch_neighbours {
-            return;
+        if first && disk.cfg.prefetch_neighbours {
+            for near in neighbours(layer, zone) {
+                self.prefetch_zone(layer, near, now);
+            }
         }
-        for near in neighbours(layer, zone) {
-            self.prefetch_zone(layer, near, now);
-        }
+        waits
     }
 
     /// Copies a zone's archives in the background, reading its manifest
@@ -512,7 +528,7 @@ impl TileStore {
         runtime.spawn(async move {
             let Ok(read) = manifest::read(objects.as_ref(), &layer.zone_prefix(zone)).await else { return };
             for a in read.manifest.archives.iter().rev().filter(|a| !layer.is_expired(&a.epoch, now)) {
-                disk.schedule(objects.clone(), &a.key, a.bytes);
+                disk.copy(objects.clone(), &a.key, a.bytes);
             }
         });
     }
@@ -828,7 +844,7 @@ impl TileStore {
         if let Some(disk) = &self.disk {
             for a in &live {
                 if a.bytes <= disk.cfg.max_archive_bytes {
-                    if let Err(e) = disk.fetch(self.store.as_ref(), &a.key).await {
+                    if let Err(e) = disk.fetch(self.store.as_ref(), &a.key, a.bytes).await {
                         tracing::debug!(key = a.key, error = %e, "archive copy for comparison failed; read remotely");
                     }
                 }
