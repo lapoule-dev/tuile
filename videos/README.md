@@ -19,6 +19,36 @@ seule façon de retrouver leur tracé est de rejouer les caméras du pack avec
 `tuile-bake --tape-from`. Les générateurs évoluent, donc recuire la même
 chaîne d'arguments ne donne plus le même vol.
 
+## `pyrenees-2min-nadir-50km-tilestore-W.mp4`
+
+Le premier film cuit **à travers le store de tuiles** (`tuile-tile-server`,
+bucket R2 `stl-tiles`), store déjà rempli par une cuisson précédente. Même
+bande que `pyrenees-2min-nadir-50km-fixed.mp4`.
+
+- bande `tile-store-test/ref-20260920/1-2880.tuilepack.mcap` (copie de
+  `packs/cad37e576618a47f/1-2880.tuilepack.mcap`), rejouée telle quelle avec
+  `--trajectory pyrenees:2:24:50000:0.40`
+- pack W : `tile-store-test/W/1-2880.tuilepack` (bucket `stl-track-data`),
+  scène `90baed1a239165d4`, 4 372 tuiles, 1,75 Go
+- imagerie Bing (défaut), viewport 3840×2880, sse 3, 16 échantillons, 1920×1440
+- cuisson `tuile-bake-qh8wv` avec `TUILE_TILES_BUCKET=stl-tiles` : 10 min 57 s
+  (cuisson 9 min 01 s, vidage du store 20 s)
+- rendu `tuile-render-xq94m` : 3 tâches × L4 ; 2880 frames, 120,000 s, 663 Mo
+- image `blender-globe:5.1-su@sha256:497fcd15…` (branche `feat/tile-server`,
+  commit `14725be`)
+
+**Le store est transparent.** Quatre cuissons de la même bande — B0 et B0' sans
+store, A store froid, W store chaud — comparées tuile à tuile : toutes les
+tuiles communes (même id, même drapé) ont des octets identiques (positions,
+normales, UV, index, texture, origine), 4 094 à 4 183 par paire.
+**La cuisson, elle, n'est pas reproductible** : B0 et B0' ne sélectionnent pas
+les mêmes tuiles (203 / 103 de différence), store ou pas. Les packs de
+comparaison sont gardés sous `stl-track-data/tile-store-test/{B0,B0prime,A,W}/`.
+
+**Les damiers de couleur sont bien visibles** — aplats de mer, blocs plus
+saturés, raccords entre niveaux : c'est le film témoin de
+`docs/18-color-harmonization.md`.
+
 ## `pyrenees-2min-nadir-50km.mp4`
 
 2880 frames, 1920×1440, 120,000000 s, 632 Mo. Le premier tour des Pyrénées.
