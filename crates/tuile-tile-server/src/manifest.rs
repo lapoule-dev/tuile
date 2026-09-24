@@ -32,6 +32,11 @@ pub struct ArchiveRef {
     /// Seconds since the Unix epoch, at publication.
     pub created: u64,
     pub tiles: u64,
+    /// Bytes of tile data it holds — what compaction tiers by. Not the file
+    /// size: an archive reserves room for its header and root directory, so a
+    /// three-tile delta and a full zone would look alike by file size.
+    #[serde(default)]
+    pub bytes: u64,
 }
 
 /// An archive no longer part of the zone, kept until readers holding an older

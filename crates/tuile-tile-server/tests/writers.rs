@@ -185,6 +185,49 @@ async fn of_two_simultaneous_compactions_at_most_one_publishes() {
 }
 
 #[tokio::test]
+async fn a_compaction_planned_on_an_older_manifest_does_not_undo_a_newer_one() {
+    let clock = TestClock::new();
+    let objects = memory();
+    let s = store_on(objects.clone(), &clock, eager());
+    // A base, then four small deltas that rewrite some of its tiles.
+    for i in 0..ZONE_SIDE * ZONE_SIDE {
+        let (x, y) = in_zone(i);
+        s.put(IMAGERY, LEVEL, x, y, body(LEVEL, x, y, 0)).await.expect("put");
+    }
+    s.flush_all().await.expect("flush");
+    for d in 1..=4u32 {
+        let (x, y) = in_zone(d);
+        s.put(IMAGERY, LEVEL, x, y, body(LEVEL, x, y, d)).await.expect("put");
+        s.flush_all().await.expect("flush");
+    }
+    let prefix = common::imagery().zone_prefix(zone());
+    let stale = tuile_tile_server::manifest::read(objects.as_ref(), &prefix).await.expect("manifest").manifest;
+    assert_eq!(stale.archives.len(), 5);
+
+    // The tiered pass merges the four deltas…
+    assert!(matches!(
+        s.compact_tiered(IMAGERY, zone()).await.expect("tiered"),
+        tuile_tile_server::Compaction::Merged { merged: 4, .. }
+    ));
+    // …new deltas arrive, so the zone again has as many archives as the stale
+    // plan, but not the same ones…
+    for d in 5..=8u32 {
+        let (x, y) = in_zone(d);
+        s.put(IMAGERY, LEVEL, x, y, body(LEVEL, x, y, d)).await.expect("put");
+        s.flush_all().await.expect("flush");
+    }
+    // …then a full merge planned before all that tries to publish.
+    let late = s.merge_run_planned(IMAGERY, zone(), &stale.archives).await.expect("late merge");
+    assert_eq!(late, tuile_tile_server::Compaction::Superseded);
+
+    let fresh = store_on(objects, &clock, eager());
+    for d in 1..=8u32 {
+        let (x, y) = in_zone(d);
+        assert_eq!(fresh.get(IMAGERY, LEVEL, x, y).await.expect("get"), Some(body(LEVEL, x, y, d)), "tile {d}");
+    }
+}
+
+#[tokio::test]
 async fn a_crash_between_upload_and_publication_leaves_a_valid_zone_and_an_orphan_that_is_cleaned() {
     let clock = TestClock::new();
     let objects = memory();

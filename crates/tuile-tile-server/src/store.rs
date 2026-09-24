@@ -43,6 +43,7 @@ use tokio::io::AsyncReadExt;
 use crate::archive::{self, RemoteReader};
 use crate::layer::{Layer, Zone};
 use crate::manifest::{self, now_secs, ArchiveRef, Manifest, Retired, Versioned};
+use crate::tiering::{self, Tiering};
 use crate::StoreError;
 
 /// A source of the current time, so tests can move it.
@@ -60,9 +61,13 @@ pub const DEFAULT_FLUSH_BYTES: usize = 32 * MIB;
 pub const DEFAULT_FLUSH_AGE: Duration = Duration::from_secs(30);
 /// How stale a manifest may be; the bound on cross-instance visibility.
 pub const DEFAULT_MANIFEST_TTL: Duration = Duration::from_secs(2);
-/// Deltas in the current epoch before a compaction: each is one more range
-/// read on a miss.
-pub const DEFAULT_COMPACT_MIN_ARCHIVES: usize = 8;
+/// Archives merged at once by a tiered compaction.
+pub const DEFAULT_TIER_FANOUT: usize = 4;
+/// Archives of one run are within this size factor of each other.
+pub const DEFAULT_TIER_RATIO: u64 = 4;
+/// Past this many archives in an epoch, the cheapest run is merged anyway:
+/// each archive is one more lookup on a miss.
+pub const DEFAULT_MAX_ARCHIVES: usize = 12;
 /// A retired archive outlives any reader still holding an older manifest.
 pub const DEFAULT_RETIRE_GRACE: Duration = Duration::from_secs(10 * 60);
 /// No upload takes this long, so an unreferenced archive this old is an orphan.
@@ -97,9 +102,8 @@ pub struct StoreConfig {
     /// How long a manifest read is trusted. This bounds how late one instance
     /// sees another's publication.
     pub manifest_ttl: Duration,
-    /// A zone is compacted after a flush once its current epoch has this many
-    /// archives.
-    pub compact_min_archives: usize,
+    /// What a tiered compaction merges ([`TileStore::compact_due`]).
+    pub tiering: Tiering,
     /// How long a retired archive stays, for readers with an older manifest.
     pub retire_grace: Duration,
     /// How old an unreferenced archive must be before it is an orphan rather
@@ -117,7 +121,11 @@ impl Default for StoreConfig {
             flush_bytes: DEFAULT_FLUSH_BYTES,
             flush_age: DEFAULT_FLUSH_AGE,
             manifest_ttl: DEFAULT_MANIFEST_TTL,
-            compact_min_archives: DEFAULT_COMPACT_MIN_ARCHIVES,
+            tiering: Tiering {
+                fanout: DEFAULT_TIER_FANOUT,
+                ratio: DEFAULT_TIER_RATIO,
+                max_archives: DEFAULT_MAX_ARCHIVES,
+            },
             retire_grace: DEFAULT_RETIRE_GRACE,
             orphan_grace: DEFAULT_ORPHAN_GRACE,
             reader_cache: DEFAULT_READER_CACHE,
@@ -216,6 +224,10 @@ impl TileStore {
 
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.store
+    }
+
+    pub fn object_store_config(&self) -> &StoreConfig {
+        &self.cfg
     }
 
     #[doc(hidden)]
@@ -448,16 +460,10 @@ impl TileStore {
                 }
             }
         }
-        result?;
-
-        // A zone that keeps receiving deltas is compacted before reads have to
-        // walk too many archives.
-        let m = self.manifest(key, &layer).await?;
-        let epoch = layer.epoch((self.clock)());
-        if m.archives.iter().filter(|a| a.epoch == epoch).count() >= self.cfg.compact_min_archives {
-            self.compact_locked(&layer, key.1).await?;
-        }
-        Ok(())
+        // No compaction here: a flush runs on a writer's path (a request, a
+        // bake), and merging is the business of a long-lived process calling
+        // [`TileStore::compact_due`].
+        result
     }
 
     async fn publish_delta(&self, layer: &Layer, key: &ZoneKey, tiles: &BTreeMap<u64, Bytes>) -> Result<(), StoreError> {
@@ -485,7 +491,8 @@ impl TileStore {
             _ => {}
         }
 
-        let entry = ArchiveRef { key: object, epoch, created: now_secs(now), tiles: count };
+        let bytes = tiles.values().map(|b| b.len() as u64).sum();
+        let entry = ArchiveRef { key: object, epoch, created: now_secs(now), tiles: count, bytes };
         let published = self
             .publish(&prefix, |m| {
                 let mut next = m.clone();
@@ -522,31 +529,116 @@ impl TileStore {
 
     // ── Compaction ───────────────────────────────────────────────────────
 
-    /// Merges the archives of the zone's current epoch into one, drops the
-    /// expired ones, and removes retired and orphaned objects past their grace.
+    /// Merges **all** the archives of the zone's current epoch into one, now.
+    /// For maintenance and tests; a server calls [`TileStore::compact_due`].
     pub async fn compact(&self, layer: &str, zone: Zone) -> Result<Compaction, StoreError> {
         let l = self.layer(layer)?.clone();
         let lock = self.zone_lock(&(l.name.clone(), zone));
         let _held = lock.lock().await;
-        self.compact_locked(&l, zone).await
+        let epoch = l.epoch((self.clock)());
+        let m = manifest::read(self.store.as_ref(), &l.zone_prefix(zone)).await?.manifest;
+        // The last contiguous run of the current epoch.
+        let end = m.archives.iter().rposition(|a| a.epoch == epoch).map_or(0, |i| i + 1);
+        let start = m.archives[..end].iter().rposition(|a| a.epoch != epoch).map_or(0, |i| i + 1);
+        self.merge_run(&l, zone, &m.archives[start..end]).await
     }
 
-    async fn compact_locked(&self, layer: &Layer, zone: Zone) -> Result<Compaction, StoreError> {
+    /// Merges the next tiered run of the zone, if the policy picks one.
+    pub async fn compact_tiered(&self, layer: &str, zone: Zone) -> Result<Compaction, StoreError> {
+        let l = self.layer(layer)?.clone();
+        let lock = self.zone_lock(&(l.name.clone(), zone));
+        let _held = lock.lock().await;
+        let epoch = l.epoch((self.clock)());
+        let m = manifest::read(self.store.as_ref(), &l.zone_prefix(zone)).await?.manifest;
+        match tiering::select(&m.archives, &epoch, self.cfg.tiering) {
+            Some(run) => self.merge_run(&l, zone, &m.archives[run]).await,
+            None => Ok(Compaction::Nothing),
+        }
+    }
+
+    /// Merges a given run, as a compaction planned on an older manifest would
+    /// (tests only).
+    #[doc(hidden)]
+    pub async fn merge_run_planned(&self, layer: &str, zone: Zone, run: &[ArchiveRef]) -> Result<Compaction, StoreError> {
+        let l = self.layer(layer)?.clone();
+        self.merge_run(&l, zone, run).await
+    }
+
+    /// Every zone of every layer that has a manifest, found by listing.
+    pub async fn zones(&self) -> Result<Vec<(String, Zone)>, StoreError> {
+        let mut out = Vec::new();
+        for layer in self.layers.values() {
+            let listed: Vec<object_store::ObjectMeta> =
+                self.store.list(Some(&Path::from(layer.name.as_str()))).try_collect().await?;
+            for meta in listed {
+                if let Some(zone) = parse_manifest_key(layer, meta.location.as_ref()) {
+                    out.push((layer.name.clone(), zone));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// One pass over the whole store: in every zone, drops expired archives,
+    /// merges tiered runs until none is due, and cleans up. Meant to be called
+    /// periodically by one long-lived process; any number may, safely.
+    pub async fn compact_due(&self) -> Result<Vec<(String, Zone, Compaction)>, StoreError> {
+        let mut done = Vec::new();
+        for (layer, zone) in self.zones().await? {
+            let l = self.layer(&layer)?.clone();
+            self.prune_expired(&l, zone).await?;
+            loop {
+                match self.compact_tiered(&layer, zone).await? {
+                    Compaction::Nothing => break,
+                    c @ Compaction::Superseded => {
+                        done.push((layer.clone(), zone, c));
+                        break;
+                    }
+                    c => done.push((layer.clone(), zone, c)),
+                }
+            }
+            self.cleanup(&l, zone).await?;
+        }
+        Ok(done)
+    }
+
+    /// Retires the archives of expired epochs without merging anything.
+    async fn prune_expired(&self, layer: &Layer, zone: Zone) -> Result<(), StoreError> {
         let prefix = layer.zone_prefix(zone);
         let now = (self.clock)();
-        let epoch = layer.epoch(now);
-        let current = manifest::read(self.store.as_ref(), &prefix).await?.manifest;
-        let inputs: Vec<ArchiveRef> = current.archives.iter().filter(|a| a.epoch == epoch).cloned().collect();
-        if inputs.len() < 2 {
-            self.cleanup(layer, zone).await?;
+        let m = manifest::read(self.store.as_ref(), &prefix).await?.manifest;
+        if !m.archives.iter().any(|a| layer.is_expired(&a.epoch, now)) {
+            return Ok(());
+        }
+        let now_s = now_secs(now);
+        self.publish(&prefix, |m| {
+            let mut next = m.clone();
+            let (gone, kept): (Vec<_>, Vec<_>) = m.archives.iter().cloned().partition(|a| layer.is_expired(&a.epoch, now));
+            next.archives = kept;
+            next.retired.extend(gone.into_iter().map(|a| Retired { key: a.key, retired: now_s }));
+            Some(next)
+        })
+        .await?;
+        self.forget_manifest(&(layer.name.clone(), zone));
+        Ok(())
+    }
+
+    /// Merges a contiguous run of archives into one and publishes it in the
+    /// run's place, provided the run is still there, whole and contiguous.
+    async fn merge_run(&self, layer: &Layer, zone: Zone, run: &[ArchiveRef]) -> Result<Compaction, StoreError> {
+        if run.len() < 2 {
             return Ok(Compaction::Nothing);
         }
+        let prefix = layer.zone_prefix(zone);
+        let now = (self.clock)();
+        let epoch = run[0].epoch.clone();
 
-        // Inputs are read from local copies: one sequential download each,
-        // then every tile from memory-mapped files.
+        // Only the run is copied locally — disk use is bounded by what is
+        // merged, not by the zone. One sequential download each, then every
+        // tile from memory-mapped files.
         let dir = tempfile::tempdir()?;
-        let mut readers = Vec::with_capacity(inputs.len());
-        for (i, a) in inputs.iter().enumerate() {
+        let mut readers = Vec::with_capacity(run.len());
+        for (i, a) in run.iter().enumerate() {
             let local = dir.path().join(format!("{i}.pmtiles"));
             download(self.store.as_ref(), &a.key, &local).await?;
             let r = Arc::new(archive::open_local(&local).await?);
@@ -559,20 +651,22 @@ impl TileStore {
             .map(|(r, _)| (r.get_header().min_zoom, r.get_header().max_zoom))
             .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)));
 
-        // Stream the k-way merge into the writer through a bounded channel:
-        // memory holds a few tiles, not the zone.
+        // The writer is synchronous (`Write + Seek`): the merge stream feeds
+        // it through a bounded channel, the only bridge between the two. A
+        // failed tile is sent on like any other: the writer stops on it and
+        // reports it, so the error surfaces from one place.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<(u64, Bytes), StoreError>>(MERGE_QUEUE);
         let l = layer.clone();
         let e = epoch.clone();
         let writer =
             tokio::task::spawn_blocking(move || archive::write(&l, &e, zooms, std::iter::from_fn(move || rx.blocking_recv())));
-        // The writer is synchronous (`Write + Seek`): the stream feeds it
-        // through a bounded channel, the only bridge between the two.
-        // A failed tile is sent on like any other: the writer stops on it and
-        // reports it, so the error surfaces from one place.
         let mut tiles = std::pin::pin!(merged(readers));
+        let mut bytes = 0u64;
         while let Some(tile) = futures_util::StreamExt::next(&mut tiles).await {
             let failed = tile.is_err();
+            if let Ok((_, b)) = &tile {
+                bytes += b.len() as u64;
+            }
             if tx.send(tile).await.is_err() || failed {
                 break;
             }
@@ -582,33 +676,22 @@ impl TileStore {
 
         let object = archive_key(&prefix, &epoch, now);
         upload(self.store.as_ref(), file.path(), &object).await?;
-        let entry = ArchiveRef { key: object.clone(), epoch: epoch.clone(), created: now_secs(now), tiles: count };
-        let input_keys: Vec<String> = inputs.iter().map(|a| a.key.clone()).collect();
+        let entry = ArchiveRef { key: object.clone(), epoch, created: now_secs(now), tiles: count, bytes };
+        let run_keys: Vec<String> = run.iter().map(|a| a.key.clone()).collect();
         let now_s = now_secs(now);
 
         let published = self
             .publish(&prefix, |m| {
-                // Every input must still be there, or someone else compacted.
-                let positions: Vec<usize> = input_keys
-                    .iter()
-                    .filter_map(|k| m.archives.iter().position(|a| &a.key == k))
-                    .collect();
-                if positions.len() != input_keys.len() {
+                // The run must still be there, whole, contiguous, in order;
+                // otherwise someone else compacted part of it first.
+                let first = m.archives.iter().position(|a| a.key == run_keys[0])?;
+                let here = m.archives.get(first..first + run_keys.len())?;
+                if here.iter().map(|a| &a.key).ne(run_keys.iter()) {
                     return None;
                 }
-                let first = positions.iter().copied().min().unwrap_or(0);
-                let mut next = Manifest { generation: m.generation, archives: Vec::new(), retired: m.retired.clone() };
-                for (i, a) in m.archives.iter().enumerate() {
-                    if i == first {
-                        next.archives.push(entry.clone());
-                    }
-                    // Merged into the new archive, or past its expiry.
-                    if input_keys.contains(&a.key) || layer.is_expired(&a.epoch, now) {
-                        next.retired.push(Retired { key: a.key.clone(), retired: now_s });
-                    } else {
-                        next.archives.push(a.clone());
-                    }
-                }
+                let mut next = m.clone();
+                next.archives.splice(first..first + run_keys.len(), [entry.clone()]);
+                next.retired.extend(run_keys.iter().map(|k| Retired { key: k.clone(), retired: now_s }));
                 Some(next)
             })
             .await?;
@@ -618,8 +701,9 @@ impl TileStore {
             Some(m) => {
                 self.remember_manifest(&key, Arc::new(m));
                 metrics::counter!("tuile_tiles_compactions_total", "layer" => layer.name.clone()).increment(1);
+                metrics::counter!("tuile_tiles_compacted_bytes_total", "layer" => layer.name.clone()).increment(bytes);
                 self.cleanup(layer, zone).await?;
-                Ok(Compaction::Merged { merged: inputs.len(), tiles: count })
+                Ok(Compaction::Merged { merged: run.len(), tiles: count })
             }
             None => {
                 let _ = self.store.delete(&Path::from(object)).await;
@@ -676,6 +760,19 @@ impl TileStore {
         }
         Ok(removed)
     }
+}
+
+/// The zone a `…/manifest.json` key belongs to, if it is one of `layer`'s.
+fn parse_manifest_key(layer: &Layer, key: &str) -> Option<Zone> {
+    let rest = key.strip_prefix(layer.name.as_str())?.strip_prefix('/')?.strip_suffix("/manifest.json")?;
+    if rest == "top" {
+        return Some(Zone::Top);
+    }
+    let mut parts = rest.strip_prefix("zones/")?.split('/');
+    let level = parts.next()?.strip_prefix('z')?.parse::<u8>().ok()?;
+    let x = parts.next()?.parse().ok()?;
+    let y = parts.next()?.parse().ok()?;
+    (level == layer.zone_level && parts.next().is_none()).then_some(Zone::Cell { x, y })
 }
 
 /// A new archive's key: unique, and sortable by time within the zone.
