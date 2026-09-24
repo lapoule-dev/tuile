@@ -1,0 +1,35 @@
+[package]
+name = "tuile-tile-server"
+description = "Source tiles kept once: PMTiles archives per zone and per layer on object storage, written in memory, compacted in stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The archive format. Only what a server reads and writes: the object-store
+# backend (same `object_store` as tuile-farm), a local file for compaction,
+# the writer, and the entry stream a merge walks. No HTTP client, no S3 SDK.
+pmtiles = { version = "0.24", default-features = false, features = ["object-store", "mmap-async-tokio", "write", "iter-async"] }
+object_store = { version = "0.14.2", default-features = false }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures-util = { workspace = true }
+metrics = "0.24"
+rand = "0.9"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "fs", "io-util", "time", "rt"] }
+tracing = { workspace = true }
+tuile-core = { version = "0.1.0", path = "../tuile-core" }
+url = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "fs", "io-util", "time", "rt", "rt-multi-thread", "macros"] }
