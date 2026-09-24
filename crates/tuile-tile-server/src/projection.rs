@@ -13,9 +13,10 @@
 //!
 //! One whole-object request per archive rather than coalesced byte ranges: a
 //! zone is a few megabytes, and the latency of each request is what a
-//! projection pays for, not the bytes. For the same reason a cell zone the
-//! scene reaches is projected whole; only `top` — every scene's coarse tiles,
-//! and growing with each — is filtered tile by tile.
+//! projection pays for, not the bytes. For the same reason a zone the scene
+//! reaches is projected whole — `top` included, which holds the coarse
+//! pyramid of the whole globe that every bake pins as its floor. The footprint
+//! chooses zones; it no longer cuts inside them.
 //!
 //! # Which tiles a scene can use
 //!
@@ -34,7 +35,6 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
-use pmtiles::TileCoord;
 
 use crate::archive;
 use crate::grid::Grid;
@@ -207,7 +207,7 @@ impl TileStore {
             .filter(|(l, z)| self.layer(l).map(|l| footprint.reaches(l, *z)).unwrap_or(false))
             .collect();
         let results: Vec<Result<ProjectionReport, StoreError>> = futures_util::stream::iter(zones)
-            .map(|(layer, zone)| async move { self.project_zone(footprint, dir, &layer, zone).await })
+            .map(|(layer, zone)| async move { self.project_zone(dir, &layer, zone).await })
             .buffer_unordered(ZONES_IN_FLIGHT)
             .collect()
             .await;
@@ -227,7 +227,6 @@ impl TileStore {
 
     async fn project_zone(
         &self,
-        footprint: &Footprint,
         dir: &FsPath,
         layer_name: &str,
         zone: Zone,
@@ -240,7 +239,6 @@ impl TileStore {
 
         // Newest first: the first archive to hold a tile wins it. Each archive
         // comes down in one request, then is read locally.
-        let factor = footprint.factor_for(&layer.name);
         let scratch = tempfile::tempdir()?;
         let mut tiles: BTreeMap<u64, Bytes> = BTreeMap::new();
         for (i, a) in archives.iter().enumerate().rev() {
@@ -262,16 +260,12 @@ impl TileStore {
                     if tiles.contains_key(&id) {
                         continue;
                     }
-                    // A cell zone the scene reaches is kept whole: its archive
-                    // came down in one request anyway, and a tile left out is
-                    // a round trip later. Only `top`, shared by every scene
-                    // and growing with each, is filtered tile by tile.
-                    if zone == Zone::Top {
-                        let Some((level, x, y)) = layer.grid.from_archive(TileCoord::from(tid)) else { continue };
-                        if !footprint.keeps_with(factor, layer.grid, level, x, y) {
-                            continue;
-                        }
-                    }
+                    // A zone the scene reaches is kept whole: its archive came
+                    // down in one request anyway, and a tile left out is a
+                    // round trip later. That includes `top`: a bake pins a
+                    // coarse pyramid of the WHOLE globe as its floor, and
+                    // filtering `top` by distance sent 21 800 of its reads back
+                    // to the bucket while saving no transfer at all.
                     if let Some(bytes) = reader.get_tile(tid).await? {
                         tiles.insert(id, bytes);
                     }
