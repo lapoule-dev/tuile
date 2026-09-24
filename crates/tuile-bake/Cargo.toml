@@ -52,7 +52,10 @@ bytes = { workspace = true }
 image = { workspace = true }
 # `time` for the frame deadline: a bulk frame blocks, and an unbounded block
 # on a farm node is indistinguishable from a hang.
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "sync"] }
+# The pool tiles are finished on (composed, encoded): one thread per core,
+# bounded at the source rather than behind a semaphore.
+rayon = "1"
 thiserror = { workspace = true }
 tuile-core = { version = "0.1.0", path = "../tuile-core" }
 tuile-pack = { version = "0.1.0", path = "../tuile-pack" }
