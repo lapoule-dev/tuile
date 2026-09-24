@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, WriteMultipart};
 use rand::Rng;
@@ -82,6 +82,9 @@ pub const DEFAULT_PUBLISH_ATTEMPTS: usize = 64;
 
 // Transfer and merge tuning.
 
+/// Zones flushed at once: each is an upload and a conditional publication,
+/// mostly waiting on the network.
+pub const FLUSH_IN_FLIGHT: usize = 16;
 /// Part size of a multipart upload.
 const UPLOAD_PART: usize = 8 * MIB;
 /// Parts of one upload in flight at once.
@@ -198,6 +201,30 @@ pub struct TileStore {
     zone_locks: Mutex<HashMap<ZoneKey, Arc<tokio::sync::Mutex<()>>>>,
     fault: AtomicU8,
     gate: Mutex<Option<Arc<Gate>>>,
+    /// Local projections of remote zones, read before the bucket.
+    projections: Mutex<HashMap<ZoneKey, Arc<archive::LocalReader>>>,
+    stats: Stats,
+}
+
+/// Where reads were answered from, since the store was opened.
+#[derive(Debug, Default)]
+pub struct Stats {
+    pub buffer: std::sync::atomic::AtomicU64,
+    pub projection: std::sync::atomic::AtomicU64,
+    /// Asked of a projected zone and not in its projection.
+    pub projection_misses: std::sync::atomic::AtomicU64,
+    pub remote: std::sync::atomic::AtomicU64,
+    pub absent: std::sync::atomic::AtomicU64,
+}
+
+/// A copy of [`Stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatsSnapshot {
+    pub buffer: u64,
+    pub projection: u64,
+    pub projection_misses: u64,
+    pub remote: u64,
+    pub absent: u64,
 }
 
 impl TileStore {
@@ -217,6 +244,8 @@ impl TileStore {
             zone_locks: Mutex::default(),
             fault: AtomicU8::new(Fault::None as u8),
             gate: Mutex::default(),
+            projections: Mutex::default(),
+            stats: Stats::default(),
         }
     }
 
@@ -234,6 +263,31 @@ impl TileStore {
 
     pub fn object_store_config(&self) -> &StoreConfig {
         &self.cfg
+    }
+
+    pub(crate) fn now(&self) -> SystemTime {
+        (self.clock)()
+    }
+
+    /// Where reads were answered from.
+    pub fn stats(&self) -> StatsSnapshot {
+        let g = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+        StatsSnapshot {
+            buffer: g(&self.stats.buffer),
+            projection: g(&self.stats.projection),
+            projection_misses: g(&self.stats.projection_misses),
+            remote: g(&self.stats.remote),
+            absent: g(&self.stats.absent),
+        }
+    }
+
+    /// Reads the zone through a local projection from now on.
+    pub(crate) async fn attach_projection(&self, layer: &Layer, zone: Zone, path: &std::path::Path) -> Result<(), StoreError> {
+        let reader = Arc::new(archive::open_local(path).await?);
+        if let Ok(mut p) = self.projections.lock() {
+            p.insert((layer.name.clone(), zone), reader);
+        }
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -266,8 +320,21 @@ impl TileStore {
         let key = (l.name.clone(), zone);
 
         if let Some(bytes) = self.buffered(&key, id) {
+            self.stats.buffer.fetch_add(1, Ordering::Relaxed);
             metrics::counter!("tuile_tiles_hits_total", "layer" => l.name.clone(), "from" => "buffer").increment(1);
             return Ok(Some(bytes));
+        }
+
+        let projection = self.projections.lock().ok().and_then(|p| p.get(&key).cloned());
+        if let Some(local) = projection {
+            if let Some(bytes) = local.get_tile(pmtiles::TileId::new(id)?).await? {
+                self.stats.projection.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("tuile_tiles_hits_total", "layer" => l.name.clone(), "from" => "projection").increment(1);
+                return Ok(Some(bytes));
+            }
+            // Not in the projection: the footprint left it out, or it is
+            // truly absent. The bucket decides.
+            self.stats.projection_misses.fetch_add(1, Ordering::Relaxed);
         }
 
         let now = (self.clock)();
@@ -278,6 +345,7 @@ impl TileStore {
             }
             match self.read_tile(&archive.key, id).await {
                 Ok(Some(bytes)) => {
+                    self.stats.remote.fetch_add(1, Ordering::Relaxed);
                     metrics::counter!("tuile_tiles_hits_total", "layer" => l.name.clone(), "from" => "archive").increment(1);
                     return Ok(Some(bytes));
                 }
@@ -293,6 +361,7 @@ impl TileStore {
                 }
             }
         }
+        self.stats.absent.fetch_add(1, Ordering::Relaxed);
         metrics::counter!("tuile_tiles_misses_total", "layer" => l.name.clone()).increment(1);
         Ok(None)
     }
@@ -413,15 +482,19 @@ impl TileStore {
         Ok(due.len())
     }
 
-    /// Flushes every non-empty buffer.
+    /// Flushes every non-empty buffer, [`FLUSH_IN_FLIGHT`] zones at a time.
     pub async fn flush_all(&self) -> Result<usize, StoreError> {
         let keys: Vec<ZoneKey> = {
             let buffers = self.buffers.lock().map_err(|_| StoreError::Poisoned)?;
             buffers.iter().filter(|(_, b)| !b.pending.is_empty()).map(|(k, _)| k.clone()).collect()
         };
-        for key in &keys {
-            self.flush_zone(key).await?;
-        }
+        let results: Vec<Result<(), StoreError>> = futures_util::stream::iter(keys.clone())
+            .map(|key| async move { self.flush_zone(&key).await })
+            .buffer_unordered(FLUSH_IN_FLIGHT)
+            .collect()
+            .await;
+        // Every zone was attempted; the first failure is the one reported.
+        results.into_iter().collect::<Result<Vec<()>, _>>()?;
         Ok(keys.len())
     }
 
