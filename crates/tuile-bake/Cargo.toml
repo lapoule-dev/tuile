@@ -57,6 +57,12 @@ thiserror = { workspace = true }
 tuile-core = { version = "0.1.0", path = "../tuile-core" }
 tuile-pack = { version = "0.1.0", path = "../tuile-pack" }
 tuile-tape = { version = "0.1.0", path = "../tuile-tape" }
+# Source tiles kept once, on the bucket every bake and the tile server share.
+# The binary opens it (`TUILE_TILES_BUCKET`); the library only sees the
+# engine's `ContentStore`.
+tuile-tile-server = { version = "0.1.0", path = "../tuile-tile-server" }
+tuile-terrain = { version = "0.1.0", path = "../tuile-terrain" }
+object_store = { version = "0.14.2", default-features = false, features = ["aws"] }
 
 # --- profiling, behind the feature ------------------------------------------
 # Signal sampling across EVERY thread, without `perf` and without privileges.
