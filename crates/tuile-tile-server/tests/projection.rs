@@ -42,7 +42,7 @@ async fn a_projection_keeps_what_the_scene_can_see_and_reads_it_locally() {
     let fp = Footprint::from_eyes([eye], DEFAULT_TILE_FACTOR);
     let report = s.project(&fp, dir.path()).await.expect("project");
     assert!(report.zones_projected >= 2, "the cell and the top zone: {report:?}");
-    assert!(report.tiles_kept > 0 && report.tiles_kept < report.tiles_listed, "top filtered: {report:?}");
+    assert!(report.tiles_kept > 0 && report.tiles_kept == report.tiles_listed, "reached zones kept whole: {report:?}");
     assert_eq!(report.requests as usize, report.zones_seen, "one request per archive, one archive per zone here: {report:?}");
 
     // The tile under the eye: from the projection, bytes identical.
@@ -50,13 +50,13 @@ async fn a_projection_keeps_what_the_scene_can_see_and_reads_it_locally() {
     let stats = s.stats();
     assert_eq!((stats.projection, stats.remote), (1, 0), "{stats:?}");
 
-    // The coarse tile over Europe is kept; the one over the Pacific is not,
-    // and is still served — from the bucket, counted.
+    // The top zone is kept whole: the coarse tile over the Pacific too, since
+    // a bake pins the coarse pyramid of the whole globe.
     assert_eq!(s.get(IMAGERY, 3, 4, 2).await.expect("get"), Some(body(3, 4, 2, 0)));
     assert_eq!(s.get(IMAGERY, 3, 0, 7).await.expect("get"), Some(body(3, 0, 7, 0)));
     let stats = s.stats();
-    assert_eq!(stats.projection, 2, "{stats:?}");
-    assert_eq!((stats.projection_misses, stats.remote), (1, 1), "{stats:?}");
+    assert_eq!(stats.projection, 3, "{stats:?}");
+    assert_eq!((stats.projection_misses, stats.remote), (0, 0), "{stats:?}");
 }
 
 #[tokio::test]
@@ -128,6 +128,6 @@ async fn a_scene_far_away_projects_nothing_of_the_zone() {
     let fp = Footprint::from_eyes([Eye { lon: -150.0, lat: -20.0, height: 1_000.0 }], DEFAULT_TILE_FACTOR);
     let report = s.project(&fp, dir.path()).await.expect("project");
     assert!(!tuile_tile_server::projection::projection_path(dir.path(), &common::imagery(), zone()).exists());
-    // The top zone still projects the coarse tile over the Pacific.
-    assert!(report.zones_projected <= 1, "{report:?}");
+    // Only the top zone, whole.
+    assert_eq!(report.zones_projected, 1, "{report:?}");
 }
