@@ -15,9 +15,15 @@
 use std::sync::Arc;
 
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
-use tuile_tile_server::{StoreConfig, StoreContent, TileStore};
+use tuile_tile_server::projection::DEFAULT_TILE_FACTOR;
+use tuile_tile_server::{Eye, Footprint, StoreConfig, StoreContent, TileStore};
 
 const DEFAULT_REGION: &str = "auto";
+/// Where the scene's projections are written, unless `TUILE_TILES_DIR` says.
+const DEFAULT_PROJECTION_DIR: &str = "/tmp/tuile-tiles";
+/// A bake has no use for other writers' newest deltas: it reads its scene
+/// from its projections, and its own tiles from memory.
+const BAKE_MANIFEST_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The store, and the runtime its final flush runs on.
 pub struct Tiles {
@@ -49,7 +55,10 @@ impl Tiles {
             .build()
             .map_err(|e| format!("tile store runtime: {e}"))?;
         let store = runtime
-            .block_on(TileStore::open(Arc::new(s3), StoreConfig::default()))
+            .block_on(TileStore::open(
+                Arc::new(s3),
+                StoreConfig { manifest_ttl: BAKE_MANIFEST_TTL, ..StoreConfig::default() },
+            ))
             .map_err(|e| format!("tile bucket {bucket}: {e}"))?;
         tracing::info!(bucket, layers = store.layers().count(), "TILES-OPEN");
         Ok(Some(Self { runtime, store: Arc::new(store) }))
@@ -65,6 +74,35 @@ impl Tiles {
         }
     }
 
+    /// Projects the part of the store the scene's cameras can use into local
+    /// archives, read before the bucket for the rest of the bake.
+    pub fn project(&self, poses: &[tuile_tape::Frame]) -> Result<(), String> {
+        let eyes = poses.iter().map(|p| {
+            let g = tuile_core::geo::ecef_to_geodetic(glam::DVec3::from_array(p.position));
+            Eye { lon: g.lon.to_degrees(), lat: g.lat.to_degrees(), height: g.height }
+        });
+        let factor = std::env::var("TUILE_TILES_FACTOR").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_TILE_FACTOR);
+        let footprint = Footprint::from_eyes(eyes, factor);
+        let dir = std::env::var("TUILE_TILES_DIR").unwrap_or_else(|_| DEFAULT_PROJECTION_DIR.into());
+        let report = self
+            .runtime
+            .block_on(self.store.project(&footprint, std::path::Path::new(&dir)))
+            .map_err(|e| format!("projecting the tile store: {e}"))?;
+        tracing::info!(
+            eyes = footprint.eyes().len(),
+            factor,
+            zones_seen = report.zones_seen,
+            zones = report.zones_projected,
+            tiles_listed = report.tiles_listed,
+            tiles = report.tiles_kept,
+            mb = report.bytes as f64 / 1e6,
+            requests = report.requests,
+            seconds = report.millis as f64 / 1e3,
+            "TILES-PROJECTED"
+        );
+        Ok(())
+    }
+
     pub fn cache(&self) -> tuile_bake::TileCache {
         tuile_bake::TileCache(Arc::new(StoreContent::new(self.store.clone())))
     }
@@ -72,8 +110,18 @@ impl Tiles {
     /// Publishes whatever is still buffered. Called on the way out, success or
     /// not: tiles fetched by a failed bake are still worth keeping.
     pub fn flush(&self) -> Result<(), String> {
+        let stats = self.store.stats();
+        tracing::info!(
+            buffer = stats.buffer,
+            projection = stats.projection,
+            projection_misses = stats.projection_misses,
+            remote = stats.remote,
+            absent = stats.absent,
+            "TILES-READS"
+        );
+        let began = std::time::Instant::now();
         let zones = self.runtime.block_on(self.store.flush_all()).map_err(|e| format!("tile store flush: {e}"))?;
-        tracing::info!(zones, "TILES-FLUSHED");
+        tracing::info!(zones, seconds = began.elapsed().as_secs_f64(), "TILES-FLUSHED");
         Ok(())
     }
 }
