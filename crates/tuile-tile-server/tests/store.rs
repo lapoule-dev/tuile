@@ -177,3 +177,76 @@ async fn coarse_tiles_share_the_top_zone_and_fine_ones_their_cell() {
     s.flush_all().await.expect("flush");
     assert_eq!(archives(objects.as_ref(), "imagery/top").await.len(), 1);
 }
+
+#[tokio::test]
+async fn tiered_compaction_leaves_a_large_base_alone_while_small_deltas_pile_up() {
+    let clock = TestClock::new();
+    let objects = memory();
+    let s = store_on(objects.clone(), &clock, eager());
+    let prefix = common::imagery().zone_prefix(zone());
+    let mut expected = std::collections::BTreeMap::new();
+
+    // A base holding the whole zone.
+    for i in 0..ZONE_SIDE * ZONE_SIDE {
+        let (x, y) = in_zone(i);
+        let b = body(LEVEL, x, y, 0);
+        s.put(IMAGERY, LEVEL, x, y, b.clone()).await.expect("put");
+        expected.insert((x, y), b);
+    }
+    s.flush_all().await.expect("flush");
+    let base = tuile_tile_server::manifest::read(objects.as_ref(), &prefix).await.expect("manifest").manifest.archives[0]
+        .key
+        .clone();
+
+    // Then many small deltas, each followed by a maintenance pass.
+    const DELTAS: u32 = 24;
+    const DELTA_TILES: u32 = 3;
+    for d in 0..DELTAS {
+        for t in 0..DELTA_TILES {
+            let (x, y) = in_zone(d * DELTA_TILES + t);
+            let b = body(LEVEL, x, y, d + 1);
+            s.put(IMAGERY, LEVEL, x, y, b.clone()).await.expect("put");
+            expected.insert((x, y), b);
+        }
+        s.flush_all().await.expect("flush");
+        s.compact_due().await.expect("compact_due");
+        let m = tuile_tile_server::manifest::read(objects.as_ref(), &prefix).await.expect("manifest").manifest;
+        let sizes: Vec<u64> = m.archives.iter().map(|a| a.bytes).collect();
+        assert_eq!(m.archives[0].key, base, "the base was rewritten after delta {d}: sizes {sizes:?}");
+        assert!(m.archives.len() <= s.object_store_config().tiering.max_archives, "{} archives", m.archives.len());
+    }
+    let fresh = store_on(objects, &clock, eager());
+    for ((x, y), b) in &expected {
+        assert_eq!(fresh.get(IMAGERY, LEVEL, *x, *y).await.expect("get").as_ref(), Some(b), "{x}/{y}");
+    }
+}
+
+#[tokio::test]
+async fn a_maintenance_pass_finds_every_zone_and_drops_expired_archives() {
+    let clock = TestClock::new();
+    let objects = memory();
+    let s = store_on(objects.clone(), &clock, eager());
+    // Three zones: the test zone, its neighbour, and the top zone.
+    s.put(IMAGERY, LEVEL, X0, Y0, body(LEVEL, X0, Y0, 0)).await.expect("put");
+    s.put(IMAGERY, LEVEL, X0 + ZONE_SIDE, Y0, body(LEVEL, X0 + ZONE_SIDE, Y0, 0)).await.expect("put");
+    s.put(IMAGERY, 2, 1, 1, body(2, 1, 1, 0)).await.expect("put");
+    s.put(TERRAIN, 12, 4100, 2900, body(12, 4100, 2900, 0)).await.expect("put");
+    s.flush_all().await.expect("flush");
+    let mut zones = s.zones().await.expect("zones");
+    zones.sort();
+    assert_eq!(zones.len(), 4, "{zones:?}");
+
+    clock.advance(days(130));
+    s.compact_due().await.expect("compact_due");
+    let m = tuile_tile_server::manifest::read(objects.as_ref(), &common::imagery().zone_prefix(zone()))
+        .await
+        .expect("manifest")
+        .manifest;
+    assert!(m.archives.is_empty(), "expired imagery retired");
+    assert_eq!(m.retired.len(), 1);
+    let terrain = tuile_tile_server::manifest::read(objects.as_ref(), &common::terrain().zone_prefix(tuile_tile_server::Zone::Cell { x: 4100 >> 3, y: 2900 >> 3 }))
+        .await
+        .expect("manifest")
+        .manifest;
+    assert_eq!(terrain.archives.len(), 1, "durable terrain kept");
+}

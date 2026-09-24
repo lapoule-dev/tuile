@@ -94,15 +94,14 @@ impl TestClock {
     }
 }
 
-/// Settings that make every publication visible at once and never flush or
-/// compact on their own, so a test decides when things happen. Graces keep
-/// their defaults.
+/// Settings that make every publication visible at once and never flush on
+/// their own, so a test decides when things happen. (Nothing compacts on its
+/// own either way: only `compact*` calls do.) Graces keep their defaults.
 pub fn eager() -> StoreConfig {
     StoreConfig {
         flush_bytes: usize::MAX,
         flush_age: Duration::MAX,
         manifest_ttl: Duration::ZERO,
-        compact_min_archives: usize::MAX,
         // Many writers on one zone in the tests: let them all get through.
         publish_attempts: 1000,
         ..StoreConfig::default()
