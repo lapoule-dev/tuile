@@ -14,6 +14,7 @@
 //!   conditional writes.
 //! - [`store`] puts it together: a mutable buffer in memory, deltas, a
 //!   streaming compaction, and cleanup — safe with any number of writers.
+//! - [`tiering`] picks what a compaction merges: similar sizes, contiguous.
 //! - [`service`] adds the upstream: fetched once, stored, served.
 //!
 //! No router and no authentication here: those belong to whoever deploys it.
@@ -24,6 +25,7 @@ pub mod layer;
 pub mod manifest;
 pub mod service;
 pub mod store;
+pub mod tiering;
 pub mod upstream;
 
 pub use grid::{Grid, OutOfGrid};
@@ -31,6 +33,7 @@ pub use layer::{Layer, Zone, DURABLE_EPOCH};
 pub use pmtiles::{Compression, TileType};
 pub use service::{LayerMeta, ServiceError, TileResponse, TileService};
 pub use store::{Clock, Compaction, StoreConfig, TileStore};
+pub use tiering::Tiering;
 pub use upstream::{TemplateUpstream, Upstream, UpstreamError};
 
 /// A failure of the store.
