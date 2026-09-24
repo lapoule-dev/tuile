@@ -10,6 +10,8 @@
 //! - [`grid`] maps a source's own addressing onto an archive's quadtree.
 //! - [`layer`] says how a layer is split into zones and cut into epochs.
 //! - [`archive`] writes and reads one immutable archive.
+//! - [`catalog`] is the list of layers, kept in the bucket itself.
+//! - [`content`] makes the store the engine's tile cache.
 //! - [`manifest`] is the list of archives a zone is made of, replaced by
 //!   conditional writes.
 //! - [`store`] puts it together: a mutable buffer in memory, deltas, a
@@ -20,6 +22,8 @@
 //! No router and no authentication here: those belong to whoever deploys it.
 
 pub mod archive;
+pub mod catalog;
+pub mod content;
 pub mod grid;
 pub mod layer;
 pub mod manifest;
@@ -28,6 +32,8 @@ pub mod store;
 pub mod tiering;
 pub mod upstream;
 
+pub use catalog::{Catalog, LayerDef};
+pub use content::StoreContent;
 pub use grid::{Grid, OutOfGrid};
 pub use layer::{Layer, Zone, DURABLE_EPOCH};
 pub use pmtiles::{Compression, TileType};

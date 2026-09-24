@@ -135,3 +135,30 @@ pub async fn archives(objects: &dyn ObjectStore, prefix: &str) -> Vec<String> {
     keys.sort();
     keys
 }
+
+/// The catalog the test layers come from.
+pub fn catalog() -> tuile_tile_server::Catalog {
+    use tuile_tile_server::LayerDef;
+    tuile_tile_server::Catalog {
+        layers: vec![
+            LayerDef {
+                name: IMAGERY.into(),
+                grid: Grid::WebMercator,
+                tile_type: "jpeg".into(),
+                tile_compression: "none".into(),
+                zone_level: ZONE_LEVEL,
+                expiry_days: Some(IMAGERY_EXPIRY.as_secs() / 86_400),
+                content_type: "image/jpeg".into(),
+            },
+            LayerDef {
+                name: TERRAIN.into(),
+                grid: Grid::Geographic,
+                tile_type: "other".into(),
+                tile_compression: "gzip".into(),
+                zone_level: TERRAIN_ZONE_LEVEL,
+                expiry_days: None,
+                content_type: "application/vnd.quantized-mesh".into(),
+            },
+        ],
+    }
+}
