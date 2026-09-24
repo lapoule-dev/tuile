@@ -32,4 +32,6 @@ tuile-core = { version = "0.1.0", path = "../tuile-core" }
 url = { workspace = true }
 
 [dev-dependencies]
+# The integration test talks to a real S3-compatible bucket (R2).
+object_store = { version = "0.14.2", default-features = false, features = ["aws"] }
 tokio = { workspace = true, features = ["sync", "fs", "io-util", "time", "rt", "rt-multi-thread", "macros"] }
