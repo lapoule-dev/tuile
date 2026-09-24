@@ -210,3 +210,32 @@ async fn writes_samples_for_the_reference_tool() {
     let merged = objects.get(&m.archives[0].key.as_str().into()).await.expect("get").bytes().await.expect("bytes");
     std::fs::write(dir.join("compacted.pmtiles"), merged).expect("write");
 }
+
+/// With the forked accessors, a directory entry says exactly where its tile
+/// lies: `data_offset + offset .. + length` in the file is what `get_tile`
+/// returns — for an archive of ours with leaf directories, and for the
+/// reference fixtures. This is what projections fetch by coalesced ranges.
+#[tokio::test]
+async fn directory_entries_locate_tile_bytes_exactly() {
+    use futures_util::TryStreamExt;
+    async fn check(path: &std::path::Path) -> usize {
+        let bytes = std::fs::read(path).expect("read");
+        let reader = Arc::new(archive::open_local(path).await.expect("open"));
+        let header = reader.get_header();
+        let mut entries = reader.clone().entries();
+        let mut n = 0;
+        while let Some(e) = entries.try_next().await.expect("entry") {
+            let start = (header.data_offset() + e.offset()) as usize;
+            let direct = &bytes[start..start + e.length() as usize];
+            let tile = reader.get_tile(TileId::new(e.tile_id()).expect("id")).await.expect("get").expect("present");
+            assert_eq!(direct, tile.as_ref(), "tile {} in {}", e.tile_id(), path.display());
+            n += 1;
+        }
+        n
+    }
+    let tiles = random_tiles(40_000, 13);
+    let (file, _) = write_tiles(&common::imagery(), "202609", tiles).expect("write");
+    assert_eq!(check(file.path()).await, 40_000);
+    assert!(check(&fixture("raster-z3.pmtiles")).await > 0);
+    assert!(check(&fixture("leaf.pmtiles")).await > 0);
+}
