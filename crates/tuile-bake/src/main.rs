@@ -794,6 +794,8 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
         let mut namespaces = vec![tuile_bake::source_namespace(config.terrain_asset_id)];
         namespaces.extend(config.imagery_asset_id.map(tuile_bake::source_namespace));
         tiles.check(&namespaces);
+        // The scene's slice of the store, local before the first frame.
+        tiles.project(&poses[args.first.max(1) as usize - 1..wanted])?;
         config.tile_cache = Some(tiles.cache());
     }
     // What the pack already holds, shared with the loader so it never fetches
