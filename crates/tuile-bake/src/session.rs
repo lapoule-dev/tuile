@@ -849,7 +849,7 @@ impl Live {
                     stream,
                     scene,
                     resident,
-                    textures,
+                    Arc::clone(textures),
                     &dataset,
                     bake_max_size,
                     generation,
@@ -945,54 +945,117 @@ async fn converge(
     stream: &mut tuile_core::protocol::InProcessStream,
     scene: &mut SceneState,
     resident: &mut HashMap<TileId, Arc<TileGeometry>>,
-    memo: &TextureMemo,
+    memo: Arc<TextureMemo>,
     dataset: &str,
     bake_max_size: u32,
     generation: u64,
     errors: &mut Vec<(Option<TileId>, String)>,
 ) -> Result<(), StreamError> {
+    // Finishing a tile — composing its 2048² mosaic and encoding it — is the
+    // cost of a frame, and it used to run here, inline, one tile after the
+    // next, on the thread that also receives the stream: frame 1 of a bake
+    // spent 106 s composing 273 drapes on one core of eight. It now runs on a
+    // dedicated pool of one thread per core, while the pump keeps receiving.
+    //
+    // Each tile's result is what it was before: the encoding of one tile does
+    // not depend on any other. Only the order tiles become resident changes,
+    // and `resident` is a map. A frame converges once the server says so AND
+    // every tile it sent is finished.
+    let pool = finish_pool();
+    let mut finishing: tokio::task::JoinSet<(TileId, u64, TileGeometry)> = tokio::task::JoinSet::new();
+    // A tile evicted — or re-sent — while it is being finished must not come
+    // back from a stale task: each arrival gets a number, and only the latest
+    // is taken in.
+    let mut arrivals: HashMap<TileId, u64> = HashMap::new();
+    let mut next_arrival = 0u64;
     loop {
-        if scene.generation() >= generation && scene.is_complete() {
+        let server_done = scene.generation() >= generation && scene.is_complete();
+        if server_done && finishing.is_empty() {
             return Ok(());
         }
-        let Some(message) = stream.next_message().await else {
-            return Err(StreamError::Closed);
-        };
-        scene.apply(&message);
-        // The pump's own view of convergence, message by message. `complete`
-        // is the condition that ENDS a frame, so a run that saw it one message
-        // earlier than another kept a different selection — and that is
-        // invisible from anywhere else.
-        tuile_core::det!(
-            "pump",
-            gen_seen = scene.generation(),
-            gen_want = generation,
-            complete = scene.is_complete(),
-            selected = scene.selected().len(),
-            resident = resident.len(),
-        );
-        match message {
-            // Once per residency, and never again — so this is the only
-            // moment a tile can be taken in.
-            ServerMessage::Content {
-                tile,
-                content: TileContent::Decoded(decoded),
-                ..
-            } => {
-                resident.insert(
-                    tile,
-                    Arc::new(finish_tile(memo, dataset, tile, decoded, bake_max_size)),
-                );
-            }
-            ServerMessage::Evict { tiles } => {
-                for tile in tiles {
-                    resident.remove(&tile);
+        tokio::select! {
+            finished = finishing.join_next(), if !finishing.is_empty() => {
+                match finished {
+                    Some(Ok((tile, arrival, geometry))) => {
+                        if arrivals.get(&tile) == Some(&arrival) {
+                            arrivals.remove(&tile);
+                            resident.insert(tile, Arc::new(geometry));
+                        }
+                    }
+                    // A panicking finish is a bug, not a missing tile to wait
+                    // for: say so and let the frame fail rather than hang.
+                    Some(Err(e)) => errors.push((None, format!("finishing a tile: {e}"))),
+                    None => {}
                 }
             }
-            ServerMessage::Error { tile, message } => errors.push((tile, message)),
-            _ => {}
+            message = stream.next_message(), if !server_done => {
+                let Some(message) = message else {
+                    return Err(StreamError::Closed);
+                };
+                scene.apply(&message);
+                // The pump's own view of convergence, message by message. `complete`
+                // is the condition that ENDS a frame, so a run that saw it one message
+                // earlier than another kept a different selection — and that is
+                // invisible from anywhere else.
+                tuile_core::det!(
+                    "pump",
+                    gen_seen = scene.generation(),
+                    gen_want = generation,
+                    complete = scene.is_complete(),
+                    selected = scene.selected().len(),
+                    resident = resident.len(),
+                );
+                match message {
+                    // Once per residency, and never again — so this is the only
+                    // moment a tile can be taken in.
+                    ServerMessage::Content {
+                        tile,
+                        content: TileContent::Decoded(decoded),
+                        ..
+                    } => {
+                        next_arrival += 1;
+                        arrivals.insert(tile, next_arrival);
+                        let arrival = next_arrival;
+                        let (memo, dataset) = (Arc::clone(&memo), dataset.to_string());
+                        let (done, result) = tokio::sync::oneshot::channel();
+                        pool.spawn(move || {
+                            let _ = done.send(finish_tile(&memo, &dataset, tile, decoded, bake_max_size));
+                        });
+                        finishing.spawn(async move {
+                            let geometry = result.await.expect("a tile finish panicked");
+                            (tile, arrival, geometry)
+                        });
+                    }
+                    ServerMessage::Evict { tiles } => {
+                        for tile in tiles {
+                            arrivals.remove(&tile);
+                            resident.remove(&tile);
+                        }
+                    }
+                    ServerMessage::Error { tile, message } => errors.push((tile, message)),
+                    _ => {}
+                }
+            }
         }
     }
+}
+
+/// The pool tiles are finished on: one thread per core (unless
+/// `TUILE_FINISH_THREADS` says), built once per process.
+fn finish_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("TUILE_FINISH_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n: &usize| *n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("tuile-finish-{i}"))
+            .build()
+            .expect("the tile finishing pool")
+    })
 }
 
 /// The ground texel spacing (metres/texel) the given views want, or `None`
