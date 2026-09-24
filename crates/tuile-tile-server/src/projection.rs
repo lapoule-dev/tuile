@@ -13,7 +13,9 @@
 //!
 //! One whole-object request per archive rather than coalesced byte ranges: a
 //! zone is a few megabytes, and the latency of each request is what a
-//! projection pays for, not the bytes.
+//! projection pays for, not the bytes. For the same reason a cell zone the
+//! scene reaches is projected whole; only `top` — every scene's coarse tiles,
+//! and growing with each — is filtered tile by tile.
 //!
 //! # Which tiles a scene can use
 //!
@@ -260,9 +262,15 @@ impl TileStore {
                     if tiles.contains_key(&id) {
                         continue;
                     }
-                    let Some((level, x, y)) = layer.grid.from_archive(TileCoord::from(tid)) else { continue };
-                    if !footprint.keeps_with(factor, layer.grid, level, x, y) {
-                        continue;
+                    // A cell zone the scene reaches is kept whole: its archive
+                    // came down in one request anyway, and a tile left out is
+                    // a round trip later. Only `top`, shared by every scene
+                    // and growing with each, is filtered tile by tile.
+                    if zone == Zone::Top {
+                        let Some((level, x, y)) = layer.grid.from_archive(TileCoord::from(tid)) else { continue };
+                        if !footprint.keeps_with(factor, layer.grid, level, x, y) {
+                            continue;
+                        }
                     }
                     if let Some(bytes) = reader.get_tile(tid).await? {
                         tiles.insert(id, bytes);

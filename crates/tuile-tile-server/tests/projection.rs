@@ -42,7 +42,7 @@ async fn a_projection_keeps_what_the_scene_can_see_and_reads_it_locally() {
     let fp = Footprint::from_eyes([eye], DEFAULT_TILE_FACTOR);
     let report = s.project(&fp, dir.path()).await.expect("project");
     assert!(report.zones_projected >= 2, "the cell and the top zone: {report:?}");
-    assert!(report.tiles_kept > 0 && report.tiles_kept < report.tiles_listed, "filtered: {report:?}");
+    assert!(report.tiles_kept > 0 && report.tiles_kept < report.tiles_listed, "top filtered: {report:?}");
     assert_eq!(report.requests as usize, report.zones_seen, "one request per archive, one archive per zone here: {report:?}");
 
     // The tile under the eye: from the projection, bytes identical.
@@ -104,6 +104,19 @@ async fn projections_are_plain_archives_on_disk() {
         .await
         .expect("get");
     assert_eq!(tile, Some(body(LEVEL, X0, Y0, 0)));
+}
+
+#[tokio::test]
+async fn a_reached_cell_zone_is_projected_whole() {
+    let (objects, clock) = published().await;
+    let s = store_on(objects, &clock, eager());
+    let dir = tempfile::tempdir().expect("dir");
+    // Low over one corner: the far corner's fine tiles are still kept.
+    s.project(&Footprint::from_eyes([eye_over(LEVEL, X0, Y0, 5_800.0)], 1.0), dir.path()).await.expect("project");
+    let far = in_zone(ZONE_SIDE * ZONE_SIDE - 1);
+    assert_eq!(s.get(IMAGERY, LEVEL, far.0, far.1).await.expect("get"), Some(body(LEVEL, far.0, far.1, 0)));
+    let stats = s.stats();
+    assert_eq!((stats.projection, stats.projection_misses, stats.remote), (1, 0, 0), "{stats:?}");
 }
 
 #[tokio::test]
