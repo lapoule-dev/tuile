@@ -19,6 +19,32 @@ seule façon de retrouver leur tracé est de rejouer les caméras du pack avec
 `tuile-bake --tape-from`. Les générateurs évoluent, donc recuire la même
 chaîne d'arguments ne donne plus le même vol.
 
+## `pyrenees-2min-nadir-50km-tilestore-projection.mp4`
+
+Le même plan, cuit **à travers les projections locales** du store : avant la
+première frame, la cuisson extrait des zones distantes les tuiles que ses
+caméras peuvent voir, dans des PMTiles locaux, puis lit ceux-ci avant R2.
+
+- bande et réglages : ceux de `pyrenees-2min-nadir-50km-tilestore-W.mp4`
+- pack W2 : `tile-store-test/W2/1-2880.tuilepack`, scène `90baed1a239165d4`,
+  4 392 tuiles, 1,76 Go
+- cuisson `tuile-bake-49hwc` : **7 min 30 s** au total (cuisson 5 min 54 s,
+  projection 6,3 s, vidage 1,3 s) contre 7 min 53 s sans store et 10 min 57 s
+  avec le store sans projection
+- projection : 283 zones, 8 362 tuiles gardées sur 25 379, 114 Mo en 341
+  requêtes, facteur 12
+- lectures : 8 887 dans les projections, **31 660 replis** vers R2 — le filtre
+  est trop serré pour l'imagerie (voir plus bas), 22 absentes
+- rendu `tuile-render-29f9z` : 3 tâches × L4 ; 2880 frames, 120,000 s, 663 Mo
+- image `blender-globe:5.1-su@sha256:db9d5b56…` (branche `feat/tile-server`,
+  commit `c2ca99c`)
+
+**Toujours transparent** : 4 179 tuiles communes avec B0, 4 177 avec W, toutes
+identiques. **Les replis viennent de l'imagerie** : un drapé de 2048² compose
+des tuiles d'imagerie plusieurs niveaux plus fines que la tuile de terrain
+qu'il habille, donc à même distance de l'œil l'imagerie utile est de largeur
+bien plus petite que ce que le facteur 12 garde.
+
 ## `pyrenees-2min-nadir-50km-tilestore-W.mp4`
 
 Le premier film cuit **à travers le store de tuiles** (`tuile-tile-server`,
