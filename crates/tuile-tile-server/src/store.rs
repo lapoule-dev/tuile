@@ -913,7 +913,7 @@ async fn upload(store: &dyn ObjectStore, path: &std::path::Path, key: &str) -> R
 }
 
 /// Downloads an object to a local file.
-async fn download(store: &dyn ObjectStore, key: &str, to: &std::path::Path) -> Result<(), StoreError> {
+pub(crate) async fn download(store: &dyn ObjectStore, key: &str, to: &std::path::Path) -> Result<(), StoreError> {
     use tokio::io::AsyncWriteExt;
     let got = store.get(&Path::from(key)).await?;
     let mut stream = got.into_stream();
