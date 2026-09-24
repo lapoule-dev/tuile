@@ -15,15 +15,19 @@
 //! order evicts them. The directory survives restarts: it is indexed again on
 //! open, so a restarted server starts warm.
 //!
-//! Downloads run in the background, a bounded number at a time, and each
-//! archive is fetched once however many readers want it. Until it lands, reads
-//! go to the bucket as before.
+//! Each archive is fetched once however many readers want it. A small archive
+//! — a typical zone — is waited for: its first reader pays one whole-object
+//! request instead of the range reads it would otherwise make *besides* the
+//! copy, and every reader behind it is local. A large one (the coarse `top`
+//! zone) is copied in the background, one at a time, while reads go to the
+//! bucket by ranges as before.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 use object_store::ObjectStore;
 
 use crate::archive::{self, LocalReader};
@@ -36,10 +40,19 @@ const MIB: u64 = 1 << 20;
 
 /// Default for [`DiskCacheConfig::budget_bytes`].
 pub const DEFAULT_DISK_BUDGET: u64 = 8 * GIB;
-/// Default for [`DiskCacheConfig::downloads_in_flight`]: enough to fetch a
-/// zone's handful of archives and its neighbours' at once, few enough not to
-/// crowd the reads a request is waiting on.
-pub const DEFAULT_DOWNLOADS_IN_FLIGHT: usize = 8;
+/// Default for [`DiskCacheConfig::downloads_in_flight`]: small copies are
+/// what the first readers of their zones wait on, as many as the requests a
+/// burst of new zones brings.
+pub const DEFAULT_DOWNLOADS_IN_FLIGHT: usize = 16;
+/// Default for [`DiskCacheConfig::await_copy_bytes`]: a zone of a few
+/// megabytes comes down in about the time of the two or three range reads a
+/// single tile of it costs.
+pub const DEFAULT_AWAIT_COPY_BYTES: u64 = 4 * MIB;
+/// Archives at least this large are copied one at a time, on a queue of their
+/// own that yields to the small copies: a coarse zone of tens of megabytes
+/// must neither take the bandwidth readers are waiting on nor hold up the
+/// copies of the small zones behind it.
+pub const LARGE_ARCHIVE_BYTES: u64 = 16 * MIB;
 /// Default for [`DiskCacheConfig::max_archive_bytes`]: past this, an archive
 /// is read by ranges rather than copied whole.
 pub const DEFAULT_MAX_ARCHIVE_BYTES: u64 = 256 * MIB;
@@ -53,7 +66,8 @@ pub struct DiskCacheConfig {
     pub dir: PathBuf,
     /// Bytes of archives kept; past it, the least recently read go first.
     pub budget_bytes: u64,
-    /// Archives downloaded at once.
+    /// Archives smaller than [`LARGE_ARCHIVE_BYTES`] downloaded at once;
+    /// larger ones go one at a time, besides.
     pub downloads_in_flight: usize,
     /// Archives larger than this (by the tile bytes their manifest states)
     /// are never copied whole.
@@ -61,6 +75,9 @@ pub struct DiskCacheConfig {
     /// When a zone is first read from the bucket, also copy the zones around
     /// it at the same level: a camera that moves reaches them next.
     pub prefetch_neighbours: bool,
+    /// A read waits for the copy of an archive up to this size rather than
+    /// reading it by ranges alongside the copy. `0`: never wait.
+    pub await_copy_bytes: u64,
 }
 
 impl DiskCacheConfig {
@@ -71,6 +88,7 @@ impl DiskCacheConfig {
             downloads_in_flight: DEFAULT_DOWNLOADS_IN_FLIGHT,
             max_archive_bytes: DEFAULT_MAX_ARCHIVE_BYTES,
             prefetch_neighbours: false,
+            await_copy_bytes: DEFAULT_AWAIT_COPY_BYTES,
         }
     }
 }
@@ -79,11 +97,33 @@ impl DiskCacheConfig {
 pub(crate) struct ArchiveCache {
     pub(crate) cfg: DiskCacheConfig,
     readers: Mutex<Lru<String, Arc<LocalReader>>>,
-    inflight: Mutex<HashSet<String>>,
+    inflight: Mutex<HashMap<String, ArchiveCopy>>,
     /// The number of downloads in flight, so a caller can wait for quiet.
     pending: tokio::sync::watch::Sender<usize>,
     permits: Arc<tokio::sync::Semaphore>,
+    large_permits: Arc<tokio::sync::Semaphore>,
+    /// Small copies in flight or queued: a large copy starts only at zero.
+    small: tokio::sync::watch::Sender<usize>,
 }
+
+/// Counts a small copy for as long as it lives.
+struct SmallCopy<'a>(&'a tokio::sync::watch::Sender<usize>);
+
+impl<'a> SmallCopy<'a> {
+    fn new(small: &'a tokio::sync::watch::Sender<usize>) -> Self {
+        small.send_modify(|n| *n += 1);
+        Self(small)
+    }
+}
+
+impl Drop for SmallCopy<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n = n.saturating_sub(1));
+    }
+}
+
+/// A copy in flight: resolves to whether the archive is now local.
+pub(crate) type ArchiveCopy = Shared<BoxFuture<'static, bool>>;
 
 /// Is this archive key a plain relative path, safe to join under the cache
 /// directory?
@@ -131,12 +171,15 @@ impl ArchiveCache {
             }
         }
         let (pending, _) = tokio::sync::watch::channel(0);
+        let (small, _) = tokio::sync::watch::channel(0);
         Ok(Arc::new(Self {
             permits: Arc::new(tokio::sync::Semaphore::new(cfg.downloads_in_flight.max(1))),
+            large_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             cfg,
             readers: Mutex::new(lru),
             inflight: Mutex::default(),
             pending,
+            small,
         }))
     }
 
@@ -154,51 +197,67 @@ impl ArchiveCache {
         self.readers.lock().map(|r| r.weight()).unwrap_or(0)
     }
 
-    /// Copies an archive in the background unless it is here, on its way, or
-    /// too large. Returns whether a download was started.
-    pub(crate) fn schedule(self: &Arc<Self>, objects: Arc<dyn ObjectStore>, key: &str, bytes: u64) -> bool {
+    /// The copy of an archive, started unless it is on its way: `None` when
+    /// it is already here or is never copied (too large, odd key, no
+    /// runtime). The flag says whether this call started it. The copy runs to
+    /// its end whether or not anyone awaits it.
+    pub(crate) fn copy(self: &Arc<Self>, objects: Arc<dyn ObjectStore>, key: &str, bytes: u64) -> Option<(ArchiveCopy, bool)> {
         if bytes > self.cfg.max_archive_bytes || !safe_relative(key) || self.has(key) {
-            return false;
+            return None;
         }
-        {
-            let Ok(mut inflight) = self.inflight.lock() else { return false };
-            if !inflight.insert(key.to_string()) {
-                return false;
-            }
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let mut inflight = self.inflight.lock().ok()?;
+        if let Some(c) = inflight.get(key) {
+            return Some((c.clone(), false));
         }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            // No runtime to run it on: nothing is copied.
-            self.done(key);
-            return false;
-        };
         self.pending.send_modify(|n| *n += 1);
         let this = self.clone();
-        let key = key.to_string();
-        runtime.spawn(async move {
-            if let Err(e) = this.fetch(objects.as_ref(), &key).await {
-                tracing::debug!(key, error = %e, "archive copy failed; reads stay remote");
+        let k = key.to_string();
+        let copy = async move {
+            let ok = match this.fetch(objects.as_ref(), &k, bytes).await {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::debug!(key = k, error = %e, "archive copy failed; reads stay remote");
+                    false
+                }
+            };
+            if let Ok(mut inflight) = this.inflight.lock() {
+                inflight.remove(&k);
             }
-            this.done(&key);
             this.pending.send_modify(|n| *n = n.saturating_sub(1));
-        });
-        true
-    }
-
-    fn done(&self, key: &str) {
-        if let Ok(mut inflight) = self.inflight.lock() {
-            inflight.remove(key);
+            ok
         }
+        .boxed()
+        .shared();
+        inflight.insert(key.to_string(), copy.clone());
+        runtime.spawn(copy.clone());
+        Some((copy, true))
     }
 
-    /// Copies an archive now, and waits for it.
-    pub(crate) async fn fetch(&self, objects: &dyn ObjectStore, key: &str) -> Result<Arc<LocalReader>, StoreError> {
+    /// Copies an archive now, and waits for it. `bytes` is the size its
+    /// manifest states, which picks the queue.
+    pub(crate) async fn fetch(&self, objects: &dyn ObjectStore, key: &str, bytes: u64) -> Result<Arc<LocalReader>, StoreError> {
         if let Some(r) = self.reader(key) {
             return Ok(r);
         }
         if !safe_relative(key) {
             return Err(StoreError::Corrupt(format!("{key}: not a relative key")));
         }
-        let _permit = self.permits.acquire().await.map_err(|_| StoreError::Poisoned)?;
+        let large = bytes >= LARGE_ARCHIVE_BYTES;
+        let _small = (!large).then(|| SmallCopy::new(&self.small));
+        let _permit = if large {
+            let permit = self.large_permits.acquire().await.map_err(|_| StoreError::Poisoned)?;
+            // Behind every small copy: those are what readers wait on.
+            let mut quiet = self.small.subscribe();
+            let _ = quiet.wait_for(|n| *n == 0).await;
+            permit
+        } else {
+            self.permits.acquire().await.map_err(|_| StoreError::Poisoned)?
+        };
+        // Copied while this one waited its turn.
+        if let Some(r) = self.reader(key) {
+            return Ok(r);
+        }
         let path = self.cfg.dir.join(key);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
