@@ -32,6 +32,8 @@
 //! blind to ground nobody selected. That is why the cull setting is written
 //! into the pack rather than merely applied: see `PackWriter::culling`.
 
+mod tiles;
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -727,6 +729,14 @@ fn inspect(path: &std::path::Path) -> Result<(), String> {
 }
 
 fn bake(args: Args) -> Result<(), String> {
+    let tiles = tiles::Tiles::from_env()?;
+    let result = bake_with(args, tiles.as_ref());
+    // Whatever the bake fetched is published, even if it failed.
+    let flushed = tiles.as_ref().map(tiles::Tiles::flush).transpose();
+    result.and(flushed.map(|_| ()))
+}
+
+fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
     let token = std::env::var("TUILE_ION_TOKEN")
         .map_err(|_| "TUILE_ION_TOKEN is not set; a bake is the one job that needs it")?;
 
@@ -779,6 +789,12 @@ fn bake(args: Args) -> Result<(), String> {
         // Négatif = pas d'imagerie du tout, la vue de débogage géométrique,
         // même convention que le C ABI (`ffi.rs:244`).
         config.imagery_asset_id = if id < 0 { None } else { Some(id) };
+    }
+    if let Some(tiles) = tiles {
+        let mut namespaces = vec![tuile_bake::source_namespace(config.terrain_asset_id)];
+        namespaces.extend(config.imagery_asset_id.map(tuile_bake::source_namespace));
+        tiles.check(&namespaces);
+        config.tile_cache = Some(tiles.cache());
     }
     // What the pack already holds, shared with the loader so it never fetches
     // a drape twice.

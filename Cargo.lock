@@ -5521,6 +5521,7 @@ dependencies = [
  "glam",
  "image",
  "jemalloc_pprof",
+ "object_store",
  "pprof",
  "tempfile",
  "thiserror 2.0.18",
@@ -5535,6 +5536,8 @@ dependencies = [
  "tuile-pack",
  "tuile-planetary",
  "tuile-tape",
+ "tuile-terrain",
+ "tuile-tile-server",
 ]
 
 [[package]]
