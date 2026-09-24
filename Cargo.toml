@@ -96,3 +96,11 @@ lto = "thin"
 # unchanged — `strip` was buying nothing here that `split-debuginfo` does not.
 debug = "line-tables-only"
 split-debuginfo = "packed"
+
+# `pmtiles` with public accessors for directory entries and header sections
+# (lapoule-dev fork, branch `tuile-accessors`, one commit on top of v0.24.0).
+# The tile store's projections read an archive's directories and fetch tile
+# bytes by coalesced ranges, which needs to know where each tile lies. To be
+# dropped once the same change is released upstream.
+[patch.crates-io]
+pmtiles = { git = "https://github.com/lapoule-dev/pmtiles-rs.git", branch = "tuile-accessors" }
