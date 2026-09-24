@@ -795,7 +795,8 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
         namespaces.extend(config.imagery_asset_id.map(tuile_bake::source_namespace));
         tiles.check(&namespaces);
         // The scene's slice of the store, local before the first frame.
-        tiles.project(&poses[args.first.max(1) as usize - 1..wanted])?;
+        let imagery_layer = config.imagery_asset_id.map(tuile_bake::source_namespace);
+        tiles.project(&poses[args.first.max(1) as usize - 1..wanted], imagery_layer.as_deref())?;
         config.tile_cache = Some(tiles.cache());
     }
     // What the pack already holds, shared with the loader so it never fetches

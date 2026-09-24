@@ -21,6 +21,9 @@ use tuile_tile_server::{Eye, Footprint, StoreConfig, StoreContent, TileStore};
 const DEFAULT_REGION: &str = "auto";
 /// Where the scene's projections are written, unless `TUILE_TILES_DIR` says.
 const DEFAULT_PROJECTION_DIR: &str = "/tmp/tuile-tiles";
+/// Imagery is kept eight times farther than terrain: a 2048² drape composes
+/// imagery about three levels finer than the terrain tile it covers.
+const IMAGERY_FACTOR: f64 = DEFAULT_TILE_FACTOR * 8.0;
 /// A bake has no use for other writers' newest deltas: it reads its scene
 /// from its projections, and its own tiles from memory.
 const BAKE_MANIFEST_TTL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -76,13 +79,20 @@ impl Tiles {
 
     /// Projects the part of the store the scene's cameras can use into local
     /// archives, read before the bucket for the rest of the bake.
-    pub fn project(&self, poses: &[tuile_tape::Frame]) -> Result<(), String> {
+    pub fn project(&self, poses: &[tuile_tape::Frame], imagery_layer: Option<&str>) -> Result<(), String> {
         let eyes = poses.iter().map(|p| {
             let g = tuile_core::geo::ecef_to_geodetic(glam::DVec3::from_array(p.position));
             Eye { lon: g.lon.to_degrees(), lat: g.lat.to_degrees(), height: g.height }
         });
         let factor = std::env::var("TUILE_TILES_FACTOR").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_TILE_FACTOR);
-        let footprint = Footprint::from_eyes(eyes, factor);
+        let imagery_factor = std::env::var("TUILE_TILES_IMAGERY_FACTOR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(IMAGERY_FACTOR);
+        let mut footprint = Footprint::from_eyes(eyes, factor);
+        if let Some(name) = imagery_layer {
+            footprint = footprint.with_layer_factor(name, imagery_factor);
+        }
         let dir = std::env::var("TUILE_TILES_DIR").unwrap_or_else(|_| DEFAULT_PROJECTION_DIR.into());
         let report = self
             .runtime
@@ -91,6 +101,7 @@ impl Tiles {
         tracing::info!(
             eyes = footprint.eyes().len(),
             factor,
+            imagery_factor,
             zones_seen = report.zones_seen,
             zones = report.zones_projected,
             tiles_listed = report.tiles_listed,
