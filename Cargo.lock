@@ -3759,8 +3759,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 [[package]]
 name = "pmtiles"
 version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4bb49fe41324b32bb89bfe26aed92328ed255a99361d1e7bcb1eccfc8cf2c8a"
+source = "git+https://github.com/lapoule-dev/pmtiles-rs.git?branch=tuile-accessors#a378dff4110673aad7c79355b4e1f9230c34d9f4"
 dependencies = [
  "async-compression",
  "async-stream",
