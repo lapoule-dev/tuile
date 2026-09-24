@@ -92,7 +92,31 @@ pub struct GlobeConfig {
     /// is already stored. See [`tuile_planetary::HeldDrape`], and
     /// [`tuile_core::raster::drape_identity`] for what an identity is.
     pub held_drape: Option<tuile_planetary::HeldDrape>,
+    /// Where source tiles are kept between runs and between machines, keyed
+    /// by source and tile address; `None` fetches every tile from its source.
+    ///
+    /// The terrain is cached under the namespace [`source_namespace`] of its
+    /// asset, the imagery under its own. What is stored is what the source
+    /// served, so a pack baked through a cache is the pack baked without one.
+    pub tile_cache: Option<TileCache>,
     pub session: SessionConfig,
+}
+
+/// A [`ContentStore`](tuile_core::storage::ContentStore) the globe caches
+/// source tiles in.
+#[derive(Clone)]
+pub struct TileCache(pub Arc<dyn tuile_core::storage::ContentStore>);
+
+impl std::fmt::Debug for TileCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TileCache")
+    }
+}
+
+/// The cache namespace of a source asset: `asset-1` for the terrain asset 1.
+/// A tile store names its layers the same way.
+pub fn source_namespace(asset_id: i64) -> String {
+    format!("asset-{asset_id}")
 }
 
 impl GlobeConfig {
@@ -104,6 +128,7 @@ impl GlobeConfig {
             imagery_asset_id: Some(BING_AERIAL),
             cache_dir: None,
             held_drape: None,
+            tile_cache: None,
             session: SessionConfig::default(),
         }
     }
@@ -224,6 +249,78 @@ impl tuile_core::raster::ImageryProvider for NoImagery {
     }
 }
 
+/// A source, behind the tile cache or not — one type either way, so the globe
+/// is assembled by the same code in both cases.
+enum Cached<T, C> {
+    Direct(T),
+    Through(C),
+}
+
+impl<T: tuile_terrain::TerrainSource>
+    Cached<T, tuile_terrain::CachedTerrain<T>>
+{
+    fn wrap_terrain(
+        inner: T,
+        cache: Option<Arc<dyn tuile_core::storage::ContentStore>>,
+        asset: i64,
+    ) -> Self {
+        match cache {
+            Some(c) => Cached::Through(tuile_terrain::CachedTerrain::new(inner, c, source_namespace(asset))),
+            None => Cached::Direct(inner),
+        }
+    }
+}
+
+impl<P: tuile_core::raster::ImageryProvider>
+    Cached<P, tuile_core::raster::CachedImagery<P>>
+{
+    fn wrap_imagery(
+        inner: P,
+        cache: Option<Arc<dyn tuile_core::storage::ContentStore>>,
+        asset: i64,
+    ) -> Self {
+        match cache {
+            Some(c) => Cached::Through(tuile_core::raster::CachedImagery::new(inner, c, source_namespace(asset))),
+            None => Cached::Direct(inner),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: tuile_terrain::TerrainSource, C: tuile_terrain::TerrainSource> tuile_terrain::TerrainSource for Cached<T, C> {
+    async fn fetch_tile(
+        &self,
+        coord: tuile_terrain::TileCoord,
+    ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError> {
+        match self {
+            Cached::Direct(s) => s.fetch_tile(coord).await,
+            Cached::Through(s) => s.fetch_tile(coord).await,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<P: tuile_core::raster::ImageryProvider, C: tuile_core::raster::ImageryProvider> tuile_core::raster::ImageryProvider
+    for Cached<P, C>
+{
+    fn tiling_scheme(&self) -> tuile_core::raster::TilingScheme {
+        match self {
+            Cached::Direct(p) => p.tiling_scheme(),
+            Cached::Through(p) => p.tiling_scheme(),
+        }
+    }
+
+    async fn fetch_tile_bytes(
+        &self,
+        coord: tuile_core::raster::ImageryCoord,
+    ) -> Result<tuile_core::fetch::Fetched<bytes::Bytes>, tuile_core::raster::RasterError> {
+        match self {
+            Cached::Direct(p) => p.fetch_tile_bytes(coord).await,
+            Cached::Through(p) => p.fetch_tile_bytes(coord).await,
+        }
+    }
+}
+
 /// Resolves terrain and imagery into the two seams the core consumes.
 ///
 /// A near-transcription of what the example apps do, and deliberately so: the
@@ -277,6 +374,9 @@ async fn resolve(
         .layer()
         .await
         .map_err(|e| GlobeError::Ion(e.to_string()))?;
+    // Through the tile cache when there is one: a tile any earlier run fetched
+    // is read from it, and every tile fetched now is offered to it.
+    let terrain = Cached::wrap_terrain(terrain, config.tile_cache.clone().map(|c| c.0), config.terrain_asset_id);
 
     // Terrain only: a valid mode, and the one to reach for when the geometry
     // looks wrong and a texture is the last thing you want on top of it.
@@ -343,6 +443,7 @@ async fn resolve(
             let tms = TmsImagery::from_endpoint(ion, imagery_asset_id as u64, endpoint)
                 .await
                 .map_err(|e| GlobeError::Imagery(e.to_string()))?;
+            let tms = Cached::wrap_imagery(tms, config.tile_cache.clone().map(|c| c.0), imagery_asset_id);
             globe_on(terrain, tms, layer, options, offload::threaded())
         }
         Some("BING") => {
@@ -359,6 +460,7 @@ async fn resolve(
             let bing = BingImageryProvider::from_metadata_url(Arc::clone(&http), &metadata_url)
                 .await
                 .map_err(|e| GlobeError::Bing(e.to_string()))?;
+            let bing = Cached::wrap_imagery(bing, config.tile_cache.clone().map(|c| c.0), imagery_asset_id);
             globe_on(terrain, bing, layer, options, offload::threaded())
         }
         Some(kind) => {

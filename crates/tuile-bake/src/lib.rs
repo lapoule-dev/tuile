@@ -48,7 +48,8 @@ pub mod packed;
 mod session;
 
 pub use globe::{
-    duration_or, imagery_boost_cap, GlobeConfig, GlobeError, BING_AERIAL, CESIUM_WORLD_TERRAIN,
+    duration_or, imagery_boost_cap, source_namespace, GlobeConfig, GlobeError, TileCache, BING_AERIAL,
+    CESIUM_WORLD_TERRAIN,
 };
 pub use packed::PackedError;
 pub use session::{
