@@ -43,7 +43,7 @@ async fn a_projection_keeps_what_the_scene_can_see_and_reads_it_locally() {
     let report = s.project(&fp, dir.path()).await.expect("project");
     assert!(report.zones_projected >= 2, "the cell and the top zone: {report:?}");
     assert!(report.tiles_kept > 0 && report.tiles_kept < report.tiles_listed, "filtered: {report:?}");
-    assert!(report.requests > 0 && report.requests < report.tiles_kept, "coalesced ranges: {report:?}");
+    assert_eq!(report.requests as usize, report.zones_seen, "one request per archive, one archive per zone here: {report:?}");
 
     // The tile under the eye: from the projection, bytes identical.
     assert_eq!(s.get(IMAGERY, LEVEL, X0, Y0).await.expect("get"), Some(body(LEVEL, X0, Y0, 0)));
