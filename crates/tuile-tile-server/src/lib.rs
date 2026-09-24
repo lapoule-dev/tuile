@@ -16,17 +16,23 @@
 //!   conditional writes.
 //! - [`store`] puts it together: a mutable buffer in memory, deltas, a
 //!   streaming compaction, and cleanup — safe with any number of writers.
+//! - [`disk`] keeps whole archives on local disk, so a zone's second tile is
+//!   local.
+//! - [`lru`] is the budgeted least-recently-used map the caches share.
 //! - [`projection`] takes a scene's slice of the store to local archives.
 //! - [`tiering`] picks what a compaction merges: similar sizes, contiguous.
-//! - [`service`] adds the upstream: fetched once, stored, served.
+//! - [`service`] adds the upstream: fetched once, stored, served, the hot
+//!   tiles and the source's absences kept in memory.
 //!
 //! No router and no authentication here: those belong to whoever deploys it.
 
 pub mod archive;
 pub mod catalog;
 pub mod content;
+pub mod disk;
 pub mod grid;
 pub mod layer;
+pub mod lru;
 pub mod manifest;
 pub mod projection;
 pub mod service;
@@ -36,10 +42,11 @@ pub mod upstream;
 
 pub use catalog::{Catalog, LayerDef};
 pub use content::StoreContent;
+pub use disk::DiskCacheConfig;
 pub use grid::{Grid, OutOfGrid};
 pub use layer::{Layer, Zone, DURABLE_EPOCH};
 pub use pmtiles::{Compression, TileType};
-pub use service::{LayerMeta, ServiceError, TileResponse, TileService};
+pub use service::{etag_of, LayerMeta, ServiceConfig, ServiceError, ServiceStats, Source, TileResponse, TileService};
 pub use projection::{Eye, Footprint, ProjectionReport};
 pub use store::{Clock, Compaction, StatsSnapshot, StoreConfig, TileStore};
 pub use tiering::Tiering;
@@ -58,6 +65,9 @@ pub enum StoreError {
     Archive(#[from] pmtiles::PmtError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// A failure shared by every reader waiting on the same remote read.
+    #[error("remote: {0}")]
+    Remote(String),
     #[error("corrupt: {0}")]
     Corrupt(String),
     #[error("{0}: the manifest kept changing under every attempt")]

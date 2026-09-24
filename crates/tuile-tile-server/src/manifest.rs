@@ -37,6 +37,14 @@ pub struct ArchiveRef {
     /// three-tile delta and a full zone would look alike by file size.
     #[serde(default)]
     pub bytes: u64,
+    /// When the oldest and the newest of its tiles were fetched from their
+    /// source, in milliseconds since the Unix epoch. Absent in archives
+    /// published before this was recorded. A publication uses it to tell a
+    /// stored copy certainly newer than its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_fetch_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_fetch_ms: Option<u64>,
 }
 
 /// An archive no longer part of the zone, kept until readers holding an older
@@ -68,6 +76,10 @@ pub struct Versioned {
 
 pub(crate) fn now_secs(now: SystemTime) -> u64 {
     now.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+pub(crate) fn now_ms(now: SystemTime) -> u64 {
+    now.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 pub(crate) fn manifest_path(zone_prefix: &str) -> Path {
