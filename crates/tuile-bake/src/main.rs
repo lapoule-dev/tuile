@@ -32,12 +32,10 @@
 //! blind to ground nobody selected. That is why the cull setting is written
 //! into the pack rather than merely applied: see `PackWriter::culling`.
 
-mod tiles;
 
-use std::sync::Arc;
-use std::time::Instant;
-
-use tuile_pack::{BakedTile, PackWriter, TextureFormat};
+use tuile_bake::bake::{bake_frames, bake_settings, baked_tile, digest_of_scene, BakeFrames, PackedMirror, Poses, SceneName};
+use tuile_bake::tiles;
+use tuile_pack::BakedTile;
 
 /// CPU and heap profiling, when the build asked for it.
 ///
@@ -431,122 +429,6 @@ fn parse_args() -> Result<Job, String> {
     }))
 }
 
-/// Little-endian bytes, explicitly, rather than a view of this machine's
-/// memory.
-///
-/// A pack is a file that another machine reads. Casting a `Vec<[f32; 3]>` to
-/// bytes is one `unsafe` and encodes whatever this process happens to lay out;
-/// spelling the encoding out costs a loop on a machine chosen for having time,
-/// and makes the format a thing the file says rather than a thing the writer
-/// remembers.
-fn f32x3_le(values: &[[f32; 3]]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len() * 12);
-    for v in values {
-        for c in v {
-            out.extend_from_slice(&c.to_le_bytes());
-        }
-    }
-    out
-}
-
-fn f32x2_le(values: &[[f32; 2]]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len() * 8);
-    for v in values {
-        for c in v {
-            out.extend_from_slice(&c.to_le_bytes());
-        }
-    }
-    out
-}
-
-fn u32_le(values: &[u32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len() * 4);
-    for v in values {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    out
-}
-
-/// The name of the scene this pack is the bake of.
-///
-/// Everything that changes what a frame contains goes in, and nothing else. In
-/// particular the frame range does **not**: two shards of one shot bake
-/// different ranges of the same scene, and they must agree on the name of the
-/// scene or nothing can tell a mismatched pack from a neighbouring one. The
-/// range is in the object key beside the digest, which is where it belongs.
-///
-/// # The camera path, not the file that carried it
-///
-/// This used to hash the raw bytes of the `.mcap`, on the argument that a tape
-/// re-recorded one bit differently is a different scene — the cautious
-/// direction. The argument mistakes the envelope for the letter.
-///
-/// A container has its own reasons to change that have nothing to do with the
-/// scene: the writer's version, whether records are repeated in the summary,
-/// the compression level, the order a `HashMap` happened to iterate in. All of
-/// those renamed every scene in the world without a single camera moving —
-/// measured on 16 September 2026, when two bakes of one trajectory landed
-/// under `fb45fe68fb26e559` and `05274f175b83df6a`, and both were right.
-///
-/// So the digest is taken over the **poses**, canonically: ten little-endian
-/// `f64` per frame, in order. Two tapes that replay the same path name the same
-/// scene, whatever wrote them; two paths that differ anywhere — one frame, one
-/// bit of one coordinate — do not.
-///
-/// # Ce que `settings` doit porter
-///
-/// Tout ce qui décide du contenu sans être dans la trajectoire : la traversée
-/// résolue, **et les sources**. Ce paramètre s'appelait `traversal` et ne
-/// portait que la première, ce qui laissait passer deux collisions mesurées le
-/// 17 septembre 2026 sur la même orbite :
-///
-/// * boost d'imagerie 1 et 2 → même digest `9fb2b0f3559debc6`. Le plafond de
-///   boost est une option du chargeur, pas de la traversée, donc
-///   `exact_traversal` ne le voit pas.
-/// * asset d'imagerie 2 (Bing) et 3954 (Sentinel) → même digest, pour la même
-///   raison.
-///
-/// Un digest qui ne distingue pas deux packs les autorise à se répondre l'un
-/// pour l'autre : `--scene` accepterait le mauvais globe en silence. C'est la
-/// seule barrière entre un pack et une scène, et elle doit tout porter.
-/// Tout ce qui décide du contenu d'un pack hors trajectoire, en une chaîne.
-///
-/// Composée en UN endroit pour les deux chemins — la cuisson et `--verify` —
-/// parce que deux compositions séparées finissent par diverger, et qu'un
-/// `--verify` qui compare contre une autre scène ne vérifie rien.
-fn bake_settings(
-    config: &tuile_bake::GlobeConfig,
-    resolved: &tuile_core::traversal::Config,
-) -> String {
-    format!(
-        "{resolved:?}\nterrain={}\nimagery={:?}\nimagery_boost={}",
-        config.terrain_asset_id,
-        config.imagery_asset_id,
-        tuile_bake::imagery_boost_cap(),
-    )
-}
-
-fn digest_of_scene(poses: &[tuile_tape::Frame], viewport: (f64, f64), settings: &str) -> String {
-    let mut path = Vec::with_capacity(poses.len() * 10 * 8);
-    for pose in poses {
-        for value in pose
-            .position
-            .iter()
-            .chain(&pose.direction)
-            .chain(&pose.up)
-            .chain(std::slice::from_ref(&pose.fovy))
-        {
-            path.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-    tuile_pack::scene_digest(&[
-        &path,
-        &viewport.0.to_le_bytes(),
-        &viewport.1.to_le_bytes(),
-        settings.as_bytes(),
-    ])
-}
-
 fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -799,27 +681,14 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
         tiles.project(&poses[args.first.max(1) as usize - 1..wanted], imagery_layer.as_deref())?;
         config.tile_cache = Some(tiles.cache());
     }
-    // What the pack already holds, shared with the loader so it never fetches
-    // a drape twice.
-    //
-    // The pack is the authority — `FrameWriter::push_known` reads its real
-    // index — and this mirrors it for the one caller that has to know the
-    // answer *before* the request goes out. It is a mirror rather than the
-    // index itself because the loader asks from a worker thread, deep inside a
-    // fetch, while the writer is being borrowed mutably by the frame loop.
-    //
-    // A divergence cannot pass silently: a tile the loader withheld arrives
-    // with no imagery, so if `push_known` then fails to find it, `baked_tile`
-    // is called and refuses a drape with no texture rather than storing bare
-    // ground.
-    let already_packed: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(u64, u64)>>> =
-        std::sync::Arc::default();
-    config.held_drape = Some(tuile_bake::HeldDrape::new({
-        let packed = std::sync::Arc::clone(&already_packed);
-        move |id, drape| packed.lock().is_ok_and(|held| held.contains(&(id, drape)))
-    }));
+    // What the pack already holds, mirrored for the loader so it never fetches
+    // a drape twice. See `PackedMirror`.
+    let packed = PackedMirror::new();
+    config.held_drape = Some(packed.held_drape());
 
     let resolved = tuile_bake::exact_traversal(config.session.traversal.clone());
+    // The whole tape names the scene, not the range: two shards of one shot
+    // must agree on it. See `digest_of_scene`.
     let scene = digest_of_scene(&poses, args.viewport, &bake_settings(&config, &resolved));
     let culling = if resolved.cull { "full" } else { "disabled" };
     tracing::info!(
@@ -856,95 +725,22 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
         .collect(),
     );
 
-    let began = Instant::now();
     let mut session =
         tuile_bake::Session::globe(config).map_err(|e| format!("opening the globe: {e}"))?;
+    bake_frames(
+        &mut session,
+        &BakeFrames {
+            first: args.first,
+            last: wanted as u32,
+            viewport: args.viewport,
+            out: &args.out,
+            scene: SceneName::Given(scene.clone()),
+            culling,
+            packed: &packed,
+        },
+        &mut Poses(&poses),
+    )?;
 
-    // The render origin the pack's positions are relative to. The pack stores
-    // each tile's own ECEF origin, so this is carried for the consumer that
-    // rebases, not used to move anything here.
-    let origin = poses[args.first.max(1) as usize - 1].position;
-    // Le blob part sur disque au fil de la cuisson, à côté du pack.
-    //
-    // Sans ça, une cuisson tient les tuiles décompressées, puis le blob
-    // compressé, puis une troisième copie concaténant table et blob — trois
-    // fois le pack fini, vivants au même instant, sur une machine qui porte
-    // aussi le cache de tuiles. Une minute de film ne passait pas. Le déversoir
-    // rend le pic indépendant de la longueur : 1440 frames coûtent ce que
-    // coûtent 48.
-    let spill = args.out.with_extension("blob.part");
-    let mut writer = PackWriter::new(&scene, origin, &spill)
-        .map_err(|e| format!("opening {}: {e}", spill.display()))?
-        .culling(culling);
-
-    for number in args.first..=(wanted as u32) {
-        let pose = &poses[number as usize - 1];
-        let at = Instant::now();
-        let frame = session
-            .frame_for_pose(pose, args.viewport)
-            .map_err(|e| format!("frame {number}: {e}"))?;
-
-        // The camera goes in beside the tiles, because that is what a render
-        // will address this frame by. A renderer cooks at a timecode and hands
-        // the session a camera, never a frame number — so a pack that could
-        // only be looked up by index would be unusable by the very thing it is
-        // baked for.
-        let mut open = writer.begin_frame(
-            number,
-            tuile_pack::BakedView {
-                position: pose.position,
-                direction: pose.direction,
-                up: pose.up,
-                viewport_px: [args.viewport.0, args.viewport.1],
-                fovy_rad: pose.fovy,
-            },
-        );
-        // One tile at a time, and only the ones the pack does not already
-        // hold.
-        //
-        // Both halves of this used to be waste. The frame's tiles were built
-        // into a vector first — every PNG and every geometry buffer of the
-        // selection alive at once, on top of the frame they came from — and
-        // handed to a writer that compresses and spills them one by one
-        // anyway. And an orbit re-selects almost the same ground every frame,
-        // so most of what was built was immediately dropped as a duplicate:
-        // after frame 1 this skips the PNG clone and the four buffer
-        // conversions for every tile already stored, and touches nothing but
-        // the index.
-        let mut selected = 0usize;
-        let mut reused = 0usize;
-        for (index, tile) in frame.tiles.iter().enumerate() {
-            selected += 1;
-            if open.push_known(tile.tile.0, tile.drape()) {
-                reused += 1;
-                continue;
-            }
-            open.push(baked_tile(&frame, index, tile)?);
-            if let Ok(mut held) = already_packed.lock() {
-                held.insert((tile.tile.0, tile.drape()));
-            }
-        }
-        open.end();
-        tracing::info!(
-            frame = number,
-            selected,
-            reused,
-            seconds = at.elapsed().as_secs_f64(),
-            "BAKE-FRAME"
-        );
-    }
-
-    let bytes = writer
-        .finish_to(&args.out)
-        .map_err(|e| format!("writing {}: {e}", args.out.display()))?;
-    tracing::info!(
-        scene,
-        culling,
-        path = %args.out.display(),
-        bytes,
-        seconds = began.elapsed().as_secs_f64(),
-        "BAKE-DONE"
-    );
     // On stdout, and parseable, because the launcher turns it into an object
     // key: `packs/<scene>/<first>-<last>.tuilepack`.
     println!("BAKE-KEY packs/{scene}/{}-{wanted}.tuilepack", args.first);
@@ -1340,95 +1136,6 @@ fn first_difference(a: &BakedTile, b: &BakedTile) -> String {
     }
 }
 
-/// Whether a tile can be stored, given the drape it names and what it carries.
-///
-/// Pulled out of [`baked_tile`] so the decision can be read and tested on its
-/// own: it is two booleans, and it is the last thing standing between a
-/// withheld drape and bare ground in the film.
-///
-/// - drape 0, no texture — terrain with no imagery. Legitimate: the geometry
-///   debug view, and any tile the provider covers with nothing.
-/// - drape 0, a texture — a texture the tile owns rather than one we composed.
-/// - a drape, a texture — the ordinary draped tile.
-/// - **a drape, no texture** — the pixels are nowhere. Refused.
-fn drape_has_its_pixels(drape: u64, has_texture: bool) -> bool {
-    drape == 0 || has_texture
-}
-
-/// One tile, in the shape the pack stores and the ABI hands out.
-///
-/// The mapping is deliberately the same one `tuile_frame_tile` makes, field for
-/// field: a pack is a substitute for a live session, and a substitute that
-/// reshapes the data is a second implementation.
-fn baked_tile(
-    frame: &tuile_bake::Frame,
-    index: usize,
-    tile: &Arc<tuile_bake::TileGeometry>,
-) -> Result<BakedTile, String> {
-    // One prim per tile, as the consumer expects; terrain produces one mesh.
-    let mesh = tile
-        .content
-        .meshes
-        .first()
-        .ok_or_else(|| format!("tile {} carries no mesh", tile.tile.0))?;
-
-    // Index 0 only: a terrain tile carries one draped mosaic. A tile with
-    // several would need the pack to hold several, and nothing produces one —
-    // so this fails loudly rather than silently baking the first of many.
-    let texture = frame
-        .texture_png(index, 0)
-        .map_err(|e| format!("tile {}: {e}", tile.tile.0))?;
-    if frame
-        .texture_png(index, 1)
-        .map_err(|e| format!("tile {}: {e}", tile.tile.0))?
-        .is_some()
-    {
-        return Err(format!(
-            "tile {} carries more than one texture; the pack holds one",
-            tile.tile.0
-        ));
-    }
-
-    // A tile that names a drape and carries no texture is bare ground.
-    //
-    // It happens exactly one way: the loader withheld the imagery because the
-    // pack was said to hold this drape, and then the pack did not hold it. The
-    // pixels are nowhere. Storing it would put real terrain in the film under
-    // no picture at all, and every counter downstream would read green — the
-    // tile is present, the frame is complete, the bake succeeds.
-    if !drape_has_its_pixels(tile.drape(), texture.is_some()) {
-        return Err(format!(
-            "tile {} names drape {:016x} and carries no texture: its imagery was \
-             withheld for a pack that does not hold it",
-            tile.tile.0,
-            tile.drape()
-        ));
-    }
-
-    Ok(BakedTile {
-        id: tile.tile.0,
-        drape: tile.drape(),
-        origin_ecef: tile.origin_ecef.to_array(),
-        positions: f32x3_le(&mesh.positions),
-        normals: mesh
-            .normals
-            .as_ref()
-            .map(|n| f32x3_le(n))
-            .unwrap_or_default(),
-        uvs: mesh.uvs.as_ref().map(|u| f32x2_le(u)).unwrap_or_default(),
-        indices: u32_le(&mesh.indices),
-        vertex_count: mesh.positions.len() as u32,
-        index_count: mesh.indices.len() as u32,
-        base_color_factor: mesh.material.base_color_factor,
-        texture_format: if texture.is_some() {
-            TextureFormat::Png
-        } else {
-            TextureFormat::None
-        },
-        texture: texture.map(|t| t.png.clone()),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     /// Une trajectoire rejouée depuis un pack est la trajectoire du pack.
@@ -1509,48 +1216,7 @@ mod tests {
         assert!(err.contains("one shot"), "{err}");
     }
 
-    /// The four cases, and the one that must be refused.
-    ///
-    /// A tile naming a drape with no texture can only come from one place: the
-    /// loader withheld its imagery for a pack that turned out not to hold it.
-    /// Stored, it is real terrain under no picture — and the pack has no way to
-    /// tell later that anything was missing, because "no texture" is also how a
-    /// legitimately bare tile is recorded.
-    #[test]
-    fn a_drape_with_no_pixels_is_refused_and_nothing_else_is() {
-        assert!(
-            super::drape_has_its_pixels(0, false),
-            "bare terrain is fine"
-        );
-        assert!(
-            super::drape_has_its_pixels(0, true),
-            "an owned texture is fine"
-        );
-        assert!(
-            super::drape_has_its_pixels(0xdead, true),
-            "the ordinary tile"
-        );
-        assert!(
-            !super::drape_has_its_pixels(0xdead, false),
-            "a drape whose pixels are nowhere must not be stored"
-        );
-    }
-
     use super::*;
-
-    /// The encoding is the file's, not this machine's.
-    #[test]
-    fn vertices_are_written_little_endian_whatever_the_host_is() {
-        assert_eq!(f32x3_le(&[[1.0, -2.0, 0.5]]), {
-            let mut want = Vec::new();
-            want.extend_from_slice(&1.0f32.to_le_bytes());
-            want.extend_from_slice(&(-2.0f32).to_le_bytes());
-            want.extend_from_slice(&0.5f32.to_le_bytes());
-            want
-        });
-        assert_eq!(u32_le(&[1, 0x0102_0304]), vec![1, 0, 0, 0, 4, 3, 2, 1]);
-        assert_eq!(f32x2_le(&[[0.0, 1.0]]).len(), 8);
-    }
 
     /// Two shards of one shot must agree on the name of the scene.
     ///

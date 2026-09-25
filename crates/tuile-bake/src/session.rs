@@ -510,6 +510,9 @@ pub(crate) struct Live {
     /// different capture batches, every LOD boundary becomes an exposure seam
     /// across the ground (measured on the first SSE-1 gate render).
     imagery_detail: Option<tuile_planetary::ImageryDetail>,
+    /// The ground's heights as the resident terrain gives them, when the
+    /// source keeps them (a globe does). See [`Session::heights`].
+    heights: Option<Arc<tuile_terrain::TerrainHeights>>,
     /// Baked, encoded textures kept across frames. See [`TextureMemo`].
     textures: Arc<TextureMemo>,
     /// What the consumer holds, tile by tile.
@@ -600,6 +603,26 @@ impl Session {
     pub(crate) fn set_imagery_detail(&mut self, detail: tuile_planetary::ImageryDetail) {
         if let Source::Live(live) = &mut self.0 {
             live.set_imagery_detail(detail);
+        }
+    }
+
+    pub(crate) fn set_heights(&mut self, heights: Arc<tuile_terrain::TerrainHeights>) {
+        if let Source::Live(live) = &mut self.0 {
+            live.heights = Some(heights);
+        }
+    }
+
+    /// The ground's heights, read from the terrain this session has resident.
+    ///
+    /// The same terrain the frames are selected from, so a height read here is
+    /// the height the pack shows: a caller that places a camera against the
+    /// ground — clearing a ridge between the eye and what it films — decides
+    /// on the ground the bake will draw, not on a second copy of it. `None` for
+    /// a packed session and for a live one over a source that keeps no heights.
+    pub fn heights(&self) -> Option<Arc<tuile_terrain::TerrainHeights>> {
+        match &self.0 {
+            Source::Live(live) => live.heights.clone(),
+            Source::Packed(_) => None,
         }
     }
 
@@ -752,6 +775,7 @@ impl Live {
             runtime,
             config,
             imagery_detail: None,
+            heights: None,
             textures: Arc::new(TextureMemo::default()),
             resident: HashMap::new(),
             scene: SceneState::default(),

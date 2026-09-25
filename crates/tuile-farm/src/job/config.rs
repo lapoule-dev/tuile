@@ -46,6 +46,11 @@ pub struct Config {
     pub task_count: u32,
     /// The orchestrator cut the range: `frames` is this task's already.
     pub chunk_given: bool,
+    /// Whether this job assembles the film once every receipt is in
+    /// (`JOB_ASSEMBLE`, on by default). An orchestrator that assembles the
+    /// film itself turns it off: the job then leaves its segments and its
+    /// receipt, and nothing else.
+    pub assemble: bool,
     /// Where this run's outputs go, without a trailing slash; `None` for a
     /// local run, where nothing leaves the machine.
     pub run_prefix: Option<String>,
@@ -197,6 +202,7 @@ impl Config {
             task_index,
             task_count,
             chunk_given,
+            assemble: var("JOB_ASSEMBLE").is_none_or(|v| v != "0"),
             run_prefix: var("JOB_RUN_PREFIX").map(|p| p.trim_end_matches('/').to_string()).filter(|p| !p.is_empty()),
             archive_every_s: number("JOB_ARCHIVE_EVERY", 300)?,
             gpu_sample_s: number("JOB_GPU_SAMPLE", 30)?,
@@ -279,6 +285,19 @@ mod tests {
             [("CYCLES_BACKGROUND", "1"), ("CYCLES_AUTO_TILE", "0"), ("TUILE_WAIT_MODE", "command")]
                 .map(|(k, v)| (k.to_string(), v.to_string()))
         );
+    }
+
+    /// A job assembles unless its orchestrator says it will: only `0` turns it off.
+    #[test]
+    fn a_job_assembles_unless_told_the_orchestrator_does() {
+        let with = |v: Option<&str>| {
+            let mut pairs = vec![("JOB_FRAMES", "1:2")];
+            pairs.extend(v.map(|v| ("JOB_ASSEMBLE", v)));
+            Config::from_env(&env(&pairs)).expect("test").assemble
+        };
+        assert!(with(None), "on by default: a lone job still makes its film");
+        assert!(with(Some("1")));
+        assert!(!with(Some("0")));
     }
 
     #[test]

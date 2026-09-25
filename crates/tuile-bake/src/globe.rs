@@ -179,7 +179,7 @@ impl Session {
         // Sources resolve on the session's own runtime rather than a temporary
         // one, so the connection pool and cache that serve this call are the
         // same ones that will serve every tile afterwards.
-        let (tree, loader, detail) = runtime.block_on(resolve(&config))?;
+        let (tree, loader, detail, heights) = runtime.block_on(resolve(&config))?;
 
         let mut session_config = config.session.clone();
         session_config.dataset = config.dataset_name();
@@ -188,6 +188,7 @@ impl Session {
         // decoupled from terrain LOD, so exposure seams between imagery
         // capture batches stop lining up with terrain level boundaries.
         session.set_imagery_detail(detail);
+        session.set_heights(heights);
         Ok(session)
     }
 }
@@ -332,6 +333,7 @@ async fn resolve(
         Box<dyn tuile_core::source::TileTree>,
         Arc<dyn tuile_core::source::TileLoader>,
         ImageryDetail,
+        Arc<tuile_terrain::TerrainHeights>,
     ),
     GlobeError,
 > {
@@ -385,7 +387,7 @@ async fn resolve(
         // thread polling the server, and `globe()`'s inline offload would put
         // every tile's decode on that same thread — measured at sixty-four
         // loads in flight and one core busy.
-        let (tree, loader, detail, _heights) = globe_on(
+        let (tree, loader, detail, heights) = globe_on(
             terrain,
             NoImagery,
             layer,
@@ -400,7 +402,7 @@ async fn resolve(
             },
             offload::threaded(),
         );
-        return Ok((tree, loader, detail));
+        return Ok((tree, loader, detail, heights));
     };
 
     let ion = IonClient::new(Arc::clone(&http), config.ion_token.clone());
@@ -438,7 +440,7 @@ async fn resolve(
     // un asset qui n'est pas Bing. `externalType` absent veut dire
     // TileMapService, exactement la branche par défaut de cesium-native
     // (`IonRasterOverlay.cpp`, le `else` après `BING`).
-    let (tree, loader, detail, _heights) = match endpoint.external_type.as_deref() {
+    let (tree, loader, detail, heights) = match endpoint.external_type.as_deref() {
         None => {
             let tms = TmsImagery::from_endpoint(ion, imagery_asset_id as u64, endpoint)
                 .await
@@ -470,7 +472,7 @@ async fn resolve(
             })
         }
     };
-    Ok((tree, loader, detail))
+    Ok((tree, loader, detail, heights))
 }
 
 /// Seconds, as a C ABI carries a duration, into a `Duration`.

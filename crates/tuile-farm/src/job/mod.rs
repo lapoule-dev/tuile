@@ -337,6 +337,14 @@ async fn deliver(c: &Config, store: Option<&dyn RunStore>, render: &str, plan: &
             Stop::fatal("RECEIPT-FAILED")
         })?;
         log.line(format!("RECEIPT {} frames {}:{} segments {:?}", receipt.task, receipt.first, receipt.last, receipt.segments));
+        if !c.assemble {
+            // The orchestrator assembles: this job's part ends with its receipt.
+            log.line(format!(
+                "TASK-DONE {}/{} ({n} segments, frames {}:{}) — film left to the orchestrator",
+                c.task_index, c.task_count, plan.first, plan.last
+            ));
+            return Ok(());
+        }
         match assemble::assemble(store, keys, c.task_count, &outdir.join("assemble"), fps).await {
             Ok(Outcome::Waiting { done, of }) => {
                 log.line(format!("FILM-WAITING {done}/{of} receipts"));
