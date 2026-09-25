@@ -114,8 +114,8 @@ impl Tiles {
         Ok(())
     }
 
-    pub fn cache(&self) -> tuile_bake::TileCache {
-        tuile_bake::TileCache(Arc::new(StoreContent::new(self.store.clone())))
+    pub fn cache(&self) -> crate::TileCache {
+        crate::TileCache(Arc::new(StoreContent::new(self.store.clone())))
     }
 
     /// Publishes whatever is still buffered. Called on the way out, success or
