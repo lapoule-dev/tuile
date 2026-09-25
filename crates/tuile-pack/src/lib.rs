@@ -396,6 +396,16 @@ impl PackWriter {
         self
     }
 
+    /// Names the scene once its poses are all known.
+    ///
+    /// A bake whose poses are decided frame by frame — each camera lifted over
+    /// the ground it has just loaded — cannot name its scene up front, since
+    /// the name is taken over the poses. The name is only written by
+    /// [`PackWriter::finish_to`], so setting it any time before is enough.
+    pub fn set_scene_digest(&mut self, scene_digest: impl Into<String>) {
+        self.scene_digest = scene_digest.into();
+    }
+
     /// Whether this identity is already stored, and so needs no bytes.
     ///
     /// A camera orbit re-selects nearly the same tiles every frame, and every

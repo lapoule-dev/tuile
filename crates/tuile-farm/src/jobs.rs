@@ -517,6 +517,16 @@ impl JobsApi {
             .ok_or_else(|| JobsError::Shape { url, message: "no version for this tag".into() })
     }
 
+    /// Cancels execution `name`: its tasks stop and stop billing. For an
+    /// orchestrator that launched work whose input will now never come.
+    ///
+    /// Not retried, like [`JobsApi::run`]: a second cancel of an execution
+    /// already stopping is an error the caller should see, not paper over.
+    pub async fn cancel(&self, name: &str) -> Result<()> {
+        self.call(Method::Post, &format!("{name}:cancel"), Some(serde_json::json!({}))).await?;
+        Ok(())
+    }
+
     pub async fn execution(&self, name: &str) -> Result<Execution> {
         let v = self.call(Method::Get, name, None).await?;
         serde_json::from_value(v).map_err(|e| JobsError::Shape { url: name.to_string(), message: e.to_string() })
@@ -645,6 +655,16 @@ mod tests {
             .expect("run");
         assert_eq!(name.as_deref(), Some("projects/p/locations/r/jobs/j/executions/j-xyz"));
         assert_eq!(t.calls()[0].1, "https://jobs.test/v2/projects/p/locations/r/jobs/j:run");
+    }
+
+    #[tokio::test]
+    async fn cancel_posts_to_the_execution_itself() {
+        let t = Scripted::new(vec![Ok((200, "{}"))]);
+        api(&t).cancel("projects/p/locations/r/jobs/j/executions/j-xyz").await.expect("cancel");
+        let calls = t.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, Method::Post);
+        assert_eq!(calls[0].1, "https://jobs.test/v2/projects/p/locations/r/jobs/j/executions/j-xyz:cancel");
     }
 
     #[tokio::test]

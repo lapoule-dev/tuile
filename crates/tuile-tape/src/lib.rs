@@ -646,6 +646,43 @@ fn write_camera<W: std::io::Write + std::io::Seek>(
     Ok(())
 }
 
+/// Writes a camera path as a tape's `/camera` channel onto a writer the caller
+/// owns, so the path can share one file with channels of the caller's own.
+///
+/// A tape is read by its `/camera` channel alone ([`Tape::replaying`] skips
+/// every other topic), so a file that carries more — the subject a camera
+/// follows, per-frame annotations, attachments — replays exactly the same
+/// path. Frames are run-length coded as [`Tape::push`] codes them (bitwise
+/// equality), and stamped from `first`, the index of `frames[0]` in the whole
+/// path, so pieces of one path written separately keep their own timeline.
+///
+/// Declares the channel on first use; call it once per writer.
+pub fn write_camera_channel<W: std::io::Write + std::io::Seek>(
+    writer: &mut mcap::Writer<W>,
+    frames: &[Frame],
+    first: u64,
+) -> Result<(), TapeError> {
+    let schema = writer.add_schema(CAMERA_SCHEMA, "jsonschema", CAMERA_JSON_SCHEMA.as_bytes())?;
+    let channel = writer.add_channel(schema, CAMERA_TOPIC, "json", &std::collections::BTreeMap::new())?;
+    let mut started = first;
+    let mut open: Option<Run> = None;
+    for frame in frames {
+        match &mut open {
+            Some(run) if run.frame == *frame && run.hold < u32::MAX => run.hold += 1,
+            _ => {
+                if let Some(finished) = open.replace(Run { frame: *frame, hold: 1 }) {
+                    write_camera(writer, channel, &finished, started)?;
+                    started += u64::from(finished.hold);
+                }
+            }
+        }
+    }
+    if let Some(finished) = open {
+        write_camera(writer, channel, &finished, started)?;
+    }
+    Ok(())
+}
+
 /// Writes one rendered frame to the image channel, PNG-encoded.
 fn write_image<W: std::io::Write + std::io::Seek>(
     writer: &mut mcap::Writer<W>,
@@ -777,6 +814,43 @@ fn write_mcap(path: &Path, runs: &[Run]) -> Result<(), TapeError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A path written onto a shared file, beside a channel the tape knows
+    /// nothing about, replays exactly — held frames included.
+    #[test]
+    fn a_camera_channel_in_a_shared_file_replays_the_same_path() {
+        use super::*;
+        let still = Frame {
+            position: [1.0, 2.0, 3.0],
+            direction: [0.0, 0.0, -1.0],
+            up: [0.0, 1.0, 0.0],
+            fovy: std::f64::consts::FRAC_PI_4,
+        };
+        let moved = Frame { position: [1.0, 2.0, 3.000_000_000_000_001], ..still };
+        let path = [still, still, still, moved, still];
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("shared.mcap");
+        let mut writer = mcap::Writer::new(BufWriter::new(File::create(&file).expect("create"))).expect("writer");
+        write_camera_channel(&mut writer, &path, 0).expect("camera");
+        let schema = writer.add_schema("other.Thing", "jsonschema", b"{}").expect("schema");
+        let channel = writer.add_channel(schema, "/athlete", "json", &std::collections::BTreeMap::new()).expect("channel");
+        writer
+            .write_to_known_channel(
+                &mcap::records::MessageHeader { channel_id: channel, sequence: 0, log_time: 0, publish_time: 0 },
+                br#"{"not":"a camera"}"#,
+            )
+            .expect("foreign message");
+        writer.finish().expect("finish");
+        drop(writer);
+
+        let mut tape = Tape::replaying(&file).expect("replay");
+        let mut read = Vec::new();
+        while let Some(f) = tape.next_frame() {
+            read.push(f);
+        }
+        assert_eq!(read, path, "the same poses, bit for bit, in order");
+    }
 
     /// Deux tapes des mêmes paramètres sont le même fichier.
     ///
