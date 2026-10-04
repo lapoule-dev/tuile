@@ -3,7 +3,7 @@
     defaultPrim = "Paraglider"
     metersPerUnit = 1
     upAxis = "Z"
-    doc = """Doublure d'un asset glTF converti (voir docs/16, voie (b)) :
+    doc = """Doublure d'un asset glTF converti :
 une delta-aile minimale, matériaux nommés pour être surchargés par over
 depuis le stage — l'asset lui-même n'est jamais édité."""
 )

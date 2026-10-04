@@ -5,7 +5,12 @@
 # contre le SDK USD des deps précompilées de Blender (namespace pxrBlender,
 # libs partagées — celui que le Blender du build-fork linke réellement),
 # embarqué dans l'image 3 sous /opt/usd-blender.
-FROM registry.invalid/blender-shared-usd:5.1-2508 AS sdk
+#
+#   docker buildx build --builder <builder> --platform linux/amd64 \
+#       -f integrations/blender/Dockerfile.proctest \
+#       --build-arg REGISTRY=<registry> -t <registry>/blender-proctest --push .
+ARG REGISTRY
+FROM ${REGISTRY}/blender-shared-usd:5.1-2508 AS sdk
 
 FROM ubuntu:24.04 AS plugin
 ENV DEBIAN_FRONTEND=noninteractive
@@ -35,7 +40,7 @@ RUN set -e; \
     cp /opt/src/cubeProc/plugInfo.json /opt/plugins/cubeProc/plugin/resources/; \
     test -f /opt/plugins/cubeProc/plugin/libcubeProc.so
 
-FROM registry.invalid/blender-shared-usd:5.1-2508
+FROM ${REGISTRY}/blender-shared-usd:5.1-2508
 COPY --from=plugin /opt/plugins/cubeProc /opt/plugins/cubeProc
 COPY proctest/proc_driver.py /opt/proc/proc_driver.py
 COPY proctest/proc_run.sh /opt/proc/proc_run.sh
