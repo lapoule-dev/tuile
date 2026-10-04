@@ -195,17 +195,26 @@ pub(crate) mod tests {
 
         let f = c.advance().expect("10").expect("ok");
         assert_eq!(f.frame, 10);
-        assert_eq!(f.enter.iter().map(TileKey::of).collect::<Vec<_>>(), [key(1, 0), key(2, 0)]);
+        assert_eq!(
+            f.enter.iter().map(TileKey::of).collect::<Vec<_>>(),
+            [key(1, 0), key(2, 0)]
+        );
         assert!(f.leave.is_empty());
 
         let f = c.advance().expect("11").expect("ok");
-        assert_eq!(f.enter.iter().map(TileKey::of).collect::<Vec<_>>(), [key(3, 0)]);
+        assert_eq!(
+            f.enter.iter().map(TileKey::of).collect::<Vec<_>>(),
+            [key(3, 0)]
+        );
         assert_eq!(f.leave, [key(1, 0)]);
         assert_eq!(f.selection, [key(2, 0), key(3, 0)]);
 
         // A new drape over the same mesh is a new tile, and the old one leaves.
         let f = c.advance().expect("12").expect("ok");
-        assert_eq!(f.enter.iter().map(TileKey::of).collect::<Vec<_>>(), [key(3, 7)]);
+        assert_eq!(
+            f.enter.iter().map(TileKey::of).collect::<Vec<_>>(),
+            [key(3, 7)]
+        );
         assert_eq!(f.leave, [key(3, 0)]);
         assert_eq!(c.resident(), 2);
 

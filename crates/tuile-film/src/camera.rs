@@ -34,9 +34,12 @@ impl FrameCamera {
     /// rendered (which may be supersampled, never reshaped).
     pub fn of(view: &BakedView, aspect: f32) -> Self {
         let eye = DVec3::from_array(view.position);
+        // `look_to_rh` takes the direction as given and builds the basis
+        // from it: an unnormalised one scales the view matrix, and every ray
+        // the resolve builds from its rows then misses its pixel.
         let rotation = DMat4::look_to_rh(
             DVec3::ZERO,
-            DVec3::from_array(view.direction),
+            DVec3::from_array(view.direction).normalize(),
             DVec3::from_array(view.up),
         );
         let height = tuile_core::geo::ecef_to_geodetic(eye).height.max(10.0);
@@ -103,8 +106,22 @@ mod tests {
     }
 
     #[test]
+    fn an_unnormalised_direction_gives_a_pure_rotation() {
+        let mut v = above_null_island(1000.0);
+        v.direction = [-3.0, 0.6, 0.3];
+        let cam = FrameCamera::of(&v, 1.0);
+        for row in 0..3 {
+            let len = cam.view.row(row).truncate().length();
+            assert!((len - 1.0).abs() < 1e-6, "row {row} has length {len}");
+        }
+    }
+
+    #[test]
     fn near_follows_height() {
         assert_eq!(FrameCamera::of(&above_null_island(1.0), 1.0).near, 0.5);
-        assert_eq!(FrameCamera::of(&above_null_island(10_000.0), 1.0).near, 500.0);
+        assert_eq!(
+            FrameCamera::of(&above_null_island(10_000.0), 1.0).near,
+            500.0
+        );
     }
 }

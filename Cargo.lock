@@ -5676,6 +5676,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuile-film-gpu"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "pollster",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tuile-film",
+ "wgpu",
+]
+
+[[package]]
 name = "tuile-hydra"
 version = "0.1.0"
 dependencies = [

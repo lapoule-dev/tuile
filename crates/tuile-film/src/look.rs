@@ -72,7 +72,11 @@ mod tests {
     #[test]
     fn x_first_then_z() {
         // X by 90° tips +Z to −Y; Z by 90° then turns −Y to +X.
-        let s = blender_sun(Vec3::new(std::f32::consts::FRAC_PI_2, 0.0, std::f32::consts::FRAC_PI_2));
+        let s = blender_sun(Vec3::new(
+            std::f32::consts::FRAC_PI_2,
+            0.0,
+            std::f32::consts::FRAC_PI_2,
+        ));
         assert!((s - Vec3::X).length() < 1e-5, "{s}");
     }
 
