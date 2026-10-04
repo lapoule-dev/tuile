@@ -1,0 +1,22 @@
+[package]
+name = "tuile-film-gpu"
+description = "Renders a pre-baked film on wgpu: one visibility raster, everything else in compute"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+bytemuck = { workspace = true }
+glam = { workspace = true }
+thiserror = { workspace = true }
+tuile-film = { version = "0.1.0", path = "../tuile-film" }
+wgpu = { workspace = true }
+
+[dev-dependencies]
+pollster = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
