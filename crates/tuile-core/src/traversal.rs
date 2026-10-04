@@ -389,7 +389,9 @@ impl Config {
         Self {
             maximum_screen_space_error: 2.0,
             maximum_simultaneous_fetches: 64,
-            resident_budget_bytes: 4 * 1024 * 1024 * 1024,
+            // Saturates on wasm32, where 4 GiB does not fit in a usize — and
+            // is the whole address space anyway.
+            resident_budget_bytes: 4usize.saturating_mul(1024 * 1024 * 1024),
             resident_tile_limit: 16_000,
             pinned_level,
             ..Self::default()
