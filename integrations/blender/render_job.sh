@@ -157,8 +157,8 @@ JOB_BLENDER_ARGS="${JOB_BLENDER_ARGS:-}"
 #                         sleeps 50 ms per turn. Same images, same times; the
 #                         blocking wait is one turn a frame instead of dozens.
 #
-# Here and not in each launcher, because tuile's jobs and the host application's (which ends by
-# exec'ing this script) must not drift apart on the one thing that decides
+# Here and not in each launcher, because tuile's jobs and those of external
+# launchers (which end by exec'ing this script) must not drift apart on the one thing that decides
 # whether a render ends at all.
 export CYCLES_BACKGROUND="${CYCLES_BACKGROUND:-1}"
 export CYCLES_AUTO_TILE="${CYCLES_AUTO_TILE:-0}"
@@ -457,7 +457,7 @@ fi
 # while the probe reported four. Only Storm, which draws through GL, has any
 # business counting cards.
 #
-# And OPTIX is not a given. Measured 2026-09-10 on team/blender-globe:5.1-su:
+# And OPTIX is not a given. Measured 2026-09-10 on blender-globe:5.1-su:
 # `compute_device_type` accepts only ('NONE','CUDA','HIP','ONEAPI') — this
 # Blender was built without OptiX. So the probe asks the build what it has,
 # preferring OPTIX and settling for CUDA, and SAYS WHICH. A backend chosen

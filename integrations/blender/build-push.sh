@@ -7,13 +7,13 @@
 # # Why more than one registry
 #
 # The images are built in Europe and pulled by whatever rents us a GPU.
-# Measured on a cold US-IL host pulling team/blender-globe from Harbor:
+# Measured on a cold US-IL host pulling blender-globe from the home registry:
 # **seventeen minutes still downloading**, before a single frame — at
 # $0.74/h that is a quarter of a dollar of rent paid to a network, and it is
 # paid again on every worker. An image one region away from the worker instead
 # of one ocean is the whole point.
 #
-# So: **Harbor is the source of truth** for the layered stack — the base
+# So: **the home registry (`$TUILE_REGISTRY`) is the source of truth** for the layered stack — the base
 # images and their build cache live there, and nothing pulls them at run time.
 # The others are delivery mirrors, each next to a place we can rent a card:
 #
@@ -31,27 +31,45 @@
 #
 # Google's token expires too (one hour), but nothing stores it: Cloud Run pulls
 # with the job's own service account, which holds `artifactregistry.reader`
-# permanently. There is no credential to go stale — see infra/farm_infra.py in
-# the host-app repo.
+# permanently. There is no credential to go stale.
 #
-#   ./integrations/blender/build-push.sh shared-usd        # the base, → Harbor
-#   ./integrations/blender/build-push.sh globe --gcp       # → ECR + GAR
-#   ./integrations/blender/build-push.sh globe --runpod    # → ECR, refresh cred
-#   ./integrations/blender/build-push.sh globe --harbor    # …and mirror Harbor
+#   ./integrations/blender/build-push.sh shared-usd          # the base, → registry
+#   ./integrations/blender/build-push.sh globe --gcp         # → ECR + GAR
+#   ./integrations/blender/build-push.sh globe --runpod      # → ECR, refresh cred
+#   ./integrations/blender/build-push.sh globe --registry    # …and mirror the registry
+#
+# # Configuration
+#
+# Nothing about the deployment is baked in; it all comes from the environment.
+#
+#   TUILE_BUILDER        buildx builder to build on                  (always)
+#   TUILE_REGISTRY       home registry, with any namespace, e.g.
+#                        `registry.example.com/team` — the base images
+#                        live there and every Dockerfile is built with
+#                        `--build-arg REGISTRY=$TUILE_REGISTRY`         (always)
+#   TUILE_REPO_PREFIX    optional namespace prepended to the ECR repository
+#   TUILE_AWS_PROFILE    AWS CLI profile                             (ecr)
+#   TUILE_AWS_REGION     ECR region, default us-west-1               (ecr)
+#   TUILE_ECR_ACCOUNT    AWS account id owning the ECR repositories  (ecr)
+#   TUILE_GCP_PROJECT    Google Cloud project                        (gar)
+#   TUILE_GCP_REGION     Artifact Registry region, default europe-west1
+#   TUILE_GCP_REPO       Artifact Registry repository, default tuile
+#   TUILE_RUNPOD_CRED    name of the RunPod registry credential      (--runpod)
 #
 set -euo pipefail
 
-AWS_PROFILE_NAME="${TUILE_AWS_PROFILE:-host}"
+# Fails with the variable's name and what it is for when it is unset.
+need() {
+    if [ -z "${!1:-}" ]; then
+        echo "error: $1 is not set — $2" >&2
+        exit 2
+    fi
+}
+
 AWS_REGION_NAME="${TUILE_AWS_REGION:-us-west-1}"
-ECR_ACCOUNT="${TUILE_ECR_ACCOUNT:-000000000000}"
-ECR_HOST="${ECR_ACCOUNT}.dkr.ecr.${AWS_REGION_NAME}.amazonaws.com"
-HARBOR_HOST="registry.invalid"
-GCP_PROJECT="${TUILE_GCP_PROJECT:-gcp-project-id}"
 GCP_REGION="${TUILE_GCP_REGION:-europe-west1}"
 GCP_REPO="${TUILE_GCP_REPO:-tuile}"
 GAR_HOST="${GCP_REGION}-docker.pkg.dev"
-BUILDER="${TUILE_BUILDER:-buildx-builder}"
-RUNPOD_CRED_NAME="${TUILE_RUNPOD_CRED:-ecr-registry-cred}"
 
 # Which image, how it is built, and where it is expected.
 #
@@ -63,32 +81,40 @@ RUNPOD_CRED_NAME="${TUILE_RUNPOD_CRED:-ecr-registry-cred}"
 case "${1:-}" in
     shared-usd)
         DOCKERFILE=integrations/blender/Dockerfile.blender-shared-usd
-        REPO=team/blender-shared-usd
+        IMAGE=blender-shared-usd
         TAG=5.2-2605
         CONTEXT=.
         # A base image. No worker ever pulls it, so it needs no mirror.
-        DESTS=(harbor)
+        DESTS=(registry)
         ;;
     globe)
         DOCKERFILE=integrations/blender/Dockerfile.globe
-        REPO=team/blender-globe
+        IMAGE=blender-globe
         TAG="${TUILE_GLOBE_TAG:-5.1-su}"
         CONTEXT=.
         DESTS=(ecr)
         ;;
     render)
         DOCKERFILE=integrations/blender/Dockerfile
-        REPO=team/blender-render
+        IMAGE=blender-render
         TAG=5.1
         CONTEXT=integrations/blender
         DESTS=(ecr)
         ;;
     *)
-        echo "usage: $0 {shared-usd|globe|render} [--gcp] [--runpod] [--harbor]" >&2
+        echo "usage: $0 {shared-usd|globe|render} [--gcp] [--runpod] [--registry]" >&2
         exit 2
         ;;
 esac
 shift
+
+need TUILE_BUILDER "the buildx builder to build on"
+need TUILE_REGISTRY "the home registry the base images are pulled from"
+BUILDER="$TUILE_BUILDER"
+REGISTRY="$TUILE_REGISTRY"
+# The ECR repository name; the registry and Artifact Registry use the bare
+# image name under their own namespace.
+REPO="${TUILE_REPO_PREFIX:+${TUILE_REPO_PREFIX}/}${IMAGE}"
 
 WITH_RUNPOD=0
 BASE_OVERRIDE=""
@@ -103,7 +129,7 @@ for arg in "$@"; do
     case "$arg" in
         --base)   prev="--base" ;;
         --gcp)    DESTS+=(gar) ;;
-        --harbor) DESTS+=(harbor) ;;
+        --registry) DESTS+=(registry) ;;
         --runpod) DESTS+=(ecr); WITH_RUNPOD=1 ;;
         *) echo "argument inconnu: $arg" >&2; exit 2 ;;
     esac
@@ -115,6 +141,9 @@ for dest in "${DESTS[@]}"; do
     case " ${seen[*]-} " in *" $dest "*) ;; *) seen+=("$dest") ;; esac
 done
 DESTS=("${seen[@]}")
+if [ "$WITH_RUNPOD" = 1 ]; then
+    need TUILE_RUNPOD_CRED "the name of the RunPod registry credential to refresh"
+fi
 
 cd "$(dirname "$0")/../.."
 
@@ -123,6 +152,10 @@ IMAGES=()
 for dest in "${DESTS[@]}"; do
     case "$dest" in
         ecr)
+            need TUILE_AWS_PROFILE "the AWS CLI profile used to push to ECR"
+            need TUILE_ECR_ACCOUNT "the AWS account id owning the ECR repositories"
+            AWS_PROFILE_NAME="$TUILE_AWS_PROFILE"
+            ECR_HOST="${TUILE_ECR_ACCOUNT}.dkr.ecr.${AWS_REGION_NAME}.amazonaws.com"
             # The repository must exist before a push names it; creating it
             # here keeps a new region one command away instead of a console
             # visit.
@@ -144,11 +177,12 @@ for dest in "${DESTS[@]}"; do
             IMAGES+=("${ECR_HOST}/${REPO}:${TAG}")
             ;;
         gar)
-            # Artifact Registry nests images under a *repository*, so the
-            # `team/` prefix that ECR and Harbor use as a namespace is dropped:
-            # the repository is the namespace, and it is created by Pulumi, not
-            # here. infra/farm_infra.py names the very path built below, so a
-            # change to either must be a change to both.
+            need TUILE_GCP_PROJECT "the Google Cloud project hosting Artifact Registry"
+            # Artifact Registry nests images under a *repository*, so any
+            # namespace prefix is dropped: the repository is the namespace, and
+            # it is created by whoever provisions the cloud project, not here.
+            # The job definition that pulls the image must name the very path
+            # built below, so a change to either must be a change to both.
             #
             # gcloud's python is picked up from the environment, and a terminal
             # opened before ~/.zshrc was fixed still exports a version Homebrew
@@ -168,10 +202,10 @@ for dest in "${DESTS[@]}"; do
             gcloud auth print-access-token \
                 | docker login --username oauth2accesstoken \
                     --password-stdin "$GAR_HOST" > /dev/null
-            IMAGES+=("${GAR_HOST}/${GCP_PROJECT}/${GCP_REPO}/${REPO#*/}:${TAG}")
+            IMAGES+=("${GAR_HOST}/${TUILE_GCP_PROJECT}/${GCP_REPO}/${IMAGE}:${TAG}")
             ;;
-        harbor)
-            IMAGES+=("${HARBOR_HOST}/${REPO}:${TAG}")
+        registry)
+            IMAGES+=("${REGISTRY}/${IMAGE}:${TAG}")
             ;;
     esac
 done
@@ -181,15 +215,15 @@ for image in "${IMAGES[@]}"; do TAGS+=(-t "$image"); done
 echo "== build sur $BUILDER"
 printf '   → %s\n' "${IMAGES[@]}"
 t0=$(date +%s)
-BUILD_ARGS=()
+BUILD_ARGS=(--build-arg "REGISTRY=${REGISTRY}")
 if [ -n "$BASE_OVERRIDE" ]; then
-    BUILD_ARGS+=(--build-arg "BASE=${HARBOR_HOST}/team/blender-shared-usd:${BASE_OVERRIDE}")
+    BUILD_ARGS+=(--build-arg "BASE=${REGISTRY}/blender-shared-usd:${BASE_OVERRIDE}")
     echo "   base forcée: ${BASE_OVERRIDE}"
 fi
 # Extra `--build-arg` pairs, because the job counts belong to the machine and
 # not to the recipe.
 #
-# `BUILD_JOBS` and `USD_BUILD_JOBS` default to what fits `buildx-builder` —
+# `BUILD_JOBS` and `USD_BUILD_JOBS` default to what fits the reference k8s builder —
 # 8 cores for 12 GiB, where four parallel compilers already reached the ceiling.
 # On a 32-core builder those defaults leave 28 cores idle, so `build-on-gcp.sh`
 # raises them here. Space-separated `name=value`, forwarded verbatim.
@@ -198,11 +232,12 @@ for pair in ${TUILE_EXTRA_BUILD_ARGS:-}; do
     echo "   build-arg: $pair"
 done
 docker buildx build --builder "$BUILDER" --platform linux/amd64 \
-    -f "$DOCKERFILE" "${TAGS[@]}" "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}" \
+    -f "$DOCKERFILE" "${TAGS[@]}" "${BUILD_ARGS[@]}" \
     --push "$CONTEXT"
 echo "== poussée en $(($(date +%s) - t0))s"
 
 if [ "$WITH_RUNPOD" = 1 ]; then
+    RUNPOD_CRED_NAME="$TUILE_RUNPOD_CRED"
     # RUNPOD_API_KEY lives in tuile/.env, gitignored. The password is an ECR
     # token: it is written to the API and never echoed here.
     set -a; . ./.env; set +a
