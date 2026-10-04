@@ -88,11 +88,6 @@ le place à la verticale de l'œil.
 - `integrations/hydra/tests/make_look.py:27` : troisième soleil (NOAA
   approché), mais la bonne forme : un `DomeLight` HDRI (`sky-day.exr` statique)
   plus un `DistantLight` orienté (`:167-178`).
-- Application hôte (`host-app/services/flight-renderer`) : `host.rs:245-257`
-  a un soleil `Zenith` ou « Recorder » en Euler fixes (50°, −30°) dans l'ENU,
-  un ambiant 0,23 façon Unity. `stage.rs:194` `FILM_EXPOSURE_STOPS = −1.5`,
-  recopié du défaut Blender et authored en `primvars:film:exposure`
-  (`:249`) pour compenser la couche de vol.
 
 **Bilan** : trois ou quatre soleils, aucun ciel rendu, une brume physique mais
 à hauteur faussée hors équateur, un éclairage sans couleur, pas d'HDR côté wgpu,
@@ -204,8 +199,7 @@ Les positions ne passent en f32 qu'après rebasage (règle 7).
   avec la **normale géodésique** et une réfraction de Saemundsson/Bennett
   (pression et température standard, paramétrables). Au-delà de 1° sous
   l'horizon, pas de réfraction : continuité imposée par test ;
-- `make_look.py` et `render_usd.py:243` cessent de calculer un soleil ; l'application hôte
-  remplace `SceneSun::Recorder` par l'instant du vol ;
+- `make_look.py` et `render_usd.py:243` cessent de calculer un soleil ;
 - l'instant vient des horodatages de la trajectoire (`tuile-tape`) ou d'un
   `--at` explicite, jamais de l'horloge murale.
 
@@ -304,9 +298,9 @@ développement n'est pas branchée : même courbe, moins de parité.
   du « sunny 16 » (EV100 ≈ 15). Au crépuscule, l'exposition monte mais reste
   plafonnée à +4 EV au-dessus de la valeur de plein jour, pour que la scène
   s'assombrisse visiblement au lieu d'être compensée à fond.
-- Application hôte : `FILM_EXPOSURE_STOPS` devient l'exposition totale lue dans le stage
-  (primvar écrite par tuile). La couche de vol, émise à `2^-exposure`, suit
-  l'heure au lieu d'une constante.
+- L'exposition totale est écrite dans le stage (primvar écrite par tuile),
+  pour que toute couche superposée par l'hôte puisse la lire et suivre l'heure
+  au lieu d'une constante.
 
 ## 5. Architecture
 
@@ -411,7 +405,7 @@ la mer. Film A/B de l'orbite pyrénéenne avant/après, ouvert, rangé dans
 `videos/` avec son entrée README.
 
 **Étape 1 — un seul soleil.** `Sun::topocentric` (géodésique + réfraction) ;
-suppression des soleils de `make_look.py`, `render_usd.py:243` et de l'application hôte.
+suppression des soleils de `make_look.py` et `render_usd.py:243`.
 Acceptation : écart au SPA ≤ 0,01° sur la grille figée ; direction identique à
 1e-6 entre l'uniform wgpu, le `DistantLight` relu dans le stage et le soleil de
 Blender. Réfraction continue en 0° (test de monotonie).
