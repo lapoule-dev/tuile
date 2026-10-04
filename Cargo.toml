@@ -7,6 +7,7 @@ members = [
     "crates/tuile-bing",
     "crates/tuile-cesium-ion",
     "crates/tuile-farm",
+    "crates/tuile-film",
     "crates/tuile-camera",
     "crates/tuile-native-fetchers",
     "crates/tuile-pack",
