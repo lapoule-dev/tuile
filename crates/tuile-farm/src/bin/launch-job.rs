@@ -52,7 +52,9 @@ enum Verb {
 }
 
 fn farm() -> Result<Farm, String> {
-    let project = std::env::var("TUILE_GCP_PROJECT").unwrap_or_else(|_| "gcp-project-id".into());
+    let project = std::env::var("TUILE_GCP_PROJECT").map_err(|_| {
+        "TUILE_GCP_PROJECT is not set: the Google Cloud project that runs the render jobs".to_string()
+    })?;
     let region = std::env::var("TUILE_GCP_REGION").unwrap_or_else(|_| "europe-west1".into());
     let transport = Arc::new(HttpTransport::new().map_err(|e| e.to_string())?);
     let tokens = default_tokens().map_err(|e| e.to_string())?;

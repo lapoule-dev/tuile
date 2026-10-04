@@ -6,7 +6,7 @@
     startTimeCode = 1
     endTimeCode = 2
     timeCodesPerSecond = 24
-    doc = """Prototype de la couche de vol de l'application hôte (docs/16) : track BasisCurves
+    doc = """Prototype d'une couche de vol superposée : track BasisCurves
 rebasée, rideau au sol en dégradé d'opacité, carte-label billboardée, et le
 curseur importé PAR RÉFÉRENCE (cursor.usda en doublure d'un glTF converti)
 puis manipulé par composition — xform animé + over de matériau, sans éditer
@@ -77,7 +77,7 @@ def Xform "Overlay"
     }
 
     # ------------------------------------- curseur : référence + overs ----
-    # Le pattern glTF-par-composition (docs/16 §2 bis) : l'asset est
+    # Le pattern glTF-par-composition : l'asset est
     # référencé, placé/animé par timeSamples, recoloré par over. cursor.usda
     # tient lieu de .usdc issu de `assets/convert-gltf.sh`.
     def Xform "Cursor" (

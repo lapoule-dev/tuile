@@ -4,9 +4,9 @@
 //! What a render job is told, read once from its environment.
 //!
 //! Every variable, its default and the reason for it are the contract the
-//! launchers write to (`launch::render_env`, `render-service`). Read through a
-//! closure rather than `std::env`, so a test states the environment it means
-//! and nothing leaks in from the machine running it.
+//! launchers write to (`launch::render_env` and external schedulers). Read
+//! through a closure rather than `std::env`, so a test states the environment
+//! it means and nothing leaks in from the machine running it.
 
 use std::path::PathBuf;
 
@@ -60,8 +60,8 @@ pub struct Config {
     pub done_sleep_s: u64,
     pub pack_key: Option<String>,
     pub pack_path: PathBuf,
-    /// A pack already on disk (`TUILE_PACK`): the host application's job fetches it during the
-    /// OptiX warm-up and hands it over.
+    /// A pack already on disk (`TUILE_PACK`): an external launcher fetches it
+    /// during the OptiX warm-up and hands it over.
     pub pack_ready: Option<PathBuf>,
     pub scene: Option<String>,
     pub ion_token: bool,
@@ -106,8 +106,9 @@ pub const TRACE_BLENDER_ARGS: &str =
 /// * `TUILE_WAIT_MODE=command` — one blocking wait per frame instead of dozens
 ///   of 50 ms polls, same images, same times.
 ///
-/// Here, and not in each launcher, because tuile's jobs and the host application's must not
-/// drift apart on what decides whether a render ends at all.
+/// Here, and not in each launcher, because tuile's own jobs and those of
+/// external launchers must not drift apart on what decides whether a render
+/// ends at all.
 pub fn batch_env(get: &dyn Fn(&str) -> Option<String>) -> Vec<(String, String)> {
     [("CYCLES_BACKGROUND", "1"), ("CYCLES_AUTO_TILE", "0"), ("TUILE_WAIT_MODE", "command")]
         .iter()

@@ -13,9 +13,10 @@
 #   plugin  — the .so, linked against the SDK the base image ships.
 #   final   — base + plugin + farm scripts; nothing else.
 #
-#   docker buildx build --builder buildx-builder --platform linux/amd64 \
+#   docker buildx build --builder <builder> --platform linux/amd64 \
 #       -f integrations/blender/Dockerfile.globe \
-#       -t registry.invalid/blender-globe:5.1-su --push .
+#       --build-arg REGISTRY=<registry> \
+#       -t <registry>/blender-globe:5.1-su --push .
 
 # 2509 recompiled Blender from the current patch: 2508 predates c2ab384 and
 # still carries the cubeProc spike probe, which constructed a TestCube
@@ -34,7 +35,10 @@
 # `addons_core/hydra_cycles`. We used to carry that add-on ourselves because
 # 5.1.2 shipped the delegate without it; the assertion further down is what
 # replaced the copy.
-ARG BASE=registry.invalid/blender-shared-usd:5.2-2605
+# `REGISTRY` is where the base images live (host plus any namespace); it has
+# no default. `BASE` may be overridden whole to build on another base tag.
+ARG REGISTRY
+ARG BASE=${REGISTRY}/blender-shared-usd:5.2-2605
 # La série, parce que Blender range ses ressources sous un répertoire qui porte
 # sa version — `/opt/blender/5.2/scripts`, `/opt/blender/5.2/python`.
 #

@@ -16,14 +16,14 @@
 #              addons; without matching bindings the injection path dies).
 #              Le plugin se compile ensuite contre ce même /opt/usd, copié
 #              dans l'image finale : un seul USD dans toute la chaîne, donc un
-#              seul ABI. `team/usd-shared:25.08` reste la base de compilation de
+#              seul ABI. `usd-shared:25.08` reste la base de compilation de
 #              l'ancien chemin Blender 5.1 stock, et n'a rien à voir ici.
 #   build    — Blender cmake'd with USD_ROOT_DIR pointing at usdpy.
 #   runtime  — thin: Blender + /opt/usd + runtime libs. No toolchain.
 #
-#   docker buildx build --builder buildx-builder --platform linux/amd64 \
+#   docker buildx build --builder <builder> --platform linux/amd64 \
 #       -f integrations/blender/Dockerfile.blender-shared-usd \
-#       -t registry.invalid/blender-shared-usd:5.2-2603 --push .
+#       -t <registry>/blender-shared-usd:5.2-2603 --push .
 
 # 5.2, et la raison tient en une ligne de hdCycles.
 #
@@ -116,7 +116,7 @@ ARG BUILD_JOBS=3
 ARG USD_BUILD_JOBS=4
 # The GPU backends, and why each number is what it is.
 #
-# Measured 2026-09-10 on team/blender-globe:5.1-su: NOT ONE `.cubin` or `.ptx`
+# Measured 2026-09-10 on blender-globe:5.1-su: NOT ONE `.cubin` or `.ptx`
 # in the whole install, `compute_device_type` offering only
 # ('NONE','CUDA','HIP','ONEAPI') and CUDA enumerating zero devices on a machine
 # with four RTX 5090s. This Blender had no GPU backend at all — which is why

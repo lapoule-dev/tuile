@@ -7,10 +7,12 @@
 # natively; ffmpeg only stream-copies segments together) and the
 # driver/job scripts.
 #
-#   docker buildx build --builder buildx-builder --platform linux/amd64 \
+#   docker buildx build --builder <builder> --platform linux/amd64 \
 #       -f integrations/blender/Dockerfile \
-#       -t registry.invalid/blender-render:5.1 --push .
-FROM registry.invalid/blender-usd-base:5.1-2508
+#       --build-arg REGISTRY=<registry> \
+#       -t <registry>/blender-render:5.1 --push .
+ARG REGISTRY
+FROM ${REGISTRY}/blender-usd-base:5.1-2508
 
 # Static ffmpeg (one binary): segment encode + stream-copy concat on the pod.
 RUN curl -fL --retry 5 -o /tmp/ffmpeg.tar.xz \

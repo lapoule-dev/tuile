@@ -13,9 +13,9 @@
 # difference, not a 5.x removal), so newest Blender, the generative
 # machinery and integrated encoding coexist here.
 #
-#   docker buildx build --builder buildx-builder --platform linux/amd64 \
+#   docker buildx build --builder <builder> --platform linux/amd64 \
 #       -f integrations/blender/Dockerfile.blender-usd-base \
-#       -t registry.invalid/blender-usd-base:5.1-2508 --push .
+#       -t <registry>/blender-usd-base:5.1-2508 --push .
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive

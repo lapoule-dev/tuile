@@ -3,7 +3,7 @@
 #
 # THE OpenUSD base image. There is only one, and it is CUDA-capable.
 #
-# Built on the in-cluster amd64 builder, cached and published through Harbor:
+# Built on an amd64 buildx builder, cached and published through a registry:
 #
 # Locally, on an arm64 developer machine — no driver stack, Embree only:
 #
@@ -11,13 +11,13 @@
 #       --build-arg BASE_IMAGE=ubuntu:24.04 \
 #       -t tuile-openusd:26.08-local-arm64 .
 #
-# For the farm, natively on amd64, cached and published through Harbor:
+# For the farm, natively on amd64, cached and published through a registry:
 #
-#   docker buildx build --builder buildx-builder --platform linux/amd64 \
+#   docker buildx build --builder <builder> --platform linux/amd64 \
 #       -f integrations/hydra/Dockerfile.openusd \
-#       --cache-to   type=registry,ref=registry.invalid/tuile/openusd-cache,mode=max \
-#       --cache-from type=registry,ref=registry.invalid/tuile/openusd-cache \
-#       -t registry.invalid/tuile/openusd:26.08 --push .
+#       --cache-to   type=registry,ref=<registry>/openusd-cache,mode=max \
+#       --cache-from type=registry,ref=<registry>/openusd-cache \
+#       -t <registry>/openusd:26.08 --push .
 #
 # WHY NOT A SEPARATE CPU IMAGE: this one already renders without a GPU. It
 # carries Storm *and* Embree, and Embree is a CPU ray tracer that needs no
