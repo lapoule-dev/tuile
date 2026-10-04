@@ -53,16 +53,18 @@ pub struct FrameDiff<'a> {
 ///
 /// Starting mid-film is the normal case, not an edge: each worker of a
 /// parallel render owns a slice, and its first diff simply enters everything.
-pub struct Cursor<'p, 'a> {
-    pack: &'p Pack<'a>,
+///
+/// It holds no reference to the pack, only what was resident, so its owner can
+/// hold the pack's bytes alongside it and lend them per frame.
+pub struct Cursor {
     next: u32,
     last: u32,
     resident: HashSet<TileKey>,
 }
 
-impl<'p, 'a> Cursor<'p, 'a> {
+impl Cursor {
     /// A cursor over `first..=last`, which must lie inside the pack's range.
-    pub fn new(pack: &'p Pack<'a>, first: u32, last: u32) -> Result<Self, FilmError> {
+    pub fn new(pack: &Pack<'_>, first: u32, last: u32) -> Result<Self, FilmError> {
         let (lo, hi) = pack.frame_range();
         for frame in [first, last] {
             if frame < lo || frame > hi {
@@ -74,7 +76,6 @@ impl<'p, 'a> Cursor<'p, 'a> {
             }
         }
         Ok(Self {
-            pack,
             next: first,
             last,
             resident: HashSet::new(),
@@ -86,19 +87,25 @@ impl<'p, 'a> Cursor<'p, 'a> {
         self.resident.len()
     }
 
-    /// The next frame's diff, or `None` past the end of the range.
-    pub fn advance(&mut self) -> Option<Result<FrameDiff<'a>, FilmError>> {
+    /// Frames left in the range.
+    pub fn remaining(&self) -> u32 {
+        (self.last + 1).saturating_sub(self.next)
+    }
+
+    /// The next frame's diff, or `None` past the end of the range. `pack`
+    /// must be the pack the cursor was made for.
+    pub fn advance<'a>(&mut self, pack: &Pack<'a>) -> Option<Result<FrameDiff<'a>, FilmError>> {
         if self.next > self.last {
             return None;
         }
         let frame = self.next;
         self.next += 1;
-        Some(self.diff(frame))
+        Some(self.diff(pack, frame))
     }
 
-    fn diff(&mut self, frame: u32) -> Result<FrameDiff<'a>, FilmError> {
-        let view = self.pack.view_of(frame)?;
-        let tiles = self.pack.frame(frame)?;
+    fn diff<'a>(&mut self, pack: &Pack<'a>, frame: u32) -> Result<FrameDiff<'a>, FilmError> {
+        let view = pack.view_of(frame)?;
+        let tiles = pack.frame(frame)?;
         let mut now = HashSet::with_capacity(tiles.len());
         let mut enter = Vec::new();
         let mut selection = Vec::with_capacity(tiles.len());
@@ -193,7 +200,7 @@ pub(crate) mod tests {
         let pack = Pack::open(&bytes).expect("open");
         let mut c = Cursor::new(&pack, 10, 12).expect("cursor");
 
-        let f = c.advance().expect("10").expect("ok");
+        let f = c.advance(&pack).expect("10").expect("ok");
         assert_eq!(f.frame, 10);
         assert_eq!(
             f.enter.iter().map(TileKey::of).collect::<Vec<_>>(),
@@ -201,7 +208,7 @@ pub(crate) mod tests {
         );
         assert!(f.leave.is_empty());
 
-        let f = c.advance().expect("11").expect("ok");
+        let f = c.advance(&pack).expect("11").expect("ok");
         assert_eq!(
             f.enter.iter().map(TileKey::of).collect::<Vec<_>>(),
             [key(3, 0)]
@@ -210,7 +217,7 @@ pub(crate) mod tests {
         assert_eq!(f.selection, [key(2, 0), key(3, 0)]);
 
         // A new drape over the same mesh is a new tile, and the old one leaves.
-        let f = c.advance().expect("12").expect("ok");
+        let f = c.advance(&pack).expect("12").expect("ok");
         assert_eq!(
             f.enter.iter().map(TileKey::of).collect::<Vec<_>>(),
             [key(3, 7)]
@@ -218,7 +225,7 @@ pub(crate) mod tests {
         assert_eq!(f.leave, [key(3, 0)]);
         assert_eq!(c.resident(), 2);
 
-        assert!(c.advance().is_none());
+        assert!(c.advance(&pack).is_none());
     }
 
     #[test]
@@ -226,10 +233,10 @@ pub(crate) mod tests {
         let bytes = three_frames();
         let pack = Pack::open(&bytes).expect("open");
         let mut c = Cursor::new(&pack, 11, 11).expect("cursor");
-        let f = c.advance().expect("11").expect("ok");
+        let f = c.advance(&pack).expect("11").expect("ok");
         assert_eq!(f.enter.len(), 2);
         assert!(f.leave.is_empty());
-        assert!(c.advance().is_none());
+        assert!(c.advance(&pack).is_none());
     }
 
     #[test]

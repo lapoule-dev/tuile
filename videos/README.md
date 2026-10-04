@@ -19,6 +19,20 @@ seule façon de retrouver leur tracé est de rejouer les caméras du pack avec
 `tuile-bake --tape-from`. Les générateurs évoluent, donc recuire la même
 chaîne d'arguments ne donne plus le même vol.
 
+## `synthetic-orbit-1280x720-ss2-webgpu.mp4`
+
+Premier film du moteur **wgpu-film** (branche `spike/wgpu-film`), rendu dans
+le navigateur : deux Web Workers (wasm + WebGPU), H.264 par WebCodecs, mp4
+assemblé par `tuile-mp4`. Pas de vraie scène : un pack synthétique.
+
+- pack `cargo run --release -p tuile-film --example synthetic_pack -- synthetic.tuilepack 240`
+  (grille 16 × 16 km à 42,8° N 0,5° E, orbite de 5 km à 2 500 m, drapé changé
+  à la frame 121), scène `synthetic`, 7,3 Mo, 512 tuiles
+- page `examples/film-web/www/?pack=synthetic.tuilepack`, Chrome sur M2
+- 1280×720, suréchantillonnage 2× (4 éch./pixel), 30 images/s, 16 Mbit/s,
+  `avc1.640028` ; 240 frames en **4,9 s** (49 images/s), dont ~20 ms/frame
+  d'attente encodeur + GPU, 3,5 ms de travail CPU dans `next()`
+
 ## `pyrenees-2min-nadir-50km-tilestore-sse6.mp4`
 
 Le même plan à **SSE 6** au lieu de 3, cuit à travers le store (projections,
