@@ -12,10 +12,12 @@
 mod camera;
 mod cursor;
 mod look;
+mod mesh;
 mod slice;
 
 pub use camera::{FrameCamera, NEAR_FRACTION};
 pub use cursor::{Cursor, FilmError, FrameDiff, TileKey};
 pub use look::Look;
+pub use mesh::{texture, Mesh};
 pub use slice::slice;
-pub use tuile_pack::{fb, BakedView, Pack};
+pub use tuile_pack::{fb, BakedView, Pack, PackError};

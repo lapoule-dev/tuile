@@ -5669,6 +5669,7 @@ name = "tuile-film"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "image",
  "tempfile",
  "thiserror 2.0.18",
  "tuile-core",
@@ -5685,6 +5686,22 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tuile-film",
+ "wgpu",
+]
+
+[[package]]
+name = "tuile-film-web"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "futures-util",
+ "js-sys",
+ "tuile-film",
+ "tuile-film-gpu",
+ "tuile-mp4",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "wgpu",
 ]
 
@@ -5710,6 +5727,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tuile-core",
+]
+
+[[package]]
+name = "tuile-mp4"
+version = "0.1.0"
+dependencies = [
+ "mp4",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

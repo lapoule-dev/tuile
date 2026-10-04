@@ -1,0 +1,15 @@
+[package]
+name = "tuile-mp4"
+description = "H.264 samples into an mp4, in memory: the muxer shared by the browser and native film encoders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+mp4 = "0.14.0"
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

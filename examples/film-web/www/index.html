@@ -1,0 +1,97 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!-- Copyright (c) lapoule.dev -->
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tuile Film Bench</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --fg: #1d1d1b; --muted: #6b6a66; --line: #d9d7d0;
+    --panel: #ffffff; --accent: #2f5d8a; --bad: #a3322a; --good: #2e6b3a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #151514; --fg: #ecebe6; --muted: #9a998f; --line: #34332f;
+      --panel: #1e1e1c; --accent: #86b0d8; --bad: #e07a70; --good: #7cc48a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.45 ui-sans-serif, system-ui, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.lead { color: var(--muted); margin: 0 0 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px;
+          background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+  label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; }
+  input, select, button { font: inherit; color: var(--fg); background: var(--bg);
+          border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-width: 0; }
+  .wide { grid-column: 1 / -1; }
+  button { background: var(--accent); color: var(--panel); border: none; cursor: pointer; padding: 8px 14px; }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 16px 0; }
+  #status { color: var(--muted); font-variant-numeric: tabular-nums; }
+  #status.bad { color: var(--bad); } #status.good { color: var(--good); }
+  progress { width: 100%; height: 8px; }
+  .previews { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; }
+  .previews canvas, video { width: 100%; height: auto; background: #000; border-radius: 6px; display: block; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; margin-top: 12px; }
+  th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  section { margin-top: 20px; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  code { font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Film bench — wgpu / WebGPU</h1>
+  <p class="lead">Rend un <code>.tuilepack</code> pré-baké dans des Web Workers (wasm + WebGPU), encode en H.264 par WebCodecs, et assemble un mp4. Rien ne quitte ce navigateur.</p>
+
+  <div class="grid">
+    <label class="wide">Pack (.tuilepack)
+      <input type="file" id="file" accept=".tuilepack">
+    </label>
+    <label class="wide">… ou URL du pack
+      <input type="url" id="url" placeholder="https://…/A-B.tuilepack">
+    </label>
+    <label>Premier frame <input type="number" id="first"></label>
+    <label>Dernier frame <input type="number" id="last"></label>
+    <label>Workers <input type="number" id="workers" min="1" max="8" value="2"></label>
+    <label>Suréchantillonnage
+      <select id="ss"><option value="1">1× (1 spp)</option><option value="2" selected>2× (4 spp)</option><option value="3">3× (9 spp)</option></select>
+    </label>
+    <label>Échelle
+      <select id="scale"><option value="1" selected>viewport du pack</option><option value="0.5">½</option><option value="0.25">¼</option></select>
+    </label>
+    <label>Images/s <input type="number" id="fps" value="30" min="1" max="120"></label>
+    <label>Débit (Mbit/s) <input type="number" id="mbps" value="16" min="1" max="200"></label>
+  </div>
+
+  <div class="row">
+    <button id="go" disabled>Rendre</button>
+    <span id="status">Choisir un pack.</span>
+  </div>
+  <progress id="progress" value="0" max="1"></progress>
+
+  <section>
+    <h2>Aperçu par worker</h2>
+    <div class="previews" id="previews"></div>
+  </section>
+
+  <section>
+    <h2>Temps</h2>
+    <table id="stats"><thead><tr><th>Étape</th><th>moyenne / frame</th><th>total</th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section id="result" hidden>
+    <h2>Film</h2>
+    <video id="video" controls loop muted playsinline></video>
+    <div class="row"><a id="download" download="film.mp4">Télécharger le mp4</a><span id="summary"></span></div>
+  </section>
+</main>
+<script type="module" src="./main.js"></script>
+</body>
+</html>
