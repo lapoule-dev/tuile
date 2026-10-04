@@ -11,9 +11,9 @@
 # Version discipline: this tag must match the Blender that links it
 # (Blender 5.1 bundles USD 25.08). A :26.08 sibling serves our own stack.
 #
-#   docker buildx build --builder buildx-builder --platform linux/amd64 \
+#   docker buildx build --builder <builder> --platform linux/amd64 \
 #       -f integrations/blender/Dockerfile.usd-shared \
-#       -t registry.invalid/usd-shared:25.08 --push .
+#       -t <registry>/usd-shared:25.08 --push .
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive

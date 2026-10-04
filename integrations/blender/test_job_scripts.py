@@ -328,67 +328,6 @@ class OneArchivePerTask(unittest.TestCase):
 
 
 
-class TheImagePathIsOneString(unittest.TestCase):
-    """Le chemin poussé et le chemin déclaré doivent être le même.
-
-    Deux fichiers, deux dépôts, une seule chaîne — et Cloud Run **valide
-    l'existence de l'image au moment de créer le job**, pas au lancement. Un
-    caractère d'écart et la création répond `Error code 5: Image … not found`,
-    ce qui se lit comme un problème de droits.
-
-    S'abstient quand le checkout d'infra n'est pas là : ce test dit quelque
-    chose quand il peut, et rien quand il ne peut pas — jamais une réussite
-    qu'il n'a pas vérifiée.
-    """
-
-    FARM = (pathlib.Path(__file__).resolve().parents[3]
-            / "host-app" / "infra" / "farm_infra.py")
-
-    def setUp(self):
-        if not self.FARM.is_file():
-            self.skipTest(f"{self.FARM} absent — projet Pulumi non présent")
-        self.farm = self.FARM.read_text()
-        self.push = (pathlib.Path(__file__).with_name("build-push.sh")
-                     .read_text())
-
-    def test_the_registry_host_and_repository_agree(self):
-        for needle in ("-docker.pkg.dev", "/tuile/"):
-            self.assertIn(needle, self.farm)
-        self.assertIn('GAR_HOST="${GCP_REGION}-docker.pkg.dev"', self.push)
-        self.assertIn('GCP_REPO="${TUILE_GCP_REPO:-tuile}"', self.push)
-
-    def test_the_region_is_the_same_on_both_sides(self):
-        # La région n'est plus une constante : elle est dérivée de la carte,
-        # parce que chaque accélérateur n'existe que dans certaines régions et
-        # qu'un couple invalide est refusé à la création du job. Ce qui doit
-        # rester vrai, c'est que la région par défaut de la carte par défaut
-        # soit celle où le script pousse l'image — sinon chaque démarrage à
-        # froid traverse une frontière, facturé en egress.
-        self.assertIn('_accelerator = _config.get("accelerator") or "nvidia-l4"',
-                      self.farm, "la carte par défaut a changé")
-        l4 = self.farm[self.farm.index('"nvidia-l4": {'):]
-        l4 = l4[:l4.index("},")]
-        self.assertIn('"europe-west1"', l4,
-                      "europe-west1 n'est plus la première région du L4")
-        self.assertIn('GCP_REGION="${TUILE_GCP_REGION:-europe-west1}"',
-                      self.push)
-
-    def test_the_tag_is_the_same_on_both_sides(self):
-        # Le tag vit dans le job Pulumi ET dans la cible `globe` du script.
-        # Quand ils divergent, le job tire une image que personne n'a poussée.
-        self.assertIn('_image_tag = _config.get("image_tag") or "5.1-su"',
-                      self.farm)
-        globe = self.push[self.push.index("    globe)"):]
-        self.assertIn("TAG=5.1-su", globe[:globe.index(";;")])
-
-    def test_the_namespace_prefix_is_dropped_under_artifact_registry(self):
-        # `team/` est un espace de noms chez ECR et Harbor ; chez Google c'est
-        # le dépôt qui l'est, et un `team/` de trop donne un chemin à quatre
-        # segments que le job ne trouvera jamais.
-        self.assertIn('${REPO#*/}', self.push)
-        self.assertIn("/tuile/blender-globe:", self.farm)
-
-
 class ArchivingWhileItWrites(unittest.TestCase):
     """Le flush périodique doit survivre à un fichier qui bouge.
 
@@ -563,67 +502,6 @@ class DyingRendersMustNotBillAnHour(unittest.TestCase):
 
 
 
-
-
-class TheImagePathIsOneString(unittest.TestCase):
-    """Le chemin poussé et le chemin déclaré doivent être le même.
-
-    Deux fichiers, deux dépôts, une seule chaîne — et Cloud Run **valide
-    l'existence de l'image au moment de créer le job**, pas au lancement. Un
-    caractère d'écart et la création répond `Error code 5: Image … not found`,
-    ce qui se lit comme un problème de droits.
-
-    S'abstient quand le checkout d'infra n'est pas là : ce test dit quelque
-    chose quand il peut, et rien quand il ne peut pas — jamais une réussite
-    qu'il n'a pas vérifiée.
-    """
-
-    FARM = (pathlib.Path(__file__).resolve().parents[3]
-            / "host-app" / "infra" / "farm_infra.py")
-
-    def setUp(self):
-        if not self.FARM.is_file():
-            self.skipTest(f"{self.FARM} absent — projet Pulumi non présent")
-        self.farm = self.FARM.read_text()
-        self.push = (pathlib.Path(__file__).with_name("build-push.sh")
-                     .read_text())
-
-    def test_the_registry_host_and_repository_agree(self):
-        for needle in ("-docker.pkg.dev", "/tuile/"):
-            self.assertIn(needle, self.farm)
-        self.assertIn('GAR_HOST="${GCP_REGION}-docker.pkg.dev"', self.push)
-        self.assertIn('GCP_REPO="${TUILE_GCP_REPO:-tuile}"', self.push)
-
-    def test_the_region_is_the_same_on_both_sides(self):
-        # La région n'est plus une constante : elle est dérivée de la carte,
-        # parce que chaque accélérateur n'existe que dans certaines régions et
-        # qu'un couple invalide est refusé à la création du job. Ce qui doit
-        # rester vrai, c'est que la région par défaut de la carte par défaut
-        # soit celle où le script pousse l'image — sinon chaque démarrage à
-        # froid traverse une frontière, facturé en egress.
-        self.assertIn('_accelerator = _config.get("accelerator") or "nvidia-l4"',
-                      self.farm, "la carte par défaut a changé")
-        l4 = self.farm[self.farm.index('"nvidia-l4": {'):]
-        l4 = l4[:l4.index("},")]
-        self.assertIn('"europe-west1"', l4,
-                      "europe-west1 n'est plus la première région du L4")
-        self.assertIn('GCP_REGION="${TUILE_GCP_REGION:-europe-west1}"',
-                      self.push)
-
-    def test_the_tag_is_the_same_on_both_sides(self):
-        # Le tag vit dans le job Pulumi ET dans la cible `globe` du script.
-        # Quand ils divergent, le job tire une image que personne n'a poussée.
-        self.assertIn('_image_tag = _config.get("image_tag") or "5.1-su"',
-                      self.farm)
-        globe = self.push[self.push.index("    globe)"):]
-        self.assertIn("TAG=5.1-su", globe[:globe.index(";;")])
-
-    def test_the_namespace_prefix_is_dropped_under_artifact_registry(self):
-        # `team/` est un espace de noms chez ECR et Harbor ; chez Google c'est
-        # le dépôt qui l'est, et un `team/` de trop donne un chemin à quatre
-        # segments que le job ne trouvera jamais.
-        self.assertIn('${REPO#*/}', self.push)
-        self.assertIn("/tuile/blender-globe:", self.farm)
 
 
 class ArchivingWhileItWrites(unittest.TestCase):

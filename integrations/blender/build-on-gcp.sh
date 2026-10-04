@@ -8,7 +8,7 @@
 #
 # `blender-shared-usd`, and nothing else. It is the only image that compiles
 # OpenUSD and then 8119 objects of Blender; every other image stacks layers on
-# top of it, and `buildx-builder` does that perfectly well.
+# top of it, and the regular k8s builder does that perfectly well.
 #
 # Measured on that builder — 8 cores, 12 GiB — on 22 September 2026: about
 # ninety minutes cold, and the heavy stage's cache does not survive from one run
@@ -33,8 +33,8 @@
 #
 # No registry credentials. `docker buildx` forwards the **client's** credentials
 # to the builder at push time — the k8s path already relies on this, and
-# `build-push.sh` says so itself. The machine therefore only compiles: Harbor,
-# ECR and GAR stay on the workstation with its own tokens. That is the reason
+# `build-push.sh` says so itself. The machine therefore only compiles: the home
+# registry, ECR and GAR stay on the workstation with its own tokens. That is the reason
 # for this arrangement rather than a `git clone` on the VM followed by a push
 # from the VM, which would mean copying three keyrings onto it. It is also born
 # with no service account and no public address.
@@ -44,11 +44,20 @@
 #   ./integrations/blender/build-on-gcp.sh --destroy            # give it back
 #
 # Targets are `build-push.sh`'s own; whatever follows a `:` is passed straight
-# through to it.
+# through to it, and so is its environment (TUILE_REGISTRY, TUILE_AWS_PROFILE,
+# …). This script additionally needs:
+#
+#   TUILE_GCP_PROJECT    the Google Cloud project the machine lives in
+#   TUILE_HOME_BUILDER   optional: the buildx builder to switch back to on
+#                        exit (default: `default`)
 set -euo pipefail
 
 ZONE="${TUILE_GCP_ZONE:-europe-west1-b}"
-PROJECT="${TUILE_GCP_PROJECT:-gcp-project-id}"
+if [[ -z "${TUILE_GCP_PROJECT:-}" ]]; then
+    echo "error: TUILE_GCP_PROJECT is not set — the Google Cloud project the build machine lives in" >&2
+    exit 2
+fi
+PROJECT="$TUILE_GCP_PROJECT"
 # c2d, and the family matters more than it looks.
 #
 # `n2d-standard-32` was the obvious pick and it cannot be created here: the
@@ -115,7 +124,7 @@ cleanup() {
     #
     # Only the default builder is handed back, so the next `docker buildx build`
     # typed by hand does not silently reach for a machine that is now asleep.
-    docker buildx use "${TUILE_HOME_BUILDER:-buildx-builder}" >/dev/null 2>&1 || true
+    docker buildx use "${TUILE_HOME_BUILDER:-default}" >/dev/null 2>&1 || true
     if [[ $AWAKE -eq 1 ]]; then
         say "$VM left running (--awake) — to sleep it: gcloud compute instances suspend $VM --zone=$ZONE"
         return $code
@@ -236,10 +245,10 @@ say "builder $BUILDER up on $MACHINE"
 # ── the images ───────────────────────────────────────────────────────────────
 #
 # `build-push.sh` runs HERE, on the workstation: it is the one holding the
-# Harbor, ECR and GAR tokens. Only the compiling travels.
+# registry, ECR and GAR tokens. Only the compiling travels.
 #
 # And the job counts come from the machine, not from the recipe. The Dockerfile
-# defaults fit `buildx-builder` — 8 cores for 12 GiB, where four parallel
+# defaults fit the regular k8s builder — 8 cores for 12 GiB, where four parallel
 # compilers already hit the ceiling and the kernel killed one. Here there are
 # 32 cores and 128 GiB, which at the measured ~1.5 GiB per `cc1plus` leaves the
 # memory nowhere near the limit; the cores are the constraint, so match them.
