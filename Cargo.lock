@@ -5665,6 +5665,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuile-film"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tuile-core",
+ "tuile-pack",
+]
+
+[[package]]
 name = "tuile-hydra"
 version = "0.1.0"
 dependencies = [

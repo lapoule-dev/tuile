@@ -1,0 +1,20 @@
+[package]
+name = "tuile-film"
+description = "A pre-baked film, read frame by frame: what enters, what leaves, the camera and the look — no GPU, no I/O"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+glam = { workspace = true }
+thiserror = { workspace = true }
+tuile-core = { version = "0.1.0", path = "../tuile-core" }
+tuile-pack = { version = "0.1.0", path = "../tuile-pack" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
