@@ -458,8 +458,29 @@ async function offerScales() {
   describeEncoder();
 }
 
+// How many workers a film is split between, from the machine's logical
+// cores. The two encoders are limited by different things:
+//
+// - rav1e is the CPU's: each worker encodes on its own core, so every core
+//   but one — kept for the page and the browser's GPU process — is a worker;
+// - the browser's encoder is fast and all workers share one GPU, so past a
+//   few they queue behind each other: half the cores, four at most.
+//
+// A browser may report fewer cores than there are (privacy), never more; and
+// a number typed in the field is the user's and is left alone.
+const CORES = navigator.hardwareConcurrency || 4;
+function suggestedWorkers(encoder) {
+  const wanted = encoder === "rav1e" ? CORES - 1 : Math.round(CORES / 2);
+  return Math.max(1, Math.min(wanted, encoder === "rav1e" ? 16 : 4));
+}
+let workersTyped = false;
+$("workers").addEventListener("input", () => { workersTyped = true; });
+
 function describeEncoder() {
   if (!view) return;
+  const encoder = $("scale").selectedOptions[0].dataset.encoder;
+  if (!workersTyped) $("workers").value = suggestedWorkers(encoder);
+  $("workers").title = `${CORES} cœurs logiques détectés ; ${suggestedWorkers(encoder)} workers proposés pour cet encodeur`;
   const about = `${film.id} : viewport ${view.width}×${view.height}, table de ${(view.table_bytes / 1e6).toFixed(2)} Mo lue pour ce pack (${view.tiles} tuiles).`;
   const soft = $("scale").selectedOptions[0].dataset.encoder === "rav1e";
   status(soft
