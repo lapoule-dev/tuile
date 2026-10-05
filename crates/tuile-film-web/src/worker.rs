@@ -4,7 +4,10 @@
 use crate::source::Source;
 use futures_util::future::try_join_all;
 use js_sys::{Array, Uint8Array};
-use tuile_film::{file_reads, texture_of_span, Cursor, FrameCamera, Look, Mesh, Pack, TileKey};
+use tuile_film::{
+    cameras, file_reads, frame_tiles, texture_of_span, Cursor, FrameCamera, Look, Mesh, Pack,
+    TileKey,
+};
 use tuile_film_gpu::{FilmGpu, Settings, TileMesh, OUTPUT_FORMAT};
 use tuile_mp4::{Muxer, ParameterSets};
 use wasm_bindgen::prelude::*;
@@ -29,42 +32,158 @@ fn now_ms() -> f64 {
     js_sys::Date::now()
 }
 
-/// What a pack holds, read before any worker is started.
-#[wasm_bindgen(getter_with_clone)]
-pub struct PackInfo {
-    pub first: u32,
-    pub last: u32,
-    pub width: u32,
-    pub height: u32,
-    pub tiles: u32,
-    pub scene: String,
-    /// Whether the blob digest was checked here (a local file) — a URL was
-    /// checked by the API that serves it.
-    pub verified: bool,
+/// A pack opened for looking at: its table is read, nothing else until a
+/// texture is asked for.
+#[wasm_bindgen]
+pub struct PackView {
+    source: Source,
+    head: Vec<u8>,
+    first: u32,
+    last: u32,
+    width: u32,
+    height: u32,
+    tiles: u32,
+    scene: String,
 }
 
 #[wasm_bindgen]
-impl PackInfo {
-    /// Reads a pack's table — from a URL or a picked file — and reports its
-    /// range and the viewport its first frame was baked for. A local file's
-    /// digest is checked too, slice by slice.
-    pub async fn open(source: JsValue) -> Result<PackInfo, JsError> {
+impl PackView {
+    /// Reads a pack's table from its URL (by range).
+    pub async fn open(source: JsValue) -> Result<PackView, JsError> {
         console_error_panic_hook::set_once();
         let source = Source::from_js(&source)?;
         let head = source.head().await?;
-        let verified = source.verify(&head).await?;
-        let pack = Pack::open_table(&head).map_err(js)?;
-        let (first, last) = pack.frame_range();
-        let view = pack.view_of(first).map_err(js)?;
-        Ok(PackInfo {
+        let (first, last, width, height, tiles, scene) = {
+            let pack = Pack::open_table(&head).map_err(js)?;
+            let (first, last) = pack.frame_range();
+            let view = pack.view_of(first).map_err(js)?;
+            (
+                first,
+                last,
+                view.viewport_px[0] as u32,
+                view.viewport_px[1] as u32,
+                pack.tile_count() as u32,
+                pack.scene_digest().to_string(),
+            )
+        };
+        Ok(PackView {
+            source,
+            head,
             first,
             last,
-            width: view.viewport_px[0] as u32,
-            height: view.viewport_px[1] as u32,
-            tiles: pack.tile_count() as u32,
-            scene: pack.scene_digest().to_string(),
-            verified,
+            width,
+            height,
+            tiles,
+            scene,
         })
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn first(&self) -> u32 {
+        self.first
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn last(&self) -> u32 {
+        self.last
+    }
+
+    /// The viewport the first frame was baked for.
+    #[wasm_bindgen(getter)]
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn tiles(&self) -> u32 {
+        self.tiles
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn scene(&self) -> String {
+        self.scene.clone()
+    }
+
+    /// Bytes of the table that was read to open the pack.
+    #[wasm_bindgen(getter)]
+    pub fn table_bytes(&self) -> u32 {
+        self.head.len() as u32
+    }
+
+    /// The camera path, at most `max` samples, seven numbers each: frame,
+    /// longitude, latitude (degrees), height (m), heading, pitch, vertical
+    /// field of view (degrees).
+    pub fn cameras(&self, max: u32) -> Result<Vec<f64>, JsError> {
+        let pack = Pack::open_table(&self.head).map_err(js)?;
+        Ok(cameras(&pack, max as usize)
+            .into_iter()
+            .flat_map(|c| {
+                [
+                    f64::from(c.frame),
+                    c.lon_deg,
+                    c.lat_deg,
+                    c.height_m,
+                    c.heading_deg,
+                    c.pitch_deg,
+                    c.fovy_deg,
+                ]
+            })
+            .collect())
+    }
+
+    /// The tiles a frame draws, as a JSON array of
+    /// `{id, drape, vertices, triangles, textureBytes, lon, lat}`. Ids are
+    /// strings: they do not fit a JS number.
+    pub fn frame_tiles(&self, frame: u32) -> Result<String, JsError> {
+        let pack = Pack::open_table(&self.head).map_err(js)?;
+        let rows: Vec<String> = frame_tiles(&pack, frame)
+            .map_err(js)?
+            .into_iter()
+            .map(|t| {
+                format!(
+                    r#"{{"id":"{}","drape":"{:016x}","vertices":{},"triangles":{},"textureBytes":{},"lon":{},"lat":{}}}"#,
+                    t.id,
+                    t.drape,
+                    t.vertices,
+                    t.triangles,
+                    t.texture_bytes,
+                    if t.lon_deg.is_finite() { t.lon_deg } else { 0.0 },
+                    if t.lat_deg.is_finite() { t.lat_deg } else { 0.0 },
+                )
+            })
+            .collect();
+        Ok(format!("[{}]", rows.join(",")))
+    }
+
+    /// The encoded texture (PNG) of the `index`-th tile of a frame, read by
+    /// range; empty when the tile has none.
+    pub async fn texture(&self, frame: u32, index: u32) -> Result<Vec<u8>, JsError> {
+        let pack = Pack::open_table(&self.head).map_err(js)?;
+        let tiles = pack.frame(frame).map_err(js)?;
+        let tile = tiles
+            .get(index as usize)
+            .ok_or_else(|| js(format!("frame {frame} has no tile {index}")))?;
+        let blob = self.head.len() as u64;
+        let Some(fetch) = file_reads(&pack, blob, std::slice::from_ref(tile), 0)
+            .into_iter()
+            .next()
+        else {
+            return Ok(Vec::new());
+        };
+        if fetch.range.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bytes = self.source.read(fetch.range.clone()).await?;
+        Ok(
+            texture_of_span(&pack, tile, fetch.range.start - blob, &bytes)
+                .map_err(js)?
+                .unwrap_or_default(),
+        )
     }
 }
 

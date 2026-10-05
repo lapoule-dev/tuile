@@ -10,30 +10,13 @@ import init, { FilmWorker } from "./pkg/tuile_film_web.js";
 
 const post = (msg, transfer = []) => self.postMessage(msg, transfer);
 
-// High profile, from level 4.0 up: the first one the browser accepts wins.
-const CODECS = ["avc1.640028", "avc1.640032", "avc1.640033", "avc1.4d0033", "avc1.42e033"];
-
-async function encoderConfig(width, height, fps, bitrate) {
-  for (const codec of CODECS) {
-    const config = {
-      codec, width, height, bitrate, framerate: fps,
-      avc: { format: "avc" },
-      latencyMode: "quality",
-    };
-    const { supported } = await VideoEncoder.isConfigSupported(config);
-    if (supported) return config;
-  }
-  throw new Error(`no H.264 encoder for ${width}×${height}`);
-}
+import { encoderConfig } from "./encoder.js";
 
 self.onmessage = async ({ data }) => {
-  const { id, source, first, last, filmFirst, width, height, supersample, fps, bitrate } = data;
+  const { id, packs, filmFirst, width, height, supersample, fps, bitrate } = data;
   try {
     await init();
-    // The source is a URL on the pack API or a Blob shared with the page:
-    // either way, this worker reads only the table and its own tiles.
     const canvas = new OffscreenCanvas(width, height);
-    const film = await FilmWorker.create(canvas, source, first, last, supersample);
 
     let avcc = null;
     let failure = null;
@@ -59,7 +42,13 @@ self.onmessage = async ({ data }) => {
 
     const started = performance.now();
     let n = 0;
-    for (;;) {
+    // This worker's slice of the film, pack by pack. A pack shares nothing
+    // with the next — its own tiles, its own imagery — so each gets its own
+    // renderer, and only its table and the tiles of the frames wanted here
+    // are read from it.
+    for (const pack of packs) {
+      const film = await FilmWorker.create(canvas, pack.source, pack.first, pack.last, supersample);
+      for (;;) {
       if (failure) throw failure;
       const t0 = performance.now();
       const stats = await film.next();
@@ -95,6 +84,8 @@ self.onmessage = async ({ data }) => {
         post(msg);
       }
       n++;
+      }
+      film.free();
     }
     await encoder.flush();
     encoder.close();

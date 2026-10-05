@@ -4,7 +4,7 @@
 use std::ops::Range;
 
 use js_sys::{ArrayBuffer, Promise, Uint8Array};
-use tuile_film::{blob_start, Fnv1a, Pack, PREAMBLE};
+use tuile_film::{blob_start, PREAMBLE};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Blob, Request, RequestInit, Response, Window, WorkerGlobalScope};
@@ -103,29 +103,5 @@ impl Source {
         let preamble = self.read(0..PREAMBLE as u64).await?;
         let start = blob_start(&preamble).map_err(|e| JsError::new(&e.to_string()))?;
         self.read(0..start).await
-    }
-
-    /// Folds the blob digest over a local file, a slice at a time, and
-    /// compares it with the table's. A URL is not checked here: the API that
-    /// serves it verified the pack when it fetched it.
-    pub async fn verify(&self, head: &[u8]) -> Result<bool, JsError> {
-        let Source::Blob(blob) = self else {
-            return Ok(false);
-        };
-        let pack = Pack::open_table(head).map_err(|e| JsError::new(&e.to_string()))?;
-        let mut digest = Fnv1a::default();
-        let size = blob.size() as u64;
-        let mut at = head.len() as u64;
-        while at < size {
-            let end = (at + (32 << 20)).min(size);
-            digest.update(&self.read(at..end).await?);
-            at = end;
-        }
-        if digest.finish() != pack.blob_digest() {
-            return Err(JsError::new(
-                "the pack's blob does not match its digest: damaged file",
-            ));
-        }
-        Ok(true)
     }
 }

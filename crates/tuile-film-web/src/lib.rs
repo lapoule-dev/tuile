@@ -22,4 +22,4 @@ mod source;
 mod worker;
 
 #[cfg(target_arch = "wasm32")]
-pub use worker::{FilmMuxer, FilmWorker, FrameStats, PackInfo};
+pub use worker::{FilmMuxer, FilmWorker, FrameStats, PackView};

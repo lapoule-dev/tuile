@@ -10,83 +10,141 @@
   :root {
     --bg: #f6f5f2; --fg: #1d1d1b; --muted: #6b6a66; --line: #d9d7d0;
     --panel: #ffffff; --accent: #2f5d8a; --bad: #a3322a; --good: #2e6b3a;
+    --track: #2f5d8a; --start: #2e6b3a; --end: #a3322a;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
       --bg: #151514; --fg: #ecebe6; --muted: #9a998f; --line: #34332f;
       --panel: #1e1e1c; --accent: #86b0d8; --bad: #e07a70; --good: #7cc48a;
+      --track: #86b0d8; --start: #7cc48a; --end: #e07a70;
     }
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg);
          font: 14px/1.45 ui-sans-serif, system-ui, sans-serif; }
-  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+  main { max-width: 1180px; margin: 0 auto; padding: 24px 16px 48px; }
   h1 { font-size: 20px; margin: 0 0 4px; }
-  p.lead { color: var(--muted); margin: 0 0 20px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px;
-          background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  p.lead { color: var(--muted); margin: 0 0 16px; }
+  section { margin-top: 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .tabs button, .chip { background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+         border-radius: 999px; padding: 4px 12px; cursor: pointer; font: inherit; }
+  .tabs button[aria-selected="true"] { background: var(--accent); color: var(--panel); border-color: var(--accent); }
+  .crumbs { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; color: var(--muted); }
+  .crumbs button, .link { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0; font: inherit; text-align: left; }
+  .listing { max-height: 340px; overflow: auto; border-top: 1px solid var(--line); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th:first-child, td:first-child { text-align: left; word-break: break-all; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
   label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; }
-  input, select, button { font: inherit; color: var(--fg); background: var(--bg);
+  input, select { font: inherit; color: var(--fg); background: var(--bg);
           border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-width: 0; }
-  .wide { grid-column: 1 / -1; }
-  button { background: var(--accent); color: var(--panel); border: none; cursor: pointer; padding: 8px 14px; }
+  button.primary { background: var(--accent); color: var(--panel); border: none; border-radius: 6px;
+          cursor: pointer; padding: 8px 14px; font: inherit; }
   button:disabled { opacity: .5; cursor: default; }
-  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 16px 0; }
-  #status { color: var(--muted); font-variant-numeric: tabular-nums; }
-  #status.bad { color: var(--bad); } #status.good { color: var(--good); }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 12px 0; }
+  #status, .note { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .bad { color: var(--bad) !important; } .good { color: var(--good) !important; }
   progress { width: 100%; height: 8px; }
   .previews { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; }
   .previews canvas, video { width: 100%; height: auto; background: #000; border-radius: 6px; display: block; }
-  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; margin-top: 12px; }
-  th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--line); }
-  th:first-child, td:first-child { text-align: left; }
-  section { margin-top: 20px; }
-  h2 { font-size: 15px; margin: 0 0 8px; }
+  canvas.plot { width: 100%; height: auto; display: block; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; cursor: crosshair; }
+  .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+  .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 4px; margin-top: 8px; }
+  .gallery figure { margin: 0; position: relative; aspect-ratio: 1; background: var(--bg); border: 1px solid var(--line); overflow: hidden;
+          display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 11px; text-align: center; }
+  .gallery img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .gallery figcaption { position: absolute; left: 2px; bottom: 2px; background: rgba(0,0,0,.55); color: #fff; padding: 0 4px; border-radius: 3px; font-size: 10px; }
+  tr.pick { cursor: pointer; } tr.pick:hover td { background: var(--bg); } tr.on td { background: var(--bg); font-weight: 600; }
+  .tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; max-width: 540px; }
+  .tiles > div { position: relative; aspect-ratio: 1; background: var(--bg); border: 1px solid var(--line);
+          display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 11px; overflow: hidden; text-align: center; }
+  .tiles img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .tiles span { position: absolute; left: 3px; bottom: 2px; background: rgba(0,0,0,.55); color: #fff; padding: 0 4px; border-radius: 3px; }
+  pre { margin: 0; max-height: 260px; overflow: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
   code { font-size: 12px; }
 </style>
 </head>
 <body>
 <main>
   <h1>Film bench — wgpu / WebGPU</h1>
-  <p class="lead">Rend un <code>.tuilepack</code> pré-baké dans des Web Workers (wasm + WebGPU), encode en H.264 par WebCodecs, et assemble un mp4. Les packs viennent de <code>tuile-pack-api</code> : téléchargés une fois depuis le store, puis lus par plages — chaque worker ne lit que les tuiles de ses frames.</p>
+  <p class="lead">Consulte les films des buckets — leurs packs, la caméra et les tuiles que chacun porte, les tuiles sources — à travers <code>tuile-pack-api</code> (lecture seule, par plages), et rend un film dans des Web Workers (wasm + WebGPU + WebCodecs).</p>
 
-  <div class="grid">
-    <label class="wide">Pack de la ferme
-      <select id="packs"><option value="">— chargement de la liste… —</option></select>
-    </label>
-    <label>Premier frame <input type="number" id="first"></label>
-    <label>Dernier frame <input type="number" id="last"></label>
-    <label>Workers <input type="number" id="workers" min="1" max="8" value="2"></label>
-    <label>Suréchantillonnage
-      <select id="ss"><option value="1">1× (1 spp)</option><option value="2" selected>2× (4 spp)</option><option value="3">3× (9 spp)</option></select>
-    </label>
-    <label>Échelle
-      <select id="scale"><option value="1" selected>viewport du pack</option><option value="0.5">½</option><option value="0.25">¼</option></select>
-    </label>
-    <label>Images/s <input type="number" id="fps" value="30" min="1" max="120"></label>
-    <label>Débit (Mbit/s) <input type="number" id="mbps" value="16" min="1" max="200"></label>
-  </div>
-
-  <div class="row">
-    <button id="go" disabled>Rendre</button>
-    <span id="status">Choisir un pack.</span>
-  </div>
-  <progress id="progress" value="0" max="1"></progress>
-
-  <section>
-    <h2>Aperçu par worker</h2>
-    <div class="previews" id="previews"></div>
+  <section class="panel">
+    <h2>Films</h2>
+    <div class="tabs" id="projects" role="tablist"></div>
+    <div class="note" id="films-note"></div>
+    <div class="listing"><table id="films"><thead><tr><th>Film</th><th>packs</th><th>taille</th></tr></thead><tbody></tbody></table></div>
   </section>
 
-  <section>
-    <h2>Temps</h2>
-    <table id="stats"><thead><tr><th>Étape</th><th>moyenne / frame</th><th>total</th></tr></thead><tbody></tbody></table>
+  <section class="panel" id="film-panel" hidden>
+    <h2 id="film-title">Film</h2>
+    <div class="note" id="film-note"></div>
+    <div class="listing"><table id="chunks"><thead><tr><th>Pack</th><th>frames</th><th>taille</th><th>scène</th></tr></thead><tbody></tbody></table></div>
   </section>
 
-  <section id="result" hidden>
-    <h2>Film</h2>
-    <video id="video" controls loop muted playsinline></video>
-    <div class="row"><a id="download" download="film.mp4">Télécharger le mp4</a><span id="summary"></span></div>
+  <section class="panel" id="camera-panel" hidden>
+    <h2 id="camera-title">Caméra</h2>
+    <div class="two">
+      <div><canvas class="plot" id="track" width="720" height="480"></canvas><div class="note">Trace au sol, nord en haut — <span style="color:var(--start)">●</span> début, <span style="color:var(--end)">●</span> fin. Cliquer pour choisir une frame.</div></div>
+      <div><canvas class="plot" id="profile" width="720" height="480"></canvas><div class="note">Par frame : hauteur au-dessus de l'ellipsoïde (trait plein) et inclinaison (pointillé).</div></div>
+    </div>
+    <div class="row">
+      <label>Frame <input type="number" id="cam-frame" style="width:110px"></label>
+      <span id="cam-at" class="note"></span>
+    </div>
+  </section>
+
+  <section class="panel" id="tiles-panel" hidden>
+    <h2 id="tiles-title">Tuiles</h2>
+    <div class="two">
+      <div>
+        <div class="note" id="pack-tiles-note"></div>
+        <div class="gallery" id="pack-tiles"></div>
+      </div>
+      <div>
+        <div class="grid">
+          <label>Couche <select id="layer"></select></label>
+          <label>Niveau <input type="number" id="tz" min="0" max="22" value="12"></label>
+        </div>
+        <div class="note" id="tiles-note" style="margin:8px 0"></div>
+        <div class="tiles" id="tiles"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="pack-panel" hidden>
+    <h2 id="pack-title">Rendu</h2>
+    <div class="grid">
+      <label>Premier frame <input type="number" id="first"></label>
+      <label>Dernier frame <input type="number" id="last"></label>
+      <label>Workers <input type="number" id="workers" min="1" max="8" value="2"></label>
+      <label>Suréchantillonnage
+        <select id="ss"><option value="1">1× (1 spp)</option><option value="2" selected>2× (4 spp)</option><option value="3">3× (9 spp)</option></select>
+      </label>
+      <label>Taille du film
+        <select id="scale"><option value="1" selected>viewport du pack</option><option value="0.75">¾</option><option value="0.5">½</option><option value="0.25">¼</option></select>
+      </label>
+      <label>Images/s <input type="number" id="fps" value="30" min="1" max="120"></label>
+      <label>Débit (Mbit/s) <input type="number" id="mbps" value="16" min="1" max="200"></label>
+    </div>
+    <div class="row">
+      <button class="primary" id="go" disabled>Rendre</button>
+      <span id="status">Choisir un film.</span>
+    </div>
+    <progress id="progress" value="0" max="1"></progress>
+    <section><h2>Aperçu par worker</h2><div class="previews" id="previews"></div></section>
+    <section><h2>Temps</h2>
+      <table id="stats"><thead><tr><th>Étape</th><th>moyenne / frame</th><th>total</th></tr></thead><tbody></tbody></table>
+    </section>
+    <section id="result" hidden>
+      <h2>Film</h2>
+      <video id="video" controls loop muted playsinline></video>
+      <div class="row"><a id="download" download="film.mp4">Télécharger le mp4</a><span id="summary"></span></div>
+    </section>
   </section>
 </main>
 <script type="module" src="./main.js"></script>
