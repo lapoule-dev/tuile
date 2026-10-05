@@ -19,6 +19,10 @@
 //! reprojected once onto its own rectangle and **shared** with every other
 //! terrain tile it drapes.
 
+mod provenance;
+
+pub use provenance::{digest, Provenance, TerrainOrigin};
+
 use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -610,6 +614,9 @@ pub struct PlanetaryLoader<T: TerrainSource, I: ImageryProvider> {
     /// the availability of its descendants, folded in here so traversal can
     /// keep refining toward the finest LOD.
     availability: Arc<Availability>,
+    /// What each mesh and each imagery tile was made from, noted as it is
+    /// fetched.
+    provenance: Arc<Provenance>,
     /// Host-updated imagery detail target (drives imagery level by altitude).
     detail: ImageryDetail,
     /// Shared with the host's camera: each decoded tile's relief, so the eye can
@@ -680,6 +687,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         match fetched {
             Ok(fetched) => {
                 tracing::debug!(z = c.level, x = c.x, y = c.y, "imagery tile");
+                self.provenance.fetched_imagery(c, &fetched.value);
                 // Decode, resample and inspect in a single offloaded job. All
                 // three are pure CPU over the same buffer, so splitting them
                 // would only pay the hop three times and undo the locality.
@@ -823,6 +831,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                             kib = fetched.value.len() / 1024,
                             "terrain tile"
                         );
+                        self.provenance.fetched_terrain(coord, &fetched.value);
                         // Decoding a quantized mesh is the same kind of work as
                         // decoding a JPEG and belongs off this thread for the
                         // same reason: nothing in it awaits, and holding the
@@ -876,6 +885,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                             coord.level, coord.x, coord.y
                         ))
                     })?;
+                    self.provenance.upsampled_terrain(coord, parent);
                     let m = tuile_core::metrics::metrics();
                     m.tiles_upsampled.inc();
                     m.upsampled_by_level.inc(coord.level);
@@ -1498,6 +1508,32 @@ where
     T: TerrainSource + 'static,
     I: ImageryProvider + 'static,
 {
+    let (tree, loader, detail, heights, _) =
+        globe_with_provenance(terrain, imagery, layer, opts, offload);
+    (tree, loader, detail, heights)
+}
+
+/// [`globe_on`], with the record of what each tile is made from: for a
+/// consumer that will want to build the same tiles again from the same
+/// source tiles, and so has to know which they were.
+pub fn globe_with_provenance<T, I>(
+    terrain: T,
+    imagery: I,
+    layer: LayerJson,
+    opts: GlobeOptions,
+    offload: Arc<dyn Offload>,
+) -> (
+    Box<dyn TileTree>,
+    Arc<dyn TileLoader>,
+    ImageryDetail,
+    Arc<TerrainHeights>,
+    Arc<Provenance>,
+)
+where
+    T: TerrainSource + 'static,
+    I: ImageryProvider + 'static,
+{
+    let provenance = Arc::new(Provenance::default());
     // One growing availability, shared by the tree (reader) and loader (writer):
     // the loader folds in each tile's `metadata` ranges, the tree refines on them.
     let scheme = GeographicTilingScheme::default();
@@ -1538,11 +1574,12 @@ where
         // life, replaced the moment the tile they stand in for arrives.
         fill_meshes: Mutex::new(MeshCache::new(256)),
         availability,
+        provenance: Arc::clone(&provenance),
         detail: detail.clone(),
         heights: Arc::clone(&heights),
         offload,
     });
-    (tree, loader, detail, heights)
+    (tree, loader, detail, heights, provenance)
 }
 
 #[cfg(test)]
@@ -1603,6 +1640,7 @@ mod tests {
             meshes: Mutex::new(MeshCache::new(8)),
             fill_meshes: Mutex::new(MeshCache::new(8)),
             availability: Arc::new(tuile_terrain::Availability::default()),
+            provenance: Arc::default(),
             detail: ImageryDetail::default(),
             heights: Arc::new(TerrainHeights::new(scheme)),
             offload: offload::inline(),
