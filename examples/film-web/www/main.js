@@ -36,6 +36,26 @@ let view = null;        // the PackView of the selected chunk
 let path = null;        // its camera samples: [{frame, lon, lat, height, heading, pitch, fovy}]
 let layers = [];        // the tile store's layers
 
+// ------------------------------------------------------------------- links
+
+// The address bar always names what is on screen — project, scene, pack and
+// frame — so a view can be reopened later, or sent to someone, as it is.
+function remember(frame) {
+  const q = new URLSearchParams();
+  if (query.get("api")) q.set("api", query.get("api"));
+  if (project) q.set("project", project);
+  if (film) q.set("film", film.id);
+  if (film && view) q.set("pack", film.chunks[view.chunk].key.slice(film.id.length + 1));
+  if (frame !== undefined) q.set("frame", frame);
+  const url = `${location.pathname}?${q}`;
+  history.replaceState(null, "", url);
+  $("permalink").href = url;
+  $("permalink").hidden = !film;
+}
+
+// What the address asked for when the page loaded, used once.
+let wanted = { film: query.get("film"), pack: query.get("pack"), frame: query.get("frame") };
+
 // ---------------------------------------------------------------- projects
 
 async function start() {
@@ -56,11 +76,11 @@ async function start() {
       const imagery = layers.find((l) => l.content_type.startsWith("image/"));
       if (imagery) $("layer").value = imagery.name;
     }
-    // ?project=…&film=… opens straight onto a film.
-    const wanted = projects.find((p) => p.name === query.get("project")) ?? projects[0];
-    if (wanted) await openProject(wanted.name);
-    const row = [...$("films").querySelectorAll("tbody tr")].find((r) => r.firstChild.textContent === query.get("film"));
-    row?.click();
+    // ?project=…&film=…&pack=…&frame=… opens straight onto that view.
+    const first = projects.find((p) => p.name === query.get("project")) ?? projects[0];
+    if (first) await openProject(first.name);
+    const row = [...$("films").querySelectorAll("tbody tr")].find((r) => r.firstChild.textContent === wanted.film);
+    if (row) row.click(); else wanted = {};
   } catch (e) {
     $("films-note").textContent = `API indisponible : ${e.message}`;
     $("films-note").className = "note bad";
@@ -68,6 +88,10 @@ async function start() {
 }
 
 async function openProject(name) {
+  opening++; filming++;
+  retire(view);
+  view = null; path = null; film = null;
+  for (const panel of ["film-panel", "camera-panel", "tiles-panel", "pack-panel"]) $(panel).hidden = true;
   project = name;
   for (const b of $("projects").children) b.setAttribute("aria-selected", b.textContent === name);
   const body = $("films").querySelector("tbody");
@@ -95,6 +119,7 @@ async function openProject(name) {
 
 // -------------------------------------------------------------------- film
 
+let filming = 0;
 async function openFilm(id) {
   $("film-panel").hidden = false;
   $("film-title").textContent = id;
@@ -103,9 +128,18 @@ async function openFilm(id) {
   const body = $("chunks").querySelector("tbody");
   body.innerHTML = "";
   for (const panel of ["camera-panel", "tiles-panel", "pack-panel"]) $(panel).hidden = true;
+  // Leaving the previous scene: its view goes, and any pack still being
+  // opened for it is disowned.
+  opening++;
+  retire(view);
+  view = null; path = null; film = null;
+  const asked = ++filming;
   try {
-    film = await get(`/p/${project}/films/${id}`);
+    const got = await get(`/p/${project}/films/${id}`);
+    if (asked !== filming) return;
+    film = got;
   } catch (e) {
+    if (asked !== filming) return;
     $("film-note").textContent = e.message;
     $("film-note").className = "note bad";
     return;
@@ -143,24 +177,59 @@ async function openFilm(id) {
   $("first").value = first; $("last").value = last;
   $("first").min = $("last").min = first; $("first").max = $("last").max = last;
   $("go").disabled = true;
-  status("Ouverture du premier pack…");
-  rows[0].click();
+  // The pack and frame the address named, the first time; the first pack
+  // otherwise.
+  const named = film.chunks.findIndex((c) => c.key.slice(film.id.length + 1) === wanted.pack);
+  const at = named >= 0 ? named : 0;
+  const frame = named >= 0 && wanted.frame ? Number(wanted.frame) : undefined;
+  wanted = {};
+  status("Ouverture du pack…");
+  for (const r of rows) r.classList.toggle("on", r === rows[at]);
+  rows[at].scrollIntoView({ block: "nearest" });
+  openChunk(at, frame);
 }
 
 // ------------------------------------------------------- a chunk: its pack
 
-async function openChunk(index) {
+// A PackView is a Rust object: freed twice, or freed while one of its async
+// reads is still running, it faults. So a view is retired, never freed in
+// place — it is dropped from `view` at once, and its memory goes when the
+// last read holding it lets go.
+const leases = new WeakMap();
+function hold(v) { leases.set(v, (leases.get(v) ?? 0) + 1); }
+function release(v) {
+  const left = (leases.get(v) ?? 1) - 1;
+  leases.set(v, left);
+  if (left === 0 && v.retired) v.free();
+}
+function retire(v) {
+  if (!v || v.retired) return;
+  v.retired = true;
+  if (!leases.get(v)) v.free();
+}
+
+let opening = 0;
+async function openChunk(index, frame) {
+  const turn = ++opening;
   const chunk = film.chunks[index];
+  // From here nothing may reach the previous pack's view.
+  retire(view);
+  view = null; path = null;
+  $("go").disabled = true;
   $("camera-panel").hidden = false;
   $("camera-title").textContent = `Caméra — ${chunk.key.slice(film.id.length + 1)}`;
   $("cam-at").textContent = "Lecture de la table du pack…";
+  let opened;
   try {
-    view?.free();
-    view = await PackView.open(objectUrl(project, chunk.key));
+    opened = await PackView.open(objectUrl(project, chunk.key));
   } catch (e) {
-    $("cam-at").textContent = `Pack illisible : ${e.message ?? e}`;
+    if (turn === opening) $("cam-at").textContent = `Pack illisible : ${e.message ?? e}`;
     return;
   }
+  // Another pack was asked for while this one was being read: it wins.
+  if (turn !== opening) { opened.free(); return; }
+  view = opened;
+  view.chunk = index;
   const flat = view.cameras(3000);
   path = [];
   for (let i = 0; i < flat.length; i += 7) {
@@ -168,7 +237,8 @@ async function openChunk(index) {
   }
   $("cam-frame").min = view.first; $("cam-frame").max = view.last;
   await offerScales();
-  selectFrame(view.first);
+  if (turn !== opening) return;
+  selectFrame(frame ?? view.first);
 }
 
 function nearest(frame) {
@@ -176,8 +246,10 @@ function nearest(frame) {
 }
 
 async function selectFrame(frame) {
+  if (!view || !path) return;
   frame = Math.min(view.last, Math.max(view.first, Math.round(frame)));
   $("cam-frame").value = frame;
+  remember(frame);
   const at = nearest(frame);
   $("cam-at").textContent =
     `lon ${at.lon.toFixed(5)}°, lat ${at.lat.toFixed(5)}°, ${at.height.toFixed(0)} m, cap ${at.heading.toFixed(0)}°, inclinaison ${at.pitch.toFixed(1)}°, champ ${at.fovy.toFixed(0)}°`;
@@ -277,9 +349,12 @@ const SHOWN = 24;
 let tilesTurn = 0;
 async function showPackTiles(frame) {
   const turn = ++tilesTurn;
+  // This pack's view, for as long as its textures are being read — whatever
+  // becomes of `view` meanwhile.
+  const pack = view;
   $("tiles-panel").hidden = false;
   $("tiles-title").textContent = `Tuiles — frame ${frame}`;
-  const tiles = JSON.parse(view.frame_tiles(frame));
+  const tiles = JSON.parse(pack.frame_tiles(frame));
   const triangles = tiles.reduce((s, t) => s + t.triangles, 0);
   const pixels = tiles.reduce((s, t) => s + t.textureBytes, 0);
   $("pack-tiles-note").textContent =
@@ -293,13 +368,20 @@ async function showPackTiles(frame) {
     fig.innerHTML = `<figcaption>${t.triangles} tri.</figcaption>`;
     gallery.append(fig);
     if (!t.textureBytes) { fig.prepend("sans texture"); return; }
+    // Superseded before it started: nothing to read, and the view may be gone.
+    if (turn !== tilesTurn || pack.retired) return;
+    hold(pack);
     try {
-      const png = await view.texture(frame, i);
+      const png = await pack.texture(frame, i);
       if (turn !== tilesTurn) return;
       const img = document.createElement("img");
       img.src = URL.createObjectURL(new Blob([png], { type: "image/png" }));
       fig.prepend(img);
-    } catch (e) { fig.prepend("illisible"); }
+    } catch (e) {
+      fig.prepend("illisible");
+    } finally {
+      release(pack);
+    }
   }));
 }
 
@@ -359,10 +441,15 @@ $("tz").addEventListener("change", () => showSourceTiles());
 // baked for, unless a smaller one is asked for.
 async function offerScales() {
   const fps = Number($("fps").value), bitrate = Number($("mbps").value) * 1e6;
+  // The pack's size is read once: `view` may be another pack's, or none, by
+  // the time the browser has answered.
+  const [width, height] = [view.width, view.height];
+  const turn = opening;
   for (const option of $("scale").options) {
     const scale = Number(option.value);
-    const w = even8(view.width * scale), h = even8(view.height * scale);
+    const w = even8(width * scale), h = even8(height * scale);
     const browser = !!(await findEncoder(w, h, fps, bitrate));
+    if (turn !== opening) return;
     option.dataset.encoder = browser ? "browser" : "rav1e";
     option.textContent = `${w}×${h}${scale === 1 ? " (viewport du pack)" : ""} — ${browser ? "H.264 du navigateur" : "AV1 logiciel, lent"}`;
   }
@@ -417,6 +504,7 @@ function renderStats(totals, frames, wall) {
 }
 
 $("go").addEventListener("click", async () => {
+  if (!view || !film) return;
   const first = Number($("first").value), last = Number($("last").value);
   const fps = Number($("fps").value), bitrate = Number($("mbps").value) * 1e6;
   const scale = Number($("scale").value), supersample = Number($("ss").value);
