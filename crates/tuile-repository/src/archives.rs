@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::lock::Mutex as AsyncMutex;
 use pmtiles::{Compression, Directory, Header, TileCoord, TileId, MAX_ZOOM};
 
 use crate::{LayerInfo, Objects, RepoError, Tile, TileRepository};
@@ -206,6 +207,10 @@ pub struct ArchivedTiles {
     /// Manifests read lately, by zone, with when: a film asks for thousands
     /// of tiles of a handful of zones.
     manifests: Mutex<HashMap<String, (u64, Option<Arc<Manifest>>)>>,
+    /// One lock per zone and per archive being read for the first time: a
+    /// frame asks for many tiles of one zone at once, and they wait for one
+    /// read of its manifest and of each archive's head.
+    opening: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
 }
 
 fn malformed(key: &str, what: impl std::fmt::Display) -> RepoError {
@@ -256,6 +261,7 @@ impl ArchivedTiles {
             now,
             opened: Mutex::new(HashMap::new()),
             manifests: Mutex::new(HashMap::new()),
+            opening: Mutex::new(HashMap::new()),
         })
     }
 
@@ -263,12 +269,18 @@ impl ArchivedTiles {
     /// bounds how late a reader sees tiles another process added.
     async fn manifest(&self, zone_prefix: &str) -> Result<Option<Arc<Manifest>>, RepoError> {
         let now = (self.now)();
-        if let Ok(held) = self.manifests.lock() {
-            if let Some((at, manifest)) = held.get(zone_prefix) {
-                if now.saturating_sub(*at) < MANIFEST_TTL {
-                    return Ok(manifest.clone());
-                }
-            }
+        let held = |tiles: &Self| {
+            let held = tiles.manifests.lock().ok()?;
+            let (at, manifest) = held.get(zone_prefix)?;
+            (now.saturating_sub(*at) < MANIFEST_TTL).then(|| manifest.clone())
+        };
+        if let Some(manifest) = held(self) {
+            return Ok(manifest);
+        }
+        let turn = self.turn(zone_prefix);
+        let _mine = turn.lock().await;
+        if let Some(manifest) = held(self) {
+            return Ok(manifest);
         }
         let key = format!("{zone_prefix}/manifest.json");
         let manifest = match self.live.read_all(&key).await {
@@ -283,6 +295,14 @@ impl ArchivedTiles {
             held.insert(zone_prefix.to_string(), (now, manifest.clone()));
         }
         Ok(manifest)
+    }
+
+    /// The lock of whatever is read once under `name`.
+    fn turn(&self, name: &str) -> Arc<AsyncMutex<()>> {
+        match self.opening.lock() {
+            Ok(mut opening) => opening.entry(name.to_string()).or_default().clone(),
+            Err(_) => Arc::default(),
+        }
     }
 
     /// Forgets a zone's manifest: it named an archive that is gone.
@@ -304,6 +324,11 @@ impl ArchivedTiles {
     }
 
     async fn opened(&self, key: &str) -> Result<Arc<Opened>, RepoError> {
+        if let Some(held) = self.opened.lock().ok().and_then(|o| o.get(key).cloned()) {
+            return Ok(held);
+        }
+        let turn = self.turn(key);
+        let _mine = turn.lock().await;
         if let Some(held) = self.opened.lock().ok().and_then(|o| o.get(key).cloned()) {
             return Ok(held);
         }
