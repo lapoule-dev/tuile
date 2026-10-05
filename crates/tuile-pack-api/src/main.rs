@@ -40,7 +40,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tuile_farm::{BucketConfig, ObjectRunStore, StoreError, Tuning};
 use tuile_repository::{
     Bench, Cached, Config, DiskChunks, FilmRepository, Layout, Objects, Place, Project, Reply,
-    RunFilms, ScenePacks, TileRepository,
+    RunFilms, ScenePacks, StoreObjects, TileRepository,
 };
 use tuile_tile_server::{StoreConfig, TileStore};
 
@@ -177,10 +177,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             films,
         });
     }
+    let mut store_objects = None;
     let tiles = match config.tiles {
         Some(place) => {
             let store = open(&place)?;
             let label = store.label().to_string();
+            // The same store as objects, for a reader that finds tiles
+            // itself: its catalog and manifests straight from the bucket,
+            // its archives through the chunk cache.
+            let live: Arc<dyn Objects> = Arc::new(open(&place)?);
+            store_objects = Some(StoreObjects {
+                archives: Arc::new(Cached::new(
+                    live.clone(),
+                    DiskChunks::new(cache.join("tile-store")),
+                )),
+                live,
+            });
             match TileStore::open(store.object_store(), StoreConfig::default()).await {
                 Ok(t) => {
                     let tiles: Arc<dyn TileRepository> = Arc::new(t);
@@ -197,7 +209,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
-    let bench = Arc::new(Bench { projects, tiles });
+    let bench = Arc::new(Bench {
+        projects,
+        tiles,
+        store: store_objects,
+    });
 
     let mut app = Router::new().route(
         "/api/{*rest}",

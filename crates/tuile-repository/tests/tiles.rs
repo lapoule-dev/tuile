@@ -15,11 +15,40 @@ use futures_util::TryStreamExt;
 use object_store::memory::InMemory;
 use object_store::{ObjectStore, ObjectStoreExt};
 use tuile_farm::{ObjectRunStore, Tuning};
-use tuile_repository::{ArchivedTiles, Objects, RepoError, TileRepository};
+use tuile_repository::{
+    ArchivedTiles, Bench, Get, Got, Objects, RemoteBlocks, RemoteLive, RepoError, StoreObjects,
+    TileRepository,
+};
 use tuile_tile_server::catalog;
 use tuile_tile_server::{Catalog, Grid, LayerDef, StoreConfig, TileStore};
 
 const DAY: u64 = 24 * 3600;
+
+/// The API, called in place of a network: every path asked for is noted.
+struct Api {
+    bench: Arc<Bench>,
+    asked: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl Get for Api {
+    async fn get(&self, path: &str) -> Result<Got, String> {
+        let path = format!("/api/{path}");
+        self.asked.lock().expect("lock").push(path.clone());
+        let reply = self
+            .bench
+            .get(&path, "", None)
+            .await
+            .ok_or("no such route")?;
+        let (status, object_size) = (reply.status, reply.object_size);
+        let body = reply.whole().await.map_err(|e| e.to_string())?;
+        Ok(Got {
+            status,
+            object_size,
+            body,
+        })
+    }
+}
 
 fn layer(name: &str, grid: Grid, expiry_days: Option<u64>) -> LayerDef {
     LayerDef {
@@ -166,6 +195,97 @@ async fn the_portable_reader_answers_as_the_store_that_wrote() {
     );
     assert_eq!(answer(&portable, "imagery", 7, 76, 50).await, "absent");
     assert_eq!(answer(&portable, "nothing", 1, 0, 0).await, "not found");
+
+    // The same store once more, from the far side of the API: its catalog
+    // and manifests whole, its archives by blocks, and the tile found by the
+    // reader rather than by the server.
+    let bench = Arc::new(Bench {
+        projects: Vec::new(),
+        tiles: None,
+        store: Some(StoreObjects {
+            live: objects.clone(),
+            archives: objects.clone(),
+        }),
+    });
+    let api = Arc::new(Api {
+        bench,
+        asked: Default::default(),
+    });
+    let blocks = Arc::new(RemoteBlocks::new(api.clone(), "store"));
+    let remote = ArchivedTiles::open(
+        Arc::new(RemoteLive::new(api.clone(), "store")),
+        blocks.clone(),
+        Arc::new(move || now),
+    )
+    .await
+    .expect("open through the API");
+    assert_eq!(by_name(remote.layers()), by_name(native.layers()));
+    for (name, level, x, y) in put.iter().copied().chain([
+        ("imagery", 7, 76, 50),
+        ("imagery", 9, 0, 0),
+        ("nothing", 1, 0, 0),
+        ("imagery", 40, 0, 0),
+    ]) {
+        assert_eq!(
+            answer(&remote, name, level, x, y).await,
+            answer(native, name, level, x, y).await,
+            "through the API: {name}/{level}/{x}/{y}"
+        );
+    }
+    // What crossed the API: the catalog once, a manifest per zone, and
+    // blocks of archives — never a tile, and no block twice.
+    let asked = api.asked.lock().expect("lock").clone();
+    assert!(
+        asked.iter().all(|p| p.starts_with("/api/store/")),
+        "{asked:?}"
+    );
+    assert_eq!(
+        asked.iter().filter(|p| p.ends_with("catalog.json")).count(),
+        1
+    );
+    let block_paths: Vec<&String> = asked.iter().filter(|p| p.contains("/b8/")).collect();
+    let mut distinct = block_paths.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        block_paths.len(),
+        distinct.len(),
+        "a block was asked for twice"
+    );
+    let counts = blocks.counts();
+    assert_eq!(counts.fetched as usize, block_paths.len());
+    assert!(counts.held > counts.fetched, "{counts:?}");
+
+    // Archives rewritten under a manifest this reader still holds: both of
+    // a zone's archives move to new keys and the manifest is rewritten to
+    // name those, as a compaction does when it replaces what it merged. The
+    // reader meets the missing archives, reads the manifest again, and finds
+    // the tile where it now is.
+    let held = ArchivedTiles::open(objects.clone(), objects.clone(), Arc::new(move || now))
+        .await
+        .expect("open");
+    assert_eq!(
+        answer(&held, "imagery", 7, 77, 50).await,
+        "image/png replaced"
+    );
+    let zone = "imagery/zones/z4/9/6";
+    let manifest_path = dir.path().join(zone).join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).expect("manifest")).expect("json");
+    let archives = manifest["archives"].as_array_mut().expect("archives");
+    assert_eq!(archives.len(), 2, "the zone was written twice");
+    for (n, entry) in archives.iter_mut().enumerate() {
+        let moved = format!("{zone}/rewritten-{n}.pmtiles");
+        let from = dir.path().join(entry["key"].as_str().expect("key"));
+        std::fs::rename(from, dir.path().join(&moved)).expect("rename");
+        entry["key"] = moved.into();
+    }
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).expect("json")).expect("write");
+    assert_eq!(
+        answer(&held, "imagery", 7, 77, 50).await,
+        "image/png replaced",
+        "the tile is read from the archive only the fresh manifest names"
+    );
 
     // An expiring layer stops answering once its epoch is a lifetime behind;
     // a durable one does not.
