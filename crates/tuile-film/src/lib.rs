@@ -13,11 +13,13 @@ mod camera;
 mod cursor;
 mod look;
 mod mesh;
+mod ranges;
 mod slice;
 
 pub use camera::{FrameCamera, NEAR_FRACTION};
 pub use cursor::{Cursor, FilmError, FrameDiff, TileKey};
 pub use look::Look;
-pub use mesh::{texture, Mesh};
+pub use mesh::{texture, texture_of_span, Mesh};
+pub use ranges::{coalesce, file_reads, Fetch};
 pub use slice::slice;
-pub use tuile_pack::{fb, BakedView, Pack, PackError};
+pub use tuile_pack::{blob_start, fb, BakedView, Fnv1a, Pack, PackError, PREAMBLE};

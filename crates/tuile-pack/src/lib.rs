@@ -759,6 +759,105 @@ impl<'a> Pack<'a> {
         })
     }
 
+    /// Parses the table alone: `head` is the file up to [`blob_start`], and
+    /// the blob region is not in hand.
+    ///
+    /// This is how a pack is read **in place, remotely**: a browser holds the
+    /// file as a `Blob` (or behind an HTTP server) and fetches only the byte
+    /// ranges of the tiles a frame brings in — see [`Pack::span_of`] and
+    /// [`Pack::payload_in`]. Nothing about the blob region is verified here;
+    /// a reader that downloads the whole file folds [`Fnv1a`] over it on the
+    /// way in and compares with [`Pack::blob_digest`].
+    pub fn open_table(head: &'a [u8]) -> Result<Self, PackError> {
+        let start = blob_start(head)? as usize;
+        if head.len() < start {
+            return Err(PackError::Truncated { what: "table" });
+        }
+        let root = fb::root_as_pack(&head[MAGIC.len() + 8..start])
+            .map_err(|e| PackError::Malformed(e.to_string()))?;
+        if root.version() != VERSION {
+            return Err(PackError::Version {
+                found: root.version(),
+            });
+        }
+        Ok(Self { root, blobs: &[] })
+    }
+
+    /// What the blob region must digest to.
+    pub fn blob_digest(&self) -> u64 {
+        self.root.blob_digest()
+    }
+
+    /// The bytes of the blob region a tile's payloads occupy, from the start
+    /// of that region. The bake writes a tile's blocks together, so this is
+    /// one short range, and tiles that entered the bake together sit side by
+    /// side — a frame's newcomers coalesce into few requests.
+    pub fn span_of(&self, tile: &fb::Tile<'a>) -> Option<std::ops::Range<u64>> {
+        let blocks = [
+            tile.positions(),
+            tile.normals(),
+            tile.uvs(),
+            tile.indices(),
+            tile.texture(),
+        ];
+        let mut span: Option<std::ops::Range<u64>> = None;
+        for b in blocks.into_iter().flatten() {
+            let (a, z) = (b.offset(), b.offset() + u64::from(b.stored()));
+            span = Some(match span {
+                Some(r) => r.start.min(a)..r.end.max(z),
+                None => a..z,
+            });
+        }
+        span
+    }
+
+    /// [`Pack::payload`], from a span of the blob region the caller fetched:
+    /// `bytes` are the region's bytes starting at blob offset `at`.
+    pub fn payload_in(
+        &self,
+        block: &fb::Block,
+        at: u64,
+        bytes: &[u8],
+        what: &'static str,
+    ) -> Result<Vec<u8>, PackError> {
+        let stored = Self::stored_in(block, at, bytes, what)?;
+        lz4_flex::block::decompress(stored, block.raw() as usize)
+            .map_err(|source| PackError::Decompress { what, source })
+    }
+
+    /// [`Pack::texture`], from a fetched span (see [`Pack::payload_in`]).
+    pub fn texture_in(
+        &self,
+        tile: &fb::Tile<'a>,
+        at: u64,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, PackError> {
+        let Some(block) = tile.texture() else {
+            return Ok(Vec::new());
+        };
+        if carries_its_own_compression(tile.texture_format()) {
+            return Ok(Self::stored_in(block, at, bytes, "texture")?.to_vec());
+        }
+        self.payload_in(block, at, bytes, "texture")
+    }
+
+    fn stored_in<'b>(
+        block: &fb::Block,
+        at: u64,
+        bytes: &'b [u8],
+        what: &'static str,
+    ) -> Result<&'b [u8], PackError> {
+        let start = block
+            .offset()
+            .checked_sub(at)
+            .ok_or(PackError::Truncated { what })? as usize;
+        let end = start
+            .checked_add(block.stored() as usize)
+            .filter(|e| *e <= bytes.len())
+            .ok_or(PackError::Truncated { what })?;
+        Ok(&bytes[start..end])
+    }
+
     /// Fails unless this pack is the bake of the scene the caller means.
     ///
     /// A render that silently accepts a pack from another scene renders the
@@ -970,6 +1069,54 @@ mod tests {
     /// Le test compare les deux sur le même tampon. Le rapport exact dépend de
     /// la machine ; ce qui est vrai partout, c'est que `reopen` ne parcourt pas
     /// le blob et que `open` le parcourt entièrement.
+    /// A pack read through its table and byte ranges hands back exactly what
+    /// a pack held whole does — and the streamed digest is the stored one.
+    #[test]
+    fn ranges_read_what_the_whole_file_holds() {
+        let mut w = Bake::new("s", [0.0; 3]);
+        w.frame(1, a_view(0.0), [a_tile(1, 0), a_tile(2, 5)]);
+        w.frame(2, a_view(1.0), [a_tile(2, 5), a_tile(3, 0)]);
+        let bytes = w.finish();
+        let whole = Pack::open(&bytes).expect("open");
+
+        let start = blob_start(&bytes[..PREAMBLE]).expect("preamble") as usize;
+        let table = Pack::open_table(&bytes[..start]).expect("table");
+        let blobs = &bytes[start..];
+        let mut digest = Fnv1a::default();
+        for chunk in blobs.chunks(7) {
+            digest.update(chunk);
+        }
+        assert_eq!(digest.finish(), table.blob_digest());
+
+        for frame in [1, 2] {
+            for (a, b) in table
+                .frame(frame)
+                .expect("frame")
+                .iter()
+                .zip(whole.frame(frame).expect("frame"))
+            {
+                let span = table.span_of(a).expect("span");
+                let fetched = &blobs[span.start as usize..span.end as usize];
+                let positions = a.positions().expect("positions");
+                assert_eq!(
+                    table
+                        .payload_in(positions, span.start, fetched, "positions")
+                        .expect("ranged"),
+                    whole.baked(&b).expect("whole").positions
+                );
+                assert_eq!(
+                    table.texture_in(a, span.start, fetched).expect("tex"),
+                    whole.texture(&b).expect("tex")
+                );
+            }
+        }
+        // A span that misses the block is an error, not a short payload.
+        let tile = table.frame(1).expect("frame")[0];
+        let span = table.span_of(&tile).expect("span");
+        let short = &blobs[span.start as usize..span.end as usize - 1];
+        assert!(table.texture_in(&tile, span.start, short).is_err() || tile.texture().is_none());
+    }
+
     #[test]
     fn reopening_does_not_re_fold_the_whole_blob() {
         let mut w = Bake::new("s", [0.0; 3]);
@@ -1477,6 +1624,43 @@ mod tests {
 /// the only property that matters for something written on one machine and
 /// checked on another.
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Bytes a reader needs before it knows where the blob region starts.
+pub const PREAMBLE: usize = MAGIC.len() + 8;
+
+/// Where the blob region starts — the length of the head [`Pack::open_table`]
+/// wants — read from the file's first [`PREAMBLE`] bytes.
+pub fn blob_start(preamble: &[u8]) -> Result<u64, PackError> {
+    if preamble.len() < PREAMBLE || &preamble[..MAGIC.len()] != MAGIC {
+        return Err(PackError::NotAPack);
+    }
+    let mut len = [0u8; 8];
+    len.copy_from_slice(&preamble[MAGIC.len()..PREAMBLE]);
+    (PREAMBLE as u64)
+        .checked_add(u64::from_le_bytes(len))
+        .ok_or(PackError::Truncated { what: "table" })
+}
+
+/// The blob digest, folded as the bytes arrive — for a reader that streams a
+/// pack in rather than holding it whole before checking it.
+#[derive(Debug, Clone, Copy)]
+pub struct Fnv1a(u64);
+
+impl Default for Fnv1a {
+    fn default() -> Self {
+        Self(FNV_OFFSET)
+    }
+}
+
+impl Fnv1a {
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0 = fnv1a_fold(self.0, bytes);
+    }
+
+    pub fn finish(self) -> u64 {
+        self.0
+    }
+}
 
 fn fnv1a(bytes: &[u8]) -> u64 {
     fnv1a_fold(FNV_OFFSET, bytes)
