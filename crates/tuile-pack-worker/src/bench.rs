@@ -93,9 +93,9 @@ impl EdgeChunks {
         hit.bytes().await.ok()
     }
 
-    async fn keep(&self, url: String, bytes: Vec<u8>) {
+    async fn keep(&self, url: String, bytes: Vec<u8>, cache_control: &str) {
         let headers = Headers::new();
-        let _ = headers.set("cache-control", "public, max-age=31536000, immutable");
+        let _ = headers.set("cache-control", cache_control);
         let _ = headers.set("content-type", "application/octet-stream");
         if let Ok(response) = Response::from_bytes(bytes) {
             // A chunk the cache will not take is simply not kept.
@@ -113,8 +113,14 @@ impl ChunkStore for EdgeChunks {
     }
 
     async fn put(&self, key: &str, index: u64, bytes: &[u8]) {
-        self.keep(self.url(key, &format!("{index:08}")), bytes.to_vec())
-            .await;
+        // A chunk is kept under its object's size as well as its key, so it
+        // is what it is for good.
+        self.keep(
+            self.url(key, &format!("{index:08}")),
+            bytes.to_vec(),
+            "public, max-age=31536000, immutable",
+        )
+        .await;
     }
 
     async fn size(&self, key: &str) -> Option<u64> {
@@ -123,8 +129,14 @@ impl ChunkStore for EdgeChunks {
     }
 
     async fn note_size(&self, key: &str, size: u64) {
-        self.keep(self.url(key, "size"), size.to_string().into_bytes())
-            .await;
+        // A size is believed for a minute: an object can be replaced under
+        // its key, and its size is how that is noticed.
+        self.keep(
+            self.url(key, "size"),
+            size.to_string().into_bytes(),
+            "public, max-age=60",
+        )
+        .await;
     }
 }
 
@@ -289,7 +301,12 @@ pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> 
     // A block that this point of presence has served before is served again
     // from its cache, whole, without a line of this crate's logic running:
     // no bucket, no chunk read, nothing held in memory.
-    let cacheable = is_block(url.path());
+    // …provided the address says which object it is a block of: a pack's
+    // block names its pack's size (`?s=`), because a pack can be replaced
+    // under its key and an address kept for a year must not then answer
+    // with the old one. An archive of the tile store is never rewritten.
+    let cacheable = is_block(url.path())
+        && (url.path().starts_with("/api/store/") || url.query().is_some_and(|q| q.contains("s=")));
     let cache = Cache::default();
     let key = url.to_string();
     if cacheable {

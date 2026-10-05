@@ -376,7 +376,22 @@ impl Bench {
                     format!("a block is {}/<number>/<key>", block_segment()),
                 )
             })?;
-            return block(&project.objects, &decoded(key), index).await;
+            let reply = block(&project.objects, &decoded(key), index).await?;
+            // `?s=<size>` says which object the asker means. A pack can be
+            // replaced under its key; an asker holding the old one's plan
+            // must be told, not handed blocks of another pack.
+            if let Some(meant) = param(query, "s") {
+                if reply.object_size.map(|size| size.to_string()) != Some(meant.clone()) {
+                    return Err(Reply::text(
+                        409,
+                        format!(
+                            "{} is no longer the {meant} bytes it was: it has been replaced",
+                            decoded(key)
+                        ),
+                    ));
+                }
+            }
+            return Ok(reply);
         }
         Err(Reply::text(404, "no such route"))
     }

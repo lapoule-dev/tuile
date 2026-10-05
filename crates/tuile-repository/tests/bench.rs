@@ -174,6 +174,27 @@ async fn the_routes_answer_as_documented() {
         404
     );
 
+    // A block asked for with the size of the object it is meant to be of is
+    // served when that is the object there, and refused when it is not: a
+    // pack replaced under its key is another pack.
+    let named = |meant: u64| {
+        let (bench, key) = (&bench, key);
+        async move {
+            bench
+                .get(
+                    &format!("/api/p/engine/b8/0/{key}"),
+                    &format!("s={meant}"),
+                    None,
+                )
+                .await
+                .expect("reply")
+        }
+    };
+    assert_eq!(named(size).await.status, 200);
+    let replaced = named(size + 1).await;
+    assert_eq!(replaced.status, 409);
+    assert!(String::from_utf8_lossy(&replaced.body).contains("replaced"));
+
     // Blocks: the object cut at fixed offsets, each a whole reply of its own.
     // The size is in the address: a block cut another way is another URL, and
     // the one without a size names nothing.

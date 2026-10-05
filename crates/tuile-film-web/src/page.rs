@@ -341,9 +341,12 @@ fn encoded_key(key: &str) -> String {
 
 /// A pack's block URL: it is read in the API's fixed blocks, each a URL of
 /// its own, and `{block}` is where the reader puts a block's number.
-fn pack_url(api: &str, project: &str, key: &str) -> String {
+///
+/// The address says which object it means by its size: a pack can be
+/// replaced under its key, and blocks are kept by every cache for a year.
+fn pack_url(api: &str, project: &str, key: &str, bytes: f64) -> String {
     format!(
-        "{api}/p/{}/b{}/{{block}}/{}",
+        "{api}/p/{}/b{}/{{block}}/{}?s={bytes:.0}",
         encoded(project),
         BLOCK_BYTES >> 20,
         encoded_key(key)
@@ -722,7 +725,8 @@ async fn open_chunk(index: usize, frame: Option<u32>) {
         p.view = None;
         p.path = Rc::default();
         let scene = p.scene.clone()?;
-        let url = pack_url(&p.api, p.project.as_deref()?, &scene.chunks.get(index)?.key);
+        let chunk = scene.chunks.get(index)?;
+        let url = pack_url(&p.api, p.project.as_deref()?, &chunk.key, chunk.bytes);
         Some((p.opening, scene, url))
     }) else {
         return;
@@ -1326,7 +1330,7 @@ fn crossing(
         .filter(|c| c.last >= first && c.first <= last)
         .map(|c| {
             (
-                pack_url(api, project, &c.key),
+                pack_url(api, project, &c.key, c.bytes),
                 first.max(c.first),
                 last.min(c.last),
             )

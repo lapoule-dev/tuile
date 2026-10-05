@@ -9,10 +9,13 @@ use async_trait::async_trait;
 
 use crate::ChunkStore;
 
+/// How long a size once asked of the bucket is believed.
+const SIZE_IS_BELIEVED: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Chunks kept in a directory: `<dir>/<key>/<chunk index>`.
 pub struct DiskChunks {
     dir: PathBuf,
-    sizes: Mutex<HashMap<String, u64>>,
+    sizes: Mutex<HashMap<String, (u64, std::time::Instant)>>,
 }
 
 impl DiskChunks {
@@ -50,14 +53,17 @@ impl ChunkStore for DiskChunks {
         }
     }
 
-    /// In memory: a process asks a bucket for an object's size once.
+    /// In memory, and for a minute: an object can be replaced under its key,
+    /// and its size is how that is noticed.
     async fn size(&self, key: &str) -> Option<u64> {
-        self.sizes.lock().ok()?.get(key).copied()
+        let sizes = self.sizes.lock().ok()?;
+        let (size, noted) = sizes.get(key)?;
+        (noted.elapsed() < SIZE_IS_BELIEVED).then_some(*size)
     }
 
     async fn note_size(&self, key: &str, size: u64) {
         if let Ok(mut sizes) = self.sizes.lock() {
-            sizes.insert(key.to_string(), size);
+            sizes.insert(key.to_string(), (size, std::time::Instant::now()));
         }
     }
 }
