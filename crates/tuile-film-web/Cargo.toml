@@ -34,9 +34,14 @@ features = [
     "ColorSpaceConversion",
     "ImageBitmap",
     "ImageBitmapOptions",
+    "Headers",
     "OffscreenCanvas",
     "Performance",
     "PremultiplyAlpha",
+    "Request",
+    "RequestInit",
+    "Response",
+    "Window",
     "WorkerGlobalScope",
 ]
 

@@ -48,14 +48,11 @@
 <body>
 <main>
   <h1>Film bench — wgpu / WebGPU</h1>
-  <p class="lead">Rend un <code>.tuilepack</code> pré-baké dans des Web Workers (wasm + WebGPU), encode en H.264 par WebCodecs, et assemble un mp4. Rien ne quitte ce navigateur.</p>
+  <p class="lead">Rend un <code>.tuilepack</code> pré-baké dans des Web Workers (wasm + WebGPU), encode en H.264 par WebCodecs, et assemble un mp4. Les packs viennent de <code>tuile-pack-api</code> : téléchargés une fois depuis le store, puis lus par plages — chaque worker ne lit que les tuiles de ses frames.</p>
 
   <div class="grid">
-    <label class="wide">Pack (.tuilepack)
-      <input type="file" id="file" accept=".tuilepack">
-    </label>
-    <label class="wide">… ou URL du pack
-      <input type="url" id="url" placeholder="https://…/A-B.tuilepack">
+    <label class="wide">Pack de la ferme
+      <select id="packs"><option value="">— chargement de la liste… —</option></select>
     </label>
     <label>Premier frame <input type="number" id="first"></label>
     <label>Dernier frame <input type="number" id="last"></label>

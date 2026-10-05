@@ -30,9 +30,10 @@ self.onmessage = async ({ data }) => {
   const { id, source, first, last, filmFirst, width, height, supersample, fps, bitrate } = data;
   try {
     await init();
-    const bytes = new Uint8Array(await source.arrayBuffer());
+    // The source is a URL on the pack API or a Blob shared with the page:
+    // either way, this worker reads only the table and its own tiles.
     const canvas = new OffscreenCanvas(width, height);
-    const film = await FilmWorker.create(canvas, bytes, first, last, supersample);
+    const film = await FilmWorker.create(canvas, source, first, last, supersample);
 
     let avcc = null;
     let failure = null;
@@ -81,6 +82,7 @@ self.onmessage = async ({ data }) => {
         type: "frame", id,
         frame: stats.frame,
         selected: stats.selected, entered: stats.entered, left: stats.left,
+        fetch: stats.fetch_ms, fetchedBytes: stats.fetched_bytes, requests: stats.requests,
         unpack: stats.unpack_ms, decode: stats.decode_ms, upload: stats.upload_ms,
         record: stats.record_ms, next: t1 - t0, encode: t2 - t1,
       };

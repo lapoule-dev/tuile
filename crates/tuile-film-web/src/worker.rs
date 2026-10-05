@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
+use crate::source::Source;
 use futures_util::future::try_join_all;
 use js_sys::{Array, Uint8Array};
-use tuile_film::{texture, Cursor, FrameCamera, Look, Mesh, Pack, TileKey};
+use tuile_film::{file_reads, texture_of_span, Cursor, FrameCamera, Look, Mesh, Pack, TileKey};
 use tuile_film_gpu::{FilmGpu, Settings, TileMesh, OUTPUT_FORMAT};
 use tuile_mp4::{Muxer, ParameterSets};
 use wasm_bindgen::prelude::*;
@@ -12,6 +13,9 @@ use web_sys::{
     Blob, BlobPropertyBag, ColorSpaceConversion, ImageBitmap, ImageBitmapOptions, OffscreenCanvas,
     PremultiplyAlpha, WorkerGlobalScope,
 };
+
+/// Spans closer than this are read together.
+const COALESCE_GAP: u64 = 256 << 10;
 
 fn js(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
@@ -22,7 +26,7 @@ fn scope() -> WorkerGlobalScope {
 }
 
 fn now_ms() -> f64 {
-    scope().performance().map_or(0.0, |p| p.now())
+    js_sys::Date::now()
 }
 
 /// What a pack holds, read before any worker is started.
@@ -34,15 +38,22 @@ pub struct PackInfo {
     pub height: u32,
     pub tiles: u32,
     pub scene: String,
+    /// Whether the blob digest was checked here (a local file) — a URL was
+    /// checked by the API that serves it.
+    pub verified: bool,
 }
 
 #[wasm_bindgen]
 impl PackInfo {
-    /// Opens a pack — verifying its digest — and reports its range and the
-    /// viewport its first frame was baked for.
-    pub fn read(bytes: &[u8]) -> Result<PackInfo, JsError> {
+    /// Reads a pack's table — from a URL or a picked file — and reports its
+    /// range and the viewport its first frame was baked for. A local file's
+    /// digest is checked too, slice by slice.
+    pub async fn open(source: JsValue) -> Result<PackInfo, JsError> {
         console_error_panic_hook::set_once();
-        let pack = Pack::open(bytes).map_err(js)?;
+        let source = Source::from_js(&source)?;
+        let head = source.head().await?;
+        let verified = source.verify(&head).await?;
+        let pack = Pack::open_table(&head).map_err(js)?;
         let (first, last) = pack.frame_range();
         let view = pack.view_of(first).map_err(js)?;
         Ok(PackInfo {
@@ -52,6 +63,7 @@ impl PackInfo {
             height: view.viewport_px[1] as u32,
             tiles: pack.tile_count() as u32,
             scene: pack.scene_digest().to_string(),
+            verified,
         })
     }
 }
@@ -64,6 +76,10 @@ pub struct FrameStats {
     pub selected: u32,
     pub entered: u32,
     pub left: u32,
+    /// Reading the entering tiles' bytes (ranges).
+    pub fetch_ms: f64,
+    pub fetched_bytes: f64,
+    pub requests: u32,
     /// Pack decompression of the entering meshes.
     pub unpack_ms: f64,
     /// Browser image decoding of the entering textures.
@@ -77,7 +93,8 @@ pub struct FrameStats {
 /// One worker's slice of a film.
 #[wasm_bindgen]
 pub struct FilmWorker {
-    bytes: Vec<u8>,
+    source: Source,
+    head: Vec<u8>,
     cursor: Cursor,
     gpu: FilmGpu,
     surface: wgpu::Surface<'static>,
@@ -101,18 +118,21 @@ async fn bitmap(png: Vec<u8>) -> Result<ImageBitmap, JsValue> {
 
 #[wasm_bindgen]
 impl FilmWorker {
-    /// Takes the pack's bytes and an `OffscreenCanvas` of the film's display
-    /// size, and gets a WebGPU device ready for frames `first..=last`.
+    /// Takes the pack's source (a URL or a Blob) and an `OffscreenCanvas` of
+    /// the film's display size, and gets a WebGPU device ready for frames
+    /// `first..=last`. Only the pack's table is read now.
     pub async fn create(
         canvas: OffscreenCanvas,
-        pack: Vec<u8>,
+        source: JsValue,
         first: u32,
         last: u32,
         supersample: u32,
     ) -> Result<FilmWorker, JsError> {
         console_error_panic_hook::set_once();
+        let source = Source::from_js(&source)?;
+        let head = source.head().await?;
         let cursor = {
-            let opened = Pack::open(&pack).map_err(js)?;
+            let opened = Pack::open_table(&head).map_err(js)?;
             Cursor::new(&opened, first, last).map_err(js)?
         };
         let (width, height) = (canvas.width(), canvas.height());
@@ -171,7 +191,8 @@ impl FilmWorker {
             },
         );
         Ok(FilmWorker {
-            bytes: pack,
+            source,
+            head,
             cursor,
             gpu,
             surface,
@@ -189,24 +210,44 @@ impl FilmWorker {
     /// right after this resolves.
     pub async fn next(&mut self) -> Result<Option<FrameStats>, JsError> {
         let Self {
-            bytes,
+            source,
+            head,
             cursor,
             gpu,
             surface,
             aspect,
         } = self;
-        let pack = Pack::reopen(bytes).map_err(js)?;
+        let pack = Pack::open_table(head).map_err(js)?;
         let Some(diff) = cursor.advance(&pack) else {
             return Ok(None);
         };
         let diff = diff.map_err(js)?;
 
+        // The entering tiles' bytes, in as few ranged reads as possible, all
+        // in flight at once.
+        let tf = now_ms();
+        let blob = head.len() as u64;
+        let fetches = file_reads(&pack, blob, &diff.enter, COALESCE_GAP);
+        let reads = try_join_all(fetches.iter().map(|f| source.read(f.range.clone()))).await?;
+        let mut owner = vec![0usize; diff.enter.len()];
+        for (at, f) in fetches.iter().enumerate() {
+            for &i in &f.serves {
+                owner[i] = at;
+            }
+        }
+        let fetched_bytes: usize = reads.iter().map(Vec::len).sum();
+
         let t0 = now_ms();
         let mut meshes = Vec::with_capacity(diff.enter.len());
         let mut pngs = Vec::new();
-        for tile in &diff.enter {
-            meshes.push((TileKey::of(tile), Mesh::of(&pack, tile).map_err(js)?));
-            if let Some(png) = texture(&pack, tile).map_err(js)? {
+        for (i, tile) in diff.enter.iter().enumerate() {
+            let at = fetches[owner[i]].range.start - blob;
+            let bytes = &reads[owner[i]];
+            meshes.push((
+                TileKey::of(tile),
+                Mesh::of_span(&pack, tile, at, bytes).map_err(js)?,
+            ));
+            if let Some(png) = texture_of_span(&pack, tile, at, bytes).map_err(js)? {
                 pngs.push((meshes.len() - 1, png));
             }
         }
@@ -290,6 +331,9 @@ impl FilmWorker {
             selected: diff.selection.len() as u32,
             entered: diff.enter.len() as u32,
             left: diff.leave.len() as u32,
+            fetch_ms: t0 - tf,
+            fetched_bytes: fetched_bytes as f64,
+            requests: fetches.len() as u32,
             unpack_ms: t1 - t0,
             decode_ms: t2 - t1,
             upload_ms: t3 - t2,
