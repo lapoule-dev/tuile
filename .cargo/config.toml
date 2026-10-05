@@ -1,0 +1,11 @@
+# macOS only, in effect: SDKROOT is read by Apple's clang driver and by
+# nothing on Linux.
+#
+# The Command Line Tools ship the macOS 27 SDK as the default, and its
+# libSystem.tbd is a format the installed linker (ld-1267) rejects —
+# "tapi error: malformed file … unknown architecture" — which breaks every
+# build script that links a probe program (aws-lc-sys first). Pinning the
+# macOS 26 SDK fixes it. `force = false`: an SDKROOT already in the
+# environment wins.
+[env]
+SDKROOT = { value = "/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk", force = false }
