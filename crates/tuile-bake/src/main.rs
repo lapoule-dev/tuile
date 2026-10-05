@@ -297,6 +297,8 @@ struct Args {
     terrain: Option<i64>,
     /// What the pack carries for its tiles: see `--content`.
     content: tuile_pack::Content,
+    /// The pack this bake is the re-bake of: see `--rebake`.
+    rebake: Option<std::path::PathBuf>,
 }
 
 const USAGE: &str = "\
@@ -304,6 +306,10 @@ usage: tuile-bake --tape <path.mcap> --frames <first>:<last> --out <path.tuilepa
                   [--viewport <w>x<h>] [--sse <error>]
                   [--imagery <ion asset>] [--terrain <ion asset>]
                   [--content embedded|references|both]
+       tuile-bake --rebake <old.tuilepack> --out <path.tuilepack> [--sse <error>]
+                  [--content references|both]   (the old pack's own cameras,
+                  frames and viewport; refuses unless every frame selects and
+                  drapes what the old pack did)
        tuile-bake --inspect <path.tuilepack>
        tuile-bake --diff <a.tuilepack> <b.tuilepack>
        tuile-bake --dump <path.tuilepack> --frame <n>
@@ -333,7 +339,8 @@ fn parse_args() -> Result<Job, String> {
     let mut sse: Option<f64> = None;
     let mut imagery: Option<i64> = None;
     let mut terrain: Option<i64> = None;
-    let mut content = tuile_pack::Content::Embedded;
+    let mut content: Option<tuile_pack::Content> = None;
+    let mut rebake: Option<std::path::PathBuf> = None;
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         let mut value = || argv.next().ok_or(format!("{arg} needs a value"));
@@ -370,13 +377,14 @@ fn parse_args() -> Result<Job, String> {
                 )
             }
             "--content" => {
-                content = match value()?.as_str() {
+                content = Some(match value()?.as_str() {
                     "embedded" => tuile_pack::Content::Embedded,
                     "references" => tuile_pack::Content::References,
                     "both" => tuile_pack::Content::Both,
                     _ => return Err("--content wants embedded, references or both".into()),
-                }
+                })
             }
+            "--rebake" => rebake = Some(std::path::PathBuf::from(value()?)),
             "--sse" => {
                 let v: f64 = value()?.parse().map_err(|_| "--sse wants a number")?;
                 // Fini ET positif : `NaN` passerait un simple `<= 0.0`, et un
@@ -420,7 +428,12 @@ fn parse_args() -> Result<Job, String> {
             viewport,
         });
     }
-    let frames = frames.ok_or("--frames is required")?;
+    // A re-bake takes its frames, like its cameras, from the pack it re-bakes.
+    let frames = match (&rebake, frames) {
+        (_, Some(frames)) => frames,
+        (Some(_), None) => "1:1".to_string(),
+        (None, None) => return Err("--frames is required".into()),
+    };
     let (first, last) = frames
         .split_once(':')
         .ok_or("--frames wants <first>:<last>")?;
@@ -430,7 +443,11 @@ fn parse_args() -> Result<Job, String> {
         return Err(format!("--frames {first}:{last} runs backwards"));
     }
     Ok(Job::Bake(Args {
-        tape: tape.ok_or("--tape is required")?,
+        tape: match (&rebake, tape) {
+            (_, Some(tape)) => tape,
+            (Some(old), None) => old.clone(),
+            (None, None) => return Err("--tape is required".into()),
+        },
         out: out.ok_or("--out is required")?,
         first,
         last,
@@ -438,7 +455,14 @@ fn parse_args() -> Result<Job, String> {
         sse,
         imagery,
         terrain,
-        content,
+        // A re-bake exists to turn a pack into references to the tile store;
+        // a bake embeds, as it always has.
+        content: content.unwrap_or(if rebake.is_some() {
+            tuile_pack::Content::References
+        } else {
+            tuile_pack::Content::Embedded
+        }),
+        rebake,
     }))
 }
 
@@ -668,6 +692,99 @@ fn inspect(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// What a pack decided, without its payloads: enough to bake it again and
+/// to tell whether the new bake decided the same.
+struct Plan {
+    first: u32,
+    last: u32,
+    viewport: (f64, f64),
+    scene: String,
+    poses: Vec<tuile_tape::Frame>,
+    /// Per frame, the tiles drawn and how each is draped, in order.
+    selection: Vec<Vec<(u64, u64)>>,
+}
+
+/// Reads a pack's plan from its table alone — a pack may be gigabytes, and
+/// its table is what says all of this.
+fn plan_of(path: &std::path::Path) -> Result<Plan, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut head = vec![0u8; tuile_pack::PREAMBLE];
+    file.read_exact(&mut head).map_err(|e| format!("{}: {e}", path.display()))?;
+    let start = tuile_pack::blob_start(&head).map_err(|e| format!("{}: {e}", path.display()))?;
+    head.resize(start as usize, 0);
+    file.read_exact(&mut head[tuile_pack::PREAMBLE..])
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let pack = tuile_pack::Pack::open_table(&head).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (first, last) = pack.frame_range();
+    let mut plan = Plan {
+        first,
+        last,
+        viewport: (0.0, 0.0),
+        scene: pack.scene_digest().to_string(),
+        poses: Vec::new(),
+        selection: Vec::new(),
+    };
+    for number in first..=last {
+        let view = pack.view_of(number).map_err(|e| format!("frame {number}: {e}"))?;
+        let viewport = (view.viewport_px[0], view.viewport_px[1]);
+        if number > first && viewport != plan.viewport {
+            return Err(format!("frame {number} was baked at another viewport: not one shot"));
+        }
+        plan.viewport = viewport;
+        plan.poses.push(tuile_tape::Frame {
+            position: view.position,
+            direction: view.direction,
+            up: view.up,
+            fovy: view.fovy_rad,
+        });
+        let tiles = pack.frame(number).map_err(|e| format!("frame {number}: {e}"))?;
+        plan.selection.push(tiles.iter().map(|t| (t.id(), t.drape())).collect());
+    }
+    Ok(plan)
+}
+
+/// Fails unless the pack at `new` draws, frame for frame, the tiles `old`
+/// drew, under the same drapes.
+///
+/// A drape's identity is the imagery tiles it is composed of, so "same
+/// tiles, same drapes" is "the same ground under the same pictures" — which
+/// is what lets a pack of references stand in for the pack it was baked from.
+fn same_plan(old: &Plan, new: &std::path::Path) -> Result<(), String> {
+    let new = plan_of(new)?;
+    if (new.first, new.last) != (old.first, old.last) {
+        return Err(format!(
+            "REBAKE-DIFFERS frames {}..{} against {}..{}",
+            new.first, new.last, old.first, old.last
+        ));
+    }
+    let mut differing = Vec::new();
+    for (index, (was, is)) in old.selection.iter().zip(&new.selection).enumerate() {
+        let (mut was, mut is) = (was.clone(), is.clone());
+        was.sort_unstable();
+        is.sort_unstable();
+        if was != is {
+            let same_ground = was.iter().map(|t| t.0).eq(is.iter().map(|t| t.0));
+            differing.push((old.first + index as u32, was.len(), is.len(), same_ground));
+        }
+    }
+    if differing.is_empty() {
+        println!("REBAKE-SAME frames={} tiles and drapes, frame for frame", old.selection.len());
+        return Ok(());
+    }
+    for (frame, was, is, same_ground) in differing.iter().take(8) {
+        println!(
+            "  frame {frame}: {was} tiles then, {is} now — {}",
+            if *same_ground { "same ground, draped differently" } else { "another selection" }
+        );
+    }
+    Err(format!(
+        "REBAKE-DIFFERS {} of {} frames do not draw what the old pack drew",
+        differing.len(),
+        old.selection.len()
+    ))
+}
+
 fn bake(args: Args) -> Result<(), String> {
     let tiles = tiles::Tiles::from_env()?;
     let result = bake_with(args, tiles.as_ref());
@@ -686,11 +803,27 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
     // pour la cuire. Nommer d'après le fichier faisait dépendre le nom de
     // l'emballage — version du writer, répétition des schémas, ordre d'un
     // HashMap — et non de la trajectoire. Voir `digest_of_scene`.
-    let mut tape = tuile_tape::Tape::replaying(&args.tape)
-        .map_err(|e| format!("opening {}: {e}", args.tape.display()))?;
+    // A re-bake flies the old pack's own cameras, at its own viewport, over
+    // its own frames, and keeps its scene's name: the scene is the same one.
+    let old = args.rebake.as_deref().map(plan_of).transpose()?;
+    let mut args = args;
     let mut poses = Vec::new();
-    while let Some(frame) = tape.next_frame() {
-        poses.push(frame);
+    match &old {
+        Some(old) => {
+            // Frame n is pose n − 1; a shard that begins at frame 1351 is
+            // padded in front with poses nothing will ask for.
+            let first = old.poses.first().copied().ok_or("the old pack holds no frame")?;
+            poses.resize(old.first as usize - 1, first);
+            poses.extend(old.poses.iter().copied());
+            (args.first, args.last, args.viewport) = (old.first, old.last, old.viewport);
+        }
+        None => {
+            let mut tape = tuile_tape::Tape::replaying(&args.tape)
+                .map_err(|e| format!("opening {}: {e}", args.tape.display()))?;
+            while let Some(frame) = tape.next_frame() {
+                poses.push(frame);
+            }
+        }
     }
     if poses.is_empty() {
         return Err(format!("{} holds no camera frames", args.tape.display()));
@@ -753,7 +886,10 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
     let resolved = tuile_bake::exact_traversal(config.session.traversal.clone());
     // The whole tape names the scene, not the range: two shards of one shot
     // must agree on it. See `digest_of_scene`.
-    let scene = digest_of_scene(&poses, args.viewport, &bake_settings(&config, &resolved));
+    let scene = match &old {
+        Some(old) => old.scene.clone(),
+        None => digest_of_scene(&poses, args.viewport, &bake_settings(&config, &resolved)),
+    };
     let culling = if resolved.cull { "full" } else { "disabled" };
     // A pack of references names the tile store's layers its tiles come
     // from, which are named after the assets like the store itself names
@@ -826,6 +962,10 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
         _ => "",
     };
     println!("BAKE-KEY packs/{scene}{kind}/{}-{wanted}.tuilepack", args.first);
+    // A re-bake answers for the pack it replaces only if it is the same plan.
+    if let Some(old) = &old {
+        same_plan(old, &args.out)?;
+    }
     Ok(())
 }
 

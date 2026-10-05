@@ -646,6 +646,92 @@ fn write_camera<W: std::io::Write + std::io::Seek>(
     Ok(())
 }
 
+/// Brings the channels of several files together in one.
+///
+/// A camera path is one channel, and what the camera follows is others; they
+/// are one plan, and kept apart they are two files that must be found,
+/// fetched and kept in step together. This writes them as one: every message
+/// of every input, on its own channel, with its own schema and stamps, in
+/// time order.
+///
+/// A topic present in two inputs is refused: there is no telling which of
+/// the two the file should then say. Returns how many messages each topic
+/// carries.
+pub fn merge(
+    inputs: &[impl AsRef<Path>],
+    out: impl AsRef<Path>,
+) -> Result<std::collections::BTreeMap<String, u64>, TapeError> {
+    let files = inputs
+        .iter()
+        .map(|path| std::fs::read(path.as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
+    // Each message with the file it came from: the ids a file gives its
+    // channels and schemas are its own, and two files use the same ones.
+    let mut messages = Vec::new();
+    let mut owner = std::collections::BTreeMap::<String, usize>::new();
+    for (index, bytes) in files.iter().enumerate() {
+        for message in mcap::MessageStream::new(bytes)? {
+            let message = message?;
+            let topic = message.channel.topic.clone();
+            match owner.get(&topic) {
+                Some(first) if *first != index => {
+                    return Err(TapeError::NotAPath(format!(
+                        "{topic} is in {} and in {}: one file cannot say both",
+                        inputs[*first].as_ref().display(),
+                        inputs[index].as_ref().display()
+                    )))
+                }
+                _ => {
+                    owner.insert(topic, index);
+                }
+            }
+            messages.push(message);
+        }
+    }
+    // Stable: messages of one stamp keep the order of the inputs, and of
+    // their own file within each.
+    messages.sort_by_key(|m| m.log_time);
+    let mut writer = mcap::Writer::new(BufWriter::new(File::create(out.as_ref())?))?;
+    // Channels are declared afresh, by topic — a topic belongs to one input,
+    // so it names one channel — each with the schema it had.
+    let mut channels = std::collections::BTreeMap::<String, u16>::new();
+    let mut counts = std::collections::BTreeMap::new();
+    for message in &messages {
+        let source = &message.channel;
+        let channel = match channels.get(&source.topic) {
+            Some(channel) => *channel,
+            None => {
+                let schema = match &source.schema {
+                    Some(schema) => {
+                        writer.add_schema(&schema.name, &schema.encoding, &schema.data)?
+                    }
+                    None => 0,
+                };
+                let channel = writer.add_channel(
+                    schema,
+                    &source.topic,
+                    &source.message_encoding,
+                    &source.metadata,
+                )?;
+                channels.insert(source.topic.clone(), channel);
+                channel
+            }
+        };
+        writer.write_to_known_channel(
+            &mcap::records::MessageHeader {
+                channel_id: channel,
+                sequence: message.sequence,
+                log_time: message.log_time,
+                publish_time: message.publish_time,
+            },
+            &message.data,
+        )?;
+        *counts.entry(source.topic.clone()).or_insert(0u64) += 1;
+    }
+    writer.finish()?;
+    Ok(counts)
+}
+
 /// Writes a camera path as a tape's `/camera` channel onto a writer the caller
 /// owns, so the path can share one file with channels of the caller's own.
 ///
@@ -817,6 +903,83 @@ mod tests {
 
     /// A path written onto a shared file, beside a channel the tape knows
     /// nothing about, replays exactly — held frames included.
+    /// Two files, one path: the camera of one and the subject of the other.
+    #[test]
+    fn merged_files_replay_the_same_path_and_keep_every_channel() {
+        let frame = |x: f64| Frame {
+            position: [x, 0.0, 6_378_137.0],
+            direction: [1.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            fovy: 0.7,
+        };
+        let path: Vec<Frame> = (0..7).map(|i| frame(f64::from(i))).collect();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (camera, subject, merged) = (
+            dir.path().join("camera.mcap"),
+            dir.path().join("subject.mcap"),
+            dir.path().join("plan.mcap"),
+        );
+        let mut tape = Tape::recording(&camera).expect("recording");
+        for f in &path {
+            tape.push(*f);
+        }
+        tape.finish().expect("finish");
+
+        let mut writer =
+            mcap::Writer::new(BufWriter::new(File::create(&subject).expect("create"))).expect("writer");
+        let schema = writer.add_schema("other.Thing", "protobuf", b"descriptor").expect("schema");
+        let channel = writer
+            .add_channel(schema, "/subject", "protobuf", &std::collections::BTreeMap::new())
+            .expect("channel");
+        for n in 0..5u64 {
+            writer
+                .write_to_known_channel(
+                    &mcap::records::MessageHeader {
+                        channel_id: channel,
+                        sequence: n as u32,
+                        log_time: n * NANOS_PER_FRAME,
+                        publish_time: n * NANOS_PER_FRAME,
+                    },
+                    &[n as u8, 0xfe],
+                )
+                .expect("message");
+        }
+        writer.finish().expect("finish");
+        drop(writer);
+
+        let counts = merge(&[&subject, &camera], &merged).expect("merge");
+        assert_eq!(counts.get("/subject"), Some(&5));
+        assert!(counts.contains_key(CAMERA_TOPIC));
+
+        // The path replays as it was flown.
+        let mut replay = Tape::replaying(&merged).expect("replay");
+        let mut read = Vec::new();
+        while let Some(f) = replay.next_frame() {
+            read.push(f);
+        }
+        assert_eq!(read, path);
+
+        // The other channel is all there: bytes, schema, encoding, order.
+        let bytes = std::fs::read(&merged).expect("read");
+        let subject_messages: Vec<_> = mcap::MessageStream::new(&bytes)
+            .expect("stream")
+            .map(|m| m.expect("message"))
+            .filter(|m| m.channel.topic == "/subject")
+            .collect();
+        assert_eq!(subject_messages.len(), 5);
+        for (n, message) in subject_messages.iter().enumerate() {
+            assert_eq!(&message.data[..], &[n as u8, 0xfe]);
+            assert_eq!(message.channel.message_encoding, "protobuf");
+            let schema = message.channel.schema.as_ref().expect("schema");
+            assert_eq!((schema.name.as_str(), &schema.data[..]), ("other.Thing", &b"descriptor"[..]));
+        }
+
+        // The same topic from two files is refused, not chosen between.
+        let other = dir.path().join("camera-2.mcap");
+        std::fs::copy(&camera, &other).expect("copy");
+        assert!(matches!(merge(&[&camera, &other], dir.path().join("no.mcap")), Err(TapeError::NotAPath(_))));
+    }
+
     #[test]
     fn a_camera_channel_in_a_shared_file_replays_the_same_path() {
         use super::*;
