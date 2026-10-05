@@ -547,6 +547,51 @@ fn inspect(path: &std::path::Path) -> Result<(), String> {
     println!("origin   {:?}", pack.render_origin());
     println!("tiles    {} distinct (id, drape)", pack.tile_count());
     println!("bytes    {}", bytes.len());
+    println!("version  {}", pack.version());
+    println!("content  {:?}", pack.content());
+    if let Some((terrain, imagery)) = pack.store_layers() {
+        // What the references are into, and how much of the store they name.
+        let mut referring = 0usize;
+        let mut cut_from_an_ancestor = 0usize;
+        let mut placements = 0usize;
+        let mut terrain_tiles = std::collections::BTreeSet::new();
+        let mut imagery_tiles = std::collections::BTreeSet::new();
+        let mut imagery_levels = std::collections::BTreeMap::<u8, usize>::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for frame in first..=last {
+            for tile in pack.frame(frame).map_err(|e| e.to_string())? {
+                if !seen.insert((tile.id(), tile.drape())) {
+                    continue;
+                }
+                let Some(refs) = tuile_pack::refs_of(&tile) else {
+                    continue;
+                };
+                referring += 1;
+                let (level, x, y) = tuile_core::source::TileId(tile.id()).terrain_coord();
+                let source = refs.terrain;
+                if (u32::from(source.level), u64::from(source.x), u64::from(source.y)) != (level, x, y) {
+                    cut_from_an_ancestor += 1;
+                }
+                terrain_tiles.insert((source.level, source.x, source.y));
+                placements += refs.imagery.len();
+                for placed in &refs.imagery {
+                    if imagery_tiles.insert((placed.tile.level, placed.tile.x, placed.tile.y)) {
+                        *imagery_levels.entry(placed.tile.level).or_default() += 1;
+                    }
+                }
+            }
+        }
+        println!("store    terrain layer {terrain}, imagery layer {imagery}");
+        println!(
+            "refs     {referring} of {} tiles refer to the store; {cut_from_an_ancestor} meshes cut from an ancestor",
+            seen.len()
+        );
+        println!(
+            "         {} terrain tiles, {} imagery tiles ({placements} placements), by imagery level {imagery_levels:?}",
+            terrain_tiles.len(),
+            imagery_tiles.len()
+        );
+    }
 
     let mut total_selected = 0usize;
     let mut payload_bytes = 0usize;
