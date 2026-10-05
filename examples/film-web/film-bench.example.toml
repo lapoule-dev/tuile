@@ -1,0 +1,36 @@
+# What the film bench serves. Copy to `film-bench.toml` (ignored by git) in the
+# directory `tuile-pack-api` is started from, and name your own buckets.
+#
+# The buckets share one endpoint and one key, taken from the environment (or a
+# `.env` beside this file): TUILE_STORE_ENDPOINT, TUILE_STORE_ACCESS_KEY_ID,
+# TUILE_STORE_SECRET_ACCESS_KEY. `dir = "/path"` reads a directory instead of
+# `bucket`.
+
+# Packs as the engine's own launcher keys them:
+#   <root>/<scene digest>/<first>-<last>.tuilepack
+[[project]]
+name = "engine"
+bucket = "my-engine-bucket"
+scenes = ["packs"]
+
+# Films kept as run directories by an orchestrator. Its names are its own, so
+# they are spelled here: keys relative to the run directory, `{index:04}` where
+# a chunk's number goes.
+[[project]]
+name = "films"
+bucket = "my-films-bucket"
+
+[project.runs]
+# How many path segments name a run: 2 for <owner>/<run>/…
+depth = 2
+# A film cut into chunks: one pack each, and the object written last for a
+# chunk, whose presence says the pack is whole.
+chunk_pack = "packs/c{index:04}.tuilepack"
+chunk_ready = "packs/c{index:04}.txt"
+# A film in one pack.
+whole_pack = "scene.tuilepack"
+whole_ready = "scene.txt"
+
+# The source tiles (PMTiles archives under a catalog), read as stored.
+[tiles]
+bucket = "my-tiles-bucket"
