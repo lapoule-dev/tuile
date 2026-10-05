@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-use crate::source::Source;
+use crate::source::{Held, Source, BLOCK_BYTES};
 use futures_util::future::try_join_all;
+use futures_util::stream::{self, StreamExt};
 use js_sys::{Array, Uint8Array};
 use tuile_film::{
-    cameras, file_reads, frame_tiles, texture_of_span, Cursor, FrameCamera, Look, Mesh, Pack,
-    TileKey,
+    block_plan, cameras, file_reads, frame_tiles, texture_of_span, Cursor, FrameCamera, Look, Mesh,
+    Pack, TileKey,
 };
 use tuile_film_gpu::{FilmGpu, Settings, TileMesh, OUTPUT_FORMAT};
 use tuile_mp4::{Codec, Muxer, ParameterSets};
@@ -19,6 +20,10 @@ use web_sys::{
 
 /// Spans closer than this are read together.
 const COALESCE_GAP: u64 = 256 << 10;
+/// No read of a frame's tiles is merged past this.
+const READ_AT_MOST: u64 = 16 << 20;
+/// Blocks in flight at once while fetching ahead.
+const PRELOAD_AT_ONCE: usize = 6;
 
 fn js(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
@@ -169,7 +174,7 @@ impl PackView {
             .get(index as usize)
             .ok_or_else(|| js(format!("frame {frame} has no tile {index}")))?;
         let blob = self.head.len() as u64;
-        let Some(fetch) = file_reads(&pack, blob, std::slice::from_ref(tile), 0)
+        let Some(fetch) = file_reads(&pack, blob, std::slice::from_ref(tile), 0, u64::MAX)
             .into_iter()
             .next()
         else {
@@ -221,6 +226,23 @@ pub struct FilmWorker {
     /// Where each frame's I420 planes are copied for a software encoder;
     /// `None` when the browser's own encoder reads the canvas.
     readback: Option<wgpu::Buffer>,
+    /// The slice this worker renders.
+    first: u32,
+    last: u32,
+    /// Blocks fetched ahead of the frames that read them.
+    held: Held,
+}
+
+/// What fetching ahead did.
+#[wasm_bindgen]
+#[derive(Debug, Clone, Copy)]
+pub struct Preloaded {
+    pub blocks: u32,
+    pub bytes: f64,
+    /// Whether the blocks are held in this module's memory. When they did
+    /// not fit the budget they were fetched all the same — into the
+    /// browser's cache, which answers the render's reads from disk.
+    pub in_memory: bool,
 }
 
 async fn bitmap(png: Vec<u8>) -> Result<ImageBitmap, JsValue> {
@@ -320,6 +342,9 @@ impl FilmWorker {
             surface,
             aspect: width as f32 / height as f32,
             readback: None,
+            first,
+            last,
+            held: Held::default(),
         })
     }
 
@@ -359,6 +384,57 @@ impl FilmWorker {
         Ok(bytes)
     }
 
+    /// Fetches, before the first frame, every block of the pack this slice
+    /// reads — so that rendering waits on no network.
+    ///
+    /// The table says exactly which blocks those are. When they fit in
+    /// `budget_bytes` they are held in this module's memory, and each is let
+    /// go after the last frame that reads it; when they do not, they are
+    /// fetched and dropped, which leaves them in the browser's cache.
+    /// `progress(done, total)` is called as blocks arrive.
+    pub async fn preload(
+        &mut self,
+        budget_bytes: f64,
+        progress: &js_sys::Function,
+    ) -> Result<Preloaded, JsError> {
+        let plan = {
+            let pack = Pack::open_table(&self.head).map_err(js)?;
+            block_plan(
+                &pack,
+                self.head.len() as u64,
+                self.first,
+                self.last,
+                BLOCK_BYTES,
+                COALESCE_GAP,
+                READ_AT_MOST,
+            )
+            .map_err(js)?
+        };
+        let total = plan.len();
+        let in_memory = total as f64 * BLOCK_BYTES as f64 <= budget_bytes;
+        let source = &self.source;
+        let mut fetched = stream::iter(plan.iter().map(|(index, last)| (*index, *last)))
+            .map(|(index, last)| async move {
+                Ok::<_, JsError>((index, last, source.fetch_block(index).await?))
+            })
+            .buffer_unordered(PRELOAD_AT_ONCE);
+        let (mut done, mut bytes) = (0u32, 0f64);
+        while let Some(block) = fetched.next().await {
+            let (index, last, data) = block?;
+            done += 1;
+            bytes += data.len() as f64;
+            if in_memory {
+                self.held.keep(index, data, last);
+            }
+            let _ = progress.call2(&JsValue::NULL, &done.into(), &(total as u32).into());
+        }
+        Ok(Preloaded {
+            blocks: done,
+            bytes,
+            in_memory,
+        })
+    }
+
     /// Frames this worker has yet to render.
     pub fn remaining(&self) -> u32 {
         self.cursor.remaining()
@@ -376,6 +452,8 @@ impl FilmWorker {
             surface,
             aspect,
             readback,
+            held,
+            ..
         } = self;
         let pack = Pack::open_table(head).map_err(js)?;
         let Some(diff) = cursor.advance(&pack) else {
@@ -385,84 +463,94 @@ impl FilmWorker {
 
         // The entering tiles' bytes, in as few ranged reads as possible, all
         // in flight at once.
-        let tf = now_ms();
+        // What enters is brought in a read at a time: a frame can bring in
+        // a hundred megabytes of tiles, and holding every read, every
+        // decompressed mesh and every PNG of it at once is more than a
+        // worker's memory should be asked for. Each read's tiles are on the
+        // GPU, and its bytes let go, before the next is made.
         let blob = head.len() as u64;
-        let fetches = file_reads(&pack, blob, &diff.enter, COALESCE_GAP);
-        let reads = try_join_all(fetches.iter().map(|f| source.read(f.range.clone()))).await?;
-        let mut owner = vec![0usize; diff.enter.len()];
-        for (at, f) in fetches.iter().enumerate() {
-            for &i in &f.serves {
-                owner[i] = at;
+        let fetches = file_reads(&pack, blob, &diff.enter, COALESCE_GAP, READ_AT_MOST);
+        let (mut fetch_ms, mut unpack_ms, mut decode_ms, mut upload_ms) = (0.0, 0.0, 0.0, 0.0);
+        let mut fetched_bytes = 0usize;
+        for fetch in &fetches {
+            let tf = now_ms();
+            let bytes = source.read_with(fetch.range.clone(), held).await?;
+            fetched_bytes += bytes.len();
+            let at = fetch.range.start - blob;
+
+            let t0 = now_ms();
+            let mut meshes = Vec::with_capacity(fetch.serves.len());
+            let mut pngs = Vec::new();
+            for &i in &fetch.serves {
+                let tile = &diff.enter[i];
+                meshes.push((
+                    TileKey::of(tile),
+                    Mesh::of_span(&pack, tile, at, &bytes).map_err(js)?,
+                ));
+                if let Some(png) = texture_of_span(&pack, tile, at, &bytes).map_err(js)? {
+                    pngs.push((meshes.len() - 1, png));
+                }
             }
-        }
-        let fetched_bytes: usize = reads.iter().map(Vec::len).sum();
+            drop(bytes);
 
-        let t0 = now_ms();
-        let mut meshes = Vec::with_capacity(diff.enter.len());
-        let mut pngs = Vec::new();
-        for (i, tile) in diff.enter.iter().enumerate() {
-            let at = fetches[owner[i]].range.start - blob;
-            let bytes = &reads[owner[i]];
-            meshes.push((
-                TileKey::of(tile),
-                Mesh::of_span(&pack, tile, at, bytes).map_err(js)?,
-            ));
-            if let Some(png) = texture_of_span(&pack, tile, at, bytes).map_err(js)? {
-                pngs.push((meshes.len() - 1, png));
+            let t1 = now_ms();
+            // This read's textures decode at once, on the browser's threads.
+            let (owners, futures): (Vec<usize>, Vec<_>) =
+                pngs.into_iter().map(|(at, png)| (at, bitmap(png))).unzip();
+            let bitmaps = try_join_all(futures)
+                .await
+                .map_err(|e| js(format!("image decode: {e:?}")))?;
+            let mut textures: Vec<Option<wgpu::Texture>> =
+                (0..meshes.len()).map(|_| None).collect();
+
+            let t2 = now_ms();
+            for (at, bitmap) in owners.into_iter().zip(bitmaps) {
+                let (w, h) = (bitmap.width(), bitmap.height());
+                let texture = gpu.create_albedo(w, h);
+                gpu.queue().copy_external_image_to_texture(
+                    &wgpu::CopyExternalImageSourceInfo {
+                        source: wgpu::ExternalImageSource::ImageBitmap(bitmap.clone()),
+                        origin: wgpu::Origin2d::ZERO,
+                        flip_y: false,
+                    },
+                    wgpu::CopyExternalImageDestInfo {
+                        texture: &texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                        color_space: wgpu::PredefinedColorSpace::Srgb,
+                        premultiplied_alpha: false,
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                bitmap.close();
+                textures[at] = Some(texture);
             }
-        }
-
-        let t1 = now_ms();
-        // Every entering texture decodes at once, on the browser's threads.
-        let (owners, futures): (Vec<usize>, Vec<_>) =
-            pngs.into_iter().map(|(at, png)| (at, bitmap(png))).unzip();
-        let bitmaps = try_join_all(futures)
-            .await
-            .map_err(|e| js(format!("image decode: {e:?}")))?;
-        let mut textures: Vec<Option<wgpu::Texture>> = (0..meshes.len()).map(|_| None).collect();
-
-        let t2 = now_ms();
-        for (at, bitmap) in owners.into_iter().zip(bitmaps) {
-            let (w, h) = (bitmap.width(), bitmap.height());
-            let texture = gpu.create_albedo(w, h);
-            gpu.queue().copy_external_image_to_texture(
-                &wgpu::CopyExternalImageSourceInfo {
-                    source: wgpu::ExternalImageSource::ImageBitmap(bitmap.clone()),
-                    origin: wgpu::Origin2d::ZERO,
-                    flip_y: false,
-                },
-                wgpu::CopyExternalImageDestInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                    color_space: wgpu::PredefinedColorSpace::Srgb,
-                    premultiplied_alpha: false,
-                },
-                wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-            );
-            bitmap.close();
-            textures[at] = Some(texture);
-        }
-        for ((key, mesh), texture) in meshes.iter().zip(textures) {
-            gpu.enter(
-                *key,
-                &TileMesh {
-                    origin_ecef: mesh.origin_ecef,
-                    positions: &mesh.positions,
-                    normals: &mesh.normals,
-                    uvs: &mesh.uvs,
-                    indices: &mesh.indices,
-                    index_count: mesh.index_count,
-                    base_color_factor: mesh.base_color_factor,
-                },
-                texture,
-            )
-            .map_err(js)?;
+            for ((key, mesh), texture) in meshes.iter().zip(textures) {
+                gpu.enter(
+                    *key,
+                    &TileMesh {
+                        origin_ecef: mesh.origin_ecef,
+                        positions: &mesh.positions,
+                        normals: &mesh.normals,
+                        uvs: &mesh.uvs,
+                        indices: &mesh.indices,
+                        index_count: mesh.index_count,
+                        base_color_factor: mesh.base_color_factor,
+                    },
+                    texture,
+                )
+                .map_err(js)?;
+            }
+            let t3 = now_ms();
+            fetch_ms += t0 - tf;
+            unpack_ms += t1 - t0;
+            decode_ms += t2 - t1;
+            upload_ms += t3 - t2;
         }
 
         let t3 = now_ms();
@@ -488,6 +576,8 @@ impl FilmWorker {
         for key in &diff.leave {
             gpu.leave(key);
         }
+        // And the blocks no later frame reads.
+        held.done_with(diff.frame);
         let t4 = now_ms();
 
         Ok(Some(FrameStats {
@@ -495,12 +585,12 @@ impl FilmWorker {
             selected: diff.selection.len() as u32,
             entered: diff.enter.len() as u32,
             left: diff.leave.len() as u32,
-            fetch_ms: t0 - tf,
+            fetch_ms,
             fetched_bytes: fetched_bytes as f64,
             requests: fetches.len() as u32,
-            unpack_ms: t1 - t0,
-            decode_ms: t2 - t1,
-            upload_ms: t3 - t2,
+            unpack_ms,
+            decode_ms,
+            upload_ms,
             record_ms: t4 - t3,
         }))
     }

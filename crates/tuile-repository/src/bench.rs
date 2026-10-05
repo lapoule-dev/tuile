@@ -7,6 +7,7 @@
 //! GET /api/projects                      the projects, their layout, the tile store
 //! GET /api/p/<project>/films             the films the project's bucket holds
 //! GET /api/p/<project>/films/<id>        one film: its packs (chunks), in order
+//! GET /api/p/<project>/b/<n>/<key>       block n of an object: a whole reply (200)
 //! GET /api/p/<project>/o/<key>           an object, by byte range (206)
 //! GET /api/p/<project>/ls?prefix=        one level of the bucket, as it lies
 //! GET /api/tiles/catalog                 the tile store's layers
@@ -19,6 +20,16 @@
 //! own response. What a route means — which range a header asks for, what a
 //! missing film answers — is decided once.
 //!
+//! **A reader of packs asks for blocks, not ranges.** An object is cut into
+//! fixed blocks of [`CHUNK`] bytes and each has its own URL, answered whole —
+//! a plain 200, immutable. That is the one shape every cache keeps without
+//! being argued with: a browser stores it like any file, and an edge cache
+//! keys it by its URL. Ranged replies are neither stored nor matched
+//! reliably by either, and a range is whatever its asker computed, so no two
+//! askers share one. Blocks are the same for every frame, every slice of a
+//! film and every reader of it. The ranged route stays, for a media element
+//! and a curious human.
+//!
 //! Every route is a GET and nothing writes to a bucket.
 
 use std::ops::Range;
@@ -26,13 +37,18 @@ use std::sync::Arc;
 
 use percent_encoding::percent_decode_str;
 
-use crate::{FilmRepository, Objects, RepoError, TileRepository};
+use crate::{FilmRepository, Objects, RepoError, TileRepository, CHUNK};
 
 /// How much an open-ended range (`bytes=N-`) is answered with. A media
 /// element asks that way and then asks again from where the answer stopped.
 pub const OPEN_RANGE: u64 = 8 << 20;
 /// The largest object served without a range.
-pub const WHOLE_LIMIT: u64 = 64 << 20;
+pub const WHOLE_LIMIT: u64 = 32 << 20;
+/// The most one request is answered with. A reply is held whole while it is
+/// put together, and a host may have little memory to hold it in — a Worker
+/// has 128 MB for everything, shared by the requests it is serving at that
+/// moment. A client reads a large span as several.
+pub const RANGE_LIMIT: u64 = 32 << 20;
 
 pub struct Project {
     pub name: String,
@@ -59,6 +75,9 @@ pub struct Reply {
     pub ranged: bool,
     /// A strong validator for the object, on a reply that carries its bytes.
     pub etag: Option<String>,
+    /// The whole object's size, on a block: its reader cannot tell a short
+    /// last block from a truncated one otherwise.
+    pub object_size: Option<u64>,
     /// `Cache-Control`.
     pub cache_control: &'static str,
     pub body: Vec<u8>,
@@ -96,6 +115,7 @@ impl Reply {
             content_range: None,
             ranged: false,
             etag: None,
+            object_size: None,
             cache_control: FRESH,
             body: message.to_string().into_bytes(),
         }
@@ -109,6 +129,7 @@ impl Reply {
                 content_range: None,
                 ranged: false,
                 etag: None,
+                object_size: None,
                 cache_control: FRESH,
                 body,
             },
@@ -228,6 +249,12 @@ impl Bench {
         if let Some(key) = rest.strip_prefix("o/") {
             return self.object(project, &decoded(key), range).await;
         }
+        if let Some((index, key)) = rest.strip_prefix("b/").and_then(|r| r.split_once('/')) {
+            let index = index
+                .parse()
+                .map_err(|_| Reply::text(400, "a block is b/<number>/<key>"))?;
+            return self.block(project, &decoded(key), index).await;
+        }
         Err(Reply::text(404, "no such route"))
     }
 
@@ -250,6 +277,15 @@ impl Bench {
                 None => Reply::text(400, format!("{key} is {size} bytes: ask for a range")),
             });
         };
+        if bytes.end - bytes.start > RANGE_LIMIT {
+            return Err(Reply::text(
+                400,
+                format!(
+                    "{} bytes asked for in one range; {RANGE_LIMIT} at most — read it as several",
+                    bytes.end - bytes.start
+                ),
+            ));
+        }
         let body = project
             .objects
             .read(key, bytes.clone())
@@ -262,6 +298,39 @@ impl Bench {
                 .then(|| format!("bytes {}-{}/{size}", bytes.start, bytes.end - 1)),
             ranged: true,
             etag: Some(etag(key, size)),
+            object_size: Some(size),
+            cache_control: IMMUTABLE,
+            body,
+        })
+    }
+
+    /// Block `index` of an object: bytes `index × CHUNK` up to the next
+    /// block, or the object's end. Whole, immutable, and the same for whoever
+    /// asks.
+    async fn block(&self, project: &Project, key: &str, index: u64) -> Result<Reply, Reply> {
+        if !safe(key) {
+            return Err(Reply::text(400, format!("not a key: {key}")));
+        }
+        let size = project.objects.size(key).await.map_err(Reply::of)?;
+        let start = index.saturating_mul(CHUNK);
+        if start >= size {
+            return Err(Reply::text(404, format!("{key} has no block {index}")));
+        }
+        let body = project
+            .objects
+            .read(key, start..(start + CHUNK).min(size))
+            .await
+            .map_err(Reply::of)?;
+        Ok(Reply {
+            status: 200,
+            content_type: "application/octet-stream".into(),
+            content_range: None,
+            ranged: false,
+            etag: Some(format!(
+                "{}-{index}\"",
+                etag(key, size).trim_end_matches('"')
+            )),
+            object_size: Some(size),
             cache_control: IMMUTABLE,
             body,
         })
@@ -289,6 +358,7 @@ impl Bench {
                 content_range: None,
                 ranged: false,
                 etag: None,
+                object_size: None,
                 // A tile can be refetched and replaced in the store.
                 cache_control: FRESH,
                 body: tile.bytes,
@@ -328,6 +398,57 @@ mod tests {
         // No range: only for what is small enough to send whole.
         assert_eq!(resolve(None, 10), Some((0..10, false)));
         assert_eq!(resolve(None, big), None);
+    }
+
+    #[test]
+    fn a_range_too_large_for_one_reply_is_refused_before_it_is_read() {
+        use crate::{Entry, Listing, Objects, RepoError};
+        use std::sync::Arc;
+
+        /// A huge object nobody may read: reading it fails the test.
+        struct Huge;
+        #[async_trait::async_trait]
+        impl Objects for Huge {
+            fn label(&self) -> String {
+                "huge".into()
+            }
+            async fn list(&self, _: &str) -> Result<Vec<Entry>, RepoError> {
+                Ok(Vec::new())
+            }
+            async fn browse(&self, _: &str) -> Result<Listing, RepoError> {
+                Ok(Listing::default())
+            }
+            async fn size(&self, _: &str) -> Result<u64, RepoError> {
+                Ok(3 << 30)
+            }
+            async fn read(&self, _: &str, range: Range<u64>) -> Result<Vec<u8>, RepoError> {
+                assert!(
+                    range.end - range.start <= RANGE_LIMIT,
+                    "a read past the limit reached the bucket"
+                );
+                Ok(vec![0; (range.end - range.start) as usize])
+            }
+        }
+        let objects: Arc<dyn Objects> = Arc::new(Huge);
+        let bench = Bench {
+            projects: vec![Project {
+                name: "p".into(),
+                films: Arc::new(crate::ScenePacks::new(objects.clone(), ["packs"])),
+                objects,
+            }],
+            tiles: None,
+        };
+        let get = |range: &'static str| {
+            futures_executor::block_on(bench.get("/api/p/p/o/a.tuilepack", "", Some(range)))
+        };
+        let too_much = get("bytes=2137432-163204141").expect("reply");
+        assert_eq!(too_much.status, 400);
+        assert!(String::from_utf8_lossy(&too_much.body).contains("read it as several"));
+        assert_eq!(get("bytes=0-4194303").expect("reply").status, 206);
+        // The whole of it, with no range, is refused too.
+        let whole = futures_executor::block_on(bench.get("/api/p/p/o/a.tuilepack", "", None))
+            .expect("reply");
+        assert_eq!(whole.status, 400);
     }
 
     #[test]
