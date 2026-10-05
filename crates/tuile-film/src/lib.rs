@@ -19,7 +19,7 @@ mod survey;
 
 pub use camera::{FrameCamera, NEAR_FRACTION};
 pub use cursor::{Cursor, FilmError, FrameDiff, TileKey};
-pub use look::Look;
+pub use look::{Imagery, Look};
 pub use mesh::{texture, texture_of_span, Mesh};
 pub use ranges::{coalesce, file_reads, Fetch};
 pub use slice::slice;

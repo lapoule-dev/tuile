@@ -12,7 +12,7 @@ struct Frame {
     fwd: vec4f,
     // xyz: world radiance (linear); w: exposure scale.
     world: vec4f,
-    // xyz: sun irradiance at normal incidence.
+    // xyz: sun strength — a white surface facing it comes out at this.
     sun: vec4f,
     to_sun: vec4f,
     // x, y: internal (supersampled) size; z: supersampling factor; w: unused.

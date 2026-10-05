@@ -8,7 +8,7 @@
 //! pixel off it as the sky. Skipped when the machine has no adapter.
 
 use glam::Vec3;
-use tuile_film::{BakedView, FrameCamera, Look, TileKey};
+use tuile_film::{BakedView, FrameCamera, Imagery, Look, TileKey};
 use tuile_film_gpu::{FilmGpu, Settings, TileMesh};
 
 /// The WGS84 equatorial radius: the square sits on the ground at null island.
@@ -198,13 +198,14 @@ fn close(found: [u8; 3], wanted: [f32; 3]) -> bool {
 fn look() -> Look {
     Look {
         to_sun: Vec3::X,
+        imagery: Imagery::Decoded,
         ..Look::default()
     }
 }
 
 #[test]
 fn the_square_is_shaded_by_the_look_and_the_rest_is_sky() {
-    let Some(r) = render(look(), [200, 120, 40, 255], 2) else {
+    let Some(r) = render(look(), [90, 60, 30, 255], 2) else {
         eprintln!("no GPU adapter: skipped");
         return;
     };
@@ -213,13 +214,13 @@ fn the_square_is_shaded_by_the_look_and_the_rest_is_sky() {
         let mut out = [0.0; 3];
         for c in 0..3 {
             let a = eotf(f32::from(albedo[c]) / 255.0);
-            let radiance = a * (look.world[c] + look.sun[c] / std::f32::consts::PI);
+            let radiance = a * (look.world[c] + look.sun[c]);
             out[c] = oetf(radiance * look.exposure_scale());
         }
         out
     };
     let centre = pixel(&r, 32, 24);
-    let wanted = expected([200, 120, 40]);
+    let wanted = expected([90, 60, 30]);
     assert!(
         close(centre, wanted),
         "centre {centre:?}, wanted {:?}",
@@ -240,7 +241,7 @@ fn the_square_is_shaded_by_the_look_and_the_rest_is_sky() {
 
 #[test]
 fn i420_luma_matches_the_picture() {
-    let Some(r) = render(look(), [200, 120, 40, 255], 1) else {
+    let Some(r) = render(look(), [90, 60, 30, 255], 1) else {
         eprintln!("no GPU adapter: skipped");
         return;
     };
@@ -266,4 +267,30 @@ fn each_tile_resolves_its_own_pixels() {
     let right = pixel(&r, 46, 24);
     assert!(left[0] > 2 * left[2], "left {left:?} should be red");
     assert!(right[2] > 2 * right[0], "right {right:?} should be blue");
+}
+
+/// Lit as stored, the texture's sRGB values are taken for linear ones: the
+/// square comes out at its stored value times the light, with no curve
+/// undone first.
+#[test]
+fn imagery_lit_as_stored_skips_the_srgb_decode() {
+    let look = Look {
+        imagery: Imagery::AsStored,
+        ..look()
+    };
+    let Some(r) = render(look, [30, 15, 5, 255], 1) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mut wanted = [0.0; 3];
+    for (c, v) in [30u8, 15, 5].into_iter().enumerate() {
+        let radiance = f32::from(v) / 255.0 * (look.world[c] + look.sun[c]);
+        wanted[c] = oetf(radiance * look.exposure_scale());
+    }
+    let centre = pixel(&r, 32, 24);
+    assert!(
+        close(centre, wanted),
+        "centre {centre:?}, wanted {:?}",
+        wanted.map(|c| c * 255.0)
+    );
 }
