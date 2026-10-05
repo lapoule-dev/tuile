@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tuile_farm::{ObjectRunStore, Tuning};
 use tuile_pack::{blob_start, BakedTile, BakedView, Pack, PackWriter, TextureFormat, PREAMBLE};
 use tuile_repository::{
-    Cached, FilmRepository, Objects, RepoError, RunFilms, RunLayout, ScenePacks,
+    Cached, DiskChunks, FilmRepository, Objects, RepoError, RunFilms, RunLayout, ScenePacks,
 };
 
 fn tile(id: u64) -> BakedTile {
@@ -198,7 +198,7 @@ async fn holds_its_contract(repo: &dyn FilmRepository, objects: &dyn Objects) ->
 
 /// The same bucket, reached directly and through the chunk cache.
 fn stores(root: &Path, cache: &Path) -> Vec<Arc<dyn Objects>> {
-    let cached: Arc<dyn Objects> = Arc::new(Cached::new(direct(root), cache));
+    let cached: Arc<dyn Objects> = Arc::new(Cached::new(direct(root), DiskChunks::new(cache)));
     vec![direct(root), cached]
 }
 
