@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures_util::future::try_join_all;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 use crate::films::{in_order, line_of, range_of_pack, safe};
 use crate::{Chunk, Entry, Film, FilmRepository, FilmSummary, Objects, RepoError, Unreadable};
@@ -41,6 +41,9 @@ pub struct RunLayout {
     #[serde(default)]
     pub whole_ready: Option<String>,
 }
+
+/// How many packs' tables are read at once when a film is opened.
+const TABLES_AT_ONCE: usize = 4;
 
 /// One `{index}` or `{index:0N}` placeholder, between a prefix and a suffix.
 struct Template<'a> {
@@ -216,9 +219,15 @@ impl FilmRepository for RunFilms {
         let mut chunks = Vec::new();
         let mut unreadable = Vec::new();
         if let (false, Some(pack)) = (ready.is_empty(), pack.as_ref()) {
-            // Read side by side: a film has dozens of chunks.
-            let ranges =
-                try_join_all(ready.iter().map(|(_, e)| range_of_pack(objects, &e.key))).await?;
+            // Read side by side, a few at a time: a film has dozens of
+            // chunks, a table is megabytes, and a host may have little
+            // memory to hold them in — a Worker has 128 MB for everything.
+            let keys: Vec<String> = ready.iter().map(|(_, e)| e.key.clone()).collect();
+            let ranges: Vec<_> = stream::iter(keys)
+                .map(|key| async move { range_of_pack(objects, &key).await })
+                .buffered(TABLES_AT_ONCE)
+                .try_collect()
+                .await?;
             for ((i, entry), range) in ready.iter().zip(ranges) {
                 let marker_key = marker.as_ref().map(|m| m.key(*i));
                 used.push(pack.key(*i));
