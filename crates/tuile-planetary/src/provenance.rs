@@ -67,8 +67,11 @@ impl Provenance {
         self.imagery.lock().ok()?.get(&tile).copied()
     }
 
+    // What follows is the loader's side: what it notes as it fetches. Public
+    // because a loader need not be this crate's.
+
     /// `tile` was decoded from its own bytes.
-    pub(crate) fn fetched_terrain(&self, tile: TileCoord, bytes: &[u8]) {
+    pub fn fetched_terrain(&self, tile: TileCoord, bytes: &[u8]) {
         if let Ok(mut terrain) = self.terrain.lock() {
             terrain.insert(tile, (tile, digest(bytes)));
         }
@@ -76,7 +79,7 @@ impl Provenance {
 
     /// `tile` was cut from `parent`'s mesh, so it comes from wherever that
     /// did.
-    pub(crate) fn upsampled_terrain(&self, tile: TileCoord, parent: TileCoord) {
+    pub fn upsampled_terrain(&self, tile: TileCoord, parent: TileCoord) {
         if let Ok(mut terrain) = self.terrain.lock() {
             if let Some(origin) = terrain.get(&parent).copied() {
                 terrain.insert(tile, origin);
@@ -84,7 +87,7 @@ impl Provenance {
         }
     }
 
-    pub(crate) fn fetched_imagery(&self, tile: ImageryCoord, bytes: &[u8]) {
+    pub fn fetched_imagery(&self, tile: ImageryCoord, bytes: &[u8]) {
         if let Ok(mut imagery) = self.imagery.lock() {
             imagery.insert(tile, digest(bytes));
         }

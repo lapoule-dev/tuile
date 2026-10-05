@@ -152,6 +152,10 @@ pub struct TileGeometry {
     /// evicts, and a frame that promised a texture must be able to hand out
     /// its bytes however long it lives.
     pub(crate) memoized: Option<Arc<EncodedTexture>>,
+    /// Where the tile comes from in the tile store, when the session's
+    /// source notes it: the terrain tile its mesh was built from, and the
+    /// imagery tiles of its drape with their placement.
+    pub(crate) refs: Option<tuile_pack::TileRefs>,
 }
 
 impl TileGeometry {
@@ -181,6 +185,7 @@ impl TileGeometry {
                 texture_index: 0,
             }),
             memoized,
+            refs: None,
         }
     }
 
@@ -513,6 +518,8 @@ pub(crate) struct Live {
     /// The ground's heights as the resident terrain gives them, when the
     /// source keeps them (a globe does). See [`Session::heights`].
     heights: Option<Arc<tuile_terrain::TerrainHeights>>,
+    /// What each tile is made from, when the source notes it (a globe does).
+    provenance: Option<Arc<tuile_planetary::Provenance>>,
     /// Baked, encoded textures kept across frames. See [`TextureMemo`].
     textures: Arc<TextureMemo>,
     /// What the consumer holds, tile by tile.
@@ -609,6 +616,12 @@ impl Session {
     pub(crate) fn set_heights(&mut self, heights: Arc<tuile_terrain::TerrainHeights>) {
         if let Source::Live(live) = &mut self.0 {
             live.heights = Some(heights);
+        }
+    }
+
+    pub(crate) fn set_provenance(&mut self, provenance: Arc<tuile_planetary::Provenance>) {
+        if let Source::Live(live) = &mut self.0 {
+            live.provenance = Some(provenance);
         }
     }
 
@@ -776,6 +789,7 @@ impl Live {
             config,
             imagery_detail: None,
             heights: None,
+            provenance: None,
             textures: Arc::new(TextureMemo::default()),
             resident: HashMap::new(),
             scene: SceneState::default(),
@@ -851,6 +865,7 @@ impl Live {
 
         let timeout = self.config.frame_timeout;
         let bake_max_size = self.config.bake_max_size;
+        let provenance = self.provenance.clone();
         // Copied out before the destructure below, which leaves `config`
         // behind its `..`.
         let dataset = self.config.dataset.clone();
@@ -876,6 +891,7 @@ impl Live {
                     Arc::clone(textures),
                     &dataset,
                     bake_max_size,
+                    provenance,
                     generation,
                     &mut errors,
                 ),
@@ -972,6 +988,7 @@ async fn converge(
     memo: Arc<TextureMemo>,
     dataset: &str,
     bake_max_size: u32,
+    provenance: Option<Arc<tuile_planetary::Provenance>>,
     generation: u64,
     errors: &mut Vec<(Option<TileId>, String)>,
 ) -> Result<(), StreamError> {
@@ -986,7 +1003,8 @@ async fn converge(
     // and `resident` is a map. A frame converges once the server says so AND
     // every tile it sent is finished.
     let pool = finish_pool();
-    let mut finishing: tokio::task::JoinSet<(TileId, u64, TileGeometry)> = tokio::task::JoinSet::new();
+    let mut finishing: tokio::task::JoinSet<(TileId, u64, TileGeometry)> =
+        tokio::task::JoinSet::new();
     // A tile evicted — or re-sent — while it is being finished must not come
     // back from a stale task: each arrival gets a number, and only the latest
     // is taken in.
@@ -1041,9 +1059,17 @@ async fn converge(
                         arrivals.insert(tile, next_arrival);
                         let arrival = next_arrival;
                         let (memo, dataset) = (Arc::clone(&memo), dataset.to_string());
+                        let provenance = provenance.clone();
                         let (done, result) = tokio::sync::oneshot::channel();
                         pool.spawn(move || {
-                            let _ = done.send(finish_tile(&memo, &dataset, tile, decoded, bake_max_size));
+                            let _ = done.send(finish_tile_from(
+                                &memo,
+                                &dataset,
+                                tile,
+                                decoded,
+                                bake_max_size,
+                                provenance.as_deref(),
+                            ));
                         });
                         finishing.spawn(async move {
                             let geometry = result.await.expect("a tile finish panicked");
@@ -1258,13 +1284,74 @@ pub fn exact_traversal(mut config: Config) -> Config {
 /// crosses the ABI — so the host sees `textures` and a `base_color_texture`
 /// index and never the layer stack. Without this, every ion terrain tile
 /// crosses with `textures` empty and `base_color_texture == -1`.
+#[cfg(test)]
 fn finish_tile(
+    memo: &TextureMemo,
+    dataset: &str,
+    tile: TileId,
+    decoded: DecodedTileContent,
+    bake_max_size: u32,
+) -> TileGeometry {
+    finish_tile_from(memo, dataset, tile, decoded, bake_max_size, None)
+}
+
+/// Where a decoded tile comes from in the tile store: its terrain tile, and
+/// the imagery tiles of its drape as they are stacked.
+///
+/// `None` when the source noted nothing of this tile, or of one of its
+/// layers: a reference that names half of what a tile is made from is worse
+/// than none, since it reads as complete.
+fn refs_of(
+    provenance: &tuile_planetary::Provenance,
+    tile: TileId,
+    decoded: &DecodedTileContent,
+    bake_max_size: u32,
+) -> Option<tuile_pack::TileRefs> {
+    use tuile_pack::{ImageryPlacement, StoreTile, TileRefs};
+    let (level, x, y) = tile.terrain_coord();
+    let origin = provenance.terrain(tuile_terrain::TileCoord::new(level, x, y))?;
+    let imagery = decoded
+        .imagery
+        .iter()
+        .map(|layer| {
+            Some(ImageryPlacement {
+                tile: StoreTile {
+                    level: u8::try_from(layer.coord.level).ok()?,
+                    x: u32::try_from(layer.coord.x).ok()?,
+                    y: u32::try_from(layer.coord.y).ok()?,
+                    digest: provenance.imagery(layer.coord)?,
+                },
+                coverage: layer.coverage,
+                translation: layer.translation,
+                scale: layer.scale,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(TileRefs {
+        terrain: StoreTile {
+            level: u8::try_from(origin.source.level).ok()?,
+            x: u32::try_from(origin.source.x).ok()?,
+            y: u32::try_from(origin.source.y).ok()?,
+            digest: origin.digest,
+        },
+        skirt_height: origin.skirt_height as f32,
+        composed_side: tuile_core::raster::composed_side(&decoded.imagery, bake_max_size),
+        imagery,
+    })
+}
+
+/// [`finish_tile`], noting where the tile comes from when `provenance` knows.
+fn finish_tile_from(
     memo: &TextureMemo,
     dataset: &str,
     tile: TileId,
     mut decoded: DecodedTileContent,
     bake_max_size: u32,
+    provenance: Option<&tuile_planetary::Provenance>,
 ) -> TileGeometry {
+    // Before the layers are composed and gone: they are what a reference
+    // into the tile store is made of.
+    let refs = provenance.and_then(|p| refs_of(p, tile, &decoded, bake_max_size));
     if tracing::enabled!(tracing::Level::DEBUG) && !decoded.imagery.is_empty() {
         let mut levels: Vec<u32> = decoded.imagery.iter().map(|l| l.coord.level).collect();
         levels.sort_unstable();
@@ -1341,6 +1428,7 @@ fn finish_tile(
         content: decoded,
         baked,
         memoized,
+        refs,
     }
 }
 
@@ -1472,6 +1560,7 @@ mod tests {
                 },
                 baked: None,
                 memoized: None,
+                refs: None,
             })],
         )
     }
@@ -1671,6 +1760,56 @@ mod tests {
         assert_eq!(
             exact_traversal(Config::default()).maximum_screen_space_error,
             Config::default().maximum_screen_space_error
+        );
+    }
+
+    /// A tile's reference into the tile store is taken from what the loader
+    /// noted, before the layers are composed and gone.
+    #[test]
+    fn a_finished_tile_says_where_it_comes_from_when_the_loader_noted_it() {
+        use tuile_core::raster::ImageryCoord;
+        let tile = TileId(7);
+        let (level, x, y) = tile.terrain_coord();
+        let coord = tuile_terrain::TileCoord::new(level, x, y);
+        let imagery = ImageryCoord {
+            level: 0,
+            x: 0,
+            y: 0,
+        };
+        let memo = TextureMemo::default();
+
+        // Nothing noted, or no record at all: no reference.
+        let silent = tuile_planetary::Provenance::default();
+        for provenance in [None, Some(&silent)] {
+            let finished = finish_tile_from(&memo, "t", tile, draped_content(), 256, provenance);
+            assert_eq!(finished.refs, None);
+        }
+
+        // The terrain alone is half a reference, which is none.
+        let noted = tuile_planetary::Provenance::default();
+        noted.fetched_terrain(coord, b"terrain bytes");
+        let half = finish_tile_from(&memo, "t", tile, draped_content(), 256, Some(&noted));
+        assert_eq!(half.refs, None);
+
+        noted.fetched_imagery(imagery, b"imagery bytes");
+        let content = draped_content();
+        let layer = content.imagery[0].clone();
+        let side = tuile_core::raster::composed_side(&content.imagery, 256);
+        let finished = finish_tile_from(&memo, "t", tile, content, 256, Some(&noted));
+        assert!(finished.content.imagery.is_empty(), "the layers are consumed");
+        let refs = finished.refs.expect("a reference");
+        assert_eq!(refs.terrain.digest, tuile_planetary::digest(b"terrain bytes"));
+        assert_eq!(
+            (u32::from(refs.terrain.level), u64::from(refs.terrain.x), u64::from(refs.terrain.y)),
+            (level, x, y)
+        );
+        assert_eq!(refs.composed_side, side);
+        assert_eq!(refs.imagery.len(), 1);
+        let placed = refs.imagery[0];
+        assert_eq!(placed.tile.digest, tuile_planetary::digest(b"imagery bytes"));
+        assert_eq!(
+            (placed.coverage, placed.translation, placed.scale),
+            (layer.coverage, layer.translation, layer.scale)
         );
     }
 
