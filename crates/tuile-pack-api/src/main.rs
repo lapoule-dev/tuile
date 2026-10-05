@@ -1,81 +1,90 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! A local HTTP API over the farm's packs.
+//! A local, read-only HTTP API over the buckets a film is made from.
 //!
 //! ```text
-//! GET /packs?prefix=packs/        the farm's packs: [{key, size, cached}]
-//! GET /packs/<key>                a pack, by byte range (206)
-//! GET /pmtiles?prefix=<zone>/     the tile store's PMTiles archives
-//! GET /pmtiles/<key>              an archive, by byte range (206)
-//! GET /pmtiles/catalog.json       the tile store's catalog, as stored
-//! GET /                           the film bench page, if --www is given
+//! GET /api/projects                      the projects, their layout, the tile store
+//! GET /api/p/<project>/films             the films the project's bucket holds
+//! GET /api/p/<project>/films/<id>        one film: its packs (chunks), in order
+//! GET /api/p/<project>/o/<key>           an object, by byte range (206)
+//! GET /api/p/<project>/ls?prefix=        one level of the bucket, as it lies
+//! GET /api/tiles/catalog                 the tile store's layers
+//! GET /api/tiles/<layer>/<z>/<x>/<y>     one source tile, as stored
+//! GET /                                  the bench page, if --www is given
 //! ```
 //!
-//! Both shelves work the same way. An object is fetched from its store once,
-//! into the cache directory, and every request after that reads the local file
-//! by range. Both kinds are immutable under their keys — a pack's key hashes its
-//! inputs, and the tile store names each archive afresh on every compaction —
-//! so a cached copy never goes stale. A pack's blob digest is also checked on
-//! the way in.
+//! This is an adapter and nothing more. What a film is made of and where it
+//! lies is `tuile-repository`'s to know: every route here talks to a
+//! `dyn FilmRepository`, a `dyn Objects` or a `dyn TileRepository`, and no
+//! key is built in this file. A Worker serving the same routes over an R2
+//! binding would differ in its `Objects` and in nothing else.
 //!
-//! A pack is fetched from the store **once**, into the cache directory, and its
-//! blob digest checked on the way in; every request after that — every worker
-//! of every film rendered from it — reads the local file by range. A browser
-//! never holds a whole pack: each worker asks for the bytes of the tiles its
-//! frames bring in.
+//! **Nothing is downloaded whole.** Each project's bucket is wrapped in
+//! `Cached`: a pack runs to gigabytes and a browser reads a few megabytes of
+//! it per frame, so objects are fetched in fixed chunks, on demand, each
+//! chunk once.
 //!
-//! Packs come from the farm's store, configured as for `tuile-farm`:
-//! `TUILE_STORE_DIR`, or `TUILE_STORE_ENDPOINT`, `TUILE_STORE_BUCKET`,
-//! `TUILE_STORE_ACCESS_KEY_ID`, `TUILE_STORE_SECRET_ACCESS_KEY`. PMTiles come
-//! from the tile store, as for a bake: `TUILE_TILES_DIR`, or
-//! `TUILE_TILES_BUCKET` on the same endpoint and credentials. A shelf with no
-//! configuration is simply not served. A `.env` in the working directory is
-//! read first. Credentials stay in this process; the page never sees them.
+//! What is served is described by a configuration file (`--config`, default
+//! `film-bench.toml`): the projects, each a bucket read through one layout,
+//! and the tile store. See `examples/film-web/film-bench.example.toml`. The
+//! buckets share one endpoint and one key, taken from the environment as the
+//! farm takes them — `TUILE_STORE_ENDPOINT`, `TUILE_STORE_ACCESS_KEY_ID`,
+//! `TUILE_STORE_SECRET_ACCESS_KEY` — with a `.env` in the working directory
+//! read first. Credentials stay in this process.
+//!
+//! Every route is a GET and nothing here writes to a bucket.
 //!
 //! ```bash
 //! cargo run --release -p tuile-pack-api -- --www examples/film-web/www
 //! ```
 
-use std::collections::HashMap;
-use std::io::Read;
+mod config;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axum::extract::{Query, Request};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::extract::{Path as UrlPath, Query};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use axum::Router;
-use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
-use tower_http::services::{ServeDir, ServeFile};
-use tuile_farm::{BucketConfig, ObjectRunStore, RunStore, Tuning};
+use tower_http::services::ServeDir;
+use tuile_farm::{BucketConfig, ObjectRunStore, StoreError, Tuning};
+use tuile_repository::{
+    Cached, FilmRepository, Objects, RepoError, RunFilms, ScenePacks, TileRepository,
+};
 
-/// One kind of object, from one store, cached in one directory.
-struct Shelf {
-    name: &'static str,
-    store: ObjectRunStore,
-    cache: PathBuf,
-    suffix: &'static str,
-    /// Packs carry a digest of their blob region; archives do not.
-    verify: bool,
-    /// One lock per key: two workers asking for an object nobody has
-    /// fetched yet must wait for one download, not start two.
-    fetching: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+use config::{Config, Layout, Place};
+use tuile_tile_server::{StoreConfig, TileStore};
+
+/// How much an open-ended range (`bytes=N-`) is answered with. A media
+/// element asks that way and then asks again from where the answer stopped.
+const OPEN_RANGE: u64 = 8 << 20;
+/// The largest object served without a range.
+const WHOLE_LIMIT: u64 = 64 << 20;
+
+struct Project {
+    name: String,
+    objects: Arc<dyn Objects>,
+    films: Arc<dyn FilmRepository>,
 }
 
-#[derive(serde::Deserialize)]
-struct ListQuery {
-    prefix: Option<String>,
+struct Api {
+    projects: Vec<Arc<Project>>,
+    tiles: Option<(String, Arc<dyn TileRepository>)>,
 }
 
-#[derive(serde::Serialize)]
-struct Listed {
-    key: String,
-    size: u64,
-    cached: bool,
+impl Api {
+    fn project(&self, name: &str) -> Result<Arc<Project>, Response> {
+        self.projects
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
+            .ok_or_else(|| error(StatusCode::NOT_FOUND, format!("no project {name}")))
+    }
 }
 
 fn error(status: StatusCode, message: impl std::fmt::Display) -> Response {
@@ -83,170 +92,203 @@ fn error(status: StatusCode, message: impl std::fmt::Display) -> Response {
     (status, message.to_string()).into_response()
 }
 
-/// A key is a path inside the store, never outside the cache.
-fn safe(key: &str, suffix: &str) -> bool {
+fn repo_error(e: RepoError) -> Response {
+    match e {
+        RepoError::NotFound(_) => error(StatusCode::NOT_FOUND, e),
+        RepoError::Malformed { .. } => error(StatusCode::UNPROCESSABLE_ENTITY, e),
+        RepoError::Store(_) => error(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+/// A key is a path inside the bucket and inside the cache, never out of it.
+fn safe(key: &str) -> bool {
     !key.is_empty()
-        && key.ends_with(suffix)
         && !key.starts_with('/')
         && key
             .split('/')
             .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
-async fn list(shelf: Arc<Shelf>, q: ListQuery) -> Response {
-    let api = shelf;
-    let prefix = q.prefix.unwrap_or_default();
-    match api.store.list(&prefix).await {
-        Ok(entries) => Json(
-            entries
-                .into_iter()
-                .filter(|e| e.key.ends_with(api.suffix))
-                .map(|e| Listed {
-                    cached: api.cache.join(&e.key).exists(),
-                    key: e.key,
-                    size: e.size,
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Err(e) => error(StatusCode::BAD_GATEWAY, e),
+fn content_type(key: &str) -> &'static str {
+    match key.rsplit('.').next().unwrap_or_default() {
+        "mp4" => "video/mp4",
+        "json" => "application/json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "txt" | "scene" | "usda" | "log" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
     }
 }
 
-/// Folds the blob digest over a pack on disk and compares it with its table.
-fn verify(path: &Path) -> Result<(), String> {
-    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut preamble = [0u8; tuile_pack::PREAMBLE];
-    file.read_exact(&mut preamble).map_err(|e| e.to_string())?;
-    let start = tuile_pack::blob_start(&preamble).map_err(|e| e.to_string())? as usize;
-    let mut head = preamble.to_vec();
-    head.resize(start, 0);
-    file.read_exact(&mut head[tuile_pack::PREAMBLE..])
-        .map_err(|e| e.to_string())?;
-    let expected = tuile_pack::Pack::open_table(&head)
-        .map_err(|e| e.to_string())?
-        .blob_digest();
-    let mut digest = tuile_pack::Fnv1a::default();
-    let mut buf = vec![0u8; 8 << 20];
-    loop {
-        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        digest.update(&buf[..n]);
-    }
-    let found = digest.finish();
-    if found != expected {
-        return Err(format!(
-            "blob digest {found:016x}, the table says {expected:016x}"
-        ));
-    }
-    Ok(())
+/// `bytes=a-b`, `bytes=a-` or nothing, resolved against the object's size.
+/// `None` is a range that cannot be satisfied.
+fn resolve(range: Option<&str>, size: u64) -> Option<(std::ops::Range<u64>, bool)> {
+    let Some(spec) = range else {
+        return (size <= WHOLE_LIMIT).then_some((0..size, false));
+    };
+    let (a, b) = spec.strip_prefix("bytes=")?.split_once('-')?;
+    let start: u64 = a.trim().parse().ok()?;
+    let end = match b.trim() {
+        "" => (start + OPEN_RANGE).min(size),
+        b => b.parse::<u64>().ok()?.checked_add(1)?.min(size),
+    };
+    (start < end).then_some((start..end, true))
 }
 
-/// The object's local copy, fetched (and verified) if this is the first ask.
-async fn cached(api: &Shelf, key: &str) -> Result<PathBuf, Response> {
-    let path = api.cache.join(key);
-    if path.exists() {
-        return Ok(path);
-    }
-    let lock = api
-        .fetching
-        .lock()
-        .await
-        .entry(key.to_string())
-        .or_default()
-        .clone();
-    let _held = lock.lock().await;
-    if path.exists() {
-        return Ok(path);
-    }
-    let partial = path.with_extension("part");
-    if let Some(dir) = path.parent() {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    }
-    let t = std::time::Instant::now();
-    tracing::info!("{}: fetching {key} from {}", api.name, api.store.label());
-    let bytes = api.store.get(key, &partial).await.map_err(|e| match e {
-        tuile_farm::StoreError::NotFound(_) => error(StatusCode::NOT_FOUND, e),
-        e => error(StatusCode::BAD_GATEWAY, e),
-    })?;
-    if api.verify {
-        let check = partial.clone();
-        tokio::task::spawn_blocking(move || verify(&check))
-            .await
-            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?
-            .map_err(|e| error(StatusCode::BAD_GATEWAY, format!("{key}: {e}")))?;
-    }
-    tokio::fs::rename(&partial, &path)
-        .await
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    tracing::info!(
-        "{key}: {:.1} MB fetched and verified in {:.1} s",
-        bytes as f64 / 1e6,
-        t.elapsed().as_secs_f64()
-    );
-    Ok(path)
+#[derive(serde::Deserialize, Default)]
+struct ListQuery {
+    #[serde(default)]
+    prefix: String,
 }
 
-async fn object(api: Arc<Shelf>, request: Request) -> Response {
-    let prefix = format!("/{}/", api.name);
-    let key = request.uri().path().trim_start_matches(&prefix).to_string();
-    if !safe(&key, api.suffix) {
-        return error(
-            StatusCode::BAD_REQUEST,
-            format!("not a {} key: {key}", api.name),
-        );
-    }
-    let path = match cached(&api, &key).await {
+async fn projects(api: Arc<Api>) -> Response {
+    Json(serde_json::json!({
+        "projects": api.projects.iter().map(|p| serde_json::json!({
+            "name": p.name, "store": p.objects.label(), "layout": p.films.layout(),
+        })).collect::<Vec<_>>(),
+        "tiles": api.tiles.as_ref().map(|(label, _)| label),
+    }))
+    .into_response()
+}
+
+async fn ls(api: Arc<Api>, project: String, q: ListQuery) -> Response {
+    let project = match api.project(&project) {
         Ok(p) => p,
         Err(r) => return r,
     };
-    let mut response = match tower::ServiceExt::oneshot(ServeFile::new(path), request).await {
-        Ok(r) => r.into_response(),
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+    match project.objects.browse(&q.prefix).await {
+        Ok(listing) => Json(listing).into_response(),
+        Err(e) => repo_error(e),
+    }
+}
+
+async fn films(api: Arc<Api>, project: String) -> Response {
+    let project = match api.project(&project) {
+        Ok(p) => p,
+        Err(r) => return r,
     };
-    // Nothing under a key ever changes (see the module docs).
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    match project.films.films().await {
+        Ok(films) => Json(films).into_response(),
+        Err(e) => repo_error(e),
+    }
+}
+
+async fn film(api: Arc<Api>, project: String, id: String) -> Response {
+    let project = match api.project(&project) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match project.films.film(&id).await {
+        Ok(film) => Json(film).into_response(),
+        Err(e) => repo_error(e),
+    }
+}
+
+async fn object(api: Arc<Api>, project: String, key: String, headers: HeaderMap) -> Response {
+    let project = match api.project(&project) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if !safe(&key) {
+        return error(StatusCode::BAD_REQUEST, format!("not a key: {key}"));
+    }
+    let size = match project.objects.size(&key).await {
+        Ok(s) => s,
+        Err(e) => return repo_error(e),
+    };
+    let wanted = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    let Some((range, partial)) = resolve(wanted, size) else {
+        return match wanted {
+            Some(_) => (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{size}"))],
+            )
+                .into_response(),
+            None => error(
+                StatusCode::BAD_REQUEST,
+                format!("{key} is {size} bytes: ask for a range"),
+            ),
+        };
+    };
+    let bytes = match project.objects.read(&key, range.clone()).await {
+        Ok(b) => b,
+        Err(e) => return repo_error(e),
+    };
+    let mut response = (
+        if partial {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        },
+        bytes,
+    )
+        .into_response();
+    let h = response.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type(&key)),
     );
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if partial {
+        if let Ok(v) =
+            HeaderValue::from_str(&format!("bytes {}-{}/{size}", range.start, range.end - 1))
+        {
+            h.insert(header::CONTENT_RANGE, v);
+        }
+    }
     response
 }
 
-/// The tile store's catalog, fetched afresh: it is the one object that does
-/// change, as archives are added and compacted.
-async fn catalog(api: Arc<Shelf>) -> Response {
-    let tmp = api.cache.join(".catalog.json.part");
-    if let Err(e) = tokio::fs::create_dir_all(&api.cache).await {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, e);
-    }
-    if let Err(e) = api.store.get("catalog.json", &tmp).await {
-        return error(StatusCode::BAD_GATEWAY, e);
-    }
-    match tokio::fs::read(&tmp).await {
-        Ok(bytes) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
-        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
+async fn tile_catalog(api: Arc<Api>) -> Response {
+    match &api.tiles {
+        Some((_, tiles)) => Json(tiles.layers()).into_response(),
+        None => error(StatusCode::NOT_FOUND, "no tile store configured"),
     }
 }
 
-/// The tile store, as a bake finds it: a directory, or `TUILE_TILES_BUCKET`
-/// on the farm's endpoint and credentials.
-fn tile_store() -> Result<Option<ObjectRunStore>, tuile_farm::StoreError> {
-    let tuning = Tuning::from_env();
-    if let Ok(dir) = std::env::var("TUILE_TILES_DIR") {
-        return ObjectRunStore::local(Path::new(&dir), tuning).map(Some);
+async fn tile(api: Arc<Api>, layer: String, z: u8, x: u32, y: u32) -> Response {
+    let Some((_, tiles)) = &api.tiles else {
+        return error(StatusCode::NOT_FOUND, "no tile store configured");
+    };
+    match tiles.tile(&layer, z, x, y).await {
+        Ok(Some(t)) => ([(header::CONTENT_TYPE, t.content_type)], t.bytes).into_response(),
+        Ok(None) => error(
+            StatusCode::NOT_FOUND,
+            format!("{layer}/{z}/{x}/{y} is not in the store"),
+        ),
+        Err(e) => repo_error(e),
     }
-    let Ok(bucket) = std::env::var("TUILE_TILES_BUCKET") else {
-        return Ok(None);
+}
+
+fn open(place: &Place) -> Result<ObjectRunStore, StoreError> {
+    let tuning = Tuning::from_env();
+    match place {
+        Place::Dir(dir) => ObjectRunStore::local(dir, tuning),
+        Place::Bucket(bucket) => ObjectRunStore::bucket(
+            &BucketConfig {
+                bucket: bucket.clone(),
+                ..bucket_base()?
+            },
+            tuning,
+        ),
+    }
+}
+
+/// The endpoint and key every bucket here shares.
+fn bucket_base() -> Result<BucketConfig, StoreError> {
+    let var = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| StoreError::Config(format!("{name} is not set")))
     };
-    let config = BucketConfig {
-        bucket,
-        ..BucketConfig::from_env()?
-    };
-    ObjectRunStore::bucket(&config, tuning).map(Some)
+    Ok(BucketConfig {
+        endpoint: var("TUILE_STORE_ENDPOINT")?,
+        bucket: String::new(),
+        access_key_id: var("TUILE_STORE_ACCESS_KEY_ID")?,
+        secret_access_key: var("TUILE_STORE_SECRET_ACCESS_KEY")?,
+        region: std::env::var("TUILE_STORE_REGION").unwrap_or_else(|_| "auto".into()),
+    })
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -259,8 +301,7 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,tuile_pack_api=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
     dotenvy::dotenv().ok();
@@ -273,47 +314,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .or_else(|| std::env::var("TUILE_PACK_CACHE").ok())
             .unwrap_or_else(|| ".pack-cache".into()),
     );
-    let mut app = Router::new();
-    let packs = match ObjectRunStore::from_env() {
-        Ok(store) => Some(store),
-        Err(e) => {
-            tracing::warn!("no pack store ({e}): /packs is not served");
-            None
-        }
-    };
-    let shelves = [
-        packs.map(|store| ("packs", store, ".tuilepack", true)),
-        tile_store()?.map(|store| ("pmtiles", store, ".pmtiles", false)),
-    ];
-    for (name, store, suffix, verify) in shelves.into_iter().flatten() {
+
+    let config_path = arg(&args, "--config").unwrap_or_else(|| "film-bench.toml".into());
+    let config = Config::read(Path::new(&config_path))?;
+
+    let mut projects_open = Vec::new();
+    for project in config.projects {
+        // The bucket, then the cache over it: both are `Objects`, and
+        // everything from here on is handed the second.
+        let objects: Arc<dyn Objects> = Arc::new(Cached::new(
+            Arc::new(open(&project.place)?),
+            cache.join(&project.name),
+        ));
+        let films: Arc<dyn FilmRepository> = match project.layout {
+            Layout::Scenes(roots) => Arc::new(ScenePacks::new(objects.clone(), roots)),
+            Layout::Runs(layout) => Arc::new(RunFilms::new(objects.clone(), layout)?),
+        };
         tracing::info!(
-            "/{name}: {}, cached in {}",
-            store.label(),
-            cache.join(name).display()
+            "project {}: {} read as {}",
+            project.name,
+            objects.label(),
+            films.layout()
         );
-        let shelf = Arc::new(Shelf {
-            name,
-            store,
-            cache: cache.join(name),
-            suffix,
-            verify,
-            fetching: Mutex::default(),
-        });
-        let (l, o) = (shelf.clone(), shelf.clone());
-        app = app
-            .route(
-                &format!("/{name}"),
-                get(move |Query(q): Query<ListQuery>| list(l.clone(), q)),
-            )
-            .route(
-                &format!("/{name}/{{*key}}"),
-                get(move |r: Request| object(o.clone(), r)),
-            );
-        if name == "pmtiles" {
-            let c = shelf.clone();
-            app = app.route("/pmtiles/catalog.json", get(move || catalog(c.clone())));
-        }
+        projects_open.push(Arc::new(Project {
+            name: project.name,
+            objects,
+            films,
+        }));
     }
+    let tiles = match config.tiles {
+        Some(place) => {
+            let store = open(&place)?;
+            let label = store.label().to_string();
+            match TileStore::open(store.object_store(), StoreConfig::default()).await {
+                Ok(t) => {
+                    let tiles: Arc<dyn TileRepository> = Arc::new(t);
+                    tracing::info!("tiles: {label}, {} layers", tiles.layers().len());
+                    Some((label, tiles))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "tiles: {label} cannot be opened ({e}): /api/tiles is not served"
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let api = Arc::new(Api {
+        projects: projects_open,
+        tiles,
+    });
+
+    let (a, b, c, d, f, g, h) = (
+        api.clone(),
+        api.clone(),
+        api.clone(),
+        api.clone(),
+        api.clone(),
+        api.clone(),
+        api,
+    );
+    let mut app = Router::new()
+        .route("/api/projects", get(move || projects(a.clone())))
+        .route(
+            "/api/p/{project}/ls",
+            get(move |UrlPath(p): UrlPath<String>, Query(q): Query<ListQuery>| ls(b.clone(), p, q)),
+        )
+        .route(
+            "/api/p/{project}/films",
+            get(move |UrlPath(p): UrlPath<String>| films(c.clone(), p)),
+        )
+        .route(
+            "/api/p/{project}/films/{*id}",
+            get(move |UrlPath((p, id)): UrlPath<(String, String)>| film(h.clone(), p, id)),
+        )
+        .route(
+            "/api/p/{project}/o/{*key}",
+            get(
+                move |UrlPath((p, k)): UrlPath<(String, String)>, h: HeaderMap| {
+                    object(d.clone(), p, k, h)
+                },
+            ),
+        )
+        .route("/api/tiles/catalog", get(move || tile_catalog(f.clone())))
+        .route(
+            "/api/tiles/{layer}/{z}/{x}/{y}",
+            get(
+                move |UrlPath((l, z, x, y)): UrlPath<(String, u8, u32, u32)>| {
+                    tile(g.clone(), l, z, x, y)
+                },
+            ),
+        );
     if let Some(www) = arg(&args, "--www") {
         app = app.fallback_service(ServeDir::new(www));
     }
@@ -333,17 +426,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keys_stay_inside_the_cache() {
-        let t = ".tuilepack";
-        assert!(safe("packs/24cd8199f4c13cfa/1-2880.tuilepack", t));
-        assert!(safe(
-            "z6/1759000000-000000000000000000000001-00000000deadbeef.pmtiles",
-            ".pmtiles"
-        ));
-        assert!(!safe("../secrets.tuilepack", t));
-        assert!(!safe("packs/../../x.tuilepack", t));
-        assert!(!safe("/etc/x.tuilepack", t));
-        assert!(!safe("packs/a.mp4", t));
-        assert!(!safe("packs//a.tuilepack", t));
+    fn keys_stay_inside_the_bucket() {
+        assert!(safe("packs/24cd8199f4c13cfa/1-2880.tuilepack"));
+        assert!(safe("owner/run/chunks/0003.tuilepack"));
+        assert!(!safe("../secrets"));
+        assert!(!safe("packs/../../x"));
+        assert!(!safe("/etc/passwd"));
+        assert!(!safe("packs//a"));
+        assert!(!safe(""));
+    }
+
+    #[test]
+    fn ranges_resolve_against_the_size() {
+        assert_eq!(resolve(Some("bytes=0-15"), 100), Some((0..16, true)));
+        assert_eq!(resolve(Some("bytes=90-200"), 100), Some((90..100, true)));
+        assert_eq!(resolve(Some("bytes=100-"), 100), None);
+        assert_eq!(resolve(Some("bytes=5-4"), 100), None);
+        // Open-ended: a window, never the rest of a multi-gigabyte pack.
+        let big = 11 << 30;
+        assert_eq!(resolve(Some("bytes=0-"), big), Some((0..OPEN_RANGE, true)));
+        // No range: only for what is small enough to send whole.
+        assert_eq!(resolve(None, 10), Some((0..10, false)));
+        assert_eq!(resolve(None, big), None);
     }
 }
