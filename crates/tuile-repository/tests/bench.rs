@@ -174,8 +174,19 @@ async fn the_routes_answer_as_documented() {
     );
 
     // Blocks: the object cut at fixed offsets, each a whole reply of its own.
+    // The size is in the address: a block cut another way is another URL, and
+    // the one without a size names nothing.
+    assert_eq!(tuile_repository::block_segment(), "b16");
+    assert_eq!(
+        bench
+            .get(&format!("/api/p/engine/b/0/{key}"), "", None)
+            .await
+            .expect("reply")
+            .status,
+        404
+    );
     let block = bench
-        .get(&format!("/api/p/engine/b/0/{key}"), "", None)
+        .get(&format!("/api/p/engine/b16/0/{key}"), "", None)
         .await
         .expect("reply");
     assert_eq!(
@@ -194,7 +205,7 @@ async fn the_routes_answer_as_documented() {
     assert_ne!(block.etag, head.etag, "a block is not the object");
     assert_eq!(
         bench
-            .get(&format!("/api/p/engine/b/1/{key}"), "", None)
+            .get(&format!("/api/p/engine/b16/1/{key}"), "", None)
             .await
             .expect("reply")
             .status,
@@ -202,7 +213,7 @@ async fn the_routes_answer_as_documented() {
     );
     assert_eq!(
         bench
-            .get(&format!("/api/p/engine/b/x/{key}"), "", None)
+            .get(&format!("/api/p/engine/b16/x/{key}"), "", None)
             .await
             .expect("reply")
             .status,
@@ -210,7 +221,7 @@ async fn the_routes_answer_as_documented() {
     );
     assert_eq!(
         bench
-            .get("/api/p/engine/b/0/packs/../x", "", None)
+            .get("/api/p/engine/b16/0/packs/../x", "", None)
             .await
             .expect("reply")
             .status,

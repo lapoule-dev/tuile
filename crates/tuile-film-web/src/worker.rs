@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-use crate::source::{Held, Source, BLOCK_BYTES};
+use crate::source::{Source, BLOCK_BYTES};
 use futures_util::future::try_join_all;
 use futures_util::stream::{self, StreamExt};
 use js_sys::{Array, Uint8Array};
@@ -192,6 +192,23 @@ impl PackView {
     }
 }
 
+/// The same pack, asked from Rust: the page is Rust too, and takes the
+/// samples and tiles as they are rather than flattened for JavaScript.
+impl PackView {
+    /// The camera path, at most `max` samples.
+    pub fn samples(&self, max: usize) -> Vec<tuile_film::CameraSample> {
+        Pack::open_table(&self.head)
+            .map(|pack| cameras(&pack, max))
+            .unwrap_or_default()
+    }
+
+    /// The tiles a frame draws.
+    pub fn tiles_of(&self, frame: u32) -> Option<Vec<tuile_film::TileInfo>> {
+        let pack = Pack::open_table(&self.head).ok()?;
+        frame_tiles(&pack, frame).ok()
+    }
+}
+
 /// One frame's account: what changed and where the time went.
 #[wasm_bindgen]
 #[derive(Debug, Clone, Copy)]
@@ -229,8 +246,6 @@ pub struct FilmWorker {
     /// The slice this worker renders.
     first: u32,
     last: u32,
-    /// Blocks fetched ahead of the frames that read them.
-    held: Held,
 }
 
 /// What fetching ahead did.
@@ -239,10 +254,6 @@ pub struct FilmWorker {
 pub struct Preloaded {
     pub blocks: u32,
     pub bytes: f64,
-    /// Whether the blocks are held in this module's memory. When they did
-    /// not fit the budget they were fetched all the same — into the
-    /// browser's cache, which answers the render's reads from disk.
-    pub in_memory: bool,
 }
 
 async fn bitmap(png: Vec<u8>) -> Result<ImageBitmap, JsValue> {
@@ -344,7 +355,6 @@ impl FilmWorker {
             readback: None,
             first,
             last,
-            held: Held::default(),
         })
     }
 
@@ -385,18 +395,16 @@ impl FilmWorker {
     }
 
     /// Fetches, before the first frame, every block of the pack this slice
-    /// reads — so that rendering waits on no network.
+    /// reads, so that rendering waits on no network.
     ///
-    /// The table says exactly which blocks those are. When they fit in
-    /// `budget_bytes` they are held in this module's memory, and each is let
-    /// go after the last frame that reads it; when they do not, they are
-    /// fetched and dropped, which leaves them in the browser's cache.
+    /// The table says exactly which blocks those are. They are fetched and
+    /// let go: what keeps them is the browser's own cache, on disk, which a
+    /// block — a whole, immutable reply at its own URL — goes into like any
+    /// file. The render's reads of the same blocks are then local. Nothing
+    /// is held here: a film's blocks run to gigabytes, and a cache the
+    /// browser already keeps need not be kept twice.
     /// `progress(done, total)` is called as blocks arrive.
-    pub async fn preload(
-        &mut self,
-        budget_bytes: f64,
-        progress: &js_sys::Function,
-    ) -> Result<Preloaded, JsError> {
+    pub async fn preload(&self, progress: &js_sys::Function) -> Result<Preloaded, JsError> {
         let plan = {
             let pack = Pack::open_table(&self.head).map_err(js)?;
             block_plan(
@@ -410,28 +418,20 @@ impl FilmWorker {
             )
             .map_err(js)?
         };
-        let total = plan.len();
-        let in_memory = total as f64 * BLOCK_BYTES as f64 <= budget_bytes;
+        let total = plan.len() as u32;
         let source = &self.source;
-        let mut fetched = stream::iter(plan.iter().map(|(index, last)| (*index, *last)))
-            .map(|(index, last)| async move {
-                Ok::<_, JsError>((index, last, source.fetch_block(index).await?))
-            })
+        let mut fetched = stream::iter(plan.into_keys())
+            .map(|index| async move { Ok::<_, JsError>(source.fetch_block(index).await?.len()) })
             .buffer_unordered(PRELOAD_AT_ONCE);
         let (mut done, mut bytes) = (0u32, 0f64);
         while let Some(block) = fetched.next().await {
-            let (index, last, data) = block?;
+            bytes += block? as f64;
             done += 1;
-            bytes += data.len() as f64;
-            if in_memory {
-                self.held.keep(index, data, last);
-            }
-            let _ = progress.call2(&JsValue::NULL, &done.into(), &(total as u32).into());
+            let _ = progress.call2(&JsValue::NULL, &done.into(), &total.into());
         }
         Ok(Preloaded {
             blocks: done,
             bytes,
-            in_memory,
         })
     }
 
@@ -452,7 +452,6 @@ impl FilmWorker {
             surface,
             aspect,
             readback,
-            held,
             ..
         } = self;
         let pack = Pack::open_table(head).map_err(js)?;
@@ -474,7 +473,7 @@ impl FilmWorker {
         let mut fetched_bytes = 0usize;
         for fetch in &fetches {
             let tf = now_ms();
-            let bytes = source.read_with(fetch.range.clone(), held).await?;
+            let bytes = source.read(fetch.range.clone()).await?;
             fetched_bytes += bytes.len();
             let at = fetch.range.start - blob;
 
@@ -576,8 +575,6 @@ impl FilmWorker {
         for key in &diff.leave {
             gpu.leave(key);
         }
-        // And the blocks no later frame reads.
-        held.done_with(diff.frame);
         let t4 = now_ms();
 
         Ok(Some(FrameStats {

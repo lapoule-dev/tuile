@@ -6044,6 +6044,8 @@ dependencies = [
  "futures-util",
  "js-sys",
  "rav1e",
+ "serde",
+ "serde_json",
  "tuile-film",
  "tuile-film-gpu",
  "tuile-mp4",
