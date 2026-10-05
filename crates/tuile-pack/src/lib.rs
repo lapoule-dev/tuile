@@ -978,6 +978,23 @@ impl<'a> Pack<'a> {
             .ok_or(PackError::NoSuchFrame(frame))
     }
 
+    /// Every frame's camera, in the order the frames were baked.
+    ///
+    /// [`Pack::view_of`] finds one frame by walking the list; asking it for
+    /// each frame of a long film in turn is quadratic. A reader that wants
+    /// the whole path asks here, once.
+    pub fn views(&self) -> Vec<(u32, BakedView)> {
+        self.root
+            .frames()
+            .map(|frames| {
+                frames
+                    .iter()
+                    .filter_map(|f| Some((f.frame(), BakedView::from_fb(f.view()?))))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Decompresses one payload. The only copy a pack ever makes.
     pub fn payload(&self, block: &fb::Block, what: &'static str) -> Result<Vec<u8>, PackError> {
         let stored = self.stored(block, what)?;
@@ -1071,6 +1088,20 @@ mod tests {
     /// le blob et que `open` le parcourt entièrement.
     /// A pack read through its table and byte ranges hands back exactly what
     /// a pack held whole does — and the streamed digest is the stored one.
+    #[test]
+    fn the_whole_path_is_each_frames_view() {
+        let mut w = Bake::new("s", [0.0; 3]);
+        w.frame(4, a_view(0.0), [a_tile(1, 0)]);
+        w.frame(5, a_view(2.5), [a_tile(1, 0)]);
+        let bytes = w.finish();
+        let pack = Pack::open(&bytes).expect("open");
+        let views = pack.views();
+        assert_eq!(views.iter().map(|(f, _)| *f).collect::<Vec<_>>(), [4, 5]);
+        for (frame, view) in views {
+            assert_eq!(view, pack.view_of(frame).expect("view"));
+        }
+    }
+
     #[test]
     fn ranges_read_what_the_whole_file_holds() {
         let mut w = Bake::new("s", [0.0; 3]);
