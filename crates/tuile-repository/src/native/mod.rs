@@ -3,8 +3,8 @@
 
 //! The adapters a native process reaches a bucket with.
 
-mod cached;
+mod disk;
 mod store;
 mod tiles;
 
-pub use cached::{Cached, CHUNK};
+pub use disk::DiskChunks;

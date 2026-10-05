@@ -9,7 +9,9 @@
 //!
 //! - [`Objects`] — bytes in a bucket, read by range. One contract, three
 //!   implementations: a bucket or directory ([`tuile_farm::ObjectRunStore`]),
-//!   and [`Cached`], which wraps any other and keeps each chunk it has read.
+//!   a bucket asked over signed HTTP ([`s3::S3Objects`]), and [`Cached`],
+//!   which wraps any other and keeps each chunk it has read in a
+//!   [`ChunkStore`] — a directory, or a Worker's edge cache.
 //! - [`FilmRepository`] — the films a bucket holds and what each is made of.
 //!   [`ScenePacks`] reads the engine's own layout (packs keyed by scene
 //!   digest); [`RunFilms`] reads run directories as an orchestrator lays
@@ -26,15 +28,22 @@
 //! The contracts and the layouts compile to wasm32; the adapters that reach a
 //! bucket from a native process (`native`) do not, and are not built there.
 
+pub mod bench;
+mod cached;
+mod config;
 mod films;
 mod objects;
 mod runs;
+pub mod s3;
 mod scenes;
 mod tiles;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 
+pub use bench::{Bench, Project, Reply};
+pub use cached::{Cached, ChunkStore, CHUNK};
+pub use config::{Config, Layout, Place, ProjectConfig};
 pub use films::{Chunk, Film, FilmRepository, FilmSummary, Unreadable};
 pub use objects::{Entry, Listing, Objects, RepoError};
 pub use runs::{RunFilms, RunLayout};
@@ -42,4 +51,4 @@ pub use scenes::ScenePacks;
 pub use tiles::{LayerInfo, Tile, TileRepository};
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{Cached, CHUNK};
+pub use native::DiskChunks;

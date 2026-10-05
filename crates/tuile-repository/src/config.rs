@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use tuile_repository::RunLayout;
+use crate::RunLayout;
 
 /// A bucket on the configured endpoint, or a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
