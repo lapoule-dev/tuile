@@ -7,8 +7,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::future::try_join_all;
 
-use crate::films::{frames_of, in_order, line_of, safe};
-use crate::{Chunk, Entry, Film, FilmRepository, FilmSummary, Objects, RepoError};
+use crate::films::{in_order, line_of, range_of_pack, safe};
+use crate::{Chunk, Entry, Film, FilmRepository, FilmSummary, Objects, RepoError, Unreadable};
 
 /// How an orchestrator lays a film's packs out in its run directory.
 ///
@@ -214,12 +214,26 @@ impl FilmRepository for RunFilms {
 
         let mut used: Vec<String> = Vec::new();
         let mut chunks = Vec::new();
+        let mut unreadable = Vec::new();
         if let (false, Some(pack)) = (ready.is_empty(), pack.as_ref()) {
             // Read side by side: a film has dozens of chunks.
             let ranges =
-                try_join_all(ready.iter().map(|(_, e)| frames_of(objects, &e.key))).await?;
-            for ((i, entry), (first, last)) in ready.iter().zip(ranges) {
+                try_join_all(ready.iter().map(|(_, e)| range_of_pack(objects, &e.key))).await?;
+            for ((i, entry), range) in ready.iter().zip(ranges) {
                 let marker_key = marker.as_ref().map(|m| m.key(*i));
+                used.push(pack.key(*i));
+                used.extend(marker_key.clone());
+                let (first, last) = match range {
+                    Ok(range) => range,
+                    Err(why) => {
+                        unreadable.push(Unreadable {
+                            key: entry.key.clone(),
+                            bytes: entry.size,
+                            why,
+                        });
+                        continue;
+                    }
+                };
                 chunks.push(Chunk {
                     key: entry.key.clone(),
                     first,
@@ -230,25 +244,29 @@ impl FilmRepository for RunFilms {
                         None => None,
                     },
                 });
-                used.push(pack.key(*i));
-                used.extend(marker_key);
             }
         } else if let Some(entry) = layout.whole_pack.as_deref().and_then(|w| by_name.get(w)) {
-            let (first, last) = frames_of(objects, &entry.key).await?;
             let marker = layout
                 .whole_ready
                 .as_deref()
                 .filter(|m| by_name.contains_key(m));
-            chunks.push(Chunk {
-                key: entry.key.clone(),
-                first,
-                last,
-                bytes: entry.size,
-                scene: match marker {
-                    Some(m) => line_of(objects, &format!("{id}/{m}")).await?,
-                    None => None,
-                },
-            });
+            match range_of_pack(objects, &entry.key).await? {
+                Ok((first, last)) => chunks.push(Chunk {
+                    key: entry.key.clone(),
+                    first,
+                    last,
+                    bytes: entry.size,
+                    scene: match marker {
+                        Some(m) => line_of(objects, &format!("{id}/{m}")).await?,
+                        None => None,
+                    },
+                }),
+                Err(why) => unreadable.push(Unreadable {
+                    key: entry.key.clone(),
+                    bytes: entry.size,
+                    why,
+                }),
+            }
             used.extend(layout.whole_pack.clone());
             used.extend(marker.map(str::to_string));
         } else {
@@ -259,6 +277,7 @@ impl FilmRepository for RunFilms {
             id: id.to_string(),
             layout: FilmRepository::layout(self),
             chunks: in_order(id, chunks)?,
+            unreadable,
             others: by_name
                 .iter()
                 .filter(|(name, _)| !used.iter().any(|u| u == *name))

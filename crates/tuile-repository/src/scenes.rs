@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::films::{frames_of, in_order, line_of, name_of, parent_of, safe};
-use crate::{Chunk, Film, FilmRepository, FilmSummary, Objects, RepoError};
+use crate::films::{in_order, line_of, name_of, parent_of, range_of_pack, safe};
+use crate::{Chunk, Film, FilmRepository, FilmSummary, Objects, RepoError, Unreadable};
 
 /// The engine's layout: packs keyed by the scene they are the bake of.
 ///
@@ -91,17 +91,27 @@ impl FilmRepository for ScenePacks {
         let listing = self.objects.browse(id).await?;
         let has = |key: &str| listing.files.iter().find(|f| f.key == key);
         let mut chunks = Vec::new();
+        let mut unreadable = Vec::new();
         let mut others = Vec::new();
         for file in &listing.files {
             let name = name_of(&file.key);
             if let Some((first, last)) = range_of(name) {
                 // The name is the launcher's claim; the table is the pack's.
-                let found = frames_of(self.objects.as_ref(), &file.key).await?;
-                if found != (first, last) {
-                    return Err(RepoError::Malformed {
+                let why = match range_of_pack(self.objects.as_ref(), &file.key).await? {
+                    Ok(found) if found == (first, last) => None,
+                    Ok(found) => Some(format!(
+                        "named {first}–{last}, holds {}–{}",
+                        found.0, found.1
+                    )),
+                    Err(why) => Some(why),
+                };
+                if let Some(why) = why {
+                    unreadable.push(Unreadable {
                         key: file.key.clone(),
-                        what: format!("named {first}–{last}, holds {}–{}", found.0, found.1),
+                        bytes: file.size,
+                        why,
                     });
+                    continue;
                 }
                 let scene_key = format!("{}.scene", file.key);
                 let scene = match has(&scene_key) {
@@ -119,7 +129,7 @@ impl FilmRepository for ScenePacks {
                 others.push(file.clone());
             }
         }
-        if chunks.is_empty() {
+        if chunks.is_empty() && unreadable.is_empty() {
             return Err(RepoError::NotFound(id.to_string()));
         }
         // Two bakes of one scene may cover the same frames (a short probe and
@@ -145,6 +155,7 @@ impl FilmRepository for ScenePacks {
             id: id.to_string(),
             layout: self.layout(),
             chunks: in_order(id, kept)?,
+            unreadable,
             others,
         })
     }
