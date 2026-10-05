@@ -68,7 +68,10 @@ impl Cached {
     async fn chunk(&self, key: &str, size: u64, index: u64) -> Result<Vec<u8>, RepoError> {
         // A chunk is kept under its size as well as its key: cut another
         // way, the same number would be other bytes.
-        let kept = format!("{}m/{key}", CHUNK >> 20);
+        // …and under the object's size. A key is not for ever what it was:
+        // an object replaced under its key is another object, and its
+        // chunks must not be answered with the old one's.
+        let kept = format!("{}m/{size}/{key}", CHUNK >> 20);
         if let Some(bytes) = self.store.get(&kept, index).await {
             return Ok(bytes);
         }
@@ -108,7 +111,9 @@ impl Objects for Cached {
         self.inner.browse(prefix).await
     }
 
-    /// Asked of the bucket once per object.
+    /// Asked of the bucket, and kept for as long as the chunk store says a
+    /// size it noted is still to be believed — a moment, not for ever: an
+    /// object can be replaced under its key.
     async fn size(&self, key: &str) -> Result<u64, RepoError> {
         if let Some(size) = self.store.size(key).await {
             return Ok(size);
@@ -235,6 +240,64 @@ mod tests {
 
     fn block<T>(f: impl std::future::Future<Output = T>) -> T {
         futures_executor::block_on(f)
+    }
+
+    /// An object replaced under its key is read as what it now is: the
+    /// chunks kept of the old one answer for the old one only.
+    #[test]
+    fn an_object_replaced_under_its_key_is_not_answered_with_the_old_one() {
+        /// A chunk store that keeps chunks for good and believes no size.
+        #[derive(Default)]
+        struct Forgetful(Memory);
+        #[async_trait]
+        impl ChunkStore for Forgetful {
+            async fn get(&self, key: &str, index: u64) -> Option<Vec<u8>> {
+                self.0.get(key, index).await
+            }
+            async fn put(&self, key: &str, index: u64, bytes: &[u8]) {
+                self.0.put(key, index, bytes).await
+            }
+            async fn size(&self, _: &str) -> Option<u64> {
+                None
+            }
+            async fn note_size(&self, _: &str, _: u64) {}
+        }
+        let kept = Arc::new(Forgetful::default());
+        /// The same chunk store, behind two caches of two buckets.
+        struct Shared(Arc<Forgetful>);
+        #[async_trait]
+        impl ChunkStore for Shared {
+            async fn get(&self, key: &str, index: u64) -> Option<Vec<u8>> {
+                self.0.get(key, index).await
+            }
+            async fn put(&self, key: &str, index: u64, bytes: &[u8]) {
+                self.0.put(key, index, bytes).await
+            }
+            async fn size(&self, key: &str) -> Option<u64> {
+                self.0.size(key).await
+            }
+            async fn note_size(&self, key: &str, size: u64) {
+                self.0.note_size(key, size).await
+            }
+        }
+        let bucket = |object: Vec<u8>| {
+            Arc::new(Bucket {
+                object,
+                reads: AtomicUsize::new(0),
+                sizes: AtomicUsize::new(0),
+            })
+        };
+        let (old, new) = (noise(5000), vec![7u8; 300]);
+        let before = Cached::new(bucket(old.clone()), Shared(kept.clone()));
+        assert_eq!(block(before.read("k", 0..300)).expect("read"), old[..300]);
+        // The same key, over the same kept chunks, now holds something else.
+        let after = Cached::new(bucket(new.clone()), Shared(kept.clone()));
+        assert_eq!(block(after.read("k", 0..300)).expect("read"), new);
+        // And the old one's chunks are still the old one's.
+        assert_eq!(
+            block(before.read("k", 100..200)).expect("read"),
+            old[100..200]
+        );
     }
 
     /// **No byte is read from the bucket twice** — whatever ranges are asked

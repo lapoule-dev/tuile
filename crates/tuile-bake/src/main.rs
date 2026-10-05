@@ -299,6 +299,12 @@ struct Args {
     content: tuile_pack::Content,
     /// The pack this bake is the re-bake of: see `--rebake`.
     rebake: Option<std::path::PathBuf>,
+    /// Whether `--frames` was given: a re-bake then bakes that part of the
+    /// old pack's frames instead of all of them.
+    frames_given: bool,
+    /// Whether a re-bake that does not draw what the old pack drew is
+    /// written anyway: see `--accept-drift`.
+    accept_drift: bool,
 }
 
 const USAGE: &str = "\
@@ -341,6 +347,7 @@ fn parse_args() -> Result<Job, String> {
     let mut terrain: Option<i64> = None;
     let mut content: Option<tuile_pack::Content> = None;
     let mut rebake: Option<std::path::PathBuf> = None;
+    let mut accept_drift = false;
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         let mut value = || argv.next().ok_or(format!("{arg} needs a value"));
@@ -385,6 +392,7 @@ fn parse_args() -> Result<Job, String> {
                 })
             }
             "--rebake" => rebake = Some(std::path::PathBuf::from(value()?)),
+            "--accept-drift" => accept_drift = true,
             "--sse" => {
                 let v: f64 = value()?.parse().map_err(|_| "--sse wants a number")?;
                 // Fini ET positif : `NaN` passerait un simple `<= 0.0`, et un
@@ -429,6 +437,7 @@ fn parse_args() -> Result<Job, String> {
         });
     }
     // A re-bake takes its frames, like its cameras, from the pack it re-bakes.
+    let frames_given = frames.is_some();
     let frames = match (&rebake, frames) {
         (_, Some(frames)) => frames,
         (Some(_), None) => "1:1".to_string(),
@@ -463,6 +472,8 @@ fn parse_args() -> Result<Job, String> {
             tuile_pack::Content::Embedded
         }),
         rebake,
+        frames_given,
+        accept_drift,
     }))
 }
 
@@ -752,24 +763,25 @@ fn plan_of(path: &std::path::Path) -> Result<Plan, String> {
 /// is what lets a pack of references stand in for the pack it was baked from.
 fn same_plan(old: &Plan, new: &std::path::Path) -> Result<(), String> {
     let new = plan_of(new)?;
-    if (new.first, new.last) != (old.first, old.last) {
+    if new.first < old.first || new.last > old.last {
         return Err(format!(
             "REBAKE-DIFFERS frames {}..{} against {}..{}",
             new.first, new.last, old.first, old.last
         ));
     }
     let mut differing = Vec::new();
-    for (index, (was, is)) in old.selection.iter().zip(&new.selection).enumerate() {
+    let then = &old.selection[(new.first - old.first) as usize..];
+    for (index, (was, is)) in then.iter().zip(&new.selection).enumerate() {
         let (mut was, mut is) = (was.clone(), is.clone());
         was.sort_unstable();
         is.sort_unstable();
         if was != is {
             let same_ground = was.iter().map(|t| t.0).eq(is.iter().map(|t| t.0));
-            differing.push((old.first + index as u32, was.len(), is.len(), same_ground));
+            differing.push((new.first + index as u32, was.len(), is.len(), same_ground));
         }
     }
     if differing.is_empty() {
-        println!("REBAKE-SAME frames={} tiles and drapes, frame for frame", old.selection.len());
+        println!("REBAKE-SAME frames={} tiles and drapes, frame for frame", new.selection.len());
         return Ok(());
     }
     for (frame, was, is, same_ground) in differing.iter().take(8) {
@@ -778,10 +790,12 @@ fn same_plan(old: &Plan, new: &std::path::Path) -> Result<(), String> {
             if *same_ground { "same ground, draped differently" } else { "another selection" }
         );
     }
+    // How far apart, in tiles: what tells a wrong setting from a drift.
+    let apart: usize = differing.iter().map(|d| d.1.abs_diff(d.2)).sum();
     Err(format!(
-        "REBAKE-DIFFERS {} of {} frames do not draw what the old pack drew",
+        "REBAKE-DIFFERS {} of {} frames do not draw what the old pack drew (tiles apart {apart})",
         differing.len(),
-        old.selection.len()
+        new.selection.len()
     ))
 }
 
@@ -815,7 +829,13 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
             let first = old.poses.first().copied().ok_or("the old pack holds no frame")?;
             poses.resize(old.first as usize - 1, first);
             poses.extend(old.poses.iter().copied());
-            (args.first, args.last, args.viewport) = (old.first, old.last, old.viewport);
+            // All of the old pack's frames, or the part of them asked for.
+            (args.first, args.last) = if args.frames_given {
+                (args.first.max(old.first), args.last.min(old.last))
+            } else {
+                (old.first, old.last)
+            };
+            args.viewport = old.viewport;
         }
         None => {
             let mut tape = tuile_tape::Tape::replaying(&args.tape)
@@ -964,7 +984,13 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
     println!("BAKE-KEY packs/{scene}{kind}/{}-{wanted}.tuilepack", args.first);
     // A re-bake answers for the pack it replaces only if it is the same plan.
     if let Some(old) = &old {
-        same_plan(old, &args.out)?;
+        match same_plan(old, &args.out) {
+            Ok(()) => {}
+            // Said, and written anyway: today's selection of the same shot,
+            // which is what was asked for.
+            Err(differs) if args.accept_drift => println!("{differs} — accepted"),
+            Err(differs) => return Err(differs),
+        }
     }
     Ok(())
 }
@@ -1138,13 +1164,24 @@ fn diff(a_path: &std::path::Path, b_path: &std::path::Path) -> Result<(), String
         if ids_a != ids_b {
             let set_a: std::collections::BTreeSet<_> = ids_a.iter().collect();
             let set_b: std::collections::BTreeSet<_> = ids_b.iter().collect();
+            // By terrain level, because that is what tells a selection that
+            // refined further from one that picked other ground.
+            let levels = |only: Vec<&&u64>| {
+                let mut by_level = std::collections::BTreeMap::<u32, usize>::new();
+                for id in only {
+                    *by_level
+                        .entry(tuile_core::source::TileId(**id).terrain_coord().0)
+                        .or_default() += 1;
+                }
+                by_level
+            };
             println!(
-                "  frame {number}: SELECTION differs — {} vs {} tiles, {} only in \
-                 the first, {} only in the second",
+                "  frame {number}: SELECTION differs — {} vs {} tiles; only in the \
+                 first, by level {:?}; only in the second {:?}",
                 ids_a.len(),
                 ids_b.len(),
-                set_a.difference(&set_b).count(),
-                set_b.difference(&set_a).count()
+                levels(set_a.difference(&set_b).collect()),
+                levels(set_b.difference(&set_a).collect()),
             );
             continue;
         }
@@ -1161,7 +1198,14 @@ fn diff(a_path: &std::path::Path, b_path: &std::path::Path) -> Result<(), String
             );
             continue;
         }
-        // Same ground, same draping: anything left is the bytes themselves.
+        // Same ground, same draping: anything left is the bytes themselves —
+        // where both packs carry any.
+        if a.content() == tuile_pack::Content::References
+            || b.content() == tuile_pack::Content::References
+        {
+            same += 1;
+            continue;
+        }
         let mut bytes_differ = 0usize;
         for (x, y) in ta.iter().zip(tb.iter()) {
             if a.baked(x).map_err(|e| e.to_string())? != b.baked(y).map_err(|e| e.to_string())? {
