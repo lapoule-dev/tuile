@@ -13,6 +13,8 @@
 //! parameter sets, so every slice's `avcC` is checked against the first and a
 //! mismatch is an error, never a film that turns to garbage half-way.
 
+mod av1;
+
 use std::io::Cursor;
 
 use mp4::{AvcConfig, MediaConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig, TrackType};
@@ -21,6 +23,8 @@ use mp4::{AvcConfig, MediaConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig, 
 pub enum Mp4Error {
     #[error("not an avcC record: {0}")]
     BadAvcc(&'static str),
+    #[error("not an av1C record: {0}")]
+    BadAv1c(&'static str),
     #[error("{0} differs from the first slice's: not the same encode")]
     Mismatch(&'static str),
     #[error("frame {0} arrived out of order (expected {1})")]
@@ -113,12 +117,26 @@ pub fn nal_units(stream: &[u8]) -> Vec<&[u8]> {
     units
 }
 
-/// One film being written: a single H.264 track at a constant frame rate.
+/// What a film is encoded with, and what its track header needs to say so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Codec {
+    /// H.264, with the parameter sets of the encoder's `avcC`.
+    Avc(ParameterSets),
+    /// AV1, with its `av1C` record.
+    Av1(Vec<u8>),
+}
+
+enum Writer {
+    Avc(Mp4Writer<Cursor<Vec<u8>>>, ParameterSets),
+    Av1(av1::Av1Writer),
+}
+
+/// One film being written: a single video track at a constant frame rate.
+///
+/// H.264 samples are length-prefixed access units; AV1 samples are temporal
+/// units as an encoder emits them.
 pub struct Muxer {
-    writer: Mp4Writer<Cursor<Vec<u8>>>,
-    sets: ParameterSets,
-    /// Ticks per frame, in a timescale of `fps × TICKS`.
-    duration: u32,
+    writer: Writer,
     next: u64,
 }
 
@@ -127,70 +145,88 @@ pub struct Muxer {
 const TICKS: u32 = 512;
 
 impl Muxer {
+    /// An H.264 film.
     pub fn new(width: u16, height: u16, fps: u32, sets: ParameterSets) -> Result<Self, Mp4Error> {
-        let brand = |s: &str| s.parse().map_err(Mp4Error::Mp4);
-        let config = Mp4Config {
-            major_brand: brand("isom")?,
-            minor_version: 512,
-            compatible_brands: vec![
-                brand("isom")?,
-                brand("iso2")?,
-                brand("avc1")?,
-                brand("mp41")?,
-            ],
-            timescale: 1000,
+        Self::with(width, height, fps, Codec::Avc(sets))
+    }
+
+    pub fn with(width: u16, height: u16, fps: u32, codec: Codec) -> Result<Self, Mp4Error> {
+        let writer = match codec {
+            Codec::Av1(config) => {
+                Writer::Av1(av1::Av1Writer::new(width, height, fps, TICKS, &config)?)
+            }
+            Codec::Avc(sets) => {
+                let brand = |s: &str| s.parse().map_err(Mp4Error::Mp4);
+                let config = Mp4Config {
+                    major_brand: brand("isom")?,
+                    minor_version: 512,
+                    compatible_brands: vec![
+                        brand("isom")?,
+                        brand("iso2")?,
+                        brand("avc1")?,
+                        brand("mp41")?,
+                    ],
+                    timescale: 1000,
+                };
+                let mut writer = Mp4Writer::write_start(Cursor::new(Vec::new()), &config)?;
+                writer.add_track(&TrackConfig {
+                    track_type: TrackType::Video,
+                    timescale: fps * TICKS,
+                    language: "und".into(),
+                    media_conf: MediaConfig::AvcConfig(AvcConfig {
+                        width,
+                        height,
+                        seq_param_set: sets.sps.clone(),
+                        pic_param_set: sets.pps.clone(),
+                    }),
+                })?;
+                Writer::Avc(writer, sets)
+            }
         };
-        let mut writer = Mp4Writer::write_start(Cursor::new(Vec::new()), &config)?;
-        writer.add_track(&TrackConfig {
-            track_type: TrackType::Video,
-            timescale: fps * TICKS,
-            language: "und".into(),
-            media_conf: MediaConfig::AvcConfig(AvcConfig {
-                width,
-                height,
-                seq_param_set: sets.sps.clone(),
-                pic_param_set: sets.pps.clone(),
-            }),
-        })?;
-        Ok(Self {
-            writer,
-            sets,
-            duration: TICKS,
-            next: 0,
-        })
+        Ok(Self { writer, next: 0 })
     }
 
-    /// Fails unless a slice encoded with `sets` can join this film.
-    pub fn check(&self, sets: &ParameterSets) -> Result<(), Mp4Error> {
-        if sets.sps != self.sets.sps {
-            return Err(Mp4Error::Mismatch("sequence parameter set"));
+    /// Fails unless a slice encoded as `codec` can join this film: the same
+    /// codec, configured the same.
+    pub fn check(&self, codec: &Codec) -> Result<(), Mp4Error> {
+        match (&self.writer, codec) {
+            (Writer::Avc(_, mine), Codec::Avc(sets)) if sets.sps != mine.sps => {
+                Err(Mp4Error::Mismatch("sequence parameter set"))
+            }
+            (Writer::Avc(_, mine), Codec::Avc(sets)) if sets.pps != mine.pps => {
+                Err(Mp4Error::Mismatch("picture parameter set"))
+            }
+            (Writer::Av1(mine), Codec::Av1(config)) if mine.config() != config.as_slice() => {
+                Err(Mp4Error::Mismatch("AV1 configuration record"))
+            }
+            (Writer::Avc(..), Codec::Avc(_)) | (Writer::Av1(_), Codec::Av1(_)) => Ok(()),
+            _ => Err(Mp4Error::Mismatch("codec")),
         }
-        if sets.pps != self.sets.pps {
-            return Err(Mp4Error::Mismatch("picture parameter set"));
-        }
-        Ok(())
     }
 
-    /// Appends frame `index` (counted from 0), length-prefixed. Frames must
-    /// arrive in order: there are no B-frames to reorder in what we encode,
-    /// and a gap is a lost frame, which must not pass silently.
-    pub fn push(&mut self, index: u64, avcc: Vec<u8>, key: bool) -> Result<(), Mp4Error> {
+    /// Appends frame `index` (counted from 0). Frames must arrive in order:
+    /// there are no B-frames to reorder in what we encode, and a gap is a
+    /// lost frame, which must not pass silently.
+    pub fn push(&mut self, index: u64, sample: Vec<u8>, key: bool) -> Result<(), Mp4Error> {
         if index != self.next {
             return Err(Mp4Error::OutOfOrder(index, self.next));
         }
         if index == 0 && !key {
             return Err(Mp4Error::NoKeyFrame);
         }
-        self.writer.write_sample(
-            1,
-            &Mp4Sample {
-                start_time: index * u64::from(self.duration),
-                duration: self.duration,
-                rendering_offset: 0,
-                is_sync: key,
-                bytes: avcc.into(),
-            },
-        )?;
+        match &mut self.writer {
+            Writer::Av1(writer) => writer.push(&sample, key),
+            Writer::Avc(writer, _) => writer.write_sample(
+                1,
+                &Mp4Sample {
+                    start_time: index * u64::from(TICKS),
+                    duration: TICKS,
+                    rendering_offset: 0,
+                    is_sync: key,
+                    bytes: sample.into(),
+                },
+            )?,
+        }
         self.next += 1;
         Ok(())
     }
@@ -200,9 +236,14 @@ impl Muxer {
         self.next
     }
 
-    pub fn finish(mut self) -> Result<Vec<u8>, Mp4Error> {
-        self.writer.write_end()?;
-        Ok(self.writer.into_writer().into_inner())
+    pub fn finish(self) -> Result<Vec<u8>, Mp4Error> {
+        match self.writer {
+            Writer::Av1(writer) => Ok(writer.finish()),
+            Writer::Avc(mut writer, _) => {
+                writer.write_end()?;
+                Ok(writer.into_writer().into_inner())
+            }
+        }
     }
 }
 
@@ -253,7 +294,15 @@ mod tests {
             sps: vec![0x67, 0x42],
             pps: PPS.to_vec(),
         };
-        assert!(matches!(m.check(&other), Err(Mp4Error::Mismatch(_))));
+        assert!(matches!(
+            m.check(&Codec::Avc(other)),
+            Err(Mp4Error::Mismatch(_))
+        ));
+        assert!(m.check(&Codec::Avc(sets.clone())).is_ok());
+        assert!(matches!(
+            m.check(&Codec::Av1(vec![0x81, 0, 0, 0])),
+            Err(Mp4Error::Mismatch("codec"))
+        ));
         let bytes = m.finish().expect("finish");
 
         let size = bytes.len() as u64;
@@ -274,5 +323,32 @@ mod tests {
             m.push(0, vec![], false),
             Err(Mp4Error::NoKeyFrame)
         ));
+    }
+}
+
+#[cfg(test)]
+mod av1_film {
+    use super::*;
+
+    #[test]
+    fn an_av1_film_keeps_the_same_rules() {
+        let record = vec![0x81, 0x05, 0x0c, 0x00];
+        let mut m = Muxer::with(640, 360, 30, Codec::Av1(record.clone())).expect("muxer");
+        assert!(matches!(
+            m.push(0, vec![0x32, 0x00], false),
+            Err(Mp4Error::NoKeyFrame)
+        ));
+        m.push(0, vec![0x12, 0x00, 0x0a, 0x00], true).expect("0");
+        assert!(matches!(
+            m.push(2, vec![], false),
+            Err(Mp4Error::OutOfOrder(2, 1))
+        ));
+        assert!(m.check(&Codec::Av1(record)).is_ok());
+        assert!(matches!(
+            m.check(&Codec::Av1(vec![0x81, 0x08, 0x0c, 0x00])),
+            Err(Mp4Error::Mismatch("AV1 configuration record"))
+        ));
+        assert_eq!(m.frames(), 1);
+        assert!(m.finish().expect("finish").len() > 100);
     }
 }
