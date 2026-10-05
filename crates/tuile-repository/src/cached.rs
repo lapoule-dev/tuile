@@ -123,6 +123,14 @@ impl Objects for Cached {
             )));
         }
         let chunks = covering(&range);
+        // Exactly one whole chunk — what an aligned reader asks for — is
+        // handed back as it is: no second copy of four megabytes.
+        if chunks.end - chunks.start == 1
+            && range.start == chunks.start * CHUNK
+            && range.end == ((chunks.start + 1) * CHUNK).min(size)
+        {
+            return self.chunk(key, size, chunks.start).await;
+        }
         let parts =
             futures_util::future::try_join_all(chunks.clone().map(|i| self.chunk(key, size, i)))
                 .await?;

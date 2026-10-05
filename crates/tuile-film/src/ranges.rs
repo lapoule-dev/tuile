@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use tuile_pack::{fb, Pack};
+
+use crate::{Cursor, FilmError};
 
 /// One read to make from the blob region, and which of the wanted spans it
 /// serves.
@@ -20,14 +23,23 @@ pub struct Fetch {
 /// more than a few kilobytes of bytes nobody asked for, and the bake writes
 /// tiles that entered together side by side, so a frame's newcomers mostly
 /// come back as one or two ranges.
-pub fn coalesce(spans: &[Range<u64>], gap: u64) -> Vec<Fetch> {
+///
+/// No read grows past `max` bytes by merging. A frame can bring in a hundred
+/// megabytes of tiles at once — the first of a film usually does — and one
+/// read of that size is more than a server will answer and more than a
+/// reader should hold: it is cut into several, each still whole tiles. A
+/// single span larger than `max` is its own read; it cannot be cut.
+pub fn coalesce(spans: &[Range<u64>], gap: u64, max: u64) -> Vec<Fetch> {
     let mut order: Vec<usize> = (0..spans.len()).collect();
     order.sort_by_key(|&i| spans[i].start);
     let mut out: Vec<Fetch> = Vec::new();
     for i in order {
         let span = &spans[i];
         match out.last_mut() {
-            Some(f) if span.start <= f.range.end.saturating_add(gap) => {
+            Some(f)
+                if span.start <= f.range.end.saturating_add(gap)
+                    && f.range.end.max(span.end) - f.range.start <= max =>
+            {
                 f.range.end = f.range.end.max(span.end);
                 f.serves.push(i);
             }
@@ -53,6 +65,7 @@ pub fn file_reads(
     blob_start: u64,
     tiles: &[fb::Tile<'_>],
     gap: u64,
+    max: u64,
 ) -> Vec<Fetch> {
     let spans: Vec<Range<u64>> = tiles
         .iter()
@@ -61,7 +74,40 @@ pub fn file_reads(
                 .map_or(0..0, |r| blob_start + r.start..blob_start + r.end)
         })
         .collect();
-    coalesce(&spans, gap)
+    coalesce(&spans, gap, max)
+}
+
+/// The fixed blocks of a pack's file that rendering `first..=last` reads,
+/// each with the last frame that reads it.
+///
+/// A renderer brings a frame's tiles in with [`file_reads`]; this walks the
+/// same frames and makes the same reads, so the blocks named here are
+/// exactly the ones the render will ask for — no more, which is what lets
+/// them all be fetched before the first frame, and no fewer. The last frame
+/// of each is when it can be let go.
+pub fn block_plan(
+    pack: &Pack<'_>,
+    blob_start: u64,
+    first: u32,
+    last: u32,
+    block: u64,
+    gap: u64,
+    max: u64,
+) -> Result<BTreeMap<u64, u32>, FilmError> {
+    let mut plan = BTreeMap::new();
+    let mut cursor = Cursor::new(pack, first, last)?;
+    while let Some(diff) = cursor.advance(pack) {
+        let diff = diff?;
+        for fetch in file_reads(pack, blob_start, &diff.enter, gap, max) {
+            if fetch.range.is_empty() {
+                continue;
+            }
+            for index in fetch.range.start / block..fetch.range.end.div_ceil(block) {
+                plan.insert(index, diff.frame);
+            }
+        }
+    }
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -70,6 +116,68 @@ mod tests {
     use crate::cursor::tests::three_frames;
     use crate::{texture, texture_of_span, Mesh};
 
+    /// A hundred megabytes of neighbours is not one read: no merged read
+    /// passes the cap, every span is still served whole by exactly one, and
+    /// a span bigger than the cap stands alone.
+    #[test]
+    fn no_read_grows_past_the_cap() {
+        let spans: Vec<Range<u64>> = (0..40).map(|i| i * 10..i * 10 + 10).collect();
+        let reads = coalesce(&spans, 100, 64);
+        assert!(reads.len() > 1);
+        for f in &reads {
+            assert!(f.range.end - f.range.start <= 64, "{:?}", f.range);
+            for &i in &f.serves {
+                assert!(f.range.start <= spans[i].start && spans[i].end <= f.range.end);
+            }
+        }
+        let mut served: Vec<usize> = reads.iter().flat_map(|f| f.serves.clone()).collect();
+        served.sort_unstable();
+        assert_eq!(
+            served,
+            (0..40).collect::<Vec<_>>(),
+            "each span in exactly one read"
+        );
+
+        let big = coalesce(&[0..10, 10..500, 500..510], 100, 64);
+        assert_eq!(
+            big.iter().map(|f| f.range.clone()).collect::<Vec<_>>(),
+            [0..10, 10..500, 500..510]
+        );
+    }
+
+    /// The plan names every block the render's own reads touch, and for
+    /// each the last frame that needs it.
+    #[test]
+    fn a_plan_names_the_blocks_a_render_reads_and_when_each_is_done() {
+        let bytes = three_frames();
+        let start = tuile_pack::blob_start(&bytes).expect("preamble");
+        let table = Pack::open_table(&bytes[..start as usize]).expect("table");
+        // Tiny blocks, so a small pack spans several.
+        let block = 16;
+        let plan = block_plan(&table, start, 10, 12, block, 0, u64::MAX).expect("plan");
+
+        let mut cursor = Cursor::new(&table, 10, 12).expect("cursor");
+        let mut touched: BTreeMap<u64, u32> = BTreeMap::new();
+        while let Some(diff) = cursor.advance(&table) {
+            let diff = diff.expect("diff");
+            for f in file_reads(&table, start, &diff.enter, 0, u64::MAX) {
+                for index in f.range.start / block..f.range.end.div_ceil(block) {
+                    touched.insert(index, diff.frame);
+                }
+            }
+        }
+        assert!(!plan.is_empty());
+        assert_eq!(plan, touched);
+        // Frame 12 brings a tile in, so something is still needed then, and
+        // nothing is needed outside the slice.
+        assert!(plan.values().any(|f| *f == 12));
+        assert!(plan.values().all(|f| (10..=12).contains(f)));
+        // A slice of one frame needs fewer blocks than the whole film.
+        let one = block_plan(&table, start, 11, 11, block, 0, u64::MAX).expect("plan");
+        assert!(one.len() <= plan.len());
+        assert!(one.values().all(|f| *f == 11));
+    }
+
     #[test]
     fn file_reads_bring_in_what_the_whole_pack_holds() {
         let bytes = three_frames();
@@ -77,7 +185,7 @@ mod tests {
         let start = tuile_pack::blob_start(&bytes).expect("preamble");
         let table = Pack::open_table(&bytes[..start as usize]).expect("table");
         let tiles = table.frame(11).expect("frame");
-        let reads = file_reads(&table, start, &tiles, 0);
+        let reads = file_reads(&table, start, &tiles, 0, u64::MAX);
         for f in &reads {
             let got = &bytes[f.range.start as usize..f.range.end as usize];
             for &i in &f.serves {
@@ -99,7 +207,7 @@ mod tests {
     #[test]
     fn neighbours_merge_and_strangers_do_not() {
         let spans = [100..200, 0..50, 210..300, 10_000..10_100];
-        let f = coalesce(&spans, 32);
+        let f = coalesce(&spans, 32, u64::MAX);
         assert_eq!(f.len(), 3);
         assert_eq!(
             f[0],

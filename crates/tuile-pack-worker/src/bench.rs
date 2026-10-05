@@ -190,6 +190,9 @@ fn respond(reply: Reply) -> Result<Response> {
     if let Some(etag) = &reply.etag {
         headers.set("etag", etag)?;
     }
+    if let Some(size) = reply.object_size {
+        headers.set("x-object-size", &size.to_string())?;
+    }
     if reply.ranged {
         headers.set("accept-ranges", "bytes")?;
     }
@@ -201,8 +204,16 @@ fn respond(reply: Reply) -> Result<Response> {
         .with_headers(headers))
 }
 
+/// Whether a path is a block of an object: `/api/p/<project>/b/<n>/<key>`.
+/// A block is a whole, immutable reply — the one kind the edge cache keeps.
+fn is_block(path: &str) -> bool {
+    path.strip_prefix("/api/p/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, rest)| rest.starts_with("b/"))
+}
+
 #[event(fetch)]
-pub async fn main(request: Request, env: Env, _ctx: Context) -> Result<Response> {
+pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> {
     let url = request.url()?;
     if !url.path().starts_with("/api/") {
         return env.assets("ASSETS")?.fetch_request(request).await;
@@ -210,12 +221,23 @@ pub async fn main(request: Request, env: Env, _ctx: Context) -> Result<Response>
     if request.method() != Method::Get {
         return Response::error("the API is read-only", 405);
     }
+    // A block that this point of presence has served before is served again
+    // from its cache, whole, without a line of this crate's logic running:
+    // no bucket, no chunk assembled, nothing held in memory.
+    let cacheable = is_block(url.path());
+    let cache = Cache::default();
+    let key = url.to_string();
+    if cacheable {
+        if let Ok(Some(hit)) = cache.get(&key, false).await {
+            return Ok(hit);
+        }
+    }
     let bench = match bench(&env) {
         Ok(b) => b,
         Err(e) => return Response::error(format!("misconfigured: {e}"), 500),
     };
     let range = request.headers().get("range")?;
-    match bench
+    let reply = match bench
         .get(
             url.path(),
             url.query().unwrap_or_default(),
@@ -223,7 +245,17 @@ pub async fn main(request: Request, env: Env, _ctx: Context) -> Result<Response>
         )
         .await
     {
-        Some(reply) => respond(reply),
-        None => Response::error("no such route", 404),
+        Some(reply) => reply,
+        None => return Response::error("no such route", 404),
+    };
+    let stored = cacheable && reply.status == 200;
+    let mut response = respond(reply)?;
+    if stored {
+        // Kept after the reply has gone: the client does not wait for it.
+        let copy = response.cloned()?;
+        ctx.wait_until(async move {
+            let _ = cache.put(&key, copy).await;
+        });
     }
+    Ok(response)
 }

@@ -62,6 +62,9 @@ fn respond(reply: Reply) -> Response {
     if let Some(Ok(v)) = reply.etag.as_deref().map(HeaderValue::from_str) {
         headers.insert(header::ETAG, v);
     }
+    if let Some(size) = reply.object_size {
+        headers.insert("x-object-size", HeaderValue::from(size));
+    }
     if reply.ranged {
         headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     }

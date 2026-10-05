@@ -30,4 +30,4 @@ mod worker;
 #[cfg(target_arch = "wasm32")]
 pub use soft::{SoftEncoder, SoftPacket};
 #[cfg(target_arch = "wasm32")]
-pub use worker::{FilmMuxer, FilmWorker, FrameStats, PackView};
+pub use worker::{FilmMuxer, FilmWorker, FrameStats, PackView, Preloaded};

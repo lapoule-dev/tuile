@@ -173,6 +173,50 @@ async fn the_routes_answer_as_documented() {
         404
     );
 
+    // Blocks: the object cut at fixed offsets, each a whole reply of its own.
+    let block = bench
+        .get(&format!("/api/p/engine/b/0/{key}"), "", None)
+        .await
+        .expect("reply");
+    assert_eq!(
+        block.status, 200,
+        "a block is a whole reply, not a partial one"
+    );
+    assert_eq!(
+        block.body.len() as u64,
+        size,
+        "this object fits in its first block"
+    );
+    assert_eq!(&block.body[..8], b"TUILEPK\0");
+    assert_eq!(block.object_size, Some(size));
+    assert_eq!(block.cache_control, "public, max-age=31536000, immutable");
+    assert!(block.content_range.is_none());
+    assert_ne!(block.etag, head.etag, "a block is not the object");
+    assert_eq!(
+        bench
+            .get(&format!("/api/p/engine/b/1/{key}"), "", None)
+            .await
+            .expect("reply")
+            .status,
+        404
+    );
+    assert_eq!(
+        bench
+            .get(&format!("/api/p/engine/b/x/{key}"), "", None)
+            .await
+            .expect("reply")
+            .status,
+        400
+    );
+    assert_eq!(
+        bench
+            .get("/api/p/engine/b/0/packs/../x", "", None)
+            .await
+            .expect("reply")
+            .status,
+        400
+    );
+
     // A key with a space, percent-encoded on the way in.
     let note = bench
         .get(

@@ -21,7 +21,7 @@ pub use camera::{FrameCamera, NEAR_FRACTION};
 pub use cursor::{Cursor, FilmError, FrameDiff, TileKey};
 pub use look::{Imagery, Look};
 pub use mesh::{texture, texture_of_span, Mesh};
-pub use ranges::{coalesce, file_reads, Fetch};
+pub use ranges::{block_plan, coalesce, file_reads, Fetch};
 pub use slice::slice;
 pub use survey::{cameras, frame_tiles, CameraSample, TileInfo};
 pub use tuile_pack::{blob_start, fb, BakedView, Fnv1a, Pack, PackError, PREAMBLE};

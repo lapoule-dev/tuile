@@ -14,7 +14,11 @@ import init, { FilmMuxer, PackView } from "./pkg/tuile_film_web.js";
 import { findEncoder } from "./encoder.js";
 
 const $ = (id) => document.getElementById(id);
+// Two lines, two subjects: `status` is the render's, and stays on the pack
+// being rendered whatever else is looked at meanwhile; `note` is about the
+// pack on screen.
 const status = (text, kind = "") => { $("status").textContent = text; $("status").className = kind; };
+const note = (text, kind = "") => { $("encoder-note").textContent = text; $("encoder-note").className = `note ${kind}`; };
 const mb = (bytes) => bytes >= 1e9 ? `${(bytes / 1e9).toFixed(2)} Go` : `${(bytes / 1e6).toFixed(0)} Mo`;
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
@@ -26,7 +30,9 @@ const get = async (path) => {
   if (!response.ok) throw new Error(`${path} : HTTP ${response.status} — ${await response.text()}`);
   return response.json();
 };
-const objectUrl = (project, key) => `${API}/p/${project}/o/${key}`;
+// A pack is read in the API's fixed blocks, each a URL of its own: `{block}`
+// is where the reader puts a block's number.
+const objectUrl = (project, key) => `${API}/p/${project}/b/{block}/${key}`;
 
 await init();
 
@@ -91,7 +97,8 @@ async function openProject(name) {
   opening++; filming++;
   retire(view);
   view = null; path = null; film = null;
-  for (const panel of ["film-panel", "camera-panel", "tiles-panel", "pack-panel"]) $(panel).hidden = true;
+  for (const panel of ["film-panel", "camera-panel", "tiles-panel"]) $(panel).hidden = true;
+  $("pack-panel").hidden = !job;
   project = name;
   for (const b of $("projects").children) b.setAttribute("aria-selected", b.textContent === name);
   const body = $("films").querySelector("tbody");
@@ -127,7 +134,8 @@ async function openFilm(id) {
   $("film-note").textContent = "Lecture de la scène (la plage de chaque pack est lue dans sa table)…";
   const body = $("chunks").querySelector("tbody");
   body.innerHTML = "";
-  for (const panel of ["camera-panel", "tiles-panel", "pack-panel"]) $(panel).hidden = true;
+  for (const panel of ["camera-panel", "tiles-panel"]) $(panel).hidden = true;
+  $("pack-panel").hidden = !job;
   // Leaving the previous scene: its view goes, and any pack still being
   // opened for it is disowned.
   opening++;
@@ -183,7 +191,7 @@ async function openFilm(id) {
   const at = named >= 0 ? named : 0;
   const frame = named >= 0 && wanted.frame ? Number(wanted.frame) : undefined;
   wanted = {};
-  status("Ouverture du pack…");
+  note("Ouverture du pack…");
   for (const r of rows) r.classList.toggle("on", r === rows[at]);
   rows[at].scrollIntoView({ block: "nearest" });
   openChunk(at, frame);
@@ -454,7 +462,7 @@ async function offerScales() {
     option.textContent = `${w}×${h}${scale === 1 ? " (viewport du pack)" : ""} — ${browser ? "H.264 du navigateur" : "AV1 logiciel, lent"}`;
   }
   $("scale").value = "1";
-  $("go").disabled = false;
+  $("go").disabled = rendering;
   describeEncoder();
 }
 
@@ -483,7 +491,7 @@ function describeEncoder() {
   $("workers").title = `${CORES} cœurs logiques détectés ; ${suggestedWorkers(encoder)} workers proposés pour cet encodeur`;
   const about = `${film.id} : viewport ${view.width}×${view.height}, table de ${(view.table_bytes / 1e6).toFixed(2)} Mo lue pour ce pack (${view.tiles} tuiles).`;
   const soft = $("scale").selectedOptions[0].dataset.encoder === "rav1e";
-  status(soft
+  note(soft
     ? `${about} Le navigateur n'a pas d'encodeur H.264 à cette taille : repli sur rav1e (AV1 en WebAssembly), de l'ordre de la seconde par image et par worker. Une taille plus petite passe par l'encodeur du navigateur.`
     : about, soft ? "" : "good");
 }
@@ -499,10 +507,37 @@ function slices(first, last, parts) {
 
 // What a slice of the film has to read: each pack it crosses, with the frames
 // of that pack the slice wants.
-function crossing(first, last) {
-  return film.chunks
+function crossing(of, first, last) {
+  return of.film.chunks
     .filter((c) => c.last >= first && c.first <= last)
-    .map((c) => ({ source: objectUrl(project, c.key), first: Math.max(first, c.first), last: Math.min(last, c.last) }));
+    .map((c) => ({ source: objectUrl(of.project, c.key), first: Math.max(first, c.first), last: Math.min(last, c.last) }));
+}
+
+// The render in hand, or the last one made: what it was asked of, frozen at
+// the click. The page goes on to other packs; a render and the film it
+// leaves keep naming the one they are of.
+let job = null;
+let rendering = false;
+
+// Where a job's pack is, as a link that reopens it.
+function linkTo(of) {
+  const q = new URLSearchParams();
+  if (query.get("api")) q.set("api", query.get("api"));
+  q.set("project", of.project);
+  q.set("film", of.film.id);
+  if (of.packs.length === 1) q.set("pack", of.packs[0]);
+  const a = document.createElement("a");
+  a.href = `${location.pathname}?${q}`;
+  a.textContent = of.packs.length === 1 ? `${of.project} / ${of.film.id} / ${of.packs[0]}` : `${of.project} / ${of.film.id} (${of.packs.length} packs)`;
+  return a;
+}
+
+// How much of this machine's memory the workers may hold blocks in, each.
+// A browser says how much memory there is only roughly, and never more than
+// eight gigabytes: four tenths of that, shared, a gigabyte and a half at most.
+function blockBudget(workers) {
+  const total = (navigator.deviceMemory ?? 4) * 0.4 * 2 ** 30;
+  return Math.min(1.5 * 2 ** 30, total / workers);
 }
 
 const even8 = (x) => Math.max(8, Math.round(x / 8) * 8);
@@ -525,20 +560,30 @@ function renderStats(totals, frames, wall) {
 }
 
 $("go").addEventListener("click", async () => {
-  if (!view || !film) return;
+  if (!view || !film || rendering) return;
   const first = Number($("first").value), last = Number($("last").value);
   const fps = Number($("fps").value), bitrate = Number($("mbps").value) * 1e6;
   const scale = Number($("scale").value), supersample = Number($("ss").value);
   const width = even8(view.width * scale), height = even8(view.height * scale);
+  const of = { project, film };
   // A film with a hole between two packs cannot be one contiguous mp4.
-  const covered = crossing(first, last);
+  const covered = crossing(of, first, last);
   const frames = covered.reduce((s, c) => s + c.last - c.first + 1, 0);
   if (frames !== last - first + 1) {
     status(`Les frames ${first}–${last} ne sont pas toutes dans un pack (${frames} sur ${last - first + 1}).`, "bad");
     return;
   }
   const parts = slices(first, last, Number($("workers").value));
+  const encoder = $("scale").selectedOptions[0].dataset.encoder === "rav1e" ? "AV1 (rav1e)" : "H.264";
+  job = {
+    ...of, first, last, width, height, supersample, fps,
+    packs: film.chunks.filter((c) => c.last >= first && c.first <= last).map((c) => c.key.slice(film.id.length + 1)),
+  };
+  const about = `frames ${first}–${last}, ${width}×${height}, ${supersample * supersample} éch./pixel, ${fps} images/s, ${encoder}, ${parts.length} workers`;
+  $("job").replaceChildren("Rendu de ", linkTo(job), ` — ${about}`);
+  $("job").hidden = false;
 
+  rendering = true;
   $("go").disabled = true;
   $("result").hidden = true;
   $("progress").value = 0;
@@ -553,10 +598,16 @@ $("go").addEventListener("click", async () => {
   });
 
   const totals = { fetch: 0, unpack: 0, decode: 0, upload: 0, record: 0, next: 0, encode: 0 };
+  const ahead = parts.map(() => ({ done: 0, total: 0, bytes: 0, inMemory: true, finished: false }));
   let done = 0;
   bytes = 0; requests = 0;
   const started = performance.now();
-  status(`${parts.length} workers, ${width}×${height}, ${supersample * supersample} échantillons/pixel, ${covered.length} pack${covered.length > 1 ? "s" : ""}…`);
+  const budget = blockBudget(parts.length);
+  status("Préchargement des blocs…");
+  const preloading = () => {
+    const d = ahead.reduce((s, a) => s + a.done, 0), t = ahead.reduce((s, a) => s + a.total, 0);
+    if (done === 0) status(`Préchargement : ${d} blocs sur ${t} (${(d * 4).toFixed(0)} Mo sur ${(t * 4).toFixed(0)})…`);
+  };
 
   let results;
   const workers = [];
@@ -565,9 +616,13 @@ $("go").addEventListener("click", async () => {
       const w = new Worker(new URL("./film-worker.js", import.meta.url), { type: "module" });
       workers.push(w);
       w.onmessage = ({ data }) => {
-        if (data.type === "frame") {
+        if (data.type === "preload") {
+          Object.assign(ahead[id], data);
+          preloading();
+        } else if (data.type === "frame") {
           for (const k in totals) totals[k] += data[k];
           bytes += data.fetchedBytes; requests += data.requests;
+          if (done === 0) status(`Rendu… blocs préchargés ${ahead.every((x) => x.inMemory) ? "en mémoire WebAssembly" : "dans le cache du navigateur (trop pour la mémoire allouée)"}.`);
           done++;
           $("progress").value = done;
           if (data.preview) { contexts[id].drawImage(data.preview, 0, 0, contexts[id].canvas.width, contexts[id].canvas.height); data.preview.close(); }
@@ -579,17 +634,19 @@ $("go").addEventListener("click", async () => {
         }
       };
       w.onerror = (e) => reject(new Error(`worker ${id} : ${e.message}`));
-      w.postMessage({ id, packs: crossing(a, b), filmFirst: first, width, height, supersample, fps, bitrate });
+      w.postMessage({ id, packs: crossing(of, a, b), filmFirst: first, width, height, supersample, fps, bitrate, budget });
     })));
   } catch (e) {
     workers.forEach((w) => w.terminate());
     status(e.message, "bad");
-    $("go").disabled = false;
+    rendering = false;
+    $("go").disabled = !view;
     return;
   }
   workers.forEach((w) => w.terminate());
   const wall = (performance.now() - started) / 1000;
   renderStats(totals, done, wall);
+  const loaded = ahead.reduce((s, a) => s + a.bytes, 0);
 
   try {
     const muxer = new FilmMuxer(width, height, fps, results[0].record);
@@ -602,14 +659,17 @@ $("go").addEventListener("click", async () => {
     const url = URL.createObjectURL(new Blob([mp4], { type: "video/mp4" }));
     $("video").src = url;
     $("download").href = url;
-    $("download").download = `film-${film.id.replaceAll("/", "-")}-${first}-${last}-${width}x${height}-ss${supersample}.mp4`;
+    $("download").download = `${job.project}-${job.film.id.replaceAll("/", "-")}-${first}-${last}-${width}x${height}-ss${supersample}.mp4`;
     $("summary").textContent = `${count} images, ${(mp4.length / 1e6).toFixed(1)} Mo, ${results[0].codec}`;
+    // The film says what it is of: the pack, by a link that reopens it.
+    $("video-source").replaceChildren("Généré depuis ", linkTo(job), ` — ${about}.`);
     $("result").hidden = false;
-    status(`Terminé : ${count} images en ${wall.toFixed(1)} s (${(count / wall).toFixed(1)} images/s).`, "good");
+    status(`Terminé : ${count} images en ${wall.toFixed(1)} s (${(count / wall).toFixed(1)} images/s), ${(loaded / 1e6).toFixed(0)} Mo préchargés.`, "good");
   } catch (e) {
     status(`Assemblage refusé : ${e.message ?? e}`, "bad");
   }
-  $("go").disabled = false;
+  rendering = false;
+  $("go").disabled = !view;
 });
 
 if (!("gpu" in navigator)) status("Ce navigateur n'expose pas WebGPU : consultation seule.", "bad");

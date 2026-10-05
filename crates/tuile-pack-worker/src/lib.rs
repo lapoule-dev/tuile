@@ -11,12 +11,13 @@
 //! the edge cache as a place to keep chunks, and the translation of a
 //! request and a reply.
 //!
-//! **A byte is read from a bucket once.** Every object goes through
-//! `Cached`: it is read in fixed chunks, each kept in the edge cache, and a
-//! ranged request is answered from the chunks that cover it — a 206 cut from
-//! what is already at the edge. Replies carry a validator and are immutable,
-//! so a browser keeps the ranges it has read and asks for none of them
-//! twice either.
+//! **A byte is read from a bucket once.** A pack's reader asks for its
+//! fixed blocks, each a URL of its own answered whole and immutable. The
+//! reply to a block is kept in the edge cache under that URL and served
+//! from there to whoever asks next, before any of this crate's logic runs;
+//! a browser keeps it too, as it keeps any file. Behind that, every object
+//! goes through `Cached`, so the tables the repositories read and the odd
+//! ranged request are cut from chunks the edge already holds.
 //!
 //! Configuration, all of it from the environment:
 //!

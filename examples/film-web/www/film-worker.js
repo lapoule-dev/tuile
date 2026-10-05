@@ -91,7 +91,7 @@ function softEncoder(width, height, fps, bitrate) {
 }
 
 self.onmessage = async ({ data }) => {
-  const { id, packs, filmFirst, width, height, supersample, fps, bitrate } = data;
+  const { id, packs, filmFirst, width, height, supersample, fps, bitrate, budget } = data;
   try {
     await init();
     const canvas = new OffscreenCanvas(width, height);
@@ -99,6 +99,7 @@ self.onmessage = async ({ data }) => {
     const encoder = config ? browserEncoder(config, fps) : softEncoder(width, height, fps, bitrate);
 
     const started = performance.now();
+    const loaded = { blocks: 0, bytes: 0, inMemory: true };
     let n = 0;
     // This worker's slice of the film, pack by pack. A pack shares nothing
     // with the next — its own tiles, its own imagery — so each gets its own
@@ -107,6 +108,18 @@ self.onmessage = async ({ data }) => {
     for (const pack of packs) {
       const film = await FilmWorker.create(canvas, pack.source, pack.first, pack.last, supersample);
       encoder.prepare(film);
+      // Every block this slice of the pack reads, fetched before its first
+      // frame: rendering then waits on no network. Held in the module's
+      // memory when they fit the budget, left to the browser's cache when
+      // they do not.
+      const ahead = await film.preload(budget, (done, total) => {
+        if (done === total || done % 4 === 0) post({ type: "preload", id, done: loaded.blocks + done, total: loaded.blocks + total });
+      });
+      loaded.blocks += ahead.blocks;
+      loaded.bytes += ahead.bytes;
+      loaded.inMemory &&= ahead.in_memory;
+      ahead.free();
+      post({ type: "preload", id, done: loaded.blocks, total: loaded.blocks, bytes: loaded.bytes, inMemory: loaded.inMemory });
       for (;;) {
         const t0 = performance.now();
         const stats = await film.next();
