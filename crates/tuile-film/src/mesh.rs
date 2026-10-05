@@ -20,8 +20,26 @@ pub struct Mesh {
 
 impl Mesh {
     pub fn of(pack: &Pack<'_>, tile: &fb::Tile<'_>) -> Result<Self, PackError> {
+        Self::read(tile, |b, what| pack.payload(b, what))
+    }
+
+    /// The mesh out of a fetched span of the blob region: `bytes` start at
+    /// blob offset `at` (see `Pack::span_of`).
+    pub fn of_span(
+        pack: &Pack<'_>,
+        tile: &fb::Tile<'_>,
+        at: u64,
+        bytes: &[u8],
+    ) -> Result<Self, PackError> {
+        Self::read(tile, |b, what| pack.payload_in(b, at, bytes, what))
+    }
+
+    fn read(
+        tile: &fb::Tile<'_>,
+        payload: impl Fn(&fb::Block, &'static str) -> Result<Vec<u8>, PackError>,
+    ) -> Result<Self, PackError> {
         let block = |b: Option<&fb::Block>, what| match b {
-            Some(b) => pack.payload(b, what),
+            Some(b) => payload(b, what),
             None => Ok(Vec::new()),
         };
         let origin_ecef = match tile.origin_ecef() {
@@ -42,6 +60,20 @@ impl Mesh {
             base_color_factor,
         })
     }
+}
+
+/// [`texture`], out of a fetched span of the blob region.
+pub fn texture_of_span(
+    pack: &Pack<'_>,
+    tile: &fb::Tile<'_>,
+    at: u64,
+    bytes: &[u8],
+) -> Result<Option<Vec<u8>>, PackError> {
+    if tile.texture_format() == TextureFormat::None {
+        return Ok(None);
+    }
+    let bytes = pack.texture_in(tile, at, bytes)?;
+    Ok((!bytes.is_empty()).then_some(bytes))
 }
 
 /// The tile's encoded texture (a PNG), or `None` when it has none.
