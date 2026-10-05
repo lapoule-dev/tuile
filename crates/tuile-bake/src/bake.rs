@@ -358,6 +358,7 @@ pub fn baked_tile(frame: &Frame, index: usize, tile: &Arc<TileGeometry>) -> Resu
         index_count: mesh.indices.len() as u32,
         base_color_factor: mesh.material.base_color_factor,
         texture_format: if texture.is_some() { TextureFormat::Png } else { TextureFormat::None },
+        refs: None,
         texture: texture.map(|t| t.png.clone()),
     })
 }

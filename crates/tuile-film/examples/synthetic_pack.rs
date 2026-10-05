@@ -98,6 +98,7 @@ fn tile(centre: DVec3, enu: glam::DMat3, i: i32, j: i32, drape: u64) -> BakedTil
         base_color_factor: [1.0; 4],
         texture: Some(texture(i, j, drape)),
         texture_format: TextureFormat::Png,
+        refs: None,
     }
 }
 

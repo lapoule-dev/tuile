@@ -6,8 +6,8 @@ use futures_util::future::try_join_all;
 use futures_util::stream::{self, StreamExt};
 use js_sys::{Array, Uint8Array};
 use tuile_film::{
-    block_plan, cameras, file_reads, frame_tiles, texture_of_span, Cursor, FrameCamera, Look, Mesh,
-    Pack, TileKey,
+    block_plan, cameras, file_reads, frame_tiles, texture_of_span, Content, Cursor, FrameCamera,
+    Look, Mesh, Pack, TileKey,
 };
 use tuile_film_gpu::{FilmGpu, Settings, TileMesh, OUTPUT_FORMAT};
 use tuile_mp4::{Codec, Muxer, ParameterSets};
@@ -288,6 +288,15 @@ impl FilmWorker {
         let head = source.head().await?;
         let cursor = {
             let opened = Pack::open_table(&head).map_err(js)?;
+            // A pack of references embeds nothing to render from. Reading
+            // its tiles in the store is the next step; until then it is
+            // refused here, by name, rather than read as an empty film.
+            if opened.content() == Content::References {
+                return Err(js(
+                    "this pack holds references into the tile store and no payload; \
+                     rendering from the store is not built yet",
+                ));
+            }
             Cursor::new(&opened, first, last).map_err(js)?
         };
         let (width, height) = (canvas.width(), canvas.height());

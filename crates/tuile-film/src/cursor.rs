@@ -164,6 +164,7 @@ pub(crate) mod tests {
             base_color_factor: [1.0; 4],
             texture: None,
             texture_format: TextureFormat::None,
+            refs: None,
         }
     }
 

@@ -32,6 +32,7 @@ fn tile(id: u64) -> BakedTile {
         base_color_factor: [1.0; 4],
         texture: None,
         texture_format: TextureFormat::None,
+        refs: None,
     }
 }
 

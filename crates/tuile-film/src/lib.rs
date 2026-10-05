@@ -24,4 +24,7 @@ pub use mesh::{texture, texture_of_span, Mesh};
 pub use ranges::{block_plan, coalesce, file_reads, Fetch};
 pub use slice::slice;
 pub use survey::{cameras, frame_tiles, CameraSample, TileInfo};
-pub use tuile_pack::{blob_start, fb, BakedView, Fnv1a, Pack, PackError, PREAMBLE};
+pub use tuile_pack::{
+    blob_start, fb, refs_of, BakedView, Content, Fnv1a, ImageryPlacement, Pack, PackError,
+    StoreTile, TileRefs, PREAMBLE,
+};

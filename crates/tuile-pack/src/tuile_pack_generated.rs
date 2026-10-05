@@ -94,6 +94,104 @@ impl<'a> ::flatbuffers::Verifiable for TextureFormat {
 }
 
 impl ::flatbuffers::SimpleToVerifyInSlice for TextureFormat {}
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MIN_CONTENT: i8 = 0;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MAX_CONTENT: i8 = 2;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+#[allow(non_camel_case_types)]
+pub const ENUM_VALUES_CONTENT: [Content; 3] = [
+  Content::Embedded,
+  Content::References,
+  Content::Both,
+];
+
+/// What a pack carries for its tiles.
+///
+/// A pack was first everything a render needs. It can now be the plan alone:
+/// which tiles each frame draws and where each comes from, the bytes staying
+/// in the tile store they were read from at the bake. This says which, so
+/// that no reader has to infer it from what happens to be present.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct Content(pub i8);
+#[allow(non_upper_case_globals)]
+impl Content {
+  /// The finished meshes and composed textures, in the blob region.
+  pub const Embedded: Self = Self(0);
+  /// References to the tile store's tiles; no payload.
+  pub const References: Self = Self(1);
+  /// Both: one pack that renders either way, which is how the two ways are
+  /// compared.
+  pub const Both: Self = Self(2);
+
+  pub const ENUM_MIN: i8 = 0;
+  pub const ENUM_MAX: i8 = 2;
+  pub const ENUM_VALUES: &'static [Self] = &[
+    Self::Embedded,
+    Self::References,
+    Self::Both,
+  ];
+  /// Returns the variant's name or "" if unknown.
+  pub fn variant_name(self) -> Option<&'static str> {
+    match self {
+      Self::Embedded => Some("Embedded"),
+      Self::References => Some("References"),
+      Self::Both => Some("Both"),
+      _ => None,
+    }
+  }
+}
+impl ::core::fmt::Debug for Content {
+  fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+    if let Some(name) = self.variant_name() {
+      f.write_str(name)
+    } else {
+      f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
+    }
+  }
+}
+impl<'a> ::flatbuffers::Follow<'a> for Content {
+  type Inner = Self;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    let b = unsafe { ::flatbuffers::read_scalar_at::<i8>(buf, loc) };
+    Self(b)
+  }
+}
+
+impl ::flatbuffers::Push for Content {
+    type Output = Content;
+    #[inline]
+    unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
+        unsafe { ::flatbuffers::emplace_scalar::<i8>(dst, self.0) };
+    }
+}
+
+impl ::flatbuffers::EndianScalar for Content {
+  type Scalar = i8;
+  #[inline]
+  fn to_little_endian(self) -> i8 {
+    self.0.to_le()
+  }
+  #[inline]
+  #[allow(clippy::wrong_self_convention)]
+  fn from_little_endian(v: i8) -> Self {
+    let b = i8::from_le(v);
+    Self(b)
+  }
+}
+
+impl<'a> ::flatbuffers::Verifiable for Content {
+  #[inline]
+  fn run_verifier(
+    v: &mut ::flatbuffers::Verifier, pos: usize
+  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+    i8::run_verifier(v, pos)
+  }
+}
+
+impl ::flatbuffers::SimpleToVerifyInSlice for Content {}
 /// One payload in the blob region that follows the table.
 ///
 /// Compression and zero-copy do not contradict each other once they are
@@ -257,6 +355,658 @@ impl<'a> Block {
         &x_le as *const _ as *const u8,
         self.0[12..].as_mut_ptr(),
         ::core::mem::size_of::<<u32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+}
+
+/// The terrain tile a mesh was built from, in the store's terrain layer.
+///
+/// Not necessarily the tile that was asked for: where the source has no tile
+/// at a level, the mesh is cut from the nearest ancestor that exists, and
+/// this names that ancestor. `Tile.id` remains the tile drawn.
+// struct TerrainRef, aligned to 8
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq)]
+pub struct TerrainRef(pub [u8; 24]);
+impl Default for TerrainRef { 
+  fn default() -> Self { 
+    Self([0; 24])
+  }
+}
+impl ::core::fmt::Debug for TerrainRef {
+  fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+    f.debug_struct("TerrainRef")
+      .field("x", &self.x())
+      .field("y", &self.y())
+      .field("level", &self.level())
+      .field("digest", &self.digest())
+      .finish()
+  }
+}
+
+impl ::flatbuffers::SimpleToVerifyInSlice for TerrainRef {}
+impl<'a> ::flatbuffers::Follow<'a> for TerrainRef {
+  type Inner = &'a TerrainRef;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    unsafe { <&'a TerrainRef>::follow(buf, loc) }
+  }
+}
+impl<'a> ::flatbuffers::Follow<'a> for &'a TerrainRef {
+  type Inner = &'a TerrainRef;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    unsafe { ::flatbuffers::follow_cast_ref::<TerrainRef>(buf, loc) }
+  }
+}
+impl<'b> ::flatbuffers::Push for TerrainRef {
+    type Output = TerrainRef;
+    #[inline]
+    unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
+        let src = unsafe { ::core::slice::from_raw_parts(self as *const TerrainRef as *const u8, <Self as ::flatbuffers::Push>::size()) };
+        dst.copy_from_slice(src);
+    }
+    #[inline]
+    fn alignment() -> ::flatbuffers::PushAlignment {
+        ::flatbuffers::PushAlignment::new(8)
+    }
+}
+
+impl<'a> ::flatbuffers::Verifiable for TerrainRef {
+  #[inline]
+  fn run_verifier(
+    v: &mut ::flatbuffers::Verifier, pos: usize
+  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+    v.in_buffer::<Self>(pos)
+  }
+}
+
+impl<'a> TerrainRef {
+  #[allow(clippy::too_many_arguments)]
+  pub fn new(
+    x: u32,
+    y: u32,
+    level: u8,
+    digest: u64,
+  ) -> Self {
+    let mut s = Self([0; 24]);
+    s.set_x(x);
+    s.set_y(y);
+    s.set_level(level);
+    s.set_digest(digest);
+    s
+  }
+
+  pub fn x(&self) -> u32 {
+    let mut mem = ::core::mem::MaybeUninit::<<u32 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[0..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<u32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_x(&mut self, x: u32) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[0..].as_mut_ptr(),
+        ::core::mem::size_of::<<u32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn y(&self) -> u32 {
+    let mut mem = ::core::mem::MaybeUninit::<<u32 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[4..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<u32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_y(&mut self, x: u32) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[4..].as_mut_ptr(),
+        ::core::mem::size_of::<<u32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn level(&self) -> u8 {
+    let mut mem = ::core::mem::MaybeUninit::<<u8 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[8..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<u8 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_level(&mut self, x: u8) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[8..].as_mut_ptr(),
+        ::core::mem::size_of::<<u8 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  /// FNV-1a of the tile's bytes as the store held them at the bake. A store
+  /// is alive — a tile is fetched again when it expires — and this is how a
+  /// render knows it is no longer looking at what was baked.
+  pub fn digest(&self) -> u64 {
+    let mut mem = ::core::mem::MaybeUninit::<<u64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[16..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<u64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_digest(&mut self, x: u64) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[16..].as_mut_ptr(),
+        ::core::mem::size_of::<<u64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+}
+
+/// One imagery tile of a drape and where it lies on the terrain tile: what
+/// the composition of the texture needs, in the order it is stacked.
+// struct ImageryRef, aligned to 8
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq)]
+pub struct ImageryRef(pub [u8; 56]);
+impl Default for ImageryRef { 
+  fn default() -> Self { 
+    Self([0; 56])
+  }
+}
+impl ::core::fmt::Debug for ImageryRef {
+  fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+    f.debug_struct("ImageryRef")
+      .field("x", &self.x())
+      .field("y", &self.y())
+      .field("level", &self.level())
+      .field("cover_w", &self.cover_w())
+      .field("cover_s", &self.cover_s())
+      .field("cover_e", &self.cover_e())
+      .field("cover_n", &self.cover_n())
+      .field("translate_u", &self.translate_u())
+      .field("translate_v", &self.translate_v())
+      .field("scale_u", &self.scale_u())
+      .field("scale_v", &self.scale_v())
+      .field("digest", &self.digest())
+      .finish()
+  }
+}
+
+impl ::flatbuffers::SimpleToVerifyInSlice for ImageryRef {}
+impl<'a> ::flatbuffers::Follow<'a> for ImageryRef {
+  type Inner = &'a ImageryRef;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    unsafe { <&'a ImageryRef>::follow(buf, loc) }
+  }
+}
+impl<'a> ::flatbuffers::Follow<'a> for &'a ImageryRef {
+  type Inner = &'a ImageryRef;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    unsafe { ::flatbuffers::follow_cast_ref::<ImageryRef>(buf, loc) }
+  }
+}
+impl<'b> ::flatbuffers::Push for ImageryRef {
+    type Output = ImageryRef;
+    #[inline]
+    unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
+        let src = unsafe { ::core::slice::from_raw_parts(self as *const ImageryRef as *const u8, <Self as ::flatbuffers::Push>::size()) };
+        dst.copy_from_slice(src);
+    }
+    #[inline]
+    fn alignment() -> ::flatbuffers::PushAlignment {
+        ::flatbuffers::PushAlignment::new(8)
+    }
+}
+
+impl<'a> ::flatbuffers::Verifiable for ImageryRef {
+  #[inline]
+  fn run_verifier(
+    v: &mut ::flatbuffers::Verifier, pos: usize
+  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+    v.in_buffer::<Self>(pos)
+  }
+}
+
+impl<'a> ImageryRef {
+  #[allow(clippy::too_many_arguments)]
+  pub fn new(
+    x: u32,
+    y: u32,
+    level: u8,
+    cover_w: f32,
+    cover_s: f32,
+    cover_e: f32,
+    cover_n: f32,
+    translate_u: f32,
+    translate_v: f32,
+    scale_u: f32,
+    scale_v: f32,
+    digest: u64,
+  ) -> Self {
+    let mut s = Self([0; 56]);
+    s.set_x(x);
+    s.set_y(y);
+    s.set_level(level);
+    s.set_cover_w(cover_w);
+    s.set_cover_s(cover_s);
+    s.set_cover_e(cover_e);
+    s.set_cover_n(cover_n);
+    s.set_translate_u(translate_u);
+    s.set_translate_v(translate_v);
+    s.set_scale_u(scale_u);
+    s.set_scale_v(scale_v);
+    s.set_digest(digest);
+    s
+  }
+
+  pub fn x(&self) -> u32 {
+    let mut mem = ::core::mem::MaybeUninit::<<u32 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[0..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<u32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_x(&mut self, x: u32) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[0..].as_mut_ptr(),
+        ::core::mem::size_of::<<u32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn y(&self) -> u32 {
+    let mut mem = ::core::mem::MaybeUninit::<<u32 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[4..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<u32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_y(&mut self, x: u32) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[4..].as_mut_ptr(),
+        ::core::mem::size_of::<<u32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn level(&self) -> u8 {
+    let mut mem = ::core::mem::MaybeUninit::<<u8 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[8..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<u8 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_level(&mut self, x: u8) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[8..].as_mut_ptr(),
+        ::core::mem::size_of::<<u8 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  /// The part of the terrain tile's uv this imagery tile covers:
+  /// west, south, east, north.
+  pub fn cover_w(&self) -> f32 {
+    let mut mem = ::core::mem::MaybeUninit::<<f32 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[12..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_cover_w(&mut self, x: f32) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[12..].as_mut_ptr(),
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn cover_s(&self) -> f32 {
+    let mut mem = ::core::mem::MaybeUninit::<<f32 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[16..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_cover_s(&mut self, x: f32) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[16..].as_mut_ptr(),
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn cover_e(&self) -> f32 {
+    let mut mem = ::core::mem::MaybeUninit::<<f32 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[20..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_cover_e(&mut self, x: f32) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[20..].as_mut_ptr(),
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn cover_n(&self) -> f32 {
+    let mut mem = ::core::mem::MaybeUninit::<<f32 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[24..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_cover_n(&mut self, x: f32) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[24..].as_mut_ptr(),
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  /// uv of the imagery tile = uv of the terrain tile × scale + translation.
+  pub fn translate_u(&self) -> f32 {
+    let mut mem = ::core::mem::MaybeUninit::<<f32 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[28..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_translate_u(&mut self, x: f32) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[28..].as_mut_ptr(),
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn translate_v(&self) -> f32 {
+    let mut mem = ::core::mem::MaybeUninit::<<f32 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[32..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_translate_v(&mut self, x: f32) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[32..].as_mut_ptr(),
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn scale_u(&self) -> f32 {
+    let mut mem = ::core::mem::MaybeUninit::<<f32 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[36..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_scale_u(&mut self, x: f32) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[36..].as_mut_ptr(),
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn scale_v(&self) -> f32 {
+    let mut mem = ::core::mem::MaybeUninit::<<f32 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[40..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_scale_v(&mut self, x: f32) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[40..].as_mut_ptr(),
+        ::core::mem::size_of::<<f32 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  /// As `TerrainRef.digest`.
+  pub fn digest(&self) -> u64 {
+    let mut mem = ::core::mem::MaybeUninit::<<u64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[48..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<u64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_digest(&mut self, x: u64) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[48..].as_mut_ptr(),
+        ::core::mem::size_of::<<u64 as ::flatbuffers::EndianScalar>::Scalar>(),
       );
     }
   }
@@ -751,6 +1501,10 @@ impl<'a> Tile<'a> {
   pub const VT_INDICES: ::flatbuffers::VOffsetT = 22;
   pub const VT_TEXTURE: ::flatbuffers::VOffsetT = 24;
   pub const VT_TEXTURE_FORMAT: ::flatbuffers::VOffsetT = 26;
+  pub const VT_TERRAIN: ::flatbuffers::VOffsetT = 28;
+  pub const VT_SKIRT_HEIGHT: ::flatbuffers::VOffsetT = 30;
+  pub const VT_IMAGERY: ::flatbuffers::VOffsetT = 32;
+  pub const VT_COMPOSED_SIDE: ::flatbuffers::VOffsetT = 34;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -764,6 +1518,10 @@ impl<'a> Tile<'a> {
     let mut builder = TileBuilder::new(_fbb);
     builder.add_drape(args.drape);
     builder.add_id(args.id);
+    builder.add_composed_side(args.composed_side);
+    if let Some(x) = args.imagery { builder.add_imagery(x); }
+    builder.add_skirt_height(args.skirt_height);
+    if let Some(x) = args.terrain { builder.add_terrain(x); }
     if let Some(x) = args.texture { builder.add_texture(x); }
     if let Some(x) = args.indices { builder.add_indices(x); }
     if let Some(x) = args.uvs { builder.add_uvs(x); }
@@ -864,6 +1622,39 @@ impl<'a> Tile<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<TextureFormat>(Tile::VT_TEXTURE_FORMAT, Some(TextureFormat::None)).unwrap()}
   }
+  /// Where the mesh comes from.
+  #[inline]
+  pub fn terrain(&self) -> Option<&'a TerrainRef> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<TerrainRef>(Tile::VT_TERRAIN, None)}
+  }
+  /// How deep the mesh's skirts hang, in metres: a choice of the bake, not
+  /// something the tile's bytes say.
+  #[inline]
+  pub fn skirt_height(&self) -> f32 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<f32>(Tile::VT_SKIRT_HEIGHT, Some(0.0)).unwrap()}
+  }
+  /// The drape, bottom layer first. Empty for a tile with no imagery.
+  #[inline]
+  pub fn imagery(&self) -> Option<::flatbuffers::Vector<'a, ImageryRef>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ImageryRef>>>(Tile::VT_IMAGERY, None)}
+  }
+  /// The side of the composed texture, in texels.
+  #[inline]
+  pub fn composed_side(&self) -> u32 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u32>(Tile::VT_COMPOSED_SIDE, Some(0)).unwrap()}
+  }
 }
 
 impl ::flatbuffers::Verifiable for Tile<'_> {
@@ -884,6 +1675,10 @@ impl ::flatbuffers::Verifiable for Tile<'_> {
      .visit_field::<Block>("indices", Self::VT_INDICES, false)?
      .visit_field::<Block>("texture", Self::VT_TEXTURE, false)?
      .visit_field::<TextureFormat>("texture_format", Self::VT_TEXTURE_FORMAT, false)?
+     .visit_field::<TerrainRef>("terrain", Self::VT_TERRAIN, false)?
+     .visit_field::<f32>("skirt_height", Self::VT_SKIRT_HEIGHT, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ImageryRef>>>("imagery", Self::VT_IMAGERY, false)?
+     .visit_field::<u32>("composed_side", Self::VT_COMPOSED_SIDE, false)?
      .finish();
     Ok(())
   }
@@ -901,6 +1696,10 @@ pub struct TileArgs<'a> {
     pub indices: Option<&'a Block>,
     pub texture: Option<&'a Block>,
     pub texture_format: TextureFormat,
+    pub terrain: Option<&'a TerrainRef>,
+    pub skirt_height: f32,
+    pub imagery: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ImageryRef>>>,
+    pub composed_side: u32,
 }
 impl<'a> Default for TileArgs<'a> {
   #[inline]
@@ -918,6 +1717,10 @@ impl<'a> Default for TileArgs<'a> {
       indices: None,
       texture: None,
       texture_format: TextureFormat::None,
+      terrain: None,
+      skirt_height: 0.0,
+      imagery: None,
+      composed_side: 0,
     }
   }
 }
@@ -976,6 +1779,22 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> TileBuilder<'a, 'b, A> {
     self.fbb_.push_slot::<TextureFormat>(Tile::VT_TEXTURE_FORMAT, texture_format, TextureFormat::None);
   }
   #[inline]
+  pub fn add_terrain(&mut self, terrain: &TerrainRef) {
+    self.fbb_.push_slot_always::<&TerrainRef>(Tile::VT_TERRAIN, terrain);
+  }
+  #[inline]
+  pub fn add_skirt_height(&mut self, skirt_height: f32) {
+    self.fbb_.push_slot::<f32>(Tile::VT_SKIRT_HEIGHT, skirt_height, 0.0);
+  }
+  #[inline]
+  pub fn add_imagery(&mut self, imagery: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , ImageryRef>>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Tile::VT_IMAGERY, imagery);
+  }
+  #[inline]
+  pub fn add_composed_side(&mut self, composed_side: u32) {
+    self.fbb_.push_slot::<u32>(Tile::VT_COMPOSED_SIDE, composed_side, 0);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> TileBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     TileBuilder {
@@ -1005,6 +1824,10 @@ impl ::core::fmt::Debug for Tile<'_> {
       ds.field("indices", &self.indices());
       ds.field("texture", &self.texture());
       ds.field("texture_format", &self.texture_format());
+      ds.field("terrain", &self.terrain());
+      ds.field("skirt_height", &self.skirt_height());
+      ds.field("imagery", &self.imagery());
+      ds.field("composed_side", &self.composed_side());
       ds.finish()
   }
 }
@@ -1164,6 +1987,9 @@ impl<'a> Pack<'a> {
   pub const VT_CULLING: ::flatbuffers::VOffsetT = 16;
   pub const VT_TILES: ::flatbuffers::VOffsetT = 18;
   pub const VT_FRAMES: ::flatbuffers::VOffsetT = 20;
+  pub const VT_CONTENT: ::flatbuffers::VOffsetT = 22;
+  pub const VT_TERRAIN_LAYER: ::flatbuffers::VOffsetT = 24;
+  pub const VT_IMAGERY_LAYER: ::flatbuffers::VOffsetT = 26;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -1176,6 +2002,8 @@ impl<'a> Pack<'a> {
   ) -> ::flatbuffers::WIPOffset<Pack<'bldr>> {
     let mut builder = PackBuilder::new(_fbb);
     builder.add_blob_digest(args.blob_digest);
+    if let Some(x) = args.imagery_layer { builder.add_imagery_layer(x); }
+    if let Some(x) = args.terrain_layer { builder.add_terrain_layer(x); }
     if let Some(x) = args.frames { builder.add_frames(x); }
     if let Some(x) = args.tiles { builder.add_tiles(x); }
     if let Some(x) = args.culling { builder.add_culling(x); }
@@ -1184,6 +2012,7 @@ impl<'a> Pack<'a> {
     builder.add_first_frame(args.first_frame);
     if let Some(x) = args.scene_digest { builder.add_scene_digest(x); }
     builder.add_version(args.version);
+    builder.add_content(args.content);
     builder.finish()
   }
 
@@ -1270,6 +2099,30 @@ impl<'a> Pack<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Frame>>>>(Pack::VT_FRAMES, None)}
   }
+  /// What the tiles carry. A pack of an earlier version says nothing here
+  /// and reads as `Embedded`, which is what it is.
+  #[inline]
+  pub fn content(&self) -> Content {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<Content>(Pack::VT_CONTENT, Some(Content::Embedded)).unwrap()}
+  }
+  /// The layers of the tile store the references are into.
+  #[inline]
+  pub fn terrain_layer(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(Pack::VT_TERRAIN_LAYER, None)}
+  }
+  #[inline]
+  pub fn imagery_layer(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(Pack::VT_IMAGERY_LAYER, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for Pack<'_> {
@@ -1287,6 +2140,9 @@ impl ::flatbuffers::Verifiable for Pack<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("culling", Self::VT_CULLING, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<Tile>>>>("tiles", Self::VT_TILES, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<Frame>>>>("frames", Self::VT_FRAMES, false)?
+     .visit_field::<Content>("content", Self::VT_CONTENT, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("terrain_layer", Self::VT_TERRAIN_LAYER, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("imagery_layer", Self::VT_IMAGERY_LAYER, false)?
      .finish();
     Ok(())
   }
@@ -1301,6 +2157,9 @@ pub struct PackArgs<'a> {
     pub culling: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub tiles: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Tile<'a>>>>>,
     pub frames: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Frame<'a>>>>>,
+    pub content: Content,
+    pub terrain_layer: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub imagery_layer: Option<::flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for PackArgs<'a> {
   #[inline]
@@ -1315,6 +2174,9 @@ impl<'a> Default for PackArgs<'a> {
       culling: None,
       tiles: None,
       frames: None,
+      content: Content::Embedded,
+      terrain_layer: None,
+      imagery_layer: None,
     }
   }
 }
@@ -1361,6 +2223,18 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> PackBuilder<'a, 'b, A> {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Pack::VT_FRAMES, frames);
   }
   #[inline]
+  pub fn add_content(&mut self, content: Content) {
+    self.fbb_.push_slot::<Content>(Pack::VT_CONTENT, content, Content::Embedded);
+  }
+  #[inline]
+  pub fn add_terrain_layer(&mut self, terrain_layer: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Pack::VT_TERRAIN_LAYER, terrain_layer);
+  }
+  #[inline]
+  pub fn add_imagery_layer(&mut self, imagery_layer: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Pack::VT_IMAGERY_LAYER, imagery_layer);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> PackBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     PackBuilder {
@@ -1387,6 +2261,9 @@ impl ::core::fmt::Debug for Pack<'_> {
       ds.field("culling", &self.culling());
       ds.field("tiles", &self.tiles());
       ds.field("frames", &self.frames());
+      ds.field("content", &self.content());
+      ds.field("terrain_layer", &self.terrain_layer());
+      ds.field("imagery_layer", &self.imagery_layer());
       ds.finish()
   }
 }
