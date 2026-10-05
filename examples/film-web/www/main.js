@@ -73,10 +73,10 @@ async function openProject(name) {
   const body = $("films").querySelector("tbody");
   body.innerHTML = "";
   $("films-note").className = "note";
-  $("films-note").textContent = "Lecture des films…";
+  $("films-note").textContent = "Lecture des packs du bucket…";
   try {
     const films = await get(`/p/${name}/films`);
-    $("films-note").textContent = `${films.length} films, ${mb(films.reduce((s, f) => s + f.bytes, 0))} de packs.`;
+    $("films-note").textContent = `${films.length} scènes à rendre, ${mb(films.reduce((s, f) => s + f.bytes, 0))} de packs. Rien ici n'est déjà rendu : ce sont les packs cuits, que cette page rend.`;
     for (const f of films) {
       const tr = document.createElement("tr");
       tr.className = "pick";
@@ -99,7 +99,7 @@ async function openFilm(id) {
   $("film-panel").hidden = false;
   $("film-title").textContent = id;
   $("film-note").className = "note";
-  $("film-note").textContent = "Lecture du film (la plage de chaque pack est lue dans sa table)…";
+  $("film-note").textContent = "Lecture de la scène (la plage de chaque pack est lue dans sa table)…";
   const body = $("chunks").querySelector("tbody");
   body.innerHTML = "";
   for (const panel of ["camera-panel", "tiles-panel", "pack-panel"]) $(panel).hidden = true;
@@ -116,7 +116,7 @@ async function openFilm(id) {
     body.append(tr);
   }
   if (!film.chunks.length) {
-    $("film-note").textContent = `Aucun pack lisible par ce build dans ce film : ${film.unreadable.length} illisible${film.unreadable.length > 1 ? "s" : ""}.`;
+    $("film-note").textContent = `Aucun pack lisible par ce build dans cette scène : ${film.unreadable.length} illisible${film.unreadable.length > 1 ? "s" : ""}.`;
     $("film-note").className = "note bad";
     return;
   }
@@ -352,30 +352,34 @@ $("tz").addEventListener("change", () => showSourceTiles());
 
 // ------------------------------------------------------------------ render
 
-// Offers only the sizes this browser can encode, and picks the largest. H.264
-// stops at 4096×2304 in most encoders: a pack baked larger renders reduced,
-// and the page says so rather than failing at the first frame.
+// Says, for each size, which encoder it will get. Encoding is progressive:
+// the browser's H.264 encoder when it has one for the size, and otherwise
+// rav1e in wasm — any size, but seconds per frame rather than milliseconds.
+// The pack's own viewport stays the default: a slower film at the size it was
+// baked for, unless a smaller one is asked for.
 async function offerScales() {
   const fps = Number($("fps").value), bitrate = Number($("mbps").value) * 1e6;
-  let best = null;
   for (const option of $("scale").options) {
     const scale = Number(option.value);
     const w = even8(view.width * scale), h = even8(view.height * scale);
-    const ok = !!(await findEncoder(w, h, fps, bitrate));
-    option.disabled = !ok;
-    option.textContent = `${w}×${h}${scale === 1 ? " (viewport du pack)" : ""}${ok ? "" : " — pas d'encodeur H.264"}`;
-    if (ok && best === null) best = option.value;
+    const browser = !!(await findEncoder(w, h, fps, bitrate));
+    option.dataset.encoder = browser ? "browser" : "rav1e";
+    option.textContent = `${w}×${h}${scale === 1 ? " (viewport du pack)" : ""} — ${browser ? "H.264 du navigateur" : "AV1 logiciel, lent"}`;
   }
-  const about = `${film.id} : viewport ${view.width}×${view.height}, table de ${(view.table_bytes / 1e6).toFixed(2)} Mo lue pour ce pack (${view.tiles} tuiles).`;
-  if (best === null) {
-    $("go").disabled = true;
-    status(`${about} Ce navigateur n'a d'encodeur H.264 pour aucune des tailles proposées.`, "bad");
-    return;
-  }
-  $("scale").value = best;
+  $("scale").value = "1";
   $("go").disabled = false;
-  status(best === "1" ? about : `${about} Pas d'encodeur H.264 à cette taille dans ce navigateur : rendu réduit à ${$("scale").selectedOptions[0].textContent}.`, best === "1" ? "good" : "");
+  describeEncoder();
 }
+
+function describeEncoder() {
+  if (!view) return;
+  const about = `${film.id} : viewport ${view.width}×${view.height}, table de ${(view.table_bytes / 1e6).toFixed(2)} Mo lue pour ce pack (${view.tiles} tuiles).`;
+  const soft = $("scale").selectedOptions[0].dataset.encoder === "rav1e";
+  status(soft
+    ? `${about} Le navigateur n'a pas d'encodeur H.264 à cette taille : repli sur rav1e (AV1 en WebAssembly), de l'ordre de la seconde par image et par worker. Une taille plus petite passe par l'encodeur du navigateur.`
+    : about, soft ? "" : "good");
+}
+$("scale").addEventListener("change", describeEncoder);
 
 // The farm's split: equal spans, the remainder on the last.
 function slices(first, last, parts) {
@@ -400,7 +404,7 @@ function renderStats(totals, frames, wall) {
   const rows = [
     ["Lecture par plages", "fetch"], ["Dépaquetage (LZ4)", "unpack"], ["Décodage PNG (navigateur)", "decode"],
     ["Upload GPU", "upload"], ["Enregistrement + soumission", "record"],
-    ["next() complet", "next"], ["Encodage (attente file)", "encode"],
+    ["next() complet", "next"], ["Encodage", "encode"],
   ];
   const body = $("stats").querySelector("tbody");
   body.innerHTML = "";
@@ -479,9 +483,9 @@ $("go").addEventListener("click", async () => {
   renderStats(totals, done, wall);
 
   try {
-    const muxer = new FilmMuxer(width, height, fps, results[0].avcc);
+    const muxer = new FilmMuxer(width, height, fps, results[0].record);
     for (const r of results) {
-      muxer.check(r.avcc);
+      muxer.check(r.record);
       for (const c of r.chunks) muxer.push(c.index, c.data, c.key);
     }
     const count = muxer.frames();

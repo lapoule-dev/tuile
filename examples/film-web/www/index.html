@@ -5,7 +5,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tuile Film Bench</title>
+<title>Tuile — rendu WebGPU / WebAssembly / Web Workers</title>
 <style>
   :root {
     --bg: #f6f5f2; --fg: #1d1d1b; --muted: #6b6a66; --line: #d9d7d0;
@@ -70,18 +70,18 @@
 </head>
 <body>
 <main>
-  <h1>Film bench — wgpu / WebGPU</h1>
-  <p class="lead">Consulte les films des buckets — leurs packs, la caméra et les tuiles que chacun porte, les tuiles sources — à travers <code>tuile-pack-api</code> (lecture seule, par plages), et rend un film dans des Web Workers (wasm + WebGPU + WebCodecs).</p>
+  <h1>Rendu de films 3D Tiles dans le navigateur — WebGPU, WebAssembly, Web Workers</h1>
+  <p class="lead">Un moteur Rust compilé en <b>WebAssembly</b> rend des packs pré-cuits avec <b>WebGPU</b> (une passe de visibilité, le reste en compute shaders), réparti sur plusieurs <b>Web Workers</b>, et encode le film sur place : H.264 par WebCodecs, ou AV1 par rav1e en WebAssembly quand le navigateur n'a pas d'encodeur à la taille voulue. Les packs et les tuiles sont lus par plages depuis les buckets, à travers <code>tuile-pack-api</code>.</p>
 
   <section class="panel">
-    <h2>Films</h2>
+    <h2>Packs à rendre</h2>
     <div class="tabs" id="projects" role="tablist"></div>
     <div class="note" id="films-note"></div>
-    <div class="listing"><table id="films"><thead><tr><th>Film</th><th>packs</th><th>taille</th></tr></thead><tbody></tbody></table></div>
+    <div class="listing"><table id="films"><thead><tr><th>Scène</th><th>packs</th><th>taille</th></tr></thead><tbody></tbody></table></div>
   </section>
 
   <section class="panel" id="film-panel" hidden>
-    <h2 id="film-title">Film</h2>
+    <h2 id="film-title">Scène</h2>
     <div class="note" id="film-note"></div>
     <div class="listing"><table id="chunks"><thead><tr><th>Pack</th><th>frames</th><th>taille</th><th>scène</th></tr></thead><tbody></tbody></table></div>
   </section>
@@ -133,7 +133,7 @@
     </div>
     <div class="row">
       <button class="primary" id="go" disabled>Rendre</button>
-      <span id="status">Choisir un film.</span>
+      <span id="status">Choisir une scène.</span>
     </div>
     <progress id="progress" value="0" max="1"></progress>
     <section><h2>Aperçu par worker</h2><div class="previews" id="previews"></div></section>

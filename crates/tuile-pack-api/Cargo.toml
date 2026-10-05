@@ -14,7 +14,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "net"] }
-tower-http = { version = "0.6", features = ["cors", "fs"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "set-header"] }
 tuile-repository = { version = "0.1.0", path = "../tuile-repository" }
 tuile-tile-server = { path = "../tuile-tile-server" }
 tracing = { workspace = true }

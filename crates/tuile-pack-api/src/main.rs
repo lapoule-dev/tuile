@@ -52,6 +52,7 @@ use axum::routing::get;
 use axum::Router;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tuile_farm::{BucketConfig, ObjectRunStore, StoreError, Tuning};
 use tuile_repository::{
     Cached, FilmRepository, Objects, RepoError, RunFilms, ScenePacks, TileRepository,
@@ -408,7 +409,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         );
     if let Some(www) = arg(&args, "--www") {
-        app = app.fallback_service(ServeDir::new(www));
+        // The page, its scripts and its wasm are rebuilt together and must be
+        // loaded together: a cached script against a fresh module fails at
+        // the first call. `no-cache` makes the browser ask each time; an
+        // unchanged file still costs only a 304.
+        app = app.fallback_service(
+            tower::ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::overriding(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("no-cache"),
+                ))
+                .service(ServeDir::new(www)),
+        );
     }
     let cors = CorsLayer::permissive().expose_headers([
         header::CONTENT_RANGE,
