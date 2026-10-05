@@ -10,8 +10,8 @@ authors.workspace = true
 [dependencies]
 glam = { workspace = true }
 thiserror = { workspace = true }
-tuile-core = { version = "0.1.0", path = "../tuile-core" }
-tuile-pack = { version = "0.1.0", path = "../tuile-pack" }
+tuile-core = { version = "0.2.0", path = "../tuile-core" }
+tuile-pack = { version = "0.2.0", path = "../tuile-pack" }
 
 [dev-dependencies]
 image = { workspace = true }

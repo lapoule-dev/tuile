@@ -16,11 +16,11 @@ toml = "0.8"
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "net"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header"] }
-tuile-repository = { version = "0.1.0", path = "../tuile-repository" }
+tuile-repository = { version = "0.2.0", path = "../tuile-repository" }
 tuile-tile-server = { path = "../tuile-tile-server" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tuile-farm = { version = "0.1.0", path = "../tuile-farm" }
+tuile-farm = { version = "0.2.0", path = "../tuile-farm" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
