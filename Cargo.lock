@@ -5874,13 +5874,16 @@ dependencies = [
  "axum",
  "dotenvy",
  "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
- "tower",
+ "toml",
  "tower-http",
  "tracing",
  "tracing-subscriber",
  "tuile-farm",
- "tuile-pack",
+ "tuile-repository",
+ "tuile-tile-server",
 ]
 
 [[package]]
@@ -5896,6 +5899,22 @@ dependencies = [
  "tracing",
  "tuile-core",
  "tuile-terrain",
+]
+
+[[package]]
+name = "tuile-repository"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tuile-farm",
+ "tuile-pack",
+ "tuile-tile-server",
 ]
 
 [[package]]

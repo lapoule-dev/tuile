@@ -1,0 +1,34 @@
+[package]
+name = "tuile-repository"
+description = "Where films live: repositories over the buckets that hold packs, camera tapes and source tiles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# The contracts and the key layouts: everything a reader of the buckets needs
+# to know, and nothing that ties it to one way of reaching them. This half
+# compiles to wasm32, so a Worker reads the same layouts through its own
+# `Objects` over an R2 binding.
+[dependencies]
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tuile-pack = { version = "0.1.0", path = "../tuile-pack" }
+
+# The native adapters: an S3 bucket or a directory, the on-disk chunk cache,
+# the tile store.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["fs", "sync"] }
+tuile-farm = { version = "0.1.0", path = "../tuile-farm" }
+tuile-tile-server = { path = "../tuile-tile-server" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
