@@ -39,7 +39,7 @@ fn fetch(request: &Request) -> Result<Promise, JsValue> {
 /// rendered with, so a block read once — by this worker, another, or an
 /// earlier render — comes from the browser's cache, and one nobody here has
 /// read comes from the edge's.
-const BLOCK: u64 = 16 << 20;
+const BLOCK: u64 = 8 << 20;
 /// Where a block's number goes in a pack's URL.
 const BLOCK_PLACEHOLDER: &str = "{block}";
 

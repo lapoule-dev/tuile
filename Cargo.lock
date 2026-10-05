@@ -6168,9 +6168,13 @@ name = "tuile-repository"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
+ "flate2",
  "futures-executor",
  "futures-util",
+ "object_store",
  "percent-encoding",
+ "pmtiles",
  "roxmltree",
  "serde",
  "serde_json",

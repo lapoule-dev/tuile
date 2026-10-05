@@ -10,9 +10,10 @@ use futures_util::lock::Mutex;
 
 use crate::{Entry, Listing, Objects, RepoError};
 
-/// Four megabytes: a frame's newcomers usually fit in one or two, and a
-/// bucket answers a ranged GET of this size in about the time of its latency.
-pub const CHUNK: u64 = 4 << 20;
+/// Eight megabytes: a frame's newcomers usually fit in one or two, a bucket
+/// answers a ranged GET of this size in little more than its latency, and a
+/// host with little memory can still hold a few at once.
+pub const CHUNK: u64 = 8 << 20;
 
 /// Where chunks that have been read are kept.
 ///
@@ -65,7 +66,10 @@ impl Cached {
     }
 
     async fn chunk(&self, key: &str, size: u64, index: u64) -> Result<Vec<u8>, RepoError> {
-        if let Some(bytes) = self.store.get(key, index).await {
+        // A chunk is kept under its size as well as its key: cut another
+        // way, the same number would be other bytes.
+        let kept = format!("{}m/{key}", CHUNK >> 20);
+        if let Some(bytes) = self.store.get(&kept, index).await {
             return Ok(bytes);
         }
         let lock = match self.fetching.lock() {
@@ -77,14 +81,14 @@ impl Cached {
                 .clone(),
         };
         let _held = lock.lock().await;
-        if let Some(bytes) = self.store.get(key, index).await {
+        if let Some(bytes) = self.store.get(&kept, index).await {
             return Ok(bytes);
         }
         let bytes = self
             .inner
             .read(key, index * CHUNK..((index + 1) * CHUNK).min(size))
             .await?;
-        self.store.put(key, index, &bytes).await;
+        self.store.put(&kept, index, &bytes).await;
         Ok(bytes)
     }
 }
@@ -124,7 +128,7 @@ impl Objects for Cached {
         }
         let chunks = covering(&range);
         // Exactly one whole chunk — what an aligned reader asks for — is
-        // handed back as it is: no second copy of four megabytes.
+        // handed back as it is: no second copy of the chunk.
         if chunks.end - chunks.start == 1
             && range.start == chunks.start * CHUNK
             && range.end == ((chunks.start + 1) * CHUNK).min(size)

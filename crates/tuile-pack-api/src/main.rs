@@ -44,8 +44,15 @@ use tuile_repository::{
 };
 use tuile_tile_server::{StoreConfig, TileStore};
 
-/// A `Reply` as this server's response.
-fn respond(reply: Reply) -> Response {
+/// A `Reply` as this server's response. A body left to be read is read here,
+/// whole: this process has the memory for a block.
+async fn respond(mut reply: Reply) -> Response {
+    if let Some(later) = reply.later.take() {
+        match later.read().await {
+            Ok(body) => reply.body = body,
+            Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+        }
+    }
     if reply.status >= 400 {
         tracing::warn!("{}: {}", reply.status, String::from_utf8_lossy(&reply.body));
     }
@@ -84,7 +91,7 @@ async fn api(bench: Arc<Bench>, request: Request) -> Response {
         .get(uri.path(), uri.query().unwrap_or_default(), range)
         .await
     {
-        Some(reply) => respond(reply),
+        Some(reply) => respond(reply).await,
         None => (StatusCode::NOT_FOUND, "no such route").into_response(),
     }
 }

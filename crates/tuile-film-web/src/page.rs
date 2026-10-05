@@ -155,9 +155,19 @@ struct Page {
     track: Option<TrackMap>,
     job: Option<Job>,
     rendering: bool,
+    /// How each worker of the render in hand is told it is over: what a
+    /// stop sends through, to end the wait on them.
+    stoppers: Vec<Stopper>,
     workers_typed: bool,
     wanted: Wanted,
 }
+
+/// The end of a worker's slice, to be said once: by the worker when it is
+/// done or has failed, or by a stop.
+type Stopper = Rc<RefCell<Option<oneshot::Sender<Result<Slice, String>>>>>;
+
+/// What a stopped render ends with, in place of an error.
+const STOPPED: &str = "Rendu arrêté.";
 
 thread_local! {
     static PAGE: RefCell<Page> = RefCell::new(Page::default());
@@ -1407,6 +1417,17 @@ fn join(slices: &[Slice], width: u32, height: u32, fps: u32) -> Result<(Vec<u8>,
     Ok((muxer.finish().map_err(|e| e.to_string())?, frames))
 }
 
+/// Ends the render in hand: every wait on a worker is answered now, and the
+/// render, finding its workers over, terminates them — whatever each was in
+/// the middle of — and gives the page back.
+fn stop() {
+    for stopper in page(|p| std::mem::take(&mut p.stoppers)) {
+        if let Some(tx) = stopper.borrow_mut().take() {
+            let _ = tx.send(Err(STOPPED.to_string()));
+        }
+    }
+}
+
 async fn render() {
     let Some((view, scene, project, api)) = page(|p| {
         if p.rendering {
@@ -1472,6 +1493,7 @@ async fn render() {
     });
     let go: web_sys::HtmlButtonElement = el("go").unchecked_into();
     go.set_disabled(true);
+    show("stop", true);
     show("result", false);
     let progress: HtmlProgressElement = el("progress").unchecked_into();
     progress.set_value(0.0);
@@ -1501,7 +1523,13 @@ async fn render() {
     let started = now();
     status("Préchargement des blocs…", "");
 
-    let mut workers = Vec::new();
+    // Each worker with its two handlers, which live exactly as long as it.
+    type Handled = (
+        Worker,
+        Closure<dyn FnMut(MessageEvent)>,
+        Closure<dyn FnMut(Event)>,
+    );
+    let mut workers: Vec<Handled> = Vec::new();
     let mut waits = Vec::new();
     for (id, (a, b)) in parts.iter().copied().enumerate() {
         let options = WorkerOptions::new();
@@ -1510,13 +1538,22 @@ async fn render() {
             Ok(w) => w,
             Err(e) => {
                 status(&format!("worker {id} : {}", text(e)), "bad");
-                page(|p| p.rendering = false);
+                // The workers already started have nothing to render for.
+                for (started, ..) in &workers {
+                    started.terminate();
+                }
+                page(|p| {
+                    p.rendering = false;
+                    p.stoppers.clear();
+                });
+                show("stop", false);
                 go.set_disabled(false);
                 return;
             }
         };
         let (tx, rx) = oneshot::channel::<Result<Slice, String>>();
-        let tx = Rc::new(RefCell::new(Some(tx)));
+        let tx: Stopper = Rc::new(RefCell::new(Some(tx)));
+        page(|p| p.stoppers.push(tx.clone()));
         let (totals_in, ahead_in, tx_in) = (totals.clone(), ahead.clone(), tx.clone());
         let (context, progress_in) = (contexts[id].clone(), progress.clone());
         let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
@@ -1632,13 +1669,18 @@ async fn render() {
     drop(workers);
     let wall = (now() - started) / 1000.0;
     let finish = |go: &web_sys::HtmlButtonElement| {
-        page(|p| p.rendering = false);
+        page(|p| {
+            p.rendering = false;
+            p.stoppers.clear();
+        });
+        show("stop", false);
         go.set_disabled(page(|p| p.view.is_none()));
     };
     let slices = match results {
         Ok(s) => s,
         Err(e) => {
-            status(&e, "bad");
+            // A stop is not a failure, and is not shown as one.
+            status(&e, if e == STOPPED { "" } else { "bad" });
             finish(&go);
             return;
         }
@@ -1756,6 +1798,7 @@ pub fn start_page() {
         page(|p| p.workers_typed = true)
     });
     on(&el("go"), "click", |_| spawn_local(render()));
+    on(&el("stop"), "click", |_| stop());
 
     if get(&window().navigator(), "gpu").is_undefined() {
         status(

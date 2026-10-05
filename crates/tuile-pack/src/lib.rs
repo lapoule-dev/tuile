@@ -504,7 +504,8 @@ impl PackWriter {
                         uvs: self.put(&tile.uvs, true),
                         indices: self.put(&tile.indices, true),
                         texture: tile.texture.as_deref().map(|t| {
-                            let as_produced = self.version >= 2 && carries_its_own_compression(tile.texture_format);
+                            let as_produced = self.version >= 2
+                                && carries_its_own_compression(tile.texture_format);
                             self.put(t, !as_produced)
                         }),
                         texture_format: tile.texture_format,
@@ -860,7 +861,8 @@ impl<'a> Pack<'a> {
         let Some(block) = tile.texture() else {
             return Ok(Vec::new());
         };
-        if self.stores_textures_as_produced() && carries_its_own_compression(tile.texture_format()) {
+        if self.stores_textures_as_produced() && carries_its_own_compression(tile.texture_format())
+        {
             return Ok(Self::stored_in(block, at, bytes, "texture")?.to_vec());
         }
         self.payload_in(block, at, bytes, "texture")
@@ -1060,7 +1062,8 @@ impl<'a> Pack<'a> {
         let Some(block) = tile.texture() else {
             return Ok(Vec::new());
         };
-        if self.stores_textures_as_produced() && carries_its_own_compression(tile.texture_format()) {
+        if self.stores_textures_as_produced() && carries_its_own_compression(tile.texture_format())
+        {
             return Ok(self.stored(block, "texture")?.to_vec());
         }
         self.payload(block, "texture")
@@ -1147,15 +1150,26 @@ mod tests {
     fn both_layout_versions_are_read() {
         // Compressible on purpose: under LZ4 it is stored shorter, so the two
         // layouts really do lay different bytes down.
-        let texture: Vec<u8> = b"\x89PNG\r\n\x1a\n".iter().copied().chain(std::iter::repeat_n(7u8, 4000)).collect();
+        let texture: Vec<u8> = b"\x89PNG\r\n\x1a\n"
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(7u8, 4000))
+            .collect();
         let mut stored = Vec::new();
         for version in READABLE {
             let bytes = written_at(version, &texture);
             let pack = Pack::open(&bytes).expect("open");
             assert_eq!(pack.version(), version);
             let tile = pack.frame(1).expect("frame")[0];
-            assert_eq!(pack.texture(&tile).expect("texture"), texture, "version {version}, whole");
-            assert_eq!(pack.baked(&tile).expect("baked").texture.as_deref(), Some(texture.as_slice()));
+            assert_eq!(
+                pack.texture(&tile).expect("texture"),
+                texture,
+                "version {version}, whole"
+            );
+            assert_eq!(
+                pack.baked(&tile).expect("baked").texture.as_deref(),
+                Some(texture.as_slice())
+            );
 
             let start = blob_start(&bytes).expect("start") as usize;
             let table = Pack::open_table(&bytes[..start]).expect("table");
@@ -1163,22 +1177,110 @@ mod tests {
             let span = table.span_of(&tile).expect("span");
             let fetched = &bytes[start + span.start as usize..start + span.end as usize];
             assert_eq!(
-                table.texture_in(&tile, span.start, fetched).expect("ranged"),
+                table
+                    .texture_in(&tile, span.start, fetched)
+                    .expect("ranged"),
                 texture,
                 "version {version}, by range"
             );
             stored.push(tile.texture().expect("block").stored());
         }
-        assert!(stored[0] < stored[1], "v1 compressed the texture ({}), v2 did not ({})", stored[0], stored[1]);
+        assert!(
+            stored[0] < stored[1],
+            "v1 compressed the texture ({}), v2 did not ({})",
+            stored[0],
+            stored[1]
+        );
         assert_eq!(stored[1] as usize, texture.len());
     }
 
     #[test]
     fn a_layout_from_the_future_is_refused() {
         let bytes = written_at(READABLE.end() + 1, b"x");
-        assert!(matches!(Pack::open(&bytes), Err(PackError::Version { found }) if found == READABLE.end() + 1));
+        assert!(
+            matches!(Pack::open(&bytes), Err(PackError::Version { found }) if found == READABLE.end() + 1)
+        );
         let start = blob_start(&bytes).expect("start") as usize;
-        assert!(matches!(Pack::open_table(&bytes[..start]), Err(PackError::Version { .. })));
+        assert!(matches!(
+            Pack::open_table(&bytes[..start]),
+            Err(PackError::Version { .. })
+        ));
+    }
+
+    /// Drives a future that never waits on anything but its own reads.
+    fn now<T>(future: impl std::future::Future<Output = T>) -> T {
+        let mut future = std::pin::pin!(future);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => panic!("a read of a slice does not wait"),
+        }
+    }
+
+    /// The frame range of a pack held in memory, read by ranges, and how
+    /// many bytes that took.
+    fn range_by_ranges(bytes: &[u8]) -> (Result<(u32, u32), PackError>, usize) {
+        let start = blob_start(&bytes[..PREAMBLE]).expect("preamble");
+        let read = std::cell::Cell::new(0);
+        let range = now(frame_range_by(start, |range| {
+            let part = bytes[range.start as usize..range.end as usize].to_vec();
+            read.set(read.get() + part.len());
+            async move { Ok::<_, std::convert::Infallible>(part) }
+        }))
+        .expect("infallible");
+        (range, read.get())
+    }
+
+    #[test]
+    fn the_frame_range_is_read_without_the_table() {
+        // A table far larger than what is read of it: hundreds of frames,
+        // each with its own tiles.
+        let mut w = Bake::new("s", [0.0; 3]);
+        for frame in 7..=406u32 {
+            let tiles: Vec<_> = (0..12)
+                .map(|i| a_tile(u64::from(frame) * 100 + i, 0))
+                .collect();
+            w.frame(frame, a_view(f64::from(frame)), tiles);
+        }
+        let bytes = w.finish();
+        let start = blob_start(&bytes[..PREAMBLE]).expect("preamble") as usize;
+        let whole = Pack::open_table(&bytes[..start]).expect("table");
+        assert_eq!(whole.frame_range(), (7, 406));
+        assert!(start > 200_000, "a table of {start} bytes proves nothing");
+
+        let (range, read) = range_by_ranges(&bytes);
+        assert_eq!(range.expect("range"), whole.frame_range());
+        assert!(
+            read <= 2 * ROOT_WINDOW as usize,
+            "{read} bytes read of {start}"
+        );
+    }
+
+    #[test]
+    fn the_frame_range_by_ranges_holds_for_every_version_and_refuses_the_others() {
+        for version in READABLE {
+            let bytes = written_at(version, b"texture");
+            let start = blob_start(&bytes[..PREAMBLE]).expect("preamble") as usize;
+            let whole = Pack::open_table(&bytes[..start]).expect("table");
+            assert_eq!(
+                range_by_ranges(&bytes).0.expect("range"),
+                whole.frame_range()
+            );
+        }
+        let other = written_at(READABLE.end() + 1, b"texture");
+        assert!(matches!(
+            range_by_ranges(&other).0,
+            Err(PackError::Version { found }) if found == READABLE.end() + 1
+        ));
+        // A table that is not one says so instead of answering.
+        let mut noise = written_at(*READABLE.end(), b"texture");
+        let start = blob_start(&noise[..PREAMBLE]).expect("preamble") as usize;
+        noise[PREAMBLE..PREAMBLE + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(start > PREAMBLE + 4);
+        assert!(matches!(
+            range_by_ranges(&noise).0,
+            Err(PackError::Malformed(_))
+        ));
     }
 
     #[test]
@@ -1763,6 +1865,118 @@ pub fn blob_start(preamble: &[u8]) -> Result<u64, PackError> {
     (PREAMBLE as u64)
         .checked_add(u64::from_le_bytes(len))
         .ok_or(PackError::Truncated { what: "table" })
+}
+
+/// How much of a table's start is asked for at once when only its root is
+/// wanted: the root, its vtable and the scalars it holds sit there, since a
+/// FlatBuffers table is built back to front and its root is written last.
+const ROOT_WINDOW: u64 = 4096;
+/// A vtable of the root: a few fields, two bytes each. Anything larger is not
+/// one.
+const VTABLE_LIMIT: u64 = 1024;
+
+/// A pack's frame range, read without its table.
+///
+/// A table lists every tile and every frame of its pack and can run to more
+/// than a hundred megabytes — more than some readers have memory for, when
+/// all they want is which frames the pack holds. Those are two scalars of the
+/// table's root, and FlatBuffers says where a root and its fields are: this
+/// follows the root offset and the vtable and reads them, a few bytes, through
+/// `read`, which is handed ranges of the *file*.
+///
+/// `start` is where the blob region starts ([`blob_start`]). The layout
+/// version is checked, as [`Pack::open_table`] checks it. The table is not
+/// verified beyond what is read: a pack this calls readable may still be
+/// refused by whoever opens its table in full.
+///
+/// The outer error is the reader's; the inner one is the pack's.
+pub async fn frame_range_by<R, Fut, E>(
+    start: u64,
+    read: R,
+) -> Result<Result<(u32, u32), PackError>, E>
+where
+    R: Fn(std::ops::Range<u64>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, E>>,
+{
+    let base = PREAMBLE as u64;
+    let Some(len) = start.checked_sub(base).filter(|len| *len >= 4) else {
+        return Ok(Err(PackError::Truncated { what: "table" }));
+    };
+    let window = read(base..base + len.min(ROOT_WINDOW)).await?;
+
+    // `n` bytes at `at`, an offset within the table: from the window when it
+    // holds them, from the file otherwise.
+    let bytes = async |at: u64, n: u64| -> Result<Option<Vec<u8>>, E> {
+        let Some(end) = at.checked_add(n).filter(|end| *end <= len) else {
+            return Ok(None);
+        };
+        if let Some(held) = window.get(at as usize..end as usize) {
+            return Ok(Some(held.to_vec()));
+        }
+        let got = read(base + at..base + end).await?;
+        Ok((got.len() as u64 == n).then_some(got))
+    };
+    let u16_at = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+    let u32_of = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let bad = |what: &str| Ok(Err(PackError::Malformed(what.to_string())));
+
+    let Some(root) = bytes(0, 4).await? else {
+        return bad("no root offset");
+    };
+    let table = u64::from(u32_of(&root));
+    let Some(to_vtable) = bytes(table, 4).await? else {
+        return bad("the root lies outside the table");
+    };
+    // A table points back to its vtable by a signed offset.
+    let to_vtable = i64::from(i32::from_le_bytes([
+        to_vtable[0],
+        to_vtable[1],
+        to_vtable[2],
+        to_vtable[3],
+    ]));
+    let Some(vtable) = (table as i64)
+        .checked_sub(to_vtable)
+        .and_then(|v| u64::try_from(v).ok())
+    else {
+        return bad("the root's vtable lies outside the table");
+    };
+    let Some(sizes) = bytes(vtable, 4).await? else {
+        return bad("the root's vtable lies outside the table");
+    };
+    let vtable_len = u64::from(u16_at(&sizes, 0));
+    if !(4..=VTABLE_LIMIT).contains(&vtable_len) {
+        return bad("the root's vtable is not one");
+    }
+    let Some(slots) = bytes(vtable, vtable_len).await? else {
+        return bad("the root's vtable runs past the table");
+    };
+
+    // A field the writer left out is its default, which for these is 0.
+    let mut fields = [0u32; 3];
+    let wanted = [
+        fb::Pack::VT_VERSION,
+        fb::Pack::VT_FIRST_FRAME,
+        fb::Pack::VT_LAST_FRAME,
+    ];
+    for (value, slot) in fields.iter_mut().zip(wanted) {
+        let slot = usize::from(slot);
+        if slot + 2 > slots.len() {
+            continue;
+        }
+        let offset = u64::from(u16_at(&slots, slot));
+        if offset == 0 {
+            continue;
+        }
+        let Some(field) = bytes(table + offset, 4).await? else {
+            return bad("a field of the root lies outside the table");
+        };
+        *value = u32_of(&field);
+    }
+    let [version, first, last] = fields;
+    if !READABLE.contains(&version) {
+        return Ok(Err(PackError::Version { found: version }));
+    }
+    Ok(Ok((first, last)))
 }
 
 /// The blob digest, folded as the bytes arrive — for a reader that streams a

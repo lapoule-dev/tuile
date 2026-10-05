@@ -6,12 +6,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tuile_repository::s3::{Http, HttpReply, S3Config, S3Objects, Signed};
 use tuile_repository::{
-    block_segment, Bench, Cached, ChunkStore, Config, FilmRepository, Layout, Objects, Place,
-    Project, Reply, RunFilms, ScenePacks,
+    block_segment, ArchivedTiles, Bench, Cached, ChunkStore, Config, FilmRepository, Layout, Now,
+    Objects, Place, Project, Reply, RunFilms, ScenePacks, TileRepository,
 };
 use worker::{
-    event, Cache, Context, Date, Env, Fetch, Headers, Method, Request, RequestInit, Response,
-    Result,
+    console_log, event, Cache, Context, Date, Env, Fetch, Headers, Method, Request, RequestInit,
+    Response, Result,
 };
 
 /// `fetch`, as the transport the S3 protocol is sent with.
@@ -124,8 +124,9 @@ impl ChunkStore for EdgeChunks {
     }
 }
 
-/// The bench this deployment serves, from its environment.
-fn bench(env: &Env) -> std::result::Result<Bench, String> {
+/// The bench this deployment serves, from its environment. The tile store is
+/// opened — its catalog read — only for a request that is about tiles.
+async fn bench(env: &Env, with_tiles: bool) -> std::result::Result<Bench, String> {
     let var = |name: &str| {
         env.secret(name)
             .map(|s| s.to_string())
@@ -177,13 +178,47 @@ fn bench(env: &Env) -> std::result::Result<Bench, String> {
             films,
         });
     }
-    Ok(Bench {
-        projects,
-        tiles: None,
-    })
+    let tiles = match config.tiles {
+        Some(Place::Bucket(bucket)) if with_tiles => {
+            let live: Arc<dyn Objects> = Arc::new(S3Objects::new(
+                S3Config {
+                    endpoint,
+                    bucket: bucket.clone(),
+                    access_key_id: key,
+                    secret_access_key: secret,
+                    region: "auto".into(),
+                },
+                FetchHttp,
+            ));
+            // The catalog and the manifests change as tiles are added, and
+            // are read from the bucket; an archive never does, and is read
+            // through the edge cache.
+            let archives: Arc<dyn Objects> = Arc::new(Cached::new(
+                live.clone(),
+                EdgeChunks {
+                    project: format!("tiles-{bucket}"),
+                },
+            ));
+            let now: Now = Arc::new(|| Date::now().as_millis() / 1000);
+            match ArchivedTiles::open(live, archives, now).await {
+                Ok(tiles) => {
+                    let tiles: Arc<dyn TileRepository> = Arc::new(tiles);
+                    Some((bucket, tiles))
+                }
+                Err(e) => {
+                    // The films are still worth serving without it.
+                    console_log!("tiles: {bucket} cannot be opened: {e}");
+                    None
+                }
+            }
+        }
+        Some(Place::Dir(_)) => return Err("tiles: a Worker reads buckets, not directories".into()),
+        _ => None,
+    };
+    Ok(Bench { projects, tiles })
 }
 
-fn respond(reply: Reply) -> Result<Response> {
+async fn respond(mut reply: Reply) -> Result<Response> {
     let headers = Headers::new();
     headers.set("content-type", &reply.content_type)?;
     headers.set("cache-control", reply.cache_control)?;
@@ -199,12 +234,21 @@ fn respond(reply: Reply) -> Result<Response> {
     if let Some(range) = &reply.content_range {
         headers.set("content-range", range)?;
     }
-    Ok(Response::from_bytes(reply.body)?
-        .with_status(reply.status)
-        .with_headers(headers))
+    let response = match reply.later.take() {
+        // A block is one chunk of the cache below: read whole, and handed
+        // over as it is.
+        Some(later) => Response::from_bytes(
+            later
+                .read()
+                .await
+                .map_err(|e| worker::Error::RustError(e.to_string()))?,
+        )?,
+        None => Response::from_bytes(reply.body)?,
+    };
+    Ok(response.with_status(reply.status).with_headers(headers))
 }
 
-/// Whether a path is a block of an object: `/api/p/<project>/b16/<n>/<key>`.
+/// Whether a path is a block of an object: `/api/p/<project>/b8/<n>/<key>`.
 /// A block is a whole, immutable reply — the one kind the edge cache keeps.
 fn is_block(path: &str) -> bool {
     path.strip_prefix("/api/p/")
@@ -223,7 +267,7 @@ pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> 
     }
     // A block that this point of presence has served before is served again
     // from its cache, whole, without a line of this crate's logic running:
-    // no bucket, no chunk assembled, nothing held in memory.
+    // no bucket, no chunk read, nothing held in memory.
     let cacheable = is_block(url.path());
     let cache = Cache::default();
     let key = url.to_string();
@@ -232,7 +276,8 @@ pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> 
             return Ok(hit);
         }
     }
-    let bench = match bench(&env) {
+    let with_tiles = url.path().starts_with("/api/tiles/") || url.path() == "/api/projects";
+    let bench = match bench(&env, with_tiles).await {
         Ok(b) => b,
         Err(e) => return Response::error(format!("misconfigured: {e}"), 500),
     };
@@ -249,7 +294,7 @@ pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> 
         None => return Response::error("no such route", 404),
     };
     let stored = cacheable && reply.status == 200;
-    let mut response = respond(reply)?;
+    let mut response = respond(reply).await?;
     if stored {
         // Kept after the reply has gone: the client does not wait for it.
         let copy = response.cloned()?;
