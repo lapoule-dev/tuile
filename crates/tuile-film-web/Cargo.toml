@@ -20,6 +20,8 @@ tuile-mp4 = { version = "0.1.0", path = "../tuile-mp4" }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 futures-channel = { workspace = true }
 futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 # The fallback encoder: pure Rust, so it builds for wasm32 as it is. No
 # assembly, no threads — the workers are the parallelism.
 rav1e = { version = "0.8", default-features = false }
@@ -35,18 +37,51 @@ version = "0.3.76"
 features = [
     "Blob",
     "BlobPropertyBag",
+    "CanvasRenderingContext2d",
     "ColorSpaceConversion",
+    "CssStyleDeclaration",
+    "DedicatedWorkerGlobalScope",
+    "Document",
+    "DomRect",
+    "DomTokenList",
+    "Element",
+    "Event",
+    "EventTarget",
+    "Headers",
+    "History",
+    "HtmlAnchorElement",
+    "HtmlButtonElement",
+    "HtmlCanvasElement",
+    "HtmlCollection",
+    "HtmlElement",
+    "HtmlInputElement",
+    "HtmlMediaElement",
+    "HtmlOptionElement",
+    "HtmlOptionsCollection",
+    "HtmlProgressElement",
+    "HtmlSelectElement",
     "ImageBitmap",
     "ImageBitmapOptions",
-    "Headers",
+    "Location",
+    "MessageEvent",
+    "MouseEvent",
+    "Navigator",
+    "Node",
+    "NodeList",
     "OffscreenCanvas",
     "Performance",
     "PremultiplyAlpha",
     "Request",
     "RequestInit",
     "Response",
+    "Text",
+    "Url",
+    "UrlSearchParams",
     "Window",
+    "Worker",
     "WorkerGlobalScope",
+    "WorkerOptions",
+    "WorkerType",
 ]
 
 [package.metadata.wasm-pack.profile.release]

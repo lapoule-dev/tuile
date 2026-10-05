@@ -39,45 +39,14 @@ fn fetch(request: &Request) -> Result<Promise, JsValue> {
 /// rendered with, so a block read once — by this worker, another, or an
 /// earlier render — comes from the browser's cache, and one nobody here has
 /// read comes from the edge's.
-const BLOCK: u64 = 4 << 20;
+const BLOCK: u64 = 16 << 20;
 /// Where a block's number goes in a pack's URL.
 const BLOCK_PLACEHOLDER: &str = "{block}";
 
 /// The size of a block, for whoever plans which to fetch.
 pub const BLOCK_BYTES: u64 = BLOCK;
-
-/// Blocks fetched ahead of the frames that read them, kept in this module's
-/// memory, each with the last frame that needs it.
-#[derive(Default)]
-pub struct Held {
-    blocks: std::collections::HashMap<u64, Vec<u8>>,
-    last_use: std::collections::BTreeMap<u64, u32>,
-}
-
-impl Held {
-    pub fn keep(&mut self, index: u64, bytes: Vec<u8>, last_use: u32) {
-        self.blocks.insert(index, bytes);
-        self.last_use.insert(index, last_use);
-    }
-
-    /// Lets go of every block no frame after `frame` reads.
-    pub fn done_with(&mut self, frame: u32) {
-        let Self { blocks, last_use } = self;
-        last_use.retain(|index, last| {
-            let needed = *last > frame;
-            if !needed {
-                blocks.remove(index);
-            }
-            needed
-        });
-    }
-
-    pub fn bytes(&self) -> usize {
-        self.blocks.values().map(Vec::len).sum()
-    }
-}
 /// Blocks in flight at once, per read.
-const BLOCKS_AT_ONCE: usize = 4;
+const BLOCKS_AT_ONCE: usize = 2;
 /// Tries at a block before giving up. A server under a film's load fails a
 /// request now and then; the same request a moment later goes through.
 const TRIES: u32 = 5;
@@ -173,10 +142,6 @@ impl Source {
         Err(JsError::new(&format!("{url}: could not be read")))
     }
 
-    pub async fn read(&self, range: Range<u64>) -> Result<Vec<u8>, JsError> {
-        self.read_with(range, &Held::default()).await
-    }
-
     /// One block of a pack by its number, for a reader fetching ahead.
     pub async fn fetch_block(&self, index: u64) -> Result<Vec<u8>, JsError> {
         match self {
@@ -185,9 +150,9 @@ impl Source {
         }
     }
 
-    /// `range` of the pack, from the blocks already `held` where they are,
-    /// from the network for the rest.
-    pub async fn read_with(&self, range: Range<u64>, held: &Held) -> Result<Vec<u8>, JsError> {
+    /// `range` of the pack. A URL is read in whole blocks, which the
+    /// browser's cache answers when it has seen them.
+    pub async fn read(&self, range: Range<u64>) -> Result<Vec<u8>, JsError> {
         let wanted = (range.end - range.start) as usize;
         if wanted == 0 {
             return Ok(Vec::new());
@@ -217,29 +182,15 @@ impl Source {
                         "{url}: a pack's URL names its blocks with {BLOCK_PLACEHOLDER}"
                     )));
                 }
-                // Whole blocks: those not held, a few at a time.
+                // Whole blocks, a few at a time, in order.
                 let blocks = range.start / BLOCK..range.end.div_ceil(BLOCK);
-                let missing: Vec<u64> = blocks
-                    .clone()
-                    .filter(|i| !held.blocks.contains_key(i))
-                    .collect();
-                let fetched: Vec<(u64, Vec<u8>)> = stream::iter(missing)
-                    .map(|index| async move {
-                        Ok::<_, JsError>((index, Self::block(url, index).await?))
-                    })
+                let parts: Vec<Vec<u8>> = stream::iter(blocks.clone())
+                    .map(|index| Self::block(url, index))
                     .buffered(BLOCKS_AT_ONCE)
                     .try_collect()
                     .await?;
                 let mut out = Vec::with_capacity(wanted);
-                for index in blocks {
-                    let part: &[u8] = match held.blocks.get(&index) {
-                        Some(bytes) => bytes,
-                        None => fetched
-                            .iter()
-                            .find(|(i, _)| *i == index)
-                            .map(|(_, bytes)| bytes.as_slice())
-                            .unwrap_or_default(),
-                    };
+                for (index, part) in blocks.zip(parts.iter()) {
                     let base = index * BLOCK;
                     let from = (range.start.max(base) - base) as usize;
                     let to =

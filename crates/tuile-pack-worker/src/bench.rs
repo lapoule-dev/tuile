@@ -6,8 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tuile_repository::s3::{Http, HttpReply, S3Config, S3Objects, Signed};
 use tuile_repository::{
-    Bench, Cached, ChunkStore, Config, FilmRepository, Layout, Objects, Place, Project, Reply,
-    RunFilms, ScenePacks,
+    block_segment, Bench, Cached, ChunkStore, Config, FilmRepository, Layout, Objects, Place,
+    Project, Reply, RunFilms, ScenePacks,
 };
 use worker::{
     event, Cache, Context, Date, Env, Fetch, Headers, Method, Request, RequestInit, Response,
@@ -204,12 +204,12 @@ fn respond(reply: Reply) -> Result<Response> {
         .with_headers(headers))
 }
 
-/// Whether a path is a block of an object: `/api/p/<project>/b/<n>/<key>`.
+/// Whether a path is a block of an object: `/api/p/<project>/b16/<n>/<key>`.
 /// A block is a whole, immutable reply — the one kind the edge cache keeps.
 fn is_block(path: &str) -> bool {
     path.strip_prefix("/api/p/")
         .and_then(|rest| rest.split_once('/'))
-        .is_some_and(|(_, rest)| rest.starts_with("b/"))
+        .is_some_and(|(_, rest)| rest.starts_with(&format!("{}/", block_segment())))
 }
 
 #[event(fetch)]

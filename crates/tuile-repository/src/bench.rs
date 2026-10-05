@@ -7,7 +7,7 @@
 //! GET /api/projects                      the projects, their layout, the tile store
 //! GET /api/p/<project>/films             the films the project's bucket holds
 //! GET /api/p/<project>/films/<id>        one film: its packs (chunks), in order
-//! GET /api/p/<project>/b/<n>/<key>       block n of an object: a whole reply (200)
+//! GET /api/p/<project>/b16/<n>/<key>      block n of an object: a whole reply (200)
 //! GET /api/p/<project>/o/<key>           an object, by byte range (206)
 //! GET /api/p/<project>/ls?prefix=        one level of the bucket, as it lies
 //! GET /api/tiles/catalog                 the tile store's layers
@@ -21,7 +21,7 @@
 //! missing film answers — is decided once.
 //!
 //! **A reader of packs asks for blocks, not ranges.** An object is cut into
-//! fixed blocks of [`CHUNK`] bytes and each has its own URL, answered whole —
+//! fixed blocks of [`BLOCK`] bytes and each has its own URL, answered whole —
 //! a plain 200, immutable. That is the one shape every cache keeps without
 //! being argued with: a browser stores it like any file, and an edge cache
 //! keys it by its URL. Ranged replies are neither stored nor matched
@@ -38,6 +38,25 @@ use std::sync::Arc;
 use percent_encoding::percent_decode_str;
 
 use crate::{FilmRepository, Objects, RepoError, TileRepository, CHUNK};
+
+/// The size of a block: what one request for a pack brings back.
+///
+/// It is a trade. A frame reads a few megabytes scattered over its pack, so a
+/// small block wastes little and costs a request each; a large one brings
+/// bytes nobody asked for and saves the requests — and requests are what a
+/// film's worth of reading is short of, each one a round trip to the edge
+/// and, on a cold cache, a signed read of the bucket behind it. Sixteen
+/// megabytes is four of the cache's own chunks, and still small enough for a
+/// Worker to hold a few of at once.
+pub const BLOCK: u64 = 4 * CHUNK;
+
+/// The path segment that names a block: `b16` for sixteen-megabyte blocks.
+/// The size is in the URL because a block is immutable there: cut another
+/// way, the same number would be other bytes under an address every cache
+/// has been told never to ask about again.
+pub fn block_segment() -> String {
+    format!("b{}", BLOCK >> 20)
+}
 
 /// How much an open-ended range (`bytes=N-`) is answered with. A media
 /// element asks that way and then asks again from where the answer stopped.
@@ -249,10 +268,16 @@ impl Bench {
         if let Some(key) = rest.strip_prefix("o/") {
             return self.object(project, &decoded(key), range).await;
         }
-        if let Some((index, key)) = rest.strip_prefix("b/").and_then(|r| r.split_once('/')) {
-            let index = index
-                .parse()
-                .map_err(|_| Reply::text(400, "a block is b/<number>/<key>"))?;
+        if let Some((index, key)) = rest
+            .strip_prefix(&format!("{}/", block_segment()))
+            .and_then(|r| r.split_once('/'))
+        {
+            let index = index.parse().map_err(|_| {
+                Reply::text(
+                    400,
+                    format!("a block is {}/<number>/<key>", block_segment()),
+                )
+            })?;
             return self.block(project, &decoded(key), index).await;
         }
         Err(Reply::text(404, "no such route"))
@@ -304,7 +329,7 @@ impl Bench {
         })
     }
 
-    /// Block `index` of an object: bytes `index × CHUNK` up to the next
+    /// Block `index` of an object: bytes `index × BLOCK` up to the next
     /// block, or the object's end. Whole, immutable, and the same for whoever
     /// asks.
     async fn block(&self, project: &Project, key: &str, index: u64) -> Result<Reply, Reply> {
@@ -312,13 +337,13 @@ impl Bench {
             return Err(Reply::text(400, format!("not a key: {key}")));
         }
         let size = project.objects.size(key).await.map_err(Reply::of)?;
-        let start = index.saturating_mul(CHUNK);
+        let start = index.saturating_mul(BLOCK);
         if start >= size {
             return Err(Reply::text(404, format!("{key} has no block {index}")));
         }
         let body = project
             .objects
-            .read(key, start..(start + CHUNK).min(size))
+            .read(key, start..(start + BLOCK).min(size))
             .await
             .map_err(Reply::of)?;
         Ok(Reply {

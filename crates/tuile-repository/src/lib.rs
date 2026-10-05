@@ -41,7 +41,7 @@ mod tiles;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 
-pub use bench::{Bench, Project, Reply};
+pub use bench::{block_segment, Bench, Project, Reply, BLOCK};
 pub use cached::{Cached, ChunkStore, CHUNK};
 pub use config::{Config, Layout, Place, ProjectConfig};
 pub use films::{Chunk, Film, FilmRepository, FilmSummary, Unreadable};
