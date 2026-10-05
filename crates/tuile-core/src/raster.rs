@@ -1236,6 +1236,24 @@ pub fn bake_layers(layers: &[ImageryLayer], base: [f32; 4], size: (u32, u32)) ->
     }
 }
 
+/// The side of the texture a stack of layers composes into: as many texels
+/// as its sharpest layer brings to the tile, within `[64, max_size]`.
+///
+/// Its own function because the size is part of what a drape is: whoever
+/// composes the same layers again elsewhere must compose them at this size.
+pub fn composed_side(layers: &[ImageryLayer], max_size: u32) -> u32 {
+    layers
+        .iter()
+        .map(|l| {
+            let x = (l.texture.width as f32 * l.scale[0]).ceil() as u32;
+            let y = (l.texture.height as f32 * l.scale[1]).ceil() as u32;
+            x.max(y)
+        })
+        .max()
+        .unwrap_or(64)
+        .clamp(64, max_size.max(64))
+}
+
 /// Bakes a tile's draped imagery into a texture it owns.
 ///
 /// The portable form of the drape: offline renderers and interchange formats
@@ -1253,17 +1271,7 @@ pub fn bake_imagery(content: &mut DecodedTileContent, max_size: u32) {
     if content.imagery.is_empty() || content.meshes.iter().any(|m| m.uvs.is_none()) {
         return;
     }
-    let side = content
-        .imagery
-        .iter()
-        .map(|l| {
-            let x = (l.texture.width as f32 * l.scale[0]).ceil() as u32;
-            let y = (l.texture.height as f32 * l.scale[1]).ceil() as u32;
-            x.max(y)
-        })
-        .max()
-        .unwrap_or(64)
-        .clamp(64, max_size.max(64));
+    let side = composed_side(&content.imagery, max_size);
     let base = content
         .meshes
         .first()
