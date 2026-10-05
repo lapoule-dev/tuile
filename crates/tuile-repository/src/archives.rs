@@ -46,6 +46,8 @@ const MAX_DEPTH: usize = 4;
 /// Opened archives kept: a header and a root directory each.
 const OPENED: usize = 64;
 const SECONDS_PER_DAY: u64 = 24 * 3600;
+/// How long a manifest read is trusted, in seconds.
+const MANIFEST_TTL: u64 = 60;
 
 /// The time, in seconds since the Unix epoch. Handed in because a Worker
 /// has no system clock to ask.
@@ -201,6 +203,9 @@ pub struct ArchivedTiles {
     layers: Vec<Layer>,
     now: Now,
     opened: Mutex<HashMap<String, Arc<Opened>>>,
+    /// Manifests read lately, by zone, with when: a film asks for thousands
+    /// of tiles of a handful of zones.
+    manifests: Mutex<HashMap<String, (u64, Option<Arc<Manifest>>)>>,
 }
 
 fn malformed(key: &str, what: impl std::fmt::Display) -> RepoError {
@@ -250,18 +255,40 @@ impl ArchivedTiles {
             layers,
             now,
             opened: Mutex::new(HashMap::new()),
+            manifests: Mutex::new(HashMap::new()),
         })
     }
 
-    async fn manifest(&self, zone_prefix: &str) -> Result<Option<Manifest>, RepoError> {
+    /// A zone's manifest, read again once it is [`MANIFEST_TTL`] old: that
+    /// bounds how late a reader sees tiles another process added.
+    async fn manifest(&self, zone_prefix: &str) -> Result<Option<Arc<Manifest>>, RepoError> {
+        let now = (self.now)();
+        if let Ok(held) = self.manifests.lock() {
+            if let Some((at, manifest)) = held.get(zone_prefix) {
+                if now.saturating_sub(*at) < MANIFEST_TTL {
+                    return Ok(manifest.clone());
+                }
+            }
+        }
         let key = format!("{zone_prefix}/manifest.json");
-        match self.live.read_all(&key).await {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|e| malformed(&key, e)),
+        let manifest = match self.live.read_all(&key).await {
+            Ok(bytes) => Some(Arc::new(
+                serde_json::from_slice::<Manifest>(&bytes).map_err(|e| malformed(&key, e))?,
+            )),
             // A zone nothing was ever written to.
-            Err(RepoError::NotFound(_)) => Ok(None),
-            Err(e) => Err(e),
+            Err(RepoError::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+        if let Ok(mut held) = self.manifests.lock() {
+            held.insert(zone_prefix.to_string(), (now, manifest.clone()));
+        }
+        Ok(manifest)
+    }
+
+    /// Forgets a zone's manifest: it named an archive that is gone.
+    fn forget(&self, zone_prefix: &str) {
+        if let Ok(mut held) = self.manifests.lock() {
+            held.remove(zone_prefix);
         }
     }
 
@@ -383,26 +410,37 @@ impl TileRepository for ArchivedTiles {
                 l.grid.name()
             )));
         };
-        let Some(manifest) = self.manifest(&l.zone_prefix(level, x, y)).await? else {
-            return Ok(None);
-        };
+        let zone = l.zone_prefix(level, x, y);
         let now = (self.now)();
-        for archive in manifest.archives.iter().rev() {
-            if l.is_expired(&archive.epoch, now) {
-                continue;
+        // Twice at most: a manifest held from a moment ago may name an
+        // archive that has since been merged into another and removed. The
+        // tile is then in an archive only a fresh manifest names.
+        for fresh in [false, true] {
+            if fresh {
+                self.forget(&zone);
             }
-            match self.read_tile(&archive.key, id).await {
-                Ok(Some(bytes)) => {
-                    return Ok(Some(Tile {
-                        bytes,
-                        content_type: l.content_type.clone(),
-                    }))
+            let Some(manifest) = self.manifest(&zone).await? else {
+                return Ok(None);
+            };
+            let mut gone = false;
+            for archive in manifest.archives.iter().rev() {
+                if l.is_expired(&archive.epoch, now) {
+                    continue;
                 }
-                // Not in this archive, or the archive was compacted away
-                // under a manifest read a moment too early: an older one may
-                // still hold the tile.
-                Ok(None) | Err(RepoError::NotFound(_)) => {}
-                Err(e) => return Err(e),
+                match self.read_tile(&archive.key, id).await {
+                    Ok(Some(bytes)) => {
+                        return Ok(Some(Tile {
+                            bytes,
+                            content_type: l.content_type.clone(),
+                        }))
+                    }
+                    Ok(None) => {}
+                    Err(RepoError::NotFound(_)) => gone = true,
+                    Err(e) => return Err(e),
+                }
+            }
+            if !gone {
+                break;
             }
         }
         Ok(None)

@@ -12,6 +12,8 @@
 //! GET /api/p/<project>/ls?prefix=        one level of the bucket, as it lies
 //! GET /api/tiles/catalog                 the tile store's layers
 //! GET /api/tiles/<layer>/<z>/<x>/<y>     one source tile, as stored
+//! GET /api/store/live/<key>               the store's catalog, or a manifest
+//! GET /api/store/b8/<n>/<key>             block n of one of the store's archives
 //! ```
 //!
 //! No server is in here and no transport: a native process and a Worker both
@@ -75,11 +77,28 @@ pub struct Project {
     pub films: Arc<dyn FilmRepository>,
 }
 
+/// The tile store as the objects it is made of, for a reader that looks
+/// tiles up itself.
+///
+/// A store is a catalog, a manifest per zone, and archives. A reader that
+/// is handed those — rather than tiles, one request each — finds a tile the
+/// way the store's own reader does, and what crosses the network is blocks
+/// of archives: few, large, immutable, and the same for whoever asks, which
+/// is the one shape every cache keeps.
+pub struct StoreObjects {
+    /// The catalog and the manifests: rewritten as tiles are added.
+    pub live: Arc<dyn Objects>,
+    /// The archives: never changed once written.
+    pub archives: Arc<dyn Objects>,
+}
+
 /// Everything a bench serves.
 pub struct Bench {
     pub projects: Vec<Project>,
     /// The tile store and where it is, when there is one.
     pub tiles: Option<(String, Arc<dyn TileRepository>)>,
+    /// The same store, as objects.
+    pub store: Option<StoreObjects>,
 }
 
 /// An HTTP response, before any server has it.
@@ -163,6 +182,14 @@ impl Eq for Later {}
 /// What a listing or an error is sent with: asked for again each time. What
 /// a bucket holds changes.
 pub const FRESH: &str = "no-cache";
+
+/// What a store's catalog and manifests are sent with: kept a moment, so a
+/// film's workers do not each ask for the same manifest, and asked for again
+/// soon, since tiles are added.
+pub const BRIEF: &str = "public, max-age=30";
+
+/// The largest catalog or manifest served: they are kilobytes.
+const LIVE_LIMIT: u64 = 4 << 20;
 
 /// What an object's bytes are sent with.
 ///
@@ -312,6 +339,9 @@ impl Bench {
         if let Some(rest) = rest.strip_prefix("tiles/") {
             return self.tiles_route(rest).await;
         }
+        if let Some(rest) = rest.strip_prefix("store/") {
+            return self.store_route(rest).await;
+        }
         let (name, rest) = rest
             .strip_prefix("p/")
             .and_then(|r| r.split_once('/'))
@@ -346,7 +376,52 @@ impl Bench {
                     format!("a block is {}/<number>/<key>", block_segment()),
                 )
             })?;
-            return self.block(project, &decoded(key), index).await;
+            return block(&project.objects, &decoded(key), index).await;
+        }
+        Err(Reply::text(404, "no such route"))
+    }
+
+    /// The store's objects: `store/live/<key>` for what changes,
+    /// `store/b8/<n>/<key>` for blocks of what does not.
+    async fn store_route(&self, rest: &str) -> Result<Reply, Reply> {
+        let Some(store) = &self.store else {
+            return Err(Reply::text(404, "no tile store configured"));
+        };
+        if let Some(key) = rest.strip_prefix("live/") {
+            let key = decoded(key);
+            // Only what a store rewrites, which is small: its catalog and
+            // its manifests. Everything else is an archive, read by blocks.
+            if !safe(&key) || !key.ends_with(".json") {
+                return Err(Reply::text(400, format!("not a live object: {key}")));
+            }
+            let size = store.live.size(&key).await.map_err(Reply::of)?;
+            if size > LIVE_LIMIT {
+                return Err(Reply::text(400, format!("{key} is {size} bytes")));
+            }
+            let body = store.live.read(&key, 0..size).await.map_err(Reply::of)?;
+            return Ok(Reply {
+                status: 200,
+                content_type: "application/json".into(),
+                content_range: None,
+                ranged: false,
+                etag: None,
+                object_size: Some(size),
+                cache_control: BRIEF,
+                body,
+                later: None,
+            });
+        }
+        if let Some((index, key)) = rest
+            .strip_prefix(&format!("{}/", block_segment()))
+            .and_then(|r| r.split_once('/'))
+        {
+            let index = index.parse().map_err(|_| {
+                Reply::text(
+                    400,
+                    format!("a block is {}/<number>/<key>", block_segment()),
+                )
+            })?;
+            return block(&store.archives, &decoded(key), index).await;
         }
         Err(Reply::text(404, "no such route"))
     }
@@ -398,45 +473,6 @@ impl Bench {
         })
     }
 
-    /// Block `index` of an object: bytes `index × BLOCK` up to the next
-    /// block, or the object's end. Whole, immutable, and the same for whoever
-    /// asks.
-    async fn block(&self, project: &Project, key: &str, index: u64) -> Result<Reply, Reply> {
-        if !safe(key) {
-            return Err(Reply::text(400, format!("not a key: {key}")));
-        }
-        let size = project.objects.size(key).await.map_err(Reply::of)?;
-        let start = index.saturating_mul(BLOCK);
-        if start >= size {
-            return Err(Reply::text(404, format!("{key} has no block {index}")));
-        }
-        // Not read here: cut along the cache's chunks, for whoever sends it
-        // to read a piece at a time.
-        let end = (start + BLOCK).min(size);
-        let ranges = (start..end)
-            .step_by(CHUNK as usize)
-            .map(|at| at..(at + CHUNK).min(end))
-            .collect();
-        Ok(Reply {
-            status: 200,
-            content_type: "application/octet-stream".into(),
-            content_range: None,
-            ranged: false,
-            etag: Some(format!(
-                "{}-{index}\"",
-                etag(key, size).trim_end_matches('"')
-            )),
-            object_size: Some(size),
-            cache_control: IMMUTABLE,
-            body: Vec::new(),
-            later: Some(Later {
-                objects: project.objects.clone(),
-                key: key.to_string(),
-                ranges,
-            }),
-        })
-    }
-
     async fn tiles_route(&self, rest: &str) -> Result<Reply, Reply> {
         let Some((_, tiles)) = &self.tiles else {
             return Err(Reply::text(404, "no tile store configured"));
@@ -471,6 +507,45 @@ impl Bench {
             )),
         }
     }
+}
+
+/// Block `index` of an object: bytes `index × BLOCK` up to the next
+/// block, or the object's end. Whole, immutable, and the same for whoever
+/// asks.
+async fn block(objects: &Arc<dyn Objects>, key: &str, index: u64) -> Result<Reply, Reply> {
+    if !safe(key) {
+        return Err(Reply::text(400, format!("not a key: {key}")));
+    }
+    let size = objects.size(key).await.map_err(Reply::of)?;
+    let start = index.saturating_mul(BLOCK);
+    if start >= size {
+        return Err(Reply::text(404, format!("{key} has no block {index}")));
+    }
+    // Not read here: cut along the cache's chunks, for whoever sends it
+    // to read a piece at a time.
+    let end = (start + BLOCK).min(size);
+    let ranges = (start..end)
+        .step_by(CHUNK as usize)
+        .map(|at| at..(at + CHUNK).min(end))
+        .collect();
+    Ok(Reply {
+        status: 200,
+        content_type: "application/octet-stream".into(),
+        content_range: None,
+        ranged: false,
+        etag: Some(format!(
+            "{}-{index}\"",
+            etag(key, size).trim_end_matches('"')
+        )),
+        object_size: Some(size),
+        cache_control: IMMUTABLE,
+        body: Vec::new(),
+        later: Some(Later {
+            objects: objects.clone(),
+            key: key.to_string(),
+            ranges,
+        }),
+    })
 }
 
 #[cfg(test)]
@@ -539,6 +614,7 @@ mod tests {
                 objects,
             }],
             tiles: None,
+            store: None,
         };
         let get = |range: &'static str| {
             futures_executor::block_on(bench.get("/api/p/p/o/a.tuilepack", "", Some(range)))

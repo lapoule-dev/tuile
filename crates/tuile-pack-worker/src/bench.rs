@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tuile_repository::s3::{Http, HttpReply, S3Config, S3Objects, Signed};
 use tuile_repository::{
     block_segment, ArchivedTiles, Bench, Cached, ChunkStore, Config, FilmRepository, Layout, Now,
-    Objects, Place, Project, Reply, RunFilms, ScenePacks, TileRepository,
+    Objects, Place, Project, Reply, RunFilms, ScenePacks, StoreObjects, TileRepository,
 };
 use worker::{
     console_log, event, Cache, Context, Date, Delay, Env, Fetch, Headers, Method, Request,
@@ -182,8 +182,10 @@ async fn bench(env: &Env, with_tiles: bool) -> std::result::Result<Bench, String
             films,
         });
     }
-    let tiles = match config.tiles {
-        Some(Place::Bucket(bucket)) if with_tiles => {
+    // The tile store, as objects and as tiles. As objects it costs nothing
+    // to offer: nothing is read until a route asks.
+    let store = match &config.tiles {
+        Some(Place::Bucket(bucket)) => {
             let live: Arc<dyn Objects> = Arc::new(S3Objects::new(
                 S3Config {
                     endpoint,
@@ -203,11 +205,18 @@ async fn bench(env: &Env, with_tiles: bool) -> std::result::Result<Bench, String
                     project: format!("tiles-{bucket}"),
                 },
             ));
+            Some((bucket.clone(), StoreObjects { live, archives }))
+        }
+        Some(Place::Dir(_)) => return Err("tiles: a Worker reads buckets, not directories".into()),
+        None => None,
+    };
+    let tiles = match &store {
+        Some((bucket, objects)) if with_tiles => {
             let now: Now = Arc::new(|| Date::now().as_millis() / 1000);
-            match ArchivedTiles::open(live, archives, now).await {
+            match ArchivedTiles::open(objects.live.clone(), objects.archives.clone(), now).await {
                 Ok(tiles) => {
                     let tiles: Arc<dyn TileRepository> = Arc::new(tiles);
-                    Some((bucket, tiles))
+                    Some((bucket.clone(), tiles))
                 }
                 Err(e) => {
                     // The films are still worth serving without it.
@@ -216,10 +225,13 @@ async fn bench(env: &Env, with_tiles: bool) -> std::result::Result<Bench, String
                 }
             }
         }
-        Some(Place::Dir(_)) => return Err("tiles: a Worker reads buckets, not directories".into()),
         _ => None,
     };
-    Ok(Bench { projects, tiles })
+    Ok(Bench {
+        projects,
+        tiles,
+        store: store.map(|(_, objects)| objects),
+    })
 }
 
 async fn respond(mut reply: Reply) -> Result<Response> {
@@ -255,9 +267,14 @@ async fn respond(mut reply: Reply) -> Result<Response> {
 /// Whether a path is a block of an object: `/api/p/<project>/b8/<n>/<key>`.
 /// A block is a whole, immutable reply — the one kind the edge cache keeps.
 fn is_block(path: &str) -> bool {
-    path.strip_prefix("/api/p/")
-        .and_then(|rest| rest.split_once('/'))
-        .is_some_and(|(_, rest)| rest.starts_with(&format!("{}/", block_segment())))
+    let blocks = format!("{}/", block_segment());
+    // A project's object, or one of the tile store's archives.
+    path.strip_prefix("/api/store/")
+        .is_some_and(|rest| rest.starts_with(&blocks))
+        || path
+            .strip_prefix("/api/p/")
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(_, rest)| rest.starts_with(&blocks))
 }
 
 #[event(fetch)]
