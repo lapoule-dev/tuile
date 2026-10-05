@@ -176,7 +176,7 @@ async fn the_routes_answer_as_documented() {
     // Blocks: the object cut at fixed offsets, each a whole reply of its own.
     // The size is in the address: a block cut another way is another URL, and
     // the one without a size names nothing.
-    assert_eq!(tuile_repository::block_segment(), "b16");
+    assert_eq!(tuile_repository::block_segment(), "b8");
     assert_eq!(
         bench
             .get(&format!("/api/p/engine/b/0/{key}"), "", None)
@@ -186,26 +186,27 @@ async fn the_routes_answer_as_documented() {
         404
     );
     let block = bench
-        .get(&format!("/api/p/engine/b16/0/{key}"), "", None)
+        .get(&format!("/api/p/engine/b8/0/{key}"), "", None)
         .await
         .expect("reply");
     assert_eq!(
         block.status, 200,
         "a block is a whole reply, not a partial one"
     );
+    let bytes = block.clone().whole().await.expect("the block's bytes");
     assert_eq!(
-        block.body.len() as u64,
+        bytes.len() as u64,
         size,
         "this object fits in its first block"
     );
-    assert_eq!(&block.body[..8], b"TUILEPK\0");
+    assert_eq!(&bytes[..8], b"TUILEPK\0");
     assert_eq!(block.object_size, Some(size));
     assert_eq!(block.cache_control, "public, max-age=31536000, immutable");
     assert!(block.content_range.is_none());
     assert_ne!(block.etag, head.etag, "a block is not the object");
     assert_eq!(
         bench
-            .get(&format!("/api/p/engine/b16/1/{key}"), "", None)
+            .get(&format!("/api/p/engine/b8/1/{key}"), "", None)
             .await
             .expect("reply")
             .status,
@@ -213,7 +214,7 @@ async fn the_routes_answer_as_documented() {
     );
     assert_eq!(
         bench
-            .get(&format!("/api/p/engine/b16/x/{key}"), "", None)
+            .get(&format!("/api/p/engine/b8/x/{key}"), "", None)
             .await
             .expect("reply")
             .status,
@@ -221,7 +222,7 @@ async fn the_routes_answer_as_documented() {
     );
     assert_eq!(
         bench
-            .get("/api/p/engine/b16/0/packs/../x", "", None)
+            .get("/api/p/engine/b8/0/packs/../x", "", None)
             .await
             .expect("reply")
             .status,

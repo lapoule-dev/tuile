@@ -7,7 +7,7 @@
 //! GET /api/projects                      the projects, their layout, the tile store
 //! GET /api/p/<project>/films             the films the project's bucket holds
 //! GET /api/p/<project>/films/<id>        one film: its packs (chunks), in order
-//! GET /api/p/<project>/b16/<n>/<key>      block n of an object: a whole reply (200)
+//! GET /api/p/<project>/b8/<n>/<key>       block n of an object: a whole reply (200)
 //! GET /api/p/<project>/o/<key>           an object, by byte range (206)
 //! GET /api/p/<project>/ls?prefix=        one level of the bucket, as it lies
 //! GET /api/tiles/catalog                 the tile store's layers
@@ -43,14 +43,14 @@ use crate::{FilmRepository, Objects, RepoError, TileRepository, CHUNK};
 ///
 /// It is a trade. A frame reads a few megabytes scattered over its pack, so a
 /// small block wastes little and costs a request each; a large one brings
-/// bytes nobody asked for and saves the requests — and requests are what a
-/// film's worth of reading is short of, each one a round trip to the edge
-/// and, on a cold cache, a signed read of the bucket behind it. Sixteen
-/// megabytes is four of the cache's own chunks, and still small enough for a
-/// Worker to hold a few of at once.
-pub const BLOCK: u64 = 4 * CHUNK;
+/// bytes nobody asked for and saves the requests. And a block is held whole
+/// by whoever serves it — several at once, when a film's workers ask
+/// together, in a Worker that has 128 MB for everything. So a block is one
+/// chunk of the cache below, read and handed over without being assembled
+/// or copied, and eight megabytes is as large as that stays comfortable.
+pub const BLOCK: u64 = CHUNK;
 
-/// The path segment that names a block: `b16` for sixteen-megabyte blocks.
+/// The path segment that names a block: `b8` for eight-megabyte blocks.
 /// The size is in the URL because a block is immutable there: cut another
 /// way, the same number would be other bytes under an address every cache
 /// has been told never to ask about again.
@@ -100,7 +100,65 @@ pub struct Reply {
     /// `Cache-Control`.
     pub cache_control: &'static str,
     pub body: Vec<u8>,
+    /// The body, when it has not been read: `body` is then empty, and whoever
+    /// sends the reply reads this as it sends.
+    pub later: Option<Later>,
 }
+
+/// A body not read yet: ranges of one object, to be sent in order.
+///
+/// A block is megabytes, and whoever serves it decides how to hold them: a
+/// reply names the pieces — each one chunk of the cache below, so each is
+/// read without being assembled or copied — and its sender reads them when
+/// it sends.
+#[derive(Clone)]
+pub struct Later {
+    objects: Arc<dyn Objects>,
+    pub key: String,
+    pub ranges: Vec<Range<u64>>,
+}
+
+impl Later {
+    /// How many bytes the whole body is.
+    pub fn len(&self) -> u64 {
+        self.ranges.iter().map(|r| r.end - r.start).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// One piece of the body.
+    pub async fn part(&self, index: usize) -> Result<Vec<u8>, RepoError> {
+        match self.ranges.get(index) {
+            Some(range) => self.objects.read(&self.key, range.clone()).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// The whole body, for a server with the memory to hold it.
+    pub async fn read(&self) -> Result<Vec<u8>, RepoError> {
+        let mut out = Vec::with_capacity(self.len() as usize);
+        for index in 0..self.ranges.len() {
+            out.extend(self.part(index).await?);
+        }
+        Ok(out)
+    }
+}
+
+impl std::fmt::Debug for Later {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {:?}", self.key, self.ranges)
+    }
+}
+
+impl PartialEq for Later {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.ranges == other.ranges
+    }
+}
+
+impl Eq for Later {}
 
 /// What a listing or an error is sent with: asked for again each time. What
 /// a bucket holds changes.
@@ -137,6 +195,7 @@ impl Reply {
             object_size: None,
             cache_control: FRESH,
             body: message.to_string().into_bytes(),
+            later: None,
         }
     }
 
@@ -151,8 +210,17 @@ impl Reply {
                 object_size: None,
                 cache_control: FRESH,
                 body,
+                later: None,
             },
             Err(e) => Self::text(500, e),
+        }
+    }
+
+    /// The body, whole: read now if it had not been.
+    pub async fn whole(self) -> Result<Vec<u8>, RepoError> {
+        match self.later {
+            Some(later) => later.read().await,
+            None => Ok(self.body),
         }
     }
 
@@ -326,6 +394,7 @@ impl Bench {
             object_size: Some(size),
             cache_control: IMMUTABLE,
             body,
+            later: None,
         })
     }
 
@@ -341,11 +410,13 @@ impl Bench {
         if start >= size {
             return Err(Reply::text(404, format!("{key} has no block {index}")));
         }
-        let body = project
-            .objects
-            .read(key, start..(start + BLOCK).min(size))
-            .await
-            .map_err(Reply::of)?;
+        // Not read here: cut along the cache's chunks, for whoever sends it
+        // to read a piece at a time.
+        let end = (start + BLOCK).min(size);
+        let ranges = (start..end)
+            .step_by(CHUNK as usize)
+            .map(|at| at..(at + CHUNK).min(end))
+            .collect();
         Ok(Reply {
             status: 200,
             content_type: "application/octet-stream".into(),
@@ -357,7 +428,12 @@ impl Bench {
             )),
             object_size: Some(size),
             cache_control: IMMUTABLE,
-            body,
+            body: Vec::new(),
+            later: Some(Later {
+                objects: project.objects.clone(),
+                key: key.to_string(),
+                ranges,
+            }),
         })
     }
 
@@ -387,6 +463,7 @@ impl Bench {
                 // A tile can be refetched and replaced in the store.
                 cache_control: FRESH,
                 body: tile.bytes,
+                later: None,
             }),
             None => Err(Reply::text(
                 404,
@@ -470,6 +547,23 @@ mod tests {
         assert_eq!(too_much.status, 400);
         assert!(String::from_utf8_lossy(&too_much.body).contains("read it as several"));
         assert_eq!(get("bytes=0-4194303").expect("reply").status, 206);
+        // A block of it is cut into pieces and none of them is read here.
+        let block = futures_executor::block_on(bench.get(
+            &format!("/api/p/p/{}/3/a.tuilepack", block_segment()),
+            "",
+            None,
+        ))
+        .expect("reply");
+        assert_eq!(block.status, 200);
+        assert!(block.body.is_empty());
+        let later = block.later.expect("a block is read as it is sent");
+        assert_eq!(later.len(), BLOCK);
+        assert_eq!(later.ranges.len(), (BLOCK / CHUNK) as usize);
+        assert_eq!(later.ranges[0].start, 3 * BLOCK);
+        assert!(later
+            .ranges
+            .iter()
+            .all(|r| r.start % CHUNK == 0 && r.end - r.start == CHUNK));
         // The whole of it, with no range, is refused too.
         let whole = futures_executor::block_on(bench.get("/api/p/p/o/a.tuilepack", "", None))
             .expect("reply");

@@ -2,7 +2,7 @@
 // Copyright (c) lapoule.dev
 
 use async_trait::async_trait;
-use tuile_pack::{blob_start, Pack, PREAMBLE};
+use tuile_pack::{blob_start, frame_range_by, PREAMBLE};
 
 use crate::{Entry, Objects, RepoError};
 
@@ -113,8 +113,11 @@ async fn frames_of(objects: &dyn Objects, key: &str) -> Result<(u32, u32), RepoE
             what: "table",
         }));
     }
-    let head = objects.read(key, 0..start).await?;
-    Ok(Pack::open_table(&head).map_err(malformed)?.frame_range())
+    // Not the table: it can be larger than the memory there is to read it
+    // into, and the range is two numbers at a known place in it.
+    frame_range_by(start, |range| objects.read(key, range))
+        .await?
+        .map_err(malformed)
 }
 
 /// A one-line object — a digest, a marker — trimmed.

@@ -28,6 +28,7 @@
 //! The contracts and the layouts compile to wasm32; the adapters that reach a
 //! bucket from a native process (`native`) do not, and are not built there.
 
+mod archives;
 pub mod bench;
 mod cached;
 mod config;
@@ -41,7 +42,8 @@ mod tiles;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 
-pub use bench::{block_segment, Bench, Project, Reply, BLOCK};
+pub use archives::{ArchivedTiles, Now};
+pub use bench::{block_segment, Bench, Later, Project, Reply, BLOCK};
 pub use cached::{Cached, ChunkStore, CHUNK};
 pub use config::{Config, Layout, Place, ProjectConfig};
 pub use films::{Chunk, Film, FilmRepository, FilmSummary, Unreadable};
