@@ -10,8 +10,8 @@ use tuile_repository::{
     Objects, Place, Project, Reply, RunFilms, ScenePacks, TileRepository,
 };
 use worker::{
-    console_log, event, Cache, Context, Date, Env, Fetch, Headers, Method, Request, RequestInit,
-    Response, Result,
+    console_log, event, Cache, Context, Date, Delay, Env, Fetch, Headers, Method, Request,
+    RequestInit, Response, Result,
 };
 
 /// `fetch`, as the transport the S3 protocol is sent with.
@@ -21,6 +21,10 @@ struct FetchHttp;
 impl Http for FetchHttp {
     fn now(&self) -> u64 {
         Date::now().as_millis() / 1000
+    }
+
+    async fn pause(&self, milliseconds: u32) {
+        Delay::from(std::time::Duration::from_millis(u64::from(milliseconds))).await;
     }
 
     async fn send(&self, request: &Signed) -> std::result::Result<HttpReply, String> {

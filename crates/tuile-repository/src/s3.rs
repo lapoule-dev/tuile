@@ -41,6 +41,21 @@ pub trait Http: Send + Sync {
     /// The time, in seconds since the Unix epoch: a signature carries it.
     fn now(&self) -> u64;
     async fn send(&self, request: &Signed) -> Result<HttpReply, String>;
+    /// Waits, before a request is tried again.
+    async fn pause(&self, milliseconds: u32);
+}
+
+/// Tries at a request the bucket turned away for being busy.
+const TRIES: u32 = 5;
+/// The wait before the second try; each one after waits twice as long.
+const FIRST_PAUSE_MS: u32 = 200;
+
+/// Whether a status says "not now" rather than "no": too many requests, or
+/// a server that could not answer this once. A bucket limits how many reads
+/// of one object it serves at a time, and a scene opened twice asks for the
+/// same small objects together.
+fn passing(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
 /// The bucket's address and the key that signs for it.
@@ -293,15 +308,26 @@ impl<H: Http> S3Objects<H> {
             encode(path, true),
             if query.is_empty() { "" } else { "?" },
         );
-        let reply = self
-            .http
-            .send(&Signed {
-                method,
-                url,
-                headers,
-            })
-            .await
-            .map_err(|e| RepoError::Store(format!("{key}: {e}")))?;
+        let signed = Signed {
+            method,
+            url,
+            headers,
+        };
+        let mut pause = FIRST_PAUSE_MS;
+        let mut tries = 1;
+        let reply = loop {
+            let reply = self
+                .http
+                .send(&signed)
+                .await
+                .map_err(|e| RepoError::Store(format!("{key}: {e}")))?;
+            if !passing(reply.status) || tries == TRIES {
+                break reply;
+            }
+            self.http.pause(pause).await;
+            pause *= 2;
+            tries += 1;
+        };
         match reply.status {
             200 | 206 => Ok(reply),
             404 => Err(RepoError::NotFound(key.to_string())),
@@ -401,6 +427,70 @@ mod tests {
     const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
     const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
     const WHEN: u64 = 1_369_353_600; // 2013-05-24T00:00:00Z
+
+    /// A bucket that is busy for its first `busy` requests.
+    struct Busy {
+        busy: usize,
+        sent: std::sync::atomic::AtomicUsize,
+        pauses: std::sync::Mutex<Vec<u32>>,
+    }
+
+    #[async_trait]
+    impl Http for Busy {
+        fn now(&self) -> u64 {
+            WHEN
+        }
+        async fn send(&self, _: &Signed) -> Result<HttpReply, String> {
+            let n = self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(if n < self.busy {
+                HttpReply {
+                    status: 429,
+                    content_length: None,
+                    body: b"Reduce your rate of simultaneous reads on the same object.".to_vec(),
+                }
+            } else {
+                HttpReply {
+                    status: 206,
+                    content_length: Some(3),
+                    body: b"abc".to_vec(),
+                }
+            })
+        }
+        async fn pause(&self, milliseconds: u32) {
+            self.pauses.lock().expect("lock").push(milliseconds);
+        }
+    }
+
+    fn bucket(busy: usize) -> S3Objects<Busy> {
+        S3Objects::new(
+            S3Config {
+                endpoint: "https://example.invalid".into(),
+                bucket: "b".into(),
+                access_key_id: KEY.into(),
+                secret_access_key: SECRET.into(),
+                region: "auto".into(),
+            },
+            Busy {
+                busy,
+                sent: Default::default(),
+                pauses: Default::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_busy_bucket_is_asked_again_and_not_for_ever() {
+        let objects = bucket(2);
+        let got = futures_executor::block_on(objects.read("k", 0..3)).expect("read");
+        assert_eq!(got, b"abc");
+        assert_eq!(*objects.http.pauses.lock().expect("lock"), [200, 400]);
+
+        let objects = bucket(usize::MAX);
+        let refused = futures_executor::block_on(objects.read("k", 0..3));
+        assert!(matches!(refused, Err(RepoError::Store(why)) if why.contains("HTTP 429")));
+        let sent = objects.http.sent.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(sent, TRIES as usize);
+    }
 
     #[test]
     fn a_time_is_stamped_as_the_signature_wants() {
