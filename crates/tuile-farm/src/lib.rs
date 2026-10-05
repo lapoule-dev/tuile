@@ -246,6 +246,43 @@ impl ObjectRunStore {
         &self.label
     }
 
+    /// The client underneath, for a reader that speaks `object_store` itself
+    /// (the tile store does).
+    pub fn object_store(&self) -> Arc<dyn ObjectStore> {
+        self.store.clone()
+    }
+
+    /// One level of the store: the "directories" directly under `prefix` and
+    /// the objects in it. What a browser of the bucket shows — [`RunStore::list`]
+    /// walks everything below a prefix, which on a large bucket is millions.
+    pub async fn browse(&self, prefix: &str) -> Result<(Vec<String>, Vec<Entry>)> {
+        let prefix = prefix.trim_matches('/');
+        let path = if prefix.is_empty() { None } else { Some(key_path(prefix)?) };
+        let listed = self
+            .store
+            .list_with_delimiter(path.as_ref())
+            .await
+            .map_err(|e| StoreError::store(prefix, e))?;
+        let mut dirs: Vec<String> = listed.common_prefixes.iter().map(|p| p.to_string()).collect();
+        let mut files: Vec<Entry> = listed
+            .objects
+            .into_iter()
+            .map(|meta| Entry { key: meta.location.to_string(), size: meta.size })
+            .collect();
+        dirs.sort();
+        files.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok((dirs, files))
+    }
+
+    /// An object's size, or `NotFound`.
+    pub async fn size(&self, key: &str) -> Result<u64> {
+        self.store
+            .head(&key_path(key)?)
+            .await
+            .map(|meta| meta.size)
+            .map_err(|e| StoreError::store(key, e))
+    }
+
     /// The body of [`RunStore::get`], into `tmp`.
     async fn download(
         &self,
