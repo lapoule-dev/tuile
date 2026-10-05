@@ -68,6 +68,13 @@ fn scene_bucket(root: &Path) {
     );
     pack(&root.join("packs/bbbb000000000002/1-4.tuilepack"), 1, 4);
     put(&root.join("packs/notes.txt"), b"not a scene");
+    // A scene whose only pack is not one this build reads, and one whose
+    // name disagrees with what it holds: still films, with nothing to render.
+    put(
+        &root.join("packs/cccc000000000003/1-9.tuilepack"),
+        b"an older format, or noise",
+    );
+    pack(&root.join("packs/dddd000000000004/1-9.tuilepack"), 1, 7);
 }
 
 /// How the run directories below are laid out. The names are this test's:
@@ -106,6 +113,13 @@ fn run_bucket(root: &Path) {
     put(&both.join("cuts/k001.done"), b"d1\n");
     pack(&both.join("all.tuilepack"), 1, 9);
 
+    // One chunk of two that this build cannot read.
+    let old = root.join("260/fourth");
+    pack(&old.join("cuts/k000.tuilepack"), 1, 4);
+    put(&old.join("cuts/k000.done"), b"d0\n");
+    put(&old.join("cuts/k001.tuilepack"), b"not a pack");
+    put(&old.join("cuts/k001.done"), b"d1\n");
+
     // Not films: nothing baked; and only a chunk still being uploaded.
     put(&root.join("300/empty/notes.txt"), b"nothing here");
     pack(&root.join("400/uploading/cuts/k000.tuilepack"), 1, 3);
@@ -118,17 +132,30 @@ async fn holds_its_contract(repo: &dyn FilmRepository, objects: &dyn Objects) ->
     for summary in &films {
         let film = repo.film(&summary.id).await.expect("a listed film opens");
         assert_eq!(film.id, summary.id);
-        assert!(!film.chunks.is_empty(), "{}: a film with no chunk", film.id);
+        // Every pack the listing counted is accounted for: read, or said to
+        // be unreadable and why. None makes the film fail to open.
+        assert!(
+            !film.chunks.is_empty() || !film.unreadable.is_empty(),
+            "{}: a film with no pack",
+            film.id
+        );
         assert_eq!(
-            film.chunks.len(),
+            film.chunks.len() + film.unreadable.len(),
             summary.packs,
             "{}: the summary miscounts",
             film.id
         );
-        assert_eq!(
-            film.chunks.iter().map(|c| c.bytes).sum::<u64>(),
-            summary.bytes
-        );
+        let bytes: u64 = film
+            .chunks
+            .iter()
+            .map(|c| c.bytes)
+            .chain(film.unreadable.iter().map(|u| u.bytes))
+            .sum();
+        assert_eq!(bytes, summary.bytes);
+        for u in &film.unreadable {
+            assert!(!u.why.is_empty());
+            assert!(film.chunks.iter().all(|c| c.key != u.key));
+        }
         for pair in film.chunks.windows(2) {
             assert!(
                 pair[0].last < pair[1].first,
@@ -183,11 +210,11 @@ async fn every_repository_over_every_store_holds_the_contract() {
     run_bucket(&runs_root);
     for objects in stores(&scenes_root, &dir.path().join("cache-scenes")) {
         let repo = ScenePacks::new(objects.clone(), ["packs"]);
-        assert_eq!(holds_its_contract(&repo, objects.as_ref()).await, 2);
+        assert_eq!(holds_its_contract(&repo, objects.as_ref()).await, 4);
     }
     for objects in stores(&runs_root, &dir.path().join("cache-runs")) {
         let repo = RunFilms::new(objects.clone(), layout()).expect("layout");
-        assert_eq!(holds_its_contract(&repo, objects.as_ref()).await, 3);
+        assert_eq!(holds_its_contract(&repo, objects.as_ref()).await, 4);
     }
 }
 
@@ -257,7 +284,13 @@ async fn an_uncut_run_is_one_chunk_and_a_run_with_both_is_read_by_its_chunks() {
         .into_iter()
         .map(|f| f.id)
         .collect();
-    assert_eq!(ids, ["100/first", "200/second", "250/third"]);
+    assert_eq!(ids, ["100/first", "200/second", "250/third", "260/fourth"]);
+
+    // A chunk that cannot be read is reported, and the film still opens.
+    let partly = repo.film("260/fourth").await.expect("film");
+    assert_eq!(partly.chunks.len(), 1);
+    assert_eq!(partly.unreadable.len(), 1);
+    assert!(partly.unreadable[0].key.ends_with("cuts/k001.tuilepack"));
     assert!(matches!(
         repo.film("400/uploading").await,
         Err(RepoError::NotFound(_))
@@ -278,4 +311,24 @@ fn a_layout_that_can_find_no_pack_is_refused() {
         ..layout()
     };
     assert!(RunFilms::new(direct(dir.path()), unnumbered).is_err());
+}
+
+#[tokio::test]
+async fn a_pack_this_build_cannot_read_is_reported_not_fatal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    scene_bucket(dir.path());
+    let repo = ScenePacks::new(direct(dir.path()), ["packs"]);
+    let old = repo
+        .film("packs/cccc000000000003")
+        .await
+        .expect("an old film still opens");
+    assert!(old.chunks.is_empty());
+    assert_eq!(old.unreadable.len(), 1);
+    let renamed = repo.film("packs/dddd000000000004").await.expect("film");
+    assert!(renamed.chunks.is_empty());
+    assert!(
+        renamed.unreadable[0].why.contains("named 1–9, holds 1–7"),
+        "{}",
+        renamed.unreadable[0].why
+    );
 }

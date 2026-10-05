@@ -35,7 +35,7 @@ mod tiles;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 
-pub use films::{Chunk, Film, FilmRepository, FilmSummary};
+pub use films::{Chunk, Film, FilmRepository, FilmSummary, Unreadable};
 pub use objects::{Entry, Listing, Objects, RepoError};
 pub use runs::{RunFilms, RunLayout};
 pub use scenes::ScenePacks;
