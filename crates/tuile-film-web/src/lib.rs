@@ -12,14 +12,22 @@
 //! The page joins the slices with [`FilmMuxer`], which refuses a slice whose
 //! encoder produced other parameter sets.
 //!
+//! Encoding is progressive: the browser's H.264 encoder when it has one for
+//! the picture size, and otherwise [`SoftEncoder`] — rav1e, compiled into
+//! this module — fed I420 planes the GPU converted.
+//!
 //! Imagery never enters the wasm heap as pixels: the pack's PNG goes to the
 //! browser's own decoder (`createImageBitmap`, off-thread) and from there
 //! straight into a GPU texture.
 
 #[cfg(target_arch = "wasm32")]
+mod soft;
+#[cfg(target_arch = "wasm32")]
 mod source;
 #[cfg(target_arch = "wasm32")]
 mod worker;
 
+#[cfg(target_arch = "wasm32")]
+pub use soft::{SoftEncoder, SoftPacket};
 #[cfg(target_arch = "wasm32")]
 pub use worker::{FilmMuxer, FilmWorker, FrameStats, PackView};

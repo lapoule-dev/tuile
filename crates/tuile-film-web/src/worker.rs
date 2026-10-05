@@ -9,7 +9,7 @@ use tuile_film::{
     TileKey,
 };
 use tuile_film_gpu::{FilmGpu, Settings, TileMesh, OUTPUT_FORMAT};
-use tuile_mp4::{Muxer, ParameterSets};
+use tuile_mp4::{Codec, Muxer, ParameterSets};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -218,6 +218,9 @@ pub struct FilmWorker {
     gpu: FilmGpu,
     surface: wgpu::Surface<'static>,
     aspect: f32,
+    /// Where each frame's I420 planes are copied for a software encoder;
+    /// `None` when the browser's own encoder reads the canvas.
+    readback: Option<wgpu::Buffer>,
 }
 
 async fn bitmap(png: Vec<u8>) -> Result<ImageBitmap, JsValue> {
@@ -316,7 +319,44 @@ impl FilmWorker {
             gpu,
             surface,
             aspect: width as f32 / height as f32,
+            readback: None,
         })
+    }
+
+    /// Makes every frame from now on also leave its picture as I420 planes,
+    /// for [`FilmWorker::read_i420`]. Off by default: the browser's encoder
+    /// reads the canvas and needs no copy.
+    pub fn enable_i420(&mut self) {
+        let size = self.gpu.i420_planes().size();
+        self.readback = Some(self.gpu.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("film i420 readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        }));
+    }
+
+    /// The last frame's picture as planar I420 (Y, then U, then V), BT.709
+    /// limited range, converted on the GPU. Half the bytes of RGBA, and what
+    /// an encoder wants.
+    pub async fn read_i420(&self) -> Result<Vec<u8>, JsError> {
+        let buffer = self
+            .readback
+            .as_ref()
+            .ok_or_else(|| js("enable_i420 was not called"))?;
+        let (done, mapped) = futures_channel::oneshot::channel();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = done.send(result);
+            });
+        mapped
+            .await
+            .map_err(|_| js("the readback was dropped"))?
+            .map_err(js)?;
+        let bytes = buffer.slice(..).get_mapped_range().to_vec();
+        buffer.unmap();
+        Ok(bytes)
     }
 
     /// Frames this worker has yet to render.
@@ -335,6 +375,7 @@ impl FilmWorker {
             gpu,
             surface,
             aspect,
+            readback,
         } = self;
         let pack = Pack::open_table(head).map_err(js)?;
         let Some(diff) = cursor.advance(&pack) else {
@@ -437,6 +478,10 @@ impl FilmWorker {
             frame.texture.as_image_copy(),
             gpu.output().size(),
         );
+        if let Some(buffer) = readback.as_ref() {
+            gpu.encode_i420(&mut encoder).map_err(js)?;
+            encoder.copy_buffer_to_buffer(gpu.i420_planes(), 0, buffer, 0, buffer.size());
+        }
         gpu.queue().submit([encoder.finish()]);
         frame.present();
         // Released only now: the frame that stopped drawing them is recorded.
@@ -461,30 +506,38 @@ impl FilmWorker {
     }
 }
 
-/// The page's side: one mp4 from every worker's encoded chunks, in order.
+/// The page's side: one mp4 from every worker's encoded frames, in order.
 #[wasm_bindgen]
 pub struct FilmMuxer {
     inner: Option<Muxer>,
 }
 
+/// The codec an encoder's configuration record is for: an `av1C` starts with
+/// its marker bit set, an `avcC` with its version, 1.
+fn codec_of(config: &[u8]) -> Result<Codec, JsError> {
+    match config.first() {
+        Some(0x81) => Ok(Codec::Av1(config.to_vec())),
+        _ => Ok(Codec::Avc(ParameterSets::from_avcc(config).map_err(js)?)),
+    }
+}
+
 #[wasm_bindgen]
 impl FilmMuxer {
-    /// `avcc` is the `description` of the first encoder's decoder config.
+    /// `config` is the first encoder's configuration record: the `avcC`
+    /// description WebCodecs hands out for H.264, or an `av1C` for AV1.
     #[wasm_bindgen(constructor)]
-    pub fn new(width: u16, height: u16, fps: u32, avcc: &[u8]) -> Result<FilmMuxer, JsError> {
-        let sets = ParameterSets::from_avcc(avcc).map_err(js)?;
+    pub fn new(width: u16, height: u16, fps: u32, config: &[u8]) -> Result<FilmMuxer, JsError> {
         Ok(FilmMuxer {
-            inner: Some(Muxer::new(width, height, fps, sets).map_err(js)?),
+            inner: Some(Muxer::with(width, height, fps, codec_of(config)?).map_err(js)?),
         })
     }
 
-    /// Fails unless an encoder with this `avcc` can join the film.
-    pub fn check(&self, avcc: &[u8]) -> Result<(), JsError> {
-        let sets = ParameterSets::from_avcc(avcc).map_err(js)?;
-        self.muxer()?.check(&sets).map_err(js)
+    /// Fails unless an encoder with this record can join the film.
+    pub fn check(&self, config: &[u8]) -> Result<(), JsError> {
+        self.muxer()?.check(&codec_of(config)?).map_err(js)
     }
 
-    /// Appends frame `index` of the film (from 0), as WebCodecs emitted it.
+    /// Appends frame `index` of the film (from 0), as its encoder emitted it.
     pub fn push(&mut self, index: u32, data: Vec<u8>, key: bool) -> Result<(), JsError> {
         self.inner
             .as_mut()

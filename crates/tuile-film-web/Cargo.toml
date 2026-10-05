@@ -18,7 +18,11 @@ tuile-mp4 = { version = "0.1.0", path = "../tuile-mp4" }
 # `--workspace` build on a laptop skips it instead of failing on a missing
 # worker scope — the same arrangement as `tuile-web`.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+futures-channel = { workspace = true }
 futures-util = { workspace = true }
+# The fallback encoder: pure Rust, so it builds for wasm32 as it is. No
+# assembly, no threads — the workers are the parallelism.
+rav1e = { version = "0.8", default-features = false }
 tuile-film-gpu = { version = "0.1.0", path = "../tuile-film-gpu" }
 wgpu = { workspace = true, features = ["webgpu"] }
 wasm-bindgen = "0.2.99"
