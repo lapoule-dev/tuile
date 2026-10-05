@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) lapoule.dev
+
+//! The adapters a native process reaches a bucket with.
+
+mod disk;
+mod store;
+mod tiles;
+
+pub use disk::DiskChunks;
