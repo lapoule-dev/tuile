@@ -66,14 +66,26 @@ pub use generated::tuile::pack as fb;
 /// What every pack starts with, so a wrong file says so instead of parsing.
 pub const MAGIC: &[u8; 8] = b"TUILEPK\0";
 
-/// The layout version. Bumped when an old reader would misread a new file.
+/// The layout version written. Bumped when an old reader would misread a new
+/// file.
 pub const VERSION: u32 = 2;
+
+/// The layout versions read. A bucket outlives the formats written to it,
+/// and a pack is hours of baking: an older one is read, not re-baked.
+///
+/// - **1** — every block is LZ4, the texture's included (a PNG run through
+///   LZ4: a PNG plus a header).
+/// - **2** — a texture keeps the compression it already has and is stored as
+///   produced; `Tile.texture_format` says what the block carries.
+///
+/// Nothing else differs: same table, same blocks, same blob digest.
+pub const READABLE: std::ops::RangeInclusive<u32> = 1..=2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PackError {
     #[error("not a tuile pack (bad magic)")]
     NotAPack,
-    #[error("pack layout version {found}, this build reads {VERSION}")]
+    #[error("pack layout version {found}, this build reads {} to {}", READABLE.start(), READABLE.end())]
     Version { found: u32 },
     #[error("truncated: the {what} runs past the end of the file")]
     Truncated { what: &'static str },
@@ -216,6 +228,9 @@ pub const VIEW_TOLERANCE_RAD: f64 = 1.0e-3;
 
 /// Builds a pack. Payloads are compressed here, on the machine that has time.
 pub struct PackWriter {
+    /// The layout version being written: [`VERSION`], unless a test asked for
+    /// an older one.
+    version: u32,
     scene_digest: String,
     culling: String,
     render_origin: [f64; 3],
@@ -373,6 +388,7 @@ impl PackWriter {
             // culled has to be assumed to have culled the usual way, and
             // `culling` is what a reader complains about.
             culling: "full".into(),
+            version: VERSION,
             render_origin,
             tiles: Vec::new(),
             index: std::collections::HashMap::new(),
@@ -437,6 +453,14 @@ impl PackWriter {
         }
     }
 
+    /// Writes an older layout instead of the current one. For tests of the
+    /// readers: nothing bakes an old pack on purpose.
+    #[doc(hidden)]
+    pub fn as_version(mut self, version: u32) -> Self {
+        self.version = version;
+        self
+    }
+
     /// Adds one frame's selection, deduplicating tiles against every frame
     /// already added.
     pub fn frame(
@@ -480,7 +504,8 @@ impl PackWriter {
                         uvs: self.put(&tile.uvs, true),
                         indices: self.put(&tile.indices, true),
                         texture: tile.texture.as_deref().map(|t| {
-                            self.put(t, !carries_its_own_compression(tile.texture_format))
+                            let as_produced = self.version >= 2 && carries_its_own_compression(tile.texture_format);
+                            self.put(t, !as_produced)
                         }),
                         texture_format: tile.texture_format,
                     };
@@ -645,7 +670,7 @@ impl PackWriter {
         let first = self.frames.first().map_or(0, |(n, _, _)| *n);
         let last = self.frames.last().map_or(0, |(n, _, _)| *n);
         let mut b = fb::PackBuilder::new(&mut fbb);
-        b.add_version(VERSION);
+        b.add_version(self.version);
         b.add_scene_digest(digest);
         b.add_blob_digest(blob_digest);
         b.add_first_frame(first);
@@ -690,7 +715,7 @@ impl<'a> Pack<'a> {
             .ok_or(PackError::Truncated { what: "table" })?;
         let root = fb::root_as_pack(&bytes[start..end])
             .map_err(|e| PackError::Malformed(e.to_string()))?;
-        if root.version() != VERSION {
+        if !READABLE.contains(&root.version()) {
             return Err(PackError::Version {
                 found: root.version(),
             });
@@ -748,7 +773,7 @@ impl<'a> Pack<'a> {
             .ok_or(PackError::Truncated { what: "table" })?;
         let root = fb::root_as_pack(&bytes[start..end])
             .map_err(|e| PackError::Malformed(e.to_string()))?;
-        if root.version() != VERSION {
+        if !READABLE.contains(&root.version()) {
             return Err(PackError::Version {
                 found: root.version(),
             });
@@ -775,7 +800,7 @@ impl<'a> Pack<'a> {
         }
         let root = fb::root_as_pack(&head[MAGIC.len() + 8..start])
             .map_err(|e| PackError::Malformed(e.to_string()))?;
-        if root.version() != VERSION {
+        if !READABLE.contains(&root.version()) {
             return Err(PackError::Version {
                 found: root.version(),
             });
@@ -835,7 +860,7 @@ impl<'a> Pack<'a> {
         let Some(block) = tile.texture() else {
             return Ok(Vec::new());
         };
-        if carries_its_own_compression(tile.texture_format()) {
+        if self.stores_textures_as_produced() && carries_its_own_compression(tile.texture_format()) {
             return Ok(Self::stored_in(block, at, bytes, "texture")?.to_vec());
         }
         self.payload_in(block, at, bytes, "texture")
@@ -856,6 +881,17 @@ impl<'a> Pack<'a> {
             .filter(|e| *e <= bytes.len())
             .ok_or(PackError::Truncated { what })?;
         Ok(&bytes[start..end])
+    }
+
+    /// The layout version this pack was written as.
+    pub fn version(&self) -> u32 {
+        self.root.version()
+    }
+
+    /// From version 2 on a texture is stored as its codec produced it;
+    /// before, it went through LZ4 like every other block.
+    fn stores_textures_as_produced(&self) -> bool {
+        self.root.version() >= 2
     }
 
     /// Fails unless this pack is the bake of the scene the caller means.
@@ -1024,7 +1060,7 @@ impl<'a> Pack<'a> {
         let Some(block) = tile.texture() else {
             return Ok(Vec::new());
         };
-        if carries_its_own_compression(tile.texture_format()) {
+        if self.stores_textures_as_produced() && carries_its_own_compression(tile.texture_format()) {
             return Ok(self.stored(block, "texture")?.to_vec());
         }
         self.payload(block, "texture")
@@ -1088,6 +1124,63 @@ mod tests {
     /// le blob et que `open` le parcourt entièrement.
     /// A pack read through its table and byte ranges hands back exactly what
     /// a pack held whole does — and the streamed digest is the stored one.
+    /// A tile with a texture, written at `version` and read back whole.
+    fn written_at(version: u32, texture: &[u8]) -> Vec<u8> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut tile = a_tile(1, 9);
+        tile.texture = Some(texture.to_vec());
+        tile.texture_format = TextureFormat::Png;
+        let mut w = PackWriter::new("s", [0.0; 3], dir.path().join("blob"))
+            .expect("writer")
+            .as_version(version);
+        w.frame(1, a_view(0.0), [tile]);
+        let path = dir.path().join("p.tuilepack");
+        w.finish_to(&path).expect("finish");
+        std::fs::read(path).expect("read")
+    }
+
+    /// **Both layouts are read, and a texture comes back the same from
+    /// either** — whole, and by range. Version 1 ran it through LZ4; version
+    /// 2 stores it as produced. A reader that treated one as the other would
+    /// hand an image decoder LZ4 framing, or decompress a PNG.
+    #[test]
+    fn both_layout_versions_are_read() {
+        // Compressible on purpose: under LZ4 it is stored shorter, so the two
+        // layouts really do lay different bytes down.
+        let texture: Vec<u8> = b"\x89PNG\r\n\x1a\n".iter().copied().chain(std::iter::repeat_n(7u8, 4000)).collect();
+        let mut stored = Vec::new();
+        for version in READABLE {
+            let bytes = written_at(version, &texture);
+            let pack = Pack::open(&bytes).expect("open");
+            assert_eq!(pack.version(), version);
+            let tile = pack.frame(1).expect("frame")[0];
+            assert_eq!(pack.texture(&tile).expect("texture"), texture, "version {version}, whole");
+            assert_eq!(pack.baked(&tile).expect("baked").texture.as_deref(), Some(texture.as_slice()));
+
+            let start = blob_start(&bytes).expect("start") as usize;
+            let table = Pack::open_table(&bytes[..start]).expect("table");
+            let tile = table.frame(1).expect("frame")[0];
+            let span = table.span_of(&tile).expect("span");
+            let fetched = &bytes[start + span.start as usize..start + span.end as usize];
+            assert_eq!(
+                table.texture_in(&tile, span.start, fetched).expect("ranged"),
+                texture,
+                "version {version}, by range"
+            );
+            stored.push(tile.texture().expect("block").stored());
+        }
+        assert!(stored[0] < stored[1], "v1 compressed the texture ({}), v2 did not ({})", stored[0], stored[1]);
+        assert_eq!(stored[1] as usize, texture.len());
+    }
+
+    #[test]
+    fn a_layout_from_the_future_is_refused() {
+        let bytes = written_at(READABLE.end() + 1, b"x");
+        assert!(matches!(Pack::open(&bytes), Err(PackError::Version { found }) if found == READABLE.end() + 1));
+        let start = blob_start(&bytes).expect("start") as usize;
+        assert!(matches!(Pack::open_table(&bytes[..start]), Err(PackError::Version { .. })));
+    }
+
     #[test]
     fn the_whole_path_is_each_frames_view() {
         let mut w = Bake::new("s", [0.0; 3]);
