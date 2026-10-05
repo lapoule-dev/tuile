@@ -11,7 +11,7 @@ import init, { FilmMuxer, PackInfo } from "./pkg/tuile_film_web.js";
 const $ = (id) => document.getElementById(id);
 const status = (text, kind = "") => { $("status").textContent = text; $("status").className = kind; };
 
-let source = null;   // a Blob: the File, or the fetched bytes
+let source = null;   // the pack's URL on the API
 let info = null;
 
 await init();
@@ -19,40 +19,52 @@ await init();
 if (!("gpu" in navigator)) status("Ce navigateur n'expose pas WebGPU.", "bad");
 if (typeof VideoEncoder === "undefined") status("Ce navigateur n'expose pas WebCodecs.", "bad");
 
-async function load(blob, name) {
-  status(`Lecture de ${name} (${(blob.size / 1e6).toFixed(1)} Mo)…`);
+// The API that lists and serves the farm's packs: this page's own origin
+// when tuile-pack-api serves it, or ?api=http://host:port.
+const API = new URLSearchParams(location.search).get("api") ?? location.origin;
+
+async function load(packSource, name) {
+  status(`Lecture de la table de ${name}…`);
   $("go").disabled = true;
   try {
-    // Opens and verifies the pack once, here: a bad pack fails before any
-    // worker starts.
-    const bytes = new Uint8Array(await blob.arrayBuffer());
-    info = PackInfo.read(bytes);
-    source = blob;
+    // Only the table is read; the API checked the pack's digest when it
+    // fetched it. A bad pack fails before any worker starts.
+    info = await PackInfo.open(packSource);
+    source = packSource;
     $("first").value = info.first;
     $("last").value = info.last;
     $("first").min = $("last").min = info.first;
     $("first").max = $("last").max = info.last;
-    status(`${name} : frames ${info.first}–${info.last}, ${info.tiles} tuiles, viewport ${info.width}×${info.height}, scène ${info.scene}`, "good");
+    status(`${name} : frames ${info.first}–${info.last}, ${info.tiles} tuiles, viewport ${info.width}×${info.height}, scène ${info.scene}${info.verified ? ", digest vérifié" : ""}`, "good");
     $("go").disabled = false;
   } catch (e) {
     status(`Pack illisible : ${e.message ?? e}`, "bad");
   }
 }
 
-$("file").addEventListener("change", (e) => {
-  const file = e.target.files[0];
-  if (file) load(file, file.name);
-});
-
-async function fromUrl(url) {
-  status(`Téléchargement de ${url}…`);
-  const response = await fetch(url);
-  if (!response.ok) { status(`${url} : HTTP ${response.status}`, "bad"); return; }
-  await load(await response.blob(), url.split("/").pop());
+async function listPacks() {
+  const select = $("packs");
+  try {
+    const response = await fetch(`${API}/packs?prefix=${encodeURIComponent(new URLSearchParams(location.search).get("prefix") ?? "")}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status} : ${await response.text()}`);
+    const packs = (await response.json()).sort((a, b) => a.key.localeCompare(b.key));
+    select.innerHTML = `<option value="">— ${packs.length} packs —</option>` + packs.map((p) =>
+      `<option value="${p.key}">${p.key} · ${(p.size / 1e6).toFixed(0)} Mo${p.cached ? " · en cache" : ""}</option>`).join("");
+  } catch (e) {
+    select.innerHTML = `<option value="">API indisponible (${API}) : ${e.message}</option>`;
+  }
 }
-$("url").addEventListener("change", (e) => e.target.value && fromUrl(e.target.value));
-const fromQuery = new URLSearchParams(location.search).get("pack");
-if (fromQuery) { $("url").value = fromQuery; fromUrl(fromQuery); }
+$("packs").addEventListener("change", async (e) => {
+  const key = e.target.value;
+  if (!key) return;
+  const url = `${API}/packs/${key}`;
+  status(`${key} : premier accès, l'API le télécharge depuis le store et vérifie son digest…`);
+  // The first ranged read makes the API fetch the pack once; later ones are
+  // served from its cache.
+  await load(url, key);
+  listPacks();
+});
+listPacks();
 
 // The farm's split: equal spans, the remainder on the last.
 function slices(first, last, parts) {
@@ -64,9 +76,10 @@ function slices(first, last, parts) {
 
 const even8 = (x) => Math.max(8, Math.round(x / 8) * 8);
 
+let bytes = 0, requests = 0;
 function renderStats(totals, frames, wall) {
   const rows = [
-    ["Dépaquetage (LZ4)", "unpack"], ["Décodage PNG (navigateur)", "decode"],
+    ["Lecture par plages", "fetch"], ["Dépaquetage (LZ4)", "unpack"], ["Décodage PNG (navigateur)", "decode"],
     ["Upload GPU", "upload"], ["Enregistrement + soumission", "record"],
     ["next() complet", "next"], ["Encodage (attente file)", "encode"],
   ];
@@ -78,6 +91,9 @@ function renderStats(totals, frames, wall) {
     body.append(tr);
   }
   const tr = document.createElement("tr");
+  const io = document.createElement("tr");
+  io.innerHTML = `<td>Octets lus</td><td>${(bytes / 1e6 / Math.max(frames, 1)).toFixed(2)} Mo</td><td>${(bytes / 1e6).toFixed(1)} Mo en ${requests} requêtes</td>`;
+  body.append(io);
   tr.innerHTML = `<td><b>Mur</b></td><td><b>${(wall * 1000 / Math.max(frames, 1)).toFixed(1)} ms</b></td><td><b>${wall.toFixed(2)} s — ${(frames / wall).toFixed(1)} images/s</b></td>`;
   body.append(tr);
 }
@@ -103,8 +119,9 @@ $("go").addEventListener("click", async () => {
     return c.getContext("2d");
   });
 
-  const totals = { unpack: 0, decode: 0, upload: 0, record: 0, next: 0, encode: 0 };
+  const totals = { fetch: 0, unpack: 0, decode: 0, upload: 0, record: 0, next: 0, encode: 0 };
   let done = 0;
+  bytes = 0; requests = 0;
   const started = performance.now();
   status(`${parts.length} workers, ${width}×${height}, ${supersample * supersample} échantillons/pixel…`);
 
@@ -117,6 +134,7 @@ $("go").addEventListener("click", async () => {
       w.onmessage = ({ data }) => {
         if (data.type === "frame") {
           for (const k in totals) totals[k] += data[k];
+          bytes += data.fetchedBytes; requests += data.requests;
           done++;
           $("progress").value = done;
           if (data.preview) { contexts[id].drawImage(data.preview, 0, 0, contexts[id].canvas.width, contexts[id].canvas.height); data.preview.close(); }

@@ -17,6 +17,8 @@
 //! straight into a GPU texture.
 
 #[cfg(target_arch = "wasm32")]
+mod source;
+#[cfg(target_arch = "wasm32")]
 mod worker;
 
 #[cfg(target_arch = "wasm32")]

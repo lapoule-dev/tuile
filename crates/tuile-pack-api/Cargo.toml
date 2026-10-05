@@ -1,0 +1,25 @@
+[package]
+name = "tuile-pack-api"
+description = "A local HTTP API over the farm's packs: list them, fetch each once, serve it by byte range"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+axum = "0.8"
+dotenvy = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "net"] }
+# ServeFile answers Range requests (206, Content-Range) and conditional ones;
+# writing that by hand is how a seek past a chunk boundary gets served wrong.
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tuile-farm = { version = "0.1.0", path = "../tuile-farm" }
+tuile-pack = { version = "0.1.0", path = "../tuile-pack" }
+
+[lints]
+workspace = true
