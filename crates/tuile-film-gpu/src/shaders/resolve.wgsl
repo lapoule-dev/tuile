@@ -107,6 +107,6 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
     }
 
     let cos = max(dot(normal, frame.to_sun.xyz), 0.0);
-    let radiance = base * (frame.world.xyz + frame.sun.xyz * cos / 3.14159265);
+    let radiance = base * (frame.world.xyz + frame.sun.xyz * cos);
     textureStore(hdr, xy, vec4f(radiance, 1.0));
 }

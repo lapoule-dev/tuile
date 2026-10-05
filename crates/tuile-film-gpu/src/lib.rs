@@ -746,9 +746,14 @@ impl FilmGpu {
             uvs.unwrap_or_else(empty),
             indices.unwrap_or_else(empty),
         ];
+        // Decoded by the sampler through an sRGB view, or read as it lies.
+        let sampled_as = match self.settings.look.imagery {
+            tuile_film::Imagery::Decoded => ALBEDO_VIEW,
+            tuile_film::Imagery::AsStored => ALBEDO_FORMAT,
+        };
         let view = albedo.as_ref().map(|t| {
             t.create_view(&wgpu::TextureViewDescriptor {
-                format: Some(ALBEDO_VIEW),
+                format: Some(sampled_as),
                 // An sRGB view cannot be storage; it is only ever sampled.
                 usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
                 ..Default::default()
