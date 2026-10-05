@@ -11,8 +11,8 @@ authors.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-tuile-film = { version = "0.1.0", path = "../tuile-film" }
-tuile-mp4 = { version = "0.1.0", path = "../tuile-mp4" }
+tuile-film = { version = "0.2.0", path = "../tuile-film" }
+tuile-mp4 = { version = "0.2.0", path = "../tuile-mp4" }
 
 # The browser is the only target: everything below exists solely there, and a
 # `--workspace` build on a laptop skips it instead of failing on a missing
@@ -25,7 +25,7 @@ serde_json = { workspace = true }
 # The fallback encoder: pure Rust, so it builds for wasm32 as it is. No
 # assembly, no threads — the workers are the parallelism.
 rav1e = { version = "0.8", default-features = false }
-tuile-film-gpu = { version = "0.1.0", path = "../tuile-film-gpu" }
+tuile-film-gpu = { version = "0.2.0", path = "../tuile-film-gpu" }
 wgpu = { workspace = true, features = ["webgpu"] }
 wasm-bindgen = "0.2.99"
 wasm-bindgen-futures = "0.4.49"

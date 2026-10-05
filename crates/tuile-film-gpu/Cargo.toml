@@ -11,12 +11,12 @@ authors.workspace = true
 bytemuck = { workspace = true }
 glam = { workspace = true }
 thiserror = { workspace = true }
-tuile-film = { version = "0.1.0", path = "../tuile-film" }
+tuile-film = { version = "0.2.0", path = "../tuile-film" }
 wgpu = { workspace = true }
 
 [dev-dependencies]
 image = { workspace = true }
-tuile-core = { version = "0.1.0", path = "../tuile-core" }
+tuile-core = { version = "0.2.0", path = "../tuile-core" }
 pollster = { workspace = true }
 tempfile = { workspace = true }
 
