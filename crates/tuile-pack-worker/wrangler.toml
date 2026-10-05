@@ -1,0 +1,21 @@
+# The bench as a Cloudflare Worker: the API in Rust, the page as static
+# assets beside it.
+#
+#   wrangler dev                    local, with secrets from .dev.vars
+#   wrangler deploy                 to the account wrangler is logged into
+#
+# What a deployment serves and with which key is not in this file: see
+# `.dev.vars.example`, and `wrangler secret put` for a real one.
+name = "tuile-film-bench"
+main = "build/index.js"
+compatibility_date = "2026-04-01"
+
+[build]
+command = "worker-build --release"
+
+# The page: html, scripts and the renderer's wasm, built by
+#   wasm-pack build crates/tuile-film-web --release --target web \
+#       --out-dir ../../examples/film-web/www/pkg
+[assets]
+directory = "../../examples/film-web/www"
+binding = "ASSETS"

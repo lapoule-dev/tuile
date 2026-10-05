@@ -12,6 +12,7 @@ members = [
     "crates/tuile-film-web",
     "crates/tuile-mp4",
     "crates/tuile-pack-api",
+    "crates/tuile-pack-worker",
     "crates/tuile-repository",
     "crates/tuile-camera",
     "crates/tuile-native-fetchers",

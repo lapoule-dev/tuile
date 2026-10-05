@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) lapoule.dev
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use tuile_repository::s3::{Http, HttpReply, S3Config, S3Objects, Signed};
+use tuile_repository::{
+    Bench, Cached, ChunkStore, Config, FilmRepository, Layout, Objects, Place, Project, Reply,
+    RunFilms, ScenePacks,
+};
+use worker::{
+    event, Cache, Context, Date, Env, Fetch, Headers, Method, Request, RequestInit, Response,
+    Result,
+};
+
+/// `fetch`, as the transport the S3 protocol is sent with.
+struct FetchHttp;
+
+#[async_trait(?Send)]
+impl Http for FetchHttp {
+    fn now(&self) -> u64 {
+        Date::now().as_millis() / 1000
+    }
+
+    async fn send(&self, request: &Signed) -> std::result::Result<HttpReply, String> {
+        let headers = Headers::new();
+        for (name, value) in &request.headers {
+            headers.set(name, value).map_err(|e| e.to_string())?;
+        }
+        let mut init = RequestInit::new();
+        init.with_method(if request.method == "HEAD" {
+            Method::Head
+        } else {
+            Method::Get
+        })
+        .with_headers(headers);
+        let outgoing = Request::new_with_init(&request.url, &init).map_err(|e| e.to_string())?;
+        let mut response = Fetch::Request(outgoing)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let content_length = response
+            .headers()
+            .get("content-length")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok());
+        Ok(HttpReply {
+            status: response.status_code(),
+            content_length,
+            body: response.bytes().await.map_err(|e| e.to_string())?,
+        })
+    }
+}
+
+/// Chunks kept in the edge cache of the point of presence that read them.
+///
+/// The cache is keyed by URL, so a chunk is given one: a name under a host
+/// that does not exist, never fetched, only looked up. An entry is immutable
+/// and kept for as long as the cache will have it; if it is evicted, the
+/// chunk is read from the bucket again and nothing else changes.
+struct EdgeChunks {
+    project: String,
+}
+
+impl EdgeChunks {
+    fn url(&self, key: &str, part: &str) -> String {
+        // Percent-encoded as one path segment each: a key may hold anything.
+        let encode = |text: &str| {
+            text.bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'/' => {
+                        (b as char).to_string()
+                    }
+                    _ => format!("%{b:02X}"),
+                })
+                .collect::<String>()
+        };
+        format!(
+            "https://chunks.invalid/{}/{}/{part}",
+            encode(&self.project),
+            encode(key)
+        )
+    }
+
+    async fn lookup(&self, url: String) -> Option<Vec<u8>> {
+        let mut hit = Cache::default().get(url, false).await.ok()??;
+        hit.bytes().await.ok()
+    }
+
+    async fn keep(&self, url: String, bytes: Vec<u8>) {
+        let headers = Headers::new();
+        let _ = headers.set("cache-control", "public, max-age=31536000, immutable");
+        let _ = headers.set("content-type", "application/octet-stream");
+        if let Ok(response) = Response::from_bytes(bytes) {
+            // A chunk the cache will not take is simply not kept.
+            let _ = Cache::default()
+                .put(url, response.with_headers(headers))
+                .await;
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl ChunkStore for EdgeChunks {
+    async fn get(&self, key: &str, index: u64) -> Option<Vec<u8>> {
+        self.lookup(self.url(key, &format!("{index:08}"))).await
+    }
+
+    async fn put(&self, key: &str, index: u64, bytes: &[u8]) {
+        self.keep(self.url(key, &format!("{index:08}")), bytes.to_vec())
+            .await;
+    }
+
+    async fn size(&self, key: &str) -> Option<u64> {
+        let bytes = self.lookup(self.url(key, "size")).await?;
+        std::str::from_utf8(&bytes).ok()?.parse().ok()
+    }
+
+    async fn note_size(&self, key: &str, size: u64) {
+        self.keep(self.url(key, "size"), size.to_string().into_bytes())
+            .await;
+    }
+}
+
+/// The bench this deployment serves, from its environment.
+fn bench(env: &Env) -> std::result::Result<Bench, String> {
+    let var = |name: &str| {
+        env.secret(name)
+            .map(|s| s.to_string())
+            .or_else(|_| env.var(name).map(|v| v.to_string()))
+            .map_err(|_| format!("{name} is not set"))
+    };
+    let config = Config::parse(&var("BENCH_CONFIG")?).map_err(|e| format!("BENCH_CONFIG: {e}"))?;
+    let (endpoint, key, secret) = (
+        var("TUILE_STORE_ENDPOINT")?,
+        var("TUILE_STORE_ACCESS_KEY_ID")?,
+        var("TUILE_STORE_SECRET_ACCESS_KEY")?,
+    );
+    let mut projects = Vec::new();
+    for project in config.projects {
+        let Place::Bucket(bucket) = project.place else {
+            return Err(format!(
+                "project {}: a Worker reads buckets, not directories",
+                project.name
+            ));
+        };
+        // The bucket over signed HTTP, then the edge cache over it: a chunk
+        // is read from the bucket once per point of presence, and every
+        // range after that is cut from what the cache holds.
+        let bucket: Arc<dyn Objects> = Arc::new(S3Objects::new(
+            S3Config {
+                endpoint: endpoint.clone(),
+                bucket,
+                access_key_id: key.clone(),
+                secret_access_key: secret.clone(),
+                region: "auto".into(),
+            },
+            FetchHttp,
+        ));
+        let objects: Arc<dyn Objects> = Arc::new(Cached::new(
+            bucket,
+            EdgeChunks {
+                project: project.name.clone(),
+            },
+        ));
+        let films: Arc<dyn FilmRepository> = match project.layout {
+            Layout::Scenes(roots) => Arc::new(ScenePacks::new(objects.clone(), roots)),
+            Layout::Runs(layout) => {
+                Arc::new(RunFilms::new(objects.clone(), layout).map_err(|e| e.to_string())?)
+            }
+        };
+        projects.push(Project {
+            name: project.name,
+            objects,
+            films,
+        });
+    }
+    Ok(Bench {
+        projects,
+        tiles: None,
+    })
+}
+
+fn respond(reply: Reply) -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("content-type", &reply.content_type)?;
+    headers.set("cache-control", reply.cache_control)?;
+    if let Some(etag) = &reply.etag {
+        headers.set("etag", etag)?;
+    }
+    if reply.ranged {
+        headers.set("accept-ranges", "bytes")?;
+    }
+    if let Some(range) = &reply.content_range {
+        headers.set("content-range", range)?;
+    }
+    Ok(Response::from_bytes(reply.body)?
+        .with_status(reply.status)
+        .with_headers(headers))
+}
+
+#[event(fetch)]
+pub async fn main(request: Request, env: Env, _ctx: Context) -> Result<Response> {
+    let url = request.url()?;
+    if !url.path().starts_with("/api/") {
+        return env.assets("ASSETS")?.fetch_request(request).await;
+    }
+    if request.method() != Method::Get {
+        return Response::error("the API is read-only", 405);
+    }
+    let bench = match bench(&env) {
+        Ok(b) => b,
+        Err(e) => return Response::error(format!("misconfigured: {e}"), 500),
+    };
+    let range = request.headers().get("range")?;
+    match bench
+        .get(
+            url.path(),
+            url.query().unwrap_or_default(),
+            range.as_deref(),
+        )
+        .await
+    {
+        Some(reply) => respond(reply),
+        None => Response::error("no such route", 404),
+    }
+}
