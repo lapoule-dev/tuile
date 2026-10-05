@@ -68,7 +68,14 @@ pub const MAGIC: &[u8; 8] = b"TUILEPK\0";
 
 /// The layout version written. Bumped when an old reader would misread a new
 /// file.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
+
+/// The version a pack that only embeds is still written as: nothing in it
+/// differs from a version-2 pack, so every reader already deployed keeps
+/// reading the packs it could read yesterday.
+pub const EMBEDDED_VERSION: u32 = 2;
+
+pub use fb::Content;
 
 /// The layout versions read. A bucket outlives the formats written to it,
 /// and a pack is hours of baking: an older one is read, not re-baked.
@@ -78,8 +85,49 @@ pub const VERSION: u32 = 2;
 /// - **2** — a texture keeps the compression it already has and is stored as
 ///   produced; `Tile.texture_format` says what the block carries.
 ///
+/// - **3** — a tile may say where it comes from in the tile store
+///   ([`TileRefs`]), and may then carry no payload at all; `Pack.content`
+///   says which ([`Content`]). A pack that only embeds is not written as 3.
+///
 /// Nothing else differs: same table, same blocks, same blob digest.
-pub const READABLE: std::ops::RangeInclusive<u32> = 1..=2;
+pub const READABLE: std::ops::RangeInclusive<u32> = 1..=3;
+
+/// A tile of the store a pack refers to, and what its bytes digested to at
+/// the bake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreTile {
+    pub level: u8,
+    pub x: u32,
+    pub y: u32,
+    /// FNV-1a of the bytes as the store held them ([`Fnv1a`]).
+    pub digest: u64,
+}
+
+/// One imagery tile of a drape, and where it lies on the terrain tile.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImageryPlacement {
+    pub tile: StoreTile,
+    /// The part of the terrain tile's uv it covers: west, south, east, north.
+    pub coverage: [f32; 4],
+    /// uv of the imagery tile = uv of the terrain tile × scale + translation.
+    pub translation: [f32; 2],
+    pub scale: [f32; 2],
+}
+
+/// Where a tile comes from in the tile store: enough to build its mesh and
+/// compose its texture again from the store's own tiles.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TileRefs {
+    /// The terrain tile the mesh was built from — the tile itself, or the
+    /// ancestor it was cut from where the source has none at its level.
+    pub terrain: StoreTile,
+    /// How deep the mesh's skirts hang, in metres.
+    pub skirt_height: f32,
+    /// The drape, bottom layer first.
+    pub imagery: Vec<ImageryPlacement>,
+    /// The side of the composed texture, in texels.
+    pub composed_side: u32,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PackError {
@@ -139,6 +187,8 @@ pub struct BakedTile {
     pub base_color_factor: [f32; 4],
     pub texture: Option<Vec<u8>>,
     pub texture_format: TextureFormat,
+    /// Where the tile comes from in the tile store, when the bake knows.
+    pub refs: Option<TileRefs>,
 }
 
 /// One camera, twelve doubles — the same shape the ABI's `TuileViewState`
@@ -248,6 +298,10 @@ pub struct PackWriter {
     /// La première erreur d'écriture du blob, gardée pour être rendue par
     /// `finish_to`. Voir [`PackWriter::put`].
     spill_error: Option<std::io::Error>,
+    /// What the tiles carry, and the store layers references are into.
+    content: Content,
+    terrain_layer: String,
+    imagery_layer: String,
 }
 
 /// One tile, once its payloads are already in the blob.
@@ -258,12 +312,14 @@ struct StoredTile {
     vertex_count: u32,
     index_count: u32,
     base_color_factor: [f32; 4],
-    positions: fb::Block,
-    normals: fb::Block,
-    uvs: fb::Block,
-    indices: fb::Block,
+    /// The geometry's four blocks: positions, normals, uvs, indices. `None`
+    /// in a pack of references.
+    geometry: Option<[fb::Block; 4]>,
     texture: Option<fb::Block>,
     texture_format: TextureFormat,
+    /// Where the tile comes from: metadata too — a few dozen bytes a layer —
+    /// and boxed, so that a tile without any costs a pointer.
+    refs: Option<Box<TileRefs>>,
 }
 
 /// The compressed payloads, written to a file as they are produced.
@@ -388,13 +444,16 @@ impl PackWriter {
             // culled has to be assumed to have culled the usual way, and
             // `culling` is what a reader complains about.
             culling: "full".into(),
-            version: VERSION,
+            version: EMBEDDED_VERSION,
             render_origin,
             tiles: Vec::new(),
             index: std::collections::HashMap::new(),
             frames: Vec::new(),
             blob: BlobSink::create(blob_path.into())?,
             spill_error: None,
+            content: Content::Embedded,
+            terrain_layer: String::new(),
+            imagery_layer: String::new(),
         })
     }
 
@@ -453,6 +512,24 @@ impl PackWriter {
         }
     }
 
+    /// Makes this a pack of references into the tile store's `terrain` and
+    /// `imagery` layers — alone ([`Content::References`]) or beside the
+    /// payloads ([`Content::Both`]) — written as [`VERSION`]. Tiles pushed
+    /// without [`BakedTile::refs`] are then tiles the store cannot give back,
+    /// and [`PackWriter::finish_to`] refuses a pack of references that has
+    /// any. Call before the first tile.
+    pub fn with_content(mut self, content: Content, terrain: &str, imagery: &str) -> Self {
+        self.content = content;
+        self.terrain_layer = terrain.to_string();
+        self.imagery_layer = imagery.to_string();
+        self.version = if content == Content::Embedded {
+            EMBEDDED_VERSION
+        } else {
+            VERSION
+        };
+        self
+    }
+
     /// Writes an older layout instead of the current one. For tests of the
     /// readers: nothing bakes an old pack on purpose.
     #[doc(hidden)]
@@ -489,6 +566,7 @@ impl PackWriter {
                     // rend le pic indépendant de la longueur du film : une
                     // tuile qui vient d'entrer ne pèse plus que ses cinq
                     // blocs dès la ligne suivante.
+                    let embeds = self.content != Content::References;
                     let stored = StoredTile {
                         id: tile.id,
                         drape: tile.drape,
@@ -499,16 +577,25 @@ impl PackWriter {
                         // La géométrie garde de la structure à exploiter —
                         // 26 à 48 % mesurés. L'image, elle, porte déjà son
                         // propre codec.
-                        positions: self.put(&tile.positions, true),
-                        normals: self.put(&tile.normals, true),
-                        uvs: self.put(&tile.uvs, true),
-                        indices: self.put(&tile.indices, true),
-                        texture: tile.texture.as_deref().map(|t| {
+                        geometry: embeds.then(|| {
+                            [
+                                self.put(&tile.positions, true),
+                                self.put(&tile.normals, true),
+                                self.put(&tile.uvs, true),
+                                self.put(&tile.indices, true),
+                            ]
+                        }),
+                        texture: tile.texture.as_deref().filter(|_| embeds).map(|t| {
                             let as_produced = self.version >= 2
                                 && carries_its_own_compression(tile.texture_format);
                             self.put(t, !as_produced)
                         }),
                         texture_format: tile.texture_format,
+                        // A pack that only embeds says nothing of the store.
+                        refs: tile
+                            .refs
+                            .filter(|_| self.content != Content::Embedded)
+                            .map(Box::new),
                     };
                     self.tiles.push(stored);
                     at
@@ -621,6 +708,16 @@ impl PackWriter {
         if let Some(e) = self.spill_error.take() {
             return Err(e);
         }
+        // A pack of references with a tile that refers to nothing is a frame
+        // short of ground, found out at render time. It is refused here.
+        if self.content == Content::References {
+            if let Some(tile) = self.tiles.iter().find(|t| t.refs.is_none()) {
+                return Err(std::io::Error::other(format!(
+                    "tile {} has no reference into the tile store, and this pack embeds nothing",
+                    tile.id
+                )));
+            }
+        }
 
         let mut fbb = flatbuffers::FlatBufferBuilder::with_capacity(1 << 20);
         let tiles: Vec<_> = self
@@ -629,6 +726,11 @@ impl PackWriter {
             .map(|tile| {
                 let origin = fbb.create_vector(&tile.origin_ecef);
                 let factor = fbb.create_vector(&tile.base_color_factor);
+                let imagery = tile.refs.as_ref().map(|refs| {
+                    let placed: Vec<fb::ImageryRef> =
+                        refs.imagery.iter().map(placement_to_fb).collect();
+                    fbb.create_vector(&placed)
+                });
                 let mut b = fb::TileBuilder::new(&mut fbb);
                 b.add_id(tile.id);
                 b.add_drape(tile.drape);
@@ -636,14 +738,24 @@ impl PackWriter {
                 b.add_vertex_count(tile.vertex_count);
                 b.add_index_count(tile.index_count);
                 b.add_base_color_factor(factor);
-                b.add_positions(&tile.positions);
-                b.add_normals(&tile.normals);
-                b.add_uvs(&tile.uvs);
-                b.add_indices(&tile.indices);
+                if let Some([positions, normals, uvs, indices]) = tile.geometry.as_ref() {
+                    b.add_positions(positions);
+                    b.add_normals(normals);
+                    b.add_uvs(uvs);
+                    b.add_indices(indices);
+                }
                 if let Some(tex) = tile.texture.as_ref() {
                     b.add_texture(tex);
                 }
                 b.add_texture_format(tile.texture_format);
+                if let Some(refs) = tile.refs.as_ref() {
+                    b.add_terrain(&store_tile_to_fb(&refs.terrain));
+                    b.add_skirt_height(refs.skirt_height);
+                    b.add_composed_side(refs.composed_side);
+                }
+                if let Some(imagery) = imagery {
+                    b.add_imagery(imagery);
+                }
                 b.finish()
             })
             .collect();
@@ -668,6 +780,8 @@ impl PackWriter {
         let digest = fbb.create_string(&self.scene_digest);
         let culling = fbb.create_string(&self.culling);
         let origin = fbb.create_vector(&self.render_origin);
+        let terrain_layer = fbb.create_string(&self.terrain_layer);
+        let imagery_layer = fbb.create_string(&self.imagery_layer);
         let first = self.frames.first().map_or(0, |(n, _, _)| *n);
         let last = self.frames.last().map_or(0, |(n, _, _)| *n);
         let mut b = fb::PackBuilder::new(&mut fbb);
@@ -680,6 +794,11 @@ impl PackWriter {
         b.add_culling(culling);
         b.add_tiles(tiles);
         b.add_frames(frames);
+        if self.content != Content::Embedded {
+            b.add_content(self.content);
+            b.add_terrain_layer(terrain_layer);
+            b.add_imagery_layer(imagery_layer);
+        }
         let root = b.finish();
         fbb.finish(root, Some("TUIL"));
         let table = fbb.finished_data();
@@ -690,6 +809,61 @@ impl PackWriter {
         let blob_len = self.blob.drain_into(out)?;
         Ok(MAGIC.len() as u64 + 8 + table.len() as u64 + blob_len)
     }
+}
+
+fn store_tile_to_fb(tile: &StoreTile) -> fb::TerrainRef {
+    fb::TerrainRef::new(tile.x, tile.y, tile.level, tile.digest)
+}
+
+fn placement_to_fb(p: &ImageryPlacement) -> fb::ImageryRef {
+    fb::ImageryRef::new(
+        p.tile.x,
+        p.tile.y,
+        p.tile.level,
+        p.coverage[0],
+        p.coverage[1],
+        p.coverage[2],
+        p.coverage[3],
+        p.translation[0],
+        p.translation[1],
+        p.scale[0],
+        p.scale[1],
+        p.tile.digest,
+    )
+}
+
+/// Where a tile comes from in the tile store, when its pack says.
+pub fn refs_of(tile: &fb::Tile<'_>) -> Option<TileRefs> {
+    let terrain = tile.terrain()?;
+    Some(TileRefs {
+        terrain: StoreTile {
+            level: terrain.level(),
+            x: terrain.x(),
+            y: terrain.y(),
+            digest: terrain.digest(),
+        },
+        skirt_height: tile.skirt_height(),
+        imagery: tile
+            .imagery()
+            .map(|placed| {
+                placed
+                    .iter()
+                    .map(|p| ImageryPlacement {
+                        tile: StoreTile {
+                            level: p.level(),
+                            x: p.x(),
+                            y: p.y(),
+                            digest: p.digest(),
+                        },
+                        coverage: [p.cover_w(), p.cover_s(), p.cover_e(), p.cover_n()],
+                        translation: [p.translate_u(), p.translate_v()],
+                        scale: [p.scale_u(), p.scale_v()],
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        composed_side: tile.composed_side(),
+    })
 }
 
 /// A pack, read in place.
@@ -888,6 +1062,21 @@ impl<'a> Pack<'a> {
     /// The layout version this pack was written as.
     pub fn version(&self) -> u32 {
         self.root.version()
+    }
+
+    /// What the tiles carry. A pack written before this was said reads as
+    /// [`Content::Embedded`], which is what every such pack is.
+    pub fn content(&self) -> Content {
+        self.root.content()
+    }
+
+    /// The tile store's layers the references are into: terrain, imagery.
+    /// `None` for a pack that only embeds.
+    pub fn store_layers(&self) -> Option<(&'a str, &'a str)> {
+        if self.content() == Content::Embedded {
+            return None;
+        }
+        Some((self.root.terrain_layer()?, self.root.imagery_layer()?))
     }
 
     /// From version 2 on a texture is stored as its codec produced it;
@@ -1107,6 +1296,7 @@ impl<'a> Pack<'a> {
                 None => None,
             },
             texture_format: tile.texture_format(),
+            refs: None,
         })
     }
 }
@@ -1622,6 +1812,7 @@ mod tests {
             base_color_factor: [1.0, 0.5, 0.25, 1.0],
             texture: Some((0..4096u32).map(|i| (i % 251) as u8).collect()),
             texture_format: TextureFormat::Png,
+            refs: None,
         }
     }
 
@@ -1631,6 +1822,126 @@ mod tests {
     /// back *nearly* the same geometry is not a substitute — it is a second
     /// implementation, and the difference shows up as a render that does not
     /// match the one it was supposed to reproduce. Byte for byte, or nothing.
+    /// Where a tile comes from, with values no default would produce.
+    fn some_refs(seed: u32) -> TileRefs {
+        TileRefs {
+            terrain: StoreTile {
+                level: 13,
+                x: 8_300 + seed,
+                y: 6_100,
+                digest: 0xfeed_0000_0000_0000 | u64::from(seed),
+            },
+            skirt_height: 61.5,
+            imagery: vec![
+                ImageryPlacement {
+                    tile: StoreTile {
+                        level: 4,
+                        x: 8,
+                        y: 5,
+                        digest: 11,
+                    },
+                    coverage: [0.0, 0.0, 1.0, 1.0],
+                    translation: [0.25, 0.5],
+                    scale: [0.001, 0.002],
+                },
+                ImageryPlacement {
+                    tile: StoreTile {
+                        level: 15,
+                        x: 16_600 + seed,
+                        y: 12_090,
+                        digest: 12,
+                    },
+                    coverage: [0.5, 0.0, 1.0, 0.5],
+                    translation: [-1.0, 0.0],
+                    scale: [2.0, 2.0],
+                },
+            ],
+            composed_side: 512,
+        }
+    }
+
+    fn with_refs(mut tile: BakedTile, seed: u32) -> BakedTile {
+        tile.refs = Some(some_refs(seed));
+        tile
+    }
+
+    #[test]
+    fn a_pack_of_both_carries_the_payloads_and_where_they_come_from() {
+        let mut w =
+            Bake::new("s", [0.0; 3]).with(|w| w.with_content(Content::Both, "terrain", "imagery"));
+        let (a, b) = (with_refs(a_tile(7, 100), 1), with_refs(a_tile(9, 200), 2));
+        w.frame(1, a_view(0.0), [a.clone(), b.clone()]);
+        let bytes = w.finish();
+        let pack = Pack::open(&bytes).expect("open");
+        assert_eq!(pack.version(), VERSION);
+        assert_eq!(pack.content(), Content::Both);
+        assert_eq!(pack.store_layers(), Some(("terrain", "imagery")));
+        let tiles = pack.frame(1).expect("frame");
+        for (stored, written) in tiles.iter().zip([&a, &b]) {
+            assert_eq!(refs_of(stored), written.refs);
+            let positions = stored.positions().expect("the payload is there too");
+            assert_eq!(
+                pack.payload(positions, "positions").expect("payload"),
+                written.positions
+            );
+        }
+    }
+
+    #[test]
+    fn a_pack_of_references_carries_no_payload_at_all() {
+        let mut w = Bake::new("s", [0.0; 3])
+            .with(|w| w.with_content(Content::References, "terrain", "imagery"));
+        let a = with_refs(a_tile(7, 100), 1);
+        w.frame(1, a_view(0.0), [a.clone()]);
+        w.frame(2, a_view(1.0), [a.clone()]);
+        let bytes = w.finish();
+        let start = blob_start(&bytes[..PREAMBLE]).expect("preamble") as usize;
+        assert_eq!(start, bytes.len(), "nothing follows the table");
+        let pack = Pack::open(&bytes).expect("open");
+        assert_eq!(pack.content(), Content::References);
+        assert_eq!(pack.frame_range(), (1, 2));
+        let tile = &pack.frame(2).expect("frame")[0];
+        assert_eq!(refs_of(tile), a.refs);
+        assert!(tile.positions().is_none() && tile.texture().is_none());
+        assert_eq!((tile.vertex_count(), tile.index_count()), (341, 300));
+        assert!(pack.span_of(tile).is_none());
+    }
+
+    #[test]
+    fn a_pack_of_references_refuses_a_tile_that_refers_to_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut w = PackWriter::new("s", [0.0; 3], dir.path().join("blob.part"))
+            .expect("writer")
+            .with_content(Content::References, "terrain", "imagery");
+        w.frame(
+            1,
+            a_view(0.0),
+            [with_refs(a_tile(7, 100), 1), a_tile(9, 200)],
+        );
+        let refused = w
+            .finish_to(dir.path().join("p.tuilepack"))
+            .expect_err("refused");
+        assert!(refused.to_string().contains("tile 9"), "{refused}");
+    }
+
+    #[test]
+    fn a_pack_that_only_embeds_is_written_as_it_always_was() {
+        // Version 2, no word of the store — even when the bake knew where
+        // each tile came from — so every reader already out there reads it.
+        let mut w = Bake::new("s", [0.0; 3]);
+        w.frame(1, a_view(0.0), [with_refs(a_tile(7, 100), 1)]);
+        let with = w.finish();
+        let mut w = Bake::new("s", [0.0; 3]);
+        w.frame(1, a_view(0.0), [a_tile(7, 100)]);
+        let without = w.finish();
+        assert_eq!(with, without);
+        let pack = Pack::open(&with).expect("open");
+        assert_eq!(pack.version(), EMBEDDED_VERSION);
+        assert_eq!(pack.content(), Content::Embedded);
+        assert_eq!(pack.store_layers(), None);
+        assert_eq!(refs_of(&pack.frame(1).expect("frame")[0]), None);
+    }
+
     #[test]
     fn a_tile_survives_the_round_trip_byte_for_byte() {
         let mut w = Bake::new("scene-abc", [1.0, 2.0, 3.0]);

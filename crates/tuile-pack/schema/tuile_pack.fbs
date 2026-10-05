@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 //
-// The pre-baked scene container: what a render needs, and nothing a render
-// would have to compute.
+// The pre-baked scene container: what was decided at the bake — which tiles
+// each frame draws — with either the bytes a render needs (`Embedded`), or
+// where to read them in the tile store (`References`), or both.
 //
 // Regenerate the Rust with:
 //
@@ -36,6 +37,58 @@ enum TextureFormat : byte {
   Png = 1,
 }
 
+/// What a pack carries for its tiles.
+///
+/// A pack was first everything a render needs. It can now be the plan alone:
+/// which tiles each frame draws and where each comes from, the bytes staying
+/// in the tile store they were read from at the bake. This says which, so
+/// that no reader has to infer it from what happens to be present.
+enum Content : byte {
+  /// The finished meshes and composed textures, in the blob region.
+  Embedded = 0,
+  /// References to the tile store's tiles; no payload.
+  References = 1,
+  /// Both: one pack that renders either way, which is how the two ways are
+  /// compared.
+  Both = 2,
+}
+
+/// The terrain tile a mesh was built from, in the store's terrain layer.
+///
+/// Not necessarily the tile that was asked for: where the source has no tile
+/// at a level, the mesh is cut from the nearest ancestor that exists, and
+/// this names that ancestor. `Tile.id` remains the tile drawn.
+struct TerrainRef {
+  x: uint32;
+  y: uint32;
+  level: uint8;
+  /// FNV-1a of the tile's bytes as the store held them at the bake. A store
+  /// is alive — a tile is fetched again when it expires — and this is how a
+  /// render knows it is no longer looking at what was baked.
+  digest: uint64;
+}
+
+/// One imagery tile of a drape and where it lies on the terrain tile: what
+/// the composition of the texture needs, in the order it is stacked.
+struct ImageryRef {
+  x: uint32;
+  y: uint32;
+  level: uint8;
+  /// The part of the terrain tile's uv this imagery tile covers:
+  /// west, south, east, north.
+  cover_w: float;
+  cover_s: float;
+  cover_e: float;
+  cover_n: float;
+  /// uv of the imagery tile = uv of the terrain tile × scale + translation.
+  translate_u: float;
+  translate_v: float;
+  scale_u: float;
+  scale_v: float;
+  /// As `TerrainRef.digest`.
+  digest: uint64;
+}
+
 /// One tile, deduplicated across the whole frame range.
 ///
 /// The identity is `(id, drape)`, never `id` alone: a tile keeps its id from
@@ -57,6 +110,16 @@ table Tile {
   indices: Block;
   texture: Block;
   texture_format: TextureFormat;
+  // ── since version 3; absent from a pack that only embeds ──────────────
+  /// Where the mesh comes from.
+  terrain: TerrainRef;
+  /// How deep the mesh's skirts hang, in metres: a choice of the bake, not
+  /// something the tile's bytes say.
+  skirt_height: float;
+  /// The drape, bottom layer first. Empty for a tile with no imagery.
+  imagery: [ImageryRef];
+  /// The side of the composed texture, in texels.
+  composed_side: uint32;
 }
 
 /// The camera one frame was baked for. Twelve doubles, exactly the shape the
@@ -110,6 +173,13 @@ table Pack {
   tiles: [Tile];
   /// One entry per frame in `[first_frame, last_frame]`, in order.
   frames: [Frame];
+  // ── since version 3 ────────────────────────────────────────────────────
+  /// What the tiles carry. A pack of an earlier version says nothing here
+  /// and reads as `Embedded`, which is what it is.
+  content: Content;
+  /// The layers of the tile store the references are into.
+  terrain_layer: string;
+  imagery_layer: string;
 }
 
 root_type Pack;
