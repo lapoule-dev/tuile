@@ -17,6 +17,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use futures_util::lock::Mutex as AsyncMutex;
 
 use crate::bench::block_segment;
 use crate::{Entry, Listing, Objects, RepoError, BLOCK};
@@ -176,6 +177,9 @@ pub struct RemoteBlocks<G> {
     root: String,
     capacity: usize,
     held: Mutex<Held>,
+    /// One lock per block being fetched: readers after the same block at the
+    /// same moment wait for one request rather than each making their own.
+    flights: Mutex<HashMap<(String, u64), Arc<AsyncMutex<()>>>>,
 }
 
 impl<G: Get> RemoteBlocks<G> {
@@ -195,6 +199,7 @@ impl<G: Get> RemoteBlocks<G> {
                 sizes: HashMap::new(),
                 counts: BlockCounts::default(),
             }),
+            flights: Mutex::new(HashMap::new()),
         }
     }
 
@@ -203,18 +208,39 @@ impl<G: Get> RemoteBlocks<G> {
     }
 
     async fn block(&self, key: &str, index: u64) -> Result<Arc<Vec<u8>>, RepoError> {
-        if let Ok(mut held) = self.held.lock() {
-            let at = held
-                .blocks
-                .iter()
-                .position(|(k, i, _)| *i == index && k == key);
-            if let Some(entry) = at.and_then(|at| held.blocks.remove(at)) {
-                let block = entry.2.clone();
-                held.blocks.push_back(entry);
-                held.counts.held += 1;
-                return Ok(block);
-            }
+        if let Some(block) = self.held_block(key, index) {
+            return Ok(block);
         }
+        let flight = match self.flights.lock() {
+            Ok(mut flights) => flights.entry((key.to_string(), index)).or_default().clone(),
+            Err(_) => Arc::default(),
+        };
+        let _landing = flight.lock().await;
+        // Whoever held the lock before may have brought the block in.
+        if let Some(block) = self.held_block(key, index) {
+            return Ok(block);
+        }
+        let fetched = self.fetch_block(key, index).await;
+        if let Ok(mut flights) = self.flights.lock() {
+            flights.remove(&(key.to_string(), index));
+        }
+        fetched
+    }
+
+    fn held_block(&self, key: &str, index: u64) -> Option<Arc<Vec<u8>>> {
+        let mut held = self.held.lock().ok()?;
+        let at = held
+            .blocks
+            .iter()
+            .position(|(k, i, _)| *i == index && k == key)?;
+        let entry = held.blocks.remove(at)?;
+        let block = entry.2.clone();
+        held.blocks.push_back(entry);
+        held.counts.held += 1;
+        Some(block)
+    }
+
+    async fn fetch_block(&self, key: &str, index: u64) -> Result<Arc<Vec<u8>>, RepoError> {
         let path = format!("{}/{}/{index}/{}", self.root, block_segment(), encoded(key));
         let got = fetched(self.get.as_ref(), &path, key).await?;
         let size = got.object_size.ok_or_else(|| {

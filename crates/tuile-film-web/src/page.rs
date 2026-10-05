@@ -37,7 +37,9 @@ use web_sys::{
 use crate::encode::browser_config;
 use crate::js::{get, now, number, object, string, text};
 use crate::source::BLOCK_BYTES;
+use crate::store::Store;
 use crate::worker::PackView;
+use tuile_repository::{RepoError, TileRepository};
 
 // ------------------------------------------------------------------ the API
 
@@ -85,7 +87,8 @@ struct Scene {
     others: Vec<serde_json::Value>,
 }
 
-#[derive(serde::Deserialize, Clone)]
+/// A layer of the tile store, as the store's own catalog describes it.
+#[derive(Clone)]
 struct Layer {
     name: String,
     grid: String,
@@ -144,6 +147,8 @@ struct Page {
     view: Option<(Rc<PackView>, usize)>,
     path: Rc<Vec<CameraSample>>,
     layers: Vec<Layer>,
+    /// The tile store, opened through the API.
+    store: Option<Rc<Store>>,
     /// Counters that name the latest request of each kind: a reply to an
     /// earlier one finds the number moved on and stops.
     opening: u32,
@@ -439,23 +444,39 @@ async fn start() {
         let _ = el("projects").append_child(&button);
     }
     if projects.tiles.is_some() {
-        if let Ok(layers) = get_json::<Vec<Layer>>("/tiles/catalog").await {
-            let layers: Vec<Layer> = layers
-                .into_iter()
-                .filter(|l| !l.name.ends_with(".absent"))
-                .collect();
-            let choice = select("layer");
-            choice.set_inner_html("");
-            for layer in &layers {
-                let option: HtmlOptionElement = create("option").unchecked_into();
-                option.set_value(&layer.name);
-                option.set_text(&format!("{} — {}", layer.name, layer.content_type));
-                let _ = choice.append_child(&option);
+        // The store is opened here, in the page: its catalog now, and from
+        // then on blocks of its archives, in which this page finds each tile.
+        match Store::open(&page(|p| p.api.clone())).await {
+            Ok(store) => {
+                let layers: Vec<Layer> = store
+                    .tiles
+                    .layers()
+                    .into_iter()
+                    .filter(|l| !l.name.ends_with(".absent"))
+                    .map(|l| Layer {
+                        name: l.name,
+                        grid: l.grid,
+                        content_type: l.content_type,
+                    })
+                    .collect();
+                let choice = select("layer");
+                choice.set_inner_html("");
+                for layer in &layers {
+                    let option: HtmlOptionElement = create("option").unchecked_into();
+                    option.set_value(&layer.name);
+                    option.set_text(&format!("{} — {}", layer.name, layer.content_type));
+                    let _ = choice.append_child(&option);
+                }
+                if let Some(imagery) = layers.iter().find(|l| l.content_type.starts_with("image/"))
+                {
+                    choice.set_value(&imagery.name);
+                }
+                page(|p| {
+                    p.layers = layers;
+                    p.store = Some(Rc::new(store));
+                });
             }
-            if let Some(imagery) = layers.iter().find(|l| l.content_type.starts_with("image/")) {
-                choice.set_value(&imagery.name);
-            }
-            page(|p| p.layers = layers);
+            Err(e) => set_text("tiles-note", &format!("Store de tuiles illisible : {e}")),
         }
     }
     // ?project=…&film=…&pack=…&frame=… opens straight onto that view.
@@ -1083,12 +1104,12 @@ fn tile_at(grid: &str, z: u32, lon: f64, lat: f64) -> (i64, i64, i64) {
 
 /// The source tiles around the point under a camera, read as stored.
 async fn show_source_tiles(at: Option<CameraSample>) {
-    let Some((turn, at, layer, api)) = page(|p| {
+    let Some((turn, at, layer, store)) = page(|p| {
         p.source_at = at.or(p.source_at);
         p.source_turn += 1;
         let name = select("layer").value();
         let layer = p.layers.iter().find(|l| l.name == name)?.clone();
-        Some((p.source_turn, p.source_at?, layer, p.api.clone()))
+        Some((p.source_turn, p.source_at?, layer, p.store.clone()?))
     }) else {
         if page(|p| p.layers.is_empty()) {
             set_text("tiles-note", "Pas de store de tuiles configuré.");
@@ -1117,25 +1138,26 @@ async fn show_source_tiles(at: Option<CameraSample>) {
         let cell_el = create("div");
         let _ = cell_el.append_child(&cell("span", &format!("{z}/{x}/{y}")));
         let _ = grid.append_child(&cell_el);
-        let url = format!("{api}/tiles/{}/{z}/{x}/{y}", encoded(&layer.name));
-        let kind = layer.content_type.clone();
+        let (store, name, kind) = (
+            store.clone(),
+            layer.name.clone(),
+            layer.content_type.clone(),
+        );
         async move {
-            let Ok(response) = fetch(&url).await else {
-                return;
-            };
+            let found = store.tiles.tile(&name, z as u8, x as u32, y as u32).await;
             if page(|p| p.source_turn) != turn {
                 return;
             }
-            if response.status() == 404 {
-                prepend_text(&cell_el, "absente du store");
-                return;
-            }
-            if !response.ok() {
-                prepend_text(&cell_el, &format!("HTTP {}", response.status()));
-                return;
-            }
-            let Some(bytes) = body_of(&response).await else {
-                return;
+            let bytes = match found {
+                Ok(Some(tile)) => tile.bytes,
+                Ok(None) | Err(RepoError::NotFound(_)) => {
+                    prepend_text(&cell_el, "absente du store");
+                    return;
+                }
+                Err(e) => {
+                    prepend_text(&cell_el, &e.to_string());
+                    return;
+                }
             };
             if kind.starts_with("image/") {
                 if let Some(img) = image_of(&bytes, &kind) {
@@ -1151,11 +1173,22 @@ async fn show_source_tiles(at: Option<CameraSample>) {
         }
     });
     join_all(shown).await;
-}
-
-async fn body_of(response: &Response) -> Option<Vec<u8>> {
-    let buffer = JsFuture::from(response.array_buffer().ok()?).await.ok()?;
-    Some(Uint8Array::new(&buffer).to_vec())
+    if page(|p| p.source_turn) != turn {
+        return;
+    }
+    // Where the bytes came from: blocks of archives, not tiles.
+    let counts = store.counts();
+    set_text(
+        "tiles-note",
+        &format!(
+            "Store source, sous la caméra : {} niveau {z}, autour de {x}/{y} (grille {}). Tuiles trouvées ici dans les archives du store, lues par blocs : {} blocs demandés à l'API ({:.1} Mo), {} lectures servies par les blocs déjà en mémoire.",
+            layer.name,
+            layer.grid,
+            counts.fetched,
+            counts.fetched_bytes as f64 / 1e6,
+            counts.held
+        ),
+    );
 }
 
 // ------------------------------------------------------------------- render

@@ -6039,6 +6039,7 @@ dependencies = [
 name = "tuile-film-web"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "console_error_panic_hook",
  "futures-channel",
  "futures-util",
@@ -6049,6 +6050,7 @@ dependencies = [
  "tuile-film",
  "tuile-film-gpu",
  "tuile-mp4",
+ "tuile-repository",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

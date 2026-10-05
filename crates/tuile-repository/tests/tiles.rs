@@ -35,6 +35,9 @@ impl Get for Api {
     async fn get(&self, path: &str) -> Result<Got, String> {
         let path = format!("/api/{path}");
         self.asked.lock().expect("lock").push(path.clone());
+        // A network answers later: without this every request would finish
+        // before the next began, and nothing asked at once would overlap.
+        tokio::task::yield_now().await;
         let reply = self
             .bench
             .get(&path, "", None)
@@ -232,6 +235,45 @@ async fn the_portable_reader_answers_as_the_store_that_wrote() {
             "through the API: {name}/{level}/{x}/{y}"
         );
     }
+    // Many tiles asked for at once, as a frame does: readers after the
+    // same manifest or the same block wait for one request.
+    let first_reader = api.asked.lock().expect("lock").len();
+    let together = ArchivedTiles::open(
+        Arc::new(RemoteLive::new(api.clone(), "store")),
+        Arc::new(RemoteBlocks::new(api.clone(), "store")),
+        Arc::new(move || now),
+    )
+    .await
+    .expect("open through the API");
+    let before = api.asked.lock().expect("lock").len();
+    let answers = futures_util::future::join_all(
+        put.iter()
+            .map(|(name, level, x, y)| answer(&together, name, *level, *x, *y)),
+    )
+    .await;
+    assert!(answers
+        .iter()
+        .all(|a| a.starts_with("image/") || a.starts_with("application/")));
+    let at_once: Vec<String> = api.asked.lock().expect("lock")[before..].to_vec();
+    let mut once = at_once.clone();
+    once.sort();
+    once.dedup();
+    assert_eq!(at_once.len(), once.len(), "asked twice: {at_once:?}");
+    // The same for a block read by several at once, with nothing above it
+    // to line the readers up.
+    let alone = RemoteBlocks::new(api.clone(), "store");
+    let before = api.asked.lock().expect("lock").len();
+    let reads =
+        futures_util::future::join_all((0..6).map(|_| alone.read("catalog.json", 0..10))).await;
+    assert!(reads
+        .iter()
+        .all(|r| r.as_deref().ok() == Some(&b"{\n  \"layer"[..])));
+    assert_eq!(api.asked.lock().expect("lock").len() - before, 1);
+    assert_eq!(alone.counts().fetched, 1);
+
+    // Back to what the first reader asked, which the next lines count.
+    api.asked.lock().expect("lock").truncate(first_reader);
+
     // What crossed the API: the catalog once, a manifest per zone, and
     // blocks of archives — never a tile, and no block twice.
     let asked = api.asked.lock().expect("lock").clone();
