@@ -1,0 +1,21 @@
+[package]
+name = "tuile-pack-worker"
+description = "The bench's API as a Cloudflare Worker: the same routes, buckets reached over signed HTTP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# A Worker is the only target: a `--workspace` build on a laptop skips this
+# crate's body instead of failing on a runtime that is not there.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+async-trait = { workspace = true }
+tuile-repository = { version = "0.1.0", path = "../tuile-repository" }
+worker = "0.8"
+
+[lints]
+workspace = true
