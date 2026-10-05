@@ -295,12 +295,15 @@ struct Args {
     imagery: Option<i64>,
     /// L'asset de terrain ion, ou `None` pour le défaut (World Terrain).
     terrain: Option<i64>,
+    /// What the pack carries for its tiles: see `--content`.
+    content: tuile_pack::Content,
 }
 
 const USAGE: &str = "\
 usage: tuile-bake --tape <path.mcap> --frames <first>:<last> --out <path.tuilepack>
                   [--viewport <w>x<h>] [--sse <error>]
                   [--imagery <ion asset>] [--terrain <ion asset>]
+                  [--content embedded|references|both]
        tuile-bake --inspect <path.tuilepack>
        tuile-bake --diff <a.tuilepack> <b.tuilepack>
        tuile-bake --dump <path.tuilepack> --frame <n>
@@ -330,6 +333,7 @@ fn parse_args() -> Result<Job, String> {
     let mut sse: Option<f64> = None;
     let mut imagery: Option<i64> = None;
     let mut terrain: Option<i64> = None;
+    let mut content = tuile_pack::Content::Embedded;
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         let mut value = || argv.next().ok_or(format!("{arg} needs a value"));
@@ -364,6 +368,14 @@ fn parse_args() -> Result<Job, String> {
                         .parse()
                         .map_err(|_| "--terrain wants an ion asset id")?,
                 )
+            }
+            "--content" => {
+                content = match value()?.as_str() {
+                    "embedded" => tuile_pack::Content::Embedded,
+                    "references" => tuile_pack::Content::References,
+                    "both" => tuile_pack::Content::Both,
+                    _ => return Err("--content wants embedded, references or both".into()),
+                }
             }
             "--sse" => {
                 let v: f64 = value()?.parse().map_err(|_| "--sse wants a number")?;
@@ -426,6 +438,7 @@ fn parse_args() -> Result<Job, String> {
         sse,
         imagery,
         terrain,
+        content,
     }))
 }
 
@@ -686,11 +699,25 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
     let packed = PackedMirror::new();
     config.held_drape = Some(packed.held_drape());
 
+    // The tile store's layers this globe's tiles live in: named after the
+    // assets, as the store names them.
+    let store_layers = (
+        tuile_bake::source_namespace(config.terrain_asset_id),
+        config.imagery_asset_id.map(tuile_bake::source_namespace),
+    );
     let resolved = tuile_bake::exact_traversal(config.session.traversal.clone());
     // The whole tape names the scene, not the range: two shards of one shot
     // must agree on it. See `digest_of_scene`.
     let scene = digest_of_scene(&poses, args.viewport, &bake_settings(&config, &resolved));
     let culling = if resolved.cull { "full" } else { "disabled" };
+    // A pack of references names the tile store's layers its tiles come
+    // from, which are named after the assets like the store itself names
+    // them. Without imagery there is nothing to refer to on that side.
+    let pack_content = tuile_bake::bake::PackContent {
+        content: args.content,
+        terrain_layer: store_layers.0.clone(),
+        imagery_layer: store_layers.1.clone().unwrap_or_default(),
+    };
     tracing::info!(
         scene,
         culling,
@@ -736,6 +763,7 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
             out: &args.out,
             scene: SceneName::Given(scene.clone()),
             culling,
+            content: &pack_content,
             packed: &packed,
         },
         &mut Poses(&poses),
@@ -743,7 +771,16 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
 
     // On stdout, and parseable, because the launcher turns it into an object
     // key: `packs/<scene>/<first>-<last>.tuilepack`.
-    println!("BAKE-KEY packs/{scene}/{}-{wanted}.tuilepack", args.first);
+    //
+    // The scene is the same scene whatever the pack carries of it, so the
+    // digest does not change; the key does, or a pack of references would
+    // land on the pack that embeds the same frames and replace it.
+    let kind = match args.content {
+        tuile_pack::Content::References => ".references",
+        tuile_pack::Content::Both => ".both",
+        _ => "",
+    };
+    println!("BAKE-KEY packs/{scene}{kind}/{}-{wanted}.tuilepack", args.first);
     Ok(())
 }
 

@@ -91,6 +91,26 @@ impl PackedMirror {
     }
 }
 
+/// What a pack carries for its tiles: the tiles, references to them in the
+/// tile store, or both — and which layers of the store the references name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackContent {
+    pub content: tuile_pack::Content,
+    pub terrain_layer: String,
+    pub imagery_layer: String,
+}
+
+impl PackContent {
+    /// The tiles themselves and nothing of the store: what a pack always was.
+    pub fn embedded() -> Self {
+        Self {
+            content: tuile_pack::Content::Embedded,
+            terrain_layer: String::new(),
+            imagery_layer: String::new(),
+        }
+    }
+}
+
 /// One bake of a frame range.
 pub struct BakeFrames<'a> {
     pub first: u32,
@@ -100,6 +120,9 @@ pub struct BakeFrames<'a> {
     pub scene: SceneName,
     /// How the selection was culled, written into the pack.
     pub culling: &'a str,
+    /// What the pack carries for its tiles, and the tile store's layers its
+    /// references are into.
+    pub content: &'a PackContent,
     pub packed: &'a PackedMirror,
 }
 
@@ -156,7 +179,8 @@ pub fn bake_frames(
                     &spill,
                 )
                 .map_err(|e| format!("opening {}: {e}", spill.display()))?
-                .culling(job.culling),
+                .culling(job.culling)
+                .with_content(job.content.content, &job.content.terrain_layer, &job.content.imagery_layer),
             ),
         };
 
@@ -358,7 +382,7 @@ pub fn baked_tile(frame: &Frame, index: usize, tile: &Arc<TileGeometry>) -> Resu
         index_count: mesh.indices.len() as u32,
         base_color_factor: mesh.material.base_color_factor,
         texture_format: if texture.is_some() { TextureFormat::Png } else { TextureFormat::None },
-        refs: None,
+        refs: tile.refs.clone(),
         texture: texture.map(|t| t.png.clone()),
     })
 }

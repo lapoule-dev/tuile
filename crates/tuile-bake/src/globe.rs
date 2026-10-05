@@ -20,7 +20,7 @@ use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_cesium_ion::{tms::TmsImagery, AssetEndpoint, IonClient, IonTerrainSource};
 use tuile_core::offload;
 use tuile_native_fetchers::{NativeHttp, RetryConfig, TransportConfig};
-use tuile_planetary::{globe_on, GlobeOptions, ImageryDetail, LayerBudget};
+use tuile_planetary::{globe_with_provenance, GlobeOptions, ImageryDetail, LayerBudget};
 
 use crate::session::{Session, SessionConfig};
 
@@ -179,7 +179,7 @@ impl Session {
         // Sources resolve on the session's own runtime rather than a temporary
         // one, so the connection pool and cache that serve this call are the
         // same ones that will serve every tile afterwards.
-        let (tree, loader, detail, heights) = runtime.block_on(resolve(&config))?;
+        let (tree, loader, detail, heights, provenance) = runtime.block_on(resolve(&config))?;
 
         let mut session_config = config.session.clone();
         session_config.dataset = config.dataset_name();
@@ -189,6 +189,9 @@ impl Session {
         // capture batches stop lining up with terrain level boundaries.
         session.set_imagery_detail(detail);
         session.set_heights(heights);
+        // What each tile is made from, for a pack that refers to the tile
+        // store instead of — or beside — carrying the tiles.
+        session.set_provenance(provenance);
         Ok(session)
     }
 }
@@ -334,6 +337,7 @@ async fn resolve(
         Arc<dyn tuile_core::source::TileLoader>,
         ImageryDetail,
         Arc<tuile_terrain::TerrainHeights>,
+        Arc<tuile_planetary::Provenance>,
     ),
     GlobeError,
 > {
@@ -387,7 +391,7 @@ async fn resolve(
         // thread polling the server, and `globe()`'s inline offload would put
         // every tile's decode on that same thread — measured at sixty-four
         // loads in flight and one core busy.
-        let (tree, loader, detail, heights) = globe_on(
+        let (tree, loader, detail, heights, provenance) = globe_with_provenance(
             terrain,
             NoImagery,
             layer,
@@ -402,7 +406,7 @@ async fn resolve(
             },
             offload::threaded(),
         );
-        return Ok((tree, loader, detail, heights));
+        return Ok((tree, loader, detail, heights, provenance));
     };
 
     let ion = IonClient::new(Arc::clone(&http), config.ion_token.clone());
@@ -440,13 +444,13 @@ async fn resolve(
     // un asset qui n'est pas Bing. `externalType` absent veut dire
     // TileMapService, exactement la branche par défaut de cesium-native
     // (`IonRasterOverlay.cpp`, le `else` après `BING`).
-    let (tree, loader, detail, heights) = match endpoint.external_type.as_deref() {
+    let (tree, loader, detail, heights, provenance) = match endpoint.external_type.as_deref() {
         None => {
             let tms = TmsImagery::from_endpoint(ion, imagery_asset_id as u64, endpoint)
                 .await
                 .map_err(|e| GlobeError::Imagery(e.to_string()))?;
             let tms = Cached::wrap_imagery(tms, config.tile_cache.clone().map(|c| c.0), imagery_asset_id);
-            globe_on(terrain, tms, layer, options, offload::threaded())
+            globe_with_provenance(terrain, tms, layer, options, offload::threaded())
         }
         Some("BING") => {
             let o = &endpoint.options;
@@ -463,7 +467,7 @@ async fn resolve(
                 .await
                 .map_err(|e| GlobeError::Bing(e.to_string()))?;
             let bing = Cached::wrap_imagery(bing, config.tile_cache.clone().map(|c| c.0), imagery_asset_id);
-            globe_on(terrain, bing, layer, options, offload::threaded())
+            globe_with_provenance(terrain, bing, layer, options, offload::threaded())
         }
         Some(kind) => {
             return Err(GlobeError::UnsupportedImagery {
@@ -472,7 +476,7 @@ async fn resolve(
             })
         }
     };
-    Ok((tree, loader, detail, heights))
+    Ok((tree, loader, detail, heights, provenance))
 }
 
 /// Seconds, as a C ABI carries a duration, into a `Duration`.
