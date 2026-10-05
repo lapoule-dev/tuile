@@ -42,13 +42,16 @@
 //! ([`tuile_core::drive::drive_until_complete`]): the selection is a function of
 //! the camera and the sources, not of the network's mood.
 
+pub mod bake;
 mod globe;
 pub mod memory;
 pub mod packed;
 mod session;
+pub mod tiles;
 
 pub use globe::{
-    duration_or, imagery_boost_cap, GlobeConfig, GlobeError, BING_AERIAL, CESIUM_WORLD_TERRAIN,
+    duration_or, imagery_boost_cap, source_namespace, GlobeConfig, GlobeError, TileCache, BING_AERIAL,
+    CESIUM_WORLD_TERRAIN,
 };
 pub use packed::PackedError;
 pub use session::{

@@ -90,7 +90,7 @@ case "${1:-}" in
     globe)
         DOCKERFILE=integrations/blender/Dockerfile.globe
         IMAGE=blender-globe
-        TAG=5.1-su
+        TAG="${TUILE_GLOBE_TAG:-5.1-su}"
         CONTEXT=.
         DESTS=(ecr)
         ;;

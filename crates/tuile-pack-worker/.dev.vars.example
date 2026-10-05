@@ -1,0 +1,13 @@
+# Copy to `.dev.vars` (ignored by git) for `wrangler dev`. In production each
+# of these is a secret: `wrangler secret put <NAME>`.
+
+# The buckets' S3 endpoint, and a key that can READ them. Read-only is all
+# the bench needs and all it should be given.
+TUILE_STORE_ENDPOINT="https://<account>.r2.cloudflarestorage.com"
+TUILE_STORE_ACCESS_KEY_ID="…"
+TUILE_STORE_SECRET_ACCESS_KEY="…"
+
+# What is served: the bench's TOML (see examples/film-web/film-bench.example.toml),
+# on one line with \n for its line breaks and TOML's literal strings ('…'),
+# which need no escaping here. Buckets only.
+BENCH_CONFIG="[[project]]\nname = 'engine'\nbucket = 'my-engine-bucket'\nscenes = ['packs']\n"

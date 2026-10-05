@@ -19,6 +19,143 @@ seule façon de retrouver leur tracé est de rejouer les caméras du pack avec
 `tuile-bake --tape-from`. Les générateurs évoluent, donc recuire la même
 chaîne d'arguments ne donne plus le même vol.
 
+## `synthetic-orbit-1280x720-ss2-webgpu.mp4`
+
+Premier film du moteur **wgpu-film** (branche `spike/wgpu-film`), rendu dans
+le navigateur : deux Web Workers (wasm + WebGPU), H.264 par WebCodecs, mp4
+assemblé par `tuile-mp4`. Pas de vraie scène : un pack synthétique.
+
+- pack `cargo run --release -p tuile-film --example synthetic_pack -- synthetic.tuilepack 240`
+  (grille 16 × 16 km à 42,8° N 0,5° E, orbite de 5 km à 2 500 m, drapé changé
+  à la frame 121), scène `synthetic`, 7,3 Mo, 512 tuiles
+- page `examples/film-web/www/?pack=synthetic.tuilepack`, Chrome sur M2
+- 1280×720, suréchantillonnage 2× (4 éch./pixel), 30 images/s, 16 Mbit/s,
+  `avc1.640028` ; 240 frames en **4,9 s** (49 images/s), dont ~20 ms/frame
+  d'attente encodeur + GPU, 3,5 ms de travail CPU dans `next()`
+
+## `pyrenees-2min-nadir-50km-tilestore-sse6.mp4`
+
+Le même plan à **SSE 6** au lieu de 3, cuit à travers le store (projections,
+pool de finition).
+
+- pack `packs/24cd8199f4c13cfa/1-2880.tuilepack` (bucket `tracks-bucket`),
+  scène `ef5dd4813ae33cbb`, **888 Mo** (1,73 Go à SSE 3)
+- cuisson `tuile-bake-9s6b9` : **2 min 44 s** (3 min 02 s à SSE 3)
+- rendu `tuile-render-nqpb5` : 3 × L4, **9 min 52 s** (10 min 32 s à SSE 3) ;
+  2880 frames, 1920×1440, 624 Mo
+
+À l'œil : un peu plus doux, et plus de tuiles d'imagerie grossières restent à
+l'écran — donc plus de pavés de couleur (un bloc vert franc à 60 s, absent à
+SSE 3). Le pack est deux fois plus léger, le rendu gagne 40 s.
+
+## `pyrenees-2min-nadir-50km-tilestore-projection-v4.mp4`
+
+Cinquième passe : tuiles finies sur un pool d'un thread par cœur, et zone
+`top` projetée entière. **La cuisson ne parle plus au réseau.**
+
+- pack W5 : `tile-store-test/W5/1-2880.tuilepack`, scène `90baed1a239165d4`,
+  4 266 tuiles ; cuisson `tuile-bake-m6bwr` ; rendu `tuile-render-r6hx6`
+  (3 × L4, 10 min 32 s), 2880 frames, 663 Mo
+- cuisson **3 min 02 s** au total (contre 7 min 52 s sans store) : cuisson
+  111 s dont frame 1 35 s (106 s avant le pool), les 2 879 autres 74 s ;
+  projection 5,8 s pour 377 Mo en 320 requêtes ; vidage 0,8 s
+- lectures : 41 027 dans les projections, 40 replis (des absences), **0 vers
+  R2**
+- image `blender-globe:5.1-su` (commit `9a7404e`, pool `79d1922`)
+
+Toujours transparent : 4 142 tuiles communes avec B0, identiques.
+
+## `pyrenees-2min-nadir-50km-tilestore-projection-v3.mp4`
+
+Quatrième passe : les zones de cellule atteintes projetées entières.
+
+- pack W4 : `tile-store-test/W4/1-2880.tuilepack`, scène `90baed1a239165d4`,
+  4 251 tuiles ; cuisson `tuile-bake-pgjkq`, rendu 3 × L4, 2880 frames, 663 Mo
+- **5 min 30 s** au total ; cuisson 234 s (frame 1 105 s, les autres 128 s) ;
+  projection 7,6 s, 377 Mo en 320 requêtes
+- lectures : 18 756 dans les projections, 21 842 replis — inchangés, ce qui a
+  désigné `top` : la cuisson épingle une pyramide grossière du globe entier
+  (niveaux 0 à 5), que le filtre par distance coupait. Corrigé ensuite
+  (`top` gardée entière, commit `9a7404e`)
+- image `blender-globe:5.1-su` (commit `9a8ea20`)
+
+Toujours transparent : 4 127 tuiles communes avec B0, identiques.
+
+## `pyrenees-2min-nadir-50km-tilestore-projection-v2.mp4`
+
+Troisième passe à travers le store : une requête par archive, imagerie
+projetée huit fois plus loin que le terrain.
+
+- pack W3 : `tile-store-test/W3/1-2880.tuilepack`, scène `90baed1a239165d4`,
+  4 255 tuiles ; rendu `tuile-render-2drdk`, 3 × L4, 2880 frames, 663 Mo
+- cuisson `tuile-bake-hbb2n` : **5 min 49 s** au total (cuisson 242 s dont
+  frame 1 106 s et les 2 879 autres 133 s ; projection 8,3 s pour 377 Mo en
+  318 requêtes ; vidage 0,9 s)
+- lectures : 18 580 dans les projections, encore 21 849 replis vers R2 — le
+  filtre par tuile écarte ce que la cuisson utilise ; puisque chaque archive
+  arrive entière, la passe suivante garde toutes les tuiles des zones
+  atteintes et ne filtre plus que `top`
+- image `blender-globe:5.1-su` (commit `afc1a32`)
+
+Toujours transparent : 4 136 tuiles communes avec B0, 4 100 avec W,
+identiques.
+
+## `pyrenees-2min-nadir-50km-tilestore-projection.mp4`
+
+Le même plan, cuit **à travers les projections locales** du store : avant la
+première frame, la cuisson extrait des zones distantes les tuiles que ses
+caméras peuvent voir, dans des PMTiles locaux, puis lit ceux-ci avant R2.
+
+- bande et réglages : ceux de `pyrenees-2min-nadir-50km-tilestore-W.mp4`
+- pack W2 : `tile-store-test/W2/1-2880.tuilepack`, scène `90baed1a239165d4`,
+  4 392 tuiles, 1,76 Go
+- cuisson `tuile-bake-49hwc` : **7 min 30 s** au total (cuisson 5 min 54 s,
+  projection 6,3 s, vidage 1,3 s) contre 7 min 53 s sans store et 10 min 57 s
+  avec le store sans projection
+- projection : 283 zones, 8 362 tuiles gardées sur 25 379, 114 Mo en 341
+  requêtes, facteur 12
+- lectures : 8 887 dans les projections, **31 660 replis** vers R2 — le filtre
+  est trop serré pour l'imagerie (voir plus bas), 22 absentes
+- rendu `tuile-render-29f9z` : 3 tâches × L4 ; 2880 frames, 120,000 s, 663 Mo
+- image `blender-globe:5.1-su@sha256:db9d5b56…` (branche `feat/tile-server`,
+  commit `c2ca99c`)
+
+**Toujours transparent** : 4 179 tuiles communes avec B0, 4 177 avec W, toutes
+identiques. **Les replis viennent de l'imagerie** : un drapé de 2048² compose
+des tuiles d'imagerie plusieurs niveaux plus fines que la tuile de terrain
+qu'il habille, donc à même distance de l'œil l'imagerie utile est de largeur
+bien plus petite que ce que le facteur 12 garde.
+
+## `pyrenees-2min-nadir-50km-tilestore-W.mp4`
+
+Le premier film cuit **à travers le store de tuiles** (`tuile-tile-server`,
+bucket R2 `tiles-bucket`), store déjà rempli par une cuisson précédente. Même
+bande que `pyrenees-2min-nadir-50km-fixed.mp4`.
+
+- bande `tile-store-test/ref-20260920/1-2880.tuilepack.mcap` (copie de
+  `packs/cad37e576618a47f/1-2880.tuilepack.mcap`), rejouée telle quelle avec
+  `--trajectory pyrenees:2:24:50000:0.40`
+- pack W : `tile-store-test/W/1-2880.tuilepack` (bucket `tracks-bucket`),
+  scène `90baed1a239165d4`, 4 372 tuiles, 1,75 Go
+- imagerie Bing (défaut), viewport 3840×2880, sse 3, 16 échantillons, 1920×1440
+- cuisson `tuile-bake-qh8wv` avec `TUILE_TILES_BUCKET=tiles-bucket` : 10 min 57 s
+  (cuisson 9 min 01 s, vidage du store 20 s)
+- rendu `tuile-render-xq94m` : 3 tâches × L4 ; 2880 frames, 120,000 s, 663 Mo
+- image `blender-globe:5.1-su@sha256:497fcd15…` (branche `feat/tile-server`,
+  commit `14725be`)
+
+**Le store est transparent.** Quatre cuissons de la même bande — B0 et B0' sans
+store, A store froid, W store chaud — comparées tuile à tuile : toutes les
+tuiles communes (même id, même drapé) ont des octets identiques (positions,
+normales, UV, index, texture, origine), 4 094 à 4 183 par paire.
+**La cuisson, elle, n'est pas reproductible** : B0 et B0' ne sélectionnent pas
+les mêmes tuiles (203 / 103 de différence), store ou pas. Les packs de
+comparaison sont gardés sous `tracks-bucket/tile-store-test/{B0,B0prime,A,W}/`.
+
+**Les damiers de couleur sont bien visibles** — aplats de mer, blocs plus
+saturés, raccords entre niveaux : c'est le film témoin de
+`docs/18-color-harmonization.md`.
+
 ## `pyrenees-2min-nadir-50km.mp4`
 
 2880 frames, 1920×1440, 120,000000 s, 632 Mo. Le premier tour des Pyrénées.

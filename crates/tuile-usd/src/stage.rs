@@ -38,6 +38,14 @@ pub struct ManifestConfig {
     /// Refine while a tile's screen-space error exceeds this (pixels).
     /// `0.0` lets the traversal default stand.
     pub max_sse: f64,
+    /// The time code of `frames[0]`. A stage for one stretch of a longer shot
+    /// keeps the shot's own frame numbers, so what it renders is numbered as
+    /// the shot is: `1` for a whole shot.
+    pub first_frame: u32,
+    /// The origin to rebase on, when the caller fixes it: the centroid of
+    /// `frames` otherwise ([`render_origin`]). Every layer drawn with this
+    /// stage must use the same one.
+    pub origin: Option<[f64; 3]>,
 }
 
 impl Default for ManifestConfig {
@@ -48,6 +56,8 @@ impl Default for ManifestConfig {
             terrain_asset_id: 0,
             imagery_asset_id: 0,
             max_sse: 0.0,
+            first_frame: 1,
+            origin: None,
         }
     }
 }
@@ -198,7 +208,10 @@ pub fn write_manifest(
             "a manifest needs at least one camera frame",
         ));
     }
-    let origin = render_origin(frames);
+    let origin = config.origin.unwrap_or_else(|| render_origin(frames));
+    // Time code of frames[i]: the shot's own numbering (see `first_frame`).
+    let first = config.first_frame.max(1) as usize;
+    let at = |i: usize| first + i;
     let aspect = f64::from(config.viewport_px.0) / f64::from(config.viewport_px.1);
     let fovy_constant = frames
         .iter()
@@ -209,8 +222,8 @@ pub fn write_manifest(
     writeln!(out, "    defaultPrim = \"World\"")?;
     writeln!(out, "    metersPerUnit = 1")?;
     writeln!(out, "    upAxis = \"Z\"")?;
-    writeln!(out, "    startTimeCode = 1")?;
-    writeln!(out, "    endTimeCode = {}", frames.len())?;
+    writeln!(out, "    startTimeCode = {}", at(0))?;
+    writeln!(out, "    endTimeCode = {}", at(frames.len() - 1))?;
     writeln!(out, "    timeCodesPerSecond = {}", config.fps)?;
     writeln!(out, ")")?;
     writeln!(out)?;
@@ -228,7 +241,7 @@ pub fn write_manifest(
     writeln!(out, "        float2 clippingRange.timeSamples = {{")?;
     for (i, frame) in frames.iter().enumerate() {
         let (near, far) = clipping_range(frame.position);
-        writeln!(out, "            {}: ({near}, {far}),", i + 1)?;
+        writeln!(out, "            {}: ({near}, {far}),", at(i))?;
     }
     writeln!(out, "        }}")?;
     writeln!(
@@ -246,7 +259,7 @@ pub fn write_manifest(
     } else {
         writeln!(out, "        float focalLength.timeSamples = {{")?;
         for (i, frame) in frames.iter().enumerate() {
-            writeln!(out, "            {}: {},", i + 1, focal_length(frame.fovy))?;
+            writeln!(out, "            {}: {},", at(i), focal_length(frame.fovy))?;
         }
         writeln!(out, "        }}")?;
     }
@@ -255,7 +268,7 @@ pub fn write_manifest(
         writeln!(
             out,
             "            {}: {},",
-            i + 1,
+            at(i),
             matrix_literal(&camera_rows(frame, origin))
         )?;
     }
@@ -497,6 +510,27 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
         }
+    }
+
+    /// A stretch of a longer shot keeps the shot's frame numbers and the origin
+    /// it is given, so its render is numbered — and placed — as the shot is.
+    #[test]
+    fn a_stretch_keeps_the_shot_s_numbers_and_the_given_origin() {
+        let frames = [looking_down_x([200.0, 0.0, 0.0]), looking_down_x([100.0, 0.0, 0.0])];
+        let config = ManifestConfig { first_frame: 1351, origin: Some([180.0, 0.0, 0.0]), ..ManifestConfig::default() };
+        let mut out = Vec::new();
+        write_manifest(&frames, &config, &mut out).expect("writing");
+        let text = String::from_utf8(out).expect("utf-8");
+        for needle in [
+            "startTimeCode = 1351",
+            "endTimeCode = 1352",
+            "1351: ( (0, 1, 0, 0), (0, 0, 1, 0), (1, 0, 0, 0), (20, 0, 0, 1) ),",
+            "1352: ( (0, 1, 0, 0), (0, 0, 1, 0), (1, 0, 0, 0), (-80, 0, 0, 1) ),",
+            "double3 primvars:tuile:renderOrigin = (180, 0, 0)",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+        assert!(!text.contains("\n            1: "), "no sample at the shot's frame 1");
     }
 
     /// La caméra est nommée par un ATTRIBUT, jamais par une relation.
