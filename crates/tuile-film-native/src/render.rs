@@ -236,6 +236,11 @@ pub async fn render(
 
             // Everything the entering tiles read from the store, asked for
             // at once: a frame's reads wait on one another for nothing.
+            // Let go between frames only: what a frame was told it need not
+            // read must still be there when the frame composes with it.
+            if textures.len() >= TEXTURES_HELD {
+                textures.clear();
+            }
             let (mut terrain_read, mut imagery_read) = (HashMap::new(), HashMap::new());
             if let Some((terrain_layer, imagery_layer)) = layers {
                 let (mut terrain_wanted, mut imagery_wanted) = (HashSet::new(), HashSet::new());
@@ -344,9 +349,6 @@ pub async fn render(
                                 let texture = gpu.create_imagery(decoded.width, decoded.height);
                                 gpu.write_rgba(&texture, &decoded.rgba8);
                                 timings.upload += ms(t);
-                                if textures.len() >= TEXTURES_HELD {
-                                    textures.clear();
-                                }
                                 textures.insert(at, (texture, opaque));
                             }
                             let (texture, opaque) = &textures[&at];

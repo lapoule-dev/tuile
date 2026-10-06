@@ -6,7 +6,10 @@
 //! ```text
 //! tuile-film-render <packs prefix> [options]
 //!
-//!   --out <film.mp4>      the film, AV1 in an mp4
+//!   --out <film.mp4>      the film, in an mp4
+//!   --codec <av1|h264>    av1 by rav1e, anywhere; h264 by the machine's
+//!                         own encoder, on macOS when built with the
+//!                         `videotoolbox` feature (the default there)
 //!   --pictures <dir>      one PNG a frame
 //!   --meter <dir>         measure light going in and coming out; write
 //!                         tiles.csv, frames.csv, tone.json, report.md
@@ -140,7 +143,22 @@ async fn main() -> Result<(), Error> {
 
     let mut sinks: Vec<Box<dyn Sink>> = Vec::new();
     if let Some(path) = value("--out") {
-        sinks.push(Box::new(Av1Film::at(path, (mbps * 1e6) as u32)));
+        let bitrate = (mbps * 1e6) as u32;
+        let codec = value("--codec");
+        #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+        let film: Box<dyn Sink> = match codec.as_deref() {
+            Some("av1") => Box::new(Av1Film::at(path, bitrate)),
+            Some("h264") | None => Box::new(tuile_film_native::H264Film::at(path, bitrate)),
+            Some(other) => return Err(format!("no codec {other}").into()),
+        };
+        #[cfg(not(all(target_os = "macos", feature = "videotoolbox")))]
+        let film: Box<dyn Sink> = match codec.as_deref() {
+            Some("av1") | None => Box::new(Av1Film::at(path, bitrate)),
+            Some(other) => {
+                return Err(format!("no {other} encoder was built into this binary").into())
+            }
+        };
+        sinks.push(film);
     }
     if let Some(dir) = value("--pictures") {
         sinks.push(Box::new(Pictures::into(dir)));
