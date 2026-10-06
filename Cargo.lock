@@ -3010,6 +3010,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ea1f30cedd69f0a2954655f7188c6a834246d2bcf1e315e2ac40c4b24dc9519"
 dependencies = [
  "cfg-if",
+ "rayon",
 ]
 
 [[package]]
@@ -3259,6 +3260,16 @@ dependencies = [
  "spirv",
  "thiserror 2.0.18",
  "unicode-ident",
+]
+
+[[package]]
+name = "nasm-rs"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "706bf8a5e8c8ddb99128c3291d31bd21f4bcde17f0f4c20ec678d85c74faa149"
+dependencies = [
+ "jobserver",
+ "log",
 ]
 
 [[package]]
@@ -4524,6 +4535,7 @@ dependencies = [
  "av1-grain",
  "bitstream-io",
  "built",
+ "cc",
  "cfg-if",
  "interpolate_name",
  "itertools 0.14.0",
@@ -4531,6 +4543,7 @@ dependencies = [
  "libfuzzer-sys",
  "log",
  "maybe-rayon",
+ "nasm-rs",
  "new_debug_unreachable",
  "noop_proc_macro",
  "num-derive",
@@ -6033,6 +6046,26 @@ dependencies = [
  "thiserror 2.0.18",
  "tuile-core",
  "tuile-film",
+ "wgpu",
+]
+
+[[package]]
+name = "tuile-film-native"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "dotenvy",
+ "image",
+ "rav1e",
+ "tempfile",
+ "tokio",
+ "tuile-core",
+ "tuile-farm",
+ "tuile-film",
+ "tuile-film-gpu",
+ "tuile-mp4",
+ "tuile-radiometry",
+ "tuile-repository",
  "wgpu",
 ]
 
