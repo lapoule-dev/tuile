@@ -39,8 +39,16 @@ use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tuile_farm::{BucketConfig, ObjectRunStore, RunStore, Tuning};
 
-/// Screen-space errors tried on the first frame, likeliest first.
-const CANDIDATES: [u32; 5] = [6, 16, 3, 8, 4];
+/// Screen-space errors tried on the first frame, coarsest first.
+///
+/// In that order the distance to the old frame falls until the old pack's
+/// own setting is reached and rises past it, so the search stops at the
+/// first setting that does worse than the one before — and at the first
+/// that does not converge: a finer one draws more, and would not either.
+/// Tried likeliest first, a setting too fine for the scene (3, on a wide
+/// view) spent its quarter of an hour not converging and failed the whole
+/// pack, whose own setting had already been found.
+const CANDIDATES: [u32; 5] = [16, 8, 6, 4, 3];
 /// A first frame this close to the old one, in tiles, is the setting.
 const CLOSE_ENOUGH: u64 = 12;
 /// Bytes of a table asked for at once.
@@ -55,7 +63,10 @@ const BAKE_KNOBS: [(&str, &str); 4] = [
 ];
 
 #[derive(Parser)]
-#[command(name = "migrate-packs", about = "Re-bake packs as references, in place")]
+#[command(
+    name = "migrate-packs",
+    about = "Re-bake packs as references, in place"
+)]
 struct Cli {
     /// The pack API that lists the projects, their films and their packs.
     api: String,
@@ -150,7 +161,12 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<(), String> {
     let work = match &cli.work {
         Some(dir) => dir.clone(),
-        None => cli.ledger.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf(),
+        None => cli
+            .ledger
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf(),
     };
     let bake = match &cli.bake {
         Some(path) => path.clone(),
@@ -185,7 +201,10 @@ async fn run(cli: Cli) -> Result<(), String> {
         .collect();
     if cli.dry_run {
         for p in &wanted {
-            println!("{} {} {} frames {}:{}", p.bytes, p.project, p.key, p.first, p.last);
+            println!(
+                "{} {} {} frames {}:{}",
+                p.bytes, p.project, p.key, p.first, p.last
+            );
         }
         println!("{} packs to migrate", wanted.len());
         return Ok(());
@@ -195,7 +214,10 @@ async fn run(cli: Cli) -> Result<(), String> {
         return Err("TUILE_ION_TOKEN is not set; a bake is the one job that needs it".into());
     }
     if !wanted.is_empty() && !setup.bake.exists() {
-        return Err(format!("{}: no such baker (see --bake)", setup.bake.display()));
+        return Err(format!(
+            "{}: no such baker (see --bake)",
+            setup.bake.display()
+        ));
     }
 
     for pack in wanted {
@@ -207,7 +229,10 @@ async fn run(cli: Cli) -> Result<(), String> {
             frames: [pack.first, pack.last],
             ..Entry::default()
         };
-        let place = stores.iter().find(|(name, _)| *name == pack.project).map(|(_, s)| s.as_str());
+        let place = stores
+            .iter()
+            .find(|(name, _)| *name == pack.project)
+            .map(|(_, s)| s.as_str());
         let outcome = match place {
             Some(place) => migrate(&setup, place, &pack, &mut entry).await,
             None => Err(format!("project {} has no store", pack.project)),
@@ -259,14 +284,23 @@ async fn listing(api: &str) -> Result<(Vec<(String, String)>, Vec<Chunk>), Strin
         serde_json::from_slice(&body).map_err(|e| format!("{url}: {e}"))
     };
     let text = |v: &serde_json::Value, field: &str| -> Result<String, String> {
-        v[field].as_str().map(str::to_string).ok_or_else(|| format!("the API gave no {field}"))
+        v[field]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("the API gave no {field}"))
     };
     let number = |v: &serde_json::Value, field: &str| -> Result<u64, String> {
-        v[field].as_u64().ok_or_else(|| format!("the API gave no {field}"))
+        v[field]
+            .as_u64()
+            .ok_or_else(|| format!("the API gave no {field}"))
     };
 
     let mut stores = Vec::new();
-    for project in get(&["projects"]).await?["projects"].as_array().into_iter().flatten() {
+    for project in get(&["projects"]).await?["projects"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
         stores.push((text(project, "name")?, text(project, "store")?));
     }
     let mut packs = Vec::new();
@@ -301,7 +335,11 @@ fn done(ledger: &Path) -> Result<BTreeSet<(String, String)>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(seen),
         Err(e) => return Err(format!("{}: {e}", ledger.display())),
     };
-    for (index, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+    for (index, line) in text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+    {
         let entry: serde_json::Value = serde_json::from_str(line)
             .map_err(|e| format!("{} line {}: {e}", ledger.display(), index + 1))?;
         if entry["outcome"] != "failed" {
@@ -331,9 +369,14 @@ fn open(place: &str) -> Result<ObjectRunStore, String> {
     if let Some(dir) = place.strip_prefix("dir ") {
         return ObjectRunStore::local(Path::new(dir), tuning).map_err(|e| e.to_string());
     }
-    let bucket = place.strip_prefix("bucket ").ok_or_else(|| format!("{place:?} is not a store"))?;
+    let bucket = place
+        .strip_prefix("bucket ")
+        .ok_or_else(|| format!("{place:?} is not a store"))?;
     let var = |name: &str| {
-        std::env::var(name).ok().filter(|v| !v.is_empty()).ok_or_else(|| format!("{name} is not set"))
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| format!("{name} is not set"))
     };
     let config = BucketConfig {
         endpoint: var("TUILE_STORE_ENDPOINT")?,
@@ -360,24 +403,38 @@ async fn fetch_table(
     if size < preamble {
         return Err(format!("{key}: {size} bytes is not a pack"));
     }
-    let head = store.get_range(key, 0..preamble).await.map_err(|e| e.to_string())?;
+    let head = store
+        .get_range(key, 0..preamble)
+        .await
+        .map_err(|e| e.to_string())?;
     let start = tuile_pack::blob_start(&head).map_err(|e| format!("{key}: {e}"))?;
     if start > size {
-        return Err(format!("{key}: its table ends at {start}, past its {size} bytes"));
+        return Err(format!(
+            "{key}: its table ends at {start}, past its {size} bytes"
+        ));
     }
     let mut file = std::fs::File::create(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
-    file.write_all(&head).map_err(|e| format!("{}: {e}", dest.display()))?;
+    file.write_all(&head)
+        .map_err(|e| format!("{}: {e}", dest.display()))?;
     let mut at = preamble;
     while at < start {
         let end = (at + lot.max(1)).min(start);
-        let bytes = store.get_range(key, at..end).await.map_err(|e| e.to_string())?;
+        let bytes = store
+            .get_range(key, at..end)
+            .await
+            .map_err(|e| e.to_string())?;
         if bytes.len() as u64 != end - at {
-            return Err(format!("{key}: bytes {at}..{end} came back {} long", bytes.len()));
+            return Err(format!(
+                "{key}: bytes {at}..{end} came back {} long",
+                bytes.len()
+            ));
         }
-        file.write_all(&bytes).map_err(|e| format!("{}: {e}", dest.display()))?;
+        file.write_all(&bytes)
+            .map_err(|e| format!("{}: {e}", dest.display()))?;
         at = end;
     }
-    file.sync_all().map_err(|e| format!("{}: {e}", dest.display()))?;
+    file.sync_all()
+        .map_err(|e| format!("{}: {e}", dest.display()))?;
     Ok(start)
 }
 
@@ -405,14 +462,20 @@ fn check_new(path: &Path, first: u32, last: u32) -> Result<usize, String> {
     let mut seen = BTreeSet::new();
     let mut referring = 0usize;
     for frame in first..=last {
-        for tile in pack.frame(frame).map_err(|e| not(format!("frame {frame}: {e}")))? {
+        for tile in pack
+            .frame(frame)
+            .map_err(|e| not(format!("frame {frame}: {e}")))?
+        {
             if seen.insert((tile.id(), tile.drape())) && tuile_pack::refs_of(&tile).is_some() {
                 referring += 1;
             }
         }
     }
     if referring != seen.len() || seen.is_empty() {
-        return Err(not(format!("{referring} of {} tiles refer to the store", seen.len())));
+        return Err(not(format!(
+            "{referring} of {} tiles refer to the store",
+            seen.len()
+        )));
     }
     Ok(seen.len())
 }
@@ -431,7 +494,11 @@ async fn migrate(
     let size = store.size(&pack.key).await.map_err(|e| e.to_string())?;
     let table = fetch_table(&store, &pack.key, size, LOT, &setup.old).await?;
     entry.table_bytes = Some(table);
-    eprintln!("TABLE {} ← {}: {table} of {size} bytes read", pack.key, store.label());
+    eprintln!(
+        "TABLE {} ← {}: {table} of {size} bytes read",
+        pack.key,
+        store.label()
+    );
 
     // A pack this already replaced, or one baked as references since.
     let (content, first, last) = old_pack(&setup.old)?;
@@ -445,16 +512,22 @@ async fn migrate(
     for sse in CANDIDATES {
         let probe = rebake(setup, sse, Some((first, first))).await?;
         if !probe.done {
-            return Err(format!("probe at sse {sse}: {}", probe.verdict));
+            eprintln!(
+                "PROBE {} sse {sse}: {} — not a setting for this pack",
+                pack.key,
+                tail(&probe.verdict, 120)
+            );
+            break;
         }
-        if best.is_none_or(|(apart, _)| probe.apart < apart) {
-            best = Some((probe.apart, sse));
+        if best.is_some_and(|(apart, _)| probe.apart > apart) {
+            break;
         }
+        best = Some((probe.apart, sse));
         if probe.apart <= CLOSE_ENOUGH {
             break;
         }
     }
-    let (apart, sse) = best.ok_or("no setting was tried")?;
+    let (apart, sse) = best.ok_or("no setting converged on the first frame")?;
     entry.sse = Some(sse);
     entry.first_frame_apart = Some(apart);
 
@@ -464,16 +537,25 @@ async fn migrate(
         return Err(format!("rebake: {}", whole.verdict));
     }
     entry.tiles = Some(check_new(&setup.new, first, last)?);
-    entry.new_bytes =
-        Some(std::fs::metadata(&setup.new).map_err(|e| format!("{}: {e}", setup.new.display()))?.len());
+    entry.new_bytes = Some(
+        std::fs::metadata(&setup.new)
+            .map_err(|e| format!("{}: {e}", setup.new.display()))?
+            .len(),
+    );
 
     // The object this replaces is still the one whose table was read: a pack
     // re-baked by someone else in the hours this took is not overwritten.
     let now = store.size(&pack.key).await.map_err(|e| e.to_string())?;
     if now != size {
-        return Err(format!("{} changed while it was re-baked: {size} bytes then, {now} now", pack.key));
+        return Err(format!(
+            "{} changed while it was re-baked: {size} bytes then, {now} now",
+            pack.key
+        ));
     }
-    store.put(&setup.new, &pack.key).await.map_err(|e| format!("put failed: {e}"))?;
+    store
+        .put(&setup.new, &pack.key)
+        .await
+        .map_err(|e| format!("put failed: {e}"))?;
     Ok("replaced")
 }
 
@@ -499,7 +581,9 @@ async fn rebake(setup: &Setup, sse: u32, frames: Option<(u32, u32)>) -> Result<R
     if let Some((first, last)) = frames {
         command.args(["--frames", &format!("{first}:{last}")]);
     }
-    command.env("TUILE_CACHE_DIR", &setup.cache).envs(BAKE_KNOBS);
+    command
+        .env("TUILE_CACHE_DIR", &setup.cache)
+        .envs(BAKE_KNOBS);
     if let Some(bucket) = &setup.tiles_bucket {
         command.env("TUILE_TILES_BUCKET", bucket);
     }
@@ -535,7 +619,10 @@ async fn kept(stream: Option<impl AsyncRead + Unpin>) -> Vec<String> {
             Ok(_) => {}
         }
         let line = clean(&String::from_utf8_lossy(&raw));
-        if ["REBAKE-", "BAKE-FAIL", "BAKE-DONE"].iter().any(|k| line.contains(k)) {
+        if ["REBAKE-", "BAKE-FAIL", "BAKE-DONE"]
+            .iter()
+            .any(|k| line.contains(k))
+        {
             lines.push(line);
         } else if line.contains("peak_gib")
             || (line.contains("BAKE-FRAME") && shown.elapsed() >= Duration::from_secs(120))
@@ -549,22 +636,42 @@ async fn kept(stream: Option<impl AsyncRead + Unpin>) -> Vec<String> {
 
 /// What the baker concluded, from the lines kept of it.
 fn read_verdict(done: bool, lines: &[String]) -> Rebaked {
-    let verdict = lines.iter().find(|l| l.contains("REBAKE-")).cloned().unwrap_or_default();
+    let verdict = lines
+        .iter()
+        .find(|l| l.contains("REBAKE-"))
+        .cloned()
+        .unwrap_or_default();
     // A baker that failed says why on its last line, whatever it said of the
     // selection before.
-    let failure = lines.iter().rev().find(|l| l.contains("BAKE-FAIL")).cloned();
+    let failure = lines
+        .iter()
+        .rev()
+        .find(|l| l.contains("BAKE-FAIL"))
+        .cloned();
     if !done {
         let why = failure.unwrap_or_else(|| {
             let from = lines.len().saturating_sub(2);
             lines[from..].join(" | ")
         });
-        return Rebaked { done, apart: u64::MAX, verdict: why };
+        return Rebaked {
+            done,
+            apart: u64::MAX,
+            verdict: why,
+        };
     }
     if verdict.contains("REBAKE-SAME") {
-        return Rebaked { done, apart: 0, verdict };
+        return Rebaked {
+            done,
+            apart: 0,
+            verdict,
+        };
     }
     let apart = tiles_apart(&verdict).unwrap_or(u64::MAX);
-    Rebaked { done, apart, verdict }
+    Rebaked {
+        done,
+        apart,
+        verdict,
+    }
 }
 
 /// The number after `tiles apart `, in a `REBAKE-DIFFERS` line.
@@ -638,13 +745,23 @@ mod tests {
         let dest = dir.path().join("head");
 
         // A lot far smaller than the table, and not a divisor of it.
-        let start = fetch_table(&store, "run/scene.tuilepack", object.len() as u64, 37, &dest)
-            .await
-            .expect("fetch");
+        let start = fetch_table(
+            &store,
+            "run/scene.tuilepack",
+            object.len() as u64,
+            37,
+            &dest,
+        )
+        .await
+        .expect("fetch");
 
         assert_eq!(start as usize, tuile_pack::PREAMBLE + 1000);
         let head = std::fs::read(&dest).expect("read");
-        assert_eq!(head, object[..start as usize], "the head, byte for byte, and nothing after");
+        assert_eq!(
+            head,
+            object[..start as usize],
+            "the head, byte for byte, and nothing after"
+        );
     }
 
     #[tokio::test]
@@ -657,8 +774,14 @@ mod tests {
         let store =
             ObjectRunStore::local(&dir.path().join("store"), Tuning::default()).expect("store");
 
-        let outcome =
-            fetch_table(&store, "cut.tuilepack", cut.len() as u64, 64, &dir.path().join("head")).await;
+        let outcome = fetch_table(
+            &store,
+            "cut.tuilepack",
+            cut.len() as u64,
+            64,
+            &dir.path().join("head"),
+        )
+        .await;
 
         assert!(outcome.expect_err("refused").contains("past its 500 bytes"));
     }
@@ -678,14 +801,22 @@ mod tests {
         let seen = done(&ledger).expect("ledger");
 
         assert!(seen.contains(&("a".into(), "k1".into())));
-        assert!(!seen.contains(&("a".into(), "k2".into())), "a failed pack is tried again");
+        assert!(
+            !seen.contains(&("a".into(), "k2".into())),
+            "a failed pack is tried again"
+        );
         assert!(seen.contains(&("b".into(), "k3".into())));
-        assert!(done(&dir.path().join("absent.jsonl")).expect("no ledger yet").is_empty());
+        assert!(done(&dir.path().join("absent.jsonl"))
+            .expect("no ledger yet")
+            .is_empty());
     }
 
     #[test]
     fn a_verdict_is_read_from_the_bakers_lines() {
-        let same = read_verdict(true, &["REBAKE-SAME frames=24 tiles and drapes".to_string()]);
+        let same = read_verdict(
+            true,
+            &["REBAKE-SAME frames=24 tiles and drapes".to_string()],
+        );
         assert_eq!((same.done, same.apart), (true, 0));
 
         let differs = read_verdict(
@@ -710,8 +841,12 @@ mod tests {
 
     #[test]
     fn a_kept_line_carries_no_colour_and_no_token() {
-        let line = "\u{1b}[32m INFO\u{1b}[0m fetching https://x/y?access_token=eyJhbGci.OiJI-Uz_I1 done\n";
-        assert_eq!(clean(line), " INFO fetching https://x/y?access_token=<redacted> done");
+        let line =
+            "\u{1b}[32m INFO\u{1b}[0m fetching https://x/y?access_token=eyJhbGci.OiJI-Uz_I1 done\n";
+        assert_eq!(
+            clean(line),
+            " INFO fetching https://x/y?access_token=<redacted> done"
+        );
         assert_eq!(clean(&"é".repeat(400)).chars().count(), 300);
         assert_eq!(tail("abcdef", 3), "def");
         assert_eq!(tail("ab", 3), "ab");
