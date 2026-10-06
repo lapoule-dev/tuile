@@ -94,8 +94,9 @@ pub struct Done {
     /// The tone table applied, if one was.
     pub tone: Option<LevelGrades>,
     /// For a table made from the store's: the places the film's imagery
-    /// lies in, and how many of them the store had a table for.
-    pub tone_places: (usize, usize),
+    /// lies in, how many of them the store keeps a table of their own for,
+    /// and whether the others were given the layer's.
+    pub tone_places: (usize, usize, bool),
 }
 
 /// Store tiles asked for at once.
@@ -237,9 +238,9 @@ pub async fn render(
                                 *places.entry(place).or_default() += tiles;
                             }
                         }
-                        let (table, had) = sources.store.film_tone(imagery, &places).await?;
-                        done.tone_places = (places.len(), had);
-                        table
+                        let tone = sources.store.film_tone(imagery, &places).await?;
+                        done.tone_places = (tone.places, tone.fitted, tone.layer_table);
+                        tone.table
                     }
                 };
                 done.tone.clone_from(&table);

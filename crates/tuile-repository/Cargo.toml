@@ -12,6 +12,8 @@ authors.workspace = true
 # compiles to wasm32, so a Worker reads the same layouts through its own
 # `Objects` over an R2 binding.
 [dependencies]
+# Numbers only, no dependency of its own: the grades a store keeps.
+tuile-radiometry = { version = "0.2.0", path = "../tuile-radiometry" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 # PMTiles directories are gzipped; pure Rust, so it builds for a Worker.

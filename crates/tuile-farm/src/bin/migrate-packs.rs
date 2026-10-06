@@ -6,7 +6,7 @@
 //! ```text
 //! migrate-packs <api> <ledger.jsonl> [--max-gb N] [--only <substring>]
 //!               [--bake <tuile-bake>] [--work <dir>] [--tiles-bucket <name>]
-//!               [--dry-run]
+//!               [--dry-run] [--again]
 //! ```
 //!
 //! One pack at a time, smallest first: read its table, choose the
@@ -80,6 +80,11 @@ struct Cli {
     /// List what would be migrated, and stop.
     #[arg(long)]
     dry_run: bool,
+    /// Re-bake packs that are references already, too: what a baker that
+    /// has since been corrected would make of the same plan. With a ledger
+    /// of its own, since the ledger is what says a pack is done.
+    #[arg(long)]
+    again: bool,
 }
 
 /// One pack of one project, as the API lists it.
@@ -121,6 +126,8 @@ struct Entry {
 
 /// What every pack's migration is handed.
 struct Setup {
+    /// Whether packs that are references already are re-baked as well.
+    again: bool,
     bake: PathBuf,
     old: PathBuf,
     new: PathBuf,
@@ -152,6 +159,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             .with_file_name("tuile-bake"),
     };
     let setup = Setup {
+        again: cli.again,
         bake,
         old: work.join("work.old.tuilepack"),
         new: work.join("work.new.tuilepack"),
@@ -427,7 +435,7 @@ async fn migrate(
 
     // A pack this already replaced, or one baked as references since.
     let (content, first, last) = old_pack(&setup.old)?;
-    if content == tuile_pack::Content::References {
+    if content == tuile_pack::Content::References && !setup.again {
         return Ok("already references");
     }
     entry.frames = [first, last];

@@ -279,7 +279,7 @@ async fn main() -> Result<(), Error> {
         done.renewed,
         match (&done.tone, order.tone_strength) {
             (None, _) if done.tone_places.0 > 0 => format!(
-                "none — the store has no table for any of the film's {} places",
+                "none — the store keeps no table for any of the film's {} places, nor one for the layer",
                 done.tone_places.0
             ),
             (None, _) => "none".to_string(),
@@ -287,8 +287,11 @@ async fn main() -> Result<(), Error> {
                 "one grade a level, anchor {}, strength {s}{}",
                 t.anchor,
                 match done.tone_places {
-                    (0, _) => String::new(),
-                    (places, had) => format!(", from the store's tables for {had} of the film's {places} places"),
+                    (0, ..) => String::new(),
+                    (places, fitted, layer) => format!(
+                        ", from the store: {fitted} of the film's {places} places have a table of their own{}",
+                        if layer { ", the others the layer's" } else { ", the others none" }
+                    ),
                 }
             ),
         }

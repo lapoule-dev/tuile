@@ -108,9 +108,10 @@ impl Store {
         }
     }
 
-    /// [`Self::small`] for a key made on the spot.
-    pub async fn small_owned(&self, key: String) -> Result<Option<Vec<u8>>, RepoError> {
-        self.small(&key).await
+    /// The store's small files, as objects: what
+    /// `tuile_repository::tone::film_tone` reads a film's grades through.
+    pub fn live(&self) -> &dyn Objects {
+        self.live.as_ref()
     }
 
     /// Blocks of archives asked of the API, and blocks answered from memory.
