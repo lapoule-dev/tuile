@@ -557,3 +557,47 @@ fn a_layer_is_composed_at_its_levels_grade() {
         assert!(moved > (side * side) as usize, "grade {n} did nothing");
     }
 }
+
+/// A tile's pixels are resolved in groups of 64, and a dispatch holds at
+/// most 65535 groups in a row: a tile of more than 4.2 million pixels —
+/// the near ground of a large picture — must still be resolved whole. Laid
+/// out in one row, it was not resolved at all, and came out black.
+#[test]
+fn a_tile_of_more_pixels_than_one_row_of_groups_is_resolved_whole() {
+    let albedo = [200, 180, 160, 255];
+    let (Some(small), Some(large)) = (render(look(), albedo, 1), render(look(), albedo, 64)) else {
+        eprintln!("no adapter: skipped");
+        return;
+    };
+    // The square's own pixels, away from its edge: those the small render
+    // shows in the colour of its centre, with neighbours that are too.
+    let (width, height) = (small.width, small.rgba.len() as u32 / 4 / small.width);
+    let centre = pixel(&small, width / 2, height / 2);
+    let inside = |x: u32, y: u32| pixel(&small, x, y) == centre;
+    let mut within = Vec::new();
+    for y in 1..height - 1 {
+        for x in 1..width - 1 {
+            if inside(x, y)
+                && inside(x - 1, y)
+                && inside(x + 1, y)
+                && inside(x, y - 1)
+                && inside(x, y + 1)
+            {
+                within.push((x, y));
+            }
+        }
+    }
+    // Sixty-four samples a side: is this tile past one row of groups?
+    let samples = within.len() as u64 * 64 * 64;
+    assert!(
+        samples > 65_535 * 64,
+        "the square is {samples} samples: not enough to say"
+    );
+    for (x, y) in within {
+        let (got, wanted) = (pixel(&large, x, y), centre);
+        assert!(
+            got.iter().zip(wanted).all(|(g, w)| g.abs_diff(w) <= 2),
+            "pixel {x},{y} is {got:?}, not {wanted:?}"
+        );
+    }
+}

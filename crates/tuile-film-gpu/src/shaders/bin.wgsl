@@ -14,6 +14,11 @@ const MAX_SLOTS: u32 = 8192u;
 const SCAN_THREADS: u32 = 256u;
 const PER_THREAD: u32 = MAX_SLOTS / SCAN_THREADS;
 const RESOLVE_GROUP: u32 = 64u;
+// Groups in a row of a tile's resolve. A dispatch is at most 65535 groups
+// in a dimension: in one row, a tile of more than four million pixels —
+// the near ground of a large picture — could not be resolved at all, and
+// came out black.
+const RESOLVE_ROW: u32 = 1024u;
 
 @group(0) @binding(0) var vis: texture_2d<u32>;
 @group(0) @binding(1) var<storage, read_write> counts: array<atomic<u32>>;
@@ -57,8 +62,9 @@ fn scan(@builtin(local_invocation_index) t: u32) {
         let n = atomicLoad(&counts[s]);
         starts[s] = at;
         atomicStore(&cursor[s], at);
-        args[3u * s] = (n + RESOLVE_GROUP - 1u) / RESOLVE_GROUP;
-        args[3u * s + 1u] = 1u;
+        let groups = (n + RESOLVE_GROUP - 1u) / RESOLVE_GROUP;
+        args[3u * s] = min(groups, RESOLVE_ROW);
+        args[3u * s + 1u] = (groups + RESOLVE_ROW - 1u) / RESOLVE_ROW;
         args[3u * s + 2u] = 1u;
         at += n;
     }
