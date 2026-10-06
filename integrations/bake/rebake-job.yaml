@@ -106,6 +106,22 @@ spec:
               value: /work
             # The baker sizes its pools on the machine's cores, which are the
             # node's and not this container's share of them.
+            # What bounds the baker's memory, so that a pack of any size is
+            # baked inside the limit below. Tiles kept resident for the
+            # selection are the large term, and its default is the size of
+            # the limit itself; a frame that needs more than this fails, by
+            # name, instead of taking the container down. Then the decoded
+            # textures remembered between tiles, and the fetch cache.
+            - name: TUILE_RESIDENT_BUDGET_GB
+              value: "${TUILE_RESIDENT_GB}"
+            - name: TUILE_TEXTURE_MEMO_MB
+              value: "256"
+            - name: TUILE_CACHE_MEMORY_MB
+              value: "256"
+            # The baker says what it holds once a minute: a run that grows
+            # is seen growing.
+            - name: TUILE_MEMORY_EVERY
+              value: "60"
             - name: TUILE_FINISH_THREADS
               value: "${TUILE_THREADS}"
             - name: TOKIO_WORKER_THREADS
