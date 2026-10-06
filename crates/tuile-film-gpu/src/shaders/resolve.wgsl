@@ -10,6 +10,8 @@
 // filtering. No fragment-stage derivative is needed, so this runs in compute.
 
 const RESOLVE_GROUP: u32 = 64u;
+// Groups in a row: see `bin.wgsl`, which lays the dispatch out.
+const RESOLVE_ROW: u32 = 1024u;
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage, read> tiles: array<TileFrame>;
@@ -65,8 +67,9 @@ fn lerp3(b: vec2f, x: vec2f, y: vec2f, z: vec2f) -> vec2f {
 @compute @workgroup_size(RESOLVE_GROUP)
 fn resolve(@builtin(global_invocation_id) id: vec3u) {
     let slot = current.slot;
-    if (id.x >= counts[slot]) { return; }
-    let pixel = list[starts[slot] + id.x];
+    let n = id.y * (RESOLVE_ROW * RESOLVE_GROUP) + id.x;
+    if (n >= counts[slot]) { return; }
+    let pixel = list[starts[slot] + n];
     let w = frame.size.x;
     let xy = vec2u(pixel % w, pixel / w);
     let tri = textureLoad(vis, xy, 0).y;
