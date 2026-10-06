@@ -78,11 +78,21 @@ pub struct Done {
     pub tiles_from_pack: u64,
     /// Source tiles the store has renewed since the bake.
     pub renewed: u64,
+    /// The first frame rendered, which enters every tile it draws…
+    pub opening: Timings,
+    /// …and every frame after it, together.
     pub timings: Timings,
+    /// Tiles the first frame entered, and all the others together.
+    pub opening_tiles: u64,
     pub seconds: f64,
+    /// Before the first frame: opening the adapter and the sink.
+    pub setup_seconds: f64,
     /// The tone table applied, if one was.
     pub tone: Option<LevelGains>,
 }
+
+/// Store tiles asked for at once.
+const AT_ONCE: usize = 48;
 
 /// Imagery tiles kept on the GPU before they are let go.
 const TEXTURES_HELD: usize = 2048;
@@ -171,6 +181,7 @@ pub async fn render(
     let mut done = Done {
         width,
         height,
+        setup_seconds: began.elapsed().as_secs_f64(),
         ..Done::default()
     };
     // What is resident, and the imagery levels of each one's drape.
@@ -223,6 +234,56 @@ pub async fn render(
             let mut timings = Timings::default();
             let mut entered = 0usize;
 
+            // Everything the entering tiles read from the store, asked for
+            // at once: a frame's reads wait on one another for nothing.
+            let (mut terrain_read, mut imagery_read) = (HashMap::new(), HashMap::new());
+            if let Some((terrain_layer, imagery_layer)) = layers {
+                let (mut terrain_wanted, mut imagery_wanted) = (HashSet::new(), HashSet::new());
+                for tile in &diff.enter {
+                    if resident.contains_key(&TileKey::of(tile)) {
+                        continue;
+                    }
+                    let Some(refs) = refs_of(tile) else { continue };
+                    terrain_wanted.insert((refs.terrain.level, refs.terrain.x, refs.terrain.y));
+                    for placed in &refs.imagery {
+                        let at = (placed.tile.level, placed.tile.x, placed.tile.y);
+                        if !textures.contains_key(&at) {
+                            imagery_wanted.insert(at);
+                        }
+                    }
+                }
+                let store = &sources.store.tiles;
+                for (layer, wanted, read, spent) in [
+                    (
+                        terrain_layer,
+                        terrain_wanted,
+                        &mut terrain_read,
+                        &mut timings.read_terrain,
+                    ),
+                    (
+                        imagery_layer,
+                        imagery_wanted,
+                        &mut imagery_read,
+                        &mut timings.read_imagery,
+                    ),
+                ] {
+                    let t = Instant::now();
+                    let wanted: Vec<(u8, u32, u32)> = wanted.into_iter().collect();
+                    for some in wanted.chunks(AT_ONCE) {
+                        let found = futures_util::future::join_all(
+                            some.iter().map(|at| store.tile(layer, at.0, at.1, at.2)),
+                        )
+                        .await;
+                        for (at, tile) in some.iter().zip(found) {
+                            if let Some(tile) = tile? {
+                                read.insert(*at, tile.bytes);
+                            }
+                        }
+                    }
+                    *spent += ms(t);
+                }
+            }
+
             for tile in &diff.enter {
                 let key = TileKey::of(tile);
                 if resident.contains_key(&key) {
@@ -235,61 +296,54 @@ pub async fn render(
                 let refs = layers.and_then(|_| refs_of(tile));
                 let (mesh, texture, origin, imagery_of) = match (refs, layers, scheme.as_ref()) {
                     (Some(refs), Some((terrain_layer, imagery_layer)), Some(scheme)) => {
-                        let t = Instant::now();
                         let source = refs.terrain;
-                        let terrain = sources
-                            .store
-                            .tiles
-                            .tile(terrain_layer, source.level, source.x, source.y)
-                            .await?
+                        // Shared by the tiles cut from one ancestor.
+                        let terrain = terrain_read
+                            .get(&(source.level, source.x, source.y))
                             .ok_or_else(|| {
                                 format!(
-                                    "terrain {}/{}/{} is no longer in the tile store",
+                                    "terrain {}/{}/{} of layer {terrain_layer} is no longer in the tile store",
                                     source.level, source.x, source.y
                                 )
                             })?;
-                        timings.read += ms(t);
-                        if !is_baked(&source, &terrain.bytes) {
+                        if !is_baked(&source, terrain) {
                             done.renewed += 1;
                         }
                         let t = Instant::now();
-                        let mesh = terrain_mesh(tile.id(), &refs, &terrain.bytes, factor)?;
-                        timings.build += ms(t);
+                        let mesh = terrain_mesh(tile.id(), &refs, terrain, factor)?;
+                        timings.mesh += ms(t);
 
                         let mut drape = Vec::with_capacity(refs.imagery.len());
                         let mut translucent = false;
                         for placed in &refs.imagery {
                             let at = (placed.tile.level, placed.tile.x, placed.tile.y);
                             if !textures.contains_key(&at) {
-                                let t = Instant::now();
-                                let found = sources
-                                    .store
-                                    .tiles
-                                    .tile(imagery_layer, at.0, at.1, at.2)
-                                    .await?
-                                    .ok_or_else(|| {
-                                        format!(
-                                            "imagery {}/{}/{} is no longer in the tile store",
-                                            at.0, at.1, at.2
-                                        )
-                                    })?;
-                                timings.read += ms(t);
-                                let renewed = !is_baked(&placed.tile, &found.bytes);
+                                let found = imagery_read.get(&at).ok_or_else(|| {
+                                    format!(
+                                        "imagery {}/{}/{} of layer {imagery_layer} is no longer in the tile store",
+                                        at.0, at.1, at.2
+                                    )
+                                })?;
+                                let renewed = !is_baked(&placed.tile, found);
                                 done.renewed += u64::from(renewed);
+                                let t = Instant::now();
                                 observer.imagery(&ImageryIn {
                                     level: at.0,
                                     x: at.1,
                                     y: at.2,
-                                    bytes: &found.bytes,
+                                    bytes: found,
                                     renewed,
                                     gain: gain(at.0),
                                 });
+                                timings.observe += ms(t);
                                 let t = Instant::now();
-                                let decoded = imagery_texture(&placed.tile, scheme, &found.bytes)?;
+                                let decoded = imagery_texture(&placed.tile, scheme, found)?;
                                 let opaque = decoded.rgba8.chunks_exact(4).all(|p| p[3] == 255);
+                                timings.decode += ms(t);
+                                let t = Instant::now();
                                 let texture = gpu.create_imagery(decoded.width, decoded.height);
                                 gpu.write_rgba(&texture, &decoded.rgba8);
-                                timings.build += ms(t);
+                                timings.upload += ms(t);
                                 if textures.len() >= TEXTURES_HELD {
                                     textures.clear();
                                 }
@@ -348,7 +402,7 @@ pub async fn render(
                             gpu.compose(&albedo, factor, layers);
                             Some(albedo)
                         };
-                        timings.gpu += ms(t);
+                        timings.enter += ms(t);
                         done.tiles_from_store += 1;
                         (mesh, texture, Origin::Store, imagery_of)
                     }
@@ -365,7 +419,7 @@ pub async fn render(
                             .objects
                             .read(&file.key, blobs + span.start..blobs + span.end)
                             .await?;
-                        timings.read += ms(t);
+                        timings.read_pack += ms(t);
                         let t = Instant::now();
                         let mesh = Mesh::of_span(&pack, tile, span.start, &part)?;
                         let texture = match texture_of_span(&pack, tile, span.start, &part)? {
@@ -377,17 +431,20 @@ pub async fn render(
                             }
                             None => None,
                         };
-                        timings.build += ms(t);
+                        timings.decode += ms(t);
                         done.tiles_from_pack += 1;
                         (mesh, texture, Origin::Pack, Vec::new())
                     }
                 };
+                let t = Instant::now();
                 observer.tile(&TileIn {
                     frame: diff.frame,
                     key,
                     origin,
                     imagery: &imagery_of,
                 });
+                timings.observe += ms(t);
+                let t = Instant::now();
                 gpu.enter(
                     key,
                     &TileMesh {
@@ -401,6 +458,7 @@ pub async fn render(
                     },
                     texture,
                 )?;
+                timings.enter += ms(t);
                 resident.insert(key, imagery_of.iter().map(|at| at.0).collect());
                 entered += 1;
             }
@@ -425,6 +483,8 @@ pub async fn render(
                 encoder.copy_buffer_to_buffer(gpu.i420_planes(), 0, planes, 0, planes.size());
             }
             gpu.queue().submit([encoder.finish()]);
+            timings.draw += ms(t);
+            let t = Instant::now();
             let rows = read_back(&gpu, &picture).await?;
             let mut rgba = Vec::with_capacity((width * height * 4) as usize);
             for row in rows.chunks(padded as usize) {
@@ -434,7 +494,8 @@ pub async fn render(
                 Some(planes) => read_back(&gpu, planes).await?,
                 None => Vec::new(),
             };
-            timings.gpu += ms(t);
+            timings.readback += ms(t);
+            let t = Instant::now();
 
             // Let go only once the frame that no longer draws them is drawn.
             let drawn: HashSet<TileKey> = diff.selection.iter().copied().collect();
@@ -448,11 +509,14 @@ pub async fn render(
                 resident.remove(&key);
             }
 
+            timings.leave += ms(t);
+
             let mut layers_drawn: BTreeMap<u8, u32> = BTreeMap::new();
             for level in resident.values().flatten() {
                 *layers_drawn.entry(*level).or_default() += 1;
             }
             let layers: Vec<(u8, u32)> = layers_drawn.into_iter().collect();
+            let t = Instant::now();
             observer.frame(&FrameOut {
                 frame: diff.frame,
                 index,
@@ -464,14 +528,30 @@ pub async fn render(
                 layers: &layers,
                 timings,
             });
+            timings.observe += ms(t);
+            let t = Instant::now();
             sink.picture(index, diff.frame, &rgba, &i420)?;
-            done.timings.read += timings.read;
-            done.timings.build += timings.build;
-            done.timings.gpu += timings.gpu;
+            timings.sink += ms(t);
+            if index == 0 {
+                done.opening = timings;
+                done.opening_tiles = entered as u64;
+            } else {
+                done.timings.add(&timings);
+            }
             index += 1;
+            if index % 200 == 0 {
+                let so_far = began.elapsed().as_secs_f64();
+                eprintln!(
+                    "  frame {} — {index} rendered in {so_far:.0} s ({:.1} frames/s)",
+                    diff.frame,
+                    f64::from(index) / so_far
+                );
+            }
         }
     }
+    let t = Instant::now();
     sink.close()?;
+    done.timings.sink += ms(t);
     done.frames = index;
     done.seconds = began.elapsed().as_secs_f64();
     Ok(done)

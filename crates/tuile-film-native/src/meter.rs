@@ -126,7 +126,7 @@ fn light_of(frame: &FrameOut<'_>) -> Light {
 #[derive(Default)]
 pub struct LightMeter {
     tiles: HashMap<Coord, TileLight>,
-    frames: Vec<(Light, usize, usize, Vec<(u8, u32)>, [f64; 3])>,
+    frames: Vec<(Light, usize, usize, Vec<(u8, u32)>, f64)>,
     undecodable: u32,
 }
 
@@ -170,7 +170,7 @@ impl Observer for LightMeter {
             frame.tiles,
             frame.entered,
             frame.layers.to_vec(),
-            [frame.timings.read, frame.timings.build, frame.timings.gpu],
+            frame.timings.total(),
         ));
     }
 }
@@ -428,15 +428,15 @@ impl LightMeter {
         std::fs::write(dir.join("tiles.csv"), csv)?;
 
         let mut csv = String::from(
-            "frame,tiles,entered,layers_by_level,mean,p5,p50,p95,top,middle,bottom,red,blue,read_ms,build_ms,gpu_ms\n",
+            "frame,tiles,entered,layers_by_level,mean,p5,p50,p95,top,middle,bottom,red,blue,render_ms\n",
         );
         for (l, tiles, entered, layers, t) in &self.frames {
             let levels: Vec<String> = layers.iter().map(|(l, n)| format!("{l}:{n}")).collect();
             writeln!(
                 csv,
-                "{},{tiles},{entered},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{:.1},{:.1}",
+                "{},{tiles},{entered},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{t:.1}",
                 l.frame, levels.join(" "), l.mean, l.p5, l.p50, l.p95,
-                l.bands[0], l.bands[1], l.bands[2], l.red, l.blue, t[0], t[1], t[2]
+                l.bands[0], l.bands[1], l.bands[2], l.red, l.blue
             )?;
         }
         std::fs::write(dir.join("frames.csv"), csv)?;

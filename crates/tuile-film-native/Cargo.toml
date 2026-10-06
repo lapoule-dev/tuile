@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 dotenvy = { workspace = true }
+futures-util = { workspace = true }
 image = { workspace = true }
 # Pure Rust, any picture size. Without its assembly it is slow; it is the
 # encoder a machine has when it has nothing else.

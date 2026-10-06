@@ -27,6 +27,11 @@ pub trait Sink {
     fn close(&mut self) -> Result<(), Error> {
         Ok(())
     }
+    /// Time spent off the render's own thread, in seconds, by name: what
+    /// the render's own timings cannot see.
+    fn spent(&self) -> Vec<(String, f64)> {
+        Vec::new()
+    }
 }
 
 /// Keeps nothing: a render made to be measured.
@@ -73,11 +78,36 @@ impl Sink for Pictures {
 }
 
 /// The film as an mp4, AV1 by rav1e: no encoder asked of the machine.
+///
+/// The encoder runs on its own thread, a few pictures behind the render,
+/// so that drawing a frame and encoding the one before it overlap.
 pub struct Av1Film {
     path: PathBuf,
     bitrate: u32,
-    state: Option<(Context<u8>, Muxer, (usize, usize))>,
-    written: u64,
+    pictures: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    encoder: Option<std::thread::JoinHandle<Result<(Vec<u8>, f64), String>>>,
+    size: (usize, usize),
+    encoding_seconds: f64,
+}
+
+/// Pictures waiting for the encoder before the render waits for it.
+const WAITING: usize = 4;
+
+fn drain(ctx: &mut Context<u8>, muxer: &mut Muxer) -> Result<(), String> {
+    loop {
+        match ctx.receive_packet() {
+            Ok(packet) => muxer
+                .push(
+                    packet.input_frameno,
+                    packet.data,
+                    packet.frame_type == FrameType::KEY,
+                )
+                .map_err(|e| e.to_string())?,
+            Err(EncoderStatus::Encoded) => continue,
+            Err(EncoderStatus::NeedMoreData | EncoderStatus::LimitReached) => return Ok(()),
+            Err(e) => return Err(format!("AV1 encoder: {e:?}")),
+        }
+    }
 }
 
 impl Av1Film {
@@ -85,29 +115,10 @@ impl Av1Film {
         Self {
             path: path.into(),
             bitrate,
-            state: None,
-            written: 0,
-        }
-    }
-
-    fn drain(&mut self) -> Result<(), Error> {
-        let Some((ctx, muxer, _)) = self.state.as_mut() else {
-            return Ok(());
-        };
-        loop {
-            match ctx.receive_packet() {
-                Ok(packet) => {
-                    muxer.push(
-                        packet.input_frameno,
-                        packet.data,
-                        packet.frame_type == FrameType::KEY,
-                    )?;
-                    self.written += 1;
-                }
-                Err(EncoderStatus::Encoded) => continue,
-                Err(EncoderStatus::NeedMoreData | EncoderStatus::LimitReached) => return Ok(()),
-                Err(e) => return Err(format!("AV1 encoder: {e:?}").into()),
-            }
+            pictures: None,
+            encoder: None,
+            size: (0, 0),
+            encoding_seconds: 0.0,
         }
     }
 }
@@ -133,18 +144,43 @@ impl Sink for Av1Film {
         enc.speed_settings.rdo_lookahead_frames = 1;
         enc.min_key_frame_interval = u64::from(2 * fps.max(1));
         enc.max_key_frame_interval = u64::from(2 * fps.max(1));
-        let ctx: Context<u8> = Config::new()
+        // A picture cut in tiles is encoded on as many cores.
+        enc.tiles = if width * height >= 1280 * 720 { 8 } else { 2 };
+        let mut ctx: Context<u8> = Config::new()
             .with_encoder_config(enc)
             .with_threads(0)
             .new_context()
             .map_err(|e| format!("AV1 encoder: {e:?}"))?;
-        let muxer = Muxer::with(
+        let mut muxer = Muxer::with(
             u16::try_from(width)?,
             u16::try_from(height)?,
             fps,
             Codec::Av1(ctx.container_sequence_header()),
         )?;
-        self.state = Some((ctx, muxer, (width as usize, height as usize)));
+        let (w, h) = (width as usize, height as usize);
+        self.size = (w, h);
+        let (pictures, waiting) = std::sync::mpsc::sync_channel::<Vec<u8>>(WAITING);
+        self.pictures = Some(pictures);
+        self.encoder = Some(std::thread::spawn(move || {
+            let (luma, chroma) = (w * h, (w / 2) * (h / 2));
+            let mut busy = 0.0f64;
+            for i420 in waiting {
+                let began = std::time::Instant::now();
+                let mut frame = ctx.new_frame();
+                frame.planes[0].copy_from_raw_u8(&i420[..luma], w, 1);
+                frame.planes[1].copy_from_raw_u8(&i420[luma..luma + chroma], w / 2, 1);
+                frame.planes[2].copy_from_raw_u8(&i420[luma + chroma..], w / 2, 1);
+                ctx.send_frame(frame)
+                    .map_err(|e| format!("AV1 encoder: {e:?}"))?;
+                drain(&mut ctx, &mut muxer)?;
+                busy += began.elapsed().as_secs_f64();
+            }
+            let began = std::time::Instant::now();
+            ctx.flush();
+            drain(&mut ctx, &mut muxer)?;
+            let film = muxer.finish().map_err(|e| e.to_string())?;
+            Ok((film, busy + began.elapsed().as_secs_f64()))
+        }));
         Ok(())
     }
 
@@ -153,31 +189,38 @@ impl Sink for Av1Film {
     }
 
     fn picture(&mut self, _index: u32, _frame: u32, _: &[u8], i420: &[u8]) -> Result<(), Error> {
-        let (ctx, _, (w, h)) = self.state.as_mut().ok_or("the film was not opened")?;
-        let (w, h) = (*w, *h);
-        let (luma, chroma) = (w * h, (w / 2) * (h / 2));
-        if i420.len() != luma + 2 * chroma {
+        let (w, h) = self.size;
+        if i420.len() != w * h + 2 * (w / 2) * (h / 2) {
             return Err(format!("a {w}×{h} I420 picture is not {} bytes", i420.len()).into());
         }
-        let mut frame = ctx.new_frame();
-        frame.planes[0].copy_from_raw_u8(&i420[..luma], w, 1);
-        frame.planes[1].copy_from_raw_u8(&i420[luma..luma + chroma], w / 2, 1);
-        frame.planes[2].copy_from_raw_u8(&i420[luma + chroma..], w / 2, 1);
-        ctx.send_frame(frame)
-            .map_err(|e| format!("AV1 encoder: {e:?}"))?;
-        self.drain()
+        let pictures = self.pictures.as_ref().ok_or("the film was not opened")?;
+        if pictures.send(i420.to_vec()).is_err() {
+            // The encoder stopped: say why, not that a channel closed.
+            self.pictures = None;
+            return match self.encoder.take().map(std::thread::JoinHandle::join) {
+                Some(Ok(Err(why))) => Err(why.into()),
+                _ => Err("the encoder stopped".into()),
+            };
+        }
+        Ok(())
     }
 
     fn close(&mut self) -> Result<(), Error> {
-        if let Some((ctx, ..)) = self.state.as_mut() {
-            ctx.flush();
-        }
-        self.drain()?;
-        let (_, muxer, _) = self.state.take().ok_or("the film was not opened")?;
+        self.pictures = None;
+        let encoder = self.encoder.take().ok_or("the film was not opened")?;
+        let (film, seconds) = encoder.join().map_err(|_| "the encoder panicked")??;
+        self.encoding_seconds = seconds;
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&self.path, muxer.finish()?)?;
+        std::fs::write(&self.path, film)?;
         Ok(())
+    }
+
+    fn spent(&self) -> Vec<(String, f64)> {
+        vec![(
+            "encoding AV1, on its own thread".into(),
+            self.encoding_seconds,
+        )]
     }
 }
