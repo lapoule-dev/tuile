@@ -831,7 +831,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                             kib = fetched.value.len() / 1024,
                             "terrain tile"
                         );
-                        self.provenance.fetched_terrain(coord, &fetched.value);
+                        let digest = provenance::digest(&fetched.value);
                         // Decoding a quantized mesh is the same kind of work as
                         // decoding a JPEG and belongs off this thread for the
                         // same reason: nothing in it awaits, and holding the
@@ -844,6 +844,8 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                         // the source may have served these bytes from a cache, but
                         // the ranges still reach the shared availability, so
                         // refinement never stalls at a cached level.
+                        self.provenance
+                            .fetched_terrain(coord, decoded.header.center, digest);
                         self.reveal(coord, decoded.metadata_available.as_deref());
                         Some(Arc::new(decoded))
                     }
@@ -885,7 +887,8 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                             coord.level, coord.x, coord.y
                         ))
                     })?;
-                    self.provenance.upsampled_terrain(coord, parent);
+                    self.provenance
+                        .upsampled_terrain(coord, parent, from.header.center);
                     let m = tuile_core::metrics::metrics();
                     m.tiles_upsampled.inc();
                     m.upsampled_by_level.inc(coord.level);
