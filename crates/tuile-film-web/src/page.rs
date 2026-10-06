@@ -40,7 +40,7 @@ use crate::source::{Source, BLOCK_BYTES};
 use crate::store::Store;
 use crate::worker::PackView;
 use tuile_film::Pack;
-use tuile_radiometry::{region_key, LevelGrades, REGION_LEVEL};
+use tuile_radiometry::REGION_LEVEL;
 use tuile_repository::{RepoError, TileRepository};
 
 // ------------------------------------------------------------------ the API
@@ -1321,11 +1321,12 @@ fn describe_encoder() {
 /// frames of that pack the slice wants.
 /// The film's table of grades, as JSON (empty if the store has none for
 /// it), with how many places the film's imagery lies in and how many of
-/// them the store had a table for.
+/// them the store keeps a table of their own for (the others are given
+/// the layer's, if it has one).
 ///
 /// Every pack of the film is asked where its imagery lies — the whole
-/// film, whatever frames are to be rendered — and the tables the store
-/// keeps for those places are made one by how much of the film is in each.
+/// film, whatever frames are to be rendered; the rest is the store's
+/// (`tuile_repository::tone`), the same lines a native render runs.
 async fn film_tone(
     scene: &Scene,
     api: &str,
@@ -1352,30 +1353,13 @@ async fn film_tone(
         return Ok((String::new(), 0, 0));
     };
     let store = Store::open(api).await.map_err(|e| e.to_string())?;
-    let asked: Vec<((u32, u32), u32)> = places.iter().map(|(p, n)| (*p, *n)).collect();
-    let mut found = Vec::new();
-    // A few at a time: most places have no table, and each is a request.
-    for some in asked.chunks(16) {
-        let read = join_all(
-            some.iter()
-                .map(|((x, y), _)| store.small_owned(region_key(&layer, *x, *y))),
-        )
-        .await;
-        for ((_, tiles), bytes) in some.iter().zip(read) {
-            if let Some(bytes) = bytes.map_err(|e| e.to_string())? {
-                let table = std::str::from_utf8(&bytes)
-                    .ok()
-                    .and_then(LevelGrades::from_json)
-                    .ok_or("a table of the store is not a tone table")?;
-                found.push((table, *tiles as f32));
-            }
-        }
-    }
-    let parts: Vec<(&LevelGrades, f32)> = found.iter().map(|(t, w)| (t, *w)).collect();
+    let tone = tuile_repository::tone::film_tone(store.live(), &layer, &places)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok((
-        LevelGrades::merged(&parts).map_or(String::new(), |t| t.to_json()),
-        places.len(),
-        found.len(),
+        tone.table.map_or(String::new(), |t| t.to_json()),
+        tone.places,
+        tone.fitted,
     ))
 }
 

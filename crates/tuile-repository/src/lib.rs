@@ -39,6 +39,7 @@ mod runs;
 pub mod s3;
 mod scenes;
 mod tiles;
+pub mod tone;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
