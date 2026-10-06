@@ -35,8 +35,12 @@ objc2-video-toolbox = { version = "0.3.2", optional = true }
 # NVIDIA's encoder, for the `nvenc` feature.
 [target.'cfg(target_os = "linux")'.dependencies]
 nvidia-video-codec-sdk = { version = "0.4.0", optional = true }
-# The same cudarc the encoder's bindings are built on, for its context.
-cudarc = { version = "0.16.4", optional = true, default-features = false, features = ["driver", "std", "cuda-version-from-build-system", "dynamic-linking"] }
+# The same cudarc the encoder's bindings are built on, for its context. The
+# bindings take it with its default features, and features are unified: its
+# default `dynamic-loading` is therefore the only linking mode there is to
+# choose (asking for `dynamic-linking` beside it stops cudarc's build), and
+# CUDA is opened at run time, not linked.
+cudarc = { version = "0.16.4", optional = true, features = ["cuda-version-from-build-system"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

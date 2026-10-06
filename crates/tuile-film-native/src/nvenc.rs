@@ -11,6 +11,9 @@
 //!
 //! The encoder runs on its own thread, a few pictures behind the render.
 
+// The bindings' one way into an input buffer is an unchecked copy.
+#![allow(unsafe_code)]
+
 use std::path::PathBuf;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::JoinHandle;
@@ -97,7 +100,8 @@ fn encode(
     }
     // The preset's own settings, with what a film needs changed: no frame
     // reordering (pictures out as they went in), a key frame every two
-    // seconds, and the bitrate asked for.
+    // seconds, no looking ahead (one picture in, one picture out, which is
+    // what the loop below relies on), and the bitrate asked for.
     let tuning = NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_HIGH_QUALITY;
     let mut config = encoder
         .get_preset_config(guid, NV_ENC_PRESET_P4_GUID, tuning)
@@ -105,6 +109,7 @@ fn encode(
         .presetCfg;
     config.frameIntervalP = 1;
     config.gopLength = 2 * fps;
+    config.rcParams.set_enableLookahead(0);
     config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
     config.rcParams.averageBitRate = bitrate;
     config.rcParams.maxBitRate = bitrate.saturating_mul(2);
