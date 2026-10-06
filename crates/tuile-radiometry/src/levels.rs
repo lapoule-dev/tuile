@@ -138,6 +138,12 @@ pub struct LevelParams {
     pub dead_zone_stops: f32,
     /// No level is moved by more than this.
     pub clamp_stops: f32,
+    /// How much of the saturation a grade's fit finds is kept, as a power:
+    /// the fit matches colour in linear light, where vivid colours weigh
+    /// more than the eye gives them, and overshoots. Three quarters is
+    /// what brought the most vivid twentieth of a graded source to its
+    /// reference's, measured in CIELAB on rendered frames.
+    pub saturation_share: f32,
 }
 
 impl Default for LevelParams {
@@ -146,6 +152,7 @@ impl Default for LevelParams {
             anchor: 10,
             dead_zone_stops: 0.08,
             clamp_stops: 2.0,
+            saturation_share: 0.75,
         }
     }
 }

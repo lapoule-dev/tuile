@@ -31,6 +31,18 @@ fn present(@builtin(global_invocation_id) id: vec3u) {
             }
         }
     }
-    let linear = sum / f32(k * k) * frame.world.w;
+    var linear = sum / f32(k * k) * frame.world.w;
+    // The picture's own contrast and saturation: one setting for every
+    // film, whatever its imagery. Luminance is raised to a power about
+    // middle grey, colours keeping their ratios, then what is not
+    // luminance is scaled.
+    let luma = vec3f(0.2126, 0.7152, 0.0722);
+    if (frame.sun.w != 1.0) {
+        linear *= pow(max(dot(linear, luma), 1e-5) / 0.18, frame.sun.w - 1.0);
+    }
+    if (frame.to_sun.w != 1.0) {
+        let y = dot(linear, luma);
+        linear = max(vec3f(y) + (linear - vec3f(y)) * frame.to_sun.w, vec3f(0.0));
+    }
     textureStore(out, id.xy, vec4f(oetf(linear), 1.0));
 }

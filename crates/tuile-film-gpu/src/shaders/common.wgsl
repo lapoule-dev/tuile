@@ -13,7 +13,9 @@ struct Frame {
     // xyz: world radiance (linear); w: exposure scale.
     world: vec4f,
     // xyz: sun strength — a white surface facing it comes out at this.
+    // w: the picture's contrast, a power on luminance about middle grey.
     sun: vec4f,
+    // xyz: towards the sun. w: the picture's saturation.
     to_sun: vec4f,
     // x, y: internal (supersampled) size; z: supersampling factor; w: unused.
     size: vec4u,

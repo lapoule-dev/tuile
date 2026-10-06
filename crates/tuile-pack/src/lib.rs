@@ -1127,6 +1127,25 @@ impl<'a> Pack<'a> {
         self.root.tiles().map_or(0, |t| t.len())
     }
 
+    /// Where the pack's imagery lies, as tiles of `level`: each such tile
+    /// some imagery tile the pack refers to is in or is, with how many.
+    /// Imagery coarser than `level` is in none. Empty for a pack that
+    /// holds no reference.
+    pub fn imagery_regions(&self, level: u8) -> std::collections::BTreeMap<(u32, u32), u32> {
+        let mut regions = std::collections::BTreeMap::new();
+        for tile in self.root.tiles().into_iter().flatten() {
+            for placed in refs_of(&tile).map(|r| r.imagery).unwrap_or_default() {
+                if placed.tile.level >= level {
+                    let down = placed.tile.level - level;
+                    *regions
+                        .entry((placed.tile.x >> down, placed.tile.y >> down))
+                        .or_default() += 1;
+                }
+            }
+        }
+        regions
+    }
+
     /// The tiles one frame selected, in the order the bake recorded them.
     pub fn frame(&self, frame: u32) -> Result<Vec<fb::Tile<'a>>, PackError> {
         let frames = self

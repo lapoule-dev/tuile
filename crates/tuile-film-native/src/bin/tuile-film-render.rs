@@ -18,7 +18,9 @@
 //!                         in (AV1 on NVIDIA), rav1e otherwise.
 //!   --pictures <dir>      one PNG a frame
 //!   --meter <dir>         measure light going in and coming out; write
-//!                         tiles.csv, frames.csv, tone.json, report.md
+//!                         tiles.csv, frames.csv, tone.json, report.md,
+//!                         and each place's table of grades under the key
+//!                         a tile store keeps it by (<layer>/tone/…)
 //!   --frames <a:b>        first and last frame (default: the whole film)
 //!   --every <n>           one frame in n (default 1)
 //!   --scale <s>           picture size against the bake's (default 1)
@@ -26,7 +28,8 @@
 //!   --fps <n>             default 30
 //!   --mbps <n>            default 12
 //!   --no-tone             imagery as stored: no tone correction
-//!   --tone-table <file>   this tone table, not the store's
+//!   --tone-table <file>   this tone table, not the one made from the
+//!                         tables the store keeps for the film's places
 //!   --tone <0..1>         how much of the correction (default 1)
 //!   --imagery <decoded|stored>
 //!                         how imagery's values are read before lighting:
@@ -34,6 +37,8 @@
 //!                         default), or as they lie, washed, as one Cycles
 //!                         film this was once calibrated on
 //!   --exposure <stops>    the look's exposure
+//!   --contrast <power>    the look's contrast, about middle grey
+//!   --saturation <factor> the look's saturation
 //!   --anchor <level>      the level --meter's own solve holds still (10)
 //!   --cache <dir>         chunks of packs and archives (default
 //!                         $TUILE_CACHE_DIR, else ./film-cache)
@@ -173,6 +178,12 @@ async fn main() -> Result<(), Error> {
     if let Some(stops) = value("--exposure") {
         order.look.exposure_ev = stops.parse()?;
     }
+    if let Some(power) = value("--contrast") {
+        order.look.contrast = power.parse()?;
+    }
+    if let Some(factor) = value("--saturation") {
+        order.look.saturation = factor.parse()?;
+    }
     if flag("--no-tone") {
         order.tone = Tone::Off;
     }
@@ -267,8 +278,19 @@ async fn main() -> Result<(), Error> {
         done.tiles_from_pack,
         done.renewed,
         match (&done.tone, order.tone_strength) {
+            (None, _) if done.tone_places.0 > 0 => format!(
+                "none — the store has no table for any of the film's {} places",
+                done.tone_places.0
+            ),
             (None, _) => "none".to_string(),
-            (Some(t), s) => format!("one grade a level, anchor {}, strength {s}", t.anchor),
+            (Some(t), s) => format!(
+                "one grade a level, anchor {}, strength {s}{}",
+                t.anchor,
+                match done.tone_places {
+                    (0, _) => String::new(),
+                    (places, had) => format!(", from the store's tables for {had} of the film's {places} places"),
+                }
+            ),
         }
     );
     for (name, cache) in [("packs", &sources.packs), ("archives", &sources.archives)] {
@@ -290,6 +312,19 @@ async fn main() -> Result<(), Error> {
     if let Some(dir) = metering {
         let solved = meter.solve(anchor);
         let report = meter.write(&PathBuf::from(&dir), prefix, &solved)?;
+        if let Some((_, layer)) = film
+            .packs
+            .first()
+            .and_then(|p| tuile_film::Pack::open_table(&p.head).ok())
+            .as_ref()
+            .and_then(|p| p.store_layers())
+        {
+            let keys = meter.write_places(&PathBuf::from(&dir), layer, anchor)?;
+            println!(
+                "tables of {} places written under {dir}/{layer}/tone/",
+                keys.len()
+            );
+        }
         println!("\n{report}");
     }
     Ok(())

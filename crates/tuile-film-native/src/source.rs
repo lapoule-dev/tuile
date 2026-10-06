@@ -16,7 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tuile_core::raster::TilingScheme;
 use tuile_film::Pack;
-use tuile_radiometry::LevelGrades;
+use tuile_radiometry::{region_key, LevelGrades};
 use tuile_repository::{
     ArchivedTiles, Cached, DiskChunks, Entry, Listing, Objects, RepoError, TileRepository, CHUNK,
 };
@@ -272,20 +272,33 @@ impl Store {
         }
     }
 
-    /// The tone correction the store holds for an imagery layer, if any.
-    /// A failure to ask is a failure, not an absence.
-    pub async fn tone_of(&self, layer: &str) -> Result<Option<LevelGrades>, Error> {
-        let key = format!("{layer}/tone.json");
-        match self.live.read_all(&key).await {
-            Ok(bytes) => Ok(Some(
-                std::str::from_utf8(&bytes)
-                    .ok()
-                    .and_then(LevelGrades::from_json)
-                    .ok_or_else(|| format!("{key} is not a tone table"))?,
-            )),
-            Err(RepoError::NotFound(_)) => Ok(None),
-            Err(other) => Err(other.into()),
+    /// The grades of a film: the tables the store keeps for the places
+    /// its imagery lies in, made one by how much of the film is in each.
+    /// `places` is `Pack::imagery_regions` summed over the film. With the
+    /// table come how many of the places the store had one for; `None` if
+    /// it had none. A failure to ask is a failure, not an absence.
+    pub async fn film_tone(
+        &self,
+        layer: &str,
+        places: &std::collections::BTreeMap<(u32, u32), u32>,
+    ) -> Result<(Option<LevelGrades>, usize), Error> {
+        let mut found = Vec::new();
+        for ((x, y), tiles) in places {
+            let key = region_key(layer, *x, *y);
+            match self.live.read_all(&key).await {
+                Ok(bytes) => found.push((
+                    std::str::from_utf8(&bytes)
+                        .ok()
+                        .and_then(LevelGrades::from_json)
+                        .ok_or_else(|| format!("{key} is not a tone table"))?,
+                    *tiles as f32,
+                )),
+                Err(RepoError::NotFound(_)) => {}
+                Err(other) => return Err(other.into()),
+            }
         }
+        let parts: Vec<(&LevelGrades, f32)> = found.iter().map(|(t, w)| (t, *w)).collect();
+        Ok((LevelGrades::merged(&parts), found.len()))
     }
 }
 
