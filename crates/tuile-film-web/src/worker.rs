@@ -17,7 +17,7 @@ use tuile_film::{
     Look, Mesh, Pack, TileKey,
 };
 use tuile_film::{refs_of, StoreTile, TileRefs};
-use tuile_film_gpu::{FilmGpu, Settings, TileMesh, OUTPUT_FORMAT};
+use tuile_film_gpu::{DrapeLayer, FilmGpu, Settings, TileMesh, OUTPUT_FORMAT};
 use tuile_mp4::{Codec, Muxer, ParameterSets};
 use tuile_repository::TileRepository;
 use wasm_bindgen::prelude::*;
@@ -267,20 +267,39 @@ struct StoreSide {
     terrain: String,
     imagery: String,
     scheme: TilingScheme,
-    textures: HashMap<(u8, u32, u32), Arc<DecodedTexture>>,
+    textures: HashMap<(u8, u32, u32), Imagery>,
     /// Source tiles whose bytes are no longer the ones the pack was baked
     /// from: the store has renewed them since.
     renewed: u32,
 }
 
-/// Imagery tiles kept decoded before the oldest are let go. A tile is a
+/// Imagery tiles kept on the GPU before they are let go. A tile is a
 /// quarter of a megabyte; a frame's newcomers share most of theirs.
 const TEXTURES_HELD: usize = 1024;
 
+/// One imagery tile, ready to be composed: on the GPU, and — for the rare
+/// tile that is not opaque, which the GPU's composition does not blend —
+/// kept decoded as well.
+#[derive(Clone)]
+struct Imagery {
+    texture: wgpu::Texture,
+    translucent: Option<Arc<DecodedTexture>>,
+}
+
+/// How a tile's drape is to be made.
+enum Drape {
+    /// No imagery: the tile is its base colour.
+    None,
+    /// Composed on the GPU, from layers already there.
+    Layers { side: u32, layers: Vec<DrapeLayer> },
+    /// Composed here: one of its layers is translucent.
+    Texels(DecodedTexture),
+}
+
 impl StoreSide {
-    /// One imagery tile, decoded and on geographic spacing; read from the
-    /// store the first time it is asked for.
-    async fn texture(&mut self, tile: &StoreTile) -> Result<Arc<DecodedTexture>, JsError> {
+    /// One imagery tile, decoded, laid on geographic spacing and uploaded;
+    /// read from the store the first time it is asked for.
+    async fn imagery(&mut self, gpu: &FilmGpu, tile: &StoreTile) -> Result<Imagery, JsError> {
         let key = (tile.level, tile.x, tile.y);
         if let Some(held) = self.textures.get(&key) {
             return Ok(held.clone());
@@ -300,22 +319,31 @@ impl StoreSide {
         if !is_baked(tile, &found.bytes) {
             self.renewed += 1;
         }
-        let texture = Arc::new(imagery_texture(tile, &self.scheme, &found.bytes).map_err(js)?);
+        let decoded = imagery_texture(tile, &self.scheme, &found.bytes).map_err(js)?;
+        let texture = gpu.create_imagery(decoded.width, decoded.height);
+        gpu.write_rgba(&texture, &decoded.rgba8);
+        let opaque = decoded.rgba8.chunks_exact(4).all(|texel| texel[3] == 255);
+        let imagery = Imagery {
+            texture,
+            translucent: (!opaque).then(|| Arc::new(decoded)),
+        };
         if self.textures.len() >= TEXTURES_HELD {
             self.textures.clear();
         }
-        self.textures.insert(key, texture.clone());
-        Ok(texture)
+        self.textures.insert(key, imagery.clone());
+        Ok(imagery)
     }
 
-    /// A tile the pack refers to: its mesh from its terrain tile, its drape
-    /// composed from its imagery tiles, as the bake made them.
+    /// A tile the pack refers to: its mesh from its terrain tile, and its
+    /// drape from its imagery tiles — the layers for the GPU to compose, as
+    /// the bake composed them.
     async fn build(
         &mut self,
+        gpu: &FilmGpu,
         id: u64,
         refs: &TileRefs,
         base_color_factor: [f32; 4],
-    ) -> Result<(Mesh, Option<DecodedTexture>), JsError> {
+    ) -> Result<(Mesh, Drape), JsError> {
         let source = refs.terrain;
         let terrain = self
             .store
@@ -333,15 +361,59 @@ impl StoreSide {
             self.renewed += 1;
         }
         let mesh = terrain_mesh(id, refs, &terrain.bytes, base_color_factor).map_err(js)?;
-        let mut layers = HashMap::new();
-        for placed in &refs.imagery {
-            let key = (placed.tile.level, placed.tile.x, placed.tile.y);
-            layers.insert(key, self.texture(&placed.tile).await?);
+        if refs.imagery.is_empty() {
+            return Ok((mesh, Drape::None));
         }
-        let drape = compose(refs, base_color_factor, |t| {
-            layers[&(t.level, t.x, t.y)].clone()
-        });
-        Ok((mesh, drape))
+        let mut placed = Vec::with_capacity(refs.imagery.len());
+        for layer in &refs.imagery {
+            placed.push((layer, self.imagery(gpu, &layer.tile).await?));
+        }
+        // A translucent layer blends with what is under it, which the GPU's
+        // composition cannot read: that drape is composed here, exactly.
+        if placed
+            .iter()
+            .any(|(_, imagery)| imagery.translucent.is_some())
+        {
+            let mut decoded = HashMap::new();
+            for (layer, imagery) in &placed {
+                let texels = match &imagery.translucent {
+                    Some(texels) => texels.clone(),
+                    None => {
+                        // Opaque, so not kept decoded: read once more.
+                        let tile = &layer.tile;
+                        let found = self
+                            .store
+                            .tiles
+                            .tile(&self.imagery, tile.level, tile.x, tile.y)
+                            .await
+                            .map_err(js)?
+                            .ok_or_else(|| js("an imagery tile left the store mid-frame"))?;
+                        Arc::new(imagery_texture(tile, &self.scheme, &found.bytes).map_err(js)?)
+                    }
+                };
+                decoded.insert((layer.tile.level, layer.tile.x, layer.tile.y), texels);
+            }
+            let composed = compose(refs, base_color_factor, |t| {
+                decoded[&(t.level, t.x, t.y)].clone()
+            });
+            return Ok((mesh, composed.map_or(Drape::None, Drape::Texels)));
+        }
+        let layers = placed
+            .into_iter()
+            .map(|(layer, imagery)| DrapeLayer {
+                texture: imagery.texture,
+                coverage: layer.coverage,
+                translation: layer.translation,
+                scale: layer.scale,
+            })
+            .collect();
+        Ok((
+            mesh,
+            Drape::Layers {
+                side: refs.composed_side.max(1),
+                layers,
+            },
+        ))
     }
 }
 
@@ -699,13 +771,22 @@ impl FilmWorker {
                     Some(v) if v.len() == 4 => [v.get(0), v.get(1), v.get(2), v.get(3)],
                     _ => [1.0; 4],
                 };
-                let (mesh, drape) = store.build(tile.id(), &refs, factor).await?;
+                let (mesh, drape) = store.build(gpu, tile.id(), &refs, factor).await?;
                 let t0 = now_ms();
-                let texture = drape.map(|drape| {
-                    let texture = gpu.create_albedo(drape.width, drape.height);
-                    gpu.write_rgba(&texture, &drape.rgba8);
-                    texture
-                });
+                let texture = match drape {
+                    Drape::None => None,
+                    // Composed by the GPU before the frame is drawn.
+                    Drape::Layers { side, layers } => {
+                        let texture = gpu.create_albedo(side, side);
+                        gpu.compose(&texture, factor, layers);
+                        Some(texture)
+                    }
+                    Drape::Texels(texels) => {
+                        let texture = gpu.create_albedo(texels.width, texels.height);
+                        gpu.write_rgba(&texture, &texels.rgba8);
+                        Some(texture)
+                    }
+                };
                 gpu.enter(
                     TileKey::of(tile),
                     &TileMesh {
