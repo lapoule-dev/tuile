@@ -1,0 +1,133 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# Re-bakes every pack of a pack API's projects as references, in place — the
+# packs that are references already included (`--again`).
+#
+# Nothing of a deployment is written here. Four things come from outside:
+#
+#   TUILE_BAKE_IMAGE       the image built from `integrations/bake/Dockerfile`
+#   TUILE_PACK_API         the pack API that lists the projects and their packs
+#   TUILE_PRIORITY_CLASS   the cluster's lowest priority class
+#   Secret `tuile-rebake`, in the namespace, read whole as the environment:
+#       TUILE_STORE_ENDPOINT, TUILE_STORE_ACCESS_KEY_ID,
+#       TUILE_STORE_SECRET_ACCESS_KEY, TUILE_TILES_BUCKET, TUILE_ION_TOKEN,
+#       and TUILE_STORE_REGION where the buckets want one
+#
+#   kubectl create namespace tuile
+#   kubectl -n tuile create secret generic tuile-rebake --from-literal=…
+#   sed -e "s|\${TUILE_BAKE_IMAGE}|$TUILE_BAKE_IMAGE|" \
+#       -e "s|\${TUILE_PACK_API}|$TUILE_PACK_API|" \
+#       -e "s|\${TUILE_PRIORITY_CLASS}|$TUILE_PRIORITY_CLASS|" \
+#       integrations/bake/rebake-job.yaml | kubectl -n tuile apply -f -
+#
+#   kubectl -n tuile logs -f job/tuile-rebake      # one JSON line per pack
+#   kubectl -n tuile delete job tuile-rebake       # stops it; the ledger stays
+#
+# The ledger is what says a pack is done, and it lives on the claim: a pod
+# that is evicted or restarted picks up where the last one stopped, and a
+# pack whose bake was cut short was never replaced. Re-baking everything
+# *once more* wants a ledger of its own — another file name, or a new claim.
+#
+# It is written to be the first thing a busy cluster throws out: a priority
+# class below every service's, a CPU request so small that under contention
+# the services get the cores, and a memory request close to what a bake
+# holds, so that it is only scheduled where that memory is really free.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tuile-rebake-work
+spec:
+  accessModes: [ReadWriteOnce]
+  # The ledger, one table, one new pack, a tile cache capped at 1 GiB, and
+  # the tile store's projections, which nothing caps: a hundred small packs
+  # left 1.3 GB of them.
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tuile-rebake
+spec:
+  completions: 1
+  parallelism: 1
+  # A failed pack is a ledger line, not a failed pod: the driver only exits
+  # non-zero when it cannot list the packs or write its ledger.
+  backoffLimit: 3
+  # Being evicted for a service's sake is the plan, not a failure.
+  podFailurePolicy:
+    rules:
+      - action: Ignore
+        onPodConditions:
+          - type: DisruptionTarget
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tuile-rebake
+    spec:
+      restartPolicy: Never
+      priorityClassName: ${TUILE_PRIORITY_CLASS}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rebake
+          image: ${TUILE_BAKE_IMAGE}
+          args:
+            - ${TUILE_PACK_API}
+            - /work/ledger.jsonl
+            - --work
+            - /work
+            - --again
+          workingDir: /work
+          envFrom:
+            - secretRef:
+                name: tuile-rebake
+          env:
+            # The tile store's projections go to the claim, not to `/tmp`:
+            # they outgrow a scratch volume within the first packs, and the
+            # next pod finds them there.
+            - name: TUILE_TILES_DIR
+              value: /work/tiles
+            # A projection is written as a temporary file and renamed into
+            # place, which only works within one volume.
+            - name: TMPDIR
+              value: /work
+            # The baker sizes its pools on the machine's cores, which are the
+            # node's and not this container's share of them.
+            - name: TUILE_FINISH_THREADS
+              value: "2"
+            - name: TOKIO_WORKER_THREADS
+              value: "2"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 2Gi
+            # A bake has been measured between 0.6 and 1.4 GB resident.
+            limits:
+              cpu: 1500m
+              memory: 3Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: tuile-rebake-work
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
