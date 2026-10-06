@@ -66,6 +66,12 @@ impl Http for FetchHttp {
 /// chunk is read from the bucket again and nothing else changes.
 struct EdgeChunks {
     project: String,
+    /// Whether chunks read are kept here. Not for a request whose whole
+    /// reply is kept by the cache in front: the same megabytes would be
+    /// copied and kept twice, and an isolate serving several blocks at once
+    /// runs out of memory on the copies (the runtime's log: "Worker
+    /// exceeded memory limit").
+    keeping: bool,
 }
 
 impl EdgeChunks {
@@ -118,6 +124,9 @@ impl ChunkStore for EdgeChunks {
     }
 
     async fn put(&self, key: &str, index: u64, bytes: &[u8]) {
+        if !self.keeping {
+            return;
+        }
         // A chunk is kept under its object's size as well as its key, so it
         // is what it is for good.
         self.keep(
@@ -147,7 +156,7 @@ impl ChunkStore for EdgeChunks {
 
 /// The bench this deployment serves, from its environment. The tile store is
 /// opened — its catalog read — only for a request that is about tiles.
-async fn bench(env: &Env, with_tiles: bool) -> std::result::Result<Bench, String> {
+async fn bench(env: &Env, with_tiles: bool, keeping: bool) -> std::result::Result<Bench, String> {
     let var = |name: &str| {
         env.secret(name)
             .map(|s| s.to_string())
@@ -185,6 +194,7 @@ async fn bench(env: &Env, with_tiles: bool) -> std::result::Result<Bench, String
             bucket,
             EdgeChunks {
                 project: project.name.clone(),
+                keeping,
             },
         ));
         let films: Arc<dyn FilmRepository> = match project.layout {
@@ -220,6 +230,7 @@ async fn bench(env: &Env, with_tiles: bool) -> std::result::Result<Bench, String
                 live.clone(),
                 EdgeChunks {
                     project: format!("tiles-{bucket}"),
+                    keeping,
                 },
             ));
             Some((bucket.clone(), StoreObjects { live, archives }))
@@ -279,12 +290,12 @@ async fn respond(mut reply: Reply) -> Result<(Vec<u8>, u16, Headers)> {
     Ok((body, reply.status, headers))
 }
 
-/// A response of these bytes. Made afresh each time one is needed: a reply
-/// kept in the cache is its own response, not a clone of the one sent — a
-/// cloned body is a stream read from two ends, and a request whose client
-/// had finished before the cache had was found hung by the runtime.
-fn response(body: &[u8], status: u16, headers: &Headers) -> Result<Response> {
-    Ok(Response::from_bytes(body.to_vec())?
+/// A response of these bytes. A reply kept in the cache is its own
+/// response, not a clone of the one sent — a cloned body is a stream read
+/// from two ends, and a request whose client had finished before the cache
+/// had was found hung by the runtime.
+fn response(body: Vec<u8>, status: u16, headers: &Headers) -> Result<Response> {
+    Ok(Response::from_bytes(body)?
         .with_status(status)
         .with_headers(headers.clone()))
 }
@@ -328,7 +339,7 @@ pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> 
         }
     }
     let with_tiles = url.path().starts_with("/api/tiles/") || url.path() == "/api/projects";
-    let bench = match bench(&env, with_tiles).await {
+    let bench = match bench(&env, with_tiles, !cacheable).await {
         Ok(b) => b,
         Err(e) => return Response::error(format!("misconfigured: {e}"), 500),
     };
@@ -348,10 +359,12 @@ pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> 
     let (body, status, headers) = respond(reply).await?;
     if stored {
         // Kept after the reply has gone: the client does not wait for it.
-        let copy = response(&body, status, &headers)?;
+        // One copy of the block and no more: several blocks are in flight
+        // in one isolate at a time, and its memory is what gives first.
+        let copy = response(body.clone(), status, &headers)?;
         ctx.wait_until(async move {
             let _ = cache.put(&key, copy).await;
         });
     }
-    response(&body, status, &headers)
+    response(body, status, &headers)
 }
