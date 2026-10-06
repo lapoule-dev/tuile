@@ -23,3 +23,14 @@ references/
 # Session and scratch files.
 claude.session
 *.log
+
+# Secrets and a deployment's local configuration: an image is not where
+# either belongs, and `COPY . .` would put them there.
+.env
+.env.*
+film-bench.toml
+
+# Local data: fetched packs and finished renders, gigabytes no build reads.
+.pack-cache/
+local-packs/
+videos/
