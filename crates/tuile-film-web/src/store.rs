@@ -108,6 +108,11 @@ impl Store {
         }
     }
 
+    /// [`Self::small`] for a key made on the spot.
+    pub async fn small_owned(&self, key: String) -> Result<Option<Vec<u8>>, RepoError> {
+        self.small(&key).await
+    }
+
     /// Blocks of archives asked of the API, and blocks answered from memory.
     pub fn counts(&self) -> BlockCounts {
         self.blocks.counts()

@@ -476,8 +476,9 @@ async fn bitmap(png: Vec<u8>) -> Result<ImageBitmap, JsValue> {
 impl FilmWorker {
     /// Takes the pack's source (a URL or a Blob) and an `OffscreenCanvas` of
     /// the film's display size, and gets a WebGPU device ready for frames
-    /// `first..=last`. Only the pack's table is read now. `tone` is how much
-    /// of the store's tone correction to apply, 0 to 1.
+    /// `first..=last`. Only the pack's table is read now. `tone_table` is
+    /// the film's table of grades (empty for none) — the film's, the same
+    /// for every worker of it — and `tone` how much of it to apply, 0 to 1.
     pub async fn create(
         canvas: OffscreenCanvas,
         source: JsValue,
@@ -485,6 +486,7 @@ impl FilmWorker {
         last: u32,
         supersample: u32,
         tone: f32,
+        tone_table: String,
     ) -> Result<FilmWorker, JsError> {
         console_error_panic_hook::set_once();
         let source = Source::from_js(&source)?;
@@ -512,18 +514,13 @@ impl FilmWorker {
                         Some(layer) if layer.grid == "geographic" => TilingScheme::geographic(),
                         _ => TilingScheme::web_mercator(),
                     };
-                    // Beside the layer, if the store has worked one out.
-                    let table = match store.small(&format!("{imagery}/tone.json")).await {
-                        Ok(Some(bytes)) => Some(
-                            std::str::from_utf8(&bytes)
-                                .ok()
-                                .and_then(LevelGrades::from_json)
-                                .ok_or_else(|| {
-                                    js(format!("{imagery}/tone.json is not a tone table"))
-                                })?,
-                        ),
-                        Ok(None) => None,
-                        Err(e) => return Err(js(e)),
+                    let table = if tone_table.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            LevelGrades::from_json(&tone_table)
+                                .ok_or_else(|| js("the film's tone table is not one"))?,
+                        )
                     };
                     Some(StoreSide {
                         tone: table,

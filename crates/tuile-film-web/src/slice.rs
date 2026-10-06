@@ -13,8 +13,9 @@
 //! Messages, both ways, are plain objects with a `type`:
 //!
 //! - in: the order — `packs: [{source, first, last}]`, `filmFirst`, `width`,
-//!   `height`, `supersample`, `fps`, `bitrate`, `tone` (how much of the
-//!   store's tone correction, 0 to 1), and an `id` echoed back;
+//!   `height`, `supersample`, `fps`, `bitrate`, `toneTable` (the film's
+//!   table of grades, as JSON, empty for none), `tone` (how much of it,
+//!   0 to 1), and an `id` echoed back;
 //! - out: `preload` (blocks fetched ahead), `frame` (one frame's account,
 //!   now and then with a `preview` bitmap), `done` (the encoded slice) or
 //!   `error`.
@@ -24,7 +25,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent, OffscreenCanvas};
 
 use crate::encode::Encoder;
-use crate::js::{call, get, now, number, object, settled, text};
+use crate::js::{call, get, now, number, object, settled, string, text};
 use crate::worker::FilmWorker;
 
 fn scope() -> DedicatedWorkerGlobalScope {
@@ -86,6 +87,7 @@ async fn render(order: &JsValue, id: &JsValue) -> Result<(), String> {
             last,
             supersample,
             number(order, "tone") as f32,
+            string(order, "toneTable"),
         )
         .await
         .map_err(text)?;
