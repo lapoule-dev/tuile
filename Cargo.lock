@@ -6142,6 +6142,7 @@ dependencies = [
  "tuile-core",
  "tuile-farm",
  "tuile-film",
+ "tuile-radiometry",
  "tuile-repository",
  "tuile-tile-server",
 ]
