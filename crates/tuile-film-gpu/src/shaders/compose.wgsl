@@ -32,10 +32,14 @@ struct Job {
     // 0: fill with `base`. 1: write the layer.
     mode: u32,
     pad: u32,
-    // What the layer's colour is multiplied by, in linear light: the tone
-    // correction of the layer's level. Exactly 1, and the stored bytes go
-    // through untouched.
+    // The grade of the layer's level, applied in linear light: a colour
+    // taken away (rgb of `black`), a gain per channel (rgb of `gain`), a
+    // power on luminance about a pivot (`gain.w` about `more.x`), a factor
+    // on what is not luminance (`black.w`). `more.y` is 0 for a layer that
+    // is not graded: its stored bytes go through untouched.
     gain: vec4f,
+    black: vec4f,
+    more: vec4f,
 }
 
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -59,13 +63,17 @@ fn stored_of(c: vec3f) -> vec3f {
     return select(1.055 * pow(c, vec3f(1.0 / 2.4)) - 0.055, c * 12.92, c <= vec3f(0.0031308));
 }
 
-// The layer's level brought to the tone of the anchor level. Every texel of
-// every tile of a level goes through the same curve, so two tiles of one
-// level meet as they met before.
+// The layer's level brought to the anchor's: black point, gain, contrast,
+// saturation. Every texel of every tile of a level goes through the same
+// curve, so two tiles of one level meet as they met before.
 fn toned(bytes: vec3f) -> vec3f {
-    if (all(job.gain.rgb == vec3f(1.0))) { return bytes; }
-    let lit = min(linear_of(bytes / 255.0) * job.gain.rgb, vec3f(1.0));
-    return round(stored_of(lit) * 255.0);
+    if (job.more.y == 0.0) { return bytes; }
+    let luma = vec3f(0.2126, 0.7152, 0.0722);
+    var lit = max(linear_of(bytes / 255.0) - job.black.rgb, vec3f(0.0)) * job.gain.rgb;
+    lit *= pow(max(dot(lit, luma), 1e-5) / max(job.more.x, 1e-5), job.gain.w - 1.0);
+    let y = dot(lit, luma);
+    lit = max(vec3f(y) + (lit - vec3f(y)) * job.black.w, vec3f(0.0));
+    return round(stored_of(min(lit, vec3f(1.0))) * 255.0);
 }
 
 @compute @workgroup_size(8, 8)

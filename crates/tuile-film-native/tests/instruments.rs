@@ -97,7 +97,7 @@ fn the_meter_finds_the_step_between_two_sources_and_which_levels_are_one() {
             y,
             bytes: &flat(grey),
             renewed: false,
-            gain: [1.0; 3],
+            grade: Default::default(),
         });
     };
     // Levels 10 to 12 one source; 13 and 14 another, darker.
@@ -116,12 +116,15 @@ fn the_meter_finds_the_step_between_two_sources_and_which_levels_are_one() {
     });
 
     let solved = meter.solve(10);
-    assert_eq!(solved.of(11), [0.0; 3]);
-    assert_eq!(solved.of(12), [0.0; 3]);
-    // Stored 90 against stored 160 is 1.78 stops of light.
-    let step = solved.of(13)[0];
-    assert!((step - 1.78).abs() < 0.03, "{step}");
-    assert_eq!(solved.of(14), solved.of(13));
+    assert!(solved.of(11).is_identity());
+    assert!(solved.of(12).is_identity());
+    // Stored 90 against stored 160 is 1.78 stops of light: flat tiles have
+    // nothing but a gain to say.
+    let found = solved.of(13);
+    let lifted = (found.apply([0.1022; 3])[1] / 0.1022).log2();
+    assert!((1.6..1.95).contains(&lifted), "{found:?}");
+    assert_eq!(solved.of(14), found);
+    assert!(solved.sources[0].before.0 > 1.5 && solved.sources[0].after.0 < 0.1);
 
     let dir = tempfile::tempdir().expect("dir");
     let report = meter.write(dir.path(), "a film", &solved).expect("write");

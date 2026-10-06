@@ -28,10 +28,11 @@
 //!   --no-tone             imagery as stored: no tone correction
 //!   --tone-table <file>   this tone table, not the store's
 //!   --tone <0..1>         how much of the correction (default 1)
-//!   --imagery <stored|decoded>
+//!   --imagery <decoded|stored>
 //!                         how imagery's values are read before lighting:
-//!                         as they lie (the default look), or decoded from
-//!                         sRGB as a photograph asks
+//!                         decoded from sRGB as a photograph asks (the
+//!                         default), or as they lie, washed, as one Cycles
+//!                         film this was once calibrated on
 //!   --exposure <stops>    the look's exposure
 //!   --anchor <level>      the level --meter's own solve holds still (10)
 //!   --cache <dir>         chunks of packs and archives (default
@@ -49,7 +50,7 @@ use tuile_film_native::{
     render, Av1Film, Error, Film, LightMeter, Nothing, Observer, Order, Pictures, Sink, Sources,
     Tone,
 };
-use tuile_radiometry::LevelGains;
+use tuile_radiometry::LevelGrades;
 use tuile_repository::Objects;
 
 fn bucket(name: &str) -> Result<Arc<dyn Objects>, Error> {
@@ -161,12 +162,12 @@ async fn main() -> Result<(), Error> {
     if let Some(path) = value("--tone-table") {
         let text = std::fs::read_to_string(&path)?;
         order.tone = Tone::Table(
-            LevelGains::from_json(&text).ok_or_else(|| format!("{path} is not a tone table"))?,
+            LevelGrades::from_json(&text).ok_or_else(|| format!("{path} is not a tone table"))?,
         );
     }
     match value("--imagery").as_deref() {
-        Some("decoded") => order.look.imagery = tuile_film::Imagery::Decoded,
-        Some("stored") | None => {}
+        Some("stored") => order.look = tuile_film::Look::cycles_film(),
+        Some("decoded") | None => {}
         Some(other) => return Err(format!("imagery is read stored or decoded, not {other}").into()),
     }
     if let Some(stops) = value("--exposure") {
@@ -267,7 +268,7 @@ async fn main() -> Result<(), Error> {
         done.renewed,
         match (&done.tone, order.tone_strength) {
             (None, _) => "none".to_string(),
-            (Some(t), s) => format!("one gain a level, anchor {}, strength {s}", t.anchor),
+            (Some(t), s) => format!("one grade a level, anchor {}, strength {s}", t.anchor),
         }
     );
     for (name, cache) in [("packs", &sources.packs), ("archives", &sources.archives)] {

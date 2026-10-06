@@ -16,7 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tuile_core::raster::TilingScheme;
 use tuile_film::Pack;
-use tuile_radiometry::LevelGains;
+use tuile_radiometry::LevelGrades;
 use tuile_repository::{
     ArchivedTiles, Cached, DiskChunks, Entry, Listing, Objects, RepoError, TileRepository, CHUNK,
 };
@@ -274,13 +274,13 @@ impl Store {
 
     /// The tone correction the store holds for an imagery layer, if any.
     /// A failure to ask is a failure, not an absence.
-    pub async fn tone_of(&self, layer: &str) -> Result<Option<LevelGains>, Error> {
+    pub async fn tone_of(&self, layer: &str) -> Result<Option<LevelGrades>, Error> {
         let key = format!("{layer}/tone.json");
         match self.live.read_all(&key).await {
             Ok(bytes) => Ok(Some(
                 std::str::from_utf8(&bytes)
                     .ok()
-                    .and_then(LevelGains::from_json)
+                    .and_then(LevelGrades::from_json)
                     .ok_or_else(|| format!("{key} is not a tone table"))?,
             )),
             Err(RepoError::NotFound(_)) => Ok(None),
