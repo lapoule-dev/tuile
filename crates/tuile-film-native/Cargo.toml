@@ -1,0 +1,35 @@
+[package]
+name = "tuile-film-native"
+description = "Renders a film natively from its packs and the tile store, read through one cached repository — and lets instruments watch what goes in and what comes out"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+dotenvy = { workspace = true }
+image = { workspace = true }
+# Pure Rust, any picture size. Without its assembly it is slow; it is the
+# encoder a machine has when it has nothing else.
+rav1e = { version = "0.8", default-features = false, features = ["threading"] }
+tokio = { workspace = true }
+tuile-core = { version = "0.2.0", path = "../tuile-core" }
+tuile-farm = { version = "0.2.0", path = "../tuile-farm" }
+tuile-film = { version = "0.2.0", path = "../tuile-film" }
+tuile-film-gpu = { version = "0.2.0", path = "../tuile-film-gpu" }
+tuile-mp4 = { version = "0.2.0", path = "../tuile-mp4" }
+tuile-radiometry = { version = "0.2.0", path = "../tuile-radiometry" }
+tuile-repository = { version = "0.2.0", path = "../tuile-repository" }
+wgpu = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+# rav1e's own assembly: several times faster, and no longer Rust alone.
+asm = ["rav1e/asm"]
+
+[lints]
+workspace = true
