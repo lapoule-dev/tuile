@@ -22,9 +22,15 @@ pub enum Imagery {
 /// unoccluded dome and sun is the whole model, with no shadow and no
 /// occlusion.
 ///
-/// The exposure is a choice, not a derivation: with imagery brought to its
-/// coarse levels' tone (see `tuile-radiometry`), 0.8 stops puts open
-/// country near middle grey.
+/// Exposure, contrast and saturation are the picture's own, one setting for
+/// every film whatever its imagery, and are aimed at what photographs of
+/// country taken from the air measure. Over 66 such photographs of green
+/// country, their ground alone: mean lightness L* 47 (quartiles 38 to 53),
+/// lightness between the 5th and 95th centiles 58 apart (42 to 67), mean
+/// chroma C* 21 (14 to 27). With imagery brought to its coarse levels' tone
+/// (see `tuile-radiometry`), these defaults give L* 44, 42 apart and C* 17
+/// on the film they were set on: the flat end of what photographs show,
+/// because nothing here casts a shadow.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Look {
     /// The dome's radiance, linear RGB (colour × intensity).
@@ -37,6 +43,11 @@ pub struct Look {
     /// Exposure in stops.
     pub exposure_ev: f32,
     pub imagery: Imagery,
+    /// The picture's contrast: a power on its luminance about middle grey
+    /// (0.18), applied after exposure. One is none.
+    pub contrast: f32,
+    /// The picture's saturation, applied last. One is none.
+    pub saturation: f32,
 }
 
 impl Default for Look {
@@ -46,8 +57,10 @@ impl Default for Look {
             sun: Vec3::new(1.0, 0.98, 0.92) * 2.5,
             // An unoriented distant light shines along −Z.
             to_sun: Vec3::Z,
-            exposure_ev: 0.8,
+            exposure_ev: 1.0,
             imagery: Imagery::Decoded,
+            contrast: 1.5,
+            saturation: 1.0,
         }
     }
 }
@@ -74,6 +87,8 @@ impl Look {
         Self {
             exposure_ev: -1.5 + 2.3,
             imagery: Imagery::AsStored,
+            contrast: 1.0,
+            saturation: 1.0,
             ..Self::default()
         }
     }

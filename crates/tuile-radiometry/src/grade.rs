@@ -71,6 +71,17 @@ fn stored_of_linear(value: f32) -> u8 {
     (stored * 255.0).round() as u8
 }
 
+/// The level whose tiles are the places grades are kept by in a tile
+/// store: a few tens of kilometres, the scale at which a source of imagery
+/// changes and its exposure with it.
+pub const REGION_LEVEL: u8 = 9;
+
+/// Where a place's grades are kept in a tile store, beside the imagery
+/// layer they are of.
+pub fn region_key(layer: &str, x: u32, y: u32) -> String {
+    format!("{layer}/tone/{REGION_LEVEL}/{x}/{y}.json")
+}
+
 /// What a level's colour goes through to be the anchor's: see the module.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Grade {
@@ -576,11 +587,10 @@ impl LevelGrades {
                 let every = cells.len().div_ceil(FITTED);
                 cells = cells.into_iter().step_by(every).collect();
             }
-            let mut under: Vec<f32> = cells.iter().map(|c| luma(c.1).max(1e-5)).collect();
-            let pivot = kept(quantile(&mut under, 0.5).clamp(0.01, 1.0));
+            // One pivot for every grade: grades of two places can then be
+            // told apart, and merged, number by number.
+            let pivot = Grade::IDENTITY.pivot;
 
-            // The best gain alone first — where the fit starts from, and
-            // what the grade is to be judged against.
             // Half the source's own darkest hundredth, channel by channel.
             let black = [0, 1, 2].map(|i| {
                 let mut mine: Vec<f32> = cells.iter().map(|c| c.0[i]).collect();
@@ -630,7 +640,7 @@ impl LevelGrades {
             grade.black = grade.black.map(kept);
             grade.gain = grade.gain.map(|g| kept(g.log2()).exp2());
             grade.contrast = kept(grade.contrast);
-            grade.saturation = kept(grade.saturation);
+            grade.saturation = kept(grade.saturation.powf(params.saturation_share));
 
             let mut at = Vec::new();
             let mut left = |grade: &Grade| {
@@ -664,6 +674,61 @@ impl LevelGrades {
             grades,
             sources: reports,
         }
+    }
+
+    /// One table from several, each counting for its weight: the grades of
+    /// the places a film crosses, made the film's. A level is the mean of
+    /// the tables that know it — black points as they are, gain, contrast
+    /// and saturation as ratios. `None` if nothing weighs anything.
+    ///
+    /// One table a film, and not one a place, is what keeps two tiles of a
+    /// level meeting as they met: the same grade from the first frame to
+    /// the last.
+    pub fn merged(parts: &[(&LevelGrades, f32)]) -> Option<Self> {
+        let parts: Vec<&(&LevelGrades, f32)> = parts.iter().filter(|p| p.1 > 0.0).collect();
+        let anchor = parts.first()?.0.anchor;
+        let levels: BTreeSet<u8> = parts
+            .iter()
+            .flat_map(|p| p.0.grades.keys().copied())
+            .collect();
+        let mut grades = BTreeMap::new();
+        for level in levels {
+            let (mut black, mut gain, mut contrast, mut saturation, mut weight) =
+                ([0.0f32; 3], [0.0f32; 3], 0.0f32, 0.0f32, 0.0f32);
+            for (table, w) in parts.iter().copied() {
+                let Some(g) = table.grades.get(&level) else {
+                    continue;
+                };
+                for i in 0..3 {
+                    black[i] += w * g.black[i];
+                    gain[i] += w * g.gain[i].ln();
+                }
+                contrast += w * g.contrast.ln();
+                saturation += w * g.saturation.ln();
+                weight += w;
+            }
+            let unchanged =
+                black == [0.0; 3] && gain == [0.0; 3] && contrast == 0.0 && saturation == 0.0;
+            grades.insert(
+                level,
+                if unchanged {
+                    Grade::IDENTITY
+                } else {
+                    Grade {
+                        black: black.map(|b| kept(b / weight)),
+                        gain: gain.map(|g| kept(g / weight / std::f32::consts::LN_2).exp2()),
+                        contrast: kept((contrast / weight).exp()),
+                        pivot: Grade::IDENTITY.pivot,
+                        saturation: kept((saturation / weight).exp()),
+                    }
+                },
+            );
+        }
+        Some(Self {
+            anchor,
+            grades,
+            sources: Vec::new(),
+        })
     }
 
     /// The grades as a reader of the store finds them: a small JSON object.
@@ -1009,6 +1074,48 @@ mod tests {
         let graded: Vec<[f32; 3]> = other.iter().map(|c| grade.apply(*c)).collect();
         assert!(spread(&gained) < spread(&truth) * 0.85);
         assert!((spread(&graded) - spread(&truth)).abs() < 0.02);
+    }
+
+    #[test]
+    fn tables_of_several_places_make_one_by_their_weights() {
+        let of = |stops: f32, saturation: f32| LevelGrades {
+            anchor: 10,
+            grades: BTreeMap::from([
+                (10, Grade::IDENTITY),
+                (
+                    13,
+                    Grade {
+                        gain: [stops.exp2(); 3],
+                        saturation,
+                        ..Grade::IDENTITY
+                    },
+                ),
+            ]),
+            sources: Vec::new(),
+        };
+        let (here, there) = (of(1.0, 1.44), of(2.0, 1.0));
+        // A place that never saw level 13 says nothing of it.
+        let elsewhere = LevelGrades {
+            anchor: 10,
+            grades: BTreeMap::from([(10, Grade::IDENTITY)]),
+            sources: Vec::new(),
+        };
+        let one = LevelGrades::merged(&[(&here, 3.0), (&there, 1.0), (&elsewhere, 5.0)])
+            .expect("a table");
+        assert!(one.of(10).is_identity());
+        // Three parts of one stop and one of two: a stop and a quarter.
+        assert!(
+            (one.of(13).gain[0].log2() - 1.25).abs() < 1e-3,
+            "{:?}",
+            one.of(13)
+        );
+        // 1.44 three times and 1 once, as ratios: 1.44^(3/4).
+        assert!((one.of(13).saturation - 1.44f32.powf(0.75)).abs() < 2e-3);
+        assert_eq!(LevelGrades::merged(&[(&here, 0.0)]), None);
+        assert_eq!(
+            region_key("imagery", 251, 167),
+            "imagery/tone/9/251/167.json"
+        );
     }
 
     #[test]

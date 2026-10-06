@@ -32,7 +32,8 @@ pub enum Tone {
     /// The imagery as stored.
     #[default]
     Off,
-    /// The table the store holds beside the imagery layer, if it holds one.
+    /// The tables the store keeps for the places the film crosses, made
+    /// one table for the film.
     OfTheStore,
     /// This table.
     Table(LevelGrades),
@@ -92,6 +93,9 @@ pub struct Done {
     pub setup_seconds: f64,
     /// The tone table applied, if one was.
     pub tone: Option<LevelGrades>,
+    /// For a table made from the store's: the places the film's imagery
+    /// lies in, and how many of them the store had a table for.
+    pub tone_places: (usize, usize),
 }
 
 /// Store tiles asked for at once.
@@ -222,7 +226,21 @@ pub async fn render(
                 let table = match &order.tone {
                     Tone::Off => None,
                     Tone::Table(table) => Some(table.clone()),
-                    Tone::OfTheStore => sources.store.tone_of(imagery).await?,
+                    Tone::OfTheStore => {
+                        // Over the whole film, not the frames asked for: a
+                        // film is one grade from its first frame to its last.
+                        let mut places = BTreeMap::new();
+                        for each in &film.packs {
+                            let regions = Pack::open_table(&each.head)?
+                                .imagery_regions(tuile_radiometry::REGION_LEVEL);
+                            for (place, tiles) in regions {
+                                *places.entry(place).or_default() += tiles;
+                            }
+                        }
+                        let (table, had) = sources.store.film_tone(imagery, &places).await?;
+                        done.tone_places = (places.len(), had);
+                        table
+                    }
                 };
                 done.tone.clone_from(&table);
                 tone = Some((imagery.to_string(), table));

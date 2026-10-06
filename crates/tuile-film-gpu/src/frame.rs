@@ -34,8 +34,8 @@ impl FrameUniform {
             up: up.extend(0.0).to_array(),
             fwd: fwd.extend(0.0).to_array(),
             world: look.world.extend(look.exposure_scale()).to_array(),
-            sun: look.sun.extend(0.0).to_array(),
-            to_sun: look.to_sun.extend(0.0).to_array(),
+            sun: look.sun.extend(look.contrast).to_array(),
+            to_sun: look.to_sun.extend(look.saturation).to_array(),
             size,
         }
     }

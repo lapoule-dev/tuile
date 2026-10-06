@@ -44,7 +44,7 @@ mod stats;
 mod transfer;
 
 pub use field::{apply, GainField, LATTICE, STOPS_PER_UNIT};
-pub use grade::{Grade, GradeReport, LevelGrades, Seen};
+pub use grade::{region_key, Grade, GradeReport, LevelGrades, Seen, REGION_LEVEL};
 pub use levels::{apply_multipliers, tone_of, LevelGains, LevelParams, Observation, PairReport};
 pub use stats::{linear_of, BlockStats, BLOCKS};
 pub use transfer::{transfer, Params, Transfer};

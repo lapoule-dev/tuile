@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::path::Path;
 
-use tuile_radiometry::{tone_of, Grade, LevelGrades, LevelParams, Seen};
+use tuile_radiometry::{region_key, tone_of, Grade, LevelGrades, LevelParams, Seen, REGION_LEVEL};
 
 use crate::observe::{FrameOut, ImageryIn, Observer, TileIn};
 use crate::Error;
@@ -30,9 +30,9 @@ const CELLS: u32 = 8;
 /// How far up a tile looks for an ancestor: past this the ground a tile
 /// covers is less than a cell of what was kept of the ancestor.
 const REACH: u8 = 3;
-/// The level whose tiles are the regions a change of source is broken down
-/// by.
-const REGION: u8 = 9;
+/// The level whose tiles are the places a change of source is broken down
+/// by, and grades kept by.
+const REGION: u8 = REGION_LEVEL;
 /// Under this, a linear value is the dark, where a ratio means little.
 const FLOOR: f32 = 0.004;
 
@@ -306,6 +306,52 @@ impl LightMeter {
                 ..LevelParams::default()
             },
         )
+    }
+
+    /// One table a place: the grades fitted on the tiles of each region
+    /// this render read, with how many tiles each was fitted on. Tiles
+    /// coarser than a region are everywhere, and count in every one.
+    pub fn solve_places(&self, anchor: u8) -> Vec<((u32, u32), LevelGrades, usize)> {
+        let seen = self.seen();
+        let places: std::collections::BTreeSet<(u32, u32)> = seen
+            .iter()
+            .map(|s| s.1)
+            .filter(|place| place.0 != u32::MAX)
+            .collect();
+        places
+            .into_iter()
+            .map(|place| {
+                let here: Vec<Seen> = seen
+                    .iter()
+                    .filter(|s| s.1 == place || s.1 .0 == u32::MAX)
+                    .map(|s| s.0.clone())
+                    .collect();
+                let tiles = seen.iter().filter(|s| s.1 == place).count();
+                let params = LevelParams {
+                    anchor,
+                    clamp_stops: 3.0,
+                    ..LevelParams::default()
+                };
+                (place, LevelGrades::solve(&here, &params), tiles)
+            })
+            .collect()
+    }
+
+    /// Writes each place's table under `dir` at the key a tile store keeps
+    /// it by, beside the imagery layer `layer` — ready to be put there —
+    /// and returns the keys.
+    pub fn write_places(&self, dir: &Path, layer: &str, anchor: u8) -> Result<Vec<String>, Error> {
+        let mut keys = Vec::new();
+        for ((x, y), grades, _) in self.solve_places(anchor) {
+            let key = region_key(layer, x, y);
+            let path = dir.join(&key);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, grades.to_json())?;
+            keys.push(key);
+        }
+        Ok(keys)
     }
 
     /// Writes `tiles.csv`, `frames.csv`, `tone.json` and `report.md` into
