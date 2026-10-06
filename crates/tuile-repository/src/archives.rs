@@ -46,6 +46,8 @@ const HEADER_BYTES: usize = 127;
 const MAX_DEPTH: usize = 4;
 /// Opened archives kept: a header and a root directory each.
 const OPENED: usize = 64;
+/// Leaf directories kept, parsed: a few thousand entries each.
+const LEAVES: usize = 256;
 const SECONDS_PER_DAY: u64 = 24 * 3600;
 /// How long a manifest read is trusted, in seconds.
 const MANIFEST_TTL: u64 = 60;
@@ -204,6 +206,10 @@ pub struct ArchivedTiles {
     layers: Vec<Layer>,
     now: Now,
     opened: Mutex<HashMap<String, Arc<Opened>>>,
+    /// Leaf directories read lately, by archive and offset. A frame's tiles
+    /// are neighbours, and neighbours share a leaf: without this, each of
+    /// them reads, inflates and parses the same few thousand entries.
+    leaves: Mutex<HashMap<(String, u64), Arc<Directory>>>,
     /// Manifests read lately, by zone, with when: a film asks for thousands
     /// of tiles of a handful of zones.
     manifests: Mutex<HashMap<String, (u64, Option<Arc<Manifest>>)>>,
@@ -260,6 +266,7 @@ impl ArchivedTiles {
             layers,
             now,
             opened: Mutex::new(HashMap::new()),
+            leaves: Mutex::new(HashMap::new()),
             manifests: Mutex::new(HashMap::new()),
             opening: Mutex::new(HashMap::new()),
         })
@@ -323,6 +330,29 @@ impl ArchivedTiles {
         parse_directory(key, header, bytes)
     }
 
+    /// A leaf directory, parsed once and kept: archives never change, so
+    /// what was at an offset of one is there for good.
+    async fn leaf(
+        &self,
+        key: &str,
+        header: &Header,
+        offset: u64,
+        length: u64,
+    ) -> Result<Arc<Directory>, RepoError> {
+        let at = (key.to_string(), offset);
+        if let Some(held) = self.leaves.lock().ok().and_then(|l| l.get(&at).cloned()) {
+            return Ok(held);
+        }
+        let leaf = Arc::new(self.directory(key, header, offset, length).await?);
+        if let Ok(mut held) = self.leaves.lock() {
+            if held.len() >= LEAVES {
+                held.clear();
+            }
+            held.insert(at, leaf.clone());
+        }
+        Ok(leaf)
+    }
+
     async fn opened(&self, key: &str) -> Result<Arc<Opened>, RepoError> {
         if let Some(held) = self.opened.lock().ok().and_then(|o| o.get(key).cloned()) {
             return Ok(held);
@@ -365,9 +395,9 @@ impl ArchivedTiles {
         let opened = self.opened(key).await?;
         let header = &opened.header;
         let id = TileId::new(id).map_err(|e| malformed(key, e))?;
-        let mut leaf: Option<Directory> = None;
+        let mut leaf: Option<Arc<Directory>> = None;
         for _ in 0..MAX_DEPTH {
-            let directory = leaf.as_ref().unwrap_or(&opened.root);
+            let directory = leaf.as_deref().unwrap_or(&opened.root);
             let Some(entry) = directory.find_tile_id(id) else {
                 return Ok(None);
             };
@@ -377,7 +407,7 @@ impl ArchivedTiles {
                 return Ok(Some(self.archives.read(key, start..start + length).await?));
             }
             let start = header.leaf_offset() + offset;
-            leaf = Some(self.directory(key, header, start, length).await?);
+            leaf = Some(self.leaf(key, header, start, length).await?);
         }
         Err(malformed(key, "directories nested too deep"))
     }

@@ -69,6 +69,9 @@ impl Sink for Both {
     fn close(&mut self) -> Result<(), Error> {
         self.0.iter_mut().try_for_each(|s| s.close())
     }
+    fn spent(&self) -> Vec<(String, f64)> {
+        self.0.iter().flat_map(|s| s.spent()).collect()
+    }
 }
 
 #[tokio::main]
@@ -159,16 +162,45 @@ async fn main() -> Result<(), Error> {
     let done = render(&sources, &film, &order, &mut sink, observer).await?;
     let megabytes = |b: u64| b as f64 / 1e6;
     println!(
-        "{} frames at {}×{} in {:.1} s ({:.1} frames/s) — reading {:.1} s, building {:.1} s, GPU {:.1} s",
+        "{} frames at {}×{} in {:.1} s ({:.2} frames/s), {:.1} s of it before the first frame",
         done.frames,
         done.width,
         done.height,
         done.seconds,
         f64::from(done.frames) / done.seconds.max(1e-9),
-        done.timings.read / 1000.0,
-        done.timings.build / 1000.0,
-        done.timings.gpu / 1000.0
+        done.setup_seconds
     );
+    // Where the time went: the frame that enters everything, then the rest.
+    let after = f64::from(done.frames.saturating_sub(1)).max(1.0);
+    println!(
+        "\n{:<18} {:>14} {:>16} {:>12} {:>7}",
+        "step", "opening frame", "frames after", "per frame", "share"
+    );
+    let whole = done.opening.total() + done.timings.total();
+    for ((name, opening), (_, rest)) in done.opening.steps().iter().zip(done.timings.steps()) {
+        println!(
+            "{name:<18} {:>11.0} ms {:>13.1} s {:>9.1} ms {:>6.1}%",
+            opening,
+            rest / 1000.0,
+            rest / after,
+            (opening + rest) * 100.0 / whole.max(1e-9)
+        );
+    }
+    println!(
+        "{:<18} {:>11.0} ms {:>13.1} s {:>9.1} ms   ({} tiles entered by the opening frame)",
+        "all steps",
+        done.opening.total(),
+        done.timings.total() / 1000.0,
+        done.timings.total() / after,
+        done.opening_tiles
+    );
+    for (name, seconds) in sink.spent() {
+        println!(
+            "{name}: {seconds:.1} s, {:.1} ms a frame",
+            seconds * 1000.0 / f64::from(done.frames.max(1))
+        );
+    }
+    println!();
     println!(
         "tiles: {} from the store, {} from the pack, {} source tiles renewed since the bake; tone: {}",
         done.tiles_from_store,
@@ -189,6 +221,12 @@ async fn main() -> Result<(), Error> {
             megabytes(fetched.bytes)
         );
     }
+    let live = sources.live.so_far();
+    println!(
+        "store catalog and manifests: {} reads ({:.2} MB), from the bucket each time",
+        live.reads,
+        megabytes(live.bytes)
+    );
     if let Some(dir) = metering {
         let solved = meter.solve(anchor);
         let report = meter.write(&PathBuf::from(&dir), prefix, &solved)?;

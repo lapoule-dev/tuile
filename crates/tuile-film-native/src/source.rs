@@ -5,8 +5,9 @@
 //!
 //! Both are `Objects`, and both are read through a cache of chunks on disk
 //! (`tuile_repository::Cached`), so a second render of the same film asks
-//! the buckets for nothing but what changes. A counter sits on each side of
-//! the cache: what the render asked for, and what went out for it.
+//! the buckets for nothing but what changes; the chunks last read stay in
+//! memory, so a tile is not a chunk read from disk. A counter sits on each
+//! side of the cache: what the render asked for, and what went out for it.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,8 +18,7 @@ use tuile_core::raster::TilingScheme;
 use tuile_film::Pack;
 use tuile_radiometry::LevelGains;
 use tuile_repository::{
-    ArchivedTiles, Cached, ChunkStore, DiskChunks, Entry, Listing, Objects, RepoError,
-    TileRepository,
+    ArchivedTiles, Cached, DiskChunks, Entry, Listing, Objects, RepoError, TileRepository, CHUNK,
 };
 
 use crate::Error;
@@ -85,53 +85,87 @@ impl Objects for Counting {
     }
 }
 
-/// Chunks kept in memory before they are let go: a frame's tiles come from
-/// a handful of archives, read over and over.
-const WARM: usize = 24;
+/// Bytes of chunks kept in memory before the oldest are let go. A film's
+/// tiles come from a few hundred chunks, read over and over; holding fewer
+/// than it uses means reading each from disk, whole, again and again.
+const HELD_BYTES: usize = 1 << 30;
 
-/// A chunk store with its latest chunks kept in memory in front of it: a
-/// tile is a few kilobytes of a chunk of megabytes, and reading the whole
-/// chunk from disk for each one is most of a render's reading.
-struct Warm<S> {
-    behind: S,
-    held: std::sync::Mutex<std::collections::VecDeque<((String, u64), Arc<Vec<u8>>)>>,
+/// `Objects` with the chunks last read kept in memory, and ranges cut out
+/// of them. A tile is a few kilobytes of a chunk of megabytes: asked of the
+/// disk cache each time, every tile costs a chunk read and copied whole,
+/// which is most of what reading from a warm cache would otherwise cost.
+struct Held {
+    behind: Arc<dyn Objects>,
+    chunks: std::sync::Mutex<std::collections::VecDeque<((String, u64), Arc<Vec<u8>>)>>,
+    /// Sizes, believed for as long as this lives: one render.
+    sizes: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
-impl<S> Warm<S> {
-    fn keep(&self, key: &str, index: u64, bytes: Arc<Vec<u8>>) {
-        if let Ok(mut held) = self.held.lock() {
-            if held.len() >= WARM {
-                held.pop_front();
-            }
-            held.push_back(((key.to_string(), index), bytes));
+impl Held {
+    async fn chunk(&self, key: &str, size: u64, index: u64) -> Result<Arc<Vec<u8>>, RepoError> {
+        let held = self.chunks.lock().ok().and_then(|chunks| {
+            chunks
+                .iter()
+                .find(|(at, _)| at.0 == key && at.1 == index)
+                .map(|(_, bytes)| bytes.clone())
+        });
+        if let Some(bytes) = held {
+            return Ok(bytes);
         }
+        let range = index * CHUNK..((index + 1) * CHUNK).min(size);
+        let bytes = Arc::new(self.behind.read(key, range).await?);
+        if let Ok(mut chunks) = self.chunks.lock() {
+            let mut held: usize = chunks.iter().map(|c| c.1.len()).sum();
+            while held + bytes.len() > HELD_BYTES {
+                match chunks.pop_front() {
+                    Some(gone) => held -= gone.1.len(),
+                    None => break,
+                }
+            }
+            chunks.push_back(((key.to_string(), index), bytes.clone()));
+        }
+        Ok(bytes)
     }
 }
 
 #[async_trait]
-impl<S: ChunkStore> ChunkStore for Warm<S> {
-    async fn get(&self, key: &str, index: u64) -> Option<Vec<u8>> {
-        let warm = self.held.lock().ok().and_then(|held| {
-            held.iter()
-                .find(|(at, _)| at.0 == key && at.1 == index)
-                .map(|(_, bytes)| bytes.clone())
-        });
-        if let Some(bytes) = warm {
-            return Some(bytes.as_ref().clone());
+impl Objects for Held {
+    fn label(&self) -> String {
+        self.behind.label()
+    }
+    async fn list(&self, prefix: &str) -> Result<Vec<Entry>, RepoError> {
+        self.behind.list(prefix).await
+    }
+    async fn browse(&self, prefix: &str) -> Result<Listing, RepoError> {
+        self.behind.browse(prefix).await
+    }
+    async fn size(&self, key: &str) -> Result<u64, RepoError> {
+        if let Some(size) = self.sizes.lock().ok().and_then(|s| s.get(key).copied()) {
+            return Ok(size);
         }
-        let bytes = self.behind.get(key, index).await?;
-        self.keep(key, index, Arc::new(bytes.clone()));
-        Some(bytes)
+        let size = self.behind.size(key).await?;
+        if let Ok(mut sizes) = self.sizes.lock() {
+            sizes.insert(key.to_string(), size);
+        }
+        Ok(size)
     }
-    async fn put(&self, key: &str, index: u64, bytes: &[u8]) {
-        self.keep(key, index, Arc::new(bytes.to_vec()));
-        self.behind.put(key, index, bytes).await;
-    }
-    async fn size(&self, key: &str) -> Option<u64> {
-        self.behind.size(key).await
-    }
-    async fn note_size(&self, key: &str, size: u64) {
-        self.behind.note_size(key, size).await;
+    async fn read(&self, key: &str, range: Range<u64>) -> Result<Vec<u8>, RepoError> {
+        let size = self.size(key).await?;
+        if range.end > size || range.start > range.end {
+            return Err(RepoError::Store(format!(
+                "{key}: bytes {}..{} are outside its {size}",
+                range.start, range.end
+            )));
+        }
+        let mut out = Vec::with_capacity((range.end - range.start) as usize);
+        for index in range.start / CHUNK..range.end.div_ceil(CHUNK) {
+            let chunk = self.chunk(key, size, index).await?;
+            let base = index * CHUNK;
+            let from = range.start.max(base) - base;
+            let to = (range.end.min(base + chunk.len() as u64)) - base;
+            out.extend_from_slice(&chunk[from as usize..to as usize]);
+        }
+        Ok(out)
     }
 }
 
@@ -256,6 +290,8 @@ pub struct Sources {
     pub packs: Cache,
     pub archives: Cache,
     pub store: Store,
+    /// The store's catalog and manifests: read from the bucket, never kept.
+    pub live: Arc<Counting>,
 }
 
 impl Sources {
@@ -269,6 +305,8 @@ impl Sources {
     ) -> Result<Self, Error> {
         let packs = Cache::over(runs, cache.join("packs"));
         let archives = Cache::over(tiles.clone(), cache.join("tiles"));
+        let live = Counting::new(tiles);
+        let tiles: Arc<dyn Objects> = live.clone();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
@@ -285,6 +323,7 @@ impl Sources {
                 tiles: store,
                 live: tiles,
             },
+            live,
         })
     }
 }

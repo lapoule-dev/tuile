@@ -6055,6 +6055,7 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "dotenvy",
+ "futures-util",
  "image",
  "rav1e",
  "tempfile",
