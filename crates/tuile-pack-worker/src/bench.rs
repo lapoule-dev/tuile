@@ -106,6 +106,11 @@ impl EdgeChunks {
     }
 }
 
+/// What an object's size is kept under. Not `size`: an earlier build kept
+/// sizes under that name for a year, and what it kept is still in the cache
+/// and would still be believed — of objects that have since been replaced.
+const SIZE_NOTE: &str = "size-for-a-minute";
+
 #[async_trait(?Send)]
 impl ChunkStore for EdgeChunks {
     async fn get(&self, key: &str, index: u64) -> Option<Vec<u8>> {
@@ -124,7 +129,7 @@ impl ChunkStore for EdgeChunks {
     }
 
     async fn size(&self, key: &str) -> Option<u64> {
-        let bytes = self.lookup(self.url(key, "size")).await?;
+        let bytes = self.lookup(self.url(key, SIZE_NOTE)).await?;
         std::str::from_utf8(&bytes).ok()?.parse().ok()
     }
 
@@ -132,7 +137,7 @@ impl ChunkStore for EdgeChunks {
         // A size is believed for a minute: an object can be replaced under
         // its key, and its size is how that is noticed.
         self.keep(
-            self.url(key, "size"),
+            self.url(key, SIZE_NOTE),
             size.to_string().into_bytes(),
             "public, max-age=60",
         )
