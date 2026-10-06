@@ -362,6 +362,7 @@ fn a_drape_composed_on_the_gpu_is_the_bakes() {
             coverage,
             translation,
             scale,
+            gain: [1.0; 3],
         });
         cpu_layers.push(ImageryLayer {
             coord: ImageryCoord {
@@ -438,4 +439,92 @@ fn a_drape_composed_on_the_gpu_is_the_bakes() {
         base_only < (side * side) as usize / 2,
         "{base_only} texels are bare"
     );
+}
+
+/// A level's tone correction is one gain, applied in linear light to every
+/// texel of the layer: a stop more is twice the light, whatever the tile.
+#[test]
+fn a_layer_is_composed_at_its_levels_tone() {
+    use tuile_film_gpu::DrapeLayer;
+
+    let Some((device, queue)) = device() else {
+        eprintln!("no adapter: skipped");
+        return;
+    };
+    let mut film = FilmGpu::new(
+        device,
+        queue,
+        Settings {
+            width: 64,
+            height: 48,
+            supersample: 1,
+            look: Look::default(),
+        },
+    );
+    // Flat tiles, so that the filtering has nothing to say and what comes
+    // back is the gain alone; dark, middling, and bright enough to clip.
+    let side = 32u32;
+    let gain = [2.0f32, 0.5, 1.0];
+    let row = (side * 4).next_multiple_of(256);
+    let (mut worst, mut untouched_apart, mut moved) = (0u8, 0usize, 0usize);
+    for stored in [[12u8, 40, 7], [90, 130, 201], [230, 250, 66]] {
+        let rgba8: Vec<u8> = (0..side * side)
+            .flat_map(|_| [stored[0], stored[1], stored[2], 255])
+            .collect();
+        let texture = film.create_imagery(side, side);
+        film.write_rgba(&texture, &rgba8);
+        let albedo = film.create_albedo(side, side);
+        film.compose(
+            &albedo,
+            [0.0, 0.0, 0.0, 1.0],
+            vec![DrapeLayer {
+                texture,
+                coverage: [0.0, 0.0, 1.0, 1.0],
+                translation: [0.0, 0.0],
+                scale: [1.0, 1.0],
+                gain,
+            }],
+        );
+        let mut pending = film.device().create_command_encoder(&Default::default());
+        film.record_pending(&mut pending);
+        film.queue().submit([pending.finish()]);
+        let got = read(&film, |encoder| {
+            let buffer = film.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size: u64::from(row * side),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                albedo.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row),
+                        rows_per_image: Some(side),
+                    },
+                },
+                albedo.size(),
+            );
+            (buffer, 0)
+        });
+        for y in 0..side as usize {
+            for x in 0..side as usize {
+                let out = &got[y * row as usize + x * 4..][..3];
+                for c in 0..3 {
+                    let wanted = (oetf((eotf(f32::from(stored[c]) / 255.0) * gain[c]).min(1.0))
+                        * 255.0)
+                        .round();
+                    worst = worst.max(out[c].abs_diff(wanted as u8));
+                    moved += usize::from(out[c] != stored[c]);
+                }
+                // The channel whose gain is one is the stored byte, exactly.
+                untouched_apart += usize::from(out[2] != stored[2]);
+            }
+        }
+    }
+    assert!(worst <= 1, "worst channel {worst} from the gain asked for");
+    assert_eq!(untouched_apart, 0);
+    assert!(moved > (side * side) as usize, "the gain did nothing");
 }

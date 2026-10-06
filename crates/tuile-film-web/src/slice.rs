@@ -13,7 +13,8 @@
 //! Messages, both ways, are plain objects with a `type`:
 //!
 //! - in: the order — `packs: [{source, first, last}]`, `filmFirst`, `width`,
-//!   `height`, `supersample`, `fps`, `bitrate`, and an `id` echoed back;
+//!   `height`, `supersample`, `fps`, `bitrate`, `tone` (how much of the
+//!   store's tone correction, 0 to 1), and an `id` echoed back;
 //! - out: `preload` (blocks fetched ahead), `frame` (one frame's account,
 //!   now and then with a `preview` bitmap), `done` (the encoded slice) or
 //!   `error`.
@@ -84,6 +85,7 @@ async fn render(order: &JsValue, id: &JsValue) -> Result<(), String> {
             first,
             last,
             supersample,
+            number(order, "tone") as f32,
         )
         .await
         .map_err(text)?;

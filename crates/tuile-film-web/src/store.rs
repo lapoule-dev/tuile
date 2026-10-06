@@ -14,7 +14,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use js_sys::Uint8Array;
 use tuile_repository::{
-    ArchivedTiles, BlockCounts, Get, Got, Now, RemoteBlocks, RemoteLive, RepoError,
+    ArchivedTiles, BlockCounts, Get, Got, Now, Objects, RemoteBlocks, RemoteLive, RepoError,
 };
 
 use crate::js::{call, get, number, settled, sleep, text};
@@ -75,6 +75,7 @@ impl Get for FetchGet {
 /// A store opened through the API.
 pub struct Store {
     pub tiles: ArchivedTiles,
+    live: Arc<RemoteLive<FetchGet>>,
     blocks: Arc<RemoteBlocks<FetchGet>>,
 }
 
@@ -86,13 +87,25 @@ impl Store {
         });
         let blocks = Arc::new(RemoteBlocks::new(fetch.clone(), "store"));
         let now: Now = Arc::new(|| (js_sys::Date::now() / 1000.0) as u64);
-        let tiles = ArchivedTiles::open(
-            Arc::new(RemoteLive::new(fetch, "store")),
-            blocks.clone(),
-            now,
-        )
-        .await?;
-        Ok(Self { tiles, blocks })
+        let live = Arc::new(RemoteLive::new(fetch, "store"));
+        let tiles = ArchivedTiles::open(live.clone(), blocks.clone(), now).await?;
+        Ok(Self {
+            tiles,
+            live,
+            blocks,
+        })
+    }
+
+    /// One of the store's small files, whole — or `None` if the store has
+    /// no such file. A failure to ask is a failure, not an absence: a
+    /// renderer that took the one for the other would draw without what it
+    /// was meant to draw with, and say nothing.
+    pub async fn small(&self, key: &str) -> Result<Option<Vec<u8>>, RepoError> {
+        match self.live.read_all(key).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(RepoError::NotFound(_)) => Ok(None),
+            Err(other) => Err(other),
+        }
     }
 
     /// Blocks of archives asked of the API, and blocks answered from memory.

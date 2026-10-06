@@ -67,7 +67,11 @@ fn edge_step(a: &Image, b: &Image, horizontal: bool) -> f32 {
         for along in 0..image.side {
             for across in 0..4 {
                 let across = if far { image.side - 1 - across } else { across };
-                let (x, y) = if horizontal { (across, along) } else { (along, across) };
+                let (x, y) = if horizontal {
+                    (across, along)
+                } else {
+                    (along, across)
+                };
                 let i = ((y * image.side + x) * 4) as usize;
                 for c in 0..3 {
                     sum[c] += f64::from(linear_of(image.rgba[i + c]));
@@ -109,7 +113,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let [layer, level, x0, y0, n] = args.as_slice() else {
         return Err("usage: radiometry_bench <layer> <level> <x> <y> <tiles a side>".into());
     };
-    let (level, x0, y0, n): (u8, u32, u32, u32) = (level.parse()?, x0.parse()?, y0.parse()?, n.parse()?);
+    let (level, x0, y0, n): (u8, u32, u32, u32) =
+        (level.parse()?, x0.parse()?, y0.parse()?, n.parse()?);
     let bucket: Arc<dyn Objects> = Arc::new(ObjectRunStore::bucket(
         &BucketConfig::from_env()?,
         Tuning::from_env(),
@@ -145,19 +150,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let (mut before, mut after, mut overall, mut agreement) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut before, mut after, mut overall, mut agreement) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut pairs, mut same, mut kept) = (0u32, 0u32, Vec::new());
     let mut corrected: HashMap<(u32, u32), Image> = HashMap::new();
     for y in y0..y0 + n {
         for x in x0..x0 + n {
-            let (Some(Some(child)), Some(Some(parent))) =
-                (images.get(&(level, x, y)), images.get(&(level - 1, x / 2, y / 2)))
-            else {
+            let (Some(Some(child)), Some(Some(parent))) = (
+                images.get(&(level, x, y)),
+                images.get(&(level - 1, x / 2, y / 2)),
+            ) else {
                 continue;
             };
             pairs += 1;
             let quadrant = (x % 2, y % 2);
-            let parent_tone = BlockStats::of_quadrant(&parent.rgba, parent.side, parent.side, quadrant);
+            let parent_tone =
+                BlockStats::of_quadrant(&parent.rgba, parent.side, parent.side, quadrant);
             let child_tone = BlockStats::of(&child.rgba, child.side, child.side);
             let found = transfer(&child_tone, &parent_tone, &params);
             same += u32::from(found.same_source);
@@ -188,20 +196,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for y in y0..y0 + n {
         for x in x0..x0 + n {
             for (dx, dy, horizontal) in [(1u32, 0u32, true), (0, 1, false)] {
-                let (Some(Some(a)), Some(Some(b))) =
-                    (images.get(&(level, x, y)), images.get(&(level, x + dx, y + dy)))
-                else {
+                let (Some(Some(a)), Some(Some(b))) = (
+                    images.get(&(level, x, y)),
+                    images.get(&(level, x + dx, y + dy)),
+                ) else {
                     continue;
                 };
                 seams_before.push(edge_step(a, b, horizontal));
-                if let (Some(a), Some(b)) = (corrected.get(&(x, y)), corrected.get(&(x + dx, y + dy))) {
+                if let (Some(a), Some(b)) =
+                    (corrected.get(&(x, y)), corrected.get(&(x + dx, y + dy)))
+                {
                     seams_after.push(edge_step(a, b, horizontal));
                 }
             }
         }
     }
 
-    println!("{layer} level {level} against {}: {pairs} tiles with their parent", level - 1);
+    println!(
+        "{layer} level {level} against {}: {pairs} tiles with their parent",
+        level - 1
+    );
     if pairs == 0 {
         return Ok(());
     }

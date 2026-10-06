@@ -38,9 +38,11 @@
 //! reference: what a GPU computes is checked against it.
 
 mod field;
+mod levels;
 mod stats;
 mod transfer;
 
 pub use field::{apply, GainField, LATTICE, STOPS_PER_UNIT};
+pub use levels::{apply_multipliers, tone_of, LevelGains, LevelParams, Observation, PairReport};
 pub use stats::{linear_of, BlockStats, BLOCKS};
 pub use transfer::{transfer, Params, Transfer};
