@@ -67,6 +67,15 @@ async fn sleep(ms: i32) {
 }
 
 impl Source {
+    /// The API a pack's URL is under — `https://host/api` — which is where
+    /// the tile store is reached too. `None` for a pack opened from a file.
+    pub fn api(&self) -> Option<String> {
+        match self {
+            Source::Url(url) => url.find("/p/").map(|at| url[..at].to_string()),
+            Source::Blob(_) => None,
+        }
+    }
+
     pub fn from_js(value: &JsValue) -> Result<Self, JsError> {
         if let Some(url) = value.as_string() {
             return Ok(Source::Url(url));

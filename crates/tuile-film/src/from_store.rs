@@ -88,9 +88,16 @@ pub fn terrain_mesh(
     let source = &refs.terrain;
     let (level, x, y) = TileId(id).terrain_coord();
     let target = TileCoord::new(level, x, y);
-    let from = TileCoord::new(u32::from(source.level), u64::from(source.x), u64::from(source.y));
+    let from = TileCoord::new(
+        u32::from(source.level),
+        u64::from(source.x),
+        u64::from(source.y),
+    );
     if from.level > target.level {
-        return Err(terrain_error(source, "is below the tile it is said to make"));
+        return Err(terrain_error(
+            source,
+            "is below the tile it is said to make",
+        ));
     }
     let mut mesh = tuile_terrain::decode(bytes).map_err(|e| terrain_error(source, e))?;
     // Down from the ancestor to the tile, one level at a time: each rung is
@@ -112,7 +119,13 @@ pub fn terrain_mesh(
         .meshes
         .first()
         .ok_or_else(|| terrain_error(source, "decodes to no mesh"))?;
-    let le3 = |values: &[[f32; 3]]| values.iter().flatten().flat_map(|c| c.to_le_bytes()).collect();
+    let le3 = |values: &[[f32; 3]]| {
+        values
+            .iter()
+            .flatten()
+            .flat_map(|c| c.to_le_bytes())
+            .collect()
+    };
     Ok(Mesh {
         origin_ecef: content.local_origin_ecef.to_array(),
         positions: le3(&built.positions),
@@ -177,5 +190,9 @@ pub fn compose(
         })
         .collect();
     let side = refs.composed_side.max(1);
-    Some(raster::bake_layers(&layers, base_color_factor, (side, side)))
+    Some(raster::bake_layers(
+        &layers,
+        base_color_factor,
+        (side, side),
+    ))
 }

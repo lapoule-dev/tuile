@@ -70,8 +70,12 @@ pub fn file_reads(
     let spans: Vec<Range<u64>> = tiles
         .iter()
         .map(|t| {
-            pack.span_of(t)
-                .map_or(0..0, |r| blob_start + r.start..blob_start + r.end)
+            // A tile with no payload — one the pack only refers to — reads
+            // nothing, and its empty range sits where the blob begins rather
+            // than at the head of the file, so nothing subtracts past it.
+            pack.span_of(t).map_or(blob_start..blob_start, |r| {
+                blob_start + r.start..blob_start + r.end
+            })
         })
         .collect();
     coalesce(&spans, gap, max)

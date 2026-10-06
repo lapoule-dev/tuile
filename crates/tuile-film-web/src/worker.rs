@@ -1,16 +1,25 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::source::{Source, BLOCK_BYTES};
+use crate::store::Store;
 use futures_util::future::try_join_all;
 use futures_util::stream::{self, StreamExt};
 use js_sys::{Array, Uint8Array};
+use tuile_core::content::DecodedTexture;
+use tuile_core::raster::TilingScheme;
+use tuile_film::from_store::{compose, imagery_texture, is_baked, terrain_mesh};
 use tuile_film::{
     block_plan, cameras, file_reads, frame_tiles, texture_of_span, Content, Cursor, FrameCamera,
     Look, Mesh, Pack, TileKey,
 };
+use tuile_film::{refs_of, StoreTile, TileRefs};
 use tuile_film_gpu::{FilmGpu, Settings, TileMesh, OUTPUT_FORMAT};
 use tuile_mp4::{Codec, Muxer, ParameterSets};
+use tuile_repository::TileRepository;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -246,6 +255,94 @@ pub struct FilmWorker {
     /// The slice this worker renders.
     first: u32,
     last: u32,
+    /// The tile store, for a pack whose tiles are references into it.
+    store: Option<StoreSide>,
+}
+
+/// What rendering from the tile store needs beside the pack: the store, the
+/// layers the pack's references are into, and the imagery tiles already
+/// decoded — one imagery tile lies under several terrain tiles.
+struct StoreSide {
+    store: Store,
+    terrain: String,
+    imagery: String,
+    scheme: TilingScheme,
+    textures: HashMap<(u8, u32, u32), Arc<DecodedTexture>>,
+    /// Source tiles whose bytes are no longer the ones the pack was baked
+    /// from: the store has renewed them since.
+    renewed: u32,
+}
+
+/// Imagery tiles kept decoded before the oldest are let go. A tile is a
+/// quarter of a megabyte; a frame's newcomers share most of theirs.
+const TEXTURES_HELD: usize = 1024;
+
+impl StoreSide {
+    /// One imagery tile, decoded and on geographic spacing; read from the
+    /// store the first time it is asked for.
+    async fn texture(&mut self, tile: &StoreTile) -> Result<Arc<DecodedTexture>, JsError> {
+        let key = (tile.level, tile.x, tile.y);
+        if let Some(held) = self.textures.get(&key) {
+            return Ok(held.clone());
+        }
+        let found = self
+            .store
+            .tiles
+            .tile(&self.imagery, tile.level, tile.x, tile.y)
+            .await
+            .map_err(js)?
+            .ok_or_else(|| {
+                js(format!(
+                    "imagery {}/{}/{} is no longer in the tile store",
+                    tile.level, tile.x, tile.y
+                ))
+            })?;
+        if !is_baked(tile, &found.bytes) {
+            self.renewed += 1;
+        }
+        let texture = Arc::new(imagery_texture(tile, &self.scheme, &found.bytes).map_err(js)?);
+        if self.textures.len() >= TEXTURES_HELD {
+            self.textures.clear();
+        }
+        self.textures.insert(key, texture.clone());
+        Ok(texture)
+    }
+
+    /// A tile the pack refers to: its mesh from its terrain tile, its drape
+    /// composed from its imagery tiles, as the bake made them.
+    async fn build(
+        &mut self,
+        id: u64,
+        refs: &TileRefs,
+        base_color_factor: [f32; 4],
+    ) -> Result<(Mesh, Option<DecodedTexture>), JsError> {
+        let source = refs.terrain;
+        let terrain = self
+            .store
+            .tiles
+            .tile(&self.terrain, source.level, source.x, source.y)
+            .await
+            .map_err(js)?
+            .ok_or_else(|| {
+                js(format!(
+                    "terrain {}/{}/{} is no longer in the tile store",
+                    source.level, source.x, source.y
+                ))
+            })?;
+        if !is_baked(&source, &terrain.bytes) {
+            self.renewed += 1;
+        }
+        let mesh = terrain_mesh(id, refs, &terrain.bytes, base_color_factor).map_err(js)?;
+        let mut layers = HashMap::new();
+        for placed in &refs.imagery {
+            let key = (placed.tile.level, placed.tile.x, placed.tile.y);
+            layers.insert(key, self.texture(&placed.tile).await?);
+        }
+        let drape = compose(refs, base_color_factor, |t| {
+            layers[&(t.level, t.x, t.y)].clone()
+        });
+        Ok((mesh, drape))
+    }
 }
 
 /// What fetching ahead did.
@@ -288,16 +385,37 @@ impl FilmWorker {
         let head = source.head().await?;
         let cursor = {
             let opened = Pack::open_table(&head).map_err(js)?;
-            // A pack of references embeds nothing to render from. Reading
-            // its tiles in the store is the next step; until then it is
-            // refused here, by name, rather than read as an empty film.
-            if opened.content() == Content::References {
-                return Err(js(
-                    "this pack holds references into the tile store and no payload; \
-                     rendering from the store is not built yet",
-                ));
-            }
             Cursor::new(&opened, first, last).map_err(js)?
+        };
+        // A pack of references is rendered from the tile store, which is
+        // reached through the same API the pack came from.
+        let store = {
+            let opened = Pack::open_table(&head).map_err(js)?;
+            match (opened.content(), opened.store_layers(), source.api()) {
+                (Content::Embedded, ..) | (_, None, _) => None,
+                (Content::References, Some(_), None) => {
+                    return Err(js(
+                        "this pack holds references into the tile store, which a pack \
+                         opened from a file cannot reach",
+                    ))
+                }
+                (_, Some(_), None) => None,
+                (_, Some((terrain, imagery)), Some(api)) => {
+                    let store = Store::open(&api).await.map_err(js)?;
+                    let scheme = match store.tiles.layers().iter().find(|l| l.name == imagery) {
+                        Some(layer) if layer.grid == "geographic" => TilingScheme::geographic(),
+                        _ => TilingScheme::web_mercator(),
+                    };
+                    Some(StoreSide {
+                        store,
+                        terrain: terrain.to_string(),
+                        imagery: imagery.to_string(),
+                        scheme,
+                        textures: HashMap::new(),
+                        renewed: 0,
+                    })
+                }
+            }
         };
         let (width, height) = (canvas.width(), canvas.height());
 
@@ -364,6 +482,7 @@ impl FilmWorker {
             readback: None,
             first,
             last,
+            store,
         })
     }
 
@@ -461,6 +580,7 @@ impl FilmWorker {
             surface,
             aspect,
             readback,
+            store,
             ..
         } = self;
         let pack = Pack::open_table(head).map_err(js)?;
@@ -477,7 +597,16 @@ impl FilmWorker {
         // worker's memory should be asked for. Each read's tiles are on the
         // GPU, and its bytes let go, before the next is made.
         let blob = head.len() as u64;
-        let fetches = file_reads(&pack, blob, &diff.enter, COALESCE_GAP, READ_AT_MOST);
+        // What enters comes from one of two places: the pack, for a tile it
+        // carries, or the tile store, for a tile it only refers to. A tile
+        // the store can give is taken from the store; the pack's own copy is
+        // the fallback, and what every older pack has.
+        let (referred, carried): (Vec<_>, Vec<_>) = diff
+            .enter
+            .iter()
+            .copied()
+            .partition(|tile| store.is_some() && tile.terrain().is_some());
+        let fetches = file_reads(&pack, blob, &carried, COALESCE_GAP, READ_AT_MOST);
         let (mut fetch_ms, mut unpack_ms, mut decode_ms, mut upload_ms) = (0.0, 0.0, 0.0, 0.0);
         let mut fetched_bytes = 0usize;
         for fetch in &fetches {
@@ -490,7 +619,7 @@ impl FilmWorker {
             let mut meshes = Vec::with_capacity(fetch.serves.len());
             let mut pngs = Vec::new();
             for &i in &fetch.serves {
-                let tile = &diff.enter[i];
+                let tile = &carried[i];
                 meshes.push((
                     TileKey::of(tile),
                     Mesh::of_span(&pack, tile, at, &bytes).map_err(js)?,
@@ -559,6 +688,42 @@ impl FilmWorker {
             unpack_ms += t1 - t0;
             decode_ms += t2 - t1;
             upload_ms += t3 - t2;
+        }
+
+        // The tiles the pack refers to, built from the store's own tiles.
+        if let Some(store) = store.as_mut() {
+            for tile in &referred {
+                let tf = now_ms();
+                let Some(refs) = refs_of(tile) else { continue };
+                let factor = match tile.base_color_factor() {
+                    Some(v) if v.len() == 4 => [v.get(0), v.get(1), v.get(2), v.get(3)],
+                    _ => [1.0; 4],
+                };
+                let (mesh, drape) = store.build(tile.id(), &refs, factor).await?;
+                let t0 = now_ms();
+                let texture = drape.map(|drape| {
+                    let texture = gpu.create_albedo(drape.width, drape.height);
+                    gpu.write_rgba(&texture, &drape.rgba8);
+                    texture
+                });
+                gpu.enter(
+                    TileKey::of(tile),
+                    &TileMesh {
+                        origin_ecef: mesh.origin_ecef,
+                        positions: &mesh.positions,
+                        normals: &mesh.normals,
+                        uvs: &mesh.uvs,
+                        indices: &mesh.indices,
+                        index_count: mesh.index_count,
+                        base_color_factor: mesh.base_color_factor,
+                    },
+                    texture,
+                )
+                .map_err(js)?;
+                // Reading the store and composing the drape, then the GPU.
+                decode_ms += t0 - tf;
+                upload_ms += now_ms() - t0;
+            }
         }
 
         let t3 = now_ms();
