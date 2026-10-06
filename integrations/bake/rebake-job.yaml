@@ -69,6 +69,10 @@ spec:
     spec:
       restartPolicy: Never
       priorityClassName: ${TUILE_PRIORITY_CLASS}
+      # The node with room for it: a bake is all CPU, and a cluster's free
+      # CPU is rarely on the node the scheduler would pick by memory.
+      nodeSelector:
+        kubernetes.io/hostname: ${TUILE_NODE}
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -103,17 +107,19 @@ spec:
             # The baker sizes its pools on the machine's cores, which are the
             # node's and not this container's share of them.
             - name: TUILE_FINISH_THREADS
-              value: "2"
+              value: "${TUILE_THREADS}"
             - name: TOKIO_WORKER_THREADS
-              value: "2"
+              value: "${TUILE_THREADS}"
           resources:
             requests:
               cpu: 100m
-              memory: 2Gi
-            # A bake has been measured between 0.6 and 1.4 GB resident.
+              memory: ${TUILE_MEMORY_REQUEST}
+            # A bake has been measured between 0.6 and 1.4 GB resident. With
+            # the threads above at one core and a half, a pack of four frames
+            # took a quarter of an hour: the CPU limit is what a run costs.
             limits:
-              cpu: 1500m
-              memory: 3Gi
+              cpu: "${TUILE_CPU_LIMIT}"
+              memory: ${TUILE_MEMORY_LIMIT}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
