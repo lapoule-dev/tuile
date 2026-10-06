@@ -155,6 +155,9 @@ impl Default for LevelParams {
 pub struct LevelGains {
     pub anchor: u8,
     pub gains: BTreeMap<u8, [f32; 3]>,
+    /// The source each level is of: levels that are one source resampled
+    /// name the same level, the coarsest of them.
+    pub sources: BTreeMap<u8, u8>,
     /// For each pair of levels observed: how many observations, their
     /// agreed gain, and what the solve leaves of it. What a reader looks at
     /// to know whether "one gain a level" holds on this ground.
@@ -362,6 +365,7 @@ impl LevelGains {
         Self {
             anchor,
             gains,
+            sources: source,
             pairs,
         }
     }
@@ -412,6 +416,7 @@ impl LevelGains {
         Some(Self {
             anchor,
             gains,
+            sources: BTreeMap::new(),
             pairs: Vec::new(),
         })
     }
