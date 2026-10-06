@@ -1,0 +1,16 @@
+[package]
+name = "tuile-radiometry"
+description = "Radiometric harmonisation of imagery tiles: a low-frequency gain field, anchored by the pyramid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# No backend and nothing heavy: numbers in, numbers out. It compiles to
+# wasm32, where a renderer applies a field it read, and runs natively, where
+# a bake computes one.
+[dependencies]
+
+[lints]
+workspace = true
