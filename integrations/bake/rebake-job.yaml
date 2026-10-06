@@ -107,11 +107,14 @@ spec:
             # The baker sizes its pools on the machine's cores, which are the
             # node's and not this container's share of them.
             # What bounds the baker's memory, so that a pack of any size is
-            # baked inside the limit below. Tiles kept resident for the
-            # selection are the large term, and its default is the size of
-            # the limit itself; a frame that needs more than this fails, by
-            # name, instead of taking the container down. Then the decoded
-            # textures remembered between tiles, and the fetch cache.
+            # baked inside the limit below: the decoded textures remembered
+            # between tiles and the fetch cache.
+            #
+            # The budget of resident tiles is NOT one of them, and must not
+            # be lowered to fit: it is counted in the tiles' own terms, not
+            # in bytes held. At 2, the first frame of a 7200-frame pack did
+            # not converge in fifteen minutes; at 4 it converged in 43 s with
+            # the baker at 1.4 GiB and the container peaking at 2.0 GiB.
             - name: TUILE_RESIDENT_BUDGET_GB
               value: "${TUILE_RESIDENT_GB}"
             - name: TUILE_TEXTURE_MEMO_MB
