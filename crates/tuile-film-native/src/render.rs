@@ -52,6 +52,8 @@ pub struct Order {
     pub tone: Tone,
     /// How much of the tone correction, 0 to 1.
     pub tone_strength: f32,
+    /// How the film is lit, exposed, and its imagery read.
+    pub look: Look,
 }
 
 impl Default for Order {
@@ -64,6 +66,7 @@ impl Default for Order {
             fps: 30,
             tone: Tone::OfTheStore,
             tone_strength: 1.0,
+            look: Look::default(),
         }
     }
 }
@@ -158,7 +161,7 @@ pub async fn render(
             width,
             height,
             supersample: order.supersample.max(1),
-            look: Look::default(),
+            look: order.look,
         },
     );
     let padded = (width * 4).div_ceil(256) * 256;
