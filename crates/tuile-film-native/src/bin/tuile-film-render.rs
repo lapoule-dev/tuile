@@ -7,9 +7,15 @@
 //! tuile-film-render <packs prefix> [options]
 //!
 //!   --out <film.mp4>      the film, in an mp4
-//!   --codec <av1|h264>    av1 by rav1e, anywhere; h264 by the machine's
-//!                         own encoder, on macOS when built with the
-//!                         `videotoolbox` feature (the default there)
+//!   --codec <name>        av1: rav1e, in software, anywhere.
+//!                         h264: the machine's own encoder — VideoToolbox
+//!                         on macOS (feature `videotoolbox`), NVENC on
+//!                         Linux (feature `nvenc`).
+//!                         nvenc-av1, nvenc-h264: an NVIDIA card's encoder
+//!                         (feature `nvenc`; card chosen by
+//!                         TUILE_CUDA_DEVICE, default 0).
+//!                         Default: the machine's own where one was built
+//!                         in (AV1 on NVIDIA), rav1e otherwise.
 //!   --pictures <dir>      one PNG a frame
 //!   --meter <dir>         measure light going in and coming out; write
 //!                         tiles.csv, frames.csv, tone.json, report.md
@@ -74,6 +80,40 @@ impl Sink for Both {
     }
     fn spent(&self) -> Vec<(String, f64)> {
         self.0.iter().flat_map(|s| s.spent()).collect()
+    }
+}
+
+/// The film's encoder: the one asked for, or the best this binary has —
+/// the machine's own before software.
+fn film_sink(path: String, bitrate: u32, codec: Option<&str>) -> Result<Box<dyn Sink>, Error> {
+    #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+    if matches!(codec, Some("h264") | None) {
+        return Ok(Box::new(tuile_film_native::H264Film::at(path, bitrate)));
+    }
+    #[cfg(all(target_os = "linux", feature = "nvenc"))]
+    {
+        use tuile_film_native::{NvencCodec, NvencFilm};
+        let device = std::env::var("TUILE_CUDA_DEVICE")
+            .ok()
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(0);
+        match codec {
+            Some("nvenc-av1") | None => {
+                return Ok(Box::new(
+                    NvencFilm::at(path, bitrate, NvencCodec::Av1).on_device(device),
+                ))
+            }
+            Some("nvenc-h264") | Some("h264") => {
+                return Ok(Box::new(
+                    NvencFilm::at(path, bitrate, NvencCodec::H264).on_device(device),
+                ))
+            }
+            _ => {}
+        }
+    }
+    match codec {
+        Some("av1") | None => Ok(Box::new(Av1Film::at(path, bitrate))),
+        Some(other) => Err(format!("no {other} encoder was built into this binary").into()),
     }
 }
 
@@ -145,19 +185,7 @@ async fn main() -> Result<(), Error> {
     if let Some(path) = value("--out") {
         let bitrate = (mbps * 1e6) as u32;
         let codec = value("--codec");
-        #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
-        let film: Box<dyn Sink> = match codec.as_deref() {
-            Some("av1") => Box::new(Av1Film::at(path, bitrate)),
-            Some("h264") | None => Box::new(tuile_film_native::H264Film::at(path, bitrate)),
-            Some(other) => return Err(format!("no codec {other}").into()),
-        };
-        #[cfg(not(all(target_os = "macos", feature = "videotoolbox")))]
-        let film: Box<dyn Sink> = match codec.as_deref() {
-            Some("av1") | None => Box::new(Av1Film::at(path, bitrate)),
-            Some(other) => {
-                return Err(format!("no {other} encoder was built into this binary").into())
-            }
-        };
+        let film: Box<dyn Sink> = film_sink(path, bitrate, codec.as_deref())?;
         sinks.push(film);
     }
     if let Some(dir) = value("--pictures") {

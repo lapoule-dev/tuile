@@ -20,7 +20,10 @@
 //!   out. The render knows nothing of what an observer does with it;
 //!   [`meter::LightMeter`] is one, and measures light.
 
+pub mod av1;
 pub mod meter;
+#[cfg(all(target_os = "linux", feature = "nvenc"))]
+pub mod nvenc;
 pub mod observe;
 pub mod render;
 pub mod sink;
@@ -29,6 +32,8 @@ pub mod source;
 pub mod videotoolbox;
 
 pub use meter::LightMeter;
+#[cfg(all(target_os = "linux", feature = "nvenc"))]
+pub use nvenc::{NvencCodec, NvencFilm};
 pub use observe::{FrameOut, ImageryIn, Observer, Origin, TileIn, Timings};
 pub use render::{render, Order, Tone};
 pub use sink::{Av1Film, Nothing, Pictures, Sink};

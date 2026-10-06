@@ -32,6 +32,12 @@ objc2-core-media = { version = "0.3.2", optional = true }
 objc2-core-video = { version = "0.3.2", optional = true }
 objc2-video-toolbox = { version = "0.3.2", optional = true }
 
+# NVIDIA's encoder, for the `nvenc` feature.
+[target.'cfg(target_os = "linux")'.dependencies]
+nvidia-video-codec-sdk = { version = "0.4.0", optional = true }
+# The same cudarc the encoder's bindings are built on, for its context.
+cudarc = { version = "0.16.4", optional = true, default-features = false, features = ["driver", "std", "cuda-version-from-build-system", "dynamic-linking"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 
@@ -46,6 +52,10 @@ videotoolbox = [
     "dep:objc2-core-video",
     "dep:objc2-video-toolbox",
 ]
+
+# AV1 or H.264 by an NVIDIA card's encoder (NVENC, over CUDA): Linux only,
+# and ignored elsewhere.
+nvenc = ["dep:nvidia-video-codec-sdk", "dep:cudarc"]
 
 [lints]
 workspace = true
