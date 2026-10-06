@@ -28,6 +28,11 @@
 //!   --no-tone             imagery as stored: no tone correction
 //!   --tone-table <file>   this tone table, not the store's
 //!   --tone <0..1>         how much of the correction (default 1)
+//!   --imagery <stored|decoded>
+//!                         how imagery's values are read before lighting:
+//!                         as they lie (the default look), or decoded from
+//!                         sRGB as a photograph asks
+//!   --exposure <stops>    the look's exposure
 //!   --anchor <level>      the level --meter's own solve holds still (10)
 //!   --cache <dir>         chunks of packs and archives (default
 //!                         $TUILE_CACHE_DIR, else ./film-cache)
@@ -158,6 +163,14 @@ async fn main() -> Result<(), Error> {
         order.tone = Tone::Table(
             LevelGains::from_json(&text).ok_or_else(|| format!("{path} is not a tone table"))?,
         );
+    }
+    match value("--imagery").as_deref() {
+        Some("decoded") => order.look.imagery = tuile_film::Imagery::Decoded,
+        Some("stored") | None => {}
+        Some(other) => return Err(format!("imagery is read stored or decoded, not {other}").into()),
+    }
+    if let Some(stops) = value("--exposure") {
+        order.look.exposure_ev = stops.parse()?;
     }
     if flag("--no-tone") {
         order.tone = Tone::Off;
