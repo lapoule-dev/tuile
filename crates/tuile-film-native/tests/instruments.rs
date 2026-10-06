@@ -196,3 +196,37 @@ fn a_film_of_pictures_is_an_mp4_with_every_one_of_them() {
     let count = u32::from_be_bytes(bytes[stsz + 12..stsz + 16].try_into().expect("four bytes"));
     assert_eq!(count, 5);
 }
+
+/// The machine's own encoder, where there is one: every picture given
+/// comes back, in an mp4 a player opens.
+#[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+#[test]
+fn the_machines_encoder_writes_an_h264_mp4_with_every_picture() {
+    use tuile_film_native::H264Film;
+
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("film.mp4");
+    let (width, height) = (320usize, 240usize);
+    let mut film = H264Film::at(&path, 2_000_000);
+    film.open(width as u32, height as u32, 30).expect("open");
+    for n in 0..12u32 {
+        let mut i420 = vec![(30 + n * 15) as u8; width * height];
+        i420.resize(width * height * 3 / 2, 128);
+        film.picture(n, n + 1, &[], &i420).expect("picture");
+    }
+    assert!(film.picture(12, 13, &[], &[0; 10]).is_err());
+    film.close().expect("close");
+
+    let bytes = std::fs::read(&path).expect("film");
+    let has = |tag: &[u8]| bytes.windows(tag.len()).any(|w| w == tag);
+    assert!(
+        has(b"ftyp") && has(b"moov") && has(b"avc1") && has(b"avcC"),
+        "not an H.264 mp4"
+    );
+    let stsz = bytes
+        .windows(4)
+        .position(|w| w == b"stsz")
+        .expect("a sample size table");
+    let count = u32::from_be_bytes(bytes[stsz + 12..stsz + 16].try_into().expect("four bytes"));
+    assert_eq!(count, 12);
+}

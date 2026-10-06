@@ -182,7 +182,11 @@ impl Cache {
     pub fn over(origin: Arc<dyn Objects>, dir: impl Into<std::path::PathBuf>) -> Self {
         let fetched = Counting::new(origin);
         let cached: Arc<dyn Objects> = Arc::new(Cached::new(fetched.clone(), DiskChunks::new(dir)));
-        let asked = Counting::new(cached);
+        let asked = Counting::new(Arc::new(Held {
+            behind: cached,
+            chunks: std::sync::Mutex::default(),
+            sizes: std::sync::Mutex::default(),
+        }));
         Self {
             objects: asked.clone(),
             asked,

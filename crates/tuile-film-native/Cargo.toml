@@ -25,12 +25,27 @@ tuile-radiometry = { version = "0.2.0", path = "../tuile-radiometry" }
 tuile-repository = { version = "0.2.0", path = "../tuile-repository" }
 wgpu = { workspace = true }
 
+# The system's frameworks, for the `videotoolbox` feature.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3.2", optional = true }
+objc2-core-media = { version = "0.3.2", optional = true }
+objc2-core-video = { version = "0.3.2", optional = true }
+objc2-video-toolbox = { version = "0.3.2", optional = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 
 [features]
 # rav1e's own assembly: several times faster, and no longer Rust alone.
 asm = ["rav1e/asm"]
+# H.264 by the machine's own hardware encoder, through VideoToolbox: macOS
+# only, and ignored elsewhere.
+videotoolbox = [
+    "dep:objc2-core-foundation",
+    "dep:objc2-core-media",
+    "dep:objc2-core-video",
+    "dep:objc2-video-toolbox",
+]
 
 [lints]
 workspace = true

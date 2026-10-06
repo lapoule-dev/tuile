@@ -80,35 +80,57 @@ pub struct Light {
     pub blue: f32,
 }
 
+/// Stored values as linear light, once.
+fn linear_table() -> &'static [f32; 256] {
+    static TABLE: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|v| linear(v as f32)))
+}
+
+/// Bins of luminance a picture's percentiles are read from: a 4096th of
+/// white each, which is finer than a stored value anywhere but the dark.
+const BINS: usize = 4096;
+
 fn light_of(frame: &FrameOut<'_>) -> Light {
-    let (width, height) = (frame.width, frame.height);
+    let (width, height) = (frame.width as usize, frame.height as usize);
+    let table = linear_table();
     let mut sum = [0.0f64; 3];
-    let mut bands = [[0.0f64; 2]; 3];
-    let mut each = Vec::with_capacity((width * height) as usize);
-    for (i, p) in frame.rgba.chunks_exact(4).enumerate() {
-        let rgb = [
-            linear(p[0].into()),
-            linear(p[1].into()),
-            linear(p[2].into()),
-        ];
-        for c in 0..3 {
-            sum[c] += f64::from(rgb[c]);
+    let mut bands = [0.0f64; 3];
+    let mut bins = vec![0u32; BINS + 1];
+    let third = (height / 3).max(1);
+    for (row, texels) in frame.rgba.chunks_exact(width * 4).enumerate() {
+        let (mut r, mut g, mut b) = (0.0f32, 0.0f32, 0.0f32);
+        for p in texels.chunks_exact(4) {
+            let rgb = [
+                table[p[0] as usize],
+                table[p[1] as usize],
+                table[p[2] as usize],
+            ];
+            r += rgb[0];
+            g += rgb[1];
+            b += rgb[2];
+            let y = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+            bins[(y * BINS as f32) as usize] += 1;
         }
-        let y = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
-        let band = ((i as u32 / width) * 3 / height).min(2) as usize;
-        bands[band][0] += f64::from(y);
-        bands[band][1] += 1.0;
-        each.push(y);
+        sum[0] += f64::from(r);
+        sum[1] += f64::from(g);
+        sum[2] += f64::from(b);
+        bands[(row / third).min(2)] += f64::from(0.2126 * r + 0.7152 * g + 0.0722 * b);
     }
-    each.sort_by(f32::total_cmp);
-    let at = |q: f32| {
-        each.get(((each.len().max(1) - 1) as f32 * q) as usize)
-            .copied()
-            .unwrap_or(0.0)
-            .max(1e-6)
-            .log2()
+    let n = (width * height).max(1) as f64;
+    let at = |q: f64| {
+        let (mut seen, wanted) = (0u64, (n * q) as u64);
+        for (bin, count) in bins.iter().enumerate() {
+            seen += u64::from(*count);
+            if seen > wanted {
+                return ((bin as f32 + 0.5) / BINS as f32).log2();
+            }
+        }
+        0.0
     };
-    let n = f64::from(width * height).max(1.0);
+    let rows_in = |band: usize| match band {
+        2 => height - 2 * third.min(height / 2),
+        _ => third,
+    };
     let mean = sum.map(|s| (s / n) as f32);
     Light {
         frame: frame.frame,
@@ -116,7 +138,11 @@ fn light_of(frame: &FrameOut<'_>) -> Light {
         p5: at(0.05),
         p50: at(0.5),
         p95: at(0.95),
-        bands: bands.map(|b| ((b[0] / b[1].max(1.0)) as f32).max(1e-6).log2()),
+        bands: std::array::from_fn(|band| {
+            ((bands[band] / (rows_in(band) * width).max(1) as f64) as f32)
+                .max(1e-6)
+                .log2()
+        }),
         red: (mean[0] / mean[1].max(1e-6)).max(1e-6).log2(),
         blue: (mean[2] / mean[1].max(1e-6)).max(1e-6).log2(),
     }

@@ -25,12 +25,16 @@ pub mod observe;
 pub mod render;
 pub mod sink;
 pub mod source;
+#[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+pub mod videotoolbox;
 
 pub use meter::LightMeter;
 pub use observe::{FrameOut, ImageryIn, Observer, Origin, TileIn, Timings};
 pub use render::{render, Order, Tone};
 pub use sink::{Av1Film, Nothing, Pictures, Sink};
 pub use source::{Counting, Film, Reads, Sources};
+#[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+pub use videotoolbox::H264Film;
 
 /// What goes wrong here is told to a person, not matched on.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
