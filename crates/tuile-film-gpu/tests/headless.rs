@@ -194,13 +194,52 @@ fn close(found: [u8; 3], wanted: [f32; 3]) -> bool {
         .all(|(f, w)| (f32::from(*f) - w * 255.0).abs() <= 2.0)
 }
 
-/// The sun straight down the camera's line of sight, so cos θ = 1.
+/// The sun straight down the camera's line of sight, so cos θ = 1, and
+/// the picture left as the lights make it: its contrast and saturation are
+/// tested apart.
 fn look() -> Look {
     Look {
         to_sun: Vec3::X,
         imagery: Imagery::Decoded,
+        contrast: 1.0,
+        saturation: 1.0,
         ..Look::default()
     }
+}
+
+/// The picture's own contrast and saturation come after the lights and the
+/// exposure: luminance to a power about middle grey, then what is not
+/// luminance scaled.
+#[test]
+fn the_pictures_contrast_and_saturation_come_after_the_exposure() {
+    let graded = Look {
+        contrast: 1.5,
+        saturation: 0.7,
+        ..look()
+    };
+    let Some(r) = render(graded, [90, 60, 30, 255], 2) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mut lit = [0.0f32; 3];
+    for c in 0..3 {
+        let a = eotf(f32::from([90u8, 60, 30][c]) / 255.0);
+        lit[c] = a * (graded.world[c] + graded.sun[c]) * graded.exposure_scale();
+    }
+    let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let by = (luma(lit) / 0.18).powf(graded.contrast - 1.0);
+    let lit = lit.map(|v| v * by);
+    let y = luma(lit);
+    let wanted = lit.map(|v| oetf(y + (v - y) * graded.saturation));
+    let centre = pixel(&r, 32, 24);
+    assert!(
+        close(centre, wanted),
+        "centre {centre:?}, wanted {:?}",
+        wanted.map(|c| c * 255.0)
+    );
+    // And it is not what the lights alone give.
+    let plain = render(look(), [90, 60, 30, 255], 2).expect("an adapter");
+    assert_ne!(pixel(&plain, 32, 24), centre);
 }
 
 #[test]
