@@ -6018,6 +6018,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tuile-core",
  "tuile-pack",
+ "tuile-terrain",
 ]
 
 [[package]]
@@ -6127,6 +6128,7 @@ version = "0.2.0"
 dependencies = [
  "axum",
  "dotenvy",
+ "image",
  "serde",
  "serde_json",
  "tempfile",
@@ -6136,7 +6138,9 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "tuile-core",
  "tuile-farm",
+ "tuile-film",
  "tuile-repository",
  "tuile-tile-server",
 ]

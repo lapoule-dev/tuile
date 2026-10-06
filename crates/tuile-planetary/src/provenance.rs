@@ -30,6 +30,11 @@ pub fn digest(bytes: &[u8]) -> u64 {
     })
 }
 
+/// A centre as a key: the same bits, or not the same mesh.
+fn bits(centre: [f64; 3]) -> [u64; 3] {
+    centre.map(f64::to_bits)
+}
+
 /// The terrain tile a mesh was built from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TerrainOrigin {
@@ -46,14 +51,20 @@ pub struct TerrainOrigin {
 /// [`crate::globe_with_provenance`].
 #[derive(Default)]
 pub struct Provenance {
-    terrain: Mutex<HashMap<TileCoord, (TileCoord, u64)>>,
+    /// By the tile **and the centre of its mesh**. A tile can be built
+    /// twice in one session, from two places — cut from an ancestor while
+    /// the source's own tile was not known to exist, decoded from that tile
+    /// later — and the two meshes are both out there. The centre is the
+    /// source tile's own, carried through every cut, so it says which.
+    terrain: Mutex<HashMap<(TileCoord, [u64; 3]), (TileCoord, u64)>>,
     imagery: Mutex<HashMap<ImageryCoord, u64>>,
 }
 
 impl Provenance {
-    /// Where the mesh of `tile` came from, once the loader has built it.
-    pub fn terrain(&self, tile: TileCoord) -> Option<TerrainOrigin> {
-        let (source, digest) = *self.terrain.lock().ok()?.get(&tile)?;
+    /// Where the mesh of `tile` whose origin is `centre` came from, once the
+    /// loader has built it.
+    pub fn terrain(&self, tile: TileCoord, centre: [f64; 3]) -> Option<TerrainOrigin> {
+        let (source, digest) = *self.terrain.lock().ok()?.get(&(tile, bits(centre)))?;
         let rect = GeographicTilingScheme::default().tile_rect(tile);
         Some(TerrainOrigin {
             source,
@@ -70,19 +81,20 @@ impl Provenance {
     // What follows is the loader's side: what it notes as it fetches. Public
     // because a loader need not be this crate's.
 
-    /// `tile` was decoded from its own bytes.
-    pub fn fetched_terrain(&self, tile: TileCoord, bytes: &[u8]) {
+    /// `tile` was decoded from its own bytes, which digest to `digest`, into
+    /// a mesh centred on `centre`.
+    pub fn fetched_terrain(&self, tile: TileCoord, centre: [f64; 3], digest: u64) {
         if let Ok(mut terrain) = self.terrain.lock() {
-            terrain.insert(tile, (tile, digest(bytes)));
+            terrain.insert((tile, bits(centre)), (tile, digest));
         }
     }
 
-    /// `tile` was cut from `parent`'s mesh, so it comes from wherever that
-    /// did.
-    pub fn upsampled_terrain(&self, tile: TileCoord, parent: TileCoord) {
+    /// `tile` was cut from the mesh of `parent` centred on `centre` — a cut
+    /// keeps its ancestor's centre — so it comes from wherever that did.
+    pub fn upsampled_terrain(&self, tile: TileCoord, parent: TileCoord, centre: [f64; 3]) {
         if let Ok(mut terrain) = self.terrain.lock() {
-            if let Some(origin) = terrain.get(&parent).copied() {
-                terrain.insert(tile, origin);
+            if let Some(origin) = terrain.get(&(parent, bits(centre))).copied() {
+                terrain.insert((tile, bits(centre)), origin);
             }
         }
     }
@@ -106,19 +118,35 @@ mod tests {
             TileCoord::new(4, 10, 4),
             TileCoord::new(5, 21, 9),
         );
-        assert_eq!(noted.terrain(root), None);
-        noted.fetched_terrain(root, b"bytes of the root");
-        noted.upsampled_terrain(child, root);
-        noted.upsampled_terrain(grandchild, child);
-        let origin = noted.terrain(grandchild).expect("noted");
+        let centre = [1.0, 2.0, 3.0];
+        assert_eq!(noted.terrain(root, centre), None);
+        noted.fetched_terrain(root, centre, digest(b"bytes of the root"));
+        noted.upsampled_terrain(child, root, centre);
+        noted.upsampled_terrain(grandchild, child, centre);
+        let origin = noted.terrain(grandchild, centre).expect("noted");
         assert_eq!(origin.source, root);
         assert_eq!(origin.digest, digest(b"bytes of the root"));
         // The skirt is the drawn tile's, not its ancestor's: it hangs from
         // the edges of the tile that is drawn.
-        assert!(origin.skirt_height < noted.terrain(root).expect("noted").skirt_height);
+        assert!(origin.skirt_height < noted.terrain(root, centre).expect("noted").skirt_height);
         // A tile cut from a parent nobody noted comes from nowhere known.
-        noted.upsampled_terrain(TileCoord::new(9, 1, 1), TileCoord::new(8, 0, 0));
-        assert_eq!(noted.terrain(TileCoord::new(9, 1, 1)), None);
+        noted.upsampled_terrain(TileCoord::new(9, 1, 1), TileCoord::new(8, 0, 0), centre);
+        assert_eq!(noted.terrain(TileCoord::new(9, 1, 1), centre), None);
+    }
+
+    /// One tile, built twice in a session: first cut from its parent, then
+    /// decoded from its own bytes once the source turned out to have them.
+    /// Both meshes exist, and each says where it came from.
+    #[test]
+    fn a_tile_built_twice_keeps_both_origins() {
+        let noted = Provenance::default();
+        let (parent, tile) = (TileCoord::new(7, 20, 9), TileCoord::new(8, 41, 18));
+        let (of_parent, of_tile) = ([10.0, 0.0, 0.0], [10.5, 0.0, 0.0]);
+        noted.fetched_terrain(parent, of_parent, 1);
+        noted.upsampled_terrain(tile, parent, of_parent);
+        noted.fetched_terrain(tile, of_tile, 2);
+        assert_eq!(noted.terrain(tile, of_parent).expect("cut").source, parent);
+        assert_eq!(noted.terrain(tile, of_tile).expect("own").source, tile);
     }
 
     #[test]

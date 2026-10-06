@@ -1309,7 +1309,12 @@ fn refs_of(
 ) -> Option<tuile_pack::TileRefs> {
     use tuile_pack::{ImageryPlacement, StoreTile, TileRefs};
     let (level, x, y) = tile.terrain_coord();
-    let origin = provenance.terrain(tuile_terrain::TileCoord::new(level, x, y))?;
+    // By the tile and by the centre of this mesh: a tile can be built twice
+    // in a session, from two places, and this is one of the two.
+    let origin = provenance.terrain(
+        tuile_terrain::TileCoord::new(level, x, y),
+        decoded.local_origin_ecef.to_array(),
+    )?;
     let imagery = decoded
         .imagery
         .iter()
@@ -1787,7 +1792,8 @@ mod tests {
 
         // The terrain alone is half a reference, which is none.
         let noted = tuile_planetary::Provenance::default();
-        noted.fetched_terrain(coord, b"terrain bytes");
+        let centre = draped_content().local_origin_ecef.to_array();
+        noted.fetched_terrain(coord, centre, tuile_planetary::digest(b"terrain bytes"));
         let half = finish_tile_from(&memo, "t", tile, draped_content(), 256, Some(&noted));
         assert_eq!(half.refs, None);
 

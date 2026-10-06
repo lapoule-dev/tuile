@@ -11,6 +11,7 @@
 
 mod camera;
 mod cursor;
+pub mod from_store;
 mod look;
 mod mesh;
 mod ranges;
