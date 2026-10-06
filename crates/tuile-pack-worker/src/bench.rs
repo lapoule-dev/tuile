@@ -251,7 +251,7 @@ async fn bench(env: &Env, with_tiles: bool) -> std::result::Result<Bench, String
     })
 }
 
-async fn respond(mut reply: Reply) -> Result<Response> {
+async fn respond(mut reply: Reply) -> Result<(Vec<u8>, u16, Headers)> {
     let headers = Headers::new();
     headers.set("content-type", &reply.content_type)?;
     headers.set("cache-control", reply.cache_control)?;
@@ -267,18 +267,26 @@ async fn respond(mut reply: Reply) -> Result<Response> {
     if let Some(range) = &reply.content_range {
         headers.set("content-range", range)?;
     }
-    let response = match reply.later.take() {
+    let body = match reply.later.take() {
         // A block is one chunk of the cache below: read whole, and handed
         // over as it is.
-        Some(later) => Response::from_bytes(
-            later
-                .read()
-                .await
-                .map_err(|e| worker::Error::RustError(e.to_string()))?,
-        )?,
-        None => Response::from_bytes(reply.body)?,
+        Some(later) => later
+            .read()
+            .await
+            .map_err(|e| worker::Error::RustError(e.to_string()))?,
+        None => std::mem::take(&mut reply.body),
     };
-    Ok(response.with_status(reply.status).with_headers(headers))
+    Ok((body, reply.status, headers))
+}
+
+/// A response of these bytes. Made afresh each time one is needed: a reply
+/// kept in the cache is its own response, not a clone of the one sent — a
+/// cloned body is a stream read from two ends, and a request whose client
+/// had finished before the cache had was found hung by the runtime.
+fn response(body: &[u8], status: u16, headers: &Headers) -> Result<Response> {
+    Ok(Response::from_bytes(body.to_vec())?
+        .with_status(status)
+        .with_headers(headers.clone()))
 }
 
 /// Whether a path is a block of an object: `/api/p/<project>/b8/<n>/<key>`.
@@ -337,13 +345,13 @@ pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> 
         None => return Response::error("no such route", 404),
     };
     let stored = cacheable && reply.status == 200;
-    let mut response = respond(reply).await?;
+    let (body, status, headers) = respond(reply).await?;
     if stored {
         // Kept after the reply has gone: the client does not wait for it.
-        let copy = response.cloned()?;
+        let copy = response(&body, status, &headers)?;
         ctx.wait_until(async move {
             let _ = cache.put(&key, copy).await;
         });
     }
-    Ok(response)
+    response(&body, status, &headers)
 }

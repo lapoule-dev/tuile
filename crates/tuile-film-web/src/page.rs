@@ -36,9 +36,11 @@ use web_sys::{
 
 use crate::encode::browser_config;
 use crate::js::{get, now, number, object, string, text};
-use crate::source::BLOCK_BYTES;
+use crate::source::{Source, BLOCK_BYTES};
 use crate::store::Store;
 use crate::worker::PackView;
+use tuile_film::Pack;
+use tuile_radiometry::{region_key, LevelGrades, REGION_LEVEL};
 use tuile_repository::{RepoError, TileRepository};
 
 // ------------------------------------------------------------------ the API
@@ -1317,6 +1319,66 @@ fn describe_encoder() {
 
 /// What a slice of the film has to read: each pack it crosses, with the
 /// frames of that pack the slice wants.
+/// The film's table of grades, as JSON (empty if the store has none for
+/// it), with how many places the film's imagery lies in and how many of
+/// them the store had a table for.
+///
+/// Every pack of the film is asked where its imagery lies — the whole
+/// film, whatever frames are to be rendered — and the tables the store
+/// keeps for those places are made one by how much of the film is in each.
+async fn film_tone(
+    scene: &Scene,
+    api: &str,
+    project: &str,
+) -> Result<(String, usize, usize), String> {
+    let mut places: std::collections::BTreeMap<(u32, u32), u32> = Default::default();
+    let mut layer = None;
+    for (url, _, _) in crossing(scene, api, project, 0, u32::MAX) {
+        let head = Source::from_js(&url.into())
+            .map_err(text)?
+            .head()
+            .await
+            .map_err(text)?;
+        let pack = Pack::open_table(&head).map_err(|e| e.to_string())?;
+        let Some((_, imagery)) = pack.store_layers() else {
+            continue;
+        };
+        layer = Some(imagery.to_string());
+        for (place, tiles) in pack.imagery_regions(REGION_LEVEL) {
+            *places.entry(place).or_default() += tiles;
+        }
+    }
+    let Some(layer) = layer else {
+        return Ok((String::new(), 0, 0));
+    };
+    let store = Store::open(api).await.map_err(|e| e.to_string())?;
+    let asked: Vec<((u32, u32), u32)> = places.iter().map(|(p, n)| (*p, *n)).collect();
+    let mut found = Vec::new();
+    // A few at a time: most places have no table, and each is a request.
+    for some in asked.chunks(16) {
+        let read = join_all(
+            some.iter()
+                .map(|((x, y), _)| store.small_owned(region_key(&layer, *x, *y))),
+        )
+        .await;
+        for ((_, tiles), bytes) in some.iter().zip(read) {
+            if let Some(bytes) = bytes.map_err(|e| e.to_string())? {
+                let table = std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(LevelGrades::from_json)
+                    .ok_or("a table of the store is not a tone table")?;
+                found.push((table, *tiles as f32));
+            }
+        }
+    }
+    let parts: Vec<(&LevelGrades, f32)> = found.iter().map(|(t, w)| (t, *w)).collect();
+    Ok((
+        LevelGrades::merged(&parts).map_or(String::new(), |t| t.to_json()),
+        places.len(),
+        found.len(),
+    ))
+}
+
 fn crossing(
     scene: &Scene,
     api: &str,
@@ -1506,6 +1568,26 @@ async fn render() {
         );
         return;
     }
+    // One table of grades for the film, made here once and handed to every
+    // worker: a film is one grade a level from its first frame to its last.
+    let tone_table = if tone > 0.0 {
+        status("Calage des couleurs : lecture des tables du store…", "");
+        match film_tone(&scene, &api, &project).await {
+            Ok((table, places, had)) => {
+                status(
+                    &format!("Calage des couleurs : tables du store pour {had} régions sur les {places} du film."),
+                    "",
+                );
+                table
+            }
+            Err(why) => {
+                status(&format!("Calage des couleurs impossible : {why}"), "bad");
+                return;
+            }
+        }
+    } else {
+        String::new()
+    };
     let parts = slice(first, last, (value_of("workers") as u32).max(1));
     let encoder = if chosen_is_soft() {
         "AV1 (rav1e)"
@@ -1694,6 +1776,7 @@ async fn render() {
             ("height", height.into()),
             ("supersample", supersample.into()),
             ("tone", tone.into()),
+            ("toneTable", tone_table.as_str().into()),
             ("fps", fps.into()),
             ("bitrate", bitrate.into()),
         ]);
