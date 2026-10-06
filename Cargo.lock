@@ -1043,6 +1043,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudarc"
+version = "0.16.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17200eb07e7d85a243aa1bf4569a7aa998385ba98d14833973a817a63cc86e92"
+dependencies = [
+ "libloading 0.8.9",
+]
+
+[[package]]
 name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3495,6 +3504,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "nvidia-video-codec-sdk"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b150dfc88653e761947906dfc0ea14af16ae366cfc55122caab94381761605a"
+dependencies = [
+ "cudarc",
+ "lazy_static",
 ]
 
 [[package]]
@@ -6104,6 +6123,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tuile-pack",
  "url",
 ]
 
@@ -6140,9 +6160,11 @@ name = "tuile-film-native"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "cudarc",
  "dotenvy",
  "futures-util",
  "image",
+ "nvidia-video-codec-sdk",
  "objc2-core-foundation",
  "objc2-core-media",
  "objc2-core-video",
