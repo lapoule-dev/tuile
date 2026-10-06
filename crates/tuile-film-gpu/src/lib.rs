@@ -118,6 +118,7 @@ struct Pipelines {
     resolve: wgpu::ComputePipeline,
     present: wgpu::ComputePipeline,
     mips: wgpu::ComputePipeline,
+    compose: wgpu::ComputePipeline,
     y_plane: wgpu::ComputePipeline,
     uv_planes: wgpu::ComputePipeline,
 }
@@ -143,6 +144,40 @@ pub struct FilmGpu {
     resident: HashMap<TileKey, Resident>,
     free: Vec<u32>,
     pending_mips: Vec<wgpu::Texture>,
+    /// Drapes to compose before the next frame is drawn — and before their
+    /// mips, which are made from what this writes.
+    pending_drapes: Vec<Drape>,
+}
+
+/// One imagery tile of a drape and where it lies on the terrain tile.
+pub struct DrapeLayer {
+    /// The imagery tile, sRGB-encoded as stored, on geographic spacing:
+    /// see [`FilmGpu::create_imagery`]. Shared by every tile it lies on.
+    pub texture: wgpu::Texture,
+    /// The part of the tile's uv it covers: u0, v0, u1, v1.
+    pub coverage: [f32; 4],
+    /// uv of the imagery tile = uv of the tile × scale + translation.
+    pub translation: [f32; 2],
+    pub scale: [f32; 2],
+}
+
+struct Drape {
+    albedo: wgpu::Texture,
+    base: [f32; 4],
+    layers: Vec<DrapeLayer>,
+}
+
+/// What one dispatch of the composition is told: `compose.wgsl`'s `Job`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ComposeJob {
+    coverage: [f32; 4],
+    translation: [f32; 2],
+    scale: [f32; 2],
+    base: [f32; 4],
+    origin: [u32; 2],
+    mode: u32,
+    pad: u32,
 }
 
 fn shader(device: &wgpu::Device, name: &str, body: &str) -> wgpu::ShaderModule {
@@ -336,6 +371,11 @@ impl FilmGpu {
             include_str!("shaders/present.wgsl"),
         );
         let mips_module = shader(&device, "film mips", include_str!("shaders/mips.wgsl"));
+        let compose_module = shader(
+            &device,
+            "film compose",
+            include_str!("shaders/compose.wgsl"),
+        );
         let i420_module = shader(&device, "film i420", include_str!("shaders/i420.wgsl"));
         let pipelines = Pipelines {
             raster,
@@ -345,6 +385,7 @@ impl FilmGpu {
             resolve: compute(&device, &resolve_module, "resolve", Some(&resolve_layout)),
             present: compute(&device, &present_module, "present", None),
             mips: compute(&device, &mips_module, "downsample", None),
+            compose: compute(&device, &compose_module, "compose", None),
             y_plane: compute(&device, &i420_module, "y_plane", None),
             uv_planes: compute(&device, &i420_module, "uv_planes", None),
         };
@@ -480,6 +521,7 @@ impl FilmGpu {
             resident: HashMap::new(),
             free: (0..MAX_SLOTS).rev().collect(),
             pending_mips: Vec::new(),
+            pending_drapes: Vec::new(),
         }
     }
 
@@ -675,10 +717,149 @@ impl FilmGpu {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: ALBEDO_FORMAT,
-            // RENDER_ATTACHMENT is what a browser's external-image copy needs.
-            usage: U::TEXTURE_BINDING | U::STORAGE_BINDING | U::COPY_DST | U::RENDER_ATTACHMENT,
+            // RENDER_ATTACHMENT is what a browser's external-image copy needs;
+            // COPY_SRC lets a test read back what was composed into it.
+            usage: U::TEXTURE_BINDING
+                | U::STORAGE_BINDING
+                | U::COPY_DST
+                | U::COPY_SRC
+                | U::RENDER_ATTACHMENT,
             view_formats: &[ALBEDO_VIEW],
         })
+    }
+
+    /// A texture for one imagery tile, to be composed into drapes: a single
+    /// level, sRGB-encoded as stored. Fill it with [`Self::write_rgba`].
+    pub fn create_imagery(&self, width: u32, height: u32) -> wgpu::Texture {
+        use wgpu::TextureUsages as U;
+        self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("film imagery"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: ALBEDO_FORMAT,
+            usage: U::TEXTURE_BINDING | U::COPY_DST | U::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+    }
+
+    /// Composes a drape into level 0 of `albedo`, before the next frame is
+    /// drawn: `base` where no layer reaches, then each layer over its
+    /// rectangle, in order. The arithmetic is the bake's.
+    ///
+    /// Every layer must be opaque — an imagery tile is. A stack with a
+    /// translucent layer blends, which this pass does not do: compose that
+    /// one on the CPU and upload it.
+    pub fn compose(&mut self, albedo: &wgpu::Texture, base: [f32; 4], layers: Vec<DrapeLayer>) {
+        self.pending_drapes.push(Drape {
+            albedo: albedo.clone(),
+            base,
+            layers,
+        });
+    }
+
+    /// Records what was queued since the last frame — drapes, then the mips
+    /// of every texture entered — onto `encoder`. [`Self::render`] does this
+    /// itself; it is public for a caller that wants the textures made without
+    /// drawing a frame.
+    pub fn record_pending(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.record_drapes(encoder);
+        Self::record_mips(
+            &self.device,
+            &self.pipelines.mips,
+            encoder,
+            &self.pending_mips,
+        );
+        self.pending_mips.clear();
+    }
+
+    fn record_drapes(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.pending_drapes.is_empty() {
+            return;
+        }
+        let layout = self.pipelines.compose.get_bind_group_layout(0);
+        // Every dispatch's bind group is made before the pass begins: the
+        // pass borrows them for as long as it lives.
+        let mut dispatches = Vec::new();
+        for drape in self.pending_drapes.drain(..) {
+            let (w, h) = (drape.albedo.width(), drape.albedo.height());
+            let dst = drape.albedo.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(ALBEDO_FORMAT),
+                base_mip_level: 0,
+                mip_level_count: Some(1),
+                ..Default::default()
+            });
+            let mut dispatch = |job: ComposeJob, src: &wgpu::TextureView, size: [u32; 2]| {
+                let uniform = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("film compose job"),
+                        contents: bytemuck::bytes_of(&job),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("film compose"),
+                    layout: &layout,
+                    entries: &[
+                        entry(0, wgpu::BindingResource::TextureView(src)),
+                        entry(1, wgpu::BindingResource::TextureView(&dst)),
+                        entry(2, uniform.as_entire_binding()),
+                    ],
+                });
+                dispatches.push((group, size[0].div_ceil(8), size[1].div_ceil(8)));
+            };
+            let blank = ComposeJob {
+                coverage: [0.0; 4],
+                translation: [0.0; 2],
+                scale: [0.0; 2],
+                base: drape.base,
+                origin: [0, 0],
+                mode: 0,
+                pad: 0,
+            };
+            dispatch(blank, &self.white, [w, h]);
+            for layer in &drape.layers {
+                // The texels whose centres can fall in the layer's rectangle,
+                // generously: the shader decides each one exactly.
+                let c = layer.coverage;
+                let x0 = ((c[0] * w as f32).floor().max(0.0) as u32).min(w);
+                let y0 = ((c[1] * h as f32).floor().max(0.0) as u32).min(h);
+                let x1 = ((c[2] * w as f32).ceil().max(0.0) as u32).min(w);
+                let y1 = ((c[3] * h as f32).ceil().max(0.0) as u32).min(h);
+                if x1 <= x0 || y1 <= y0 {
+                    continue;
+                }
+                let src = layer
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                dispatch(
+                    ComposeJob {
+                        coverage: c,
+                        translation: layer.translation,
+                        scale: layer.scale,
+                        origin: [x0, y0],
+                        mode: 1,
+                        ..blank
+                    },
+                    &src,
+                    [x1 - x0, y1 - y0],
+                );
+            }
+        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("film compose"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipelines.compose);
+        for (group, x, y) in &dispatches {
+            pass.set_bind_group(0, group, &[]);
+            pass.dispatch_workgroups(*x, *y, 1);
+        }
     }
 
     /// Uploads tightly packed sRGB-encoded RGBA8 into level 0.
@@ -816,6 +997,14 @@ impl FilmGpu {
         camera: &FrameCamera,
         selection: &[TileKey],
     ) -> Result<wgpu::CommandEncoder, FilmGpuError> {
+        // What was queued since the last frame comes first: the drapes, then
+        // the mips made from them, before anything samples either.
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("film frame"),
+            });
+        self.record_pending(&mut encoder);
         let mut drawn = Vec::with_capacity(selection.len());
         let mut top = 0usize;
         for key in selection {
@@ -842,18 +1031,6 @@ impl FilmGpu {
                 .write_buffer(&self.tiles_buf, 0, bytemuck::cast_slice(&self.tiles[..top]));
         }
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("film frame"),
-            });
-        Self::record_mips(
-            &self.device,
-            &self.pipelines.mips,
-            &mut encoder,
-            &self.pending_mips,
-        );
-        self.pending_mips.clear();
         encoder.clear_buffer(&self.counts, 0, None);
 
         {

@@ -294,3 +294,148 @@ fn imagery_lit_as_stored_skips_the_srgb_decode() {
         wanted.map(|c| c * 255.0)
     );
 }
+
+/// A texture of noise that is the same every run.
+fn noise(side: u32, seed: u32) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..side * side * 4)
+        .map(|i| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            // Opaque: an imagery tile is.
+            if i % 4 == 3 {
+                255
+            } else {
+                (state >> 8) as u8
+            }
+        })
+        .collect()
+}
+
+/// A drape composed on the GPU is the drape the bake composes: the same
+/// layers, in the same order, at the same size, give the same texels — to
+/// within one step of a byte, which is how far two machines' arithmetic may
+/// part on a value that falls on a boundary.
+#[test]
+fn a_drape_composed_on_the_gpu_is_the_bakes() {
+    use std::sync::Arc;
+    use tuile_core::content::DecodedTexture;
+    use tuile_core::raster::{bake_layers, ImageryCoord, ImageryLayer};
+    use tuile_film_gpu::DrapeLayer;
+
+    let Some((device, queue)) = device() else {
+        eprintln!("no adapter: skipped");
+        return;
+    };
+    let mut film = FilmGpu::new(
+        device,
+        queue,
+        Settings {
+            width: 64,
+            height: 48,
+            supersample: 1,
+            look: Look::default(),
+        },
+    );
+
+    // A floor under everything, then three tiles of a finer level laid in
+    // quarters, with a quarter the floor alone covers; placements that land
+    // between texels, so the filtering is exercised and not only the masks.
+    let side = 96u32;
+    let stack: [(u32, u32, [f32; 4], [f32; 2], [f32; 2]); 4] = [
+        (16, 1, [0.0, 0.0, 1.0, 1.0], [0.21, 0.37], [0.4, 0.33]),
+        (32, 2, [0.0, 0.0, 0.5, 0.5], [0.0, 0.0], [2.0, 2.0]),
+        (32, 3, [0.5, 0.0, 1.0, 0.5], [-1.0, 0.0], [2.0, 2.0]),
+        (24, 4, [0.0, 0.5, 0.5, 1.0], [0.013, -0.97], [1.93, 1.97]),
+    ];
+    let base = [0.2, 0.4, 0.6, 1.0];
+
+    let mut cpu_layers = Vec::new();
+    let mut gpu_layers = Vec::new();
+    for (texels, seed, coverage, translation, scale) in stack {
+        let rgba8 = noise(texels, seed);
+        let texture = film.create_imagery(texels, texels);
+        film.write_rgba(&texture, &rgba8);
+        gpu_layers.push(DrapeLayer {
+            texture,
+            coverage,
+            translation,
+            scale,
+        });
+        cpu_layers.push(ImageryLayer {
+            coord: ImageryCoord {
+                level: 0,
+                x: 0,
+                y: 0,
+            },
+            texture: Arc::new(DecodedTexture {
+                width: texels,
+                height: texels,
+                rgba8,
+            }),
+            coverage,
+            translation,
+            scale,
+        });
+    }
+    let wanted = bake_layers(&cpu_layers, base, (side, side));
+
+    let albedo = film.create_albedo(side, side);
+    film.compose(&albedo, base, gpu_layers);
+    let row = (side * 4).next_multiple_of(256);
+    // The drape is recorded, and read back, in one submission.
+    let mut pending = film.device().create_command_encoder(&Default::default());
+    film.record_pending(&mut pending);
+    film.queue().submit([pending.finish()]);
+    let got = read(&film, |encoder| {
+        let buffer = film.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: u64::from(row * side),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            albedo.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(side),
+                },
+            },
+            albedo.size(),
+        );
+        (buffer, 0)
+    });
+
+    let (mut apart, mut worst) = (0usize, 0u8);
+    for y in 0..side as usize {
+        for x in 0..side as usize * 4 {
+            let (g, c) = (
+                got[y * row as usize + x],
+                wanted.rgba8[y * side as usize * 4 + x],
+            );
+            let d = g.abs_diff(c);
+            apart += usize::from(d > 0);
+            worst = worst.max(d);
+        }
+    }
+    let values = (side * side * 4) as usize;
+    assert!(worst <= 1, "a texel is {worst} away from the bake's");
+    assert!(
+        apart * 100 <= values,
+        "{apart} of {values} values differ from the bake's"
+    );
+    // And it is not the base colour everywhere: the layers were written.
+    let base_only = wanted
+        .rgba8
+        .chunks(4)
+        .filter(|p| p[..3] == [51, 102, 153])
+        .count();
+    assert!(
+        base_only < (side * side) as usize / 2,
+        "{base_only} texels are bare"
+    );
+}
