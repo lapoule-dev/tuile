@@ -4,8 +4,9 @@
 //! A light meter on a render.
 //!
 //! Going in: the tone of every imagery tile as the store holds it, and —
-//! tile against ancestor, over the same ground — what one level is from
-//! another, over the whole film and region by region. Coming out: the
+//! tile against ancestor, over the same ground — the step a joint between
+//! the two would show, which is what a grade per level is fitted on and
+//! judged by, over the whole film and region by region. Coming out: the
 //! luminance of every picture.
 //!
 //! It is an [`Observer`]: the render does not know it is there.
@@ -14,21 +15,26 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::path::Path;
 
-use tuile_radiometry::{tone_of, LevelGains, LevelParams, Observation};
+use tuile_radiometry::{tone_of, Grade, LevelGrades, LevelParams, Seen};
 
 use crate::observe::{FrameOut, ImageryIn, Observer, TileIn};
 use crate::Error;
 
 type Coord = (u8, u32, u32);
 
-/// The side of what is kept of each imagery tile: enough to find, in an
-/// ancestor five levels up, the ground a tile covers.
-const KEPT: u32 = 32;
-/// How far up a tile looks for an ancestor to be seen against.
-const REACH: u8 = 5;
+/// The side of what is kept of each imagery tile.
+const KEPT: u32 = 64;
+/// A tile and an ancestor are compared over this many cells a side: coarse,
+/// because a joint is seen as a step in tone over tens of texels.
+const CELLS: u32 = 8;
+/// How far up a tile looks for an ancestor: past this the ground a tile
+/// covers is less than a cell of what was kept of the ancestor.
+const REACH: u8 = 3;
 /// The level whose tiles are the regions a change of source is broken down
 /// by.
 const REGION: u8 = 9;
+/// Under this, a linear value is the dark, where a ratio means little.
+const FLOOR: f32 = 0.004;
 
 fn linear(stored: f32) -> f32 {
     let v = stored / 255.0;
@@ -57,12 +63,33 @@ fn median(values: &mut [f32]) -> f32 {
 struct TileLight {
     /// Its tone as stored, linear.
     tone: [f32; 3],
-    /// The tile reduced to `KEPT` a side, stored values averaged.
-    kept: Vec<u8>,
-    gain: [f32; 3],
+    /// The tile reduced to `KEPT` a side, as linear RGB.
+    kept: Vec<[f32; 3]>,
+    grade: Grade,
     renewed: bool,
     /// Tiles of the film whose drape it is in.
     drapes: u32,
+}
+
+/// The mean of a square of what was kept of a tile.
+fn cell(kept: &[[f32; 3]], x: u32, y: u32, side: u32) -> [f32; 3] {
+    let mut sum = [0.0f32; 3];
+    for row in y..y + side {
+        for col in x..x + side {
+            let c = kept[(row * KEPT + col) as usize];
+            for i in 0..3 {
+                sum[i] += c[i];
+            }
+        }
+    }
+    sum.map(|v| v / (side * side) as f32)
+}
+
+/// The step between two colours, in stops, worst channel.
+fn step(a: [f32; 3], b: [f32; 3]) -> f32 {
+    (0..3)
+        .map(|i| ((a[i] + FLOOR) / (b[i] + FLOOR)).log2().abs())
+        .fold(0.0, f32::max)
 }
 
 /// What a picture measures, in stops.
@@ -169,13 +196,21 @@ impl Observer for LightMeter {
         }
         let kept =
             image::imageops::resize(&rgba, KEPT, KEPT, image::imageops::FilterType::Triangle)
-                .into_raw();
+                .pixels()
+                .map(|p| {
+                    [
+                        linear(p[0].into()),
+                        linear(p[1].into()),
+                        linear(p[2].into()),
+                    ]
+                })
+                .collect();
         self.tiles.insert(
             (tile.level, tile.x, tile.y),
             TileLight {
                 tone,
                 kept,
-                gain: tile.gain,
+                grade: tile.grade,
                 renewed: tile.renewed,
                 drapes: 0,
             },
@@ -208,8 +243,8 @@ impl LightMeter {
     }
 
     /// Every tile against its two nearest ancestors among the tiles seen,
-    /// and the region each observation is in.
-    fn observations(&self) -> Vec<(Observation, (u32, u32))> {
+    /// cell for cell over the same ground, and the region each is in.
+    fn seen(&self) -> Vec<(Seen, (u32, u32))> {
         let mut out = Vec::new();
         for (coord, light) in &self.tiles {
             let mut found = 0;
@@ -220,23 +255,20 @@ impl LightMeter {
                 else {
                     continue;
                 };
-                let span = (1u32 << up) as f32;
-                let (x, y) = (
-                    (coord.1 & ((1 << up) - 1)) as f32 / span,
-                    (coord.2 & ((1 << up) - 1)) as f32 / span,
+                // Where the tile lies in what was kept of the ancestor.
+                let across = KEPT >> up;
+                let (x0, y0) = (
+                    (coord.1 & ((1 << up) - 1)) * across,
+                    (coord.2 & ((1 << up) - 1)) * across,
                 );
-                let (under, counted) = tone_of(
-                    &ancestor.kept,
-                    KEPT,
-                    KEPT,
-                    (x, y, x + 1.0 / span, y + 1.0 / span),
-                );
-                if counted < 0.5 || under.iter().any(|c| *c <= 0.0) {
-                    continue;
-                }
-                let mut gain = [0.0f32; 3];
-                for c in 0..3 {
-                    gain[c] = (under[c] / light.tone[c]).log2();
+                let (mut tile, mut under) = (Vec::new(), Vec::new());
+                for j in 0..CELLS {
+                    for i in 0..CELLS {
+                        let side = KEPT / CELLS;
+                        tile.push(cell(&light.kept, i * side, j * side, side));
+                        let side = across / CELLS;
+                        under.push(cell(&ancestor.kept, x0 + i * side, y0 + j * side, side));
+                    }
                 }
                 let region = if coord.0 >= REGION {
                     let down = coord.0 - REGION;
@@ -245,13 +277,11 @@ impl LightMeter {
                     (u32::MAX, u32::MAX)
                 };
                 out.push((
-                    Observation {
+                    Seen {
                         level: coord.0,
                         ancestor: coord.0 - up,
-                        gain,
-                        // An ancestor far up shows this ground in a handful
-                        // of what was kept of it.
-                        weight: (KEPT as f32 / span / 4.0).min(1.0),
+                        tile,
+                        under,
                     },
                     region,
                 ));
@@ -264,13 +294,15 @@ impl LightMeter {
         out
     }
 
-    /// One gain a level, solved from the tiles this render read.
-    pub fn solve(&self, anchor: u8) -> LevelGains {
-        let seen: Vec<Observation> = self.observations().iter().map(|o| o.0).collect();
-        LevelGains::solve(
+    /// One grade a level, fitted on the tiles this render read: the one
+    /// that leaves the least step at the joints between sources.
+    pub fn solve(&self, anchor: u8) -> LevelGrades {
+        let seen: Vec<Seen> = self.seen().into_iter().map(|s| s.0).collect();
+        LevelGrades::solve(
             &seen,
             &LevelParams {
                 anchor,
+                clamp_stops: 3.0,
                 ..LevelParams::default()
             },
         )
@@ -279,13 +311,25 @@ impl LightMeter {
     /// Writes `tiles.csv`, `frames.csv`, `tone.json` and `report.md` into
     /// `dir`, and returns the report. `title` heads it; `solved` is
     /// [`Self::solve`]'s.
-    pub fn write(&self, dir: &Path, title: &str, solved: &LevelGains) -> Result<String, Error> {
+    pub fn write(&self, dir: &Path, title: &str, solved: &LevelGrades) -> Result<String, Error> {
         std::fs::create_dir_all(dir)?;
         let mut report = format!("# {title}\n");
+        let said = |g: &Grade| {
+            if g.is_identity() {
+                "—".to_string()
+            } else {
+                let stops = g.gain.map(f32::log2);
+                format!(
+                    "black {:+.3} {:+.3} {:+.3}, gain {:+.2} {:+.2} {:+.2} stops, contrast {:.2} about {:.2}, saturation {:.2}",
+                    g.black[0], g.black[1], g.black[2], stops[0], stops[1], stops[2],
+                    g.contrast, g.pivot, g.saturation
+                )
+            }
+        };
 
         writeln!(report, "\n## Imagery going in, by level\n")?;
-        writeln!(report, "Luminance in stops under white, as stored. The gain is the one this render's tiles solve to, in stops, R G B.\n")?;
-        writeln!(report, "| level | tiles | median | darkest | brightest | p10–p90 | gain solved | gain applied |")?;
+        writeln!(report, "Luminance in stops under white, as stored.\n")?;
+        writeln!(report, "| level | tiles | median | darkest | brightest | p10–p90 | grade fitted | grade applied |")?;
         writeln!(report, "|---|---|---|---|---|---|---|---|")?;
         let mut by_level: BTreeMap<u8, Vec<&TileLight>> = BTreeMap::new();
         for (coord, light) in &self.tiles {
@@ -295,73 +339,84 @@ impl LightMeter {
             let mut values: Vec<f32> = lights.iter().map(|l| stops(l.tone)).collect();
             values.sort_by(f32::total_cmp);
             let at = |q: f32| values[((values.len() - 1) as f32 * q) as usize];
-            let (g, applied) = (solved.of(*level), lights[0].gain.map(f32::log2));
             writeln!(
                 report,
-                "| {level} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:+.2} {:+.2} {:+.2} | {:+.2} {:+.2} {:+.2} |",
-                values.len(), at(0.5), at(0.0), at(1.0), at(0.9) - at(0.1),
-                g[0], g[1], g[2], applied[0], applied[1], applied[2]
+                "| {level} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} |",
+                values.len(),
+                at(0.5),
+                at(0.0),
+                at(1.0),
+                at(0.9) - at(0.1),
+                said(&solved.of(*level)),
+                said(&lights[0].grade)
             )?;
         }
 
-        writeln!(report, "\n## Level against level, over the same ground\n")?;
-        writeln!(report, "| level → ancestor | tiles | gain R G B (median) | spread among tiles | left by one gain a level |")?;
-        writeln!(report, "|---|---|---|---|---|")?;
-        for p in &solved.pairs {
+        writeln!(report, "\n## The step at a joint between sources\n")?;
+        writeln!(report, "A tile against an ancestor of another source, over the same ground, in stops: the median cell and the 90th centile.\n")?;
+        writeln!(
+            report,
+            "| source (levels) | tiles | cells | nothing done | best gain alone | the grade |"
+        )?;
+        writeln!(report, "|---|---|---|---|---|---|")?;
+        for r in &solved.sources {
+            let levels: Vec<String> = r.levels.iter().map(u8::to_string).collect();
             writeln!(
                 report,
-                "| {} → {} | {} | {:+.2} {:+.2} {:+.2} | {:.2} | {:+.2} {:+.2} {:+.2} |",
-                p.level,
-                p.ancestor,
-                p.observations,
-                p.gain[0],
-                p.gain[1],
-                p.gain[2],
-                p.spread,
-                p.residual[0],
-                p.residual[1],
-                p.residual[2]
+                "| {} | {} | {} | {:.2} / {:.2} | {:.2} / {:.2} | {:.2} / {:.2} |",
+                levels.join(" "),
+                r.observations,
+                r.cells,
+                r.before.0,
+                r.before.1,
+                r.gain_alone.0,
+                r.gain_alone.1,
+                r.after.0,
+                r.after.1
             )?;
         }
 
+        // The same step, region by region: with nothing done, as this
+        // render composed it, and under the grade fitted.
         writeln!(
             report,
-            "\n## A change of source, region by region (level {REGION} tiles)\n"
+            "\n## The same step, region by region (level {REGION} tiles)\n"
         )?;
+        writeln!(report, "Median cell, worst channel, in stops.\n")?;
         writeln!(
             report,
-            "| region x/y | tiles | step R G B (median) | spread | left by one gain a level |"
+            "| region x/y | tiles | nothing done | as applied in this render | the grade fitted |"
         )?;
         writeln!(report, "|---|---|---|---|---|")?;
-        let observations = self.observations();
-        let mut by_region: BTreeMap<(u32, u32), Vec<&Observation>> = BTreeMap::new();
-        for (o, region) in &observations {
-            if solved.of(o.level) != solved.of(o.ancestor) {
-                by_region.entry(*region).or_default().push(o);
+        let applied: BTreeMap<u8, Grade> = self.tiles.iter().map(|(c, l)| (c.0, l.grade)).collect();
+        let applied = |level: u8| applied.get(&level).copied().unwrap_or(Grade::IDENTITY);
+        let mut by_region: BTreeMap<(u32, u32), (usize, [Vec<f32>; 3])> = BTreeMap::new();
+        for (s, region) in self.seen() {
+            if solved.of(s.level) == solved.of(s.ancestor) {
+                continue;
+            }
+            let entry = by_region.entry(region).or_default();
+            entry.0 += 1;
+            let ways = [
+                (Grade::IDENTITY, Grade::IDENTITY),
+                (applied(s.level), applied(s.ancestor)),
+                (solved.of(s.level), solved.of(s.ancestor)),
+            ];
+            for (way, (mine, theirs)) in ways.iter().enumerate() {
+                for (t, u) in s.tile.iter().zip(&s.under) {
+                    entry.1[way].push(step(mine.apply(*t), theirs.apply(*u)));
+                }
             }
         }
-        for (region, seen) in &by_region {
-            let (mut step, mut left, mut spread) = ([0.0f32; 3], [0.0f32; 3], 0.0f32);
-            for c in 0..3 {
-                let mut values: Vec<f32> = seen.iter().map(|o| o.gain[c]).collect();
-                step[c] = median(&mut values);
-                let mut off: Vec<f32> = values.iter().map(|v| (v - step[c]).abs()).collect();
-                spread = spread.max(median(&mut off));
-                left[c] = step[c] - (solved.of(seen[0].level)[c] - solved.of(seen[0].ancestor)[c]);
-            }
+        for (region, (tiles, mut ways)) in by_region {
             writeln!(
                 report,
-                "| {}/{} | {} | {:+.2} {:+.2} {:+.2} | {:.2} | {:+.2} {:+.2} {:+.2} |",
+                "| {}/{} | {tiles} | {:.2} | {:.2} | {:.2} |",
                 region.0,
                 region.1,
-                seen.len(),
-                step[0],
-                step[1],
-                step[2],
-                spread,
-                left[0],
-                left[1],
-                left[2]
+                median(&mut ways[0]),
+                median(&mut ways[1]),
+                median(&mut ways[2])
             )?;
         }
 
@@ -421,21 +476,15 @@ impl LightMeter {
             )?;
         }
 
-        let mut csv = String::from(
-            "level,x,y,drapes,renewed,red,green,blue,stops,gain_r,gain_g,gain_b,stops_as_composed\n",
-        );
+        let mut csv =
+            String::from("level,x,y,drapes,renewed,red,green,blue,stops,stops_as_composed\n");
         let mut coords: Vec<&Coord> = self.tiles.keys().collect();
         coords.sort();
         for coord in coords {
             let t = &self.tiles[coord];
-            let after = [
-                t.tone[0] * t.gain[0],
-                t.tone[1] * t.gain[1],
-                t.tone[2] * t.gain[2],
-            ];
             writeln!(
                 csv,
-                "{},{},{},{},{},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3}",
+                "{},{},{},{},{},{:.4},{:.4},{:.4},{:.3},{:.3}",
                 coord.0,
                 coord.1,
                 coord.2,
@@ -445,10 +494,7 @@ impl LightMeter {
                 t.tone[1],
                 t.tone[2],
                 stops(t.tone),
-                t.gain[0].log2(),
-                t.gain[1].log2(),
-                t.gain[2].log2(),
-                stops(after)
+                stops(t.grade.apply(t.tone))
             )?;
         }
         std::fs::write(dir.join("tiles.csv"), csv)?;

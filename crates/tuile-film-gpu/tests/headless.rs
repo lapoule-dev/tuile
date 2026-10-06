@@ -362,7 +362,7 @@ fn a_drape_composed_on_the_gpu_is_the_bakes() {
             coverage,
             translation,
             scale,
-            gain: [1.0; 3],
+            grade: Default::default(),
         });
         cpu_layers.push(ImageryLayer {
             coord: ImageryCoord {
@@ -441,11 +441,11 @@ fn a_drape_composed_on_the_gpu_is_the_bakes() {
     );
 }
 
-/// A level's tone correction is one gain, applied in linear light to every
-/// texel of the layer: a stop more is twice the light, whatever the tile.
+/// A level's grade is applied in linear light to every texel of the layer,
+/// as the reference does it: black point, gain, contrast, saturation.
 #[test]
-fn a_layer_is_composed_at_its_levels_tone() {
-    use tuile_film_gpu::DrapeLayer;
+fn a_layer_is_composed_at_its_levels_grade() {
+    use tuile_film_gpu::{DrapeLayer, LayerGrade};
 
     let Some((device, queue)) = device() else {
         eprintln!("no adapter: skipped");
@@ -462,69 +462,98 @@ fn a_layer_is_composed_at_its_levels_tone() {
         },
     );
     // Flat tiles, so that the filtering has nothing to say and what comes
-    // back is the gain alone; dark, middling, and bright enough to clip.
+    // back is the grade alone; dark, middling, and bright enough to clip.
     let side = 32u32;
-    let gain = [2.0f32, 0.5, 1.0];
     let row = (side * 4).next_multiple_of(256);
-    let (mut worst, mut untouched_apart, mut moved) = (0u8, 0usize, 0usize);
-    for stored in [[12u8, 40, 7], [90, 130, 201], [230, 250, 66]] {
-        let rgba8: Vec<u8> = (0..side * side)
-            .flat_map(|_| [stored[0], stored[1], stored[2], 255])
-            .collect();
-        let texture = film.create_imagery(side, side);
-        film.write_rgba(&texture, &rgba8);
-        let albedo = film.create_albedo(side, side);
-        film.compose(
-            &albedo,
-            [0.0, 0.0, 0.0, 1.0],
-            vec![DrapeLayer {
-                texture,
-                coverage: [0.0, 0.0, 1.0, 1.0],
-                translation: [0.0, 0.0],
-                scale: [1.0, 1.0],
-                gain,
-            }],
-        );
-        let mut pending = film.device().create_command_encoder(&Default::default());
-        film.record_pending(&mut pending);
-        film.queue().submit([pending.finish()]);
-        let got = read(&film, |encoder| {
-            let buffer = film.device().create_buffer(&wgpu::BufferDescriptor {
-                label: Some("readback"),
-                size: u64::from(row * side),
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            encoder.copy_texture_to_buffer(
-                albedo.as_image_copy(),
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(row),
-                        rows_per_image: Some(side),
-                    },
-                },
-                albedo.size(),
+    let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let grades = [
+        // A gain alone, one channel left as it is.
+        LayerGrade {
+            gain: [2.0, 0.5, 1.0],
+            ..LayerGrade::IDENTITY
+        },
+        // Everything at once.
+        LayerGrade {
+            black: [0.01, 0.004, -0.006],
+            gain: [2.4, 2.1, 1.6],
+            contrast: 1.2,
+            pivot: 0.2,
+            saturation: 1.3,
+        },
+    ];
+    for (n, grade) in grades.into_iter().enumerate() {
+        let (mut worst, mut moved) = (0u8, 0usize);
+        for stored in [[12u8, 40, 7], [90, 130, 201], [230, 250, 66]] {
+            let rgba8: Vec<u8> = (0..side * side)
+                .flat_map(|_| [stored[0], stored[1], stored[2], 255])
+                .collect();
+            let texture = film.create_imagery(side, side);
+            film.write_rgba(&texture, &rgba8);
+            let albedo = film.create_albedo(side, side);
+            film.compose(
+                &albedo,
+                [0.0, 0.0, 0.0, 1.0],
+                vec![DrapeLayer {
+                    texture,
+                    coverage: [0.0, 0.0, 1.0, 1.0],
+                    translation: [0.0, 0.0],
+                    scale: [1.0, 1.0],
+                    grade,
+                }],
             );
-            (buffer, 0)
-        });
-        for y in 0..side as usize {
-            for x in 0..side as usize {
-                let out = &got[y * row as usize + x * 4..][..3];
-                for c in 0..3 {
-                    let wanted = (oetf((eotf(f32::from(stored[c]) / 255.0) * gain[c]).min(1.0))
-                        * 255.0)
-                        .round();
-                    worst = worst.max(out[c].abs_diff(wanted as u8));
-                    moved += usize::from(out[c] != stored[c]);
+            let mut pending = film.device().create_command_encoder(&Default::default());
+            film.record_pending(&mut pending);
+            film.queue().submit([pending.finish()]);
+            let got = read(&film, |encoder| {
+                let buffer = film.device().create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("readback"),
+                    size: u64::from(row * side),
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                encoder.copy_texture_to_buffer(
+                    albedo.as_image_copy(),
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(row),
+                            rows_per_image: Some(side),
+                        },
+                    },
+                    albedo.size(),
+                );
+                (buffer, 0)
+            });
+            // The reference, as the grade is defined.
+            let mut c = [0.0f32; 3];
+            for i in 0..3 {
+                c[i] =
+                    (eotf(f32::from(stored[i]) / 255.0) - grade.black[i]).max(0.0) * grade.gain[i];
+            }
+            let by = (luma(c).max(1e-5) / grade.pivot).powf(grade.contrast - 1.0);
+            c = c.map(|v| v * by);
+            let y = luma(c);
+            c = c.map(|v| (y + (v - y) * grade.saturation).max(0.0));
+            let wanted = c.map(|v| (oetf(v.min(1.0)) * 255.0).round() as u8);
+            for y in 0..side as usize {
+                for x in 0..side as usize {
+                    let out = &got[y * row as usize + x * 4..][..3];
+                    for i in 0..3 {
+                        worst = worst.max(out[i].abs_diff(wanted[i]));
+                        moved += usize::from(out[i] != stored[i]);
+                    }
+                    if n == 0 {
+                        // The channel whose gain is one is the stored byte.
+                        assert_eq!(out[2], stored[2]);
+                    }
                 }
-                // The channel whose gain is one is the stored byte, exactly.
-                untouched_apart += usize::from(out[2] != stored[2]);
             }
         }
+        assert!(
+            worst <= 1,
+            "grade {n}: worst channel {worst} from the reference"
+        );
+        assert!(moved > (side * side) as usize, "grade {n} did nothing");
     }
-    assert!(worst <= 1, "worst channel {worst} from the gain asked for");
-    assert_eq!(untouched_apart, 0);
-    assert!(moved > (side * side) as usize, "the gain did nothing");
 }

@@ -17,8 +17,8 @@ use tuile_film::from_store::{compose, imagery_texture, is_baked, terrain_mesh};
 use tuile_film::{
     refs_of, texture_of_span, Content, Cursor, FrameCamera, Look, Mesh, Pack, TileKey,
 };
-use tuile_film_gpu::{DrapeLayer, FilmGpu, Settings, TileMesh};
-use tuile_radiometry::{apply_multipliers, LevelGains};
+use tuile_film_gpu::{DrapeLayer, FilmGpu, LayerGrade, Settings, TileMesh};
+use tuile_radiometry::{Grade, LevelGrades};
 use tuile_repository::TileRepository;
 
 use crate::observe::{FrameOut, ImageryIn, Observer, Origin, TileIn, Timings};
@@ -35,7 +35,7 @@ pub enum Tone {
     /// The table the store holds beside the imagery layer, if it holds one.
     OfTheStore,
     /// This table.
-    Table(LevelGains),
+    Table(LevelGrades),
 }
 
 /// What to render.
@@ -91,7 +91,7 @@ pub struct Done {
     /// Before the first frame: opening the adapter and the sink.
     pub setup_seconds: f64,
     /// The tone table applied, if one was.
-    pub tone: Option<LevelGains>,
+    pub tone: Option<LevelGrades>,
 }
 
 /// Store tiles asked for at once.
@@ -99,6 +99,16 @@ const AT_ONCE: usize = 48;
 
 /// Imagery tiles kept on the GPU before they are let go.
 const TEXTURES_HELD: usize = 2048;
+
+fn layer_grade(grade: &Grade) -> LayerGrade {
+    LayerGrade {
+        black: grade.black,
+        gain: grade.gain,
+        contrast: grade.contrast,
+        pivot: grade.pivot,
+        saturation: grade.saturation,
+    }
+}
 
 fn ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
@@ -190,7 +200,7 @@ pub async fn render(
     // What is resident, and the imagery levels of each one's drape.
     let mut resident: HashMap<TileKey, Vec<u8>> = HashMap::new();
     let mut textures: HashMap<(u8, u32, u32), (wgpu::Texture, bool)> = HashMap::new();
-    let mut tone: Option<(String, Option<LevelGains>)> = None;
+    let mut tone: Option<(String, Option<LevelGrades>)> = None;
     let mut index = 0u32;
 
     for file in &film.packs {
@@ -218,10 +228,12 @@ pub async fn render(
                 tone = Some((imagery.to_string(), table));
             }
         }
-        let gain = |level: u8| {
+        // The same for every tile of a level, so that two of them meet as
+        // they did.
+        let grade = |level: u8| {
             tone.as_ref()
                 .and_then(|(_, table)| table.as_ref())
-                .map_or([1.0; 3], |t| t.multipliers(level, order.tone_strength))
+                .map_or(Grade::IDENTITY, |t| t.of(level).at(order.tone_strength))
         };
 
         // Frames a, a + every, …: each from a cursor of its own when frames
@@ -341,7 +353,7 @@ pub async fn render(
                                     y: at.2,
                                     bytes: found,
                                     renewed,
-                                    gain: gain(at.0),
+                                    grade: grade(at.0),
                                 });
                                 timings.observe += ms(t);
                                 let t = Instant::now();
@@ -381,7 +393,7 @@ pub async fn render(
                                     .ok_or("an imagery tile left the store mid-frame")?;
                                 let mut texels =
                                     imagery_texture(&placed.tile, scheme, &found.bytes)?;
-                                apply_multipliers(&mut texels.rgba8, gain(at.0));
+                                grade(at.0).apply_rgba8(&mut texels.rgba8);
                                 decoded.insert(at, std::sync::Arc::new(texels));
                             }
                             compose(&refs, factor, |t| decoded[&(t.level, t.x, t.y)].clone()).map(
@@ -401,7 +413,7 @@ pub async fn render(
                                     coverage: placed.coverage,
                                     translation: placed.translation,
                                     scale: placed.scale,
-                                    gain: gain(placed.tile.level),
+                                    grade: layer_grade(&grade(placed.tile.level)),
                                 })
                                 .collect();
                             gpu.compose(&albedo, factor, layers);

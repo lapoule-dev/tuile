@@ -17,9 +17,9 @@ use tuile_film::{
     Look, Mesh, Pack, TileKey,
 };
 use tuile_film::{refs_of, StoreTile, TileRefs};
-use tuile_film_gpu::{DrapeLayer, FilmGpu, Settings, TileMesh, OUTPUT_FORMAT};
+use tuile_film_gpu::{DrapeLayer, FilmGpu, LayerGrade, Settings, TileMesh, OUTPUT_FORMAT};
 use tuile_mp4::{Codec, Muxer, ParameterSets};
-use tuile_radiometry::{apply_multipliers, LevelGains};
+use tuile_radiometry::{Grade, LevelGrades};
 use tuile_repository::TileRepository;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -272,9 +272,9 @@ struct StoreSide {
     /// Source tiles whose bytes are no longer the ones the pack was baked
     /// from: the store has renewed them since.
     renewed: u32,
-    /// The imagery layer's tone correction, a gain a level, if the store
+    /// The imagery layer's tone correction, a grade a level, if the store
     /// holds one — and how much of it is asked for, 0 to 1.
-    tone: Option<LevelGains>,
+    tone: Option<LevelGrades>,
     tone_strength: f32,
 }
 
@@ -302,12 +302,12 @@ enum Drape {
 }
 
 impl StoreSide {
-    /// What a layer of this imagery level is multiplied by: the same for
-    /// every tile of the level, so that two of them meet as they did.
-    fn gain(&self, level: u8) -> [f32; 3] {
-        self.tone
-            .as_ref()
-            .map_or([1.0; 3], |tone| tone.multipliers(level, self.tone_strength))
+    /// The grade a layer of this imagery level is composed with: the same
+    /// for every tile of the level, so that two of them meet as they did.
+    fn grade(&self, level: u8) -> Grade {
+        self.tone.as_ref().map_or(Grade::IDENTITY, |tone| {
+            tone.of(level).at(self.tone_strength)
+        })
     }
 
     /// One imagery tile, decoded, laid on geographic spacing and uploaded;
@@ -404,14 +404,14 @@ impl StoreSide {
                         Arc::new(imagery_texture(tile, &self.scheme, &found.bytes).map_err(js)?)
                     }
                 };
-                // The level's tone, as the GPU's composition would give it.
-                let gain = self.gain(layer.tile.level);
-                let texels = if gain == [1.0; 3] {
+                // The level's grade, as the GPU's composition would give it.
+                let grade = self.grade(layer.tile.level);
+                let texels = if grade.is_identity() {
                     texels
                 } else {
-                    let mut toned = (*texels).clone();
-                    apply_multipliers(&mut toned.rgba8, gain);
-                    Arc::new(toned)
+                    let mut graded = (*texels).clone();
+                    grade.apply_rgba8(&mut graded.rgba8);
+                    Arc::new(graded)
                 };
                 decoded.insert((layer.tile.level, layer.tile.x, layer.tile.y), texels);
             }
@@ -427,7 +427,16 @@ impl StoreSide {
                 coverage: layer.coverage,
                 translation: layer.translation,
                 scale: layer.scale,
-                gain: self.gain(layer.tile.level),
+                grade: {
+                    let g = self.grade(layer.tile.level);
+                    LayerGrade {
+                        black: g.black,
+                        gain: g.gain,
+                        contrast: g.contrast,
+                        pivot: g.pivot,
+                        saturation: g.saturation,
+                    }
+                },
             })
             .collect();
         Ok((
@@ -508,7 +517,7 @@ impl FilmWorker {
                         Ok(Some(bytes)) => Some(
                             std::str::from_utf8(&bytes)
                                 .ok()
-                                .and_then(LevelGains::from_json)
+                                .and_then(LevelGrades::from_json)
                                 .ok_or_else(|| {
                                     js(format!("{imagery}/tone.json is not a tone table"))
                                 })?,

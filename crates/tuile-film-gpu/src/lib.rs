@@ -159,10 +159,47 @@ pub struct DrapeLayer {
     /// uv of the imagery tile = uv of the tile × scale + translation.
     pub translation: [f32; 2],
     pub scale: [f32; 2],
-    /// What the layer's colour is multiplied by, in linear light — the tone
-    /// correction of its level. `[1.0; 3]` leaves the stored bytes as they
-    /// are, exactly.
+    /// The grade of its level; the identity leaves the stored bytes as
+    /// they are, exactly.
+    pub grade: LayerGrade,
+}
+
+/// What a layer's colour goes through at composition, in linear light and
+/// in this order: `black` taken away, multiplied by `gain`, luminance
+/// raised to `contrast` about `pivot`, what is not luminance multiplied by
+/// `saturation`. One per imagery level — every tile of a level the same —
+/// so that levels of different sources meet without a step.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerGrade {
+    pub black: [f32; 3],
     pub gain: [f32; 3],
+    pub contrast: f32,
+    pub pivot: f32,
+    pub saturation: f32,
+}
+
+impl LayerGrade {
+    /// Changes nothing.
+    pub const IDENTITY: Self = Self {
+        black: [0.0; 3],
+        gain: [1.0; 3],
+        contrast: 1.0,
+        pivot: 0.18,
+        saturation: 1.0,
+    };
+
+    pub fn is_identity(&self) -> bool {
+        self.black == [0.0; 3]
+            && self.gain == [1.0; 3]
+            && self.contrast == 1.0
+            && self.saturation == 1.0
+    }
+}
+
+impl Default for LayerGrade {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
 }
 
 struct Drape {
@@ -183,6 +220,8 @@ struct ComposeJob {
     mode: u32,
     pad: u32,
     gain: [f32; 4],
+    black: [f32; 4],
+    more: [f32; 4],
 }
 
 fn shader(device: &wgpu::Device, name: &str, body: &str) -> wgpu::ShaderModule {
@@ -827,12 +866,14 @@ impl FilmGpu {
                 mode: 0,
                 pad: 0,
                 gain: [1.0; 4],
+                black: [0.0, 0.0, 0.0, 1.0],
+                more: [0.18, 0.0, 0.0, 0.0],
             };
             dispatch(blank, &self.white, [w, h]);
             for layer in &drape.layers {
                 // The texels whose centres can fall in the layer's rectangle,
                 // generously: the shader decides each one exactly.
-                let c = layer.coverage;
+                let (c, g) = (layer.coverage, layer.grade);
                 let x0 = ((c[0] * w as f32).floor().max(0.0) as u32).min(w);
                 let y0 = ((c[1] * h as f32).floor().max(0.0) as u32).min(h);
                 let x1 = ((c[2] * w as f32).ceil().max(0.0) as u32).min(w);
@@ -850,7 +891,9 @@ impl FilmGpu {
                         scale: layer.scale,
                         origin: [x0, y0],
                         mode: 1,
-                        gain: [layer.gain[0], layer.gain[1], layer.gain[2], 1.0],
+                        gain: [g.gain[0], g.gain[1], g.gain[2], g.contrast],
+                        black: [g.black[0], g.black[1], g.black[2], g.saturation],
+                        more: [g.pivot, f32::from(u8::from(!g.is_identity())), 0.0, 0.0],
                         ..blank
                     },
                     &src,

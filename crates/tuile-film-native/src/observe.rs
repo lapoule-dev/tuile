@@ -7,6 +7,7 @@
 //! back: an observer cannot change a film, only watch it being made.
 
 use tuile_film::TileKey;
+use tuile_radiometry::Grade;
 
 /// An imagery tile, the first time the render reads it.
 pub struct ImageryIn<'a> {
@@ -17,8 +18,8 @@ pub struct ImageryIn<'a> {
     pub bytes: &'a [u8],
     /// The store has renewed it since the pack was baked.
     pub renewed: bool,
-    /// What its level's colour is multiplied by at composition.
-    pub gain: [f32; 3],
+    /// The grade its level is composed with.
+    pub grade: Grade,
 }
 
 /// Where a tile's mesh and drape came from.
