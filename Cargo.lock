@@ -6048,6 +6048,7 @@ dependencies = [
  "rav1e",
  "serde",
  "serde_json",
+ "tuile-core",
  "tuile-film",
  "tuile-film-gpu",
  "tuile-mp4",

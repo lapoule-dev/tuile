@@ -11,6 +11,7 @@ authors.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+tuile-core = { version = "0.2.0", path = "../tuile-core" }
 tuile-film = { version = "0.2.0", path = "../tuile-film" }
 tuile-mp4 = { version = "0.2.0", path = "../tuile-mp4" }
 
