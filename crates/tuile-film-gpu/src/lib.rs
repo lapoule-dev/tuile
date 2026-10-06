@@ -159,6 +159,10 @@ pub struct DrapeLayer {
     /// uv of the imagery tile = uv of the tile × scale + translation.
     pub translation: [f32; 2],
     pub scale: [f32; 2],
+    /// What the layer's colour is multiplied by, in linear light — the tone
+    /// correction of its level. `[1.0; 3]` leaves the stored bytes as they
+    /// are, exactly.
+    pub gain: [f32; 3],
 }
 
 struct Drape {
@@ -178,6 +182,7 @@ struct ComposeJob {
     origin: [u32; 2],
     mode: u32,
     pad: u32,
+    gain: [f32; 4],
 }
 
 fn shader(device: &wgpu::Device, name: &str, body: &str) -> wgpu::ShaderModule {
@@ -821,6 +826,7 @@ impl FilmGpu {
                 origin: [0, 0],
                 mode: 0,
                 pad: 0,
+                gain: [1.0; 4],
             };
             dispatch(blank, &self.white, [w, h]);
             for layer in &drape.layers {
@@ -844,6 +850,7 @@ impl FilmGpu {
                         scale: layer.scale,
                         origin: [x0, y0],
                         mode: 1,
+                        gain: [layer.gain[0], layer.gain[1], layer.gain[2], 1.0],
                         ..blank
                     },
                     &src,

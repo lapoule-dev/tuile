@@ -44,8 +44,13 @@ struct Tally {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let path = args.first().ok_or("usage: store_parity <both.tuilepack> [tiles]")?;
-    let limit: usize = args.get(1).and_then(|n| n.parse().ok()).unwrap_or(usize::MAX);
+    let path = args
+        .first()
+        .ok_or("usage: store_parity <both.tuilepack> [tiles]")?;
+    let limit: usize = args
+        .get(1)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(usize::MAX);
 
     let bytes = std::fs::read(path)?;
     let pack = Pack::open(&bytes)?;
@@ -120,7 +125,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 let Some(imagery) = store
-                    .tile(imagery_layer, placed.tile.level, placed.tile.x, placed.tile.y)
+                    .tile(
+                        imagery_layer,
+                        placed.tile.level,
+                        placed.tile.x,
+                        placed.tile.y,
+                    )
                     .await?
                 else {
                     missing = true;
@@ -146,8 +156,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (None, None) => tally.textures_same += 1,
                 (Some(composed), Some(png)) => {
                     let carried = image::load_from_memory(&png)?.to_rgba8();
-                    let same_size = (carried.width(), carried.height())
-                        == (composed.width, composed.height);
+                    let same_size =
+                        (carried.width(), carried.height()) == (composed.width, composed.height);
                     let (apart, worst) = if same_size {
                         carried.as_raw().iter().zip(&composed.rgba8).fold(
                             (0u64, 0u8),
@@ -181,7 +191,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ => {
                     tally.textures_differ += 1;
-                    println!("  tile {}: one side has a texture and the other none", tile.id());
+                    println!(
+                        "  tile {}: one side has a texture and the other none",
+                        tile.id()
+                    );
                 }
             }
         }

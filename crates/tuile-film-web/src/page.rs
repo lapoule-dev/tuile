@@ -1483,6 +1483,12 @@ async fn render() {
     let (fps, bitrate) = (value_of("fps") as u32, value_of("mbps") * 1e6);
     let scale: f64 = select("scale").value().parse().unwrap_or(1.0);
     let supersample = select("ss").value().parse().unwrap_or(1u32);
+    // How much of the store's tone correction: all of it, unless the
+    // address says otherwise (`?tone=0` is the imagery as stored).
+    let tone = query()
+        .get("tone")
+        .and_then(|t| t.parse::<f64>().ok())
+        .unwrap_or(1.0);
     let (width, height) = (
         even8(f64::from(view.width()) * scale),
         even8(f64::from(view.height()) * scale),
@@ -1687,6 +1693,7 @@ async fn render() {
             ("width", width.into()),
             ("height", height.into()),
             ("supersample", supersample.into()),
+            ("tone", tone.into()),
             ("fps", fps.into()),
             ("bitrate", bitrate.into()),
         ]);

@@ -6052,6 +6052,7 @@ dependencies = [
  "tuile-film",
  "tuile-film-gpu",
  "tuile-mp4",
+ "tuile-radiometry",
  "tuile-repository",
  "wasm-bindgen",
  "wasm-bindgen-futures",

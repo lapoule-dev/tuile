@@ -19,6 +19,7 @@ use tuile_film::{
 use tuile_film::{refs_of, StoreTile, TileRefs};
 use tuile_film_gpu::{DrapeLayer, FilmGpu, Settings, TileMesh, OUTPUT_FORMAT};
 use tuile_mp4::{Codec, Muxer, ParameterSets};
+use tuile_radiometry::{apply_multipliers, LevelGains};
 use tuile_repository::TileRepository;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -271,6 +272,10 @@ struct StoreSide {
     /// Source tiles whose bytes are no longer the ones the pack was baked
     /// from: the store has renewed them since.
     renewed: u32,
+    /// The imagery layer's tone correction, a gain a level, if the store
+    /// holds one — and how much of it is asked for, 0 to 1.
+    tone: Option<LevelGains>,
+    tone_strength: f32,
 }
 
 /// Imagery tiles kept on the GPU before they are let go. A tile is a
@@ -297,6 +302,14 @@ enum Drape {
 }
 
 impl StoreSide {
+    /// What a layer of this imagery level is multiplied by: the same for
+    /// every tile of the level, so that two of them meet as they did.
+    fn gain(&self, level: u8) -> [f32; 3] {
+        self.tone
+            .as_ref()
+            .map_or([1.0; 3], |tone| tone.multipliers(level, self.tone_strength))
+    }
+
     /// One imagery tile, decoded, laid on geographic spacing and uploaded;
     /// read from the store the first time it is asked for.
     async fn imagery(&mut self, gpu: &FilmGpu, tile: &StoreTile) -> Result<Imagery, JsError> {
@@ -391,6 +404,15 @@ impl StoreSide {
                         Arc::new(imagery_texture(tile, &self.scheme, &found.bytes).map_err(js)?)
                     }
                 };
+                // The level's tone, as the GPU's composition would give it.
+                let gain = self.gain(layer.tile.level);
+                let texels = if gain == [1.0; 3] {
+                    texels
+                } else {
+                    let mut toned = (*texels).clone();
+                    apply_multipliers(&mut toned.rgba8, gain);
+                    Arc::new(toned)
+                };
                 decoded.insert((layer.tile.level, layer.tile.x, layer.tile.y), texels);
             }
             let composed = compose(refs, base_color_factor, |t| {
@@ -405,6 +427,7 @@ impl StoreSide {
                 coverage: layer.coverage,
                 translation: layer.translation,
                 scale: layer.scale,
+                gain: self.gain(layer.tile.level),
             })
             .collect();
         Ok((
@@ -444,13 +467,15 @@ async fn bitmap(png: Vec<u8>) -> Result<ImageBitmap, JsValue> {
 impl FilmWorker {
     /// Takes the pack's source (a URL or a Blob) and an `OffscreenCanvas` of
     /// the film's display size, and gets a WebGPU device ready for frames
-    /// `first..=last`. Only the pack's table is read now.
+    /// `first..=last`. Only the pack's table is read now. `tone` is how much
+    /// of the store's tone correction to apply, 0 to 1.
     pub async fn create(
         canvas: OffscreenCanvas,
         source: JsValue,
         first: u32,
         last: u32,
         supersample: u32,
+        tone: f32,
     ) -> Result<FilmWorker, JsError> {
         console_error_panic_hook::set_once();
         let source = Source::from_js(&source)?;
@@ -478,7 +503,22 @@ impl FilmWorker {
                         Some(layer) if layer.grid == "geographic" => TilingScheme::geographic(),
                         _ => TilingScheme::web_mercator(),
                     };
+                    // Beside the layer, if the store has worked one out.
+                    let table = match store.small(&format!("{imagery}/tone.json")).await {
+                        Ok(Some(bytes)) => Some(
+                            std::str::from_utf8(&bytes)
+                                .ok()
+                                .and_then(LevelGains::from_json)
+                                .ok_or_else(|| {
+                                    js(format!("{imagery}/tone.json is not a tone table"))
+                                })?,
+                        ),
+                        Ok(None) => None,
+                        Err(e) => return Err(js(e)),
+                    };
                     Some(StoreSide {
+                        tone: table,
+                        tone_strength: tone.clamp(0.0, 1.0),
                         store,
                         terrain: terrain.to_string(),
                         imagery: imagery.to_string(),
