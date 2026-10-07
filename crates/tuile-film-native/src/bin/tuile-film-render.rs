@@ -31,10 +31,11 @@
 //!   --tone-table <file>   this grade, not the film's own: a film's grade
 //!                         as --calibrate writes it
 //!   --tone <0..1>         how much of the grade (default 1)
-//!   --calibrate <dir>     fit the film's own grade on its imagery — its
-//!                         tiles brought to one another, those that
-//!                         already meet kept as they are, then the film to
-//!                         the look's target, all of it bounded —
+//!   --calibrate <dir>     fit the film's own grade on its imagery — a
+//!                         continuous field that brings its tiles to one
+//!                         another and gives two neighbours the same along
+//!                         the edge they share, then the film to the look's
+//!                         target, all of it bounded —
 //!                         and write it under <dir> at the key it is kept
 //!                         by, beside each pack — with, under <dir>, the
 //!                         mosaic of each level before and after, and
@@ -44,6 +45,10 @@
 //!   --reference-level <n> with --calibrate: the finest level at which the
 //!                         imagery is one homogeneous picture, which the
 //!                         finer tiles are measured against (default 12)
+//!   --measure <moments|curves>
+//!                         with --calibrate: what a tile is measured by —
+//!                         its moments, or its transfer curve a channel
+//!                         (the default)
 //!   --put                 with --calibrate: also write it to the bucket
 //!   --light <x>           with --calibrate: the light the renderer puts
 //!                         on ground, instead of the one this render shows
@@ -403,12 +408,26 @@ async fn main() -> Result<(), Error> {
             "\nreference level {reference}: {} tiles read from the store for it, {missing} not there",
             wanted.len()
         );
+        // The grade written beside the pack: the continuous field, the
+        // tiles measured by their transfer curves unless told otherwise.
+        let measure = match value("--measure").as_deref() {
+            Some("moments") => Measure::Moments,
+            Some("curves") | None => Measure::Curves,
+            Some(other) => {
+                return Err(format!("a tile is measured by moments or curves, not {other}").into())
+            }
+        };
+        let field_bounds = FieldBounds {
+            reference_level: reference,
+            ..FieldBounds::default()
+        };
         let grade = FilmGrade::fit(
             &observed,
+            measure,
             light,
             &LookTarget::default(),
             &Bounds::default(),
-            &tile_bounds,
+            &field_bounds,
         );
         // What was seen, for a film of several packs to be fitted as one;
         // and the seams of each level, before and after.
@@ -422,13 +441,8 @@ async fn main() -> Result<(), Error> {
         // measured by their moments and by their transfer curves. Each is
         // traced and drawn, and what each leaves is measured again — the
         // corrected tiles seen anew, by both measures — so that the four,
-        // and the film as it is, are judged by the same rule. The grade
-        // written below is still the blocks', by moments.
+        // and the film as it is, are judged by the same rule.
         let lift = order.look.exposure_ev + grade.exposure_ev;
-        let field_bounds = FieldBounds {
-            reference_level: reference,
-            ..FieldBounds::default()
-        };
         let out = PathBuf::from(&dir);
         let write = |sub: &str, name: &str, text: String| -> Result<(), Error> {
             let path = out.join(sub);
@@ -585,21 +599,25 @@ fn said(grade: &FilmGrade) -> String {
     );
     let r = &grade.fitted;
     out += &format!(
-        "  tiles: {} finer than the reference, {} measured against it; {} blocks, {} edges of {} a border between two\n  the film's own block: {} tiles untouched; {} tiles given a gain; {} blocks held at a bound\n  pairs of neighbours in accord: {} — given two gains: {}\n  apart from the film's own block: {:.2} / {:.2} stops → {:.2} / {:.2} (median / p95)\n",
+        "  the tiles to one another: a continuous field, the tiles measured by their {}\n  {} tiles finer than the reference, {} measured against it; {} seams of {} edges in all, of {}\n  widest break along an edge that is not a seam: {} stops; steps made where the tiles show none: {}\n  the tiles' step across the seams: {:.2} / {:.2} stops → {:.2} / {:.2} (median / p95)\n  apart from the film's own tone: {:.2} / {:.2} → {:.2} / {:.2}; {} tiles untouched, {} corners held at a bound\n",
+        grade.field.measure.name(),
         r.tiles,
         r.measured,
-        r.blocks,
-        r.borders,
+        r.seams,
+        r.seam_edges,
         r.edges,
-        r.untouched,
-        grade.tiles.stops.len(),
-        r.held,
-        r.accorded,
-        r.accord_broken,
+        r.widest_break,
+        r.steps_made,
+        r.seam_before.0,
+        r.seam_before.1,
+        r.seam_after.0,
+        r.seam_after.1,
         r.apart_before.0,
         r.apart_before.1,
         r.apart_after.0,
         r.apart_after.1,
+        r.untouched,
+        r.held,
     );
     if !grade.limited.is_empty() {
         out += &format!("  held back at a bound: {}\n", grade.limited.join("; "));

@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 
 use tuile_radiometry::{
-    region_key, Bounds, FilmGrade, LevelGrades, LookTarget, Observed, TileBounds,
+    region_key, Bounds, FieldBounds, FilmGrade, LevelGrades, LookTarget, Observed,
 };
 
 use crate::{Objects, RepoError};
@@ -116,7 +116,7 @@ pub async fn film_grade(
         &parts,
         &LookTarget::default(),
         &Bounds::default(),
-        &TileBounds::default(),
+        &FieldBounds::default(),
     ))
 }
 
@@ -318,18 +318,24 @@ mod tests {
     fn graded(seen: &Observed) -> FilmGrade {
         FilmGrade::fit(
             seen,
+            tuile_radiometry::Measure::Moments,
             1.0,
             &LookTarget::default(),
             &Bounds::default(),
-            &TileBounds::default(),
+            &FieldBounds::default(),
         )
+    }
+
+    /// The gain on light the grade gives the middle of a tile, in stops.
+    fn lift(grade: &FilmGrade, x: u32) -> f32 {
+        grade.field.at((13, x, 7), 0.5, 0.5).gain[1].log2()
     }
 
     #[test]
     fn a_films_grade_is_its_packs_own_and_nobody_elses() {
         let seen = seen_of(0, 12, 4);
         let grade = graded(&seen);
-        assert!(grade.exposure_ev > 0.0 && !grade.tiles.stops.is_empty());
+        assert!(grade.exposure_ev > 0.0 && lift(&grade, 1) > 0.9);
         let mut files = Files(BTreeMap::from([
             (pack_tone_key("film/1-10.tuilepack"), grade.to_json()),
             // Another film's grade lies in the same store.
@@ -390,7 +396,7 @@ mod tests {
         // capture and gives no tile a gain.
         let (west, east) = (seen_of(0, 4, 4), seen_of(4, 12, 4));
         let (g_west, g_east) = (graded(&west), graded(&east));
-        assert!(g_west.tiles.stops.is_empty() && g_east.tiles.stops.is_empty());
+        assert!(lift(&g_west, 1).abs() < 0.05 && lift(&g_east, 8).abs() < 0.05);
         let mut files = Bytes(BTreeMap::from([
             (
                 pack_tone_key("film/a.tuilepack"),
@@ -409,9 +415,9 @@ mod tests {
             .expect("a grade");
         // Together they are two captures, and the smaller is brought to
         // the larger across the cut.
-        let lifted = film.tiles.of((13, 0, 7)).gain[1].log2();
+        let lifted = lift(&film, 1);
         assert!((lifted - 1.0).abs() < 0.1, "{lifted}");
-        assert!(film.tiles.of((13, 5, 7)).is_identity());
+        assert!(lift(&film, 9).abs() < 0.05);
         // Without what one of them saw the film cannot be fitted, and that
         // is said rather than drawn around.
         files.0.remove(&pack_seen_key("film/b.tuilepack"));
