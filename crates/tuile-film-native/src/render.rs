@@ -233,12 +233,11 @@ pub async fn render(
             _ => pack.store_layers(),
         };
         let scheme = layers.map(|(_, imagery)| sources.store.scheme_of(imagery));
-        // The same for every tile of a level, so that two of them meet as
-        // they did.
-        let grade = |level: u8| {
+        // A tile's own gain: the same wherever the film draws it.
+        let grade = |at: (u8, u32, u32)| {
             film_grade
                 .as_ref()
-                .map_or(Grade::IDENTITY, |g| g.levels.of(level).at(strength))
+                .map_or(Grade::IDENTITY, |g| g.tiles.of(at).at(strength))
         };
 
         // Frames a, a + every, …: each from a cursor of its own when frames
@@ -358,7 +357,7 @@ pub async fn render(
                                     y: at.2,
                                     bytes: found,
                                     renewed,
-                                    grade: grade(at.0),
+                                    grade: grade(at),
                                 });
                                 timings.observe += ms(t);
                                 let t = Instant::now();
@@ -398,7 +397,7 @@ pub async fn render(
                                     .ok_or("an imagery tile left the store mid-frame")?;
                                 let mut texels =
                                     imagery_texture(&placed.tile, scheme, &found.bytes)?;
-                                grade(at.0).apply_rgba8(&mut texels.rgba8);
+                                grade(at).apply_rgba8(&mut texels.rgba8);
                                 decoded.insert(at, std::sync::Arc::new(texels));
                             }
                             compose(&refs, factor, |t| decoded[&(t.level, t.x, t.y)].clone()).map(
@@ -418,7 +417,11 @@ pub async fn render(
                                     coverage: placed.coverage,
                                     translation: placed.translation,
                                     scale: placed.scale,
-                                    grade: layer_grade(&grade(placed.tile.level)),
+                                    grade: layer_grade(&grade((
+                                        placed.tile.level as u8,
+                                        placed.tile.x,
+                                        placed.tile.y,
+                                    ))),
                                 })
                                 .collect();
                             gpu.compose(&albedo, factor, layers);
