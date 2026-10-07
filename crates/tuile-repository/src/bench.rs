@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use percent_encoding::percent_decode_str;
 
-use crate::{FilmRepository, Objects, RepoError, TileRepository, CHUNK};
+use crate::{FilmRepository, Objects, Read, RepoError, TileRepository, CHUNK};
 
 /// The size of a block: what one request for a pack brings back.
 ///
@@ -202,6 +202,51 @@ const LIVE_LIMIT: u64 = 4 << 20;
 /// network once.
 pub const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
+/// What a request asks beside its path: the headers this API reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Asked<'a> {
+    /// The `Range` header.
+    pub range: Option<&'a str>,
+    /// The `If-None-Match` header: the validators of what the client holds.
+    pub if_none_match: Option<&'a str>,
+}
+
+impl<'a> From<Option<&'a str>> for Asked<'a> {
+    /// A request with a `Range` header, or none, and nothing else.
+    fn from(range: Option<&'a str>) -> Self {
+        Self {
+            range,
+            if_none_match: None,
+        }
+    }
+}
+
+/// The validators an `If-None-Match` header lists, as their opaque tags:
+/// weakness (`W/`) dropped, quotes kept.
+fn tags(if_none_match: &str) -> impl Iterator<Item = &str> {
+    if_none_match
+        .split(',')
+        .map(|tag| tag.trim().trim_start_matches("W/"))
+        .filter(|tag| !tag.is_empty())
+}
+
+/// Whether an `If-None-Match` header names `etag`: by the weak comparison,
+/// which is the one a GET is revalidated with — an intermediary that
+/// re-encodes a body weakens its validator, and it is still the same body
+/// to whoever holds it. `*` names anything.
+pub fn names(if_none_match: &str, etag: &str) -> bool {
+    let etag = etag.trim_start_matches("W/");
+    tags(if_none_match).any(|tag| tag == "*" || tag == etag)
+}
+
+/// The validator of a body that has no other: what it is, and how long.
+fn body_tag(body: &[u8]) -> String {
+    let hash = body.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    format!("\"{hash:016x}-{:x}\"", body.len())
+}
+
 /// The validator of an object: its key and its size, which is all that
 /// identifies it and all that is known without reading it.
 fn etag(key: &str, size: u64) -> String {
@@ -244,6 +289,19 @@ impl Reply {
     }
 
     /// The body, whole: read now if it had not been.
+    /// This reply as the answer to a client that already holds it: its
+    /// validator and how long to keep it, and no body.
+    fn not_modified(self) -> Self {
+        Reply {
+            status: 304,
+            content_range: None,
+            ranged: false,
+            body: Vec::new(),
+            later: None,
+            ..self
+        }
+    }
+
     pub async fn whole(self) -> Result<Vec<u8>, RepoError> {
         match self.later {
             Some(later) => later.read().await,
@@ -318,16 +376,40 @@ impl Bench {
     }
 
     /// Answers a GET. `path` is as the request line has it, still
-    /// percent-encoded; `range` is the `Range` header. `None` is a path this
-    /// API does not own, for the caller to serve something else on.
-    pub async fn get(&self, path: &str, query: &str, range: Option<&str>) -> Option<Reply> {
+    /// percent-encoded; `asked` is what its headers ask — a `Range` alone
+    /// may be given as it is. `None` is a path this API does not own, for
+    /// the caller to serve something else on.
+    ///
+    /// Every reply that carries a body carries a validator, and a request
+    /// that names it is answered 304 with no body: for a block, without a
+    /// byte of it having been read.
+    pub async fn get<'a>(
+        &self,
+        path: &str,
+        query: &str,
+        asked: impl Into<Asked<'a>>,
+    ) -> Option<Reply> {
+        let asked = asked.into();
         let rest = path.strip_prefix("/api/")?;
-        Some(match self.route(rest, query, range).await {
+        let mut reply = match self.route(rest, query, &asked).await {
             Ok(reply) | Err(reply) => reply,
-        })
+        };
+        if reply.status == 200 && reply.etag.is_none() && reply.later.is_none() {
+            reply.etag = Some(body_tag(&reply.body));
+        }
+        let held = matches!(reply.status, 200 | 206)
+            && asked
+                .if_none_match
+                .zip(reply.etag.as_deref())
+                .is_some_and(|(theirs, ours)| names(theirs, ours));
+        if held {
+            reply = reply.not_modified();
+        }
+        Some(reply)
     }
 
-    async fn route(&self, rest: &str, query: &str, range: Option<&str>) -> Result<Reply, Reply> {
+    async fn route(&self, rest: &str, query: &str, asked: &Asked<'_>) -> Result<Reply, Reply> {
+        let range = asked.range;
         if rest == "projects" {
             return Ok(Reply::json(&serde_json::json!({
                 "projects": self.projects.iter().map(|p| serde_json::json!({
@@ -340,7 +422,7 @@ impl Bench {
             return self.tiles_route(rest).await;
         }
         if let Some(rest) = rest.strip_prefix("store/") {
-            return self.store_route(rest).await;
+            return self.store_route(rest, asked).await;
         }
         let (name, rest) = rest
             .strip_prefix("p/")
@@ -398,7 +480,7 @@ impl Bench {
 
     /// The store's objects: `store/live/<key>` for what changes,
     /// `store/b8/<n>/<key>` for blocks of what does not.
-    async fn store_route(&self, rest: &str) -> Result<Reply, Reply> {
+    async fn store_route(&self, rest: &str, asked: &Asked<'_>) -> Result<Reply, Reply> {
         let Some(store) = &self.store else {
             return Err(Reply::text(404, "no tile store configured"));
         };
@@ -409,22 +491,41 @@ impl Bench {
             if !safe(&key) || !key.ends_with(".json") {
                 return Err(Reply::text(400, format!("not a live object: {key}")));
             }
-            let size = store.live.size(&key).await.map_err(Reply::of)?;
-            if size > LIVE_LIMIT {
-                return Err(Reply::text(400, format!("{key} is {size} bytes")));
-            }
-            let body = store.live.read(&key, 0..size).await.map_err(Reply::of)?;
-            return Ok(Reply {
-                status: 200,
+            // The condition goes to the bucket, with its own validator:
+            // an object the client still holds is not read to find that out.
+            let known = asked.if_none_match.and_then(|theirs| tags(theirs).next());
+            let read = store.live.read_if_changed(&key, known).await.map_err(|e| {
+                match e {
+                    // Nothing there is an answer, and kept as long as one:
+                    // what a store does not have is asked for by every film.
+                    RepoError::NotFound(_) => Reply {
+                        cache_control: BRIEF,
+                        ..Reply::of(e)
+                    },
+                    e => Reply::of(e),
+                }
+            })?;
+            let live = |status, etag: Option<String>, body: Vec<u8>| Reply {
+                status,
                 content_type: "application/json".into(),
                 content_range: None,
                 ranged: false,
-                etag: None,
-                object_size: Some(size),
+                etag,
+                object_size: None,
                 cache_control: BRIEF,
                 body,
                 later: None,
-            });
+            };
+            return match read {
+                Read::Unchanged => Ok(live(304, known.map(str::to_string), Vec::new())),
+                Read::Changed { bytes, .. } if bytes.len() as u64 > LIVE_LIMIT => {
+                    Err(Reply::text(400, format!("{key} is {} bytes", bytes.len())))
+                }
+                Read::Changed { bytes, etag } => Ok(Reply {
+                    object_size: Some(bytes.len() as u64),
+                    ..live(200, etag, bytes)
+                }),
+            };
         }
         if let Some((index, key)) = rest
             .strip_prefix(&format!("{}/", block_segment()))

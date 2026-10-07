@@ -4,10 +4,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tuile_repository::bench::names;
 use tuile_repository::s3::{Http, HttpReply, S3Config, S3Objects, Signed};
 use tuile_repository::{
-    block_segment, ArchivedTiles, Bench, Cached, ChunkStore, Config, FilmRepository, Layout, Now,
-    Objects, Place, Project, Reply, RunFilms, ScenePacks, StoreObjects, TileRepository,
+    block_segment, ArchivedTiles, Asked, Bench, Cached, ChunkStore, Config, FilmRepository, Layout,
+    Now, Objects, Place, Project, Reply, RunFilms, ScenePacks, StoreObjects, TileRepository,
 };
 use worker::{
     console_log, event, Cache, Context, Date, Delay, Env, Fetch, Headers, Method, Request,
@@ -331,12 +332,29 @@ pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> 
     // block names its pack's size (`?s=`), because a pack can be replaced
     // under its key and an address kept for a year must not then answer
     // with the old one. An archive of the tile store is never rewritten.
-    let cacheable = is_block(url.path())
-        && (url.path().starts_with("/api/store/") || url.query().is_some_and(|q| q.contains("s=")));
+    let named = url.query_pairs().any(|(name, _)| name == "s");
+    let cacheable = is_block(url.path()) && (url.path().starts_with("/api/store/") || named);
+    let if_none_match = request.headers().get("if-none-match")?;
     let cache = Cache::default();
     let key = url.to_string();
     if cacheable {
         if let Ok(Some(hit)) = cache.get(&key, false).await {
+            // A client that already holds this block is told so, and sent
+            // nothing: the cache is asked by address, and does not see
+            // what the request holds.
+            let held = if_none_match
+                .as_deref()
+                .zip(hit.headers().get("etag")?)
+                .is_some_and(|(theirs, ours)| names(theirs, &ours));
+            if held {
+                let headers = Headers::new();
+                for name in ["etag", "cache-control", "x-object-size"] {
+                    if let Some(value) = hit.headers().get(name)? {
+                        headers.set(name, &value)?;
+                    }
+                }
+                return Ok(Response::empty()?.with_status(304).with_headers(headers));
+            }
             return Ok(hit);
         }
     }
@@ -350,7 +368,10 @@ pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> 
         .get(
             url.path(),
             url.query().unwrap_or_default(),
-            range.as_deref(),
+            Asked {
+                range: range.as_deref(),
+                if_none_match: if_none_match.as_deref(),
+            },
         )
         .await
     {

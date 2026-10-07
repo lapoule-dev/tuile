@@ -392,3 +392,105 @@ async fn an_object_is_read_again_only_when_it_was_written_again() {
         Err(RepoError::NotFound(_))
     ));
 }
+
+/// The store's small objects from the far side of the API: each carries
+/// its store's validator, a client that holds one is sent nothing — and the
+/// object is not read to find that out —, one written again is sent whole,
+/// and what is not there says so for as long as what is.
+#[tokio::test]
+async fn a_live_object_is_sent_again_only_when_it_was_written_again() {
+    use tuile_repository::{Asked, Read};
+
+    /// Counts the bytes that leave the store.
+    struct Counted(Arc<dyn Objects>, std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl Objects for Counted {
+        fn label(&self) -> String {
+            self.0.label()
+        }
+        async fn list(&self, p: &str) -> Result<Vec<tuile_repository::Entry>, RepoError> {
+            self.0.list(p).await
+        }
+        async fn browse(&self, p: &str) -> Result<tuile_repository::Listing, RepoError> {
+            self.0.browse(p).await
+        }
+        async fn size(&self, key: &str) -> Result<u64, RepoError> {
+            self.0.size(key).await
+        }
+        async fn read(&self, key: &str, range: std::ops::Range<u64>) -> Result<Vec<u8>, RepoError> {
+            let bytes = self.0.read(key, range).await?;
+            self.1
+                .fetch_add(bytes.len(), std::sync::atomic::Ordering::Relaxed);
+            Ok(bytes)
+        }
+        async fn read_if_changed(&self, key: &str, known: Option<&str>) -> Result<Read, RepoError> {
+            let read = self.0.read_if_changed(key, known).await?;
+            if let Read::Changed { bytes, .. } = &read {
+                self.1
+                    .fetch_add(bytes.len(), std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(read)
+        }
+    }
+
+    let root = tempfile::tempdir().expect("dir");
+    let path = root.path().join("layer/top/manifest.json");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, b"{\"archives\":[]}").expect("write");
+    let files: Arc<dyn Objects> =
+        Arc::new(ObjectRunStore::local(root.path(), Tuning::default()).expect("store"));
+    let live = Arc::new(Counted(files.clone(), Default::default()));
+    let sent = || live.1.load(std::sync::atomic::Ordering::Relaxed);
+    let bench = Bench {
+        projects: Vec::new(),
+        tiles: None,
+        store: Some(StoreObjects {
+            live: live.clone(),
+            archives: files,
+        }),
+    };
+    let url = "/api/store/live/layer/top/manifest.json";
+
+    let first = bench.get(url, "", None).await.expect("reply");
+    assert_eq!(first.status, 200);
+    assert_eq!(first.cache_control, "public, max-age=30");
+    let tag = first.etag.clone().expect("a live object has a validator");
+    let read_once = sent();
+    assert_eq!(read_once, first.body.len());
+
+    let asking = |tag: &str| Asked {
+        range: None,
+        if_none_match: Some(Box::leak(tag.to_string().into_boxed_str())),
+    };
+    let held = bench.get(url, "", asking(&tag)).await.expect("reply");
+    assert_eq!((held.status, held.body.len()), (304, 0));
+    assert_eq!(held.etag.as_deref(), Some(tag.as_str()));
+    assert_eq!(
+        sent(),
+        read_once,
+        "an object the client holds was read from the store"
+    );
+
+    // Written again, to the same size.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    std::fs::write(&path, b"{\"archives\":[]} ".map(|b| b)[..15].to_vec()).expect("write");
+    std::fs::write(&path, b"{\"archivez\":[]}").expect("write");
+    let again = bench.get(url, "", asking(&tag)).await.expect("reply");
+    assert_eq!(again.status, 200);
+    assert_eq!(again.body, b"{\"archivez\":[]}");
+    assert_ne!(again.etag.as_deref(), Some(tag.as_str()));
+
+    // Nothing there: said for as long as something there would be.
+    let none = bench
+        .get("/api/store/live/layer/tone/9/1/1.json", "", None)
+        .await
+        .expect("reply");
+    assert_eq!(none.status, 404);
+    assert_eq!(none.cache_control, "public, max-age=30");
+    // Not a live object at all: an error like any other, asked again.
+    let refused = bench
+        .get("/api/store/live/layer/top/a.pmtiles", "", None)
+        .await
+        .expect("reply");
+    assert_eq!((refused.status, refused.cache_control), (400, "no-cache"));
+}

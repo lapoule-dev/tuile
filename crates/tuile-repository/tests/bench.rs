@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tuile_farm::{ObjectRunStore, Tuning};
 use tuile_pack::{BakedView, PackWriter};
-use tuile_repository::{Bench, Objects, Project, ScenePacks};
+use tuile_repository::{Asked, Bench, Objects, Project, ScenePacks};
 
 fn pack(path: &Path, first: u32, last: u32) {
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
@@ -144,11 +144,86 @@ async fn the_routes_answer_as_documented() {
         Some(tag.as_str()),
         "one object, one validator, whatever the range"
     );
-    // A listing is not: what a bucket holds changes.
+    // A listing is not: what a bucket holds changes. It is asked for again
+    // each time — and, carrying a validator of what it says, answered with
+    // nothing when it says the same.
     assert_eq!(films.cache_control, "no-cache");
-    assert!(films.etag.is_none());
+    let listed = films.etag.clone().expect("a listing has a validator");
+    let asking = |if_none_match: &'static str| Asked {
+        range: None,
+        if_none_match: Some(if_none_match),
+    };
+    let held: &'static str = Box::leak(listed.clone().into_boxed_str());
+    let same = bench
+        .get("/api/p/engine/films", "", asking(held))
+        .await
+        .expect("reply");
+    assert_eq!((same.status, same.body.len()), (304, 0));
+    assert_eq!(same.etag.as_deref(), Some(listed.as_str()));
+    assert_eq!(same.cache_control, "no-cache");
+    // Weakened on the way, in a list, or anything at all: still held.
+    for theirs in [
+        format!("W/{listed}"),
+        format!("\"other\", {listed}"),
+        "*".to_string(),
+    ] {
+        let theirs: &'static str = Box::leak(theirs.into_boxed_str());
+        let reply = bench
+            .get("/api/p/engine/films", "", asking(theirs))
+            .await
+            .expect("reply");
+        assert_eq!(reply.status, 304, "{theirs}");
+    }
+    // Another validator is another listing: the whole of it again.
+    let other = bench
+        .get("/api/p/engine/films", "", asking("\"0000000000000000-0\""))
+        .await
+        .expect("reply");
+    assert_eq!((other.status, other.body), (200, films.body.clone()));
+    // Bytes held are not sent again either, by range or by block, and a
+    // block the client holds is answered without one byte of it being read.
+    let held: &'static str = Box::leak(tag.clone().into_boxed_str());
+    let bytes = bench
+        .get(
+            &object,
+            "",
+            Asked {
+                range: Some("bytes=0-7"),
+                if_none_match: Some(held),
+            },
+        )
+        .await
+        .expect("reply");
+    assert_eq!((bytes.status, bytes.body.len()), (304, 0));
+    let block = object.replace("/o/", "/b8/0/");
+    let whole = bench.get(&block, "", None).await.expect("reply");
+    let block_tag: &'static str = Box::leak(
+        whole
+            .etag
+            .clone()
+            .expect("a block has a validator")
+            .into_boxed_str(),
+    );
+    let unread = bench
+        .get(&block, "", asking(block_tag))
+        .await
+        .expect("reply");
+    assert_eq!(unread.status, 304);
+    assert!(unread.later.is_none() && unread.body.is_empty());
+    // A pack replaced is a 409 whatever the client holds: never "unchanged".
+    let replaced = bench
+        .get(&block, "s=1", asking(block_tag))
+        .await
+        .expect("reply");
+    assert_eq!(replaced.status, 409);
+    // An error has nothing to validate.
+    let missing = bench
+        .get("/api/p/engine/films/none", "", asking("*"))
+        .await
+        .expect("reply");
+    assert_eq!(missing.status, 404);
     let past = bench
-        .get(&object, "", Some(&format!("bytes={size}-")))
+        .get(&object, "", Some(format!("bytes={size}-").as_str()))
         .await
         .expect("reply");
     assert_eq!(
