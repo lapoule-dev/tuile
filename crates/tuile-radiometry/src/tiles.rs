@@ -1021,6 +1021,92 @@ impl Observed {
     }
 }
 
+/// Places from a tile's edge over which a mosaic blends one capture into
+/// the next, of [`PAIRS`] a side.
+const BLENDED: usize = 2;
+
+impl Observed {
+    /// How tile `a` and its neighbour `b` meet along their edge, **read
+    /// against the reference under them**: at each place along the edge,
+    /// the step from one tile's last place to the other's first, less the
+    /// step the reference shows between the same two places. What is left
+    /// is in the film and not in the ground — whatever the season the
+    /// film was taken in, and whatever the relief does there, since the
+    /// reference is one picture across the edge.
+    ///
+    /// `None` if either tile was not set against a reference; an edge with
+    /// fewer than half its places to compare says nothing.
+    pub fn junction_against(&self, a: TileAt, b: TileAt, upright: bool) -> Option<Junction> {
+        let (mine, theirs) = (
+            self.tiles.get(&a)?.paired.as_deref()?,
+            self.tiles.get(&b)?.paired.as_deref()?,
+        );
+        if !mine.reference.iter().any(|c| c[0].is_finite())
+            || !theirs.reference.iter().any(|c| c[0].is_finite())
+        {
+            return None;
+        }
+        // Places at `k` along the edge, `depth` in from it on a's side or
+        // on b's. A mosaic blends two captures over the places nearest
+        // their seam — measured, two of them: a step of more than a stop
+        // shows as a quarter of one between the places that face each
+        // other. So each side is read past the blend, over the two places
+        // after it; the reference taken away, the ground between places
+        // that far apart costs nothing.
+        let place = |last: bool, depth: usize, k: usize| {
+            let at = if last { PAIRS - 1 - depth } else { depth };
+            if upright {
+                k * PAIRS + at
+            } else {
+                at * PAIRS + k
+            }
+        };
+        let stops = |c: [f32; 3]| (luma(c) + FLOOR).log2();
+        // A side's film and reference past the blend, in stops; `None` if
+        // either of its places cannot be compared.
+        let side = |of: &Paired, last: bool, k: usize| {
+            let (mut film, mut under) = (0.0f32, 0.0f32);
+            for depth in BLENDED..BLENDED + 2 {
+                let at = place(last, depth, k);
+                if !crate::linear::ground(of.tile[at]) || !crate::linear::ground(of.reference[at]) {
+                    return None;
+                }
+                film += stops(of.tile[at]) / 2.0;
+                under += stops(of.reference[at]) / 2.0;
+            }
+            Some((film, under))
+        };
+        let (mut across, mut beyond) = (Vec::with_capacity(PAIRS), Vec::with_capacity(PAIRS));
+        for k in 0..PAIRS {
+            let (Some(a), Some(b)) = (side(mine, true, k), side(theirs, false, k)) else {
+                continue;
+            };
+            let step = a.0 - b.0;
+            across.push(step);
+            beyond.push(step - (a.1 - b.1));
+        }
+        if beyond.len() * 2 < PAIRS {
+            return Some(Junction {
+                step: 0.0,
+                coherence: 0.0,
+                tiles: 0.0,
+            });
+        }
+        let places = beyond.clone();
+        let step = median(&mut beyond);
+        let coherence = places
+            .iter()
+            .filter(|c| c.signum() == step.signum())
+            .count() as f32
+            / places.len() as f32;
+        Some(Junction {
+            step,
+            coherence,
+            tiles: median(&mut across),
+        })
+    }
+}
+
 impl TileGains {
     /// What is done to a tile: its correction, as the measure it was
     /// fitted by makes of it. Nothing for a tile that was not fitted.
@@ -2161,6 +2247,78 @@ mod tests {
         // The shared column is draped by both.
         assert_eq!(together.tiles[&(13, 106, 200)].usage, 2.0);
         assert_eq!(solved(&together).0, solved(&whole).0);
+    }
+
+    /// Two neighbours over ground that goes on from one to the other,
+    /// `ground` saying its light by column and row of the two together —
+    /// the reference shows it as it is, the tiles through `east` on the
+    /// right-hand one.
+    fn against(ground: impl Fn(usize, usize) -> f32, east: f32) -> Observed {
+        let mut observed = Observed::default();
+        for (n, by) in [(0usize, 1.0f32), (1, east)] {
+            let places: [[f32; 3]; PAIRS * PAIRS] = std::array::from_fn(|k| {
+                let light = ground(n * PAIRS + k % PAIRS, k / PAIRS);
+                [light, light * 1.1, light * 0.8]
+            });
+            let texels = vec![[0.1f32; 3]; 64 * 64];
+            let mut seen = TileSeen::of_linear(&texels, 64).expect("a tile");
+            seen.paired = Some(Box::new(Paired {
+                tile: places.map(|c| c.map(|v| v * by)),
+                reference: places,
+            }));
+            observed.see((13, 10 + n as u32, 20), || Some(seen), 1.0);
+        }
+        observed
+    }
+
+    #[test]
+    fn a_step_the_reference_does_not_show_is_a_seam_and_one_it_shows_is_not() {
+        let rolling =
+            |x: usize, y: usize| 0.08 + 0.03 * ((x as f32 * 0.7).sin() + (y as f32 * 0.5).cos());
+        // One capture: nothing between the two but the ground.
+        let met = |observed: &Observed| {
+            observed
+                .junction_against((13, 10, 20), (13, 11, 20), true)
+                .expect("both set against it")
+        };
+        assert_eq!(met(&against(rolling, 1.0)).apart(), 0.0);
+        // The right-hand tile a stop darker: a seam of a stop, all along.
+        let seam = met(&against(rolling, 0.5));
+        assert!(
+            (seam.step - 1.0).abs() < 0.05 && seam.coherence == 1.0,
+            "{seam:?}"
+        );
+        assert!((seam.apart() - 1.0).abs() < 0.05);
+        // The ground itself a stop darker east of the edge — a forest's
+        // edge, a shore — in the film and in the reference alike: the two
+        // tiles step by a stop, and it is no seam.
+        let shore = met(&against(
+            |x, y| rolling(x, y) * if x < PAIRS { 1.0 } else { 0.5 },
+            1.0,
+        ));
+        assert!(shore.tiles.abs() > 0.9, "{shore:?}");
+        assert_eq!(shore.apart(), 0.0, "{shore:?}");
+        // A seam blended over the places nearest the edge, as a mosaic
+        // blends them: between the places that face each other hardly a
+        // step, and a stop all the same.
+        let mut blended = against(rolling, 0.5);
+        let east = blended.tiles.get_mut(&(13, 11, 20)).expect("a tile");
+        let paired = east.paired.as_deref_mut().expect("its places");
+        for k in 0..PAIRS {
+            paired.tile[k * PAIRS] = paired.tile[k * PAIRS].map(|v| v * 1.9);
+            paired.tile[k * PAIRS + 1] = paired.tile[k * PAIRS + 1].map(|v| v * 1.3);
+        }
+        let seam = met(&blended);
+        assert!((seam.apart() - 1.0).abs() < 0.05, "{seam:?}");
+        // Tiles that were set against nothing cannot be read this way.
+        let mut alone = against(rolling, 0.5);
+        for tile in alone.tiles.values_mut() {
+            tile.paired = None;
+        }
+        assert_eq!(
+            alone.junction_against((13, 10, 20), (13, 11, 20), true),
+            None
+        );
     }
 
     #[test]

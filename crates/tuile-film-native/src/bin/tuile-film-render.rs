@@ -442,6 +442,86 @@ async fn main() -> Result<(), Error> {
                 "reference layer {under}: {} tiles of it read, {} not there; of the film's {} tiles, {} have it under all of them, {} under none",
                 set.read, set.absent, set.tiles, set.whole, set.bare
             );
+            // Read as any layer of the store is: its catalog, manifests and
+            // tables kept with their validators, its archives by chunks.
+            let (asked, kept, chunks) = (
+                sources.live.so_far(),
+                sources.revalidations(),
+                sources.archives.reads(),
+            );
+            println!(
+                "  the store's small objects since the render began: {} asked of the bucket — {} unchanged (no body sent), {} downloaded ({:.3} MB); its archives: {} reads asked of the cache, {} of them gone to the bucket for ({:.1} MB)",
+                asked.reads,
+                kept.unchanged,
+                kept.fetched,
+                megabytes(kept.fetched_bytes),
+                chunks.0.reads,
+                chunks.1.reads,
+                megabytes(chunks.1.bytes),
+            );
+            // Every tile's line as it was fitted, and what the lines leave:
+            // how far the reference stands from what a line says, by the
+            // light it says — were that to bend, a line would not be enough.
+            let trace = PathBuf::from(&dir).join("trace/linear");
+            std::fs::create_dir_all(&trace)?;
+            let mut lines = String::from(
+                "level,x,y,usage,places,gain_r,gain_g,gain_b,bias_r,bias_g,bias_b,ratio_r,ratio_g,ratio_b,agreement_r,agreement_g,agreement_b,trust_r,trust_g,trust_b,weight\n",
+            );
+            // Half a stop a bin, from nine stops under white.
+            const BINS: usize = 18;
+            let mut left = [[(0.0f64, 0.0f64, 0.0f64); BINS]; 3];
+            for (at, tile) in &observed.tiles {
+                let Some(fit) = tile.paired.as_deref().and_then(|p| p.fit()) else {
+                    continue;
+                };
+                let line = &fit.line;
+                let three = |v: [f32; 3]| format!("{:.6},{:.6},{:.6}", v[0], v[1], v[2]);
+                let weight = fit.places.iter().map(|p| p.2).sum::<f32>() / fit.places.len() as f32;
+                lines += &format!(
+                    "{},{},{},{:.1},{},{},{},{},{},{},{weight:.4}\n",
+                    at.0,
+                    at.1,
+                    at.2,
+                    tile.usage,
+                    line.places,
+                    three(line.gain),
+                    three(line.bias),
+                    three(line.ratio),
+                    three(line.agreement),
+                    three(line.trust),
+                );
+                for (stored, shown, weight) in &fit.places {
+                    for band in 0..3 {
+                        let said = line.gain[band] * stored[band] + line.bias[band];
+                        if said <= 0.0 || shown[band] <= 0.0 {
+                            continue;
+                        }
+                        let bin = ((said.log2() + 9.0) * 2.0).floor();
+                        if (0.0..BINS as f32).contains(&bin) {
+                            let (off, w) =
+                                (f64::from((shown[band] / said).log2()), f64::from(*weight));
+                            let b = &mut left[band][bin as usize];
+                            *b = (b.0 + w * off, b.1 + w, b.2 + w * off * off);
+                        }
+                    }
+                }
+            }
+            let mut residuals = String::from("band,stops,weight,mean_stops,spread_stops\n");
+            for (band, bins) in left.iter().enumerate() {
+                for (bin, (sum, weight, squares)) in bins.iter().enumerate() {
+                    if *weight > 0.0 {
+                        let mean = sum / weight;
+                        residuals += &format!(
+                            "{},{:.2},{weight:.1},{mean:.5},{:.5}\n",
+                            ["r", "g", "b"][band],
+                            bin as f32 / 2.0 - 9.0 + 0.25,
+                            (squares / weight - mean * mean).max(0.0).sqrt(),
+                        );
+                    }
+                }
+            }
+            std::fs::write(trace.join("lines.csv"), lines)?;
+            std::fs::write(trace.join("residuals.csv"), residuals)?;
             std::fs::create_dir_all(&dir)?;
             for level in 1..=22u8 {
                 let path = PathBuf::from(&dir).join(format!("reference-{level}.png"));
@@ -583,7 +663,15 @@ async fn main() -> Result<(), Error> {
         };
         println!("\nas it is:");
         judge("as-it-is", &|_, _, _| Local::IDENTITY)?;
-        for measure in [Measure::Moments, Measure::Curves] {
+        // The earlier fits, against a level of the film's own imagery, for
+        // comparison — not when the grade is fitted on lines: they are a
+        // third of a gigabyte of mosaics that say nothing of it.
+        let earlier: &[Measure] = if measure == Measure::Linear {
+            &[]
+        } else {
+            &[Measure::Moments, Measure::Curves]
+        };
+        for measure in earlier.iter().copied() {
             let version = format!("blocks-{}", measure.name());
             let (gains, of_blocks, trace) =
                 TileGains::solve_traced(&observed, measure, &tile_bounds);
@@ -602,8 +690,14 @@ async fn main() -> Result<(), Error> {
             judge(&version, &|at, _, _| gains.local(at))?;
 
             let version = format!("field-{}", measure.name());
+            // Against the level of the film's own imagery, whatever the
+            // grade written is fitted against.
+            let against_level = FieldBounds {
+                reference_level: reference,
+                ..FieldBounds::default()
+            };
             let (field, of_field, trace) =
-                CornerField::solve_traced(&observed, measure, &field_bounds);
+                CornerField::solve_traced(&observed, measure, &against_level);
             for (name, table) in trace.tables() {
                 write(&format!("trace/{version}"), name, table)?;
             }
@@ -655,6 +749,57 @@ async fn main() -> Result<(), Error> {
                 of_field.held,
             );
             judge("field-linear", &|at, u, v| field.at(at, u, v))?;
+            // The three side by side — one above the other, a film being
+            // wider than high: the reference, the film as the store holds
+            // it, the film as the field leaves it. Half the mosaics' size.
+            if let Some(under) = &reference_layer {
+                let cap = value("--reference-cap").map_or(Ok(14), |c| c.parse())?;
+                let mut pictured =
+                    Reference::new(under.clone(), sources.store.scheme_of(under), cap);
+                for level in 1..=22u8 {
+                    let Some((tiles, extent)) = meter.extent(level) else {
+                        continue;
+                    };
+                    let (was, is) = (
+                        out.join(format!("mosaic-{level}-as-it-is.png")),
+                        out.join(format!("mosaic-{level}-field-linear.png")),
+                    );
+                    if !(was.exists() && is.exists()) {
+                        continue;
+                    }
+                    const SIDE: u32 = 32;
+                    let above = pictured
+                        .mosaic(
+                            &sources.store.tiles,
+                            &sources.store.scheme_of(&layer),
+                            &tiles,
+                            extent,
+                            SIDE,
+                            lift,
+                        )
+                        .await?;
+                    let (wide, high) = above.dimensions();
+                    let mut three = image::RgbImage::new(wide, high * 3 + 16);
+                    image::imageops::replace(&mut three, &above, 0, 0);
+                    for (row, path) in [(1u32, &was), (2, &is)] {
+                        let full = image::open(path)?.to_rgb8();
+                        let half = image::imageops::resize(
+                            &full,
+                            wide,
+                            high,
+                            image::imageops::FilterType::Triangle,
+                        );
+                        image::imageops::replace(&mut three, &half, 0, i64::from(row * (high + 8)));
+                    }
+                    let path = out.join(format!("triptych-{level}.png"));
+                    three.save(&path)?;
+                    println!(
+                        "  the reference, the film as it is, the film corrected: {} ({wide}×{})",
+                        path.display(),
+                        high * 3 + 16
+                    );
+                }
+            }
         }
         let putting = if flag("--put") {
             let config = BucketConfig {

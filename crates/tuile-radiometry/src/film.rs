@@ -519,6 +519,7 @@ impl FilmGrade {
         let measure = match inside(text, "\"measure\":\"", '"')?.as_str() {
             "moments" => Measure::Moments,
             "curves" => Measure::Curves,
+            "linear" => Measure::Linear,
             _ => return None,
         };
         // The corners, each its numbers and then its pivot…
@@ -824,6 +825,41 @@ mod tests {
             FilmGrade::of_packs(&[(&g_west, &west)], &target, &bounds, &field).as_ref(),
             Some(&g_west)
         );
+    }
+
+    #[test]
+    fn a_grade_fitted_on_lines_against_a_reference_is_read_back() {
+        // The same film, each tile set against a reference that is its own
+        // ground without the dark tiles' loss of light.
+        let mut observed = film(0.05, 12, 4, 0.75);
+        observed.tiles.retain(|at, _| at.0 == 13);
+        for (at, tile) in &mut observed.tiles {
+            let by = if at.1 < 54 { (-0.75f32).exp2() } else { 1.0 };
+            let place = |k: usize| {
+                let light =
+                    0.03 + 0.04 * ((k % 16) as f32 * 0.9).sin().abs() + 0.002 * (k / 16) as f32;
+                [light, light * 1.1, light * 0.8]
+            };
+            tile.paired = Some(Box::new(crate::Paired {
+                tile: std::array::from_fn(|k| place(k).map(|v| v * by)),
+                reference: std::array::from_fn(place),
+            }));
+        }
+        let grade = FilmGrade::fit(
+            &observed,
+            Measure::Linear,
+            1.0,
+            &LookTarget::default(),
+            &Bounds::default(),
+            &FieldBounds {
+                reference_level: 0,
+                ..FieldBounds::default()
+            },
+        );
+        assert!(!grade.field.given.is_empty());
+        assert_eq!(grade.field.measure, Measure::Linear);
+        let read = FilmGrade::from_json(&grade.to_json()).expect("read back");
+        assert_eq!(read.field, grade.field);
     }
 
     #[test]
