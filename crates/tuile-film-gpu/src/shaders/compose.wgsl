@@ -49,6 +49,9 @@ struct Job {
     //   2  x: the pivot of the contrast, as its stops under white
     //   3–8 the transfer curve of red, green, blue, two vectors each: stops
     //      added to a texel by the light it came in with, at −8 … −1 stops
+    // When `more.w` is 1 a corner carries a colour matrix instead, in its
+    // first three vectors: a row a channel out — red, green, blue in, then
+    // what is added.
     corners: array<vec4f, 36>,
 }
 
@@ -127,6 +130,19 @@ fn fielded(bytes: vec3f, t: vec2f) -> vec3f {
     return round(stored_of(min(lit, vec3f(1.0))) * 255.0);
 }
 
+// A texel through the matrix its place in the tile gives it: the four
+// corners' matrices blended, then applied in linear light. A function of
+// where the texel is and of what colour it has.
+fn matrixed(bytes: vec3f, t: vec2f) -> vec3f {
+    let lit = vec4f(linear_of(bytes / 255.0), 1.0);
+    let made = vec3f(
+        dot(blended(0u, t), lit),
+        dot(blended(1u, t), lit),
+        dot(blended(2u, t), lit),
+    );
+    return round(stored_of(clamp(made, vec3f(0.0), vec3f(1.0))) * 255.0);
+}
+
 @compute @workgroup_size(8, 8)
 fn compose(@builtin(global_invocation_id) id: vec3u) {
     let at = id.xy + job.origin;
@@ -151,6 +167,10 @@ fn compose(@builtin(global_invocation_id) id: vec3u) {
     let top = step_down(bytes(p0), bytes(vec2u(p1.x, p0.y)), w.x);
     let bottom = step_down(bytes(vec2u(p0.x, p1.y)), bytes(p1), w.x);
     let texel = step_down(top, bottom, w.y);
+    if (job.more.w == 1.0) {
+        textureStore(dst, at, vec4f(matrixed(texel.rgb, t) / 255.0, 1.0));
+        return;
+    }
     if (job.more.z == 1.0) {
         textureStore(dst, at, vec4f(fielded(texel.rgb, t) / 255.0, 1.0));
         return;

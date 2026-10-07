@@ -66,7 +66,8 @@ pub fn through(matrix: &Affine, colour: [f32; 3]) -> [f32; 3] {
 pub struct MatrixBounds {
     /// How much of the reference's own look is left in what the film is
     /// brought to, 0 to 1: at 0 the film keeps the look of its imagery
-    /// whole, at 1 it takes the reference's.
+    /// whole, at 1 it takes the reference's. [`MatrixBounds::DOSE`] unless
+    /// told.
     pub toward: f32,
     /// How strongly a corner's matrix is held to changing nothing, against
     /// a tile's places fully believed.
@@ -82,10 +83,17 @@ pub struct MatrixBounds {
     pub least_seam: usize,
 }
 
+impl MatrixBounds {
+    /// The dose of the reference's look a film takes when nothing says:
+    /// three tenths, chosen by eye on a first film — more, and the film is
+    /// the reference's green; less, and it is its imagery's pallor.
+    pub const DOSE: f32 = 0.3;
+}
+
 impl Default for MatrixBounds {
     fn default() -> Self {
         Self {
-            toward: 0.25,
+            toward: Self::DOSE,
             held: 0.02,
             smooth: 0.5,
             seam_stops: 0.6,

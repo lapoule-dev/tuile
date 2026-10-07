@@ -674,6 +674,7 @@ fn a_layer_is_composed_through_a_field_carried_by_its_corners() {
             corner(0.0, lifted),
             corner(1.0, lifted),
         ],
+        matrices: None,
     };
     let rgba8: Vec<u8> = (0..side * side)
         .flat_map(|_| [grey, grey, grey, 255])
@@ -748,4 +749,141 @@ fn a_layer_is_composed_through_a_field_carried_by_its_corners() {
     // Along the left edge only the two left corners count: no gain there,
     // whatever the right ones hold.
     assert!((at(0, 0) - f32::from(grey)).abs() <= 2.0, "{}", at(0, 0));
+}
+
+#[test]
+fn a_layer_is_composed_through_matrices_carried_by_its_corners() {
+    use tuile_film_gpu::{DrapeLayer, LayerCorner, LayerField};
+
+    let Some((device, queue)) = device() else {
+        eprintln!("no adapter: skipped");
+        return;
+    };
+    let mut film = FilmGpu::new(
+        device,
+        queue,
+        Settings {
+            width: 64,
+            height: 48,
+            supersample: 1,
+            look: Look::default(),
+        },
+    );
+    let side = 32u32;
+    let row = (side * 4).next_multiple_of(256);
+    let linear = |v: f32| {
+        let v = v / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let stored = |v: f32| {
+        let v = v.clamp(0.0, 1.0);
+        let s = if v <= 0.003_130_8 {
+            v * 12.92
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        };
+        (s * 255.0).round()
+    };
+    // A tile of one colour. On its left corners nothing is done; on its
+    // right ones red is given the blue and blue the red with a little
+    // added — a matrix no gain a channel could be.
+    let colour = [60u8, 120, 200];
+    let same = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0f32],
+    ];
+    let turned = [
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.05f32],
+    ];
+    let field = LayerField {
+        corners: [LayerCorner::IDENTITY; 4],
+        matrices: Some([same, turned, same, turned]),
+    };
+    let rgba8: Vec<u8> = (0..side * side)
+        .flat_map(|_| [colour[0], colour[1], colour[2], 255])
+        .collect();
+    let texture = film.create_imagery(side, side);
+    film.write_rgba(&texture, &rgba8);
+    let albedo = film.create_albedo(side, side);
+    film.compose(
+        &albedo,
+        [0.0, 0.0, 0.0, 1.0],
+        vec![DrapeLayer {
+            texture,
+            coverage: [0.0, 0.0, 1.0, 1.0],
+            translation: [0.0, 0.0],
+            scale: [1.0, 1.0],
+            grade: Default::default(),
+            field: Some(field),
+        }],
+    );
+    let mut pending = film.device().create_command_encoder(&Default::default());
+    film.record_pending(&mut pending);
+    film.queue().submit([pending.finish()]);
+    let got = read(&film, |encoder| {
+        let buffer = film.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: u64::from(row * side),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            albedo.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: side,
+                height: side,
+                depth_or_array_layers: 1,
+            },
+        );
+        (buffer, 0)
+    });
+    let at = |x: u32, y: u32, c: u32| f32::from(got[(y * row + x * 4 + c) as usize]);
+    let place = |i: u32| {
+        let uv = (i as f32 + 0.5) / side as f32;
+        (uv * (side - 1) as f32).floor().max(0.0) / (side - 1) as f32
+            + ((uv * (side - 1) as f32).fract()) / (side - 1) as f32
+    };
+    let lit = colour.map(|v| linear(f32::from(v)));
+    let mut worst = 0.0f32;
+    for (x, y) in [(0, 0), (31, 0), (0, 31), (31, 31), (16, 16), (7, 25)] {
+        let u = place(x);
+        for c in 0..3usize {
+            // The two matrices blended across, then applied in linear light.
+            let made: f32 = (0..3)
+                .map(|i| (same[c][i] * (1.0 - u) + turned[c][i] * u) * lit[i])
+                .sum::<f32>()
+                + same[c][3] * (1.0 - u)
+                + turned[c][3] * u;
+            worst = worst.max((at(x, y, c as u32) - stored(made)).abs());
+        }
+    }
+    assert!(
+        worst <= 1.0,
+        "{worst} bytes from the matrices blended by hand"
+    );
+    // On the left the colour nearly as it was — the first texel's middle
+    // is a sixty-fourth of the way across — and on the right red and blue
+    // turned.
+    assert!((at(0, 5, 0) - 60.0).abs() <= 8.0 && (at(0, 5, 2) - 200.0).abs() <= 8.0);
+    assert!(
+        at(31, 5, 0) > 190.0 && at(31, 5, 2) < 110.0,
+        "{} {}",
+        at(31, 5, 0),
+        at(31, 5, 2)
+    );
 }

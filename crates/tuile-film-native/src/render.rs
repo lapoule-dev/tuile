@@ -20,7 +20,7 @@ use tuile_film::{
 use tuile_film_gpu::{
     DrapeLayer, FilmGpu, LayerCorner, LayerField, LayerGrade, Settings, TileMesh,
 };
-use tuile_radiometry::{Blended, FilmGrade, Local};
+use tuile_radiometry::{linear_of, through, Affine, Blended, FilmGrade, Local, MatrixField, SAME};
 use tuile_repository::TileRepository;
 
 use crate::observe::{FrameOut, ImageryIn, Observer, Origin, TileIn, Timings};
@@ -116,6 +116,20 @@ fn layer_field(corners: &[Blended; 4], strength: f32) -> LayerField {
             saturation_stops: c.saturation_stops * strength,
             curve: c.curve.map(|channel| channel.map(|v| v * strength)),
         }),
+        matrices: None,
+    }
+}
+
+/// A tile's corner matrices as the composition is handed them, each taken
+/// at `strength`: that part of the way from changing nothing.
+fn layer_matrices(corners: &[Affine; 4], strength: f32) -> LayerField {
+    LayerField {
+        corners: [LayerCorner::IDENTITY; 4],
+        matrices: Some(corners.map(|matrix| {
+            std::array::from_fn(|o| {
+                std::array::from_fn(|i| SAME[o][i] + (matrix[o][i] - SAME[o][i]) * strength)
+            })
+        })),
     }
 }
 
@@ -243,9 +257,46 @@ pub async fn render(
         let scheme = layers.map(|(_, imagery)| sources.store.scheme_of(imagery));
         // A tile's own gain: the same wherever the film draws it.
         let corners = |at: (u8, u32, u32)| film_grade.as_ref().and_then(|g| g.field.corners(at));
+        // …or the function a tile, for a film that has one: it is drawn
+        // in the field's place.
+        let matrices = |at: (u8, u32, u32)| {
+            film_grade
+                .as_ref()
+                .and_then(|g| g.matrix.as_ref())
+                .and_then(|m| m.given.get(&at))
+                .map(|four| layer_matrices(four, strength))
+        };
         // Where a drape is composed without the GPU: the field, texel by
         // texel.
         let fielded = |at: (u8, u32, u32), rgba8: &mut [u8], width: u32, height: u32| {
+            if let Some(LayerField {
+                matrices: Some(four),
+                ..
+            }) = matrices(at)
+            {
+                let field = MatrixField {
+                    given: [(at, four)].into(),
+                };
+                for (n, texel) in rgba8.chunks_exact_mut(4).enumerate() {
+                    let (x, y) = (n as u32 % width, n as u32 / width);
+                    let matrix = field.at(
+                        at,
+                        (x as f32 + 0.5) / width as f32,
+                        (y as f32 + 0.5) / height as f32,
+                    );
+                    let lit = [0, 1, 2].map(|c| linear_of(texel[c]));
+                    for (c, made) in through(&matrix, lit).iter().enumerate() {
+                        let v = made.clamp(0.0, 1.0);
+                        let stored = if v <= 0.003_130_8 {
+                            v * 12.92
+                        } else {
+                            1.055 * v.powf(1.0 / 2.4) - 0.055
+                        };
+                        texel[c] = (stored * 255.0).round() as u8;
+                    }
+                }
+                return;
+            }
             let Some(corners) = corners(at) else {
                 return;
             };
@@ -473,12 +524,13 @@ pub async fn render(
                                     translation: placed.translation,
                                     scale: placed.scale,
                                     grade: LayerGrade::IDENTITY,
-                                    field: corners((
-                                        placed.tile.level as u8,
-                                        placed.tile.x,
-                                        placed.tile.y,
-                                    ))
-                                    .map(|c| layer_field(&c, strength)),
+                                    field: {
+                                        let at =
+                                            (placed.tile.level as u8, placed.tile.x, placed.tile.y);
+                                        matrices(at).or_else(|| {
+                                            corners(at).map(|c| layer_field(&c, strength))
+                                        })
+                                    },
                                 })
                                 .collect();
                             gpu.compose(&albedo, factor, layers);
