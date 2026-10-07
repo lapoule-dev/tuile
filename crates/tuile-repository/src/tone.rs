@@ -95,9 +95,14 @@ pub async fn film_tone(
         }
     }
     let fitted = own.iter().filter(|(t, _)| t.is_some()).count();
+    // A place nobody fitted is given the layer's gains and nothing more.
+    // How dark one source is against another holds from place to place;
+    // how flat and how dull it is does not — it is the ground's, and a
+    // contrast and a saturation fitted on moorland burnt a coast out.
+    let elsewhere = of_layer.gains_alone();
     let parts: Vec<(&LevelGrades, f32)> = own
         .iter()
-        .map(|(t, weight)| (t.as_ref().unwrap_or(&of_layer), *weight))
+        .map(|(t, weight)| (t.as_ref().unwrap_or(&elsewhere), *weight))
         .collect();
     Ok(FilmTone {
         table: LevelGrades::merged(&parts),
@@ -142,6 +147,10 @@ mod tests {
     }
 
     fn of(stops: f32) -> String {
+        with(stops, 1.2)
+    }
+
+    fn with(stops: f32, saturation: f32) -> String {
         LevelGrades {
             anchor: 10,
             grades: BTreeMap::from([
@@ -150,6 +159,7 @@ mod tests {
                     13,
                     Grade {
                         gain: [stops.exp2(); 3],
+                        saturation,
                         ..Grade::IDENTITY
                     },
                 ),
@@ -169,13 +179,23 @@ mod tests {
         // The first place is fitted: one stop. The layer says three.
         let mut files = Files(BTreeMap::from([
             (region_key("imagery", 1, 1), of(1.0)),
-            (layer_tone_key("imagery"), of(3.0)),
+            (
+                layer_tone_key("imagery"),
+                of(3.0).replace("\"saturation\":1.2000", "\"saturation\":1.9000"),
+            ),
         ]));
         let tone = block(film_tone(&files, "imagery", &places)).expect("a tone");
         assert_eq!((tone.places, tone.fitted, tone.layer_table), (2, 1, true));
         // Thirty tiles at one stop and ten at three: a stop and a half.
-        let gain = tone.table.expect("a table").of(13).gain[0].log2();
+        let table = tone.table.expect("a table");
+        let gain = table.of(13).gain[0].log2();
         assert!((gain - 1.5).abs() < 1e-3, "{gain}");
+        // Of the layer's table the unfitted place takes the gain alone: its
+        // saturation is another ground's. Three parts of 1.2, one of none.
+        assert!(
+            (table.of(13).saturation - 1.2f32.powf(0.75)).abs() < 2e-3,
+            "{table:?}"
+        );
 
         // Without the layer's table the layer is not graded at all, though
         // a place of it has a table: another imagery's film is left alone.

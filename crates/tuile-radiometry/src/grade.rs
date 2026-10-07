@@ -676,6 +676,30 @@ impl LevelGrades {
         }
     }
 
+    /// These grades with their gains alone: black point, contrast and
+    /// saturation left as they are. What of a table holds for ground it was
+    /// not fitted on.
+    #[must_use]
+    pub fn gains_alone(&self) -> Self {
+        Self {
+            anchor: self.anchor,
+            grades: self
+                .grades
+                .iter()
+                .map(|(level, g)| {
+                    (
+                        *level,
+                        Grade {
+                            gain: g.gain,
+                            ..Grade::IDENTITY
+                        },
+                    )
+                })
+                .collect(),
+            sources: Vec::new(),
+        }
+    }
+
     /// One table from several, each counting for its weight: the grades of
     /// the places a film crosses, made the film's. A level is the mean of
     /// the tables that know it — black points as they are, gain, contrast

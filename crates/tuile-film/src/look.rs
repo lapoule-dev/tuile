@@ -59,7 +59,7 @@ impl Default for Look {
             to_sun: Vec3::Z,
             exposure_ev: 1.0,
             imagery: Imagery::Decoded,
-            contrast: 1.5,
+            contrast: 1.25,
             saturation: 1.0,
         }
     }

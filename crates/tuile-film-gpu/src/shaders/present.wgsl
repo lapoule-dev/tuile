@@ -15,6 +15,9 @@ fn oetf(c: vec3f) -> vec3f {
     return select(1.055 * pow(x, vec3f(1.0 / 2.4)) - 0.055, 12.92 * x, x <= vec3f(0.0031308));
 }
 
+// Where the roll-off of highlights begins, in linear luminance.
+const KNEE: f32 = 0.5;
+
 @compute @workgroup_size(8, 8)
 fn present(@builtin(global_invocation_id) id: vec3u) {
     let size = textureDimensions(out);
@@ -43,6 +46,15 @@ fn present(@builtin(global_invocation_id) id: vec3u) {
     if (frame.to_sun.w != 1.0) {
         let y = dot(linear, luma);
         linear = max(vec3f(y) + (linear - vec3f(y)) * frame.to_sun.w, vec3f(0.0));
+    }
+    // Highlights are rolled off, not cut: above the knee luminance bends
+    // towards white and never reaches past it, colours keeping their
+    // ratios. A picture pushed bright keeps what its bright ground showed,
+    // where a straight clip turned towns and beaches to flat white.
+    let lit = dot(linear, luma);
+    if (lit > KNEE) {
+        let bent = KNEE + (1.0 - KNEE) * tanh((lit - KNEE) / (1.0 - KNEE));
+        linear *= bent / lit;
     }
     textureStore(out, id.xy, vec4f(oetf(linear), 1.0));
 }
