@@ -755,6 +755,69 @@ async fn main() -> Result<(), Error> {
                 of_field.held,
             );
             judge("field-linear", &|at, u, v| field.at(at, u, v))?;
+            // The same field at several doses of the reference, one above
+            // the other from none to all of it: the tiles are brought
+            // together the same in each, and only what the film is given
+            // back of its own standing against the reference changes. For
+            // choosing the dose by eye.
+            const DOSES: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
+            for level in 1..=22u8 {
+                if meter.extent(level).is_none() || level <= 12 {
+                    continue;
+                }
+                let mut rows = Vec::new();
+                for dose in DOSES {
+                    let bounds = FieldBounds {
+                        toward: dose,
+                        ..field_bounds
+                    };
+                    // Each with the exposure the film would be given at
+                    // that dose: a film brought to a darker reference is
+                    // lifted by more.
+                    let dosed = FilmGrade::fit(
+                        &observed,
+                        Measure::Linear,
+                        light,
+                        &LookTarget::default(),
+                        &Bounds::default(),
+                        &bounds,
+                    );
+                    let lifted = order.look.exposure_ev + dosed.exposure_ev;
+                    let dosed = dosed.field;
+                    let path = out.join(format!("dose-{level}.tmp.png"));
+                    if meter
+                        .mosaic_with(level, |at, u, v| dosed.at(at, u, v), lifted, &path)?
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let full = image::open(&path)?.to_rgb8();
+                    std::fs::remove_file(&path)?;
+                    rows.push(image::imageops::resize(
+                        &full,
+                        full.width() / 4,
+                        full.height() / 4,
+                        image::imageops::FilterType::Triangle,
+                    ));
+                }
+                let Some(first) = rows.first() else { continue };
+                let (wide, high) = first.dimensions();
+                let mut sheet = image::RgbImage::new(wide, (high + 8) * rows.len() as u32);
+                for (row, picture) in rows.iter().enumerate() {
+                    image::imageops::replace(
+                        &mut sheet,
+                        picture,
+                        0,
+                        (row as u32 * (high + 8)).into(),
+                    );
+                }
+                let path = out.join(format!("doses-{level}.png"));
+                sheet.save(&path)?;
+                println!(
+                    "  the field at doses {DOSES:?} of the reference, top to bottom: {}",
+                    path.display()
+                );
+            }
             // The three side by side — one above the other, a film being
             // wider than high: the reference, the film as the store holds
             // it, the film as the field leaves it. Half the mosaics' size.
