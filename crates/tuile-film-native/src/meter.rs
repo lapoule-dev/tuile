@@ -16,8 +16,8 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use tuile_radiometry::{
-    region_key, tone_of, Bounds, FilmGrade, Grade, LevelGrades, LevelParams, LookTarget, Sample,
-    Seen, REGION_LEVEL,
+    region_key, tone_of, Grade, LevelGrades, LevelParams, Local, Observed, Seen, TileGains,
+    TileSeen, REGION_LEVEL,
 };
 
 use crate::observe::{FrameOut, ImageryIn, Observer, TileIn};
@@ -72,6 +72,8 @@ struct TileLight {
     renewed: bool,
     /// Tiles of the film whose drape it is in.
     drapes: u32,
+    /// The tile as a film's grade is fitted on it.
+    seen: Option<TileSeen>,
 }
 
 /// The mean of a square of what was kept of a tile.
@@ -216,6 +218,7 @@ impl Observer for LightMeter {
                 grade: tile.grade,
                 renewed: tile.renewed,
                 drapes: 0,
+                seen: TileSeen::of_rgba8(&rgba, rgba.width(), rgba.height()),
             },
         );
     }
@@ -476,12 +479,129 @@ impl LightMeter {
         out
     }
 
+    /// The film's imagery as it would be seen once corrected: every tile
+    /// draped on a tile of it, its texels put through `correction` — which
+    /// is asked for a tile and a place in it, across and down, 0 to 1 — and
+    /// seen again as any tile is. For measuring what a correction leaves,
+    /// by any measure, on the same footing as what was there before:
+    /// with a correction that changes nothing, this is the film as it is.
+    pub fn corrected(&self, correction: impl Fn(Coord, f32, f32) -> Local) -> Observed {
+        let mut observed = Observed::default();
+        for (coord, light) in &self.tiles {
+            if light.drapes == 0 {
+                continue;
+            }
+            let texels: Vec<[f32; 3]> = (0..KEPT * KEPT)
+                .map(|k| {
+                    let (i, j) = (k % KEPT, k / KEPT);
+                    correction(
+                        *coord,
+                        (i as f32 + 0.5) / KEPT as f32,
+                        (j as f32 + 0.5) / KEPT as f32,
+                    )
+                    .apply(light.kept[k as usize])
+                })
+                .collect();
+            observed.see(
+                *coord,
+                || TileSeen::of_linear(&texels, KEPT as usize),
+                light.drapes as f32,
+            );
+        }
+        observed
+    }
+
+    /// The mosaic of one level: every tile of it this render read, where
+    /// it lies, at the full size of what was kept of it ([`KEPT`] texels a
+    /// side), lifted by `stops` — with `gains` each tile as a film with
+    /// those gains draws it, without them as the store holds it. The two
+    /// side by side are the before and after of a film's grade. Returns
+    /// the picture's size; `None` for a level nothing was read of.
+    pub fn mosaic(
+        &self,
+        level: u8,
+        gains: Option<&TileGains>,
+        stops: f32,
+        path: &Path,
+    ) -> Result<Option<(u32, u32)>, Error> {
+        self.mosaic_with(
+            level,
+            |coord, _, _| gains.map_or(Local::IDENTITY, |g| g.local(coord)),
+            stops,
+            path,
+        )
+    }
+
+    /// [`Self::mosaic`] with any grade: `grade` is asked for a tile and a
+    /// place in it, across and down, 0 to 1 — one grade a tile, or a field
+    /// that varies across one. The whole grade is applied: black point,
+    /// gain, contrast, saturation.
+    pub fn mosaic_with(
+        &self,
+        level: u8,
+        grade: impl Fn(Coord, f32, f32) -> Local,
+        stops: f32,
+        path: &Path,
+    ) -> Result<Option<(u32, u32)>, Error> {
+        let tiles: Vec<(&Coord, &TileLight)> =
+            self.tiles.iter().filter(|(c, _)| c.0 == level).collect();
+        let (Some(x0), Some(x1), Some(y0), Some(y1)) = (
+            tiles.iter().map(|(c, _)| c.1).min(),
+            tiles.iter().map(|(c, _)| c.1).max(),
+            tiles.iter().map(|(c, _)| c.2).min(),
+            tiles.iter().map(|(c, _)| c.2).max(),
+        ) else {
+            return Ok(None);
+        };
+        let (wide, high) = ((x1 - x0 + 1) * KEPT, (y1 - y0 + 1) * KEPT);
+        if u64::from(wide) * u64::from(high) > 64_000_000 {
+            return Ok(None);
+        }
+        let stored = |v: f32| {
+            let v = v.clamp(0.0, 1.0);
+            let s = if v <= 0.003_130_8 {
+                v * 12.92
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            };
+            (s * 255.0).round() as u8
+        };
+        let lift = stops.exp2();
+        let mut picture = image::RgbImage::from_pixel(wide, high, image::Rgb([24, 24, 24]));
+        for (coord, light) in &tiles {
+            for j in 0..KEPT {
+                for i in 0..KEPT {
+                    let c = light.kept[(j * KEPT + i) as usize];
+                    // At the texel's middle.
+                    let graded = grade(
+                        **coord,
+                        (i as f32 + 0.5) / KEPT as f32,
+                        (j as f32 + 0.5) / KEPT as f32,
+                    )
+                    .apply(c);
+                    picture.put_pixel(
+                        (coord.1 - x0) * KEPT + i,
+                        (coord.2 - y0) * KEPT + j,
+                        image::Rgb(graded.map(|v| stored(v * lift))),
+                    );
+                }
+            }
+        }
+        picture.save(path)?;
+        Ok(Some((wide, high)))
+    }
+
     /// A picture of one level's tiles as the store holds them, each where
     /// it lies, with the seams between neighbours drawn in red: a step of
     /// more than 0.15 stops of luminance between the two tiles' facing
     /// edges. What is uniform within a patch and steps at its border is a
     /// capture; what the red encloses is its extent.
-    pub fn seams_picture(&self, level: u8, path: &Path) -> Result<Option<(u32, u32)>, Error> {
+    pub fn seams_picture(
+        &self,
+        level: u8,
+        gains: Option<&TileGains>,
+        path: &Path,
+    ) -> Result<Option<(u32, u32)>, Error> {
         const SIDE: u32 = 16;
         let tiles: Vec<(&Coord, &TileLight)> =
             self.tiles.iter().filter(|(c, _)| c.0 == level).collect();
@@ -507,12 +627,17 @@ impl LightMeter {
             };
             (s * 255.0).round() as u8
         };
+        // A tile's gain a channel, if gains are given: the picture is then
+        // of the tiles as a film with those gains draws them.
+        let gain_of = |coord: &Coord| gains.map_or([1.0; 3], |g| g.of(*coord).gain);
         let step = KEPT / SIDE;
         for (coord, light) in &tiles {
+            let gain = gain_of(coord);
             for j in 0..SIDE {
                 for i in 0..SIDE {
                     // Lifted two stops, as a render would show it.
-                    let c = cell(&light.kept, i * step, j * step, step).map(|v| stored(v * 4.0));
+                    let c = cell(&light.kept, i * step, j * step, step);
+                    let c = [0, 1, 2].map(|k| stored(c[k] * gain[k] * 4.0));
                     picture.put_pixel(
                         (coord.1 - x0) * SIDE + i,
                         (coord.2 - y0) * SIDE + j,
@@ -571,27 +696,16 @@ impl LightMeter {
         Ok(Some((wide, high)))
     }
 
-    /// What the film is made of: every imagery tile draped on a tile of
-    /// it, cell by cell, counted for the tiles it is draped on.
-    fn samples(&self) -> Vec<Sample> {
-        let side = KEPT / CELLS;
-        let mut out = Vec::new();
+    /// The film's imagery as this render saw it: every tile draped on a
+    /// tile of it, counted for the tiles it is draped on.
+    pub fn observed(&self) -> Observed {
+        let mut observed = Observed::default();
         for (coord, light) in &self.tiles {
-            if light.drapes == 0 {
-                continue;
-            }
-            let weight = light.drapes as f32 / (CELLS * CELLS) as f32;
-            for j in 0..CELLS {
-                for i in 0..CELLS {
-                    out.push(Sample {
-                        level: coord.0,
-                        colour: cell(&light.kept, i * side, j * side, side),
-                        weight,
-                    });
-                }
+            if light.drapes > 0 {
+                observed.see(*coord, || light.seen.clone(), light.drapes as f32);
             }
         }
-        out
+        observed
     }
 
     /// How much light this render put on ground: its pictures' mean linear
@@ -601,22 +715,15 @@ impl LightMeter {
     pub fn light(&self) -> Option<f32> {
         let luminance = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
         let (mut imagery, mut weight) = (0.0f64, 0.0f64);
-        for s in self.samples() {
-            imagery += f64::from(luminance(s.colour) * s.weight);
-            weight += f64::from(s.weight);
+        for tile in self.observed().tiles.values() {
+            let mean =
+                tile.cells.iter().map(|c| luminance(*c)).sum::<f32>() / tile.cells.len() as f32;
+            imagery += f64::from(mean * tile.usage);
+            weight += f64::from(tile.usage);
         }
         let pictures: f64 = self.frames.iter().map(|f| f64::from(f.0.mean.exp2())).sum();
         (weight > 0.0 && imagery > 0.0 && !self.frames.is_empty())
             .then(|| (pictures / self.frames.len() as f64 / (imagery / weight)) as f32)
-    }
-
-    /// The film's own grade, fitted on the imagery this render read: its
-    /// levels brought to the one it draws most, and the film brought to
-    /// `target`, within `bounds`. `light` is [`Self::light`]'s, or the
-    /// renderer's known one.
-    pub fn film_grade(&self, light: f32, target: &LookTarget, bounds: &Bounds) -> FilmGrade {
-        let seen: Vec<Seen> = self.seen().into_iter().map(|s| s.0).collect();
-        FilmGrade::fit(&seen, &self.samples(), light, target, bounds)
     }
 
     /// One grade a level, fitted on the tiles this render read: the one

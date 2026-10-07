@@ -21,7 +21,9 @@
 
 use std::collections::BTreeMap;
 
-use tuile_radiometry::{region_key, FilmGrade, LevelGrades};
+use tuile_radiometry::{
+    region_key, Bounds, FilmGrade, LevelGrades, LookTarget, Observed, TileBounds,
+};
 
 use crate::{Objects, RepoError};
 
@@ -50,9 +52,17 @@ pub async fn layer_is_graded(live: &dyn Objects, layer: &str) -> Result<bool, Re
     }
 }
 
-/// The grade of a film made of these packs: each pack's own
-/// ([`pack_tone_key`]), made one. `None` for a film none of whose packs has
-/// one — it is then drawn as it is, with nothing of another film's.
+/// Where what a pack's bake saw of its imagery is kept: what a film of
+/// several packs is fitted on as one.
+pub fn pack_seen_key(pack: &str) -> String {
+    format!("{pack}.tone.seen")
+}
+
+/// The grade of a film made of these packs. A film of one pack has that
+/// pack's own ([`pack_tone_key`]). A film of several is fitted anew on
+/// what all of them saw ([`pack_seen_key`]), so that it is one grade from
+/// its first frame to its last. `None` for a film none of whose packs has
+/// a grade — it is then drawn as it is, with nothing of another film's.
 ///
 /// A pack without a grade is not an error; a grade that cannot be read is,
 /// and so is a store that cannot be asked: a render that took either for an
@@ -61,26 +71,53 @@ pub async fn film_grade(
     packs: &dyn Objects,
     keys: &[&str],
 ) -> Result<Option<FilmGrade>, RepoError> {
-    let mut found = Vec::new();
+    async fn whole(packs: &dyn Objects, key: &str) -> Result<Option<Vec<u8>>, RepoError> {
+        match packs.read_all(key).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(RepoError::NotFound(_)) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+    let not = |key: &str, what: &str| RepoError::Store(format!("{key} is not {what}"));
+    let mut grades = Vec::new();
     for some in keys.chunks(AT_ONCE) {
-        let read = futures_util::future::join_all(some.iter().map(|key| async move {
-            let key = pack_tone_key(key);
-            match packs.read_all(&key).await {
-                Ok(bytes) => std::str::from_utf8(&bytes)
+        let read = futures_util::future::join_all(some.iter().map(|pack| async move {
+            let key = pack_tone_key(pack);
+            match whole(packs, &key).await? {
+                Some(bytes) => std::str::from_utf8(&bytes)
                     .ok()
                     .and_then(FilmGrade::from_json)
-                    .map(Some)
-                    .ok_or_else(|| RepoError::Store(format!("{key} is not a film's grade"))),
-                Err(RepoError::NotFound(_)) => Ok(None),
-                Err(other) => Err(other),
+                    .map(|grade| Some((*pack, grade)))
+                    .ok_or_else(|| not(&key, "a film's grade")),
+                None => Ok(None),
             }
         }))
         .await;
         for grade in read {
-            found.extend(grade?);
+            grades.extend(grade?);
         }
     }
-    Ok(FilmGrade::merged(&found.iter().collect::<Vec<_>>()))
+    match grades.len() {
+        0 => return Ok(None),
+        1 => return Ok(grades.pop().map(|(_, grade)| grade)),
+        _ => {}
+    }
+    // Several: what each saw, then the film as one.
+    let mut seen = Vec::new();
+    for (pack, _) in &grades {
+        let key = pack_seen_key(pack);
+        let bytes = whole(packs, &key)
+            .await?
+            .ok_or_else(|| RepoError::NotFound(key.clone()))?;
+        seen.push(Observed::from_bytes(&bytes).ok_or_else(|| not(&key, "what a bake saw"))?);
+    }
+    let parts: Vec<(&FilmGrade, &Observed)> = grades.iter().map(|(_, g)| g).zip(&seen).collect();
+    Ok(FilmGrade::of_packs(
+        &parts,
+        &LookTarget::default(),
+        &Bounds::default(),
+        &TileBounds::default(),
+    ))
 }
 
 /// A film's table, and what it was made of.
@@ -256,27 +293,55 @@ mod tests {
         assert_eq!(tone.table, None);
     }
 
+    /// A pack's imagery: columns `from..to` of a film four tiles high, the
+    /// columns before `dark` a capture a stop darker, over a reference
+    /// level that is one picture.
+    fn seen_of(from: u32, to: u32, dark: u32) -> Observed {
+        use tuile_radiometry::{TileSeen, GRID};
+        let flat = |tone: f32, usage: f32| TileSeen {
+            cells: [[tone; 3]; GRID * GRID],
+            edges: [[[tone; 3]; GRID]; 4],
+            usage,
+            tones: None,
+        };
+        let mut observed = Observed::default();
+        for y in 6..10 {
+            for x in from..to {
+                let tone = if x < dark { 0.02 } else { 0.04 };
+                observed.tiles.insert((13, x, y), flat(tone, 1.0));
+                observed.tiles.insert((12, x / 2, y / 2), flat(0.04, 0.0));
+            }
+        }
+        observed
+    }
+
+    fn graded(seen: &Observed) -> FilmGrade {
+        FilmGrade::fit(
+            seen,
+            1.0,
+            &LookTarget::default(),
+            &Bounds::default(),
+            &TileBounds::default(),
+        )
+    }
+
     #[test]
     fn a_films_grade_is_its_packs_own_and_nobody_elses() {
-        use tuile_radiometry::{Bounds, LookTarget, Sample};
-        let dark: Vec<Sample> = (0..200)
-            .map(|i| Sample {
-                level: 14,
-                colour: [0.02 + 0.0004 * i as f32; 3],
-                weight: 1.0,
-            })
-            .collect();
-        let grade = FilmGrade::fit(&[], &dark, 1.0, &LookTarget::default(), &Bounds::default());
-        assert!(grade.exposure_ev > 0.0);
+        let seen = seen_of(0, 12, 4);
+        let grade = graded(&seen);
+        assert!(grade.exposure_ev > 0.0 && !grade.tiles.stops.is_empty());
         let mut files = Files(BTreeMap::from([
             (pack_tone_key("film/1-10.tuilepack"), grade.to_json()),
             // Another film's grade lies in the same store.
             (pack_tone_key("other/1-10.tuilepack"), grade.to_json()),
         ]));
-        // One pack of two has a grade: it is the film's.
+        // One pack of two has a grade: it is the film's, as it is.
         let keys = ["film/1-10.tuilepack", "film/11-20.tuilepack"];
         let found = block(film_grade(&files, &keys)).expect("asked");
-        assert_eq!(found.expect("a grade").exposure_ev, grade.exposure_ev);
+        assert_eq!(
+            found.as_ref(),
+            FilmGrade::from_json(&grade.to_json()).as_ref()
+        );
         // A film without one has none, whatever lies beside it.
         assert_eq!(
             block(film_grade(&files, &["bare/1-10.tuilepack"])).expect("asked"),
@@ -291,6 +356,66 @@ mod tests {
             .0
             .insert(pack_tone_key("broken/1.tuilepack"), grade.to_json());
         assert!(block(film_grade(&files, &["broken/1.tuilepack"])).is_err());
+    }
+
+    /// Files of bytes, for what is not text.
+    struct Bytes(BTreeMap<String, Vec<u8>>);
+
+    #[async_trait::async_trait]
+    impl Objects for Bytes {
+        fn label(&self) -> String {
+            "test".into()
+        }
+        async fn list(&self, _: &str) -> Result<Vec<Entry>, RepoError> {
+            Ok(Vec::new())
+        }
+        async fn browse(&self, _: &str) -> Result<Listing, RepoError> {
+            Ok(Listing::default())
+        }
+        async fn size(&self, key: &str) -> Result<u64, RepoError> {
+            self.0
+                .get(key)
+                .map(|b| b.len() as u64)
+                .ok_or_else(|| RepoError::NotFound(key.to_string()))
+        }
+        async fn read(&self, key: &str, range: Range<u64>) -> Result<Vec<u8>, RepoError> {
+            self.size(key).await?;
+            Ok(self.0[key][range.start as usize..range.end as usize].to_vec())
+        }
+    }
+
+    #[test]
+    fn a_film_of_several_packs_is_fitted_as_one_from_what_each_saw() {
+        // Two packs, cut where the capture changes: each alone is one
+        // capture and gives no tile a gain.
+        let (west, east) = (seen_of(0, 4, 4), seen_of(4, 12, 4));
+        let (g_west, g_east) = (graded(&west), graded(&east));
+        assert!(g_west.tiles.stops.is_empty() && g_east.tiles.stops.is_empty());
+        let mut files = Bytes(BTreeMap::from([
+            (
+                pack_tone_key("film/a.tuilepack"),
+                g_west.to_json().into_bytes(),
+            ),
+            (
+                pack_tone_key("film/b.tuilepack"),
+                g_east.to_json().into_bytes(),
+            ),
+            (pack_seen_key("film/a.tuilepack"), west.to_bytes()),
+            (pack_seen_key("film/b.tuilepack"), east.to_bytes()),
+        ]));
+        let keys = ["film/a.tuilepack", "film/b.tuilepack"];
+        let film = block(film_grade(&files, &keys))
+            .expect("asked")
+            .expect("a grade");
+        // Together they are two captures, and the smaller is brought to
+        // the larger across the cut.
+        let lifted = film.tiles.of((13, 0, 7)).gain[1].log2();
+        assert!((lifted - 1.0).abs() < 0.1, "{lifted}");
+        assert!(film.tiles.of((13, 5, 7)).is_identity());
+        // Without what one of them saw the film cannot be fitted, and that
+        // is said rather than drawn around.
+        files.0.remove(&pack_seen_key("film/b.tuilepack"));
+        assert!(block(film_grade(&files, &keys)).is_err());
     }
 
     #[test]

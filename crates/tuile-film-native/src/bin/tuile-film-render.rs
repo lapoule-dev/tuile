@@ -29,14 +29,21 @@
 //!   --mbps <n>            default 12
 //!   --no-tone             no grade: imagery as stored, the look as it is
 //!   --tone-table <file>   this grade, not the film's own: a film's grade
-//!                         as --calibrate writes it, or a table of levels
+//!                         as --calibrate writes it
 //!   --tone <0..1>         how much of the grade (default 1)
 //!   --calibrate <dir>     fit the film's own grade on its imagery — its
-//!                         levels brought to the one it draws most, then
-//!                         the film to the look's target, both bounded —
+//!                         tiles brought to one another, those that
+//!                         already meet kept as they are, then the film to
+//!                         the look's target, all of it bounded —
 //!                         and write it under <dir> at the key it is kept
-//!                         by, beside each pack. Renders with no grade;
-//!                         --every and --scale make it quick.
+//!                         by, beside each pack — with, under <dir>, the
+//!                         mosaic of each level before and after, and
+//!                         trace/: every computation of the fit as CSV
+//!                         tables. Renders with no grade; --every and
+//!                         --scale make it quick.
+//!   --reference-level <n> with --calibrate: the finest level at which the
+//!                         imagery is one homogeneous picture, which the
+//!                         finer tiles are measured against (default 12)
 //!   --put                 with --calibrate: also write it to the bucket
 //!   --light <x>           with --calibrate: the light the renderer puts
 //!                         on ground, instead of the one this render shows
@@ -64,9 +71,13 @@ use tuile_film_native::{
     render, Av1Film, Error, Film, LightMeter, Nothing, Observer, Order, Pictures, Sink, Sources,
     Tone,
 };
-use tuile_radiometry::{Bounds, FilmGrade, LevelGrades, LookTarget};
-use tuile_repository::tone::pack_tone_key;
+use tuile_radiometry::{
+    Bounds, CornerField, FieldBounds, FilmGrade, Local, LookTarget, Measure, TileBounds, TileGains,
+    TileSeen,
+};
+use tuile_repository::tone::{pack_seen_key, pack_tone_key};
 use tuile_repository::Objects;
+use tuile_repository::TileRepository;
 
 fn bucket(name: &str) -> Result<Arc<dyn Objects>, Error> {
     let config = BucketConfig {
@@ -176,14 +187,8 @@ async fn main() -> Result<(), Error> {
     }
     if let Some(path) = value("--tone-table") {
         let text = std::fs::read_to_string(&path)?;
-        let grade = FilmGrade::from_json(&text)
-            .or_else(|| {
-                LevelGrades::from_json(&text).map(|levels| FilmGrade {
-                    levels,
-                    ..FilmGrade::none()
-                })
-            })
-            .ok_or_else(|| format!("{path} is neither a film's grade nor a table of levels"))?;
+        let grade =
+            FilmGrade::from_json(&text).ok_or_else(|| format!("{path} is not a film's grade"))?;
         order.tone = Tone::Grade(grade);
     }
     match value("--imagery").as_deref() {
@@ -339,7 +344,7 @@ async fn main() -> Result<(), Error> {
         }
         for level in 0..=22u8 {
             let path = PathBuf::from(&dir).join(format!("seams-{level}.png"));
-            if let Some((wide, high)) = meter.seams_picture(level, &path)? {
+            if let Some((wide, high)) = meter.seams_picture(level, None, &path)? {
                 println!("seams of level {level}: {} ({wide}×{high})", path.display());
             }
         }
@@ -364,11 +369,173 @@ async fn main() -> Result<(), Error> {
         }
         let shown = meter.light().ok_or("no picture came out")?;
         let light = value("--light").map_or(Ok(shown), |l| l.parse())?;
-        let grade = meter.film_grade(light, &LookTarget::default(), &Bounds::default());
+        // What the render saw, and under it the reference level the tiles
+        // are measured against — which a film need not draw, and is read
+        // from the store here.
+        let mut tile_bounds = TileBounds::default();
+        if let Some(level) = value("--reference-level") {
+            tile_bounds.reference_level = level.parse()?;
+        }
+        let mut observed = meter.observed();
+        let reference = tile_bounds.reference_level;
+        let wanted: std::collections::BTreeSet<(u32, u32)> = observed
+            .tiles
+            .keys()
+            .filter(|at| at.0 > reference)
+            .map(|at| (at.1 >> (at.0 - reference), at.2 >> (at.0 - reference)))
+            .filter(|at| !observed.tiles.contains_key(&(reference, at.0, at.1)))
+            .collect();
+        let mut missing = 0usize;
+        for (x, y) in &wanted {
+            let seen = match sources.store.tiles.tile(&layer, reference, *x, *y).await? {
+                Some(tile) => image::load_from_memory(&tile.bytes)
+                    .ok()
+                    .and_then(|decoded| {
+                        let rgba = decoded.to_rgba8();
+                        TileSeen::of_rgba8(&rgba, rgba.width(), rgba.height())
+                    }),
+                None => None,
+            };
+            missing += usize::from(seen.is_none());
+            observed.see((reference, *x, *y), || seen, 0.0);
+        }
+        println!(
+            "\nreference level {reference}: {} tiles read from the store for it, {missing} not there",
+            wanted.len()
+        );
+        let grade = FilmGrade::fit(
+            &observed,
+            light,
+            &LookTarget::default(),
+            &Bounds::default(),
+            &tile_bounds,
+        );
+        // What was seen, for a film of several packs to be fitted as one;
+        // and the seams of each level, before and after.
+        let seen = observed.to_bytes();
         println!(
             "\nlight on ground: {shown:.3} shown by this render, {light:.3} used\n{}",
             said(&grade)
         );
+        // Two ways of fitting, each with two ways of measuring, on the same
+        // observations: a gain a block and a continuous field, the tiles
+        // measured by their moments and by their transfer curves. Each is
+        // traced and drawn, and what each leaves is measured again — the
+        // corrected tiles seen anew, by both measures — so that the four,
+        // and the film as it is, are judged by the same rule. The grade
+        // written below is still the blocks', by moments.
+        let lift = order.look.exposure_ev + grade.exposure_ev;
+        let field_bounds = FieldBounds {
+            reference_level: reference,
+            ..FieldBounds::default()
+        };
+        let out = PathBuf::from(&dir);
+        let write = |sub: &str, name: &str, text: String| -> Result<(), Error> {
+            let path = out.join(sub);
+            std::fs::create_dir_all(&path)?;
+            std::fs::write(path.join(name), text)?;
+            Ok(())
+        };
+        // The reference tiles, to set corrected tiles against.
+        let under: Vec<_> = observed
+            .tiles
+            .iter()
+            .filter(|(at, _)| at.0 <= reference)
+            .map(|(at, tile)| (*at, tile.clone()))
+            .collect();
+        let judge = |version: &str,
+                     correction: &dyn Fn((u8, u32, u32), f32, f32) -> Local|
+         -> Result<(), Error> {
+            let mut seen = meter.corrected(correction);
+            for (at, tile) in &under {
+                seen.tiles.entry(*at).or_insert_with(|| tile.clone());
+            }
+            for measure in [Measure::Moments, Measure::Curves] {
+                let mut text = format!("level,x,y,usage,{}\n", measure.names().join(","));
+                for (at, tile) in seen.tiles.iter().filter(|(at, _)| at.0 > reference) {
+                    let Some(found) = measure.of(&seen, *at, reference) else {
+                        continue;
+                    };
+                    let numbers: Vec<String> = found
+                        .iter()
+                        .map(|v| {
+                            if v.is_finite() {
+                                format!("{v:.5}")
+                            } else {
+                                String::new()
+                            }
+                        })
+                        .collect();
+                    text += &format!(
+                        "{},{},{},{:.1},{}\n",
+                        at.0,
+                        at.1,
+                        at.2,
+                        tile.usage,
+                        numbers.join(",")
+                    );
+                }
+                write(
+                    &format!("eval/{version}"),
+                    &format!("{}.csv", measure.name()),
+                    text,
+                )?;
+            }
+            for level in reference + 1..=22u8 {
+                let path = out.join(format!("mosaic-{level}-{version}.png"));
+                if let Some((wide, high)) = meter.mosaic_with(level, correction, lift, &path)? {
+                    println!(
+                        "  mosaic of level {level}: {} ({wide}×{high})",
+                        path.display()
+                    );
+                }
+            }
+            Ok(())
+        };
+        println!("\nas it is:");
+        judge("as-it-is", &|_, _, _| Local::IDENTITY)?;
+        for measure in [Measure::Moments, Measure::Curves] {
+            let version = format!("blocks-{}", measure.name());
+            let (gains, of_blocks, trace) =
+                TileGains::solve_traced(&observed, measure, &tile_bounds);
+            for (name, table) in trace.tables() {
+                write(&format!("trace/{version}"), name, table)?;
+            }
+            println!(
+                "\n{version}: {} blocks, {} of {} edges a border; {} tiles untouched, {} given a gain; pairs in accord given two gains: {}",
+                of_blocks.blocks,
+                of_blocks.borders,
+                of_blocks.edges,
+                of_blocks.untouched,
+                gains.stops.len(),
+                of_blocks.accord_broken,
+            );
+            judge(&version, &|at, _, _| gains.local(at))?;
+
+            let version = format!("field-{}", measure.name());
+            let (field, of_field, trace) =
+                CornerField::solve_traced(&observed, measure, &field_bounds);
+            for (name, table) in trace.tables() {
+                write(&format!("trace/{version}"), name, table)?;
+            }
+            println!(
+                "\n{version}: {} seams of {} edges in all, of {}; widest break along an edge that is not a seam: {}; steps made where the tiles show none: {}\n  the tiles' step across the seams: {:.2} / {:.2} stops → {:.2} / {:.2}; apart from the film's own tone: {:.2} / {:.2} → {:.2} / {:.2}",
+                of_field.seams,
+                of_field.seam_edges,
+                of_field.edges,
+                of_field.widest_break,
+                of_field.steps_made,
+                of_field.seam_before.0,
+                of_field.seam_before.1,
+                of_field.seam_after.0,
+                of_field.seam_after.1,
+                of_field.apart_before.0,
+                of_field.apart_before.1,
+                of_field.apart_after.0,
+                of_field.apart_after.1,
+            );
+            judge(&version, &|at, u, v| field.at(at, u, v))?;
+        }
         let putting = if flag("--put") {
             let config = BucketConfig {
                 bucket: std::env::var("TUILE_STORE_BUCKET")?,
@@ -379,18 +546,22 @@ async fn main() -> Result<(), Error> {
             None
         };
         for pack in &film.packs {
-            let key = pack_tone_key(&pack.key);
-            let path = PathBuf::from(&dir).join(&key);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, grade.to_json())?;
-            match &putting {
-                Some(store) => {
-                    store.put(&path, &key).await?;
-                    println!("written to the bucket: {key}");
+            for (key, bytes) in [
+                (pack_tone_key(&pack.key), grade.to_json().into_bytes()),
+                (pack_seen_key(&pack.key), seen.clone()),
+            ] {
+                let path = PathBuf::from(&dir).join(&key);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
                 }
-                None => println!("written: {}", path.display()),
+                std::fs::write(&path, bytes)?;
+                match &putting {
+                    Some(store) => {
+                        store.put(&path, &key).await?;
+                        println!("written to the bucket: {key}");
+                    }
+                    None => println!("written: {}", path.display()),
+                }
             }
         }
     }
@@ -412,23 +583,24 @@ fn said(grade: &FilmGrade) -> String {
         grade.before[2],
         grade.after[2],
     );
-    let whole: f32 = grade.usage.values().sum();
-    for (level, tiles) in &grade.usage {
-        let g = grade.levels.of(*level);
-        let stops = g.gain.map(f32::log2);
-        out += &format!(
-            "  level {level} ({:.0}% of the film): {}\n",
-            tiles * 100.0 / whole.max(1e-6),
-            if g.is_identity() {
-                "as it is".to_string()
-            } else {
-                format!(
-                    "gain {:+.2} {:+.2} {:+.2} stops, contrast {:.2}, saturation {:.2}",
-                    stops[0], stops[1], stops[2], g.contrast, g.saturation
-                )
-            }
-        );
-    }
+    let r = &grade.fitted;
+    out += &format!(
+        "  tiles: {} finer than the reference, {} measured against it; {} blocks, {} edges of {} a border between two\n  the film's own block: {} tiles untouched; {} tiles given a gain; {} blocks held at a bound\n  pairs of neighbours in accord: {} — given two gains: {}\n  apart from the film's own block: {:.2} / {:.2} stops → {:.2} / {:.2} (median / p95)\n",
+        r.tiles,
+        r.measured,
+        r.blocks,
+        r.borders,
+        r.edges,
+        r.untouched,
+        grade.tiles.stops.len(),
+        r.held,
+        r.accorded,
+        r.accord_broken,
+        r.apart_before.0,
+        r.apart_before.1,
+        r.apart_after.0,
+        r.apart_after.1,
+    );
     if !grade.limited.is_empty() {
         out += &format!("  held back at a bound: {}\n", grade.limited.join("; "));
     }

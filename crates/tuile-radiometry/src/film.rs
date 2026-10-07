@@ -10,18 +10,18 @@
 //!   It is not fitted; it is what every film is brought to.
 //! - **a film's grade** ([`FilmGrade`]) is that film's, and relative. It
 //!   has two parts:
-//!   - *its levels brought to one another* — a [`Grade`] per level of
-//!     imagery, with the level the film draws most left exactly as it is.
-//!     The others are brought to it. This part makes tiles agree and
-//!     leaves the film as light as it was;
+//!   - *its tiles brought to one another* — a gain a tile of imagery
+//!     ([`TileGains`]): tiles that already meet are kept exactly as they
+//!     are to one another, what is most of the film is not touched, and
+//!     the rest is brought to it. This part makes tiles agree;
 //!   - *the film brought to the target* — one exposure, one contrast, one
 //!     saturation for every picture of it. No colour: one gain for the
 //!     three channels, so a grey stays grey.
 //!
-//! Every number of a film's grade has a floor and a ceiling ([`Bounds`]).
-//! A fit that wants more than it may have is given the bound and says so
-//! ([`FilmGrade::limited`]): a film that cannot be brought to the target
-//! within the bounds is left short of it, never pushed past them.
+//! Every number of a film's grade has a floor and a ceiling ([`Bounds`],
+//! [`TileBounds`]). A fit that wants more than it may have is given the
+//! bound and says so: a film that cannot be brought to the target within
+//! the bounds is left short of it, never pushed past them.
 //!
 //! Nothing here is borrowed: a film's grade is fitted on that film's
 //! imagery alone. A film without one is drawn with the target's own
@@ -35,8 +35,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::grade::{Grade, LevelGrades, Seen};
-use crate::levels::LevelParams;
+use crate::tiles::{Observed, TileBounds, TileGains, TileReport};
 
 const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
 
@@ -77,17 +76,10 @@ impl Default for LookTarget {
     }
 }
 
-/// What a film's grade may not go past.
+/// What the film's part of a grade may not go past. A tile's has its own
+/// ([`TileBounds`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bounds {
-    /// A level against the film's own, in stops either way.
-    pub level_stops: f32,
-    /// A channel of a level against that level's gain on light, in stops
-    /// either way: how much cast a level may be corrected by.
-    pub level_tint_stops: f32,
-    /// A level's contrast and saturation, least and most.
-    pub level_contrast: (f32, f32),
-    pub level_saturation: (f32, f32),
     /// The film against the target, in stops either way.
     pub film_stops: f32,
     /// The film's contrast and saturation, least and most.
@@ -98,10 +90,6 @@ pub struct Bounds {
 impl Default for Bounds {
     fn default() -> Self {
         Self {
-            level_stops: 1.0,
-            level_tint_stops: 0.15,
-            level_contrast: (0.85, 1.2),
-            level_saturation: (0.85, 1.2),
             film_stops: 2.0,
             film_contrast: (0.8, 1.3),
             film_saturation: (0.8, 1.3),
@@ -109,35 +97,28 @@ impl Default for Bounds {
     }
 }
 
-/// A piece of the film's imagery: one cell of one tile, in linear light,
-/// counted for the tiles of the film it is draped on.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Sample {
-    pub level: u8,
-    pub colour: [f32; 3],
-    pub weight: f32,
-}
-
 /// What pictures measure: mean L*, contrast, mean C*.
-pub type Measure = [f32; 3];
+pub type Pictured = [f32; 3];
 
 /// A film's grade: see the module.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FilmGrade {
-    /// The film's levels brought to the one it draws most.
-    pub levels: LevelGrades,
+    /// The film's tiles brought to one another.
+    pub tiles: TileGains,
     /// The film brought to the target: stops added to the renderer's own
     /// exposure, then its contrast and saturation multiplied by these.
     pub exposure_ev: f32,
     pub contrast: f32,
     pub saturation: f32,
-    /// How much of the film each level is: tiles draped, by level.
-    pub usage: BTreeMap<u8, f32>,
+    /// The light the renderer was taken to put on ground.
+    pub light: f32,
     /// What the film's pictures were foretold to measure with nothing
     /// done, and with this grade.
-    pub before: Measure,
-    pub after: Measure,
-    /// What the fit wanted more of than it may have.
+    pub before: Pictured,
+    pub after: Pictured,
+    /// What the tiles' gains were found from, and what they leave.
+    pub fitted: TileReport,
+    /// What the film's part wanted more of than it may have.
     pub limited: Vec<String>,
 }
 
@@ -185,7 +166,7 @@ fn shown(lit: [f32; 3], contrast: f32, saturation: f32) -> [f32; 3] {
 const MEASURED: usize = 40_000;
 
 /// What pictures made of these lit colours measure.
-fn measure(lit: &[([f32; 3], f32)], stops: f32, contrast: f32, saturation: f32) -> Measure {
+fn measure(lit: &[([f32; 3], f32)], stops: f32, contrast: f32, saturation: f32) -> Pictured {
     let gain = stops.exp2();
     let mut lightness: Vec<(f32, f32)> = Vec::with_capacity(lit.len());
     let (mut sum_l, mut sum_c, mut sum_w) = (0.0f64, 0.0f64, 0.0f64);
@@ -238,144 +219,65 @@ fn where_it_is(low: f32, high: f32, wanted: f32, of: impl Fn(f32) -> f32) -> f32
     0.5 * (low + high)
 }
 
-/// A level's grade held within its bounds, and what was held back.
-fn bounded(level: u8, grade: Grade, bounds: &Bounds, limited: &mut Vec<String>) -> Grade {
-    if grade.is_identity() {
-        return grade;
-    }
-    let mut held = |what: &str| limited.push(format!("level {level}: {what}"));
-    // The gain on light, then each channel against it.
-    let light = luma(grade.gain).max(1e-6).log2();
-    let lifted = light.clamp(-bounds.level_stops, bounds.level_stops);
-    if lifted != light {
-        held("gain");
-    }
-    // Each channel against the light of the three together — and that
-    // light is itself moved by holding a channel back, so it is taken
-    // again until it has settled.
-    let wanted = grade.gain.map(|g| g.max(1e-6).log2() - light);
-    let mut tint = wanted;
-    for _ in 0..8 {
-        let together = luma(tint.map(f32::exp2)).max(1e-6).log2();
-        tint =
-            tint.map(|t| (t - together).clamp(-bounds.level_tint_stops, bounds.level_tint_stops));
-    }
-    if (0..3).any(|i| (tint[i] - wanted[i]).abs() > 0.01) {
-        held("cast");
-    }
-    let gain = tint.map(|t| kept(lifted + t).exp2());
-    let mut between = |value: f32, (least, most): (f32, f32), what: &str| {
-        let kept_value = value.clamp(least, most);
-        if kept_value != value {
-            limited.push(format!("level {level}: {what}"));
-        }
-        kept_value
-    };
-    Grade {
-        black: grade.black,
-        gain,
-        contrast: between(grade.contrast, bounds.level_contrast, "contrast"),
-        pivot: grade.pivot,
-        saturation: between(grade.saturation, bounds.level_saturation, "saturation"),
-    }
-}
-
 impl FilmGrade {
     /// The grade of a film that has none: nothing is done to its imagery,
     /// and it is drawn with the renderer's own settings.
     pub fn none() -> Self {
         Self {
-            levels: LevelGrades {
-                anchor: 0,
-                grades: BTreeMap::new(),
-                sources: Vec::new(),
-            },
+            tiles: TileGains::default(),
             exposure_ev: 0.0,
             contrast: 1.0,
             saturation: 1.0,
-            usage: BTreeMap::new(),
+            light: 1.0,
             before: [0.0; 3],
             after: [0.0; 3],
+            fitted: TileReport::default(),
             limited: Vec::new(),
         }
     }
 
-    /// Fits a film's grade on its imagery: `seen`, its tiles against their
-    /// ancestors over the same ground; `samples`, what it is made of;
-    /// `light`, a picture's linear value for an imagery value of one.
+    /// Fits a film's grade on its imagery as it was seen. `light` is a
+    /// picture's linear value for an imagery value of one.
     pub fn fit(
-        seen: &[Seen],
-        samples: &[Sample],
+        observed: &Observed,
         light: f32,
         target: &LookTarget,
         bounds: &Bounds,
+        tile_bounds: &TileBounds,
     ) -> Self {
-        let mut usage: BTreeMap<u8, f32> = BTreeMap::new();
-        for s in samples {
-            *usage.entry(s.level).or_default() += s.weight;
-        }
-        let Some(own) = usage
-            .iter()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(level, _)| *level)
-        else {
+        if observed.tiles.is_empty() {
             return Self::none();
-        };
+        }
         let mut limited = Vec::new();
 
-        // The levels brought to the film's own.
-        // A film of one level has nothing to be brought to anything.
-        let mut levels = if seen.is_empty() {
-            LevelGrades {
-                anchor: own,
-                grades: BTreeMap::new(),
-                sources: Vec::new(),
-            }
-        } else {
-            LevelGrades::solve(
-                seen,
-                &LevelParams {
-                    anchor: own,
-                    // Wider than a level may be given: what the fit wanted is
-                    // then known, and what is held back of it can be said.
-                    clamp_stops: 3.0 * bounds.level_stops,
-                    ..LevelParams::default()
-                },
-            )
-        };
-        // The solve holds the level it was told to, or — if nothing of it
-        // was seen against another — the nearest that was. Whichever it
-        // held, the film's own is brought back to nothing and the others
-        // with it, so that the film is as light as it was.
-        let held = levels.of(own);
-        if !held.is_identity() {
-            let back = luma(held.gain).max(1e-6);
-            for grade in levels.grades.values_mut() {
-                grade.gain = grade.gain.map(|g| g / back);
-            }
-            levels.grades.insert(own, Grade::IDENTITY);
-        }
-        for (level, grade) in &mut levels.grades {
-            *grade = bounded(*level, *grade, bounds, &mut limited);
-        }
+        // The tiles brought to one another.
+        let (tiles, fitted) = TileGains::solve(observed, tile_bounds);
 
-        // The film as it will be lit, a part of it if it is large.
-        let every = samples.len().div_ceil(MEASURED).max(1);
-        let lit: Vec<([f32; 3], f32)> = samples
-            .iter()
-            .step_by(every)
-            .map(|s| {
-                (
-                    levels.of(s.level).apply(s.colour).map(|v| v * light),
-                    s.weight,
-                )
-            })
-            .collect();
-        let raw: Vec<([f32; 3], f32)> = samples
-            .iter()
-            .step_by(every)
-            .map(|s| (s.colour.map(|v| v * light), s.weight))
-            .collect();
+        // The film as it will be lit: every cell of every tile, counted
+        // for the tiles of the film it is draped on — a part of it if it
+        // is large.
+        let cells: usize = observed.tiles.values().map(|t| t.cells.len()).sum();
+        let every = cells.div_ceil(MEASURED).max(1);
+        let pieces = |graded: bool| -> Vec<([f32; 3], f32)> {
+            observed
+                .tiles
+                .iter()
+                .flat_map(|(at, tile)| {
+                    let grade = if graded {
+                        tiles.of(*at)
+                    } else {
+                        crate::grade::Grade::IDENTITY
+                    };
+                    let weight = tile.usage / tile.cells.len() as f32;
+                    tile.cells
+                        .iter()
+                        .map(move |c| (grade.apply(*c).map(|v| v * light), weight))
+                })
+                .step_by(every)
+                .filter(|(_, weight)| *weight > 0.0)
+                .collect()
+        };
+        let (lit, raw) = (pieces(true), pieces(false));
         let before = measure(&raw, 0.0, 1.0, 1.0);
 
         // The film brought to the target, one thing at a time and each
@@ -440,101 +342,109 @@ impl FilmGrade {
             }
         }
         Self {
-            levels,
+            tiles,
             exposure_ev: stops,
             contrast,
             saturation,
-            usage,
+            light,
             before,
             after,
+            fitted,
             limited,
         }
     }
 
-    /// One grade from several, each counting for how much imagery it was
-    /// fitted on: the grades of a film's packs, made the film's. One grade
-    /// from the first frame to the last is what keeps a film from changing
-    /// where one pack ends and the next begins. `None` of nothing.
-    ///
-    /// A mean, not a fit over the packs together: packs whose own levels
-    /// differ are brought to one another only as far as their means are.
-    pub fn merged(parts: &[&FilmGrade]) -> Option<Self> {
-        let weighed: Vec<(&FilmGrade, f32)> = parts
-            .iter()
-            .map(|p| (*p, p.usage.values().sum::<f32>()))
-            .filter(|(_, weight)| *weight > 0.0)
-            .collect();
-        let total: f32 = weighed.iter().map(|(_, w)| w).sum();
-        if total <= 0.0 {
-            return None;
-        }
-        if let [(only, _)] = weighed[..] {
-            return Some(only.clone());
-        }
-        let tables: Vec<(&LevelGrades, f32)> =
-            weighed.iter().map(|(p, w)| (&p.levels, *w)).collect();
-        let mean = |of: &dyn Fn(&FilmGrade) -> f32| {
-            weighed.iter().map(|(p, w)| of(p) * w).sum::<f32>() / total
-        };
-        let both =
-            |of: &dyn Fn(&FilmGrade) -> Measure| [0, 1, 2].map(|i| mean(&|p: &FilmGrade| of(p)[i]));
-        let mut usage: BTreeMap<u8, f32> = BTreeMap::new();
-        let mut limited: Vec<String> = Vec::new();
-        for (part, _) in &weighed {
-            for (level, tiles) in &part.usage {
-                *usage.entry(*level).or_default() += tiles;
-            }
-            for what in &part.limited {
-                if !limited.contains(what) {
-                    limited.push(what.clone());
-                }
+    /// The grade of a film made of several packs, from the grade and what
+    /// was seen of each. One pack's grade is the film's. Several are not
+    /// averaged: what they saw is put together and the film is fitted
+    /// anew, so that it is one grade from its first frame to its last and
+    /// a tile two packs drape has one gain. `None` of nothing.
+    pub fn of_packs(
+        parts: &[(&FilmGrade, &Observed)],
+        target: &LookTarget,
+        bounds: &Bounds,
+        tile_bounds: &TileBounds,
+    ) -> Option<Self> {
+        match parts {
+            [] => None,
+            [(only, _)] => Some((*only).clone()),
+            several => {
+                let observed = Observed::merged(several.iter().map(|(_, seen)| *seen));
+                let light =
+                    several.iter().map(|(g, _)| g.light).sum::<f32>() / several.len() as f32;
+                Some(Self::fit(&observed, light, target, bounds, tile_bounds))
             }
         }
-        Some(Self {
-            levels: LevelGrades::merged(&tables)?,
-            exposure_ev: kept(mean(&|p| p.exposure_ev)),
-            contrast: kept(mean(&|p| p.contrast.ln()).exp()),
-            saturation: kept(mean(&|p| p.saturation.ln()).exp()),
-            usage,
-            before: both(&|p| p.before),
-            after: both(&|p| p.after),
-            limited,
-        })
     }
 
-    /// The grade as it is kept beside a pack: a small JSON object.
+    /// The grade as it is kept beside a pack: a small JSON object. A
+    /// tile's gain is in 64ths of a stop.
     pub fn to_json(&self) -> String {
-        let three = |v: Measure| format!("[{:.2},{:.2},{:.2}]", v[0], v[1], v[2]);
-        let usage: Vec<String> = self
-            .usage
+        let three = |v: Pictured| format!("[{:.2},{:.2},{:.2}]", v[0], v[1], v[2]);
+        let pair = |v: (f32, f32)| format!("[{:.3},{:.3}]", v.0, v.1);
+        // Every tile given anything: a gain, or only the rest.
+        let mut given = self.tiles.stops.clone();
+        for at in self.tiles.rest.keys() {
+            given.entry(*at).or_insert([0.0; 3]);
+        }
+        let tiles: Vec<String> = given
             .iter()
-            .map(|(level, tiles)| format!("\"{level}\":{tiles:.1}"))
+            .map(|((level, x, y), g)| {
+                // A gain; then, for a tile given more than a gain, every
+                // other number of the measure in its order, and last the
+                // pivot. Stops in 64ths, a black point in 65536ths.
+                let at = (*level, *x, *y);
+                let mut n: Vec<i32> = g.iter().map(|v| (v * 64.0).round() as i32).collect();
+                if let Some(rest) = self.tiles.rest.get(&at) {
+                    for (value, name) in rest.iter().zip(&self.tiles.measure.names()[3..]) {
+                        let steps = if *name == "black" { 65536.0 } else { 64.0 };
+                        n.push((value * steps).round() as i32);
+                    }
+                    let pivot = self.tiles.pivot.get(&at).copied().unwrap_or(-2.5);
+                    n.push((pivot * 64.0).round() as i32);
+                }
+                let list: Vec<String> = n.iter().map(i32::to_string).collect();
+                format!("\"{level}/{x}/{y}\":[{}]", list.join(","))
+            })
             .collect();
         let limited: Vec<String> = self
             .limited
             .iter()
             .map(|what| format!("\"{}\"", what.replace(['"', '\\', ']'], "")))
             .collect();
+        let r = &self.fitted;
         format!(
-            "{{\"film_grade\":1,\"film\":{{\"exposure_ev\":{},\"contrast\":{},\"saturation\":{}}},\"usage\":{{{}}},\"before\":{},\"after\":{},\"limited\":[{}],\"table\":{}}}",
+            "{{\"film_grade\":2,\"measure\":\"{}\",\"film\":{{\"exposure_ev\":{},\"contrast\":{},\"saturation\":{},\"light\":{}}},\"before\":{},\"after\":{},\"limited\":[{}],\"fitted\":{{\"tiles\":{},\"measured\":{},\"blocks\":{},\"untouched\":{},\"edges\":{},\"borders\":{},\"accorded\":{},\"accord_broken\":{},\"held\":{},\"apart_before\":{},\"apart_after\":{}}},\"gain_unit\":\"64ths of a stop\",\"tiles\":{{{}}}}}",
+            self.tiles.measure.name(),
             self.exposure_ev,
             self.contrast,
             self.saturation,
-            usage.join(","),
+            self.light,
             three(self.before),
             three(self.after),
             limited.join(","),
-            self.levels.to_json()
+            r.tiles,
+            r.measured,
+            r.blocks,
+            r.untouched,
+            r.edges,
+            r.borders,
+            r.accorded,
+            r.accord_broken,
+            r.held,
+            pair(r.apart_before),
+            pair(r.apart_after),
+            tiles.join(",")
         )
     }
 
     /// Reads [`Self::to_json`] back. `None` if this is not one.
     pub fn from_json(text: &str) -> Option<Self> {
-        if !text.contains("\"film_grade\":1") {
+        if !text.contains("\"film_grade\":2") {
             return None;
         }
-        let inside = |open: &str, close: char| -> Option<&str> {
-            text.split(open).nth(1)?.split(close).next()
+        let inside = |text: &'_ str, open: &str, close: char| -> Option<String> {
+            Some(text.split(open).nth(1)?.split(close).next()?.to_string())
         };
         let number = |text: &str, key: &str| -> Option<f32> {
             text.split(&format!("\"{key}\":"))
@@ -545,37 +455,97 @@ impl FilmGrade {
                 .parse()
                 .ok()
         };
-        let three = |key: &str| -> Option<Measure> {
-            let v: Vec<f32> = inside(&format!("\"{key}\":["), ']')?
-                .split(',')
-                .filter_map(|n| n.trim().parse().ok())
-                .collect();
+        let list = |text: &str, key: &str| -> Option<Vec<f32>> {
+            Some(
+                inside(text, &format!("\"{key}\":["), ']')?
+                    .split(',')
+                    .filter_map(|n| n.trim().parse().ok())
+                    .collect(),
+            )
+        };
+        let three = |key: &str| -> Option<Pictured> {
+            let v = list(text, key)?;
             (v.len() == 3).then(|| [v[0], v[1], v[2]])
         };
-        let film = inside("\"film\":{", '}')?;
-        let usage = inside("\"usage\":{", '}')?
-            .split(',')
-            .filter_map(|entry| {
-                let (level, tiles) = entry.split_once(':')?;
-                Some((
-                    level.trim().trim_matches('"').parse().ok()?,
-                    tiles.trim().parse().ok()?,
-                ))
-            })
-            .collect();
-        let limited = inside("\"limited\":[", ']')?
+        let film = inside(text, "\"film\":{", '}')?;
+        let fitted = inside(text, "\"fitted\":{", '}')?;
+        let count = |key: &str| number(&fitted, key).map(|v| v as usize);
+        let pair = |key: &str| -> Option<(f32, f32)> {
+            let v = list(&fitted, key)?;
+            (v.len() == 2).then(|| (v[0], v[1]))
+        };
+        let limited = inside(text, "\"limited\":[", ']')?
             .split("\",\"")
             .map(|what| what.trim_matches('"').to_string())
             .filter(|what| !what.is_empty())
             .collect();
+        // The tiles come last: `"<level>/<x>/<y>":[r,g,b]`, one after the
+        // other.
+        let body = text.split("\"tiles\":{").nth(1)?;
+        let measure = if text.contains("\"measure\":\"curves\"") {
+            crate::Measure::Curves
+        } else {
+            crate::Measure::Moments
+        };
+        let (mut stops, mut rest, mut pivot) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        for entry in body.split(']') {
+            let Some((at, gains)) = entry.split_once(":[") else {
+                continue;
+            };
+            let mut at = at
+                .trim_matches(|c: char| !c.is_ascii_digit())
+                .split('/')
+                .map(str::parse::<u32>);
+            let (level, x, y) = (at.next()?.ok()?, at.next()?.ok()?, at.next()?.ok()?);
+            let at = (u8::try_from(level).ok()?, x, y);
+            let n: Vec<f32> = gains
+                .split(',')
+                .filter_map(|n| n.trim().parse::<i32>().ok())
+                .map(|n| n as f32)
+                .collect();
+            if n.len() != 3 && n.len() != measure.len() + 1 {
+                return None;
+            }
+            let gain = [n[0] / 64.0, n[1] / 64.0, n[2] / 64.0];
+            if gain != [0.0; 3] {
+                stops.insert(at, gain);
+            }
+            if n.len() > 3 {
+                let values: Vec<f32> = n[3..n.len() - 1]
+                    .iter()
+                    .zip(&measure.names()[3..])
+                    .map(|(v, name)| v / if *name == "black" { 65536.0 } else { 64.0 })
+                    .collect();
+                rest.insert(at, values);
+                pivot.insert(at, n[n.len() - 1] / 64.0);
+            }
+        }
         Some(Self {
-            levels: LevelGrades::from_json(text.split("\"table\":").nth(1)?)?,
-            exposure_ev: number(film, "exposure_ev")?,
-            contrast: number(film, "contrast")?,
-            saturation: number(film, "saturation")?,
-            usage,
+            tiles: TileGains {
+                measure,
+                stops,
+                rest,
+                pivot,
+            },
+            exposure_ev: number(&film, "exposure_ev")?,
+            contrast: number(&film, "contrast")?,
+            saturation: number(&film, "saturation")?,
+            light: number(&film, "light")?,
             before: three("before")?,
             after: three("after")?,
+            fitted: TileReport {
+                tiles: count("tiles")?,
+                measured: count("measured")?,
+                blocks: count("blocks")?,
+                untouched: count("untouched")?,
+                edges: count("edges")?,
+                borders: count("borders")?,
+                accorded: count("accorded")?,
+                accord_broken: count("accord_broken")?,
+                held: count("held")?,
+                apart_before: pair("apart_before")?,
+                apart_after: pair("apart_after")?,
+            },
             limited,
         })
     }
@@ -584,125 +554,111 @@ impl FilmGrade {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tiles::{TileSeen, GRID};
 
-    /// Ground of varied tone and colour, the same for the same seed, about
-    /// `tone` in linear light.
-    fn ground(seed: u32, cells: usize, tone: f32) -> Vec<[f32; 3]> {
-        let mut state = seed | 1;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            (state >> 8) as f32 / (1u32 << 24) as f32
+    /// A value that is the same for the same seed, 0 to 1.
+    fn noise(seed: u32) -> f32 {
+        let mut s = seed.wrapping_mul(0x9E37_79B9) ^ 0x85EB_CA6B;
+        s ^= s >> 15;
+        s = s.wrapping_mul(0x2C1B_3C6D);
+        s ^= s >> 12;
+        (s >> 8) as f32 / (1u32 << 24) as f32
+    }
+
+    /// A film of `wide` × 4 tiles of level 13 about `tone`, of varied tone
+    /// and colour, whose first `dark` columns are a capture `stops` darker
+    /// — over a reference level that shows the same ground as one picture.
+    fn film(tone: f32, wide: u32, dark: u32, stops: f32) -> Observed {
+        let mut observed = Observed::default();
+        let ground = |x: u32, y: u32, k: usize| {
+            let seed = (y * 1000 + x) * 64 + k as u32;
+            let light = tone * (0.6 + 0.8 * noise(seed));
+            [
+                light * (0.8 + 0.4 * noise(seed + 9000)),
+                light * (0.9 + 0.4 * noise(seed + 18000)),
+                light * (0.6 + 0.4 * noise(seed + 27000)),
+            ]
         };
-        (0..cells)
-            .map(|_| {
-                let light = tone * (0.25 + 1.5 * next());
-                [
-                    light * (0.8 + 0.4 * next()),
-                    light * (0.9 + 0.4 * next()),
-                    light * (0.6 + 0.4 * next()),
-                ]
-            })
-            .collect()
-    }
-
-    /// A film of two levels over the same ground: `fine` drawn `share` of
-    /// the time and darker than `coarse` by `stops`, with `cast` more of it
-    /// on blue.
-    fn film(tone: f32, stops: f32, cast: f32, share: f32) -> (Vec<Seen>, Vec<Sample>) {
-        let (coarse, fine) = (12u8, 14u8);
-        let mut seen = Vec::new();
-        let mut samples = Vec::new();
-        for tile in 0..40u32 {
-            let under = ground(tile + 1, 64, tone);
-            let over: Vec<[f32; 3]> = under
-                .iter()
-                .map(|c| {
-                    let by = (-stops).exp2();
-                    [c[0] * by, c[1] * by, c[2] * by * (-cast).exp2()]
-                })
-                .collect();
-            for c in &under {
-                samples.push(Sample {
-                    level: coarse,
-                    colour: *c,
-                    weight: 1.0 - share,
-                });
+        for y in 0..4u32 {
+            for x in 0..wide {
+                let by = if x < dark { (-stops).exp2() } else { 1.0 };
+                let cells: [[f32; 3]; GRID * GRID] =
+                    std::array::from_fn(|k| ground(x, y, k).map(|v| v * by));
+                observed.tiles.insert(
+                    (13, 50 + x, 70 + y),
+                    TileSeen {
+                        cells,
+                        edges: [[[tone * by; 3]; GRID]; 4],
+                        usage: 1.0,
+                        tones: None,
+                    },
+                );
+                // The reference under it: the same ground, a level up, as
+                // it is — each of its cells four of the tile's.
+                let under = observed
+                    .tiles
+                    .entry((12, (50 + x) / 2, (70 + y) / 2))
+                    .or_insert(TileSeen {
+                        cells: [[0.0; 3]; GRID * GRID],
+                        edges: [[[tone; 3]; GRID]; 4],
+                        usage: 0.0,
+                        tones: None,
+                    });
+                let (i0, j0) = (((50 + x) % 2) as usize * 4, ((70 + y) % 2) as usize * 4);
+                for cj in 0..4 {
+                    for ci in 0..4 {
+                        let mut sum = [0.0f32; 3];
+                        for (dj, di) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                            let c = ground(x, y, (cj * 2 + dj) * GRID + ci * 2 + di);
+                            for i in 0..3 {
+                                sum[i] += c[i] / 4.0;
+                            }
+                        }
+                        under.cells[(j0 + cj) * GRID + i0 + ci] = sum;
+                    }
+                }
             }
-            for c in &over {
-                samples.push(Sample {
-                    level: fine,
-                    colour: *c,
-                    weight: share,
-                });
-            }
-            seen.push(Seen {
-                level: fine,
-                ancestor: coarse,
-                tile: over,
-                under,
-            });
         }
-        (seen, samples)
+        observed
     }
 
-    fn fit(seen: &[Seen], samples: &[Sample], bounds: &Bounds) -> FilmGrade {
-        FilmGrade::fit(seen, samples, 1.0, &LookTarget::default(), bounds)
-    }
-
-    #[test]
-    fn the_level_a_film_draws_most_is_left_as_it_is() {
-        // Fine tiles half a stop darker, and most of the film.
-        let (seen, samples) = film(0.18, 0.5, 0.0, 0.8);
-        let grade = fit(&seen, &samples, &Bounds::default());
-        assert!(grade.levels.of(14).is_identity(), "{:?}", grade.levels);
-        // The other is brought to it: half a stop down.
-        let coarse = luma(grade.levels.of(12).gain).log2();
-        assert!((coarse + 0.5).abs() < 0.05, "{coarse}");
-
-        // The same film drawn mostly from the coarse level holds that one.
-        let (seen, samples) = film(0.18, 0.5, 0.0, 0.2);
-        let grade = fit(&seen, &samples, &Bounds::default());
-        assert!(grade.levels.of(12).is_identity(), "{:?}", grade.levels);
-        let fine = luma(grade.levels.of(14).gain).log2();
-        assert!((fine - 0.5).abs() < 0.05, "{fine}");
+    fn fit(observed: &Observed, target: &LookTarget) -> FilmGrade {
+        FilmGrade::fit(
+            observed,
+            1.0,
+            target,
+            &Bounds::default(),
+            &TileBounds::default(),
+        )
     }
 
     #[test]
-    fn nothing_goes_past_its_bounds_and_what_is_held_back_is_said() {
-        // Two stops between the levels, and a strong cast: more than a
-        // level may be given of either.
-        let (seen, samples) = film(0.18, 2.0, 0.8, 0.2);
+    fn a_films_tiles_are_brought_together_before_the_film_is_measured() {
+        // A dark film, a third of it a capture a stop darker still.
+        let grade = fit(&film(0.05, 6, 2, 1.0), &LookTarget::default());
+        assert_eq!(grade.fitted.blocks, 2, "{:?}", grade.fitted);
+        // The larger capture is the film's own; the other is brought up.
+        assert!(grade.tiles.of((13, 55, 70)).is_identity());
+        let lifted = grade.tiles.of((13, 50, 70)).gain[1].log2();
+        assert!((lifted - 1.0).abs() < 0.05, "{lifted}");
+        // The film is then exposed as the tiles will be drawn, not as the
+        // imagery lies: as much as the same film of one capture, and less
+        // than its darker third would have asked for.
+        let one_capture = fit(&film(0.05, 6, 0, 0.0), &LookTarget::default());
+        assert!(one_capture.exposure_ev > 0.5);
+        assert!(
+            (grade.exposure_ev - one_capture.exposure_ev).abs() < 0.05,
+            "{} against {}",
+            grade.exposure_ev,
+            one_capture.exposure_ev
+        );
+    }
+
+    #[test]
+    fn the_films_part_stays_within_its_bounds_and_says_when_it_is_short() {
+        // Far too dark to be brought to the target in two stops.
         let bounds = Bounds::default();
-        let grade = fit(&seen, &samples, &bounds);
-        let fine = grade.levels.of(14);
-        let light = luma(fine.gain).log2();
-        assert!(light <= bounds.level_stops + 1e-3, "{light}");
-        for g in fine.gain {
-            assert!(
-                (g.log2() - light).abs() <= bounds.level_tint_stops + 1e-3,
-                "{fine:?}"
-            );
-        }
-        assert!(
-            fine.contrast >= bounds.level_contrast.0 && fine.contrast <= bounds.level_contrast.1
-        );
-        assert!(
-            fine.saturation >= bounds.level_saturation.0
-                && fine.saturation <= bounds.level_saturation.1
-        );
-        assert!(
-            grade.limited.iter().any(|w| w == "level 14: gain"),
-            "{:?}",
-            grade.limited
-        );
-        assert!(grade.limited.iter().any(|w| w == "level 14: cast"));
-
-        // And the film: far too dark to be brought to the target in two
-        // stops. It is given two, and said to be short.
-        let (seen, samples) = film(0.004, 0.0, 0.0, 0.5);
-        let grade = fit(&seen, &samples, &bounds);
+        let grade = fit(&film(0.004, 4, 0, 0.0), &LookTarget::default());
         assert_eq!(grade.exposure_ev, bounds.film_stops);
         assert!(
             grade.contrast >= bounds.film_contrast.0 && grade.contrast <= bounds.film_contrast.1
@@ -722,10 +678,9 @@ mod tests {
     }
 
     #[test]
-    fn a_dark_film_is_lifted_to_the_target_and_a_grey_stays_grey() {
-        let (seen, samples) = film(0.05, 0.0, 0.0, 0.5);
+    fn a_dark_film_is_lifted_to_the_target_with_no_colour() {
         let target = LookTarget::default();
-        let grade = FilmGrade::fit(&seen, &samples, 1.0, &target, &Bounds::default());
+        let grade = fit(&film(0.05, 4, 0, 0.0), &target);
         assert!(
             grade.before[0] < target.lightness - 10.0,
             "{:?}",
@@ -737,24 +692,20 @@ mod tests {
             "{:?}",
             grade.after
         );
-        // The film's part is three numbers and no colour: nothing in it
-        // can turn a grey.
-        for grade in grade.levels.grades.values() {
-            assert!(grade.is_identity());
-        }
+        // One capture: no tile is given a gain, and the film's part is
+        // three numbers with no colour in them.
+        assert!(grade.tiles.stops.is_empty());
     }
 
     #[test]
     fn a_film_already_at_the_target_is_not_touched() {
-        // Found by the fit itself: the film as lit that measures the
-        // target's lightness.
-        let (seen, samples) = film(0.18, 0.0, 0.0, 0.5);
+        let observed = film(0.18, 4, 0, 0.0);
         let mut target = LookTarget::default();
-        let as_it_is = FilmGrade::fit(&seen, &samples, 1.0, &target, &Bounds::default());
+        let as_it_is = fit(&observed, &target);
         target.lightness = as_it_is.before[0];
         target.contrast = as_it_is.before[1];
         target.chroma = as_it_is.before[2];
-        let grade = FilmGrade::fit(&seen, &samples, 1.0, &target, &Bounds::default());
+        let grade = fit(&observed, &target);
         assert_eq!(
             (grade.exposure_ev, grade.contrast, grade.saturation),
             (0.0, 1.0, 1.0)
@@ -762,82 +713,88 @@ mod tests {
         assert!(grade.limited.is_empty(), "{:?}", grade.limited);
         // A little off is still left alone; far off is not.
         target.lightness += 0.9 * target.within[0];
-        let near = FilmGrade::fit(&seen, &samples, 1.0, &target, &Bounds::default());
-        assert_eq!(near.exposure_ev, 0.0);
+        assert_eq!(fit(&observed, &target).exposure_ev, 0.0);
         target.lightness += 3.0 * target.within[0];
-        let far = FilmGrade::fit(&seen, &samples, 1.0, &target, &Bounds::default());
-        assert!(far.exposure_ev > 0.0);
+        assert!(fit(&observed, &target).exposure_ev > 0.0);
     }
 
     #[test]
     fn a_film_of_nothing_has_no_grade_and_borrows_none() {
-        let grade = fit(&[], &[], &Bounds::default());
+        let grade = fit(&Observed::default(), &LookTarget::default());
         assert_eq!(grade, FilmGrade::none());
-        assert!(grade.levels.of(13).is_identity());
-        assert_eq!(FilmGrade::merged(&[&grade]), None);
-
-        // A film of one level, never seen against another: its levels are
-        // left alone, and it is still brought to the target.
-        let one: Vec<Sample> = ground(7, 400, 0.03)
-            .into_iter()
-            .map(|colour| Sample {
-                level: 15,
-                colour,
-                weight: 1.0,
-            })
-            .collect();
-        let grade = fit(&[], &one, &Bounds::default());
-        assert!(grade.levels.of(15).is_identity());
-        assert!(grade.exposure_ev > 0.0, "{grade:?}");
+        assert!(grade.tiles.of((13, 1, 1)).is_identity());
+        let (target, bounds, tiles) = (
+            LookTarget::default(),
+            Bounds::default(),
+            TileBounds::default(),
+        );
+        assert_eq!(FilmGrade::of_packs(&[], &target, &bounds, &tiles), None);
     }
 
     #[test]
-    fn the_grades_of_a_films_packs_are_made_one() {
-        let (seen, samples) = film(0.05, 0.5, 0.0, 0.8);
-        let one = fit(&seen, &samples, &Bounds::default());
-        let (seen, samples) = film(0.10, 0.5, 0.0, 0.8);
-        let other = fit(&seen, &samples, &Bounds::default());
-        assert!(one.exposure_ev > other.exposure_ev);
-        let film = FilmGrade::merged(&[&one, &other]).expect("a grade");
-        // Equal parts: half-way between the two.
-        let middle = 0.5 * (one.exposure_ev + other.exposure_ev);
-        assert!((film.exposure_ev - middle).abs() < 1e-3, "{film:?}");
-        assert_eq!(film.usage[&14], one.usage[&14] + other.usage[&14]);
+    fn a_film_of_several_packs_is_fitted_as_one() {
+        let whole = film(0.05, 8, 3, 1.0);
+        let part = |from: u32, to: u32| Observed {
+            tiles: whole
+                .tiles
+                .iter()
+                .filter(|(at, _)| at.0 == 12 || (50 + from..50 + to).contains(&at.1))
+                .map(|(at, tile)| (*at, tile.clone()))
+                .collect(),
+        };
+        let (west, east) = (part(0, 4), part(4, 8));
+        let (target, bounds, tiles) = (
+            LookTarget::default(),
+            Bounds::default(),
+            TileBounds::default(),
+        );
+        let (g_west, g_east) = (fit(&west, &target), fit(&east, &target));
+        // Each pack alone: the west holds its dark capture as its own.
+        assert!(g_west.tiles.of((13, 50, 70)).is_identity());
+        let film = FilmGrade::of_packs(
+            &[(&g_west, &west), (&g_east, &east)],
+            &target,
+            &bounds,
+            &tiles,
+        )
+        .expect("a grade");
+        assert_eq!(film, fit(&whole, &target));
+        assert!(!film.tiles.of((13, 50, 70)).is_identity());
         // One pack alone is its own grade, exactly.
-        assert_eq!(FilmGrade::merged(&[&one]).as_ref(), Some(&one));
+        assert_eq!(
+            FilmGrade::of_packs(&[(&g_west, &west)], &target, &bounds, &tiles).as_ref(),
+            Some(&g_west)
+        );
     }
 
     #[test]
     fn a_grade_is_read_back_as_it_was_written() {
-        let (seen, samples) = film(0.004, 3.0, 0.8, 0.2);
-        let mut grade = fit(&seen, &samples, &Bounds::default());
-        assert!(!grade.limited.is_empty());
+        let grade = fit(&film(0.004, 6, 2, 0.75), &LookTarget::default());
+        assert!(!grade.limited.is_empty() && !grade.tiles.stops.is_empty());
         let read = FilmGrade::from_json(&grade.to_json()).expect("read back");
-        // What a fit was found from is not kept.
-        grade.levels.sources.clear();
-        let close = |a: f32, b: f32| (a - b).abs() < 0.01;
+        assert_eq!(read.tiles, grade.tiles);
         assert_eq!(read.limited, grade.limited);
         assert_eq!(
-            read.usage.keys().collect::<Vec<_>>(),
-            grade.usage.keys().collect::<Vec<_>>()
+            (read.exposure_ev, read.contrast, read.saturation, read.light),
+            (
+                grade.exposure_ev,
+                grade.contrast,
+                grade.saturation,
+                grade.light
+            )
         );
-        assert_eq!(
-            (read.exposure_ev, read.contrast, read.saturation),
-            (grade.exposure_ev, grade.contrast, grade.saturation)
-        );
+        let close = |a: f32, b: f32| (a - b).abs() < 0.01;
         for i in 0..3 {
             assert!(close(read.before[i], grade.before[i]));
             assert!(close(read.after[i], grade.after[i]));
         }
-        assert_eq!(read.levels.anchor, grade.levels.anchor);
-        for (level, g) in &grade.levels.grades {
-            let r = read.levels.of(*level);
-            assert!(close(r.contrast, g.contrast) && close(r.saturation, g.saturation));
-            for i in 0..3 {
-                assert!(close(r.gain[i].log2(), g.gain[i].log2()), "{r:?} {g:?}");
-            }
-        }
+        assert_eq!(read.fitted.blocks, grade.fitted.blocks);
+        assert_eq!(read.fitted.borders, grade.fitted.borders);
+        assert_eq!(read.fitted.accord_broken, 0);
+        assert!(close(
+            read.fitted.apart_before.1,
+            grade.fitted.apart_before.1
+        ));
         assert_eq!(FilmGrade::from_json("{}"), None);
-        assert_eq!(FilmGrade::from_json(&grade.levels.to_json()), None);
     }
 }
