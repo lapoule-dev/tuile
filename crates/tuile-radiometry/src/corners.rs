@@ -58,6 +58,13 @@ pub struct FieldBounds {
     pub seam_linked_stops: f32,
     /// A seam of fewer edges than this is not one.
     pub least_seam: usize,
+    /// Where the film is brought, from its own to the reference's: at 0
+    /// the tiles are brought to one another and the film stays what it
+    /// mostly is; at 1 they are brought to the reference, the film with
+    /// them. What it adds is the same for every tile — the film's own
+    /// standing against the reference, given back — so it is the film's,
+    /// not a tile's, and the bounds are not on it.
+    pub toward: f32,
 }
 
 impl Default for FieldBounds {
@@ -69,6 +76,7 @@ impl Default for FieldBounds {
             seam_stops: 0.6,
             seam_linked_stops: 0.3,
             least_seam: 3,
+            toward: 0.0,
         }
     }
 }
@@ -253,31 +261,55 @@ impl CornerField {
             return (nothing, report);
         }
 
-        // The film's own, number by number: the middle of its tiles'
-        // measures, each counted for how much of the film it is. The field
-        // brings tiles to it, so what is most of the film is asked for
-        // nothing.
-        let own: Vec<f32> = (0..found)
-            .map(|c| {
-                let mut values: Vec<(f32, f32)> = (0..n)
-                    .filter_map(|i| measures[i].as_ref().map(|m| (m[c], usage[i].max(1e-3))))
-                    .filter(|(v, _)| v.is_finite())
-                    .collect();
-                if values.is_empty() {
-                    0.0
-                } else {
-                    weighted_median(&mut values)
-                }
-            })
+        // The zone each tile is in: ground, or water for a tile that is
+        // water for the most part. Two zones are not one film against the
+        // reference — a sea stands stops from where the land beside it
+        // does — so each has its own, and what a tile is brought to and
+        // given back is its zone's.
+        const ZONES: usize = 2;
+        let zone: Vec<usize> = at
+            .iter()
+            .map(|a| usize::from(measure == Measure::Linear && observed.on_water(*a)))
             .collect();
-        // What each tile wants of the field: to be brought to the film's
+        // A zone's own, number by number: the middle of its tiles'
+        // measures, each counted for how much of the film it is. The field
+        // brings tiles to it, so what is most of a zone is asked for
+        // nothing.
+        let owns: [Vec<f32>; ZONES] = std::array::from_fn(|z| {
+            (0..found)
+                .map(|c| {
+                    let mut values: Vec<(f32, f32)> = (0..n)
+                        .filter(|i| zone[*i] == z)
+                        .filter_map(|i| measures[i].as_ref().map(|m| (m[c], usage[i].max(1e-3))))
+                        .filter(|(v, _)| v.is_finite())
+                        .collect();
+                    if values.is_empty() {
+                        0.0
+                    } else {
+                        weighted_median(&mut values)
+                    }
+                })
+                .collect()
+        });
+        // What every tile of a zone is given beside: the zone's own, given
+        // back by as much as the film is brought to the reference.
+        let shifts: [Vec<f32>; ZONES] =
+            std::array::from_fn(|z| owns[z].iter().map(|o| -bounds.toward * o).collect());
+        // What each tile wants of the field: to be brought to its zone's
         // own. A number that could not be taken wants nothing.
         let wanted: Vec<Option<Vec<f32>>> = measures
             .iter()
-            .map(|m| {
+            .enumerate()
+            .map(|(i, m)| {
                 m.as_ref().map(|m| {
                     (0..found)
-                        .map(|c| if m[c].is_finite() { own[c] - m[c] } else { 0.0 })
+                        .map(|c| {
+                            if m[c].is_finite() {
+                                owns[zone[i]][c] - m[c]
+                            } else {
+                                0.0
+                            }
+                        })
                         .collect()
                 })
             })
@@ -367,7 +399,14 @@ impl CornerField {
         }
         // Strong edges begin a seam; it goes on along the edges that touch
         // it and are strong enough to follow.
-        let mut seam: Vec<bool> = evidence.iter().map(|e| *e > bounds.seam_stops).collect();
+        // A shore — a tile of water beside a tile of ground — is a seam by
+        // what it is: the field of one zone does not go on into the other.
+        let shore: Vec<bool> = edges.iter().map(|e| zone[e.a] != zone[e.b]).collect();
+        let mut seam: Vec<bool> = evidence
+            .iter()
+            .zip(&shore)
+            .map(|(e, shore)| *shore || *e > bounds.seam_stops)
+            .collect();
         let mut front: Vec<usize> = (0..edges.len()).filter(|k| seam[*k]).collect();
         while let Some(k) = front.pop() {
             for end in ends(&edges[k]) {
@@ -396,7 +435,7 @@ impl CornerField {
             *length.entry(find(&mut of_seam, k)).or_default() += 1;
         }
         for k in 0..edges.len() {
-            if seam[k] && length[&find(&mut of_seam, k)] < bounds.least_seam {
+            if seam[k] && !shore[k] && length[&find(&mut of_seam, k)] < bounds.least_seam {
                 seam[k] = false;
             }
         }
@@ -584,7 +623,9 @@ impl CornerField {
             if seam[k] {
                 seam_before.push(e.met.step.abs());
                 seam_after.push((e.met.step + jump).abs());
-                report.steps_made += usize::from(e.met.step.abs() < 0.1 && jump.abs() > 0.05);
+                // Not at a shore: the two sides there are not one ground.
+                report.steps_made +=
+                    usize::from(!shore[k] && e.met.step.abs() < 0.1 && jump.abs() > 0.05);
             } else {
                 report.widest_break = report.widest_break.max(widest);
             }
@@ -615,7 +656,7 @@ impl CornerField {
                     head += &format!(",{prefix}{name}");
                 }
             }
-            head += ",gain_tl,gain_tr,gain_bl,gain_br";
+            head += ",gain_tl,gain_tr,gain_bl,gain_br,zone";
             trace.head = head;
             for (i, (level, x, y)) in at.iter().enumerate() {
                 let mut row = format!(
@@ -635,15 +676,16 @@ impl CornerField {
                 for c in 0..found {
                     row += &number(measures[i].as_ref().map_or(f32::NAN, |m| m[c]));
                 }
-                for value in &own {
+                for value in &owns[zone[i]] {
                     row += &number(*value);
                 }
-                for value in mean_of(&value, i) {
-                    row += &number(value);
+                for (value, beside) in mean_of(&value, i).iter().zip(&shifts[zone[i]]) {
+                    row += &number(value + beside);
                 }
                 for corner in given_of(i) {
-                    row += &number(tone_of(&corner));
+                    row += &number(tone_of(&corner) + tone_of(&shifts[zone[i]]));
                 }
+                row += &format!(",{}", ["ground", "water"][zone[i]]);
                 trace.tiles.push(row);
             }
             for (k, e) in edges.iter().enumerate() {
@@ -671,16 +713,29 @@ impl CornerField {
             }
         }
 
-        let touched: Vec<usize> = (0..n).filter(|tile| !untouched(*tile)).collect();
+        // Every tile is given the film's part; without one, only the tiles
+        // the field touches are given anything.
+        let whole = shifts.iter().flatten().any(|v| *v != 0.0);
+        let touched: Vec<usize> = (0..n).filter(|tile| whole || !untouched(*tile)).collect();
         let given = touched
             .iter()
-            .map(|tile| (at[*tile], given_of(*tile)))
+            .map(|tile| {
+                let mut corners = given_of(*tile);
+                for corner in &mut corners {
+                    for (value, beside) in corner.iter_mut().zip(&shifts[zone[*tile]]) {
+                        *value += beside;
+                    }
+                    measure.keep(corner);
+                }
+                (at[*tile], corners)
+            })
             .collect();
         let pivot = touched
             .iter()
             .map(|tile| {
-                let corners: [f32; CORNERS] =
-                    std::array::from_fn(|corner| pivot[&class[slot(*tile, corner)]]);
+                let corners: [f32; CORNERS] = std::array::from_fn(|corner| {
+                    pivot[&class[slot(*tile, corner)]] + tone_of(&shifts[zone[*tile]])
+                });
                 (at[*tile], corners)
             })
             .collect();
@@ -1073,5 +1128,103 @@ mod tests {
         );
         assert!((gain(0, 0.5) - gain(3, 0.5)).abs() < 0.1);
         assert!(report.seam_after.0 < 0.1, "{report:?}");
+    }
+
+    #[test]
+    fn a_film_is_brought_to_the_reference_by_as_much_as_it_is_told() {
+        // A film of one capture, a stop lighter than the reference all
+        // over. Left to itself the field does nothing; told to go to the
+        // reference, it gives every tile the same stop back — past the
+        // half-stop a tile alone may be given here.
+        let mut observed = Observed::default();
+        for y in 0..3u32 {
+            for x in 0..4u32 {
+                let places: [[f32; 3]; crate::PAIRS * crate::PAIRS] = std::array::from_fn(|k| {
+                    let light = 0.04
+                        + 0.02 * ((k % 16) as f32 * 0.8 + x as f32).sin().abs()
+                        + 0.001 * (k / 16) as f32;
+                    [light, light * 1.1, light * 0.8]
+                });
+                let mut seen = flat(-3.0, 1.0);
+                seen.paired = Some(Box::new(crate::Paired {
+                    tile: places.map(|c| c.map(|v| v * 2.0)),
+                    reference: places,
+                }));
+                observed.tiles.insert((13, 100 + x, 200 + y), seen);
+            }
+        }
+        let bounds = |toward: f32| FieldBounds {
+            reference_level: 0,
+            toward,
+            limits: Limits {
+                light_stops: 0.5,
+                ..Limits::default()
+            },
+            ..FieldBounds::default()
+        };
+        let (own, _) = CornerField::solve_by(&observed, Measure::Linear, &bounds(0.0));
+        assert!(own.given.is_empty());
+        let (whole, report) = CornerField::solve_by(&observed, Measure::Linear, &bounds(1.0));
+        assert_eq!(whole.given.len(), 12);
+        assert_eq!(report.held, 0);
+        for tile in whole.given.keys() {
+            let gain = whole.at(*tile, 0.3, 0.6).gain;
+            for band in gain {
+                assert!((band.log2() + 1.0).abs() < 0.05, "{tile:?}: {gain:?}");
+            }
+        }
+        let (half, _) = CornerField::solve_by(&observed, Measure::Linear, &bounds(0.5));
+        let gain = half.at((13, 101, 201), 0.5, 0.5).gain[1].log2();
+        assert!((gain + 0.5).abs() < 0.05, "{gain}");
+    }
+
+    #[test]
+    fn the_sea_is_brought_to_the_reference_as_sea_and_the_land_as_land() {
+        // Four columns of land a stop lighter than the reference, then four
+        // of sea three stops lighter than the reference's sea.
+        let mut observed = Observed::default();
+        for y in 0..4u32 {
+            for x in 0..8u32 {
+                let wave =
+                    |k: usize| 1.0 + 0.3 * ((k % 16) as f32 * 0.8 + (k / 16) as f32 * 0.3).sin();
+                let (tile, reference): ([[f32; 3]; 256], [[f32; 3]; 256]) = if x < 4 {
+                    (
+                        std::array::from_fn(|k| [0.08, 0.09, 0.06].map(|v| v * wave(k))),
+                        std::array::from_fn(|k| [0.04, 0.045, 0.03].map(|v| v * wave(k))),
+                    )
+                } else {
+                    (
+                        std::array::from_fn(|k| [0.04, 0.08, 0.16].map(|v| v * wave(k))),
+                        std::array::from_fn(|k| [0.005, 0.01, 0.02].map(|v| v * wave(k))),
+                    )
+                };
+                let mut seen = flat(-3.0, 1.0);
+                seen.paired = Some(Box::new(crate::Paired { tile, reference }));
+                observed.tiles.insert((13, 100 + x, 200 + y), seen);
+            }
+        }
+        let bounds = FieldBounds {
+            reference_level: 0,
+            toward: 1.0,
+            ..FieldBounds::default()
+        };
+        let (field, report) = CornerField::solve_by(&observed, Measure::Linear, &bounds);
+        // The shore is a seam, and nothing was held at a bound: each zone
+        // is as its own is, three stops though the sea be from the land's.
+        assert_eq!(report.seam_edges, 4, "{report:?}");
+        assert_eq!((report.held, report.steps_made), (0, 0));
+        let gain = |x: u32, u: f32| field.at((13, 100 + x, 202), u, 0.5).gain[1].log2();
+        for (x, u, wanted) in [
+            (0, 0.5, -1.0),
+            (3, 0.98, -1.0),
+            (4, 0.02, -3.0),
+            (7, 0.5, -3.0),
+        ] {
+            assert!(
+                (gain(x, u) - wanted).abs() < 0.05,
+                "column {x}: {} for {wanted}",
+                gain(x, u)
+            );
+        }
     }
 }

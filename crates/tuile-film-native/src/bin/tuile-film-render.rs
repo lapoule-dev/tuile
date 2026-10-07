@@ -57,6 +57,10 @@
 //!                         the linear measure is taken against
 //!   --reference-cap <n>   the film's level past which that layer gets no
 //!                         finer (default 14)
+//!   --toward <0..1>       with --measure linear: where the film is brought,
+//!                         from its own tone (0: the tiles are only brought
+//!                         to one another) to the reference's (1, the
+//!                         default)
 //!   --put                 with --calibrate: also write it to the bucket
 //!   --light <x>           with --calibrate: the light the renderer puts
 //!                         on ground, instead of the one this render shows
@@ -555,12 +559,18 @@ async fn main() -> Result<(), Error> {
         };
         // A line is against a reference that is no tile of the film: every
         // tile is measured, whatever its level.
+        let toward: f32 = match (measure, value("--toward")) {
+            (Measure::Linear, Some(toward)) => toward.parse()?,
+            (Measure::Linear, None) => 1.0,
+            _ => 0.0,
+        };
         let field_bounds = FieldBounds {
             reference_level: if measure == Measure::Linear {
                 0
             } else {
                 reference
             },
+            toward,
             ..FieldBounds::default()
         };
         let grade = FilmGrade::fit(
@@ -720,12 +730,8 @@ async fn main() -> Result<(), Error> {
             judge(&version, &|at, u, v| field.at(at, u, v))?;
         }
         if reference_layer.is_some() {
-            let bounds = FieldBounds {
-                reference_level: 0,
-                ..FieldBounds::default()
-            };
             let (field, of_field, trace) =
-                CornerField::solve_traced(&observed, Measure::Linear, &bounds);
+                CornerField::solve_traced(&observed, Measure::Linear, &field_bounds);
             for (name, table) in trace.tables() {
                 write("trace/field-linear", name, table)?;
             }

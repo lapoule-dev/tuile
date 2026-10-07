@@ -69,6 +69,9 @@ pub struct Line {
     /// How much of the slope read off the places is in the gain, 0 to 1:
     /// the rest is the ratio's.
     pub trust: [f32; 3],
+    /// Whether the tile is water for the most part, and was fitted on its
+    /// water: see [`Paired::on_water`].
+    pub water: bool,
 }
 
 /// A line and what it was fitted on.
@@ -106,11 +109,21 @@ pub(crate) fn ground(c: [f32; 3]) -> bool {
 /// composite of a year, where the open sea is nine places in ten of this
 /// and land one in a thousand.
 ///
-/// Water is not ground to be matched. One source shows a sea light and
-/// blue, another near black: stops apart, and nothing to do with how a
-/// capture was exposed. A tile is not darkened for lying on the shore.
+/// Water and ground are two zones, and one is not laid on the reference as
+/// the other is: one source shows a sea light and blue, another near
+/// black, stops apart, where their ground differs by a fraction of that. A
+/// tile is measured on the zone it mostly is, against the same zone of the
+/// reference — a shore is not darkened for the sea beside it, nor a sea
+/// turned to the colour of the land.
 pub(crate) fn water(reference: [f32; 3]) -> bool {
     reference[2] > reference[0] && reference[2] > 0.8 * reference[1]
+}
+
+/// Whether a place of water can be compared: as ground, but the reference
+/// may be as dark as a sea is.
+fn sea(tile: [f32; 3], reference: [f32; 3]) -> bool {
+    let seen = |c: [f32; 3]| c.iter().all(|v| v.is_finite() && *v < BURNT) && !snow(c);
+    seen(tile) && seen(reference) && luma(tile) > DARK && water(reference)
 }
 
 impl Paired {
@@ -122,12 +135,31 @@ impl Paired {
         }
     }
 
-    /// The places both pictures show ground that can be compared.
+    /// Whether the tile is water for the most part: more of its places
+    /// that can be compared lie on water than on ground.
+    pub fn on_water(&self) -> bool {
+        let (mut wet, mut dry) = (0usize, 0usize);
+        for (t, r) in self.tile.iter().zip(&self.reference) {
+            wet += usize::from(sea(*t, *r));
+            dry += usize::from(ground(*t) && ground(*r) && !water(*r));
+        }
+        wet > dry
+    }
+
+    /// The places both pictures show the same zone, and can be compared:
+    /// the tile's water if it is water for the most part, else its ground.
     pub fn places(&self) -> impl Iterator<Item = ([f32; 3], [f32; 3])> + '_ {
+        let wet = self.on_water();
         self.tile
             .iter()
             .zip(&self.reference)
-            .filter(|(t, r)| ground(**t) && ground(**r) && !water(**r))
+            .filter(move |(t, r)| {
+                if wet {
+                    sea(**t, **r)
+                } else {
+                    ground(**t) && ground(**r) && !water(**r)
+                }
+            })
             .map(|(t, r)| (*t, *r))
     }
 
@@ -183,9 +215,10 @@ impl Paired {
             }
         }
         // A picture is not laid on another by turning it over, nor by a
-        // gain of sixteen.
+        // gain of sixty-four — a sea can be that much darker on one source
+        // than on another, in the band it has least of.
         if !bands.iter().all(|b| {
-            b.gain.is_finite() && b.bias.is_finite() && (1.0 / 16.0..=16.0).contains(&b.gain)
+            b.gain.is_finite() && b.bias.is_finite() && (1.0 / 64.0..=64.0).contains(&b.gain)
         }) {
             return None;
         }
@@ -197,6 +230,7 @@ impl Paired {
                 agreement: bands.map(|b| b.agreement as f32),
                 ratio: bands.map(|b| b.ratio as f32),
                 trust: bands.map(|b| b.trust as f32),
+                water: self.on_water(),
             },
             places: places
                 .iter()
@@ -496,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn water_under_a_tile_does_not_move_its_line() {
+    fn a_tile_is_measured_on_the_zone_it_mostly_is() {
         // A third of the tile lies on the sea: light and blue on the tile,
         // near black on the reference. The shore is laid as shore.
         let mut coast = paired(|_, c| laid(c));
@@ -506,16 +540,25 @@ mod tests {
         }
         let line = coast.line().expect("a line");
         close(&line, 0.02);
+        assert!(!line.water && !coast.on_water());
         assert!(
             line.places <= PAIRS * PAIRS * 2 / 3 + PAIRS,
             "{}",
             line.places
         );
-        // And a tile that is all sea has no line at all.
-        let sea = Paired {
-            tile: [[0.03, 0.08, 0.15]; PAIRS * PAIRS],
-            reference: [[0.004, 0.02, 0.025]; PAIRS * PAIRS],
-        };
-        assert_eq!(sea.line(), None);
+        // A tile that is sea for two thirds is laid as sea: its water on
+        // the reference's water, a quarter of its light, whatever its
+        // strip of shore says.
+        let mut bay = paired(|_, c| laid(c));
+        for k in (0..PAIRS * PAIRS).filter(|k| k % PAIRS < PAIRS * 2 / 3) {
+            let swell = 1.0 + 0.3 * noise(5, k);
+            bay.tile[k] = [0.03, 0.08, 0.16].map(|v| v * swell);
+            bay.reference[k] = [0.0075, 0.02, 0.04].map(|v| v * swell);
+        }
+        let line = bay.line().expect("a line");
+        assert!(line.water && bay.on_water());
+        for band in 0..3 {
+            assert!((line.ratio[band] - 0.25).abs() < 0.01, "{line:?}");
+        }
     }
 }
