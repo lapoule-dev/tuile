@@ -1026,6 +1026,18 @@ impl Observed {
 const BLENDED: usize = 2;
 
 impl Observed {
+    /// Whether a tile is water for the most part, as the reference under
+    /// it shows: see [`Paired::on_water`]. Ground, for a tile that was set
+    /// against nothing.
+    pub fn on_water(&self, at: TileAt) -> bool {
+        self.tiles
+            .get(&at)
+            .and_then(|tile| tile.paired.as_deref())
+            .is_some_and(Paired::on_water)
+    }
+}
+
+impl Observed {
     /// How tile `a` and its neighbour `b` meet along their edge, **read
     /// against the reference under them**: at each place along the edge,
     /// the step from one tile's last place to the other's first, less the
