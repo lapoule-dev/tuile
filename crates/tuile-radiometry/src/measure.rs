@@ -92,6 +92,9 @@ fn along(curve: &[f32; KNOTS.len()], stops: f32) -> f32 {
 /// it out, one with no contrast leaves that at one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Local {
+    /// A colour matrix the texel goes through first, where in the tile it
+    /// is having been taken into it already ([`crate::MatrixField`]).
+    pub matrix: Option<crate::Affine>,
     pub black: [f32; 3],
     pub gain: [f32; 3],
     /// Stops added to each channel, by the light it has: see [`Curves`].
@@ -105,6 +108,7 @@ pub struct Local {
 impl Local {
     /// Changes nothing.
     pub const IDENTITY: Self = Self {
+        matrix: None,
         black: [0.0; 3],
         gain: [1.0; 3],
         curve: None,
@@ -114,7 +118,8 @@ impl Local {
     };
 
     pub fn is_identity(&self) -> bool {
-        self.black == [0.0; 3]
+        self.matrix.is_none_or(|m| m == crate::SAME)
+            && self.black == [0.0; 3]
             && self.gain == [1.0; 3]
             && self.curve.is_none_or(|c| c == [[0.0; KNOTS.len()]; 3])
             && self.contrast == 1.0
@@ -123,6 +128,10 @@ impl Local {
 
     /// One linear colour, corrected. Not clamped above.
     pub fn apply(&self, colour: [f32; 3]) -> [f32; 3] {
+        let colour = match &self.matrix {
+            Some(matrix) => crate::through(matrix, colour).map(|v| v.max(0.0)),
+            None => colour,
+        };
         let mut c = [0.0f32; 3];
         for i in 0..3 {
             let came = (colour[i] - self.black[i]).max(0.0);
@@ -420,6 +429,7 @@ impl Blended {
     pub fn local(&self) -> Local {
         let gain = self.gain_stops.map(f32::exp2);
         Local {
+            matrix: None,
             // Found in the light the gain leaves, where a texel loses it
             // before the gain.
             black: std::array::from_fn(|c| self.black[c] / gain[c].max(1e-6)),
