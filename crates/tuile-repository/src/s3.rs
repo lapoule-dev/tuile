@@ -16,7 +16,7 @@ use std::ops::Range;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-use crate::{Entry, Listing, Objects, RepoError};
+use crate::{Entry, Listing, Objects, Read, RepoError};
 
 /// A request as the protocol built it, for a transport to send as it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +31,8 @@ pub struct HttpReply {
     pub status: u16,
     /// The `Content-Length` header, which is all a `HEAD` is asked for.
     pub content_length: Option<u64>,
+    /// The `ETag` header: the bucket's validator for the object.
+    pub etag: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -278,12 +280,20 @@ impl<H: Http> S3Objects<H> {
         key: &str,
         query: &[(&str, String)],
         range: Option<Range<u64>>,
+        if_none_match: Option<&str>,
     ) -> Result<HttpReply, RepoError> {
         let path = format!("/{}/{key}", self.config.bucket);
         let path = path.trim_end_matches('/');
-        let ranged: Vec<(&str, String)> = range
+        // Sent and signed: a condition the bucket did not see signed is one
+        // it may ignore.
+        let ranged: Vec<(&str, String)> = if_none_match
             .iter()
-            .map(|r| ("range", format!("bytes={}-{}", r.start, r.end - 1)))
+            .map(|tag| ("if-none-match", tag.to_string()))
+            .chain(
+                range
+                    .iter()
+                    .map(|r| ("range", format!("bytes={}-{}", r.start, r.end - 1))),
+            )
             .collect();
         let unsigned = Unsigned {
             method,
@@ -330,6 +340,8 @@ impl<H: Http> S3Objects<H> {
         };
         match reply.status {
             200 | 206 => Ok(reply),
+            // Only ever the answer to a condition this sent.
+            304 if if_none_match.is_some() => Ok(reply),
             404 => Err(RepoError::NotFound(key.to_string())),
             status => Err(RepoError::Store(format!(
                 "{key}: HTTP {status} — {}",
@@ -360,7 +372,7 @@ impl<H: Http> S3Objects<H> {
             if let Some(t) = &token {
                 query.push(("continuation-token", t.clone()));
             }
-            let reply = self.request("GET", "", &query, None).await?;
+            let reply = self.request("GET", "", &query, None, None).await?;
             let got = page(&String::from_utf8_lossy(&reply.body))
                 .map_err(|e| RepoError::Store(format!("listing {prefix}: {e}")))?;
             all.files.extend(got.files);
@@ -396,7 +408,7 @@ impl<H: Http> Objects for S3Objects<H> {
     }
 
     async fn size(&self, key: &str) -> Result<u64, RepoError> {
-        self.request("HEAD", key, &[], None)
+        self.request("HEAD", key, &[], None, None)
             .await?
             .content_length
             .ok_or_else(|| RepoError::Store(format!("{key}: no Content-Length")))
@@ -407,7 +419,7 @@ impl<H: Http> Objects for S3Objects<H> {
             return Ok(Vec::new());
         }
         let wanted = range.end - range.start;
-        let body = self.request("GET", key, &[], Some(range)).await?.body;
+        let body = self.request("GET", key, &[], Some(range), None).await?.body;
         if body.len() as u64 != wanted {
             return Err(RepoError::Store(format!(
                 "{key}: asked for {wanted} bytes, got {}",
@@ -415,6 +427,18 @@ impl<H: Http> Objects for S3Objects<H> {
             )));
         }
         Ok(body)
+    }
+
+    async fn read_if_changed(&self, key: &str, known: Option<&str>) -> Result<Read, RepoError> {
+        let reply = self.request("GET", key, &[], None, known).await?;
+        Ok(if reply.status == 304 {
+            Read::Unchanged
+        } else {
+            Read::Changed {
+                bytes: reply.body,
+                etag: reply.etag,
+            }
+        })
     }
 }
 
@@ -446,12 +470,14 @@ mod tests {
                 HttpReply {
                     status: 429,
                     content_length: None,
+                    etag: None,
                     body: b"Reduce your rate of simultaneous reads on the same object.".to_vec(),
                 }
             } else {
                 HttpReply {
                     status: 206,
                     content_length: Some(3),
+                    etag: None,
                     body: b"abc".to_vec(),
                 }
             })
@@ -574,5 +600,86 @@ mod tests {
         assert_eq!(p.dirs, ["packs/a/sub"]);
         assert_eq!(p.next.as_deref(), Some("abc="));
         assert!(page("<not xml").is_err());
+    }
+
+    /// A bucket holding one object under one validator, which keeps the
+    /// requests it was sent.
+    struct Tagged {
+        sent: std::sync::Mutex<Vec<Signed>>,
+    }
+
+    #[async_trait]
+    impl Http for Tagged {
+        fn now(&self) -> u64 {
+            WHEN
+        }
+        async fn send(&self, request: &Signed) -> Result<HttpReply, String> {
+            self.sent.lock().expect("lock").push(request.clone());
+            let asked = request
+                .headers
+                .iter()
+                .find(|(name, _)| name == "if-none-match")
+                .map(|(_, value)| value.as_str());
+            Ok(if asked == Some("\"v7\"") {
+                HttpReply {
+                    status: 304,
+                    ..HttpReply::default()
+                }
+            } else {
+                HttpReply {
+                    status: 200,
+                    content_length: Some(5),
+                    etag: Some("\"v7\"".into()),
+                    body: b"hello".to_vec(),
+                }
+            })
+        }
+        async fn pause(&self, _: u32) {}
+    }
+
+    #[test]
+    fn an_object_still_the_one_known_is_not_sent_again() {
+        let objects = S3Objects::new(
+            S3Config {
+                endpoint: "https://example.invalid".into(),
+                bucket: "b".into(),
+                access_key_id: KEY.into(),
+                secret_access_key: SECRET.into(),
+                region: "auto".into(),
+            },
+            Tagged {
+                sent: std::sync::Mutex::default(),
+            },
+        );
+        let block = futures_executor::block_on;
+        // Nothing known: the object, and the bucket's validator with it.
+        let first = block(objects.read_if_changed("k.json", None)).expect("read");
+        assert_eq!(
+            first,
+            Read::Changed {
+                bytes: b"hello".to_vec(),
+                etag: Some("\"v7\"".into())
+            }
+        );
+        // Known and still that: nothing comes back.
+        assert_eq!(
+            block(objects.read_if_changed("k.json", Some("\"v7\""))).expect("read"),
+            Read::Unchanged
+        );
+        // Known, but no longer that: the object again.
+        assert!(matches!(
+            block(objects.read_if_changed("k.json", Some("\"v6\""))).expect("read"),
+            Read::Changed { .. }
+        ));
+        // The condition went out, and was signed with the rest.
+        let sent = objects.http.sent.lock().expect("lock");
+        assert!(!sent[0].headers.iter().any(|(n, _)| n == "if-none-match"));
+        let authorization = &sent[1]
+            .headers
+            .iter()
+            .find(|(n, _)| n == "authorization")
+            .expect("signed")
+            .1;
+        assert!(authorization.contains("if-none-match"), "{authorization}");
     }
 }

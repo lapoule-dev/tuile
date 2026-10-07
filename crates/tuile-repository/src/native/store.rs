@@ -6,7 +6,7 @@ use std::ops::Range;
 use async_trait::async_trait;
 use tuile_farm::{ObjectRunStore, RunStore, StoreError};
 
-use crate::{Entry, Listing, Objects, RepoError};
+use crate::{Entry, Listing, Objects, Read, RepoError};
 
 impl From<StoreError> for RepoError {
     fn from(e: StoreError) -> Self {
@@ -62,5 +62,15 @@ impl Objects for ObjectRunStore {
             )));
         }
         Ok(bytes.to_vec())
+    }
+
+    async fn read_if_changed(&self, key: &str, known: Option<&str>) -> Result<Read, RepoError> {
+        Ok(match self.get_if_changed(key, known).await? {
+            Some((bytes, etag)) => Read::Changed {
+                bytes: bytes.to_vec(),
+                etag,
+            },
+            None => Read::Unchanged,
+        })
     }
 }

@@ -341,3 +341,54 @@ async fn the_portable_reader_answers_as_the_store_that_wrote() {
         "image/png imagery/4/9/6"
     );
 }
+
+/// A small object that changes is read again only when it has: the store's
+/// own validator says so, and it changes whenever the object is written,
+/// even to the same size — which a size alone cannot tell.
+#[tokio::test]
+async fn an_object_is_read_again_only_when_it_was_written_again() {
+    use tuile_repository::Read;
+
+    let root = tempfile::tempdir().expect("dir");
+    let store = ObjectRunStore::local(root.path(), Tuning::default()).expect("store");
+    let objects: &dyn Objects = &store;
+    let path = root.path().join("zone/manifest.json");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, b"{\"n\":1}").expect("write");
+
+    let Read::Changed { bytes, etag } = objects
+        .read_if_changed("zone/manifest.json", None)
+        .await
+        .expect("read")
+    else {
+        panic!("nothing was known: the object must come");
+    };
+    assert_eq!(bytes, b"{\"n\":1}");
+    let etag = etag.expect("a store of files gives a validator");
+    assert_eq!(
+        objects
+            .read_if_changed("zone/manifest.json", Some(&etag))
+            .await
+            .expect("read"),
+        Read::Unchanged
+    );
+
+    // Written again, to the very same size, a moment later.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    std::fs::write(&path, b"{\"n\":2}").expect("write");
+    let Read::Changed { bytes, etag: next } = objects
+        .read_if_changed("zone/manifest.json", Some(&etag))
+        .await
+        .expect("read")
+    else {
+        panic!("the object was written again: it must come");
+    };
+    assert_eq!(bytes, b"{\"n\":2}");
+    assert_ne!(next.as_deref(), Some(etag.as_str()));
+
+    // Gone is gone, not unchanged.
+    assert!(matches!(
+        objects.read_if_changed("zone/none.json", Some(&etag)).await,
+        Err(RepoError::NotFound(_))
+    ));
+}

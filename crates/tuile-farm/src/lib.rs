@@ -274,6 +274,28 @@ impl ObjectRunStore {
         Ok((dirs, files))
     }
 
+    /// A whole object and the store's validator for it — or `None` if it is
+    /// still the one `known` names, in which case nothing was transferred.
+    pub async fn get_if_changed(
+        &self,
+        key: &str,
+        known: Option<&str>,
+    ) -> Result<Option<(Bytes, Option<String>)>> {
+        let options = GetOptions {
+            if_none_match: known.map(str::to_string),
+            ..GetOptions::default()
+        };
+        match self.store.get_opts(&key_path(key)?, options).await {
+            Ok(found) => {
+                let etag = found.meta.e_tag.clone();
+                let bytes = found.bytes().await.map_err(|e| StoreError::store(key, e))?;
+                Ok(Some((bytes, etag)))
+            }
+            Err(object_store::Error::NotModified { .. }) => Ok(None),
+            Err(e) => Err(StoreError::store(key, e)),
+        }
+    }
+
     /// An object's size, or `NotFound`.
     pub async fn size(&self, key: &str) -> Result<u64> {
         self.store
