@@ -14,6 +14,8 @@ authors.workspace = true
 [dependencies]
 # Numbers only, no dependency of its own: the grades a store keeps.
 tuile-radiometry = { version = "0.2.0", path = "../tuile-radiometry" }
+# The contract of a store of bytes, which what is kept here is kept in.
+tuile-core = { version = "0.2.0", path = "../tuile-core" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 # PMTiles directories are gzipped; pure Rust, so it builds for a Worker.
