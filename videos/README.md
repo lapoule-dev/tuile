@@ -321,3 +321,89 @@ et `Session::wait()` attend une transition qui n'arrive pas — zéro CPU, zéro
 GPU, mesuré sept minutes durant sur le même pack. `Done:` reste faux dans les
 deux modes (`-2147483648%` puis `0%`) : c'est `renderer_percent_done()`, non
 bloquant, à regarder à part.
+
+
+## 577d-native-tone-off.mp4 / 577d-native-tone-on.mp4 — the same film, imagery as stored and with one gain a level (2026-10-06)
+
+Rendered natively by `tuile-film-render` (branch `feat/render-reads-the-store`, commit `aa70aa0` plus the NVENC sink in progress), from the packs of run `1557732/20260924T221734Z-577d` (10 packs of references, frames 1–8094, scene `72212abb4518d1b0`) and the tile store (layers `asset-1` terrain, `asset-2` imagery). 1920×1080, supersample 2, 30 fps, every frame, H.264 by VideoToolbox at 12 Mb/s.
+
+- `tone-off`: `--no-tone`.
+- `tone-on`: `--tone-table tone.json`, the table the first render's own light meter solved (anchor level 10; levels 13–19 at +1.57 / +1.53 / +0.96 stops R G B, levels 1–12 at 0).
+
+To make them again (worktree `tuile-store-render`, buckets in the environment):
+
+```bash
+tuile-film-render 1557732/20260924T221734Z-577d/packs --no-tone --out 577d-native-tone-off.mp4 --meter off
+tuile-film-render 1557732/20260924T221734Z-577d/packs --tone-table off/tone.json --out 577d-native-tone-on.mp4 --meter on
+```
+
+Measured (stops): top third − bottom third, worst frame 0.72 → 0.30, frames beyond 0.3: 266 → 0; mean luminance range over the film 0.38 → 0.24. The meter's reports are in the worktree under `local-packs/probe/577d-film/{off,on}/`.
+
+## 577d-decoded-grade-off.mp4 / 577d-decoded-grade-on.mp4 — imagery decoded from sRGB, without and with a grade per level (2026-10-06)
+
+Same run and settings as the `577d-native-tone-*` pair above (packs of `1557732/20260924T221734Z-577d`, frames 1–8094, 1920×1080, supersample 2, 30 fps, H.264 by VideoToolbox, 12 Mb/s), rendered by `tuile-film-render` at commit `cfd8d66` of `feat/render-reads-the-store`. Two things differ from that pair: the default look now decodes imagery from sRGB (exposure 0.8 stops), and the correction is a whole grade a level — black point, gain, contrast, saturation — not a gain.
+
+- `grade-off`: `--no-tone --anchor 10 --meter off` (the meter fits the grade from this render's own tiles).
+- `grade-on`: `--tone-table off/tone.json`. Levels 1–12 untouched; levels 13–19: black +0.005 +0.005 +0.013, gain +1.70 +1.51 +1.92 stops, contrast 0.88 about 0.18, saturation 1.77.
+
+The same table is in the tile store as `asset-2/tone.json` (version 2). Measured (stops): top third − bottom third, worst frame 1.55 → 0.61; mean luminance range over the film 0.95 → 0.52; largest step between consecutive frames 0.17 → 0.06. Reports under `local-packs/probe/577d-grade/{off,on}/` in the worktree.
+
+## 8743-native.mp4 — a coast, re-rendered after the grade burnt it out (2026-10-07)
+
+Rendered natively by `tuile-film-render` at commit `adcee1c` of `feat/render-reads-the-store`, from the pack `packs/8743dc56923d2b3b/1-2880.tuilepack` (references, frames 1–2880, scene of the pack's own digest) and the tile store (terrain `asset-1`, imagery `asset-2`). 1920×1440, supersample 2, 30 fps, every frame, H.264 by VideoToolbox at 12 Mb/s. Default look: imagery decoded from sRGB, exposure 1.0, contrast none, highlights rolled off above 0.5.
+
+Grade: none of the film's 28 places has a table of its own, so each takes the layer's gains alone (levels 13–19 at +1.70 / +1.51 / +1.92 stops), no contrast or saturation.
+
+```bash
+tuile-film-render packs/8743dc56923d2b3b --out 8743-native.mp4 --meter film
+```
+
+Sampled frames measured L* 45, contrast 56, burnt 1.2 % (before: 44, 83, 6.5 %). What it does not fix: patches of different tone within imagery level 13, which are the source's.
+
+## 8743-film-grade.mp4 — the film's own grade, no tile touched (2026-10-07)
+
+`packs/8743dc56923d2b3b`, frames 1–2880, 1920×1440, supersample 2, 30 fps, H.264 by VideoToolbox, 12 Mb/s, rendered by `tuile-film-render` at commit `60e4037` of `feat/render-reads-the-store` with the grade then kept beside the pack: exposure +1.5 stops and saturation ×1.3 for the whole film, no gain on any tile. Sampled frames: L* 46, b* +1.3, C* 17, contrast 52, nothing burnt. The captures of imagery level 13 still show as plates.
+
+## 8743-tile-gains-trial.mp4 — a trial of a gain a tile, not a result (2026-10-07)
+
+Same film and settings, with a gain a tile of imagery from a prototype kept in the worktree (`local-packs/probe/8743/tiles/proto/`, `field.py` at μ = 3): every level-13 tile measured against the same ground in level 12, an edge-preserving fit over those offsets, the result applied as it is. Grade file: `local-packs/probe/8743/blocks/field-mu3.tone.json`, passed by `--tone-table`. Film part as above.
+
+It brings the plates together, and it **does not hold the rule that tiles in accord stay in accord**: of 2706 edges where the tiles themselves show under a tenth of a stop, 156 are given a step of more than 0.05 stop and 75 of more than 0.15. Kept to judge the direction by, not to ship.
+
+## 8743-sentinel-field.mp4 — tiles brought together against a Sentinel-2 reference (2026-10-07)
+
+`packs/8743dc56923d2b3b`, frames 1–2880, 1920×1440, supersample 2, 30 fps, H.264 by VideoToolbox, 12 Mb/s, rendered natively by `tuile-film-render` at commit `b340564` of `feat/render-reads-the-store`, with a grade fitted against the store's layer `asset-3954` (Sentinel-2 cloudless, brought in for this film's footprint by `tuile-bake --reference`).
+
+```bash
+tuile-film-render packs/8743dc56923d2b3b --calibrate <dir> --every 24 --scale 0.5 \
+    --reference-layer asset-3954 --measure linear
+tuile-film-render packs/8743dc56923d2b3b \
+    --tone-table <dir>/packs/8743dc56923d2b3b/1-2880.tuilepack.tone.json --out 8743-sentinel-field.mp4
+```
+
+The grade: every level-13 tile measured by the line that lays it on the reference (16×16 co-located places, orthogonal regression, one weight a place), a continuous field over the tiles' corners, jumps only at seams read against the reference past the two places a mosaic blends over (286 seam edges of 9170). Water was not yet left out of the measure in this render (it is from the next commit on).
+
+What it does: the large grey-blue plates join their green neighbours. What it does not: a capture boundary that runs through the middle of a tile is smoothed, not removed (lower half of the boundary at columns 4073|4074); patches in the sea and steps along the shore; the film is brought to its own median tone against the reference, not to the reference — it stays lighter and less saturated than Sentinel-2. To compare with `8743-film-grade.mp4` (same film, no tile touched).
+
+## 8743-sentinel-zones.mp4 — brought to the Sentinel-2 reference, sea and land each as itself (2026-10-07)
+
+Same film and settings as `8743-sentinel-field.mp4`, rendered at commit `23ab0c1` with the grade of `--calibrate … --reference-layer asset-3954 --measure linear` (`--toward 1`, the default: the whole of the reference's look). A tile is measured on the zone it mostly is — water against water, ground against ground — each zone is given its own standing against the reference back, and a shore between a tile of water and a tile of ground is a seam.
+
+Judged too green and too close to the reference's look, where the film is to keep the look of its own imagery. And the sea near a shore comes out green: a tile that is ground for the most part gives its strip of water the ground's correction — a zone is a tile's here, not a texel's.
+
+## 4dbd-matrix-30.mp4 — a function a tile, fitted against a Sentinel-2 reference, three tenths of its look (2026-10-07)
+
+Run `1557732/20260924T181803Z-4dbd`, its ten packs of references, frames 1–8094, 1920×1080, supersample 2, 30 fps, H.264 by VideoToolbox, 12 Mb/s, rendered natively by `tuile-film-render` at commit `0354035` of `main` in 334 s. Imagery levels 1 to 19.
+
+```bash
+# the reference under the film's packs, once (reads the reference's source, writes the store's layer)
+tuile-bake --reference <pack>            # each of the ten
+tuile-film-render 1557732/20260924T181803Z-4dbd/packs --calibrate <dir> --every 24 --scale 0.5 \
+    --reference-layer asset-3954 --measure matrix
+tuile-film-render 1557732/20260924T181803Z-4dbd/packs \
+    --tone-table <dir>/1557732/20260924T181803Z-4dbd/packs/c0000.tuilepack.tone.json --out 4dbd-matrix-30.mp4
+```
+
+The grade: a colour matrix at each corner of a tile, blended across it and applied in the composition shader; fitted for the whole film at once on a lattice no finer than level 14 — a finer tile takes the function of the level-14 tile it lies in — against the reference given the film's own look, with three tenths of the reference's left in (`--toward`, `TUILE_REFERENCE_DOSE`). What a channel takes of the other two, and what is added, are held far more than its own gain.
+
+Two earlier fits of this film were thrown away before this one, and say why it is as it is: fitted a tile at a time, the function smeared each field of a level-16 tile onto the reference's; fitted on the lattice with every term free, the film came out flat. The same grade is kept beside the film's packs, and the page of the demonstration draws it.
