@@ -49,7 +49,7 @@ pub use bench::{block_segment, Bench, Later, Project, Reply, StoreObjects, BLOCK
 pub use cached::{Cached, ChunkStore, CHUNK};
 pub use config::{Config, Layout, Place, ProjectConfig};
 pub use films::{Chunk, Film, FilmRepository, FilmSummary, Unreadable};
-pub use objects::{Entry, Listing, Objects, RepoError};
+pub use objects::{Entry, Listing, Objects, Read, RepoError};
 pub use remote::{BlockCounts, Get, Got, RemoteBlocks, RemoteLive};
 pub use runs::{RunFilms, RunLayout};
 pub use scenes::ScenePacks;

@@ -60,4 +60,32 @@ pub trait Objects: Send + Sync {
         let size = self.size(key).await?;
         self.read(key, 0..size).await
     }
+
+    /// A whole object, unless it is still the one `known` names: for the
+    /// small ones that change, read again and again, of which the same bytes
+    /// need not travel twice.
+    ///
+    /// `known` is a validator a previous call handed back. A store that has
+    /// none to give answers `Changed` with no validator every time, which is
+    /// what this default does: correct, and no saving.
+    async fn read_if_changed(&self, key: &str, known: Option<&str>) -> Result<Read, RepoError> {
+        let _ = known;
+        Ok(Read::Changed {
+            bytes: self.read_all(key).await?,
+            etag: None,
+        })
+    }
+}
+
+/// What [`Objects::read_if_changed`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Read {
+    /// The object is the one the caller already holds.
+    Unchanged,
+    /// The object, and the validator its store gives it: opaque, and changed
+    /// whenever the object is written again, even to the same size.
+    Changed {
+        bytes: Vec<u8>,
+        etag: Option<String>,
+    },
 }

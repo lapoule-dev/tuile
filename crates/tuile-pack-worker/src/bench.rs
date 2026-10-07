@@ -50,9 +50,11 @@ impl Http for FetchHttp {
             .ok()
             .flatten()
             .and_then(|v| v.parse().ok());
+        let etag = response.headers().get("etag").ok().flatten();
         Ok(HttpReply {
             status: response.status_code(),
             content_length,
+            etag,
             body: response.bytes().await.map_err(|e| e.to_string())?,
         })
     }
