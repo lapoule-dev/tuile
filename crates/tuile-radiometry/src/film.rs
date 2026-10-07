@@ -37,6 +37,7 @@
 use std::collections::BTreeMap;
 
 use crate::corners::{CornerField, CornerReport, FieldBounds};
+use crate::matrix::{MatrixBounds, MatrixField};
 use crate::measure::Measure;
 use crate::tiles::Observed;
 
@@ -108,6 +109,10 @@ pub type Pictured = [f32; 3];
 pub struct FilmGrade {
     /// The film's tiles brought to one another.
     pub field: CornerField,
+    /// A fitted function a tile in the field's place — where in the tile
+    /// and what colour in, the colour out: see [`MatrixField`]. A film has
+    /// the one or the other.
+    pub matrix: Option<MatrixField>,
     /// The film brought to the target: stops added to the renderer's own
     /// exposure, then its contrast and saturation multiplied by these.
     pub exposure_ev: f32,
@@ -228,6 +233,7 @@ impl FilmGrade {
     pub fn none() -> Self {
         Self {
             field: CornerField::default(),
+            matrix: None,
             exposure_ev: 0.0,
             contrast: 1.0,
             saturation: 1.0,
@@ -250,6 +256,39 @@ impl FilmGrade {
         bounds: &Bounds,
         field_bounds: &FieldBounds,
     ) -> Self {
+        Self::fit_with(observed, measure, light, target, bounds, field_bounds, None)
+    }
+
+    /// Fits a film's grade with a function a tile ([`MatrixField`]) in the
+    /// field's place: the tiles brought to the reference in the film's own
+    /// look, then the film to the target as ever.
+    pub fn fit_matrix(
+        observed: &Observed,
+        light: f32,
+        target: &LookTarget,
+        bounds: &Bounds,
+        matrix_bounds: &MatrixBounds,
+    ) -> Self {
+        Self::fit_with(
+            observed,
+            Measure::Linear,
+            light,
+            target,
+            bounds,
+            &FieldBounds::default(),
+            Some(matrix_bounds),
+        )
+    }
+
+    fn fit_with(
+        observed: &Observed,
+        measure: Measure,
+        light: f32,
+        target: &LookTarget,
+        bounds: &Bounds,
+        field_bounds: &FieldBounds,
+        matrix_bounds: Option<&MatrixBounds>,
+    ) -> Self {
         if observed.tiles.is_empty() {
             return Self {
                 field: CornerField {
@@ -261,8 +300,19 @@ impl FilmGrade {
         }
         let mut limited = Vec::new();
 
-        // The tiles brought to one another.
-        let (field, fitted) = CornerField::solve_by(observed, measure, field_bounds);
+        // The tiles brought to one another: by a function a tile, or by
+        // the field.
+        let matrices = matrix_bounds.map(|bounds| MatrixField::solve(observed, bounds).0);
+        let (field, fitted) = match matrices {
+            Some(_) => (
+                CornerField {
+                    measure,
+                    ..CornerField::default()
+                },
+                CornerReport::default(),
+            ),
+            None => CornerField::solve_by(observed, measure, field_bounds),
+        };
 
         // The film as it will be lit: every cell of every tile, counted
         // for the tiles of the film it is draped on — a part of it if it
@@ -276,17 +326,21 @@ impl FilmGrade {
                 .iter()
                 .flat_map(|(at, tile)| {
                     let corners = if graded { field.corners(*at) } else { None };
+                    let matrices = matrices.as_ref().filter(|_| graded);
                     let weight = tile.usage / tile.cells.len() as f32;
                     tile.cells.iter().enumerate().map(move |(k, c)| {
-                        let lit = match &corners {
-                            Some(corners) => crate::measure::Blended::mix(
-                                corners,
-                                ((k % grid) as f32 + 0.5) / grid as f32,
-                                ((k / grid) as f32 + 0.5) / grid as f32,
-                            )
-                            .local()
-                            .apply(*c),
-                            None => *c,
+                        let (u, v) = (
+                            ((k % grid) as f32 + 0.5) / grid as f32,
+                            ((k / grid) as f32 + 0.5) / grid as f32,
+                        );
+                        let lit = match (matrices, &corners) {
+                            (Some(matrices), _) => {
+                                crate::through(&matrices.at(*at, u, v), *c).map(|v| v.max(0.0))
+                            }
+                            (None, Some(corners)) => crate::measure::Blended::mix(corners, u, v)
+                                .local()
+                                .apply(*c),
+                            (None, None) => *c,
                         };
                         (lit.map(|v| v * light), weight)
                     })
@@ -361,6 +415,7 @@ impl FilmGrade {
         }
         Self {
             field,
+            matrix: matrices,
             exposure_ev: stops,
             contrast,
             saturation,
@@ -446,9 +501,43 @@ impl FilmGrade {
             .iter()
             .map(|what| format!("\"{}\"", what.replace(['"', '\\', ']'], "")))
             .collect();
+        // A function a tile, if the film has one: its corners' matrices,
+        // each written once, twelve numbers as they are; and the tiles,
+        // each naming its four.
+        let matrix = self.matrix.as_ref().map_or(String::new(), |field| {
+            let (mut corners, mut known, mut tiles) =
+                (Vec::new(), BTreeMap::<String, usize>::new(), Vec::new());
+            for ((level, x, y), four) in &field.given {
+                let named: Vec<String> = four
+                    .iter()
+                    .map(|matrix| {
+                        let text = matrix
+                            .iter()
+                            .flatten()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let next = known.len();
+                        known
+                            .entry(text.clone())
+                            .or_insert_with(|| {
+                                corners.push(format!("[{text}]"));
+                                next
+                            })
+                            .to_string()
+                    })
+                    .collect();
+                tiles.push(format!("\"{level}/{x}/{y}\":[{}]", named.join(",")));
+            }
+            format!(
+                "\"matrix_corners\":[{}],\"matrix_tiles\":{{{}}},",
+                corners.join(","),
+                tiles.join(",")
+            )
+        });
         let r = &self.fitted;
         format!(
-            "{{\"film_grade\":3,\"measure\":\"{}\",\"film\":{{\"exposure_ev\":{},\"contrast\":{},\"saturation\":{},\"light\":{}}},\"before\":{},\"after\":{},\"limited\":[{}],\"fitted\":{{\"tiles\":{},\"measured\":{},\"edges\":{},\"seam_edges\":{},\"seams\":{},\"steps_made\":{},\"untouched\":{},\"held\":{},\"widest_break\":{},\"seam_before\":{},\"seam_after\":{},\"apart_before\":{},\"apart_after\":{}}},\"unit\":\"64ths of a stop\",\"corners\":[{}],\"tiles\":{{{}}}}}",
+            "{{\"film_grade\":3,\"measure\":\"{}\",\"film\":{{\"exposure_ev\":{},\"contrast\":{},\"saturation\":{},\"light\":{}}},\"before\":{},\"after\":{},\"limited\":[{}],\"fitted\":{{\"tiles\":{},\"measured\":{},\"edges\":{},\"seam_edges\":{},\"seams\":{},\"steps_made\":{},\"untouched\":{},\"held\":{},\"widest_break\":{},\"seam_before\":{},\"seam_after\":{},\"apart_before\":{},\"apart_after\":{}}},\"unit\":\"64ths of a stop\",{}\"corners\":[{}],\"tiles\":{{{}}}}}",
             measure.name(),
             self.exposure_ev,
             self.contrast,
@@ -470,6 +559,7 @@ impl FilmGrade {
             pair(r.seam_after),
             pair(r.apart_before),
             pair(r.apart_after),
+            matrix,
             corners.join(","),
             tiles.join(",")
         )
@@ -571,12 +661,60 @@ impl FilmGrade {
             given.insert(at, of);
             pivot.insert(at, std::array::from_fn(|c| corners[named[c]].1));
         }
+        // A function a tile, if one was written.
+        let matrix = match text.split("\"matrix_corners\":[").nth(1) {
+            None => None,
+            Some(body) => {
+                let (corners, rest) = body.split_once("],\"matrix_tiles\":{")?;
+                let mut matrices: Vec<crate::Affine> = Vec::new();
+                for corner in corners.split(']') {
+                    let numbers: Vec<f32> = corner
+                        .trim_start_matches([',', '['])
+                        .split(',')
+                        .filter_map(|n| n.trim().parse().ok())
+                        .collect();
+                    if numbers.is_empty() {
+                        continue;
+                    }
+                    if numbers.len() != 12 {
+                        return None;
+                    }
+                    matrices.push(std::array::from_fn(|o| {
+                        std::array::from_fn(|i| numbers[o * 4 + i])
+                    }));
+                }
+                let mut given = BTreeMap::new();
+                for entry in rest.split_once("},\"corners\":")?.0.split(']') {
+                    let Some((at, named)) = entry.split_once(":[") else {
+                        continue;
+                    };
+                    let mut at = at
+                        .trim_matches(|c: char| !c.is_ascii_digit())
+                        .split('/')
+                        .map(str::parse::<u32>);
+                    let (level, x, y) = (at.next()?.ok()?, at.next()?.ok()?, at.next()?.ok()?);
+                    let named: Vec<usize> = named
+                        .split(',')
+                        .filter_map(|n| n.trim().parse().ok())
+                        .collect();
+                    if named.len() != 4 || named.iter().any(|n| *n >= matrices.len()) {
+                        return None;
+                    }
+                    given.insert(
+                        (u8::try_from(level).ok()?, x, y),
+                        std::array::from_fn(|c| matrices[named[c]]),
+                    );
+                }
+                Some(MatrixField { given })
+            }
+        };
         Some(Self {
             field: CornerField {
                 measure,
                 given,
                 pivot,
             },
+            matrix,
             exposure_ev: number(&film, "exposure_ev")?,
             contrast: number(&film, "contrast")?,
             saturation: number(&film, "saturation")?,
@@ -824,6 +962,44 @@ mod tests {
         assert_eq!(
             FilmGrade::of_packs(&[(&g_west, &west)], &target, &bounds, &field).as_ref(),
             Some(&g_west)
+        );
+    }
+
+    #[test]
+    fn a_grade_with_a_function_a_tile_is_read_back_to_the_bit() {
+        let mut observed = film(0.05, 6, 2, 0.75);
+        observed.tiles.retain(|at, _| at.0 == 13);
+        for (at, tile) in &mut observed.tiles {
+            let by = if at.1 < 52 { (-0.75f32).exp2() } else { 1.0 };
+            let place = |k: usize| {
+                let light =
+                    0.03 + 0.04 * ((k % 16) as f32 * 0.9).sin().abs() + 0.002 * (k / 16) as f32;
+                [light, light * 1.1, light * 0.6]
+            };
+            tile.paired = Some(Box::new(crate::Paired {
+                tile: std::array::from_fn(|k| place(k).map(|v| v * by)),
+                reference: std::array::from_fn(place),
+            }));
+        }
+        let grade = FilmGrade::fit_matrix(
+            &observed,
+            1.0,
+            &LookTarget::default(),
+            &Bounds::default(),
+            &MatrixBounds::default(),
+        );
+        let field = grade.matrix.as_ref().expect("a function a tile");
+        assert_eq!(field.given.len(), observed.tiles.len());
+        assert!(grade.field.given.is_empty());
+        let read = FilmGrade::from_json(&grade.to_json()).expect("read back");
+        assert_eq!(read.matrix, grade.matrix);
+        assert_eq!(read.exposure_ev, grade.exposure_ev);
+        // A grade without one is read back without one.
+        assert_eq!(
+            FilmGrade::from_json(&FilmGrade::none().to_json())
+                .expect("read")
+                .matrix,
+            None
         );
     }
 

@@ -57,10 +57,12 @@
 //!                         the linear measure is taken against
 //!   --reference-cap <n>   the film's level past which that layer gets no
 //!                         finer (default 14)
-//!   --toward <0..1>       with --measure linear: where the film is brought,
-//!                         from its own tone (0: the tiles are only brought
-//!                         to one another) to the reference's (1, the
-//!                         default)
+//!   --toward <0..1>       with --measure linear or matrix: the dose of the
+//!                         reference's look the film takes, from none (0:
+//!                         its tiles are brought together, in the look of
+//!                         its own imagery) to all of it (1). Unless given:
+//!                         TUILE_REFERENCE_DOSE from the environment, else
+//!                         three tenths
 //!   --put                 with --calibrate: also write it to the bucket
 //!   --light <x>           with --calibrate: the light the renderer puts
 //!                         on ground, instead of the one this render shows
@@ -561,8 +563,11 @@ async fn main() -> Result<(), Error> {
         // tile is measured, whatever its level.
         let toward: f32 = match (measure, value("--toward")) {
             (Measure::Linear, Some(toward)) => toward.parse()?,
-            // A quarter of the reference's look: the film keeps its own.
-            (Measure::Linear, None) => 0.25,
+            // Else what the environment says, else the dose chosen by eye.
+            (Measure::Linear, None) => match std::env::var("TUILE_REFERENCE_DOSE") {
+                Ok(dose) => dose.parse()?,
+                Err(_) => MatrixBounds::DOSE,
+            },
             _ => 0.0,
         };
         let field_bounds = FieldBounds {
@@ -574,14 +579,30 @@ async fn main() -> Result<(), Error> {
             toward,
             ..FieldBounds::default()
         };
-        let grade = FilmGrade::fit(
-            &observed,
-            measure,
-            light,
-            &LookTarget::default(),
-            &Bounds::default(),
-            &field_bounds,
-        );
+        // The grade written beside the pack: with a function a tile in the
+        // field's place, if that is what was asked for.
+        let with_matrices = value("--measure").as_deref() == Some("matrix");
+        let grade = if with_matrices {
+            FilmGrade::fit_matrix(
+                &observed,
+                light,
+                &LookTarget::default(),
+                &Bounds::default(),
+                &MatrixBounds {
+                    toward,
+                    ..MatrixBounds::default()
+                },
+            )
+        } else {
+            FilmGrade::fit(
+                &observed,
+                measure,
+                light,
+                &LookTarget::default(),
+                &Bounds::default(),
+                &field_bounds,
+            )
+        };
         // What was seen, for a film of several packs to be fitted as one;
         // and the seams of each level, before and after.
         let seen = observed.to_bytes();

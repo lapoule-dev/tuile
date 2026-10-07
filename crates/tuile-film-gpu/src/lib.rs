@@ -215,6 +215,12 @@ impl LayerCorner {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerField {
     pub corners: [LayerCorner; 4],
+    /// A colour matrix at each corner, in place of everything above: three
+    /// rows of four — a channel out for each; red, green, blue in, then
+    /// what is added — blended across the tile and applied to the texel in
+    /// linear light. A fitted function of where a texel is and what colour
+    /// it has.
+    pub matrices: Option<[[[f32; 4]; 3]; 4]>,
 }
 
 /// What a layer's colour goes through at composition, in linear light and
@@ -283,6 +289,14 @@ struct ComposeJob {
 impl LayerField {
     fn packed(&self) -> [[f32; 4]; 36] {
         let mut out = [[0.0f32; 4]; 36];
+        if let Some(matrices) = &self.matrices {
+            // The same nine vectors a corner; a matrix takes the first
+            // three, a row each.
+            for (matrix, at) in matrices.iter().zip(out.chunks_exact_mut(9)) {
+                at[..3].copy_from_slice(matrix);
+            }
+            return out;
+        }
         for (corner, at) in self.corners.iter().zip(out.chunks_exact_mut(9)) {
             let (g, b) = (corner.gain_stops, corner.black);
             at[0] = [g[0], g[1], g[2], corner.contrast_stops];
@@ -971,7 +985,7 @@ impl FilmGpu {
                             g.pivot,
                             f32::from(u8::from(!g.is_identity() && layer.field.is_none())),
                             f32::from(u8::from(layer.field.is_some())),
-                            0.0,
+                            f32::from(u8::from(layer.field.is_some_and(|f| f.matrices.is_some()))),
                         ],
                         corners: layer.field.map_or([[0.0; 4]; 36], |f| f.packed()),
                         ..blank
