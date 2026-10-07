@@ -16,7 +16,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tuile_core::raster::TilingScheme;
 use tuile_film::Pack;
-use tuile_repository::tone::{film_tone, FilmTone};
+use tuile_radiometry::FilmGrade;
+use tuile_repository::tone::{film_grade, layer_is_graded};
 use tuile_repository::{
     ArchivedTiles, Cached, DiskChunks, Entry, Listing, Objects, Read, RepoError, Revalidated,
     Revalidations, TileRepository, CHUNK,
@@ -284,19 +285,17 @@ impl Store {
         }
     }
 
-    /// The grades of a film: see [`tuile_repository::tone::film_tone`].
-    /// `places` is `Pack::imagery_regions` summed over the film.
-    pub async fn film_tone(
-        &self,
-        layer: &str,
-        places: &std::collections::BTreeMap<(u32, u32), u32>,
-    ) -> Result<FilmTone, Error> {
-        Ok(film_tone(self.live.as_ref(), layer, places).await?)
+    /// Whether an imagery layer is graded at all: its store says.
+    pub async fn is_graded(&self, layer: &str) -> Result<bool, Error> {
+        Ok(layer_is_graded(self.live.as_ref(), layer).await?)
     }
 }
 
 /// Everything a render reads.
 pub struct Sources {
+    /// The packs' bucket as it is, for what is written again under its
+    /// key: a film's grade.
+    runs: Arc<dyn Objects>,
     pub packs: Cache,
     pub archives: Cache,
     pub store: Store,
@@ -324,7 +323,7 @@ impl Sources {
         tiles: Arc<dyn Objects>,
         cache: &std::path::Path,
     ) -> Result<Self, Error> {
-        let packs = Cache::over(runs, cache.join("packs"));
+        let packs = Cache::over(runs.clone(), cache.join("packs"));
         let archives = Cache::over(tiles.clone(), cache.join("tiles"));
         let live = Counting::new(tiles);
         let keeper = FoyerStore::with_config(StoreConfig {
@@ -346,6 +345,7 @@ impl Sources {
         )
         .await?;
         Ok(Self {
+            runs,
             packs,
             archives,
             store: Store {
@@ -356,6 +356,13 @@ impl Sources {
             revalidated,
             keeper,
         })
+    }
+
+    /// The grade of a film, from what is kept beside its packs; `None` for
+    /// a film that has none.
+    pub async fn film_grade(&self, film: &Film) -> Result<Option<FilmGrade>, Error> {
+        let keys: Vec<&str> = film.packs.iter().map(|p| p.key.as_str()).collect();
+        Ok(film_grade(self.runs.as_ref(), &keys).await?)
     }
 
     /// What became of the store's small objects: asked about and unchanged,

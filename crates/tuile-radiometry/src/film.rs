@@ -324,16 +324,25 @@ impl FilmGrade {
         let mut limited = Vec::new();
 
         // The levels brought to the film's own.
-        let mut levels = LevelGrades::solve(
-            seen,
-            &LevelParams {
+        // A film of one level has nothing to be brought to anything.
+        let mut levels = if seen.is_empty() {
+            LevelGrades {
                 anchor: own,
-                // Wider than a level may be given: what the fit wanted is
-                // then known, and what is held back of it can be said.
-                clamp_stops: 3.0 * bounds.level_stops,
-                ..LevelParams::default()
-            },
-        );
+                grades: BTreeMap::new(),
+                sources: Vec::new(),
+            }
+        } else {
+            LevelGrades::solve(
+                seen,
+                &LevelParams {
+                    anchor: own,
+                    // Wider than a level may be given: what the fit wanted is
+                    // then known, and what is held back of it can be said.
+                    clamp_stops: 3.0 * bounds.level_stops,
+                    ..LevelParams::default()
+                },
+            )
+        };
         // The solve holds the level it was told to, or — if nothing of it
         // was seen against another — the nearest that was. Whichever it
         // held, the film's own is brought back to nothing and the others
@@ -507,7 +516,7 @@ impl FilmGrade {
             .map(|what| format!("\"{}\"", what.replace(['"', '\\', ']'], "")))
             .collect();
         format!(
-            "{{\"film_grade\":1,\"film\":{{\"exposure_ev\":{:.4},\"contrast\":{:.4},\"saturation\":{:.4}}},\"usage\":{{{}}},\"before\":{},\"after\":{},\"limited\":[{}],\"table\":{}}}",
+            "{{\"film_grade\":1,\"film\":{{\"exposure_ev\":{},\"contrast\":{},\"saturation\":{}}},\"usage\":{{{}}},\"before\":{},\"after\":{},\"limited\":[{}],\"table\":{}}}",
             self.exposure_ev,
             self.contrast,
             self.saturation,
@@ -766,6 +775,20 @@ mod tests {
         assert_eq!(grade, FilmGrade::none());
         assert!(grade.levels.of(13).is_identity());
         assert_eq!(FilmGrade::merged(&[&grade]), None);
+
+        // A film of one level, never seen against another: its levels are
+        // left alone, and it is still brought to the target.
+        let one: Vec<Sample> = ground(7, 400, 0.03)
+            .into_iter()
+            .map(|colour| Sample {
+                level: 15,
+                colour,
+                weight: 1.0,
+            })
+            .collect();
+        let grade = fit(&[], &one, &Bounds::default());
+        assert!(grade.levels.of(15).is_identity());
+        assert!(grade.exposure_ev > 0.0, "{grade:?}");
     }
 
     #[test]

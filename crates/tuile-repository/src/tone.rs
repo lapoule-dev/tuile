@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use tuile_radiometry::{region_key, LevelGrades};
+use tuile_radiometry::{region_key, FilmGrade, LevelGrades};
 
 use crate::{Objects, RepoError};
 
@@ -33,6 +33,54 @@ const AT_ONCE: usize = 16;
 /// and by being there, what says the layer is graded at all.
 pub fn layer_tone_key(layer: &str) -> String {
     format!("{layer}/tone.json")
+}
+
+/// Where a pack's grade is kept: beside the pack, as its scene digest is.
+pub fn pack_tone_key(pack: &str) -> String {
+    format!("{pack}.tone.json")
+}
+
+/// Whether a layer is graded at all: whether its store keeps
+/// `<layer>/tone.json`. Only that it is there is read, not what it says.
+pub async fn layer_is_graded(live: &dyn Objects, layer: &str) -> Result<bool, RepoError> {
+    match live.size(&layer_tone_key(layer)).await {
+        Ok(_) => Ok(true),
+        Err(RepoError::NotFound(_)) => Ok(false),
+        Err(other) => Err(other),
+    }
+}
+
+/// The grade of a film made of these packs: each pack's own
+/// ([`pack_tone_key`]), made one. `None` for a film none of whose packs has
+/// one — it is then drawn as it is, with nothing of another film's.
+///
+/// A pack without a grade is not an error; a grade that cannot be read is,
+/// and so is a store that cannot be asked: a render that took either for an
+/// absence would draw ungraded and say nothing.
+pub async fn film_grade(
+    packs: &dyn Objects,
+    keys: &[&str],
+) -> Result<Option<FilmGrade>, RepoError> {
+    let mut found = Vec::new();
+    for some in keys.chunks(AT_ONCE) {
+        let read = futures_util::future::join_all(some.iter().map(|key| async move {
+            let key = pack_tone_key(key);
+            match packs.read_all(&key).await {
+                Ok(bytes) => std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(FilmGrade::from_json)
+                    .map(Some)
+                    .ok_or_else(|| RepoError::Store(format!("{key} is not a film's grade"))),
+                Err(RepoError::NotFound(_)) => Ok(None),
+                Err(other) => Err(other),
+            }
+        }))
+        .await;
+        for grade in read {
+            found.extend(grade?);
+        }
+    }
+    Ok(FilmGrade::merged(&found.iter().collect::<Vec<_>>()))
 }
 
 /// A film's table, and what it was made of.
@@ -206,6 +254,54 @@ mod tests {
         // And a layer the store has never heard of, likewise.
         let tone = block(film_tone(&files, "another", &places)).expect("a tone");
         assert_eq!(tone.table, None);
+    }
+
+    #[test]
+    fn a_films_grade_is_its_packs_own_and_nobody_elses() {
+        use tuile_radiometry::{Bounds, LookTarget, Sample};
+        let dark: Vec<Sample> = (0..200)
+            .map(|i| Sample {
+                level: 14,
+                colour: [0.02 + 0.0004 * i as f32; 3],
+                weight: 1.0,
+            })
+            .collect();
+        let grade = FilmGrade::fit(&[], &dark, 1.0, &LookTarget::default(), &Bounds::default());
+        assert!(grade.exposure_ev > 0.0);
+        let mut files = Files(BTreeMap::from([
+            (pack_tone_key("film/1-10.tuilepack"), grade.to_json()),
+            // Another film's grade lies in the same store.
+            (pack_tone_key("other/1-10.tuilepack"), grade.to_json()),
+        ]));
+        // One pack of two has a grade: it is the film's.
+        let keys = ["film/1-10.tuilepack", "film/11-20.tuilepack"];
+        let found = block(film_grade(&files, &keys)).expect("asked");
+        assert_eq!(found.expect("a grade").exposure_ev, grade.exposure_ev);
+        // A film without one has none, whatever lies beside it.
+        assert_eq!(
+            block(film_grade(&files, &["bare/1-10.tuilepack"])).expect("asked"),
+            None
+        );
+        // A grade that cannot be read is an error, not an absence.
+        files
+            .0
+            .insert(pack_tone_key("film/11-20.tuilepack"), "not one".into());
+        assert!(block(film_grade(&files, &keys)).is_err());
+        files
+            .0
+            .insert(pack_tone_key("broken/1.tuilepack"), grade.to_json());
+        assert!(block(film_grade(&files, &["broken/1.tuilepack"])).is_err());
+    }
+
+    #[test]
+    fn a_layer_is_graded_if_its_store_says_so() {
+        let files = Files(BTreeMap::from([
+            (layer_tone_key("imagery"), "{}".into()),
+            (layer_tone_key("broken"), "{}".into()),
+        ]));
+        assert!(block(layer_is_graded(&files, "imagery")).expect("asked"));
+        assert!(!block(layer_is_graded(&files, "another")).expect("asked"));
+        assert!(block(layer_is_graded(&files, "broken")).is_err());
     }
 
     #[test]
