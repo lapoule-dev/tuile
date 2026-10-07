@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use tuile_tile_server::projection::DEFAULT_TILE_FACTOR;
-use tuile_tile_server::{Eye, Footprint, StoreConfig, StoreContent, TileStore};
+use tuile_tile_server::{Eye, Footprint, Grid, LayerDef, StoreConfig, StoreContent, TileStore};
 
 const DEFAULT_REGION: &str = "auto";
 /// Where the scene's projections are written, unless `TUILE_TILES_DIR` says.
@@ -41,6 +41,14 @@ fn var(name: &str) -> Result<String, String> {
 impl Tiles {
     /// Opens the store named by the environment, or `None` when there is none.
     pub fn from_env() -> Result<Option<Self>, String> {
+        Self::from_env_with(None)
+    }
+
+    /// The same, with `layer` declared in the store's catalog first if the
+    /// store does not know it yet: a store keeps a source's tiles only once
+    /// it has a layer for them. A layer the store already has is left as the
+    /// store describes it. Says whether the layer was added.
+    pub fn from_env_with(layer: Option<LayerDef>) -> Result<Option<Self>, String> {
         let Ok(bucket) = var("TUILE_TILES_BUCKET") else { return Ok(None) };
         let s3 = AmazonS3Builder::new()
             .with_bucket_name(&bucket)
@@ -57,9 +65,27 @@ impl Tiles {
             .enable_all()
             .build()
             .map_err(|e| format!("tile store runtime: {e}"))?;
+        let s3: Arc<dyn object_store::ObjectStore> = Arc::new(s3);
+        if let Some(layer) = layer {
+            let added = runtime
+                .block_on(async {
+                    let mut catalog = tuile_tile_server::catalog::read(s3.as_ref()).await?;
+                    if catalog.layers.iter().any(|l| l.name == layer.name) {
+                        return Ok::<_, tuile_tile_server::StoreError>(false);
+                    }
+                    tracing::info!(layer = %layer.name, grid = ?layer.grid, "TILES-LAYER-ADDED");
+                    catalog.layers.push(layer);
+                    tuile_tile_server::catalog::write(s3.as_ref(), &catalog).await?;
+                    Ok(true)
+                })
+                .map_err(|e| format!("tile bucket {bucket}: its catalog: {e}"))?;
+            if !added {
+                tracing::info!("TILES-LAYER-KNOWN");
+            }
+        }
         let store = runtime
             .block_on(TileStore::open(
-                Arc::new(s3),
+                s3,
                 StoreConfig { manifest_ttl: BAKE_MANIFEST_TTL, ..StoreConfig::default() },
             ))
             .map_err(|e| format!("tile bucket {bucket}: {e}"))?;
@@ -112,6 +138,11 @@ impl Tiles {
             "TILES-PROJECTED"
         );
         Ok(())
+    }
+
+    /// The grid a layer's tiles are addressed on, if the store has the layer.
+    pub fn grid(&self, layer: &str) -> Option<Grid> {
+        self.store.layer(layer).ok().map(|l| l.grid)
     }
 
     pub fn cache(&self) -> crate::TileCache {

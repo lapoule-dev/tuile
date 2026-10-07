@@ -49,6 +49,8 @@ tuile-planetary = { version = "0.2.0", path = "../tuile-planetary" }
 tuile-native-fetchers = { version = "0.2.0", path = "../tuile-native-fetchers" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+# Several tiles asked of a source at once.
+futures-util = { workspace = true }
 image = { workspace = true }
 # `time` for the frame deadline: a bulk frame blocks, and an unbounded block
 # on a farm node is indistinguishable from a hang.

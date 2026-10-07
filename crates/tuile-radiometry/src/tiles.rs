@@ -65,6 +65,7 @@
 use std::collections::BTreeMap;
 
 use crate::grade::Grade;
+use crate::linear::{Paired, PAIRS};
 use crate::measure::{Limits, Local, Measure};
 
 /// Level, column, row.
@@ -117,6 +118,10 @@ pub struct TileSeen {
     /// How its texels are spread, a channel at a time: what a curve is
     /// fitted on. `None` for a tile seen without them.
     pub tones: Option<Box<Tones>>,
+    /// Its ground place for place, and the reference under it once it has
+    /// been set against one ([`Self::set_against`]): what a line is fitted
+    /// on. `None` for a tile seen without it.
+    pub paired: Option<Box<Paired>>,
 }
 
 /// Bins a channel's texels are counted in: an eighth of a stop each, from
@@ -277,11 +282,23 @@ impl TileSeen {
                 ]
             })
         });
+        let places = std::array::from_fn(|k| {
+            let (i, j) = (k % PAIRS, k / PAIRS);
+            let (x0, x1) = (i * w / PAIRS, ((i + 1) * w / PAIRS).max(i * w / PAIRS + 1));
+            let (y0, y1) = (j * h / PAIRS, ((j + 1) * h / PAIRS).max(j * h / PAIRS + 1));
+            let seen = (y0..y1).any(|y| (x0..x1).any(|x| rgba[(y * w + x) * 4 + 3] >= 128));
+            if seen {
+                mean(x0, x1.min(w), y0, y1.min(h))
+            } else {
+                [f32::NAN; 3]
+            }
+        });
         Some(Self {
             cells,
             edges,
             usage: 0.0,
             tones: Some(Box::new(tones)),
+            paired: Some(Box::new(Paired::alone(places))),
         })
     }
 
@@ -322,7 +339,41 @@ impl TileSeen {
             tones: Some(Box::new(Tones::count((side, side), |x, y| {
                 Some(texels[y * side + x])
             }))),
+            paired: Some(Box::new(Paired::alone(std::array::from_fn(|k| {
+                let (i, j) = (k % PAIRS, k / PAIRS);
+                let cut = |i: usize| {
+                    (
+                        i * side / PAIRS,
+                        ((i + 1) * side / PAIRS).max(i * side / PAIRS + 1),
+                    )
+                };
+                mean(cut(i).0, cut(i).1.min(side), cut(j).0, cut(j).1.min(side))
+            })))),
         })
+    }
+
+    /// Sets the tile against a reference picture of the same ground:
+    /// `under` is asked for the reference over a rectangle of the tile —
+    /// from `(u0, v0)` to `(u1, v1)`, across and down, 0 to 1 — in linear
+    /// light, and answers `None` where it has none.
+    pub fn set_against(&mut self, mut under: impl FnMut(f32, f32, f32, f32) -> Option<[f32; 3]>) {
+        let Some(paired) = self.paired.as_deref_mut() else {
+            return;
+        };
+        let side = PAIRS as f32;
+        for (k, place) in paired.reference.iter_mut().enumerate() {
+            let (i, j) = ((k % PAIRS) as f32, (k / PAIRS) as f32);
+            *place = under(i / side, j / side, (i + 1.0) / side, (j + 1.0) / side)
+                .unwrap_or([f32::NAN; 3]);
+        }
+    }
+
+    /// Sets the tile against the reference another sight of the same tile
+    /// was set against: for a tile seen again once corrected.
+    pub fn set_against_as(&mut self, other: &TileSeen) {
+        if let (Some(mine), Some(theirs)) = (self.paired.as_deref_mut(), other.paired.as_deref()) {
+            mine.reference = theirs.reference;
+        }
     }
 
     pub(crate) fn mean(&self) -> [f32; 3] {
@@ -366,9 +417,14 @@ fn unpacked(kept: u16) -> f32 {
     ((f32::from(kept) / 4095.0 - 16.0).exp2() - 1.0 / 65536.0).max(0.0)
 }
 
-const MAGIC: &[u8; 8] = b"TLOBS\x02\0\0";
-/// Bytes a tile is kept in: where it is, its usage, its cells and edges.
-const KEPT: usize = 1 + 4 + 4 + 4 + (GRID * GRID + 4 * GRID) * 3 * 2 + 1 + 5 * 3 * BINS * 2;
+const MAGIC: &[u8; 8] = b"TLOBS\x03\0\0";
+/// What a place that is not a number is kept as: past every light there is.
+const NOTHING: u16 = u16::MAX;
+/// Bytes a tile is kept in: where it is, its usage, its cells and edges,
+/// how its texels are spread, and its places against the reference.
+const KEPT: usize =
+    1 + 4 + 4 + 4 + (GRID * GRID + 4 * GRID) * 3 * 2 + 1 + 5 * 3 * BINS * 2 + PLACES;
+const PLACES: usize = 1 + 2 * PAIRS * PAIRS * 3 * 2;
 
 impl Observed {
     /// Sees a tile, or sees it draped once more.
@@ -416,6 +472,24 @@ impl Observed {
                     .map_or(0, |t| t.spread[i / (3 * BINS)][i / BINS % 3][i % BINS]);
                 out.extend_from_slice(&count.to_le_bytes());
             }
+            // Then its places, and the reference under them.
+            out.push(u8::from(tile.paired.is_some()));
+            for i in 0..2 * PAIRS * PAIRS * 3 {
+                let value = tile.paired.as_ref().map_or(f32::NAN, |p| {
+                    let of = if i < PAIRS * PAIRS * 3 {
+                        &p.tile
+                    } else {
+                        &p.reference
+                    };
+                    of[i / 3 % (PAIRS * PAIRS)][i % 3]
+                });
+                let kept = if value.is_finite() {
+                    packed(value)
+                } else {
+                    NOTHING
+                };
+                out.extend_from_slice(&kept.to_le_bytes());
+            }
         }
         out
     }
@@ -433,7 +507,24 @@ impl Observed {
             let mut values = kept[13..13 + seen]
                 .chunks_exact(2)
                 .map(|b| unpacked(u16::from_le_bytes([b[0], b[1]])));
-            let spread = &kept[13 + seen..];
+            let (spread, places) = kept[13 + seen..].split_at(KEPT - PLACES - 13 - seen);
+            let paired = (places[0] == 1).then(|| {
+                let mut paired = Paired::alone([[f32::NAN; 3]; PAIRS * PAIRS]);
+                for (i, b) in places[1..].chunks_exact(2).enumerate() {
+                    let kept = u16::from_le_bytes([b[0], b[1]]);
+                    let of = if i < PAIRS * PAIRS * 3 {
+                        &mut paired.tile
+                    } else {
+                        &mut paired.reference
+                    };
+                    of[i / 3 % (PAIRS * PAIRS)][i % 3] = if kept == NOTHING {
+                        f32::NAN
+                    } else {
+                        unpacked(kept)
+                    };
+                }
+                Box::new(paired)
+            });
             let tones = (spread[0] == 1).then(|| {
                 let mut tones = Tones {
                     spread: [[[0; BINS]; 3]; 5],
@@ -464,6 +555,7 @@ impl Observed {
                     edges,
                     usage: f32::from_le_bytes(four(9)),
                     tones,
+                    paired,
                 },
             );
         }
@@ -1885,6 +1977,7 @@ mod tests {
                     edges: [[[0.1; 3]; GRID]; 4],
                     usage: 1.0,
                     tones: None,
+                    paired: None,
                 },
             );
         }
@@ -2068,6 +2161,41 @@ mod tests {
         // The shared column is draped by both.
         assert_eq!(together.tiles[&(13, 106, 200)].usage, 2.0);
         assert_eq!(solved(&together).0, solved(&whole).0);
+    }
+
+    #[test]
+    fn a_tile_set_against_a_reference_is_read_back_with_it() {
+        let texels: Vec<[f32; 3]> = (0..64 * 64)
+            .map(|k| [0.05 + 0.1 * noise(1, k % 64, k / 64), 0.1, 0.07])
+            .collect();
+        let mut seen = TileSeen::of_linear(&texels, 64).expect("a tile");
+        // A reference over the left half only, each place by where it is.
+        seen.set_against(|u0, v0, u1, _| (u1 <= 0.5).then_some([u0 + 0.01, v0 + 0.01, 0.2]));
+        let mut observed = Observed::default();
+        observed.see((13, 4, 5), || Some(seen.clone()), 2.0);
+        let read = Observed::from_bytes(&observed.to_bytes()).expect("read back");
+        let (was, is) = (
+            seen.paired.as_deref().expect("its places"),
+            read.tiles[&(13, 4, 5)].paired.as_deref().expect("kept"),
+        );
+        for k in 0..PAIRS * PAIRS {
+            for c in 0..3 {
+                for (a, b) in [
+                    (was.tile[k][c], is.tile[k][c]),
+                    (was.reference[k][c], is.reference[k][c]),
+                ] {
+                    assert!(
+                        a.is_nan() && b.is_nan() || (a / b).log2().abs() < 0.001,
+                        "{k}: {a} {b}"
+                    );
+                }
+            }
+        }
+        assert!(is.reference[3][0].is_finite() && is.reference[PAIRS - 1][0].is_nan());
+        assert_eq!(
+            is.reference[PAIRS + 2][1],
+            unpacked(packed(1.0 / PAIRS as f32 + 0.01))
+        );
     }
 
     #[test]

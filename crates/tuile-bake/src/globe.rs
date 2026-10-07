@@ -486,6 +486,97 @@ async fn resolve(
     Ok((tree, loader, detail, heights, provenance))
 }
 
+/// An ion-hosted imagery asset, opened and not yet asked for a tile: what it
+/// is, as its own descriptor states it.
+///
+/// For a source that is not drawn but measured against — a reference a
+/// film's imagery is brought to. Opening it and fetching from it are two
+/// steps because the cache its tiles go through can only be opened in
+/// between: a store keeps tiles by layer, and a layer is declared with the
+/// grid and the format only the open asset can tell.
+pub struct ReferenceImagery {
+    tms: TmsImagery<NativeHttp>,
+    asset: i64,
+    pub scheme: tuile_core::raster::TilingScheme,
+    /// The file extension of its tiles: `jpg`, `png`.
+    pub extension: String,
+}
+
+/// What became of the tiles a reference was asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReferenceFetched {
+    pub asked: usize,
+    /// Tiles that came — from the cache or from the source.
+    pub there: usize,
+    /// Tiles the source says it has not.
+    pub absent: usize,
+    pub bytes: u64,
+}
+
+/// Tiles asked of the source at once.
+const REFERENCE_AT_ONCE: usize = 16;
+
+impl ReferenceImagery {
+    /// Opens the asset: its endpoint and its descriptor, no tile.
+    pub async fn open(config: &GlobeConfig, asset: i64) -> Result<Self, GlobeError> {
+        use tuile_core::raster::ImageryProvider as _;
+        let transport = TransportConfig {
+            retry: RetryConfig::patient(),
+            ..match &config.cache_dir {
+                Some(dir) => TransportConfig::at(dir),
+                None => TransportConfig::at(tuile_native_fetchers::default_cache_dir()),
+            }
+        };
+        let http = Arc::new(
+            NativeHttp::with_transport(transport)
+                .await
+                .map_err(|e| GlobeError::Transport(e.to_string()))?,
+        );
+        let ion = IonClient::new(http, config.ion_token.clone());
+        let tms = TmsImagery::open(ion, asset as u64).await.map_err(|e| GlobeError::Ion(e.to_string()))?;
+        Ok(Self {
+            scheme: tms.tiling_scheme(),
+            extension: tms.extension().unwrap_or_default(),
+            tms,
+            asset,
+        })
+    }
+
+    /// Brings `wanted` tiles through `cache`, and does nothing else: no
+    /// terrain, no traversal, no frame. A tile the cache holds is not asked
+    /// of the source again; one the source says it has not is remembered as
+    /// absent.
+    pub async fn fetch(
+        self,
+        wanted: &[tuile_core::raster::ImageryCoord],
+        cache: TileCache,
+    ) -> Result<ReferenceFetched, GlobeError> {
+        use tuile_core::raster::ImageryProvider as _;
+        let asset = self.asset;
+        let tms = tuile_core::raster::CachedImagery::new(self.tms, cache.0, source_namespace(asset));
+        let mut done = ReferenceFetched { asked: wanted.len(), ..ReferenceFetched::default() };
+        for some in wanted.chunks(REFERENCE_AT_ONCE) {
+            let got = futures_util::future::join_all(some.iter().map(|c| tms.fetch_tile_bytes(*c))).await;
+            for (coord, tile) in some.iter().zip(got) {
+                match tile {
+                    Ok(fetched) => {
+                        done.there += 1;
+                        done.bytes += fetched.value.len() as u64;
+                    }
+                    Err(tuile_core::raster::RasterError::Fetch(tuile_core::fetch::FetchError::NotFound(_))) => {
+                        done.absent += 1;
+                    }
+                    // Anything else is a tile the reference should have and
+                    // does not: a measure taken without it would be a
+                    // measure against a hole.
+                    Err(e) => return Err(GlobeError::Imagery(format!("reference {asset} tile {coord:?}: {e}"))),
+                }
+            }
+        }
+        Ok(done)
+    }
+}
+
 /// Seconds, as a C ABI carries a duration, into a `Duration`.
 ///
 /// Non-finite and non-positive both mean "the caller did not choose", which is

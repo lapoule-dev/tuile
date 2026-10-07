@@ -19,12 +19,16 @@
 //!   imagery tile that comes in, every tile built, every picture that comes
 //!   out. The render knows nothing of what an observer does with it;
 //!   [`meter::LightMeter`] is one, and measures light.
+//!
+//! Beside them, [`reference`] reads another layer of the store under a
+//! film's imagery, for its tiles to be measured against.
 
 pub mod av1;
 pub mod meter;
 #[cfg(all(target_os = "linux", feature = "nvenc"))]
 pub mod nvenc;
 pub mod observe;
+pub mod reference;
 pub mod render;
 pub mod sink;
 pub mod source;
@@ -35,6 +39,7 @@ pub use meter::LightMeter;
 #[cfg(all(target_os = "linux", feature = "nvenc"))]
 pub use nvenc::{NvencCodec, NvencFilm};
 pub use observe::{FrameOut, ImageryIn, Observer, Origin, TileIn, Timings};
+pub use reference::{Reference, SetAgainst};
 pub use render::{render, Order, Tone};
 pub use sink::{Av1Film, Nothing, Pictures, Sink};
 pub use source::{Counting, Film, Reads, Sources};
