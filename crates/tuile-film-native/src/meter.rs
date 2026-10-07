@@ -15,7 +15,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::path::Path;
 
-use tuile_radiometry::{region_key, tone_of, Grade, LevelGrades, LevelParams, Seen, REGION_LEVEL};
+use tuile_radiometry::{
+    region_key, tone_of, Bounds, FilmGrade, Grade, LevelGrades, LevelParams, LookTarget, Sample,
+    Seen, REGION_LEVEL,
+};
 
 use crate::observe::{FrameOut, ImageryIn, Observer, TileIn};
 use crate::Error;
@@ -292,6 +295,328 @@ impl LightMeter {
             }
         }
         out
+    }
+
+    /// Where two tiles of one level meet, and where a tile lies on a far
+    /// coarser one: what a grade a level cannot mend, measured.
+    ///
+    /// A grade a level gives every tile of a level the same curve, so two
+    /// neighbours of a level meet after it as they met before. If they did
+    /// not meet before — two captures within one level — they still do
+    /// not. The step across the edge two neighbours share is compared with
+    /// the step across a line drawn inside a tile, which is what ground
+    /// alone does over the same distance.
+    pub fn joints(&self) -> String {
+        const STRIP: u32 = 4;
+        const SEAM: f32 = 0.15;
+        let side = KEPT / CELLS;
+        // The step, in stops of luminance and of blue against green,
+        // between two strips of a tile's kept texels, cell by cell along
+        // the edge: the median cell.
+        let across = |a: &[[f32; 3]], ax: u32, b: &[[f32; 3]], bx: u32, upright: bool| {
+            let (mut light, mut cast) = (Vec::new(), Vec::new());
+            for i in 0..CELLS {
+                let strip = |kept: &[[f32; 3]], at: u32| {
+                    let mut sum = [0.0f32; 3];
+                    for along in i * side..(i + 1) * side {
+                        for off in 0..STRIP {
+                            let (x, y) = if upright {
+                                (at + off, along)
+                            } else {
+                                (along, at + off)
+                            };
+                            let c = kept[(y * KEPT + x) as usize];
+                            for k in 0..3 {
+                                sum[k] += c[k];
+                            }
+                        }
+                    }
+                    sum.map(|v| v / (side * STRIP) as f32)
+                };
+                let (p, q) = (strip(a, ax), strip(b, bx));
+                let y = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+                light.push(((y(p) + FLOOR) / (y(q) + FLOOR)).log2());
+                cast.push(
+                    ((p[2] + FLOOR) / (p[1] + FLOOR)).log2()
+                        - ((q[2] + FLOOR) / (q[1] + FLOOR)).log2(),
+                );
+            }
+            // A change of capture steps the whole edge one way; ground
+            // steps it here up and there down.
+            let one_way = light.iter().all(|v| *v > 0.0) || light.iter().all(|v| *v < 0.0);
+            (median(&mut light), median(&mut cast), one_way)
+        };
+        let mut out = String::from("## Joints between tiles of one level\n\n");
+        out += "The step across the edge two neighbours of a level share, against the step across a line inside a tile (ground alone), in stops of luminance; `cast` is blue against green.\n\n";
+        out += "| level | tiles | edges | inside: median / p95 | at edges: median / p95 | edges past the inside p95 | past 0.15 | past 0.30 | cast at edges p95 | seams: edges / lines inside |\n|---|---|---|---|---|---|---|---|---|---|\n";
+        out += "\nA seam is a step of more than 0.15 stops that goes the same way all along the edge; the last column counts them at edges and, for comparison, along lines inside tiles.\n\n";
+        let mut levels: BTreeMap<u8, Vec<&Coord>> = BTreeMap::new();
+        for coord in self.tiles.keys() {
+            levels.entry(coord.0).or_default().push(coord);
+        }
+        let quantile = |values: &mut Vec<f32>, q: f32| {
+            if values.is_empty() {
+                return f32::NAN;
+            }
+            values.sort_by(f32::total_cmp);
+            values[((values.len() - 1) as f32 * q) as usize]
+        };
+        let mut worst: Vec<(f32, f32, Coord, Coord)> = Vec::new();
+        for (level, coords) in &levels {
+            let (mut inside, mut edges, mut casts) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut seams, mut seams_inside) = (0usize, 0usize);
+            for coord in coords {
+                let mine = &self.tiles[*coord].kept;
+                let middle = KEPT / 2;
+                for upright in [true, false] {
+                    let (light, _, one_way) = across(mine, middle - STRIP, mine, middle, upright);
+                    inside.push(light.abs());
+                    seams_inside += usize::from(one_way && light.abs() > SEAM);
+                }
+                for (next, upright) in [
+                    ((coord.0, coord.1 + 1, coord.2), true),
+                    ((coord.0, coord.1, coord.2 + 1), false),
+                ] {
+                    let Some(other) = self.tiles.get(&next) else {
+                        continue;
+                    };
+                    let (light, cast, one_way) =
+                        across(mine, KEPT - STRIP, &other.kept, 0, upright);
+                    edges.push(light.abs());
+                    casts.push(cast.abs());
+                    if one_way && light.abs() > SEAM {
+                        seams += 1;
+                        worst.push((light, cast, **coord, next));
+                    }
+                }
+            }
+            if edges.is_empty() {
+                continue;
+            }
+            let bound = quantile(&mut inside, 0.95);
+            let past = |limit: f32| {
+                edges.iter().filter(|e| **e > limit).count() as f32 * 100.0 / edges.len() as f32
+            };
+            let (p_bound, p15, p30) = (past(bound), past(0.15), past(0.30));
+            let _ = writeln!(
+                out,
+                "| {level} | {} | {} | {:.3} / {:.3} | {:.3} / {:.3} | {:.0}% | {:.0}% | {:.0}% | {:.3} | {seams} ({:.0}%) / {seams_inside} ({:.0}%) |",
+                coords.len(),
+                edges.len(),
+                quantile(&mut inside, 0.5),
+                bound,
+                quantile(&mut edges, 0.5),
+                quantile(&mut edges, 0.95),
+                p_bound,
+                p15,
+                p30,
+                quantile(&mut casts, 0.95),
+                seams as f32 * 100.0 / edges.len() as f32,
+                seams_inside as f32 * 100.0 / inside.len().max(1) as f32,
+            );
+        }
+        worst.sort_by(|a, b| b.0.abs().total_cmp(&a.0.abs()));
+        out += "\nThe widest steps (luminance, cast, the two tiles as level/x/y, and how many tiles of the film each is draped on):\n\n";
+        for (light, cast, a, b) in worst.iter().take(20) {
+            let _ = writeln!(
+                out,
+                "- {light:+.2} stops, cast {cast:+.2}: {}/{}/{} ({}) | {}/{}/{} ({})",
+                a.0, a.1, a.2, self.tiles[a].drapes, b.0, b.1, b.2, self.tiles[b].drapes
+            );
+        }
+
+        // A tile on an ancestor however far: the tile's whole tone against
+        // the texel of the ancestor it lies in. Rough tile by tile, telling
+        // over many.
+        out += "\n## A level against every coarser level the film also reads\n\n";
+        out += "Median over tiles of the tile's tone against the same ground in the coarser tile, in stops of luminance (positive: the finer is lighter), and cast (blue against green).\n\n| level | against | tiles | luminance median / p10 / p90 | cast median |\n|---|---|---|---|---|\n";
+        let mut pairs: BTreeMap<(u8, u8), (Vec<f32>, Vec<f32>)> = BTreeMap::new();
+        for (coord, light) in &self.tiles {
+            for up in 1..=coord.0 {
+                let Some(ancestor) = self
+                    .tiles
+                    .get(&(coord.0 - up, coord.1 >> up, coord.2 >> up))
+                else {
+                    continue;
+                };
+                // Where the tile's middle falls in what was kept of it.
+                let span = 1u64 << up;
+                let at = |v: u32| ((u64::from(v) % span) * 2 + 1) * u64::from(KEPT) / (span * 2);
+                let (x, y) = (at(coord.1) as u32, at(coord.2) as u32);
+                let under = ancestor.kept[(y.min(KEPT - 1) * KEPT + x.min(KEPT - 1)) as usize];
+                let mut mine = [0.0f32; 3];
+                for c in &light.kept {
+                    for k in 0..3 {
+                        mine[k] += c[k];
+                    }
+                }
+                let mine = mine.map(|v| v / light.kept.len() as f32);
+                let y_of = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+                let entry = pairs.entry((coord.0, coord.0 - up)).or_default();
+                entry
+                    .0
+                    .push(((y_of(mine) + FLOOR) / (y_of(under) + FLOOR)).log2());
+                entry.1.push(
+                    ((mine[2] + FLOOR) / (mine[1] + FLOOR)).log2()
+                        - ((under[2] + FLOOR) / (under[1] + FLOOR)).log2(),
+                );
+            }
+        }
+        for ((level, against), (mut light, mut cast)) in pairs {
+            let _ = writeln!(
+                out,
+                "| {level} | {against} | {} | {:+.2} / {:+.2} / {:+.2} | {:+.2} |",
+                light.len(),
+                quantile(&mut light, 0.5),
+                quantile(&mut light, 0.1),
+                quantile(&mut light, 0.9),
+                quantile(&mut cast, 0.5),
+            );
+        }
+        out
+    }
+
+    /// A picture of one level's tiles as the store holds them, each where
+    /// it lies, with the seams between neighbours drawn in red: a step of
+    /// more than 0.15 stops of luminance between the two tiles' facing
+    /// edges. What is uniform within a patch and steps at its border is a
+    /// capture; what the red encloses is its extent.
+    pub fn seams_picture(&self, level: u8, path: &Path) -> Result<Option<(u32, u32)>, Error> {
+        const SIDE: u32 = 16;
+        let tiles: Vec<(&Coord, &TileLight)> =
+            self.tiles.iter().filter(|(c, _)| c.0 == level).collect();
+        let (Some(x0), Some(x1), Some(y0), Some(y1)) = (
+            tiles.iter().map(|(c, _)| c.1).min(),
+            tiles.iter().map(|(c, _)| c.1).max(),
+            tiles.iter().map(|(c, _)| c.2).min(),
+            tiles.iter().map(|(c, _)| c.2).max(),
+        ) else {
+            return Ok(None);
+        };
+        let (wide, high) = ((x1 - x0 + 1) * SIDE, (y1 - y0 + 1) * SIDE);
+        if wide > 8192 || high > 8192 {
+            return Ok(None);
+        }
+        let mut picture = image::RgbImage::from_pixel(wide, high, image::Rgb([40, 40, 40]));
+        let stored = |v: f32| {
+            let v = v.clamp(0.0, 1.0);
+            let s = if v <= 0.003_130_8 {
+                v * 12.92
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            };
+            (s * 255.0).round() as u8
+        };
+        let step = KEPT / SIDE;
+        for (coord, light) in &tiles {
+            for j in 0..SIDE {
+                for i in 0..SIDE {
+                    // Lifted two stops, as a render would show it.
+                    let c = cell(&light.kept, i * step, j * step, step).map(|v| stored(v * 4.0));
+                    picture.put_pixel(
+                        (coord.1 - x0) * SIDE + i,
+                        (coord.2 - y0) * SIDE + j,
+                        image::Rgb(c),
+                    );
+                }
+            }
+        }
+        let luminance = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        for (coord, light) in &tiles {
+            for (next, upright) in [
+                ((coord.0, coord.1 + 1, coord.2), true),
+                ((coord.0, coord.1, coord.2 + 1), false),
+            ] {
+                let Some(other) = self.tiles.get(&next) else {
+                    continue;
+                };
+                // The whole facing strips, a sixteenth of a tile deep.
+                let strip = |kept: &[[f32; 3]], at: u32| {
+                    let mut sum = 0.0f32;
+                    for along in 0..KEPT {
+                        for off in 0..4 {
+                            let (x, y) = if upright {
+                                (at + off, along)
+                            } else {
+                                (along, at + off)
+                            };
+                            sum += luminance(kept[(y * KEPT + x) as usize]);
+                        }
+                    }
+                    sum / (KEPT * 4) as f32
+                };
+                let apart = ((strip(&light.kept, KEPT - 4) + FLOOR)
+                    / (strip(&other.kept, 0) + FLOOR))
+                    .log2()
+                    .abs();
+                if apart <= 0.15 {
+                    continue;
+                }
+                let shade = if apart > 0.5 {
+                    [255, 0, 0]
+                } else {
+                    [255, 160, 0]
+                };
+                for along in 0..SIDE {
+                    let (x, y) = if upright {
+                        ((next.1 - x0) * SIDE, (coord.2 - y0) * SIDE + along)
+                    } else {
+                        ((coord.1 - x0) * SIDE + along, (next.2 - y0) * SIDE)
+                    };
+                    picture.put_pixel(x, y, image::Rgb(shade));
+                }
+            }
+        }
+        picture.save(path)?;
+        Ok(Some((wide, high)))
+    }
+
+    /// What the film is made of: every imagery tile draped on a tile of
+    /// it, cell by cell, counted for the tiles it is draped on.
+    fn samples(&self) -> Vec<Sample> {
+        let side = KEPT / CELLS;
+        let mut out = Vec::new();
+        for (coord, light) in &self.tiles {
+            if light.drapes == 0 {
+                continue;
+            }
+            let weight = light.drapes as f32 / (CELLS * CELLS) as f32;
+            for j in 0..CELLS {
+                for i in 0..CELLS {
+                    out.push(Sample {
+                        level: coord.0,
+                        colour: cell(&light.kept, i * side, j * side, side),
+                        weight,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// How much light this render put on ground: its pictures' mean linear
+    /// luminance for an imagery luminance of one — lighting and exposure
+    /// together, as [`FilmGrade::fit`] wants it. Read off a render made
+    /// with no grade. `None` before a picture came out.
+    pub fn light(&self) -> Option<f32> {
+        let luminance = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let (mut imagery, mut weight) = (0.0f64, 0.0f64);
+        for s in self.samples() {
+            imagery += f64::from(luminance(s.colour) * s.weight);
+            weight += f64::from(s.weight);
+        }
+        let pictures: f64 = self.frames.iter().map(|f| f64::from(f.0.mean.exp2())).sum();
+        (weight > 0.0 && imagery > 0.0 && !self.frames.is_empty())
+            .then(|| (pictures / self.frames.len() as f64 / (imagery / weight)) as f32)
+    }
+
+    /// The film's own grade, fitted on the imagery this render read: its
+    /// levels brought to the one it draws most, and the film brought to
+    /// `target`, within `bounds`. `light` is [`Self::light`]'s, or the
+    /// renderer's known one.
+    pub fn film_grade(&self, light: f32, target: &LookTarget, bounds: &Bounds) -> FilmGrade {
+        let seen: Vec<Seen> = self.seen().into_iter().map(|s| s.0).collect();
+        FilmGrade::fit(&seen, &self.samples(), light, target, bounds)
     }
 
     /// One grade a level, fitted on the tiles this render read: the one

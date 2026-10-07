@@ -27,10 +27,19 @@
 //!   --supersample <n>     default 2
 //!   --fps <n>             default 30
 //!   --mbps <n>            default 12
-//!   --no-tone             imagery as stored: no tone correction
-//!   --tone-table <file>   this tone table, not the one made from the
-//!                         tables the store keeps for the film's places
-//!   --tone <0..1>         how much of the correction (default 1)
+//!   --no-tone             no grade: imagery as stored, the look as it is
+//!   --tone-table <file>   this grade, not the film's own: a film's grade
+//!                         as --calibrate writes it, or a table of levels
+//!   --tone <0..1>         how much of the grade (default 1)
+//!   --calibrate <dir>     fit the film's own grade on its imagery — its
+//!                         levels brought to the one it draws most, then
+//!                         the film to the look's target, both bounded —
+//!                         and write it under <dir> at the key it is kept
+//!                         by, beside each pack. Renders with no grade;
+//!                         --every and --scale make it quick.
+//!   --put                 with --calibrate: also write it to the bucket
+//!   --light <x>           with --calibrate: the light the renderer puts
+//!                         on ground, instead of the one this render shows
 //!   --imagery <decoded|stored>
 //!                         how imagery's values are read before lighting:
 //!                         decoded from sRGB as a photograph asks (the
@@ -50,12 +59,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tuile_farm::{BucketConfig, ObjectRunStore, Tuning};
+use tuile_farm::{BucketConfig, ObjectRunStore, RunStore, Tuning};
 use tuile_film_native::{
     render, Av1Film, Error, Film, LightMeter, Nothing, Observer, Order, Pictures, Sink, Sources,
     Tone,
 };
-use tuile_radiometry::LevelGrades;
+use tuile_radiometry::{Bounds, FilmGrade, LevelGrades, LookTarget};
+use tuile_repository::tone::pack_tone_key;
 use tuile_repository::Objects;
 
 fn bucket(name: &str) -> Result<Arc<dyn Objects>, Error> {
@@ -166,9 +176,15 @@ async fn main() -> Result<(), Error> {
     }
     if let Some(path) = value("--tone-table") {
         let text = std::fs::read_to_string(&path)?;
-        order.tone = Tone::Table(
-            LevelGrades::from_json(&text).ok_or_else(|| format!("{path} is not a tone table"))?,
-        );
+        let grade = FilmGrade::from_json(&text)
+            .or_else(|| {
+                LevelGrades::from_json(&text).map(|levels| FilmGrade {
+                    levels,
+                    ..FilmGrade::none()
+                })
+            })
+            .ok_or_else(|| format!("{path} is neither a film's grade nor a table of levels"))?;
+        order.tone = Tone::Grade(grade);
     }
     match value("--imagery").as_deref() {
         Some("stored") => order.look = tuile_film::Look::cycles_film(),
@@ -184,7 +200,8 @@ async fn main() -> Result<(), Error> {
     if let Some(factor) = value("--saturation") {
         order.look.saturation = factor.parse()?;
     }
-    if flag("--no-tone") {
+    let calibrating = value("--calibrate");
+    if flag("--no-tone") || calibrating.is_some() {
         order.tone = Tone::Off;
     }
     let mbps: f64 = value("--mbps").map_or(Ok(12.0), |m| m.parse())?;
@@ -224,7 +241,7 @@ async fn main() -> Result<(), Error> {
     let mut meter = LightMeter::default();
     let metering = value("--meter");
     let mut nobody = ();
-    let observer: &mut dyn Observer = if metering.is_some() {
+    let observer: &mut dyn Observer = if metering.is_some() || calibrating.is_some() {
         &mut meter
     } else {
         &mut nobody
@@ -273,29 +290,17 @@ async fn main() -> Result<(), Error> {
     }
     println!();
     println!(
-        "tiles: {} from the store, {} from the pack, {} source tiles renewed since the bake; tone: {}",
-        done.tiles_from_store,
-        done.tiles_from_pack,
-        done.renewed,
-        match (&done.tone, order.tone_strength) {
-            (None, _) if done.tone_places.0 > 0 => format!(
-                "none — the store keeps no table for this imagery layer, which is how a layer is graded ({} places)",
-                done.tone_places.0
-            ),
-            (None, _) => "none".to_string(),
-            (Some(t), s) => format!(
-                "one grade a level, anchor {}, strength {s}{}",
-                t.anchor,
-                match done.tone_places {
-                    (0, ..) => String::new(),
-                    (places, fitted, layer) => format!(
-                        ", from the store: {fitted} of the film's {places} places have a table of their own{}",
-                        if layer { ", the others the layer's" } else { "" }
-                    ),
-                }
-            ),
-        }
+        "tiles: {} from the store, {} from the pack, {} source tiles renewed since the bake",
+        done.tiles_from_store, done.tiles_from_pack, done.renewed,
     );
+    match &done.grade {
+        None => println!("grade: none — the film has none of its own, and borrows none"),
+        Some(grade) => println!(
+            "grade: the film's own, strength {}\n{}",
+            order.tone_strength,
+            said(grade)
+        ),
+    }
     for (name, cache) in [("packs", &sources.packs), ("archives", &sources.archives)] {
         let (asked, fetched) = cache.reads();
         println!(
@@ -332,8 +337,100 @@ async fn main() -> Result<(), Error> {
                 keys.len()
             );
         }
-        println!("\n{report}");
+        for level in 0..=22u8 {
+            let path = PathBuf::from(&dir).join(format!("seams-{level}.png"));
+            if let Some((wide, high)) = meter.seams_picture(level, &path)? {
+                println!("seams of level {level}: {} ({wide}×{high})", path.display());
+            }
+        }
+        let joints = meter.joints();
+        std::fs::write(PathBuf::from(&dir).join("joints.md"), &joints)?;
+        println!("\n{report}\n{joints}");
+    }
+    if let Some(dir) = calibrating {
+        let layer = film
+            .packs
+            .first()
+            .and_then(|p| tuile_film::Pack::open_table(&p.head).ok())
+            .as_ref()
+            .and_then(|p| p.store_layers())
+            .map(|(_, imagery)| imagery.to_string())
+            .ok_or("the film's packs name no imagery layer: nothing to fit a grade on")?;
+        if !sources.store.is_graded(&layer).await? {
+            return Err(format!(
+                "{layer} is not a graded layer: its store keeps no {layer}/tone.json"
+            )
+            .into());
+        }
+        let shown = meter.light().ok_or("no picture came out")?;
+        let light = value("--light").map_or(Ok(shown), |l| l.parse())?;
+        let grade = meter.film_grade(light, &LookTarget::default(), &Bounds::default());
+        println!(
+            "\nlight on ground: {shown:.3} shown by this render, {light:.3} used\n{}",
+            said(&grade)
+        );
+        let putting = if flag("--put") {
+            let config = BucketConfig {
+                bucket: std::env::var("TUILE_STORE_BUCKET")?,
+                ..BucketConfig::from_env()?
+            };
+            Some(ObjectRunStore::bucket(&config, Tuning::from_env())?)
+        } else {
+            None
+        };
+        for pack in &film.packs {
+            let key = pack_tone_key(&pack.key);
+            let path = PathBuf::from(&dir).join(&key);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, grade.to_json())?;
+            match &putting {
+                Some(store) => {
+                    store.put(&path, &key).await?;
+                    println!("written to the bucket: {key}");
+                }
+                None => println!("written: {}", path.display()),
+            }
+        }
     }
     sources.close().await?;
     Ok(())
+}
+
+/// A film's grade, in words.
+fn said(grade: &FilmGrade) -> String {
+    let mut out = format!(
+        "  the film to the target: exposure {:+.2} stops, contrast ×{:.2}, saturation ×{:.2}\n  foretold L* {:.1} → {:.1}, contrast {:.1} → {:.1}, C* {:.1} → {:.1}\n",
+        grade.exposure_ev,
+        grade.contrast,
+        grade.saturation,
+        grade.before[0],
+        grade.after[0],
+        grade.before[1],
+        grade.after[1],
+        grade.before[2],
+        grade.after[2],
+    );
+    let whole: f32 = grade.usage.values().sum();
+    for (level, tiles) in &grade.usage {
+        let g = grade.levels.of(*level);
+        let stops = g.gain.map(f32::log2);
+        out += &format!(
+            "  level {level} ({:.0}% of the film): {}\n",
+            tiles * 100.0 / whole.max(1e-6),
+            if g.is_identity() {
+                "as it is".to_string()
+            } else {
+                format!(
+                    "gain {:+.2} {:+.2} {:+.2} stops, contrast {:.2}, saturation {:.2}",
+                    stops[0], stops[1], stops[2], g.contrast, g.saturation
+                )
+            }
+        );
+    }
+    if !grade.limited.is_empty() {
+        out += &format!("  held back at a bound: {}\n", grade.limited.join("; "));
+    }
+    out
 }

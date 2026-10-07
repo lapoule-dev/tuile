@@ -18,7 +18,7 @@ use tuile_film::{
     refs_of, texture_of_span, Content, Cursor, FrameCamera, Look, Mesh, Pack, TileKey,
 };
 use tuile_film_gpu::{DrapeLayer, FilmGpu, LayerGrade, Settings, TileMesh};
-use tuile_radiometry::{Grade, LevelGrades};
+use tuile_radiometry::{FilmGrade, Grade};
 use tuile_repository::TileRepository;
 
 use crate::observe::{FrameOut, ImageryIn, Observer, Origin, TileIn, Timings};
@@ -32,11 +32,11 @@ pub enum Tone {
     /// The imagery as stored.
     #[default]
     Off,
-    /// The tables the store keeps for the places the film crosses, made
-    /// one table for the film.
-    OfTheStore,
-    /// This table.
-    Table(LevelGrades),
+    /// The film's own grade, kept beside its packs; nothing if it has
+    /// none.
+    OfTheFilm,
+    /// This grade.
+    Grade(FilmGrade),
 }
 
 /// What to render.
@@ -65,7 +65,7 @@ impl Default for Order {
             scale: 1.0,
             supersample: 2,
             fps: 30,
-            tone: Tone::OfTheStore,
+            tone: Tone::OfTheFilm,
             tone_strength: 1.0,
             look: Look::default(),
         }
@@ -91,12 +91,8 @@ pub struct Done {
     pub seconds: f64,
     /// Before the first frame: opening the adapter and the sink.
     pub setup_seconds: f64,
-    /// The tone table applied, if one was.
-    pub tone: Option<LevelGrades>,
-    /// For a table made from the store's: the places the film's imagery
-    /// lies in, how many of them the store keeps a table of their own for,
-    /// and whether the others were given the layer's.
-    pub tone_places: (usize, usize, bool),
+    /// The film's grade as applied, if one was.
+    pub grade: Option<FilmGrade>,
 }
 
 /// Store tiles asked for at once.
@@ -161,6 +157,21 @@ pub async fn render(
     let width = (((view.viewport_px[0] as f32 * order.scale) as u32) / 8).max(1) * 8;
     let height = (((view.viewport_px[1] as f32 * order.scale) as u32) / 8).max(1) * 8;
 
+    // The film's grade, before anything is set up: one from its first
+    // frame to its last, and part of it is how the picture is exposed.
+    let film_grade = match &order.tone {
+        Tone::Off => None,
+        Tone::Grade(grade) => Some(grade.clone()),
+        Tone::OfTheFilm => sources.film_grade(film).await?,
+    };
+    let strength = order.tone_strength.clamp(0.0, 1.0);
+    let mut look = order.look;
+    if let Some(grade) = &film_grade {
+        look.exposure_ev += grade.exposure_ev * strength;
+        look.contrast *= grade.contrast.powf(strength);
+        look.saturation *= grade.saturation.powf(strength);
+    }
+
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = instance.request_adapter(&Default::default()).await?;
     let (device, queue) = adapter
@@ -176,7 +187,7 @@ pub async fn render(
             width,
             height,
             supersample: order.supersample.max(1),
-            look: order.look,
+            look,
         },
     );
     let padded = (width * 4).div_ceil(256) * 256;
@@ -199,13 +210,13 @@ pub async fn render(
     let mut done = Done {
         width,
         height,
+        grade: film_grade.clone(),
         setup_seconds: began.elapsed().as_secs_f64(),
         ..Done::default()
     };
     // What is resident, and the imagery levels of each one's drape.
     let mut resident: HashMap<TileKey, Vec<u8>> = HashMap::new();
     let mut textures: HashMap<(u8, u32, u32), (wgpu::Texture, bool)> = HashMap::new();
-    let mut tone: Option<(String, Option<LevelGrades>)> = None;
     let mut index = 0u32;
 
     for file in &film.packs {
@@ -222,37 +233,12 @@ pub async fn render(
             _ => pack.store_layers(),
         };
         let scheme = layers.map(|(_, imagery)| sources.store.scheme_of(imagery));
-        if let Some((_, imagery)) = layers {
-            if tone.as_ref().is_none_or(|(layer, _)| layer != imagery) {
-                let table = match &order.tone {
-                    Tone::Off => None,
-                    Tone::Table(table) => Some(table.clone()),
-                    Tone::OfTheStore => {
-                        // Over the whole film, not the frames asked for: a
-                        // film is one grade from its first frame to its last.
-                        let mut places = BTreeMap::new();
-                        for each in &film.packs {
-                            let regions = Pack::open_table(&each.head)?
-                                .imagery_regions(tuile_radiometry::REGION_LEVEL);
-                            for (place, tiles) in regions {
-                                *places.entry(place).or_default() += tiles;
-                            }
-                        }
-                        let tone = sources.store.film_tone(imagery, &places).await?;
-                        done.tone_places = (tone.places, tone.fitted, tone.layer_table);
-                        tone.table
-                    }
-                };
-                done.tone.clone_from(&table);
-                tone = Some((imagery.to_string(), table));
-            }
-        }
         // The same for every tile of a level, so that two of them meet as
         // they did.
         let grade = |level: u8| {
-            tone.as_ref()
-                .and_then(|(_, table)| table.as_ref())
-                .map_or(Grade::IDENTITY, |t| t.of(level).at(order.tone_strength))
+            film_grade
+                .as_ref()
+                .map_or(Grade::IDENTITY, |g| g.levels.of(level).at(strength))
         };
 
         // Frames a, a + every, …: each from a cursor of its own when frames
