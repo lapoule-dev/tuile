@@ -71,6 +71,12 @@ struct Chunk {
     first: u32,
     last: u32,
     bytes: f64,
+    /// How many frames the pack holds, and the viewport it was baked for.
+    /// Absent from an API older than this page.
+    #[serde(default)]
+    frames: Option<u32>,
+    #[serde(default)]
+    viewport: Option<[u32; 2]>,
     scene: Option<String>,
 }
 
@@ -643,7 +649,7 @@ async fn open_scene(id: String) {
             "td",
             &format!("illisible — {} ({})", u.why, megabytes(u.bytes)),
         );
-        let _ = why.set_attribute("colspan", "3");
+        let _ = why.set_attribute("colspan", "5");
         why.set_class_name("bad");
         let _ = why.set_attribute("style", "text-align:left");
         let _ = tr.append_child(&why);
@@ -682,6 +688,10 @@ async fn open_scene(id: String) {
         let tr = row(&[
             &chunk.key[within..],
             &format!("{}–{}", chunk.first, chunk.last),
+            &chunk.frames.map_or("—".into(), |n| n.to_string()),
+            &chunk
+                .viewport
+                .map_or("—".into(), |[w, h]| format!("{w} × {h}")),
             &megabytes(chunk.bytes),
             chunk.scene.as_deref().unwrap_or("—"),
         ]);

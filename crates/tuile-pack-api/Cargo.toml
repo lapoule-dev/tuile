@@ -8,7 +8,9 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 axum = "0.8"
+bytes = { workspace = true }
 dotenvy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -16,6 +18,8 @@ toml = "0.8"
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "net"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header"] }
+# The contract of a store of bytes, which what packs hold is remembered in.
+tuile-core = { version = "0.2.0", path = "../tuile-core" }
 tuile-repository = { version = "0.2.0", path = "../tuile-repository" }
 tuile-tile-server = { path = "../tuile-tile-server" }
 tracing = { workspace = true }
@@ -25,7 +29,6 @@ tuile-farm = { version = "0.2.0", path = "../tuile-farm" }
 [dev-dependencies]
 image = { workspace = true }
 tempfile = { workspace = true }
-tuile-core = { version = "0.2.0", path = "../tuile-core" }
 tuile-film = { version = "0.2.0", path = "../tuile-film" }
 tuile-radiometry = { version = "0.2.0", path = "../tuile-radiometry" }
 

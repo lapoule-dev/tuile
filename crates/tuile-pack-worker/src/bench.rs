@@ -4,6 +4,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use tuile_core::storage::ContentStore;
 use tuile_repository::bench::names;
 use tuile_repository::s3::{Http, HttpReply, S3Config, S3Objects, Signed};
 use tuile_repository::{
@@ -77,19 +79,39 @@ struct EdgeChunks {
     keeping: bool,
 }
 
+/// Percent-encoded as a path: a key may hold anything.
+fn encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// What this point of presence's cache holds under an address.
+async fn lookup(url: String) -> Option<Vec<u8>> {
+    let mut hit = Cache::default().get(url, false).await.ok()??;
+    hit.bytes().await.ok()
+}
+
+/// Keeps bytes under an address in this point of presence's cache.
+async fn keep(url: String, bytes: Vec<u8>, cache_control: &str) {
+    let headers = Headers::new();
+    let _ = headers.set("cache-control", cache_control);
+    let _ = headers.set("content-type", "application/octet-stream");
+    if let Ok(response) = Response::from_bytes(bytes) {
+        // What the cache will not take is simply not kept.
+        let _ = Cache::default()
+            .put(url, response.with_headers(headers))
+            .await;
+    }
+}
+
 impl EdgeChunks {
     fn url(&self, key: &str, part: &str) -> String {
-        // Percent-encoded as one path segment each: a key may hold anything.
-        let encode = |text: &str| {
-            text.bytes()
-                .map(|b| match b {
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'/' => {
-                        (b as char).to_string()
-                    }
-                    _ => format!("%{b:02X}"),
-                })
-                .collect::<String>()
-        };
         format!(
             "https://chunks.invalid/{}/{}/{part}",
             encode(&self.project),
@@ -98,20 +120,49 @@ impl EdgeChunks {
     }
 
     async fn lookup(&self, url: String) -> Option<Vec<u8>> {
-        let mut hit = Cache::default().get(url, false).await.ok()??;
-        hit.bytes().await.ok()
+        lookup(url).await
     }
 
     async fn keep(&self, url: String, bytes: Vec<u8>, cache_control: &str) {
-        let headers = Headers::new();
-        let _ = headers.set("cache-control", cache_control);
-        let _ = headers.set("content-type", "application/octet-stream");
-        if let Ok(response) = Response::from_bytes(bytes) {
-            // A chunk the cache will not take is simply not kept.
-            let _ = Cache::default()
-                .put(url, response.with_headers(headers))
-                .await;
-        }
+        keep(url, bytes, cache_control).await;
+    }
+}
+
+/// Small things worth remembering — what a pack was found to hold — kept in
+/// the edge cache of the point of presence that worked them out, under an
+/// address that is never fetched. The cache is one per point of presence: a
+/// listing is slow the first time each sees a pack, and not after.
+struct EdgeNotes {
+    project: String,
+}
+
+/// How long a note is kept when whoever wrote it did not say.
+const NOTE_KEPT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+impl EdgeNotes {
+    fn url(&self, key: &str) -> String {
+        format!(
+            "https://notes.invalid/{}/{}",
+            encode(&self.project),
+            encode(key)
+        )
+    }
+}
+
+#[async_trait(?Send)]
+impl ContentStore for EdgeNotes {
+    async fn get(&self, key: &str) -> Option<Bytes> {
+        lookup(self.url(key)).await.map(Bytes::from)
+    }
+
+    async fn put(&self, key: &str, value: Bytes, ttl: Option<std::time::Duration>) {
+        let seconds = ttl.unwrap_or(NOTE_KEPT).as_secs();
+        keep(
+            self.url(key),
+            value.to_vec(),
+            &format!("public, max-age={seconds}"),
+        )
+        .await;
     }
 }
 
@@ -200,11 +251,20 @@ async fn bench(env: &Env, with_tiles: bool, keeping: bool) -> std::result::Resul
                 keeping,
             },
         ));
+        // What a pack holds is worked out once per point of presence, and
+        // remembered there: a film is listed without its packs being asked.
+        let notes: Arc<dyn ContentStore> = Arc::new(EdgeNotes {
+            project: project.name.clone(),
+        });
         let films: Arc<dyn FilmRepository> = match project.layout {
-            Layout::Scenes(roots) => Arc::new(ScenePacks::new(objects.clone(), roots)),
-            Layout::Runs(layout) => {
-                Arc::new(RunFilms::new(objects.clone(), layout).map_err(|e| e.to_string())?)
+            Layout::Scenes(roots) => {
+                Arc::new(ScenePacks::new(objects.clone(), roots).remembering(notes))
             }
+            Layout::Runs(layout) => Arc::new(
+                RunFilms::new(objects.clone(), layout)
+                    .map_err(|e| e.to_string())?
+                    .remembering(notes),
+            ),
         };
         projects.push(Project {
             name: project.name,

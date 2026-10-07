@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::films::{in_order, line_of, name_of, parent_of, range_of_pack, safe};
+use crate::films::{in_order, line_of, name_of, parent_of, safe, Outlines};
 use crate::{Chunk, Film, FilmRepository, FilmSummary, Objects, RepoError, Unreadable};
 
 /// The engine's layout: packs keyed by the scene they are the bake of.
@@ -22,6 +22,7 @@ use crate::{Chunk, Film, FilmRepository, FilmSummary, Objects, RepoError, Unread
 pub struct ScenePacks {
     objects: Arc<dyn Objects>,
     roots: Vec<String>,
+    outlines: Outlines,
 }
 
 const PACK: &str = ".tuilepack";
@@ -45,7 +46,15 @@ impl ScenePacks {
                 .into_iter()
                 .map(|r| r.into().trim_matches('/').to_string())
                 .collect(),
+            outlines: Outlines::default(),
         }
+    }
+
+    /// Remembers in `keeper` what each pack was found to hold, so a film is
+    /// listed without asking its packs again.
+    pub fn remembering(mut self, keeper: Arc<dyn tuile_core::storage::ContentStore>) -> Self {
+        self.outlines = Outlines(Some(keeper));
+        self
     }
 
     fn holds(&self, id: &str) -> bool {
@@ -97,34 +106,31 @@ impl FilmRepository for ScenePacks {
             let name = name_of(&file.key);
             if let Some((first, last)) = range_of(name) {
                 // The name is the launcher's claim; the table is the pack's.
-                let why = match range_of_pack(self.objects.as_ref(), &file.key).await? {
-                    Ok(found) if found == (first, last) => None,
-                    Ok(found) => Some(format!(
+                let outline = match self.outlines.of(self.objects.as_ref(), file).await? {
+                    Ok(found) if (found.first, found.last) == (first, last) => Ok(found),
+                    Ok(found) => Err(format!(
                         "named {first}–{last}, holds {}–{}",
-                        found.0, found.1
+                        found.first, found.last
                     )),
-                    Err(why) => Some(why),
+                    Err(why) => Err(why),
                 };
-                if let Some(why) = why {
-                    unreadable.push(Unreadable {
-                        key: file.key.clone(),
-                        bytes: file.size,
-                        why,
-                    });
-                    continue;
-                }
+                let outline = match outline {
+                    Ok(outline) => outline,
+                    Err(why) => {
+                        unreadable.push(Unreadable {
+                            key: file.key.clone(),
+                            bytes: file.size,
+                            why,
+                        });
+                        continue;
+                    }
+                };
                 let scene_key = format!("{}.scene", file.key);
                 let scene = match has(&scene_key) {
                     Some(_) => line_of(self.objects.as_ref(), &scene_key).await?,
                     None => None,
                 };
-                chunks.push(Chunk {
-                    key: file.key.clone(),
-                    first,
-                    last,
-                    bytes: file.size,
-                    scene,
-                });
+                chunks.push(Chunk::of(file, outline, scene));
             } else if !name.ends_with(".tuilepack.scene") {
                 others.push(file.clone());
             }

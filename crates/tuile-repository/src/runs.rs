@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 
-use crate::films::{in_order, line_of, range_of_pack, safe};
+use crate::films::{in_order, line_of, safe, Outlines};
 use crate::{Chunk, Entry, Film, FilmRepository, FilmSummary, Objects, RepoError, Unreadable};
 
 /// How an orchestrator lays a film's packs out in its run directory.
@@ -95,6 +95,7 @@ impl<'a> Template<'a> {
 pub struct RunFilms {
     objects: Arc<dyn Objects>,
     layout: RunLayout,
+    outlines: Outlines,
 }
 
 /// The first `depth` segments of a key that has more than that.
@@ -126,7 +127,18 @@ impl RunFilms {
                 "neither chunk_pack nor whole_pack: no pack to find".into()
             ));
         }
-        Ok(Self { objects, layout })
+        Ok(Self {
+            objects,
+            layout,
+            outlines: Outlines::default(),
+        })
+    }
+
+    /// Remembers in `keeper` what each pack was found to hold, so a film is
+    /// listed without asking its packs again.
+    pub fn remembering(mut self, keeper: Arc<dyn tuile_core::storage::ContentStore>) -> Self {
+        self.outlines = Outlines(Some(keeper));
+        self
     }
 
     fn template(text: &Option<String>) -> Option<Template<'_>> {
@@ -222,9 +234,10 @@ impl FilmRepository for RunFilms {
             // Read side by side, a few at a time: a film has dozens of
             // chunks, a table is megabytes, and a host may have little
             // memory to hold them in — a Worker has 128 MB for everything.
-            let keys: Vec<String> = ready.iter().map(|(_, e)| e.key.clone()).collect();
-            let ranges: Vec<_> = stream::iter(keys)
-                .map(|key| async move { range_of_pack(objects, &key).await })
+            let outlines = &self.outlines;
+            let packs: Vec<Entry> = ready.iter().map(|(_, e)| (*e).clone()).collect();
+            let ranges: Vec<_> = stream::iter(packs)
+                .map(|pack| async move { outlines.of(objects, &pack).await })
                 .buffered(TABLES_AT_ONCE)
                 .try_collect()
                 .await?;
@@ -232,8 +245,8 @@ impl FilmRepository for RunFilms {
                 let marker_key = marker.as_ref().map(|m| m.key(*i));
                 used.push(pack.key(*i));
                 used.extend(marker_key.clone());
-                let (first, last) = match range {
-                    Ok(range) => range,
+                let outline = match range {
+                    Ok(outline) => outline,
                     Err(why) => {
                         unreadable.push(Unreadable {
                             key: entry.key.clone(),
@@ -243,33 +256,25 @@ impl FilmRepository for RunFilms {
                         continue;
                     }
                 };
-                chunks.push(Chunk {
-                    key: entry.key.clone(),
-                    first,
-                    last,
-                    bytes: entry.size,
-                    scene: match &marker_key {
-                        Some(m) => line_of(objects, &format!("{id}/{m}")).await?,
-                        None => None,
-                    },
-                });
+                let scene = match &marker_key {
+                    Some(m) => line_of(objects, &format!("{id}/{m}")).await?,
+                    None => None,
+                };
+                chunks.push(Chunk::of(entry, outline, scene));
             }
         } else if let Some(entry) = layout.whole_pack.as_deref().and_then(|w| by_name.get(w)) {
             let marker = layout
                 .whole_ready
                 .as_deref()
                 .filter(|m| by_name.contains_key(m));
-            match range_of_pack(objects, &entry.key).await? {
-                Ok((first, last)) => chunks.push(Chunk {
-                    key: entry.key.clone(),
-                    first,
-                    last,
-                    bytes: entry.size,
-                    scene: match marker {
+            match self.outlines.of(objects, entry).await? {
+                Ok(outline) => {
+                    let scene = match marker {
                         Some(m) => line_of(objects, &format!("{id}/{m}")).await?,
                         None => None,
-                    },
-                }),
+                    };
+                    chunks.push(Chunk::of(entry, outline, scene));
+                }
                 Err(why) => unreadable.push(Unreadable {
                     key: entry.key.clone(),
                     bytes: entry.size,
