@@ -70,8 +70,16 @@ pub struct MatrixBounds {
     /// told.
     pub toward: f32,
     /// How strongly a corner's matrix is held to changing nothing, against
-    /// a tile's places fully believed.
+    /// a tile's places fully believed: this for a channel's own gain…
     pub held: f32,
+    /// …and this for the rest of it — what a channel takes of the other
+    /// two, and what is added. Far more: a gain keeps the contrast of what
+    /// it is given, and those do not. Least squares of the film on what
+    /// is wanted, left free, presses out whatever the film shows that the
+    /// reference does not — a mown field, a roof — as it pressed a line's
+    /// slope: the film comes out flat. Held, they are used where a tile
+    /// leaves no doubt — a sea beside a shore — and hardly elsewhere.
+    pub held_apart: f32,
     /// How strongly two corners of a tile are held to the same matrix.
     pub smooth: f32,
     /// A seam begins where the film steps across an edge by more than this
@@ -81,6 +89,14 @@ pub struct MatrixBounds {
     pub seam_linked_stops: f32,
     /// A seam of fewer edges than this is not one.
     pub least_seam: usize,
+    /// The finest level the function is fitted at: a tile finer than this
+    /// takes the function of the tile of this level it lies in, at the
+    /// place it has in it. No finer than the reference is — and coarse
+    /// enough that a tile holds many fields, woods and roofs: a function
+    /// fitted on a tile the size of a field lays that field on the
+    /// reference's, and a field mown in one picture and green in the other
+    /// is not a capture to be brought in.
+    pub lattice_level: u8,
 }
 
 impl MatrixBounds {
@@ -95,10 +111,12 @@ impl Default for MatrixBounds {
         Self {
             toward: Self::DOSE,
             held: 0.02,
+            held_apart: 0.5,
             smooth: 0.5,
             seam_stops: 0.6,
             seam_linked_stops: 0.3,
             least_seam: 3,
+            lattice_level: 14,
         }
     }
 }
@@ -247,25 +265,51 @@ impl MatrixField {
     /// Fits the field for a film: see the module.
     pub fn solve(observed: &Observed, bounds: &MatrixBounds) -> (Self, MatrixReport, Look) {
         let look = Self::look(observed);
-        let at: Vec<TileAt> = observed.tiles.keys().copied().collect();
+        // The tiles the function is fitted on: the film's own down to the
+        // lattice's level, and for a finer one the tile of that level it
+        // lies in — with where in it, and how much of it, the finer is.
+        let home = |a: TileAt| -> (TileAt, f32, f32, f32) {
+            let Some(deeper) = a.0.checked_sub(bounds.lattice_level).filter(|d| *d > 0) else {
+                return (a, 0.0, 0.0, 1.0);
+            };
+            let span = (1u32 << deeper) as f32;
+            (
+                (bounds.lattice_level, a.1 >> deeper, a.2 >> deeper),
+                (a.1 & ((1 << deeper) - 1)) as f32 / span,
+                (a.2 & ((1 << deeper) - 1)) as f32 / span,
+                1.0 / span,
+            )
+        };
+        let film: Vec<TileAt> = observed.tiles.keys().copied().collect();
+        let at: Vec<TileAt> = film
+            .iter()
+            .map(|a| home(*a).0)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let n = at.len();
         let index: BTreeMap<TileAt, usize> = at.iter().enumerate().map(|(i, a)| (*a, i)).collect();
-        // Every tile's places: where, the film's colour, what is wanted.
-        let places: Vec<Vec<(f32, f32, [f32; 3], [f32; 3])>> = at
-            .iter()
-            .map(|a| {
-                observed.tiles[a].paired.as_deref().map_or(Vec::new(), |p| {
-                    places_of(p)
-                        .into_iter()
-                        .map(|(u, v, film, reference)| {
-                            (u, v, film, look.wanted(reference, bounds.toward))
-                        })
-                        .collect()
-                })
-            })
-            .collect();
+        // Every such tile's places — its own and those of the finer tiles
+        // in it: where, the film's colour, what is wanted.
+        let mut places: Vec<Vec<(f32, f32, [f32; 3], [f32; 3])>> = vec![Vec::new(); n];
+        for a in &film {
+            let Some(paired) = observed.tiles[a].paired.as_deref() else {
+                continue;
+            };
+            let (within, u0, v0, span) = home(*a);
+            places[index[&within]].extend(places_of(paired).into_iter().map(
+                |(u, v, colour, reference)| {
+                    (
+                        u0 + u * span,
+                        v0 + v * span,
+                        colour,
+                        look.wanted(reference, bounds.toward),
+                    )
+                },
+            ));
+        }
         let mut report = MatrixReport {
-            tiles: n,
+            tiles: film.len(),
             measured: places.iter().filter(|p| !p.is_empty()).count(),
             places: places.iter().map(Vec::len).sum(),
             ..MatrixReport::default()
@@ -432,12 +476,18 @@ impl MatrixField {
         for round in 0..ROUNDS {
             let mut normal = CooMatrix::<f64>::new(nodes * 4, nodes * 4);
             let mut right = DMatrix::<f64>::zeros(nodes * 4, 3);
+            let mut held_at: Vec<(usize, usize)> = Vec::with_capacity(n * 16);
             for tile in 0..n {
                 // A tile's places, gathered before they are spread over
                 // the whole: sixteen unknowns a tile, however many places.
                 let mut block = [[0.0f64; 16]; 16];
                 let mut side = [[0.0f64; 3]; 16];
+                // A tile counts for one tile, however many finer ones gave
+                // it their places: what is held and what is smoothed are
+                // told against a tile's worth of them.
+                let share = (PAIRS * PAIRS) as f64 / places[tile].len().max(PAIRS * PAIRS) as f64;
                 for ((u, v, film, wanted), w) in places[tile].iter().zip(&weights[tile]) {
+                    let w = w * share;
                     let (b, f) = (blend(*u, *v), seen(*film));
                     let row: [f64; 16] = std::array::from_fn(|k| b[k / 4] * f[k % 4]);
                     for i in 0..16 {
@@ -460,14 +510,12 @@ impl MatrixField {
                         }
                     }
                 }
-                // Held to changing nothing, a corner at a time; and two
-                // corners of a tile held to the same.
-                let hold = f64::from(bounds.held) * whole / 4.0;
+                // Held to changing nothing, a corner at a time — by how
+                // much depends on the channel out, so it is added below, a
+                // channel at a time; and two corners of a tile held to the
+                // same.
                 for k in 0..16 {
-                    normal.push(unknown(k), unknown(k), hold);
-                    if k % 4 < 3 {
-                        right[(unknown(k), k % 4)] += hold;
-                    }
+                    held_at.push((unknown(k), k % 4));
                 }
                 let smooth = f64::from(bounds.smooth) * whole;
                 for (p, q) in SIDES {
@@ -483,10 +531,29 @@ impl MatrixField {
                     }
                 }
             }
-            let Ok(factored) = CscCholesky::factor(&CscMatrix::from(&normal)) else {
+            let mut failed = false;
+            for out in 0..3 {
+                let (mut normal, mut right) = (normal.clone(), right.column(out).clone_owned());
+                for (unknown, feature) in &held_at {
+                    let own = *feature == out;
+                    let hold =
+                        f64::from(if own { bounds.held } else { bounds.held_apart }) * whole / 4.0;
+                    normal.push(*unknown, *unknown, hold);
+                    if own {
+                        right[*unknown] += hold;
+                    }
+                }
+                let Ok(factored) = CscCholesky::factor(&CscMatrix::from(&normal)) else {
+                    failed = true;
+                    break;
+                };
+                let found =
+                    factored.solve(&DMatrix::from_column_slice(nodes * 4, 1, right.as_slice()));
+                solved.set_column(out, &found.column(0));
+            }
+            if failed {
                 break;
-            };
-            solved = factored.solve(&right);
+            }
             if round + 1 == ROUNDS {
                 break;
             }
@@ -532,6 +599,24 @@ impl MatrixField {
                 .map(|tile| (at[tile], std::array::from_fn(|q| corner(tile, q))))
                 .collect(),
         };
+        // …and the film's tiles: a tile the function was fitted on has its
+        // corners; a finer one, the function at each of its own corners —
+        // blended between those, it is the same function over the same
+        // ground.
+        let given = film
+            .iter()
+            .map(|a| {
+                let (within, u0, v0, span) = home(*a);
+                let four = std::array::from_fn(|q| {
+                    field.at(
+                        within,
+                        u0 + (q % 2) as f32 * span,
+                        v0 + (q / 2) as f32 * span,
+                    )
+                });
+                (*a, four)
+            })
+            .collect();
         let stops = |c: [f32; 3]| (luma(c).max(0.0) + 0.001).log2();
         let (mut before, mut after) = (Vec::new(), Vec::new());
         for tile in 0..n {
@@ -543,7 +628,7 @@ impl MatrixField {
         }
         report.before = centiles(&mut before);
         report.after = centiles(&mut after);
-        (field, report, look)
+        (Self { given }, report, look)
     }
 }
 
@@ -723,5 +808,70 @@ mod tests {
             through(&CAPTURE, [0.08, 0.1, 0.06]),
         );
         assert!((on_ground[1] - 0.1).abs() < 0.03, "{on_ground:?}");
+    }
+
+    #[test]
+    fn a_tile_finer_than_the_lattice_takes_the_function_of_the_tile_it_lies_in() {
+        // One tile of the lattice's level, and under it its sixteen tiles
+        // two levels down. Each fine tile is a patchwork of its own —
+        // every other one lighter on the film than on the reference, as
+        // fields mown in one picture and not in the other. Fitted a tile
+        // at a time, each would be laid on the reference; fitted on the
+        // lattice, they are given one function, and it is one function
+        // from each to the next.
+        let mut observed = Observed::default();
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let mown = (x + y) % 2 == 0;
+                let reference: [[f32; 3]; PAIRS * PAIRS] =
+                    std::array::from_fn(|k| ground_at(40 + x, 80 + y, k));
+                let texels = vec![[0.1f32; 3]; 64 * 64];
+                let mut tile = TileSeen::of_linear(&texels, 64).expect("a tile");
+                tile.paired = Some(Box::new(Paired {
+                    tile: reference
+                        .map(|c| through(&CAPTURE, c).map(|v| if mown { v * 1.6 } else { v })),
+                    reference,
+                }));
+                observed.see((16, 400 + x, 800 + y), || Some(tile), 1.0);
+            }
+        }
+        let fine = |lattice_level: u8| {
+            MatrixField::solve(
+                &observed,
+                &MatrixBounds {
+                    toward: 1.0,
+                    lattice_level,
+                    ..MatrixBounds::default()
+                },
+            )
+            .0
+        };
+        let gain = |field: &MatrixField, x: u32, y: u32, u: f32, v: f32| {
+            let made = through(&field.at((16, 400 + x, 800 + y), u, v), [0.1, 0.12, 0.05]);
+            made[1].log2()
+        };
+        // A tile at a time: the mown and the unmown are given different
+        // things, by most of what parts them.
+        let own = fine(16);
+        assert!((gain(&own, 0, 0, 0.5, 0.5) - gain(&own, 1, 0, 0.5, 0.5)).abs() > 0.3);
+        // On the lattice: one function, hardly different from one tile's
+        // middle to the next, and the same on either side of an edge.
+        let held = fine(14);
+        assert_eq!(held.given.len(), 16);
+        assert!((gain(&held, 0, 0, 0.5, 0.5) - gain(&held, 1, 0, 0.5, 0.5)).abs() < 0.08);
+        for (x, y, v) in [(0u32, 1u32, 0.3f32), (2, 2, 0.9), (1, 3, 0.5)] {
+            let (mine, theirs) = (
+                held.at((16, 400 + x, 800 + y), 1.0, v),
+                held.at((16, 401 + x, 800 + y), 0.0, v),
+            );
+            for o in 0..3 {
+                for i in 0..4 {
+                    assert!(
+                        (mine[o][i] - theirs[o][i]).abs() < 1e-4,
+                        "{mine:?} {theirs:?}"
+                    );
+                }
+            }
+        }
     }
 }

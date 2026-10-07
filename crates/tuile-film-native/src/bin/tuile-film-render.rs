@@ -847,7 +847,9 @@ async fn main() -> Result<(), Error> {
             // choosing the dose by eye.
             const DOSES: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
             for level in 1..=22u8 {
-                if meter.extent(level).is_none() || level <= 12 {
+                // The field's doses, that is: not drawn for a function a
+                // tile, which has its own.
+                if meter.extent(level).is_none() || level <= 12 || with_matrices {
                     continue;
                 }
                 let mut rows = Vec::new();
