@@ -6275,7 +6275,9 @@ dependencies = [
 name = "tuile-pack-api"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "bytes",
  "dotenvy",
  "image",
  "serde",
@@ -6300,6 +6302,8 @@ name = "tuile-pack-worker"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "bytes",
+ "tuile-core",
  "tuile-repository",
  "worker",
 ]

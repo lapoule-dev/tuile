@@ -38,6 +38,12 @@ fn tile(id: u64) -> BakedTile {
 
 /// A real pack of frames `first..=last`, written where the layout wants it.
 fn pack(path: &Path, first: u32, last: u32) {
+    pack_of(path, first, last, [640.0, 480.0]);
+}
+
+/// The same, baked for a viewport. A wider one is given more tiles, so that
+/// no two of these packs are the same size.
+fn pack_of(path: &Path, first: u32, last: u32, viewport_px: [f64; 2]) {
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     let scratch = tempfile::tempdir().expect("scratch");
     let mut w = PackWriter::new("scene", [0.0; 3], scratch.path().join("blob")).expect("writer");
@@ -46,10 +52,15 @@ fn pack(path: &Path, first: u32, last: u32) {
             position: [7_000_000.0 + f64::from(frame), 0.0, 0.0],
             direction: [-1.0, 0.0, 0.0],
             up: [0.0, 0.0, 1.0],
-            viewport_px: [640.0, 480.0],
+            viewport_px,
             fovy_rad: 1.0,
         };
-        w.frame(frame, view, [tile(u64::from(frame % 3))]);
+        let tiles = if viewport_px[0] > 640.0 { 2 } else { 1 };
+        w.frame(
+            frame,
+            view,
+            (0..tiles).map(|i| tile(u64::from(frame % 3) + 10 * i)),
+        );
     }
     w.finish_to(path).expect("finish");
 }
@@ -184,6 +195,8 @@ async fn holds_its_contract(repo: &dyn FilmRepository, objects: &dyn Objects) ->
                 "{}",
                 chunk.key
             );
+            assert_eq!(chunk.frames as usize, table.views().len(), "{}", chunk.key);
+            assert_eq!(chunk.viewport, Some([640, 480]), "{}", chunk.key);
         }
     }
     assert!(matches!(
@@ -212,11 +225,111 @@ async fn every_repository_over_every_store_holds_the_contract() {
     for objects in stores(&scenes_root, &dir.path().join("cache-scenes")) {
         let repo = ScenePacks::new(objects.clone(), ["packs"]);
         assert_eq!(holds_its_contract(&repo, objects.as_ref()).await, 4);
+        // And the same of a repository that remembers, asked twice: what it
+        // recalls is held to what it read.
+        let repo = repo.remembering(Arc::new(Memory::default()));
+        for _ in 0..2 {
+            assert_eq!(holds_its_contract(&repo, objects.as_ref()).await, 4);
+        }
     }
     for objects in stores(&runs_root, &dir.path().join("cache-runs")) {
         let repo = RunFilms::new(objects.clone(), layout()).expect("layout");
         assert_eq!(holds_its_contract(&repo, objects.as_ref()).await, 4);
+        let repo = repo.remembering(Arc::new(Memory::default()));
+        for _ in 0..2 {
+            assert_eq!(holds_its_contract(&repo, objects.as_ref()).await, 4);
+        }
     }
+}
+
+/// A store of bytes that keeps everything it is given.
+#[derive(Default)]
+struct Memory(std::sync::Mutex<std::collections::HashMap<String, bytes::Bytes>>);
+
+#[async_trait::async_trait]
+impl tuile_core::storage::ContentStore for Memory {
+    async fn get(&self, key: &str) -> Option<bytes::Bytes> {
+        self.0.lock().expect("lock").get(key).cloned()
+    }
+
+    async fn put(&self, key: &str, value: bytes::Bytes, _: Option<std::time::Duration>) {
+        self.0.lock().expect("lock").insert(key.to_string(), value);
+    }
+}
+
+/// Objects that count the reads made of packs.
+struct Counted {
+    inner: Arc<dyn Objects>,
+    pack_reads: std::sync::atomic::AtomicUsize,
+}
+
+impl Counted {
+    fn taken(&self) -> usize {
+        self.pack_reads
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[async_trait::async_trait]
+impl Objects for Counted {
+    fn label(&self) -> String {
+        self.inner.label()
+    }
+    async fn list(&self, prefix: &str) -> Result<Vec<tuile_repository::Entry>, RepoError> {
+        self.inner.list(prefix).await
+    }
+    async fn browse(&self, prefix: &str) -> Result<tuile_repository::Listing, RepoError> {
+        self.inner.browse(prefix).await
+    }
+    async fn size(&self, key: &str) -> Result<u64, RepoError> {
+        self.inner.size(key).await
+    }
+    async fn read(&self, key: &str, range: std::ops::Range<u64>) -> Result<Vec<u8>, RepoError> {
+        if key.ends_with(".tuilepack") {
+            self.pack_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.inner.read(key, range).await
+    }
+}
+
+#[tokio::test]
+async fn a_pack_already_listed_is_not_read_to_be_listed_again() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    scene_bucket(dir.path());
+    let objects = Arc::new(Counted {
+        inner: direct(dir.path()),
+        pack_reads: Default::default(),
+    });
+    let keeper = Arc::new(Memory::default());
+    let film = "packs/aaaa000000000001";
+    // Each listing is a repository of its own, as each request to a host is:
+    // what is remembered is in the keeper, not in the repository.
+    let listed = async || {
+        ScenePacks::new(objects.clone(), ["packs"])
+            .remembering(keeper.clone())
+            .film(film)
+            .await
+            .expect("film")
+    };
+    let first = listed().await;
+    assert!(objects.taken() > 0, "the pack was never read");
+    let again = listed().await;
+    assert_eq!(objects.taken(), 0, "a pack already listed was read again");
+    assert_eq!(again, first);
+    assert_eq!(first.chunks[0].frames, 8);
+    assert_eq!(first.chunks[0].viewport, Some([640, 480]));
+
+    // A pack written again under its key is another pack: it is read, and
+    // listed as what it now holds.
+    let key = dir.path().join(film).join("1-8.tuilepack");
+    let before = std::fs::metadata(&key).expect("pack").len();
+    std::fs::remove_file(&key).expect("remove");
+    pack_of(&key, 1, 8, [1920.0, 1080.0]);
+    assert_ne!(std::fs::metadata(&key).expect("pack").len(), before);
+    let replaced = listed().await;
+    assert!(objects.taken() > 0, "a replaced pack was not read");
+    assert_eq!(replaced.chunks[0].viewport, Some([1920, 1080]));
 }
 
 fn direct(root: &Path) -> Arc<dyn Objects> {

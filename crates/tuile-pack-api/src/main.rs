@@ -140,6 +140,24 @@ fn bucket_base() -> Result<BucketConfig, StoreError> {
     })
 }
 
+/// What packs were found to hold, for as long as this server runs: a few
+/// bytes a pack, of the packs someone listed.
+#[derive(Default)]
+struct Notes(std::sync::Mutex<std::collections::HashMap<String, bytes::Bytes>>);
+
+#[async_trait::async_trait]
+impl tuile_core::storage::ContentStore for Notes {
+    async fn get(&self, key: &str) -> Option<bytes::Bytes> {
+        self.0.lock().ok()?.get(key).cloned()
+    }
+
+    async fn put(&self, key: &str, value: bytes::Bytes, _: Option<std::time::Duration>) {
+        if let Ok(mut notes) = self.0.lock() {
+            notes.insert(key.to_string(), value);
+        }
+    }
+}
+
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|a| a == name)
@@ -174,9 +192,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(open(&project.place)?),
             DiskChunks::new(cache.join(&project.name)),
         ));
+        let notes = Arc::new(Notes::default());
         let films: Arc<dyn FilmRepository> = match project.layout {
-            Layout::Scenes(roots) => Arc::new(ScenePacks::new(objects.clone(), roots)),
-            Layout::Runs(layout) => Arc::new(RunFilms::new(objects.clone(), layout)?),
+            Layout::Scenes(roots) => {
+                Arc::new(ScenePacks::new(objects.clone(), roots).remembering(notes))
+            }
+            Layout::Runs(layout) => {
+                Arc::new(RunFilms::new(objects.clone(), layout)?.remembering(notes))
+            }
         };
         tracing::info!(
             "project {}: {} read as {}",

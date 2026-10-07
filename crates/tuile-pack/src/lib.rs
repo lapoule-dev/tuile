@@ -1426,12 +1426,12 @@ mod tests {
         }
     }
 
-    /// The frame range of a pack held in memory, read by ranges, and how
-    /// many bytes that took.
-    fn range_by_ranges(bytes: &[u8]) -> (Result<(u32, u32), PackError>, usize) {
+    /// The outline of a pack held in memory, read by ranges, and how many
+    /// bytes that took.
+    fn outline_by_ranges(bytes: &[u8]) -> (Result<Outline, PackError>, usize) {
         let start = blob_start(&bytes[..PREAMBLE]).expect("preamble");
         let read = std::cell::Cell::new(0);
-        let range = now(frame_range_by(start, |range| {
+        let range = now(outline_by(start, |range| {
             let part = bytes[range.start as usize..range.end as usize].to_vec();
             read.set(read.get() + part.len());
             async move { Ok::<_, std::convert::Infallible>(part) }
@@ -1441,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn the_frame_range_is_read_without_the_table() {
+    fn the_outline_is_read_without_the_table() {
         // A table far larger than what is read of it: hundreds of frames,
         // each with its own tiles.
         let mut w = Bake::new("s", [0.0; 3]);
@@ -1457,8 +1457,16 @@ mod tests {
         assert_eq!(whole.frame_range(), (7, 406));
         assert!(start > 200_000, "a table of {start} bytes proves nothing");
 
-        let (range, read) = range_by_ranges(&bytes);
-        assert_eq!(range.expect("range"), whole.frame_range());
+        let (outline, read) = outline_by_ranges(&bytes);
+        let outline = outline.expect("outline");
+        assert_eq!((outline.first, outline.last), whole.frame_range());
+        assert_eq!(outline.frames, 400);
+        let baked = whole.view_of(7).expect("view").viewport_px;
+        assert_eq!(
+            outline.viewport,
+            Some([baked[0] as u32, baked[1] as u32]),
+            "the viewport the first frame was baked for"
+        );
         assert!(
             read <= 2 * ROOT_WINDOW as usize,
             "{read} bytes read of {start}"
@@ -1466,19 +1474,28 @@ mod tests {
     }
 
     #[test]
-    fn the_frame_range_by_ranges_holds_for_every_version_and_refuses_the_others() {
+    fn a_pack_of_one_frame_in_several_says_how_many_it_holds() {
+        let mut w = Bake::new("s", [0.0; 3]);
+        for frame in [10u32, 20, 30] {
+            w.frame(frame, a_view(f64::from(frame)), vec![a_tile(1, 0)]);
+        }
+        let outline = outline_by_ranges(&w.finish()).0.expect("outline");
+        assert_eq!((outline.first, outline.last, outline.frames), (10, 30, 3));
+    }
+
+    #[test]
+    fn the_outline_by_ranges_holds_for_every_version_and_refuses_the_others() {
         for version in READABLE {
             let bytes = written_at(version, b"texture");
             let start = blob_start(&bytes[..PREAMBLE]).expect("preamble") as usize;
             let whole = Pack::open_table(&bytes[..start]).expect("table");
-            assert_eq!(
-                range_by_ranges(&bytes).0.expect("range"),
-                whole.frame_range()
-            );
+            let outline = outline_by_ranges(&bytes).0.expect("outline");
+            assert_eq!((outline.first, outline.last), whole.frame_range());
+            assert_eq!(outline.frames as usize, whole.views().len());
         }
         let other = written_at(READABLE.end() + 1, b"texture");
         assert!(matches!(
-            range_by_ranges(&other).0,
+            outline_by_ranges(&other).0,
             Err(PackError::Version { found }) if found == READABLE.end() + 1
         ));
         // A table that is not one says so instead of answering.
@@ -1487,7 +1504,7 @@ mod tests {
         noise[PREAMBLE..PREAMBLE + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(start > PREAMBLE + 4);
         assert!(matches!(
-            range_by_ranges(&noise).0,
+            outline_by_ranges(&noise).0,
             Err(PackError::Malformed(_))
         ));
     }
@@ -2205,14 +2222,28 @@ const ROOT_WINDOW: u64 = 4096;
 /// one.
 const VTABLE_LIMIT: u64 = 1024;
 
-/// A pack's frame range, read without its table.
+/// What a listing says of a pack: which frames it holds, how many, and the
+/// picture they were baked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Outline {
+    pub first: u32,
+    pub last: u32,
+    /// How many frames the pack holds — not `last - first + 1` when a bake
+    /// kept one frame in several.
+    pub frames: u32,
+    /// The viewport its first frame was baked for, in pixels. `None` for a
+    /// pack of no frame.
+    pub viewport: Option<[u32; 2]>,
+}
+
+/// A pack's [`Outline`], read without its table.
 ///
 /// A table lists every tile and every frame of its pack and can run to more
 /// than a hundred megabytes — more than some readers have memory for, when
-/// all they want is which frames the pack holds. Those are two scalars of the
-/// table's root, and FlatBuffers says where a root and its fields are: this
-/// follows the root offset and the vtable and reads them, a few bytes, through
-/// `read`, which is handed ranges of the *file*.
+/// all they want is which frames the pack holds. Those are scalars of the
+/// table's root and of its first frame, and FlatBuffers says where a root,
+/// a vector and their fields are: this follows the offsets and reads them, a
+/// few bytes each, through `read`, which is handed ranges of the *file*.
 ///
 /// `start` is where the blob region starts ([`blob_start`]). The layout
 /// version is checked, as [`Pack::open_table`] checks it. The table is not
@@ -2220,10 +2251,7 @@ const VTABLE_LIMIT: u64 = 1024;
 /// refused by whoever opens its table in full.
 ///
 /// The outer error is the reader's; the inner one is the pack's.
-pub async fn frame_range_by<R, Fut, E>(
-    start: u64,
-    read: R,
-) -> Result<Result<(u32, u32), PackError>, E>
+pub async fn outline_by<R, Fut, E>(start: u64, read: R) -> Result<Result<Outline, PackError>, E>
 where
     R: Fn(std::ops::Range<u64>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>, E>>,
@@ -2250,35 +2278,53 @@ where
     let u32_of = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
     let bad = |what: &str| Ok(Err(PackError::Malformed(what.to_string())));
 
+    // The vtable of the table at `table`: where each of its fields is.
+    let slots_of = async |table: u64| -> Result<Result<Vec<u8>, &'static str>, E> {
+        let Some(to_vtable) = bytes(table, 4).await? else {
+            return Ok(Err("a table lies outside the table region"));
+        };
+        // A table points back to its vtable by a signed offset.
+        let to_vtable = i64::from(i32::from_le_bytes([
+            to_vtable[0],
+            to_vtable[1],
+            to_vtable[2],
+            to_vtable[3],
+        ]));
+        let Some(vtable) = (table as i64)
+            .checked_sub(to_vtable)
+            .and_then(|v| u64::try_from(v).ok())
+        else {
+            return Ok(Err("a vtable lies outside the table region"));
+        };
+        let Some(sizes) = bytes(vtable, 4).await? else {
+            return Ok(Err("a vtable lies outside the table region"));
+        };
+        let vtable_len = u64::from(u16_at(&sizes, 0));
+        if !(4..=VTABLE_LIMIT).contains(&vtable_len) {
+            return Ok(Err("a vtable is not one"));
+        }
+        Ok(bytes(vtable, vtable_len)
+            .await?
+            .ok_or("a vtable runs past the table region"))
+    };
+    // Where a field is from its table's start, or 0 when the writer left it
+    // out.
+    let offset_of = |slots: &[u8], slot: u16| {
+        let slot = usize::from(slot);
+        if slot + 2 > slots.len() {
+            0
+        } else {
+            u64::from(u16_at(slots, slot))
+        }
+    };
+
     let Some(root) = bytes(0, 4).await? else {
         return bad("no root offset");
     };
     let table = u64::from(u32_of(&root));
-    let Some(to_vtable) = bytes(table, 4).await? else {
-        return bad("the root lies outside the table");
-    };
-    // A table points back to its vtable by a signed offset.
-    let to_vtable = i64::from(i32::from_le_bytes([
-        to_vtable[0],
-        to_vtable[1],
-        to_vtable[2],
-        to_vtable[3],
-    ]));
-    let Some(vtable) = (table as i64)
-        .checked_sub(to_vtable)
-        .and_then(|v| u64::try_from(v).ok())
-    else {
-        return bad("the root's vtable lies outside the table");
-    };
-    let Some(sizes) = bytes(vtable, 4).await? else {
-        return bad("the root's vtable lies outside the table");
-    };
-    let vtable_len = u64::from(u16_at(&sizes, 0));
-    if !(4..=VTABLE_LIMIT).contains(&vtable_len) {
-        return bad("the root's vtable is not one");
-    }
-    let Some(slots) = bytes(vtable, vtable_len).await? else {
-        return bad("the root's vtable runs past the table");
+    let slots = match slots_of(table).await? {
+        Ok(slots) => slots,
+        Err(what) => return bad(what),
     };
 
     // A field the writer left out is its default, which for these is 0.
@@ -2289,11 +2335,7 @@ where
         fb::Pack::VT_LAST_FRAME,
     ];
     for (value, slot) in fields.iter_mut().zip(wanted) {
-        let slot = usize::from(slot);
-        if slot + 2 > slots.len() {
-            continue;
-        }
-        let offset = u64::from(u16_at(&slots, slot));
+        let offset = offset_of(&slots, slot);
         if offset == 0 {
             continue;
         }
@@ -2306,7 +2348,53 @@ where
     if !READABLE.contains(&version) {
         return Ok(Err(PackError::Version { found: version }));
     }
-    Ok(Ok((first, last)))
+
+    // The frames: a vector of tables, each reached by its own offset. Its
+    // length is how many there are, and the first one's view is the picture.
+    let (mut frames, mut viewport) = (0, None);
+    let offset = offset_of(&slots, fb::Pack::VT_FRAMES);
+    if offset != 0 {
+        let at = table + offset;
+        let Some(to_vector) = bytes(at, 4).await? else {
+            return bad("the frames lie outside the table");
+        };
+        let vector = at + u64::from(u32_of(&to_vector));
+        let Some(head) = bytes(vector, 4).await? else {
+            return bad("the frames lie outside the table");
+        };
+        frames = u32_of(&head);
+        if frames > 0 {
+            let Some(to_frame) = bytes(vector + 4, 4).await? else {
+                return bad("the frames run past the table");
+            };
+            let frame = vector + 4 + u64::from(u32_of(&to_frame));
+            let slots = match slots_of(frame).await? {
+                Ok(slots) => slots,
+                Err(what) => return bad(what),
+            };
+            let offset = offset_of(&slots, fb::Frame::VT_VIEW);
+            if offset != 0 {
+                // A view is a struct, held in its frame: twelve doubles, the
+                // viewport the tenth and eleventh.
+                let Some(view) = bytes(frame + offset, 96).await? else {
+                    return bad("a view lies outside the table");
+                };
+                let f64_at = |at: usize| {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&view[at..at + 8]);
+                    f64::from_le_bytes(b)
+                };
+                let side = |v: f64| (v.is_finite() && v >= 1.0).then_some(v.round() as u32);
+                viewport = side(f64_at(72)).zip(side(f64_at(80))).map(|(w, h)| [w, h]);
+            }
+        }
+    }
+    Ok(Ok(Outline {
+        first,
+        last,
+        frames,
+        viewport,
+    }))
 }
 
 /// The blob digest, folded as the bytes arrive — for a reader that streams a

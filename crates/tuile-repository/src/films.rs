@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use async_trait::async_trait;
-use tuile_pack::{blob_start, frame_range_by, PREAMBLE};
+use bytes::Bytes;
+use tuile_core::storage::ContentStore;
+use tuile_pack::{blob_start, outline_by, Outline, PREAMBLE};
 
 use crate::{Entry, Objects, RepoError};
 
@@ -16,8 +21,27 @@ pub struct Chunk {
     pub first: u32,
     pub last: u32,
     pub bytes: u64,
+    /// How many frames the pack holds: fewer than its range is long when a
+    /// bake kept one frame in several.
+    pub frames: u32,
+    /// The viewport the pack was baked for, in pixels.
+    pub viewport: Option<[u32; 2]>,
     /// The scene digest the bake named this chunk by, when it left one.
     pub scene: Option<String>,
+}
+
+impl Chunk {
+    pub(crate) fn of(entry: &Entry, outline: Outline, scene: Option<String>) -> Self {
+        Self {
+            key: entry.key.clone(),
+            first: outline.first,
+            last: outline.last,
+            bytes: entry.size,
+            frames: outline.frames,
+            viewport: outline.viewport,
+            scene,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -65,7 +89,9 @@ pub struct Film {
 /// - Every chunk is a pack that is there now, readable through the
 ///   [`Objects`] the repository was built on: `bytes` is its size, and its
 ///   table reports exactly `first..=last`. The range is always the pack's
-///   own: nothing but a pack says which frames it holds.
+///   own: nothing but a pack says which frames it holds. So are `frames`
+///   and `viewport`. What a pack said may be remembered, by key and size,
+///   for a day.
 /// - A pack that cannot be read is never a chunk and never an error: it is
 ///   in `unreadable`, with why. A bucket outlives the formats written to it,
 ///   and one old pack must not take a film's listing down. A film has at
@@ -81,28 +107,82 @@ pub trait FilmRepository: Send + Sync {
     async fn film(&self, id: &str) -> Result<Film, RepoError>;
 }
 
-/// A pack's frame range, or — when the pack is there but is not one this
-/// build reads — why not. Only a failure to reach the bucket is an error.
-pub(crate) async fn range_of_pack(
-    objects: &dyn Objects,
-    key: &str,
-) -> Result<Result<(u32, u32), String>, RepoError> {
-    match frames_of(objects, key).await {
-        Ok(range) => Ok(Ok(range)),
-        Err(RepoError::Malformed { what, .. }) => Ok(Err(what)),
-        Err(e) => Err(e),
+/// How long what was read of a pack is remembered. A pack is told from the
+/// one it replaced under its key by its size; two of the same size are not,
+/// and this is how long the first would then be listed for the second.
+const REMEMBERED: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// What packs were found to hold, remembered: a listing asks every pack of a
+/// film which frames it holds, and a pack does not change its mind.
+///
+/// The memory is a cache, any [`ContentStore`]: what it has lost is read from
+/// the pack again. Only what a pack *is* is remembered — a pack that cannot
+/// be read is asked every time, since the next build may read it.
+#[derive(Clone, Default)]
+pub(crate) struct Outlines(pub Option<Arc<dyn ContentStore>>);
+
+/// The name a pack's outline is remembered under: its key and its size, and
+/// the layout of what is kept.
+fn remembered_as(pack: &Entry) -> String {
+    format!("outline/1/{}@{}", pack.key, pack.size)
+}
+
+fn kept(outline: Outline) -> Bytes {
+    let [w, h] = outline.viewport.unwrap_or_default();
+    let numbers = [outline.first, outline.last, outline.frames, w, h];
+    Bytes::from(numbers.map(u32::to_le_bytes).concat())
+}
+
+fn recalled(kept: &[u8]) -> Option<Outline> {
+    if kept.len() != 20 {
+        return None;
+    }
+    let at = |i: usize| u32::from_le_bytes([kept[i], kept[i + 1], kept[i + 2], kept[i + 3]]);
+    Some(Outline {
+        first: at(0),
+        last: at(4),
+        frames: at(8),
+        viewport: (at(12) > 0 && at(16) > 0).then_some([at(12), at(16)]),
+    })
+}
+
+impl Outlines {
+    /// A pack's outline, or — when the pack is there but is not one this
+    /// build reads — why not. Only a failure to reach the bucket is an error.
+    pub(crate) async fn of(
+        &self,
+        objects: &dyn Objects,
+        pack: &Entry,
+    ) -> Result<Result<Outline, String>, RepoError> {
+        let name = remembered_as(pack);
+        if let Some(keeper) = &self.0 {
+            if let Some(outline) = keeper.get(&name).await.as_deref().and_then(recalled) {
+                return Ok(Ok(outline));
+            }
+        }
+        match read_outline(objects, pack).await {
+            Ok(outline) => {
+                if let Some(keeper) = &self.0 {
+                    keeper.put(&name, kept(outline), Some(REMEMBERED)).await;
+                }
+                Ok(Ok(outline))
+            }
+            Err(RepoError::Malformed { what, .. }) => Ok(Err(what)),
+            Err(e) => Err(e),
+        }
     }
 }
 
-/// The frame range a pack's own table reports.
-async fn frames_of(objects: &dyn Objects, key: &str) -> Result<(u32, u32), RepoError> {
+/// What a pack's own table reports.
+async fn read_outline(objects: &dyn Objects, pack: &Entry) -> Result<Outline, RepoError> {
+    let key = pack.key.as_str();
     let malformed = |e: tuile_pack::PackError| RepoError::Malformed {
         key: key.to_string(),
         what: e.to_string(),
     };
     // An object too short to hold what it claims is not a pack; asking the
     // store for bytes it does not have would be a store error instead.
-    let size = objects.size(key).await?;
+    let size = pack.size;
     if size < PREAMBLE as u64 {
         return Err(malformed(tuile_pack::PackError::NotAPack));
     }
@@ -114,8 +194,8 @@ async fn frames_of(objects: &dyn Objects, key: &str) -> Result<(u32, u32), RepoE
         }));
     }
     // Not the table: it can be larger than the memory there is to read it
-    // into, and the range is two numbers at a known place in it.
-    frame_range_by(start, |range| objects.read(key, range))
+    // into, and what is wanted is a few numbers at known places in it.
+    outline_by(start, |range| objects.read(key, range))
         .await?
         .map_err(malformed)
 }
