@@ -306,11 +306,15 @@ async fn main() -> Result<(), Error> {
             megabytes(fetched.bytes)
         );
     }
-    let live = sources.live.so_far();
+    let (asked, kept) = (sources.live.so_far(), sources.revalidations());
     println!(
-        "store catalog and manifests: {} reads ({:.2} MB), from the bucket each time",
-        live.reads,
-        megabytes(live.bytes)
+        "store catalog, manifests and tables: {} asked of the bucket — {} unchanged (no body sent), {} downloaded ({:.3} MB), {} not there; {} more answered from what was kept without asking",
+        asked.reads,
+        kept.unchanged,
+        kept.fetched,
+        megabytes(kept.fetched_bytes),
+        kept.absent,
+        kept.kept
     );
     if let Some(dir) = metering {
         let solved = meter.solve(anchor);
@@ -330,5 +334,6 @@ async fn main() -> Result<(), Error> {
         }
         println!("\n{report}");
     }
+    sources.close().await?;
     Ok(())
 }

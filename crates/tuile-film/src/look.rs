@@ -22,15 +22,20 @@ pub enum Imagery {
 /// unoccluded dome and sun is the whole model, with no shadow and no
 /// occlusion.
 ///
-/// Exposure, contrast and saturation are the picture's own, one setting for
-/// every film whatever its imagery, and are aimed at what photographs of
-/// country taken from the air measure. Over 66 such photographs of green
-/// country, their ground alone: mean lightness L* 47 (quartiles 38 to 53),
-/// lightness between the 5th and 95th centiles 58 apart (42 to 67), mean
-/// chroma C* 21 (14 to 27). With imagery brought to its coarse levels' tone
-/// (see `tuile-radiometry`), these defaults give L* 44, 42 apart and C* 17
-/// on the film they were set on: the flat end of what photographs show,
-/// because nothing here casts a shadow.
+/// Exposure, contrast and saturation are the picture's own, and are aimed
+/// at what photographs of country taken from the air measure. Over 66 such
+/// photographs of green country, their ground alone: mean lightness L* 47
+/// (quartiles 38 to 53), lightness between the 5th and 95th centiles 58
+/// apart (42 to 67), mean chroma C* 21 (14 to 27).
+///
+/// The exposure default puts both films it was set on at L* 45 to 46, with
+/// their imagery brought to its coarse levels' tone (`tuile-radiometry`).
+/// **The contrast default is none**, and not for want of trying: under one
+/// look, moorland came out 25 apart and a coast 56. A power that lifts the
+/// first to what photographs show (1.5) burnt a twentieth of the second
+/// white. Contrast is the ground's as much as the picture's, so one number
+/// for every film is the wrong tool; what a film should aim at is to be
+/// derived for that film. Highlights are rolled off whatever it is set to.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Look {
     /// The dome's radiance, linear RGB (colour × intensity).
@@ -59,7 +64,7 @@ impl Default for Look {
             to_sun: Vec3::Z,
             exposure_ev: 1.0,
             imagery: Imagery::Decoded,
-            contrast: 1.25,
+            contrast: 1.0,
             saturation: 1.0,
         }
     }

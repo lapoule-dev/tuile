@@ -6179,6 +6179,7 @@ dependencies = [
  "tuile-mp4",
  "tuile-radiometry",
  "tuile-repository",
+ "tuile-storage-foyer",
  "wgpu",
 ]
 
@@ -6343,6 +6344,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tuile-core",
  "tuile-farm",
  "tuile-pack",
  "tuile-radiometry",

@@ -18,8 +18,11 @@ use tuile_core::raster::TilingScheme;
 use tuile_film::Pack;
 use tuile_repository::tone::{film_tone, FilmTone};
 use tuile_repository::{
-    ArchivedTiles, Cached, DiskChunks, Entry, Listing, Objects, RepoError, TileRepository, CHUNK,
+    ArchivedTiles, Cached, DiskChunks, Entry, Listing, Objects, Read, RepoError, Revalidated,
+    Revalidations, TileRepository, CHUNK,
 };
+
+use tuile_storage_foyer::{FoyerStore, StoreConfig};
 
 use crate::Error;
 
@@ -82,6 +85,15 @@ impl Objects for Counting {
         let bytes = self.inner.read_all(key).await?;
         self.count(bytes.len());
         Ok(bytes)
+    }
+    async fn read_if_changed(&self, key: &str, known: Option<&str>) -> Result<Read, RepoError> {
+        let read = self.inner.read_if_changed(key, known).await?;
+        // A question is a read; only an object that came counts its bytes.
+        self.count(match &read {
+            Read::Changed { bytes, .. } => bytes.len(),
+            Read::Unchanged => 0,
+        });
+        Ok(read)
     }
 }
 
@@ -288,14 +300,25 @@ pub struct Sources {
     pub packs: Cache,
     pub archives: Cache,
     pub store: Store,
-    /// The store's catalog and manifests: read from the bucket, never kept.
+    /// The store's catalog, manifests and tables as the bucket was asked
+    /// for them: every question, and the bytes of what came.
     pub live: Arc<Counting>,
+    /// The same, as the render was answered: kept between two renders with
+    /// the bucket's validators, and asked for again only conditionally.
+    revalidated: Arc<Revalidated>,
+    keeper: FoyerStore,
 }
+
+/// What is kept of the store's small objects between two renders: they are
+/// kilobytes each, a few hundred of them a film.
+const KEPT_IN_MEMORY: usize = 32 << 20;
+const KEPT_ON_DISK: usize = 256 << 20;
 
 impl Sources {
     /// `runs` holds the packs, `tiles` the tile store; chunks of both are
-    /// kept under `cache`. The store's catalog and manifests change, and are
-    /// read from `tiles` each time.
+    /// kept under `cache`, and so are the store's catalog, manifests and
+    /// tables — those with their validators, since they change: each is
+    /// asked for again, and comes again only if it was written again.
     pub async fn open(
         runs: Arc<dyn Objects>,
         tiles: Arc<dyn Objects>,
@@ -304,12 +327,20 @@ impl Sources {
         let packs = Cache::over(runs, cache.join("packs"));
         let archives = Cache::over(tiles.clone(), cache.join("tiles"));
         let live = Counting::new(tiles);
-        let tiles: Arc<dyn Objects> = live.clone();
+        let keeper = FoyerStore::with_config(StoreConfig {
+            dir: cache.join("live"),
+            memory_bytes: KEPT_IN_MEMORY,
+            disk_bytes: KEPT_ON_DISK,
+            // The validator says when an entry is stale, not a clock.
+            default_ttl: None,
+        })
+        .await?;
+        let revalidated = Arc::new(Revalidated::new(live.clone(), Arc::new(keeper.clone())));
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         let store = ArchivedTiles::open(
-            tiles.clone(),
+            revalidated.clone(),
             archives.objects.clone(),
             Arc::new(move || now),
         )
@@ -319,9 +350,23 @@ impl Sources {
             archives,
             store: Store {
                 tiles: store,
-                live: tiles,
+                live: revalidated.clone(),
             },
             live,
+            revalidated,
+            keeper,
         })
+    }
+
+    /// What became of the store's small objects: asked about and unchanged,
+    /// or come whole.
+    pub fn revalidations(&self) -> Revalidations {
+        self.revalidated.so_far()
+    }
+
+    /// Flushes what was kept to disk. Without it the next render finds
+    /// nothing: call it on the way out.
+    pub async fn close(&self) -> Result<(), Error> {
+        Ok(self.keeper.close().await?)
     }
 }
