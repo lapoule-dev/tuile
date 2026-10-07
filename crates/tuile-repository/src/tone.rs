@@ -3,13 +3,18 @@
 
 //! A film's table of grades, from what a tile store keeps.
 //!
-//! A store keeps grades two ways, beside the imagery layer they are of: one
-//! table a place (`tuile_radiometry::region_key`), fitted on that place's
-//! own tiles, and one table for the layer as a whole (`<layer>/tone.json`),
-//! for the places nobody has fitted yet. A film's table is made of the
-//! tables of the places its imagery lies in, each counting for how much of
-//! the film is in it — the place's own where the store has one, the
-//! layer's where it has not.
+//! Grades are an imagery layer's own: what brings one provider's levels to
+//! one another says nothing of another provider's, and a layer is graded
+//! only if its store says so. The switch is the layer's own table,
+//! `<layer>/tone.json`: a layer without one is drawn as stored, whatever
+//! else lies beside it.
+//!
+//! A graded layer keeps grades two ways: one table a place
+//! (`tuile_radiometry::region_key`), fitted on that place's own tiles, and
+//! the layer's table, for the places nobody has fitted yet. A film's table
+//! is made of the tables of the places its imagery lies in, each counting
+//! for how much of the film is in it — the place's own where the store has
+//! one, the layer's where it has not.
 //!
 //! Read through [`Objects`], so the same lines serve a native render next
 //! to the bucket and a page behind an API.
@@ -24,7 +29,8 @@ use crate::{Objects, RepoError};
 /// each is a request.
 const AT_ONCE: usize = 16;
 
-/// Where a layer's own table is kept: the grades of a place without one.
+/// Where a layer's own table is kept: the grades of a place without one,
+/// and by being there, what says the layer is graded at all.
 pub fn layer_tone_key(layer: &str) -> String {
     format!("{layer}/tone.json")
 }
@@ -38,7 +44,8 @@ pub struct FilmTone {
     pub places: usize,
     /// Of those, the places the store keeps a table of their own for.
     pub fitted: usize,
-    /// Whether the others were given the layer's table.
+    /// Whether the layer is graded at all: whether its store keeps a table
+    /// for it. Where it does not, nothing was asked of the places.
     pub layer_table: bool,
 }
 
@@ -65,6 +72,16 @@ pub async fn film_tone(
     layer: &str,
     places: &BTreeMap<(u32, u32), u32>,
 ) -> Result<FilmTone, RepoError> {
+    // The layer's own table first: without it the layer is not graded,
+    // and no place is asked anything.
+    let Some(of_layer) = table(live, layer_tone_key(layer)).await? else {
+        return Ok(FilmTone {
+            table: None,
+            places: places.len(),
+            fitted: 0,
+            layer_table: false,
+        });
+    };
     let asked: Vec<(&(u32, u32), &u32)> = places.iter().collect();
     let mut own: Vec<(Option<LevelGrades>, f32)> = Vec::with_capacity(asked.len());
     for some in asked.chunks(AT_ONCE) {
@@ -78,21 +95,15 @@ pub async fn film_tone(
         }
     }
     let fitted = own.iter().filter(|(t, _)| t.is_some()).count();
-    // The layer's table, only if some place needs it.
-    let of_layer = if fitted < own.len() {
-        table(live, layer_tone_key(layer)).await?
-    } else {
-        None
-    };
     let parts: Vec<(&LevelGrades, f32)> = own
         .iter()
-        .filter_map(|(t, weight)| t.as_ref().or(of_layer.as_ref()).map(|t| (t, *weight)))
+        .map(|(t, weight)| (t.as_ref().unwrap_or(&of_layer), *weight))
         .collect();
     Ok(FilmTone {
         table: LevelGrades::merged(&parts),
         places: own.len(),
         fitted,
-        layer_table: of_layer.is_some(),
+        layer_table: true,
     })
 }
 
@@ -166,27 +177,26 @@ mod tests {
         let gain = tone.table.expect("a table").of(13).gain[0].log2();
         assert!((gain - 1.5).abs() < 1e-3, "{gain}");
 
-        // Without the layer's table, the fitted place alone speaks.
+        // Without the layer's table the layer is not graded at all, though
+        // a place of it has a table: another imagery's film is left alone.
         files.0.remove(&layer_tone_key("imagery"));
         let tone = block(film_tone(&files, "imagery", &places)).expect("a tone");
-        assert_eq!((tone.fitted, tone.layer_table), (1, false));
-        assert!((tone.table.expect("a table").of(13).gain[0].log2() - 1.0).abs() < 1e-3);
-
-        // Nothing kept at all: no table, and no error.
-        files.0.clear();
-        let tone = block(film_tone(&files, "imagery", &places)).expect("a tone");
+        assert_eq!((tone.fitted, tone.layer_table), (0, false));
+        assert_eq!(tone.table, None);
+        // And a layer the store has never heard of, likewise.
+        let tone = block(film_tone(&files, "another", &places)).expect("a tone");
         assert_eq!(tone.table, None);
     }
 
     #[test]
     fn a_store_that_cannot_be_asked_is_an_error_not_an_absence() {
         let places = BTreeMap::from([((7, 7), 1)]);
-        let files = Files(BTreeMap::from([(region_key("broken", 7, 7), of(1.0))]));
+        let files = Files(BTreeMap::from([(layer_tone_key("broken"), of(1.0))]));
         assert!(block(film_tone(&files, "broken", &places)).is_err());
-        let files = Files(BTreeMap::from([(
-            region_key("imagery", 7, 7),
-            "not a table".into(),
-        )]));
+        let files = Files(BTreeMap::from([
+            (layer_tone_key("imagery"), of(1.0)),
+            (region_key("imagery", 7, 7), "not a table".into()),
+        ]));
         assert!(block(film_tone(&files, "imagery", &places)).is_err());
     }
 }
