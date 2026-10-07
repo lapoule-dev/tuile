@@ -1373,6 +1373,35 @@ async fn film_tone(
     ))
 }
 
+/// The film's own grade, as it is kept beside its packs
+/// (`<pack>.tone.json`): `None` for a film that has none. A film's packs
+/// carry one grade, fitted on the whole of it, so the first pack's is the
+/// film's.
+async fn film_grade(scene: &Scene, api: &str, project: &str) -> Result<Option<String>, String> {
+    let Some(first) = scene.chunks.first() else {
+        return Ok(None);
+    };
+    let key = tuile_repository::tone::pack_tone_key(&first.key);
+    let response = fetch(&format!(
+        "{api}/p/{}/o/{}",
+        encoded(project),
+        encoded_key(&key)
+    ))
+    .await?;
+    if response.status() == 404 {
+        return Ok(None);
+    }
+    let body = JsFuture::from(response.text().map_err(text)?)
+        .await
+        .map_err(text)?
+        .as_string()
+        .unwrap_or_default();
+    if !response.ok() {
+        return Err(format!("{key} : HTTP {}", response.status()));
+    }
+    Ok(Some(body))
+}
+
 fn crossing(
     scene: &Scene,
     api: &str,
@@ -1564,7 +1593,26 @@ async fn render() {
     }
     // One table of grades for the film, made here once and handed to every
     // worker: a film is one grade a level from its first frame to its last.
-    let tone_table = if tone > 0.0 {
+    // The film's own grade first, kept beside its packs; a film that has
+    // none takes the store's tables by place.
+    let own = if tone > 0.0 {
+        match film_grade(&scene, &api, &project).await {
+            Ok(own) => own,
+            Err(why) => {
+                status(&format!("Calage des couleurs impossible : {why}"), "bad");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let tone_table = if let Some(own) = own {
+        status(
+            "Calage des couleurs : calage propre au film, lu à côté de ses packs.",
+            "",
+        );
+        own
+    } else if tone > 0.0 {
         status("Calage des couleurs : lecture des tables du store…", "");
         match film_tone(&scene, &api, &project).await {
             Ok((table, places, had)) => {
