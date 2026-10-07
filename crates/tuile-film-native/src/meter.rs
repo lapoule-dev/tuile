@@ -532,6 +532,27 @@ impl LightMeter {
         )
     }
 
+    /// The tiles of a level a mosaic is drawn of, and the columns and rows
+    /// it spans: first and last of each. `None` for a level nothing was
+    /// read of.
+    pub fn extent(&self, level: u8) -> Option<(Vec<Coord>, (u32, u32, u32, u32))> {
+        let tiles: Vec<Coord> = self
+            .tiles
+            .keys()
+            .filter(|c| c.0 == level)
+            .copied()
+            .collect();
+        Some((
+            tiles.clone(),
+            (
+                tiles.iter().map(|c| c.1).min()?,
+                tiles.iter().map(|c| c.2).min()?,
+                tiles.iter().map(|c| c.1).max()?,
+                tiles.iter().map(|c| c.2).max()?,
+            ),
+        ))
+    }
+
     /// [`Self::mosaic`] with any grade: `grade` is asked for a tile and a
     /// place in it, across and down, 0 to 1 — one grade a tile, or a field
     /// that varies across one. The whole grade is applied: black point,

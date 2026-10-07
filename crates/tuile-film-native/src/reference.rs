@@ -31,6 +31,17 @@ struct Decoded {
     rgb: Vec<u8>,
 }
 
+/// Linear light as it is stored: the byte of its sRGB encoding.
+fn stored(v: f32) -> u8 {
+    let v = v.clamp(0.0, 1.0);
+    let s = if v <= 0.003_130_8 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    };
+    (s * 255.0).round() as u8
+}
+
 /// What became of setting a film's tiles against the reference.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SetAgainst {
@@ -173,6 +184,109 @@ impl Reference {
         (counted > 0).then(|| sum.map(|v| (v / f64::from(counted)) as f32))
     }
 
+    /// Reads the tiles of the reference under a film's tile that are not
+    /// held yet. Returns how many came, and how many the store has not.
+    async fn hold(
+        &mut self,
+        store: &ArchivedTiles,
+        under: &[Coord],
+    ) -> Result<(usize, usize), Error> {
+        let missing: Vec<Coord> = under
+            .iter()
+            .filter(|c| !self.held.contains_key(c))
+            .copied()
+            .collect();
+        let read = futures_util::future::join_all(
+            missing
+                .iter()
+                .map(|c| store.tile(&self.layer, c.0, c.1, c.2)),
+        )
+        .await;
+        let (mut came, mut absent) = (0, 0);
+        for (c, tile) in missing.iter().zip(read) {
+            let decoded = tile?
+                .and_then(|tile| image::load_from_memory(&tile.bytes).ok())
+                .map(|picture| {
+                    let rgb = picture.to_rgb8();
+                    Decoded {
+                        wide: rgb.width() as usize,
+                        high: rgb.height() as usize,
+                        rgb: rgb.into_raw(),
+                    }
+                });
+            came += usize::from(decoded.is_some());
+            absent += usize::from(decoded.is_none());
+            self.held.insert(*c, decoded);
+            self.order.push_back(*c);
+        }
+        Ok((came, absent))
+    }
+
+    /// Lets go of the tiles held longest, past what is held at once —
+    /// never one of `under`.
+    fn let_go(&mut self, under: &[Coord]) {
+        let mut kept = Vec::new();
+        while self.order.len() + kept.len() > HELD {
+            let Some(gone) = self.order.pop_front() else {
+                break;
+            };
+            if under.contains(&gone) {
+                kept.push(gone);
+            } else {
+                self.held.remove(&gone);
+            }
+        }
+        self.order.extend(kept);
+    }
+
+    /// The reference as a mosaic of a film's tiles: under each of `tiles`,
+    /// `side` texels a side, where the tile lies from `(x0, y0)` — as the
+    /// film's own mosaic is drawn, to be set beside it. Lifted by `stops`.
+    pub async fn mosaic(
+        &mut self,
+        store: &ArchivedTiles,
+        film: &TilingScheme,
+        tiles: &[Coord],
+        extent: (u32, u32, u32, u32),
+        side: u32,
+        stops: f32,
+    ) -> Result<image::RgbImage, Error> {
+        let (x0, y0, x1, y1) = extent;
+        let mut picture = image::RgbImage::from_pixel(
+            (x1 - x0 + 1) * side,
+            (y1 - y0 + 1) * side,
+            image::Rgb([24, 24, 24]),
+        );
+        let lift = stops.exp2();
+        let mut ordered: Vec<(Vec<Coord>, Coord)> = tiles
+            .iter()
+            .map(|at| (self.tiles_under(film, *at), *at))
+            .collect();
+        ordered.sort();
+        for (under, at) in ordered {
+            self.hold(store, &under).await?;
+            for j in 0..side {
+                for i in 0..side {
+                    let rect = (
+                        i as f32 / side as f32,
+                        j as f32 / side as f32,
+                        (i + 1) as f32 / side as f32,
+                        (j + 1) as f32 / side as f32,
+                    );
+                    if let Some(colour) = self.under(film, at, rect) {
+                        picture.put_pixel(
+                            (at.1 - x0) * side + i,
+                            (at.2 - y0) * side + j,
+                            image::Rgb(colour.map(|v| stored(v * lift))),
+                        );
+                    }
+                }
+            }
+            self.let_go(&under);
+        }
+        Ok(picture)
+    }
+
     /// Sets every tile of a film against the reference, read from the
     /// store as it goes: `film` is the grid the film's imagery is cut on.
     pub async fn set_under(
@@ -190,33 +304,9 @@ impl Reference {
             .collect();
         tiles.sort();
         for (under, at) in tiles {
-            let missing: Vec<Coord> = under
-                .iter()
-                .filter(|c| !self.held.contains_key(c))
-                .copied()
-                .collect();
-            let read = futures_util::future::join_all(
-                missing
-                    .iter()
-                    .map(|c| store.tile(&self.layer, c.0, c.1, c.2)),
-            )
-            .await;
-            for (c, tile) in missing.iter().zip(read) {
-                let decoded = tile?
-                    .and_then(|tile| image::load_from_memory(&tile.bytes).ok())
-                    .map(|picture| {
-                        let rgb = picture.to_rgb8();
-                        Decoded {
-                            wide: rgb.width() as usize,
-                            high: rgb.height() as usize,
-                            rgb: rgb.into_raw(),
-                        }
-                    });
-                done.read += usize::from(decoded.is_some());
-                done.absent += usize::from(decoded.is_none());
-                self.held.insert(*c, decoded);
-                self.order.push_back(*c);
-            }
+            let (came, absent) = self.hold(store, &under).await?;
+            done.read += came;
+            done.absent += absent;
             let Some(seen) = observed.tiles.get_mut(&at) else {
                 continue;
             };
@@ -227,15 +317,7 @@ impl Reference {
             done.tiles += 1;
             done.whole += usize::from(there == PAIRS * PAIRS);
             done.bare += usize::from(there == 0);
-            while self.order.len() > HELD {
-                if let Some(gone) = self.order.pop_front() {
-                    if !under.contains(&gone) {
-                        self.held.remove(&gone);
-                    } else {
-                        self.order.push_back(gone);
-                    }
-                }
-            }
+            self.let_go(&under);
         }
         Ok(done)
     }
@@ -272,15 +354,6 @@ pub fn picture(
         return Ok(None);
     }
     let lift = stops.exp2();
-    let stored = |v: f32| {
-        let v = (v * lift).clamp(0.0, 1.0);
-        let s = if v <= 0.003_130_8 {
-            v * 12.92
-        } else {
-            1.055 * v.powf(1.0 / 2.4) - 0.055
-        };
-        (s * 255.0).round() as u8
-    };
     // A place with nothing is drawn as what no ground is.
     let mut picture = image::RgbImage::from_pixel(wide * 2 + side, high, image::Rgb([24, 24, 24]));
     for (at, paired) in tiles {
@@ -288,7 +361,7 @@ pub fn picture(
             let (i, j) = ((k % PAIRS) as u32, (k / PAIRS) as u32);
             for (of, across) in [(&paired.tile, 0), (&paired.reference, wide + side)] {
                 let colour = if of[k][0].is_finite() {
-                    of[k].map(stored)
+                    of[k].map(|v| stored(v * lift))
                 } else {
                     [255, 0, 255]
                 };

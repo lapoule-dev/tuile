@@ -327,23 +327,28 @@ impl CornerField {
                         (Some(p), Some(q)) => Some(tone_of(p) - tone_of(q)),
                         _ => None,
                     },
-                    met: observed.junction(at[i], at[j], upright).unwrap_or(
-                        crate::tiles::Junction {
+                    // Against the reference where the tiles were set
+                    // against one — what a line is fitted on; else from
+                    // the two tiles alone.
+                    met: (measure == Measure::Linear)
+                        .then(|| observed.junction_against(at[i], at[j], upright))
+                        .flatten()
+                        .or_else(|| observed.junction(at[i], at[j], upright))
+                        .unwrap_or(crate::tiles::Junction {
                             step: 0.0,
                             coherence: 0.0,
                             tiles: 0.0,
-                        },
-                    ),
+                        }),
                 });
             }
         }
         report.edges = edges.len();
 
         // Where the field may jump: where two tiles do not meet *at their
-        // edge* — an edge that is in neither tile, by more than the ground
-        // slopes on either side, all along it ([`crate::Junction`]). Read
-        // off the two tiles alone: no reference, so no season; the ground's
-        // own slope taken away, so little of its relief.
+        // edge*, all along it ([`crate::Junction`]). Read against the
+        // reference under them when there is one — the step that is in the
+        // film and not in the ground; else off the two tiles alone, the
+        // ground's own slope on either side taken away.
         let evidence: Vec<f32> = edges.iter().map(|e| e.met.apart()).collect();
         // The two ends of an edge, as corners of the grid of its level.
         let ends = |e: &Edge| {
@@ -1021,5 +1026,52 @@ mod tests {
             edges.iter().filter(|e| e[8] == "1").count(),
             report.seam_edges
         );
+    }
+
+    #[test]
+    fn a_field_fitted_on_lines_jumps_where_the_film_steps_and_the_reference_does_not() {
+        // Eight tiles by four over one ground; the four on the right are a
+        // stop darker in the film and not in the reference. What is kept of
+        // the tiles' own cells shows nothing — only the places set against
+        // the reference do.
+        let mut observed = Observed::default();
+        for y in 0..4u32 {
+            for x in 0..8u32 {
+                let by = if x < 4 { 1.0f32 } else { 0.5 };
+                let places: [[f32; 3]; crate::PAIRS * crate::PAIRS] = std::array::from_fn(|k| {
+                    let (gx, gy) = (
+                        (x as usize * crate::PAIRS + k % crate::PAIRS) as f32,
+                        (y as usize * crate::PAIRS + k / crate::PAIRS) as f32,
+                    );
+                    let light = 0.08 + 0.03 * ((gx * 0.7).sin() + (gy * 0.5).cos());
+                    [light, light * 1.1, light * 0.8]
+                });
+                let mut seen = flat(-3.0, 1.0);
+                seen.paired = Some(Box::new(crate::Paired {
+                    tile: places.map(|c| c.map(|v| v * by)),
+                    reference: places,
+                }));
+                observed.tiles.insert((13, 100 + x, 200 + y), seen);
+            }
+        }
+        let bounds = FieldBounds {
+            reference_level: 0,
+            ..FieldBounds::default()
+        };
+        let (field, report) = CornerField::solve_by(&observed, Measure::Linear, &bounds);
+        assert_eq!(report.measured, 32);
+        assert_eq!(report.seam_edges, 4, "{report:?}");
+        assert_eq!(report.steps_made, 0);
+        // On either side of the seam the two are given a stop apart, right
+        // at the edge; away from it each side is flat.
+        let gain = |x: u32, u: f32| field.at((13, 100 + x, 201), u, 0.5).gain[1].log2();
+        assert!(
+            (gain(4, 0.01) - gain(3, 0.99) - 1.0).abs() < 0.1,
+            "{} {}",
+            gain(3, 0.99),
+            gain(4, 0.01)
+        );
+        assert!((gain(0, 0.5) - gain(3, 0.5)).abs() < 0.1);
+        assert!(report.seam_after.0 < 0.1, "{report:?}");
     }
 }
