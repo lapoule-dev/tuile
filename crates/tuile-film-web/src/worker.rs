@@ -437,6 +437,7 @@ impl StoreSide {
                         saturation: g.saturation,
                     }
                 },
+                field: None,
             })
             .collect();
         Ok((

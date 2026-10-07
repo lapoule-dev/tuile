@@ -37,7 +37,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::measure::{Limits, Local, Measure};
+use crate::measure::{Blended, Limits, Local, Measure};
 use crate::tiles::{find, light_of, luma, shown, weighted_median, Observed, TileAt, FLOOR};
 
 /// What the field may not go past, and how it is told things.
@@ -87,12 +87,12 @@ pub struct CornerReport {
     /// an edge that is not a seam, over every number of the measure.
     /// Nought, by construction.
     pub widest_break: f32,
-    /// Seam edges where the tiles themselves show under a tenth of a stop
-    /// and the field jumps by more than a twentieth: steps made where there
-    /// was none.
+    /// Seam edges where the two tiles step by under a tenth of a stop and
+    /// the field jumps by more than a twentieth: steps made where there was
+    /// none.
     pub steps_made: usize,
-    /// The step of the tiles themselves across the seam edges, with nothing
-    /// done and with the field.
+    /// The step at the seam edges — the tiles' facing cells, less what the
+    /// reference shows there — with nothing done and with the field.
     pub seam_before: (f32, f32),
     pub seam_after: (f32, f32),
     /// How far tiles are from the film's own tone against the reference.
@@ -156,7 +156,7 @@ impl CornerTrace {
             (
                 "edges.csv",
                 table(
-                    "edge,a,b,upright,direct,d_tone_light,d_offset_light,evidence,seam,seam_id,jump_light,break",
+                    "edge,a,b,upright,direct,d_tone_light,d_offset_light,evidence,seam,seam_id,jump_light,break,step,coherence,step_tiles",
                     &self.edges,
                 ),
             ),
@@ -165,21 +165,23 @@ impl CornerTrace {
 }
 
 impl CornerField {
+    /// A tile's four corners, each in the form it is blended in: what a
+    /// renderer is handed. `None` for a tile the field does nothing to.
+    pub fn corners(&self, tile: TileAt) -> Option<[Blended; CORNERS]> {
+        let given = self.given.get(&tile)?;
+        let pivot = self.pivot.get(&tile).copied().unwrap_or([-2.5; CORNERS]);
+        Some(std::array::from_fn(|corner| {
+            self.measure.blended(&given[corner], pivot[corner])
+        }))
+    }
+
     /// What is done to a tile at a place in it, `u` across and `v` down,
-    /// each 0 to 1: its corners blended, and what the measure makes of
-    /// that.
+    /// each 0 to 1: its corners blended, and what that does to a texel.
     pub fn at(&self, tile: TileAt, u: f32, v: f32) -> Local {
-        let Some(corners) = self.given.get(&tile) else {
-            return Local::IDENTITY;
-        };
-        let blend = |c: [f32; CORNERS]| {
-            (c[0] * (1.0 - u) + c[1] * u) * (1.0 - v) + (c[2] * (1.0 - u) + c[3] * u) * v
-        };
-        let given: Vec<f32> = (0..corners[0].len())
-            .map(|k| blend([corners[0][k], corners[1][k], corners[2][k], corners[3][k]]))
-            .collect();
-        let pivot = self.pivot.get(&tile).map_or(-2.5, |p| blend(*p));
-        self.measure.local(&given, pivot)
+        match self.corners(tile) {
+            Some(corners) => Blended::mix(&corners, u, v).local(),
+            None => Local::IDENTITY,
+        }
     }
 
     /// Finds the field for a film, the tiles measured by their moments:
@@ -293,6 +295,8 @@ impl CornerField {
             direct: f32,
             d_tone: f32,
             d_offset: Option<f32>,
+            /// How the two meet at their edge.
+            met: crate::tiles::Junction,
         }
         let mut edges: Vec<Edge> = Vec::new();
         for (i, (level, x, y)) in at.iter().enumerate() {
@@ -323,28 +327,24 @@ impl CornerField {
                         (Some(p), Some(q)) => Some(tone_of(p) - tone_of(q)),
                         _ => None,
                     },
+                    met: observed.junction(at[i], at[j], upright).unwrap_or(
+                        crate::tiles::Junction {
+                            step: 0.0,
+                            coherence: 0.0,
+                            tiles: 0.0,
+                        },
+                    ),
                 });
             }
         }
         report.edges = edges.len();
 
-        // Where the field may jump. The evidence of a seam at an edge is
-        // what both say, when they say it the same way: the tiles step, and
-        // the reference shows nothing there that would explain it.
-        //
-        // By tone alone. Contrast and saturation against the reference were
-        // tried as evidence too: measured on a real film they swing by
-        // stops from one tile to the next, drew a seam along a third of all
-        // edges, and made two hundred steps where the tiles showed none.
-        // So where two captures differ only in shape, the field goes from
-        // one to the other smoothly, over a few tiles, and makes no step.
-        let evidence: Vec<f32> = edges
-            .iter()
-            .map(|e| match e.d_offset {
-                Some(d) if d.signum() == e.d_tone.signum() => d.abs().min(e.d_tone.abs()),
-                _ => 0.0,
-            })
-            .collect();
+        // Where the field may jump: where two tiles do not meet *at their
+        // edge* — an edge that is in neither tile, by more than the ground
+        // slopes on either side, all along it ([`crate::Junction`]). Read
+        // off the two tiles alone: no reference, so no season; the ground's
+        // own slope taken away, so little of its relief.
+        let evidence: Vec<f32> = edges.iter().map(|e| e.met.apart()).collect();
         // The two ends of an edge, as corners of the grid of its level.
         let ends = |e: &Edge| {
             let (level, x, y) = at[e.a];
@@ -577,9 +577,9 @@ impl CornerField {
             let (jump, widest) = along(e);
             jumps.push((jump, widest));
             if seam[k] {
-                seam_before.push(e.d_tone.abs());
-                seam_after.push((e.d_tone + jump).abs());
-                report.steps_made += usize::from(e.d_tone.abs() < 0.1 && jump.abs() > 0.05);
+                seam_before.push(e.met.step.abs());
+                seam_after.push((e.met.step + jump).abs());
+                report.steps_made += usize::from(e.met.step.abs() < 0.1 && jump.abs() > 0.05);
             } else {
                 report.widest_break = report.widest_break.max(widest);
             }
@@ -643,7 +643,7 @@ impl CornerField {
             }
             for (k, e) in edges.iter().enumerate() {
                 trace.edges.push(format!(
-                    "{k},{},{},{},{:.4},{:.4},{},{:.4},{},{},{:.4},{:.4}",
+                    "{k},{},{},{},{:.4},{:.4},{},{:.4},{},{},{:.4},{:.4},{:.4},{:.3},{:.4}",
                     e.a,
                     e.b,
                     u8::from(e.upright),
@@ -659,6 +659,9 @@ impl CornerField {
                     },
                     jumps[k].0,
                     jumps[k].1,
+                    e.met.step,
+                    e.met.coherence,
+                    e.met.tiles,
                 ));
             }
         }

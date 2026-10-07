@@ -17,8 +17,10 @@ use tuile_film::from_store::{compose, imagery_texture, is_baked, terrain_mesh};
 use tuile_film::{
     refs_of, texture_of_span, Content, Cursor, FrameCamera, Look, Mesh, Pack, TileKey,
 };
-use tuile_film_gpu::{DrapeLayer, FilmGpu, LayerGrade, Settings, TileMesh};
-use tuile_radiometry::{FilmGrade, Grade};
+use tuile_film_gpu::{
+    DrapeLayer, FilmGpu, LayerCorner, LayerField, LayerGrade, Settings, TileMesh,
+};
+use tuile_radiometry::{Blended, FilmGrade, Local};
 use tuile_repository::TileRepository;
 
 use crate::observe::{FrameOut, ImageryIn, Observer, Origin, TileIn, Timings};
@@ -101,13 +103,19 @@ const AT_ONCE: usize = 48;
 /// Imagery tiles kept on the GPU before they are let go.
 const TEXTURES_HELD: usize = 2048;
 
-fn layer_grade(grade: &Grade) -> LayerGrade {
-    LayerGrade {
-        black: grade.black,
-        gain: grade.gain,
-        contrast: grade.contrast,
-        pivot: grade.pivot,
-        saturation: grade.saturation,
+/// A tile's corners as the composition is handed them, each taken at
+/// `strength`: every number of a corner is one that blends, so a part of
+/// it is that part of each.
+fn layer_field(corners: &[Blended; 4], strength: f32) -> LayerField {
+    LayerField {
+        corners: corners.map(|c| LayerCorner {
+            gain_stops: c.gain_stops.map(|v| v * strength),
+            black: c.black.map(|v| v * strength),
+            contrast_stops: c.contrast_stops * strength,
+            pivot_stops: c.pivot_stops,
+            saturation_stops: c.saturation_stops * strength,
+            curve: c.curve.map(|channel| channel.map(|v| v * strength)),
+        }),
     }
 }
 
@@ -234,10 +242,56 @@ pub async fn render(
         };
         let scheme = layers.map(|(_, imagery)| sources.store.scheme_of(imagery));
         // A tile's own gain: the same wherever the film draws it.
-        let grade = |at: (u8, u32, u32)| {
-            film_grade
-                .as_ref()
-                .map_or(Grade::IDENTITY, |g| g.tiles.of(at).at(strength))
+        let corners = |at: (u8, u32, u32)| film_grade.as_ref().and_then(|g| g.field.corners(at));
+        // Where a drape is composed without the GPU: the field, texel by
+        // texel.
+        let fielded = |at: (u8, u32, u32), rgba8: &mut [u8], width: u32, height: u32| {
+            let Some(corners) = corners(at) else {
+                return;
+            };
+            let field = layer_field(&corners, strength);
+            let linear: [f32; 256] = std::array::from_fn(|v| {
+                let v = v as f32 / 255.0;
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            });
+            let blended: [Blended; 4] = std::array::from_fn(|c| {
+                let k = &field.corners[c];
+                Blended {
+                    gain_stops: k.gain_stops,
+                    black: k.black,
+                    contrast_stops: k.contrast_stops,
+                    pivot_stops: k.pivot_stops,
+                    saturation_stops: k.saturation_stops,
+                    curve: k.curve,
+                }
+            });
+            for (n, texel) in rgba8.chunks_exact_mut(4).enumerate() {
+                let (x, y) = (n as u32 % width, n as u32 / width);
+                let local: Local = Blended::mix(
+                    &blended,
+                    (x as f32 + 0.5) / width as f32,
+                    (y as f32 + 0.5) / height as f32,
+                )
+                .local();
+                let graded = local.apply([
+                    linear[texel[0] as usize],
+                    linear[texel[1] as usize],
+                    linear[texel[2] as usize],
+                ]);
+                for c in 0..3 {
+                    let v = graded[c].clamp(0.0, 1.0);
+                    let stored = if v <= 0.003_130_8 {
+                        v * 12.92
+                    } else {
+                        1.055 * v.powf(1.0 / 2.4) - 0.055
+                    };
+                    texel[c] = (stored * 255.0).round() as u8;
+                }
+            }
         };
 
         // Frames a, a + every, …: each from a cursor of its own when frames
@@ -357,7 +411,7 @@ pub async fn render(
                                     y: at.2,
                                     bytes: found,
                                     renewed,
-                                    grade: grade(at),
+                                    grade: Default::default(),
                                 });
                                 timings.observe += ms(t);
                                 let t = Instant::now();
@@ -397,7 +451,8 @@ pub async fn render(
                                     .ok_or("an imagery tile left the store mid-frame")?;
                                 let mut texels =
                                     imagery_texture(&placed.tile, scheme, &found.bytes)?;
-                                grade(at).apply_rgba8(&mut texels.rgba8);
+                                let (w, h) = (texels.width, texels.height);
+                                fielded(at, &mut texels.rgba8, w, h);
                                 decoded.insert(at, std::sync::Arc::new(texels));
                             }
                             compose(&refs, factor, |t| decoded[&(t.level, t.x, t.y)].clone()).map(
@@ -417,11 +472,13 @@ pub async fn render(
                                     coverage: placed.coverage,
                                     translation: placed.translation,
                                     scale: placed.scale,
-                                    grade: layer_grade(&grade((
+                                    grade: LayerGrade::IDENTITY,
+                                    field: corners((
                                         placed.tile.level as u8,
                                         placed.tile.x,
                                         placed.tile.y,
-                                    ))),
+                                    ))
+                                    .map(|c| layer_field(&c, strength)),
                                 })
                                 .collect();
                             gpu.compose(&albedo, factor, layers);

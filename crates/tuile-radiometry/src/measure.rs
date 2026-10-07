@@ -299,37 +299,89 @@ impl Measure {
         }
     }
 
-    /// What a correction does to a texel. `pivot` is the light a contrast
-    /// turns about, as its stops under white: the tile's own tone once the
-    /// gain is on.
-    pub fn local(&self, given: &[f32], pivot: f32) -> Local {
-        let gain = Self::tone(given).map(f32::exp2);
+    /// A correction as it is blended: every number of it such that mixing
+    /// two of these is the same as mixing the two corrections. `pivot` is
+    /// the light a contrast turns about, as its stops under white: the
+    /// tile's own tone once the gain is on.
+    pub fn blended(&self, given: &[f32], pivot: f32) -> Blended {
+        let gain_stops = Self::tone(given);
         match self {
             // A measure says how far above the film's own a black point
-            // stands, so what is added to it is what is taken away — and
-            // it is found in the light the gain leaves, where a texel
-            // loses it before the gain.
-            Self::Moments => Local {
-                black: gain.map(|g| -given[5] / g.max(1e-6)),
-                gain,
-                curve: None,
-                contrast: given[3].exp2(),
-                pivot: pivot.exp2(),
-                saturation: given[4].exp2(),
+            // stands, so what is added to it is what is taken away.
+            Self::Moments => Blended {
+                gain_stops,
+                black: [-given[5]; 3],
+                contrast_stops: given[3],
+                pivot_stops: pivot,
+                saturation_stops: given[4],
+                curve: [[0.0; KNOTS.len()]; 3],
             },
             Self::Curves => {
                 let knots = KNOTS.len();
-                let curve: Curves =
-                    std::array::from_fn(|c| std::array::from_fn(|j| given[3 + c * knots + j]));
-                Local {
+                Blended {
+                    gain_stops,
                     black: [0.0; 3],
-                    gain,
-                    curve: (curve != [[0.0; KNOTS.len()]; 3]).then_some(curve),
-                    contrast: 1.0,
-                    pivot: pivot.exp2(),
-                    saturation: 1.0,
+                    contrast_stops: 0.0,
+                    pivot_stops: pivot,
+                    saturation_stops: 0.0,
+                    curve: std::array::from_fn(|c| {
+                        std::array::from_fn(|j| given[3 + c * knots + j])
+                    }),
                 }
             }
+        }
+    }
+
+    /// What a correction does to a texel: see [`Self::blended`].
+    pub fn local(&self, given: &[f32], pivot: f32) -> Local {
+        self.blended(given, pivot).local()
+    }
+}
+
+/// A correction in the form it is blended in, between the corners of a
+/// tile: stops stay stops until the blend is done. What a renderer is
+/// handed, a corner at a time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Blended {
+    /// The gain, in stops a channel.
+    pub gain_stops: [f32; 3],
+    /// A colour taken away, in the light the gain leaves.
+    pub black: [f32; 3],
+    pub contrast_stops: f32,
+    pub pivot_stops: f32,
+    pub saturation_stops: f32,
+    pub curve: Curves,
+}
+
+impl Blended {
+    /// Four corners at a place in a tile, `u` across and `v` down.
+    pub fn mix(corners: &[Blended; 4], u: f32, v: f32) -> Self {
+        let blend = |of: &dyn Fn(&Blended) -> f32| {
+            (of(&corners[0]) * (1.0 - u) + of(&corners[1]) * u) * (1.0 - v)
+                + (of(&corners[2]) * (1.0 - u) + of(&corners[3]) * u) * v
+        };
+        Self {
+            gain_stops: std::array::from_fn(|c| blend(&|b| b.gain_stops[c])),
+            black: std::array::from_fn(|c| blend(&|b| b.black[c])),
+            contrast_stops: blend(&|b| b.contrast_stops),
+            pivot_stops: blend(&|b| b.pivot_stops),
+            saturation_stops: blend(&|b| b.saturation_stops),
+            curve: std::array::from_fn(|c| std::array::from_fn(|j| blend(&|b| b.curve[c][j]))),
+        }
+    }
+
+    /// What it does to a texel.
+    pub fn local(&self) -> Local {
+        let gain = self.gain_stops.map(f32::exp2);
+        Local {
+            // Found in the light the gain leaves, where a texel loses it
+            // before the gain.
+            black: std::array::from_fn(|c| self.black[c] / gain[c].max(1e-6)),
+            gain,
+            curve: (self.curve != [[0.0; KNOTS.len()]; 3]).then_some(self.curve),
+            contrast: self.contrast_stops.exp2(),
+            pivot: self.pivot_stops.exp2(),
+            saturation: self.saturation_stops.exp2(),
         }
     }
 }

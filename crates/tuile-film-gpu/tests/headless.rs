@@ -411,6 +411,7 @@ fn a_drape_composed_on_the_gpu_is_the_bakes() {
             translation,
             scale,
             grade: Default::default(),
+            field: None,
         });
         cpu_layers.push(ImageryLayer {
             coord: ImageryCoord {
@@ -547,6 +548,7 @@ fn a_layer_is_composed_at_its_levels_grade() {
                     translation: [0.0, 0.0],
                     scale: [1.0, 1.0],
                     grade,
+                    field: None,
                 }],
             );
             let mut pending = film.device().create_command_encoder(&Default::default());
@@ -604,4 +606,146 @@ fn a_layer_is_composed_at_its_levels_grade() {
         );
         assert!(moved > (side * side) as usize, "grade {n} did nothing");
     }
+}
+
+/// A field is blended across the imagery tile from its four corners: a
+/// texel is given what its place in the tile says, and along an edge only
+/// the two corners on it count.
+#[test]
+fn a_layer_is_composed_through_a_field_carried_by_its_corners() {
+    use tuile_film_gpu::{DrapeLayer, LayerCorner, LayerField};
+
+    let Some((device, queue)) = device() else {
+        eprintln!("no adapter: skipped");
+        return;
+    };
+    let mut film = FilmGpu::new(
+        device,
+        queue,
+        Settings {
+            width: 64,
+            height: 48,
+            supersample: 1,
+            look: Look::default(),
+        },
+    );
+    let side = 32u32;
+    let row = (side * 4).next_multiple_of(256);
+    let linear = |v: f32| {
+        let v = v / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let stored = |v: f32| {
+        let v = v.clamp(0.0, 1.0);
+        let s = if v <= 0.003_130_8 {
+            v * 12.92
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        };
+        (s * 255.0).round()
+    };
+    // A flat grey tile. The field: nothing on the left, a stop of gain on
+    // the right; and on the bottom corners, a transfer curve that lifts
+    // the light this grey has by another stop.
+    let grey = 60u8;
+    let came = linear(f32::from(grey)).log2();
+    let mut lifted = [[0.0f32; 8]; 3];
+    for curve in &mut lifted {
+        // The same lift at every point: whatever the light, a stop.
+        *curve = [1.0; 8];
+    }
+    assert!(
+        (-8.0..=-1.0).contains(&came),
+        "the grey is within the curve"
+    );
+    let corner = |gain: f32, curve: [[f32; 8]; 3]| LayerCorner {
+        gain_stops: [gain; 3],
+        curve,
+        ..LayerCorner::IDENTITY
+    };
+    let field = LayerField {
+        corners: [
+            corner(0.0, [[0.0; 8]; 3]),
+            corner(1.0, [[0.0; 8]; 3]),
+            corner(0.0, lifted),
+            corner(1.0, lifted),
+        ],
+    };
+    let rgba8: Vec<u8> = (0..side * side)
+        .flat_map(|_| [grey, grey, grey, 255])
+        .collect();
+    let texture = film.create_imagery(side, side);
+    film.write_rgba(&texture, &rgba8);
+    let albedo = film.create_albedo(side, side);
+    film.compose(
+        &albedo,
+        [0.0, 0.0, 0.0, 1.0],
+        vec![DrapeLayer {
+            texture,
+            coverage: [0.0, 0.0, 1.0, 1.0],
+            translation: [0.0, 0.0],
+            scale: [1.0, 1.0],
+            grade: Default::default(),
+            field: Some(field),
+        }],
+    );
+    let mut pending = film.device().create_command_encoder(&Default::default());
+    film.record_pending(&mut pending);
+    film.queue().submit([pending.finish()]);
+    let got = read(&film, |encoder| {
+        let buffer = film.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: u64::from(row * side),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            albedo.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: side,
+                height: side,
+                depth_or_array_layers: 1,
+            },
+        );
+        (buffer, 0)
+    });
+    let at = |x: u32, y: u32| f32::from(got[(y * row + x * 4) as usize]);
+    // Where a texel lies in the tile, as the composition places it.
+    let place = |i: u32| {
+        let uv = (i as f32 + 0.5) / side as f32;
+        (uv * (side - 1) as f32).floor().max(0.0) / (side - 1) as f32
+            + ((uv * (side - 1) as f32).fract()) / (side - 1) as f32
+    };
+    let mut worst = 0.0f32;
+    for (x, y) in [(0, 0), (31, 0), (0, 31), (31, 31), (16, 16), (7, 25)] {
+        let (u, v) = (place(x), place(y));
+        // A stop of gain across, a stop of curve down.
+        let expected = stored(linear(f32::from(grey)) * (u + v).exp2());
+        worst = worst.max((at(x, y) - expected).abs());
+    }
+    assert!(worst <= 1.0, "{worst} bytes from the field blended by hand");
+    // Not a flat tile any more: the corners differ, and so do the texels.
+    // Two stops at the far corner, one at each of the near ones.
+    assert!(
+        at(31, 31) > at(0, 0) + 50.0,
+        "{} against {}",
+        at(31, 31),
+        at(0, 0)
+    );
+    assert!(at(31, 0) > at(0, 0) + 20.0 && at(0, 31) > at(0, 0) + 20.0);
+    // Along the left edge only the two left corners count: no gain there,
+    // whatever the right ones hold.
+    assert!((at(0, 0) - f32::from(grey)).abs() <= 2.0, "{}", at(0, 0));
 }

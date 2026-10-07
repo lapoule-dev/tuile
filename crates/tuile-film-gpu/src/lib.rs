@@ -162,6 +162,59 @@ pub struct DrapeLayer {
     /// The grade of its level; the identity leaves the stored bytes as
     /// they are, exactly.
     pub grade: LayerGrade,
+    /// A correction that varies across the imagery tile, in place of
+    /// `grade`: see [`LayerField`].
+    pub field: Option<LayerField>,
+}
+
+/// Points a transfer curve is given at: a stop apart, from eight stops
+/// under white to one.
+pub const CURVE_KNOTS: usize = 8;
+
+/// What is done to an imagery tile at one of its corners, as it is blended
+/// across the tile: every number here is mixed between the four corners
+/// before anything is made of it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerCorner {
+    /// The gain, in stops a channel.
+    pub gain_stops: [f32; 3],
+    /// A colour taken away, in the light the gain leaves.
+    pub black: [f32; 3],
+    /// A power on luminance about the pivot, as its stops (the power is
+    /// two to this), and the pivot as its stops under white.
+    pub contrast_stops: f32,
+    pub pivot_stops: f32,
+    /// A factor on what is not luminance, as its stops.
+    pub saturation_stops: f32,
+    /// A transfer curve a channel: stops added to a texel by the light it
+    /// came in with, at each of [`CURVE_KNOTS`] lights from −8 stops to
+    /// −1, the line between two of them, the end's value beyond.
+    pub curve: [[f32; CURVE_KNOTS]; 3],
+}
+
+impl LayerCorner {
+    /// Changes nothing.
+    pub const IDENTITY: Self = Self {
+        gain_stops: [0.0; 3],
+        black: [0.0; 3],
+        contrast_stops: 0.0,
+        pivot_stops: -2.5,
+        saturation_stops: 0.0,
+        curve: [[0.0; CURVE_KNOTS]; 3],
+    };
+}
+
+/// A correction carried by the four corners of an imagery tile — top-left,
+/// top-right, bottom-left, bottom-right — and blended across it. Two tiles
+/// that share an edge and are given the same two corners along it are
+/// composed the same along that edge, whatever lies between.
+///
+/// Applied in linear light and in this order: the gain, the colour taken
+/// away, the transfer curve read at the light the texel came in with, the
+/// power on luminance, the factor on what is not luminance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerField {
+    pub corners: [LayerCorner; 4],
 }
 
 /// What a layer's colour goes through at composition, in linear light and
@@ -222,6 +275,26 @@ struct ComposeJob {
     gain: [f32; 4],
     black: [f32; 4],
     more: [f32; 4],
+    /// A field's four corners, nine vectors each: gain and contrast, black
+    /// and saturation, pivot, then the curve of each channel in two.
+    corners: [[f32; 4]; 36],
+}
+
+impl LayerField {
+    fn packed(&self) -> [[f32; 4]; 36] {
+        let mut out = [[0.0f32; 4]; 36];
+        for (corner, at) in self.corners.iter().zip(out.chunks_exact_mut(9)) {
+            let (g, b) = (corner.gain_stops, corner.black);
+            at[0] = [g[0], g[1], g[2], corner.contrast_stops];
+            at[1] = [b[0], b[1], b[2], corner.saturation_stops];
+            at[2] = [corner.pivot_stops, 0.0, 0.0, 0.0];
+            for (channel, curve) in corner.curve.iter().enumerate() {
+                at[3 + 2 * channel] = [curve[0], curve[1], curve[2], curve[3]];
+                at[4 + 2 * channel] = [curve[4], curve[5], curve[6], curve[7]];
+            }
+        }
+        out
+    }
 }
 
 fn shader(device: &wgpu::Device, name: &str, body: &str) -> wgpu::ShaderModule {
@@ -868,6 +941,7 @@ impl FilmGpu {
                 gain: [1.0; 4],
                 black: [0.0, 0.0, 0.0, 1.0],
                 more: [0.18, 0.0, 0.0, 0.0],
+                corners: [[0.0; 4]; 36],
             };
             dispatch(blank, &self.white, [w, h]);
             for layer in &drape.layers {
@@ -893,7 +967,13 @@ impl FilmGpu {
                         mode: 1,
                         gain: [g.gain[0], g.gain[1], g.gain[2], g.contrast],
                         black: [g.black[0], g.black[1], g.black[2], g.saturation],
-                        more: [g.pivot, f32::from(u8::from(!g.is_identity())), 0.0, 0.0],
+                        more: [
+                            g.pivot,
+                            f32::from(u8::from(!g.is_identity() && layer.field.is_none())),
+                            f32::from(u8::from(layer.field.is_some())),
+                            0.0,
+                        ],
+                        corners: layer.field.map_or([[0.0; 4]; 36], |f| f.packed()),
                         ..blank
                     },
                     &src,

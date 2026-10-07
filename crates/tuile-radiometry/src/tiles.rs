@@ -810,6 +810,125 @@ impl Observed {
     }
 }
 
+/// Whether a cell is snow, or cloud, or anything as light and as
+/// colourless: not ground to be matched. Snow on one side of an edge and
+/// none on the other is the ground as it was that day — it is not a seam
+/// to be mended, and a tile is not to be darkened for having it.
+pub(crate) fn snow(c: [f32; 3]) -> bool {
+    let y = luma(c);
+    let (most, least) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+    y > 0.45 && most - least < 0.2 * y
+}
+
+/// How two neighbours of a level meet along the edge they share.
+///
+/// Measured **at the edge, in the gradient domain, from the two tiles
+/// alone**: a seam is an edge that is in neither picture. Across the edge
+/// the two tiles' facing cells step by some amount; just inside each tile,
+/// the ground steps from one cell to the next by some amount too — its own
+/// slope there, relief and all. What the edge steps by *beyond the mean of
+/// those two slopes* is what neither tile has: the seam.
+///
+/// Nothing else is asked. No reference: a reference is another picture of
+/// the ground, of another season, and whatever grows or melts between the
+/// two would be read as a seam. And not how far apart the two tiles are as
+/// wholes: snow on one and forest on the other are apart and meet
+/// perfectly well. Both were tried on a real film, and both drew seams
+/// where the tiles met.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Junction {
+    /// The step from the second tile to the first across the edge that is
+    /// in neither tile, in stops of light: the median over the cells along
+    /// the edge.
+    pub step: f32,
+    /// The share of those cells that step the way the median does. A seam
+    /// steps them all; ground steps some up and some down.
+    pub coherence: f32,
+    /// What the facing cells step by, before the ground's own slope is
+    /// taken away.
+    pub tiles: f32,
+}
+
+impl Junction {
+    /// Of the cells along an edge, as many as must step the same way for
+    /// the edge to be a seam: all but one.
+    pub const COHERENT: f32 = 0.87;
+
+    /// How far the two tiles are from meeting: the step, if it runs all
+    /// along the edge; nothing if it does not.
+    pub fn apart(&self) -> f32 {
+        if self.coherence >= Self::COHERENT {
+            self.step.abs()
+        } else {
+            0.0
+        }
+    }
+}
+
+impl Observed {
+    /// How tile `a` and its neighbour `b` — to its right if `upright`,
+    /// below it otherwise — meet along their edge: see [`Junction`].
+    /// Cells under snow are left out of it. `None` if either was not seen.
+    pub fn junction(&self, a: TileAt, b: TileAt, upright: bool) -> Option<Junction> {
+        let (mine, theirs) = (self.tiles.get(&a)?, self.tiles.get(&b)?);
+        // A cell of a tile, `depth` cells in from the shared edge, at
+        // `k` along it: an eighth of a tile each, so that the first is
+        // already past the texels a mosaic blends at a seam.
+        let cell = |tile: &TileSeen, from_end: bool, depth: usize, k: usize| {
+            let at = if from_end { GRID - 1 - depth } else { depth };
+            let c = if upright {
+                tile.cells[k * GRID + at]
+            } else {
+                tile.cells[at * GRID + k]
+            };
+            (luma(c) + FLOOR).log2()
+        };
+        let snowy = |tile: &TileSeen, from_end: bool, depth: usize, k: usize| {
+            let at = if from_end { GRID - 1 - depth } else { depth };
+            snow(if upright {
+                tile.cells[k * GRID + at]
+            } else {
+                tile.cells[at * GRID + k]
+            })
+        };
+        let (mut across, mut beyond) = (Vec::with_capacity(GRID), Vec::with_capacity(GRID));
+        for k in 0..GRID {
+            // a's last two cells towards the edge, b's first two away
+            // from it: four cells in a line across the edge.
+            if [(mine, true), (theirs, false)]
+                .iter()
+                .any(|(tile, end)| (0..2).any(|depth| snowy(tile, *end, depth, k)))
+            {
+                continue;
+            }
+            let (a1, a0) = (cell(mine, true, 1, k), cell(mine, true, 0, k));
+            let (b0, b1) = (cell(theirs, false, 0, k), cell(theirs, false, 1, k));
+            let step = a0 - b0;
+            // The ground's own slope, on either side, in the same sense.
+            let slope = 0.5 * ((a1 - a0) + (b0 - b1));
+            across.push(step);
+            beyond.push(step - slope);
+        }
+        // Under snow for more than half its length, an edge says nothing.
+        if beyond.len() * 2 < GRID {
+            return Some(Junction {
+                step: 0.0,
+                coherence: 0.0,
+                tiles: 0.0,
+            });
+        }
+        let cells = beyond.clone();
+        let step = median(&mut beyond);
+        let coherence = cells.iter().filter(|c| c.signum() == step.signum()).count() as f32
+            / cells.len() as f32;
+        Some(Junction {
+            step,
+            coherence,
+            tiles: median(&mut across),
+        })
+    }
+}
+
 impl TileGains {
     /// What is done to a tile: its correction, as the measure it was
     /// fitted by makes of it. Nothing for a tile that was not fitted.
@@ -1745,6 +1864,125 @@ mod tests {
                 assert_eq!(rest.len(), measure.len() - 3);
             }
         }
+    }
+
+    /// Two tiles side by side, each cell as `light` says for where it is
+    /// across the pair (0 to 15) and down (0 to 7), in stops; the second
+    /// tile's capture `seam` stops lighter.
+    fn pair(light: impl Fn(usize, usize) -> f32, seam: f32) -> Observed {
+        let mut observed = Observed::default();
+        for (n, gain) in [(0usize, 0.0f32), (1, seam)] {
+            let mut cells = [[0.0f32; 3]; GRID * GRID];
+            for (k, c) in cells.iter_mut().enumerate() {
+                // Ground has a colour: earth, here.
+                let v = (light(n * GRID + k % GRID, k / GRID) + gain).exp2();
+                *c = [v, 0.8 * v, 0.5 * v];
+            }
+            observed.tiles.insert(
+                (13, 10 + n as u32, 20),
+                TileSeen {
+                    cells,
+                    edges: [[[0.1; 3]; GRID]; 4],
+                    usage: 1.0,
+                    tones: None,
+                },
+            );
+        }
+        observed
+    }
+
+    fn met(observed: &Observed) -> Junction {
+        observed
+            .junction((13, 10, 20), (13, 11, 20), true)
+            .expect("two tiles")
+    }
+
+    #[test]
+    fn a_slope_of_the_ground_is_not_a_seam() {
+        // Ground that darkens steadily from one tile into the next, a
+        // tenth of a stop a cell: the two tiles are most of a stop apart as
+        // wholes, their facing cells a tenth of a stop apart — and they
+        // meet perfectly, because that is what the ground does there.
+        let observed = pair(|x, _| -2.0 - 0.1 * x as f32, 0.0);
+        let junction = met(&observed);
+        assert!((junction.tiles - 0.1).abs() < 0.01, "{junction:?}");
+        assert!(junction.step.abs() < 0.01, "{junction:?}");
+        assert!(junction.apart() < 0.01);
+    }
+
+    #[test]
+    fn a_step_that_is_in_neither_tile_is_a_seam_whatever_the_ground_does() {
+        // The same slope, and the second tile a capture a stop lighter:
+        // the edge steps by a stop more than the ground slopes.
+        let observed = pair(|x, _| -2.0 - 0.1 * x as f32, 1.0);
+        let junction = met(&observed);
+        assert!((junction.step + 1.0).abs() < 0.02, "{junction:?}");
+        assert_eq!(junction.coherence, 1.0);
+        assert!((junction.apart() - 1.0).abs() < 0.02);
+        // And on ground that is rough along the edge too: every cell still
+        // steps the same way.
+        let rough = pair(
+            |x, y| -3.0 - 0.1 * x as f32 + 0.3 * ((y * 5) % 3) as f32,
+            0.6,
+        );
+        assert!(
+            (met(&rough).apart() - 0.6).abs() < 0.02,
+            "{:?}",
+            met(&rough)
+        );
+    }
+
+    #[test]
+    fn ground_that_steps_here_up_and_there_down_is_not_a_seam() {
+        // Relief across the edge: lit slopes in some rows, shaded ones in
+        // others. Large steps, and no one way to them.
+        let observed = pair(
+            |x, y| {
+                if (x < GRID) == (y % 2 == 0) {
+                    -2.0
+                } else {
+                    -3.0
+                }
+            },
+            0.0,
+        );
+        let junction = met(&observed);
+        assert!(junction.coherence < Junction::COHERENT, "{junction:?}");
+        assert_eq!(junction.apart(), 0.0);
+    }
+
+    #[test]
+    fn snow_on_one_side_of_an_edge_is_not_a_seam() {
+        // One tile's last cells are under snow along the whole edge; the
+        // other's are bare ground. Two stops between them, all the same
+        // way — and it is the ground as it was, not a seam.
+        let mut observed = pair(|_, _| -3.0, 0.0);
+        let west = observed.tiles.get_mut(&(13, 10, 20)).expect("a tile");
+        for k in 0..GRID {
+            west.cells[k * GRID + GRID - 1] = [0.8, 0.8, 0.82];
+        }
+        let junction = met(&observed);
+        assert_eq!(junction.apart(), 0.0, "{junction:?}");
+        // The same two stops of bare, coloured ground would be one.
+        let mut observed = pair(|_, _| -3.0, 0.0);
+        let west = observed.tiles.get_mut(&(13, 10, 20)).expect("a tile");
+        for k in 0..GRID {
+            for depth in 0..2 {
+                west.cells[k * GRID + GRID - 1 - depth] = [0.5, 0.4, 0.25];
+            }
+        }
+        assert!(met(&observed).apart() > 1.5, "{:?}", met(&observed));
+        // And snow along a part of the edge leaves the rest to speak.
+        let mut observed = pair(|_, _| -3.0, 0.7);
+        let west = observed.tiles.get_mut(&(13, 10, 20)).expect("a tile");
+        for k in 0..3 {
+            west.cells[k * GRID + GRID - 1] = [0.8, 0.8, 0.82];
+        }
+        assert!(
+            (met(&observed).apart() - 0.7).abs() < 0.02,
+            "{:?}",
+            met(&observed)
+        );
     }
 
     #[test]
