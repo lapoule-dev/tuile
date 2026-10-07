@@ -38,12 +38,14 @@
 //! reference: what a GPU computes is checked against it.
 
 mod field;
+mod film;
 mod grade;
 mod levels;
 mod stats;
 mod transfer;
 
 pub use field::{apply, GainField, LATTICE, STOPS_PER_UNIT};
+pub use film::{Bounds, FilmGrade, LookTarget, Measure, Sample};
 pub use grade::{region_key, Grade, GradeReport, LevelGrades, Seen, REGION_LEVEL};
 pub use levels::{apply_multipliers, tone_of, LevelGains, LevelParams, Observation, PairReport};
 pub use stats::{linear_of, BlockStats, BLOCKS};
