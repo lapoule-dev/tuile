@@ -118,6 +118,11 @@ struct Entry {
     /// Bytes of the old pack actually read: its table.
     #[serde(skip_serializing_if = "Option::is_none")]
     table_bytes: Option<u64>,
+    /// What the new pack says it was baked from: the tile store's terrain
+    /// and imagery layers. What a pack was re-baked from is not to be
+    /// guessed afterwards.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sources: Option<[String; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sse: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -446,6 +451,14 @@ fn old_pack(head: &Path) -> Result<(tuile_pack::Content, u32, u32), String> {
     Ok((pack.content(), first, last))
 }
 
+/// The terrain and imagery layers a pack of references names.
+fn sources_of(path: &Path) -> Option<[String; 2]> {
+    let bytes = std::fs::read(path).ok()?;
+    let pack = tuile_pack::Pack::open(&bytes).ok()?;
+    let (terrain, imagery) = pack.store_layers()?;
+    Some([terrain.to_string(), imagery.to_string()])
+}
+
 /// Fails unless the pack at `path` is references to the store for every tile
 /// of frames `first..=last`. Returns how many distinct tiles it draws.
 fn check_new(path: &Path, first: u32, last: u32) -> Result<usize, String> {
@@ -537,6 +550,7 @@ async fn migrate(
         return Err(format!("rebake: {}", whole.verdict));
     }
     entry.tiles = Some(check_new(&setup.new, first, last)?);
+    entry.sources = sources_of(&setup.new);
     entry.new_bytes = Some(
         std::fs::metadata(&setup.new)
             .map_err(|e| format!("{}: {e}", setup.new.display()))?

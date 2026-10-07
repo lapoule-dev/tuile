@@ -584,6 +584,15 @@ fn inspect(path: &std::path::Path) -> Result<(), String> {
     println!("bytes    {}", bytes.len());
     println!("version  {}", pack.version());
     println!("content  {:?}", pack.content());
+    // What it was baked from: a pack of references names its terrain and its
+    // imagery as the tile store's layers, which are named after the assets.
+    match pack.store_layers() {
+        Some((terrain, imagery)) => println!(
+            "sources  terrain {terrain}, imagery {}",
+            if imagery.is_empty() { "none" } else { imagery }
+        ),
+        None => println!("sources  not recorded: an embedded pack does not say what it was baked from"),
+    }
     if let Some((terrain, imagery)) = pack.store_layers() {
         // What the references are into, and how much of the store they name.
         let mut referring = 0usize;
@@ -713,6 +722,10 @@ struct Plan {
     poses: Vec<tuile_tape::Frame>,
     /// Per frame, the tiles drawn and how each is draped, in order.
     selection: Vec<Vec<(u64, u64)>>,
+    /// The terrain and imagery the pack was baked from, where it says: a
+    /// pack of references names them, an embedded one of an earlier version
+    /// does not. No imagery at all is `Some((terrain, None))`.
+    sources: Option<(i64, Option<i64>)>,
 }
 
 /// Reads a pack's plan from its table alone — a pack may be gigabytes, and
@@ -735,6 +748,12 @@ fn plan_of(path: &std::path::Path) -> Result<Plan, String> {
         scene: pack.scene_digest().to_string(),
         poses: Vec::new(),
         selection: Vec::new(),
+        sources: pack.store_layers().and_then(|(terrain, imagery)| {
+            Some((
+                tuile_bake::asset_of_namespace(terrain)?,
+                tuile_bake::asset_of_namespace(imagery),
+            ))
+        }),
     };
     for number in first..=last {
         let view = pack.view_of(number).map_err(|e| format!("frame {number}: {e}"))?;
@@ -875,6 +894,16 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
     // knob the session honours is read by `exact_traversal`, and a digest
     // taken before that would give two packs baked at different screen-space
     // errors the same name — after which they answer for each other.
+    // A re-bake is the same scene from the same sources: where the old pack
+    // names its terrain and its imagery, those are used, and not whatever
+    // the default happens to be — a pack baked from one imagery re-baked
+    // from another is another film under the same name. What is asked for
+    // on the command line still wins.
+    let from_old = old.as_ref().and_then(|old| old.sources);
+    if let Some((terrain, imagery)) = from_old {
+        config.terrain_asset_id = terrain;
+        config.imagery_asset_id = imagery;
+    }
     if let Some(id) = args.terrain {
         config.terrain_asset_id = id;
     }
@@ -902,6 +931,17 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
     let store_layers = (
         tuile_bake::source_namespace(config.terrain_asset_id),
         config.imagery_asset_id.map(tuile_bake::source_namespace),
+    );
+    println!(
+        "BAKE-SOURCES terrain={} imagery={} ({})",
+        store_layers.0,
+        store_layers.1.as_deref().unwrap_or("none"),
+        match (args.terrain.is_some() || args.imagery.is_some(), from_old.is_some(), old.is_some()) {
+            (true, ..) => "as asked",
+            (false, true, _) => "the old pack's own",
+            (false, false, true) => "the defaults: the old pack does not say what it was baked from",
+            (false, false, false) => "the defaults",
+        }
     );
     let resolved = tuile_bake::exact_traversal(config.session.traversal.clone());
     // The whole tape names the scene, not the range: two shards of one shot

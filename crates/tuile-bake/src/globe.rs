@@ -119,6 +119,13 @@ pub fn source_namespace(asset_id: i64) -> String {
     format!("asset-{asset_id}")
 }
 
+/// The source asset a namespace names: the inverse of [`source_namespace`].
+/// A pack of references records its two sources this way, as the layers of
+/// the tile store its tiles came through.
+pub fn asset_of_namespace(namespace: &str) -> Option<i64> {
+    namespace.strip_prefix("asset-")?.parse().ok()
+}
+
 impl GlobeConfig {
     /// The common case: World Terrain draped with Bing Aerial.
     pub fn new(ion_token: impl Into<String>) -> Self {
@@ -518,6 +525,9 @@ mod tests {
     fn the_default_globe_is_world_terrain_with_bing() {
         let config = GlobeConfig::new("token");
         assert_eq!(config.terrain_asset_id, CESIUM_WORLD_TERRAIN);
+        // A source's name in a pack is its asset, both ways.
+        assert_eq!(asset_of_namespace(&source_namespace(3954)), Some(3954));
+        assert_eq!(asset_of_namespace("imagery"), None);
         assert_eq!(config.imagery_asset_id, Some(BING_AERIAL));
     }
 
