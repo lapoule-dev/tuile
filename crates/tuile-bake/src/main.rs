@@ -579,6 +579,9 @@ fn inspect(path: &std::path::Path) -> Result<(), String> {
     println!("scene    {}", pack.scene_digest());
     println!("culling  {}", pack.culling());
     println!("frames   {first}..={last}");
+    if let Ok(view) = pack.view_of(first) {
+        println!("viewport {}×{}", view.viewport_px[0], view.viewport_px[1]);
+    }
     println!("origin   {:?}", pack.render_origin());
     println!("tiles    {} distinct (id, drape)", pack.tile_count());
     println!("bytes    {}", bytes.len());
