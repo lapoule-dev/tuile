@@ -17,9 +17,11 @@ use tuile_film::{
     Look, Mesh, Pack, TileKey,
 };
 use tuile_film::{refs_of, StoreTile, TileRefs};
-use tuile_film_gpu::{DrapeLayer, FilmGpu, LayerGrade, Settings, TileMesh, OUTPUT_FORMAT};
+use tuile_film_gpu::{
+    DrapeLayer, FilmGpu, LayerCorner, LayerField, LayerGrade, Settings, TileMesh, OUTPUT_FORMAT,
+};
 use tuile_mp4::{Codec, Muxer, ParameterSets};
-use tuile_radiometry::{Grade, LevelGrades};
+use tuile_radiometry::{linear_of, through, FilmGrade, Grade, LevelGrades, MatrixField, SAME};
 use tuile_repository::TileRepository;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -276,6 +278,9 @@ struct StoreSide {
     /// holds one — and how much of it is asked for, 0 to 1.
     tone: Option<LevelGrades>,
     tone_strength: f32,
+    /// The film's own grade, kept beside its packs, if it has one: a
+    /// function a tile, drawn in the place of a grade a level.
+    film: Option<FilmGrade>,
 }
 
 /// Imagery tiles kept on the GPU before they are let go. A tile is a
@@ -304,6 +309,22 @@ enum Drape {
 impl StoreSide {
     /// The grade a layer of this imagery level is composed with: the same
     /// for every tile of the level, so that two of them meet as they did.
+    /// A tile's corner matrices as the composition is handed them, each
+    /// taken at the strength asked for; `None` for a film without a
+    /// function a tile, or a tile it does nothing to.
+    fn matrices(&self, at: (u8, u32, u32)) -> Option<LayerField> {
+        let four = self.film.as_ref()?.matrix.as_ref()?.given.get(&at)?;
+        let strength = self.tone_strength;
+        Some(LayerField {
+            corners: [LayerCorner::IDENTITY; 4],
+            matrices: Some(four.map(|matrix| {
+                std::array::from_fn(|o| {
+                    std::array::from_fn(|i| SAME[o][i] + (matrix[o][i] - SAME[o][i]) * strength)
+                })
+            })),
+        })
+    }
+
     fn grade(&self, level: u8) -> Grade {
         self.tone.as_ref().map_or(Grade::IDENTITY, |tone| {
             tone.of(level).at(self.tone_strength)
@@ -404,7 +425,42 @@ impl StoreSide {
                         Arc::new(imagery_texture(tile, &self.scheme, &found.bytes).map_err(js)?)
                     }
                 };
-                // The level's grade, as the GPU's composition would give it.
+                // The tile's function, texel by texel, as the GPU's
+                // composition would give it…
+                let at = (layer.tile.level, layer.tile.x, layer.tile.y);
+                let texels = match self.matrices(at) {
+                    Some(LayerField {
+                        matrices: Some(four),
+                        ..
+                    }) => {
+                        let field = MatrixField {
+                            given: [(at, four)].into(),
+                        };
+                        let mut made = (*texels).clone();
+                        let (wide, high) = (made.width, made.height);
+                        for (n, texel) in made.rgba8.chunks_exact_mut(4).enumerate() {
+                            let (x, y) = (n as u32 % wide, n as u32 / wide);
+                            let matrix = field.at(
+                                at,
+                                (x as f32 + 0.5) / wide as f32,
+                                (y as f32 + 0.5) / high as f32,
+                            );
+                            let lit = [0, 1, 2].map(|c| linear_of(texel[c]));
+                            for (c, value) in through(&matrix, lit).iter().enumerate() {
+                                let v = value.clamp(0.0, 1.0);
+                                let stored = if v <= 0.003_130_8 {
+                                    v * 12.92
+                                } else {
+                                    1.055 * v.powf(1.0 / 2.4) - 0.055
+                                };
+                                texel[c] = (stored * 255.0).round() as u8;
+                            }
+                        }
+                        Arc::new(made)
+                    }
+                    _ => texels,
+                };
+                // …or the level's grade.
                 let grade = self.grade(layer.tile.level);
                 let texels = if grade.is_identity() {
                     texels
@@ -437,7 +493,7 @@ impl StoreSide {
                         saturation: g.saturation,
                     }
                 },
-                field: None,
+                field: self.matrices((layer.tile.level, layer.tile.x, layer.tile.y)),
             })
             .collect();
         Ok((
@@ -515,7 +571,10 @@ impl FilmWorker {
                         Some(layer) if layer.grid == "geographic" => TilingScheme::geographic(),
                         _ => TilingScheme::web_mercator(),
                     };
-                    let table = if tone_table.is_empty() {
+                    // What the page handed over: the film's own grade, or
+                    // a table of grades a level.
+                    let film = FilmGrade::from_json(&tone_table);
+                    let table = if tone_table.is_empty() || film.is_some() {
                         None
                     } else {
                         Some(
@@ -524,6 +583,7 @@ impl FilmWorker {
                         )
                     };
                     Some(StoreSide {
+                        film,
                         tone: table,
                         tone_strength: tone.clamp(0.0, 1.0),
                         store,
@@ -588,7 +648,20 @@ impl FilmWorker {
                 width,
                 height,
                 supersample: supersample.max(1),
-                look: Look::default(),
+                // The film brought to the look's target, by as much of its
+                // grade as is asked for.
+                look: {
+                    let mut look = Look::default();
+                    if let Some((grade, strength)) = store
+                        .as_ref()
+                        .and_then(|s| Some((s.film.as_ref()?, s.tone_strength)))
+                    {
+                        look.exposure_ev += grade.exposure_ev * strength;
+                        look.contrast *= grade.contrast.powf(strength);
+                        look.saturation *= grade.saturation.powf(strength);
+                    }
+                    look
+                },
             },
         );
         Ok(FilmWorker {

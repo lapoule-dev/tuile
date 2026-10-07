@@ -102,6 +102,11 @@ pub async fn film_grade(
         1 => return Ok(grades.pop().map(|(_, grade)| grade)),
         _ => {}
     }
+    // Packs fitted together carry the one grade of their film, each a
+    // copy of it: it is the film's as it is.
+    if grades.windows(2).all(|pair| pair[0].1 == pair[1].1) {
+        return Ok(grades.pop().map(|(_, grade)| grade));
+    }
     // Several: what each saw, then the film as one.
     let mut seen = Vec::new();
     for (pack, _) in &grades {
@@ -303,6 +308,7 @@ mod tests {
             edges: [[[tone; 3]; GRID]; 4],
             usage,
             tones: None,
+            paired: None,
         };
         let mut observed = Observed::default();
         for y in 6..10 {
@@ -348,6 +354,23 @@ mod tests {
             found.as_ref(),
             FilmGrade::from_json(&grade.to_json()).as_ref()
         );
+        // Both packs with the same grade — fitted together, each a copy of
+        // the film's: it is the film's as it is, with nothing of what each
+        // saw asked for (there is none here to ask for).
+        let mut both = Files(BTreeMap::from([
+            (pack_tone_key("film/1-10.tuilepack"), grade.to_json()),
+            (pack_tone_key("film/11-20.tuilepack"), grade.to_json()),
+        ]));
+        assert_eq!(
+            block(film_grade(&both, &keys)).expect("asked").as_ref(),
+            FilmGrade::from_json(&grade.to_json()).as_ref()
+        );
+        // Two that differ are not one grade: what each saw is wanted.
+        both.0.insert(
+            pack_tone_key("film/11-20.tuilepack"),
+            graded(&seen_of(0, 12, 8)).to_json(),
+        );
+        assert!(block(film_grade(&both, &keys)).is_err());
         // A film without one has none, whatever lies beside it.
         assert_eq!(
             block(film_grade(&files, &["bare/1-10.tuilepack"])).expect("asked"),
