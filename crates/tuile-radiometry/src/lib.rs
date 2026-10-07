@@ -43,6 +43,7 @@ mod film;
 mod grade;
 mod levels;
 mod linear;
+mod matrix;
 mod measure;
 mod stats;
 mod tiles;
@@ -54,6 +55,7 @@ pub use film::{Bounds, FilmGrade, LookTarget, Pictured};
 pub use grade::{region_key, Grade, GradeReport, LevelGrades, Seen, REGION_LEVEL};
 pub use levels::{apply_multipliers, tone_of, LevelGains, LevelParams, Observation, PairReport};
 pub use linear::{Fit, Line, Paired, PAIRS};
+pub use matrix::{through, Affine, Look, MatrixBounds, MatrixField, MatrixReport, SAME};
 pub use measure::{Blended, Curves, Limits, Local, Measure, KNOTS};
 pub use stats::{linear_of, BlockStats, BLOCKS};
 pub use tiles::{

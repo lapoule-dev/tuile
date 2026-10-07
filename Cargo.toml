@@ -74,6 +74,8 @@ http-cache = { version = "1.0.0-alpha.6", default-features = false, features = [
 foyer = "0.22.3"
 gltf = "1.4.1"
 nalgebra = { version = "0.35", default-features = false, features = ["std"] }
+nalgebra-sparse = "0.12"
+petgraph = { version = "0.8", default-features = false }
 flate2 = "1.1.9"
 bytemuck = { version = "1", features = ["derive"] }
 tracing = "0.1.44"
