@@ -11,6 +11,8 @@ authors.workspace = true
 # wasm32, where a renderer applies a field it read, and runs natively, where
 # a bake computes one.
 [dependencies]
+# The least squares of a tile's line against its reference.
+nalgebra = { workspace = true }
 
 [lints]
 workspace = true

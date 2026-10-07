@@ -703,6 +703,7 @@ mod tests {
             edges: [[[tone; 3]; GRID]; 4],
             usage,
             tones: None,
+            paired: None,
         }
     }
 

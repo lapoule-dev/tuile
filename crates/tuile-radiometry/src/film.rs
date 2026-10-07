@@ -640,6 +640,7 @@ mod tests {
                         edges: [[[tone * by; 3]; GRID]; 4],
                         usage: 1.0,
                         tones: None,
+                        paired: None,
                     },
                 );
                 // The reference under it: the same ground, a level up, as
@@ -652,6 +653,7 @@ mod tests {
                         edges: [[[tone; 3]; GRID]; 4],
                         usage: 0.0,
                         tones: None,
+                        paired: None,
                     });
                 let (i0, j0) = (((50 + x) % 2) as usize * 4, ((70 + y) % 2) as usize * 4);
                 for cj in 0..4 {

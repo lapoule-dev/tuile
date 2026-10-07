@@ -251,6 +251,16 @@ impl<H: IonHttp> TmsImagery<H> {
         })
     }
 
+    /// The file extension of a tile, as the descriptor states it (`jpg`,
+    /// `png`): what says what kind of image the asset serves.
+    pub fn extension(&self) -> Option<String> {
+        self.state
+            .lock()
+            .expect("not poisoned")
+            .as_ref()
+            .map(|s| s.resource.extension.clone())
+    }
+
     /// What ion's terms require a consumer to display.
     pub fn attributions(&self) -> Vec<Attribution> {
         self.state

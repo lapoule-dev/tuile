@@ -261,6 +261,21 @@ enum Job {
         pack: std::path::PathBuf,
         frame: u32,
     },
+    /// Bring a reference imagery's tiles into the tile store over the ground
+    /// a pack's imagery covers, and bake nothing.
+    ///
+    /// A film's imagery is brought to one tone against a reference: another
+    /// imagery of the same ground, homogeneous where the film's is a
+    /// patchwork of captures. It is not drawn, so no bake ever fetches it;
+    /// this does, into the same store, as one more layer.
+    Reference {
+        pack: std::path::PathBuf,
+        /// The ion asset of the reference imagery.
+        asset: i64,
+        /// No reference tile is asked for finer than this level of the
+        /// film's own imagery: a tone is not a matter of detail.
+        cap: u32,
+    },
     /// Bake the same scene live, again, and compare it against a pack tile
     /// for tile and byte for byte.
     Verify {
@@ -317,6 +332,9 @@ usage: tuile-bake --tape <path.mcap> --frames <first>:<last> --out <path.tuilepa
                   frames and viewport; refuses unless every frame selects and
                   drapes what the old pack did)
        tuile-bake --inspect <path.tuilepack>
+tuile-bake --reference <path.tuilepack> [--reference-asset 3954] [--reference-cap 14]
+                     bring a reference imagery's tiles into the tile store
+                     over the ground the pack's imagery covers; bakes nothing
        tuile-bake --diff <a.tuilepack> <b.tuilepack>
        tuile-bake --dump <path.tuilepack> --frame <n>
        tuile-bake --verify <path.tuilepack> --tape <path.mcap> [--viewport <w>x<h>]
@@ -348,6 +366,9 @@ fn parse_args() -> Result<Job, String> {
     let mut content: Option<tuile_pack::Content> = None;
     let mut rebake: Option<std::path::PathBuf> = None;
     let mut accept_drift = false;
+    let mut reference: Option<std::path::PathBuf> = None;
+    let mut reference_asset: i64 = SENTINEL_2;
+    let mut reference_cap: u32 = 14;
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         let mut value = || argv.next().ok_or(format!("{arg} needs a value"));
@@ -393,6 +414,11 @@ fn parse_args() -> Result<Job, String> {
             }
             "--rebake" => rebake = Some(std::path::PathBuf::from(value()?)),
             "--accept-drift" => accept_drift = true,
+            "--reference" => reference = Some(std::path::PathBuf::from(value()?)),
+            "--reference-asset" => {
+                reference_asset = value()?.parse().map_err(|_| "--reference-asset wants an ion asset id")?
+            }
+            "--reference-cap" => reference_cap = value()?.parse().map_err(|_| "--reference-cap wants a level")?,
             "--sse" => {
                 let v: f64 = value()?.parse().map_err(|_| "--sse wants a number")?;
                 // Fini ET positif : `NaN` passerait un simple `<= 0.0`, et un
@@ -417,6 +443,9 @@ fn parse_args() -> Result<Job, String> {
     }
     if let Some(pack) = dump {
         return Ok(Job::Dump { pack, frame });
+    }
+    if let Some(pack) = reference {
+        return Ok(Job::Reference { pack, asset: reference_asset, cap: reference_cap });
     }
     if let Some(pack) = verify {
         return Ok(Job::Verify {
@@ -516,8 +545,118 @@ fn run() -> Result<(), String> {
             imagery,
             terrain,
         } => verify(&pack, &tape, viewport, imagery, terrain),
+        Job::Reference { pack, asset, cap } => reference(&pack, asset, cap),
         Job::Bake(args) => bake(args),
     }
+}
+
+/// ion's asset id for the cloudless Sentinel-2 composite: one picture of the
+/// whole ground, which is what a reference is for.
+const SENTINEL_2: i64 = 3954;
+/// A reference imagery is kept as long as the film's own: it is a provider's
+/// content like any other, and is not made durable here.
+const REFERENCE_EXPIRY_DAYS: u64 = 152;
+
+/// Brings a reference imagery into the tile store over a pack's ground: see
+/// [`Job::Reference`].
+fn reference(path: &std::path::Path, asset: i64, cap: u32) -> Result<(), String> {
+    use tuile_core::raster::{ImageryCoord, Projection, TilingScheme};
+    use tuile_tile_server::Grid;
+
+    let token = std::env::var("TUILE_ION_TOKEN")
+        .map_err(|_| "TUILE_ION_TOKEN is not set; the reference is read from ion")?;
+    let head = {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut head = vec![0u8; tuile_pack::PREAMBLE];
+        file.read_exact(&mut head).map_err(|e| format!("{}: {e}", path.display()))?;
+        let start = tuile_pack::blob_start(&head).map_err(|e| format!("{}: {e}", path.display()))?;
+        head.resize(start as usize, 0);
+        file.read_exact(&mut head[tuile_pack::PREAMBLE..]).map_err(|e| format!("{}: {e}", path.display()))?;
+        head
+    };
+    let pack = tuile_pack::Pack::open_table(&head).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (_, imagery_layer) = pack
+        .store_layers()
+        .ok_or_else(|| format!("{}: a pack of no reference names no imagery to bring a reference under", path.display()))?;
+    let film = pack.imagery_tiles();
+    if film.is_empty() {
+        return Err(format!("{}: the pack refers to no imagery tile", path.display()));
+    }
+    let layer = tuile_bake::source_namespace(asset);
+
+    let mut config = tuile_bake::GlobeConfig::new(&token);
+    if let Ok(dir) = std::env::var("TUILE_CACHE_DIR") {
+        config.cache_dir = Some(dir.into());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("runtime: {e}"))?;
+    // The reference first, to know what it is; then the store, with a layer
+    // for it; then its tiles. Each on its own turn of the runtime: the store
+    // drives one of its own.
+    let reference = runtime
+        .block_on(tuile_bake::ReferenceImagery::open(&config, asset))
+        .map_err(|e| e.to_string())?;
+    let grid = match reference.scheme.projection {
+        Projection::WebMercator => Grid::WebMercator,
+        Projection::Geographic => Grid::Geographic,
+    };
+    let (tile_type, content_type) = match reference.extension.as_str() {
+        "jpg" | "jpeg" => ("jpeg", "image/jpeg"),
+        "png" => ("png", "image/png"),
+        other => return Err(format!("the reference serves .{other} tiles, which the store has no name for")),
+    };
+    let store = tiles::Tiles::from_env_with(Some(tuile_tile_server::LayerDef {
+        name: layer.clone(),
+        grid,
+        tile_type: tile_type.into(),
+        tile_compression: "none".into(),
+        // As the store's other layers of each grid are cut.
+        zone_level: match grid {
+            Grid::WebMercator => 10,
+            Grid::Geographic => 9,
+        },
+        expiry_days: Some(REFERENCE_EXPIRY_DAYS),
+        content_type: content_type.into(),
+    }))?
+    .ok_or("TUILE_TILES_BUCKET is not set: there is no store to bring the reference into")?;
+    // The grid the film's own imagery is addressed on, from the store.
+    let own = match store.grid(imagery_layer) {
+        Some(Grid::Geographic) => TilingScheme::geographic(),
+        Some(Grid::WebMercator) => TilingScheme::web_mercator(),
+        None => return Err(format!("the store has no layer {imagery_layer}")),
+    };
+    // Under each of the film's tiles, the reference's tiles of the finest
+    // level that is no finer than the film's tile — nor than the cap.
+    let scheme = reference.scheme;
+    let mut wanted = std::collections::BTreeSet::new();
+    for (level, x, y) in film.keys() {
+        let coord = ImageryCoord { level: u32::from(*level), x: u64::from(*x), y: u64::from(*y) };
+        let rect = own.tile_rect(coord);
+        let as_wide = own.tile_rect(ImageryCoord { level: coord.level.min(cap), x: 0, y: 0 }).width();
+        let at = (scheme.minimum_level..=scheme.maximum_level)
+            .rev()
+            .find(|l| scheme.tile_rect(ImageryCoord { level: *l, x: 0, y: 0 }).width() >= as_wide * 0.999)
+            .unwrap_or(scheme.minimum_level);
+        wanted.extend(scheme.tiles_in_rectangle(&rect, at).into_iter().map(|c| (c.level, c.x, c.y)));
+    }
+    let wanted: Vec<ImageryCoord> = wanted.into_iter().map(|(level, x, y)| ImageryCoord { level, x, y }).collect();
+    let fetched = runtime.block_on(reference.fetch(&wanted, store.cache()));
+    // Flushed whether or not every tile came: what was fetched is worth
+    // keeping.
+    store.flush()?;
+    let fetched = fetched.map_err(|e| e.to_string())?;
+    println!(
+        "REFERENCE layer={layer} under={imagery_layer} film_tiles={} asked={} there={} absent={} mb={:.1}",
+        film.len(),
+        fetched.asked,
+        fetched.there,
+        fetched.absent,
+        fetched.bytes as f64 / 1e6
+    );
+    Ok(())
 }
 
 /// Reads a pack back and reports what a render would get from it.

@@ -73,6 +73,7 @@ http-cache-reqwest = { version = "1.0.0-alpha.6", default-features = false, feat
 http-cache = { version = "1.0.0-alpha.6", default-features = false, features = ["manager-foyer", "url-standard"] }
 foyer = "0.22.3"
 gltf = "1.4.1"
+nalgebra = { version = "0.35", default-features = false, features = ["std"] }
 flate2 = "1.1.9"
 bytemuck = { version = "1", features = ["derive"] }
 tracing = "0.1.44"

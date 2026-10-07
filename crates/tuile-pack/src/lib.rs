@@ -1146,6 +1146,21 @@ impl<'a> Pack<'a> {
         regions
     }
 
+    /// Every imagery tile of the store the pack refers to — level, column,
+    /// row — with how many of the pack's tiles it is draped on. Empty for a
+    /// pack that holds no reference.
+    pub fn imagery_tiles(&self) -> std::collections::BTreeMap<(u8, u32, u32), u32> {
+        let mut tiles = std::collections::BTreeMap::new();
+        for tile in self.root.tiles().into_iter().flatten() {
+            for placed in refs_of(&tile).map(|r| r.imagery).unwrap_or_default() {
+                *tiles
+                    .entry((placed.tile.level, placed.tile.x, placed.tile.y))
+                    .or_default() += 1;
+            }
+        }
+        tiles
+    }
+
     /// The tiles one frame selected, in the order the bake recorded them.
     pub fn frame(&self, frame: u32) -> Result<Vec<fb::Tile<'a>>, PackError> {
         let frames = self
@@ -1941,6 +1956,39 @@ mod tests {
         assert!(tile.positions().is_none() && tile.texture().is_none());
         assert_eq!((tile.vertex_count(), tile.index_count()), (341, 300));
         assert!(pack.span_of(tile).is_none());
+    }
+
+    #[test]
+    fn a_pack_says_which_imagery_tiles_it_refers_to_and_how_often() {
+        let mut w = Bake::new("s", [0.0; 3])
+            .with(|w| w.with_content(Content::References, "terrain", "imagery"));
+        // Two tiles of the film, each with its own drape, and a third that
+        // shares the first one's imagery.
+        let (a, b) = (with_refs(a_tile(7, 100), 1), with_refs(a_tile(8, 101), 2));
+        let mut c = a_tile(9, 102);
+        c.refs = a.refs.clone();
+        w.frame(1, a_view(0.0), [a.clone(), b.clone(), c]);
+        let bytes = w.finish();
+        let pack = Pack::open(&bytes).expect("open");
+        let listed = pack.imagery_tiles();
+        let of = |tile: &BakedTile| -> Vec<(u8, u32, u32)> {
+            tile.refs
+                .as_ref()
+                .expect("refs")
+                .imagery
+                .iter()
+                .map(|p| (p.tile.level, p.tile.x, p.tile.y))
+                .collect()
+        };
+        assert!(!of(&a).is_empty() && of(&a) != of(&b));
+        // Counted here from the tiles as they went in: `a` twice — the
+        // third tile has its drape — and `b` once.
+        let mut expected = std::collections::BTreeMap::new();
+        for at in of(&a).into_iter().chain(of(&a)).chain(of(&b)) {
+            *expected.entry(at).or_insert(0u32) += 1;
+        }
+        assert_eq!(listed, expected);
+        assert!(listed.values().any(|n| *n >= 2));
     }
 
     #[test]

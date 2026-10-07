@@ -50,6 +50,7 @@ mod session;
 pub mod tiles;
 
 pub use globe::{
+    ReferenceFetched, ReferenceImagery,
     asset_of_namespace, duration_or, imagery_boost_cap, source_namespace, GlobeConfig, GlobeError, TileCache, BING_AERIAL,
     CESIUM_WORLD_TERRAIN,
 };

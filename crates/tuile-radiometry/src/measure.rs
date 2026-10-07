@@ -173,6 +173,16 @@ pub enum Measure {
     /// the three of them against one another the saturation. So it carries
     /// none of those as numbers of their own.
     Curves,
+    /// By the **line** that lays the tile on a reference picture of the
+    /// same ground, a band at a time ([`crate::Line`]): its gain, as the
+    /// tone, then its bias, as how far above the reference's the tile's
+    /// black stands. The model a mosaic is commonly normalised by.
+    ///
+    /// The three lines against one another are the contrast and the
+    /// saturation, so it carries neither as a number of its own. The
+    /// reference is not a tile of the film: it is what each tile was set
+    /// against when it was seen ([`crate::TileSeen::set_against`]).
+    Linear,
 }
 
 const CURVE_NAMES: [&str; 3 + 3 * KNOTS.len()] = [
@@ -194,6 +204,9 @@ impl Measure {
                 "black",
             ],
             Self::Curves => &CURVE_NAMES,
+            Self::Linear => &[
+                "tone_r", "tone_g", "tone_b", "black_r", "black_g", "black_b",
+            ],
         }
     }
 
@@ -210,6 +223,7 @@ impl Measure {
         match self {
             Self::Moments => "moments",
             Self::Curves => "curves",
+            Self::Linear => "linear",
         }
     }
 
@@ -217,8 +231,21 @@ impl Measure {
     /// for a tile that cannot be set against it at all; a number that
     /// could not be taken is `NaN`.
     pub fn of(&self, observed: &Observed, at: TileAt, reference_level: u8) -> Option<Vec<f32>> {
+        if *self == Self::Linear {
+            // Against what the tile was set against, whatever the level.
+            let line = observed.tiles.get(&at)?.paired.as_deref()?.line()?;
+            return Some(vec![
+                -line.gain[0].log2(),
+                -line.gain[1].log2(),
+                -line.gain[2].log2(),
+                -line.bias[0],
+                -line.bias[1],
+                -line.bias[2],
+            ]);
+        }
         let tone = observed.offset(at, reference_level)?;
         match self {
+            Self::Linear => None,
             Self::Moments => {
                 let apart = observed.apart(at, reference_level);
                 Some(vec![
@@ -273,6 +300,11 @@ impl Measure {
                 values[4] = values[4].clamp(-limits.shape_stops, limits.shape_stops);
                 values[5] = values[5].clamp(-limits.black, limits.black);
             }
+            Self::Linear => {
+                for black in &mut values[3..] {
+                    *black = black.clamp(-limits.black, limits.black);
+                }
+            }
             Self::Curves => {
                 let knots = KNOTS.len();
                 for channel in values[3..].chunks_exact_mut(knots) {
@@ -294,7 +326,11 @@ impl Measure {
     /// far smaller — to a 65536th.
     pub fn keep(&self, values: &mut [f32]) {
         for (value, name) in values.iter_mut().zip(self.names()) {
-            let steps = if *name == "black" { 65536.0 } else { 64.0 };
+            let steps = if name.starts_with("black") {
+                65536.0
+            } else {
+                64.0
+            };
             *value = (*value * steps).round() / steps;
         }
     }
@@ -314,6 +350,16 @@ impl Measure {
                 contrast_stops: given[3],
                 pivot_stops: pivot,
                 saturation_stops: given[4],
+                curve: [[0.0; KNOTS.len()]; 3],
+            },
+            // The same, a band at a time: with all of what was measured
+            // given back, a texel `t` comes out `gain × t + bias`.
+            Self::Linear => Blended {
+                gain_stops,
+                black: [-given[3], -given[4], -given[5]],
+                contrast_stops: 0.0,
+                pivot_stops: pivot,
+                saturation_stops: 0.0,
                 curve: [[0.0; KNOTS.len()]; 3],
             },
             Self::Curves => {
@@ -438,6 +484,7 @@ pub(crate) fn own_tone(observed: &Observed, at: TileAt) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linear::PAIRS;
     use crate::tiles::TileSeen;
 
     const SIDE: usize = 64;
@@ -609,10 +656,68 @@ mod tests {
         }
     }
 
+    /// A tile that is the ground through the line `ground = GAIN × tile +
+    /// BIAS` the other way, set against that ground.
+    fn against_the_ground() -> Observed {
+        let mut seen = tile(5, |c| [0, 1, 2].map(|k| (c[k] - BIAS[k]) / GAIN[k]));
+        let ground = tile(5, |c| c).paired.expect("its places").tile;
+        seen.set_against(|u, v, _, _| {
+            Some(ground[(v * PAIRS as f32) as usize * PAIRS + (u * PAIRS as f32) as usize])
+        });
+        let mut observed = Observed::default();
+        observed.tiles.insert((13, 100, 200), seen);
+        observed
+    }
+
+    const GAIN: [f32; 3] = [1.5, 1.2, 0.8];
+    const BIAS: [f32; 3] = [0.003, 0.001, 0.002];
+
+    #[test]
+    fn a_tile_is_measured_by_its_line_against_what_it_was_set_against() {
+        let observed = against_the_ground();
+        // Whatever the level asked for: the reference is not a tile.
+        let found = Measure::Linear
+            .of(&observed, (13, 100, 200), 0)
+            .expect("measured");
+        assert_eq!(found.len(), Measure::Linear.len());
+        assert_eq!(
+            &Measure::Linear.names()[..3],
+            ["tone_r", "tone_g", "tone_b"]
+        );
+        for k in 0..3 {
+            assert!((found[k] + GAIN[k].log2()).abs() < 0.03, "{found:?}");
+            assert!((found[3 + k] + BIAS[k]).abs() < 0.001, "{found:?}");
+        }
+        // A tile that was set against nothing is not measured.
+        let mut alone = Observed::default();
+        alone.tiles.insert((13, 1, 1), tile(5, |c| c));
+        assert_eq!(Measure::Linear.of(&alone, (13, 1, 1), 0), None);
+    }
+
+    #[test]
+    fn the_correction_of_a_line_lays_the_tile_on_its_reference() {
+        let observed = against_the_ground();
+        let found = Measure::Linear
+            .of(&observed, (13, 100, 200), 0)
+            .expect("measured");
+        let given: Vec<f32> = found.iter().map(|v| -v).collect();
+        let local = Measure::Linear.local(&given, -3.0);
+        for ground in [[0.02f32, 0.03, 0.025], [0.2, 0.15, 0.1], [0.08, 0.1, 0.05]] {
+            let stored = [0, 1, 2].map(|k| (ground[k] - BIAS[k]) / GAIN[k]);
+            let shown = local.apply(stored);
+            for k in 0..3 {
+                assert!(
+                    (shown[k] - ground[k]).abs() < 0.02 * ground[k] + 0.0005,
+                    "{stored:?} → {shown:?}, wanted {ground:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_correction_is_held_within_its_bounds_and_kept_to_its_step() {
         let limits = Limits::default();
-        for measure in [Measure::Moments, Measure::Curves] {
+        for measure in [Measure::Moments, Measure::Curves, Measure::Linear] {
             let mut given = vec![9.0f32; measure.len()];
             given[2] = -9.0;
             measure.within(&mut given, &limits);
@@ -621,7 +726,7 @@ mod tests {
             assert!(light.abs() <= limits.light_stops + 1.0 / 32.0, "{given:?}");
             for (value, name) in given.iter().zip(measure.names()).skip(3) {
                 let bound = match *name {
-                    "black" => limits.black,
+                    "black" | "black_r" | "black_g" | "black_b" => limits.black,
                     "contrast" | "saturation" => limits.shape_stops,
                     _ => limits.curve_stops,
                 };

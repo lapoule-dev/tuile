@@ -45,10 +45,18 @@
 //!   --reference-level <n> with --calibrate: the finest level at which the
 //!                         imagery is one homogeneous picture, which the
 //!                         finer tiles are measured against (default 12)
-//!   --measure <moments|curves>
+//!   --measure <moments|curves|linear>
 //!                         with --calibrate: what a tile is measured by —
-//!                         its moments, or its transfer curve a channel
-//!                         (the default)
+//!                         its moments, its transfer curve a channel (the
+//!                         default), or the line that lays it on the
+//!                         reference layer, a band at a time
+//!   --reference-layer <name>
+//!                         with --calibrate: a layer of the store that is
+//!                         one homogeneous picture of the ground, which
+//!                         every tile is set against place for place — what
+//!                         the linear measure is taken against
+//!   --reference-cap <n>   the film's level past which that layer gets no
+//!                         finer (default 14)
 //!   --put                 with --calibrate: also write it to the bucket
 //!   --light <x>           with --calibrate: the light the renderer puts
 //!                         on ground, instead of the one this render shows
@@ -73,8 +81,8 @@ use std::sync::Arc;
 
 use tuile_farm::{BucketConfig, ObjectRunStore, RunStore, Tuning};
 use tuile_film_native::{
-    render, Av1Film, Error, Film, LightMeter, Nothing, Observer, Order, Pictures, Sink, Sources,
-    Tone,
+    render, Av1Film, Error, Film, LightMeter, Nothing, Observer, Order, Pictures, Reference, Sink,
+    Sources, Tone,
 };
 use tuile_radiometry::{
     Bounds, CornerField, FieldBounds, FilmGrade, Local, LookTarget, Measure, TileBounds, TileGains,
@@ -408,17 +416,71 @@ async fn main() -> Result<(), Error> {
             "\nreference level {reference}: {} tiles read from the store for it, {missing} not there",
             wanted.len()
         );
+        // A reference picture from another layer, under every tile of the
+        // film whatever its level: what a line is fitted against.
+        let reference_layer = value("--reference-layer");
+        if let Some(under) = &reference_layer {
+            if !sources
+                .store
+                .tiles
+                .layers()
+                .iter()
+                .any(|l| l.name == *under)
+            {
+                return Err(format!("the store has no layer {under}").into());
+            }
+            let cap = value("--reference-cap").map_or(Ok(14), |c| c.parse())?;
+            let mut pictured = Reference::new(under.clone(), sources.store.scheme_of(under), cap);
+            let set = pictured
+                .set_under(
+                    &sources.store.tiles,
+                    &sources.store.scheme_of(&layer),
+                    &mut observed,
+                )
+                .await?;
+            println!(
+                "reference layer {under}: {} tiles of it read, {} not there; of the film's {} tiles, {} have it under all of them, {} under none",
+                set.read, set.absent, set.tiles, set.whole, set.bare
+            );
+            std::fs::create_dir_all(&dir)?;
+            for level in 1..=22u8 {
+                let path = PathBuf::from(&dir).join(format!("reference-{level}.png"));
+                if let Some((wide, high)) = tuile_film_native::reference::picture(
+                    &observed,
+                    level,
+                    order.look.exposure_ev,
+                    &path,
+                )? {
+                    println!(
+                        "  level {level} and the reference under it: {} ({wide}×{high})",
+                        path.display()
+                    );
+                }
+            }
+        }
         // The grade written beside the pack: the continuous field, the
         // tiles measured by their transfer curves unless told otherwise.
         let measure = match value("--measure").as_deref() {
             Some("moments") => Measure::Moments,
             Some("curves") | None => Measure::Curves,
+            Some("linear") if reference_layer.is_some() => Measure::Linear,
+            Some("linear") => {
+                return Err("a line is fitted against a reference: --reference-layer".into())
+            }
             Some(other) => {
-                return Err(format!("a tile is measured by moments or curves, not {other}").into())
+                return Err(
+                    format!("a tile is measured by moments, curves or linear, not {other}").into(),
+                )
             }
         };
+        // A line is against a reference that is no tile of the film: every
+        // tile is measured, whatever its level.
         let field_bounds = FieldBounds {
-            reference_level: reference,
+            reference_level: if measure == Measure::Linear {
+                0
+            } else {
+                reference
+            },
             ..FieldBounds::default()
         };
         let grade = FilmGrade::fit(
@@ -464,9 +526,22 @@ async fn main() -> Result<(), Error> {
             for (at, tile) in &under {
                 seen.tiles.entry(*at).or_insert_with(|| tile.clone());
             }
-            for measure in [Measure::Moments, Measure::Curves] {
+            // Against the same reference as before it was corrected.
+            for (at, tile) in &mut seen.tiles {
+                if let Some(was) = observed.tiles.get(at) {
+                    tile.set_against_as(was);
+                }
+            }
+            let measures = [Measure::Moments, Measure::Curves, Measure::Linear];
+            let measures = &measures[..if reference_layer.is_some() { 3 } else { 2 }];
+            for measure in measures.iter().copied() {
                 let mut text = format!("level,x,y,usage,{}\n", measure.names().join(","));
-                for (at, tile) in seen.tiles.iter().filter(|(at, _)| at.0 > reference) {
+                let above = if measure == Measure::Linear {
+                    0
+                } else {
+                    reference
+                };
+                for (at, tile) in seen.tiles.iter().filter(|(at, _)| at.0 > above) {
                     let Some(found) = measure.of(&seen, *at, reference) else {
                         continue;
                     };
@@ -549,6 +624,37 @@ async fn main() -> Result<(), Error> {
                 of_field.apart_after.1,
             );
             judge(&version, &|at, u, v| field.at(at, u, v))?;
+        }
+        if reference_layer.is_some() {
+            let bounds = FieldBounds {
+                reference_level: 0,
+                ..FieldBounds::default()
+            };
+            let (field, of_field, trace) =
+                CornerField::solve_traced(&observed, Measure::Linear, &bounds);
+            for (name, table) in trace.tables() {
+                write("trace/field-linear", name, table)?;
+            }
+            println!(
+                "\nfield-linear: {} of {} tiles measured; {} seams of {} edges in all, of {}; widest break along an edge that is not a seam: {}; steps made where the tiles show none: {}\n  the tiles' step across the seams: {:.2} / {:.2} stops → {:.2} / {:.2}; apart from the film's own tone: {:.2} / {:.2} → {:.2} / {:.2}; {} corners held at a bound",
+                of_field.measured,
+                of_field.tiles,
+                of_field.seams,
+                of_field.seam_edges,
+                of_field.edges,
+                of_field.widest_break,
+                of_field.steps_made,
+                of_field.seam_before.0,
+                of_field.seam_before.1,
+                of_field.seam_after.0,
+                of_field.seam_after.1,
+                of_field.apart_before.0,
+                of_field.apart_before.1,
+                of_field.apart_after.0,
+                of_field.apart_after.1,
+                of_field.held,
+            );
+            judge("field-linear", &|at, u, v| field.at(at, u, v))?;
         }
         let putting = if flag("--put") {
             let config = BucketConfig {
