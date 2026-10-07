@@ -32,7 +32,7 @@
 
 use std::collections::BTreeMap;
 
-use nalgebra::{DMatrix, Matrix4, SMatrix};
+use nalgebra::DMatrix;
 use nalgebra_sparse::factorization::CscCholesky;
 use nalgebra_sparse::{CooMatrix, CscMatrix};
 use petgraph::unionfind::UnionFind;
@@ -96,8 +96,8 @@ impl Default for MatrixBounds {
 }
 
 /// The film's look, as what it makes of the reference: a matrix for ground
-/// and one for water, each fitted over every place of the film where the
-/// reference shows that zone.
+/// and one for water — a gain and what is added, a band at a time — each
+/// from the tiles of the film that are that zone for the most part.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Look {
     pub ground: Affine,
@@ -128,6 +128,9 @@ pub struct MatrixReport {
     pub corners: usize,
     pub edges: usize,
     pub seam_edges: usize,
+    /// The seams: the tile on the near side of each edge, and whether the
+    /// far side is to its right (else below it).
+    pub seams: Vec<(TileAt, bool)>,
     /// How far the film stands from what is wanted, in stops of luminance,
     /// as the median and the 95th centile over its places: as it is, and
     /// through the field.
@@ -164,65 +167,6 @@ fn places_of(paired: &Paired) -> Vec<(f32, f32, [f32; 3], [f32; 3])> {
         .collect()
 }
 
-/// The matrix that lays colours `from` on colours `to`, least squares
-/// weighed again by how far each pair is left. The identity if there is
-/// too little to say.
-fn laid(pairs: &[([f32; 3], [f32; 3])]) -> Affine {
-    if pairs.len() < 64 {
-        return SAME;
-    }
-    let mut weights = vec![1.0f64; pairs.len()];
-    let mut found = SAME;
-    for _ in 0..6 {
-        let mut normal = Matrix4::<f64>::zeros();
-        let mut right = SMatrix::<f64, 4, 3>::zeros();
-        for ((from, to), w) in pairs.iter().zip(&weights) {
-            let f = [
-                f64::from(from[0]),
-                f64::from(from[1]),
-                f64::from(from[2]),
-                1.0,
-            ];
-            for i in 0..4 {
-                for j in 0..4 {
-                    normal[(i, j)] += w * f[i] * f[j];
-                }
-                for o in 0..3 {
-                    right[(i, o)] += w * f[i] * f64::from(to[o]);
-                }
-            }
-        }
-        // Held to changing nothing by a hair: colours that all lie along
-        // one line leave a matrix otherwise unsaid.
-        let hold = 1e-6 * normal.trace().max(1e-12);
-        for i in 0..4 {
-            normal[(i, i)] += hold;
-            if i < 3 {
-                right[(i, i)] += hold;
-            }
-        }
-        let Some(solved) = normal.cholesky() else {
-            return found;
-        };
-        let solved = solved.solve(&right);
-        found = std::array::from_fn(|o| std::array::from_fn(|i| solved[(i, o)] as f32));
-        let mut apart: Vec<f64> = pairs
-            .iter()
-            .map(|(from, to)| {
-                let made = through(&found, *from);
-                f64::from((0..3).map(|c| (made[c] - to[c]).abs()).fold(0.0, f32::max))
-            })
-            .collect();
-        let far = apart.clone();
-        apart.sort_by(f64::total_cmp);
-        let scale = (apart[apart.len() / 2] * 3.5).max(1e-3);
-        for (w, r) in weights.iter_mut().zip(far) {
-            *w = 1.0 / (1.0 + (r / scale) * (r / scale));
-        }
-    }
-    found
-}
-
 fn centiles(values: &mut [f32]) -> (f32, f32) {
     if values.is_empty() {
         return (0.0, 0.0);
@@ -248,23 +192,47 @@ impl MatrixField {
     }
 
     /// The film's look: see [`Look`].
+    ///
+    /// A band at a time, from the lines that lay each tile on the
+    /// reference ([`Paired::fit`]): the middle of them over the tiles of a
+    /// zone, turned round — what the reference is made into, to look as
+    /// the film does. Not a matrix fitted of the film on the reference:
+    /// least squares of one picture on another gives a slope too low by as
+    /// much as the two fail to agree, and a look fitted so is the film
+    /// with its contrast pressed out.
     pub fn look(observed: &Observed) -> Look {
-        let (mut dry, mut wet) = (Vec::new(), Vec::new());
+        // Per zone and band: the stops of a line's gain, and its bias.
+        let mut lines: [[(Vec<f32>, Vec<f32>); 3]; 2] = Default::default();
         for tile in observed.tiles.values() {
-            let Some(paired) = tile.paired.as_deref() else {
+            let Some(line) = tile.paired.as_deref().and_then(Paired::line) else {
                 continue;
             };
-            for (_, _, film, reference) in places_of(paired) {
-                if water(reference) {
-                    wet.push((reference, film));
-                } else {
-                    dry.push((reference, film));
-                }
+            for band in 0..3 {
+                let of = &mut lines[usize::from(line.water)][band];
+                of.0.push(line.gain[band].log2());
+                of.1.push(line.bias[band]);
+            }
+        }
+        let middle = |values: &mut Vec<f32>| {
+            values.sort_by(f32::total_cmp);
+            values.get(values.len() / 2).copied()
+        };
+        let mut zones = [SAME; 2];
+        for (zone, of) in zones.iter_mut().zip(&mut lines) {
+            for band in 0..3 {
+                let (Some(gain), Some(bias)) = (middle(&mut of[band].0), middle(&mut of[band].1))
+                else {
+                    continue;
+                };
+                // reference = gain × film + bias, turned round.
+                let gain = gain.exp2();
+                zone[band][band] = 1.0 / gain;
+                zone[band][3] = -bias / gain;
             }
         }
         Look {
-            ground: laid(&dry),
-            water: laid(&wet),
+            ground: zones[0],
+            water: zones[1],
         }
     }
 
@@ -368,6 +336,12 @@ impl MatrixField {
             }
         }
         report.seam_edges = seam.iter().filter(|s| **s).count();
+        report.seams = edges
+            .iter()
+            .zip(&seam)
+            .filter(|(_, s)| **s)
+            .map(|(e, _)| (at[e.a], e.upright))
+            .collect();
 
         // The unknowns: a tile's four corners, made one with its
         // neighbour's along every edge that is not a seam.
@@ -614,12 +588,11 @@ mod tests {
         observed
     }
 
-    /// A capture: lighter, with a cast, some of one channel in another, a
-    /// veil.
+    /// A capture: lighter, with a cast and a veil.
     const CAPTURE: Affine = [
-        [1.5, 0.2, 0.0, 0.010],
-        [0.1, 1.2, 0.1, 0.006],
-        [0.0, 0.3, 0.9, 0.012],
+        [1.5, 0.0, 0.0, 0.010],
+        [0.0, 1.2, 0.0, 0.006],
+        [0.0, 0.0, 0.9, 0.012],
     ];
 
     fn whole(toward: f32) -> MatrixBounds {
@@ -713,9 +686,11 @@ mod tests {
         // the right. The film shows its ground through the capture and its
         // sea light and blue, as a film of one capture does: its look for
         // water is not its look for ground.
-        let sea = |k: usize| k % PAIRS >= PAIRS / 2;
+        // The last column of tiles is open sea: where the film's look for
+        // water is read.
         let mut observed = seen(4, |_, _, c| through(&CAPTURE, c));
-        for tile in observed.tiles.values_mut() {
+        for (at, tile) in &mut observed.tiles {
+            let sea = |k: usize| at.1 == 103 || k % PAIRS >= PAIRS / 2;
             let paired = tile.paired.as_deref_mut().expect("its places");
             for k in (0..PAIRS * PAIRS).filter(|k| sea(*k)) {
                 let swell = 1.0 + 0.4 * noise(77, k);

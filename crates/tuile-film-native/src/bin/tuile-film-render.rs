@@ -89,8 +89,8 @@ use tuile_film_native::{
     Sources, Tone,
 };
 use tuile_radiometry::{
-    Bounds, CornerField, FieldBounds, FilmGrade, Local, LookTarget, Measure, TileBounds, TileGains,
-    TileSeen,
+    Bounds, CornerField, FieldBounds, FilmGrade, Local, LookTarget, MatrixBounds, MatrixField,
+    Measure, TileBounds, TileGains, TileSeen,
 };
 use tuile_repository::tone::{pack_seen_key, pack_tone_key};
 use tuile_repository::Objects;
@@ -547,8 +547,8 @@ async fn main() -> Result<(), Error> {
         let measure = match value("--measure").as_deref() {
             Some("moments") => Measure::Moments,
             Some("curves") | None => Measure::Curves,
-            Some("linear") if reference_layer.is_some() => Measure::Linear,
-            Some("linear") => {
+            Some("linear" | "matrix") if reference_layer.is_some() => Measure::Linear,
+            Some("linear" | "matrix") => {
                 return Err("a line is fitted against a reference: --reference-layer".into())
             }
             Some(other) => {
@@ -561,7 +561,8 @@ async fn main() -> Result<(), Error> {
         // tile is measured, whatever its level.
         let toward: f32 = match (measure, value("--toward")) {
             (Measure::Linear, Some(toward)) => toward.parse()?,
-            (Measure::Linear, None) => 1.0,
+            // A quarter of the reference's look: the film keeps its own.
+            (Measure::Linear, None) => 0.25,
             _ => 0.0,
         };
         let field_bounds = FieldBounds {
@@ -755,6 +756,69 @@ async fn main() -> Result<(), Error> {
                 of_field.held,
             );
             judge("field-linear", &|at, u, v| field.at(at, u, v))?;
+            // A fitted function a tile — where in it and what colour in,
+            // the colour out: traced, and drawn in the field's place.
+            if value("--measure").as_deref() == Some("matrix") {
+                let (matrices, of_matrices, look) = MatrixField::solve(
+                    &observed,
+                    &MatrixBounds {
+                        toward,
+                        ..MatrixBounds::default()
+                    },
+                );
+                println!(
+                    "\nmatrix: {} of {} tiles with places to fit on, {} places, {} corners; {} seam edges of {}\n  from what is wanted, in stops of luminance (median / p95): {:.3} / {:.3} → {:.3} / {:.3}\n  the film's look on ground {:?}\n  and on water {:?}",
+                    of_matrices.measured,
+                    of_matrices.tiles,
+                    of_matrices.places,
+                    of_matrices.corners,
+                    of_matrices.seam_edges,
+                    of_matrices.edges,
+                    of_matrices.before.0,
+                    of_matrices.before.1,
+                    of_matrices.after.0,
+                    of_matrices.after.1,
+                    look.ground,
+                    look.water,
+                );
+                let numbers = |m: &[[f32; 4]; 3]| {
+                    m.iter()
+                        .flatten()
+                        .map(|v| format!("{v:.6}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                let mut corners = String::from("level,x,y,corner,m\n");
+                for (at, four) in &matrices.given {
+                    for (corner, matrix) in four.iter().enumerate() {
+                        corners +=
+                            &format!("{},{},{},{corner},{}\n", at.0, at.1, at.2, numbers(matrix));
+                    }
+                }
+                write(
+                    "trace/matrix",
+                    "corners.csv",
+                    corners.replace("corner,m\n", "corner,rr,rg,rb,r1,gr,gg,gb,g1,br,bg,bb,b1\n"),
+                )?;
+                write(
+                    "trace/matrix",
+                    "look.csv",
+                    format!(
+                        "zone,rr,rg,rb,r1,gr,gg,gb,g1,br,bg,bb,b1,toward\nground,{},{toward}\nwater,{},{toward}\n",
+                        numbers(&look.ground),
+                        numbers(&look.water)
+                    ),
+                )?;
+                let mut seams = String::from("level,x,y,upright\n");
+                for (at, upright) in &of_matrices.seams {
+                    seams += &format!("{},{},{},{}\n", at.0, at.1, at.2, u8::from(*upright));
+                }
+                write("trace/matrix", "seams.csv", seams)?;
+                judge("matrix", &|at, u, v| Local {
+                    matrix: Some(matrices.at(at, u, v)),
+                    ..Local::IDENTITY
+                })?;
+            }
             // The same field at several doses of the reference, one above
             // the other from none to all of it: the tiles are brought
             // together the same in each, and only what the film is given
@@ -831,7 +895,14 @@ async fn main() -> Result<(), Error> {
                     };
                     let (was, is) = (
                         out.join(format!("mosaic-{level}-as-it-is.png")),
-                        out.join(format!("mosaic-{level}-field-linear.png")),
+                        out.join(format!(
+                            "mosaic-{level}-{}.png",
+                            if value("--measure").as_deref() == Some("matrix") {
+                                "matrix"
+                            } else {
+                                "field-linear"
+                            }
+                        )),
                     );
                     if !(was.exists() && is.exists()) {
                         continue;
