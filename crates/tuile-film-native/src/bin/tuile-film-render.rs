@@ -279,7 +279,7 @@ async fn main() -> Result<(), Error> {
         done.renewed,
         match (&done.tone, order.tone_strength) {
             (None, _) if done.tone_places.0 > 0 => format!(
-                "none — the store keeps no table for any of the film's {} places, nor one for the layer",
+                "none — the store keeps no table for this imagery layer, which is how a layer is graded ({} places)",
                 done.tone_places.0
             ),
             (None, _) => "none".to_string(),
@@ -290,7 +290,7 @@ async fn main() -> Result<(), Error> {
                     (0, ..) => String::new(),
                     (places, fitted, layer) => format!(
                         ", from the store: {fitted} of the film's {places} places have a table of their own{}",
-                        if layer { ", the others the layer's" } else { ", the others none" }
+                        if layer { ", the others the layer's" } else { "" }
                     ),
                 }
             ),
