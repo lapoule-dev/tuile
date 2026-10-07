@@ -45,7 +45,7 @@ pub mod tone;
 mod native;
 
 pub use archives::{ArchivedTiles, Now};
-pub use bench::{block_segment, Bench, Later, Project, Reply, StoreObjects, BLOCK};
+pub use bench::{block_segment, Asked, Bench, Later, Project, Reply, StoreObjects, BLOCK};
 pub use cached::{Cached, ChunkStore, CHUNK};
 pub use config::{Config, Layout, Place, ProjectConfig};
 pub use films::{Chunk, Film, FilmRepository, FilmSummary, Unreadable};

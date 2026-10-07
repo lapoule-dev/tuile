@@ -39,8 +39,8 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tuile_farm::{BucketConfig, ObjectRunStore, StoreError, Tuning};
 use tuile_repository::{
-    Bench, Cached, Config, DiskChunks, FilmRepository, Layout, Objects, Place, Project, Reply,
-    RunFilms, ScenePacks, StoreObjects, TileRepository,
+    Asked, Bench, Cached, Config, DiskChunks, FilmRepository, Layout, Objects, Place, Project,
+    Reply, RunFilms, ScenePacks, StoreObjects, TileRepository,
 };
 use tuile_tile_server::{StoreConfig, TileStore};
 
@@ -82,15 +82,28 @@ async fn respond(mut reply: Reply) -> Response {
 }
 
 async fn api(bench: Arc<Bench>, request: Request) -> Response {
-    let uri = request.uri();
-    let range = request
-        .headers()
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok());
-    match bench
-        .get(uri.path(), uri.query().unwrap_or_default(), range)
-        .await
-    {
+    // Owned before the first await: a request is not to be held across it.
+    let (range, if_none_match, path, query) = {
+        let header_of = |name| {
+            request
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        (
+            header_of(header::RANGE),
+            header_of(header::IF_NONE_MATCH),
+            request.uri().path().to_string(),
+            request.uri().query().unwrap_or_default().to_string(),
+        )
+    };
+    drop(request);
+    let asked = Asked {
+        range: range.as_deref(),
+        if_none_match: if_none_match.as_deref(),
+    };
+    match bench.get(&path, &query, asked).await {
         Some(reply) => respond(reply).await,
         None => (StatusCode::NOT_FOUND, "no such route").into_response(),
     }
@@ -237,6 +250,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         header::CONTENT_RANGE,
         header::ACCEPT_RANGES,
         header::CONTENT_LENGTH,
+        // A page served from elsewhere reads these two: a block's reader
+        // needs its object's size, and a cache its validator.
+        header::ETAG,
+        header::HeaderName::from_static("x-object-size"),
     ]);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on http://{addr}");
