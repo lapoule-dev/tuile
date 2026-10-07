@@ -101,6 +101,18 @@ pub(crate) fn ground(c: [f32; 3]) -> bool {
     c.iter().all(|v| v.is_finite() && *v < BURNT) && luma(c) > DARK && !snow(c)
 }
 
+/// Whether the reference shows water at a place: blue over red, and blue
+/// near green or over it. Measured on the reference of a first film — a
+/// composite of a year, where the open sea is nine places in ten of this
+/// and land one in a thousand.
+///
+/// Water is not ground to be matched. One source shows a sea light and
+/// blue, another near black: stops apart, and nothing to do with how a
+/// capture was exposed. A tile is not darkened for lying on the shore.
+pub(crate) fn water(reference: [f32; 3]) -> bool {
+    reference[2] > reference[0] && reference[2] > 0.8 * reference[1]
+}
+
 impl Paired {
     /// A tile's places, with no reference under them yet.
     pub fn alone(tile: [[f32; 3]; PAIRS * PAIRS]) -> Self {
@@ -115,7 +127,7 @@ impl Paired {
         self.tile
             .iter()
             .zip(&self.reference)
-            .filter(|(t, r)| ground(**t) && ground(**r))
+            .filter(|(t, r)| ground(**t) && ground(**r) && !water(**r))
             .map(|(t, r)| (*t, *r))
     }
 
@@ -481,5 +493,29 @@ mod tests {
             assert!(line.agreement[band] < 0.8, "{line:?}");
             assert!(line.trust[band] < 1.0, "{line:?}");
         }
+    }
+
+    #[test]
+    fn water_under_a_tile_does_not_move_its_line() {
+        // A third of the tile lies on the sea: light and blue on the tile,
+        // near black on the reference. The shore is laid as shore.
+        let mut coast = paired(|_, c| laid(c));
+        for k in (0..PAIRS * PAIRS).filter(|k| k % PAIRS < PAIRS / 3) {
+            coast.tile[k] = [0.03, 0.08, 0.15];
+            coast.reference[k] = [0.004, 0.02, 0.025];
+        }
+        let line = coast.line().expect("a line");
+        close(&line, 0.02);
+        assert!(
+            line.places <= PAIRS * PAIRS * 2 / 3 + PAIRS,
+            "{}",
+            line.places
+        );
+        // And a tile that is all sea has no line at all.
+        let sea = Paired {
+            tile: [[0.03, 0.08, 0.15]; PAIRS * PAIRS],
+            reference: [[0.004, 0.02, 0.025]; PAIRS * PAIRS],
+        };
+        assert_eq!(sea.line(), None);
     }
 }

@@ -1068,7 +1068,10 @@ impl Observed {
             let (mut film, mut under) = (0.0f32, 0.0f32);
             for depth in BLENDED..BLENDED + 2 {
                 let at = place(last, depth, k);
-                if !crate::linear::ground(of.tile[at]) || !crate::linear::ground(of.reference[at]) {
+                if !crate::linear::ground(of.tile[at])
+                    || !crate::linear::ground(of.reference[at])
+                    || crate::linear::water(of.reference[at])
+                {
                     return None;
                 }
                 film += stops(of.tile[at]) / 2.0;
