@@ -6,6 +6,7 @@
 //! `TUILE_TILES_BUCKET` names the bucket every bake and the tile server
 //! share; the endpoint and credentials are the job's usual `TUILE_STORE_*`.
 //! Unset, a bake fetches every tile from its source, as before.
+//! `TUILE_TILES_PREFIX` puts the store under a prefix of the bucket.
 //!
 //! Source tiles are then read from the store when an earlier run (of any job,
 //! or the server) fetched them, and each tile fetched now is offered to it.
@@ -66,6 +67,12 @@ impl Tiles {
             .build()
             .map_err(|e| format!("tile store runtime: {e}"))?;
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(s3);
+        // A store of its own inside a bucket that holds another: a trial that
+        // shares a real bucket without touching what it serves.
+        let s3: Arc<dyn object_store::ObjectStore> = match var("TUILE_TILES_PREFIX") {
+            Ok(prefix) => Arc::new(object_store::prefix::PrefixStore::new(s3, prefix)),
+            Err(_) => s3,
+        };
         if let Some(layer) = layer {
             let added = runtime
                 .block_on(async {
