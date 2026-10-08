@@ -419,3 +419,15 @@ The first film whose bake held no access token: every tile the shared store lack
 What it is and is not: two seconds, small, and soft — the screen-space error of 16 was chosen to bound what the trial asked of the imagery source, not for the picture. No grade. Looked at: ground everywhere, the coast at frame 1, a river valley at frame 48, no black.
 
 To make it again one needs an implementation of `Sources` and its server, which this repository does not hold; with the built-in sources the same tape, frames and settings give the same selection (`tuile-bake --diff`), see #5.
+
+## washington-orbit-48f-720p-sse2-through-tile-server.mp4 — a precise bake through a host's sources (2026-10-08)
+
+An orbit of Washington, baked cold with no access token: terrain and imagery both through a host's tile server (`GlobeConfig::sources`), the tile store shared with it under a test prefix.
+
+- tape: `orbit-tape orbit.mcap 48 -77.0353 38.8895 3000 2000` — 48 frames around the Washington Monument, 3 km out, 2 km up
+- bake: 1280×720, `--sse 2`, embedded pack, scene `0cbb0a1859ace542`, 1.57 GB, 48 frames in 117 s; peak 1.5 GB of memory. It asked the server for 9 468 imagery and 4 739 terrain tiles; the ground had been baked once before at 640×480 and `--sse 16` (18 235 and 4 442 asked, 79 s), so the coarse levels were already in the store.
+- render: `tuile-film-render <prefix>/packs-precise --out washington.mp4 --codec h264 --no-tone --fps 24` (built with `--features videotoolbox`), natively on a laptop, 48 frames in 83 s; 10 799 tiles from the pack, none from the store; H.264 by VideoToolbox, 12 Mb/s
+
+Looked at, frames 1 and 24: the Mall, the Potomac and the street grid sharp to the horizon, ground everywhere, no black. No grade. Two seconds.
+
+As for the entry above, making it again needs an implementation of `Sources` and its server, which this repository does not hold.
