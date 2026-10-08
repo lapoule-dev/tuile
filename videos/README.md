@@ -407,3 +407,15 @@ tuile-film-render 1557732/20260924T181803Z-4dbd/packs \
 The grade: a colour matrix at each corner of a tile, blended across it and applied in the composition shader; fitted for the whole film at once on a lattice no finer than level 14 — a finer tile takes the function of the level-14 tile it lies in — against the reference given the film's own look, with three tenths of the reference's left in (`--toward`, `TUILE_REFERENCE_DOSE`). What a channel takes of the other two, and what is added, are held far more than its own gain.
 
 Two earlier fits of this film were thrown away before this one, and say why it is as it is: fitted a tile at a time, the function smeared each field of a level-16 tile onto the reference's; fitted on the lattice with every term free, the film came out flat. The same grade is kept beside the film's packs, and the page of the demonstration draws it.
+
+## pyrenees-coast-48f-through-tile-server.mp4 — a bake that asked no source itself (2026-10-08)
+
+The first film whose bake held no access token: every tile the shared store lacked came through a host's tile server, handed to the globe as `Sources` (`GlobeConfig::sources`), and the server alone held the sessions.
+
+- tape: `pyrenees-tape film.mcap 1 24 20000` (1 440 frames, one minute around the Pyrenees at 20 km, tilted 20°); frames 1–48, from the Basque coast inland
+- bake: 640×480, `--sse 16`, embedded pack, scene `adddb0e5a320b454`, 15 distinct tiles over 537 selections, 17.7 MB; through the host's `Sources`, tile store shared with the server under a test prefix (`TUILE_TILES_PREFIX`). The two frames baked before it had asked the server for 13 969 imagery tiles and 2 744 terrain tiles; these 48 asked for 15 and 2 more — the rest was in the store.
+- render: `tuile-film-render <prefix>/packs --out film.mp4 --no-tone --fps 24`, natively, 48 frames in 10.6 s; 15 tiles from the pack, none from the store; H.264 by VideoToolbox, 12 Mb/s
+
+What it is and is not: two seconds, small, and soft — the screen-space error of 16 was chosen to bound what the trial asked of the imagery source, not for the picture. No grade. Looked at: ground everywhere, the coast at frame 1, a river valley at frame 48, no black.
+
+To make it again one needs an implementation of `Sources` and its server, which this repository does not hold; with the built-in sources the same tape, frames and settings give the same selection (`tuile-bake --diff`), see #5.
