@@ -589,12 +589,15 @@ impl TileStore {
         }
         let objects = self.store.clone();
         let manifests = self.manifests.clone();
+        let disk = self.disk.clone();
         let prefix = layer.zone_prefix(key.1);
         let k = key.clone();
         let flight = async move {
             let result = manifest::read(objects.as_ref(), &prefix).await.map(|v| Arc::new(v.manifest));
             if let Ok(m) = &result {
-                manifests.remember(&k, m.clone());
+                if manifests.remember(&k, m.clone()) {
+                    drop_unnamed(disk.as_deref(), &prefix, m);
+                }
             }
             if let Ok(mut f) = manifests.flights.lock() {
                 f.remove(&k);
@@ -608,7 +611,11 @@ impl TileStore {
     }
 
     fn remember_manifest(&self, key: &ZoneKey, m: Arc<Manifest>) {
-        self.manifests.remember(key, m);
+        if self.manifests.remember(key, m.clone()) {
+            if let Ok(layer) = self.layer(&key.0) {
+                drop_unnamed(self.disk.as_deref(), &layer.zone_prefix(key.1), &m);
+            }
+        }
     }
 
     fn forget_manifest(&self, key: &ZoneKey) {
@@ -966,12 +973,24 @@ impl TileStore {
         let l = self.layer(layer)?.clone();
         let lock = self.zone_lock(&(l.name.clone(), zone));
         let _held = lock.lock().await;
-        let epoch = l.epoch((self.clock)());
+        let now = (self.clock)();
         let m = manifest::read(self.store.as_ref(), &l.zone_prefix(zone)).await?.manifest;
-        match tiering::select(&m.archives, &epoch, self.cfg.tiering) {
-            Some(run) => self.merge_run(&l, zone, &m.archives[run]).await,
-            None => Ok(Compaction::Nothing),
+        // The epoch being written first, then those before it that have not
+        // expired: the deltas an epoch's last hours left behind would
+        // otherwise stay as they are until they expire. Each epoch on its
+        // own — a run never spans two.
+        let mut epochs = vec![l.epoch(now)];
+        for a in &m.archives {
+            if !epochs.contains(&a.epoch) && !l.is_expired(&a.epoch, now) {
+                epochs.push(a.epoch.clone());
+            }
         }
+        for epoch in &epochs {
+            if let Some(run) = tiering::select(&m.archives, epoch, self.cfg.tiering) {
+                return self.merge_run(&l, zone, &m.archives[run]).await;
+            }
+        }
+        Ok(Compaction::Nothing)
     }
 
     /// Merges a given run, as a compaction planned on an older manifest would
@@ -1197,13 +1216,26 @@ impl TileStore {
 impl Manifests {
     /// Keeps a manifest unless a newer generation is already kept: a read
     /// that started before our own publication must not undo it.
-    fn remember(&self, key: &ZoneKey, m: Arc<Manifest>) {
-        if let Ok(mut cache) = self.cache.lock() {
-            let older = cache.get(key).is_some_and(|(_, kept)| kept.generation > m.generation);
-            if !older {
-                cache.insert(key.clone(), (Instant::now(), m));
-            }
+    /// Says whether it was news: no copy was kept, or an older one.
+    fn remember(&self, key: &ZoneKey, m: Arc<Manifest>) -> bool {
+        let Ok(mut cache) = self.cache.lock() else { return false };
+        let kept = cache.get(key).map(|(_, kept)| kept.generation);
+        if kept.is_some_and(|kept| kept > m.generation) {
+            return false;
         }
+        cache.insert(key.clone(), (Instant::now(), m.clone()));
+        kept != Some(m.generation)
+    }
+}
+
+/// A zone as it now is: the local copies of what it was made of before
+/// (merged, expired) go at once, rather than when the disk budget is short.
+fn drop_unnamed(disk: Option<&ArchiveCache>, zone_prefix: &str, m: &Manifest) {
+    let Some(disk) = disk else { return };
+    let named: Vec<&str> = m.archives.iter().map(|a| a.key.as_str()).collect();
+    let dropped = disk.keep_only(&format!("{zone_prefix}/"), &named);
+    if dropped > 0 {
+        metrics::counter!("tuile_tiles_archive_copies_dropped_total").increment(dropped as u64);
     }
 }
 
