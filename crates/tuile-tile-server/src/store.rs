@@ -46,6 +46,7 @@ use crate::disk::{ArchiveCache, DiskCacheConfig};
 use crate::layer::{Layer, Zone};
 use crate::lru::Lru;
 use crate::manifest::{self, now_secs, ArchiveRef, Manifest, Retired, Versioned};
+use crate::peers::Announce;
 use crate::tiering::{self, Tiering};
 use crate::StoreError;
 
@@ -246,6 +247,8 @@ pub struct TileStore {
     gate: Mutex<Option<Arc<Gate>>>,
     /// Local projections of remote zones, read before the bucket.
     projections: Mutex<HashMap<ZoneKey, Arc<archive::LocalReader>>>,
+    /// Told of every manifest this store publishes, if anyone is to be.
+    announcer: Option<Arc<dyn Announce>>,
     stats: Stats,
 }
 
@@ -303,6 +306,7 @@ impl TileStore {
             fault: AtomicU8::new(Fault::None as u8),
             gate: Mutex::default(),
             projections: Mutex::default(),
+            announcer: None,
             stats: Stats::default(),
         }
     }
@@ -323,7 +327,8 @@ impl TileStore {
         &self.cfg
     }
 
-    pub(crate) fn now(&self) -> SystemTime {
+    /// The time, by this store's clock.
+    pub fn now(&self) -> SystemTime {
         (self.clock)()
     }
 
@@ -348,6 +353,27 @@ impl TileStore {
     pub async fn with_disk_cache(mut self, cfg: DiskCacheConfig) -> Result<Self, StoreError> {
         self.disk = Some(ArchiveCache::open(cfg).await?);
         Ok(self)
+    }
+
+    /// From now on every manifest this store publishes — a delta, a merge,
+    /// an expiry, a cleanup — is announced through `announcer`, for the other
+    /// instances to drop their copy of it at once: see [`crate::peers`].
+    pub fn with_announcer(mut self, announcer: Arc<dyn Announce>) -> Self {
+        self.announcer = Some(announcer);
+        self
+    }
+
+    /// What an instance does on hearing that a zone's manifest was published
+    /// at `generation`: its own copy, if older, is dropped, and the next read
+    /// of the zone reads the manifest again. A copy as new as the
+    /// announcement — this instance's own publication — is kept.
+    pub fn forget_zone(&self, layer: &str, zone: Zone, generation: u64) {
+        let key = (layer.to_string(), zone);
+        if let Ok(mut cache) = self.manifests.cache.lock() {
+            if cache.get(&key).is_some_and(|(_, kept)| kept.generation < generation) {
+                cache.remove(&key);
+            }
+        }
     }
 
     /// Bytes of archives on local disk.
@@ -807,7 +833,7 @@ impl TileStore {
         let entry =
             ArchiveRef { key: object, epoch, created: now_secs(now), tiles: count, bytes, oldest_fetch_ms, newest_fetch_ms };
         let published = self
-            .publish(&prefix, |m| {
+            .publish(key, &prefix, |m| {
                 let mut next = m.clone();
                 next.archives.push(entry.clone());
                 Some(next)
@@ -897,7 +923,7 @@ impl TileStore {
 
     /// Derives the next manifest from the current one and publishes it,
     /// retrying on a lost race. `derive` returning `None` abandons.
-    async fn publish<F>(&self, prefix: &str, derive: F) -> Result<Option<Manifest>, StoreError>
+    async fn publish<F>(&self, key: &ZoneKey, prefix: &str, derive: F) -> Result<Option<Manifest>, StoreError>
     where
         F: Fn(&Manifest) -> Option<Manifest>,
     {
@@ -906,6 +932,10 @@ impl TileStore {
             let Some(mut next) = derive(&current.manifest) else { return Ok(None) };
             next.generation = current.manifest.generation + 1;
             if manifest::replace(self.store.as_ref(), prefix, &current, &next).await? {
+                if let Some(announcer) = &self.announcer {
+                    announcer.published(&key.0, key.1, next.generation).await;
+                    metrics::counter!("tuile_tiles_announced_total", "layer" => key.0.clone()).increment(1);
+                }
                 return Ok(Some(next));
             }
             metrics::counter!("tuile_tiles_publish_conflicts_total").increment(1);
@@ -999,7 +1029,7 @@ impl TileStore {
             return Ok(());
         }
         let now_s = now_secs(now);
-        self.publish(&prefix, |m| {
+        self.publish(&(layer.name.clone(), zone), &prefix, |m| {
             let mut next = m.clone();
             let (gone, kept): (Vec<_>, Vec<_>) = m.archives.iter().cloned().partition(|a| layer.is_expired(&a.epoch, now));
             next.archives = kept;
@@ -1083,7 +1113,7 @@ impl TileStore {
         let now_s = now_secs(now);
 
         let published = self
-            .publish(&prefix, |m| {
+            .publish(&(layer.name.clone(), zone), &prefix, |m| {
                 // The run must still be there, whole, contiguous, in order;
                 // otherwise someone else compacted part of it first.
                 let first = m.archives.iter().position(|a| a.key == run_keys[0])?;
@@ -1127,7 +1157,7 @@ impl TileStore {
             m.retired.iter().filter(|r| now_s.saturating_sub(r.retired) >= grace).map(|r| r.key.clone()).collect()
         };
         if !expired.is_empty() {
-            self.publish(&prefix, |m| {
+            self.publish(&(layer.name.clone(), zone), &prefix, |m| {
                 let mut next = m.clone();
                 next.retired.retain(|r| !expired.contains(&r.key));
                 Some(next)

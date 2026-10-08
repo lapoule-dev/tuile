@@ -28,6 +28,7 @@ use serde::Serialize;
 use crate::catalog::{ABSENT_MARKER, ABSENT_SUFFIX};
 use crate::grid::Grid;
 use crate::lru::Lru;
+use crate::peers::{Claim, SharedTile, SharedTiles};
 use crate::store::TileStore;
 use crate::upstream::Upstream;
 use crate::StoreError;
@@ -40,6 +41,11 @@ pub const DEFAULT_HOT_BYTES: u64 = 256 * MIB;
 /// source is asked again, which a store hit never does; this only bounds how
 /// long another instance's newer copy stays unseen.
 pub const DEFAULT_HOT_TTL: Duration = Duration::from_secs(10 * 60);
+/// Default for [`ServiceConfig::shared_wait`]: longer than a source takes to
+/// answer, far shorter than a client waits.
+pub const DEFAULT_SHARED_WAIT: Duration = Duration::from_secs(5);
+/// Default for [`ServiceConfig::shared_poll`].
+pub const DEFAULT_SHARED_POLL: Duration = Duration::from_millis(50);
 /// What an absence weighs in the hot budget: its key and bookkeeping.
 const ABSENCE_WEIGHT: u64 = 64;
 
@@ -76,6 +82,9 @@ pub enum Source {
     Store,
     /// Fetched from the layer's source just now.
     Upstream,
+    /// Fetched by another instance moments ago, and not yet in the store:
+    /// read from what the instances share ([`crate::peers::SharedTiles`]).
+    Shared,
 }
 
 impl Source {
@@ -84,6 +93,7 @@ impl Source {
             Source::Memory => "memory",
             Source::Store => "store",
             Source::Upstream => "upstream",
+            Source::Shared => "shared",
         }
     }
 }
@@ -128,11 +138,21 @@ pub struct ServiceConfig {
     /// How long a hot tile, or a remembered absence, is served without
     /// asking the store again.
     pub hot_ttl: Duration,
+    /// With tiles shared between instances: how long this one waits for a
+    /// tile another is fetching before it fetches it itself…
+    pub shared_wait: Duration,
+    /// …and how often it looks for it meanwhile.
+    pub shared_poll: Duration,
 }
 
 impl Default for ServiceConfig {
     fn default() -> Self {
-        Self { hot_bytes: DEFAULT_HOT_BYTES, hot_ttl: DEFAULT_HOT_TTL }
+        Self {
+            hot_bytes: DEFAULT_HOT_BYTES,
+            hot_ttl: DEFAULT_HOT_TTL,
+            shared_wait: DEFAULT_SHARED_WAIT,
+            shared_poll: DEFAULT_SHARED_POLL,
+        }
     }
 }
 
@@ -144,6 +164,8 @@ pub struct ServiceStats {
     pub upstream: u64,
     /// Answered "no such tile" without asking the source.
     pub absent: u64,
+    /// Answered with what another instance had just fetched.
+    pub shared: u64,
 }
 
 #[derive(Default)]
@@ -152,10 +174,14 @@ struct Counters {
     store: AtomicU64,
     upstream: AtomicU64,
     absent: AtomicU64,
+    shared: AtomicU64,
 }
 
 type Key = (String, u8, u32, u32);
-type Flight = Shared<BoxFuture<'static, Result<Option<Bytes>, ServiceError>>>;
+/// What a flight brings back: the tile (or the source's "no such tile"), and
+/// whether it was this instance's own fetch or another's, shared.
+type Fetched = (Option<Bytes>, Source);
+type Flight = Shared<BoxFuture<'static, Result<Fetched, ServiceError>>>;
 
 /// A hot entry: a tile with its validator, or a remembered absence.
 #[derive(Clone)]
@@ -172,6 +198,8 @@ pub struct TileService {
     cfg: ServiceConfig,
     hot: Mutex<Lru<Key, Hot>>,
     counters: Counters,
+    /// What this instance shares with the others, if anything.
+    shared: Option<Arc<dyn SharedTiles>>,
 }
 
 impl TileService {
@@ -187,7 +215,16 @@ impl TileService {
             hot: Mutex::new(Lru::new(cfg.hot_bytes)),
             cfg,
             counters: Counters::default(),
+            shared: None,
         }
+    }
+
+    /// From now on, a tile this service is about to fetch is first looked
+    /// for among those other instances have just fetched, and fetched by one
+    /// instance only: see [`crate::peers`].
+    pub fn with_shared(mut self, shared: Arc<dyn SharedTiles>) -> Self {
+        self.shared = Some(shared);
+        self
     }
 
     pub fn store(&self) -> &Arc<TileStore> {
@@ -201,6 +238,7 @@ impl TileService {
             store: g(&self.counters.store),
             upstream: g(&self.counters.upstream),
             absent: g(&self.counters.absent),
+            shared: g(&self.counters.shared),
         }
     }
 
@@ -256,13 +294,17 @@ impl TileService {
             return Ok(None);
         }
 
-        let fetched = self.fetch_once(layer, level, x, y).await?;
-        self.counters.upstream.fetch_add(1, Ordering::Relaxed);
+        let (fetched, source) = self.fetch_once(layer, level, x, y).await?;
+        // A tile another instance fetched is one the source was not asked
+        // for: a hit, from here.
+        let hit = source == Source::Shared;
+        let counter = if hit { &self.counters.shared } else { &self.counters.upstream };
+        counter.fetch_add(1, Ordering::Relaxed);
         match fetched {
             Some(bytes) => {
                 let etag = etag_of(&bytes);
                 self.hot_put(key, Some((bytes.clone(), etag.clone())));
-                Ok(Some(TileResponse { bytes, content_type, etag, hit: false, source: Source::Upstream }))
+                Ok(Some(TileResponse { bytes, content_type, etag, hit, source }))
             }
             None => {
                 self.hot_put(key, None);
@@ -309,24 +351,60 @@ impl TileService {
         let upstream = self.upstreams.get(layer).cloned();
         let store = self.store.clone();
         let table = self.inflight.clone();
+        let shared = self.shared.clone();
+        let (wait, poll) = (self.cfg.shared_wait, self.cfg.shared_poll);
         let k = key.clone();
         let flight = async move {
             let result = async {
                 let upstream = upstream.ok_or_else(|| ServiceError::UnknownLayer(k.0.clone()))?;
-                metrics::counter!("tuile_tiles_upstream_total", "layer" => k.0.clone()).increment(1);
-                let got = upstream.fetch(k.1, k.2, k.3).await.map_err(|e| ServiceError::Upstream(e.0))?;
-                match &got {
-                    Some(bytes) => store.put(&k.0, k.1, k.2, k.3, bytes.clone()).await?,
-                    None => {
-                        // The source's own "no such tile" is data: remembered
-                        // in the absence sibling when the layer has one.
-                        let absence = format!("{}{ABSENT_SUFFIX}", k.0);
-                        if store.layer(&absence).is_ok() {
-                            store.put(&absence, k.1, k.2, k.3, Bytes::from_static(ABSENT_MARKER)).await?;
+                let Some(shared) = shared else {
+                    return fetch(&upstream, &store, None, &k).await;
+                };
+                let seen = |outcome: &'static str| {
+                    metrics::counter!("tuile_tiles_shared_total", "layer" => k.0.clone(), "outcome" => outcome).increment(1);
+                };
+                // Another instance may have fetched it moments ago.
+                if let Some(tile) = shared.get(&k.0, k.1, k.2, k.3).await {
+                    seen("hit");
+                    return Ok((tile.bytes, Source::Shared));
+                }
+                match shared.claim(&k.0, k.1, k.2, k.3).await {
+                    Claim::Mine(token) => {
+                        // Between the look and the claim, the one that held
+                        // the claim may have shared the tile and let go.
+                        let got = match shared.get(&k.0, k.1, k.2, k.3).await {
+                            Some(tile) => {
+                                seen("hit");
+                                Ok((tile.bytes, Source::Shared))
+                            }
+                            None => {
+                                seen("claimed");
+                                fetch(&upstream, &store, Some(&shared), &k).await
+                            }
+                        };
+                        shared.release(&k.0, k.1, k.2, k.3, &token).await;
+                        got
+                    }
+                    Claim::Theirs => {
+                        // Wait for the other's tile — never for ever: it may
+                        // have died, or its source may be slower than a
+                        // client should wait behind.
+                        let until = tokio::time::Instant::now() + wait;
+                        while tokio::time::Instant::now() < until {
+                            tokio::time::sleep(poll).await;
+                            if let Some(tile) = shared.get(&k.0, k.1, k.2, k.3).await {
+                                seen("waited");
+                                return Ok((tile.bytes, Source::Shared));
+                            }
                         }
+                        seen("gave_up");
+                        fetch(&upstream, &store, Some(&shared), &k).await
+                    }
+                    Claim::Unknown => {
+                        seen("miss");
+                        fetch(&upstream, &store, Some(&shared), &k).await
                     }
                 }
-                Ok(got)
             }
             .await;
             if let Ok(mut t) = table.lock() {
@@ -339,6 +417,37 @@ impl TileService {
         inflight.insert(key, flight.clone());
         flight
     }
+}
+
+/// Asks the source for a tile, shares it with the other instances if there
+/// is something to share it through, and hands it to the store.
+async fn fetch(
+    upstream: &Arc<dyn Upstream>,
+    store: &Arc<TileStore>,
+    shared: Option<&Arc<dyn SharedTiles>>,
+    k: &Key,
+) -> Result<Fetched, ServiceError> {
+    metrics::counter!("tuile_tiles_upstream_total", "layer" => k.0.clone()).increment(1);
+    let got = upstream.fetch(k.1, k.2, k.3).await.map_err(|e| ServiceError::Upstream(e.0))?;
+    let fetched = store.now();
+    // Shared first: whoever waits for it is waiting now, and the store's own
+    // write may take an upload.
+    if let Some(shared) = shared {
+        let fetched_ms = fetched.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        shared.put(&k.0, k.1, k.2, k.3, &SharedTile { bytes: got.clone(), fetched_ms }).await;
+    }
+    match &got {
+        Some(bytes) => store.put_fetched(&k.0, k.1, k.2, k.3, bytes.clone(), fetched).await?,
+        None => {
+            // The source's own "no such tile" is data: remembered in the
+            // absence sibling when the layer has one.
+            let absence = format!("{}{ABSENT_SUFFIX}", k.0);
+            if store.layer(&absence).is_ok() {
+                store.put_fetched(&absence, k.1, k.2, k.3, Bytes::from_static(ABSENT_MARKER), fetched).await?;
+            }
+        }
+    }
+    Ok((got, Source::Upstream))
 }
 
 /// The strong validator of a tile's bytes.
