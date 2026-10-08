@@ -414,7 +414,7 @@ The first film whose bake held no access token: every tile the shared store lack
 
 - tape: `pyrenees-tape film.mcap 1 24 20000` (1 440 frames, one minute around the Pyrenees at 20 km, tilted 20°); frames 1–48, from the Basque coast inland
 - bake: 640×480, `--sse 16`, embedded pack, scene `adddb0e5a320b454`, 15 distinct tiles over 537 selections, 17.7 MB; through the host's `Sources`, tile store shared with the server under a test prefix (`TUILE_TILES_PREFIX`). The two frames baked before it had asked the server for 13 969 imagery tiles and 2 744 terrain tiles; these 48 asked for 15 and 2 more — the rest was in the store.
-- render: `tuile-film-render <prefix>/packs --out film.mp4 --no-tone --fps 24`, natively, 48 frames in 10.6 s; 15 tiles from the pack, none from the store; H.264 by VideoToolbox, 12 Mb/s
+- render: `tuile-film-render <prefix>/packs --out film.mp4 --codec h264 --no-tone --fps 24` (built with `--features videotoolbox`), natively, 48 frames in 1.6 s; 15 tiles from the pack, none from the store; H.264 by VideoToolbox, 12 Mb/s. A first render without that feature came out as AV1 by rav1e (10.6 s), which the Mac's own player does not show: the file kept is the H.264 one.
 
 What it is and is not: two seconds, small, and soft — the screen-space error of 16 was chosen to bound what the trial asked of the imagery source, not for the picture. No grade. Looked at: ground everywhere, the coast at frame 1, a river valley at frame 48, no black.
 
