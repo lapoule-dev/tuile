@@ -267,3 +267,36 @@ async fn a_maintenance_pass_finds_every_zone_and_drops_expired_archives() {
         .manifest;
     assert_eq!(terrain.archives.len(), 1, "durable terrain kept");
 }
+
+/// The epochs of a zone's archives, oldest archive first.
+async fn epochs(objects: &dyn object_store::ObjectStore) -> Vec<String> {
+    let m = tuile_tile_server::manifest::read(objects, &common::imagery().zone_prefix(zone())).await.expect("manifest").manifest;
+    m.archives.iter().map(|a| a.epoch.clone()).collect()
+}
+
+#[tokio::test]
+async fn a_past_month_s_deltas_are_merged_among_themselves_and_never_with_another_month_s() {
+    let clock = TestClock::new();
+    let objects = memory();
+    let s = store_on(objects.clone(), &clock, eager());
+    let fanout = eager().tiering.fanout as u32;
+    // What a month's last hours leave: enough small deltas for a run.
+    for v in 0..fanout {
+        s.put(IMAGERY, LEVEL, X0 + v, Y0, body(LEVEL, X0 + v, Y0, v)).await.expect("put");
+        s.flush_all().await.expect("flush");
+    }
+    clock.advance(days(31)); // next month
+    // And too few of the new month for a run of their own.
+    for v in fanout..fanout + 2 {
+        s.put(IMAGERY, LEVEL, X0 + v, Y0, body(LEVEL, X0 + v, Y0, v)).await.expect("put");
+        s.flush_all().await.expect("flush");
+    }
+    assert_eq!(epochs(objects.as_ref()).await.len(), fanout as usize + 2);
+
+    s.compact_due().await.expect("compact_due");
+    assert_eq!(epochs(objects.as_ref()).await, ["202609", "202610", "202610"], "last month's are one, this month's untouched");
+    let fresh = store_on(objects, &clock, eager());
+    for v in 0..fanout + 2 {
+        assert_eq!(fresh.get(IMAGERY, LEVEL, X0 + v, Y0).await.expect("get"), Some(body(LEVEL, X0 + v, Y0, v)));
+    }
+}

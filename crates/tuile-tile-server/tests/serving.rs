@@ -474,3 +474,47 @@ async fn a_compaction_keeps_the_fetch_times_of_what_it_merges() {
     let fresh = store_on(objects, &clock, eager());
     assert_eq!(fresh.get(IMAGERY, LEVEL, X0, Y0).await.expect("get"), Some(body(LEVEL, X0, Y0, 1)));
 }
+
+/// Rewrites the zone's manifest as a writer older than the fetch times
+/// would: what it does not know of an archive, it does not write back.
+async fn rewritten_by_an_older_writer(objects: &dyn ObjectStore) {
+    let prefix = common::imagery().zone_prefix(zone());
+    let read = tuile_tile_server::manifest::read(objects, &prefix).await.expect("manifest");
+    let mut next = read.manifest.clone();
+    next.generation += 1;
+    for a in &mut next.archives {
+        (a.oldest_fetch_ms, a.newest_fetch_ms) = (None, None);
+    }
+    assert!(tuile_tile_server::manifest::replace(objects, &prefix, &read, &next).await.expect("replace"));
+}
+
+#[tokio::test]
+async fn a_manifest_rewritten_without_fetch_times_costs_a_duplicate_and_nothing_else() {
+    let clock = TestClock::new();
+    let objects = memory();
+    let t0 = clock.now();
+    let a = store_on(objects.clone(), &clock, eager());
+    a.put_fetched(IMAGERY, LEVEL, X0, Y0, body(LEVEL, X0, Y0, 1), t0 + Duration::from_secs(20)).await.expect("put");
+    a.flush_all().await.expect("flush");
+    rewritten_by_an_older_writer(objects.as_ref()).await;
+
+    // An older copy of the tile can no longer be told older: it is published.
+    let b = store_on(objects.clone(), &clock, eager());
+    b.put_fetched(IMAGERY, LEVEL, X0, Y0, body(LEVEL, X0, Y0, 9), t0 + Duration::from_secs(10)).await.expect("put");
+    // The same bytes are still told the same, whatever the manifest says.
+    let (x, y) = in_zone(1);
+    b.put_fetched(IMAGERY, LEVEL, x, y, body(LEVEL, x, y, 1), t0 + Duration::from_secs(30)).await.expect("put");
+    b.flush_all().await.expect("flush");
+    assert_eq!(b.stats().dedup_newer, 0);
+    assert_eq!(archive_count(objects.as_ref()).await, 2);
+
+    // Merging an archive without fetch times with one that has them gives
+    // one without: a bound on half its tiles would be a lie.
+    assert!(matches!(b.compact(IMAGERY, zone()).await.expect("compact"), tuile_tile_server::Compaction::Merged { .. }));
+    let m = tuile_tile_server::manifest::read(objects.as_ref(), &common::imagery().zone_prefix(zone())).await.expect("m").manifest;
+    assert_eq!(m.archives.len(), 1);
+    assert_eq!((m.archives[0].oldest_fetch_ms, m.archives[0].newest_fetch_ms), (None, None));
+    let fresh = store_on(objects, &clock, eager());
+    assert_eq!(fresh.get(IMAGERY, LEVEL, X0, Y0).await.expect("get"), Some(body(LEVEL, X0, Y0, 9)));
+    assert_eq!(fresh.get(IMAGERY, LEVEL, x, y).await.expect("get"), Some(body(LEVEL, x, y, 1)));
+}

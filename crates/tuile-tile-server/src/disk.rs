@@ -283,6 +283,22 @@ impl ArchiveCache {
         Ok(reader)
     }
 
+    /// Drops the copies under `prefix` that `named` does not hold: what a
+    /// zone's manifest no longer names is never read through it again, and
+    /// would otherwise sit in the budget until the least recently used of
+    /// all. Returns how many were dropped.
+    pub(crate) fn keep_only(&self, prefix: &str, named: &[&str]) -> usize {
+        let Ok(mut readers) = self.readers.lock() else { return 0 };
+        let gone: Vec<String> =
+            readers.keys().filter(|k| k.starts_with(prefix) && !named.contains(&k.as_str())).cloned().collect();
+        for key in &gone {
+            readers.remove(key);
+            // A reader still holding the mapping keeps it until it is done.
+            let _ = std::fs::remove_file(self.cfg.dir.join(key));
+        }
+        gone.len()
+    }
+
     /// Waits until no download is in flight.
     pub(crate) async fn settle(&self) {
         let mut rx = self.pending.subscribe();

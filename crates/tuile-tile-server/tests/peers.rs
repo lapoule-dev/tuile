@@ -16,6 +16,7 @@ use bytes::Bytes;
 use common::*;
 use object_store::ObjectStore;
 use tuile_tile_server::catalog::layers;
+use tuile_tile_server::disk::DiskCacheConfig;
 use tuile_tile_server::peers::InMemory;
 use tuile_tile_server::{
     Claim, ServiceConfig, SharedTile, SharedTiles, Source, StoreConfig, TileService, TileStore, Upstream,
@@ -211,4 +212,57 @@ async fn the_claim_is_given_back_once_the_tile_is_fetched() {
         matches!(shared.claim(IMAGERY, LEVEL, X0, Y0).await, Claim::Mine(_)),
         "nothing is left claimed behind a fetch"
     );
+}
+
+fn archives_on_disk(dir: &std::path::Path) -> usize {
+    let mut n = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(d).expect("read_dir") {
+            let p = e.expect("entry").path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|e| e == "pmtiles") {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+#[tokio::test]
+async fn a_compaction_pass_elsewhere_is_heard_and_its_merged_archives_leave_the_disk() {
+    let (clock, objects) = (TestClock::new(), memory());
+    let fanout = eager().tiering.fanout as u32;
+    let writer = store(&objects, &clock, eager());
+    for i in 0..fanout {
+        let (x, y) = in_zone(i);
+        writer.put(IMAGERY, LEVEL, x, y, body(LEVEL, x, y, 1)).await.expect("put");
+        writer.flush_all().await.expect("flush");
+    }
+
+    // A server that trusts a manifest for an hour, with the zone on its disk.
+    let trusting = StoreConfig { manifest_ttl: Duration::from_secs(3600), manifest_max_stale: Duration::ZERO, ..eager() };
+    let dir = tempfile::tempdir().expect("dir");
+    let server =
+        Arc::new(store(&objects, &clock, trusting).with_disk_cache(DiskCacheConfig::new(dir.path())).await.expect("disk"));
+    let bus = Arc::new(InMemory::default());
+    bus.listen(&server);
+    assert_eq!(server.get(IMAGERY, LEVEL, X0, Y0).await.expect("get"), Some(body(LEVEL, X0, Y0, 1)));
+    server.settle().await;
+    assert_eq!(archives_on_disk(dir.path()), fanout as usize);
+
+    // The pass of another process, on the bucket alone, saying what it did.
+    let job = store(&objects, &clock, eager()).with_announcer(bus.clone());
+    let done = job.compact_due().await.expect("compact_due");
+    assert!(done.iter().any(|(_, _, c)| matches!(c, tuile_tile_server::Compaction::Merged { .. })), "{done:?}");
+    assert!(bus.announced() >= 1);
+
+    // The server reads the zone as it now is, at once, and keeps only that.
+    let before = server.stats();
+    let (x, y) = in_zone(1);
+    assert_eq!(server.get(IMAGERY, LEVEL, x, y).await.expect("get"), Some(body(LEVEL, x, y, 1)));
+    server.settle().await;
+    assert_eq!(archives_on_disk(dir.path()), 1, "the merged archive, and none of what it replaced");
+    assert_eq!(server.stats().disk, before.disk + 1, "read from the copy of the merged archive");
 }

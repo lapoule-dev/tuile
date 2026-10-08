@@ -89,6 +89,11 @@ impl<K: Eq + Hash + Clone, V: Clone> Lru<K, V> {
         Some(slot.value)
     }
 
+    /// Every key held, in no particular order.
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.map.keys()
+    }
+
     /// Total weight held.
     pub fn weight(&self) -> u64 {
         self.weight
