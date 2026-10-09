@@ -2,10 +2,16 @@
 // Copyright (c) lapoule.dev
 
 /*
- * Builds the workspace rustdoc and stages it where the site can serve it.
+ * Builds the rustdoc of the published crates and stages it where the site can
+ * serve it.
  *
  *   node ./scripts/rustdoc.mjs            # cargo doc, then stage
  *   node ./scripts/rustdoc.mjs --stage-only   # stage an existing target/doc
+ *
+ * What is documented is the selection below, not the whole workspace. Rustdoc
+ * accumulates in `target/doc` — its search index and crate switcher remember
+ * every crate ever documented there — so a build starts by clearing that
+ * directory, and staging refuses a tree that holds anything but the selection.
  *
  * The output lands in `site/public/docs/api/`, which Astro copies verbatim into
  * `dist/` at build time, so it is served as plain files at `/docs/api/...` with
@@ -31,11 +37,70 @@ const repoRoot = resolve(siteDir, '..');
 const docDir = join(repoRoot, 'target', 'doc');
 const stageDir = join(siteDir, 'public', 'docs', 'api');
 
+// The published documentation: these packages' libraries…
+const libraries = [
+  // core and formats
+  'tuile-core',
+  'tuile-b3dm',
+  'tuile-terrain',
+  'tuile-pack',
+  // sources and storage
+  'tuile-native-fetchers',
+  'tuile-web',
+  'tuile-storage-foyer',
+  'tuile-tile-server',
+  'tuile-repository',
+  'tuile-bing',
+  'tuile-cesium-ion',
+  // scene and rendering
+  'tuile-planetary',
+  'tuile-camera',
+  'tuile-ui',
+  'tuile-atmosphere',
+  'tuile-radiometry',
+  'tuile-wgpu',
+  // film
+  'tuile-bake',
+  'tuile-film',
+  'tuile-film-gpu',
+  'tuile-film-native',
+  'tuile-film-web',
+  'tuile-mp4',
+  // integrations
+  'tuile-usd',
+  'tuile-hydra',
+  'tuile-metrics',
+  'tuile-pack-worker',
+];
+
+// …and these programs, as [package, binary].
+const programs = [
+  ['tuile-film-native', 'tuile-film-render'],
+  ['tuile-pack-api', 'tuile-pack-api'],
+  ['wgpu-viewer', 'wgpu-viewer'],
+];
+
+// Held back for a later publication: tuile-tape and tuile-farm with all their
+// tools, the tool of tuile-usd, and the examples other than the viewer.
+
+const crateName = (n) => n.replaceAll('-', '_');
+const expected = [...libraries, ...programs.map(([, bin]) => bin)].map(crateName).sort();
+
+const packages = [...new Set([...libraries, ...programs.map(([pkg]) => pkg)])];
+const cargoArgs = [
+  'doc',
+  '--no-deps',
+  ...packages.flatMap((pkg) => ['-p', pkg]),
+  '--lib',
+  ...programs.flatMap(([, bin]) => ['--bin', bin]),
+];
+
 const stageOnly = process.argv.includes('--stage-only');
 
 if (!stageOnly) {
-  console.log('> cargo doc --workspace --no-deps');
-  const r = spawnSync('cargo', ['doc', '--workspace', '--no-deps'], {
+  await rm(docDir, { recursive: true, force: true });
+  console.log(`> cargo ${cargoArgs.join(' ')}`);
+  const r = spawnSync('cargo', cargoArgs, {
     cwd: repoRoot,
     stdio: 'inherit',
   });
@@ -51,6 +116,21 @@ if (!stageOnly) {
 
 if (!existsSync(docDir)) {
   console.error(`no rustdoc at ${docDir} — run without --stage-only first.`);
+  process.exit(1);
+}
+
+// A crate is a directory with its own index; `src/`, `static.files/` and the
+// index directories are rustdoc's shared furniture.
+const documented = (await readdir(docDir, { withFileTypes: true }))
+  .filter((e) => e.isDirectory() && existsSync(join(docDir, e.name, 'index.html')))
+  .map((e) => e.name)
+  .sort();
+const missing = expected.filter((c) => !documented.includes(c));
+const extra = documented.filter((c) => !expected.includes(c));
+if (missing.length || extra.length) {
+  if (missing.length) console.error(`missing from ${docDir}: ${missing.join(', ')}`);
+  if (extra.length) console.error(`not in the selection: ${extra.join(', ')}`);
+  console.error('target/doc is not the selection; run without --stage-only to rebuild it.');
   process.exit(1);
 }
 

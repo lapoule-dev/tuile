@@ -22,7 +22,7 @@ All of these run from this directory.
 |---|---|
 | `npm install` | Install dependencies. |
 | `npm run dev` | Development server on <http://localhost:4321>. |
-| `npm run docs:api` | `cargo doc --workspace --no-deps`, then stage the result under `public/docs/api/`. |
+| `npm run docs:api` | `cargo doc --no-deps` for the published crates, then stage the result under `public/docs/api/`. |
 | `npm run build` | Static build into `dist/`. |
 | `npm run preview` | Serve `dist/` locally on <http://localhost:4321>. |
 | `npm run build:all` | `docs:api` then `build`, in that order. |
@@ -41,8 +41,17 @@ npm run preview           # http://localhost:4321
 
 ## How the Rust API documentation is wired
 
-`cargo doc --workspace --no-deps` writes rustdoc into the workspace's
-`target/doc`. `scripts/rustdoc.mjs` runs that and then copies the tree into
+Not every crate of the workspace is documented here: `scripts/rustdoc.mjs`
+holds the list — twenty-seven libraries and three programs — and
+`src/pages/docs/index.astro` groups the same names under headings. The crates
+that record and replay camera paths, the ones that drive a render farm, their
+tools and most examples are held back for a later publication. Adding a crate
+means adding it to both files.
+
+The script clears `target/doc`, because rustdoc's search index and crate
+switcher remember every crate ever documented there, runs `cargo doc --no-deps`
+for the selection, checks that what came out is exactly the selection, and then
+copies the tree into
 `public/docs/api/`, which Astro copies verbatim into `dist/` at build time;
 `dist/` is served as plain files, so the docs land at
 `/docs/api/<crate>/index.html`.
@@ -61,7 +70,7 @@ directory is read by Astro's build when it copies `public/`. Re-staging after a
 build without rebuilding will not reach `dist/`. `npm run build:all` gets the
 order right.
 
-The generated tree is about 50 MB in some 2,100 files and is gitignored (`public/docs/api/`), along
+The generated tree is about 45 MB in some 1,700 files and is gitignored (`public/docs/api/`), along
 with `dist/`, `node_modules/` and `.astro/`. A fresh checkout therefore starts
 with the API links returning 404, and the API page says so on the page itself
 rather than pretending otherwise.
@@ -120,8 +129,8 @@ negotiable:
    3D Tiles Community Standard, never relative to another product. Describe the
    gap in the ecosystem; do not name who occupies it. The single exception in
    the codebase — connector crates named after the service they connect to —
-   stays out of the prose, which is why the API page hides those two crate names
-   from its index and points at rustdoc's own crate switcher instead.
+   stays out of the prose: the API page lists those two crates by their crate
+   name, as it does every other, and says nothing more about them.
 2. **SPDX headers** on every source file: `MIT OR Apache-2.0`, copyright
    lapoule.dev.
 
