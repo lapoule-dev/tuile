@@ -99,7 +99,71 @@ pub struct GlobeConfig {
     /// asset, the imagery under its own. What is stored is what the source
     /// served, so a pack baked through a cache is the pack baked without one.
     pub tile_cache: Option<TileCache>,
+    /// The host's own sources, in place of the built-in ones: see
+    /// [`Sources`]. With one, the token is not read.
+    pub sources: Option<SourcesHandle>,
     pub session: SessionConfig,
+}
+
+/// Where a globe's tiles come from, when the host brings its own sources.
+///
+/// By default a globe resolves each asset itself, from the access token it
+/// is given. A host that keeps its tiles elsewhere — behind a server of its
+/// own, which already holds the sessions, the quota and the store — gives the
+/// globe a `Sources` instead. The globe then resolves nothing: no token is
+/// read, no endpoint is asked for, no descriptor is fetched; every tile comes
+/// from what the host handed over, through the same tile cache as ever.
+///
+/// The assets keep their numbers either way. They are what a pack records and
+/// what the tile cache is keyed by, so a pack baked through a host's sources
+/// is the pack the built-in ones would have given, provided the tiles are the
+/// same tiles. That proviso is the host's to keep.
+#[async_trait::async_trait]
+pub trait Sources: Send + Sync {
+    /// The terrain of `asset`: its `layer.json`, and its tiles.
+    async fn terrain(
+        &self,
+        asset: i64,
+    ) -> Result<(tuile_terrain::LayerJson, Arc<dyn tuile_terrain::TerrainSource>), String>;
+
+    /// The imagery of `asset`.
+    async fn imagery(&self, asset: i64) -> Result<Arc<dyn tuile_core::raster::ImageryProvider>, String>;
+}
+
+/// A [`Sources`] a config can carry.
+#[derive(Clone)]
+pub struct SourcesHandle(pub Arc<dyn Sources>);
+
+impl std::fmt::Debug for SourcesHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Sources")
+    }
+}
+
+/// A source held by pointer, as the source it points to.
+struct Held<T: ?Sized>(Arc<T>);
+
+#[async_trait::async_trait]
+impl tuile_terrain::TerrainSource for Held<dyn tuile_terrain::TerrainSource> {
+    async fn fetch_tile(
+        &self,
+        coord: tuile_terrain::TileCoord,
+    ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError> {
+        self.0.fetch_tile(coord).await
+    }
+}
+
+#[async_trait::async_trait]
+impl tuile_core::raster::ImageryProvider for Held<dyn tuile_core::raster::ImageryProvider> {
+    fn tiling_scheme(&self) -> tuile_core::raster::TilingScheme {
+        self.0.tiling_scheme()
+    }
+    async fn fetch_tile_bytes(
+        &self,
+        coord: tuile_core::raster::ImageryCoord,
+    ) -> Result<tuile_core::fetch::Fetched<bytes::Bytes>, tuile_core::raster::RasterError> {
+        self.0.fetch_tile_bytes(coord).await
+    }
 }
 
 /// A [`ContentStore`](tuile_core::storage::ContentStore) the globe caches
@@ -136,6 +200,7 @@ impl GlobeConfig {
             cache_dir: None,
             held_drape: None,
             tile_cache: None,
+            sources: None,
             session: SessionConfig::default(),
         }
     }
@@ -150,6 +215,8 @@ impl GlobeConfig {
 pub enum GlobeError {
     #[error("no ion token was supplied")]
     MissingToken,
+    #[error("the host's sources: {0}")]
+    Sources(String),
     #[error("starting the tokio runtime: {0}")]
     Runtime(#[from] std::io::Error),
     #[error("the native HTTP transport: {0}")]
@@ -178,7 +245,7 @@ impl Session {
     /// document, and there is nothing to hand back until they arrive. Call it
     /// once, off whatever thread the host can afford to block.
     pub fn globe(config: GlobeConfig) -> Result<Self, GlobeError> {
-        if config.ion_token.trim().is_empty() {
+        if config.sources.is_none() && config.ion_token.trim().is_empty() {
             return Err(GlobeError::MissingToken);
         }
 
@@ -366,6 +433,31 @@ async fn resolve(
     // abandonner jette tout ce qui est déjà cuit. Le 19 septembre 2026 une
     // cuisson est morte à la frame 2807 sur 2880, après vingt-sept minutes, sur
     // un unique `http status 500`. Voir `RetryConfig::patient`.
+    // The host's own sources: the same globe, the same options, the same
+    // cache in front — and nothing resolved here.
+    if let Some(sources) = &config.sources {
+        let cache = || config.tile_cache.clone().map(|c| c.0);
+        let (layer, terrain) = sources.0.terrain(config.terrain_asset_id).await.map_err(GlobeError::Sources)?;
+        let terrain = Cached::wrap_terrain(Held(terrain), cache(), config.terrain_asset_id);
+        let options = |no_imagery| GlobeOptions {
+            no_imagery,
+            max_level: max_level(),
+            imagery_slots: imagery_slots.clone(),
+            imagery_boost_cap: imagery_boost_cap(),
+            deterministic_floor: true,
+            held_drape: config.held_drape.clone(),
+            composed_at: config.session.bake_max_size,
+        };
+        return Ok(match config.imagery_asset_id {
+            None => globe_with_provenance(terrain, NoImagery, layer, options(true), offload::threaded()),
+            Some(asset) => {
+                let imagery = sources.0.imagery(asset).await.map_err(GlobeError::Sources)?;
+                let imagery = Cached::wrap_imagery(Held(imagery), cache(), asset);
+                globe_with_provenance(terrain, imagery, layer, options(false), offload::threaded())
+            }
+        });
+    }
+
     let transport = TransportConfig {
         retry: RetryConfig::patient(),
         ..match &config.cache_dir {
@@ -486,8 +578,8 @@ async fn resolve(
     Ok((tree, loader, detail, heights, provenance))
 }
 
-/// An ion-hosted imagery asset, opened and not yet asked for a tile: what it
-/// is, as its own descriptor states it.
+/// An imagery asset, opened and not yet asked for a tile: what it is, as
+/// its own descriptor states it — or as the host's sources give it.
 ///
 /// For a source that is not drawn but measured against — a reference a
 /// film's imagery is brought to. Opening it and fetching from it are two
@@ -495,10 +587,12 @@ async fn resolve(
 /// between: a store keeps tiles by layer, and a layer is declared with the
 /// grid and the format only the open asset can tell.
 pub struct ReferenceImagery {
-    tms: TmsImagery<NativeHttp>,
+    provider: Arc<dyn tuile_core::raster::ImageryProvider>,
     asset: i64,
     pub scheme: tuile_core::raster::TilingScheme,
-    /// The file extension of its tiles: `jpg`, `png`.
+    /// The file extension of its tiles: `jpg`, `png`. Empty when the
+    /// imagery comes from a host's sources: the host's own store says what
+    /// its tiles are.
     pub extension: String,
 }
 
@@ -520,6 +614,11 @@ impl ReferenceImagery {
     /// Opens the asset: its endpoint and its descriptor, no tile.
     pub async fn open(config: &GlobeConfig, asset: i64) -> Result<Self, GlobeError> {
         use tuile_core::raster::ImageryProvider as _;
+        // The host's own sources, as for a globe: nothing resolved here.
+        if let Some(sources) = &config.sources {
+            let provider = sources.0.imagery(asset).await.map_err(GlobeError::Sources)?;
+            return Ok(Self { scheme: provider.tiling_scheme(), extension: String::new(), provider, asset });
+        }
         let transport = TransportConfig {
             retry: RetryConfig::patient(),
             ..match &config.cache_dir {
@@ -537,7 +636,7 @@ impl ReferenceImagery {
         Ok(Self {
             scheme: tms.tiling_scheme(),
             extension: tms.extension().unwrap_or_default(),
-            tms,
+            provider: Arc::new(tms),
             asset,
         })
     }
@@ -553,7 +652,7 @@ impl ReferenceImagery {
     ) -> Result<ReferenceFetched, GlobeError> {
         use tuile_core::raster::ImageryProvider as _;
         let asset = self.asset;
-        let tms = tuile_core::raster::CachedImagery::new(self.tms, cache.0, source_namespace(asset));
+        let tms = tuile_core::raster::CachedImagery::new(Held(self.provider), cache.0, source_namespace(asset));
         let mut done = ReferenceFetched { asked: wanted.len(), ..ReferenceFetched::default() };
         for some in wanted.chunks(REFERENCE_AT_ONCE) {
             let got = futures_util::future::join_all(some.iter().map(|c| tms.fetch_tile_bytes(*c))).await;
@@ -597,6 +696,56 @@ pub fn duration_or(seconds: f64, fallback: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sources that say what was asked of them, and have nothing.
+    struct Asked(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl Sources for Asked {
+        async fn terrain(
+            &self,
+            asset: i64,
+        ) -> Result<(tuile_terrain::LayerJson, Arc<dyn tuile_terrain::TerrainSource>), String> {
+            self.0.lock().expect("lock").push(format!("terrain {asset}"));
+            Err("no terrain here".into())
+        }
+        async fn imagery(&self, asset: i64) -> Result<Arc<dyn tuile_core::raster::ImageryProvider>, String> {
+            self.0.lock().expect("lock").push(format!("imagery {asset}"));
+            Err("no imagery here".into())
+        }
+    }
+
+    /// With a host's sources the globe resolves nothing itself: no token is
+    /// needed, and the first thing that happens is the host being asked.
+    #[test]
+    #[allow(clippy::panic, reason = "a test asserting by panicking")]
+    fn a_host_s_sources_are_asked_and_no_token_is_needed() {
+        let asked = Arc::new(Asked(std::sync::Mutex::new(Vec::new())));
+        let mut config = GlobeConfig::new("");
+        config.sources = Some(SourcesHandle(asked.clone()));
+        match Session::globe(config) {
+            Err(GlobeError::Sources(why)) => assert_eq!(why, "no terrain here"),
+            Err(other) => panic!("wrong error: {other:?}"),
+            Ok(_) => panic!("a globe out of sources that have nothing"),
+        }
+        assert_eq!(*asked.0.lock().expect("lock"), [format!("terrain {CESIUM_WORLD_TERRAIN}")]);
+    }
+
+    /// A reference imagery is asked of the host's sources too, by its asset.
+    #[test]
+    #[allow(clippy::panic, reason = "a test asserting by panicking")]
+    fn a_reference_imagery_is_asked_of_a_host_s_sources() {
+        let asked = Arc::new(Asked(std::sync::Mutex::new(Vec::new())));
+        let mut config = GlobeConfig::new("");
+        config.sources = Some(SourcesHandle(asked.clone()));
+        let runtime = Session::runtime().expect("runtime");
+        match runtime.block_on(ReferenceImagery::open(&config, 3954)) {
+            Err(GlobeError::Sources(why)) => assert_eq!(why, "no imagery here"),
+            Err(other) => panic!("wrong error: {other:?}"),
+            Ok(_) => panic!("a reference out of sources that have nothing"),
+        }
+        assert_eq!(*asked.0.lock().expect("lock"), ["imagery 3954"]);
+    }
 
     /// An empty token is a configuration mistake worth naming, not a network
     /// error to be discovered three seconds later against ion's 401.

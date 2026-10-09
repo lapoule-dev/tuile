@@ -2,7 +2,10 @@
 // Copyright (c) lapoule.dev
 
 //! Against a real bucket: does it honour the conditional writes everything
-//! else relies on, and do many writers still lose nothing there?
+//! else relies on, and do many writers still lose nothing there? And does a
+//! zone's whole life — deltas of several months written by two instances, a
+//! tile rewritten in each, a compaction pass by a third process, expiry,
+//! removal — go there as it does in memory?
 //!
 //! Opt-in: set `TUILE_TILES_TEST_BUCKET`, with `CLOUDFLARE_ACCOUNT_ID`,
 //! `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`. Everything happens under a
@@ -115,5 +118,127 @@ async fn the_bucket_honours_conditional_writes_and_many_writers_lose_nothing() {
         assert_eq!(fresh.get(IMAGERY, LEVEL, *x, *y).await.expect("get").as_ref(), Some(b), "after compaction {x}/{y}");
     }
 
+    remove_prefix(raw.as_ref(), &prefix).await;
+}
+
+fn archives_on_disk(dir: &std::path::Path) -> usize {
+    let mut n = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(d).expect("read_dir") {
+            let p = e.expect("entry").path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|e| e == "pmtiles") {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+async fn epochs(objects: &dyn ObjectStore) -> Vec<String> {
+    let m = tuile_tile_server::manifest::read(objects, &imagery().zone_prefix(zone())).await.expect("manifest").manifest;
+    m.archives.iter().map(|a| a.epoch.clone()).collect()
+}
+
+/// The life of a zone, on whatever holds the objects. The months are the
+/// test clock's: the archives are written today and named for the month the
+/// clock says, which is all that ages them.
+async fn the_life_of_a_zone(objects: Arc<dyn ObjectStore>) {
+    use std::time::Duration;
+    use tuile_tile_server::peers::InMemory;
+    use tuile_tile_server::{Compaction, DiskCacheConfig, StoreConfig};
+
+    let clock = TestClock::new();
+    let fanout = eager().tiering.fanout as u32;
+    let minute = Duration::from_secs(60);
+
+    // 1. A month's deltas, by two instances in turn: one tile rewritten in
+    // each, one tile of its own in each.
+    let writers = [store_on(objects.clone(), &clock, eager()), store_on(objects.clone(), &clock, eager())];
+    let delta = |v: u32| {
+        let w = &writers[(v % 2) as usize];
+        async move {
+            let (x, y) = in_zone(v + 1);
+            w.put(IMAGERY, LEVEL, X0, Y0, body(LEVEL, X0, Y0, v)).await.expect("put");
+            w.put(IMAGERY, LEVEL, x, y, body(LEVEL, x, y, v)).await.expect("put");
+            w.flush_all().await.expect("flush");
+        }
+    };
+    for v in 0..fanout {
+        delta(v).await;
+        clock.advance(minute);
+    }
+    // 2. The month after: two more, too few for a run of their own.
+    clock.advance(days(31));
+    for v in fanout..fanout + 2 {
+        delta(v).await;
+        clock.advance(minute);
+    }
+    let last = fanout + 1;
+    assert_eq!(archives(objects.as_ref(), IMAGERY).await.len(), fanout as usize + 2);
+
+    // 3. A server that trusts a manifest for an hour, the zone on its disk.
+    let trusting = StoreConfig { manifest_ttl: Duration::from_secs(3600), manifest_max_stale: Duration::ZERO, ..eager() };
+    let dir = tempfile::tempdir().expect("dir");
+    let server = Arc::new(
+        store_on(objects.clone(), &clock, trusting).with_disk_cache(DiskCacheConfig::new(dir.path())).await.expect("disk"),
+    );
+    let bus = Arc::new(InMemory::default());
+    bus.listen(&server);
+    let every_tile = |s: Arc<tuile_tile_server::TileStore>, from: u32| async move {
+        assert_eq!(s.get(IMAGERY, LEVEL, X0, Y0).await.expect("get"), Some(body(LEVEL, X0, Y0, last)), "the last written wins");
+        for v in from..=last {
+            let (x, y) = in_zone(v + 1);
+            assert_eq!(s.get(IMAGERY, LEVEL, x, y).await.expect("get"), Some(body(LEVEL, x, y, v)), "delta {v}");
+        }
+    };
+    every_tile(server.clone(), 0).await;
+    server.settle().await;
+    assert_eq!(archives_on_disk(dir.path()), fanout as usize + 2);
+
+    // 4. A pass by another process: the past month's deltas become one,
+    // never with the next month's; the server reads the zone as it now is.
+    let job = store_on(objects.clone(), &clock, eager()).with_announcer(bus.clone());
+    let done = job.compact_due().await.expect("compact_due");
+    assert!(done.iter().any(|(_, _, c)| matches!(c, Compaction::Merged { .. })), "{done:?}");
+    assert_eq!(epochs(objects.as_ref()).await, ["202609", "202610", "202610"]);
+    every_tile(server.clone(), 0).await;
+    server.settle().await;
+    assert_eq!(archives_on_disk(dir.path()), 3, "the merged archive and the two it was not merged with");
+    // What was merged is retired, not removed: a reader still on the older
+    // manifest reads it.
+    assert_eq!(archives(objects.as_ref(), IMAGERY).await.len(), fanout as usize + 3);
+
+    // 5. The first month runs out, the second has not.
+    clock.advance(days(80));
+    job.compact_due().await.expect("compact_due");
+    assert_eq!(epochs(objects.as_ref()).await, ["202610", "202610"]);
+    every_tile(server.clone(), fanout).await;
+    let (x, y) = in_zone(1);
+    assert_eq!(server.get(IMAGERY, LEVEL, x, y).await.expect("get"), None, "a tile of the month that ran out");
+
+    // 6. Past the grace, what was retired is gone from the bucket itself.
+    clock.advance(Duration::from_secs(601));
+    job.compact_due().await.expect("compact_due");
+    assert_eq!(archives(objects.as_ref(), IMAGERY).await.len(), 2);
+    every_tile(Arc::new(store_on(objects, &clock, eager())), fanout).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_life_of_a_zone_in_memory() {
+    the_life_of_a_zone(memory()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "talks to a real bucket; set TUILE_TILES_TEST_BUCKET and run with --ignored"]
+async fn the_life_of_a_zone_on_the_bucket() {
+    let Some(Scratch { raw, scoped, prefix }) = bucket() else {
+        eprintln!("TUILE_TILES_TEST_BUCKET not set: skipped");
+        return;
+    };
+    eprintln!("under {prefix}/");
+    the_life_of_a_zone(scoped).await;
     remove_prefix(raw.as_ref(), &prefix).await;
 }
