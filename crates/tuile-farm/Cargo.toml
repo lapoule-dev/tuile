@@ -66,4 +66,4 @@ glob = "0.3"
 tempfile = { workspace = true }
 # `migrate-packs` reads a pack's table, and only its table, to know what the
 # pack is before it is re-baked.
-tuile-pack = { version = "0.2.0", path = "../tuile-pack" }
+tuile-pack = { version = "0.3.0", path = "../tuile-pack" }
