@@ -8,14 +8,14 @@
  *   node ./scripts/rustdoc.mjs --stage-only   # stage an existing target/doc
  *
  * The output lands in `site/public/docs/api/`, which Astro copies verbatim into
- * `dist/client/` at build time, so the SSR server serves it at `/docs/api/...`
- * with no route of our own in the way. It is gitignored: twenty-odd megabytes
+ * `dist/` at build time, so it is served as plain files at `/docs/api/...` with
+ * no route of our own in the way. It is gitignored: twenty-odd megabytes
  * of machine-written HTML has no place in the history, and one command
  * regenerates it.
  *
  * One deliberate omission: `target/doc` has no root `index.html` for a
  * workspace build, and if it ever grows one we skip it, because `/docs/api/`
- * is our own crate-index page. Every other rustdoc artefact — the per-crate
+ * redirects to our own crate-index page at `/docs`. Every other rustdoc artefact — the per-crate
  * trees, `static.files/`, the search index, `crates.js` — is copied as is, so
  * rustdoc's own search and cross-crate links keep working.
  */
@@ -80,4 +80,4 @@ const crates = (await readdir(stageDir, { withFileTypes: true }))
 
 console.log(`staged ${crates.length} crates into public/docs/api (${crates.join(', ')})`);
 if (files) console.log(`plus ${files} shared files (${(bytes / 1024).toFixed(0)} KiB)`);
-console.log('serve with: npm run build && node ./dist/server/entry.mjs');
+console.log('serve with: npm run build && npm run preview');

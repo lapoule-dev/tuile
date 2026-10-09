@@ -3,9 +3,10 @@
 
 # The Tuile site
 
-The project's marketing and documentation site: Astro, server-side rendered
-through the standalone Node adapter, with the workspace's rustdoc served
-alongside it.
+The project's marketing and documentation site: Astro, built statically, with
+the workspace's rustdoc served alongside it. It is published at
+<https://tuile.lapoule.dev>, the API reference under
+<https://tuile.lapoule.dev/docs>.
 
 It is a single-page application in the sense that matters — `ClientRouter`
 (Astro's view transitions) intercepts in-site navigation, so moving between
@@ -22,9 +23,10 @@ All of these run from this directory.
 | `npm install` | Install dependencies. |
 | `npm run dev` | Development server on <http://localhost:4321>. |
 | `npm run docs:api` | `cargo doc --workspace --no-deps`, then stage the result under `public/docs/api/`. |
-| `npm run build` | Astro SSR build into `dist/`. |
-| `npm start` | Serve the build: `node ./dist/server/entry.mjs`. |
+| `npm run build` | Static build into `dist/`. |
+| `npm run preview` | Serve `dist/` locally on <http://localhost:4321>. |
 | `npm run build:all` | `docs:api` then `build`, in that order. |
+| `npm run deploy` | Publish `dist/` (see *Publishing* below). |
 
 The usual first run:
 
@@ -32,42 +34,68 @@ The usual first run:
 npm install
 npm run docs:api          # a couple of minutes cold, seconds afterwards
 npm run build
-node ./dist/server/entry.mjs      # http://localhost:4321
+npm run preview           # http://localhost:4321
 ```
 
-`PORT=8080 node ./dist/server/entry.mjs` moves it; `HOST=0.0.0.0` exposes it.
+`npm run preview -- --port 8080` moves it; `--host` exposes it.
 
 ## How the Rust API documentation is wired
 
 `cargo doc --workspace --no-deps` writes rustdoc into the workspace's
 `target/doc`. `scripts/rustdoc.mjs` runs that and then copies the tree into
-`public/docs/api/`, which Astro copies verbatim into `dist/client/` at build
-time; the standalone Node server serves `dist/client`, so the docs land at
+`public/docs/api/`, which Astro copies verbatim into `dist/` at build time;
+`dist/` is served as plain files, so the docs land at
 `/docs/api/<crate>/index.html`.
 
 There is deliberately no route handler in the middle. Rustdoc's relative links,
 its shared assets under `static.files/` and its search index all work
 unmodified precisely because nothing rewrites them.
 
-The one thing not copied is a root `index.html`, so `/docs/api/` stays the
-site's own crate-index page (`src/pages/docs/api/index.astro`). Everything
-below that path is rustdoc's.
+The entry point is `/docs`, the site's own crate-index page
+(`src/pages/docs/index.astro`), which links into the generated tree one level
+down. Everything below `/docs/api/` is rustdoc's; the one thing not copied is a
+root `index.html`, and `/docs/api` itself redirects to `/docs`.
 
 **Ordering matters**: `docs:api` must run *before* `build`, because the staging
 directory is read by Astro's build when it copies `public/`. Re-staging after a
 build without rebuilding will not reach `dist/`. `npm run build:all` gets the
 order right.
 
-The generated tree is about 22 MB and is gitignored (`public/docs/api/`), along
+The generated tree is about 50 MB in some 2,100 files and is gitignored (`public/docs/api/`), along
 with `dist/`, `node_modules/` and `.astro/`. A fresh checkout therefore starts
 with the API links returning 404, and the API page says so on the page itself
 rather than pretending otherwise.
+
+## Publishing
+
+The build is a folder of files, so publishing is uploading `dist/`.
+`wrangler.toml` describes it as a Cloudflare Worker made of static assets only
+— no script — and the custom domain is attached at deploy time:
+
+```bash
+npm run build:all
+CLOUDFLARE_ACCOUNT_ID=<the account that owns the zone> \
+  wrangler deploy --domain tuile.lapoule.dev      # what `npm run deploy` runs
+```
+
+Two settings in that file carry behaviour. `html_handling =
+"auto-trailing-slash"` serves an `.html` file at its extensionless address:
+`/docs` answers with `docs.html` (the build writes one file per page, see
+`build.format` in `astro.config.mjs`), and a link to `tuile_core/index.html` is
+redirected to `tuile_core/` — the same directory, so rustdoc's relative links
+still resolve. `not_found_handling = "404-page"` answers
+an unknown path with `dist/404.html` and a 404 status.
+
+The platform caps a deployment's file count and each file's size (25 MiB). The
+rustdoc tree is nearly all of the count; `wrangler deploy` prints it, and
+refuses outright past the cap rather than publishing part of a tree.
 
 ## Layout
 
 ```
 site/
-├── astro.config.mjs        # output: 'server' + @astrojs/node (standalone)
+├── astro.config.mjs        # output: 'static', one .html file per page
+├── wrangler.toml           # the deployment: dist/ as static assets
 ├── scripts/rustdoc.mjs     # cargo doc → public/docs/api/
 ├── src/
 │   ├── layouts/Base.astro  # shell, nav, ClientRouter, footer
@@ -77,7 +105,7 @@ site/
 │   │   ├── 3d-tiles.astro          /3d-tiles        the standard, condensed
 │   │   ├── roadmap.astro           /roadmap         milestones and criteria
 │   │   ├── getting-started.astro   /getting-started the real cargo commands
-│   │   ├── docs/api/index.astro    /docs/api        rustdoc entry point
+│   │   ├── docs/index.astro        /docs            rustdoc entry point
 │   │   └── 404.astro
 │   └── styles/global.css   # every colour is a token; dark via prefers-color-scheme
 └── public/docs/api/        # generated, gitignored

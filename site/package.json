@@ -7,15 +7,14 @@
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",
-    "start": "node ./dist/server/entry.mjs",
-    "preview": "node ./dist/server/entry.mjs",
+    "preview": "astro preview",
     "docs:api": "node ./scripts/rustdoc.mjs",
     "docs:api:stage": "node ./scripts/rustdoc.mjs --stage-only",
     "build:all": "npm run docs:api && npm run build",
+    "deploy": "wrangler deploy --domain tuile.lapoule.dev",
     "check": "astro check"
   },
   "dependencies": {
-    "@astrojs/node": "^9.5.5",
     "astro": "^5.18.2"
   }
 }

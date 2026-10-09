@@ -4,19 +4,14 @@
 
 import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import Base from '../../../layouts/Base.astro';
+import Base from '../../layouts/Base.astro';
 
-// Where `scripts/rustdoc.mjs` staged the generated HTML. In development that is
-// `public/`; after `astro build` the same tree has been copied into
-// `dist/client/`, which the standalone Node server serves. Try the places the
-// process could reasonably be started from, and degrade gracefully if none of
-// them match — a wrong guess must never hide the links.
-const candidates = [
-  join(process.cwd(), 'dist', 'client', 'docs', 'api'),
-  join(process.cwd(), 'public', 'docs', 'api'),
-  join(process.cwd(), '..', 'client', 'docs', 'api'),
-];
-const stage = candidates.find((p) => existsSync(join(p, 'crates.js')));
+// Where `scripts/rustdoc.mjs` staged the generated HTML. This page is rendered
+// at build time (and by the development server), both started from `site/`, so
+// the crate list is whatever was staged when the build ran. If nothing was,
+// degrade gracefully — a missing tree must never hide the links.
+const staged = join(process.cwd(), 'public', 'docs', 'api');
+const stage = existsSync(join(staged, 'crates.js')) ? staged : undefined;
 
 // The provider connectors are documented in rustdoc's own crate switcher; this
 // page describes the engine, and the engine is defined by the standard.
@@ -68,14 +63,14 @@ const sections = order
 
 <Base
   title="API reference — Tuile"
-  description="The generated Rust API documentation for every crate in the Tuile workspace, built with cargo doc and served by this site under /docs/api/."
+  description="The generated Rust API documentation for every crate in the Tuile workspace, built with cargo doc and served by this site under /docs."
   kicker="API reference"
   heading="The crates, as rustdoc sees them."
   lede="This is the generated Rust documentation for the workspace — every public type, trait and module, with the source linked. It is built by cargo, not written by hand, and it is the authority when this site and the code disagree."
 >
   {!stage && (
     <p class="note">
-      <strong>Not generated on this instance.</strong> The links below will return 404 until
+      <strong>Not generated for this build.</strong> The links below will return 404 until
       the rustdoc has been built and staged. From the <code>site/</code> directory run
       <code>npm run docs:api</code>, then rebuild: <code>npm run build</code>. Nothing
       generated is committed, so a fresh checkout always starts in this state.
@@ -135,19 +130,21 @@ const sections = order
   <p>
     <code>cargo doc --workspace --no-deps</code> writes rustdoc into the workspace's
     <code>target/doc</code>. The site's <code>npm run docs:api</code> runs exactly that and
-    then copies the result into <code>site/public/docs/api/</code>, which Astro copies into
-    <code>dist/client/</code>, which the standalone Node server serves. There is no route
-    handler in between — rustdoc's relative links, its shared assets and its search index
-    all work unmodified, because nothing rewrites them.
+    then copies the result into <code>site/public/docs/api/</code>, which the static build
+    copies into <code>dist/docs/api/</code>, which is served as plain files. There is no
+    route handler in between — rustdoc's relative links, its shared assets and its search
+    index all work unmodified, because nothing rewrites them.
   </p>
 
   <p>
-    The one file deliberately not copied is a root index, so that <code>/docs/api/</code>
-    stays this page. Everything below it is rustdoc's.
+    This page is <code>/docs</code>; the generated tree sits one level down, at
+    <code>/docs/api/&lt;crate&gt;/</code>, and everything below that path is rustdoc's. The
+    one file deliberately not copied is a root index: <code>/docs/api</code> itself
+    redirects here.
   </p>
 
   <p class="note">
-    The generated tree is around 22 MB and is <strong>gitignored</strong>. Regenerating it
+    The generated tree is around 50 MB and is <strong>gitignored</strong>. Regenerating it
     costs a couple of minutes of cold compilation and seconds thereafter. It is not part of
     <code>npm run build</code>, so editing a page does not pay for a documentation build;
     <code>npm run build:all</code> runs both in order.
