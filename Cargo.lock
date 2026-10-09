@@ -6403,6 +6403,7 @@ dependencies = [
  "bytes",
  "dotenvy",
  "image",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

@@ -9,8 +9,9 @@ use tuile_core::storage::ContentStore;
 use tuile_repository::bench::names;
 use tuile_repository::s3::{Http, HttpReply, S3Config, S3Objects, Signed};
 use tuile_repository::{
-    block_segment, ArchivedTiles, Asked, Bench, Cached, ChunkStore, Config, FilmRepository, Layout,
-    Now, Objects, Place, Project, Reply, RunFilms, ScenePacks, StoreObjects, TileRepository,
+    block_segment, ArchivedTiles, Asked, Bench, Cached, ChunkStore, Config, FilmRepository, Get,
+    Got, Layout, Now, Objects, Place, Project, RemoteBlocks, RemoteLive, Reply, RunFilms,
+    ScenePacks, StoreObjects, TileRepository,
 };
 use worker::{
     console_log, event, Cache, Context, Date, Delay, Env, Fetch, Headers, Method, Request,
@@ -60,6 +61,57 @@ impl Http for FetchHttp {
             etag,
             body: response.bytes().await.map_err(|e| e.to_string())?,
         })
+    }
+}
+
+/// `fetch`, as the way to a tile store somebody else serves: a GET under its
+/// address, with the header that server wants a credential in.
+struct RemoteGet {
+    root: String,
+    credential: Option<(String, String)>,
+}
+
+#[async_trait(?Send)]
+impl Get for RemoteGet {
+    async fn get(&self, path: &str) -> std::result::Result<Got, String> {
+        const TRIES: u32 = 4;
+        let url = format!("{}/{path}", self.root);
+        let mut wait = 150;
+        let mut last = String::new();
+        for attempt in 1..=TRIES {
+            let headers = Headers::new();
+            if let Some((name, value)) = &self.credential {
+                headers.set(name, value).map_err(|e| e.to_string())?;
+            }
+            let mut init = RequestInit::new();
+            init.with_method(Method::Get).with_headers(headers);
+            let outgoing = Request::new_with_init(&url, &init).map_err(|e| e.to_string())?;
+            match Fetch::Request(outgoing).send().await {
+                // Busy, or a passing failure: worth asking again.
+                Ok(response) if matches!(response.status_code(), 429 | 500 | 502 | 503 | 504) => {
+                    last = format!("{path}: HTTP {}", response.status_code());
+                }
+                Ok(mut response) => {
+                    let object_size = response
+                        .headers()
+                        .get("x-object-size")
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.parse().ok());
+                    return Ok(Got {
+                        status: response.status_code(),
+                        object_size,
+                        body: response.bytes().await.map_err(|e| e.to_string())?,
+                    });
+                }
+                Err(e) => last = format!("{path}: {e}"),
+            }
+            if attempt < TRIES {
+                Delay::from(std::time::Duration::from_millis(wait)).await;
+                wait *= 3;
+            }
+        }
+        Err(format!("{last}, after {TRIES} tries"))
     }
 }
 
@@ -227,7 +279,7 @@ async fn bench(env: &Env, with_tiles: bool, keeping: bool) -> std::result::Resul
     for project in config.projects {
         let Place::Bucket(bucket) = project.place else {
             return Err(format!(
-                "project {}: a Worker reads buckets, not directories",
+                "project {}: a Worker reads a project from a bucket",
                 project.name
             ));
         };
@@ -297,6 +349,24 @@ async fn bench(env: &Env, with_tiles: bool, keeping: bool) -> std::result::Resul
                 },
             ));
             Some((bucket.clone(), StoreObjects { live, archives }))
+        }
+        Some(Place::Remote { url, header }) => {
+            // Somebody else serves the store: its catalog and manifests are
+            // asked of it each time, its archives by blocks — the very
+            // blocks this Worker's own `store/b8/…` route is asked for, so
+            // one of them is one request there, kept here by the cache in
+            // front of this route.
+            let credential = match header {
+                Some(name) => Some((name.clone(), var("TUILE_TILES_REMOTE_SECRET")?)),
+                None => None,
+            };
+            let get = Arc::new(RemoteGet {
+                root: url.clone(),
+                credential,
+            });
+            let live: Arc<dyn Objects> = Arc::new(RemoteLive::new(get.clone(), "store"));
+            let archives: Arc<dyn Objects> = Arc::new(RemoteBlocks::new(get, "store"));
+            Some((url.clone(), StoreObjects { live, archives }))
         }
         Some(Place::Dir(_)) => return Err("tiles: a Worker reads buckets, not directories".into()),
         None => None,

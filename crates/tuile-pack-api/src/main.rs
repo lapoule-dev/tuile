@@ -39,8 +39,9 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tuile_farm::{BucketConfig, ObjectRunStore, StoreError, Tuning};
 use tuile_repository::{
-    Asked, Bench, Cached, Config, DiskChunks, FilmRepository, Layout, Objects, Place, Project,
-    Reply, RunFilms, ScenePacks, StoreObjects, TileRepository,
+    ArchivedTiles, Asked, Bench, Cached, Config, DiskChunks, FilmRepository, Get, Got, Layout,
+    Objects, Place, Project, RemoteBlocks, RemoteLive, Reply, RunFilms, ScenePacks, StoreObjects,
+    TileRepository,
 };
 use tuile_tile_server::{StoreConfig, TileStore};
 
@@ -109,9 +110,62 @@ async fn api(bench: Arc<Bench>, request: Request) -> Response {
     }
 }
 
+/// A GET under the address of a tile store somebody else serves, with the
+/// header that server wants a credential in.
+struct RemoteGet {
+    http: reqwest::Client,
+    root: String,
+    credential: Option<(String, String)>,
+}
+
+#[async_trait::async_trait]
+impl Get for RemoteGet {
+    async fn get(&self, path: &str) -> Result<Got, String> {
+        const TRIES: u32 = 4;
+        let url = format!("{}/{path}", self.root);
+        let mut wait = std::time::Duration::from_millis(150);
+        let mut last = String::new();
+        for attempt in 1..=TRIES {
+            let mut request = self.http.get(&url);
+            if let Some((name, value)) = &self.credential {
+                request = request.header(name, value);
+            }
+            match request.send().await {
+                // Busy, or a passing failure: worth asking again.
+                Ok(response) if matches!(response.status().as_u16(), 429 | 500 | 502 | 503 | 504) => {
+                    last = format!("{path}: HTTP {}", response.status().as_u16());
+                }
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    let object_size = response
+                        .headers()
+                        .get("x-object-size")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse().ok());
+                    let body = response.bytes().await.map_err(|e| format!("{path}: {e}"))?;
+                    return Ok(Got {
+                        status,
+                        object_size,
+                        body: body.to_vec(),
+                    });
+                }
+                Err(e) => last = format!("{path}: {e}"),
+            }
+            if attempt < TRIES {
+                tokio::time::sleep(wait).await;
+                wait *= 3;
+            }
+        }
+        Err(format!("{last}, after {TRIES} tries"))
+    }
+}
+
 fn open(place: &Place) -> Result<ObjectRunStore, StoreError> {
     let tuning = Tuning::from_env();
     match place {
+        Place::Remote { url, .. } => Err(StoreError::NotFound(format!(
+            "{url}: an address is read by the store's routes, not as a bucket"
+        ))),
         Place::Dir(dir) => ObjectRunStore::local(dir, tuning),
         Place::Bucket(bucket) => ObjectRunStore::bucket(
             &BucketConfig {
@@ -215,6 +269,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut store_objects = None;
     let tiles = match config.tiles {
+        Some(Place::Remote { url, header }) => {
+            // Somebody else serves the store: its catalog and manifests are
+            // asked of it each time, its archives by blocks, each kept here
+            // once read.
+            let credential = match header {
+                Some(name) => Some((
+                    name,
+                    std::env::var("TUILE_TILES_REMOTE_SECRET")
+                        .map_err(|_| "TUILE_TILES_REMOTE_SECRET is not set: [tiles] names a header")?,
+                )),
+                None => None,
+            };
+            let get = Arc::new(RemoteGet {
+                http: reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(60))
+                    .build()?,
+                root: url.clone(),
+                credential,
+            });
+            let live: Arc<dyn Objects> = Arc::new(RemoteLive::new(get.clone(), "store"));
+            let archives: Arc<dyn Objects> = Arc::new(RemoteBlocks::new(get, "store"));
+            store_objects = Some(StoreObjects {
+                live: live.clone(),
+                archives: archives.clone(),
+            });
+            let now: tuile_repository::Now = Arc::new(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            });
+            match ArchivedTiles::open(live, archives, now).await {
+                Ok(t) => {
+                    let tiles: Arc<dyn TileRepository> = Arc::new(t);
+                    tracing::info!("tiles: {url}, {} layers", tiles.layers().len());
+                    Some((url, tiles))
+                }
+                Err(e) => {
+                    tracing::warn!("tiles: {url} cannot be opened ({e}): /api/tiles is not served");
+                    None
+                }
+            }
+        }
         Some(place) => {
             let store = open(&place)?;
             let label = store.label().to_string();
