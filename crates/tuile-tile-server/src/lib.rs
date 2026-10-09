@@ -50,7 +50,7 @@ pub use peers::{Announce, Claim, Emitted, FreshTiles, SharedTile, SharedTiles};
 pub use pmtiles::{Compression, TileType};
 pub use service::{etag_of, LayerMeta, ServiceConfig, ServiceError, ServiceStats, Source, TileResponse, TileService};
 pub use projection::{Eye, Footprint, ProjectionReport};
-pub use store::{Clock, Compaction, StatsSnapshot, StoreConfig, TileStore};
+pub use store::{Census, Clock, Compaction, Fresh, StatsSnapshot, StoreConfig, TileStore};
 pub use tiering::Tiering;
 pub use upstream::{TemplateUpstream, Upstream, UpstreamError};
 
