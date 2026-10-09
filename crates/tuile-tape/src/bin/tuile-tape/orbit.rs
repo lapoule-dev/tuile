@@ -10,7 +10,7 @@
 //! seams and texture swimming easiest to see.
 //!
 //! ```text
-//! cargo run -p tuile-tape --bin orbit-tape -- orbit.mcap \
+//! cargo run -p tuile-tape --bin tuile-tape -- orbit orbit.mcap \
 //!     [frames] [lon] [lat] [radius-m] [altitude-m]
 //! ```
 
@@ -40,8 +40,10 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     ]
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let arg = |n: usize| std::env::args().nth(n);
+/// `args` are the arguments after the subcommand's name.
+pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    // Counted from one, the path first — the number an error names.
+    let arg = |n: usize| args.get(n - 1).cloned();
     let path = arg(1).unwrap_or_else(|| "orbit.mcap".to_owned());
     let parse = |n: usize, or: f64| -> Result<f64, String> {
         arg(n).map_or(Ok(or), |a| {
@@ -121,7 +123,7 @@ mod tests {
     ///
     /// It did not. The target was placed on a sphere of the equatorial radius
     /// with the geodetic latitude used as a geocentric one, so
-    /// `orbit-tape … 2.17 42.52 8000 5000` — five kilometres over the
+    /// `tuile-tape orbit … 2.17 42.52 8000 5000` — five kilometres over the
     /// Pyrenees — produced a camera at **14 799 m** over a point **0.19°**
     /// further north. Nothing downstream could notice: the manifest is exact,
     /// the render is exact, and the shot is simply of somewhere else, three

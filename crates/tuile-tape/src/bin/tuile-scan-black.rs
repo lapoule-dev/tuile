@@ -22,7 +22,7 @@
 //! quantity a hole moves.
 //!
 //! ```text
-//! cargo run --release -p tuile-tape --bin scan-black -- trace.mcap
+//! cargo run --release -p tuile-tape --bin tuile-scan-black -- trace.mcap
 //! ```
 
 /// A pixel this dark on every channel is the clear colour rather than dark
@@ -51,7 +51,7 @@ struct Camera {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
-        .ok_or("usage: scan-black <trace.mcap>")?;
+        .ok_or("usage: tuile-scan-black <trace.mcap>")?;
     let bytes = std::fs::read(&path)?;
 
     // Both channels, joined on the timeline they share. A camera message is

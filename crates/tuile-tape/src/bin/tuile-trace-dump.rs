@@ -4,13 +4,13 @@
 //! Dumps rendered frames out of a trace, as PNG files.
 //!
 //! A trace is the ground truth of what the viewer actually drew, and sometimes
-//! the question is not "where is the black" (`scan-black`) but "show me frame
+//! the question is not "where is the black" (`tuile-scan-black`) but "show me frame
 //! N so I can compare it against another renderer's output over the same
 //! camera" — which is exactly the imagery-seam investigation this was written
 //! for.
 //!
 //! ```text
-//! cargo run -p tuile-tape --bin trace-dump -- trace.mcap out-prefix [every-n]
+//! cargo run -p tuile-tape --bin tuile-trace-dump -- trace.mcap out-prefix [every-n]
 //! ```
 
 fn field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
@@ -50,10 +50,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let path = args
         .next()
-        .ok_or("usage: trace-dump <trace.mcap> <out-prefix> [every-n]")?;
+        .ok_or("usage: tuile-trace-dump <trace.mcap> <out-prefix> [every-n]")?;
     let prefix = args
         .next()
-        .ok_or("usage: trace-dump <trace.mcap> <out-prefix> [every-n]")?;
+        .ok_or("usage: tuile-trace-dump <trace.mcap> <out-prefix> [every-n]")?;
     let every: usize = args.next().map_or(Ok(1), |s| s.parse())?;
 
     let bytes = std::fs::read(&path)?;

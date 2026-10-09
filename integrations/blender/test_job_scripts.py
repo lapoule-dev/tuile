@@ -5,7 +5,7 @@
 
     python3 -m unittest discover -s integrations/blender -p 'test_*.py'
 
-The launchers are Rust now (`tuile-farm`: `launch-job`, with its own tests);
+The launchers are Rust now (`tuile-farm`: `tuile-launch-job`, with its own tests);
 what stays here is what only the scripts decide — how a task cuts its slice,
 what it archives and when, how it moves its bytes through `tuile-farm`, and
 that a dying render gives the machine back. Several of these run the scripts'
@@ -678,7 +678,7 @@ class ThePackCarriesItsOwnFlight(unittest.TestCase):
 
     Un pack répond à une caméra par la pose, à un mètre et un milliradian. Le
     20 septembre 2026, un rendu lancé avec la même chaîne `pyrenees:...` que la
-    cuisson est mort en neuf secondes sur les trois tâches : `pyrenees-tape`
+    cuisson est mort en neuf secondes sur les trois tâches : `tuile-tape pyrenees`
     penche désormais de 20° sur la verticale, la cuisson avait reçu une bande
     nadir archivée, et l'écart lu était 0,349066 rad — vingt degrés, à six
     millimètres près sur la position."""
@@ -688,11 +688,11 @@ class ThePackCarriesItsOwnFlight(unittest.TestCase):
     def test_the_render_script_prefers_the_tape_over_the_trajectory(self):
         script = (pathlib.Path(__file__).parent / "render_job.sh").read_text()
         tape = script.index('"$FARM" get "$JOB_TAPE_KEY" /tmp/traj.mcap')
-        generated = script.index("/opt/tuile/bin/pyrenees-tape /tmp/traj.mcap")
+        generated = script.index("/opt/tuile/bin/tuile-tape pyrenees /tmp/traj.mcap")
         self.assertLess(tape, generated,
                         "la bande fournie doit l'emporter sur la générée")
         # Et une seule étape en sort, quelle que soit la source.
-        self.assertEqual(script.count("/opt/tuile/bin/tape-to-stage"), 1)
+        self.assertEqual(script.count("/opt/tuile/bin/tuile-tape-to-usd-stage"), 1)
 
     def test_both_scripts_take_a_supplied_tape(self):
         here = pathlib.Path(__file__).parent
@@ -956,7 +956,7 @@ class TheTwoJobsAgreeOnTheCadence(unittest.TestCase):
         for name, script in zip(("bake_job.sh", "render_job.sh"), self._scripts()):
             # L'invocation, pas les commentaires qui la nomment.
             line = [l for l in script.splitlines()
-                    if "/opt/tuile/bin/pyrenees-tape" in l]
+                    if "/opt/tuile/bin/tuile-tape pyrenees" in l]
             self.assertTrue(line, name)
             nxt = script.splitlines()[script.splitlines().index(line[0]) + 1]
             self.assertIn('"$JOB_FPS"', nxt, f"{name}: {nxt}")
@@ -966,7 +966,7 @@ class TheTwoJobsAgreeOnTheCadence(unittest.TestCase):
 class ASuppliedTapeWinsOverAGeneratedOne(unittest.TestCase):
     """Recuire un pack sur son propre tracé.
 
-    Les générateurs évoluent : `pyrenees-tape` sortait une polyligne quand les
+    Les générateurs évoluent : `tuile-tape pyrenees` sortait une polyligne quand les
     premiers films ont été tournés et sort une spline aujourd'hui. La même
     chaîne d'arguments ne décrit donc plus le même vol, et un pack recuit
     depuis elle ne se compare pas à celui d'avant. Or le suspect EST le pack —
@@ -989,7 +989,7 @@ class ASuppliedTapeWinsOverAGeneratedOne(unittest.TestCase):
         head = script[script.index('if [ -n "${JOB_TAPE_KEY:-}"'):]
         # La bande fournie doit être testée AVANT la génération, sinon elle ne
         # l'emporte sur rien.
-        self.assertLess(head.index('"$FARM" get'), head.index("pyrenees-tape"))
+        self.assertLess(head.index('"$FARM" get'), head.index("tuile-tape pyrenees"))
         self.assertIn("TAPE-DOWNLOAD-FAILED", head,
                       "un téléchargement raté cuirait une bande vide")
 

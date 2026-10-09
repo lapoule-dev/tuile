@@ -4,21 +4,21 @@
 //! Brings the channels of several MCAP files together in one.
 //!
 //! ```text
-//! merge-tape <out.mcap> <in.mcap> <in.mcap>...
+//! tuile-tape merge <out.mcap> <in.mcap> <in.mcap>...
 //! ```
 //!
 //! A camera path and what the camera follows are one plan; this writes them
 //! as one file. See [`tuile_tape::merge`]. `out` may be one of the inputs:
 //! everything is read before anything is written.
 
-fn main() -> std::process::ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let [out, inputs @ ..] = args.as_slice() else {
-        eprintln!("usage: merge-tape <out.mcap> <in.mcap> <in.mcap>...");
+/// `args` are the arguments after the subcommand's name.
+pub fn run(args: &[String]) -> std::process::ExitCode {
+    let [out, inputs @ ..] = args else {
+        eprintln!("usage: tuile-tape merge <out.mcap> <in.mcap> <in.mcap>...");
         return std::process::ExitCode::from(2);
     };
     if inputs.len() < 2 {
-        eprintln!("usage: merge-tape <out.mcap> <in.mcap> <in.mcap>...");
+        eprintln!("usage: tuile-tape merge <out.mcap> <in.mcap> <in.mcap>...");
         return std::process::ExitCode::from(2);
     }
     // Written beside the destination and moved into place, so a destination
@@ -36,7 +36,7 @@ fn main() -> std::process::ExitCode {
         }
         Err(e) => {
             let _ = std::fs::remove_file(&part);
-            eprintln!("merge-tape: {e}");
+            eprintln!("tuile-tape merge: {e}");
             std::process::ExitCode::FAILURE
         }
     }

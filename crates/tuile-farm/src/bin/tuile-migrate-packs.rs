@@ -4,7 +4,7 @@
 //! Re-bakes every pack of a pack API's projects as references, in place.
 //!
 //! ```text
-//! migrate-packs <api> <ledger.jsonl> [--max-gb N] [--only <substring>]
+//! tuile-migrate-packs <api> <ledger.jsonl> [--max-gb N] [--only <substring>]
 //!               [--bake <tuile-bake>] [--work <dir>] [--tiles-bucket <name>]
 //!               [--dry-run] [--again]
 //! ```
@@ -64,7 +64,7 @@ const BAKE_KNOBS: [(&str, &str); 4] = [
 
 #[derive(Parser)]
 #[command(
-    name = "migrate-packs",
+    name = "tuile-migrate-packs",
     about = "Re-bake packs as references, in place"
 )]
 struct Cli {
@@ -157,7 +157,7 @@ async fn main() -> ExitCode {
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("migrate-packs: {e}");
+            eprintln!("tuile-migrate-packs: {e}");
             ExitCode::FAILURE
         }
     }

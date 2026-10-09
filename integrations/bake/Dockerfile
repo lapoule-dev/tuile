@@ -31,18 +31,18 @@ ARG BAKE_BUILD_JOBS=4
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=tuile-bake-target,target=/src/target \
     cargo build --release --locked -j ${BAKE_BUILD_JOBS} \
-        -p tuile-bake -p tuile-farm --bin tuile-bake --bin migrate-packs \
-    && cp target/release/tuile-bake target/release/migrate-packs /usr/local/bin/ \
-    && ldd /usr/local/bin/tuile-bake /usr/local/bin/migrate-packs
+        -p tuile-bake -p tuile-farm --bin tuile-bake --bin tuile-migrate-packs \
+    && cp target/release/tuile-bake target/release/tuile-migrate-packs /usr/local/bin/ \
+    && ldd /usr/local/bin/tuile-bake /usr/local/bin/tuile-migrate-packs
 
 FROM debian:${DEBIAN}-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --user-group --no-create-home bake
 # Side by side: the driver looks for the baker next to itself.
-COPY --from=build /usr/local/bin/tuile-bake /usr/local/bin/migrate-packs /usr/local/bin/
+COPY --from=build /usr/local/bin/tuile-bake /usr/local/bin/tuile-migrate-packs /usr/local/bin/
 USER 10001:10001
 # The ledger, the table being read, the pack being written and the tile cache.
 WORKDIR /work
 VOLUME /work
-ENTRYPOINT ["migrate-packs"]
+ENTRYPOINT ["tuile-migrate-packs"]

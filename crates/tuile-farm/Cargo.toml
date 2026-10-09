@@ -15,12 +15,12 @@ name = "tuile-farm"
 path = "src/main.rs"
 
 [[bin]]
-name = "launch-job"
-path = "src/bin/launch-job.rs"
+name = "tuile-launch-job"
+path = "src/bin/tuile-launch-job.rs"
 
 [[bin]]
-name = "migrate-packs"
-path = "src/bin/migrate-packs.rs"
+name = "tuile-migrate-packs"
+path = "src/bin/tuile-migrate-packs.rs"
 
 [dependencies]
 # One client for every byte a job moves, and one we did not write.
@@ -64,6 +64,6 @@ glob = "0.3"
 # For `assert_run_store_contract`, which is public so the bucket test can run
 # the same contract as the unit tests.
 tempfile = { workspace = true }
-# `migrate-packs` reads a pack's table, and only its table, to know what the
+# `tuile-migrate-packs` reads a pack's table, and only its table, to know what the
 # pack is before it is re-baked.
 tuile-pack = { version = "0.3.0", path = "../tuile-pack" }

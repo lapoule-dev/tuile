@@ -64,7 +64,7 @@ RUN cargo --version \
 # carries six numbers, not fourteen hundred baked camera matrices. Baked
 # samples remain the road for REAL recorded tracks (JOB_STAGE_URL).
 RUN cargo build --release -p tuile-tape -p tuile-usd --bins \
-    && for b in orbit-tape pyrenees-tape zoom-tape tape-to-stage; do \
+    && for b in tuile-tape tuile-tape-to-usd-stage; do \
         test -x "target/release/$b" && strip "target/release/$b"; done
 # The bake, with its profiler compiled in.
 #
@@ -265,10 +265,8 @@ COPY integrations/blender/render_usd.py /opt/render/render_usd.py
 # qui cuit et celui qui lit sont alors le même digest, donc un pack et le rendu
 # qui le consomme ne peuvent pas venir de deux versions du code.
 COPY integrations/blender/bake_job.sh /opt/render/bake_job.sh
-COPY --from=rustlib /src/target/release/orbit-tape \
-                    /src/target/release/pyrenees-tape \
-                    /src/target/release/zoom-tape \
-                    /src/target/release/tape-to-stage \
+COPY --from=rustlib /src/target/release/tuile-tape \
+                    /src/target/release/tuile-tape-to-usd-stage \
                     /src/target/release/tuile-bake \
                     /src/target/release/tuile-farm \
                     /opt/tuile/bin/

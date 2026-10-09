@@ -4,7 +4,7 @@
 //! A tape becomes a manifest stage.
 //!
 //! ```text
-//! cargo run -p tuile-usd --bin tape-to-stage -- flight.mcap flight.usda \
+//! cargo run -p tuile-usd --bin tuile-tape-to-usd-stage -- flight.mcap flight.usda \
 //!     [--fps 24] [--viewport 1920x1440] [--terrain 0] [--imagery 0] [--sse 0]
 //! ```
 
@@ -12,7 +12,7 @@ use tuile_usd::{write_manifest, ManifestConfig};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: tape-to-stage <tape.mcap> <out.usda> \
+        "usage: tuile-tape-to-usd-stage <tape.mcap> <out.usda> \
          [--fps N] [--viewport WxH] [--terrain ID] [--imagery ID] [--sse PX]"
     );
     std::process::exit(2);

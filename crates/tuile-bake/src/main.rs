@@ -242,7 +242,7 @@ enum Job {
     ///
     /// A pack records the camera each frame was baked for, which makes it the
     /// only exact record of a trajectory that the generator no longer
-    /// produces. `pyrenees-tape` emitted a polyline when the first films were
+    /// produces. `tuile-tape pyrenees` emitted a polyline when the first films were
     /// shot and emits a spline now: re-baking the same argument string gives a
     /// different path, so a pack cooked from it cannot be compared with the one
     /// before it. Replaying the poses removes the generator from the question.
@@ -1589,7 +1589,7 @@ mod tests {
     /// Une trajectoire rejouée depuis un pack est la trajectoire du pack.
     ///
     /// C'est le seul enregistrement exact d'un tracé que le générateur ne
-    /// produit plus : `pyrenees-tape` sortait une polyligne quand les premiers
+    /// produit plus : `tuile-tape pyrenees` sortait une polyligne quand les premiers
     /// films ont été tournés et sort une spline aujourd'hui, donc recuire la
     /// même chaîne d'arguments donne un autre chemin. Pour demander « la
     /// traversée d'aujourd'hui s'effondre-t-elle encore au-dessus de la même

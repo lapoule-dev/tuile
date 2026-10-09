@@ -10,8 +10,8 @@
 //! MCAP, which is the thing to open afterwards.
 //!
 //! ```text
-//! cargo run -p tuile-tape --bin zoom-tape -- zoom.mcap
-//! TUILE_REPLAY=zoom.mcap TUILE_TRACE=trace.mcap cargo run --release -p wgpu-viewer
+//! cargo run -p tuile-tape --bin tuile-tape -- zoom zoom.mcap
+//! TUILE_REPLAY=zoom.mcap TUILE_TRACE=trace.mcap cargo run --release -p tuile-wgpu-viewer
 //! ```
 
 use tuile_tape::{Frame, Tape};
@@ -94,16 +94,18 @@ fn looking_down(altitude: f64) -> Frame {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args()
-        .nth(1)
+/// `args` are the arguments after the subcommand's name.
+pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let path = args
+        .first()
+        .cloned()
         .unwrap_or_else(|| "zoom.mcap".to_owned());
     // Second argument overrides the aggressiveness, so dialling it in does not
     // mean editing and rebuilding.
-    let frames: usize = std::env::args()
-        .nth(2)
+    let frames: usize = args
+        .get(1)
         .map_or(Ok(FRAMES), |a| a.parse())
-        .map_err(|_| "usage: zoom-tape <path> [frames-each-way]")?;
+        .map_err(|_| "usage: tuile-tape zoom <path> [frames-each-way]")?;
     let mut tape = Tape::recording(&path)?;
 
     // Settle at the top so the session has something loaded before it moves —

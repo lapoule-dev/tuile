@@ -4,8 +4,8 @@
 //! The engine's farm launcher.
 //!
 //! ```text
-//! launch-job bake   --trajectory orbit:4:2.17:42.52:8000:5000 --frames 1:4 --viewport 960x540 --sse 16
-//! launch-job render --engine hydra --trajectory … --frames 1:4 --tasks 2 --width 960 --extra '--height 540'
+//! tuile-launch-job bake   --trajectory orbit:4:2.17:42.52:8000:5000 --frames 1:4 --viewport 960x540 --sse 16
+//! tuile-launch-job render --engine hydra --trajectory … --frames 1:4 --tasks 2 --width 960 --extra '--height 540'
 //! ```
 //!
 //! The same verbs and shared flags as every other launcher built on
@@ -27,7 +27,7 @@ use tuile_farm::launch::{tuile, CommonArgs, Farm};
 use tuile_farm::ObjectRunStore;
 
 #[derive(Parser)]
-#[command(name = "launch-job", about = "Bake and render the engine's scenes on the farm")]
+#[command(name = "tuile-launch-job", about = "Bake and render the engine's scenes on the farm")]
 struct Cli {
     #[command(subcommand)]
     verb: Verb,
@@ -79,7 +79,7 @@ async fn main() -> ExitCode {
     let farm = match farm() {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("launch-job: {e}");
+            eprintln!("tuile-launch-job: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -90,7 +90,7 @@ async fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("launch-job: {e}");
+            eprintln!("tuile-launch-job: {e}");
             ExitCode::FAILURE
         }
     }
