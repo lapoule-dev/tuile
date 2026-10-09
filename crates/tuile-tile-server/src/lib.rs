@@ -46,7 +46,7 @@ pub use content::StoreContent;
 pub use disk::DiskCacheConfig;
 pub use grid::{Grid, OutOfGrid};
 pub use layer::{Layer, Zone, DURABLE_EPOCH};
-pub use peers::{Announce, Claim, SharedTile, SharedTiles};
+pub use peers::{Announce, Claim, Emitted, FreshTiles, SharedTile, SharedTiles};
 pub use pmtiles::{Compression, TileType};
 pub use service::{etag_of, LayerMeta, ServiceConfig, ServiceError, ServiceStats, Source, TileResponse, TileService};
 pub use projection::{Eye, Footprint, ProjectionReport};
