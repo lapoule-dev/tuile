@@ -28,7 +28,7 @@ use serde::Serialize;
 use crate::catalog::{ABSENT_MARKER, ABSENT_SUFFIX};
 use crate::grid::Grid;
 use crate::lru::Lru;
-use crate::peers::{Claim, SharedTile, SharedTiles};
+use crate::peers::{Claim, Emitted, FreshTiles, SharedTile, SharedTiles};
 use crate::store::TileStore;
 use crate::upstream::Upstream;
 use crate::StoreError;
@@ -166,6 +166,8 @@ pub struct ServiceStats {
     pub absent: u64,
     /// Answered with what another instance had just fetched.
     pub shared: u64,
+    /// Tiles taken from another instance ahead of any request.
+    pub learned: u64,
 }
 
 #[derive(Default)]
@@ -175,6 +177,7 @@ struct Counters {
     upstream: AtomicU64,
     absent: AtomicU64,
     shared: AtomicU64,
+    learned: AtomicU64,
 }
 
 type Key = (String, u8, u32, u32);
@@ -200,6 +203,7 @@ pub struct TileService {
     counters: Counters,
     /// What this instance shares with the others, if anything.
     shared: Option<Arc<dyn SharedTiles>>,
+    sink: Option<Arc<dyn FreshTiles>>,
 }
 
 impl TileService {
@@ -216,6 +220,7 @@ impl TileService {
             cfg,
             counters: Counters::default(),
             shared: None,
+            sink: None,
         }
     }
 
@@ -225,6 +230,26 @@ impl TileService {
     pub fn with_shared(mut self, shared: Arc<dyn SharedTiles>) -> Self {
         self.shared = Some(shared);
         self
+    }
+
+    /// From now on, a tile this service has just fetched is emitted to
+    /// `sink` and **not** written to the store by this service: whoever is
+    /// behind the sink writes it. See [`FreshTiles`].
+    pub fn with_sink(mut self, sink: Arc<dyn FreshTiles>) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// Takes a tile another instance has fetched, as if this one had: it is
+    /// served from memory from now on, for as long as a hot tile is. Nothing
+    /// is written, and nothing is asked of a source.
+    pub fn learn(&self, layer: &str, level: u8, x: u32, y: u32, tile: SharedTile) {
+        let key = (layer.to_string(), level, x, y);
+        self.hot_put(key, tile.bytes.map(|bytes| {
+            let etag = etag_of(&bytes);
+            (bytes, etag)
+        }));
+        self.counters.learned.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn store(&self) -> &Arc<TileStore> {
@@ -239,6 +264,7 @@ impl TileService {
             upstream: g(&self.counters.upstream),
             absent: g(&self.counters.absent),
             shared: g(&self.counters.shared),
+            learned: g(&self.counters.learned),
         }
     }
 
@@ -352,13 +378,14 @@ impl TileService {
         let store = self.store.clone();
         let table = self.inflight.clone();
         let shared = self.shared.clone();
+        let sink = self.sink.clone();
         let (wait, poll) = (self.cfg.shared_wait, self.cfg.shared_poll);
         let k = key.clone();
         let flight = async move {
             let result = async {
                 let upstream = upstream.ok_or_else(|| ServiceError::UnknownLayer(k.0.clone()))?;
                 let Some(shared) = shared else {
-                    return fetch(&upstream, &store, None, &k).await;
+                    return fetch(&upstream, &store, sink.as_ref(), None, &k).await;
                 };
                 let seen = |outcome: &'static str| {
                     metrics::counter!("tuile_tiles_shared_total", "layer" => k.0.clone(), "outcome" => outcome).increment(1);
@@ -379,7 +406,7 @@ impl TileService {
                             }
                             None => {
                                 seen("claimed");
-                                fetch(&upstream, &store, Some(&shared), &k).await
+                                fetch(&upstream, &store, sink.as_ref(), Some(&shared), &k).await
                             }
                         };
                         shared.release(&k.0, k.1, k.2, k.3, &token).await;
@@ -398,11 +425,11 @@ impl TileService {
                             }
                         }
                         seen("gave_up");
-                        fetch(&upstream, &store, Some(&shared), &k).await
+                        fetch(&upstream, &store, sink.as_ref(), Some(&shared), &k).await
                     }
                     Claim::Unknown => {
                         seen("miss");
-                        fetch(&upstream, &store, Some(&shared), &k).await
+                        fetch(&upstream, &store, sink.as_ref(), Some(&shared), &k).await
                     }
                 }
             }
@@ -419,21 +446,34 @@ impl TileService {
     }
 }
 
-/// Asks the source for a tile, shares it with the other instances if there
-/// is something to share it through, and hands it to the store.
+/// Asks the source for a tile and hands it on: to the sink when there is
+/// one — and then that is all — or else to the other instances, if there is
+/// something to share it through, and to the store.
 async fn fetch(
     upstream: &Arc<dyn Upstream>,
     store: &Arc<TileStore>,
+    sink: Option<&Arc<dyn FreshTiles>>,
     shared: Option<&Arc<dyn SharedTiles>>,
     k: &Key,
 ) -> Result<Fetched, ServiceError> {
     metrics::counter!("tuile_tiles_upstream_total", "layer" => k.0.clone()).increment(1);
     let got = upstream.fetch(k.1, k.2, k.3).await.map_err(|e| ServiceError::Upstream(e.0))?;
     let fetched = store.now();
+    let fetched_ms = fetched.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    if let Some(sink) = sink {
+        // Emitted, and no more: the tile is the sink's to share and to store.
+        // Not kept is not an error — the tile was fetched and is served.
+        let emitted = sink.emit(&k.0, k.1, k.2, k.3, &SharedTile { bytes: got.clone(), fetched_ms }).await;
+        let outcome = match emitted {
+            Emitted::Kept => "kept",
+            Emitted::NotKept => "not_kept",
+        };
+        metrics::counter!("tuile_tiles_emitted_total", "layer" => k.0.clone(), "outcome" => outcome).increment(1);
+        return Ok((got, Source::Upstream));
+    }
     // Shared first: whoever waits for it is waiting now, and the store's own
     // write may take an upload.
     if let Some(shared) = shared {
-        let fetched_ms = fetched.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
         shared.put(&k.0, k.1, k.2, k.3, &SharedTile { bytes: got.clone(), fetched_ms }).await;
     }
     match &got {
