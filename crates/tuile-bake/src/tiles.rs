@@ -156,6 +156,13 @@ impl Tiles {
         crate::TileCache(Arc::new(StoreContent::new(self.store.clone())))
     }
 
+    /// The store as a cache that is read and never written: for a bake whose
+    /// sources keep their own tiles (a host's tile server, see
+    /// [`crate::Sources`]). Such a bake has nothing to flush.
+    pub fn read_only_cache(&self) -> crate::TileCache {
+        crate::TileCache(Arc::new(StoreContent::read_only(self.store.clone())))
+    }
+
     /// Publishes whatever is still buffered. Called on the way out, success or
     /// not: tiles fetched by a failed bake are still worth keeping.
     pub fn flush(&self) -> Result<(), String> {

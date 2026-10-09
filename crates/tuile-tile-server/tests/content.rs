@@ -72,3 +72,22 @@ async fn keys_the_store_does_not_know_are_misses_not_errors() {
     assert_eq!(cache.get(&format!("img/{IMAGERY}/3/99/0")).await, None, "out of the grid");
     cache.put("img/unknown-layer/3/1/1", Bytes::from_static(b"x"), None).await; // declined, silently
 }
+
+#[tokio::test]
+async fn a_read_only_cache_reads_the_store_and_declines_what_it_is_offered() {
+    use tuile_core::storage::ContentStore;
+    let clock = TestClock::new();
+    let objects = memory();
+    let writer = store_on(objects.clone(), &clock, eager());
+    writer.put(IMAGERY, LEVEL, X0, Y0, body(LEVEL, X0, Y0, 1)).await.expect("put");
+    writer.flush_all().await.expect("flush");
+
+    let store = std::sync::Arc::new(store_on(objects, &clock, eager()));
+    let cache = tuile_tile_server::StoreContent::read_only(store.clone());
+    let key = |x: u32| format!("img/{IMAGERY}/{LEVEL}/{x}/{Y0}");
+    assert_eq!(cache.get(&key(X0)).await, Some(body(LEVEL, X0, Y0, 1)));
+
+    cache.put(&key(X0 + 1), body(LEVEL, X0 + 1, Y0, 1), None).await;
+    assert_eq!(cache.get(&key(X0 + 1)).await, None, "declined: not even in a buffer");
+    assert_eq!(store.flush_all().await.expect("flush"), 0, "and nothing to publish");
+}
