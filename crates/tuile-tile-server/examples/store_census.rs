@@ -72,7 +72,7 @@ async fn main() {
         let share = if c.tiles == 0 { 0.0 } else { 100.0 * c.repeated as f64 / c.tiles as f64 };
         println!("{layer:<24} {n:>7} {:>9} {:>11} {:>11} {:>10} {share:>6.1}%", c.archives, c.tiles, c.copies, c.repeated);
     }
-    worst.sort_by(|a, b| b.0.cmp(&a.0));
+    worst.sort_by_key(|w| std::cmp::Reverse(w.0));
     for (_, zone, c) in worst.iter().take(10) {
         println!("  {zone}: {} of {} tiles held more than once, in {} archives", c.repeated, c.tiles, c.archives);
     }
