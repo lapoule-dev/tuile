@@ -28,11 +28,19 @@ use crate::store::TileStore;
 /// A [`ContentStore`] over a [`TileStore`].
 pub struct StoreContent {
     store: Arc<TileStore>,
+    read_only: bool,
 }
 
 impl StoreContent {
     pub fn new(store: Arc<TileStore>) -> Self {
-        Self { store }
+        Self { store, read_only: false }
+    }
+
+    /// The same store, read and never written: for an engine whose tiles
+    /// are stored by someone else — a tile server it fetches them from, which
+    /// keeps what it serves. Whatever is offered is declined.
+    pub fn read_only(store: Arc<TileStore>) -> Self {
+        Self { store, read_only: true }
     }
 }
 
@@ -72,6 +80,9 @@ impl ContentStore for StoreContent {
     async fn put(&self, key: &str, value: Bytes, _ttl: Option<Duration>) {
         // The layer's own lifetime governs, not the origin's TTL: a layer
         // expires by epoch, as the catalog says.
+        if self.read_only {
+            return;
+        }
         let Some((layer, z, x, y)) = parse(key) else { return };
         let result = if is_absent(&value) {
             let absent = format!("{layer}{ABSENT_SUFFIX}");
