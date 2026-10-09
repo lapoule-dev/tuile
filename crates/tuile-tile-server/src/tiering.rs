@@ -64,7 +64,7 @@ mod tests {
     use super::*;
 
     fn a(bytes: u64) -> ArchiveRef {
-        ArchiveRef { key: format!("k{bytes}"), epoch: "e".into(), created: 0, tiles: 1, bytes }
+        ArchiveRef { key: format!("k{bytes}"), epoch: "e".into(), created: 0, tiles: 1, bytes, oldest_fetch_ms: None, newest_fetch_ms: None }
     }
 
     const POLICY: Tiering = Tiering { fanout: 4, ratio: 4, max_archives: 12 };
