@@ -51,6 +51,34 @@ pub struct SharedTile {
     pub fetched_ms: u64,
 }
 
+/// What became of a fresh tile handed to a [`FreshTiles`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Emitted {
+    /// It is on its way to the store: someone else writes it there.
+    Kept,
+    /// It could not be handed over. The tile is still served; it is not
+    /// stored, and will be fetched again one day.
+    NotKept,
+}
+
+/// Where a serving instance sends the tiles it has just fetched, when it does
+/// not write them to the store itself.
+///
+/// With one, a [`crate::TileService`] keeps no buffer and publishes nothing:
+/// each fresh tile, and each "no such tile" of a source, is emitted once, and
+/// whoever is behind — a queue, a stream, another process calling
+/// [`TileStore::publish_batch`] — puts it in the store. What is emitted is
+/// also what the other instances are to see: an implementation shares it as
+/// [`SharedTiles::put`] would have.
+///
+/// As everything here, it returns no error: a tile that could not be emitted
+/// is [`Emitted::NotKept`], and the request that fetched it is answered all
+/// the same.
+#[async_trait]
+pub trait FreshTiles: Send + Sync {
+    async fn emit(&self, layer: &str, level: u8, x: u32, y: u32, tile: &SharedTile) -> Emitted;
+}
+
 /// What became of asking to be the one that fetches a tile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
