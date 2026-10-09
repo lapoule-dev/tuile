@@ -578,8 +578,8 @@ async fn resolve(
     Ok((tree, loader, detail, heights, provenance))
 }
 
-/// An ion-hosted imagery asset, opened and not yet asked for a tile: what it
-/// is, as its own descriptor states it.
+/// An imagery asset, opened and not yet asked for a tile: what it is, as
+/// its own descriptor states it — or as the host's sources give it.
 ///
 /// For a source that is not drawn but measured against — a reference a
 /// film's imagery is brought to. Opening it and fetching from it are two
@@ -587,10 +587,12 @@ async fn resolve(
 /// between: a store keeps tiles by layer, and a layer is declared with the
 /// grid and the format only the open asset can tell.
 pub struct ReferenceImagery {
-    tms: TmsImagery<NativeHttp>,
+    provider: Arc<dyn tuile_core::raster::ImageryProvider>,
     asset: i64,
     pub scheme: tuile_core::raster::TilingScheme,
-    /// The file extension of its tiles: `jpg`, `png`.
+    /// The file extension of its tiles: `jpg`, `png`. Empty when the
+    /// imagery comes from a host's sources: the host's own store says what
+    /// its tiles are.
     pub extension: String,
 }
 
@@ -612,6 +614,11 @@ impl ReferenceImagery {
     /// Opens the asset: its endpoint and its descriptor, no tile.
     pub async fn open(config: &GlobeConfig, asset: i64) -> Result<Self, GlobeError> {
         use tuile_core::raster::ImageryProvider as _;
+        // The host's own sources, as for a globe: nothing resolved here.
+        if let Some(sources) = &config.sources {
+            let provider = sources.0.imagery(asset).await.map_err(GlobeError::Sources)?;
+            return Ok(Self { scheme: provider.tiling_scheme(), extension: String::new(), provider, asset });
+        }
         let transport = TransportConfig {
             retry: RetryConfig::patient(),
             ..match &config.cache_dir {
@@ -629,7 +636,7 @@ impl ReferenceImagery {
         Ok(Self {
             scheme: tms.tiling_scheme(),
             extension: tms.extension().unwrap_or_default(),
-            tms,
+            provider: Arc::new(tms),
             asset,
         })
     }
@@ -645,7 +652,7 @@ impl ReferenceImagery {
     ) -> Result<ReferenceFetched, GlobeError> {
         use tuile_core::raster::ImageryProvider as _;
         let asset = self.asset;
-        let tms = tuile_core::raster::CachedImagery::new(self.tms, cache.0, source_namespace(asset));
+        let tms = tuile_core::raster::CachedImagery::new(Held(self.provider), cache.0, source_namespace(asset));
         let mut done = ReferenceFetched { asked: wanted.len(), ..ReferenceFetched::default() };
         for some in wanted.chunks(REFERENCE_AT_ONCE) {
             let got = futures_util::future::join_all(some.iter().map(|c| tms.fetch_tile_bytes(*c))).await;
@@ -722,6 +729,22 @@ mod tests {
             Ok(_) => panic!("a globe out of sources that have nothing"),
         }
         assert_eq!(*asked.0.lock().expect("lock"), [format!("terrain {CESIUM_WORLD_TERRAIN}")]);
+    }
+
+    /// A reference imagery is asked of the host's sources too, by its asset.
+    #[test]
+    #[allow(clippy::panic, reason = "a test asserting by panicking")]
+    fn a_reference_imagery_is_asked_of_a_host_s_sources() {
+        let asked = Arc::new(Asked(std::sync::Mutex::new(Vec::new())));
+        let mut config = GlobeConfig::new("");
+        config.sources = Some(SourcesHandle(asked.clone()));
+        let runtime = Session::runtime().expect("runtime");
+        match runtime.block_on(ReferenceImagery::open(&config, 3954)) {
+            Err(GlobeError::Sources(why)) => assert_eq!(why, "no imagery here"),
+            Err(other) => panic!("wrong error: {other:?}"),
+            Ok(_) => panic!("a reference out of sources that have nothing"),
+        }
+        assert_eq!(*asked.0.lock().expect("lock"), ["imagery 3954"]);
     }
 
     /// An empty token is a configuration mistake worth naming, not a network
