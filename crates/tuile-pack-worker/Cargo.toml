@@ -16,8 +16,8 @@ crate-type = ["cdylib", "rlib"]
 async-trait = { workspace = true }
 bytes = { workspace = true }
 # The contract of a store of bytes, which the edge cache is one of.
-tuile-core = { version = "0.2.0", path = "../tuile-core" }
-tuile-repository = { version = "0.2.0", path = "../tuile-repository" }
+tuile-core = { version = "0.3.0", path = "../tuile-core" }
+tuile-repository = { version = "0.3.0", path = "../tuile-repository" }
 worker = "0.8"
 
 [lints]

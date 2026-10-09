@@ -22,10 +22,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 
-tuile-core = { version = "0.2.0", path = "../tuile-core" }
-tuile-cesium-ion = { version = "0.2.0", path = "../tuile-cesium-ion" }
-tuile-bing = { version = "0.2.0", path = "../tuile-bing" }
-tuile-planetary = { version = "0.2.0", path = "../tuile-planetary" }
+tuile-core = { version = "0.3.0", path = "../tuile-core" }
+tuile-cesium-ion = { version = "0.3.0", path = "../tuile-cesium-ion" }
+tuile-bing = { version = "0.3.0", path = "../tuile-bing" }
+tuile-planetary = { version = "0.3.0", path = "../tuile-planetary" }
 glam = { workspace = true }
 
 # The browser is the only target this crate has: everything below exists solely
