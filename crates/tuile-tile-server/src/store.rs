@@ -42,6 +42,7 @@ use rand::Rng;
 use tokio::io::AsyncReadExt;
 
 use crate::archive::{self, LocalReader, RemoteReader};
+use crate::catalog::ABSENT_SUFFIX;
 use crate::disk::{ArchiveCache, DiskCacheConfig};
 use crate::layer::{Layer, Zone};
 use crate::lru::Lru;
@@ -203,6 +204,32 @@ pub struct Gate {
 struct Pending {
     bytes: Bytes,
     fetched_ms: u64,
+}
+
+/// A tile fetched from a source and not yet in the store, for
+/// [`TileStore::publish_batch`]. An absence is offered as the absence
+/// sibling's own marker ([`crate::catalog::ABSENT_MARKER`]), in that layer.
+#[derive(Debug, Clone)]
+pub struct Fresh {
+    pub level: u8,
+    pub x: u32,
+    pub y: u32,
+    pub bytes: Bytes,
+    /// When it was fetched, in milliseconds since the Unix epoch.
+    pub fetched_ms: u64,
+}
+
+/// What a zone is made of, counted: see [`TileStore::census`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Census {
+    /// Archives a reader goes through (those of expired epochs left out).
+    pub archives: usize,
+    /// Tiles those archives hold, each copy counted.
+    pub copies: u64,
+    /// Tiles a reader can get: each tile counted once.
+    pub tiles: u64,
+    /// Tiles held by more than one archive.
+    pub repeated: u64,
 }
 
 #[derive(Default)]
@@ -774,7 +801,7 @@ impl TileStore {
             frozen
         };
 
-        let result = self.publish_delta(&layer, key, &frozen).await;
+        let result = self.publish_delta(&layer, key, &frozen).await.map(|_| ());
         {
             let mut buffers = self.buffers.lock().map_err(|_| StoreError::Poisoned)?;
             let b = buffers.entry(key.clone()).or_default();
@@ -802,7 +829,64 @@ impl TileStore {
         result
     }
 
-    async fn publish_delta(&self, layer: &Layer, key: &ZoneKey, frozen: &BTreeMap<u64, Pending>) -> Result<(), StoreError> {
+    /// Where a fresh tile is stored: its layer and its zone. A source's "no
+    /// such tile" (`absent`) goes to the layer's absence sibling, and nowhere
+    /// (`None`) when the layer keeps none.
+    pub fn place(&self, layer: &str, level: u8, x: u32, y: u32, absent: bool) -> Result<Option<(String, Zone)>, StoreError> {
+        let name = if absent { format!("{layer}{ABSENT_SUFFIX}") } else { layer.to_string() };
+        if absent && self.layer(&name).is_err() {
+            // Checked against the real layer all the same: a tile nobody
+            // could address is an error, not a quiet nothing.
+            self.locate(layer, level, x, y)?;
+            return Ok(None);
+        }
+        let (_, zone, _) = self.locate(&name, level, x, y)?;
+        Ok(Some((name, zone)))
+    }
+
+    /// Publishes a batch of fresh tiles of one zone, now, as a writer that
+    /// keeps no buffer does: a process fed by a queue or a stream of what
+    /// serving instances fetched (see [`crate::peers::FreshTiles`]).
+    ///
+    /// `layer` and `zone` are where [`Self::place`] put the tiles; one that
+    /// belongs elsewhere fails the whole batch, nothing written. Exactly what
+    /// a flush does from there on: tiles the store already holds as they are,
+    /// or holds a later copy of, are dropped; the rest become one delta,
+    /// published by a conditional write of the zone's manifest and announced.
+    /// Says how many tiles were written. On an error nothing was published
+    /// and the batch is the caller's to offer again.
+    pub async fn publish_batch(&self, layer: &str, zone: Zone, tiles: Vec<Fresh>) -> Result<usize, StoreError> {
+        let l = self.layer(layer)?.clone();
+        let key = (l.name.clone(), zone);
+        let mut batch: BTreeMap<u64, Pending> = BTreeMap::new();
+        for tile in tiles {
+            let (_, at, id) = self.locate(layer, tile.level, tile.x, tile.y)?;
+            if at != zone {
+                return Err(StoreError::Corrupt(format!(
+                    "{layer} {}/{}/{} is not a tile of the zone it was offered for",
+                    tile.level, tile.x, tile.y
+                )));
+            }
+            let pending = Pending { bytes: tile.bytes, fetched_ms: tile.fetched_ms };
+            // The same tile twice in a batch: the later fetch is the tile.
+            match batch.get(&id) {
+                Some(kept) if kept.fetched_ms > pending.fetched_ms => {}
+                _ => {
+                    batch.insert(id, pending);
+                }
+            }
+        }
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let lock = self.zone_lock(&key);
+        let _held = lock.lock().await;
+        self.publish_delta(&l, &key, &batch).await
+    }
+
+    /// Publishes a zone's tiles as a delta; says how many it wrote (the rest
+    /// were in the store already).
+    async fn publish_delta(&self, layer: &Layer, key: &ZoneKey, frozen: &BTreeMap<u64, Pending>) -> Result<usize, StoreError> {
         let now = (self.clock)();
         let epoch = layer.epoch(now);
         let prefix = layer.zone_prefix(key.1);
@@ -810,7 +894,7 @@ impl TileStore {
         let kept = self.drop_duplicates(layer, key, frozen, now).await?;
         if kept.is_empty() {
             // Everything is already in the store: nothing to publish.
-            return Ok(());
+            return Ok(0);
         }
         let oldest_fetch_ms = kept.values().map(|p| p.fetched_ms).min();
         let newest_fetch_ms = kept.values().map(|p| p.fetched_ms).max();
@@ -850,7 +934,7 @@ impl TileStore {
             self.remember_manifest(key, Arc::new(m));
         }
         metrics::counter!("tuile_tiles_deltas_total", "layer" => layer.name.clone()).increment(1);
-        Ok(())
+        Ok(count as usize)
     }
 
     /// The buffered tiles worth publishing: those the store does not already
@@ -1022,21 +1106,58 @@ impl TileStore {
     pub async fn compact_due(&self) -> Result<Vec<(String, Zone, Compaction)>, StoreError> {
         let mut done = Vec::new();
         for (layer, zone) in self.zones().await? {
-            let l = self.layer(&layer)?.clone();
-            self.prune_expired(&l, zone).await?;
-            loop {
-                match self.compact_tiered(&layer, zone).await? {
-                    Compaction::Nothing => break,
-                    c @ Compaction::Superseded => {
-                        done.push((layer.clone(), zone, c));
-                        break;
-                    }
-                    c => done.push((layer.clone(), zone, c)),
-                }
+            for outcome in self.maintain(&layer, zone).await? {
+                done.push((layer.clone(), zone, outcome));
             }
-            self.cleanup(&l, zone).await?;
         }
         Ok(done)
+    }
+
+    /// Everything one zone is due, now: its expired archives retired, its
+    /// tiered runs merged until none is left to merge, its retired and
+    /// orphaned archives removed past their grace. What [`Self::compact_due`]
+    /// does to every zone, for a process that knows which zone has just been
+    /// written to, or that goes round the store a few zones at a time.
+    /// Returns the merges it made, and a `Superseded` if a writer got in
+    /// first — the zone is then due again.
+    pub async fn maintain(&self, layer: &str, zone: Zone) -> Result<Vec<Compaction>, StoreError> {
+        let l = self.layer(layer)?.clone();
+        let mut done = Vec::new();
+        self.prune_expired(&l, zone).await?;
+        loop {
+            match self.compact_tiered(layer, zone).await? {
+                Compaction::Nothing => break,
+                c @ Compaction::Superseded => {
+                    done.push(c);
+                    break;
+                }
+                c => done.push(c),
+            }
+        }
+        self.cleanup(&l, zone).await?;
+        Ok(done)
+    }
+
+    /// Counts a zone's tiles archive by archive, from the bucket: how many a
+    /// reader can get, and how many are held more than once. A tile in two
+    /// archives is not an error — the newest wins — but it is space, and the
+    /// measure of how often two writers stored the same thing.
+    pub async fn census(&self, layer: &str, zone: Zone) -> Result<Census, StoreError> {
+        let l = self.layer(layer)?.clone();
+        let now = (self.clock)();
+        let m = manifest::read(self.store.as_ref(), &l.zone_prefix(zone)).await?.manifest;
+        let mut held: HashMap<u64, u32> = HashMap::new();
+        let mut census = Census::default();
+        for a in m.archives.iter().filter(|a| !l.is_expired(&a.epoch, now)) {
+            census.archives += 1;
+            for id in archive::ids(self.reader(&a.key).await?).await? {
+                census.copies += 1;
+                *held.entry(id).or_default() += 1;
+            }
+        }
+        census.tiles = held.len() as u64;
+        census.repeated = held.values().filter(|n| **n > 1).count() as u64;
+        Ok(census)
     }
 
     /// Retires the archives of expired epochs without merging anything.

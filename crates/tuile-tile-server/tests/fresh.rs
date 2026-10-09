@@ -17,8 +17,10 @@ use common::*;
 use futures_util::TryStreamExt;
 use object_store::ObjectStore;
 use tuile_tile_server::catalog::layers;
+use tuile_tile_server::catalog::{ABSENT_MARKER, ABSENT_SUFFIX};
 use tuile_tile_server::{
-    Emitted, FreshTiles, ServiceConfig, SharedTile, Source, TileService, TileStore, Upstream, UpstreamError,
+    Census, Compaction, Emitted, Fresh, FreshTiles, ServiceConfig, SharedTile, Source, TileService, TileStore, Upstream,
+    UpstreamError,
 };
 
 /// A source that has every tile except those with `x == 0`.
@@ -129,4 +131,120 @@ async fn a_tile_learnt_from_another_is_served_from_memory_without_the_source() {
     assert_eq!(source.0.load(Ordering::SeqCst), 0);
     assert_eq!(s.stats().learned, 2);
     assert_eq!(objects_in(objects.as_ref()).await, 0);
+}
+
+// ── What another process makes of a batch ────────────────────────────────
+
+fn fresh(i: u32, version: u32, fetched_ms: u64) -> Fresh {
+    let (x, y) = in_zone(i);
+    Fresh { level: LEVEL, x, y, bytes: body(LEVEL, x, y, version), fetched_ms }
+}
+
+#[tokio::test]
+async fn a_fresh_tile_is_placed_in_its_layer_and_zone_and_an_absence_in_the_sibling() {
+    let (clock, objects) = (TestClock::new(), memory());
+    let with_siblings = store(&objects, &clock);
+    assert_eq!(with_siblings.place(IMAGERY, LEVEL, X0, Y0, false).expect("place"), Some((IMAGERY.to_string(), zone())));
+    assert_eq!(
+        with_siblings.place(IMAGERY, LEVEL, X0, Y0, true).expect("place"),
+        Some((format!("{IMAGERY}{ABSENT_SUFFIX}"), zone()))
+    );
+    // A store whose layers keep no absences: nowhere, and not an error.
+    let without = store_on(objects, &clock, eager());
+    assert_eq!(without.place(IMAGERY, LEVEL, X0, Y0, true).expect("place"), None);
+    // A tile nobody could address is refused either way.
+    assert!(without.place(IMAGERY, 3, 99, 0, true).is_err());
+    assert!(without.place("no-such-layer", LEVEL, X0, Y0, false).is_err());
+}
+
+#[tokio::test]
+async fn a_batch_published_with_no_buffer_gives_the_store_what_a_flush_gives() {
+    let clock = TestClock::new();
+    // The way it was: tiles put, then flushed.
+    let flushed = memory();
+    let a = store(&flushed, &clock);
+    for i in 0..5 {
+        let (x, y) = in_zone(i);
+        a.put(IMAGERY, LEVEL, x, y, body(LEVEL, x, y, 1)).await.expect("put");
+    }
+    a.put(&format!("{IMAGERY}{ABSENT_SUFFIX}"), LEVEL, X0 + 9, Y0, Bytes::from_static(ABSENT_MARKER)).await.expect("put");
+    a.flush_all().await.expect("flush");
+
+    // The same tiles, by a process that never buffered them.
+    let batched = memory();
+    let b = store(&batched, &clock);
+    let wrote = b.publish_batch(IMAGERY, zone(), (0..5).map(|i| fresh(i, 1, 10)).collect()).await.expect("batch");
+    assert_eq!(wrote, 5);
+    let absence = Fresh { level: LEVEL, x: X0 + 9, y: Y0, bytes: Bytes::from_static(ABSENT_MARKER), fetched_ms: 10 };
+    let (layer, at) = b.place(IMAGERY, LEVEL, X0 + 9, Y0, true).expect("place").expect("a sibling");
+    assert_eq!(b.publish_batch(&layer, at, vec![absence]).await.expect("batch"), 1);
+    assert_eq!(b.flush_all().await.expect("flush"), 0, "nothing was ever buffered");
+
+    for objects in [&flushed, &batched] {
+        let reader = store(objects, &clock);
+        for i in 0..5 {
+            let (x, y) = in_zone(i);
+            assert_eq!(reader.get(IMAGERY, LEVEL, x, y).await.expect("get"), Some(body(LEVEL, x, y, 1)));
+        }
+        assert!(reader.get(&format!("{IMAGERY}{ABSENT_SUFFIX}"), LEVEL, X0 + 9, Y0).await.expect("get").is_some());
+        assert_eq!(
+            reader.census(IMAGERY, zone()).await.expect("census"),
+            Census { archives: 1, copies: 5, tiles: 5, repeated: 0 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_same_batch_from_two_processes_is_stored_once() {
+    let (clock, objects) = (TestClock::new(), memory());
+    let (a, b) = (store(&objects, &clock), store(&objects, &clock));
+    let batch = || (0..6).map(|i| fresh(i, 1, 10)).collect::<Vec<_>>();
+    assert_eq!(a.publish_batch(IMAGERY, zone(), batch()).await.expect("batch"), 6);
+    assert_eq!(b.publish_batch(IMAGERY, zone(), batch()).await.expect("batch"), 0, "all of it is there already");
+    assert_eq!(b.census(IMAGERY, zone()).await.expect("census"), Census { archives: 1, copies: 6, tiles: 6, repeated: 0 });
+
+    // A tile fetched again, changed: written, and the census says it is held twice.
+    assert_eq!(b.publish_batch(IMAGERY, zone(), vec![fresh(0, 2, 20)]).await.expect("batch"), 1);
+    assert_eq!(a.census(IMAGERY, zone()).await.expect("census"), Census { archives: 2, copies: 7, tiles: 6, repeated: 1 });
+    let (x, y) = in_zone(0);
+    assert_eq!(store(&objects, &clock).get(IMAGERY, LEVEL, x, y).await.expect("get"), Some(body(LEVEL, x, y, 2)));
+}
+
+#[tokio::test]
+async fn a_tile_twice_in_a_batch_is_the_one_fetched_last_and_a_stray_tile_fails_the_batch() {
+    let (clock, objects) = (TestClock::new(), memory());
+    let s = store(&objects, &clock);
+    // Whatever the order they come in: the later fetch first, or last.
+    let batch = vec![fresh(0, 2, 20), fresh(0, 1, 10), fresh(2, 1, 10), fresh(2, 2, 20)];
+    assert_eq!(s.publish_batch(IMAGERY, zone(), batch).await.expect("batch"), 2);
+    for i in [0, 2] {
+        let (x, y) = in_zone(i);
+        assert_eq!(store(&objects, &clock).get(IMAGERY, LEVEL, x, y).await.expect("get"), Some(body(LEVEL, x, y, 2)));
+    }
+
+    // A tile of the zone east of it, offered for this one: nothing is written.
+    let before = objects_in(objects.as_ref()).await;
+    let stray = Fresh { level: LEVEL, x: X0 + ZONE_SIDE, y: Y0, bytes: body(LEVEL, X0 + ZONE_SIDE, Y0, 1), fetched_ms: 30 };
+    assert!(s.publish_batch(IMAGERY, zone(), vec![fresh(1, 1, 30), stray]).await.is_err());
+    assert_eq!(objects_in(objects.as_ref()).await, before);
+}
+
+#[tokio::test]
+async fn one_zone_is_maintained_by_itself() {
+    let (clock, objects) = (TestClock::new(), memory());
+    let s = store(&objects, &clock);
+    let fanout = eager().tiering.fanout as u32;
+    for i in 0..fanout {
+        assert_eq!(s.publish_batch(IMAGERY, zone(), vec![fresh(i, 1, 10)]).await.expect("batch"), 1);
+    }
+    assert_eq!(s.census(IMAGERY, zone()).await.expect("census").archives, fanout as usize);
+
+    let done = store(&objects, &clock).maintain(IMAGERY, zone()).await.expect("maintain");
+    assert!(matches!(done.as_slice(), [Compaction::Merged { .. }]), "{done:?}");
+    assert_eq!(
+        s.census(IMAGERY, zone()).await.expect("census"),
+        Census { archives: 1, copies: u64::from(fanout), tiles: u64::from(fanout), repeated: 0 }
+    );
+    // Nothing more is due.
+    assert!(store(&objects, &clock).maintain(IMAGERY, zone()).await.expect("maintain").is_empty());
 }
