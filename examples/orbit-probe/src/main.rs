@@ -21,8 +21,8 @@
 //! so reloads there say the residency did not hold them.
 //!
 //! ```text
-//! cargo run --release -p orbit-probe             # 24 steps, no images
-//! cargo run --release -p orbit-probe -- --png    # also write a frame per step
+//! cargo run --release -p tuile-orbit-probe             # 24 steps, no images
+//! cargo run --release -p tuile-orbit-probe -- --png    # also write a frame per step
 //! ```
 //! Reads `CESIUM_ION_TOKEN` (env or `.env`).
 

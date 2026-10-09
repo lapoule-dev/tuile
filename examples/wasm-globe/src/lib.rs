@@ -106,7 +106,7 @@ pub struct Globe {
 impl Globe {
     /// Assembles the ion globe from a fetched `layer.json`, its base URL and
     /// the asset access token, and arms a Pyrénées oblique view (mirrors the
-    /// `globe-bulk` preset).
+    /// `tuile-globe-bulk` preset).
     #[wasm_bindgen(constructor)]
     pub fn new(layer_json: &str, base_url: &str, access_token: &str) -> Result<Globe, JsError> {
         console_error_panic_hook::set_once();

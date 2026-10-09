@@ -1,5 +1,5 @@
 [package]
-name = "warm-cache"
+name = "tuile-warm-cache"
 description = "Fills the tile store with the coarse pyramid, once, before flying."
 version.workspace = true
 edition.workspace = true

@@ -1949,28 +1949,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
-name = "globe-bulk"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "dotenvy",
- "glam 0.33.1",
- "image",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tuile-atmosphere",
- "tuile-bing",
- "tuile-cesium-ion",
- "tuile-core",
- "tuile-native-fetchers",
- "tuile-planetary",
- "tuile-terrain",
- "tuile-wgpu",
- "wgpu",
-]
-
-[[package]]
 name = "glow"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4051,30 +4029,6 @@ checksum = "5df339f526ea9a60e371768d50efc2f2508c7203290731565d1f7a6f71d21747"
 dependencies = [
  "libc",
  "libredox",
-]
-
-[[package]]
-name = "orbit-probe"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "dotenvy",
- "glam 0.33.1",
- "image",
- "pollster",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tuile-bing",
- "tuile-camera",
- "tuile-cesium-ion",
- "tuile-core",
- "tuile-native-fetchers",
- "tuile-planetary",
- "tuile-storage-foyer",
- "tuile-terrain",
- "tuile-wgpu",
- "wgpu",
 ]
 
 [[package]]
@@ -6331,6 +6285,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuile-globe-bulk"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "dotenvy",
+ "glam 0.33.1",
+ "image",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tuile-atmosphere",
+ "tuile-bing",
+ "tuile-cesium-ion",
+ "tuile-core",
+ "tuile-native-fetchers",
+ "tuile-planetary",
+ "tuile-terrain",
+ "tuile-wgpu",
+ "wgpu",
+]
+
+[[package]]
 name = "tuile-hydra"
 version = "0.3.0"
 dependencies = [
@@ -6380,6 +6356,30 @@ dependencies = [
  "tuile-cesium-ion",
  "tuile-core",
  "url",
+]
+
+[[package]]
+name = "tuile-orbit-probe"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "dotenvy",
+ "glam 0.33.1",
+ "image",
+ "pollster",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tuile-bing",
+ "tuile-camera",
+ "tuile-cesium-ion",
+ "tuile-core",
+ "tuile-native-fetchers",
+ "tuile-planetary",
+ "tuile-storage-foyer",
+ "tuile-terrain",
+ "tuile-wgpu",
+ "wgpu",
 ]
 
 [[package]]
@@ -6568,6 +6568,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuile-warm-cache"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "dotenvy",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tuile-bing",
+ "tuile-cesium-ion",
+ "tuile-core",
+ "tuile-native-fetchers",
+ "tuile-planetary",
+ "tuile-storage-foyer",
+ "tuile-terrain",
+]
+
+[[package]]
+name = "tuile-wasm-globe"
+version = "0.3.0"
+dependencies = [
+ "console_error_panic_hook",
+ "glam 0.33.1",
+ "serde",
+ "serde-wasm-bindgen",
+ "tuile-bing",
+ "tuile-core",
+ "tuile-terrain",
+ "url",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "tuile-web"
 version = "0.3.0"
 dependencies = [
@@ -6610,6 +6643,35 @@ dependencies = [
  "tuile-terrain",
  "url",
  "wgpu",
+]
+
+[[package]]
+name = "tuile-wgpu-viewer"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ctrlc",
+ "glam 0.33.1",
+ "pollster",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tuile-atmosphere",
+ "tuile-bing",
+ "tuile-camera",
+ "tuile-cesium-ion",
+ "tuile-core",
+ "tuile-metrics",
+ "tuile-native-fetchers",
+ "tuile-planetary",
+ "tuile-storage-foyer",
+ "tuile-tape",
+ "tuile-terrain",
+ "tuile-ui",
+ "tuile-wgpu",
+ "wgpu",
+ "winit",
 ]
 
 [[package]]
@@ -6765,24 +6827,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "warm-cache"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "dotenvy",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tuile-bing",
- "tuile-cesium-ion",
- "tuile-core",
- "tuile-native-fetchers",
- "tuile-planetary",
- "tuile-storage-foyer",
- "tuile-terrain",
-]
-
-[[package]]
 name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6870,21 +6914,6 @@ checksum = "990065f2fe63003fe337b932cfb5e3b80e0b4d0f5ff650e6985b1048f62c8319"
 dependencies = [
  "leb128fmt",
  "wasmparser",
-]
-
-[[package]]
-name = "wasm-globe"
-version = "0.3.0"
-dependencies = [
- "console_error_panic_hook",
- "glam 0.33.1",
- "serde",
- "serde-wasm-bindgen",
- "tuile-bing",
- "tuile-core",
- "tuile-terrain",
- "url",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -7241,35 +7270,6 @@ dependencies = [
  "log",
  "raw-window-handle",
  "web-sys",
-]
-
-[[package]]
-name = "wgpu-viewer"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "ctrlc",
- "glam 0.33.1",
- "pollster",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tuile-atmosphere",
- "tuile-bing",
- "tuile-camera",
- "tuile-cesium-ion",
- "tuile-core",
- "tuile-metrics",
- "tuile-native-fetchers",
- "tuile-planetary",
- "tuile-storage-foyer",
- "tuile-tape",
- "tuile-terrain",
- "tuile-ui",
- "tuile-wgpu",
- "wgpu",
- "winit",
 ]
 
 [[package]]

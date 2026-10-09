@@ -1,5 +1,5 @@
 [package]
-name = "orbit-probe"
+name = "tuile-orbit-probe"
 description = "Headless 360° orbit that measures tile churn: what loads, what is dropped, what comes back"
 publish = false
 version.workspace = true

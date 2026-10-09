@@ -351,7 +351,7 @@ impl Config {
     /// The settings an interactive globe session actually runs with.
     ///
     /// **One source of truth, on purpose.** These numbers used to live inside
-    /// `wgpu-viewer`'s `main`, where nothing else could reach them — so every
+    /// `tuile-wgpu-viewer`'s `main`, where nothing else could reach them — so every
     /// headless test invented its own, and a harness that never evicted passed
     /// while the real globe went black. A test that does not run the host's
     /// configuration is not testing the host.

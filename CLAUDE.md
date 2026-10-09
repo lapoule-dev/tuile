@@ -106,7 +106,7 @@ cargo check --workspace                                    # quick build
 cargo check --target wasm32-unknown-unknown -p tuile-core # wasm guardrail
 cargo test --workspace
 cargo clippy --workspace -- -D warnings
-cargo run -p wgpu-viewer -- fixtures/tileset-simple/tileset.json
+cargo run -p tuile-wgpu-viewer -- fixtures/tileset-simple/tileset.json
 ```
 
 **Never pipe a test, build or clippy run through `head` or `tail`.** `head` closes

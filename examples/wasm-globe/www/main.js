@@ -7,7 +7,7 @@
 // documents, then run the request/provide/step loop the wasm hands us,
 // fetching each terrain and imagery tile and feeding the bytes back.
 
-import init, { Globe } from "../pkg/wasm_globe.js";
+import init, { Globe } from "../pkg/tuile_wasm_globe.js";
 import { DecodePool } from "./decode-pool.js";
 
 const TERRAIN_ASSET = 1; // Cesium World Terrain

@@ -49,7 +49,7 @@ use tuile_terrain::{
 /// guarantee is a promise about tiles nothing keeps: the floor would name a
 /// level-5 tile that the GPU never held and that eviction is free to drop, and
 /// the ground under it would be bare exactly when the fallback was needed.
-/// `wgpu-viewer`'s `TUILE_PIN_LEVEL` defaults to 4 to match.
+/// `tuile-wgpu-viewer`'s `TUILE_PIN_LEVEL` defaults to 4 to match.
 ///
 /// Deeper would also be sharper and would defeat the purpose — a level-17
 /// stand-in is as likely to be missing as the level-18 tile it stands in for.

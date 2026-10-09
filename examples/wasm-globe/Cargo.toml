@@ -1,5 +1,5 @@
 [package]
-name = "wasm-globe"
+name = "tuile-wasm-globe"
 description = "Raw-wasm demo: assemble the ion globe and drive a Pyrénées view entirely in the browser (no server, no wgpu). JS only does fetch; this wasm does traversal + decode + geometry and returns a GeometryReport."
 publish = false
 version.workspace = true

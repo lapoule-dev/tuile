@@ -3,7 +3,7 @@
 
 # web-viewer — the streaming globe, in a browser
 
-The same engine as `wgpu-viewer`, rendered by THREE.js instead of wgpu.
+The same engine as `tuile-wgpu-viewer`, rendered by THREE.js instead of wgpu.
 
 Not a demo and not a port: the **real** `GeometryServer`, the real SSE traversal
 and the real planetary loader run inside a Web Worker (`tuile-web`), and the page

@@ -197,7 +197,7 @@ impl ContentPump {
     /// matrix for the *previous* origin, and at planetary scale that draws them
     /// somewhere else entirely.
     ///
-    /// Extracted from `wgpu-viewer` so a headless test can run the host's own
+    /// Extracted from `tuile-wgpu-viewer` so a headless test can run the host's own
     /// loop rather than an approximation of it. Everything after this — the
     /// resolve and the draw — is immutable and belongs to whoever owns a
     /// surface.
