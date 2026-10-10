@@ -20,8 +20,10 @@
 //! terrain tile it drapes.
 
 mod provenance;
+mod sources;
 
 pub use provenance::{digest, Provenance, TerrainOrigin};
+pub use sources::{Held, Sources};
 
 use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};

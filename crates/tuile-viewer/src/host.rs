@@ -39,11 +39,11 @@
 
 use std::path::{Path, PathBuf};
 
-/// The environment variable the token is read from.
-pub(crate) const TOKEN_VARIABLE: &str = "CESIUM_ION_TOKEN";
-
-/// The application's name: its directories, its bundle, its menu.
-pub(crate) const APP_NAME: &str = "Tuile";
+/// The application's name: its directories, its bundle, its menu. The
+/// host's, once it has said who it is — see [`crate::embed::Identity`].
+pub(crate) fn app_name() -> &'static str {
+    &crate::embed::identity().name
+}
 
 /// The machine, as far as this module needs one. A trait so that the rules
 /// above are tested against a machine that is a few fields.
@@ -95,29 +95,35 @@ fn home(host: &dyn Host) -> Option<PathBuf> {
 /// The directory for what the person configures. `None` only on a machine
 /// with no home directory, which has nowhere to keep a file anyway.
 pub(crate) fn support_dir(host: &dyn Host) -> Option<PathBuf> {
+    support_dir_of(host, app_name())
+}
+
+/// [`support_dir`], for an application called `name`.
+pub(crate) fn support_dir_of(host: &dyn Host, name: &str) -> Option<PathBuf> {
     if host.is_macos() {
-        return Some(
-            home(host)?
-                .join("Library/Application Support")
-                .join(APP_NAME),
-        );
+        return Some(home(host)?.join("Library/Application Support").join(name));
     }
     let base = host
         .var("XDG_CONFIG_HOME")
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
         .or_else(|| Some(home(host)?.join(".config")))?;
-    Some(base.join(APP_NAME.to_lowercase()))
+    Some(base.join(name.to_lowercase()))
 }
 
 /// The file a session started from an icon leaves its reasons in: why it
 /// could not start, why it stopped. Where the desktop's own log viewer looks.
 pub(crate) fn log_file(host: &dyn Host) -> Option<PathBuf> {
+    log_file_of(host, app_name())
+}
+
+/// [`log_file`], for an application called `name`.
+pub(crate) fn log_file_of(host: &dyn Host, name: &str) -> Option<PathBuf> {
     if host.is_macos() {
         return Some(
             home(host)?
                 .join("Library/Logs")
-                .join(APP_NAME)
+                .join(name)
                 .join("viewer.log"),
         );
     }
@@ -126,7 +132,7 @@ pub(crate) fn log_file(host: &dyn Host) -> Option<PathBuf> {
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
         .or_else(|| Some(home(host)?.join(".local/state")))?;
-    Some(base.join(APP_NAME.to_lowercase()).join("viewer.log"))
+    Some(base.join(name.to_lowercase()).join("viewer.log"))
 }
 
 /// Where a session started from an icon leaves the view it ended on, for the
@@ -154,25 +160,6 @@ pub(crate) struct MissingToken {
     pub file: Option<PathBuf>,
 }
 
-impl std::fmt::Display for MissingToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "There is no access token for terrain and imagery. Export \
-             {TOKEN_VARIABLE} before starting from a terminal"
-        )?;
-        match &self.file {
-            Some(file) => write!(
-                f,
-                ", or put the token on a line of its own in this file, readable \
-                 by you alone (chmod 600):\n\n{}",
-                file.display()
-            ),
-            None => write!(f, "."),
-        }
-    }
-}
-
 /// The token line of a file: the first line that is neither blank nor a
 /// comment, without a `NAME=` in front of it or quotes around it.
 fn token_line(text: &str) -> Option<String> {
@@ -189,9 +176,12 @@ fn token_line(text: &str) -> Option<String> {
 ///
 /// A variable that is set but empty counts as unset — it is what an unfilled
 /// template exports, and "the token is the empty string" helps nobody.
-pub(crate) fn token(host: &dyn Host) -> Result<(String, TokenFrom), MissingToken> {
+pub(crate) fn token(
+    host: &dyn Host,
+    variable: &str,
+) -> Result<(String, TokenFrom), MissingToken> {
     if let Some(token) = host
-        .var(TOKEN_VARIABLE)
+        .var(variable)
         .map(|t| t.trim().to_owned())
         .filter(|t| !t.is_empty())
     {
@@ -253,6 +243,7 @@ mod tests {
         }
     }
 
+    const TOKEN_VARIABLE: &str = "SOME_TOKEN";
     const FILE: &str = "/Users/someone/Library/Application Support/Tuile/token";
 
     fn mac(vars: &[(&'static str, &'static str)], file: Option<&'static str>) -> Fake {
@@ -272,7 +263,7 @@ mod tests {
             Some("from-the-file\n"),
         );
         assert_eq!(
-            token(&host),
+            token(&host, TOKEN_VARIABLE),
             Ok(("from-the-shell".to_owned(), TokenFrom::Environment))
         );
     }
@@ -282,7 +273,7 @@ mod tests {
         for vars in [&[][..], &[(TOKEN_VARIABLE, "")], &[(TOKEN_VARIABLE, "  ")]] {
             let host = mac(vars, Some("from-the-file\n"));
             assert_eq!(
-                token(&host),
+                token(&host, TOKEN_VARIABLE),
                 Ok(("from-the-file".to_owned(), TokenFrom::File(FILE.into())))
             );
         }
@@ -293,12 +284,12 @@ mod tests {
         for text in [
             "abc.def\n",
             "\n# my token\n  abc.def  \n",
-            "CESIUM_ION_TOKEN=abc.def\n",
-            "CESIUM_ION_TOKEN=\"abc.def\"\nOTHER=1\n",
+            "SOME_TOKEN=abc.def\n",
+            "SOME_TOKEN=\"abc.def\"\nOTHER=1\n",
         ] {
             let host = mac(&[], Some(text));
             assert_eq!(
-                token(&host).map(|(t, _)| t),
+                token(&host, TOKEN_VARIABLE).map(|(t, _)| t),
                 Ok("abc.def".to_owned()),
                 "{text:?}"
             );
@@ -313,12 +304,16 @@ mod tests {
             None,
             Some(""),
             Some("# nothing yet\n\n"),
-            Some("CESIUM_ION_TOKEN=\n"),
+            Some("SOME_TOKEN=\n"),
         ] {
             let host = mac(&[], file);
-            let missing = token(&host).expect_err("there is no token");
+            let missing = token(&host, TOKEN_VARIABLE).expect_err("there is no token");
             assert_eq!(missing.file, Some(PathBuf::from(FILE)));
-            let said = missing.to_string();
+            let said = crate::embed::MissingCredential {
+                variable: TOKEN_VARIABLE.to_owned(),
+                file: missing.file.clone(),
+            }
+            .to_string();
             assert!(
                 said.contains(TOKEN_VARIABLE) && said.contains(FILE),
                 "{said}"
@@ -349,7 +344,7 @@ mod tests {
         };
         assert_eq!(token_file(&moved), Some("/etc/xdg/tuile/token".into()));
         // Nowhere to look is a missing token, not a panic.
-        assert_eq!(token(&Fake::default()), Err(MissingToken { file: None }));
+        assert_eq!(token(&Fake::default(), TOKEN_VARIABLE), Err(MissingToken { file: None }));
     }
 
     /// The view a session left is the view the next one opens on; a file

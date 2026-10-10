@@ -1,288 +1,140 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! Streaming globe viewer: a winit window driving the logical geometry server
-//! in **progressive** mode. The server (terrain × Bing imagery via ion) runs
-//! on a background tokio runtime; the window, on the main thread, sends the
-//! camera every frame and pumps decoded tiles to the GPU as they arrive —
-//! tiles stream in one by one, refining as you orbit and zoom.
+//! The viewer, over the public connectors.
+//!
+//! The application itself — window, camera, controls, steering, scripting — is
+//! the `tuile-viewer` library. This binary is the one decision a host makes:
+//! **where terrain and imagery come from.** Here that is Cesium ion, with Bing
+//! imagery behind it, over a native HTTP transport; the choice is made in this
+//! file and nowhere deeper. Another host answers the same three questions with
+//! its own service and reuses everything else — see
+//! `docs/16-embedding-the-viewer.md`.
 //!
 //! ```text
 //! CESIUM_ION_TOKEN=... cargo run -p tuile-wgpu-viewer
-//! ```
-//! Drag: orbit. Right-drag: pan. Wheel: zoom. W: wireframe. F: freeze. Esc: quit.
-//! N, or a click on the compass ring: north up, about the point at the centre
-//! of the view. L: centre on the current location, at the present altitude.
-//!
-//! The session opens straight down on France from 2 000 km. These flags move
-//! that, and are the only flags there are (`--help` lists them with the keys):
-//!
-//! ```text
-//! --lon <deg> --lat <deg>   where the eye is, east and north positive
-//! --altitude <m>            its height above the ellipsoid, 1 to 1e8
-//! --heading <deg>           where it looks, 0 = north, clockwise
-//! --pitch <deg>             how far below the horizon, 90 = straight down
-//! --here                    over the current location, instead of --lon/--lat
-//!
 //! CESIUM_ION_TOKEN=... cargo run -p tuile-wgpu-viewer -- \
 //!     --lon 6.86 --lat 45.83 --altitude 6000 --heading 120 --pitch 25
 //! ```
 //!
-//! C copies a link to the present view. A running viewer can be steered by
-//! other programs with URLs of the same form — `tuile://goto?…`, `north`,
-//! `here`, `view?…`: see `steer` for the vocabulary and what it cannot do. The
-//! application bundle (`macos/README.md`) registers the scheme and carries a
-//! scripting dictionary, through which a script reads the view — position,
-//! attitude, target, range, tile counts: see `snapshot` — and commands it.
-//!
 //! The access token is read from the environment, or — for a session started
-//! from an icon — from one file the person owns: see `host`.
-//!
-//! The current location comes from the operating system's location service
-//! (macOS, cargo feature `current-location`, on by default), which asks the
-//! person before it answers; elsewhere `--here` and L say it is not available
-//! and change nothing. The coordinates are never logged or written anywhere.
-//!
-//! `TUILE_RECORD=path.jsonl` writes the camera path; `TUILE_REPLAY=path.jsonl`
-//! flies it again exactly. The format and the replay live in the `tuile-tape`
-//! crate.
+//! from an icon — from one file the person owns:
+//! `~/Library/Application Support/Tuile/token` on macOS.
 
-mod app;
-mod backdrop;
-mod desktop;
-mod host;
-mod journal;
-mod location;
-mod recording;
-mod session;
-mod settings;
-mod signals;
-// Only a script asks; without the desktop glue the answers have no reader.
-#[cfg_attr(
-    not(all(target_os = "macos", feature = "application")),
-    allow(dead_code)
-)]
-mod snapshot;
-mod sources;
-mod start;
-mod steer;
+use std::sync::Arc;
 
-use app::{App, ViewerConfig};
-use tuile_camera::CameraController;
-use tuile_core::runtime::in_process_with;
-use tuile_core::traversal::Config;
-use winit::event_loop::{ControlFlow, EventLoop};
+use tuile_bing::{BingImageryProvider, BingMetadata};
+use tuile_cesium_ion::tms::TmsImagery;
+use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
+use tuile_core::raster::ImageryProvider;
+use tuile_native_fetchers::NativeHttp;
+use tuile_terrain::{LayerJson, TerrainSource};
+use tuile_viewer::{Identity, ImageryChoice, Sources, TerrainChoice, ViewerHost};
 
-/// Whether this process was started from an application bundle — from an
-/// icon, most likely, with no terminal behind it.
-fn in_a_bundle() -> bool {
-    std::env::current_exe().is_ok_and(|exe| host::is_bundled(&exe))
+/// The environment variable the access token is read from.
+const TOKEN_VARIABLE: &str = "CESIUM_ION_TOKEN";
+
+/// The ion asset of the terrain: Cesium World Terrain.
+const WORLD_TERRAIN: i64 = 1;
+
+/// Terrain and imagery by ion asset number, resolved on demand.
+struct Ion {
+    http: Arc<NativeHttp>,
+    token: String,
+}
+
+impl Ion {
+    fn client(&self) -> IonClient<NativeHttp> {
+        IonClient::new(Arc::clone(&self.http), self.token.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl Sources for Ion {
+    async fn terrain(&self, asset: i64) -> Result<(LayerJson, Arc<dyn TerrainSource>), String> {
+        let asset = u64::try_from(asset).map_err(|_| format!("{asset} is not an asset"))?;
+        let source = IonTerrainSource::new(self.client(), asset);
+        let layer = source.layer().await.map_err(|e| e.to_string())?;
+        Ok((layer, Arc::new(source)))
+    }
+
+    /// What the endpoint *is*, not what one hopes it is: an asset ion serves
+    /// through Bing answers with a key and a map style, and one ion hosts
+    /// itself answers with a tile map resource. The two are cut on different
+    /// grids — web-mercator and geographic — and each provider says which.
+    async fn imagery(&self, asset: i64) -> Result<Arc<dyn ImageryProvider>, String> {
+        let id = u64::try_from(asset).map_err(|_| format!("{asset} is not an asset"))?;
+        let ion = self.client();
+        let endpoint = match ion.asset_endpoint(id).await.map_err(|e| e.to_string())? {
+            AssetEndpoint::Imagery(endpoint) => endpoint,
+            _ => return Err(format!("asset {asset} is not imagery")),
+        };
+        match endpoint.external_type.as_deref() {
+            None => Ok(Arc::new(
+                TmsImagery::from_endpoint(ion, id, endpoint)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )),
+            Some("BING") => {
+                let o = &endpoint.options;
+                let style = o.map_style.as_deref().unwrap_or("Aerial");
+                let metadata = BingMetadata::metadata_url(
+                    o.url.as_deref().ok_or("the endpoint names no URL")?,
+                    style,
+                    o.key.as_deref().ok_or("the endpoint carries no key")?,
+                );
+                Ok(Arc::new(
+                    BingImageryProvider::from_metadata_url(Arc::clone(&self.http), &metadata)
+                        .await
+                        .map_err(|e| e.to_string())?,
+                ))
+            }
+            Some(other) => Err(format!("asset {asset} is served as {other:?}, which is not handled")),
+        }
+    }
+}
+
+/// The public host: the project's own application over ion.
+struct Public;
+
+#[async_trait::async_trait]
+impl ViewerHost for Public {
+    fn identity(&self) -> Identity {
+        tuile_viewer::renamed_by_environment(Identity {
+            // The store this viewer has always written, so that a session
+            // after this change starts as warm as the one before it.
+            store: tuile_bing::cache_name("Aerial"),
+            credentials: format!(
+                "The access token is read from {TOKEN_VARIABLE}, or from the file `token` \
+                 in the application's support directory."
+            ),
+            ..Identity::default()
+        })
+    }
+
+    fn terrain(&self) -> TerrainChoice {
+        TerrainChoice {
+            asset: WORLD_TERRAIN,
+            cache: "ion-cwt".into(),
+        }
+    }
+
+    fn imagery(&self) -> Vec<ImageryChoice> {
+        vec![
+            // Asset 2, under the namespace its tiles have always been stored in.
+            ImageryChoice::new("aerial", "Aerial", 2, "© Microsoft, © Maxar, © Earthstar Geographics")
+                .cached_as(&tuile_bing::cache_namespace("Aerial")),
+        ]
+    }
+
+    async fn connect(&self) -> Result<Arc<dyn Sources>, String> {
+        let token = tuile_viewer::credential(TOKEN_VARIABLE).map_err(|e| e.to_string())?;
+        // One pooled, cached native transport drives both ion and Bing.
+        let http = Arc::new(NativeHttp::shared().await.map_err(|e| e.to_string())?);
+        Ok(Arc::new(Ion { http, token }))
+    }
 }
 
 fn main() {
-    journal::open();
-    if let Err(error) = session() {
-        journal::note(&format!("session failed: {error:#}"));
-        // From an icon, stderr is the system log and nobody is reading it: an
-        // application that fails must say so in a window, or it has simply
-        // not opened. This is not hypothetical — the first bundle did exactly
-        // that, over a limit on open files that no terminal session has.
-        if in_a_bundle() {
-            desktop::alert("Tuile stopped", &format!("{error:#}"));
-        } else {
-            eprintln!("Error: {error:?}");
-        }
-        std::process::exit(1);
-    }
-}
-
-/// Lifts this process's limit on open files as far as the system allows.
-///
-/// A process started by the desktop gets 256 descriptors, where a shell hands
-/// out thousands. The tile store and a pool of connections go through 256
-/// before the first frame, and the session then dies of "too many open files"
-/// — from an icon only, which is the one place nobody sees the message. The
-/// soft limit is the process's own to raise up to the hard one, so it is
-/// raised; failing to is worth a line and not worth stopping for.
-fn lift_the_open_file_limit() {
-    #[cfg(unix)]
-    if let Err(error) = rlimit::increase_nofile_limit(8192) {
-        tracing::error!("could not raise the open-file limit: {error}");
-    }
-}
-
-fn session() -> anyhow::Result<()> {
-    // The command line first, before the logger, the token, the network and
-    // the window: a mistyped flag must cost nothing but the message that says
-    // so. Exit code 2 is the usual one for a command that was not understood.
-    let (view, here) = match start::parse(std::env::args().skip(1)) {
-        Ok(start::Invocation::Run { view, here }) => (view, here),
-        Ok(start::Invocation::Help) => {
-            println!("{}", start::USAGE);
-            return Ok(());
-        }
-        Err(error) => {
-            eprintln!("tuile-wgpu-viewer: {error}\n\n{}", start::USAGE);
-            std::process::exit(2);
-        }
-    };
-    // Started from an icon, there is no terminal: the log goes quiet and
-    // what would have been an error line becomes a window.
-    let bundled = in_a_bundle();
-    // Started from an icon with nothing said about where: open where the last
-    // such session ended. From a terminal the default view stays the default
-    // — a command opens on what the command says.
-    let view = if bundled && !here && view == start::StartView::default() {
-        start::remembered(&host::Machine).unwrap_or(view)
-    } else {
-        view
-    };
-    settings::init_tracing(bundled);
-    lift_the_open_file_limit();
-    // From the environment first, and always: what a session ran with should
-    // be visible in the command that started it. A `.env` in the working
-    // directory used to be read here as well, and was removed — the process
-    // then behaved differently depending on where it was launched from, a
-    // stale file silently won over the variable that was deliberately
-    // exported, and a credential sat in the working tree one `git add -A` away
-    // from being published.
-    //
-    // What an application started from an icon reads instead — it has no
-    // environment to read — is one file the person owns, outside any checkout,
-    // which loses to the environment. See `host`.
-    let token = match host::token(&host::Machine) {
-        Ok((token, from)) => {
-            tracing::info!("access token from {from:?}");
-            token
-        }
-        Err(missing) if bundled => {
-            desktop::alert("Tuile cannot start yet", &missing.to_string());
-            std::process::exit(1);
-        }
-        Err(missing) => anyhow::bail!("{missing}"),
-    };
-    // Before the loop exists, so that a URL which *launched* the application
-    // is not missed.
-    let requests = desktop::listen();
-
-    // The geometry server is async (ion fetches over reqwest): build the scene
-    // and run the server on a background multi-thread runtime. The window
-    // talks to it over the in-process stream (channels, Send across threads).
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    // The runtime moves to the server thread; keep a handle so the store can
-    // still be flushed from here on the way out.
-    let handle = rt.handle().clone();
-    let (tree, loader, detail, heights, store, layer_budget) =
-        rt.block_on(sources::ion_globe(token))?;
-    // The budget counts decoded CPU bytes; the GPU copy costs about 1.35× that
-    // (mip chains, interleaved vertices), measured — so 3 GiB here is ~4 GiB of
-    // GPU, which unified memory carries comfortably now that a drape is a
-    // quarter of what it was.
-    //
-    // Sized above the working set on purpose. `forbid_holes` loads a whole
-    // subtree before selecting any of it, and a tile loaded but not yet
-    // selected is protected by nothing: squeeze the budget below what a view
-    // needs and those tiles are evicted and re-requested forever. At 768 MiB a
-    // motionless camera still churned twenty tiles a second — the session never
-    // settles, and it reads as the app hanging.
-    // The reference session, shared with the headless tests rather than written
-    // out here. When these numbers lived only in this file, every test invented
-    // its own and a harness that never evicted passed while the globe went
-    // black — see `Config::interactive_globe`.
-    let config = Config {
-        // TUILE_NO_CULL=1 keeps every tile the traversal reaches, however far
-        // off screen. Expensive and not a mode anyone should run in — it exists
-        // to answer one question: whether geometry that is missing was culled.
-        cull: std::env::var("TUILE_NO_CULL").is_err(),
-        // And TUILE_NO_HORIZON_CULL=1 keeps the far side of the planet, which
-        // the frustum alone cannot drop: from near the ground the frustum runs
-        // straight through the Earth. Same purpose as the flag above — when
-        // ground is missing, each of the two things that can remove it has to
-        // be switchable off on its own.
-        horizon_culling: std::env::var("TUILE_NO_HORIZON_CULL").is_err(),
-        ..Config::interactive_globe(settings::pinned_level())
-    };
-    let (stream, server) = in_process_with(tree, loader, config);
-    let server_thread = std::thread::Builder::new()
-        .name("geometry-server".into())
-        .spawn(move || rt.block_on(server.run()))?;
-
-    // Where the command line said; straight down at France from ~2000 km up
-    // when it said nothing.
-    let camera = view.camera();
-    // Clamp against the terrain, not the ellipsoid: a metre over the sea and a
-    // metre over a summit are the same request, and only the relief tells them
-    // apart. The handle is shared and live, so the floor sharpens as tiles land.
-    //
-    // One metre, not the hundred and fifty it was. A floor that high is a
-    // helicopter: it puts the eye above everything a person might want to stand
-    // next to, and at the levels the source actually serves there is detail well
-    // below it. The near plane follows — it is a quarter of the clearance — so
-    // getting close costs nothing but the precision that rebasing already
-    // provides.
-    let controller = CameraController::new(camera)
-        .with_min_altitude(1.0)
-        .with_ground(heights);
-
-    tracing::info!(
-        "tuile globe viewer — streaming Cesium World Terrain + Bing via ion\n\
-         drag: pan globe · right-drag: tilt/heading · wheel: zoom · N: north up · \
-         L: current location · C: copy link · W: wireframe · F: freeze · Esc"
-    );
-    let app_config = ViewerConfig {
-        stream,
-        controller,
-        detail,
-        layer_budget,
-        title: host::APP_NAME.into(),
-        requests,
-        remembers: bundled,
-        // `--here`: the window opens on the view above, and moves over the
-        // current location — same altitude, heading and pitch — when the
-        // system says where that is.
-        here: here.then_some(location::Placement {
-            altitude: Some(view.altitude),
-            heading: view.heading,
-            pitch: view.pitch,
-        }),
-        lit_at_unix_seconds: settings::lit_at()?,
-    };
-
-    // Everything the engine counts, scrapeable, so the log can stop being a
-    // wall of numbers and go back to reporting events.
-    tuile_metrics::serve(&handle);
-
-    // Before the loop: Ctrl-C and `kill` must end the session, not the process,
-    // or a recording dies with it.
-    signals::catch_interruptions();
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(app_config);
-    let outcome = event_loop.run_app(&mut app);
-    // Belt and braces: `exiting` covers a loop that unwinds normally, this
-    // covers one that does not. Closing an already-closed tape is a no-op.
-    app.close_the_tape();
-    let report = app.report();
-
-    // Shut down in dependency order. Dropping the app drops the client stream,
-    // which is how the server learns the session is over.
-    drop(app);
-    // The store is closed *before* the join, not after.
-    //
-    // The server thread owns the tokio runtime and `block_on`s the session on
-    // it, so when `run()` returns the runtime drops on that thread — and
-    // `Runtime::drop` waits for the store's blocking workers to finish. Waiting
-    // for the thread first and only then asking the store to close is a
-    // deadlock by construction: the thread cannot finish until a `close()` that
-    // cannot be issued until it has. It survives only because `run()` normally
-    // outlives this point.
-    settings::close_the_store(store, &handle);
-    if server_thread.join().is_err() {
-        tracing::error!("the geometry server panicked; its last work is lost");
-    }
-    tracing::info!("{report}");
-    outcome?;
-    Ok(())
+    tuile_viewer::main(Public)
 }

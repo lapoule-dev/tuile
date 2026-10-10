@@ -18,11 +18,8 @@ use tuile_camera::GlobeCamera;
 
 /// What `--help` prints. The keys are listed with the flags because this is the
 /// only text the binary can show before a window exists.
-pub(crate) const USAGE: &str = "\
-tuile-wgpu-viewer — a window on the streaming geometry server
-
-USAGE:
-    CESIUM_ION_TOKEN=... tuile-wgpu-viewer [FLAGS]
+const USAGE: &str = "\
+FLAGS_HEADER
 
 FLAGS (each takes one number; `--flag value` or `--flag=value`):
     --lon <deg>        longitude of the eye, east positive   [-180, 180]   default 2
@@ -49,9 +46,26 @@ KEYS:
     Esc                quit
 
 Everything else a session is started with is an environment variable; see the
-header of `settings.rs`. A running viewer is steered with tuile:// URLs (see
-the header of `steer.rs`) and, as the macOS application, by scripts (see
-`macos/README.md`).";
+header of `settings.rs`. A running viewer is steered with URLs of its own
+scheme (see the header of `steer.rs`) and, as the macOS application, by
+scripts (see `macos/README.md`).";
+
+/// What `--help` prints for this host: its executable's name, where its
+/// credentials are read from, then the flags and the keys.
+pub(crate) fn usage() -> String {
+    let identity = crate::embed::identity();
+    let mut head = format!(
+        "{exe} — a window on the streaming geometry server\n\nUSAGE:\n    {exe} [FLAGS]\n",
+        exe = identity.executable
+    );
+    if !identity.credentials.is_empty() {
+        head.push_str(&format!("\n{}\n", identity.credentials));
+    }
+    USAGE
+        .replace("FLAGS_HEADER\n", &head)
+        .replace("tuile://", &format!("{}://", identity.scheme))
+}
+
 
 /// The view a session opens on, in the units a person types: degrees and
 /// metres. Everything is `f64` — a longitude in `f32` is already metres off.
@@ -125,7 +139,7 @@ pub(crate) enum Invocation {
     /// current location once the system says where that is. The view's own
     /// longitude and latitude are then only where the eye waits meanwhile.
     Run { view: StartView, here: bool },
-    /// Print [`USAGE`] and leave.
+    /// Print [`usage`] and leave.
     Help,
 }
 

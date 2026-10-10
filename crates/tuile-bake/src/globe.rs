@@ -20,7 +20,12 @@ use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_cesium_ion::{tms::TmsImagery, AssetEndpoint, IonClient, IonTerrainSource};
 use tuile_core::offload;
 use tuile_native_fetchers::{NativeHttp, RetryConfig, TransportConfig};
-use tuile_planetary::{globe_with_provenance, GlobeOptions, ImageryDetail, LayerBudget};
+use tuile_planetary::{globe_with_provenance, GlobeOptions, Held, ImageryDetail, LayerBudget};
+
+/// Where a globe's tiles come from, when the host brings its own sources:
+/// defined beside the crossing it feeds, and re-exported here because this is
+/// where a bake's host has always found it.
+pub use tuile_planetary::Sources;
 
 use crate::session::{Session, SessionConfig};
 
@@ -105,31 +110,6 @@ pub struct GlobeConfig {
     pub session: SessionConfig,
 }
 
-/// Where a globe's tiles come from, when the host brings its own sources.
-///
-/// By default a globe resolves each asset itself, from the access token it
-/// is given. A host that keeps its tiles elsewhere — behind a server of its
-/// own, which already holds the sessions, the quota and the store — gives the
-/// globe a `Sources` instead. The globe then resolves nothing: no token is
-/// read, no endpoint is asked for, no descriptor is fetched; every tile comes
-/// from what the host handed over, through the same tile cache as ever.
-///
-/// The assets keep their numbers either way. They are what a pack records and
-/// what the tile cache is keyed by, so a pack baked through a host's sources
-/// is the pack the built-in ones would have given, provided the tiles are the
-/// same tiles. That proviso is the host's to keep.
-#[async_trait::async_trait]
-pub trait Sources: Send + Sync {
-    /// The terrain of `asset`: its `layer.json`, and its tiles.
-    async fn terrain(
-        &self,
-        asset: i64,
-    ) -> Result<(tuile_terrain::LayerJson, Arc<dyn tuile_terrain::TerrainSource>), String>;
-
-    /// The imagery of `asset`.
-    async fn imagery(&self, asset: i64) -> Result<Arc<dyn tuile_core::raster::ImageryProvider>, String>;
-}
-
 /// A [`Sources`] a config can carry.
 #[derive(Clone)]
 pub struct SourcesHandle(pub Arc<dyn Sources>);
@@ -137,32 +117,6 @@ pub struct SourcesHandle(pub Arc<dyn Sources>);
 impl std::fmt::Debug for SourcesHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Sources")
-    }
-}
-
-/// A source held by pointer, as the source it points to.
-struct Held<T: ?Sized>(Arc<T>);
-
-#[async_trait::async_trait]
-impl tuile_terrain::TerrainSource for Held<dyn tuile_terrain::TerrainSource> {
-    async fn fetch_tile(
-        &self,
-        coord: tuile_terrain::TileCoord,
-    ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError> {
-        self.0.fetch_tile(coord).await
-    }
-}
-
-#[async_trait::async_trait]
-impl tuile_core::raster::ImageryProvider for Held<dyn tuile_core::raster::ImageryProvider> {
-    fn tiling_scheme(&self) -> tuile_core::raster::TilingScheme {
-        self.0.tiling_scheme()
-    }
-    async fn fetch_tile_bytes(
-        &self,
-        coord: tuile_core::raster::ImageryCoord,
-    ) -> Result<tuile_core::fetch::Fetched<bytes::Bytes>, tuile_core::raster::RasterError> {
-        self.0.fetch_tile_bytes(coord).await
     }
 }
 

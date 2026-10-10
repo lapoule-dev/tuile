@@ -324,8 +324,13 @@ cargo run --release -p tuile-viewer-bundle -- app --out ~/Applications
 open "tuile://goto?lon=6.86&lat=45.83&altitude=6000&heading=120&pitch=25"
 ```
 
-See `examples/wgpu-viewer/macos/README.md` for the token file, the URL
+See `crates/tuile-viewer/macos/README.md` for the token file, the URL
 vocabulary and what the signature is worth.
+
+The viewer is a library, `tuile-viewer`; `tuile-wgpu-viewer` is that library
+over the public connectors. A program with its own tile service reuses the whole
+application — window, controls, URLs, scripting, bundle — by implementing one
+trait: see `docs/16-embedding-the-viewer.md`.
 
 Render a baked film to an mp4:
 

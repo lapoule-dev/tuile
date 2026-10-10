@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+bytes = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
@@ -19,6 +20,5 @@ tuile-core = { version = "0.4.0", path = "../tuile-core" }
 tuile-terrain = { version = "0.4.0", path = "../tuile-terrain" }
 
 [dev-dependencies]
-bytes = { workspace = true }
 futures-executor = { workspace = true }
 glam = { workspace = true }
