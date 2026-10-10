@@ -261,6 +261,42 @@ change to design with the owner, and the instrument is its acceptance
 measure: residual 0 at same-level pairs is already there; the target is 0 —
 or under a quarter pixel — on every pair, with no skirt.
 
+**Could it be done at draw time, in a shader?** In part, and it is worth
+saying exactly which part.
+
+- *What it would be.* Each frame, for each drawn tile and each of its four
+  sides, the level of what is drawn across it. In the vertex stage (the
+  film's visibility raster fetches its own vertices; the interactive
+  renderer has one too) a vertex on an edge whose neighbour is coarser is
+  moved onto the neighbour's edge. The pack does not change and no film is
+  baked again: a frame's selection is in the pack, so the neighbour levels
+  are computed at render time.
+- *What it needs.* A flag a vertex saying which edge it is on (its texture
+  coordinates already say it); per tile and per frame, four neighbour
+  levels — a few bytes beside the tile's offset; and **the neighbour's edge
+  itself**: a polyline of heights, tens of vertices, per side — a small
+  buffer or a row of a texture a tile, indexed by side. Without it the
+  shader knows that it must move a vertex and not where to.
+- *What it costs.* A lookup and an interpolation for edge vertices only;
+  the per-frame buffer is built from the selection in a millisecond or two
+  (the seam log already walks those pairs in 12 to 20 ms unoptimised). The
+  film's resolve re-intersects each pixel's triangle from the stored
+  positions, so it has to apply the same move, or read the moved positions
+  from a buffer the vertex stage wrote: the one real complication.
+- *What would still not coincide.* A coarse edge has no vertex where a fine
+  tile's corner falls on it, so the two edges would be the same line with
+  different vertices: T-junctions, closed to rounding and not bit for bit —
+  pinholes of a sample are possible, which is what a short skirt is for.
+  Where **three** levels meet at a corner the rule needs the coarsest of
+  them, so the lookup is per corner too. And it moves the fine tile's edge
+  by the metre or two the two data levels differ, in the frame the
+  neighbour changes level: no worse than the level change itself.
+
+So: a draw-time rule can make the fine edge lie on the coarse one with no
+pack change and no re-bake, at the cost of handing each tile its
+neighbours' edge profiles each frame; it does not give identical vertices,
+and the skirts stay as what covers the remainder.
+
 ### 1.6 What the safety net does not do
 
 - **A wall that shows is lit as a wall.** Where a step is now closed, the
@@ -375,7 +411,8 @@ there. It needs a bake (section 5).
 
 ## 3. Islands and open sea
 
-Almost all of this is *read*; no coast is in the material at hand.
+What follows in 3.1 to 3.4 was written from the code, before any coast was
+in hand. Section 3.5 is the island bake, run since: read it first.
 
 ### 3.1 What is drawn where a source has nothing
 
@@ -436,6 +473,63 @@ where the two surfaces disagree, instead of a hole.
 3. **Do not drape a "no data" tile**: let the parent stand, as for a missing
    one. A few lines; changes pictures only where such tiles are.
 4. A geoid for the sea: a model and a decision, not a fix.
+
+### 3.5 Ouessant: an island in open sea, baked and measured
+
+*Measured.* Eight frames round Ouessant (5.10° W 48.46° N), 4 km out and 2 km
+up, 1280×720, screen-space error 8, baked through a host's tile service as a
+pack of references: 2 265 imagery tiles and 339 terrain tiles asked, none
+absent. Rendered from `main` (`9dadefd`) and from `fix/terrain-seams`, with
+`--seams`; a 4K still of frame 1 from each. Pictures
+`videos/ouessant-orbit-*.png`.
+
+- **No hole, no black, on either branch**: 0 pixels touched by a hole in the
+  eight frames, 0 pixels with every channel under 5. Between the two
+  branches 30 pixels differ over the eight frames, 5 in the 4K still.
+- **What the sea's terrain is.** Not absent: the source has it, at every
+  level asked (9 to 13). A sea tile is **4 vertices and 2 triangles**, one
+  segment an edge, flat at 52.0 m over the ellipsoid — which is the geoid's
+  height there: the source states sea level as it should, and nothing in the
+  engine has to know a geoid for the sea to be in its place. The island's
+  level-13 tiles have 300 to 400 vertices; its **level-10 tile has 4** — the
+  whole island a tilted plane from 20 km.
+- **Terrain stops at level 13** here: every tile of levels 14 to 19 is cut
+  from it (1 449 of the 1 787 shared edges within 40 km have a cut side).
+- **Level difference between neighbours**: 0 on 947 edges, 1 on 662, **2 on
+  178**; never more, at this error.
+- **Steps.** Tiles from their own terrain at one level: 1 mm. Tiles cut from
+  one level: 3 cm at most. Own terrain at two levels: 3.3 m at the median,
+  13.5 m at most — the one-segment edges of the sea and of coarse tiles
+  against the island's detail, both sides skirted. Cut against own: 12.5 m at
+  most, **70 edges open on `main`** by up to 6.7 m (level-14 tiles cut from
+  level 13 beside level-12 and level-13 tiles), 12 px² facing the eye in all
+  — none of which let the far side through. With skirts on cut tiles: 0 open
+  edges.
+- **The seam log** (`--seams`, a quarter of a pixel): 2 421 shared edges over
+  the eight frames, 310 over, 50 of them in the picture; the same on both
+  branches, as it must be. No edge in the picture has nothing drawn across
+  it.
+- **No "no data" tile is draped**: nothing black anywhere in the sea.
+- **The sea's colour is where the island's defect is.** Round the island the
+  water is drawn from fine imagery — lighter, greyer, textured with swell —
+  and stops on dead straight lines, a diagonal and a stair of tile edges,
+  against the smooth dark blue of coarser imagery. Across that line the
+  picture steps by **2.3 stops in red**, 0.3 in green, −0.2 in blue. It is
+  the imagery's, tile-aligned, and nothing in the geometry.
+- **The light meter on it** (`--meter`, read only, nothing calibrated): the
+  imagery falls into three groups of levels (1; 11 and 12; 13 to 19); the
+  step where a tile of the last group lies over an ancestor of another is
+  0.41 stop at the median cell and **2.48 at the 90th centile**. The grade a
+  level it would fit for levels 13 to 19 is at its bounds — black −0.1, gain
+  −3.0 / −2.3 / −2.0 stops — which is the fit being driven by dark water, as
+  section 4.3 expected. One region of its report is keyed 4294967295 /
+  4294967295: a tile with no region, printed as one.
+
+What this changes in the sections above: 3.2's question is answered — sea
+tiles have one segment an edge, the sag is real (7.5 m on a level-10 edge)
+and skirts cover it, before the fix and after, wherever the coarse side is
+skirted; 3.3 holds; the island's first defect is colour at sea, and belongs
+to section 4.
 
 ## 4. Colour
 
