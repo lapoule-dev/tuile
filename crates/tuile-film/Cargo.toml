@@ -10,9 +10,9 @@ authors.workspace = true
 [dependencies]
 glam = { workspace = true }
 thiserror = { workspace = true }
-tuile-core = { version = "0.3.3", path = "../tuile-core" }
-tuile-pack = { version = "0.3.3", path = "../tuile-pack" }
-tuile-terrain = { version = "0.3.3", path = "../tuile-terrain" }
+tuile-core = { version = "0.4.0", path = "../tuile-core" }
+tuile-pack = { version = "0.4.0", path = "../tuile-pack" }
+tuile-terrain = { version = "0.4.0", path = "../tuile-terrain" }
 
 [dev-dependencies]
 image = { workspace = true }

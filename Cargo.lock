@@ -6073,7 +6073,7 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "tuile-atmosphere"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "bytemuck",
  "glam 0.33.1",
@@ -6082,7 +6082,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-b3dm"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "serde_json",
  "thiserror 2.0.18",
@@ -6090,7 +6090,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-bake"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6120,7 +6120,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-bing"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6134,7 +6134,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-camera"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "biquad",
  "glam 0.33.1",
@@ -6143,7 +6143,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-cesium-ion"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6164,7 +6164,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-core"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6188,7 +6188,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-farm"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6216,7 +6216,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-film"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "glam 0.33.1",
  "image",
@@ -6229,7 +6229,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-film-gpu"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "bytemuck",
  "glam 0.33.1",
@@ -6244,7 +6244,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-film-native"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "cudarc",
@@ -6274,7 +6274,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-film-web"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -6298,7 +6298,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-globe-bulk"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -6320,7 +6320,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-hydra"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "glam 0.33.1",
  "tempfile",
@@ -6333,7 +6333,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-metrics"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
@@ -6344,7 +6344,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-mp4"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "mp4",
  "thiserror 2.0.18",
@@ -6352,7 +6352,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-native-fetchers"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6372,7 +6372,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-orbit-probe"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -6396,7 +6396,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-pack"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "flatbuffers",
  "lz4_flex",
@@ -6408,7 +6408,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-pack-api"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -6435,7 +6435,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-pack-worker"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6446,7 +6446,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-planetary"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6461,7 +6461,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-radiometry"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "nalgebra",
  "nalgebra-sparse",
@@ -6470,7 +6470,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-repository"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6499,7 +6499,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-storage-foyer"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6513,7 +6513,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-tape"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "image",
  "mcap",
@@ -6526,7 +6526,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-terrain"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6542,7 +6542,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-tile-server"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6564,7 +6564,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-ui"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "muda 0.18.0",
  "tray-icon",
@@ -6574,7 +6574,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-usd"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "glam 0.33.1",
  "tuile-core",
@@ -6583,7 +6583,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-warm-cache"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -6601,7 +6601,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-wasm-globe"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "console_error_panic_hook",
  "glam 0.33.1",
@@ -6616,7 +6616,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-web"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6639,7 +6639,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-wgpu"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytemuck",
@@ -6661,7 +6661,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-wgpu-viewer"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",

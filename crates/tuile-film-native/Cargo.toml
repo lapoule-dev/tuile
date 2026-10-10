@@ -17,15 +17,15 @@ image = { workspace = true }
 # encoder a machine has when it has nothing else.
 rav1e = { version = "0.8", default-features = false, features = ["threading"] }
 tokio = { workspace = true }
-tuile-core = { version = "0.3.3", path = "../tuile-core" }
-tuile-farm = { version = "0.3.3", path = "../tuile-farm" }
-tuile-film = { version = "0.3.3", path = "../tuile-film" }
-tuile-film-gpu = { version = "0.3.3", path = "../tuile-film-gpu" }
-tuile-mp4 = { version = "0.3.3", path = "../tuile-mp4" }
-tuile-radiometry = { version = "0.3.3", path = "../tuile-radiometry" }
-tuile-repository = { version = "0.3.3", path = "../tuile-repository" }
+tuile-core = { version = "0.4.0", path = "../tuile-core" }
+tuile-farm = { version = "0.4.0", path = "../tuile-farm" }
+tuile-film = { version = "0.4.0", path = "../tuile-film" }
+tuile-film-gpu = { version = "0.4.0", path = "../tuile-film-gpu" }
+tuile-mp4 = { version = "0.4.0", path = "../tuile-mp4" }
+tuile-radiometry = { version = "0.4.0", path = "../tuile-radiometry" }
+tuile-repository = { version = "0.4.0", path = "../tuile-repository" }
 # Where the store's small objects are kept between two renders.
-tuile-storage-foyer = { version = "0.3.3", path = "../tuile-storage-foyer" }
+tuile-storage-foyer = { version = "0.4.0", path = "../tuile-storage-foyer" }
 wgpu = { workspace = true }
 
 # The system's frameworks, for the `videotoolbox` feature.
@@ -47,7 +47,7 @@ cudarc = { version = "0.16.4", optional = true, features = ["cuda-version-from-b
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tuile-pack = { version = "0.3.3", path = "../tuile-pack" }
+tuile-pack = { version = "0.4.0", path = "../tuile-pack" }
 
 [features]
 # rav1e's own assembly: several times faster, and no longer Rust alone.
