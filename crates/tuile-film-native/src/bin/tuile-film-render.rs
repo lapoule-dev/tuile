@@ -17,6 +17,14 @@
 //!                         Default: the machine's own where one was built
 //!                         in (AV1 on NVIDIA), rav1e otherwise.
 //!   --pictures <dir>      one PNG a frame
+//!   --seams <dir>         measure what is left between the tiles of each
+//!                         frame — every stretch of edge two drawn tiles
+//!                         share, as the renderer is handed them; write
+//!                         seams.csv (a row a frame) and seam-pairs.csv (the
+//!                         stretches over the tolerance)
+//!   --seams-tolerance <px>  what a residual is held against (0.25)
+//!   --seams-strict        fail if, in the picture, any stretch is over it
+//!                         or any edge has nothing drawn across it
 //!   --meter <dir>         measure light going in and coming out; write
 //!                         tiles.csv, frames.csv, tone.json, report.md,
 //!                         and each place's table of grades under the key
@@ -221,6 +229,24 @@ fn marker(point: &str, size: f64) -> Result<OverlayMesh, Error> {
 impl Overlays for Shapes {
     fn frame(&mut self, _: u32, _: &BakedView, out: &mut Vec<OverlayMesh>) {
         out.extend(self.0.iter().cloned());
+    }
+}
+
+/// Two observers lent for one render, each told in turn.
+struct Two<'a>(&'a mut dyn Observer, &'a mut dyn Observer);
+
+impl Observer for Two<'_> {
+    fn imagery(&mut self, tile: &tuile_film_native::ImageryIn<'_>) {
+        self.0.imagery(tile);
+        self.1.imagery(tile);
+    }
+    fn tile(&mut self, tile: &tuile_film_native::TileIn<'_>) {
+        self.0.tile(tile);
+        self.1.tile(tile);
+    }
+    fn frame(&mut self, frame: &tuile_film_native::FrameOut<'_>) {
+        self.0.frame(frame);
+        self.1.frame(frame);
     }
 }
 
@@ -452,10 +478,28 @@ async fn main() -> Result<(), Error> {
     let mut meter = LightMeter::default();
     let metering = value("--meter");
     let mut nobody = ();
-    let observer: &mut dyn Observer = if metering.is_some() || calibrating.is_some() {
-        &mut meter
-    } else {
-        &mut nobody
+    // What is left between the tiles of each frame, logged beside whatever
+    // else watches.
+    let mut seams = match value("--seams") {
+        Some(dir) => {
+            let tolerance = match value("--seams-tolerance") {
+                Some(px) => tuile_core::seam::Tolerance::Pixels(px.parse()?),
+                None => tuile_core::seam::Tolerance::QUARTER_PIXEL,
+            };
+            Some(tuile_film_native::SeamLog::into(dir, tolerance))
+        }
+        None => None,
+    };
+    let watching = metering.is_some() || calibrating.is_some();
+    let mut two;
+    let observer: &mut dyn Observer = match (seams.as_mut(), watching) {
+        (Some(seams), true) => {
+            two = Two(seams, &mut meter);
+            &mut two
+        }
+        (Some(seams), false) => seams,
+        (None, true) => &mut meter,
+        (None, false) => &mut nobody,
     };
 
     let mut shapes = Shapes(Vec::new());
@@ -478,6 +522,20 @@ async fn main() -> Result<(), Error> {
     }
 
     let done = render(&sources, &film, &order, &mut shapes, &mut sink, observer).await?;
+    if let Some(seams) = &seams {
+        println!("{}", seams.summary());
+        if let Some(why) = seams.failure() {
+            return Err(format!("the seam log was not written: {why}").into());
+        }
+        let (over, bare) = seams.in_picture();
+        if flag("--seams-strict") && over + bare > 0 {
+            return Err(format!(
+                "in the picture, {over} shared edges are over the seam tolerance and {bare} \
+                 edges have nothing across them (--seams-strict)"
+            )
+            .into());
+        }
+    }
     let megabytes = |b: u64| b as f64 / 1e6;
     println!(
         "{} frames at {}×{} in {:.1} s ({:.2} frames/s), {:.1} s of it before the first frame",

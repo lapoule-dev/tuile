@@ -42,6 +42,7 @@ pub mod protocol;
 pub mod raster;
 pub mod report;
 pub mod runtime;
+pub mod seam;
 pub mod source;
 pub mod storage;
 pub mod tiles3d;

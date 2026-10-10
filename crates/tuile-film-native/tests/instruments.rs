@@ -113,6 +113,8 @@ fn the_meter_finds_the_step_between_two_sources_and_which_levels_are_one() {
         key: TileKey { id: 1, drape: 0 },
         origin: Origin::Store,
         imagery: &[(13, 4, 4), (14, 8, 8)],
+        terrain: None,
+        mesh: &no_mesh(),
     });
 
     let solved = meter.solve(10);
@@ -156,6 +158,8 @@ fn the_meter_reads_a_picture_in_stops_and_by_thirds() {
         tiles: 3,
         entered: 3,
         layers: &[(12, 2), (13, 1)],
+        selection: &[],
+        camera: &a_camera(),
         timings: Timings::default(),
     });
     let light = meter.pictures()[0];
@@ -285,4 +289,31 @@ async fn a_pack_named_is_opened_without_its_neighbours() {
     assert!(Film::of(&objects, &["packs/c0009.tuilepack"])
         .await
         .is_err());
+}
+
+/// A tile's mesh, for an instrument that does not look at it.
+fn no_mesh() -> tuile_film::Mesh {
+    tuile_film::Mesh {
+        origin_ecef: [0.0; 3],
+        positions: Vec::new(),
+        normals: Vec::new(),
+        uvs: Vec::new(),
+        indices: Vec::new(),
+        index_count: 0,
+        base_color_factor: [1.0; 4],
+    }
+}
+
+/// A camera, likewise.
+fn a_camera() -> tuile_film::FrameCamera {
+    tuile_film::FrameCamera::of(
+        &tuile_film::BakedView {
+            position: [6_379_137.0, 0.0, 0.0],
+            direction: [-1.0, 0.0, 0.0],
+            up: [0.0, 0.0, 1.0],
+            viewport_px: [64.0, 48.0],
+            fovy_rad: 0.8,
+        },
+        64.0 / 48.0,
+    )
 }
