@@ -48,7 +48,7 @@ mod native;
 pub use archives::{ArchivedTiles, Now};
 pub use bench::{
     block_segment, Asked, Bench, Later, LiveAnswer, LiveAnswers, LiveAsk, LiveAsked, Project,
-    Reply, StoreAt, StoreObjects, BLOCK, LIVE_MANY,
+    Reply, StoreAt, StoreObjects, BLOCK, LIVE_AT_ONCE, LIVE_MANY,
 };
 pub use cached::{Cached, ChunkStore, CHUNK};
 pub use config::{Config, Layout, Place, ProjectConfig};

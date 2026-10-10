@@ -520,7 +520,9 @@ pub async fn main(mut request: Request, env: Env, ctx: Context) -> Result<Respon
         };
         let body = request.bytes().await?;
         let Some(reply) = bench
-            .post(url.path(), url.query().unwrap_or_default(), &body)
+            // A Worker may have six requests out at once: no more reads
+            // than that are asked of the bucket at a time.
+            .post_reading(url.path(), url.query().unwrap_or_default(), &body, 6)
             .await
         else {
             return Response::error("no such route", 404);
