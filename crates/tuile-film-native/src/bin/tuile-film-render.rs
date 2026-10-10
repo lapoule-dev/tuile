@@ -86,6 +86,15 @@
 //!   --haze-density <per m>, --haze-height <m>
 //!                         that air's extinction at the ellipsoid, and the
 //!                         height over which it thins by e
+//!   --haze-horizon <r,g,b>, --haze-zenith <r,g,b>
+//!                         that air's colour at the horizon — what distance
+//!                         fades to — and the sky's straight up: linear
+//!                         radiance, as the look's lights. Either asks for
+//!                         the air, as --haze does
+//!   --sun-light <r,g,b>   the sun's strength: what a white surface facing
+//!                         it comes out at, linear
+//!   --sky-light <r,g,b>   the dome's radiance, linear: what lights ground
+//!                         the sun does not reach
 //!   --anchor <level>      the level --meter's own solve holds still (10)
 //!   --cache <dir>         chunks of packs and archives (default
 //!                         $TUILE_CACHE_DIR, else ./film-cache)
@@ -110,7 +119,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use glam::DVec3;
+use glam::{DVec3, Vec3};
 use tuile_core::geo::{enu_frame, geodetic_to_ecef, Geodetic};
 use tuile_film::{BakedView, OverlayDepth, OverlayMesh, Overlays};
 
@@ -136,6 +145,45 @@ fn bucket(name: &str) -> Result<Arc<dyn Objects>, Error> {
         &config,
         Tuning::from_env(),
     )?))
+}
+
+/// `r,g,b`: a colour as three linear values, none below zero.
+fn rgb(name: &str, colour: &str) -> Result<Vec3, Error> {
+    let parts: Vec<f32> = colour
+        .split(',')
+        .map(|part| part.trim().parse())
+        .collect::<Result<_, _>>()
+        .map_err(|_| format!("{name} is <r>,<g>,<b>, not {colour}"))?;
+    match parts[..] {
+        [r, g, b] if parts.iter().all(|c| c.is_finite() && *c >= 0.0) => Ok(Vec3::new(r, g, b)),
+        _ => Err(format!("{name} is <r>,<g>,<b>, each zero or more, not {colour}").into()),
+    }
+}
+
+/// The look's colours as the command line gives them: the two lights, and
+/// the air's two ends. Naming either end of the air asks for the air.
+fn colours(
+    look: &mut tuile_film::Look,
+    value: &dyn Fn(&str) -> Option<String>,
+) -> Result<(), Error> {
+    if let Some(colour) = value("--sun-light") {
+        look.sun = rgb("--sun-light", &colour)?;
+    }
+    if let Some(colour) = value("--sky-light") {
+        look.world = rgb("--sky-light", &colour)?;
+    }
+    let horizon = value("--haze-horizon");
+    let zenith = value("--haze-zenith");
+    if horizon.is_some() || zenith.is_some() {
+        let haze = look.haze.get_or_insert_with(tuile_film::Haze::default);
+        if let Some(colour) = horizon {
+            haze.horizon = rgb("--haze-horizon", &colour)?;
+        }
+        if let Some(colour) = zenith {
+            haze.zenith = rgb("--haze-zenith", &colour)?;
+        }
+    }
+    Ok(())
 }
 
 /// The same shapes in every frame: `--ribbon` and `--marker`.
@@ -352,6 +400,7 @@ async fn main() -> Result<(), Error> {
         }
         order.look.haze = Some(haze);
     }
+    colours(&mut order.look, &value)?;
     let calibrating = value("--calibrate");
     if flag("--no-tone") || calibrating.is_some() {
         order.tone = Tone::Off;
@@ -1255,4 +1304,83 @@ fn said(grade: &FilmGrade) -> String {
         out += &format!("  held back at a bound: {}\n", grade.limited.join("; "));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tuile_film::{Haze, Look};
+
+    fn given<'a>(args: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            args.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test]
+    fn with_no_colour_named_the_look_is_left_as_it_is() {
+        let mut look = Look::default();
+        colours(&mut look, &given(&[])).unwrap();
+        assert_eq!(look, Look::default());
+        // And air already asked for keeps its own colours.
+        look.haze = Some(Haze::default());
+        colours(&mut look, &given(&[])).unwrap();
+        assert_eq!(look.haze, Some(Haze::default()));
+    }
+
+    #[test]
+    fn the_lights_take_the_colours_named() {
+        let mut look = Look::default();
+        colours(
+            &mut look,
+            &given(&[
+                ("--sun-light", "3, 1.2,0.4"),
+                ("--sky-light", "0.2,0.25,0.4"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(look.sun, Vec3::new(3.0, 1.2, 0.4));
+        assert_eq!(look.world, Vec3::new(0.2, 0.25, 0.4));
+        // Naming a light asks for no air.
+        assert_eq!(look.haze, None);
+    }
+
+    #[test]
+    fn one_end_of_the_air_asks_for_the_air_and_leaves_the_other_end() {
+        let mut look = Look::default();
+        colours(&mut look, &given(&[("--haze-horizon", "1,0.35,0.1")])).unwrap();
+        let haze = look.haze.expect("the air was asked for");
+        assert_eq!(haze.horizon, Vec3::new(1.0, 0.35, 0.1));
+        assert_eq!(haze.zenith, Haze::default().zenith);
+        assert_eq!(haze.density, Haze::default().density);
+
+        // Over air whose density was set, only the colour changes.
+        let mut look = Look {
+            haze: Some(Haze {
+                density: 2.0e-5,
+                ..Haze::default()
+            }),
+            ..Look::default()
+        };
+        colours(&mut look, &given(&[("--haze-zenith", "0.05,0.1,0.3")])).unwrap();
+        let haze = look.haze.unwrap();
+        assert_eq!(haze.zenith, Vec3::new(0.05, 0.1, 0.3));
+        assert_eq!(
+            (haze.density, haze.horizon),
+            (2.0e-5, Haze::default().horizon)
+        );
+    }
+
+    #[test]
+    fn a_colour_is_three_values_none_below_zero() {
+        for wrong in ["1,2", "1,2,3,4", "red", "1,-0.1,0", "1,nan,0", ""] {
+            let mut look = Look::default();
+            assert!(
+                colours(&mut look, &given(&[("--sun-light", wrong)])).is_err(),
+                "{wrong:?} was taken for a colour"
+            );
+        }
+    }
 }
