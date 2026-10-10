@@ -34,6 +34,8 @@ const NAME: &str = "Tuile";
 const IDENTIFIER: &str = "dev.lapoule.tuile.viewer";
 /// The viewer's package, and so its executable.
 const EXECUTABLE: &str = "tuile-wgpu-viewer";
+/// The scripting dictionary's file name, in the bundle's resources.
+const DICTIONARY: &str = "Tuile.sdef";
 /// The URL scheme the application answers to.
 const SCHEME: &str = "tuile";
 /// The oldest system the bundle claims to run on: the first one on which the
@@ -97,6 +99,10 @@ fn info_plist(version: &str) -> plist::Value {
         ("NSHighResolutionCapable", Boolean(true)),
         ("NSSupportsAutomaticGraphicsSwitching", Boolean(true)),
         ("NSPrincipalClass", text("NSApplication")),
+        // The two keys that make the application scriptable: the runtime is
+        // switched on, and told which file holds the dictionary.
+        ("NSAppleScriptEnabled", Boolean(true)),
+        ("OSAScriptingDefinition", text(DICTIONARY)),
         ("NSLocationUsageDescription", text(LOCATION_PURPOSE)),
         (
             "NSLocationWhenInUseUsageDescription",
@@ -165,6 +171,10 @@ fn assemble(binary: &Path, master: &image::RgbaImage, out: &Path) -> anyhow::Res
         contents.join("Resources").join(format!("{NAME}.icns")),
         icns(master)?,
     )?;
+    std::fs::write(
+        contents.join("Resources").join(DICTIONARY),
+        include_str!("../../macos/Tuile.sdef"),
+    )?;
     info_plist(env!("CARGO_PKG_VERSION")).to_file_xml(contents.join("Info.plist"))?;
     // Eight bytes every application bundle has carried since before this
     // format had a property list: the type, and no creator.
@@ -194,7 +204,12 @@ fn sign_and_verify(app: &Path) -> anyhow::Result<()> {
         .arg(app))?;
     run(Command::new("plutil")
         .arg("-lint")
-        .arg(app.join("Contents/Info.plist")))
+        .arg(app.join("Contents/Info.plist")))?;
+    // And the dictionary, read the way a script editor reads it: `sdef` fails
+    // on a bundle whose dictionary it cannot find or parse.
+    run(Command::new("sdef")
+        .arg(app)
+        .stdout(std::process::Stdio::null()))
 }
 
 fn build_the_viewer() -> anyhow::Result<PathBuf> {
@@ -367,9 +382,129 @@ mod tests {
         sides.sort_unstable();
         assert_eq!(sides, [16, 32, 32, 64, 128, 256, 256, 512, 512, 1024]);
 
+        // The dictionary the property list names is in the bundle, whole.
+        assert_eq!(string(&info(), "OSAScriptingDefinition"), "Tuile.sdef");
+        assert_eq!(
+            info()
+                .get("NSAppleScriptEnabled")
+                .and_then(plist::Value::as_boolean),
+            Some(true)
+        );
+        assert_eq!(
+            std::fs::read_to_string(contents.join("Resources/Tuile.sdef"))
+                .ok()
+                .as_deref(),
+            Some(include_str!("../../macos/Tuile.sdef"))
+        );
+
         // Assembling again replaces the bundle rather than piling into it.
         std::fs::write(contents.join("Resources/stale"), b"x").expect("a stray file");
         assemble(&binary, &icon::draw(64), dir.path()).expect("the bundle, again");
         assert!(!contents.join("Resources/stale").exists());
+    }
+
+    /// The round trip through the real thing: a script asks the installed
+    /// application where it is, sends it somewhere, and reads that it went.
+    ///
+    /// ```text
+    /// cargo test -p tuile-viewer-bundle -- --ignored --nocapture a_script
+    /// ```
+    ///
+    /// Ignored, because it needs the bundle installed and running (it starts
+    /// it if need be), a window server, and — the first time — the person's
+    /// consent to one program scripting another. It puts the view back where
+    /// it found it. `TUILE_APP` names a bundle other than the one in
+    /// `~/Applications`.
+    #[test]
+    #[ignore = "scripts the installed application"]
+    fn a_script_reads_the_view_and_moves_it() {
+        let app = std::env::var("TUILE_APP").unwrap_or_else(|_| {
+            format!(
+                "{}/Applications/Tuile.app",
+                std::env::var("HOME").unwrap_or_default()
+            )
+        });
+        let tell = |what: &str| {
+            let script = format!("tell application {app:?} to {what}");
+            let out = Command::new("osascript")
+                .args(["-e", &script])
+                .output()
+                .expect("osascript runs");
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            println!(
+                "{what}\n    -> {text}{}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            (out.status.success(), text)
+        };
+        let reals =
+            |text: &str| -> Vec<f64> { text.split(", ").filter_map(|n| n.parse().ok()).collect() };
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        // The dictionary is there, as a script editor would read it.
+        let sdef = Command::new("sdef").arg(&app).output().expect("sdef runs");
+        assert!(
+            sdef.status.success(),
+            "the bundle has no readable dictionary"
+        );
+        assert!(String::from_utf8_lossy(&sdef.stdout).contains("target longitude"));
+
+        let (ok, before) = tell("get view url");
+        assert!(ok, "the application does not answer scripts");
+        pause();
+
+        assert!(tell("go to longitude 10.5 latitude -20.25 altitude 5000 heading 90 pitch 45").0);
+        pause();
+        let (_, view) = tell("get {longitude, latitude, altitude, heading, pitch}");
+        let got = reals(&view);
+        for (got, want) in got.iter().zip([10.5, -20.25, 5000.0, 90.0, 45.0]) {
+            assert!((got - want).abs() < 1e-3, "{view}");
+        }
+        assert_eq!(got.len(), 5, "{view}");
+
+        // What is left out keeps its value.
+        assert!(tell("go to heading 180").0);
+        pause();
+        let (_, view) = tell("get {longitude, latitude, altitude, heading, pitch}");
+        for (got, want) in reals(&view).iter().zip([10.5, -20.25, 5000.0, 180.0, 45.0]) {
+            assert!((got - want).abs() < 1e-3, "{view}");
+        }
+        let (_, target) = tell("get {target longitude, target latitude, range}");
+        assert_eq!(reals(&target).len(), 3, "{target}");
+
+        // The turn is eased, and the easing is paced by frames: on a busy
+        // machine half a turn takes a few seconds to finish. Asked until it
+        // has, within a bound.
+        assert!(tell("north up").0);
+        let mut heading = f64::NAN;
+        for _ in 0..20 {
+            pause();
+            heading = tell("get heading").1.parse().expect("a heading");
+            if heading.min(360.0 - heading) < 1e-3 {
+                break;
+            }
+        }
+        assert!(heading.min(360.0 - heading) < 1e-3, "{heading}");
+
+        // Out of bounds is an error the script sees, and moves nothing.
+        let (ok, _) = tell("go to latitude 95");
+        assert!(!ok, "a latitude of 95 was accepted");
+        let (_, latitude) = tell("get latitude");
+        assert!(
+            latitude.parse::<f64>().is_ok_and(|l| l.abs() < 90.0),
+            "{latitude}"
+        );
+
+        assert!(tell("set wireframe to true").0);
+        pause();
+        assert_eq!(tell("get wireframe").1, "true");
+        assert!(tell("set wireframe to false").0);
+        pause();
+        assert_eq!(tell("get wireframe").1, "false");
+
+        // Back where it was, by the URL the application itself gave.
+        if before.starts_with("tuile://") {
+            run(Command::new("open").arg(&before)).expect("the view is restored");
+        }
     }
 }

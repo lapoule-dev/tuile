@@ -14,8 +14,9 @@ cargo run --release -p tuile-viewer-bundle -- app --out ~/Applications
 This builds the viewer in release and writes `~/Applications/Tuile.app`
 (`target/bundle/` without `--out`). The bundler lays out
 `Contents/MacOS/tuile-wgpu-viewer`, `Contents/Info.plist`,
-`Contents/Resources/Tuile.icns`, signs the bundle and then checks its own work
-with `plutil -lint` and `codesign --verify --strict`; it fails if either does.
+`Contents/Resources/Tuile.icns` and `Tuile.sdef`, signs the bundle and then
+checks its own work with `plutil -lint`, `codesign --verify --strict` and
+`sdef`; it fails if any of them does.
 
 The executable inside the bundle still takes every command-line flag when it is
 run from a terminal.
@@ -42,20 +43,22 @@ so in a window and names the path.
 
 ## Steering the app
 
-A running application — or one that is not running yet — takes commands as
-URLs. The system delivers them as Apple events, so anything that can open a URL
-can steer the view:
+A running application — or one that is not running yet — is steered from
+outside in two ways: URLs, and a scripting dictionary.
 
 ```bash
-# from a shell
+# a URL, from a shell
 open "tuile://goto?lon=-2.86&lat=52.51&altitude=1200&heading=0&pitch=30"
 
-# from AppleScript
+# a URL, from AppleScript
 osascript -e 'tell application "Tuile" to open location "tuile://north"'
 
-# ask it where it is: the answer is one line, a goto URL
-open "tuile://report" && cat ~/Library/Caches/Tuile/view.txt
+# the dictionary: ask where the view is, and send it somewhere
+osascript -e 'tell application "Tuile" to get {longitude, latitude, altitude, heading, pitch}'
+osascript -e 'tell application "Tuile" to go to longitude -4.02 latitude 5.34 altitude 3000'
 ```
+
+### URLs
 
 | URL | effect |
 |---|---|
@@ -63,28 +66,83 @@ open "tuile://report" && cat ~/Library/Caches/Tuile/view.txt
 | `tuile://north` | north up, about the point at the centre of the view |
 | `tuile://here` | centres on the current location |
 | `tuile://view?freeze=on\|off&wireframe=on\|off` | the two display switches |
-| `tuile://report` | writes the present view to `~/Library/Caches/Tuile/view.txt` |
 
 The parameters are the command-line flags' — same names, same units, same
 bounds, one table in the source. In the window, `C` copies the `goto` link of
 the present view to the clipboard.
 
-**What a URL can do is all in that table.** It moves the camera and flips two
-display switches. It reads no file, runs no command and carries no credential.
-Anything else — an unknown command or parameter, a value out of bounds, a URL
-over 512 bytes — is dropped whole with one line in the log. `here` goes through
-the system's own permission like the key does, and a view centred on the
-current location is **not** written by `report` (the previous report is
-removed): the permission you gave the application is not handed on to whoever
-sends it a URL.
+**A URL starts the application when it is not running**, and that start is a
+plain one: it opens on the view the last session ended on (the default view the
+first time), then goes where the URL says, and it carries no environment — a
+`TUILE_SHELL` given to an earlier `open --env` is not there any more.
 
-There is no network listener and no socket: the only way in is the URL scheme.
+### The scripting dictionary
 
-There is no scripting dictionary. `open location` above is the standard
-"open URL" Apple event, not a vocabulary of the application's own; a dictionary
-(`go to` with named parameters, a readable `view` property) would need an
-`.sdef` in the bundle and command classes registered with the scripting
-runtime.
+`sdef ~/Applications/Tuile.app` prints it; Script Editor opens it. On the
+application object, read-only unless noted:
+
+| property | |
+|---|---|
+| `longitude`, `latitude` | the eye, degrees, east and north positive |
+| `altitude` | the eye, metres above the ellipsoid |
+| `heading`, `pitch` | degrees clockwise from north; degrees below the horizon |
+| `target longitude`, `target latitude`, `target height` | the point of the ellipsoid at the centre of the view |
+| `range` | metres from the eye to that point |
+| `field of view` | vertical, degrees |
+| `view width`, `view height` | the drawable surface, device pixels |
+| `wireframe`, `frozen` | the display switches — **read and write** |
+| `view url` | the `tuile://goto?…` of the present view |
+| `tile count` | tiles drawn in the last frame |
+| `settled` | every tile drawn is the one selected, no coarser stand-in left: wait for this before capturing |
+
+and three commands: `go to` (`longitude`, `latitude`, `altitude`, `heading`,
+`pitch`, all optional), `north up`, `center on current location`.
+
+```applescript
+tell application "Tuile"
+    go to longitude 2.3522 latitude 48.8566 altitude 2500 pitch 35
+    repeat until settled
+        delay 0.5
+    end repeat
+    get {target longitude, target latitude, range}
+end tell
+```
+
+The answers come from a snapshot the render loop publishes once a frame, so a
+question never waits on a frame and is at most one frame old; a command is
+queued and carried out by the render loop on its next turn, so read a property
+a moment *after* a command, not in the same breath. The target is taken on the
+ellipsoid, not on the relief: over mountains the true ground point is nearer
+than `range` says. A value out of the flags' bounds is an error the script
+receives (number -50, with the sentence the command line would print), and
+nothing moves.
+
+The window's title carries the position too — `Tuile — 52.5100°N 2.8600°W ·
+1200 m` — refreshed a few times a second, for a person and for anything that
+can read a window's name.
+
+### What steering can and cannot do
+
+It moves the camera, flips two display switches, and reads the view. It reads
+no file, runs no command and carries no credential; there is no network
+listener and no socket. A URL that is malformed, unknown, out of bounds or over
+512 bytes is dropped whole with one line in the log.
+
+**The current location is not handed on.** `here` and `center on current
+location` go through the system's own permission, like the key. Once the view
+has been centred there, `longitude`, `latitude`, `target longitude`, `target
+latitude` and `view url` answer `missing value`, the title says "position
+withheld", and the view is not remembered for the next start — until a `go to`
+puts the view somewhere named. The permission you gave the application is not
+passed to whoever scripts it.
+
+## When it stops
+
+A session started from an icon has no terminal, so it leaves its reasons in
+`~/Library/Logs/Tuile/viewer.log`: a line when it starts, a line saying why it
+ended — the window was closed, Esc, quit from the menu, a signal, an error, a
+panic. A failure to start is also shown in a window. A session whose last line
+is `started` was killed outright.
 
 ## The current location
 

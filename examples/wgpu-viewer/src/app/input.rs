@@ -50,7 +50,10 @@ impl App {
             return;
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.ended_by = Some("the window was closed");
+                event_loop.exit();
+            }
             // Dragging the window to a display of a different density changes
             // how many device pixels a point is worth, and so how deep the
             // imagery should go. Winit sends the new size straight after, so
@@ -91,7 +94,10 @@ impl App {
                     Key::Character(ref c) if c.eq_ignore_ascii_case("c") => {
                         self.copy_the_link();
                     }
-                    Key::Named(NamedKey::Escape) => event_loop.exit(),
+                    Key::Named(NamedKey::Escape) => {
+                        self.ended_by = Some("Esc was pressed");
+                        event_loop.exit();
+                    }
                     _ => {}
                 }
             }

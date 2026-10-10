@@ -18,7 +18,6 @@
 //! ```text
 //! open "tuile://goto?lon=-2.86&lat=52.51&altitude=1200&heading=0&pitch=30"
 //! osascript -e 'tell application "Tuile" to open location "tuile://north"'
-//! open "tuile://report"     # writes the current view where a script can read it
 //! ```
 //!
 //! | URL | effect |
@@ -27,7 +26,6 @@
 //! | `tuile://north` | north up, about the point at the centre of the view |
 //! | `tuile://here` | centres on the current location (the system still asks the person) |
 //! | `tuile://view?freeze=on\|off&wireframe=on\|off` | the two display switches |
-//! | `tuile://report` | writes the present view, as a `goto` URL, to the caches directory |
 //!
 //! **What a URL can do is all in that table.** It moves the camera and flips
 //! two display switches. It reads no file, runs nothing, and carries no
@@ -74,8 +72,44 @@ pub(crate) enum Command {
     Here,
     Freeze(bool),
     Wireframe(bool),
-    /// Write the present view where another program can read it.
-    Report,
+}
+
+/// What reaches the render loop from outside it: a URL still to be read, or a
+/// command a script already spelt out.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(
+    not(all(target_os = "macos", feature = "application")),
+    allow(dead_code)
+)]
+pub(crate) enum Request {
+    Url(String),
+    Do(Command),
+}
+
+impl Goto {
+    /// A goto from numbers a script handed over, held to the flags' bounds
+    /// like everything else: `(name, value)` pairs, names as in the URLs.
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "application")),
+        allow(dead_code)
+    )]
+    pub(crate) fn from_numbers(pairs: &[(&str, f64)]) -> Result<Self, String> {
+        let mut goto = Self::default();
+        for (name, value) in pairs {
+            let value = crate::start::checked(name, *value)?;
+            match *name {
+                "lon" => goto.lon = Some(value),
+                "lat" => goto.lat = Some(value),
+                "altitude" => goto.altitude = Some(value),
+                "heading" => goto.heading = Some(value),
+                _ => goto.pitch = Some(value),
+            }
+        }
+        if goto == Self::default() {
+            return Err("go to says nowhere: give at least one parameter".to_owned());
+        }
+        Ok(goto)
+    }
 }
 
 /// Reads a steering URL into the commands it carries — several, for
@@ -137,7 +171,6 @@ pub(crate) fn parse_url(url: &str) -> Result<Vec<Command>, String> {
         }
         "north" => bare(Command::NorthUp),
         "here" => bare(Command::Here),
-        "report" => bare(Command::Report),
         "view" => {
             if pairs.is_empty() {
                 return Err("view changes nothing: give freeze= or wireframe=".to_owned());
@@ -169,8 +202,19 @@ pub(crate) fn view_of(camera: &GlobeCamera) -> StartView {
         lon: eye.lon.to_degrees(),
         lat: eye.lat.to_degrees(),
         altitude: eye.height,
-        heading: camera.heading().to_degrees(),
+        heading: tidy_heading(camera.heading().to_degrees()),
         pitch: camera.pitch().to_degrees(),
+    }
+}
+
+/// North is 0, not 1.5e-14 and not 359.99999999: a heading within a billionth
+/// of a degree of a full turn is the rounding of a view looking north, and a
+/// script comparing it to zero should find zero.
+fn tidy_heading(degrees: f64) -> f64 {
+    if !(1e-9..=360.0 - 1e-9).contains(&degrees) {
+        0.0
+    } else {
+        degrees
     }
 }
 
@@ -188,8 +232,8 @@ pub(crate) fn go(controller: &mut CameraController, goto: Goto) {
     jump(controller, view.camera());
 }
 
-/// The URL that brings a viewer back to this view: a bookmark, and what
-/// `report` writes.
+/// The URL that brings a viewer back to this view: a bookmark, and the
+/// `view url` a script reads.
 ///
 /// Seven decimals of a degree is a centimetre on the ground, a centimetre of
 /// altitude and a thousandth of a degree of attitude are below anything a
@@ -417,7 +461,6 @@ mod tests {
         assert_eq!(one("tuile://north"), Command::NorthUp);
         assert_eq!(one("tuile://north/"), Command::NorthUp);
         assert_eq!(one("tuile://here"), Command::Here);
-        assert_eq!(one("tuile://report"), Command::Report);
         assert_eq!(
             parse_url("tuile://view?freeze=on&wireframe=off"),
             Ok(vec![Command::Freeze(true), Command::Wireframe(false)])
@@ -437,6 +480,9 @@ mod tests {
             "https://goto?lon=1",
             "tuile://",
             "tuile://launch",
+            // Was a command once; a script reads the view from the
+            // application's properties now, and no file is written.
+            "tuile://report",
             "tuile://goto",
             "tuile://goto?",
             "tuile://goto?lon",
@@ -505,6 +551,18 @@ mod tests {
         assert!((turned.pitch - 60.0).abs() < 1e-6, "{turned:?}");
     }
 
+    #[test]
+    fn a_view_looking_north_reads_a_heading_of_exactly_zero() {
+        // Straight down, where the heading comes off the camera's own up and
+        // carries the last bit of a sine.
+        assert_eq!(view_of(&StartView::default().camera()).heading, 0.0);
+        assert_eq!(tidy_heading(359.999_999_999_9), 0.0);
+        // What an eased camera actually reads when it has settled on north.
+        assert_eq!(tidy_heading(1.47e-14), 0.0);
+        assert_eq!(tidy_heading(359.99), 359.99);
+        assert_eq!(tidy_heading(0.01), 0.01);
+    }
+
     /// The link a view prints is a command that returns to it: to a
     /// centimetre, and a thousandth of a degree of attitude.
     #[test]
@@ -537,6 +595,28 @@ mod tests {
             let turn = (back.heading - view.heading + 180.0).rem_euclid(360.0) - 180.0;
             assert!(turn.abs() < 1e-3, "{back:?}");
             assert!((back.pitch - view.pitch).abs() < 1e-3, "{back:?}");
+        }
+    }
+
+    #[test]
+    fn a_goto_from_numbers_is_held_to_the_same_bounds() {
+        assert_eq!(
+            Goto::from_numbers(&[("lat", 5.36), ("lon", -4.0)]),
+            Ok(Goto {
+                lon: Some(-4.0),
+                lat: Some(5.36),
+                ..Goto::default()
+            })
+        );
+        for bad in [
+            &[("lat", 95.0)][..],
+            &[("lon", f64::NAN)],
+            &[("altitude", 0.0)],
+            &[("lon", 1.0), ("pitch", 91.0)],
+            &[("zoom", 3.0)],
+            &[],
+        ] {
+            assert!(Goto::from_numbers(bad).is_err(), "{bad:?}");
         }
     }
 }

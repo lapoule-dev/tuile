@@ -30,9 +30,10 @@
 //!
 //! C copies a link to the present view. A running viewer can be steered by
 //! other programs with URLs of the same form — `tuile://goto?…`, `north`,
-//! `here`, `view?…`, `report`: see `steer` for the vocabulary and what it
-//! cannot do, and `macos/README.md` for the application bundle that registers
-//! the scheme.
+//! `here`, `view?…`: see `steer` for the vocabulary and what it cannot do. The
+//! application bundle (`macos/README.md`) registers the scheme and carries a
+//! scripting dictionary, through which a script reads the view — position,
+//! attitude, target, range, tile counts: see `snapshot` — and commands it.
 //!
 //! The access token is read from the environment, or — for a session started
 //! from an icon — from one file the person owns: see `host`.
@@ -50,11 +51,18 @@ mod app;
 mod backdrop;
 mod desktop;
 mod host;
+mod journal;
 mod location;
 mod recording;
 mod session;
 mod settings;
 mod signals;
+// Only a script asks; without the desktop glue the answers have no reader.
+#[cfg_attr(
+    not(all(target_os = "macos", feature = "application")),
+    allow(dead_code)
+)]
+mod snapshot;
 mod sources;
 mod start;
 mod steer;
@@ -72,7 +80,9 @@ fn in_a_bundle() -> bool {
 }
 
 fn main() {
+    journal::open();
     if let Err(error) = session() {
+        journal::note(&format!("session failed: {error:#}"));
         // From an icon, stderr is the system log and nobody is reading it: an
         // application that fails must say so in a window, or it has simply
         // not opened. This is not hypothetical — the first bundle did exactly
@@ -119,6 +129,14 @@ fn session() -> anyhow::Result<()> {
     // Started from an icon, there is no terminal: the log goes quiet and
     // what would have been an error line becomes a window.
     let bundled = in_a_bundle();
+    // Started from an icon with nothing said about where: open where the last
+    // such session ended. From a terminal the default view stays the default
+    // — a command opens on what the command says.
+    let view = if bundled && !here && view == start::StartView::default() {
+        start::remembered(&host::Machine).unwrap_or(view)
+    } else {
+        view
+    };
     settings::init_tracing(bundled);
     lift_the_open_file_limit();
     // From the environment first, and always: what a session ran with should
@@ -145,7 +163,7 @@ fn session() -> anyhow::Result<()> {
     };
     // Before the loop exists, so that a URL which *launched* the application
     // is not missed.
-    let urls = desktop::listen_for_urls();
+    let requests = desktop::listen();
 
     // The geometry server is async (ion fetches over reqwest): build the scene
     // and run the server on a background multi-thread runtime. The window
@@ -218,8 +236,9 @@ fn session() -> anyhow::Result<()> {
         controller,
         detail,
         layer_budget,
-        title: "tuile — globe (streaming)".into(),
-        urls,
+        title: host::APP_NAME.into(),
+        requests,
+        remembers: bundled,
         // `--here`: the window opens on the view above, and moves over the
         // current location — same altitude, heading and pitch — when the
         // system says where that is.

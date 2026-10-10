@@ -52,9 +52,12 @@ pub struct ViewerConfig {
     /// Set by `--here`: ask for the current location at start, and place the
     /// view like this when it is known.
     pub here: Option<crate::location::Placement>,
-    /// Steering URLs from other programs, as they arrive. Unread and
-    /// untrusted: see [`crate::steer::parse_url`].
-    pub urls: std::sync::mpsc::Receiver<String>,
+    /// Steering from other programs, as it arrives: URLs still unread and
+    /// untrusted (see [`crate::steer::parse_url`]), and a script's commands.
+    pub requests: std::sync::mpsc::Receiver<crate::steer::Request>,
+    /// Whether to leave the last view for the next session: see
+    /// `App::remember_the_view`.
+    pub remembers: bool,
     /// The instant the scene is lit for, UTC seconds since the Unix epoch —
     /// which sets where the sun is, and so where the terminator falls.
     pub lit_at_unix_seconds: f64,
@@ -162,8 +165,19 @@ pub struct App {
     /// Whether the view is where it is because the location service put it
     /// there — in which case it is not reported to other programs.
     located: bool,
-    /// Steering URLs waiting to be read.
-    urls: std::sync::mpsc::Receiver<String>,
+    /// Steering waiting to be carried out.
+    requests: std::sync::mpsc::Receiver<crate::steer::Request>,
+    /// Tiles drawn in the last frame, and whether all were the ones selected.
+    drawn: (usize, bool),
+    /// The last thing said to the person, and when.
+    notice: Option<(String, std::time::Instant)>,
+    /// What the title bar shows, and when it was last looked at.
+    title_shown: String,
+    title_at: std::time::Instant,
+    /// Why the session is ending, once something has decided that it is.
+    pub(crate) ended_by: Option<&'static str>,
+    /// Whether the view is written down at the end for the next start.
+    remembers: bool,
     /// The window is hidden — another window covers it, the display slept, the
     /// app was minimized. Rendering while occluded leaks GPU memory on Apple
     /// platforms.
@@ -177,7 +191,7 @@ pub struct App {
 impl App {
     pub fn new(mut config: ViewerConfig) -> Self {
         // The queue is taken out of the configuration: there is one reader.
-        let urls = std::mem::replace(&mut config.urls, std::sync::mpsc::channel().1);
+        let requests = std::mem::replace(&mut config.requests, std::sync::mpsc::channel().1);
         // Asked for here, on the main thread and before the loop turns, so the
         // system's question — if it has one — is up while the globe warms.
         let mut locator = crate::location::Locator::platform();
@@ -187,7 +201,13 @@ impl App {
         Self {
             locator,
             located: false,
-            urls,
+            requests,
+            drawn: (0, false),
+            notice: None,
+            title_shown: String::new(),
+            title_at: std::time::Instant::now(),
+            ended_by: None,
+            remembers: config.remembers,
             controller: config.controller.clone(),
             detail: config.detail.clone(),
             layer_budget: config.layer_budget.clone(),
@@ -249,19 +269,43 @@ impl App {
         }
     }
 
+    /// Leaves the view this session ends on for the next one to open on.
+    ///
+    /// Only for a session started from an icon: from a terminal, the view a
+    /// command opens on is what the command says and nothing else. And never
+    /// a view centred on the current location — that one is not written
+    /// anywhere, and the file from before is removed so that the next start
+    /// does not pretend to return to it.
+    fn remember_the_view(&self) {
+        if !self.remembers {
+            return;
+        }
+        let Some(file) = crate::host::last_view_file(&crate::host::Machine) else {
+            return;
+        };
+        if self.located {
+            let _ = std::fs::remove_file(&file);
+            return;
+        }
+        let link = crate::steer::link(&crate::steer::view_of(self.controller.target()));
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&file, format!("{link}\n"));
+    }
+
     /// Tells the person something they asked about, where they are looking.
     ///
-    /// In the title bar, because that is the one piece of text this window
-    /// has, and because the log may be going nowhere: a session started with
-    /// `RUST_LOG=error`, or from an icon, has no terminal to read. The message
-    /// stays until the next one replaces it.
+    /// In the title bar, beside the position, because that is the one piece of
+    /// text this window has and because the log may be going nowhere: a
+    /// session started from an icon has no terminal to read. The message
+    /// stays a few seconds, or until the next one replaces it.
     fn say(&mut self, message: &str) {
         tracing::info!("{message}");
-        if let Some(active) = self.active.as_ref() {
-            active
-                .window
-                .set_title(&format!("{} — {message}", self.title));
-        }
+        let now = std::time::Instant::now();
+        self.notice = Some((message.to_owned(), now));
+        // Shown on the next turn of the loop, not a quarter of a second on.
+        self.title_at = now - std::time::Duration::from_secs(1);
     }
 
     fn viewport(&self) -> (f64, f64) {
@@ -291,7 +335,15 @@ impl ApplicationHandler for App {
     /// first session recorded left a zero-byte file, because a container
     /// without its footer is not a file anything will open.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Written here and not after the loop returns: quitting from the
+        // application menu ends the process inside the loop, and what follows
+        // `run_app` never runs.
+        crate::journal::note(&format!(
+            "session ended: {}",
+            self.ended_by.unwrap_or("the application was asked to quit")
+        ));
         self.close_the_tape();
+        self.remember_the_view();
     }
 
     /// Drives the animation: one redraw per loop iteration while the window is
@@ -304,10 +356,14 @@ impl ApplicationHandler for App {
         // and warming included.
         self.take_the_location();
         self.take_the_commands();
+        // Also on the turns that draw nothing — hidden and warming, or
+        // occluded — so a script always has a view to read.
+        self.publish_the_view(None);
         // A flown tape ends the session. Without this a replay leaves a window
         // sitting on its last frame, and the run has to be closed by hand —
         // which is exactly what stops anyone from putting it in a script.
         if self.recording.finished {
+            self.ended_by = Some("the replayed tape reached its end");
             tracing::info!("{}", self.report());
             self.close_the_tape();
             event_loop.exit();
@@ -315,6 +371,7 @@ impl ApplicationHandler for App {
         }
         // Ctrl-C or `kill`: unwind rather than die, so the recording is closed.
         if crate::signals::INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+            self.ended_by = Some("a signal asked it to stop (interrupt, terminate or hang-up)");
             tracing::info!("interrupted; closing the session");
             self.close_the_tape();
             event_loop.exit();

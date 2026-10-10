@@ -2,7 +2,7 @@
 // Copyright (c) lapoule.dev
 
 //! What the viewer takes from the machine it runs on: its credential, and the
-//! two directories it may read and write.
+//! two places it may read and write.
 //!
 //! # Where the token comes from
 //!
@@ -110,28 +110,34 @@ pub(crate) fn support_dir(host: &dyn Host) -> Option<PathBuf> {
     Some(base.join(APP_NAME.to_lowercase()))
 }
 
-/// The directory for what the viewer writes and could write again — today, the
-/// view that `report` leaves for a script.
-pub(crate) fn caches_dir(host: &dyn Host) -> Option<PathBuf> {
+/// The file a session started from an icon leaves its reasons in: why it
+/// could not start, why it stopped. Where the desktop's own log viewer looks.
+pub(crate) fn log_file(host: &dyn Host) -> Option<PathBuf> {
     if host.is_macos() {
-        return Some(home(host)?.join("Library/Caches").join(APP_NAME));
+        return Some(
+            home(host)?
+                .join("Library/Logs")
+                .join(APP_NAME)
+                .join("viewer.log"),
+        );
     }
     let base = host
-        .var("XDG_CACHE_HOME")
+        .var("XDG_STATE_HOME")
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
-        .or_else(|| Some(home(host)?.join(".cache")))?;
-    Some(base.join(APP_NAME.to_lowercase()))
+        .or_else(|| Some(home(host)?.join(".local/state")))?;
+    Some(base.join(APP_NAME.to_lowercase()).join("viewer.log"))
+}
+
+/// Where a session started from an icon leaves the view it ended on, for the
+/// next one to open on: one line, a `goto` URL.
+pub(crate) fn last_view_file(host: &dyn Host) -> Option<PathBuf> {
+    Some(support_dir(host)?.join("last-view"))
 }
 
 /// The one file a token may be read from.
 pub(crate) fn token_file(host: &dyn Host) -> Option<PathBuf> {
     Some(support_dir(host)?.join("token"))
-}
-
-/// The file `report` writes the present view to.
-pub(crate) fn report_file(host: &dyn Host) -> Option<PathBuf> {
-    Some(caches_dir(host)?.join("view.txt"))
 }
 
 /// Where a token was found. Never the token.
@@ -324,8 +330,8 @@ mod tests {
     fn the_directories_follow_the_platform() {
         let host = mac(&[], None);
         assert_eq!(
-            report_file(&host),
-            Some("/Users/someone/Library/Caches/Tuile/view.txt".into())
+            log_file(&host),
+            Some("/Users/someone/Library/Logs/Tuile/viewer.log".into())
         );
         let other = Fake {
             vars: [("HOME", "/home/someone")].into_iter().collect(),
@@ -344,6 +350,38 @@ mod tests {
         assert_eq!(token_file(&moved), Some("/etc/xdg/tuile/token".into()));
         // Nowhere to look is a missing token, not a panic.
         assert_eq!(token(&Fake::default()), Err(MissingToken { file: None }));
+    }
+
+    /// The view a session left is the view the next one opens on; a file
+    /// that does not hold a whole, in-bounds view is no view at all.
+    #[test]
+    fn the_last_view_is_read_back_whole_or_not_at_all() {
+        const LAST: &str = "/Users/someone/Library/Application Support/Tuile/last-view";
+        let with = |text: &'static str| {
+            let mut host = mac(&[], None);
+            host.files.insert(PathBuf::from(LAST), text);
+            crate::start::remembered(&host)
+        };
+        let view = crate::start::StartView {
+            lon: -4.0167,
+            lat: 5.3364,
+            altitude: 1500.0,
+            heading: 45.0,
+            pitch: 30.0,
+        };
+        let got = with("tuile://goto?lon=-4.0167&lat=5.3364&altitude=1500&heading=45&pitch=30\n");
+        assert_eq!(got, Some(view));
+        for bad in [
+            "",
+            "tuile://north",
+            "tuile://goto?lon=-4.0167&lat=5.3364",
+            // Everything but the altitude: still not a whole view.
+            "tuile://goto?lon=-4.0167&lat=5.3364&heading=45&pitch=30",
+            "tuile://goto?lon=-4&lat=95&altitude=1500&heading=45&pitch=30",
+        ] {
+            assert_eq!(with(bad), None, "{bad:?}");
+        }
+        assert_eq!(crate::start::remembered(&mac(&[], None)), None);
     }
 
     #[test]

@@ -54,7 +54,7 @@ rlimit = "0.10"
 # "not available" and the viewer runs as it always did.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.4", optional = true }
-objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSAppleEventDescriptor", "NSAppleEventManager", "NSArray", "NSDate", "NSError", "NSRunLoop", "NSString"] }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSAppleEventDescriptor", "NSAppleEventManager", "NSArray", "NSDate", "NSDictionary", "NSError", "NSRunLoop", "NSScriptCommand", "NSScriptCommandDescription", "NSString", "NSValue"] }
 # The alert shown when there is no terminal, and the clipboard.
 objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSAlert", "NSApplication", "NSPasteboard", "NSResponder", "NSRunningApplication"] }
 objc2-core-location = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }

@@ -3,25 +3,30 @@
 
 //! Carrying out a [`Command`], whoever gave it.
 //!
-//! The keys and the steering URLs both end here, so there is one place where
+//! The keys, the steering URLs and a script's commands all end here, so there is one place where
 //! "north up" or "freeze" is done and no way for the two to drift apart. URLs
 //! arrive on a queue filled by the desktop's event dispatch and are drained by
 //! the loop: the camera is only ever moved from the thread that draws it.
 
 use super::App;
-use crate::steer::{self, Command};
+use crate::snapshot::Snapshot;
+use crate::steer::{self, Command, Request};
 
 impl App {
-    /// Drains the steering URLs that arrived since the last turn of the loop.
+    /// Drains what arrived from outside since the last turn of the loop.
     ///
     /// A URL that is not a command is dropped with one line and nothing else:
     /// it comes from outside the process, and must not be able to do more than
     /// fail.
     pub(super) fn take_the_commands(&mut self) {
-        while let Ok(url) = self.urls.try_recv() {
-            match steer::parse_url(&url) {
-                Ok(commands) => commands.into_iter().for_each(|c| self.apply(c)),
-                Err(why) => tracing::error!("steering URL ignored: {why}"),
+        while let Ok(request) = self.requests.try_recv() {
+            match request {
+                // A script's command arrives already read and already checked.
+                Request::Do(command) => self.apply(command),
+                Request::Url(url) => match steer::parse_url(&url) {
+                    Ok(commands) => commands.into_iter().for_each(|c| self.apply(c)),
+                    Err(why) => tracing::error!("steering URL ignored: {why}"),
+                },
             }
         }
     }
@@ -46,38 +51,6 @@ impl App {
                 tracing::info!("traversal freeze: {on}");
             }
             Command::Wireframe(on) => self.views.wireframe = on,
-            Command::Report => self.report_the_view(),
-        }
-    }
-
-    /// Writes the present view, as the URL that returns to it, where a script
-    /// can read it back.
-    ///
-    /// **Not when the view was centred on the current location.** A report is
-    /// asked for by another program, the file can be read by any program, and
-    /// the two together would turn the permission the person gave *this*
-    /// application into the machine's position for whoever asks. The view is
-    /// reportable again as soon as a `goto` has put it somewhere named.
-    fn report_the_view(&mut self) {
-        let Some(file) = crate::host::report_file(&crate::host::Machine) else {
-            self.say("view not reported: this machine has no caches directory");
-            return;
-        };
-        if self.located {
-            // And the last report goes: a reader must not take an old answer
-            // for this one.
-            let _ = std::fs::remove_file(&file);
-            self.say("view not reported: it is centred on the current location");
-            return;
-        }
-        let link = steer::link(&steer::view_of(self.controller.target()));
-        let written = file
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&file, format!("{link}\n")));
-        match written {
-            Ok(()) => self.say(&format!("view written to {}", file.display())),
-            Err(e) => self.say(&format!("view not reported: {e}")),
         }
     }
 
@@ -90,6 +63,64 @@ impl App {
             self.say("link to this view copied");
         } else {
             self.say("no clipboard on this platform");
+        }
+    }
+
+    /// Publishes this frame's view for scripts, and keeps the title bar on it.
+    ///
+    /// `drawn` is the count of tiles in the frame just presented and whether
+    /// all of them were the tiles selected; `None` on a turn of the loop that
+    /// drew nothing, which leaves the last counts standing.
+    pub(super) fn publish_the_view(&mut self, drawn: Option<(usize, bool)>) {
+        if let Some(drawn) = drawn {
+            self.drawn = drawn;
+        }
+        let size = self.active.as_ref().map_or((0, 0), |a| a.size);
+        let snapshot = Snapshot {
+            wireframe: self.views.wireframe,
+            frozen: self.views.freeze,
+            located: self.located,
+            tiles: self.drawn.0,
+            settled: self.drawn.1,
+            ..Snapshot::of(&self.controller, size)
+        };
+        crate::snapshot::publish(snapshot);
+        self.keep_the_title(&snapshot);
+    }
+
+    /// The title bar: the application, where the eye is, and — for a few
+    /// seconds — the last thing that was said.
+    ///
+    /// Rewritten a few times a second at most, and only when it changed: a
+    /// title set every frame is sixty messages a second to the window server
+    /// for a text nobody can read that fast.
+    fn keep_the_title(&mut self, snapshot: &Snapshot) {
+        /// How often the title may change while the eye moves.
+        const EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+        /// How long a message stays beside the position.
+        const NOTICE: std::time::Duration = std::time::Duration::from_secs(8);
+
+        let now = std::time::Instant::now();
+        if now.duration_since(self.title_at) < EVERY {
+            return;
+        }
+        self.title_at = now;
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(_, since)| now.duration_since(*since) > NOTICE)
+        {
+            self.notice = None;
+        }
+        let mut title = format!("{} — {}", self.title, crate::snapshot::title(snapshot));
+        if let Some((notice, _)) = &self.notice {
+            title = format!("{title} — {notice}");
+        }
+        if title != self.title_shown {
+            if let Some(active) = self.active.as_ref() {
+                active.window.set_title(&title);
+            }
+            self.title_shown = title;
         }
     }
 }
