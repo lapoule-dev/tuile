@@ -10,6 +10,7 @@
 
 use super::setup::configure_surface;
 use super::{App, DIAGNOSTICS};
+use crate::steer::Command;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, NamedKey};
@@ -49,7 +50,10 @@ impl App {
             return;
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.ended_by = Some("the window was closed");
+                event_loop.exit();
+            }
             // Dragging the window to a display of a different density changes
             // how many device pixels a point is worth, and so how deep the
             // imagery should go. Winit sends the new size straight after, so
@@ -71,7 +75,7 @@ impl App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 match event.logical_key {
                     Key::Character(ref c) if c.eq_ignore_ascii_case("w") => {
-                        self.views.wireframe = !self.views.wireframe;
+                        self.apply(Command::Wireframe(!self.views.wireframe));
                     }
                     Key::Character(ref c) if c.eq_ignore_ascii_case("d") => {
                         self.views.diagnostic = (self.views.diagnostic + 1) % DIAGNOSTICS.len();
@@ -79,20 +83,21 @@ impl App {
                         tracing::info!("view: {name} — {reads}");
                     }
                     Key::Character(ref c) if c.eq_ignore_ascii_case("f") => {
-                        self.views.freeze = !self.views.freeze;
-                        tracing::info!("traversal freeze: {}", self.views.freeze);
+                        self.apply(Command::Freeze(!self.views.freeze));
                     }
                     Key::Character(ref c) if c.eq_ignore_ascii_case("n") => {
-                        let vp = self.viewport();
-                        crate::steer::north_up(&mut self.controller, vp);
+                        self.apply(Command::NorthUp);
                     }
                     Key::Character(ref c) if c.eq_ignore_ascii_case("l") => {
-                        self.locator.request(
-                            std::time::Instant::now(),
-                            crate::location::Placement::OVERHEAD,
-                        );
+                        self.apply(Command::Here);
                     }
-                    Key::Named(NamedKey::Escape) => event_loop.exit(),
+                    Key::Character(ref c) if c.eq_ignore_ascii_case("c") => {
+                        self.copy_the_link();
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.ended_by = Some("Esc was pressed");
+                        event_loop.exit();
+                    }
                     _ => {}
                 }
             }
@@ -111,8 +116,7 @@ impl App {
                         // A ring let go where it was pressed was clicked, not
                         // turned — and a click on a compass means north up.
                         if self.nav.release() == Some(tuile_ui::Part::Ring) {
-                            let vp = self.viewport();
-                            crate::steer::north_up(&mut self.controller, vp);
+                            self.apply(Command::NorthUp);
                         }
                     }
                     MouseButton::Right => self.pointer.tilting = pressed,

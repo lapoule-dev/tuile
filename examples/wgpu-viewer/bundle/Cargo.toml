@@ -1,0 +1,27 @@
+[package]
+name = "tuile-viewer-bundle"
+description = "Packages the tuile viewer as a macOS application bundle, and draws its icon"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# A packaging tool, not a library: nothing depends on it, and its three
+# dependencies reach no other crate of the workspace.
+[dependencies]
+anyhow = { workspace = true }
+# `Info.plist`, written and read back as the property list it is rather than
+# as a string template.
+plist = "1.7"
+# The `.icns` container. Small, stable, and all there is to the format.
+icns = "0.3"
+# PNG in and out, and the resampling from the 1024-pixel master.
+image = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

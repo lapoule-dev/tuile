@@ -52,6 +52,7 @@ impl App {
         // pump.
         self.note_what_could_not_be_drawn(resolution);
         self.record_the_traced_frame();
+        self.publish_the_view(Some((rendered, resolution.stand_ins == 0)));
         self.report_once_a_second(rendered, resolution);
     }
 

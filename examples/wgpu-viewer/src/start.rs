@@ -42,13 +42,16 @@ KEYS:
     N                  north up: turn the view about the point at its centre
                        (a click on the compass ring does the same)
     L                  centre on the current location, at the present altitude
+    C                  copy a link to this view (a tuile://goto?… URL)
     W                  wireframe
     D                  cycle the diagnostic views
     F                  freeze the traversal
     Esc                quit
 
 Everything else a session is started with is an environment variable; see the
-header of `settings.rs`.";
+header of `settings.rs`. A running viewer is steered with tuile:// URLs (see
+the header of `steer.rs`) and, as the macOS application, by scripts (see
+`macos/README.md`).";
 
 /// The view a session opens on, in the units a person types: degrees and
 /// metres. Everything is `f64` — a longitude in `f32` is already metres off.
@@ -94,6 +97,24 @@ impl StartView {
             self.pitch.to_radians(),
             tuile_camera::DEFAULT_GLOBE_FOVY,
         )
+    }
+}
+
+/// The view the last session started from an icon ended on, if it left one
+/// and it still reads as a view. Anything else — no file, an edited file, a
+/// value out of bounds — is no view, and the default stands.
+pub(crate) fn remembered(host: &dyn crate::host::Host) -> Option<StartView> {
+    let file = crate::host::last_view_file(host)?;
+    let text = host.read(&file).ok()?;
+    match crate::steer::parse_url(text.trim()).ok()?.as_slice() {
+        [crate::steer::Command::Goto(goto)] => Some(StartView {
+            lon: goto.lon?,
+            lat: goto.lat?,
+            altitude: goto.altitude?,
+            heading: goto.heading?,
+            pitch: goto.pitch?,
+        }),
+        _ => None,
     }
 }
 
@@ -169,6 +190,64 @@ const FLAGS: [Flag; 5] = [
     },
 ];
 
+impl Flag {
+    /// One value for this flag: a finite number inside the bounds, or the
+    /// sentence that says what was wrong with it.
+    fn read(&self, text: &str) -> Result<f64, String> {
+        // `f64::from_str` reads "nan" and "inf" happily, and a NaN passes no
+        // range check by failing every comparison — so finiteness is asked for
+        // by name rather than left to the bounds.
+        let value = text
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| {
+                format!(
+                    "{} wants a number of {}, got {text:?}",
+                    self.name, self.unit
+                )
+            })?;
+        self.check(value)
+    }
+
+    /// The bounds alone, for a value that arrives as a number already — from a
+    /// script, which speaks in reals and not in text.
+    fn check(&self, value: f64) -> Result<f64, String> {
+        if !value.is_finite() || value < self.min || value > self.max {
+            return Err(format!(
+                "{} must be between {} and {} {}, got {value}",
+                self.name, self.min, self.max, self.unit
+            ));
+        }
+        Ok(value)
+    }
+}
+
+fn flag(name: &str) -> Result<&'static Flag, String> {
+    FLAGS
+        .iter()
+        .find(|f| f.name.strip_prefix("--") == Some(name))
+        .ok_or_else(|| format!("unknown parameter {name:?}"))
+}
+
+/// A number held to the bounds of the flag called `name` (without its dashes).
+#[cfg_attr(
+    not(all(target_os = "macos", feature = "application")),
+    allow(dead_code)
+)]
+pub(crate) fn checked(name: &str, value: f64) -> Result<f64, String> {
+    flag(name)?.check(value)
+}
+
+/// One value, checked exactly as the command line checks it: `name` is a
+/// flag's name without its dashes. This is how a steering URL gets the same
+/// vocabulary and the same bounds as the flags — there is one table, and both
+/// read it.
+pub(crate) fn value(name: &str, text: &str) -> Result<f64, String> {
+    flag(name)?.read(text)
+}
+
 /// Reads the arguments after the program name.
 ///
 /// Strict on purpose. An unknown flag, a missing or unreadable value, a value
@@ -214,26 +293,7 @@ where
                 .map(|s| s.as_ref().to_owned())
                 .ok_or_else(|| format!("{} needs a value in {}", flag.name, flag.unit))?,
         };
-        // `f64::from_str` reads "nan" and "inf" happily, and a NaN passes no
-        // range check by failing every comparison — so finiteness is asked for
-        // by name rather than left to the bounds.
-        let value = text
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .filter(|v| v.is_finite())
-            .ok_or_else(|| {
-                format!(
-                    "{} wants a number of {}, got {text:?}",
-                    flag.name, flag.unit
-                )
-            })?;
-        if value < flag.min || value > flag.max {
-            return Err(format!(
-                "{} must be between {} and {} {}, got {value}",
-                flag.name, flag.min, flag.max, flag.unit
-            ));
-        }
+        let value = flag.read(&text)?;
         *(flag.field)(&mut view) = value;
     }
     // Two answers to "where" is one too many, and picking either silently

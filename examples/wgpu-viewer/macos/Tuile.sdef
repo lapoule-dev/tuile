@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE dictionary SYSTEM "file://localhost/System/Library/DTDs/sdef.dtd">
+<!--
+  SPDX-License-Identifier: MIT OR Apache-2.0
+  Copyright (c) lapoule.dev
+
+  The scripting dictionary of the viewer's application bundle.
+
+  The properties below are answered from a snapshot the render loop publishes
+  once a frame; their `cocoa key`s are the keys of `PROPERTIES` in
+  `src/snapshot.rs`, and a test holds the two lists equal. The commands end in
+  the same `Command` values as the keys and the steering URLs.
+-->
+<dictionary title="Tuile Terminology" xmlns:xi="http://www.w3.org/2003/XInclude">
+
+  <xi:include href="file:///System/Library/ScriptingDefinitions/CocoaStandard.sdef"
+              xpointer="xpointer(/dictionary/suite)"/>
+
+  <suite name="Tuile Suite" code="Tuil" description="The view of the globe: where the eye is, what it looks at, and how to move it.">
+
+    <command name="go to" code="Tuilgoto" description="Put the eye somewhere. Every parameter is optional; what is left out keeps its present value.">
+      <cocoa class="TuileViewerScriptCommand"/>
+      <parameter name="longitude" code="Tlon" type="real" optional="yes" description="Degrees, east positive, -180 to 180.">
+        <cocoa key="lon"/>
+      </parameter>
+      <parameter name="latitude" code="Tlat" type="real" optional="yes" description="Degrees, north positive, -90 to 90.">
+        <cocoa key="lat"/>
+      </parameter>
+      <parameter name="altitude" code="Talt" type="real" optional="yes" description="Metres above the ellipsoid, 1 to 1e8.">
+        <cocoa key="altitude"/>
+      </parameter>
+      <parameter name="heading" code="Thdg" type="real" optional="yes" description="Degrees clockwise from north.">
+        <cocoa key="heading"/>
+      </parameter>
+      <parameter name="pitch" code="Tpit" type="real" optional="yes" description="Degrees below the horizon, 0 to 90; 90 looks straight down.">
+        <cocoa key="pitch"/>
+      </parameter>
+    </command>
+
+    <command name="north up" code="Tuilnrth" description="Turn the view north-up about the point at its centre.">
+      <cocoa class="TuileViewerScriptCommand"/>
+    </command>
+
+    <command name="center on current location" code="Tuilhere" description="Centre the view on the current location. The system asks the person first; nothing moves if it does not answer.">
+      <cocoa class="TuileViewerScriptCommand"/>
+    </command>
+
+    <class-extension extends="application" description="The view of the globe.">
+      <property name="longitude" code="Vlon" type="real" access="r" description="Longitude of the eye, degrees, east positive. Missing value when the view was centred on the current location.">
+        <cocoa key="longitude"/>
+      </property>
+      <property name="latitude" code="Vlat" type="real" access="r" description="Latitude of the eye, degrees, north positive. Missing value when the view was centred on the current location.">
+        <cocoa key="latitude"/>
+      </property>
+      <property name="altitude" code="Valt" type="real" access="r" description="Height of the eye above the ellipsoid, metres.">
+        <cocoa key="altitude"/>
+      </property>
+      <property name="heading" code="Vhdg" type="real" access="r" description="Direction of the view, degrees clockwise from north.">
+        <cocoa key="heading"/>
+      </property>
+      <property name="pitch" code="Vpit" type="real" access="r" description="Angle of the view below the horizon, degrees; 90 looks straight down.">
+        <cocoa key="pitch"/>
+      </property>
+      <property name="target longitude" code="Vtlo" type="real" access="r" description="Longitude of the ground point at the centre of the view. Missing value when the centre looks at the sky, or when the view was centred on the current location.">
+        <cocoa key="targetLongitude"/>
+      </property>
+      <property name="target latitude" code="Vtla" type="real" access="r" description="Latitude of the ground point at the centre of the view. Missing value when the centre looks at the sky, or when the view was centred on the current location.">
+        <cocoa key="targetLatitude"/>
+      </property>
+      <property name="target height" code="Vthe" type="real" access="r" description="Height of that point above the ellipsoid, metres. The point is taken on the ellipsoid, so this is zero; missing value when the centre looks at the sky.">
+        <cocoa key="targetHeight"/>
+      </property>
+      <property name="range" code="Vrng" type="real" access="r" description="Distance from the eye to that point, metres. Missing value when the centre looks at the sky.">
+        <cocoa key="range"/>
+      </property>
+      <property name="field of view" code="Vfov" type="real" access="r" description="Vertical field of view, degrees.">
+        <cocoa key="fieldOfView"/>
+      </property>
+      <property name="view width" code="Vwid" type="integer" access="r" description="Width of the drawable surface, device pixels.">
+        <cocoa key="viewWidth"/>
+      </property>
+      <property name="view height" code="Vhei" type="integer" access="r" description="Height of the drawable surface, device pixels.">
+        <cocoa key="viewHeight"/>
+      </property>
+      <property name="wireframe" code="Vwir" type="boolean" access="rw" description="Whether the ground is drawn as its mesh.">
+        <cocoa key="wireframe"/>
+      </property>
+      <property name="frozen" code="Vfrz" type="boolean" access="rw" description="Whether the tile selection is frozen while the camera moves.">
+        <cocoa key="frozen"/>
+      </property>
+      <property name="view url" code="Vurl" type="text" access="r" description="The tuile://goto URL that returns to this view. Missing value when the view was centred on the current location.">
+        <cocoa key="viewURL"/>
+      </property>
+      <property name="tile count" code="Vtil" type="integer" access="r" description="Tiles drawn in the last frame.">
+        <cocoa key="tileCount"/>
+      </property>
+      <property name="settled" code="Vset" type="boolean" access="r" description="Whether every tile drawn is the one selected, with no coarser stand-in waiting to be replaced: the picture has stopped refining.">
+        <cocoa key="settled"/>
+      </property>
+    </class-extension>
+
+  </suite>
+</dictionary>
