@@ -85,6 +85,65 @@ pub trait Objects: Send + Sync {
             etag: None,
         })
     }
+
+    /// [`Self::read_if_changed`] for many objects at once — each a key and
+    /// the validator held for it, if any — answered in the order asked, one
+    /// answer per key. One that fails, or is not there, is its own answer
+    /// and takes nothing from the others.
+    ///
+    /// A film reads a manifest per zone, several hundred of them, each a
+    /// kilobyte: one by one that is several hundred round trips to bring a
+    /// few hundred kilobytes. A store that can answer many in one exchange
+    /// overrides this; this default asks one by one, a few at a time.
+    async fn read_many_if_changed(
+        &self,
+        asked: &[(String, Option<String>)],
+    ) -> Vec<Result<Read, RepoError>> {
+        each_if_changed(self, asked).await
+    }
+
+    /// Many whole objects at once, in the order asked: [`Self::read_all`]
+    /// of each, through whatever [`Self::read_many_if_changed`] saves.
+    async fn read_many(&self, keys: &[String]) -> Vec<Result<Vec<u8>, RepoError>> {
+        let asked: Vec<(String, Option<String>)> =
+            keys.iter().map(|key| (key.clone(), None)).collect();
+        self.read_many_if_changed(&asked)
+            .await
+            .into_iter()
+            .zip(keys)
+            .map(|(read, key)| match read? {
+                Read::Changed { bytes, .. } => Ok(bytes),
+                // Said of nothing named: not an answer.
+                Read::Unchanged => Err(RepoError::Store(format!(
+                    "{key}: said unchanged, and nothing was held"
+                ))),
+            })
+            .collect()
+    }
+}
+
+/// How many objects are asked for at a time by a reader that asks one by
+/// one: enough that several hundred do not wait in line, and no burden on
+/// a bucket. A browser lets fewer through to one host and queues the rest.
+const AT_ONCE: usize = 16;
+
+/// Many objects asked one by one, [`AT_ONCE`] at a time: what
+/// [`Objects::read_many_if_changed`] is where nothing answers many at once.
+pub(crate) async fn each_if_changed<O: Objects + ?Sized>(
+    objects: &O,
+    asked: &[(String, Option<String>)],
+) -> Vec<Result<Read, RepoError>> {
+    let mut out = Vec::with_capacity(asked.len());
+    for some in asked.chunks(AT_ONCE) {
+        out.extend(
+            futures_util::future::join_all(
+                some.iter()
+                    .map(|(key, known)| objects.read_if_changed(key, known.as_deref())),
+            )
+            .await,
+        );
+    }
+    out
 }
 
 /// What [`Objects::read_if_changed`] found.

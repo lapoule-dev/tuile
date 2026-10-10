@@ -60,18 +60,29 @@ impl HttpGet {
     }
 }
 
-#[async_trait]
-impl Get for HttpGet {
-    async fn get(&self, path: &str) -> Result<Got, String> {
-        self.get_unless(path, None).await
-    }
-
-    async fn get_unless(&self, path: &str, known: Option<&str>) -> Result<Got, String> {
+impl HttpGet {
+    /// One request, tried again while its server is busy: a GET, perhaps
+    /// conditional, or — given a body — a POST of it. Either only reads, so
+    /// either is safe to send twice.
+    async fn asked(
+        &self,
+        path: &str,
+        known: Option<&str>,
+        body: Option<&str>,
+    ) -> Result<Got, String> {
         let url = format!("{}/{path}", self.root);
         let mut wait = FIRST_WAIT;
         let mut last = String::new();
         for attempt in 1..=TRIES {
-            let mut request = self.http.get(&url);
+            let mut request = match body {
+                // As a browser sends it, so one server answers both.
+                Some(body) => self
+                    .http
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .body(body.to_string()),
+                None => self.http.get(&url),
+            };
             if let Some((name, value)) = &self.credential {
                 request = request.header(name, value);
             }
@@ -112,6 +123,21 @@ impl Get for HttpGet {
             }
         }
         Err(format!("{last}, after {TRIES} tries"))
+    }
+}
+
+#[async_trait]
+impl Get for HttpGet {
+    async fn get(&self, path: &str) -> Result<Got, String> {
+        self.asked(path, None, None).await
+    }
+
+    async fn get_unless(&self, path: &str, known: Option<&str>) -> Result<Got, String> {
+        self.asked(path, known, None).await
+    }
+
+    async fn post(&self, path: &str, body: String) -> Result<Got, String> {
+        self.asked(path, None, Some(&body)).await
     }
 }
 
@@ -229,6 +255,11 @@ impl<G: Get> Get for Kept<G> {
         } else {
             self.inner.get_unless(path, known).await
         }
+    }
+
+    /// Nothing posted is a block: it goes through as it is.
+    async fn post(&self, path: &str, body: String) -> Result<Got, String> {
+        self.inner.post(path, body).await
     }
 
     async fn get(&self, path: &str) -> Result<Got, String> {

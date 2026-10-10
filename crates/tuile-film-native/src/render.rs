@@ -265,6 +265,10 @@ pub async fn render(
             let (count, store) = (terrain.len() + imagery.len(), &sources.store.tiles);
             for (layer, wanted) in [(terrain_layer, terrain), (imagery_layer, imagery)] {
                 let wanted: Vec<tuile_film::StoreAt> = wanted.into_iter().collect();
+                // Their zones' manifests first, all in one exchange with
+                // the store: several hundred of them, a kilobyte each, are
+                // not worth a round trip apiece.
+                store.open_zones(layer, wanted.iter().copied()).await?;
                 for some in wanted.chunks(AT_ONCE) {
                     let found = futures_util::future::join_all(
                         some.iter().map(|at| store.tile(layer, at.0, at.1, at.2)),
@@ -423,6 +427,9 @@ pub async fn render(
                 ] {
                     let t = Instant::now();
                     let wanted: Vec<(u8, u32, u32)> = wanted.into_iter().collect();
+                    // Held since the read ahead, and then nothing is asked;
+                    // otherwise their zones' manifests come together.
+                    store.open_zones(layer, wanted.iter().copied()).await?;
                     for some in wanted.chunks(AT_ONCE) {
                         let found = futures_util::future::join_all(
                             some.iter().map(|at| store.tile(layer, at.0, at.1, at.2)),

@@ -96,6 +96,21 @@ impl Objects for Counting {
         });
         Ok(read)
     }
+    /// Asked together, as the store behind answers them together; counted
+    /// one by one, as the objects they are.
+    async fn read_many_if_changed(
+        &self,
+        asked: &[(String, Option<String>)],
+    ) -> Vec<Result<Read, RepoError>> {
+        let read = self.inner.read_many_if_changed(asked).await;
+        for one in read.iter().flatten() {
+            self.count(match one {
+                Read::Changed { bytes, .. } => bytes.len(),
+                Read::Unchanged => 0,
+            });
+        }
+        read
+    }
 }
 
 /// Bytes of chunks kept in memory before the oldest are let go. A film's

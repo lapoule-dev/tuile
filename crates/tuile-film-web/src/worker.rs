@@ -755,8 +755,17 @@ impl FilmWorker {
         // bytes are let go here.
         if let Some(side) = &self.store {
             let pack = Pack::open_table(&self.head).map_err(js)?;
-            let (terrain, imagery) = tuile_film::referred(&pack, self.first, self.last).map_err(js)?;
+            let (terrain, imagery) =
+                tuile_film::referred(&pack, self.first, self.last).map_err(js)?;
             for (layer, wanted) in [(&side.terrain, terrain), (&side.imagery, imagery)] {
+                // Their zones' manifests first, all in one request: several
+                // hundred of them, a kilobyte each, are not worth a round
+                // trip apiece.
+                side.store
+                    .tiles
+                    .open_zones(layer, wanted.iter().copied())
+                    .await
+                    .map_err(js)?;
                 let mut asked = stream::iter(wanted)
                     .map(|at| side.store.tiles.tile(layer, at.0, at.1, at.2))
                     .buffer_unordered(PRELOAD_AT_ONCE);
@@ -900,6 +909,24 @@ impl FilmWorker {
 
         // The tiles the pack refers to, built from the store's own tiles.
         if let Some(store) = store.as_mut() {
+            // A manifest is believed a minute, and a film lasts longer: the
+            // zones this frame's tiles lie in whose manifests have aged are
+            // asked about together, not one by one as each tile comes.
+            let (mut terrain, mut imagery) = (Vec::new(), Vec::new());
+            for refs in referred.iter().filter_map(refs_of) {
+                terrain.push((refs.terrain.level, refs.terrain.x, refs.terrain.y));
+                for placed in &refs.imagery {
+                    imagery.push((placed.tile.level, placed.tile.x, placed.tile.y));
+                }
+            }
+            for (layer, wanted) in [(&store.terrain, terrain), (&store.imagery, imagery)] {
+                store
+                    .store
+                    .tiles
+                    .open_zones(layer, wanted)
+                    .await
+                    .map_err(js)?;
+            }
             for tile in &referred {
                 let tf = now_ms();
                 let Some(refs) = refs_of(tile) else { continue };

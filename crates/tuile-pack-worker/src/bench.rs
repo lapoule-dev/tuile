@@ -71,9 +71,11 @@ struct RemoteGet {
     credential: Option<(String, String)>,
 }
 
-#[async_trait(?Send)]
-impl Get for RemoteGet {
-    async fn get(&self, path: &str) -> std::result::Result<Got, String> {
+impl RemoteGet {
+    /// One request, tried again while its server is busy: a GET, or — given
+    /// a body — a POST of it. Either only reads, so either is safe to send
+    /// twice.
+    async fn asked(&self, path: &str, body: Option<&str>) -> std::result::Result<Got, String> {
         const TRIES: u32 = 4;
         let url = format!("{}/{path}", self.root);
         let mut wait = 150;
@@ -84,7 +86,17 @@ impl Get for RemoteGet {
                 headers.set(name, value).map_err(|e| e.to_string())?;
             }
             let mut init = RequestInit::new();
-            init.with_method(Method::Get).with_headers(headers);
+            match body {
+                Some(body) => {
+                    // As a browser sends it, so one server answers both.
+                    headers
+                        .set("content-type", "application/json")
+                        .map_err(|e| e.to_string())?;
+                    init.with_method(Method::Post).with_body(Some(body.into()))
+                }
+                None => init.with_method(Method::Get),
+            }
+            .with_headers(headers);
             let outgoing = Request::new_with_init(&url, &init).map_err(|e| e.to_string())?;
             match Fetch::Request(outgoing).send().await {
                 // Busy, or a passing failure: worth asking again.
@@ -113,6 +125,20 @@ impl Get for RemoteGet {
             }
         }
         Err(format!("{last}, after {TRIES} tries"))
+    }
+}
+
+#[async_trait(?Send)]
+impl Get for RemoteGet {
+    async fn get(&self, path: &str) -> std::result::Result<Got, String> {
+        self.asked(path, None).await
+    }
+
+    /// Many of the store's small objects asked about in one request: what
+    /// this Worker's own `POST store/live` is answered from, in one
+    /// subrequest rather than one per object.
+    async fn post(&self, path: &str, body: String) -> std::result::Result<Got, String> {
+        self.asked(path, Some(&body)).await
     }
 }
 
@@ -474,7 +500,7 @@ fn is_block(path: &str) -> bool {
 }
 
 #[event(fetch)]
-pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> {
+pub async fn main(mut request: Request, env: Env, ctx: Context) -> Result<Response> {
     let url = request.url()?;
     if !url.path().starts_with("/api/") {
         return env.assets("ASSETS")?.fetch_request(request).await;
@@ -482,6 +508,26 @@ pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> 
     // HEAD is how a reader that keeps blocks asks whether one it holds is
     // still the object's: the headers of the GET, and no body.
     let head = request.method() == Method::Head;
+    // One route is a POST, and reads like the rest: many of the store's
+    // small objects asked about at once, the keys and their validators in
+    // the body, as JSON. The page this Worker serves is of its own origin,
+    // so no preflight is answered here. Its reply is its asker's alone, and
+    // is not kept here.
+    if request.method() == Method::Post && url.path() == "/api/store/live" {
+        let bench = match bench(&env, false, true).await {
+            Ok(b) => b,
+            Err(e) => return Response::error(format!("misconfigured: {e}"), 500),
+        };
+        let body = request.bytes().await?;
+        let Some(reply) = bench
+            .post(url.path(), url.query().unwrap_or_default(), &body)
+            .await
+        else {
+            return Response::error("no such route", 404);
+        };
+        let (body, status, headers) = respond(reply).await?;
+        return response(body, status, &headers);
+    }
     if request.method() != Method::Get && !head {
         return Response::error("the API is read-only", 405);
     }

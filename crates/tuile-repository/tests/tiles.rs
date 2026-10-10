@@ -52,6 +52,26 @@ impl Get for Api {
             body,
         })
     }
+
+    async fn post(&self, path: &str, body: String) -> Result<Got, String> {
+        let path = format!("/api/{path}");
+        self.asked
+            .lock()
+            .expect("lock")
+            .push(format!("POST {path}"));
+        tokio::task::yield_now().await;
+        let reply = self
+            .bench
+            .post(&path, "", body.as_bytes())
+            .await
+            .ok_or("no such route")?;
+        Ok(Got {
+            status: reply.status,
+            object_size: None,
+            etag: None,
+            body: reply.body,
+        })
+    }
 }
 
 fn layer(name: &str, grid: Grid, expiry_days: Option<u64>) -> LayerDef {
@@ -299,6 +319,55 @@ async fn the_portable_reader_answers_as_the_store_that_wrote() {
     let counts = blocks.counts();
     assert_eq!(counts.fetched as usize, block_paths.len());
     assert!(counts.held > counts.fetched, "{counts:?}");
+
+    // A stretch of frames' tiles, their zones opened ahead: every manifest
+    // in one request, and none asked for after — not by the tiles then read,
+    // not by opening the same zones again. A zone nothing was written to is
+    // held as that, and a tile of it is absent without a question.
+    let ahead = ArchivedTiles::open(
+        Arc::new(RemoteLive::new(api.clone(), "store")),
+        Arc::new(RemoteBlocks::new(api.clone(), "store")),
+        Arc::new(move || now),
+    )
+    .await
+    .expect("open through the API");
+    let before = api.asked.lock().expect("lock").len();
+    let mut zones = 0;
+    for name in ["imagery", "terrain", "imagery.absent"] {
+        let tiles = put
+            .iter()
+            .filter(|(layer, ..)| *layer == name)
+            .map(|(_, level, x, y)| (*level, *x, *y))
+            .chain([(9, 0, 0)]);
+        zones += ahead.open_zones(name, tiles).await.expect("zones");
+    }
+    let opening: Vec<String> = api.asked.lock().expect("lock")[before..].to_vec();
+    assert_eq!(opening, ["POST /api/store/live"; 3], "one request a layer");
+    assert!(zones > 4, "{zones} zones");
+    for (name, level, x, y) in put.iter().copied().chain([("imagery", 9, 0, 0)]) {
+        assert_eq!(
+            answer(&ahead, name, level, x, y).await,
+            answer(native, name, level, x, y).await,
+            "zones opened ahead: {name}/{level}/{x}/{y}"
+        );
+    }
+    assert_eq!(
+        ahead
+            .open_zones("imagery", [(9, 0, 0), (7, 77, 50)])
+            .await
+            .expect("zones"),
+        0
+    );
+    let after: Vec<String> = api.asked.lock().expect("lock")[before + 3..].to_vec();
+    assert!(
+        !after.is_empty() && after.iter().all(|p| p.contains("/b8/")),
+        "a manifest was asked for again: {after:?}"
+    );
+    assert!(matches!(
+        ahead.open_zones("nothing", [(1, 0, 0)]).await,
+        Err(RepoError::NotFound(_))
+    ));
+    api.asked.lock().expect("lock").truncate(first_reader);
 
     // Archives rewritten under a manifest this reader still holds: both of
     // a zone's archives move to new keys and the manifest is rewritten to
