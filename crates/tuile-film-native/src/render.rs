@@ -255,6 +255,31 @@ pub async fn render(
             _ => pack.store_layers(),
         };
         let scheme = layers.map(|(_, imagery)| sources.store.scheme_of(imagery));
+        // Before this pack's first frame: every tile of the store its frames
+        // read is asked for once, so the archives they lie in are fetched
+        // ahead — each once — and no frame waits on a network. The bytes
+        // are let go: what keeps them is below, with the blocks.
+        if let Some((terrain_layer, imagery_layer)) = layers {
+            let ahead = Instant::now();
+            let (terrain, imagery) = tuile_film::referred(&pack, a, b)?;
+            let (count, store) = (terrain.len() + imagery.len(), &sources.store.tiles);
+            for (layer, wanted) in [(terrain_layer, terrain), (imagery_layer, imagery)] {
+                let wanted: Vec<tuile_film::StoreAt> = wanted.into_iter().collect();
+                for some in wanted.chunks(AT_ONCE) {
+                    let found = futures_util::future::join_all(
+                        some.iter().map(|at| store.tile(layer, at.0, at.1, at.2)),
+                    )
+                    .await;
+                    for tile in found {
+                        tile?;
+                    }
+                }
+            }
+            println!(
+                "ahead of frames {a}–{b}: {count} tiles of the store asked for in {:.1} s",
+                ahead.elapsed().as_secs_f64()
+            );
+        }
         // A tile's own gain: the same wherever the film draws it.
         let corners = |at: (u8, u32, u32)| film_grade.as_ref().and_then(|g| g.field.corners(at));
         // …or the function a tile, for a film that has one: it is drawn

@@ -19,7 +19,7 @@ mod slice;
 mod survey;
 
 pub use camera::{FrameCamera, NEAR_FRACTION};
-pub use cursor::{Cursor, FilmError, FrameDiff, TileKey};
+pub use cursor::{referred, Cursor, FilmError, FrameDiff, StoreAt, TileKey};
 pub use look::{Imagery, Look};
 pub use mesh::{texture, texture_of_span, Mesh};
 pub use ranges::{block_plan, coalesce, file_reads, Fetch};

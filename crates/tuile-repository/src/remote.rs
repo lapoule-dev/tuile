@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use futures_util::lock::Mutex as AsyncMutex;
 
 use crate::bench::block_segment;
-use crate::{Entry, Listing, Objects, RepoError, BLOCK};
+use crate::{Read, Entry, Listing, Objects, RepoError, BLOCK};
 
 /// What came back from a GET.
 #[derive(Debug, Clone, Default)]
@@ -28,6 +28,8 @@ pub struct Got {
     pub status: u16,
     /// The `x-object-size` header: the size of the object a block is of.
     pub object_size: Option<u64>,
+    /// The reply's validator (`ETag`), when its server gave one.
+    pub etag: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -37,6 +39,16 @@ pub struct Got {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait Get: Send + Sync {
     async fn get(&self, path: &str) -> Result<Got, String>;
+
+    /// The same GET, unless what is there is still what `known` names: a
+    /// conditional request (`If-None-Match`), answered 304 with no body by a
+    /// server — or a cache in front of it — that honours one. A transport
+    /// that cannot ask conditionally asks plainly, which is this default:
+    /// correct, and no saving.
+    async fn get_unless(&self, path: &str, known: Option<&str>) -> Result<Got, String> {
+        let _ = known;
+        self.get(path).await
+    }
 }
 
 /// A key as a path: each segment percent-encoded, its slashes kept.
@@ -140,6 +152,26 @@ impl<G: Get> Objects for RemoteLive<G> {
     /// One request, where the default would make two.
     async fn read_all(&self, key: &str) -> Result<Vec<u8>, RepoError> {
         self.whole(key).await
+    }
+
+    /// Asked with the validator the caller holds: a server that still has
+    /// that object says so and sends nothing.
+    async fn read_if_changed(&self, key: &str, known: Option<&str>) -> Result<Read, RepoError> {
+        let path = format!("{}/live/{}", self.root, encoded(key));
+        let got = self
+            .get
+            .get_unless(&path, known)
+            .await
+            .map_err(|e| RepoError::Store(format!("{key}: {e}")))?;
+        match got.status {
+            304 if known.is_some() => Ok(Read::Unchanged),
+            200 => Ok(Read::Changed {
+                etag: got.etag,
+                bytes: got.body,
+            }),
+            404 => Err(RepoError::NotFound(key.to_string())),
+            status => Err(RepoError::Store(format!("{key}: HTTP {status}"))),
+        }
     }
 }
 
@@ -335,3 +367,129 @@ impl<G: Get> Objects for RemoteBlocks<G> {
         Ok(out)
     }
 }
+
+/// A tile store behind another server's routes, as one set of objects: what
+/// changes — its catalog, its manifests, its tables, every `.json` — read
+/// whole each time ([`RemoteLive`]), an archive by blocks ([`RemoteBlocks`]).
+/// For a reader that is handed a store as a bucket would be.
+pub struct RemoteStore<G> {
+    live: RemoteLive<G>,
+    blocks: RemoteBlocks<G>,
+}
+
+impl<G: Get> RemoteStore<G> {
+    /// `root` is the route the store is under: `store`.
+    pub fn new(get: Arc<G>, root: impl Into<String>) -> Self {
+        let root = root.into();
+        Self {
+            live: RemoteLive::new(get.clone(), root.clone()),
+            blocks: RemoteBlocks::new(get, root),
+        }
+    }
+
+    fn changes(key: &str) -> bool {
+        key.ends_with(".json")
+    }
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+impl<G: Get> Objects for RemoteStore<G> {
+    fn label(&self) -> String {
+        self.blocks.label()
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<Entry>, RepoError> {
+        unlistable(prefix)
+    }
+
+    async fn browse(&self, prefix: &str) -> Result<Listing, RepoError> {
+        unlistable(prefix)
+    }
+
+    async fn size(&self, key: &str) -> Result<u64, RepoError> {
+        if Self::changes(key) {
+            self.live.size(key).await
+        } else {
+            self.blocks.size(key).await
+        }
+    }
+
+    async fn read(&self, key: &str, range: Range<u64>) -> Result<Vec<u8>, RepoError> {
+        if Self::changes(key) {
+            self.live.read(key, range).await
+        } else {
+            self.blocks.read(key, range).await
+        }
+    }
+
+    /// One request for what changes, where the default would make two.
+    async fn read_all(&self, key: &str) -> Result<Vec<u8>, RepoError> {
+        if Self::changes(key) {
+            self.live.read_all(key).await
+        } else {
+            let size = self.blocks.size(key).await?;
+            self.blocks.read(key, 0..size).await
+        }
+    }
+
+    async fn read_if_changed(&self, key: &str, known: Option<&str>) -> Result<Read, RepoError> {
+        if Self::changes(key) {
+            self.live.read_if_changed(key, known).await
+        } else {
+            Ok(Read::Changed {
+                bytes: self.read_all(key).await?,
+                etag: None,
+            })
+        }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// A server of one small file with one validator, that notes what each
+    /// request was conditional on.
+    #[derive(Default)]
+    struct Server(Mutex<Vec<Option<String>>>);
+
+    #[async_trait]
+    impl Get for Server {
+        async fn get(&self, path: &str) -> Result<Got, String> {
+            self.get_unless(path, None).await
+        }
+
+        async fn get_unless(&self, _: &str, known: Option<&str>) -> Result<Got, String> {
+            self.0.lock().expect("lock").push(known.map(str::to_string));
+            // Compared weakly, as a server or a cache in front of it does.
+            let same = known.is_some_and(|k| k.trim_start_matches("W/") == "\"v1\"");
+            Ok(Got {
+                status: if same { 304 } else { 200 },
+                object_size: None,
+                etag: Some("W/\"v1\"".into()),
+                body: if same { Vec::new() } else { b"{}".to_vec() },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn what_changes_is_asked_with_the_validator_held_and_not_sent_again() {
+        let server = Arc::new(Server::default());
+        let store = RemoteStore::new(server.clone(), "store");
+        let key = "layer/zone/manifest.json";
+
+        // Nothing held: the file, and its validator as the server gave it.
+        let first = store.read_if_changed(key, None).await.expect("read");
+        let Read::Changed { bytes, etag } = first else { panic!("{first:?}") };
+        assert_eq!((bytes.as_slice(), etag.as_deref()), (&b"{}"[..], Some("W/\"v1\"")));
+        // Held: asked with it, and nothing comes back.
+        assert_eq!(store.read_if_changed(key, etag.as_deref()).await.expect("read"), Read::Unchanged);
+        // Another validator than the server's: the file again.
+        assert!(matches!(store.read_if_changed(key, Some("\"v0\"")).await.expect("read"), Read::Changed { .. }));
+        assert_eq!(*server.0.lock().expect("lock"), [None, Some("W/\"v1\"".to_string()), Some("\"v0\"".to_string())]);
+    }
+}
+

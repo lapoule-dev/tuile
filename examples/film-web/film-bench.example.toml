@@ -34,3 +34,12 @@ whole_ready = "scene.txt"
 # The source tiles (PMTiles archives under a catalog), read as stored.
 [tiles]
 bucket = "my-tiles-bucket"
+#
+# Or a tile store somebody else serves on this API's `store/…` routes
+# (`<remote>/store/live/…`, `<remote>/store/b8/…`), in place of `bucket`.
+# `header` names the request header that server wants a credential in; the
+# credential is the secret TUILE_TILES_REMOTE_SECRET, never written here.
+#
+# [tiles]
+# remote = "https://tiles.example/root"
+# header = "X-Token"

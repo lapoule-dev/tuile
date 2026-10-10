@@ -4,7 +4,9 @@
 //! The adapters a native process reaches a bucket with.
 
 mod disk;
+mod http;
 mod store;
 mod tiles;
 
 pub use disk::DiskChunks;
+pub use http::{HttpGet, Kept};

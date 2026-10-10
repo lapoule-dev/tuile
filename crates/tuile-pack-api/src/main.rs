@@ -39,8 +39,9 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tuile_farm::{BucketConfig, ObjectRunStore, StoreError, Tuning};
 use tuile_repository::{
-    Asked, Bench, Cached, Config, DiskChunks, FilmRepository, Layout, Objects, Place, Project,
-    Reply, RunFilms, ScenePacks, StoreObjects, TileRepository,
+    ArchivedTiles, Asked, Bench, Cached, Config, DiskChunks, FilmRepository, HttpGet, Layout,
+    Objects, Place, Project, RemoteBlocks, RemoteLive, Reply, RunFilms, ScenePacks, StoreObjects,
+    TileRepository,
 };
 use tuile_tile_server::{StoreConfig, TileStore};
 
@@ -112,6 +113,9 @@ async fn api(bench: Arc<Bench>, request: Request) -> Response {
 fn open(place: &Place) -> Result<ObjectRunStore, StoreError> {
     let tuning = Tuning::from_env();
     match place {
+        Place::Remote { url, .. } => Err(StoreError::NotFound(format!(
+            "{url}: an address is read by the store's routes, not as a bucket"
+        ))),
         Place::Dir(dir) => ObjectRunStore::local(dir, tuning),
         Place::Bucket(bucket) => ObjectRunStore::bucket(
             &BucketConfig {
@@ -214,7 +218,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     let mut store_objects = None;
+    let mut store_at = None;
     let tiles = match config.tiles {
+        Some(Place::Remote { url, header, direct, parameter }) => {
+            // Somebody else serves the store: its catalog and manifests are
+            // asked of it each time, its archives by blocks, each kept here
+            // once read.
+            let credential = match header {
+                Some(name) => Some((
+                    name,
+                    std::env::var("TUILE_TILES_REMOTE_SECRET")
+                        .map_err(|_| "TUILE_TILES_REMOTE_SECRET is not set: [tiles] names a header")?,
+                )),
+                None => None,
+            };
+            if direct {
+                store_at = Some(tuile_repository::StoreAt {
+                    url: url.clone(),
+                    header: match parameter {
+                        Some(_) => None,
+                        None => credential.as_ref().map(|(name, _)| name.clone()),
+                    },
+                    parameter: parameter.clone(),
+                    credential: std::env::var("TUILE_TILES_REMOTE_PUBLIC_SECRET").ok().filter(|v| !v.is_empty()),
+                });
+            }
+            // A block of the remote store is downloaded once and kept,
+            // memory over disk.
+            let blocks = tuile_storage_foyer::FoyerStore::keeping(tuile_storage_foyer::StoreConfig {
+                dir: cache.join("tile-store-remote"),
+                memory_bytes: 256 << 20,
+                disk_bytes: 32 << 30,
+                default_ttl: None,
+            })
+            .await?;
+            let get = Arc::new(tuile_repository::Kept::new(
+                HttpGet::new(&url, credential)?,
+                Arc::new(blocks),
+            ));
+            let live: Arc<dyn Objects> = Arc::new(RemoteLive::new(get.clone(), "store"));
+            let archives: Arc<dyn Objects> = Arc::new(RemoteBlocks::new(get, "store"));
+            store_objects = Some(StoreObjects {
+                live: live.clone(),
+                archives: archives.clone(),
+            });
+            let now: tuile_repository::Now = Arc::new(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            });
+            match ArchivedTiles::open(live, archives, now).await {
+                Ok(t) => {
+                    let tiles: Arc<dyn TileRepository> = Arc::new(t);
+                    tracing::info!("tiles: {url}, {} layers", tiles.layers().len());
+                    Some((url, tiles))
+                }
+                Err(e) => {
+                    tracing::warn!("tiles: {url} cannot be opened ({e}): /api/tiles is not served");
+                    None
+                }
+            }
+        }
         Some(place) => {
             let store = open(&place)?;
             let label = store.label().to_string();
@@ -249,6 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         projects,
         tiles,
         store: store_objects,
+        store_at,
     });
 
     let mut app = Router::new().route(

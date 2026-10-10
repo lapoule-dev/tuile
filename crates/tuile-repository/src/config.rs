@@ -11,11 +11,31 @@ use std::path::{Path, PathBuf};
 
 use crate::RunLayout;
 
-/// A bucket on the configured endpoint, or a directory.
+/// A bucket on the configured endpoint, a directory, or — for the tile
+/// store alone — another server of this API's `store/…` routes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Place {
     Bucket(String),
     Dir(PathBuf),
+    /// A tile store served by someone else: `url` is what its
+    /// `store/live/…` and `store/b8/…` routes are under. `header` names the
+    /// request header that server wants a credential in; the credential
+    /// itself is the host's secret (`TUILE_TILES_REMOTE_SECRET`), never in
+    /// this file.
+    ///
+    /// `direct`: this API's own readers — a page — are sent to that server
+    /// themselves instead of reading through this API, with a credential
+    /// meant to be public (`TUILE_TILES_REMOTE_PUBLIC_SECRET`).
+    ///
+    /// `parameter`: the query parameter a direct reader sends that
+    /// credential in, where the server takes it there — a request with no
+    /// header of its own is not preflighted by a browser.
+    Remote {
+        url: String,
+        header: Option<String>,
+        direct: bool,
+        parameter: Option<String>,
+    },
 }
 
 /// The key layout a project's bucket is read with.
@@ -47,6 +67,14 @@ struct RawPlace {
     bucket: Option<String>,
     #[serde(default)]
     dir: Option<PathBuf>,
+    #[serde(default)]
+    remote: Option<String>,
+    #[serde(default)]
+    header: Option<String>,
+    #[serde(default)]
+    direct: Option<bool>,
+    #[serde(default)]
+    parameter: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -123,7 +151,43 @@ impl Config {
             });
         }
         let tiles = match raw.tiles {
-            Some(t) => Some(place("[tiles]", t.bucket, t.dir)?),
+            Some(RawPlace {
+                bucket: None,
+                dir: None,
+                remote: Some(url),
+                header,
+                direct,
+                parameter,
+            }) => {
+                let named = header.as_deref().is_none_or(|h| {
+                    !h.is_empty() && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                });
+                if !(url.starts_with("https://") || url.starts_with("http://")) || !named {
+                    return Err(
+                        "[tiles]: `remote` is an http(s) address, `header` a header's name".into(),
+                    );
+                }
+                Some(Place::Remote {
+                    url: url.trim_end_matches('/').to_string(),
+                    header,
+                    direct: direct.unwrap_or(false),
+                    parameter: parameter.filter(|p| !p.is_empty()),
+                })
+            }
+            Some(RawPlace {
+                remote: None,
+                header: None,
+                direct: None,
+                parameter: None,
+                bucket,
+                dir,
+            }) => Some(place("[tiles]", bucket, dir)?),
+            Some(_) => {
+                return Err(
+                    "[tiles]: one of `bucket`, `dir` and `remote`; `header` and `direct` go with `remote`"
+                        .into(),
+                )
+            }
             None => None,
         };
         Ok(Config { projects, tiles })
@@ -169,5 +233,44 @@ mod tests {
         let twice = "[[project]]\nname = \"a\"\ndir = \"/x\"\nscenes = [\"p\"]\n[[project]]\nname = \"a\"\ndir = \"/y\"\nscenes = [\"p\"]\n";
         assert!(Config::parse(twice).is_err());
         assert!(Config::parse("").is_err());
+    }
+
+    #[test]
+    fn a_tile_store_served_by_someone_else_is_named_by_its_address() {
+        let project = "[[project]]\nname = \"p\"\nbucket = \"b\"\nscenes = [\"packs\"]\n";
+        let tiles = |body: &str| Config::parse(&format!("{project}[tiles]\n{body}")).map(|c| c.tiles);
+        assert_eq!(
+            tiles("remote = \"https://tiles.example/root/\"\nheader = \"X-Token\""),
+            Ok(Some(Place::Remote {
+                url: "https://tiles.example/root".into(),
+                header: Some("X-Token".into()),
+                direct: false,
+                parameter: None,
+            }))
+        );
+        assert_eq!(
+            tiles("remote = \"http://127.0.0.1:4010/v1/tiles\""),
+            Ok(Some(Place::Remote {
+                url: "http://127.0.0.1:4010/v1/tiles".into(),
+                header: None,
+                direct: false,
+                parameter: None,
+            }))
+        );
+        assert_eq!(
+            tiles("remote = \"https://t.example\"\ndirect = true"),
+            Ok(Some(Place::Remote {
+                url: "https://t.example".into(),
+                header: None,
+                direct: true,
+                parameter: None,
+            }))
+        );
+        // One place, and a header only where there is somebody to send it to.
+        assert!(tiles("remote = \"https://t.example\"\nbucket = \"b\"").is_err());
+        assert!(tiles("bucket = \"b\"\nheader = \"X-Token\"").is_err());
+        assert!(tiles("bucket = \"b\"\ndirect = true").is_err());
+        assert!(tiles("remote = \"t.example\"").is_err());
+        assert!(tiles("remote = \"https://t.example\"\nheader = \"X Token\"").is_err());
     }
 }

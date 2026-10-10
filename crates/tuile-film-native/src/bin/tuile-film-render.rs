@@ -234,12 +234,43 @@ async fn main() -> Result<(), Error> {
         .or_else(|| std::env::var("TUILE_CACHE_DIR").ok())
         .unwrap_or_else(|| "film-cache".into());
 
-    let sources = Sources::open(
-        bucket(&std::env::var("TUILE_STORE_BUCKET")?)?,
-        bucket(&std::env::var("TUILE_TILES_BUCKET")?)?,
-        &PathBuf::from(cache),
-    )
-    .await?;
+    // The packs: a directory (`TUILE_STORE_DIR`) or a bucket. The tile store:
+    // somebody else's server of the store routes (`TUILE_TILES_REMOTE`, see
+    // `tuile_repository::HttpGet::from_env`) or a bucket.
+    let runs: Arc<dyn Objects> = match std::env::var("TUILE_STORE_DIR") {
+        Ok(dir) if !dir.is_empty() => Arc::new(ObjectRunStore::local(
+            std::path::Path::new(&dir),
+            Tuning::from_env(),
+        )?),
+        _ => bucket(&std::env::var("TUILE_STORE_BUCKET")?)?,
+    };
+    // The blocks of a remote store, counted where they cross the network.
+    let mut remote_blocks: Option<Arc<tuile_repository::Kept<tuile_repository::HttpGet>>> = None;
+    // Their store, to be closed on the way out: what it has not written by
+    // then is lost, and downloaded again by the next render.
+    let mut block_store: Option<tuile_storage_foyer::FoyerStore> = None;
+    let tiles: Arc<dyn Objects> = match tuile_repository::HttpGet::from_env()? {
+        Some(get) => {
+            println!("tile store: {}/store, by its routes", get.root());
+            // A block is downloaded once: kept in a store of its own beside
+            // the film's other caches — memory over disk — for this render
+            // and the next. Sized well above a film's blocks: what the store
+            // gives up is downloaded again.
+            let blocks = tuile_storage_foyer::FoyerStore::keeping(tuile_storage_foyer::StoreConfig {
+                dir: PathBuf::from(&cache).join("store-blocks"),
+                memory_bytes: 256 << 20,
+                disk_bytes: 32 << 30,
+                default_ttl: None,
+            })
+            .await?;
+            block_store = Some(blocks.clone());
+            let kept = Arc::new(tuile_repository::Kept::new(get, Arc::new(blocks)));
+            remote_blocks = Some(kept.clone());
+            Arc::new(tuile_repository::RemoteStore::new(kept, "store"))
+        }
+        None => bucket(&std::env::var("TUILE_TILES_BUCKET")?)?,
+    };
+    let sources = Sources::open(runs, tiles, &PathBuf::from(cache)).await?;
     let film = Film::open(sources.packs.objects.as_ref(), prefix).await?;
     let (first, last) = film.frames();
     println!(
@@ -334,6 +365,10 @@ async fn main() -> Result<(), Error> {
             fetched.reads,
             megabytes(fetched.bytes)
         );
+    }
+    if let Some(blocks) = &remote_blocks {
+        let (downloaded, held) = blocks.blocks();
+        println!("store blocks: {downloaded} downloaded from the store's server, {held} answered from those kept here");
     }
     let (asked, kept) = (sources.live.so_far(), sources.revalidations());
     println!(
@@ -994,6 +1029,9 @@ async fn main() -> Result<(), Error> {
         }
     }
     sources.close().await?;
+    if let Some(blocks) = &block_store {
+        blocks.close().await?;
+    }
     Ok(())
 }
 

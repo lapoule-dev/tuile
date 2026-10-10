@@ -99,6 +99,26 @@ pub struct Bench {
     pub tiles: Option<(String, Arc<dyn TileRepository>)>,
     /// The same store, as objects.
     pub store: Option<StoreObjects>,
+    /// Where a reader finds the store when it is not behind this API: see
+    /// [`StoreAt`].
+    pub store_at: Option<StoreAt>,
+}
+
+/// A tile store served somewhere else than behind this API, as its readers
+/// are told (`GET store/at`): what its `store/live/…` and `store/b8/…` routes
+/// are under, and the header — its name and its value — that server wants.
+/// The value is handed to every reader: it is one a host means to be public.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoreAt {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// The query parameter the credential goes in instead of a header: a
+    /// request with no header of its own is not preflighted by a browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
 }
 
 /// An HTTP response, before any server has it.
@@ -481,6 +501,21 @@ impl Bench {
     /// The store's objects: `store/live/<key>` for what changes,
     /// `store/b8/<n>/<key>` for blocks of what does not.
     async fn store_route(&self, rest: &str, asked: &Asked<'_>) -> Result<Reply, Reply> {
+        // Where the store is, for a reader that goes to it itself. Asked
+        // before anything else of the store, and answered whether or not
+        // this API holds the store too.
+        if rest == "at" {
+            return match &self.store_at {
+                Some(at) => Ok(Reply {
+                    cache_control: BRIEF,
+                    ..Reply::json(at)
+                }),
+                None => Err(Reply {
+                    cache_control: BRIEF,
+                    ..Reply::text(404, "the store is behind this API")
+                }),
+            };
+        }
         let Some(store) = &self.store else {
             return Err(Reply::text(404, "no tile store configured"));
         };
@@ -731,6 +766,7 @@ mod tests {
             }],
             tiles: None,
             store: None,
+            store_at: None,
         };
         let get = |range: &'static str| {
             futures_executor::block_on(bench.get("/api/p/p/o/a.tuilepack", "", Some(range)))

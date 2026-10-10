@@ -110,20 +110,51 @@ impl FoyerStore {
     }
 
     /// Builds a store with an explicit configuration.
+    ///
+    /// An entry reaches the disk when the memory tier lets go of it: what is
+    /// still in memory when the store is closed is not written. Right for a
+    /// cache of what can be asked for again at no cost; see
+    /// [`FoyerStore::keeping`] for what must not be.
     pub async fn with_config(cfg: StoreConfig) -> Result<Self, StoreError> {
+        Self::build(cfg, foyer::HybridCachePolicy::WriteOnEviction).await
+    }
+
+    /// As [`FoyerStore::with_config`], but every entry is written to the disk
+    /// as it is put, whether or not the memory tier still holds it: after
+    /// [`FoyerStore::close`], all of it is there for the next process. For
+    /// what is costly to fetch again and never changes — an archive's blocks.
+    pub async fn keeping(cfg: StoreConfig) -> Result<Self, StoreError> {
+        Self::build(cfg, foyer::HybridCachePolicy::WriteOnInsertion).await
+    }
+
+    async fn build(cfg: StoreConfig, policy: foyer::HybridCachePolicy) -> Result<Self, StoreError> {
         std::fs::create_dir_all(&cfg.dir).map_err(|e| StoreError(e.to_string()))?;
         let device = FsDeviceBuilder::new(&cfg.dir)
             .with_capacity(cfg.disk_bytes)
             .build()
             .map_err(|e| StoreError(e.to_string()))?;
+        // Writes to the disk go through a queue, and foyer DROPS what arrives
+        // while that queue is over its threshold (32 MiB by default): right
+        // for a cache that may forget, and the reason a store asked to keep
+        // would otherwise keep a tenth of a film's blocks (measured: 23 of
+        // 530 blocks of 700 kB). A keeping store never drops: its queue has
+        // no threshold worth the name, and holds what the disk has not yet
+        // taken.
+        let engine = match policy {
+            foyer::HybridCachePolicy::WriteOnInsertion => BlockEngineConfig::new(device)
+                .with_buffer_pool_size(64 << 20)
+                .with_submit_queue_size_threshold(usize::MAX / 2),
+            foyer::HybridCachePolicy::WriteOnEviction => BlockEngineConfig::new(device),
+        };
         let cache = HybridCacheBuilder::new()
+            .with_policy(policy)
             .memory(cfg.memory_bytes)
             // Capacity is in bytes: weigh each entry by its payload length,
             // or a few large records would evict everything else.
             .with_weighter(|_k: &String, v: &Vec<u8>| v.len())
             .storage()
             .with_io_engine_config(PsyncIoEngineConfig::new())
-            .with_engine_config(BlockEngineConfig::new(device))
+            .with_engine_config(engine)
             .build()
             .await
             .map_err(|e| StoreError(e.to_string()))?;
@@ -412,5 +443,47 @@ mod tests {
     #[test]
     fn the_default_directory_is_namespaced() {
         assert!(default_cache_dir().ends_with("tuile"));
+    }
+
+    /// A film's worth of blocks — hundreds of entries of several hundred
+    /// kilobytes, more in all than the memory tier — put as fast as they
+    /// come, the store closed, and reopened: how many are still there.
+    async fn blocks_found_after_reopening(keeping: bool, count: usize, each: usize) -> usize {
+        let dir = tempfile::tempdir().expect("dir");
+        let cfg = || StoreConfig {
+            dir: dir.path().to_path_buf(),
+            memory_bytes: 256 << 20,
+            disk_bytes: 4 << 30,
+            default_ttl: None,
+        };
+        let first = if keeping { FoyerStore::keeping(cfg()).await } else { FoyerStore::with_config(cfg()).await }.expect("store");
+        for i in 0..count {
+            first.put(&format!("block/{i}"), Bytes::from(vec![i as u8; each]), None).await;
+            // As a reader's blocks arrive: one at a time, the runtime free
+            // in between to write what it was handed.
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        first.close().await.expect("close");
+        drop(first);
+        let second = FoyerStore::with_config(cfg()).await.expect("store");
+        let mut found = 0;
+        for i in 0..count {
+            if second.get(&format!("block/{i}")).await.is_some_and(|b| b.len() == each && b[0] == i as u8) {
+                found += 1;
+            }
+        }
+        found
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_keeping_store_has_every_block_after_it_is_reopened() {
+        assert_eq!(blocks_found_after_reopening(true, 530, 700 << 10).await, 530);
+    }
+
+    /// Measured, not asserted: what the default store keeps of the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn what_a_store_that_writes_on_eviction_keeps_of_the_same() {
+        let found = blocks_found_after_reopening(false, 530, 700 << 10).await;
+        println!("write on eviction: {found} of 530 found after reopening");
     }
 }
