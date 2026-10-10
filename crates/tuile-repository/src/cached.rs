@@ -123,6 +123,12 @@ impl Objects for Cached {
         Ok(size)
     }
 
+    /// Asked of the bucket each time: a validator that was kept would say
+    /// nothing of what the bucket holds now.
+    async fn stat(&self, key: &str) -> Result<(u64, Option<String>), RepoError> {
+        self.inner.stat(key).await
+    }
+
     async fn read(&self, key: &str, range: Range<u64>) -> Result<Vec<u8>, RepoError> {
         let size = self.size(key).await?;
         if range.start > range.end || range.end > size {

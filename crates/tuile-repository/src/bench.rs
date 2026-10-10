@@ -24,9 +24,11 @@
 //!
 //! **A reader of packs asks for blocks, not ranges.** An object is cut into
 //! fixed blocks of [`BLOCK`] bytes and each has its own URL, answered whole —
-//! a plain 200, immutable. That is the one shape every cache keeps without
-//! being argued with: a browser stores it like any file, and an edge cache
-//! keys it by its URL. Ranged replies are neither stored nor matched
+//! a plain 200 with a validator. That is the one shape every cache keeps
+//! without being argued with: a browser stores it like any file, and an edge
+//! cache keys it by its URL. An object can be written again under its key, so
+//! a block is kept a moment and then asked about, by its validator: a block
+//! that has not changed costs a 304 and no bytes. Ranged replies are neither stored nor matched
 //! reliably by either, and a range is whatever its asker computed, so no two
 //! askers share one. Blocks are the same for every frame, every slice of a
 //! film and every reader of it. The ranged route stays, for a media element
@@ -53,9 +55,9 @@ use crate::{FilmRepository, Objects, Read, RepoError, TileRepository, CHUNK};
 pub const BLOCK: u64 = CHUNK;
 
 /// The path segment that names a block: `b8` for eight-megabyte blocks.
-/// The size is in the URL because a block is immutable there: cut another
-/// way, the same number would be other bytes under an address every cache
-/// has been told never to ask about again.
+/// The size is in the URL because a block's number means nothing without
+/// it: cut another way, the same number would be other bytes under the same
+/// address and the same validator.
 pub fn block_segment() -> String {
     format!("b{}", BLOCK >> 20)
 }
@@ -83,12 +85,12 @@ pub struct Project {
 /// A store is a catalog, a manifest per zone, and archives. A reader that
 /// is handed those — rather than tiles, one request each — finds a tile the
 /// way the store's own reader does, and what crosses the network is blocks
-/// of archives: few, large, immutable, and the same for whoever asks, which
+/// of archives: few, large, validated, and the same for whoever asks, which
 /// is the one shape every cache keeps.
 pub struct StoreObjects {
     /// The catalog and the manifests: rewritten as tiles are added.
     pub live: Arc<dyn Objects>,
-    /// The archives: never changed once written.
+    /// The archives: read by blocks, each with its object's validator.
     pub archives: Arc<dyn Objects>,
 }
 
@@ -660,14 +662,30 @@ impl Bench {
     }
 }
 
+/// The validator of block `index` of an object: the store's validator for
+/// the object where it gives one, the key and the size where it does not.
+fn block_tag(key: &str, size: u64, tag: Option<&str>, index: u64) -> String {
+    match tag {
+        Some(tag) => {
+            let tag = tag.trim_start_matches("W/").trim_matches('"');
+            format!("\"{tag}-{size:x}-{index}\"")
+        }
+        None => format!("{}-{index}\"", etag(key, size).trim_end_matches('"')),
+    }
+}
+
 /// Block `index` of an object: bytes `index × BLOCK` up to the next
-/// block, or the object's end. Whole, immutable, and the same for whoever
-/// asks.
+/// block, or the object's end. Whole, and the same for whoever asks.
+///
+/// Its validator is the object's own, from the store that holds it, and the
+/// block's number: an object written again under its key is another object,
+/// and every block of it another block, even where the size did not move.
+/// Kept a moment and then asked about — never for good.
 async fn block(objects: &Arc<dyn Objects>, key: &str, index: u64) -> Result<Reply, Reply> {
     if !safe(key) {
         return Err(Reply::text(400, format!("not a key: {key}")));
     }
-    let size = objects.size(key).await.map_err(Reply::of)?;
+    let (size, tag) = objects.stat(key).await.map_err(Reply::of)?;
     let start = index.saturating_mul(BLOCK);
     if start >= size {
         return Err(Reply::text(404, format!("{key} has no block {index}")));
@@ -684,12 +702,9 @@ async fn block(objects: &Arc<dyn Objects>, key: &str, index: u64) -> Result<Repl
         content_type: "application/octet-stream".into(),
         content_range: None,
         ranged: false,
-        etag: Some(format!(
-            "{}-{index}\"",
-            etag(key, size).trim_end_matches('"')
-        )),
+        etag: Some(block_tag(key, size, tag.as_deref(), index)),
         object_size: Some(size),
-        cache_control: IMMUTABLE,
+        cache_control: BRIEF,
         body: Vec::new(),
         later: Some(Later {
             objects: objects.clone(),
@@ -726,6 +741,89 @@ mod tests {
         // No range: only for what is small enough to send whole.
         assert_eq!(resolve(None, 10), Some((0..10, false)));
         assert_eq!(resolve(None, big), None);
+    }
+
+    #[test]
+    fn a_block_carries_the_validator_of_the_object_it_is_of() {
+        use crate::{Entry, Listing, Objects, RepoError};
+        use std::sync::{Arc, Mutex};
+
+        /// An object of a fixed size whose store says which writing of it
+        /// this is, or says nothing.
+        struct Written(Mutex<Option<String>>);
+        #[async_trait::async_trait]
+        impl Objects for Written {
+            fn label(&self) -> String {
+                "written".into()
+            }
+            async fn list(&self, _: &str) -> Result<Vec<Entry>, RepoError> {
+                Ok(Vec::new())
+            }
+            async fn browse(&self, _: &str) -> Result<Listing, RepoError> {
+                Ok(Listing::default())
+            }
+            async fn size(&self, _: &str) -> Result<u64, RepoError> {
+                Ok(100)
+            }
+            async fn stat(&self, _: &str) -> Result<(u64, Option<String>), RepoError> {
+                Ok((100, self.0.lock().expect("lock").clone()))
+            }
+            async fn read(&self, _: &str, range: Range<u64>) -> Result<Vec<u8>, RepoError> {
+                Ok(vec![7; (range.end - range.start) as usize])
+            }
+        }
+        let written = Arc::new(Written(Mutex::new(Some("\"first\"".into()))));
+        let objects: Arc<dyn Objects> = written.clone();
+        let bench = Bench {
+            projects: vec![Project {
+                name: "p".into(),
+                films: Arc::new(crate::ScenePacks::new(objects.clone(), ["packs"])),
+                objects,
+            }],
+            tiles: None,
+            store: None,
+            store_at: None,
+        };
+        let path = format!("/api/p/p/{}/0/zone/a.pmtiles", block_segment());
+        let get = |held: Option<&str>| {
+            let asked = Asked {
+                range: None,
+                if_none_match: held,
+            };
+            futures_executor::block_on(bench.get(&path, "", asked)).expect("reply")
+        };
+        let first = get(None);
+        let tag = first.etag.clone().expect("a validator");
+        assert_eq!(first.status, 200);
+        // Kept a moment, then asked about: never for good.
+        assert!(
+            !first.cache_control.contains("immutable"),
+            "{}",
+            first.cache_control
+        );
+        assert!(
+            first.cache_control.contains("max-age="),
+            "{}",
+            first.cache_control
+        );
+        // Whoever holds it is told so, and sent nothing.
+        let held = get(Some(&tag));
+        assert_eq!((held.status, held.later.is_none()), (304, true));
+        // Written again under its key, to the same size: another block.
+        *written.0.lock().expect("lock") = Some("W/\"second\"".into());
+        let again = get(Some(&tag));
+        assert_eq!(again.status, 200);
+        let second = again.etag.expect("a validator");
+        assert_ne!(second, tag);
+        assert!(
+            second.starts_with('"') && second.ends_with("-0\""),
+            "{second}"
+        );
+        assert_eq!(get(Some(&second)).status, 304);
+        // A store with no validator to give: the key and the size still do.
+        *written.0.lock().expect("lock") = None;
+        let plain = get(None).etag.expect("a validator");
+        assert!(plain != tag && plain != second);
     }
 
     #[test]

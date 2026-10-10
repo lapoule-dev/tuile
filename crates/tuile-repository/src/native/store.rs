@@ -52,6 +52,10 @@ impl Objects for ObjectRunStore {
         Ok(ObjectRunStore::size(self, key).await?)
     }
 
+    async fn stat(&self, key: &str) -> Result<(u64, Option<String>), RepoError> {
+        Ok(ObjectRunStore::stat(self, key).await?)
+    }
+
     async fn read(&self, key: &str, range: Range<u64>) -> Result<Vec<u8>, RepoError> {
         let wanted = range.end - range.start;
         let bytes = self.get_range(key, range).await?;
