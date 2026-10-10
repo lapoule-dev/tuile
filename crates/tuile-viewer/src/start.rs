@@ -42,6 +42,7 @@ KEYS:
                        (a click on the compass ring does the same)
     L                  centre on the current location, at the present altitude
     C                  copy a link to this view (a tuile://goto?… URL)
+    V                  go to the link on the clipboard
     I                  the next imagery layer
     W                  wireframe
     D                  cycle the diagnostic views

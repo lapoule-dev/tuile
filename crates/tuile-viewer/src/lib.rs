@@ -56,6 +56,7 @@ mod globe;
 mod host;
 mod journal;
 mod location;
+mod menu;
 mod recording;
 mod session;
 mod settings;
@@ -114,6 +115,18 @@ pub fn main(embedder: impl ViewerHost) -> ! {
         std::process::exit(1);
     }
     std::process::exit(0)
+}
+
+/// The event loop — on macOS, without the windowing layer's stock menu bar:
+/// the application brings its own (`menu`), and two would be one too many.
+fn event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
+    #[cfg(all(target_os = "macos", feature = "application"))]
+    {
+        use winit::platform::macos::EventLoopBuilderExtMacOS;
+        EventLoop::builder().with_default_menu(false).build()
+    }
+    #[cfg(not(all(target_os = "macos", feature = "application")))]
+    EventLoop::new()
 }
 
 /// Lifts this process's limit on open files as far as the system allows.
@@ -303,7 +316,7 @@ fn session(embedder: &dyn ViewerHost) -> anyhow::Result<()> {
     // Before the loop: Ctrl-C and `kill` must end the session, not the process,
     // or a recording dies with it.
     signals::catch_interruptions();
-    let event_loop = EventLoop::new()?;
+    let event_loop = event_loop()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(app_config, switcher);
     let outcome = event_loop.run_app(&mut app);

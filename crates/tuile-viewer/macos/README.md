@@ -41,6 +41,41 @@ No build creates this file, nothing puts a token in the bundle, and the token
 is never logged. With neither the variable nor the file, the application says
 so in a window and names the path.
 
+## The menu bar
+
+The application has a menu bar of its own, and every key of the window is on
+it — the keys and the items are one table (`src/menu.rs`), so neither can do
+something the other does not.
+
+| menu | items (key) |
+|---|---|
+| *application* | About, Services, Hide, Hide Others, Show All, Quit (⌘Q) |
+| View | Wireframe (W) ✓, Freeze Selection (F) ✓, Diagnostic View: Normal / Unlit / Coverage / Geometry ✓, Next Diagnostic View (D) |
+| Go | North Up (N), Centre on Current Location (L), Copy Link to This View (C), Go to Copied Link (V) |
+| Imagery | one item per layer ✓, Next Layer (I) |
+| Window | Minimize, Zoom, Enter Full Screen, Bring All to Front |
+| Help | Keys and Flags |
+
+✓ marks an item that carries a check mark for the present state — whichever
+way the state was changed: a key, a URL, a script.
+
+The keys are shown without a modifier because they have none: `W` in the
+window is the whole shortcut. A press therefore has two possible readers, the
+window and the menu's key equivalent, and it must not act twice. It cannot:
+what a key or an item asks for is turned into an absolute command — *wireframe
+on*, *layer 2* — against the state as last published, so one press read by
+both asks for the same thing twice. `Esc` still quits and is the window's
+alone; the menu's Quit is ⌘Q, as the platform expects. A key held with ⌘, ⌃
+or ⌥ is not one of these.
+
+**Go to Copied Link** goes where a link on the clipboard says — one that `C`
+copied, in this session or another. It accepts a `goto` link and nothing
+else.
+
+The layers have no key of their own: a digit is a different character on
+every keyboard that keeps its digits under Shift. Shell mode (`TUILE_SHELL`)
+is read once at start and is not on the menu.
+
 ## Steering the app
 
 A running application — or one that is not running yet — is steered from

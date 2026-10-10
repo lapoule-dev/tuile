@@ -57,6 +57,9 @@ objc2 = { version = "0.6.4", optional = true }
 objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSAppleEventDescriptor", "NSAppleEventManager", "NSArray", "NSDate", "NSDictionary", "NSError", "NSRunLoop", "NSScriptCommand", "NSScriptCommandDescription", "NSString", "NSValue"] }
 # The alert shown when there is no terminal, and the clipboard.
 objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSAlert", "NSApplication", "NSPasteboard", "NSResponder", "NSRunningApplication"] }
+# The menu bar. The menu crate this workspace already locks, through the
+# status-bar readout of `tuile-ui`; nothing is added to the dependency graph.
+muda = { version = "0.19", optional = true }
 objc2-core-location = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
 
 [features]
@@ -65,4 +68,4 @@ current-location = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-core-locatio
 # What makes the viewer an application on its desktop: steering URLs from
 # other programs, a message window when there is no terminal, the clipboard.
 # macOS only; elsewhere the feature compiles to nothing.
-application = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-app-kit"]
+application = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-app-kit", "dep:muda"]

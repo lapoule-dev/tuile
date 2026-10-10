@@ -47,6 +47,22 @@ pub(crate) fn copy(text: &str) -> bool {
     system::copy(text)
 }
 
+/// The text on the clipboard, if it holds text. Read only when the person
+/// asks for it — "go to copied link" — and only looked at as a steering URL.
+pub(crate) fn paste() -> Option<String> {
+    system::paste()
+}
+
+/// Puts a request on the queue the render loop drains: the one way anything
+/// outside the loop — the system's event dispatch, a menu — acts on the view.
+#[cfg_attr(
+    not(all(target_os = "macos", feature = "application")),
+    allow(dead_code)
+)]
+pub(crate) fn queue(request: Request) {
+    system::send(request);
+}
+
 #[cfg(all(target_os = "macos", feature = "application"))]
 mod system {
     #![allow(unsafe_code)]
@@ -86,7 +102,7 @@ mod system {
     /// the render loop has one place to look.
     static OUTBOX: Mutex<Option<Sender<Request>>> = Mutex::new(None);
 
-    fn send(request: Request) {
+    pub(super) fn send(request: Request) {
         if let Ok(outbox) = OUTBOX.lock() {
             if let Some(sender) = outbox.as_ref() {
                 // A closed channel means the window is gone; so is the point
@@ -321,6 +337,14 @@ mod system {
         // SAFETY: the string type is a constant the framework exports.
         board.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString })
     }
+
+    pub(super) fn paste() -> Option<String> {
+        let board = NSPasteboard::generalPasteboard();
+        // SAFETY: the string type is a constant the framework exports.
+        board
+            .stringForType(unsafe { NSPasteboardTypeString })
+            .map(|text| text.to_string())
+    }
 }
 
 #[cfg(not(all(target_os = "macos", feature = "application")))]
@@ -341,4 +365,10 @@ mod system {
     pub(super) fn copy(_text: &str) -> bool {
         false
     }
+
+    pub(super) fn paste() -> Option<String> {
+        None
+    }
+
+    pub(super) fn send(_request: Request) {}
 }

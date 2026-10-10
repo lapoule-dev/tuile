@@ -8,7 +8,7 @@
 //! arrive on a queue filled by the desktop's event dispatch and are drained by
 //! the loop: the camera is only ever moved from the thread that draws it.
 
-use super::App;
+use super::{App, DIAGNOSTICS};
 use crate::snapshot::Snapshot;
 use crate::steer::{self, Command, Request};
 
@@ -56,6 +56,20 @@ impl App {
                 tracing::info!("traversal freeze: {on}");
             }
             Command::Wireframe(on) => self.views.wireframe = on,
+            Command::Diagnostic(view) => {
+                let view = view % DIAGNOSTICS.len();
+                if self.views.diagnostic != view {
+                    self.views.diagnostic = view;
+                    let (name, reads) = DIAGNOSTICS[view];
+                    tracing::info!("view: {name} — {reads}");
+                }
+            }
+            Command::CopyLink => self.copy_the_link(),
+            Command::PasteLink => self.go_to_the_copied_link(),
+            Command::ShowKeys => crate::desktop::alert(
+                &format!("{} — keys and flags", self.title),
+                &crate::start::usage(),
+            ),
             Command::Imagery(layer) => self.drape(layer),
             Command::NextImagery => {
                 if let Some(next) = self.imagery.next() {
@@ -77,6 +91,39 @@ impl App {
         }
     }
 
+    /// Goes where the link on the clipboard says — a link `C` copied, here or
+    /// in another session. Only a `goto`: what is pasted is a place, and a
+    /// clipboard is not a way to flip switches.
+    fn go_to_the_copied_link(&mut self) {
+        let goto = crate::desktop::paste()
+            .and_then(|text| steer::parse_url(text.trim()).ok())
+            .and_then(|commands| match commands.as_slice() {
+                [Command::Goto(goto)] => Some(*goto),
+                _ => None,
+            });
+        match goto {
+            Some(goto) => self.apply(Command::Goto(goto)),
+            None => self.say("the clipboard holds no link to a view"),
+        }
+    }
+
+    /// The state a key or a menu item is read against: the one last
+    /// published, so that one press delivered twice asks for the same thing
+    /// twice — see `crate::menu`.
+    pub(super) fn published(&self) -> crate::menu::State {
+        let layers = self.imagery.layers.len();
+        crate::snapshot::current().map_or(
+            crate::menu::State {
+                wireframe: self.views.wireframe,
+                frozen: self.views.freeze,
+                diagnostic: self.views.diagnostic,
+                layer: self.imagery.layer,
+                layers,
+            },
+            |snapshot| crate::menu::State::of(&snapshot, layers),
+        )
+    }
+
     /// Publishes this frame's view for scripts, and keeps the title bar on it.
     ///
     /// `drawn` is the count of tiles in the frame just presented and whether
@@ -94,9 +141,14 @@ impl App {
             tiles: self.drawn.0,
             settled: self.drawn.1,
             imagery: self.imagery.layers.get(self.imagery.layer),
+            layer: self.imagery.layer,
+            diagnostic: self.views.diagnostic,
             ..Snapshot::of(&self.controller, size)
         };
         crate::snapshot::publish(snapshot);
+        if let Some(menu) = self.menu.as_mut() {
+            menu.show(crate::menu::State::of(&snapshot, self.imagery.layers.len()));
+        }
         self.keep_the_title(&snapshot);
     }
 

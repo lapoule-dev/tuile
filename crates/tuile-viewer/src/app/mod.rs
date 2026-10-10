@@ -126,7 +126,7 @@ struct Active {
 /// *coverage*, and is lit in *geometry* is imagery that is genuinely black —
 /// look for the `BLACK IMAGERY` warning. Black that stays black in *geometry*
 /// is no mesh at all, and belongs to traversal or upload, never to texturing.
-const DIAGNOSTICS: [(&str, &str); 4] = [
+pub(crate) const DIAGNOSTICS: [(&str, &str); 4] = [
     ("normal", "the real picture"),
     ("unlit", "imagery only; sun and air off"),
     (
@@ -193,6 +193,8 @@ pub struct App {
     occluded: bool,
     /// The menu-bar readout, if the platform gave us one.
     statusbar: Option<tuile_ui::StatusBar>,
+    /// The application's menu bar, where the platform has one.
+    menu: Option<crate::menu::Installed>,
     /// Running totals, reported once per second and again on the way out.
     stats: crate::session::Stats,
 }
@@ -259,6 +261,7 @@ impl App {
             // Built with the window rather than here: a status item wants the
             // main thread and an event loop already running.
             statusbar: None,
+            menu: None,
             stats: crate::session::Stats {
                 started: Some(std::time::Instant::now()),
                 ..crate::session::Stats::default()

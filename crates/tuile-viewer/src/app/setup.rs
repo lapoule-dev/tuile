@@ -20,6 +20,9 @@ impl App {
     pub(super) fn start_window(&mut self, event_loop: &ActiveEventLoop) {
         let config = self.config.take().expect("config consumed once");
         self.statusbar = tuile_ui::StatusBar::new();
+        // Here and not earlier: a menu wants the application object the event
+        // loop creates, and the main thread.
+        self.menu = crate::menu::Installed::install(self.imagery.layers);
         if self.statusbar.is_none() {
             tracing::info!("no status-bar item on this platform; the readout is off");
         }
