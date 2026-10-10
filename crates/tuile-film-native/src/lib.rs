@@ -18,7 +18,8 @@
 //! - **what watches** ([`observe`]): an [`Observer`] is told of every
 //!   imagery tile that comes in, every tile built, every picture that comes
 //!   out. The render knows nothing of what an observer does with it;
-//!   [`meter::LightMeter`] is one, and measures light.
+//!   [`meter::LightMeter`] is one, and measures light; [`seams::SeamLog`]
+//!   another, and measures what is left between the tiles a frame draws.
 //!
 //! Beside them, [`reference`] reads another layer of the store under a
 //! film's imagery, for its tiles to be measured against.
@@ -30,6 +31,7 @@ pub mod nvenc;
 pub mod observe;
 pub mod reference;
 pub mod render;
+pub mod seams;
 pub mod sink;
 pub mod source;
 #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
@@ -41,6 +43,7 @@ pub use nvenc::{NvencCodec, NvencFilm};
 pub use observe::{FrameOut, ImageryIn, Observer, Origin, TileIn, Timings};
 pub use reference::{Reference, SetAgainst};
 pub use render::{render, Order, Tone};
+pub use seams::SeamLog;
 pub use sink::{Av1Film, Nothing, Pictures, Sink};
 pub use source::{Counting, Film, Reads, Sources};
 #[cfg(all(target_os = "macos", feature = "videotoolbox"))]

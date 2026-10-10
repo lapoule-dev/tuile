@@ -466,6 +466,9 @@ pub async fn render(
                     _ => [1.0; 4],
                 };
                 let refs = layers.and_then(|_| refs_of(tile));
+                let terrain_of = refs
+                    .as_ref()
+                    .map(|r| (r.terrain.level, r.terrain.x, r.terrain.y));
                 let (mesh, texture, origin, imagery_of) = match (refs, layers, scheme.as_ref()) {
                     (Some(refs), Some((terrain_layer, imagery_layer)), Some(scheme)) => {
                         let source = refs.terrain;
@@ -619,6 +622,8 @@ pub async fn render(
                     key,
                     origin,
                     imagery: &imagery_of,
+                    terrain: terrain_of,
+                    mesh: &mesh,
                 });
                 timings.observe += ms(t);
                 let t = Instant::now();
@@ -709,6 +714,8 @@ pub async fn render(
                 tiles: diff.selection.len(),
                 entered,
                 layers: &layers,
+                selection: &diff.selection,
+                camera: &camera,
                 timings,
             });
             timings.observe += ms(t);
