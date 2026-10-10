@@ -21,6 +21,8 @@ const RESOLVE_ROW: u32 = 1024u;
 @group(0) @binding(5) var vis: texture_2d<u32>;
 @group(0) @binding(6) var hdr: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(7) var samp: sampler;
+@group(0) @binding(8) var shadow_map: texture_depth_2d;
+@group(0) @binding(9) var shadow_samp: sampler_comparison;
 
 @group(1) @binding(0) var<storage, read> positions: array<f32>;
 @group(1) @binding(1) var<storage, read> normals: array<f32>;
@@ -46,6 +48,34 @@ fn bary(d: vec3f, a: vec3f, e1: vec3f, e2: vec3f) -> vec2f {
     let t = -a;
     let q = cross(t, e1);
     return vec2f(dot(t, p), dot(d, q)) * inv;
+}
+
+// How much of the sun reaches `p` (eye-relative, its normal `n`): 1 where
+// nothing in the sun's map is nearer the sun, over 3×3 texels each read
+// through the comparison's own bilinear filter.
+//
+// The point is moved off its surface by two texels before it is looked up,
+// so that ground does not shade itself across the texel it falls in. And
+// what the map does not hold is lit: beyond it nothing is known to stand
+// before the sun, and unknown is never dark.
+fn sunlit(p: vec3f, n: vec3f) -> f32 {
+    let at = frame.sun_view_proj * vec4f(p + n * (2.0 * frame.shadow.y), 1.0);
+    let uv = vec2f(at.x, -at.y) * 0.5 + 0.5;
+    if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || at.z < 0.0 || at.z > 1.0) {
+        return 1.0;
+    }
+    let texel = 1.0 / frame.shadow.z;
+    var lit = 0.0;
+    for (var j = -1; j <= 1; j++) {
+        for (var i = -1; i <= 1; i++) {
+            let to = uv + vec2f(f32(i), f32(j)) * texel;
+            lit += textureSampleCompareLevel(shadow_map, shadow_samp, to, at.z);
+        }
+    }
+    // Towards where they stop, shadows fade: no line across the ground
+    // where the map ends.
+    let fade = smoothstep(0.8 * frame.shadow.w, frame.shadow.w, length(p));
+    return lit / 9.0 * (1.0 - fade) + fade;
 }
 
 fn position_at(i: u32) -> vec3f {
@@ -110,6 +140,39 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
     }
 
     let cos = max(dot(normal, frame.to_sun.xyz), 0.0);
-    let radiance = base * (frame.world.xyz + frame.sun.xyz * cos);
+    var radiance = base * (frame.world.xyz + frame.sun.xyz * cos);
+    if (frame.shadow.x > 0.0 || frame.haze.w != 0.0) {
+        // Where the ray meets the triangle, from the eye — held inside the
+        // triangle. The raster says the pixel is on it; of a triangle seen
+        // nearly edge-on, a skirt at a seam, the ray's own meeting with
+        // its plane may be kilometres away, and the air and the sun would
+        // be read there.
+        let inside = clamp(b, vec2f(0.0), vec2f(1.0));
+        let held = inside / max(inside.x + inside.y, 1.0);
+        let p = a + held.x * e1 + held.y * e2;
+        // A point that is no place — not a number, or further than any
+        // ground an eye over the Earth can see — is left as the look
+        // without sun's map or air shades it. Where two levels of tiles
+        // part by a hair, what shows through the gap is the far side of
+        // the planet, thousands of kilometres off: the air would whiten
+        // that hair, and it is the gap that is wrong, not the air. Not a
+        // number is told by its bits: a compiler free to assume no such
+        // number exists answers any comparison with it as it likes.
+        let known = all((bitcast<vec3u>(p) & vec3u(0x7f800000u)) != vec3u(0x7f800000u))
+            && all(abs(p) < vec3f(2.0e6));
+        if (known && frame.shadow.x > 0.0 && cos > 0.0) {
+            // A shadow takes the sun, and only the sun: the dome lights
+            // shadowed ground as it lights any other.
+            let sun = cos * (1.0 - frame.shadow.x * (1.0 - sunlit(p, normal)));
+            radiance = base * (frame.world.xyz + frame.sun.xyz * sun);
+        }
+        if (known && frame.haze.w != 0.0) {
+            // What the air leaves of the ground, and its own light for the
+            // rest. Written out: air that takes nothing leaves the ground
+            // exactly as it was.
+            let left = air_left(p);
+            radiance = radiance * left + frame.horizon.xyz * (1.0 - left);
+        }
+    }
     textureStore(hdr, xy, vec4f(radiance, 1.0));
 }

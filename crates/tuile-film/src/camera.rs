@@ -57,6 +57,11 @@ impl FrameCamera {
         (DVec3::from_array(origin_ecef) - self.eye).as_vec3()
     }
 
+    /// The eye's height over the ellipsoid, in metres.
+    pub fn height(&self) -> f64 {
+        tuile_core::geo::ecef_to_geodetic(self.eye).height
+    }
+
     pub fn view_projection(&self) -> Mat4 {
         self.projection * self.view
     }

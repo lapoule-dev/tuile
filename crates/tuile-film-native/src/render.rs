@@ -99,6 +99,9 @@ pub struct Done {
     pub setup_seconds: f64,
     /// The film's grade as applied, if one was.
     pub grade: Option<FilmGrade>,
+    /// With shadows: the finest and the coarsest a texel of the sun's map
+    /// was on the ground over the frames rendered, in metres.
+    pub shadow_texel: Option<(f32, f32)>,
 }
 
 /// Store tiles asked for at once.
@@ -659,6 +662,10 @@ pub async fn render(
                 encoder.copy_buffer_to_buffer(gpu.i420_planes(), 0, planes, 0, planes.size());
             }
             gpu.queue().submit([encoder.finish()]);
+            if let Some(texel) = gpu.shadow_texel() {
+                let (fine, coarse) = done.shadow_texel.unwrap_or((texel, texel));
+                done.shadow_texel = Some((fine.min(texel), coarse.max(texel)));
+            }
             timings.draw += ms(t);
             let t = Instant::now();
             let rows = read_back(&gpu, &picture).await?;

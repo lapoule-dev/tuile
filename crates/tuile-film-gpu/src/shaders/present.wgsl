@@ -3,7 +3,8 @@
 
 // Supersampled HDR → display pixels: box filter over the k×k block, sky where
 // no tile was drawn, exposure, then the sRGB curve ("Standard" view: no tone
-// mapping, a straight clip).
+// mapping, a straight clip). The sky is the dome's one colour, or, for a
+// look that has air, runs from the horizon's colour to the zenith's.
 //
 // A host's overlays, when the frame carries any, are laid over the picture
 // between the two: after its tone — they are display-linear, and no
@@ -38,7 +39,14 @@ fn present(@builtin(global_invocation_id) id: vec3u) {
         for (var i = 0u; i < k; i++) {
             let s = id.xy * k + vec2u(i, j);
             if (textureLoad(vis, s, 0).x == 0u) {
-                sum += frame.world.xyz;
+                if (frame.haze.w != 0.0) {
+                    // The sample's own ray, as the resolve builds it.
+                    let ndc = (vec2f(s) + 0.5) / vec2f(frame.size.xy) * vec2f(2.0, -2.0)
+                        + vec2f(-1.0, 1.0);
+                    sum += sky(frame.fwd.xyz + ndc.x * frame.right.xyz + ndc.y * frame.up.xyz);
+                } else {
+                    sum += frame.world.xyz;
+                }
             } else {
                 sum += textureLoad(hdr, s, 0).rgb;
             }
