@@ -77,13 +77,16 @@
 //!   --anchor <level>      the level --meter's own solve holds still (10)
 //!   --cache <dir>         chunks of packs and archives (default
 //!                         $TUILE_CACHE_DIR, else ./film-cache)
-//!   --ribbon <points>     an overlay to see the overlay layer by: a flat
-//!                         ribbon through these points, each
+//!   --ribbon <points>     an overlay to see the overlay layer by, not a
+//!                         feature: a ribbon through these points, each
 //!                         `longitude,latitude,height` in degrees and
 //!                         metres over the ellipsoid, a space between two
 //!   --ribbon-width <m>    its width (default 30)
 //!   --ribbon-depth <terrain|always>
 //!                         hidden by nearer ground (the default), or never
+//!   --marker <point>      another: a marker standing at this point, never
+//!                         hidden
+//!   --marker-size <m>     its height (default 80)
 //! ```
 //!
 //! A first argument ending in `.tuilepack` is one pack, opened alone: a
@@ -123,55 +126,89 @@ fn bucket(name: &str) -> Result<Arc<dyn Objects>, Error> {
     )?))
 }
 
-/// The same mesh in every frame: `--ribbon`.
-struct Ribbon(OverlayMesh);
+/// The same shapes in every frame: `--ribbon` and `--marker`.
+struct Shapes(Vec<OverlayMesh>);
 
-impl Ribbon {
-    /// A flat band `width` metres across through `points`, level at each.
-    fn through(points: &str, width: f64, depth: OverlayDepth) -> Result<Self, Error> {
-        let mut path = Vec::new();
-        for point in points.split_whitespace() {
-            let at: Vec<f64> = point.split(',').map(str::parse).collect::<Result<_, _>>()?;
-            let [lon, lat, height] = at[..] else {
-                return Err(format!("{point} is not longitude,latitude,height").into());
-            };
-            let at = Geodetic {
-                lon: lon.to_radians(),
-                lat: lat.to_radians(),
-                height,
-            };
-            path.push((geodetic_to_ecef(at), enu_frame(at).z_axis));
-        }
-        if path.len() < 2 {
-            return Err("a ribbon goes through two points at least".into());
-        }
-        let origin = path[0].0;
-        let mut mesh = OverlayMesh {
-            origin_ecef: origin.to_array(),
-            depth,
-            ..OverlayMesh::default()
-        };
-        for (i, (at, up)) in path.iter().enumerate() {
-            let along: DVec3 = path[(i + 1).min(path.len() - 1)].0 - path[i.saturating_sub(1)].0;
-            let across = along.cross(*up).normalize_or_zero() * (width / 2.0);
-            for edge in [*at - across, *at + across] {
-                mesh.positions.push((edge - origin).as_vec3().to_array());
-                // Display-linear, opaque: an orange no ground is.
-                mesh.colors.push([1.0, 0.22, 0.02, 1.0]);
-            }
-            if i > 0 {
-                let v = 2 * i as u32;
-                mesh.indices
-                    .extend_from_slice(&[v - 2, v - 1, v, v, v - 1, v + 1]);
-            }
-        }
-        Ok(Self(mesh))
-    }
+/// `longitude,latitude,height`, in degrees and metres over the ellipsoid:
+/// where it is, and up there.
+fn place(point: &str) -> Result<(DVec3, DVec3), Error> {
+    let at: Vec<f64> = point.split(',').map(str::parse).collect::<Result<_, _>>()?;
+    let [lon, lat, height] = at[..] else {
+        return Err(format!("{point} is not longitude,latitude,height").into());
+    };
+    let at = Geodetic {
+        lon: lon.to_radians(),
+        lat: lat.to_radians(),
+        height,
+    };
+    Ok((geodetic_to_ecef(at), enu_frame(at).z_axis))
 }
 
-impl Overlays for Ribbon {
+/// A band `width` metres across through `points`, level across at each: a
+/// path in the air, climbing and diving as its points do.
+fn ribbon(points: &str, width: f64, depth: OverlayDepth) -> Result<OverlayMesh, Error> {
+    let path: Vec<(DVec3, DVec3)> = points
+        .split_whitespace()
+        .map(place)
+        .collect::<Result<_, _>>()?;
+    if path.len() < 2 {
+        return Err("a ribbon goes through two points at least".into());
+    }
+    let origin = path[0].0;
+    let mut mesh = OverlayMesh {
+        origin_ecef: origin.to_array(),
+        depth,
+        ..OverlayMesh::default()
+    };
+    // Display-linear, opaque: an orange no ground is, one edge deeper than
+    // the other so that a turn reads as one.
+    let edges = [[0.72, 0.1, 0.0, 1.0], [1.0, 0.3, 0.03, 1.0]];
+    for (i, (at, up)) in path.iter().enumerate() {
+        let along = path[(i + 1).min(path.len() - 1)].0 - path[i.saturating_sub(1)].0;
+        let across = along.cross(*up).normalize_or_zero() * (width / 2.0);
+        for (edge, color) in [*at - across, *at + across].into_iter().zip(edges) {
+            mesh.positions.push((edge - origin).as_vec3().to_array());
+            mesh.colors.push(color);
+        }
+        if i > 0 {
+            let v = 2 * i as u32;
+            mesh.indices
+                .extend_from_slice(&[v - 2, v - 1, v, v, v - 1, v + 1]);
+        }
+    }
+    Ok(mesh)
+}
+
+/// A marker `size` metres tall standing on its point at `point`, tested
+/// against nothing: it shows through whatever stands before it.
+fn marker(point: &str, size: f64) -> Result<OverlayMesh, Error> {
+    let (at, up) = place(point)?;
+    let east = DVec3::Z.cross(up).normalize_or_zero();
+    let north = up.cross(east);
+    let (waist, half) = (up * (size * 0.6), size * 0.3);
+    let mut mesh = OverlayMesh {
+        origin_ecef: at.to_array(),
+        positions: vec![[0.0; 3], (up * size).as_vec3().to_array()],
+        // Its point deep, its top white, its waist between.
+        colors: vec![[0.0, 0.1, 0.5, 1.0], [1.0, 1.0, 1.0, 1.0]],
+        depth: OverlayDepth::Always,
+        ..OverlayMesh::default()
+    };
+    for corner in [east, north, -east, -north] {
+        mesh.positions
+            .push((waist + corner * half).as_vec3().to_array());
+        mesh.colors.push([0.0, 0.75, 1.0, 1.0]);
+    }
+    for side in 0..4u32 {
+        let (a, b) = (2 + side, 2 + (side + 1) % 4);
+        mesh.indices.extend_from_slice(&[0, a, b, 1, b, a]);
+    }
+    Ok(mesh)
+}
+
+impl Overlays for Shapes {
     fn frame(&mut self, _: u32, _: &BakedView, out: &mut Vec<OverlayMesh>) {
-        out.push(self.0.clone());
+        out.extend(self.0.iter().cloned());
     }
 }
 
@@ -373,8 +410,9 @@ async fn main() -> Result<(), Error> {
         &mut nobody
     };
 
-    let mut ribbon = match value("--ribbon") {
-        Some(points) => Some(Ribbon::through(
+    let mut shapes = Shapes(Vec::new());
+    if let Some(points) = value("--ribbon") {
+        shapes.0.push(ribbon(
             &points,
             value("--ribbon-width").map_or(Ok(30.0), |w| w.parse())?,
             match value("--ribbon-depth").as_deref() {
@@ -384,16 +422,14 @@ async fn main() -> Result<(), Error> {
                     return Err(format!("a ribbon is tested terrain or always, not {other}").into())
                 }
             },
-        )?),
-        None => None,
-    };
-    let mut none = ();
-    let overlays: &mut dyn Overlays = match &mut ribbon {
-        Some(ribbon) => ribbon,
-        None => &mut none,
-    };
+        )?);
+    }
+    if let Some(point) = value("--marker") {
+        let size = value("--marker-size").map_or(Ok(80.0), |s| s.parse())?;
+        shapes.0.push(marker(&point, size)?);
+    }
 
-    let done = render(&sources, &film, &order, overlays, &mut sink, observer).await?;
+    let done = render(&sources, &film, &order, &mut shapes, &mut sink, observer).await?;
     let megabytes = |b: u64| b as f64 / 1e6;
     println!(
         "{} frames at {}×{} in {:.1} s ({:.2} frames/s), {:.1} s of it before the first frame",
