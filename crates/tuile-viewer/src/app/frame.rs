@@ -44,9 +44,10 @@ impl App {
         self.take_this_frames_share_of_the_stream();
         self.upload_the_view();
         self.upload_the_control();
-        let Some((rendered, resolution)) = self.draw_and_present() else {
+        let Some((rendered, resolution, old_imagery)) = self.draw_and_present() else {
             return;
         };
+        self.note_the_turn_over(old_imagery);
         // After the draw, and deliberately: neither of these is drawing, and
         // both want the whole of `self` while the drawn tiles still borrow the
         // pump.
@@ -217,8 +218,10 @@ impl App {
     /// One method because the resolved tiles borrow the pump: choosing them and
     /// drawing them cannot be separated without either copying the list or
     /// resolving twice. Returns how many were drawn and how well, for the
-    /// status line.
-    fn draw_and_present(&mut self) -> Option<(usize, tuile_wgpu::Resolution)> {
+    /// status line — and how many of them still wear imagery other than the
+    /// layer now being served, which is how far a switch has left to go.
+    fn draw_and_present(&mut self) -> Option<(usize, tuile_wgpu::Resolution, usize)> {
+        let serving = self.imagery.generation;
         let active = self.active.as_mut()?;
         // For any selected tile not yet uploaded, fall back to its nearest ready
         // ancestor so refinement never flashes the background.
@@ -232,6 +235,12 @@ impl App {
         // server sends it and the pump reads it. Nothing here to get wrong.
         let (drawn, resolution) = active.pump.resolve(&active.gpu.queue);
         let rendered = drawn.exact.len() + drawn.fallback.len();
+        let old_imagery = drawn
+            .exact
+            .iter()
+            .chain(drawn.fallback.iter())
+            .filter(|tile| tile.imagery_source.is_some_and(|source| source != serving))
+            .count();
         // `resolve` has already brought the selection onto the current render
         // origin. The coarse layer behind it is drawn without going through
         // `resolve`, so it asks for itself.
@@ -310,7 +319,7 @@ impl App {
         if outcome != tuile_wgpu::Presented::Yes {
             return None;
         }
-        Some((rendered, resolution))
+        Some((rendered, resolution, old_imagery))
     }
 
     /// The one line a person watching a globe wants, at most once a second.

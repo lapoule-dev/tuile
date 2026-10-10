@@ -70,6 +70,10 @@ impl ImageryProvider for Held<dyn ImageryProvider> {
         self.0.tiling_scheme()
     }
 
+    fn generation(&self) -> u64 {
+        self.0.generation()
+    }
+
     async fn fetch_tile_bytes(
         &self,
         coord: tuile_core::raster::ImageryCoord,

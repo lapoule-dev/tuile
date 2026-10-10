@@ -137,10 +137,11 @@ pub struct GpuContext {
 }
 
 impl GpuContext {
-    /// The texture for an imagery coord, uploaded once however many tiles drape
-    /// it. `upload` runs only on a miss.
+    /// The texture for one tile of one imagery set, uploaded once however many
+    /// tiles drape it. `upload` runs only on a miss.
     pub(crate) fn shared_imagery(
         &self,
+        source: u32,
         coord: ImageryCoord,
         upload: impl FnOnce() -> GpuImagery,
     ) -> Arc<GpuImagery> {
@@ -148,7 +149,7 @@ impl GpuContext {
             .lock()
             .expect("imagery textures")
             .0
-            .get_or_insert(coord, upload)
+            .get_or_insert_from(source, coord, upload)
     }
 
     /// Wraps an existing device/queue (the viewer path: the host created

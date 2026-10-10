@@ -59,6 +59,8 @@ pub(crate) struct Snapshot {
     /// than a coarser stand-in still waiting for it: the picture has stopped
     /// refining, and a capture taken now is the one that was meant.
     pub settled: bool,
+    /// The imagery layer being draped, of the host's list.
+    pub imagery: Option<&'static crate::embed::ImageryChoice>,
 }
 
 impl Snapshot {
@@ -93,6 +95,7 @@ impl Snapshot {
             located: false,
             tiles: 0,
             settled: false,
+            imagery: None,
         }
     }
 }
@@ -121,7 +124,7 @@ pub(crate) enum Value {
 
 /// Every property of the view, by the key the dictionary's `cocoa key` names:
 /// the key, its type, and whether a script may set it.
-pub(crate) const PROPERTIES: [(&str, Kind, bool); 17] = [
+pub(crate) const PROPERTIES: [(&str, Kind, bool); 20] = [
     ("longitude", Kind::Real, false),
     ("latitude", Kind::Real, false),
     ("altitude", Kind::Real, false),
@@ -139,6 +142,11 @@ pub(crate) const PROPERTIES: [(&str, Kind, bool); 17] = [
     ("viewURL", Kind::Text, false),
     ("tileCount", Kind::Integer, false),
     ("settled", Kind::Flag, false),
+    // The layer by its key — what `--imagery` and the URLs call it — which a
+    // script may set; then the same layer in the words a person reads.
+    ("imagery", Kind::Text, true),
+    ("imageryName", Kind::Text, false),
+    ("imageryAttribution", Kind::Text, false),
 ];
 
 /// Answers one property from a snapshot; `None` for a key that is not one.
@@ -175,6 +183,15 @@ pub(crate) fn property(s: &Snapshot, key: &str) -> Option<Value> {
         "viewURL" => Value::Text(crate::steer::link(&s.view)),
         "tileCount" => Value::Integer(i64::try_from(s.tiles).unwrap_or(i64::MAX)),
         "settled" => Value::Flag(s.settled),
+        "imagery" => s
+            .imagery
+            .map_or(Value::Missing, |l| Value::Text(l.key.clone())),
+        "imageryName" => s
+            .imagery
+            .map_or(Value::Missing, |l| Value::Text(l.name.clone())),
+        "imageryAttribution" => s
+            .imagery
+            .map_or(Value::Missing, |l| Value::Text(l.attribution.clone())),
         _ => return None,
     })
 }
@@ -230,10 +247,14 @@ mod tests {
             pitch: 30.0,
         };
         let controller = CameraController::new(view.camera());
+        let layer: &'static crate::embed::ImageryChoice = Box::leak(Box::new(
+            crate::embed::ImageryChoice::new("labels", "Aerial with labels", 3, "© someone"),
+        ));
         Snapshot {
             wireframe: true,
             tiles: 42,
             settled: true,
+            imagery: Some(layer),
             ..Snapshot::of(&controller, (1600, 1000))
         }
     }
@@ -342,6 +363,38 @@ mod tests {
             ..snapshot()
         };
         assert_eq!(title(&high), "46.0000°N 2.0000°E · 2000 km");
+    }
+
+    /// A script reads the layer three ways — the key it would set, the name
+    /// a person reads, whose pictures they are — and reads nothing where
+    /// there is no layer.
+    #[test]
+    fn the_imagery_properties_are_the_draped_layers() {
+        let s = snapshot();
+        let none = Snapshot {
+            imagery: None,
+            ..snapshot()
+        };
+        let text = |key: &str| property(&s, key);
+        assert_eq!(text("imagery"), Some(Value::Text("labels".into())));
+        assert_eq!(
+            text("imageryName"),
+            Some(Value::Text("Aerial with labels".into()))
+        );
+        assert_eq!(
+            text("imageryAttribution"),
+            Some(Value::Text("© someone".into()))
+        );
+        for key in ["imagery", "imageryName", "imageryAttribution"] {
+            assert_eq!(property(&none, key), Some(Value::Missing), "{key}");
+        }
+        // Only the key is a script's to set.
+        let writable: Vec<&str> = PROPERTIES
+            .iter()
+            .filter(|(key, _, writable)| *writable && key.starts_with("imagery"))
+            .map(|(key, _, _)| *key)
+            .collect();
+        assert_eq!(writable, ["imagery"]);
     }
 
     /// The dictionary file and this table are the same list: a property in

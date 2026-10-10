@@ -97,6 +97,15 @@
       <property name="settled" code="Vset" type="boolean" access="r" description="Whether every tile drawn is the one selected, with no coarser stand-in waiting to be replaced: the picture has stopped refining.">
         <cocoa key="settled"/>
       </property>
+      <property name="imagery" code="Vimg" type="text" access="rw" description="The imagery layer draped on the ground, by its key — one of the layers the application lists under --help. Setting it switches layer; the old imagery stays on each tile until the new has arrived.">
+        <cocoa key="imagery"/>
+      </property>
+      <property name="imagery name" code="Vimn" type="text" access="r" description="The name of the imagery layer, as a person reads it.">
+        <cocoa key="imageryName"/>
+      </property>
+      <property name="imagery attribution" code="Vima" type="text" access="r" description="Whose pictures the imagery layer is made of.">
+        <cocoa key="imageryAttribution"/>
+      </property>
     </class-extension>
 
   </suite>

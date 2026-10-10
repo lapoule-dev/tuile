@@ -147,9 +147,23 @@ pub(crate) fn identity() -> &'static Identity {
         .unwrap_or_else(|| DEFAULT.get_or_init(Identity::default))
 }
 
-/// Fixes the process's identity. Once: the first host wins, and there is one.
-pub(crate) fn adopt(identity: Identity) {
+/// Fixes the process's identity and its layers. Once: the first host wins,
+/// and there is one.
+pub(crate) fn adopt(identity: Identity, layers: Vec<ImageryChoice>) {
     let _ = IDENTITY.set(identity);
+    let _ = LAYERS.set(layers);
+}
+
+static LAYERS: OnceLock<Vec<ImageryChoice>> = OnceLock::new();
+
+/// The imagery layers the host offers, in its order. Empty before a host has
+/// said — which is every test of this library that does not pass its own.
+///
+/// Process-wide for the same reason the identity is: the desktop's event
+/// dispatch, the scripting runtime and the menu all need the list, none of
+/// them is handed the application, and there is one list.
+pub(crate) fn layers() -> &'static [ImageryChoice] {
+    LAYERS.get().map_or(&[], Vec::as_slice)
 }
 
 /// The terrain a session stands on.
@@ -340,7 +354,10 @@ mod tests {
         let (mine, theirs) = (Identity::default(), other);
         if let (Some(a), Some(b)) = (mine.credential_file(), theirs.credential_file()) {
             assert_ne!(a, b);
-            assert!(b.to_string_lossy().to_lowercase().contains("atlas"), "{b:?}");
+            assert!(
+                b.to_string_lossy().to_lowercase().contains("atlas"),
+                "{b:?}"
+            );
             assert!(b.ends_with("token"));
         }
         if let (Some(a), Some(b)) = (mine.log_file(), theirs.log_file()) {
@@ -365,6 +382,9 @@ mod tests {
             file: Some("/somewhere/token".into()),
         }
         .to_string();
-        assert!(said.contains("SOME_KEY") && said.contains("/somewhere/token"), "{said}");
+        assert!(
+            said.contains("SOME_KEY") && said.contains("/somewhere/token"),
+            "{said}"
+        );
     }
 }

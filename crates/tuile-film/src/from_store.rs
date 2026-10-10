@@ -184,6 +184,7 @@ pub fn compose(
         .imagery
         .iter()
         .map(|placed| ImageryLayer {
+            source: 0,
             coord: coord_of(&placed.tile),
             texture: texture(&placed.tile),
             coverage: placed.coverage,

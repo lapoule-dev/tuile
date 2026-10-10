@@ -89,6 +89,7 @@ fn quad() -> DecodedTileContent {
 /// A layer of one flat colour over `coverage`, in the tile's own uv space.
 fn layer(index: u32, colour: [u8; 3], coverage: [f32; 4]) -> ImageryLayer {
     ImageryLayer {
+        source: 0,
         // Distinct per layer: the shared-imagery pool is keyed by coord, so two
         // layers claiming the same one would be the same texture and the test
         // would compare a colour with itself.

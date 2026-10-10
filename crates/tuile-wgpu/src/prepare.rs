@@ -98,6 +98,11 @@ pub struct PreparedTile {
     /// whole surface. A recorder gates on the gap; a viewer tolerates it for
     /// the frames the drape needs to catch up.
     pub sharpest_imagery_level: Option<u32>,
+    /// Which imagery set this tile is draped with, when it is draped at all:
+    /// the newest [`source`](tuile_core::raster::ImageryLayer::source) among
+    /// its layers. What a host reads to know how far a switch of imagery has
+    /// crossed the screen.
+    pub imagery_source: Option<u32>,
 }
 
 impl PreparedTile {
@@ -195,7 +200,9 @@ pub fn prepare(
             textures: batch
                 .iter()
                 .map(|layer| {
-                    gpu.shared_imagery(layer.coord, || upload_texture(gpu, &layer.texture))
+                    gpu.shared_imagery(layer.source, layer.coord, || {
+                        upload_texture(gpu, &layer.texture)
+                    })
                 })
                 .collect(),
             table: gpu
@@ -238,6 +245,7 @@ pub fn prepare(
 
     PreparedTile {
         sharpest_imagery_level: content.imagery.iter().map(|l| l.coord.level).max(),
+        imagery_source: content.imagery.iter().map(|l| l.source).max(),
         meshes,
         tile_bg,
         tile_buf,

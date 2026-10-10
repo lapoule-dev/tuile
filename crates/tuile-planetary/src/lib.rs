@@ -21,9 +21,11 @@
 
 mod provenance;
 mod sources;
+mod switch;
 
 pub use provenance::{digest, Provenance, TerrainOrigin};
 pub use sources::{Held, Sources};
+pub use switch::SwitchableImagery;
 
 use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
@@ -426,6 +428,11 @@ struct ImageryCache {
     map: HashMap<ImageryCoord, Arc<DecodedTexture>>,
     order: VecDeque<ImageryCoord>,
     cap: usize,
+    /// The provider's [`generation`](ImageryProvider::generation) everything
+    /// in `map` was fetched under. A coord names a different picture on each
+    /// side of a switch of imagery, so the cache belongs to one generation at
+    /// a time — see [`ImageryCache::turn_to`].
+    generation: u64,
 }
 
 impl ImageryCache {
@@ -434,6 +441,23 @@ impl ImageryCache {
             map: HashMap::new(),
             order: VecDeque::new(),
             cap,
+            generation: 0,
+        }
+    }
+
+    /// Makes this the cache of `generation`, forgetting every tile of any
+    /// other.
+    ///
+    /// Forgetting is safe and it is not what takes the old picture off the
+    /// screen: the cache hands out `Arc`s, so every drape already built keeps
+    /// the textures it names for as long as its tile is resident. What is
+    /// forgotten is only the *lookup*, which from here on would answer the
+    /// new imagery's question with the old imagery's tile.
+    fn turn_to(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.map.clear();
+            self.order.clear();
+            self.generation = generation;
         }
     }
 
@@ -635,6 +659,15 @@ pub struct PlanetaryLoader<T: TerrainSource, I: ImageryProvider> {
 }
 
 impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T, I> {
+    /// The decoded-imagery cache, as the cache of the imagery being served
+    /// **now**. Every access goes through here, so no lookup can answer with
+    /// a tile fetched before a switch.
+    fn decoded(&self) -> std::sync::MutexGuard<'_, ImageryCache> {
+        let mut cache = self.cache.lock().expect("imagery cache");
+        cache.turn_to(self.imagery.generation());
+        cache
+    }
+
     /// Folds a tile's `metadata` ranges into the shared availability, so the
     /// next traversal can refine past this level (how Cesium World Terrain
     /// reaches its finest LOD). Idempotent by way of the availability's own
@@ -671,7 +704,11 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         &self,
         c: ImageryCoord,
     ) -> Result<(ImageryCoord, Arc<DecodedTexture>), LoadError> {
-        if let Some(tex) = self.cache.lock().expect("imagery cache").get(&c) {
+        // Read before the fetch, and compared after it: bytes that were asked
+        // of one imagery set and answered across a switch belong to neither
+        // side's cache.
+        let generation = self.imagery.generation();
+        if let Some(tex) = self.decoded().get(&c) {
             return Ok((c, tex));
         }
         let scheme = self.imagery.tiling_scheme();
@@ -714,10 +751,12 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                     );
                     tuile_core::metrics::metrics().black_textures.inc();
                 }
-                self.cache
-                    .lock()
-                    .expect("imagery cache")
-                    .put(c, Arc::clone(&tex));
+                {
+                    let mut cache = self.decoded();
+                    if cache.generation == generation {
+                        cache.put(c, Arc::clone(&tex));
+                    }
+                }
                 Ok((c, tex))
             }
             // Absent at this zoom: stand on the parent. Recursing returns the
@@ -912,6 +951,16 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         })
     }
 
+    /// Drapes `content` with the imagery being served, whole and from one
+    /// imagery set.
+    ///
+    /// A drape is several fetches, and a provider that can be switched
+    /// ([`ImageryProvider::generation`]) may be switched between two of them.
+    /// The result would be a tile half in each picture — and, when the two
+    /// are cut on different grids, tiles of one placed by the other's
+    /// rectangles. So the generation is read before and after, and a drape
+    /// that straddled a switch is thrown away and built again; every layer of
+    /// the one that is kept is stamped with the generation it belongs to.
     async fn drape(
         &self,
         content: &mut tuile_core::DecodedTileContent,
@@ -919,6 +968,32 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         terrain_level: u32,
         id: TileId,
     ) -> Result<(), LoadError> {
+        loop {
+            let generation = self.imagery.generation();
+            content.withheld_drape = None;
+            content.imagery.clear();
+            self.drape_once(content, rect, terrain_level, id).await?;
+            if self.imagery.generation() == generation {
+                for layer in &mut content.imagery {
+                    // Truncated on purpose: an identity among the imagery sets
+                    // one session holds at once, of which there are two.
+                    layer.source = generation as u32;
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    async fn drape_once(
+        &self,
+        content: &mut tuile_core::DecodedTileContent,
+        rect: &GeoRect,
+        terrain_level: u32,
+        id: TileId,
+    ) -> Result<(), LoadError> {
+        // The cache is turned to the imagery being served before anything
+        // looks into it — `floor_under` below does, by its own lock.
+        drop(self.decoded());
         let scheme = self.imagery.tiling_scheme();
         // Start from the imagery level whose texel spacing matches the terrain
         // tile's geometric error (Cesium's getLevelWithMaximumTexelSpacing)…
@@ -1290,7 +1365,13 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
         let budget = self.opts.imagery_slots.get().saturating_sub(1).max(1);
         let deepest = scheme.containing_tile(&geo);
         let from = (deepest.level + 2).min(scheme.maximum_level);
-        if let Ok(cache) = self.cache.lock() {
+        if let Ok(mut cache) = self.cache.lock() {
+            // Only what the imagery being served has decoded: just after a
+            // switch that is nothing, the stand-in is refused below, and the
+            // consumer keeps the ancestor it has — still wearing the old
+            // picture, which is the point.
+            let generation = self.imagery.generation();
+            cache.turn_to(generation);
             // The floor-plus-partial pick — see `stand_in_layers` for why
             // "partial" is the word that matters here.
             for (served, covers) in
@@ -1311,7 +1392,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
                     covers,
                 );
                 if layer.is_visible() {
-                    content.imagery.push(layer);
+                    content.imagery.push(layer.from_source(generation as u32));
                 }
             }
         }
@@ -1364,6 +1445,12 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
     ///
     /// Bounded concurrency: this competes with the loads the picture is waiting
     /// on, and a warm-up that starves the first frame has defeated itself.
+    /// The imagery being served: a switch of imagery is a change of what
+    /// every tile's content is, which is exactly what an epoch says.
+    fn epoch(&self) -> u64 {
+        self.imagery.generation()
+    }
+
     async fn warm_up(&self, through_level: u32) {
         use futures_util::stream::StreamExt;
 
@@ -1677,6 +1764,111 @@ mod tests {
         let _ =
             futures_executor::block_on(loader.drape(&mut content, &some_ground(), 8, TileId(7)));
         content
+    }
+
+    /// An imagery set that is one flat shade everywhere, on the geographic
+    /// grid.
+    struct Painted(u8);
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl raster::ImageryProvider for Painted {
+        fn tiling_scheme(&self) -> raster::TilingScheme {
+            raster::TilingScheme::geographic()
+        }
+
+        async fn fetch_tile_bytes(
+            &self,
+            _coord: ImageryCoord,
+        ) -> Result<tuile_core::fetch::Fetched<bytes::Bytes>, raster::RasterError> {
+            let picture =
+                image::RgbaImage::from_pixel(4, 4, image::Rgba([self.0, self.0, self.0, 255]));
+            let mut png = std::io::Cursor::new(Vec::new());
+            picture
+                .write_to(&mut png, image::ImageFormat::Png)
+                .expect("a png");
+            Ok(tuile_core::fetch::Fetched::undated(bytes::Bytes::from(
+                png.into_inner(),
+            )))
+        }
+    }
+
+    /// **After a switch, a drape is the new imagery and says so.**
+    ///
+    /// Two things have to hold, and each was a way for a switch to show
+    /// nothing. The decode cache is keyed by tile address, so without turning
+    /// it over the second drape is answered from the first one's tiles — the
+    /// old picture, served as the new. And a consumer shares textures by
+    /// `(source, coord)`, so a layer not stamped with its generation is handed
+    /// the old texture still held by every tile not yet refreshed.
+    #[test]
+    fn a_switch_of_imagery_drapes_the_new_set_under_a_new_identity() {
+        let switch = SwitchableImagery::new(Arc::new(Painted(10)));
+        let scheme = GeographicTilingScheme::default();
+        let loader = PlanetaryLoader {
+            terrain: NoTerrain,
+            imagery: switch.clone(),
+            scheme,
+            opts: GlobeOptions::default(),
+            cache: Mutex::new(ImageryCache::new(64)),
+            meshes: Mutex::new(MeshCache::new(8)),
+            fill_meshes: Mutex::new(MeshCache::new(8)),
+            availability: Arc::new(tuile_terrain::Availability::default()),
+            provenance: Arc::default(),
+            detail: ImageryDetail::default(),
+            heights: Arc::new(TerrainHeights::new(scheme)),
+            offload: offload::inline(),
+        };
+        let drape = || {
+            let mut content = tuile_core::DecodedTileContent {
+                withheld_drape: None,
+                meshes: Vec::new(),
+                textures: Vec::new(),
+                imagery: Vec::new(),
+                local_origin_ecef: glam::DVec3::ZERO,
+                transform_local: glam::Mat4::IDENTITY,
+            };
+            futures_executor::block_on(loader.drape(&mut content, &some_ground(), 8, TileId(7)))
+                .expect("a drape");
+            assert!(!content.imagery.is_empty(), "nothing was draped");
+            content
+                .imagery
+                .iter()
+                .map(|layer| (layer.source, layer.coord, layer.texture.rgba8[0]))
+                .collect::<Vec<_>>()
+        };
+
+        let before = drape();
+        assert!(before
+            .iter()
+            .all(|(source, _, shade)| (*source, *shade) == (0, 10)));
+        assert_eq!(TileLoader::epoch(&loader), 0);
+
+        assert_eq!(switch.switch_to(Arc::new(Painted(200))), 1);
+        assert_eq!(
+            TileLoader::epoch(&loader),
+            1,
+            "the loader's epoch is the imagery's"
+        );
+        let after = drape();
+        // The same ground, so the same tile addresses — and none of the old
+        // pixels, and none of the old identities.
+        assert_eq!(
+            after.iter().map(|(_, coord, _)| *coord).collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|(_, coord, _)| *coord)
+                .collect::<Vec<_>>(),
+        );
+        for (source, coord, shade) in &after {
+            assert_eq!(
+                *shade, 200,
+                "{coord:?} was served from the old imagery's cache"
+            );
+            assert_eq!(
+                *source, 1,
+                "{coord:?} still carries the old imagery's identity"
+            );
+        }
     }
 
     /// A drape the consumer already holds costs **nothing**: no request leaves.

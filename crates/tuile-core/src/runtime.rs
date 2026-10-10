@@ -86,6 +86,10 @@ pub fn in_process_with(
             cache,
             residency: ResidencyView::default(),
             in_flight: HashMap::new(),
+            started: HashMap::new(),
+            epochs: HashMap::new(),
+            refreshing: HashSet::new(),
+            settled_epoch: 0,
             acked: HashSet::new(),
             filled: HashSet::new(),
             priming: Vec::new(),
@@ -114,6 +118,21 @@ pub struct GeometryServer {
     cache: ResidentCache,
     residency: ResidencyView,
     in_flight: HashMap<TileId, AbortHandle>,
+    /// The loader's [`epoch`](TileLoader::epoch) when each in-flight load was
+    /// started — what its content will be recorded as, whatever the loader
+    /// has moved on to by the time it lands.
+    started: HashMap<TileId, u64>,
+    /// The epoch each resident tile's content was loaded under. A tile whose
+    /// entry is not the loader's present epoch is out of date and due a
+    /// refresh — see [`Session::refresh`].
+    epochs: HashMap<TileId, u64>,
+    /// In-flight loads that are refreshes of a tile already resident, rather
+    /// than first loads. They are not cancelled by a camera move, and one
+    /// that fails costs the new picture, not the session.
+    refreshing: HashSet<TileId>,
+    /// The epoch every resident tile is known to be at, so a settled session
+    /// pays one comparison a pass for the mechanism and nothing else.
+    settled_epoch: u64,
     /// Tiles the consumer has confirmed it holds, from `ClientMessage::Ack`.
     ///
     /// The server's residency is not the consumer's: content is sent, then
@@ -153,6 +172,10 @@ impl GeometryServer {
             cache: &mut self.cache,
             residency: &mut self.residency,
             in_flight: &mut self.in_flight,
+            started: &mut self.started,
+            epochs: &mut self.epochs,
+            refreshing: &mut self.refreshing,
+            settled_epoch: &mut self.settled_epoch,
             priming: &mut self.priming,
             priming_outstanding: &mut self.priming_outstanding,
             priming_state: &mut self.priming_state,
@@ -275,6 +298,10 @@ struct Session<'a> {
     cache: &'a mut ResidentCache,
     residency: &'a mut ResidencyView,
     in_flight: &'a mut HashMap<TileId, AbortHandle>,
+    started: &'a mut HashMap<TileId, u64>,
+    epochs: &'a mut HashMap<TileId, u64>,
+    refreshing: &'a mut HashSet<TileId>,
+    settled_epoch: &'a mut u64,
     /// Coarse tiles asked for once at startup; drained as fetch slots free up.
     priming: &'a mut Vec<TileId>,
     /// Every primed tile that has not yet been answered — still queued above,
@@ -359,6 +386,8 @@ impl Session<'_> {
             ClientMessage::Cancel { tile } => {
                 if let Some(handle) = self.in_flight.remove(&tile) {
                     handle.abort();
+                    self.started.remove(&tile);
+                    self.refreshing.remove(&tile);
                 }
                 false
             }
@@ -598,6 +627,7 @@ impl Session<'_> {
         let reclaimed = self.cache.trim(self.selected);
         for tile in &reclaimed {
             self.residency.remove(*tile);
+            self.epochs.remove(tile);
             // Same hygiene as the insert-path eviction: the `Evict` below takes
             // the consumer's copy and its stand-in alike, so both records stop
             // being true here. `acked` left behind is the worse of the two — it
@@ -675,12 +705,20 @@ impl Session<'_> {
             let stale: Vec<TileId> = self
                 .in_flight
                 .keys()
-                .filter(|t| !wanted.contains(t) && !self.priming_outstanding.contains(t))
+                // Nor is a refresh: it is wanted by no view in particular and
+                // by every view that will ever look at its tile, and the old
+                // picture is on screen until it lands.
+                .filter(|t| {
+                    !wanted.contains(t)
+                        && !self.priming_outstanding.contains(t)
+                        && !self.refreshing.contains(t)
+                })
                 .copied()
                 .collect();
             for t in stale {
                 if let Some(handle) = self.in_flight.remove(&t) {
                     handle.abort();
+                    self.started.remove(&t);
                     crate::metrics::metrics().loads_cancelled.inc();
                 }
             }
@@ -710,49 +748,112 @@ impl Session<'_> {
             // Protected like anything else asked for, so a sweep between now
             // and its arrival cannot make the work pointless.
             self.selected.insert(tile);
-            let loader = Arc::clone(self.loader);
-            let (handle, registration) = AbortHandle::new_pair();
-            let fut: BoxLoadFut = Box::pin(async move {
-                let result = loader.load(tile).await;
-                (tile, result)
-            });
-            loads.push(Abortable::new(fut, registration));
-            self.in_flight.insert(tile, handle);
-            let m = crate::metrics::metrics();
-            m.loads_started.inc();
-            m.loads_by_level.inc(self.tree.level(tile));
-            m.loads_in_flight.set(self.in_flight.len() as u64);
+            self.start(tile, loads);
         }
         // Spawn new loads, highest priority first, within the cap. The
         // traversal only requests tiles that have content, so the loader is
         // never asked to load a structural-empty tile.
-        for req in &self.out.requests {
+        let wanted: Vec<TileId> = self.out.requests.iter().map(|r| r.tile).collect();
+        for tile in wanted {
             if self.in_flight.len() >= self.config.maximum_simultaneous_fetches {
                 break;
             }
-            let tile = req.tile;
             if self.residency.is_resident(tile) || self.in_flight.contains_key(&tile) {
                 continue;
             }
-            let loader = Arc::clone(self.loader);
-            let (handle, registration) = AbortHandle::new_pair();
-            let fut: BoxLoadFut = Box::pin(async move {
-                let result = loader.load(tile).await;
-                (tile, result)
-            });
-            loads.push(Abortable::new(fut, registration));
-            self.in_flight.insert(tile, handle);
-            let m = crate::metrics::metrics();
-            m.loads_started.inc();
-            m.loads_by_level.inc(self.tree.level(tile));
-            m.loads_in_flight.set(self.in_flight.len() as u64);
+            self.start(tile, loads);
         }
+
+        // Last, with whatever slots the view itself left free.
+        self.refresh(loads);
 
         if *self.primed && self.priming_outstanding.is_empty() {
             crate::metrics::metrics().priming_done.set(1);
         }
         self.report_priming(tx)?;
         Ok(())
+    }
+
+    /// Starts loading `tile`, and notes the epoch it was started under.
+    fn start(&mut self, tile: TileId, loads: &mut FuturesUnordered<LoadFuture>) {
+        let loader = Arc::clone(self.loader);
+        // Read here and not when the load lands: the loader may move on while
+        // the load is in flight, and content begun under the old epoch must be
+        // recorded as old — recorded as new, it would never be refreshed, and
+        // the ground would keep the previous picture for good. The other error
+        // is harmless: content that turns out newer than its record is
+        // refreshed once more than it needed.
+        self.started.insert(tile, loader.epoch());
+        let (handle, registration) = AbortHandle::new_pair();
+        let fut: BoxLoadFut = Box::pin(async move {
+            let result = loader.load(tile).await;
+            (tile, result)
+        });
+        loads.push(Abortable::new(fut, registration));
+        self.in_flight.insert(tile, handle);
+        let m = crate::metrics::metrics();
+        m.loads_started.inc();
+        m.loads_by_level.inc(self.tree.level(tile));
+        m.loads_in_flight.set(self.in_flight.len() as u64);
+    }
+
+    /// Loads again every resident tile whose content is from an earlier
+    /// [`epoch`](TileLoader::epoch) of the loader — a globe told to drape
+    /// other imagery — **without ever letting go of the content it has.**
+    ///
+    /// # The order is the whole point
+    ///
+    /// The obvious way to change what every tile shows is to drop the tiles
+    /// and let the traversal ask for them again. That is a globe with nothing
+    /// on it for as long as the network takes, and nothing on it is black.
+    /// So nothing is dropped. An out-of-date tile stays resident, stays in
+    /// the selection and stays with the consumer; its replacement is loaded
+    /// beside it and sent as a second [`ServerMessage::Content`] under the
+    /// same id, which a consumer applies by building the new surface and only
+    /// then releasing the old — one filing, replaced in place. At every
+    /// instant each tile has exactly one picture: the old one, then the new.
+    ///
+    /// # Coarse first, what is looked at first
+    ///
+    /// The protected set — the frontier, its ancestors, what a held `REPLACE`
+    /// waits on — goes before everything else, and within each group the
+    /// coarsest tiles go first: one coarse tile repaints a whole region, and
+    /// it is also the fallback every finer tile climbs to, so the change
+    /// reads as the globe turning over and then sharpening, not as confetti.
+    /// The rest of the residency follows; it is not on screen, but it is what
+    /// the camera returns to.
+    ///
+    /// Refreshes take only the fetch slots the view's own requests left free:
+    /// ground that has no picture at all outranks ground that has last
+    /// epoch's.
+    fn refresh(&mut self, loads: &mut FuturesUnordered<LoadFuture>) {
+        let now = self.loader.epoch();
+        if *self.settled_epoch == now {
+            return;
+        }
+        let mut stale: Vec<(bool, u32, TileId)> = self
+            .epochs
+            .iter()
+            .filter(|(tile, epoch)| **epoch != now && !self.in_flight.contains_key(*tile))
+            .map(|(tile, _)| (!self.selected.contains(tile), self.tree.level(*tile), *tile))
+            .collect();
+        // Nothing out of date, and nothing in flight that will be recorded as
+        // out of date when it lands: the turn-over is complete.
+        if stale.is_empty() && self.started.values().all(|epoch| *epoch == now) {
+            *self.settled_epoch = now;
+            tracing::info!(epoch = now, "every resident tile is at the loader's epoch");
+            return;
+        }
+        // Protected before the rest, coarse before fine, and the id last so
+        // that two runs refresh in the same order.
+        stale.sort_unstable_by_key(|(unprotected, level, tile)| (*unprotected, *level, tile.0));
+        for (_, _, tile) in stale {
+            if self.in_flight.len() >= self.config.maximum_simultaneous_fetches {
+                break;
+            }
+            self.refreshing.insert(tile);
+            self.start(tile, loads);
+        }
     }
 
     /// Asks for the whole coarse pyramid, once, at the start of a session.
@@ -858,9 +959,34 @@ impl Session<'_> {
         tx: &UnboundedSender<ServerMessage>,
     ) -> Result<(), Stop> {
         self.in_flight.remove(&tile);
+        let epoch = self.started.remove(&tile).unwrap_or(0);
+        let refresh = self.refreshing.remove(&tile);
         let m = crate::metrics::metrics();
         m.loads_in_flight.set(self.in_flight.len() as u64);
+        // A refresh whose tile was evicted while it was in flight has nothing
+        // left to replace. Admitting it would bring back, unasked, a tile the
+        // budget had just let go of.
+        if refresh && !self.residency.is_resident(tile) {
+            return Ok(());
+        }
         match result {
+            // A refresh that fails costs the new picture and nothing else:
+            // the tile keeps the content it has, which is the whole reason it
+            // was kept. Ending the session over it — the rule for a first
+            // load, where the alternative is a hole — would trade ground that
+            // is merely out of date for no ground at all. It is not retried:
+            // recorded at the epoch it was attempted under, it waits for the
+            // next change or for its own eviction.
+            Err(e) if refresh => {
+                m.loads_failed.inc();
+                self.epochs.insert(tile, epoch);
+                tracing::error!(?tile, "refresh failed, the tile keeps its content: {e}");
+                tx.unbounded_send(ServerMessage::Error {
+                    tile: Some(tile),
+                    message: format!("refresh failed, the tile keeps its content: {e}"),
+                })
+                .map_err(|_| Stop::Gone)
+            }
             Err(e) => {
                 m.loads_failed.inc();
                 crate::det!("load_err", tile = tile.0, level = self.tree.level(tile));
@@ -898,6 +1024,7 @@ impl Session<'_> {
                 m.imagery_bytes.set(bytes as u64);
                 for e in &evicted {
                     self.residency.remove(*e);
+                    self.epochs.remove(e);
                     // The consumer is about to drop it too, so its ack stops
                     // being true. Left behind, it would suppress the stand-in
                     // the next time this ground is looked at. The same goes for
@@ -916,6 +1043,7 @@ impl Session<'_> {
                         .map_err(|_| Stop::Gone)?;
                 }
                 self.residency.insert(tile);
+                self.epochs.insert(tile, epoch);
                 self.resolve_primed(tile, true);
                 // Arrivals are genuinely unordered — the network decides. On
                 // its own event name so a comparison can drop it and still
@@ -1489,6 +1617,184 @@ mod tests {
                  (stand-ins: {filled:?})"
             );
         }
+    }
+
+    /// A loader whose content changes when it is told to, as a globe's does
+    /// when its imagery is switched. Each tile's content carries the epoch it
+    /// was loaded under — in its origin, which nothing here reads — so a
+    /// consumer can tell the old picture from the new.
+    struct Turning {
+        inner: Arc<dyn TileLoader>,
+        epoch: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    impl TileLoader for Turning {
+        async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
+            let epoch = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
+            match self.inner.load(id).await? {
+                Loaded::Content(mut content) => {
+                    content.local_origin_ecef = dvec3(epoch as f64, 0.0, 0.0);
+                    Ok(Loaded::Content(content))
+                }
+                other => Ok(other),
+            }
+        }
+
+        fn epoch(&self) -> u64 {
+            self.epoch.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// **Changing what every tile shows never leaves a tile showing nothing.**
+    ///
+    /// The consumer here is the simplest honest one: it files content under
+    /// its tile, replaces what was there, and drops a tile only on `Evict`.
+    /// After every step of the server — every frame, in a viewer — each tile
+    /// of the selection must be held. The loader's epoch is then moved on,
+    /// as a switch of imagery does, and the same must stay true at every step
+    /// until every selected tile holds the new content.
+    ///
+    /// Seen failing with the old content dropped first — an `Evict` ahead of
+    /// each refresh, the "drop and re-request" implementation: 'selected and
+    /// held by nobody' on the first step after the change.
+    ///
+    /// Also held: the turn-over is coarse first, the new content replaces the
+    /// old under the same id with no eviction in between, and a tile is
+    /// refreshed once.
+    #[test]
+    fn a_change_of_epoch_replaces_every_tile_without_ever_dropping_one() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = write_deep_fixture(dir.path());
+        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
+        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
+        let arena = Arc::new(RwLock::new(tileset));
+        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
+        let levels = TilesetTree::new(Arc::clone(&arena));
+        let inner: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher)));
+        let epoch = Arc::new(AtomicU64::new(0));
+        let (mut stream, server) = in_process_with(
+            tree,
+            Arc::new(Turning {
+                inner,
+                epoch: Arc::clone(&epoch),
+            }) as Arc<dyn TileLoader>,
+            Config {
+                pinned_level: None,
+                stand_ins: false,
+                ..Config::default()
+            },
+        );
+        let mut server: Pin<Box<dyn Future<Output = ()>>> = Box::pin(server.run());
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        // What the consumer holds: tile → the epoch of the content filed there.
+        let mut held: HashMap<TileId, u64> = HashMap::new();
+        let mut selected: Vec<TileId> = Vec::new();
+        // Every delivery after the change, in order: (level, tile).
+        let mut turned: Vec<(u32, TileId)> = Vec::new();
+        let mut evicted_after_the_change = 0usize;
+
+        let mut step = |server: &mut Pin<Box<dyn Future<Output = ()>>>,
+                        stream: &mut InProcessStream,
+                        held: &mut HashMap<TileId, u64>,
+                        selected: &mut Vec<TileId>,
+                        turned: &mut Vec<(u32, TileId)>,
+                        evicted: &mut usize,
+                        changed: bool| {
+            stream
+                .send(ClientMessage::ViewerState {
+                    views: vec![near_view()],
+                    generation: 0,
+                })
+                .expect("send");
+            let _ = server.as_mut().poll(&mut cx);
+            while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
+                match msg {
+                    ServerMessage::Select { tiles, .. } => {
+                        *selected = tiles.iter().map(|(t, _)| *t).collect();
+                    }
+                    ServerMessage::Content { tile, content, .. } => {
+                        let TileContent::Decoded(decoded) = content else {
+                            unreachable!("in-process content is decoded")
+                        };
+                        let at = decoded.local_origin_ecef.x as u64;
+                        if changed {
+                            turned.push((levels.level(tile), tile));
+                        }
+                        held.insert(tile, at);
+                        stream.send(ClientMessage::Ack { tile }).expect("ack");
+                    }
+                    ServerMessage::Evict { tiles } => {
+                        for t in tiles {
+                            held.remove(&t);
+                            if changed {
+                                *evicted += 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // The frame: everything selected has something to draw.
+            for tile in selected.iter() {
+                assert!(
+                    held.contains_key(tile),
+                    "{tile:?} is selected and held by nobody (changed: {changed})"
+                );
+            }
+        };
+
+        for _ in 0..64 {
+            step(
+                &mut server,
+                &mut stream,
+                &mut held,
+                &mut selected,
+                &mut turned,
+                &mut evicted_after_the_change,
+                false,
+            );
+        }
+        assert!(selected.len() > 1, "the view settled on {selected:?}");
+        assert!(held.values().all(|at| *at == 0));
+        let before: HashSet<TileId> = held.keys().copied().collect();
+
+        // The switch.
+        epoch.store(1, Ordering::SeqCst);
+        for _ in 0..64 {
+            step(
+                &mut server,
+                &mut stream,
+                &mut held,
+                &mut selected,
+                &mut turned,
+                &mut evicted_after_the_change,
+                true,
+            );
+        }
+
+        // Every tile held is now the new content — the selection, and the
+        // ancestors a consumer falls back to.
+        for (tile, at) in &held {
+            assert_eq!(*at, 1, "{tile:?} still shows the old content");
+        }
+        assert_eq!(
+            held.keys().copied().collect::<HashSet<_>>(),
+            before,
+            "the change added or lost tiles"
+        );
+        assert_eq!(evicted_after_the_change, 0, "a refresh evicts nothing");
+        // Coarse first, and once each.
+        let order: Vec<u32> = turned.iter().map(|(level, _)| *level).collect();
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(order, sorted, "the turn-over was not coarse first");
+        assert_eq!(turned.len(), before.len(), "refreshed {turned:?}");
     }
 
     #[test]

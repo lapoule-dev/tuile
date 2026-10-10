@@ -169,6 +169,7 @@ fn relief_mesh(rect: &GeoRect, steps: usize) -> QuantizedMesh {
 /// One flat-coloured layer over a whole tile.
 fn painted(colour: [u8; 3], key: u64) -> ImageryLayer {
     ImageryLayer {
+        source: 0,
         coord: ImageryCoord {
             level: 1,
             x: key,

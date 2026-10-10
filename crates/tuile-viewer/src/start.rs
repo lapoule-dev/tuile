@@ -30,6 +30,8 @@ FLAGS (each takes one number; `--flag value` or `--flag=value`):
     --here             start over the current location instead of --lon/--lat
                        (asks the system's location service; the view moves
                        when the answer arrives, and stays put if none does)
+    --imagery <name>   the imagery layer to open on, by key or by name
+IMAGERY_LAYERS
     -h, --help         print this and exit
 
 KEYS:
@@ -40,6 +42,7 @@ KEYS:
                        (a click on the compass ring does the same)
     L                  centre on the current location, at the present altitude
     C                  copy a link to this view (a tuile://goto?… URL)
+    I                  the next imagery layer
     W                  wireframe
     D                  cycle the diagnostic views
     F                  freeze the traversal
@@ -61,11 +64,23 @@ pub(crate) fn usage() -> String {
     if !identity.credentials.is_empty() {
         head.push_str(&format!("\n{}\n", identity.credentials));
     }
+    let layers: Vec<String> = crate::embed::layers()
+        .iter()
+        .enumerate()
+        .map(|(index, layer)| {
+            format!(
+                "                         {:<12} {}{}",
+                layer.key,
+                layer.name,
+                if index == 0 { "   (default)" } else { "" }
+            )
+        })
+        .collect();
     USAGE
+        .replace("IMAGERY_LAYERS\n", &format!("{}\n", layers.join("\n")))
         .replace("FLAGS_HEADER\n", &head)
         .replace("tuile://", &format!("{}://", identity.scheme))
 }
-
 
 /// The view a session opens on, in the units a person types: degrees and
 /// metres. Everything is `f64` — a longitude in `f32` is already metres off.
@@ -133,12 +148,19 @@ pub(crate) fn remembered(host: &dyn crate::host::Host) -> Option<StartView> {
 }
 
 /// What the command line asked for.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Invocation {
     /// Open the window on this view — and, with `here`, move it over the
     /// current location once the system says where that is. The view's own
     /// longitude and latitude are then only where the eye waits meanwhile.
-    Run { view: StartView, here: bool },
+    ///
+    /// `imagery` is the layer `--imagery` named, as typed: which layer that
+    /// is depends on the host's list, which this parser does not have.
+    Run {
+        view: StartView,
+        here: bool,
+        imagery: Option<String>,
+    },
     /// Print [`usage`] and leave.
     Help,
 }
@@ -278,6 +300,7 @@ where
 {
     let mut view = StartView::default();
     let mut here = false;
+    let mut imagery: Option<String> = None;
     let mut seen = [false; FLAGS.len()];
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -293,6 +316,23 @@ where
             Some((name, value)) => (name, Some(value.to_owned())),
             None => (arg, None),
         };
+        if name == "--imagery" {
+            if imagery.is_some() {
+                return Err("--imagery given twice".to_owned());
+            }
+            let text = match inline {
+                Some(text) => text,
+                None => args
+                    .next()
+                    .map(|s| s.as_ref().to_owned())
+                    .ok_or_else(|| "--imagery needs the name of a layer".to_owned())?,
+            };
+            if text.trim().is_empty() {
+                return Err("--imagery needs the name of a layer".to_owned());
+            }
+            imagery = Some(text);
+            continue;
+        }
         let Some(index) = FLAGS.iter().position(|f| f.name == name) else {
             return Err(format!("unknown argument {arg:?}"));
         };
@@ -315,7 +355,11 @@ where
     if here && (seen[0] || seen[1]) {
         return Err("--here and --lon/--lat both say where to start; give one".to_owned());
     }
-    Ok(Invocation::Run { view, here })
+    Ok(Invocation::Run {
+        view,
+        here,
+        imagery,
+    })
 }
 
 #[cfg(test)]
@@ -325,7 +369,12 @@ mod tests {
 
     fn run(args: &[&str]) -> StartView {
         let parsed = parse(args);
-        let Ok(Invocation::Run { view, here: false }) = parsed else {
+        let Ok(Invocation::Run {
+            view,
+            here: false,
+            imagery: None,
+        }) = parsed
+        else {
             unreachable!("{args:?} should start a session, got {parsed:?}");
         };
         view
@@ -457,6 +506,34 @@ mod tests {
             .contains("twice"));
     }
 
+    /// `--imagery` carries a name through untouched — which layer it is, is
+    /// the host's list to say — and is held to the same grammar as the rest.
+    #[test]
+    fn imagery_takes_a_name_in_either_spelling_once() {
+        let named = |args: &[&str]| match parse(args) {
+            Ok(Invocation::Run { imagery, view, .. }) => (imagery, view),
+            other => unreachable!("{args:?} should start a session, got {other:?}"),
+        };
+        assert_eq!(named(&[]).0, None);
+        assert_eq!(named(&["--imagery", "labels"]).0.as_deref(), Some("labels"));
+        assert_eq!(
+            named(&["--imagery=Aerial with labels"]).0.as_deref(),
+            Some("Aerial with labels")
+        );
+        // Beside the numeric flags, in any order, and without disturbing them.
+        let (imagery, view) = named(&["--lat", "10", "--imagery", "satellite", "--lon", "20"]);
+        assert_eq!(imagery.as_deref(), Some("satellite"));
+        assert_eq!((view.lat, view.lon), (10.0, 20.0));
+        for bad in [
+            &["--imagery"][..],
+            &["--imagery="],
+            &["--imagery", "a", "--imagery", "b"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        assert!(USAGE.contains("--imagery"));
+    }
+
     #[test]
     fn here_replaces_the_position_and_refuses_to_share_it() {
         assert_eq!(
@@ -468,6 +545,7 @@ mod tests {
                     ..StartView::default()
                 },
                 here: true,
+                imagery: None,
             })
         );
         // Either order, either coordinate.

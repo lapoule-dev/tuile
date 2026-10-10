@@ -204,6 +204,16 @@ mod system {
         if value.is_null() {
             return;
         }
+        if setter.name().to_bytes() == b"setImagery:" {
+            // SAFETY: the dictionary types this property `text`, so the
+            // runtime hands over a string; `description` is defined on every
+            // object and returns one whatever it was handed.
+            let name: Retained<NSString> = unsafe { msg_send![value, description] };
+            // A name and nothing else: which layer it is, if any, is decided
+            // by the render loop against the host's list.
+            send(Request::Imagery(name.to_string()));
+            return;
+        }
         // SAFETY: the dictionary types both properties `boolean`, so the
         // runtime hands over a number; `boolValue` is a plain read.
         let on: bool = unsafe { msg_send![value, boolValue] };

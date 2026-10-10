@@ -351,6 +351,7 @@ fn two_imagery_layers_cover_their_own_halves_of_a_tile() {
     content.imagery = vec![
         // West half of the tile, stretched over the whole strip.
         tuile_core::raster::ImageryLayer {
+            source: 0,
             coord: tuile_core::raster::ImageryCoord {
                 level: 4,
                 x: 2,
@@ -363,6 +364,7 @@ fn two_imagery_layers_cover_their_own_halves_of_a_tile() {
         },
         // East half: same stretch, shifted a tile-width west.
         tuile_core::raster::ImageryLayer {
+            source: 0,
             coord: tuile_core::raster::ImageryCoord {
                 level: 4,
                 x: 3,
@@ -413,6 +415,7 @@ fn imagery_shared_between_tiles_is_uploaded_once() {
     };
     let texture = ramp_texture();
     let layer = tuile_core::raster::ImageryLayer {
+        source: 0,
         coord: shared,
         texture: std::sync::Arc::clone(&texture),
         coverage: [0.0, 0.0, 1.0, 1.0],

@@ -867,6 +867,17 @@ pub struct ImageryLayer {
     /// Identity. The upload key on the GPU and the cache key on the CPU — two
     /// geometry tiles naming the same coord must resolve to the same texture.
     pub coord: ImageryCoord,
+    /// Which imagery the pixels are from, when a session can hold more than
+    /// one: the other half of the identity. **A texture is `(source, coord)`**,
+    /// because two imagery sets address the same ground by the same coord.
+    ///
+    /// Zero for a session with one imagery set, which is most of them. A
+    /// source that can be *switched* ([`ImageryProvider::generation`]) stamps
+    /// each layer with the generation its pixels were fetched under, so that
+    /// while the old picture and the new are both on screen — and they must
+    /// be, or the ground goes bare between the two — a consumer never hands a
+    /// new tile the old tile's texture because the coord matched.
+    pub source: u32,
     /// The pixels, reprojected to geographic spacing over the imagery tile's
     /// own rectangle. Shared; never cloned per geometry tile.
     pub texture: Arc<DecodedTexture>,
@@ -970,11 +981,20 @@ impl ImageryLayer {
         // which is most of the ground during any movement.
         Self {
             coord,
+            source: 0,
             texture,
             coverage,
             translation,
             scale,
         }
+    }
+
+    /// The same layer, as a picture from imagery `source` — see
+    /// [`ImageryLayer::source`].
+    #[must_use]
+    pub fn from_source(mut self, source: u32) -> Self {
+        self.source = source;
+        self
     }
 
     /// Whether this layer covers any of the geometry tile at all.
@@ -1045,7 +1065,9 @@ pub fn imagery_layer_table(layers: &[ImageryLayer], slots: u32) -> Vec<[f32; 4]>
 /// insert. A byte budget here would only be a worse guess at the same question,
 /// and one that could free something still being drawn.
 pub struct ImageryPool<T> {
-    entries: std::collections::HashMap<ImageryCoord, std::sync::Weak<T>>,
+    /// Keyed by the whole identity — which imagery, then which tile of it. See
+    /// [`ImageryLayer::source`].
+    entries: std::collections::HashMap<(u32, ImageryCoord), std::sync::Weak<T>>,
 }
 
 impl<T> Default for ImageryPool<T> {
@@ -1060,11 +1082,29 @@ impl<T> ImageryPool<T> {
     /// The resource for `coord`, building it only if no live holder already has
     /// one. `make` runs at most once per coord per lifetime of the resource.
     pub fn get_or_insert(&mut self, coord: ImageryCoord, make: impl FnOnce() -> T) -> Arc<T> {
-        if let Some(live) = self.entries.get(&coord).and_then(std::sync::Weak::upgrade) {
+        self.get_or_insert_from(0, coord, make)
+    }
+
+    /// [`ImageryPool::get_or_insert`], for a session that holds more than one
+    /// imagery set: the resource for tile `coord` **of imagery `source`**.
+    ///
+    /// Keying on the coord alone is what a switch of imagery cannot survive.
+    /// The old picture is still held by every tile not yet re-draped, so its
+    /// entry is live, and a tile arriving with the new picture for the same
+    /// coord would be handed the old resource — the switch would then show
+    /// nothing new until the last old tile happened to be evicted.
+    pub fn get_or_insert_from(
+        &mut self,
+        source: u32,
+        coord: ImageryCoord,
+        make: impl FnOnce() -> T,
+    ) -> Arc<T> {
+        let key = (source, coord);
+        if let Some(live) = self.entries.get(&key).and_then(std::sync::Weak::upgrade) {
             return live;
         }
         let entry = Arc::new(make());
-        self.entries.insert(coord, Arc::downgrade(&entry));
+        self.entries.insert(key, Arc::downgrade(&entry));
         // Dead keys accumulate silently otherwise: nothing runs when the last
         // `Arc` drops. Sweeping in proportion to the map's own growth keeps the
         // cost amortised without needing a schedule of its own.
@@ -1097,7 +1137,7 @@ impl<T> ImageryPool<T> {
     pub fn live_with_coords(&self) -> Vec<(ImageryCoord, Arc<T>)> {
         self.entries
             .iter()
-            .filter_map(|(coord, weak)| std::sync::Weak::upgrade(weak).map(|r| (*coord, r)))
+            .filter_map(|((_, coord), weak)| std::sync::Weak::upgrade(weak).map(|r| (*coord, r)))
             .collect()
     }
 }
@@ -1291,6 +1331,19 @@ pub fn bake_imagery(content: &mut DecodedTileContent, max_size: u32) {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait ImageryProvider: Send + Sync {
     fn tiling_scheme(&self) -> TilingScheme;
+
+    /// Which picture this provider is serving, for one that can be told to
+    /// serve another: a number that goes up every time what
+    /// [`fetch_tile_bytes`](ImageryProvider::fetch_tile_bytes) answers with
+    /// changes — and with it, possibly, the tiling scheme.
+    ///
+    /// Zero, for ever, for the usual provider, which serves one imagery set
+    /// for its whole life. Whoever keeps what a provider returned — a decode
+    /// cache, a drape, a GPU texture pool — keeps it *per generation*: a tile
+    /// address means a different picture on each side of a change.
+    fn generation(&self) -> u64 {
+        0
+    }
 
     /// The tile's bytes **as served** — JPEG or PNG, still encoded — with the
     /// lifetime its origin stated.
@@ -2742,8 +2795,48 @@ mod tests {
         })
     }
 
+    /// Two imagery sets address the same ground by the same coord, and while
+    /// one is being switched for the other a consumer holds both. The pool
+    /// must keep them apart — or the new picture of a tile is handed the old
+    /// one's resource for as long as any tile still holds it — and must still
+    /// share within each.
+    #[test]
+    fn the_pool_shares_by_imagery_set_and_tile_together() {
+        let coord = ImageryCoord {
+            level: 5,
+            x: 3,
+            y: 7,
+        };
+        let mut pool: ImageryPool<&'static str> = ImageryPool::default();
+        let old = pool.get_or_insert_from(0, coord, || "old");
+        let new = pool.get_or_insert_from(1, coord, || "new");
+        assert_eq!(
+            (*old, *new),
+            ("old", "new"),
+            "one coord, two imagery sets, two resources"
+        );
+        // Within a set, still one resource per tile, built once.
+        let again = pool.get_or_insert_from(1, coord, || unreachable!("already live"));
+        assert!(Arc::ptr_eq(&new, &again));
+        // The plain form is the first set, so a session with one set is as it
+        // was.
+        assert!(Arc::ptr_eq(
+            &old,
+            &pool.get_or_insert(coord, || unreachable!("already live"))
+        ));
+        assert_eq!(pool.live().len(), 2);
+        assert_eq!(
+            pool.live_with_coords()
+                .iter()
+                .filter(|(c, _)| *c == coord)
+                .count(),
+            2
+        );
+    }
+
     fn layer(texture: Arc<DecodedTexture>, coverage: [f32; 4]) -> ImageryLayer {
         ImageryLayer {
+            source: 0,
             coord: ImageryCoord {
                 level: 0,
                 x: 0,

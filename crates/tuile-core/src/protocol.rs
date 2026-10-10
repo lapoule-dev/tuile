@@ -113,6 +113,14 @@ pub enum ServerMessage {
     /// fallback lands on — so a consumer that learned levels only from
     /// selections would hold the whole pyramid and be unable to say what any of
     /// it was.
+    ///
+    /// Sent once when a tile becomes resident — and **again, under the same
+    /// id, when the server refreshes it**: the loader's content changed
+    /// ([`TileLoader::epoch`](crate::source::TileLoader::epoch)) and this is
+    /// the new version of a tile the consumer already holds. A consumer
+    /// replaces in place, and in this order: build the new surface, file it
+    /// under the id, and only then release the one it displaces. There is no
+    /// `Evict` between the two and there must be no frame between them either.
     Content {
         tile: TileId,
         ancestry: Ancestry,
