@@ -69,7 +69,8 @@ impl Provenance {
         Some(TerrainOrigin {
             source,
             digest,
-            skirt_height: tuile_terrain::skirt_height(&rect),
+            // As the loader hangs it: by the level the surface is from.
+            skirt_height: tuile_terrain::skirt_depth_cut(&rect, tile.level - source.level),
         })
     }
 
@@ -126,9 +127,13 @@ mod tests {
         let origin = noted.terrain(grandchild, centre).expect("noted");
         assert_eq!(origin.source, root);
         assert_eq!(origin.digest, digest(b"bytes of the root"));
-        // The skirt is the drawn tile's, not its ancestor's: it hangs from
-        // the edges of the tile that is drawn.
-        assert!(origin.skirt_height < noted.terrain(root, centre).expect("noted").skirt_height);
+        // The skirt hangs from the edges of the tile that is drawn, as deep
+        // as its ancestor's: the surface is the ancestor's, and so is how
+        // far it can stand from a neighbour's.
+        assert_eq!(
+            origin.skirt_height,
+            noted.terrain(root, centre).expect("noted").skirt_height
+        );
         // A tile cut from a parent nobody noted comes from nowhere known.
         noted.upsampled_terrain(TileCoord::new(9, 1, 1), TileCoord::new(8, 0, 0), centre);
         assert_eq!(noted.terrain(TileCoord::new(9, 1, 1), centre), None);

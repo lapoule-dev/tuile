@@ -114,7 +114,9 @@ pub fn terrain_mesh(
         return Err(terrain_error(source, "is not an ancestor of the tile"));
     }
     let rect = GeographicTilingScheme::default().tile_rect(target);
-    let content = tuile_terrain::to_decoded(&mesh, &rect, tuile_terrain::skirt_height(&rect));
+    // The mesh says how far below its source it was cut, and the skirt is
+    // the engine's to size by that: nothing of a seam is decided here.
+    let content = tuile_terrain::to_ground(&mesh, &rect);
     let built = content
         .meshes
         .first()

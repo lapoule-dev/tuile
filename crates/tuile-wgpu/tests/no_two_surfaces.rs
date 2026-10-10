@@ -162,6 +162,7 @@ fn relief_mesh(rect: &GeoRect, steps: usize) -> QuantizedMesh {
             (0..n).map(|col| at(col, n - 1)).collect(),
         ],
         metadata_available: None,
+        cut: 0,
     }
 }
 

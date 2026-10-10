@@ -133,6 +133,24 @@ fn clip_to(
     out
 }
 
+/// The vertices on one edge of a cut tile — those whose coordinate `across`
+/// the edge is exactly `at` — one for each place `along` it.
+///
+/// Clipping keeps every polygon's vertices to itself, so a place on the edge
+/// is stated once by each triangle that touches it. One is enough to hang a
+/// wall from, and two would make a wall of no width between them.
+fn edge(across: &[f64], at: f64, along: &[f64]) -> Vec<u32> {
+    let mut on: Vec<u32> = (0..across.len() as u32)
+        .filter(|&i| across[i as usize] == at)
+        .collect();
+    on.sort_by(|&a, &b| along[a as usize].total_cmp(&along[b as usize]));
+    on.dedup_by(|later, kept| {
+        const SAME_PLACE: f64 = 1.0e-9;
+        along[*later as usize] - along[*kept as usize] < SAME_PLACE
+    });
+    on
+}
+
 /// Builds `child`'s mesh from `ancestor`'s.
 ///
 /// Every triangle is clipped to the child's quadrant and the survivors are
@@ -205,6 +223,45 @@ pub fn upsample(
     }
     let range = (high - low).max(f64::EPSILON);
 
+    // The child's own coordinates. A vertex made by clipping lands on the
+    // boundary to within rounding; it is put exactly on it, so that the edge
+    // lists below can be told by equality and two tiles cut along the same
+    // line state the same line.
+    let own = |at: f64, from: f64| {
+        const ON_THE_EDGE: f64 = 1.0e-9;
+        let t = ((at - from) / step).clamp(0.0, 1.0);
+        if t < ON_THE_EDGE {
+            0.0
+        } else if t > 1.0 - ON_THE_EDGE {
+            1.0
+        } else {
+            t
+        }
+    };
+    let u: Vec<f64> = kept.iter().map(|p| own(p.u, u0)).collect();
+    let v: Vec<f64> = kept.iter().map(|p| own(p.v, v0)).collect();
+    // The four edges, as the format lists them: west, south, east, north.
+    //
+    // They used to be left empty, on the grounds that a cut tile shares its
+    // edges exactly with the ancestor it came from. With that ancestor, and
+    // with every other tile cut from it, nearly: a vertex made by cutting is
+    // given its height over the ellipsoid, so it stands above the straight
+    // edge it was cut on by the curve of the Earth between that edge's ends
+    // — a tenth of a millimetre on level-13 terrain, kilometres on level 4.
+    // And not at all with the tile across a
+    // boundary of the *source's* grid, whose surface is another terrain
+    // tile's: the two state that line each from its own vertices and part by
+    // metres, and a tile with no edge list is given no skirt
+    // (`append_skirts` has nothing to hang it from). Wherever the source
+    // stops refining and the tree goes on — every tile nearest a camera —
+    // those lines were open, and the far side of the planet showed through.
+    let edges = [
+        edge(&u, 0.0, &v),
+        edge(&v, 0.0, &u),
+        edge(&u, 1.0, &v),
+        edge(&v, 1.0, &u),
+    ];
+
     Some(QuantizedMesh {
         header: Header {
             // The rebasing origin only has to be *near* the geometry, and an
@@ -217,22 +274,15 @@ pub fn upsample(
             bounding_sphere_radius: ancestor.header.bounding_sphere_radius,
             horizon_occlusion: ancestor.header.horizon_occlusion,
         },
-        u: kept
-            .iter()
-            .map(|p| ((p.u - u0) / step).clamp(0.0, 1.0))
-            .collect(),
-        v: kept
-            .iter()
-            .map(|p| ((p.v - v0) / step).clamp(0.0, 1.0))
-            .collect(),
+        u,
+        v,
         height: kept.iter().map(|p| (p.height - low) / range).collect(),
         indices,
         normals: kept.iter().map(|p| p.normal).collect::<Option<Vec<_>>>(),
-        // Skirts are not drawn on this globe, and an upsampled tile shares its
-        // edges exactly with the ancestor it came from anyway.
-        edges: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        edges,
         // Availability is the source's to state, and this tile is not from it.
         metadata_available: None,
+        cut: ancestor.cut + (child.level - ancestor_coord.level),
     })
 }
 
@@ -277,6 +327,7 @@ mod tests {
             normals: None,
             edges: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             metadata_available: None,
+            cut: 0,
         }
     }
 
@@ -438,6 +489,50 @@ mod tests {
 
     /// Asking for a tile that is not below the one being upsampled is a caller's
     /// mistake, and answering with a plausible mesh would hide it.
+    /// **A cut tile says where its edges are, and how far below its source
+    /// it lies.** Without the first it is given no skirt; without the second
+    /// its skirt is sized for a surface far more accurate than it is.
+    #[test]
+    fn a_cut_tile_lists_its_edges_and_counts_its_cuts() {
+        let parent = TileCoord::new(4, 3, 5);
+        let child = TileCoord::new(5, 7, 10);
+        let grandchild = TileCoord::new(6, 14, 21);
+        let once = upsample(&ridged_tile(8), parent, child).expect("child");
+        let twice = upsample(&once, child, grandchild).expect("grandchild");
+        assert_eq!((once.cut, twice.cut), (1, 2));
+        // And in one stride as in two.
+        let stride = upsample(&ridged_tile(8), parent, grandchild).expect("in one");
+        assert_eq!(stride.cut, 2);
+
+        for mesh in [&once, &twice, &stride] {
+            for (side, edge) in mesh.edges.iter().enumerate() {
+                assert!(
+                    edge.len() >= 2,
+                    "side {side} has no line to hang a wall from"
+                );
+                let (across, at, along) = match side {
+                    0 => (&mesh.u, 0.0, &mesh.v),
+                    1 => (&mesh.v, 0.0, &mesh.u),
+                    2 => (&mesh.u, 1.0, &mesh.v),
+                    _ => (&mesh.v, 1.0, &mesh.u),
+                };
+                for pair in edge.windows(2) {
+                    assert_eq!(
+                        across[pair[0] as usize], at,
+                        "a listed vertex is off its edge"
+                    );
+                    assert!(
+                        along[pair[1] as usize] > along[pair[0] as usize],
+                        "side {side}: one place listed twice, or out of order"
+                    );
+                }
+                // From corner to corner: a wall with a gap at its end is a gap.
+                assert_eq!(along[edge[0] as usize], 0.0);
+                assert_eq!(along[*edge.last().expect("checked") as usize], 1.0);
+            }
+        }
+    }
+
     #[test]
     fn only_a_descendant_can_be_upsampled() {
         let parent = sloping_tile(4);
