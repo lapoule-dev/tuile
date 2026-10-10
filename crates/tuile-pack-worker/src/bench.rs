@@ -101,6 +101,7 @@ impl Get for RemoteGet {
                     return Ok(Got {
                         status: response.status_code(),
                         object_size,
+                        etag: None,
                         body: response.bytes().await.map_err(|e| e.to_string())?,
                     });
                 }
@@ -324,6 +325,31 @@ async fn bench(env: &Env, with_tiles: bool, keeping: bool) -> std::result::Resul
             films,
         });
     }
+    // Where a page finds the store when it is to go there itself: the
+    // address, and a credential the host means to be public — never the one
+    // this Worker reads with.
+    let store_at = match &config.tiles {
+        Some(Place::Remote {
+            url,
+            header,
+            direct: true,
+            parameter,
+        }) => Some(tuile_repository::StoreAt {
+            url: url.clone(),
+            // One or the other: in the address when the server takes it
+            // there, which spares a browser its preflight.
+            header: match parameter {
+                Some(_) => None,
+                None => header.clone(),
+            },
+            parameter: parameter.clone(),
+            credential: match (header, parameter) {
+                (None, None) => None,
+                _ => Some(var("TUILE_TILES_REMOTE_PUBLIC_SECRET")?),
+            },
+        }),
+        _ => None,
+    };
     // The tile store, as objects and as tiles. As objects it costs nothing
     // to offer: nothing is read until a route asks.
     let store = match &config.tiles {
@@ -350,7 +376,7 @@ async fn bench(env: &Env, with_tiles: bool, keeping: bool) -> std::result::Resul
             ));
             Some((bucket.clone(), StoreObjects { live, archives }))
         }
-        Some(Place::Remote { url, header }) => {
+        Some(Place::Remote { url, header, .. }) => {
             // Somebody else serves the store: its catalog and manifests are
             // asked of it each time, its archives by blocks — the very
             // blocks this Worker's own `store/b8/…` route is asked for, so
@@ -392,6 +418,7 @@ async fn bench(env: &Env, with_tiles: bool, keeping: bool) -> std::result::Resul
         projects,
         tiles,
         store: store.map(|(_, objects)| objects),
+        store_at,
     })
 }
 

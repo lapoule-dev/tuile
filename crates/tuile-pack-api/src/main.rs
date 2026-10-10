@@ -39,7 +39,7 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tuile_farm::{BucketConfig, ObjectRunStore, StoreError, Tuning};
 use tuile_repository::{
-    ArchivedTiles, Asked, Bench, Cached, Config, DiskChunks, FilmRepository, Get, Got, Layout,
+    ArchivedTiles, Asked, Bench, Cached, Config, DiskChunks, FilmRepository, HttpGet, Layout,
     Objects, Place, Project, RemoteBlocks, RemoteLive, Reply, RunFilms, ScenePacks, StoreObjects,
     TileRepository,
 };
@@ -107,56 +107,6 @@ async fn api(bench: Arc<Bench>, request: Request) -> Response {
     match bench.get(&path, &query, asked).await {
         Some(reply) => respond(reply).await,
         None => (StatusCode::NOT_FOUND, "no such route").into_response(),
-    }
-}
-
-/// A GET under the address of a tile store somebody else serves, with the
-/// header that server wants a credential in.
-struct RemoteGet {
-    http: reqwest::Client,
-    root: String,
-    credential: Option<(String, String)>,
-}
-
-#[async_trait::async_trait]
-impl Get for RemoteGet {
-    async fn get(&self, path: &str) -> Result<Got, String> {
-        const TRIES: u32 = 4;
-        let url = format!("{}/{path}", self.root);
-        let mut wait = std::time::Duration::from_millis(150);
-        let mut last = String::new();
-        for attempt in 1..=TRIES {
-            let mut request = self.http.get(&url);
-            if let Some((name, value)) = &self.credential {
-                request = request.header(name, value);
-            }
-            match request.send().await {
-                // Busy, or a passing failure: worth asking again.
-                Ok(response) if matches!(response.status().as_u16(), 429 | 500 | 502 | 503 | 504) => {
-                    last = format!("{path}: HTTP {}", response.status().as_u16());
-                }
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    let object_size = response
-                        .headers()
-                        .get("x-object-size")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse().ok());
-                    let body = response.bytes().await.map_err(|e| format!("{path}: {e}"))?;
-                    return Ok(Got {
-                        status,
-                        object_size,
-                        body: body.to_vec(),
-                    });
-                }
-                Err(e) => last = format!("{path}: {e}"),
-            }
-            if attempt < TRIES {
-                tokio::time::sleep(wait).await;
-                wait *= 3;
-            }
-        }
-        Err(format!("{last}, after {TRIES} tries"))
     }
 }
 
@@ -268,8 +218,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     let mut store_objects = None;
+    let mut store_at = None;
     let tiles = match config.tiles {
-        Some(Place::Remote { url, header }) => {
+        Some(Place::Remote { url, header, direct, parameter }) => {
             // Somebody else serves the store: its catalog and manifests are
             // asked of it each time, its archives by blocks, each kept here
             // once read.
@@ -281,13 +232,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )),
                 None => None,
             };
-            let get = Arc::new(RemoteGet {
-                http: reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(60))
-                    .build()?,
-                root: url.clone(),
-                credential,
-            });
+            if direct {
+                store_at = Some(tuile_repository::StoreAt {
+                    url: url.clone(),
+                    header: match parameter {
+                        Some(_) => None,
+                        None => credential.as_ref().map(|(name, _)| name.clone()),
+                    },
+                    parameter: parameter.clone(),
+                    credential: std::env::var("TUILE_TILES_REMOTE_PUBLIC_SECRET").ok().filter(|v| !v.is_empty()),
+                });
+            }
+            // A block of the remote store is downloaded once and kept,
+            // memory over disk.
+            let blocks = tuile_storage_foyer::FoyerStore::keeping(tuile_storage_foyer::StoreConfig {
+                dir: cache.join("tile-store-remote"),
+                memory_bytes: 256 << 20,
+                disk_bytes: 32 << 30,
+                default_ttl: None,
+            })
+            .await?;
+            let get = Arc::new(tuile_repository::Kept::new(
+                HttpGet::new(&url, credential)?,
+                Arc::new(blocks),
+            ));
             let live: Arc<dyn Objects> = Arc::new(RemoteLive::new(get.clone(), "store"));
             let archives: Arc<dyn Objects> = Arc::new(RemoteBlocks::new(get, "store"));
             store_objects = Some(StoreObjects {
@@ -346,6 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         projects,
         tiles,
         store: store_objects,
+        store_at,
     });
 
     let mut app = Router::new().route(

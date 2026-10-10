@@ -23,16 +23,72 @@ use crate::js::{call, get, number, settled, sleep, text};
 /// one now and then, and the same request a moment later goes through.
 const TRIES: u32 = 5;
 
-/// GETs under the API, by the scope's own `fetch` — a page's or a worker's.
-pub struct FetchGet {
-    /// `https://host/api`.
-    api: String,
+/// How a request says who asks.
+enum Credential {
+    /// In a header: a request a browser preflights when it crosses origins.
+    Header(String, String),
+    /// In the address: no header of its own, so no preflight.
+    Parameter(String, String),
 }
 
-async fn once(url: &str) -> Result<Got, String> {
-    let response = settled(call(&js_sys::global(), "fetch", &[url.into()]).map_err(text)?)
-        .await
-        .map_err(text)?;
+/// GETs under an address, by the scope's own `fetch` — a page's or a
+/// worker's.
+pub struct FetchGet {
+    /// `https://host/api`, or the address of a store served elsewhere.
+    api: String,
+    credential: Option<Credential>,
+}
+
+// One block of an archive, from the network once and from then on from the
+// browser's cache storage — which is on disk, outlives the page, and is one
+// for the page and every one of its workers. An archive's block never
+// changes, so nothing is ever asked about a block that is there. A lock named
+// after the block makes its first readers one: workers that want the same
+// block at the same moment wait for a single download.
+//
+// `key` is the block's address without what says who asks: the same block
+// under another credential is the same block.
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+const KEPT = "tuile-store-blocks-v1";
+export async function tuile_block(url, key, header, value) {
+  const ask = () => fetch(url, header ? { headers: { [header]: value } } : undefined);
+  if (!globalThis.caches) return [await ask(), false];
+  const once = async () => {
+    const cache = await caches.open(KEPT);
+    const kept = await cache.match(key);
+    if (kept) return [kept, true];
+    const response = await ask();
+    if (response.status === 200) {
+      try { await cache.put(key, response.clone()); } catch (_) { /* full: read, not kept */ }
+    }
+    return [response, false];
+  };
+  const locks = globalThis.navigator && globalThis.navigator.locks;
+  return locks ? locks.request("tuile-block:" + key, once) : once();
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(catch)]
+    async fn tuile_block(
+        url: &str,
+        key: &str,
+        header: Option<String>,
+        value: Option<String>,
+    ) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
+}
+
+thread_local! {
+    /// Blocks this scope took from the network, and from the browser's
+    /// cache storage: what says whether a block was read twice.
+    static BLOCKS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// `(from the network, from what the browser kept)`, for this page or worker.
+pub fn blocks_read() -> (u64, u64) {
+    BLOCKS.with(std::cell::Cell::get)
+}
+
+async fn read(response: wasm_bindgen::JsValue) -> Result<Got, String> {
     let status = number(&response, "status") as u16;
     let size = call(&get(&response, "headers"), "get", &["x-object-size".into()])
         .ok()
@@ -44,18 +100,72 @@ async fn once(url: &str) -> Result<Got, String> {
     Ok(Got {
         status,
         object_size: size,
+        etag: None,
         body: Uint8Array::new(&buffer).to_vec(),
     })
+}
+
+impl FetchGet {
+    /// The address asked, and the same without what says who asks.
+    fn addresses(&self, path: &str) -> (String, String) {
+        let plain = format!("{}/{path}", self.api);
+        match &self.credential {
+            Some(Credential::Parameter(name, value)) => {
+                let mark = if plain.contains('?') { '&' } else { '?' };
+                (format!("{plain}{mark}{name}={value}"), plain)
+            }
+            _ => (plain.clone(), plain),
+        }
+    }
+
+    fn header(&self) -> Option<(String, String)> {
+        match &self.credential {
+            Some(Credential::Header(name, value)) => Some((name.clone(), value.clone())),
+            _ => None,
+        }
+    }
+
+    async fn once(&self, path: &str) -> Result<Got, String> {
+        let (url, key) = self.addresses(path);
+        let header = self.header();
+        // A block of an archive is immutable: read once, kept, never asked
+        // again. Everything else changes and is asked each time.
+        if path.contains(&format!("/{}/", tuile_repository::block_segment())) {
+            let (name, value) = header.unzip();
+            let answer = tuile_block(&url, &key, name, value).await.map_err(text)?;
+            let kept = get(&answer, "1").as_bool().unwrap_or(false);
+            BLOCKS.with(|b| {
+                let (network, held) = b.get();
+                b.set(if kept { (network, held + 1) } else { (network + 1, held) });
+            });
+            return read(get(&answer, "0")).await;
+        }
+        once(&url, header.as_ref()).await
+    }
+}
+
+async fn once(url: &str, header: Option<&(String, String)>) -> Result<Got, String> {
+    let asked = match header {
+        Some((name, value)) => {
+            let headers = js_sys::Object::new();
+            js_sys::Reflect::set(&headers, &name.as_str().into(), &value.as_str().into())
+                .map_err(text)?;
+            let init = js_sys::Object::new();
+            js_sys::Reflect::set(&init, &"headers".into(), &headers).map_err(text)?;
+            call(&js_sys::global(), "fetch", &[url.into(), init.into()])
+        }
+        None => call(&js_sys::global(), "fetch", &[url.into()]),
+    };
+    read(settled(asked.map_err(text)?).await.map_err(text)?).await
 }
 
 #[async_trait(?Send)]
 impl Get for FetchGet {
     async fn get(&self, path: &str) -> Result<Got, String> {
-        let url = format!("{}/{path}", self.api);
         let mut wait = 150;
         let mut last = String::new();
         for attempt in 1..=TRIES {
-            match once(&url).await {
+            match self.once(path).await {
                 // Busy, or a passing failure: worth asking again.
                 Ok(got) if matches!(got.status, 429 | 500 | 502 | 503 | 504) => {
                     last = format!("HTTP {}", got.status);
@@ -81,9 +191,31 @@ pub struct Store {
 
 impl Store {
     /// Reads the store's catalog. `api` is `https://host/api`.
+    ///
+    /// The API is asked first where the store is (`store/at`): behind the
+    /// API itself, which is the answer of one that says nothing, or at an
+    /// address of its own, which this reader then goes to directly — with
+    /// the credential that address wants, in a header or in the address.
     pub async fn open(api: &str) -> Result<Self, RepoError> {
-        let fetch = Arc::new(FetchGet {
-            api: api.to_string(),
+        let elsewhere = match once(&format!("{api}/store/at"), None).await {
+            Ok(got) if got.status == 200 => {
+                serde_json::from_slice::<tuile_repository::StoreAt>(&got.body).ok()
+            }
+            _ => None,
+        };
+        let fetch = Arc::new(match elsewhere {
+            Some(at) => FetchGet {
+                api: at.url.trim_end_matches('/').to_string(),
+                credential: match (at.parameter, at.header, at.credential) {
+                    (Some(name), _, Some(value)) => Some(Credential::Parameter(name, value)),
+                    (None, Some(name), Some(value)) => Some(Credential::Header(name, value)),
+                    _ => None,
+                },
+            },
+            None => FetchGet {
+                api: api.to_string(),
+                credential: None,
+            },
         });
         let blocks = Arc::new(RemoteBlocks::new(fetch.clone(), "store"));
         let now: Now = Arc::new(|| (js_sys::Date::now() / 1000.0) as u64);

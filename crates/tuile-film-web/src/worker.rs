@@ -749,6 +749,22 @@ impl FilmWorker {
             done += 1;
             let _ = progress.call2(&JsValue::NULL, &done.into(), &total.into());
         }
+        // And the tiles the slice takes from the store: each asked for once,
+        // so the archives they lie in are fetched ahead — once, into what the
+        // browser keeps — and no frame waits on a network for them. The
+        // bytes are let go here.
+        if let Some(side) = &self.store {
+            let pack = Pack::open_table(&self.head).map_err(js)?;
+            let (terrain, imagery) = tuile_film::referred(&pack, self.first, self.last).map_err(js)?;
+            for (layer, wanted) in [(&side.terrain, terrain), (&side.imagery, imagery)] {
+                let mut asked = stream::iter(wanted)
+                    .map(|at| side.store.tiles.tile(layer, at.0, at.1, at.2))
+                    .buffer_unordered(PRELOAD_AT_ONCE);
+                while let Some(found) = asked.next().await {
+                    found.map_err(js)?;
+                }
+            }
+        }
         Ok(Preloaded {
             blocks: done,
             bytes,

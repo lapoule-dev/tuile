@@ -45,6 +45,7 @@ fn bench(root: &Path) -> Bench {
         }],
         tiles: None,
         store: None,
+        store_at: None,
     }
 }
 

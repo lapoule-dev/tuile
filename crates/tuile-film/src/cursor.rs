@@ -250,3 +250,33 @@ pub(crate) mod tests {
         ));
     }
 }
+
+/// A tile of the store, by level, column and row.
+pub type StoreAt = (u8, u32, u32);
+
+/// The store's tiles the frames `first..=last` of a pack read: every terrain
+/// tile and every imagery tile their entering tiles refer to, each once.
+/// Empty for a pack that carries its tiles.
+///
+/// What a renderer asks the store for before its first frame, so that the
+/// archives those tiles lie in are fetched once, ahead, and no frame waits
+/// on a network.
+pub fn referred(
+    pack: &Pack<'_>,
+    first: u32,
+    last: u32,
+) -> Result<(std::collections::BTreeSet<StoreAt>, std::collections::BTreeSet<StoreAt>), FilmError> {
+    let mut cursor = Cursor::new(pack, first, last)?;
+    let (mut terrain, mut imagery) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+    while let Some(diff) = cursor.advance(pack) {
+        for tile in &diff?.enter {
+            let Some(refs) = tuile_pack::refs_of(tile) else { continue };
+            terrain.insert((refs.terrain.level, refs.terrain.x, refs.terrain.y));
+            for placed in &refs.imagery {
+                imagery.insert((placed.tile.level, placed.tile.x, placed.tile.y));
+            }
+        }
+    }
+    Ok((terrain, imagery))
+}
+

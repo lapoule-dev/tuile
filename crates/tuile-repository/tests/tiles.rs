@@ -48,6 +48,7 @@ impl Get for Api {
         Ok(Got {
             status,
             object_size,
+            etag: None,
             body,
         })
     }
@@ -209,6 +210,7 @@ async fn the_portable_reader_answers_as_the_store_that_wrote() {
             live: objects.clone(),
             archives: objects.clone(),
         }),
+        store_at: None,
     });
     let api = Arc::new(Api {
         bench,
@@ -448,6 +450,7 @@ async fn a_live_object_is_sent_again_only_when_it_was_written_again() {
             live: live.clone(),
             archives: files,
         }),
+        store_at: None,
     };
     let url = "/api/store/live/layer/top/manifest.json";
 

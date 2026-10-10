@@ -37,7 +37,9 @@ tuile-pack = { version = "0.3.0", path = "../tuile-pack" }
 # The native adapters: an S3 bucket or a directory, the on-disk chunk cache,
 # the tile store.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { workspace = true, features = ["fs"] }
+# A tile store served by someone else is asked over HTTP.
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["fs", "time"] }
 tracing = { workspace = true }
 tuile-farm = { version = "0.3.0", path = "../tuile-farm" }
 tuile-tile-server = { path = "../tuile-tile-server" }

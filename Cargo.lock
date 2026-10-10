@@ -6403,7 +6403,6 @@ dependencies = [
  "bytes",
  "dotenvy",
  "image",
- "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -6418,6 +6417,7 @@ dependencies = [
  "tuile-film",
  "tuile-radiometry",
  "tuile-repository",
+ "tuile-storage-foyer",
  "tuile-tile-server",
 ]
 
@@ -6468,6 +6468,7 @@ dependencies = [
  "object_store",
  "percent-encoding",
  "pmtiles",
+ "reqwest",
  "roxmltree",
  "serde",
  "serde_json",

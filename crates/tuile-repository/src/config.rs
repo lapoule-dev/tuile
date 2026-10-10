@@ -22,7 +22,20 @@ pub enum Place {
     /// request header that server wants a credential in; the credential
     /// itself is the host's secret (`TUILE_TILES_REMOTE_SECRET`), never in
     /// this file.
-    Remote { url: String, header: Option<String> },
+    ///
+    /// `direct`: this API's own readers — a page — are sent to that server
+    /// themselves instead of reading through this API, with a credential
+    /// meant to be public (`TUILE_TILES_REMOTE_PUBLIC_SECRET`).
+    ///
+    /// `parameter`: the query parameter a direct reader sends that
+    /// credential in, where the server takes it there — a request with no
+    /// header of its own is not preflighted by a browser.
+    Remote {
+        url: String,
+        header: Option<String>,
+        direct: bool,
+        parameter: Option<String>,
+    },
 }
 
 /// The key layout a project's bucket is read with.
@@ -58,6 +71,10 @@ struct RawPlace {
     remote: Option<String>,
     #[serde(default)]
     header: Option<String>,
+    #[serde(default)]
+    direct: Option<bool>,
+    #[serde(default)]
+    parameter: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -139,6 +156,8 @@ impl Config {
                 dir: None,
                 remote: Some(url),
                 header,
+                direct,
+                parameter,
             }) => {
                 let named = header.as_deref().is_none_or(|h| {
                     !h.is_empty() && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
@@ -151,17 +170,21 @@ impl Config {
                 Some(Place::Remote {
                     url: url.trim_end_matches('/').to_string(),
                     header,
+                    direct: direct.unwrap_or(false),
+                    parameter: parameter.filter(|p| !p.is_empty()),
                 })
             }
             Some(RawPlace {
                 remote: None,
                 header: None,
+                direct: None,
+                parameter: None,
                 bucket,
                 dir,
             }) => Some(place("[tiles]", bucket, dir)?),
             Some(_) => {
                 return Err(
-                    "[tiles]: one of `bucket`, `dir` and `remote`; `header` goes with `remote`"
+                    "[tiles]: one of `bucket`, `dir` and `remote`; `header` and `direct` go with `remote`"
                         .into(),
                 )
             }
@@ -221,6 +244,8 @@ mod tests {
             Ok(Some(Place::Remote {
                 url: "https://tiles.example/root".into(),
                 header: Some("X-Token".into()),
+                direct: false,
+                parameter: None,
             }))
         );
         assert_eq!(
@@ -228,11 +253,23 @@ mod tests {
             Ok(Some(Place::Remote {
                 url: "http://127.0.0.1:4010/v1/tiles".into(),
                 header: None,
+                direct: false,
+                parameter: None,
+            }))
+        );
+        assert_eq!(
+            tiles("remote = \"https://t.example\"\ndirect = true"),
+            Ok(Some(Place::Remote {
+                url: "https://t.example".into(),
+                header: None,
+                direct: true,
+                parameter: None,
             }))
         );
         // One place, and a header only where there is somebody to send it to.
         assert!(tiles("remote = \"https://t.example\"\nbucket = \"b\"").is_err());
         assert!(tiles("bucket = \"b\"\nheader = \"X-Token\"").is_err());
+        assert!(tiles("bucket = \"b\"\ndirect = true").is_err());
         assert!(tiles("remote = \"t.example\"").is_err());
         assert!(tiles("remote = \"https://t.example\"\nheader = \"X Token\"").is_err());
     }
