@@ -51,6 +51,9 @@ authors = ["lapoule.dev"]
 # Features are additive and unified across the graph: a feature listed here is
 # enabled wherever the dep is used — harmless for crates that don't need it.
 glam = { version = "0.33.1", features = ["serde"] }
+# Second-order IIR filters; the camera path smoothing runs its low-pass both
+# ways. no_std, one dependency (num-traits), MIT OR Apache-2.0.
+biquad = "0.6.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 roxmltree = "0.20"
