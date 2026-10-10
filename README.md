@@ -33,15 +33,9 @@ switch to a local frame — raw Earth-centred coordinates never reach `f32`.
 **Renderers.** `tuile-wgpu` is the reference backend, native and WebGPU, and
 the engine also draws through OpenUSD/Hydra. Both are described below.
 
-**Films.** A camera path is recorded once (`tuile-tape`), baked once into a
-*pack* of exactly the tiles each frame needs (`tuile-bake`, `tuile-pack`), and
-rendered as many times as wanted without touching a tile source again
-(`tuile-film`, `tuile-film-gpu`, `tuile-film-native`, `tuile-film-web`). The
-same film renders natively and in a browser worker.
-
-**A tile store.** Source tiles are kept once, in PMTiles archives per zone and
-per layer on object storage (`tuile-tile-server`), and read back by blocks
-that any HTTP cache can keep (`tuile-repository`).
+**Films, packs, a tile store and its server.** A flight is baked once into
+*packs*, the source tiles are kept once in a store of PMTiles archives, and
+both are served by the same small API. Described below.
 
 ## Interactive: flying the globe
 
@@ -103,6 +97,96 @@ The images and job scripts that run the plugin on a farm are under
 [`docs/13-crate-usd.md`](docs/13-crate-usd.md),
 [`docs/14-crate-hydra.md`](docs/14-crate-hydra.md) and
 [`docs/15-usd-scene-index.md`](docs/15-usd-scene-index.md).
+
+## Films and packs
+
+Rendering a flight from live sources puts a network, a token and a
+convergence race on the critical path of every frame, and makes each renderer
+pay the globe from cold. So the work moves: a camera path is recorded once
+(`tuile-tape`), **baked once** (`tuile-bake`) on a machine that has the time,
+and rendered as often as wanted from what the bake wrote.
+
+What it writes is a **pack** (`.tuilepack`, crate `tuile-pack`):
+
+```text
+[ "TUILEPK\0" ][ u64 table length ][ FlatBuffers table ][ blob region ]
+```
+
+- The table is read **in place** — mapped, or handed over as a slice. Nothing
+  is deserialised at open time, whatever the number of tiles.
+- Payloads follow it, each an independent LZ4 block: the structure is walked
+  for free and a payload costs a copy only when something asks for it.
+- A pack records, **per frame, exactly which tiles were selected** and the
+  camera they were selected for. A render does not traverse: with no network
+  and no selection to converge, it is reproducible by construction.
+- A pack may carry its tiles, or **refer to them in the tile store** — then it
+  is a few hundred kilobytes for a film, and the pixels are read from the
+  store's archives.
+
+A long film is baked and rendered **by chunks**, one pack each, in parallel;
+`tuile-farm` reads and writes them on object storage and assembles the
+segments into one mp4, in Rust. `tuile-film` reads a baked film frame by frame
+with no GPU and no I/O; `tuile-film-gpu` draws it (one visibility raster, the
+rest in compute); `tuile-film-native` renders it to an mp4 through the
+machine's own encoder; `tuile-film-web` renders the same film in a browser
+worker, frames handed to WebCodecs. `tuile-radiometry` brings imagery tiles
+shot on different days to one another's light.
+
+## The tile store
+
+`tuile-tile-server` is a tile server's job minus the HTTP: terrain and imagery
+tiles **as their source delivered them, kept once**, on any object store.
+
+- **Layout.** One set of PMTiles
+  archives per **layer** and per **zone** (a tile of a coarse level and
+  everything under it), a `manifest.json` per zone listing its archives, and a
+  `catalog.json` listing the layers — all in the bucket itself.
+- **Writing.** Fresh tiles gather in memory and are published as small *delta*
+  archives; a manifest is replaced by a conditional write, so any number of
+  writers is safe. Every archive gets a name of its own.
+- **Compaction** merges a zone's deltas in a stream — similar sizes,
+  contiguous — and cleans up what a manifest no longer names.
+- **Absences are tiles too**: what a source said it does not have is
+  remembered, so it is not asked again.
+- **In front of a source**, `TileService` fetches a tile once, serves it, keeps
+  the hot ones in memory, and hands each fresh tile to a sink — its own buffer,
+  or a stream other processes store from, so that servers only serve.
+- **For a bake**, a scene's slice of the store is *projected* to local
+  archives: a zone's second tile is a local read.
+
+## The server
+
+There is no HTTP server in the library. `tuile-repository` defines the API as
+**a function from a request to a reply**, and a host is an adapter of a few
+lines: `tuile-pack-api` (a native process) and `tuile-pack-worker` (a worker
+at the edge) serve the same routes from the same code, and any other host can.
+
+```text
+GET  /api/projects                       the projects and the tile store
+GET  /api/p/<project>/films[/<id>]       the films a bucket holds, their packs in order
+GET  /api/p/<project>/b8/<n>/<key>       block n of a pack
+GET  /api/tiles/<layer>/<z>/<x>/<y>      one source tile, as stored
+GET  /api/store/live/<key>               the store's catalog, or a zone's manifest
+POST /api/store/live                     many of those, in one reply
+GET  /api/store/b8/<n>/<key>             block n of one of the store's archives
+```
+
+- **Blocks, not ranges.** An object is cut into fixed 8 MiB blocks, each a
+  whole reply at its own address — the one shape a browser cache and an edge
+  cache both keep without argument, and the same for every reader of a film.
+- **Validators throughout.** A block carries its object's validator from the
+  bucket, a manifest its own: what a reader holds is asked about, and an
+  unchanged object costs a `304` and no bytes. A reader keeps each block and
+  downloads it once.
+- **One request for many manifests.** A film touches hundreds of zones; their
+  manifests are asked about together, each with the validator held, the bucket
+  read through a sliding window whose width the host chooses.
+- **Readers on both sides.** The same readers (`RemoteLive`, `RemoteBlocks`,
+  `ArchivedTiles`) look tiles up in the archives from a native process or from
+  wasm, through a store served by someone else — named in configuration by its
+  address — as through a bucket read directly.
+
+Routing, authentication and limits belong to whoever deploys it.
 
 ## The crates
 
