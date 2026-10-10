@@ -305,6 +305,15 @@ impl ObjectRunStore {
             .map_err(|e| StoreError::store(key, e))
     }
 
+    /// An object's size and the bucket's validator for it, or `NotFound`.
+    pub async fn stat(&self, key: &str) -> Result<(u64, Option<String>)> {
+        self.store
+            .head(&key_path(key)?)
+            .await
+            .map(|meta| (meta.size, meta.e_tag))
+            .map_err(|e| StoreError::store(key, e))
+    }
+
     /// The body of [`RunStore::get`], into `tmp`.
     async fn download(
         &self,

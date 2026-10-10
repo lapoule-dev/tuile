@@ -117,14 +117,24 @@ impl Get for HttpGet {
 
 /// A transport whose blocks are downloaded once.
 ///
-/// A block of an archive never changes, so the first reply for one is handed
-/// to a content store — its bytes and the size of its object, which a reader
-/// asks for as often as for the bytes — and every later request for it is
-/// answered from there without a word to the server. The store is the
-/// host's: memory over disk (`tuile-storage-foyer`) for a process that
-/// renders or bakes, so a block outlives the readers' own short memory, the
-/// film, and the process. Everything that is not a block — what changes —
-/// goes through each time. Only a whole reply (200) is kept.
+/// The first reply for a block is handed to a content store — its bytes, the
+/// size of its object, which a reader asks for as often as for the bytes, and
+/// the validator the server gave it. From then on:
+///
+/// - **within this transport's life** — a film, a bake — a block that has
+///   been read or confirmed is answered from the store without a word to the
+///   server, however often and by whichever reader it is asked for;
+/// - **the first time a later transport wants it** — another film, another
+///   day — the server is asked whether it is still the same, with the
+///   validator (`If-None-Match`): a 304 and no bytes when it is, the new
+///   block when the object was written again under its key.
+///
+/// The store is the host's: memory over disk (`tuile-storage-foyer`) for a
+/// process that renders or bakes, so a block outlives the readers' own short
+/// memory, the film, and the process. Everything that is not a block goes
+/// through each time. Only a whole reply (200) is kept, and a block the
+/// server gave no validator for is kept for this transport's life only:
+/// nothing could say later whether it is still true.
 ///
 /// It sits under the readers, not over them: whatever a reader keeps or
 /// forgets of its own, and however it comes to ask — for the bytes, or only
@@ -134,9 +144,38 @@ impl Get for HttpGet {
 pub struct Kept<G> {
     inner: G,
     store: std::sync::Arc<dyn tuile_core::storage::ContentStore>,
-    /// Requests answered by the server, and from the store.
+    /// The blocks read or confirmed by this transport: asked about no more.
+    sure: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Blocks downloaded, confirmed unchanged by the server, and answered
+    /// from the store without asking.
     asked: std::sync::atomic::AtomicU64,
+    confirmed: std::sync::atomic::AtomicU64,
     kept: std::sync::atomic::AtomicU64,
+}
+
+/// A block as the store holds it: the object's size, the server's validator
+/// (empty when it gave none), the bytes.
+fn packed(size: u64, etag: Option<&str>, body: &[u8]) -> Vec<u8> {
+    let etag = etag.unwrap_or_default().as_bytes();
+    let etag = &etag[..etag.len().min(usize::from(u16::MAX))];
+    let mut bytes = Vec::with_capacity(10 + etag.len() + body.len());
+    bytes.extend_from_slice(&size.to_le_bytes());
+    bytes.extend_from_slice(&(etag.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(etag);
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+fn unpacked(bytes: &[u8]) -> Option<(u64, Option<&str>, &[u8])> {
+    let (size, rest) = bytes.split_first_chunk::<8>()?;
+    let (len, rest) = rest.split_first_chunk::<2>()?;
+    let (etag, body) = rest.split_at_checked(usize::from(u16::from_le_bytes(*len)))?;
+    let etag = std::str::from_utf8(etag).ok()?;
+    Some((
+        u64::from_le_bytes(*size),
+        (!etag.is_empty()).then_some(etag),
+        body,
+    ))
 }
 
 impl<G: Get> Kept<G> {
@@ -144,26 +183,46 @@ impl<G: Get> Kept<G> {
         Self {
             inner,
             store,
+            sure: Default::default(),
             asked: Default::default(),
+            confirmed: Default::default(),
             kept: Default::default(),
         }
     }
 
-    /// `(blocks asked of the server, blocks answered from the store)`.
-    pub fn blocks(&self) -> (u64, u64) {
+    /// `(blocks downloaded, blocks the server confirmed unchanged, blocks
+    /// answered from the store without asking)`.
+    pub fn blocks(&self) -> (u64, u64, u64) {
         use std::sync::atomic::Ordering::Relaxed;
-        (self.asked.load(Relaxed), self.kept.load(Relaxed))
+        (
+            self.asked.load(Relaxed),
+            self.confirmed.load(Relaxed),
+            self.kept.load(Relaxed),
+        )
     }
 
     fn is_block(path: &str) -> bool {
         path.contains(&format!("/{}/", crate::block_segment()))
+    }
+
+    /// Where a block is in the store: its path, and the shape it is held in.
+    fn place(path: &str) -> String {
+        format!("{path}#validated")
+    }
+
+    fn is_sure(&self, path: &str) -> bool {
+        self.sure.lock().expect("lock").contains(path)
+    }
+
+    fn now_sure(&self, path: &str) {
+        self.sure.lock().expect("lock").insert(path.to_string());
     }
 }
 
 #[async_trait]
 impl<G: Get> Get for Kept<G> {
     /// What changes is asked of the server each time, with the caller's
-    /// validator; a block has none to offer, being kept for good.
+    /// validator; a block is asked about with the one kept beside it.
     async fn get_unless(&self, path: &str, known: Option<&str>) -> Result<Got, String> {
         if Self::is_block(path) {
             self.get(path).await
@@ -177,27 +236,41 @@ impl<G: Get> Get for Kept<G> {
         if !Self::is_block(path) {
             return self.inner.get(path).await;
         }
-        // The block's path is its identity. Eight bytes of the object's
-        // size, then the block.
-        if let Some(bytes) = self.store.get(path).await {
-            if let Some((size, body)) = bytes.split_first_chunk::<8>() {
+        let place = Self::place(path);
+        let held = self.store.get(&place).await;
+        let held = held.as_deref().and_then(unpacked);
+        let from_store = |(size, etag, body): (u64, Option<&str>, &[u8])| Got {
+            status: 200,
+            object_size: Some(size),
+            etag: etag.map(str::to_string),
+            body: body.to_vec(),
+        };
+        if let Some(held) = held {
+            if self.is_sure(path) {
                 self.kept.fetch_add(1, Relaxed);
-                return Ok(Got {
-                    status: 200,
-                    object_size: Some(u64::from_le_bytes(*size)),
-                    etag: None,
-                    body: body.to_vec(),
-                });
+                return Ok(from_store(held));
             }
         }
-        let got = self.inner.get(path).await?;
+        // Not yet asked about by this transport. With a validator, the
+        // server says whether what is held is still the object's block;
+        // without one it can only send the block again.
+        let known = held.and_then(|(_, etag, _)| etag);
+        let got = match known {
+            Some(known) => self.inner.get_unless(path, Some(known)).await?,
+            None => self.inner.get(path).await?,
+        };
+        if let (304, Some(held)) = (got.status, held) {
+            self.confirmed.fetch_add(1, Relaxed);
+            self.now_sure(path);
+            return Ok(from_store(held));
+        }
         self.asked.fetch_add(1, Relaxed);
         if let (200, Some(size)) = (got.status, got.object_size) {
-            let mut bytes = Vec::with_capacity(8 + got.body.len());
-            bytes.extend_from_slice(&size.to_le_bytes());
-            bytes.extend_from_slice(&got.body);
-            // No lifetime: an archive's block is the same for ever.
-            self.store.put(path, bytes.into(), None).await;
+            let bytes = packed(size, got.etag.as_deref(), &got.body);
+            // No lifetime: what says whether it is still true is the
+            // server, asked with the validator.
+            self.store.put(&place, bytes.into(), None).await;
+            self.now_sure(path);
         }
         Ok(got)
     }
@@ -210,27 +283,51 @@ mod tests {
 
     use super::*;
 
-    /// A server that counts what it is asked, shared by every transport to it.
+    /// A server of blocks that counts what it sends — whole blocks, and
+    /// "you have it" — and whose objects can be written again. Shared by
+    /// every transport to it.
     #[derive(Clone, Default)]
-    struct Server(Arc<AtomicU64>);
+    struct Server {
+        sent: Arc<AtomicU64>,
+        unchanged: Arc<AtomicU64>,
+        /// How many times the objects were written: their validator.
+        version: Arc<AtomicU64>,
+        /// A server that gives no validator.
+        silent: bool,
+    }
 
     #[async_trait]
     impl Get for Server {
         async fn get(&self, path: &str) -> Result<Got, String> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(match path {
-                p if p.ends_with("missing.pmtiles") => Got {
+            self.get_unless(path, None).await
+        }
+
+        async fn get_unless(&self, path: &str, known: Option<&str>) -> Result<Got, String> {
+            let version = self.version.load(Ordering::SeqCst);
+            let etag = format!("\"v{version}\"");
+            if path.ends_with("missing.pmtiles") {
+                return Ok(Got {
                     status: 404,
                     object_size: None,
                     etag: None,
                     body: Vec::new(),
-                },
-                p => Got {
-                    status: 200,
-                    object_size: Some(4242),
-                    etag: None,
-                    body: p.as_bytes().to_vec(),
-                },
+                });
+            }
+            if known == Some(etag.as_str()) {
+                self.unchanged.fetch_add(1, Ordering::SeqCst);
+                return Ok(Got {
+                    status: 304,
+                    object_size: None,
+                    etag: Some(etag),
+                    body: Vec::new(),
+                });
+            }
+            self.sent.fetch_add(1, Ordering::SeqCst);
+            Ok(Got {
+                status: 200,
+                object_size: Some(4242),
+                etag: (!self.silent).then_some(etag),
+                body: format!("{path} v{version}").into_bytes(),
             })
         }
     }
@@ -249,48 +346,99 @@ mod tests {
         }
     }
 
+    fn block(index: u32, name: &str) -> String {
+        format!("store/{}/{index}/layer/zone/{name}", crate::block_segment())
+    }
+
     #[tokio::test]
     async fn a_block_is_downloaded_once_whoever_asks_and_however_often() {
         let store: Arc<dyn tuile_core::storage::ContentStore> = Arc::new(Store::default());
         let server = Server::default();
-        let asked = || server.0.load(Ordering::SeqCst);
-        let block = format!("store/{}/0/layer/zone/a.pmtiles", crate::block_segment());
+        let sent = || server.sent.load(Ordering::SeqCst);
+        let unchanged = || server.unchanged.load(Ordering::SeqCst);
+        let a = block(0, "a.pmtiles");
 
         let first = Kept::new(server.clone(), store.clone());
-        let got = first.get(&block).await.expect("got");
-        assert_eq!((got.status, got.object_size, asked()), (200, Some(4242), 1));
+        let got = first.get(&a).await.expect("got");
+        assert_eq!((got.status, got.object_size, sent()), (200, Some(4242), 1));
         // Again from the same reader, for the bytes or only for the size:
-        // nothing is asked.
+        // nothing is asked, not even whether it changed.
         for _ in 0..3 {
-            let again = first.get(&block).await.expect("got");
+            let again = first.get(&a).await.expect("got");
             assert_eq!((again.object_size, &again.body), (Some(4242), &got.body));
         }
-        assert_eq!(asked(), 1);
-        // Another reader — another film, another day — over the same
-        // store: still nothing.
+        assert_eq!((sent(), unchanged(), first.blocks()), (1, 0, (1, 0, 3)));
+
+        // Another reader — another film, another day — over the same store:
+        // the server is asked once whether the block is still the same, says
+        // so without sending it, and is not asked again.
         let later = Kept::new(server.clone(), store.clone());
-        assert_eq!(later.get(&block).await.expect("got").body, got.body);
-        assert_eq!((asked(), later.blocks()), (1, (0, 1)));
+        for _ in 0..3 {
+            assert_eq!(later.get(&a).await.expect("got").body, got.body);
+        }
+        assert_eq!((sent(), unchanged(), later.blocks()), (1, 1, (0, 1, 2)));
 
         // Another block is another download; what changes is asked each
         // time; what is not there is not kept as if it were.
-        let other = format!("store/{}/1/layer/zone/a.pmtiles", crate::block_segment());
-        later.get(&other).await.expect("got");
-        assert_eq!(asked(), 2);
+        later.get(&block(1, "a.pmtiles")).await.expect("got");
+        assert_eq!(sent(), 2);
         for _ in 0..2 {
             later
                 .get("store/live/layer/zone/manifest.json")
                 .await
                 .expect("got");
         }
-        assert_eq!(asked(), 4);
-        let missing = format!(
-            "store/{}/0/layer/zone/missing.pmtiles",
-            crate::block_segment()
-        );
+        assert_eq!(sent(), 4);
+        let missing = block(0, "missing.pmtiles");
         for _ in 0..2 {
             assert_eq!(later.get(&missing).await.expect("got").status, 404);
         }
-        assert_eq!(asked(), 6);
+        assert_eq!(later.blocks().0, 3);
+    }
+
+    #[tokio::test]
+    async fn an_archive_written_again_under_its_name_is_downloaded_again() {
+        let store: Arc<dyn tuile_core::storage::ContentStore> = Arc::new(Store::default());
+        let server = Server::default();
+        let a = block(0, "a.pmtiles");
+
+        let first = Kept::new(server.clone(), store.clone());
+        let old = first.get(&a).await.expect("got").body;
+
+        // The same key, the same size, other bytes.
+        server.version.fetch_add(1, Ordering::SeqCst);
+        // The film that was reading it goes on with what it read: one film,
+        // one reading of a block.
+        assert_eq!(first.get(&a).await.expect("got").body, old);
+        // The next one is told, and holds the new block from then on.
+        let next = Kept::new(server.clone(), store.clone());
+        let new = next.get(&a).await.expect("got").body;
+        assert_ne!(new, old);
+        assert_eq!(next.get(&a).await.expect("got").body, new);
+        assert_eq!(next.blocks(), (1, 0, 1));
+        assert_eq!(server.unchanged.load(Ordering::SeqCst), 0);
+        // And the one after that only asks.
+        let last = Kept::new(server.clone(), store.clone());
+        assert_eq!(last.get(&a).await.expect("got").body, new);
+        assert_eq!(last.blocks(), (0, 1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_block_with_no_validator_is_kept_for_one_film_only() {
+        let store: Arc<dyn tuile_core::storage::ContentStore> = Arc::new(Store::default());
+        let server = Server {
+            silent: true,
+            ..Server::default()
+        };
+        let a = block(0, "a.pmtiles");
+        let first = Kept::new(server.clone(), store.clone());
+        for _ in 0..3 {
+            first.get(&a).await.expect("got");
+        }
+        assert_eq!(first.blocks(), (1, 0, 2));
+        // Nothing can say it is still true: the next film reads it again.
+        let next = Kept::new(server.clone(), store.clone());
+        next.get(&a).await.expect("got");
+        assert_eq!(next.blocks(), (1, 0, 0));
     }
 }

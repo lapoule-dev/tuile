@@ -367,8 +367,8 @@ async fn main() -> Result<(), Error> {
         );
     }
     if let Some(blocks) = &remote_blocks {
-        let (downloaded, held) = blocks.blocks();
-        println!("store blocks: {downloaded} downloaded from the store's server, {held} answered from those kept here");
+        let (downloaded, confirmed, held) = blocks.blocks();
+        println!("store blocks: {downloaded} downloaded from the store's server, {confirmed} confirmed unchanged by it (no body sent), {held} answered from those kept here without asking");
     }
     let (asked, kept) = (sources.live.so_far(), sources.revalidations());
     println!(

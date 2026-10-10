@@ -414,6 +414,14 @@ impl<H: Http> Objects for S3Objects<H> {
             .ok_or_else(|| RepoError::Store(format!("{key}: no Content-Length")))
     }
 
+    async fn stat(&self, key: &str) -> Result<(u64, Option<String>), RepoError> {
+        let head = self.request("HEAD", key, &[], None, None).await?;
+        let size = head
+            .content_length
+            .ok_or_else(|| RepoError::Store(format!("{key}: no Content-Length")))?;
+        Ok((size, head.etag))
+    }
+
     async fn read(&self, key: &str, range: Range<u64>) -> Result<Vec<u8>, RepoError> {
         if range.is_empty() {
             return Ok(Vec::new());

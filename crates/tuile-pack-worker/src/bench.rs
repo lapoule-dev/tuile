@@ -479,7 +479,10 @@ pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> 
     if !url.path().starts_with("/api/") {
         return env.assets("ASSETS")?.fetch_request(request).await;
     }
-    if request.method() != Method::Get {
+    // HEAD is how a reader that keeps blocks asks whether one it holds is
+    // still the object's: the headers of the GET, and no body.
+    let head = request.method() == Method::Head;
+    if request.method() != Method::Get && !head {
         return Response::error("the API is read-only", 405);
     }
     // A block that this point of presence has served before is served again
@@ -488,7 +491,8 @@ pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> 
     // …provided the address says which object it is a block of: a pack's
     // block names its pack's size (`?s=`), because a pack can be replaced
     // under its key and an address kept for a year must not then answer
-    // with the old one. An archive of the tile store is never rewritten.
+    // with the old one. A block of the tile store is kept here only as long
+    // as its reply says (a moment), then asked for again.
     let named = url.query_pairs().any(|(name, _)| name == "s");
     let cacheable = is_block(url.path()) && (url.path().starts_with("/api/store/") || named);
     let if_none_match = request.headers().get("if-none-match")?;
@@ -512,6 +516,9 @@ pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> 
                 }
                 return Ok(Response::empty()?.with_status(304).with_headers(headers));
             }
+            if head {
+                return Ok(Response::empty()?.with_headers(hit.headers().clone()));
+            }
             return Ok(hit);
         }
     }
@@ -521,7 +528,7 @@ pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> 
         Err(e) => return Response::error(format!("misconfigured: {e}"), 500),
     };
     let range = request.headers().get("range")?;
-    let reply = match bench
+    let mut reply = match bench
         .get(
             url.path(),
             url.query().unwrap_or_default(),
@@ -535,7 +542,12 @@ pub async fn main(request: Request, env: Env, ctx: Context) -> Result<Response> 
         Some(reply) => reply,
         None => return Response::error("no such route", 404),
     };
-    let stored = cacheable && reply.status == 200;
+    if head {
+        // Nothing of the object is read to say what it is.
+        reply.later = None;
+        reply.body.clear();
+    }
+    let stored = cacheable && reply.status == 200 && !head;
     let (body, status, headers) = respond(reply).await?;
     if stored {
         // Kept after the reply has gone: the client does not wait for it.

@@ -5,7 +5,7 @@
 //!
 //! Nothing here asks a server for a tile. The store's catalog and manifests
 //! are fetched as the small files they are, its archives by the API's fixed
-//! blocks — whole, immutable replies the browser's cache and the edge's both
+//! blocks — whole, validated replies the browser's cache and the edge's both
 //! keep — and the tile is found here, by the same reader a native process
 //! runs next to the bucket (`tuile_repository::ArchivedTiles`).
 
@@ -41,25 +41,50 @@ pub struct FetchGet {
 
 // One block of an archive, from the network once and from then on from the
 // browser's cache storage — which is on disk, outlives the page, and is one
-// for the page and every one of its workers. An archive's block never
-// changes, so nothing is ever asked about a block that is there. A lock named
-// after the block makes its first readers one: workers that want the same
-// block at the same moment wait for a single download.
+// for the page and every one of its workers.
+//
+// An archive can be written again under its key, so a block that is there is
+// asked about once by each scope that reads it — a HEAD, which crosses
+// origins without a preflight and brings the block's validator and no body —
+// and compared with the validator of what is kept. The same: the kept block
+// is read, now and for the rest of this scope's life, with nothing more
+// asked. Another, or none to compare: the block is downloaded and replaces
+// the one that was there. A lock named after the block makes its first
+// readers one: workers that want the same block at the same moment wait for
+// a single download.
 //
 // `key` is the block's address without what says who asks: the same block
 // under another credential is the same block.
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
-const KEPT = "tuile-store-blocks-v1";
+const KEPT = "tuile-store-blocks-v2";
+const SURE = new Set();
+const bare = (tag) => (tag || "").replace(/^W\//, "");
 export async function tuile_block(url, key, header, value) {
-  const ask = () => fetch(url, header ? { headers: { [header]: value } } : undefined);
+  const init = header ? { headers: { [header]: value } } : {};
+  const ask = () => fetch(url, init);
   if (!globalThis.caches) return [await ask(), false];
   const once = async () => {
     const cache = await caches.open(KEPT);
     const kept = await cache.match(key);
-    if (kept) return [kept, true];
+    if (kept) {
+      if (SURE.has(key)) return [kept, true];
+      const held = bare(kept.headers.get("etag"));
+      if (held) {
+        try {
+          const now = await fetch(url, { ...init, method: "HEAD", cache: "no-store" });
+          if (now.ok && bare(now.headers.get("etag")) === held) {
+            SURE.add(key);
+            return [kept, true];
+          }
+        } catch (_) { /* not answered: read it again below */ }
+      }
+    }
     const response = await ask();
     if (response.status === 200) {
-      try { await cache.put(key, response.clone()); } catch (_) { /* full: read, not kept */ }
+      try {
+        await cache.put(key, response.clone());
+        SURE.add(key);
+      } catch (_) { /* full: read, not kept */ }
     }
     return [response, false];
   };
@@ -128,15 +153,20 @@ impl FetchGet {
     async fn once(&self, path: &str) -> Result<Got, String> {
         let (url, key) = self.addresses(path);
         let header = self.header();
-        // A block of an archive is immutable: read once, kept, never asked
-        // again. Everything else changes and is asked each time.
+        // A block of an archive is read once and kept; a scope that finds
+        // one kept asks once whether it is still the object's. Everything
+        // else is asked each time.
         if path.contains(&format!("/{}/", tuile_repository::block_segment())) {
             let (name, value) = header.unzip();
             let answer = tuile_block(&url, &key, name, value).await.map_err(text)?;
             let kept = get(&answer, "1").as_bool().unwrap_or(false);
             BLOCKS.with(|b| {
                 let (network, held) = b.get();
-                b.set(if kept { (network, held + 1) } else { (network + 1, held) });
+                b.set(if kept {
+                    (network, held + 1)
+                } else {
+                    (network + 1, held)
+                });
             });
             return read(get(&answer, "0")).await;
         }

@@ -299,7 +299,9 @@ async fn the_routes_answer_as_documented() {
     );
     assert_eq!(&bytes[..8], b"TUILEPK\0");
     assert_eq!(block.object_size, Some(size));
-    assert_eq!(block.cache_control, "public, max-age=31536000, immutable");
+    // Kept a moment and then asked about, by its validator: an object can
+    // be written again under its key.
+    assert_eq!(block.cache_control, "public, max-age=30");
     assert!(block.content_range.is_none());
     assert_ne!(block.etag, head.etag, "a block is not the object");
     assert_eq!(

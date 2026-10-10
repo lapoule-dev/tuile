@@ -55,6 +55,16 @@ pub trait Objects: Send + Sync {
     async fn size(&self, key: &str) -> Result<u64, RepoError>;
     async fn read(&self, key: &str, range: Range<u64>) -> Result<Vec<u8>, RepoError>;
 
+    /// The object's size and the validator its store gives it: what says
+    /// whether the object under a key is still the one a reader holds bytes
+    /// of. A key can be written again, so a size alone does not.
+    ///
+    /// A store that has no validator to give answers `None`, which is what
+    /// this default does.
+    async fn stat(&self, key: &str) -> Result<(u64, Option<String>), RepoError> {
+        Ok((self.size(key).await?, None))
+    }
+
     /// A whole object. For the small ones: a marker, a manifest, a tape.
     async fn read_all(&self, key: &str) -> Result<Vec<u8>, RepoError> {
         let size = self.size(key).await?;
