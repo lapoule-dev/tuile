@@ -304,6 +304,66 @@ impl ArchivedTiles {
         Ok(manifest)
     }
 
+    /// Reads, together, the manifests of the zones these tiles of `layer`
+    /// lie in, and holds them as if each tile had asked: what a reader does
+    /// before a stretch of frames, so that its several hundred zones cost
+    /// one exchange with the store ([`Objects::read_many`]) rather than one
+    /// each. Zones whose manifest is already held are not asked about.
+    /// Returns how many manifests were asked for.
+    ///
+    /// Nothing fails here but an unknown layer. A manifest that could not
+    /// be read, or is not one, is simply not held: the tile that needs it
+    /// asks for it alone, and it is that read which says what is wrong.
+    pub async fn open_zones(
+        &self,
+        layer: &str,
+        tiles: impl IntoIterator<Item = (u8, u32, u32)>,
+    ) -> Result<usize, RepoError> {
+        let Some(l) = self.layers.iter().find(|l| l.name == layer) else {
+            return Err(RepoError::NotFound(format!("layer {layer}")));
+        };
+        let now = (self.now)();
+        let zones: std::collections::BTreeSet<String> = tiles
+            .into_iter()
+            .map(|(level, x, y)| l.zone_prefix(level, x, y))
+            .collect();
+        let zones: Vec<String> = {
+            let held = self.manifests.lock().ok();
+            zones
+                .into_iter()
+                .filter(|zone| {
+                    !held
+                        .as_ref()
+                        .and_then(|held| held.get(zone))
+                        .is_some_and(|(at, _)| now.saturating_sub(*at) < MANIFEST_TTL)
+                })
+                .collect()
+        };
+        let keys: Vec<String> = zones
+            .iter()
+            .map(|zone| format!("{zone}/manifest.json"))
+            .collect();
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let read = self.live.read_many(&keys).await;
+        for (zone, read) in zones.iter().zip(read) {
+            let manifest = match read {
+                Ok(bytes) => match serde_json::from_slice::<Manifest>(&bytes) {
+                    Ok(manifest) => Some(Arc::new(manifest)),
+                    Err(_) => continue,
+                },
+                // A zone nothing was ever written to.
+                Err(RepoError::NotFound(_)) => None,
+                Err(_) => continue,
+            };
+            if let Ok(mut held) = self.manifests.lock() {
+                held.insert(zone.clone(), (now, manifest));
+            }
+        }
+        Ok(keys.len())
+    }
+
     /// The lock of whatever is read once under `name`.
     fn turn(&self, name: &str) -> Arc<AsyncMutex<()>> {
         match self.opening.lock() {

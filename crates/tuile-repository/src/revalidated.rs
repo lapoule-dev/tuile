@@ -116,7 +116,20 @@ impl Revalidated {
             self.count(4, 1);
             return Ok(body.to_vec());
         }
-        let read = match self.inner.read_if_changed(key, held.map(|h| h.0)).await {
+        let answer = self.inner.read_if_changed(key, held.map(|h| h.0)).await;
+        self.settled(key, held, answer).await
+    }
+
+    /// What a read of `key` comes to, from what the store answered when
+    /// asked with the validator of what was `held`: counted, remembered,
+    /// kept.
+    async fn settled(
+        &self,
+        key: &str,
+        held: Option<(&str, &[u8])>,
+        answer: Result<Read, RepoError>,
+    ) -> Result<Vec<u8>, RepoError> {
+        let read = match answer {
             Ok(read) => read,
             Err(RepoError::NotFound(what)) => {
                 // Nothing there: remembered, so it is asked once. A failure
@@ -195,6 +208,55 @@ impl Objects for Revalidated {
     async fn read_if_changed(&self, key: &str, known: Option<&str>) -> Result<Read, RepoError> {
         self.inner.read_if_changed(key, known).await
     }
+
+    async fn read_many_if_changed(
+        &self,
+        asked: &[(String, Option<String>)],
+    ) -> Vec<Result<Read, RepoError>> {
+        self.inner.read_many_if_changed(asked).await
+    }
+
+    /// Each as [`Self::read_all`] would answer it, and the store asked once
+    /// for all that it must be asked about: what this reader already asked
+    /// for, or knows is not there, is not asked about again; the rest goes
+    /// together, each with the validator of what is kept of it.
+    async fn read_many(&self, keys: &[String]) -> Vec<Result<Vec<u8>, RepoError>> {
+        let mut out: Vec<Option<Result<Vec<u8>, RepoError>>> = Vec::with_capacity(keys.len());
+        // What is to be asked: where its answer goes, and what is kept.
+        let mut places = Vec::new();
+        let mut asked = Vec::new();
+        for (place, key) in keys.iter().enumerate() {
+            if Self::was(&self.missing, key) {
+                out.push(Some(Err(RepoError::NotFound(key.clone()))));
+                continue;
+            }
+            let kept = self.keeper.get(key).await;
+            match kept.as_deref().and_then(parts) {
+                Some((_, body)) if Self::was(&self.asked, key) => {
+                    self.count(4, 1);
+                    out.push(Some(Ok(body.to_vec())));
+                }
+                held => {
+                    asked.push((key.clone(), held.map(|h| h.0.to_string())));
+                    places.push((place, kept));
+                    out.push(None);
+                }
+            }
+        }
+        if !asked.is_empty() {
+            let answers = self.inner.read_many_if_changed(&asked).await;
+            for ((place, kept), answer) in places.into_iter().zip(answers) {
+                let held = kept.as_deref().and_then(parts);
+                out[place] = Some(self.settled(&keys[place], held, answer).await);
+            }
+        }
+        out.into_iter()
+            .zip(keys)
+            .map(|(read, key)| {
+                read.unwrap_or_else(|| Err(RepoError::Store(format!("{key}: not answered"))))
+            })
+            .collect()
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -217,6 +279,9 @@ mod tests {
         }
     }
 
+    /// Objects asked about at once: each a key and the validator held.
+    type Many = Vec<(String, Option<String>)>;
+
     /// A store of versioned objects that counts the bodies it sends, and
     /// can be made to fail.
     #[derive(Default)]
@@ -224,6 +289,9 @@ mod tests {
         objects: Mutex<HashMap<String, (u32, Vec<u8>)>>,
         bodies: AtomicU64,
         asked: AtomicU64,
+        /// How many times it was asked about many objects at once, and
+        /// about which.
+        together: Mutex<Vec<Many>>,
         broken: Mutex<bool>,
     }
 
@@ -276,6 +344,17 @@ mod tests {
                 bytes: body.clone(),
                 etag: Some(etag),
             })
+        }
+        async fn read_many_if_changed(
+            &self,
+            asked: &[(String, Option<String>)],
+        ) -> Vec<Result<Read, RepoError>> {
+            self.together.lock().expect("lock").push(asked.to_vec());
+            let mut out = Vec::new();
+            for (key, known) in asked {
+                out.push(self.read_if_changed(key, known.as_deref()).await);
+            }
+            out
         }
     }
 
@@ -352,6 +431,108 @@ mod tests {
             b"two"
         );
         assert_eq!(bodies(), 3);
+    }
+
+    #[test]
+    fn many_are_asked_about_together_and_each_becomes_what_it_would_alone() {
+        let store = Arc::new(Versioned::default());
+        for zone in ["a", "b", "c"] {
+            store.write(&format!("{zone}/manifest.json"), zone.as_bytes());
+        }
+        let keeper: Arc<Memory> = Arc::default();
+        let keys: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|zone| format!("{zone}/manifest.json"))
+            .collect();
+        let bodies = || store.bodies.load(Ordering::Relaxed);
+        let together = || std::mem::take(&mut *store.together.lock().expect("lock"));
+        let read = |reader: &Revalidated, keys: &[String]| -> Vec<Option<Vec<u8>>> {
+            block(reader.read_many(keys))
+                .into_iter()
+                .map(|read| match read {
+                    Ok(bytes) => Some(bytes),
+                    Err(RepoError::NotFound(_)) => None,
+                    Err(other) => panic!("{other}"),
+                })
+                .collect()
+        };
+        let abc = [
+            Some(b"a".to_vec()),
+            Some(b"b".to_vec()),
+            Some(b"c".to_vec()),
+            None,
+        ];
+
+        // Nothing kept: asked together, with nothing held; all come, but
+        // the one that is not there.
+        let first = Revalidated::new(store.clone(), keeper.clone());
+        assert_eq!(read(&first, &keys), abc);
+        let asked = together();
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].iter().map(|a| &a.0).eq(&keys) && asked[0].iter().all(|a| a.1.is_none()));
+        assert_eq!(bodies(), 3);
+        // The same reader again: nothing is asked, of what is there or not.
+        assert_eq!(read(&first, &keys), abc);
+        assert_eq!(block(first.read_all(&keys[1])).expect("read"), b"b");
+        assert!(matches!(
+            block(first.read_all(&keys[3])),
+            Err(RepoError::NotFound(_))
+        ));
+        assert!(together().is_empty());
+        assert_eq!(
+            (bodies(), first.so_far().kept, first.so_far().absent),
+            (3, 4, 1)
+        );
+
+        // Another reader, later: one written again, one written at last,
+        // one this reader has already read alone. Asked together with the
+        // validators kept; what is unchanged keeps the body held.
+        store.write(&keys[1], b"B");
+        store.write(&keys[3], b"d");
+        let second = Revalidated::new(store.clone(), keeper.clone());
+        assert_eq!(block(second.read_all(&keys[2])).expect("read"), b"c");
+        assert_eq!(
+            read(&second, &keys),
+            [
+                Some(b"a".to_vec()),
+                Some(b"B".to_vec()),
+                Some(b"c".to_vec()),
+                Some(b"d".to_vec())
+            ]
+        );
+        let asked = together();
+        assert_eq!(
+            asked,
+            [vec![
+                (keys[0].clone(), Some("\"v1\"".to_string())),
+                (keys[1].clone(), Some("\"v1\"".to_string())),
+                (keys[3].clone(), None),
+            ]]
+        );
+        assert_eq!(bodies(), 5);
+        assert_eq!(
+            second.so_far(),
+            Revalidations {
+                unchanged: 2,
+                fetched: 2,
+                fetched_bytes: 2,
+                absent: 0,
+                kept: 1,
+            }
+        );
+        // And what came is kept: a third reader is sent nothing.
+        let third = Revalidated::new(store.clone(), keeper);
+        assert_eq!(read(&third, &keys)[1], Some(b"B".to_vec()));
+        assert_eq!((bodies(), third.so_far().unchanged), (5, 4));
+
+        // A store that cannot answer: a failure of each, and no absence.
+        *store.broken.lock().expect("lock") = true;
+        let fourth = Revalidated::new(store.clone(), Arc::<Memory>::default());
+        assert!(block(fourth.read_many(&keys))
+            .iter()
+            .all(|read| matches!(read, Err(RepoError::Store(_)))));
+        *store.broken.lock().expect("lock") = false;
+        assert_eq!(read(&fourth, &keys)[3], Some(b"d".to_vec()));
     }
 
     #[test]

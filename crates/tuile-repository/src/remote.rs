@@ -14,13 +14,15 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures_util::lock::Mutex as AsyncMutex;
 
-use crate::bench::block_segment;
-use crate::{Read, Entry, Listing, Objects, RepoError, BLOCK};
+use crate::bench::{block_segment, LiveAnswers, LiveAsk, LiveAsked, LIVE_MANY};
+use crate::objects::each_if_changed;
+use crate::{Entry, Listing, Objects, Read, RepoError, BLOCK};
 
 /// What came back from a GET.
 #[derive(Debug, Clone, Default)]
@@ -48,6 +50,22 @@ pub trait Get: Send + Sync {
     async fn get_unless(&self, path: &str, known: Option<&str>) -> Result<Got, String> {
         let _ = known;
         self.get(path).await
+    }
+
+    /// A POST of `body` to a path under the API: how many small objects are
+    /// asked about in one request (`store/live`, see
+    /// [`crate::Bench::post`]). The body is text and is sent as text
+    /// (`text/plain`), with no header a GET would not carry: from a browser,
+    /// that is what crosses origins without a preflight.
+    ///
+    /// A transport that cannot post answers as a server without the route
+    /// does — `405` —, which is this default: its reader asks one by one.
+    async fn post(&self, path: &str, body: String) -> Result<Got, String> {
+        let _ = (path, body);
+        Ok(Got {
+            status: 405,
+            ..Got::default()
+        })
     }
 }
 
@@ -98,6 +116,10 @@ async fn fetched(get: &dyn Get, path: &str, key: &str) -> Result<Got, RepoError>
 pub struct RemoteLive<G> {
     get: Arc<G>,
     root: String,
+    /// Whether the server was found not to answer for many objects at once
+    /// (`POST <root>/live`): an older one. Found once and remembered, so it
+    /// is asked one by one from then on rather than refused at every turn.
+    alone: AtomicBool,
 }
 
 impl<G: Get> RemoteLive<G> {
@@ -106,7 +128,82 @@ impl<G: Get> RemoteLive<G> {
         Self {
             get,
             root: root.into(),
+            alone: AtomicBool::new(false),
         }
+    }
+
+    /// Up to [`LIVE_MANY`] objects asked about in one request. `None` is a
+    /// server that has no such route: nothing was learnt of the objects.
+    async fn together(
+        &self,
+        asked: &[(String, Option<String>)],
+    ) -> Option<Vec<Result<Read, RepoError>>> {
+        let all = |why: String| -> Vec<Result<Read, RepoError>> {
+            asked
+                .iter()
+                .map(|(key, _)| Err(RepoError::Store(format!("{key}: {why}"))))
+                .collect()
+        };
+        let body = serde_json::to_string(&LiveAsked {
+            objects: asked
+                .iter()
+                .map(|(key, etag)| LiveAsk {
+                    key: key.clone(),
+                    etag: etag.clone(),
+                })
+                .collect(),
+        });
+        let body = match body {
+            Ok(body) => body,
+            Err(e) => return Some(all(e.to_string())),
+        };
+        let got = match self.get.post(&format!("{}/live", self.root), body).await {
+            Ok(got) => got,
+            // A request that failed says nothing of the route.
+            Err(e) => return Some(all(e)),
+        };
+        let answers = match got.status {
+            200 => match serde_json::from_slice::<LiveAnswers>(&got.body) {
+                Ok(answers) if answers.objects.len() == asked.len() => answers.objects,
+                Ok(answers) => {
+                    return Some(all(format!(
+                        "{} answers to {} questions",
+                        answers.objects.len(),
+                        asked.len()
+                    )))
+                }
+                Err(e) => return Some(all(format!("not a reply to many: {e}"))),
+            },
+            404 | 405 => return None,
+            status => return Some(all(format!("HTTP {status}"))),
+        };
+        let mut out = Vec::with_capacity(asked.len());
+        for ((key, known), answer) in asked.iter().zip(answers) {
+            out.push(match answer.status {
+                // Answers come in the order asked: one under another key
+                // is an answer to something else.
+                _ if answer.key != *key => Err(RepoError::Store(format!(
+                    "{key}: answered as {}",
+                    answer.key
+                ))),
+                200 => match answer.body {
+                    Some(body) => Ok(Read::Changed {
+                        etag: answer.etag,
+                        bytes: body.into_bytes(),
+                    }),
+                    None => Err(RepoError::Store(format!("{key}: sent without its body"))),
+                },
+                304 if known.is_some() => Ok(Read::Unchanged),
+                404 => Err(RepoError::NotFound(key.clone())),
+                // Left out of a reply that was full: asked for alone.
+                413 => self.read_if_changed(key, known.as_deref()).await,
+                status => Err(RepoError::Store(format!(
+                    "{key}: HTTP {status} — {}",
+                    answer.error.unwrap_or_default()
+                ))),
+            });
+        }
+        Some(out)
     }
 
     async fn whole(&self, key: &str) -> Result<Vec<u8>, RepoError> {
@@ -172,6 +269,35 @@ impl<G: Get> Objects for RemoteLive<G> {
             404 => Err(RepoError::NotFound(key.to_string())),
             status => Err(RepoError::Store(format!("{key}: HTTP {status}"))),
         }
+    }
+
+    /// Asked together, in one request for every [`LIVE_MANY`] of them: a
+    /// server answers each as it would have alone. One that has no such
+    /// route — an older one — is asked one by one, this time and from then
+    /// on.
+    async fn read_many_if_changed(
+        &self,
+        asked: &[(String, Option<String>)],
+    ) -> Vec<Result<Read, RepoError>> {
+        let mut out = Vec::with_capacity(asked.len());
+        for some in asked.chunks(LIVE_MANY) {
+            // One object is one GET, which a cache in front may answer.
+            let together = if some.len() > 1 && !self.alone.load(Ordering::Relaxed) {
+                self.together(some).await
+            } else {
+                None
+            };
+            match together {
+                Some(answers) => out.extend(answers),
+                None => {
+                    if some.len() > 1 {
+                        self.alone.store(true, Ordering::Relaxed);
+                    }
+                    out.extend(each_if_changed(self, some).await);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -443,6 +569,19 @@ impl<G: Get> Objects for RemoteStore<G> {
             })
         }
     }
+
+    /// What changes is asked for together; an archive, should one be among
+    /// them, by its blocks as ever.
+    async fn read_many_if_changed(
+        &self,
+        asked: &[(String, Option<String>)],
+    ) -> Vec<Result<Read, RepoError>> {
+        if asked.iter().all(|(key, _)| Self::changes(key)) {
+            self.live.read_many_if_changed(asked).await
+        } else {
+            each_if_changed(self, asked).await
+        }
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -483,13 +622,252 @@ mod tests {
 
         // Nothing held: the file, and its validator as the server gave it.
         let first = store.read_if_changed(key, None).await.expect("read");
-        let Read::Changed { bytes, etag } = first else { panic!("{first:?}") };
-        assert_eq!((bytes.as_slice(), etag.as_deref()), (&b"{}"[..], Some("W/\"v1\"")));
+        let Read::Changed { bytes, etag } = first else {
+            panic!("{first:?}")
+        };
+        assert_eq!(
+            (bytes.as_slice(), etag.as_deref()),
+            (&b"{}"[..], Some("W/\"v1\""))
+        );
         // Held: asked with it, and nothing comes back.
-        assert_eq!(store.read_if_changed(key, etag.as_deref()).await.expect("read"), Read::Unchanged);
+        assert_eq!(
+            store
+                .read_if_changed(key, etag.as_deref())
+                .await
+                .expect("read"),
+            Read::Unchanged
+        );
         // Another validator than the server's: the file again.
-        assert!(matches!(store.read_if_changed(key, Some("\"v0\"")).await.expect("read"), Read::Changed { .. }));
-        assert_eq!(*server.0.lock().expect("lock"), [None, Some("W/\"v1\"".to_string()), Some("\"v0\"".to_string())]);
+        assert!(matches!(
+            store
+                .read_if_changed(key, Some("\"v0\""))
+                .await
+                .expect("read"),
+            Read::Changed { .. }
+        ));
+        assert_eq!(
+            *server.0.lock().expect("lock"),
+            [
+                None,
+                Some("W/\"v1\"".to_string()),
+                Some("\"v0\"".to_string())
+            ]
+        );
+    }
+
+    /// A bench behind a transport that notes every request made of it —
+    /// and, made `old`, has no route for many objects at once, as a server
+    /// from before there was one.
+    struct Api {
+        bench: crate::Bench,
+        old: bool,
+        asked: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Get for Api {
+        async fn get(&self, path: &str) -> Result<Got, String> {
+            self.get_unless(path, None).await
+        }
+
+        async fn get_unless(&self, path: &str, known: Option<&str>) -> Result<Got, String> {
+            self.asked.lock().expect("lock").push(format!("GET {path}"));
+            let asked = crate::Asked {
+                range: None,
+                if_none_match: known,
+            };
+            let reply = self
+                .bench
+                .get(&format!("/api/{path}"), "", asked)
+                .await
+                .ok_or("no route")?;
+            Ok(Got {
+                status: reply.status,
+                object_size: reply.object_size,
+                etag: reply.etag.clone(),
+                body: reply.body,
+            })
+        }
+
+        async fn post(&self, path: &str, body: String) -> Result<Got, String> {
+            self.asked
+                .lock()
+                .expect("lock")
+                .push(format!("POST {path}"));
+            if self.old {
+                return Ok(Got {
+                    status: 405,
+                    ..Got::default()
+                });
+            }
+            let reply = self
+                .bench
+                .post(&format!("/api/{path}"), "", body.as_bytes())
+                .await
+                .ok_or("no route")?;
+            Ok(Got {
+                status: reply.status,
+                object_size: None,
+                etag: None,
+                body: reply.body,
+            })
+        }
+    }
+
+    /// Manifests `0..n` of a store, each `{"zone":i}`, written once.
+    struct Zones(usize);
+
+    #[async_trait]
+    impl Objects for Zones {
+        fn label(&self) -> String {
+            "zones".into()
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<Entry>, RepoError> {
+            unlistable(prefix)
+        }
+        async fn browse(&self, prefix: &str) -> Result<Listing, RepoError> {
+            unlistable(prefix)
+        }
+        async fn size(&self, key: &str) -> Result<u64, RepoError> {
+            Err(RepoError::NotFound(key.to_string()))
+        }
+        async fn read(&self, key: &str, _: Range<u64>) -> Result<Vec<u8>, RepoError> {
+            Err(RepoError::NotFound(key.to_string()))
+        }
+        async fn read_if_changed(&self, key: &str, known: Option<&str>) -> Result<Read, RepoError> {
+            let zone = key
+                .strip_suffix("/manifest.json")
+                .and_then(|zone| zone.parse::<usize>().ok())
+                .filter(|zone| *zone < self.0)
+                .ok_or_else(|| RepoError::NotFound(key.to_string()))?;
+            let etag = format!("\"z{zone}\"");
+            if known == Some(etag.as_str()) {
+                return Ok(Read::Unchanged);
+            }
+            Ok(Read::Changed {
+                bytes: format!("{{\"zone\":{zone}}}").into_bytes(),
+                etag: Some(etag),
+            })
+        }
+    }
+
+    fn api(zones: usize, old: bool) -> Arc<Api> {
+        let objects: Arc<dyn Objects> = Arc::new(Zones(zones));
+        Arc::new(Api {
+            bench: crate::Bench {
+                projects: Vec::new(),
+                tiles: None,
+                store: Some(crate::StoreObjects {
+                    live: objects.clone(),
+                    archives: objects,
+                }),
+                store_at: None,
+            },
+            old,
+            asked: Mutex::default(),
+        })
+    }
+
+    /// Zones `0..n`: the even ones held under their validator, the odd ones
+    /// not held — and the last of them a zone the store has not.
+    fn questions(n: usize) -> Vec<(String, Option<String>)> {
+        (0..n)
+            .map(|zone| {
+                (
+                    format!("{zone}/manifest.json"),
+                    (zone % 2 == 0).then(|| format!("\"z{zone}\"")),
+                )
+            })
+            .collect()
+    }
+
+    fn check(answers: &[Result<Read, RepoError>], n: usize) {
+        assert_eq!(answers.len(), n);
+        for (zone, answer) in answers.iter().enumerate() {
+            match answer {
+                Ok(Read::Unchanged) => assert!(zone % 2 == 0 && zone < n - 1, "{zone}"),
+                Ok(Read::Changed { bytes, etag }) => {
+                    assert!(zone % 2 == 1 && zone < n - 1, "{zone}");
+                    assert_eq!(bytes, format!("{{\"zone\":{zone}}}").as_bytes());
+                    assert_eq!(etag.as_deref(), Some(format!("\"z{zone}\"").as_str()));
+                }
+                Err(RepoError::NotFound(key)) => {
+                    assert_eq!(
+                        (zone, key.as_str()),
+                        (n - 1, format!("{zone}/manifest.json").as_str())
+                    );
+                }
+                Err(other) => panic!("{zone}: {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn many_manifests_are_one_request_each_answered_as_it_would_be_alone() {
+        let n = 347;
+        let server = api(n - 1, false);
+        // Through the transport that keeps blocks, as a render reads.
+        let kept = Arc::new(crate::Kept::new(Arced(server.clone()), Arc::new(Nowhere)));
+        let store = RemoteStore::new(kept, "store");
+        check(&store.read_many_if_changed(&questions(n)).await, n);
+        assert_eq!(*server.asked.lock().expect("lock"), ["POST store/live"]);
+
+        // More than one request may ask about: as few requests as hold them.
+        let n = LIVE_MANY * 2 + 2;
+        let server = api(n - 1, false);
+        let live = RemoteLive::new(server.clone(), "store");
+        check(&live.read_many_if_changed(&questions(n)).await, n);
+        assert_eq!(*server.asked.lock().expect("lock"), ["POST store/live"; 3]);
+
+        // One object alone is the GET a cache in front may answer.
+        server.asked.lock().expect("lock").clear();
+        let alone = live.read_many(&["1/manifest.json".to_string()]).await;
+        assert_eq!(alone[0].as_deref().expect("read"), b"{\"zone\":1}");
+        assert_eq!(
+            *server.asked.lock().expect("lock"),
+            ["GET store/live/1/manifest.json"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_older_server_is_asked_for_many_once_and_one_by_one_from_then_on() {
+        let n = 40;
+        let server = api(n - 1, true);
+        let live = RemoteLive::new(server.clone(), "store");
+        for round in 0..3 {
+            check(&live.read_many_if_changed(&questions(n)).await, n);
+            let asked = std::mem::take(&mut *server.asked.lock().expect("lock"));
+            let posts = asked.iter().filter(|a| a.starts_with("POST")).count();
+            // Found out once, and not put to the question again.
+            assert_eq!(posts, usize::from(round == 0), "round {round}");
+            assert_eq!(asked.len() - posts, n, "round {round}");
+        }
+    }
+
+    /// The transport above, shared: a test counts what crossed it.
+    struct Arced(Arc<Api>);
+
+    #[async_trait]
+    impl Get for Arced {
+        async fn get(&self, path: &str) -> Result<Got, String> {
+            self.0.get(path).await
+        }
+        async fn get_unless(&self, path: &str, known: Option<&str>) -> Result<Got, String> {
+            self.0.get_unless(path, known).await
+        }
+        async fn post(&self, path: &str, body: String) -> Result<Got, String> {
+            self.0.post(path, body).await
+        }
+    }
+
+    /// A store that keeps nothing: no block is read here.
+    struct Nowhere;
+
+    #[async_trait]
+    impl tuile_core::storage::ContentStore for Nowhere {
+        async fn get(&self, _: &str) -> Option<bytes::Bytes> {
+            None
+        }
+        async fn put(&self, _: &str, _: bytes::Bytes, _: Option<std::time::Duration>) {}
     }
 }
-

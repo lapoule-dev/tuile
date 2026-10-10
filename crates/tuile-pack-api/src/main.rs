@@ -110,6 +110,29 @@ async fn api(bench: Arc<Bench>, request: Request) -> Response {
     }
 }
 
+/// The most a POST's body may be: a list of keys and validators, a few
+/// hundred of each.
+const POSTED_LIMIT: usize = 1 << 20;
+
+/// The one route that takes a body (`POST /api/store/live`, many of the
+/// store's small objects asked about at once), handed to the bench as it
+/// came. The content type is not looked at: a browser sends this across
+/// origins as `text/plain`, which is what spares it a preflight.
+async fn posted(bench: Arc<Bench>, request: Request) -> Response {
+    let (path, query) = (
+        request.uri().path().to_string(),
+        request.uri().query().unwrap_or_default().to_string(),
+    );
+    let body = match axum::body::to_bytes(request.into_body(), POSTED_LIMIT).await {
+        Ok(body) => body,
+        Err(e) => return (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response(),
+    };
+    match bench.post(&path, &query, &body).await {
+        Some(reply) => respond(reply).await,
+        None => (StatusCode::NOT_FOUND, "no such route").into_response(),
+    }
+}
+
 fn open(place: &Place) -> Result<ObjectRunStore, StoreError> {
     let tuning = Tuning::from_env();
     match place {
@@ -220,15 +243,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut store_objects = None;
     let mut store_at = None;
     let tiles = match config.tiles {
-        Some(Place::Remote { url, header, direct, parameter }) => {
+        Some(Place::Remote {
+            url,
+            header,
+            direct,
+            parameter,
+        }) => {
             // Somebody else serves the store: its catalog and manifests are
             // asked of it each time, its archives by blocks, each kept here
             // once read.
             let credential = match header {
                 Some(name) => Some((
                     name,
-                    std::env::var("TUILE_TILES_REMOTE_SECRET")
-                        .map_err(|_| "TUILE_TILES_REMOTE_SECRET is not set: [tiles] names a header")?,
+                    std::env::var("TUILE_TILES_REMOTE_SECRET").map_err(|_| {
+                        "TUILE_TILES_REMOTE_SECRET is not set: [tiles] names a header"
+                    })?,
                 )),
                 None => None,
             };
@@ -240,18 +269,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         None => credential.as_ref().map(|(name, _)| name.clone()),
                     },
                     parameter: parameter.clone(),
-                    credential: std::env::var("TUILE_TILES_REMOTE_PUBLIC_SECRET").ok().filter(|v| !v.is_empty()),
+                    credential: std::env::var("TUILE_TILES_REMOTE_PUBLIC_SECRET")
+                        .ok()
+                        .filter(|v| !v.is_empty()),
                 });
             }
             // A block of the remote store is downloaded once and kept,
             // memory over disk.
-            let blocks = tuile_storage_foyer::FoyerStore::keeping(tuile_storage_foyer::StoreConfig {
-                dir: cache.join("tile-store-remote"),
-                memory_bytes: 256 << 20,
-                disk_bytes: 32 << 30,
-                default_ttl: None,
-            })
-            .await?;
+            let blocks =
+                tuile_storage_foyer::FoyerStore::keeping(tuile_storage_foyer::StoreConfig {
+                    dir: cache.join("tile-store-remote"),
+                    memory_bytes: 256 << 20,
+                    disk_bytes: 32 << 30,
+                    default_ttl: None,
+                })
+                .await?;
             let get = Arc::new(tuile_repository::Kept::new(
                 HttpGet::new(&url, credential)?,
                 Arc::new(blocks),
@@ -317,9 +349,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store_at,
     });
 
+    let posting = bench.clone();
     let mut app = Router::new().route(
         "/api/{*rest}",
-        axum::routing::get(move |request: Request| api(bench.clone(), request)),
+        axum::routing::get(move |request: Request| api(bench.clone(), request))
+            .post(move |request: Request| posted(posting.clone(), request)),
     );
     if let Some(www) = arg(&args, "--www") {
         // The page, its scripts and its wasm are rebuilt together and must be

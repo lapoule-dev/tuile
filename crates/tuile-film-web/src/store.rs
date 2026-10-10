@@ -170,45 +170,77 @@ impl FetchGet {
             });
             return read(get(&answer, "0")).await;
         }
-        once(&url, header.as_ref()).await
+        once(&url, header.as_ref(), None).await
     }
 }
 
-async fn once(url: &str, header: Option<&(String, String)>) -> Result<Got, String> {
-    let asked = match header {
-        Some((name, value)) => {
+/// One `fetch`: a GET, or — given a body — a POST of it.
+///
+/// The body is a string, and nothing says what it is: `fetch` labels a
+/// string `text/plain;charset=UTF-8` by itself, which is one of the content
+/// types a browser sends to another origin without asking first. With the
+/// credential in the address, a POST then costs one request, as a GET does;
+/// naming the content type `application/json` would cost a preflight each.
+async fn once(
+    url: &str,
+    header: Option<&(String, String)>,
+    body: Option<&str>,
+) -> Result<Got, String> {
+    let asked = if header.is_none() && body.is_none() {
+        call(&js_sys::global(), "fetch", &[url.into()])
+    } else {
+        let init = js_sys::Object::new();
+        if let Some((name, value)) = header {
             let headers = js_sys::Object::new();
             js_sys::Reflect::set(&headers, &name.as_str().into(), &value.as_str().into())
                 .map_err(text)?;
-            let init = js_sys::Object::new();
             js_sys::Reflect::set(&init, &"headers".into(), &headers).map_err(text)?;
-            call(&js_sys::global(), "fetch", &[url.into(), init.into()])
         }
-        None => call(&js_sys::global(), "fetch", &[url.into()]),
+        if let Some(body) = body {
+            js_sys::Reflect::set(&init, &"method".into(), &"POST".into()).map_err(text)?;
+            js_sys::Reflect::set(&init, &"body".into(), &body.into()).map_err(text)?;
+        }
+        call(&js_sys::global(), "fetch", &[url.into(), init.into()])
     };
     read(settled(asked.map_err(text)?).await.map_err(text)?).await
+}
+
+/// A request tried again while its server is busy, or fails in passing.
+/// Everything asked here only reads, so anything is safe to send twice.
+async fn tried<F: std::future::Future<Output = Result<Got, String>>>(
+    once: impl Fn() -> F,
+) -> Result<Got, String> {
+    let mut wait = 150;
+    let mut last = String::new();
+    for attempt in 1..=TRIES {
+        match once().await {
+            // Busy, or a passing failure: worth asking again.
+            Ok(got) if matches!(got.status, 429 | 500 | 502 | 503 | 504) => {
+                last = format!("HTTP {}", got.status);
+            }
+            Ok(got) => return Ok(got),
+            Err(why) => last = why,
+        }
+        if attempt < TRIES {
+            sleep(wait).await;
+            wait *= 3;
+        }
+    }
+    Err(format!("{last}, after {TRIES} tries"))
 }
 
 #[async_trait(?Send)]
 impl Get for FetchGet {
     async fn get(&self, path: &str) -> Result<Got, String> {
-        let mut wait = 150;
-        let mut last = String::new();
-        for attempt in 1..=TRIES {
-            match self.once(path).await {
-                // Busy, or a passing failure: worth asking again.
-                Ok(got) if matches!(got.status, 429 | 500 | 502 | 503 | 504) => {
-                    last = format!("HTTP {}", got.status);
-                }
-                Ok(got) => return Ok(got),
-                Err(why) => last = why,
-            }
-            if attempt < TRIES {
-                sleep(wait).await;
-                wait *= 3;
-            }
-        }
-        Err(format!("{last}, after {TRIES} tries"))
+        tried(|| self.once(path)).await
+    }
+
+    /// Many small objects asked about in one request: see [`once`] for what
+    /// keeps it from being preflighted.
+    async fn post(&self, path: &str, body: String) -> Result<Got, String> {
+        let (url, _) = self.addresses(path);
+        let header = self.header();
+        tried(|| once(&url, header.as_ref(), Some(&body))).await
     }
 }
 
@@ -227,7 +259,7 @@ impl Store {
     /// address of its own, which this reader then goes to directly — with
     /// the credential that address wants, in a header or in the address.
     pub async fn open(api: &str) -> Result<Self, RepoError> {
-        let elsewhere = match once(&format!("{api}/store/at"), None).await {
+        let elsewhere = match once(&format!("{api}/store/at"), None, None).await {
             Ok(got) if got.status == 200 => {
                 serde_json::from_slice::<tuile_repository::StoreAt>(&got.body).ok()
             }
