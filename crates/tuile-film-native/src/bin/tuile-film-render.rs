@@ -74,6 +74,18 @@
 //!   --exposure <stops>    the look's exposure
 //!   --contrast <power>    the look's contrast, about middle grey
 //!   --saturation <factor> the look's saturation
+//!   --sun <azimuth,elevation>
+//!                         where the look's sun stands, in degrees, as seen
+//!                         from the first frame rendered: clockwise from
+//!                         north, and over the horizon. Unless given, the
+//!                         look's own: along the Earth's axis
+//!   --shadow <0..1>       how much of the sun ground loses where other
+//!                         ground stands before it (default 0: no shadows)
+//!   --haze                air between the eye and the ground, and a sky
+//!                         from horizon to zenith: the look's clear day
+//!   --haze-density <per m>, --haze-height <m>
+//!                         that air's extinction at the ellipsoid, and the
+//!                         height over which it thins by e
 //!   --anchor <level>      the level --meter's own solve holds still (10)
 //!   --cache <dir>         chunks of packs and archives (default
 //!                         $TUILE_CACHE_DIR, else ./film-cache)
@@ -327,6 +339,19 @@ async fn main() -> Result<(), Error> {
     if let Some(factor) = value("--saturation") {
         order.look.saturation = factor.parse()?;
     }
+    if let Some(strength) = value("--shadow") {
+        order.look.shadow = strength.parse()?;
+    }
+    if flag("--haze") || value("--haze-density").is_some() || value("--haze-height").is_some() {
+        let mut haze = tuile_film::Haze::default();
+        if let Some(density) = value("--haze-density") {
+            haze.density = density.parse()?;
+        }
+        if let Some(height) = value("--haze-height") {
+            haze.scale_height = height.parse()?;
+        }
+        order.look.haze = Some(haze);
+    }
     let calibrating = value("--calibrate");
     if flag("--no-tone") || calibrating.is_some() {
         order.tone = Tone::Off;
@@ -385,6 +410,29 @@ async fn main() -> Result<(), Error> {
         "{prefix}: {} packs, frames {first}–{last}",
         film.packs.len()
     );
+
+    if let Some(sun) = value("--sun") {
+        let (azimuth, elevation) = sun
+            .split_once(',')
+            .ok_or("--sun is <azimuth>,<elevation>")?;
+        let (azimuth, elevation) = (
+            azimuth.parse::<f64>()?.to_radians(),
+            elevation.parse::<f64>()?.to_radians(),
+        );
+        // East, north and up where the first frame rendered is seen from.
+        let from = order.frames.map_or(first, |f| f.0);
+        let pack = film
+            .packs
+            .iter()
+            .find(|p| (p.first..=p.last).contains(&from))
+            .ok_or("no pack holds the first frame")?;
+        let eye = tuile_film::Pack::open_table(&pack.head)?
+            .view_of(from)?
+            .position;
+        let local = enu_frame(tuile_core::geo::ecef_to_geodetic(DVec3::from_array(eye)));
+        let level = local.x_axis * azimuth.sin() + local.y_axis * azimuth.cos();
+        order.look.to_sun = (level * elevation.cos() + local.z_axis * elevation.sin()).as_vec3();
+    }
 
     let mut sinks: Vec<Box<dyn Sink>> = Vec::new();
     if let Some(path) = value("--out") {
@@ -475,6 +523,11 @@ async fn main() -> Result<(), Error> {
         "tiles: {} from the store, {} from the pack, {} source tiles renewed since the bake",
         done.tiles_from_store, done.tiles_from_pack, done.renewed,
     );
+    if let Some((fine, coarse)) = done.shadow_texel {
+        println!(
+            "shadows: a texel of the sun's map is {fine:.1} to {coarse:.1} m of ground, frame by frame"
+        );
+    }
     match &done.grade {
         None => println!("grade: none — the film has none of its own, and borrows none"),
         Some(grade) => println!(

@@ -8,7 +8,7 @@
 //! pixel off it as the sky. Skipped when the machine has no adapter.
 
 use glam::Vec3;
-use tuile_film::{BakedView, FrameCamera, Imagery, Look, OverlayDepth, OverlayMesh, TileKey};
+use tuile_film::{BakedView, FrameCamera, Haze, Imagery, Look, OverlayDepth, OverlayMesh, TileKey};
 use tuile_film_gpu::{FilmGpu, Settings, TileMesh};
 
 /// The WGS84 equatorial radius: the square sits on the ground at null island.
@@ -1187,4 +1187,236 @@ fn a_faulty_overlay_is_refused() {
         film.render_with(&camera, &[], &[mesh]),
         Err(tuile_film_gpu::FilmGpuError::Overlay(_))
     ));
+}
+
+/// What `present` makes of a radiance under a look with no contrast and no
+/// saturation of its own: the exposure, the highlights' roll-off, the curve.
+fn shown(look: &Look, radiance: Vec3) -> [f32; 3] {
+    let mut linear = radiance * look.exposure_scale();
+    let lit = linear.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+    let knee = 0.5;
+    if lit > knee {
+        linear *= (knee + (1.0 - knee) * ((lit - knee) / (1.0 - knee)).tanh()) / lit;
+    }
+    linear.to_array().map(oetf)
+}
+
+fn albedo(srgb: [u8; 4]) -> Vec3 {
+    Vec3::new(
+        eotf(f32::from(srgb[0]) / 255.0),
+        eotf(f32::from(srgb[1]) / 255.0),
+        eotf(f32::from(srgb[2]) / 255.0),
+    )
+}
+
+/// The sun a fifth off the camera's line of sight, to the east: the ridge,
+/// 500 m over the ground, shades a band of it 100 m to the west — columns
+/// 25 to 27, beside the ridge's own 29 to 35.
+fn low_sun(shadow: f32) -> Look {
+    Look {
+        to_sun: Vec3::new(1.0, 0.2, 0.0).normalize(),
+        shadow,
+        ..look()
+    }
+}
+
+/// A shadow takes the sun and only the sun: ground the ridge stands before
+/// is lit by the dome alone — and so is never black — while the ground
+/// beside it, and the ridge, keep the sun whole.
+#[test]
+fn a_shadow_takes_the_sun_and_never_the_dome() {
+    let (Some(full), Some(half), Some(none)) = (
+        frames(low_sun(1.0), 2, &[&[]]),
+        frames(low_sun(0.5), 2, &[&[]]),
+        frames(low_sun(0.0), 2, &[&[]]),
+    ) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let look = low_sun(1.0);
+    let ground = albedo(GROUND_SRGB);
+    let cos = look.to_sun.x;
+    let lit = shown(&look, ground * (look.world + look.sun * cos));
+    let by_the_dome = shown(&look, ground * look.world);
+    let by_half_the_sun = shown(&look, ground * (look.world + look.sun * cos * 0.5));
+    for row in [14, 24, 34] {
+        for column in 25..=27 {
+            let shaded = pixel(&full[0], column, row);
+            assert!(
+                close(shaded, by_the_dome),
+                "({column},{row}) {shaded:?}, wanted the dome's {:?}",
+                by_the_dome.map(|c| c * 255.0)
+            );
+            // Never black: every channel the ground has, it keeps.
+            assert!(shaded.iter().all(|c| *c >= 20), "{shaded:?}");
+            assert!(close(pixel(&half[0], column, row), by_half_the_sun));
+            // And with no shadow asked for, none.
+            assert!(close(pixel(&none[0], column, row), lit));
+        }
+        // Ground the ridge does not stand before has the sun whole — to
+        // the west of the shadow and to the east of the ridge — with not
+        // a speck of its own shade on it.
+        for column in [21, 22, 23, 37, 38, 40, 42] {
+            let open = pixel(&full[0], column, row);
+            assert!(
+                close(open, lit),
+                "({column},{row}) {open:?}, wanted {:?}",
+                lit.map(|c| c * 255.0)
+            );
+        }
+    }
+    // The ridge shades the ground, not itself.
+    let ridge = shown(&look, albedo(RIDGE_SRGB) * (look.world + look.sun * cos));
+    for row in [6, 24, 42] {
+        assert!(close(pixel(&full[0], 32, row), ridge), "row {row}");
+    }
+}
+
+/// Shadows with nothing standing before the sun, and air that takes
+/// nothing, leave the picture the default look makes — to the byte, on the
+/// ground and in the sky.
+#[test]
+fn shadows_and_air_with_nothing_to_do_change_no_byte() {
+    // The sun straight down the line of sight: what the ridge shades is
+    // behind it.
+    let idle = Look {
+        shadow: 1.0,
+        haze: Some(Haze {
+            density: 0.0,
+            scale_height: 1500.0,
+            horizon: look().world,
+            zenith: look().world,
+        }),
+        ..look()
+    };
+    for supersample in [1, 2] {
+        let (Some(plain), Some(idle)) = (
+            frames(look(), supersample, &[&[]]),
+            frames(idle, supersample, &[&[]]),
+        ) else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        assert_eq!(plain[0].rgba, idle[0].rgba);
+    }
+}
+
+/// The air takes from a ray what its closed form says — more from the
+/// ground a kilometre down than from the ridge halfway — and puts the
+/// horizon's colour in its place.
+#[test]
+fn the_air_fades_the_ground_by_what_the_ray_crosses() {
+    let haze = Haze {
+        density: 4.0e-4,
+        scale_height: 1000.0,
+        horizon: Vec3::new(0.3, 0.4, 0.5),
+        zenith: Vec3::new(0.05, 0.1, 0.4),
+    };
+    let hazy = Look {
+        haze: Some(haze),
+        ..look()
+    };
+    let Some(r) = frames(hazy, 1, &[&[]]) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let through = |srgb, left: f32| {
+        let clear = albedo(srgb) * (hazy.world + hazy.sun);
+        shown(&hazy, clear * left + haze.horizon * (1.0 - left))
+    };
+    // Column 24, row 24: the ground 132 m west of the nadir, a kilometre
+    // under the eye.
+    let ground = haze.transmittance(1000.0, 0.0, (1000.0f32.powi(2) + 132.0f32.powi(2)).sqrt());
+    assert!((0.7..0.85).contains(&ground), "{ground}");
+    let found = pixel(&r[0], 24, 24);
+    assert!(
+        close(found, through(GROUND_SRGB, ground)),
+        "{found:?}, wanted {:?}",
+        through(GROUND_SRGB, ground).map(|c| c * 255.0)
+    );
+    // The ridge, 500 m under the eye: half the way, through the thinner
+    // half of the air.
+    let ridge = haze.transmittance(1000.0, 500.0, 500.0);
+    assert!(ridge > ground + 0.1);
+    let found = pixel(&r[0], 32, 24);
+    assert!(
+        close(found, through(RIDGE_SRGB, ridge)),
+        "{found:?}, wanted {:?}",
+        through(RIDGE_SRGB, ridge).map(|c| c * 255.0)
+    );
+    // Past the ground the camera looks down at no tile: under the horizon
+    // the air has no end, and shows its own colour.
+    assert!(close(pixel(&r[0], 2, 2), shown(&hazy, haze.horizon)));
+}
+
+/// The sky of a look that has air runs from the horizon's colour, at the
+/// horizon and under it, towards the zenith's, by the air a ray crosses.
+#[test]
+fn the_sky_runs_from_the_horizon_to_the_zenith() {
+    let haze = Haze {
+        density: 1.0e-5,
+        scale_height: 1000.0,
+        horizon: Vec3::new(0.4, 0.42, 0.45),
+        zenith: Vec3::new(0.05, 0.15, 0.45),
+    };
+    let airy = Look {
+        haze: Some(haze),
+        ..look()
+    };
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mut film = FilmGpu::new(
+        device,
+        queue,
+        Settings {
+            width: 64,
+            height: 48,
+            supersample: 1,
+            look: airy,
+        },
+    );
+    // A kilometre up, looking north at the horizon, with nothing drawn.
+    let level = BakedView {
+        direction: [0.0, 0.0, 1.0],
+        up: [1.0, 0.0, 0.0],
+        ..view()
+    };
+    let camera = FrameCamera::of(&level, 64.0 / 48.0);
+    let encoder = film.render(&camera, &[]).expect("render");
+    film.queue().submit([encoder.finish()]);
+    let r = Rendered {
+        rgba: picture(&film),
+        i420: Vec::new(),
+        width: 64,
+    };
+    // Under the horizon, the horizon's colour.
+    let horizon = shown(&airy, haze.horizon);
+    for row in [24, 30, 47] {
+        assert!(close(pixel(&r, 32, row), horizon), "row {row}");
+    }
+    // At the top of the picture, what the closed form says: the air
+    // overhead, at the eye's density, as slanted as the ray, forty deep.
+    let rise = (0.4f32).tan() * (1.0 - 0.5 / 24.0);
+    let sine = rise / (1.0 + rise * rise).sqrt();
+    let overhead = haze.density * (-1.0f32).exp() * haze.scale_height;
+    let through = (-40.0 * overhead / sine).exp();
+    assert!((0.6..0.9).contains(&through), "{through}");
+    let top = shown(
+        &airy,
+        haze.zenith * through + haze.horizon * (1.0 - through),
+    );
+    assert!(
+        close(pixel(&r, 32, 0), top),
+        "{:?}, wanted {:?}",
+        pixel(&r, 32, 0),
+        top.map(|c| c * 255.0)
+    );
+    // And between the two, never back towards the horizon on the way up.
+    for row in 1..24 {
+        let (above, below) = (pixel(&r, 32, row - 1), pixel(&r, 32, row));
+        assert!(above[0] <= below[0], "row {row}: {above:?} over {below:?}");
+    }
+    assert!(pixel(&r, 32, 0)[0] + 30 < pixel(&r, 32, 23)[0]);
 }

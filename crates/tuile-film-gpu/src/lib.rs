@@ -17,6 +17,14 @@
 //! 5. **present**: supersampling box filter, exposure, sRGB curve;
 //! 6. optionally **I420**, so a native encoder reads half the bytes.
 //!
+//! Two things the look may ask for, and by default does not. **Shadows**
+//! ([`tuile_film::Look::shadow`]): one more raster, of depth alone, of the
+//! frame's tiles as the sun sees them, which the resolve reads to take the
+//! sun — and only the sun — from ground that other ground stands before.
+//! **Air** ([`tuile_film::Look::haze`]): what a ray crosses on its way to
+//! the eye, in closed form in the resolve, and a sky that runs from the
+//! horizon's colour to the zenith's in `present`.
+//!
 //! A frame may also carry a host's **overlays** ([`tuile_film::OverlayMesh`]):
 //! coloured triangles placed in the world. They are the one thing rastered
 //! besides visibility — after it, into a target of their own, against the
@@ -34,11 +42,11 @@ mod frame;
 
 use std::collections::HashMap;
 
-use glam::DVec3;
+use glam::{DVec3, Vec3};
 use tuile_film::{FrameCamera, Look, OverlayDepth, OverlayMesh, TileKey};
 use wgpu::util::DeviceExt;
 
-pub use frame::{FrameUniform, TileFrame};
+pub use frame::{shadow_reach, FrameUniform, SunView, TileFrame};
 
 /// How many tiles may be resident at once. Fixed because the scan that bins
 /// pixels by tile runs over all of them in one workgroup; it matches
@@ -53,6 +61,8 @@ const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Overlays are blended in linear light before they are filtered down: a
 /// byte a channel would band their dark colours.
 const OVERLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// The side of the sun's map, in texels, where the device allows it.
+const SHADOW_SIDE: u32 = 4096;
 /// What `present` writes, and what a canvas or an encoder reads.
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const ALBEDO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -138,6 +148,10 @@ struct Resident {
     flags: u32,
     factor: [f32; 4],
     index_count: u32,
+    /// A sphere around the mesh, from its origin: what the sun's view is
+    /// fitted to.
+    centre: Vec3,
+    radius: f32,
     bind: wgpu::BindGroup,
     // Held for as long as the bind group that names them.
     _buffers: [wgpu::Buffer; 4],
@@ -166,6 +180,8 @@ struct Targets {
 
 struct Pipelines {
     raster: wgpu::RenderPipeline,
+    /// The same tiles, depth alone, as the sun sees them.
+    shadow: wgpu::RenderPipeline,
     /// Overlays hidden by nearer ground, and overlays never hidden.
     overlay_terrain: wgpu::RenderPipeline,
     overlay_always: wgpu::RenderPipeline,
@@ -191,6 +207,10 @@ pub struct FilmGpu {
     overlay_bg: wgpu::BindGroup,
     overlay_vertices: Growing,
     overlay_indices: Growing,
+    /// The sun's map and its side, for a look that has shadows.
+    shadow_map: Option<(wgpu::TextureView, u32)>,
+    /// A texel of that map on the ground, in the frame last recorded.
+    shadow_texel: Option<f32>,
     slot_bg: wgpu::BindGroup,
     frame_buf: wgpu::Buffer,
     tiles_buf: wgpu::Buffer,
@@ -497,6 +517,13 @@ impl FilmGpu {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                texture(8, wgpu::TextureSampleType::Depth),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: compute_only,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
             ],
         });
         let slot_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -541,6 +568,47 @@ impl FilmGpu {
                 compilation_options: Default::default(),
                 targets: &[Some(VIS_FORMAT.into())],
             }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let shadow_module = shader(&device, "film shadow", include_str!("shaders/shadow.wgsl"));
+        let shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("film shadow"),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("film shadow"),
+                    bind_group_layouts: &[Some(&raster_bgl), Some(&tile_bgl)],
+                    immediate_size: 0,
+                }),
+            ),
+            vertex: wgpu::VertexState {
+                module: &shadow_module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                // Ground shades ground whichever way it faces.
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                // Zero is nearest the sun.
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                // Ground seen at a grazing angle by the sun is pushed back
+                // by its own slope, so that it does not shade itself.
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 2.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: Default::default(),
+            fragment: None,
             multiview_mask: None,
             cache: None,
         });
@@ -611,7 +679,10 @@ impl FilmGpu {
         let resolve_module = shader(
             &device,
             "film resolve",
-            include_str!("shaders/resolve.wgsl"),
+            concat!(
+                include_str!("shaders/air.wgsl"),
+                include_str!("shaders/resolve.wgsl")
+            ),
         );
         let resolve_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("film resolve"),
@@ -621,7 +692,10 @@ impl FilmGpu {
         let present_module = shader(
             &device,
             "film present",
-            include_str!("shaders/present.wgsl"),
+            concat!(
+                include_str!("shaders/air.wgsl"),
+                include_str!("shaders/present.wgsl")
+            ),
         );
         let mips_module = shader(&device, "film mips", include_str!("shaders/mips.wgsl"));
         let compose_module = shader(
@@ -632,6 +706,7 @@ impl FilmGpu {
         let i420_module = shader(&device, "film i420", include_str!("shaders/i420.wgsl"));
         let pipelines = Pipelines {
             raster,
+            shadow,
             overlay_terrain,
             overlay_always,
             count: compute(&device, &bin, "count", None),
@@ -765,6 +840,41 @@ impl FilmGpu {
             mapped_at_creation: false,
         });
 
+        // The sun's map, for a look that has shadows; a texel that shades
+        // nothing otherwise, since a binding may not be empty.
+        let shadow_side = if settings.look.shadow > 0.0 {
+            SHADOW_SIDE.min(device.limits().max_texture_dimension_2d)
+        } else {
+            1
+        };
+        let shadow_view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("film shadow map"),
+                size: wgpu::Extent3d {
+                    width: shadow_side,
+                    height: shadow_side,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("film shadow"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            // Lit where nothing in the map is nearer the sun.
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+
         let targets = Self::targets(
             &device,
             &pipelines,
@@ -778,6 +888,8 @@ impl FilmGpu {
             &args,
             &sampler,
             &blank,
+            &shadow_view,
+            &shadow_sampler,
         );
 
         Self {
@@ -790,6 +902,8 @@ impl FilmGpu {
             overlay_bg,
             overlay_vertices: Growing::default(),
             overlay_indices: Growing::default(),
+            shadow_map: (settings.look.shadow > 0.0).then_some((shadow_view, shadow_side)),
+            shadow_texel: None,
             slot_bg,
             frame_buf,
             tiles_buf,
@@ -821,6 +935,8 @@ impl FilmGpu {
         args: &wgpu::Buffer,
         sampler: &wgpu::Sampler,
         blank: &wgpu::TextureView,
+        shadow_map: &wgpu::TextureView,
+        shadow_sampler: &wgpu::Sampler,
     ) -> Targets {
         let k = settings.supersample.max(1);
         let (w, h) = (settings.width * k, settings.height * k);
@@ -925,6 +1041,8 @@ impl FilmGpu {
                     entry(5, vis_res()),
                     entry(6, wgpu::BindingResource::TextureView(&hdr)),
                     entry(7, wgpu::BindingResource::Sampler(sampler)),
+                    entry(8, wgpu::BindingResource::TextureView(shadow_map)),
+                    entry(9, wgpu::BindingResource::Sampler(shadow_sampler)),
                 ],
             }),
             present_bg: Self::present_bg(
@@ -1027,6 +1145,15 @@ impl FilmGpu {
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// How fine the shadows of the frame last recorded are: the metres of
+    /// ground, facing the sun, that one texel of the sun's map covers. The
+    /// map holds what the camera sees as far as shadows reach
+    /// ([`shadow_reach`]), so a frame that looks to the horizon has coarser
+    /// shadows than one that looks down. `None` without shadows.
+    pub fn shadow_texel(&self) -> Option<f32> {
+        self.shadow_texel
     }
 
     /// Tiles currently resident on the GPU.
@@ -1258,6 +1385,19 @@ impl FilmGpu {
                 )
             }
         };
+        // A sphere around the mesh, from the box its vertices fill.
+        let (mut low, mut high) = (Vec3::INFINITY, Vec3::NEG_INFINITY);
+        for vertex in mesh.positions.chunks_exact(12) {
+            let at = Vec3::from_array(std::array::from_fn(|axis| {
+                f32::from_le_bytes(std::array::from_fn(|byte| vertex[4 * axis + byte]))
+            }));
+            (low, high) = (low.min(at), high.max(at));
+        }
+        let (centre, radius) = if low.is_finite() && high.is_finite() {
+            ((low + high) / 2.0, (high - low).length() / 2.0)
+        } else {
+            (Vec3::ZERO, 0.0)
+        };
         let positions = buffer("film positions", mesh.positions);
         let normals = buffer("film normals", mesh.normals);
         let uvs = buffer("film uvs", mesh.uvs);
@@ -1323,6 +1463,8 @@ impl FilmGpu {
                 } else {
                     mesh.index_count
                 },
+                centre,
+                radius,
                 bind,
                 _buffers: buffers,
                 _texture: albedo,
@@ -1423,8 +1565,29 @@ impl FilmGpu {
         }
         let k = self.settings.supersample.max(1);
         let (w, h) = (self.settings.width * k, self.settings.height * k);
-        let uniform =
+        let mut uniform =
             FrameUniform::new(camera, &self.settings.look, [w, h, k, u32::from(overlaid)]);
+        // The sun's view of what this frame draws, when the look has
+        // shadows and there is anything to cast one.
+        let sun = self.shadow_map.as_ref().and_then(|(map, side)| {
+            let spheres = drawn.iter().filter(|r| r.index_count > 0).map(|r| {
+                let centre = DVec3::from_array(r.origin_ecef) - camera.eye + r.centre.as_dvec3();
+                (centre, f64::from(r.radius))
+            });
+            SunView::fitted(
+                self.settings.look.to_sun,
+                camera.eye,
+                spheres,
+                &uniform.bounding_rays(),
+                shadow_reach(camera.height()),
+                *side,
+            )
+            .map(|view| (view, map, *side))
+        });
+        if let Some((view, _, side)) = &sun {
+            uniform = uniform.shadowed(view, self.settings.look.shadow, *side);
+        }
+        self.shadow_texel = sun.as_ref().map(|(view, _, _)| view.texel);
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&uniform));
         if top > 0 {
@@ -1433,6 +1596,30 @@ impl FilmGpu {
         }
 
         encoder.clear_buffer(&self.counts, 0, None);
+
+        if let Some((_, map, _)) = &sun {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("film shadow"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: map,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipelines.shadow);
+            pass.set_bind_group(0, &self.raster_bg, &[]);
+            for r in &drawn {
+                pass.set_bind_group(1, &r.bind, &[]);
+                pass.draw(0..r.index_count, r.slot..r.slot + 1);
+            }
+        }
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
