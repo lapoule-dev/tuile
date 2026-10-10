@@ -419,6 +419,7 @@ fn a_drape_composed_on_the_gpu_is_the_bakes() {
             field: None,
         });
         cpu_layers.push(ImageryLayer {
+            source: 0,
             coord: ImageryCoord {
                 level: 0,
                 x: 0,

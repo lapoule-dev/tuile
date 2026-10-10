@@ -7,6 +7,7 @@
 
 mod command;
 mod frame;
+mod imagery;
 mod input;
 mod pacing;
 mod setup;
@@ -49,6 +50,9 @@ pub struct ViewerConfig {
     /// once there is one — see [`tuile_planetary::LayerBudget`].
     pub layer_budget: tuile_planetary::LayerBudget,
     pub title: String,
+    /// The host's imagery layers, and which of them the session opens on.
+    pub layers: &'static [crate::embed::ImageryChoice],
+    pub layer: usize,
     /// Set by `--here`: ask for the current location at start, and place the
     /// view like this when it is known.
     pub here: Option<crate::location::Placement>,
@@ -165,6 +169,11 @@ pub struct App {
     /// Whether the view is where it is because the location service put it
     /// there — in which case it is not reported to other programs.
     located: bool,
+    /// The imagery: the host's layers, which one is draped, and a change of
+    /// layer on its way — see `imagery.rs`.
+    imagery: imagery::Imagery,
+    /// How a change of layer is asked of the globe.
+    switcher: crate::globe::Switcher,
     /// Steering waiting to be carried out.
     requests: std::sync::mpsc::Receiver<crate::steer::Request>,
     /// Tiles drawn in the last frame, and whether all were the ones selected.
@@ -189,7 +198,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(mut config: ViewerConfig) -> Self {
+    /// `switcher` is how the imagery is changed under the running session.
+    pub fn new(mut config: ViewerConfig, switcher: crate::globe::Switcher) -> Self {
         // The queue is taken out of the configuration: there is one reader.
         let requests = std::mem::replace(&mut config.requests, std::sync::mpsc::channel().1);
         // Asked for here, on the main thread and before the loop turns, so the
@@ -199,6 +209,8 @@ impl App {
             locator.request(std::time::Instant::now(), placement);
         }
         Self {
+            imagery: imagery::Imagery::new(config.layers, config.layer),
+            switcher,
             locator,
             located: false,
             requests,
@@ -356,6 +368,7 @@ impl ApplicationHandler for App {
         // and warming included.
         self.take_the_location();
         self.take_the_commands();
+        self.take_the_imagery();
         // Also on the turns that draw nothing — hidden and warming, or
         // occluded — so a script always has a view to read.
         self.publish_the_view(None);

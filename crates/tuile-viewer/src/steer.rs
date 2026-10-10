@@ -26,9 +26,10 @@
 //! | `tuile://north` | north up, about the point at the centre of the view |
 //! | `tuile://here` | centres on the current location (the system still asks the person) |
 //! | `tuile://view?freeze=on\|off&wireframe=on\|off` | the two display switches |
+//! | `tuile://imagery?name=<key>` | drapes another of the host's imagery layers; `name=next` takes the one after the present |
 //!
-//! **What a URL can do is all in that table.** It moves the camera and flips
-//! two display switches. It reads no file, runs nothing, and carries no
+//! **What a URL can do is all in that table.** It moves the camera, flips
+//! two display switches and picks among the layers the host listed. It reads no file, runs nothing, and carries no
 //! credential; anything else — an unknown command, an unknown parameter, a
 //! value out of the flags' bounds, a URL longer than [`LONGEST_URL`] — is
 //! dropped whole with one line in the log, and the view does not move.
@@ -76,6 +77,31 @@ pub(crate) enum Command {
     Here,
     Freeze(bool),
     Wireframe(bool),
+    /// Drape the host's imagery layer of this index — see
+    /// [`crate::embed::ViewerHost::imagery`]. An index and not a name, so the
+    /// command is checked once, where it is read, against the list.
+    Imagery(usize),
+    /// The layer after the present one, round the list.
+    NextImagery,
+}
+
+/// Which of `layers` a person, a flag, a URL or a script means by `text`: a
+/// layer's key, or its name, in any case. One reading for all four.
+pub(crate) fn layer_named(
+    layers: &[crate::embed::ImageryChoice],
+    text: &str,
+) -> Result<usize, String> {
+    let wanted = text.trim();
+    layers
+        .iter()
+        .position(|l| l.key.eq_ignore_ascii_case(wanted) || l.name.eq_ignore_ascii_case(wanted))
+        .ok_or_else(|| {
+            let known: Vec<&str> = layers.iter().map(|l| l.key.as_str()).collect();
+            format!(
+                "there is no imagery layer {wanted:?}; the layers are: {}",
+                known.join(", ")
+            )
+        })
 }
 
 /// What reaches the render loop from outside it: a URL still to be read, or a
@@ -88,6 +114,9 @@ pub(crate) enum Command {
 pub(crate) enum Request {
     Url(String),
     Do(Command),
+    /// A script's `set imagery to "…"`: a layer by key or name, still to be
+    /// looked up in the host's list.
+    Imagery(String),
 }
 
 impl Goto {
@@ -122,6 +151,15 @@ impl Goto {
 /// All or nothing: one bad parameter refuses the whole URL, because half of a
 /// `goto` is a different place from the one that was meant.
 pub(crate) fn parse_url(url: &str) -> Result<Vec<Command>, String> {
+    parse_url_among(url, &[])
+}
+
+/// [`parse_url`], for a session whose host offers `layers`: the only URLs it
+/// adds are the ones that name one of them.
+pub(crate) fn parse_url_among(
+    url: &str,
+    layers: &[crate::embed::ImageryChoice],
+) -> Result<Vec<Command>, String> {
     if url.len() > LONGEST_URL {
         return Err(format!("a steering URL of {} bytes is not one", url.len()));
     }
@@ -178,6 +216,11 @@ pub(crate) fn parse_url(url: &str) -> Result<Vec<Command>, String> {
         }
         "north" => bare(Command::NorthUp),
         "here" => bare(Command::Here),
+        "imagery" => match pairs.as_slice() {
+            [("name", "next")] => Ok(vec![Command::NextImagery]),
+            [("name", name)] => Ok(vec![Command::Imagery(layer_named(layers, name)?)]),
+            _ => Err("imagery takes exactly one parameter, name=".to_owned()),
+        },
         "view" => {
             if pairs.is_empty() {
                 return Err("view changes nothing: give freeze= or wireframe=".to_owned());
@@ -317,6 +360,68 @@ pub(crate) fn jump(controller: &mut CameraController, camera: GlobeCamera) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn three_layers() -> Vec<crate::embed::ImageryChoice> {
+        vec![
+            crate::embed::ImageryChoice::new("aerial", "Aerial", 2, ""),
+            crate::embed::ImageryChoice::new("labels", "Aerial with labels", 3, ""),
+            crate::embed::ImageryChoice::new("satellite", "Satellite", 9, ""),
+        ]
+    }
+
+    /// A layer is named the same way wherever it is named — by its key or by
+    /// its name, in any case — and a name that is not on the host's list is
+    /// refused with the list.
+    #[test]
+    fn a_layer_is_found_by_key_or_by_name() {
+        let layers = three_layers();
+        for (text, index) in [
+            ("aerial", 0),
+            ("AERIAL", 0),
+            ("labels", 1),
+            ("aerial with labels", 1),
+            (" Satellite ", 2),
+        ] {
+            assert_eq!(layer_named(&layers, text), Ok(index), "{text:?}");
+        }
+        let refused = layer_named(&layers, "road").expect_err("not a layer");
+        assert!(refused.contains("aerial, labels, satellite"), "{refused}");
+        assert!(layer_named(&[], "aerial").is_err());
+    }
+
+    /// The imagery URL names one of the host's layers, or the next one, and
+    /// nothing else: the list is the whole of what it can ask for.
+    #[test]
+    fn an_imagery_url_picks_among_the_hosts_layers() {
+        let layers = three_layers();
+        let read = |url: &str| parse_url_among(url, &layers);
+        assert_eq!(
+            read("tuile://imagery?name=labels"),
+            Ok(vec![Command::Imagery(1)])
+        );
+        assert_eq!(
+            read("tuile://imagery?name=Satellite"),
+            Ok(vec![Command::Imagery(2)])
+        );
+        assert_eq!(
+            read("tuile://imagery?name=next"),
+            Ok(vec![Command::NextImagery])
+        );
+        for bad in [
+            "tuile://imagery",
+            "tuile://imagery?name=road",
+            "tuile://imagery?name=",
+            "tuile://imagery?layer=labels",
+            "tuile://imagery?name=labels&name=aerial",
+            "tuile://imagery?name=labels&freeze=on",
+        ] {
+            assert!(read(bad).is_err(), "{bad}");
+        }
+        // With no list there is no layer to name: the same URL is refused.
+        assert!(parse_url("tuile://imagery?name=labels").is_err());
+        // And the rest of the vocabulary is untouched by the list.
+        assert_eq!(read("tuile://north"), Ok(vec![Command::NorthUp]));
+    }
 
     const VIEWPORT: (f64, f64) = (1280.0, 800.0);
     const CENTRE: (f64, f64) = (640.0, 400.0);

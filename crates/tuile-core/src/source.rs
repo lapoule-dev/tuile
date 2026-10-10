@@ -244,6 +244,23 @@ pub trait TileLoader: Send + Sync {
     /// Default: nothing. A source with no store, or one that is already local,
     /// has nothing to gain.
     async fn warm_up(&self, _through_level: u32) {}
+
+    /// Which version of its content this loader is producing: a number that
+    /// goes up when what [`load`](TileLoader::load) returns for the *same*
+    /// tile changes — a globe told to drape other imagery, say.
+    ///
+    /// The server remembers the epoch each resident tile was loaded under.
+    /// When this number moves on, every such tile is out of date, and the
+    /// server **refreshes** it: loads it again, coarse tiles first, and sends
+    /// the new content under the same id. The old content stays resident — and
+    /// stays with the consumer — until the new one has arrived, so the change
+    /// crosses the screen tile by tile and never through a frame with nothing
+    /// to draw. See `Session::refresh` in the runtime.
+    ///
+    /// Zero, for ever, for a loader whose content does not change.
+    fn epoch(&self) -> u64 {
+        0
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -94,6 +94,9 @@ impl App {
                     Key::Character(ref c) if c.eq_ignore_ascii_case("c") => {
                         self.copy_the_link();
                     }
+                    Key::Character(ref c) if c.eq_ignore_ascii_case("i") => {
+                        self.apply(Command::NextImagery);
+                    }
                     Key::Named(NamedKey::Escape) => {
                         self.ended_by = Some("Esc was pressed");
                         event_loop.exit();

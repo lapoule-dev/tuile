@@ -66,6 +66,7 @@ osascript -e 'tell application "Tuile" to go to longitude -4.02 latitude 5.34 al
 | `tuile://north` | north up, about the point at the centre of the view |
 | `tuile://here` | centres on the current location |
 | `tuile://view?freeze=on\|off&wireframe=on\|off` | the two display switches |
+| `tuile://imagery?name=<layer>` | drapes another imagery layer; `name=next` takes the one after the present |
 
 The parameters are the command-line flags' — same names, same units, same
 bounds, one table in the source. In the window, `C` copies the `goto` link of
@@ -95,6 +96,9 @@ application object, read-only unless noted:
 | `tile count` | tiles drawn in the last frame |
 | `settled` | every tile drawn is the one selected, no coarser stand-in left: wait for this before capturing |
 
+| `imagery` | the imagery layer draped, by its key; **settable** |
+| `imagery name`, `imagery attribution` | the same layer as a person reads it, and whose pictures they are |
+
 and three commands: `go to` (`longitude`, `latitude`, `altitude`, `heading`,
 `pitch`, all optional), `north up`, `center on current location`.
 
@@ -121,9 +125,42 @@ The window's title carries the position too — `Tuile — 52.5100°N 2.8600°W 
 1200 m` — refreshed a few times a second, for a person and for anything that
 can read a window's name.
 
+### Imagery layers
+
+The layers are the host's list; the public viewer has three, shown by
+`--help`:
+
+| key | name | what it is |
+|---|---|---|
+| `aerial` | Aerial | aerial and satellite photography (the default) |
+| `labels` | Aerial with labels | the same, with roads and place names drawn over it |
+| `satellite` | Satellite | one cloudless mosaic of the whole planet: coarser, and the same colour everywhere |
+
+A layer is chosen at start with `--imagery <key>`, and changed in a running
+session by the `I` key (the next layer), by `tuile://imagery?name=<key>`, or
+by a script:
+
+```applescript
+tell application "Tuile" to set imagery to "labels"
+tell application "Tuile" to get {imagery, imagery name, imagery attribution}
+```
+
+**The ground is never bare while the layer changes.** Every tile keeps the old
+imagery until its new drape has arrived, and is then replaced in place —
+coarse tiles first, so the globe turns over and then sharpens. For a while the
+two layers are on screen together. Each layer is stored under its own
+namespace of the tile store, so coming back to one is served from disk. The
+title bar names the layer and its attribution; the journal
+(`~/Library/Logs/Tuile/viewer.log`) records how long each change took to cross
+the screen and what it cost in GPU memory.
+
+A layer the service does not have for this account changes nothing: the title
+says it is not available and the present layer stays.
+
 ### What steering can and cannot do
 
-It moves the camera, flips two display switches, and reads the view. It reads
+It moves the camera, flips two display switches, picks among the host's
+imagery layers, and reads the view. It reads
 no file, runs no command and carries no credential; there is no network
 listener and no socket. A URL that is malformed, unknown, out of bounds or over
 512 bytes is dropped whole with one line in the log.

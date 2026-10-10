@@ -95,7 +95,7 @@ fn in_a_bundle() -> bool {
 /// requires. Exit code 0 for a session that ended, 1 for one that failed, 2
 /// for a command line that was not understood.
 pub fn main(embedder: impl ViewerHost) -> ! {
-    embed::adopt(embedder.identity());
+    embed::adopt(embedder.identity(), embedder.imagery());
     journal::open();
     if let Err(error) = session(&embedder) {
         journal::note(&format!("session failed: {error:#}"));
@@ -135,8 +135,12 @@ fn session(embedder: &dyn ViewerHost) -> anyhow::Result<()> {
     // The command line first, before the logger, the token, the network and
     // the window: a mistyped flag must cost nothing but the message that says
     // so. Exit code 2 is the usual one for a command that was not understood.
-    let (view, here) = match start::parse(std::env::args().skip(1)) {
-        Ok(start::Invocation::Run { view, here }) => (view, here),
+    let (view, here, imagery) = match start::parse(std::env::args().skip(1)) {
+        Ok(start::Invocation::Run {
+            view,
+            here,
+            imagery,
+        }) => (view, here, imagery),
         Ok(start::Invocation::Help) => {
             println!("{}", start::usage());
             return Ok(());
@@ -149,6 +153,21 @@ fn session(embedder: &dyn ViewerHost) -> anyhow::Result<()> {
             );
             std::process::exit(2);
         }
+    };
+    // Which layer `--imagery` meant is the host's list to say, and a name
+    // that is not on it is a command that was not understood — said here,
+    // with the list, before anything is connected to.
+    let layers = embed::layers();
+    let opening = match imagery
+        .as_deref()
+        .map(|name| steer::layer_named(layers, name))
+    {
+        Some(Ok(index)) => index,
+        Some(Err(why)) => {
+            eprintln!("{}: {why}", embed::identity().executable);
+            std::process::exit(2);
+        }
+        None => 0,
     };
     // Started from an icon, there is no terminal: the log goes quiet and
     // what would have been an error line becomes a window.
@@ -180,10 +199,6 @@ fn session(embedder: &dyn ViewerHost) -> anyhow::Result<()> {
     // its sources. A refusal is a sentence for the person, and for a session
     // started from an icon it has to be a window — there is nobody reading
     // stderr.
-    let choices = embedder.imagery();
-    let opening = choices
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("the host offers no imagery layer"))?;
     let sources = match rt.block_on(embedder.connect()) {
         Ok(sources) => sources,
         Err(why) if bundled => {
@@ -199,9 +214,10 @@ fn session(embedder: &dyn ViewerHost) -> anyhow::Result<()> {
         heights,
         store,
         budget: layer_budget,
+        switcher,
     } = rt.block_on(async {
         let store = globe::open_the_store(&embed::identity().store).await;
-        globe::assemble(sources.as_ref(), store, &embedder.terrain(), opening).await
+        globe::assemble(sources, store, &embedder.terrain(), layers, opening).await
     })?;
     // The budget counts decoded CPU bytes; the GPU copy costs about 1.35× that
     // (mip chains, interleaved vertices), measured — so 3 GiB here is ~4 GiB of
@@ -256,7 +272,8 @@ fn session(embedder: &dyn ViewerHost) -> anyhow::Result<()> {
     tracing::info!(
         "globe viewer — streaming terrain and imagery\n\
          drag: pan globe · right-drag: tilt/heading · wheel: zoom · N: north up · \
-         L: current location · C: copy link · W: wireframe · F: freeze · Esc"
+         L: current location · C: copy link · I: next imagery · W: wireframe · \
+         F: freeze · Esc"
     );
     let app_config = ViewerConfig {
         stream,
@@ -264,6 +281,8 @@ fn session(embedder: &dyn ViewerHost) -> anyhow::Result<()> {
         detail,
         layer_budget,
         title: host::app_name().into(),
+        layers,
+        layer: opening,
         requests,
         remembers: bundled,
         // `--here`: the window opens on the view above, and moves over the
@@ -286,7 +305,7 @@ fn session(embedder: &dyn ViewerHost) -> anyhow::Result<()> {
     signals::catch_interruptions();
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(app_config);
+    let mut app = App::new(app_config, switcher);
     let outcome = event_loop.run_app(&mut app);
     // Belt and braces: `exiting` covers a loop that unwinds normally, this
     // covers one that does not. Closing an already-closed tape is a no-op.

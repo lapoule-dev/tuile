@@ -37,6 +37,16 @@ const TOKEN_VARIABLE: &str = "CESIUM_ION_TOKEN";
 /// The ion asset of the terrain: Cesium World Terrain.
 const WORLD_TERRAIN: i64 = 1;
 
+/// The ion assets of the three imagery layers.
+const AERIAL: i64 = 2;
+const AERIAL_WITH_LABELS: i64 = 3;
+const SATELLITE_MOSAIC: i64 = 3954;
+
+/// Whose pictures the layers are: shown beside the layer's name for as long
+/// as it is on screen.
+const PHOTOGRAPHY: &str = "© Microsoft and its data suppliers";
+const MOSAIC: &str = "Contains modified Copernicus Sentinel data";
+
 /// Terrain and imagery by ion asset number, resolved on demand.
 struct Ion {
     http: Arc<NativeHttp>,
@@ -89,7 +99,9 @@ impl Sources for Ion {
                         .map_err(|e| e.to_string())?,
                 ))
             }
-            Some(other) => Err(format!("asset {asset} is served as {other:?}, which is not handled")),
+            Some(other) => Err(format!(
+                "asset {asset} is served as {other:?}, which is not handled"
+            )),
         }
     }
 }
@@ -120,10 +132,24 @@ impl ViewerHost for Public {
     }
 
     fn imagery(&self) -> Vec<ImageryChoice> {
+        // The three the connector has. Neutral names: what a layer shows, not
+        // who serves it — the attribution says that.
         vec![
-            // Asset 2, under the namespace its tiles have always been stored in.
-            ImageryChoice::new("aerial", "Aerial", 2, "© Microsoft, © Maxar, © Earthstar Geographics")
+            // Asset 2, under the namespace its tiles have always been stored
+            // in, so a session after this change starts as warm as before.
+            ImageryChoice::new("aerial", "Aerial", AERIAL, PHOTOGRAPHY)
                 .cached_as(&tuile_bing::cache_namespace("Aerial")),
+            // The same photography with roads and place names drawn over it.
+            ImageryChoice::new(
+                "labels",
+                "Aerial with labels",
+                AERIAL_WITH_LABELS,
+                PHOTOGRAPHY,
+            ),
+            // One cloudless mosaic of the whole planet from a single
+            // instrument: coarser, and the same colour everywhere. Served on
+            // the geographic grid, where the two above are web-mercator.
+            ImageryChoice::new("satellite", "Satellite", SATELLITE_MOSAIC, MOSAIC),
         ]
     }
 

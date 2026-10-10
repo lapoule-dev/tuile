@@ -125,6 +125,33 @@ public binary carries its three words in `LSEnvironment`
 (`TUILE_VIEWER_NAME`, `TUILE_VIEWER_IDENTIFIER`, `TUILE_VIEWER_SCHEME`), which
 `tuile_viewer::renamed_by_environment` reads.
 
+## Switching imagery
+
+Every layer of `imagery()` can be chosen at start (`--imagery <key>`) and
+changed in a running session — the `I` key, `<scheme>://imagery?name=<key>`, a
+script's `set imagery to "<key>"`. The host does nothing for this: a layer is
+resolved through `Sources::imagery` the first time it is asked for, on the
+session's async runtime, and kept.
+
+The switch itself is the engine's, and is available to any host of
+`tuile-planetary`, viewer or not:
+
+- `tuile_planetary::SwitchableImagery` is an `ImageryProvider` holding another,
+  with a `generation` that goes up when the one it holds is replaced
+  (`switch_to`). Build the globe over it instead of over the provider.
+- The loader keeps decoded tiles per generation, stamps each layer of a drape
+  with the generation it came from (`ImageryLayer::source` — a consumer shares
+  textures by `(source, coord)`), and reports the generation as its
+  `TileLoader::epoch`.
+- The geometry server refreshes every resident tile from an earlier epoch:
+  coarse first, what is on screen first, and **keeping the old content until
+  the new has arrived**. The consumer receives a second `Content` under the
+  same id and replaces in place — create the new surface, activate it, release
+  the old.
+
+No tile is ever without imagery because of a switch, and the two layers may be
+cut on different grids.
+
 ## What is not pluggable
 
 One terrain per session. The scripting dictionary's title and suite keep the

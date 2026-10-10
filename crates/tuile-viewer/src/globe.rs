@@ -10,12 +10,16 @@
 //! write again — the tile store between runs, with each source filed under its
 //! own namespace, and the decode work moved off the server's thread.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use tuile_core::raster::{CachedImagery, ImageryProvider};
 use tuile_core::source::{TileLoader, TileTree};
 use tuile_core::storage::ContentStore;
-use tuile_planetary::{globe_on, GlobeOptions, Held, ImageryDetail, LayerBudget, Sources};
+use tuile_planetary::{
+    globe_on, GlobeOptions, Held, ImageryDetail, LayerBudget, Sources, SwitchableImagery,
+};
 use tuile_storage_foyer::FoyerStore;
 use tuile_terrain::{CachedTerrain, TerrainHeights, TerrainSource};
 
@@ -31,6 +35,78 @@ pub(crate) struct Globe {
     /// dropped leaves the disk as cold as it found it.
     pub store: Option<Arc<FoyerStore>>,
     pub budget: LayerBudget,
+    /// The handle the window changes imagery through.
+    pub switcher: Switcher,
+}
+
+/// How a switch of imagery that was asked for ended.
+pub(crate) struct Switched {
+    /// The layer asked for, as an index into the host's list.
+    pub layer: usize,
+    /// The imagery generation the globe is now draping, or why it is not.
+    pub outcome: Result<u64, String>,
+    /// When it was asked for — the start of the wait a person sees.
+    pub asked: std::time::Instant,
+}
+
+/// Changes the imagery a running globe drapes.
+///
+/// Asking is one call that returns at once: resolving a layer is a round trip
+/// or two to the host's service, and the window must not wait on it. The
+/// resolution runs on the session's async runtime and the answer is collected
+/// by the render loop ([`Switcher::poll`]) — the same shape as the location
+/// request, for the same reason.
+///
+/// Nothing here takes anything off the screen. A resolved layer is handed to
+/// the [`SwitchableImagery`] the globe was built over, and the engine does the
+/// rest: every tile keeps the old picture until its new drape is resident.
+/// A layer that cannot be resolved changes nothing at all.
+pub(crate) struct Switcher {
+    sources: Arc<dyn Sources>,
+    store: Option<Arc<FoyerStore>>,
+    switch: SwitchableImagery,
+    runtime: tokio::runtime::Handle,
+    /// Layers already resolved, so that going back to one costs nothing — and
+    /// does not open a second session with a service that counts them.
+    resolved: Arc<Mutex<HashMap<usize, Arc<dyn ImageryProvider>>>>,
+    done: (Sender<Switched>, Receiver<Switched>),
+}
+
+impl Switcher {
+    /// Starts the switch to `layers[layer]`.
+    pub(crate) fn ask(&self, layer: usize, choice: &ImageryChoice) {
+        let asked = std::time::Instant::now();
+        let (sources, store) = (Arc::clone(&self.sources), self.store.clone());
+        let (switch, resolved) = (self.switch.clone(), Arc::clone(&self.resolved));
+        let (done, choice) = (self.done.0.clone(), choice.clone());
+        self.runtime.spawn(async move {
+            let known = resolved.lock().ok().and_then(|r| r.get(&layer).cloned());
+            let provider = match known {
+                Some(provider) => Ok(provider),
+                None => imagery(sources.as_ref(), &choice, store.as_ref())
+                    .await
+                    .map_err(|e| e.to_string()),
+            };
+            let outcome = provider.map(|provider| {
+                if let Ok(mut resolved) = resolved.lock() {
+                    resolved.insert(layer, Arc::clone(&provider));
+                }
+                switch.switch_to(provider)
+            });
+            // A closed channel means the window is gone, and with it the
+            // point of saying how it went.
+            let _ = done.send(Switched {
+                layer,
+                outcome,
+                asked,
+            });
+        });
+    }
+
+    /// The outcome of a switch that has finished resolving, if one has.
+    pub(crate) fn poll(&self) -> Option<Switched> {
+        self.done.1.try_recv().ok()
+    }
 }
 
 /// One imagery layer of the host's, through the store when there is one.
@@ -77,12 +153,29 @@ pub(crate) async fn open_the_store(name: &str) -> Option<Arc<FoyerStore>> {
     }
 }
 
+/// How deep the quadtree divides when the host offers several layers.
+///
+/// With one layer the tree goes as deep as that imagery does. With several it
+/// cannot follow the layer being shown — the tree is built once — so it goes
+/// as deep as the sharpest photography in general use, and a session that
+/// opened on a coarse mosaic still has the tiles a sharper layer needs when
+/// it is switched to. Under a coarse layer the extra depth costs tiles only
+/// where the eye is close enough to select them.
+const DEPTH_FOR_ANY_LAYER: u32 = 21;
+
+/// Resolves the host's terrain and its opening imagery layer and crosses them.
 pub(crate) async fn assemble(
-    sources: &dyn Sources,
+    sources: Arc<dyn Sources>,
     store: Option<Arc<FoyerStore>>,
     terrain: &TerrainChoice,
-    opening: &ImageryChoice,
+    layers: &[ImageryChoice],
+    opening: usize,
 ) -> anyhow::Result<Globe> {
+    let runtime = tokio::runtime::Handle::current();
+    let opening_layer = layers
+        .get(opening)
+        .ok_or_else(|| anyhow::anyhow!("the host offers no imagery layer"))?;
+    let (sources_kept, sources) = (Arc::clone(&sources), sources.as_ref());
 
     let (layer, ground) = sources
         .terrain(terrain.asset)
@@ -96,8 +189,13 @@ pub(crate) async fn assemble(
         )),
         None => ground,
     };
-    let picture = imagery(sources, opening, store.as_ref()).await?;
-    tracing::info!(layer = %opening.name, "imagery");
+    let picture = imagery(sources, opening_layer, store.as_ref()).await?;
+    tracing::info!(layer = %opening_layer.name, "imagery");
+    let deepest = picture.tiling_scheme().maximum_level;
+    // The globe is built over a switch, not over the layer: the layer can
+    // then be changed under a running session, and the engine refreshes each
+    // tile behind the old picture. See `tuile_planetary::SwitchableImagery`.
+    let switch = SwitchableImagery::new(Arc::clone(&picture));
 
     // Decoding and resampling go to their own threads. Left on the server's
     // thread they run one at a time no matter how many loads are in flight —
@@ -111,25 +209,36 @@ pub(crate) async fn assemble(
     let budget = LayerBudget::default();
     let opts = GlobeOptions {
         imagery_slots: budget.clone(),
+        max_level: Some(if layers.len() > 1 {
+            deepest.max(DEPTH_FOR_ANY_LAYER)
+        } else {
+            deepest
+        }),
         ..Default::default()
     };
     let (tree, loader, detail, heights) =
-        globe_on(Held(ground), Held(picture), layer, opts, decode);
+        globe_on(Held(ground), switch.clone(), layer, opts, decode);
     Ok(Globe {
         tree,
         loader,
         detail,
         heights,
-        store,
         budget,
+        switcher: Switcher {
+            sources: sources_kept,
+            store: store.clone(),
+            switch,
+            runtime,
+            resolved: Arc::new(Mutex::new(HashMap::from([(opening, picture)]))),
+            done: channel(),
+        },
+        store,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
     /// Sources that say what was asked of them, and have nothing.
     #[derive(Default)]
     struct Asked(Mutex<Vec<String>>);
@@ -140,12 +249,18 @@ mod tests {
             &self,
             asset: i64,
         ) -> Result<(tuile_terrain::LayerJson, Arc<dyn TerrainSource>), String> {
-            self.0.lock().expect("asked").push(format!("terrain {asset}"));
+            self.0
+                .lock()
+                .expect("asked")
+                .push(format!("terrain {asset}"));
             Err("no terrain here".to_owned())
         }
 
         async fn imagery(&self, asset: i64) -> Result<Arc<dyn ImageryProvider>, String> {
-            self.0.lock().expect("asked").push(format!("imagery {asset}"));
+            self.0
+                .lock()
+                .expect("asked")
+                .push(format!("imagery {asset}"));
             Err("no imagery here".to_owned())
         }
     }
@@ -155,19 +270,30 @@ mod tests {
     /// about.
     #[test]
     fn the_globe_asks_the_hosts_sources_for_the_hosts_assets() {
-        let asked = Asked::default();
+        let asked = Arc::new(Asked::default());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime");
         let terrain = TerrainChoice {
             asset: 41,
             cache: "t".into(),
         };
         let layer = ImageryChoice::new("survey", "Survey", 77, "© someone");
-        let refused = futures_executor::block_on(assemble(&asked, None, &terrain, &layer))
+        let layers = [layer.clone()];
+        let refused = runtime
+            .block_on(assemble(
+                Arc::clone(&asked) as Arc<dyn Sources>,
+                None,
+                &terrain,
+                &layers,
+                0,
+            ))
             .err()
             .expect("there is no terrain");
         assert_eq!(refused.to_string(), "terrain: no terrain here");
         assert_eq!(*asked.0.lock().expect("asked"), ["terrain 41"]);
 
-        let refused = futures_executor::block_on(imagery(&asked, &layer, None))
+        let refused = futures_executor::block_on(imagery(asked.as_ref(), &layer, None))
             .err()
             .expect("there is no imagery");
         assert_eq!(refused.to_string(), "imagery \"Survey\": no imagery here");

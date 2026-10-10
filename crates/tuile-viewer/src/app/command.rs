@@ -23,7 +23,12 @@ impl App {
             match request {
                 // A script's command arrives already read and already checked.
                 Request::Do(command) => self.apply(command),
-                Request::Url(url) => match steer::parse_url(&url) {
+                // A script named a layer; which one is the host's list to say.
+                Request::Imagery(name) => match steer::layer_named(self.imagery.layers, &name) {
+                    Ok(layer) => self.apply(Command::Imagery(layer)),
+                    Err(why) => tracing::error!("script ignored: {why}"),
+                },
+                Request::Url(url) => match steer::parse_url_among(&url, self.imagery.layers) {
                     Ok(commands) => commands.into_iter().for_each(|c| self.apply(c)),
                     Err(why) => tracing::error!("steering URL ignored: {why}"),
                 },
@@ -51,6 +56,12 @@ impl App {
                 tracing::info!("traversal freeze: {on}");
             }
             Command::Wireframe(on) => self.views.wireframe = on,
+            Command::Imagery(layer) => self.drape(layer),
+            Command::NextImagery => {
+                if let Some(next) = self.imagery.next() {
+                    self.drape(next);
+                }
+            }
         }
     }
 
@@ -82,6 +93,7 @@ impl App {
             located: self.located,
             tiles: self.drawn.0,
             settled: self.drawn.1,
+            imagery: self.imagery.layers.get(self.imagery.layer),
             ..Snapshot::of(&self.controller, size)
         };
         crate::snapshot::publish(snapshot);
@@ -113,6 +125,11 @@ impl App {
             self.notice = None;
         }
         let mut title = format!("{} — {}", self.title, crate::snapshot::title(snapshot));
+        // Whose pictures these are, for as long as they are on screen: the
+        // title bar is the one piece of text this window has.
+        if let Some(layer) = snapshot.imagery {
+            title = format!("{title} — {} · {}", layer.name, layer.attribution);
+        }
         if let Some((notice, _)) = &self.notice {
             title = format!("{title} — {notice}");
         }
