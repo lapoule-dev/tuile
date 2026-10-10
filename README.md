@@ -30,9 +30,8 @@ compiles to `wasm32-unknown-unknown` and depends on no backend.
 imagery (`tuile-planetary`), with all geospatial arithmetic in `f64` until the
 switch to a local frame — raw Earth-centred coordinates never reach `f32`.
 
-**Renderers.** `tuile-wgpu` is the reference backend, native and WebGPU.
-`tuile-hydra` exposes the same geometry server through a C ABI for an
-OpenUSD/Hydra scene index; `tuile-usd` writes a recorded flight as a USD stage.
+**Renderers.** `tuile-wgpu` is the reference backend, native and WebGPU, and
+the engine also draws through OpenUSD/Hydra. Both are described below.
 
 **Films.** A camera path is recorded once (`tuile-tape`), baked once into a
 *pack* of exactly the tiles each frame needs (`tuile-bake`, `tuile-pack`), and
@@ -43,6 +42,67 @@ same film renders natively and in a browser worker.
 **A tile store.** Source tiles are kept once, in PMTiles archives per zone and
 per layer on object storage (`tuile-tile-server`), and read back by blocks
 that any HTTP cache can keep (`tuile-repository`).
+
+## Interactive: flying the globe
+
+The primary mode of the engine is **streaming**: a camera goes in every frame,
+decoded tiles come out as they are ready, and the picture refines as you orbit
+and zoom. The trait that says so, `GeometryStream`, lives in the core; a viewer
+is whatever holds the other end of it.
+
+- **Native.** `tuile-wgpu-viewer` is a window on the geometry server running
+  in-process: the server traverses, fetches and decodes on a background
+  runtime, the window sends its camera and pumps tiles to the GPU as they
+  arrive. A coarser tile is drawn until its replacement is resident, so the
+  ground refines and never blinks out.
+- **In a browser.** `tuile-web` runs the *same* geometry server, traversal and
+  planetary loader inside a Web Worker, fetching with the page's own `fetch`;
+  `examples/web-viewer` only draws what the worker selects, with a JavaScript
+  scene library instead of wgpu. If the page and the native viewer disagree
+  about what is on screen, the disagreement is in a renderer, not in the
+  engine. `examples/wasm-globe` is the same engine with no renderer at all:
+  traversal, decoding and geometry in wasm, reported back to the page.
+- **The camera** is its own crate. `tuile-camera` is a render-agnostic globe
+  camera and input controller — drag anchored on the ellipsoid, zoom by
+  altitude, tilt — that produces the view states the core consumes;
+  `tuile-ui` adds the on-screen compass, tilt and zoom controls;
+  `tuile-atmosphere` gives the sun, the sky and the aerial perspective.
+- **A flight is repeatable.** `tuile-tape` records the camera path of an
+  interactive session and flies it again exactly — the bridge from the
+  interactive side to films: what you flew is what gets baked and rendered.
+
+`tuile-orbit-probe` flies a headless orbit and measures what loads, what is
+dropped and what comes back; `tuile-warm-cache` fills the tile store with the
+coarse pyramid before a flight.
+
+## OpenUSD
+
+Tuile meets OpenUSD in two separate ways, and keeps them separate.
+
+**Writing USD, in pure Rust.** `tuile-usd` writes a *manifest stage* as plain
+`.usda` text, with no OpenUSD binding: a recorded camera path as an animated
+camera, plus one `Globe` prim that stands for the whole planet. The stage is a
+few kilobytes and carries no geometry — it says where the camera is and that
+there is a globe; the tiles are streamed when it is rendered.
+
+**Rendering inside OpenUSD.** `tuile-hydra` is a C ABI over the geometry
+server, one frame at a time, with buffers laid out the way Hydra reads them;
+[`integrations/hydra`](integrations/hydra) is the C++ plugin that consumes it.
+The plugin is a Hydra 2.0 scene index behind a generative procedural: drop the
+`Globe` prim into any stage and it resolves the stage's camera, asks the
+geometry server for that view's tiles, and hands terrain and imagery to
+whichever Hydra renderer is drawing — a rasteriser or a path tracer, with
+nothing in the design depending on any one of them. That is how a flight
+recorded interactively is rendered on a farm with a path tracer's light.
+
+The work itself — choosing a frame's tiles — is `tuile-bake`'s, which knows
+nothing of OpenUSD: the same selection feeds the packs of the wgpu film
+renderer and the Hydra plugin, so the two pictures are of the same ground.
+The images and job scripts that run the plugin on a farm are under
+[`integrations/`](integrations/); the design and its trajectory are in
+[`docs/13-crate-usd.md`](docs/13-crate-usd.md),
+[`docs/14-crate-hydra.md`](docs/14-crate-hydra.md) and
+[`docs/15-usd-scene-index.md`](docs/15-usd-scene-index.md).
 
 ## The crates
 
