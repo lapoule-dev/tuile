@@ -30,6 +30,7 @@ pub mod nvenc;
 pub mod observe;
 pub mod reference;
 pub mod render;
+pub mod seams;
 pub mod sink;
 pub mod source;
 #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
@@ -41,6 +42,7 @@ pub use nvenc::{NvencCodec, NvencFilm};
 pub use observe::{FrameOut, ImageryIn, Observer, Origin, TileIn, Timings};
 pub use reference::{Reference, SetAgainst};
 pub use render::{render, Order, Tone};
+pub use seams::SeamMeter;
 pub use sink::{Av1Film, Nothing, Pictures, Sink};
 pub use source::{Counting, Film, Reads, Sources};
 #[cfg(all(target_os = "macos", feature = "videotoolbox"))]

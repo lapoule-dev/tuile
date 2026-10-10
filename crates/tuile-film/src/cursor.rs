@@ -265,12 +265,23 @@ pub fn referred(
     pack: &Pack<'_>,
     first: u32,
     last: u32,
-) -> Result<(std::collections::BTreeSet<StoreAt>, std::collections::BTreeSet<StoreAt>), FilmError> {
+) -> Result<
+    (
+        std::collections::BTreeSet<StoreAt>,
+        std::collections::BTreeSet<StoreAt>,
+    ),
+    FilmError,
+> {
     let mut cursor = Cursor::new(pack, first, last)?;
-    let (mut terrain, mut imagery) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+    let (mut terrain, mut imagery) = (
+        std::collections::BTreeSet::new(),
+        std::collections::BTreeSet::new(),
+    );
     while let Some(diff) = cursor.advance(pack) {
         for tile in &diff?.enter {
-            let Some(refs) = tuile_pack::refs_of(tile) else { continue };
+            let Some(refs) = tuile_pack::refs_of(tile) else {
+                continue;
+            };
             terrain.insert((refs.terrain.level, refs.terrain.x, refs.terrain.y));
             for placed in &refs.imagery {
                 imagery.insert((placed.tile.level, placed.tile.x, placed.tile.y));
@@ -279,4 +290,3 @@ pub fn referred(
     }
     Ok((terrain, imagery))
 }
-

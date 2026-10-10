@@ -174,5 +174,14 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
             radiance = radiance * left + frame.horizon.xyz * (1.0 - left);
         }
     }
+    // PROBE (exploration): what a gap shows, painted so it can be counted.
+    if (frame.local_up.w != 0.0) {
+        let inside = clamp(b, vec2f(0.0), vec2f(1.0));
+        let held = inside / max(inside.x + inside.y, 1.0);
+        let p = a + held.x * e1 + held.y * e2;
+        if (!all(abs(p) < vec3f(2.0e6))) {
+            radiance = vec3f(1000.0, 0.0, 1000.0);
+        }
+    }
     textureStore(hdr, xy, vec4f(radiance, 1.0));
 }

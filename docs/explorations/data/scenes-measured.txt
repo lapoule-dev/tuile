@@ -1,0 +1,10 @@
+imagery level 4: its top row holds 82.676° to 85.051° and is laid over 82.676° to 90°, stretched 3.1 times; 4 layers on the terrain tile
+  the line of 85° is drawn from 89.71° to 89.98°
+imagery level 7: its top row holds 84.802° to 85.051° and is laid over 84.802° to 90°, stretched 20.9 times; 256 layers on the terrain tile
+  the line of 85° is drawn from 87.69° to 89.98°
+source tiles of level 13 part along their shared meridian by 5.61 m at most, 1.53 m on average; a level-13 skirt is 47.8 m deep, a level-14 one 23.9, level 15 11.9, level 16 6.0
+a grey drape (120, 120, 120) under the default look: factor white shows [142, 146, 149], the pack's slate (0.16, 0.20, 0.24) shows [59, 68, 76] — -2.63 / -2.31 / -2.06 stops (R G B)
+polar tile 3/8/7 on a 8×8 grid: 8 of 128 surface triangles have no area (under 1 m²), 8 of 64 skirt triangles; its skirt is 48920 m deep, as at the equator, on a tile 959 km wide at its south edge and nothing at its north
+  a north-skirt vertex of the meridian 0.00° comes out at longitude -180.00°, latitude 89.99775°
+  1000 m over the pole itself: ecef_to_geodetic gives latitude 135.0000°, height 2645150.6 m
+  1000 m over a millimetre off the axis: ecef_to_geodetic gives latitude 90.0000°, height 1000.0 m

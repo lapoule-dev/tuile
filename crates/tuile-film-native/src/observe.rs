@@ -6,7 +6,7 @@
 //! The render calls an [`Observer`] at three moments and takes nothing
 //! back: an observer cannot change a film, only watch it being made.
 
-use tuile_film::TileKey;
+use tuile_film::{FrameCamera, Mesh, TileKey};
 use tuile_radiometry::Grade;
 
 /// An imagery tile, the first time the render reads it.
@@ -38,6 +38,11 @@ pub struct TileIn<'a> {
     pub origin: Origin,
     /// The imagery tiles of its drape, bottom first: level, x, y.
     pub imagery: &'a [(u8, u32, u32)],
+    /// The terrain tile its mesh was built from — itself or an ancestor —
+    /// when the pack says: level, x, y.
+    pub terrain: Option<(u8, u32, u32)>,
+    /// Its mesh, as the GPU is handed it.
+    pub mesh: &'a Mesh,
 }
 
 /// Where time went, in milliseconds, step by step.
@@ -125,6 +130,9 @@ pub struct FrameOut<'a> {
     pub entered: usize,
     /// Drape layers drawn, by imagery level.
     pub layers: &'a [(u8, u32)],
+    /// The tiles drawn, and the camera they were drawn for.
+    pub selection: &'a [TileKey],
+    pub camera: &'a FrameCamera,
     /// Up to the picture's readback: what follows has not happened yet.
     pub timings: Timings,
 }

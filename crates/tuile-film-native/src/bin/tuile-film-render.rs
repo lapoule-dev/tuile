@@ -452,7 +452,11 @@ async fn main() -> Result<(), Error> {
     let mut meter = LightMeter::default();
     let metering = value("--meter");
     let mut nobody = ();
-    let observer: &mut dyn Observer = if metering.is_some() || calibrating.is_some() {
+    // PROBE (exploration): the seams of each frame, measured on its meshes.
+    let mut seams = value("--seams").map(tuile_film_native::SeamMeter::into);
+    let observer: &mut dyn Observer = if let Some(seams) = seams.as_mut() {
+        seams
+    } else if metering.is_some() || calibrating.is_some() {
         &mut meter
     } else {
         &mut nobody

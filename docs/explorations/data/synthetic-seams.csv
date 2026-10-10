@@ -1,0 +1,16 @@
+scene,eye,variant,sky_pixels,touched_pixels,picture
+one-surface,eye-west,main,0,0,seams-synthetic-one-surface-eye-west-main.png
+one-surface,eye-west,cut-tiles-skirted,0,0,seams-synthetic-one-surface-eye-west-cut-tiles-skirted.png
+one-surface,eye-west,cut-tiles-skirted-at-source-depth,0,0,seams-synthetic-one-surface-eye-west-cut-tiles-skirted-at-source-depth.png
+two-surfaces-neighbour-itself,eye-west,main,0,0,seams-synthetic-two-surfaces-neighbour-itself-eye-west-main.png
+two-surfaces-neighbour-itself,eye-west,cut-tiles-skirted,0,0,seams-synthetic-two-surfaces-neighbour-itself-eye-west-cut-tiles-skirted.png
+two-surfaces-neighbour-itself,eye-west,cut-tiles-skirted-at-source-depth,0,0,seams-synthetic-two-surfaces-neighbour-itself-eye-west-cut-tiles-skirted-at-source-depth.png
+two-surfaces-neighbour-itself,eye-east,main,361,509,seams-synthetic-two-surfaces-neighbour-itself-eye-east-main.png
+two-surfaces-neighbour-itself,eye-east,cut-tiles-skirted,0,0,seams-synthetic-two-surfaces-neighbour-itself-eye-east-cut-tiles-skirted.png
+two-surfaces-neighbour-itself,eye-east,cut-tiles-skirted-at-source-depth,0,0,seams-synthetic-two-surfaces-neighbour-itself-eye-east-cut-tiles-skirted-at-source-depth.png
+two-surfaces-neighbour-cut,eye-west,main,241,378,seams-synthetic-two-surfaces-neighbour-cut-eye-west-main.png
+two-surfaces-neighbour-cut,eye-west,cut-tiles-skirted,0,0,seams-synthetic-two-surfaces-neighbour-cut-eye-west-cut-tiles-skirted.png
+two-surfaces-neighbour-cut,eye-west,cut-tiles-skirted-at-source-depth,0,0,seams-synthetic-two-surfaces-neighbour-cut-eye-west-cut-tiles-skirted-at-source-depth.png
+two-surfaces-neighbour-cut,eye-east,main,361,509,seams-synthetic-two-surfaces-neighbour-cut-eye-east-main.png
+two-surfaces-neighbour-cut,eye-east,cut-tiles-skirted,0,0,seams-synthetic-two-surfaces-neighbour-cut-eye-east-cut-tiles-skirted.png
+two-surfaces-neighbour-cut,eye-east,cut-tiles-skirted-at-source-depth,0,0,seams-synthetic-two-surfaces-neighbour-cut-eye-east-cut-tiles-skirted-at-source-depth.png

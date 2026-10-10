@@ -137,7 +137,12 @@ pub fn skirt_height(rect: &GeoRect) -> f64 {
     /// How many geometric errors of headroom the skirt is given.
     const ERRORS_OF_HEADROOM: f64 = 5.0;
     let geometric_error = rect.width() * WGS84_A * VERTICAL_FRACTION / SPACINGS;
-    geometric_error * ERRORS_OF_HEADROOM
+    // PROBE (exploration): the skirt's depth, scaled.
+    let scale = std::env::var("TUILE_PROBE_SKIRT_SCALE")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(1.0);
+    geometric_error * ERRORS_OF_HEADROOM * scale
 }
 
 /// Which side of the tile a wall stands on, and everything that follows from it.

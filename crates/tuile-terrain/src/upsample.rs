@@ -205,6 +205,28 @@ pub fn upsample(
     }
     let range = (high - low).max(f64::EPSILON);
 
+    let us: Vec<f64> = kept
+        .iter()
+        .map(|p| ((p.u - u0) / step).clamp(0.0, 1.0))
+        .collect();
+    let vs: Vec<f64> = kept
+        .iter()
+        .map(|p| ((p.v - v0) / step).clamp(0.0, 1.0))
+        .collect();
+    // PROBE (exploration): an upsampled tile given the edge lists its skirts
+    // are hung from — west, south, east, north — to measure what they close.
+    let edges = if std::env::var_os("TUILE_PROBE_UPSAMPLED_SKIRTS").is_some() {
+        const ON: f64 = 1.0e-9;
+        let on = |of: &[f64], at: f64| -> Vec<u32> {
+            (0..of.len() as u32)
+                .filter(|&i| (of[i as usize] - at).abs() < ON)
+                .collect()
+        };
+        [on(&us, 0.0), on(&vs, 0.0), on(&us, 1.0), on(&vs, 1.0)]
+    } else {
+        [Vec::new(), Vec::new(), Vec::new(), Vec::new()]
+    };
+
     Some(QuantizedMesh {
         header: Header {
             // The rebasing origin only has to be *near* the geometry, and an
@@ -217,20 +239,14 @@ pub fn upsample(
             bounding_sphere_radius: ancestor.header.bounding_sphere_radius,
             horizon_occlusion: ancestor.header.horizon_occlusion,
         },
-        u: kept
-            .iter()
-            .map(|p| ((p.u - u0) / step).clamp(0.0, 1.0))
-            .collect(),
-        v: kept
-            .iter()
-            .map(|p| ((p.v - v0) / step).clamp(0.0, 1.0))
-            .collect(),
+        u: us,
+        v: vs,
         height: kept.iter().map(|p| (p.height - low) / range).collect(),
         indices,
         normals: kept.iter().map(|p| p.normal).collect::<Option<Vec<_>>>(),
         // Skirts are not drawn on this globe, and an upsampled tile shares its
         // edges exactly with the ancestor it came from anyway.
-        edges: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        edges,
         // Availability is the source's to state, and this tile is not from it.
         metadata_available: None,
     })

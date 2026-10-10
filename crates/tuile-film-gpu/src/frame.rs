@@ -145,7 +145,15 @@ impl FrameUniform {
             haze: air.map_or([0.0; 4], |(_, at)| {
                 [at.density, at.per_height, at.curve, 1.0]
             }),
-            local_up: air.map_or([0.0; 4], |(_, at)| at.up.extend(0.0).to_array()),
+            // PROBE (exploration): `w` asks the resolve to paint magenta what
+            // is no ground an eye can see — the far side, through a gap.
+            local_up: {
+                let mut up = air.map_or([0.0; 4], |(_, at)| at.up.extend(0.0).to_array());
+                if std::env::var_os("TUILE_PROBE_HOLES").is_some() {
+                    up[3] = 1.0;
+                }
+                up
+            },
             horizon: air.map_or([0.0; 4], |(haze, _)| haze.horizon.extend(0.0).to_array()),
             zenith: air.map_or([0.0; 4], |(haze, _)| haze.zenith.extend(0.0).to_array()),
         }

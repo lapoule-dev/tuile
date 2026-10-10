@@ -114,7 +114,14 @@ pub fn terrain_mesh(
         return Err(terrain_error(source, "is not an ancestor of the tile"));
     }
     let rect = GeographicTilingScheme::default().tile_rect(target);
-    let content = tuile_terrain::to_decoded(&mesh, &rect, tuile_terrain::skirt_height(&rect));
+    // PROBE (exploration): a skirt as deep as the level the surface is
+    // from, not the level the tile is cut at.
+    let deep = if std::env::var_os("TUILE_PROBE_SKIRT_OF_SOURCE").is_some() {
+        tuile_terrain::skirt_height(&GeographicTilingScheme::default().tile_rect(from))
+    } else {
+        tuile_terrain::skirt_height(&rect)
+    };
+    let content = tuile_terrain::to_decoded(&mesh, &rect, deep);
     let built = content
         .meshes
         .first()

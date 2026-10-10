@@ -6237,6 +6237,7 @@ name = "tuile-film-native"
 version = "0.3.3"
 dependencies = [
  "async-trait",
+ "bytemuck",
  "cudarc",
  "dotenvy",
  "futures-util",
@@ -6247,6 +6248,7 @@ dependencies = [
  "objc2-core-media",
  "objc2-core-video",
  "objc2-video-toolbox",
+ "pollster",
  "rav1e",
  "tempfile",
  "tokio",
@@ -6259,6 +6261,7 @@ dependencies = [
  "tuile-radiometry",
  "tuile-repository",
  "tuile-storage-foyer",
+ "tuile-terrain",
  "wgpu",
 ]
 
