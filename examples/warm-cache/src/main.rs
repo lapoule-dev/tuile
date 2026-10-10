@@ -16,8 +16,8 @@
 //! no business competing for bandwidth with the frame someone is waiting on.
 //!
 //! ```text
-//! cargo run --release -p warm-cache          # levels 0..=5
-//! cargo run --release -p warm-cache -- 6     # deeper, at four times the cost
+//! cargo run --release -p tuile-warm-cache          # levels 0..=5
+//! cargo run --release -p tuile-warm-cache -- 6     # deeper, at four times the cost
 //! ```
 //!
 //! The whole planet at level 5 is `4^5` imagery tiles — about 40 MiB
@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
     let through: u32 = std::env::args()
         .nth(1)
         .map_or(Ok(DEFAULT_THROUGH), |a| a.parse())
-        .map_err(|_| anyhow::anyhow!("usage: warm-cache [through-level]"))?;
+        .map_err(|_| anyhow::anyhow!("usage: tuile-warm-cache [through-level]"))?;
     // Past this the count stops being a warm-up and starts being a download of
     // the planet: level 8 alone is 65 536 imagery tiles.
     anyhow::ensure!(through <= 8, "level {through} is too deep for a warm-up");

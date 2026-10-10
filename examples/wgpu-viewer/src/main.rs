@@ -8,7 +8,7 @@
 //! tiles stream in one by one, refining as you orbit and zoom.
 //!
 //! ```text
-//! CESIUM_ION_TOKEN=... cargo run -p wgpu-viewer
+//! CESIUM_ION_TOKEN=... cargo run -p tuile-wgpu-viewer
 //! ```
 //! Drag: orbit. Right-drag: pan. Wheel: zoom. W: wireframe. F: freeze. Esc: quit.
 //!
@@ -44,7 +44,7 @@ fn main() -> anyhow::Result<()> {
     let token = std::env::var("CESIUM_ION_TOKEN").map_err(|_| {
         anyhow::anyhow!(
             "no CESIUM_ION_TOKEN in the environment — export it, or prefix the \
-             command: CESIUM_ION_TOKEN=... cargo run -p wgpu-viewer"
+             command: CESIUM_ION_TOKEN=... cargo run -p tuile-wgpu-viewer"
         )
     })?;
 

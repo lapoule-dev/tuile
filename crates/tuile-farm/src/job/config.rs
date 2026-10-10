@@ -81,8 +81,8 @@ pub struct Config {
     pub cache_seed: PathBuf,
     pub blender: String,
     pub render_script: String,
-    /// Where the engine's own binaries live (`tape-to-stage`, the tape
-    /// generators).
+    /// Where the engine's own binaries live (`tuile-tape-to-usd-stage`,
+    /// `tuile-tape` and its generators).
     pub tools: PathBuf,
     /// The batch configuration, each overridable (see [`batch_env`]).
     pub batch_env: Vec<(String, String)>,

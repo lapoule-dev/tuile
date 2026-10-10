@@ -604,7 +604,7 @@ elif [ -n "${JOB_TAPE_KEY:-}" ] || [ -n "${JOB_TRAJECTORY:-}" ]; then
     # A pack answers a camera by pose: the frame it holds must match the one
     # the stage asks for within a metre and a milliradian, or the tile does
     # not exist and the render fails loudly. The generators move — today's
-    # `pyrenees-tape` tilts 20 degrees off nadir where the one that shot the
+    # `tuile-tape pyrenees` tilts 20 degrees off nadir where the one that shot the
     # first films looked straight down — so regenerating from the same
     # argument string describes a different flight. Measured on 20 September
     # 2026: position right to six millimetres, orientation off by 0.349066 rad,
@@ -623,16 +623,16 @@ elif [ -n "${JOB_TAPE_KEY:-}" ] || [ -n "${JOB_TRAJECTORY:-}" ]; then
         #   zoom:frames_each_way
         IFS=: read -r kind p1 p2 p3 p4 p5 <<< "$JOB_TRAJECTORY"
         case "$kind" in
-            orbit) /opt/tuile/bin/orbit-tape /tmp/traj.mcap \
+            orbit) /opt/tuile/bin/tuile-tape orbit /tmp/traj.mcap \
                        "${p1:-1440}" "${p2:-2.17}" "${p3:-42.52}" \
                        "${p4:-8000}" "${p5:-5000}" ;;
-            pyrenees) /opt/tuile/bin/pyrenees-tape /tmp/traj.mcap \
+            pyrenees) /opt/tuile/bin/tuile-tape pyrenees /tmp/traj.mcap \
                           "${p1:-2}" "$JOB_FPS" "${p3:-50000}" "${p4:-0.40}" ;;
-            zoom)  /opt/tuile/bin/zoom-tape /tmp/traj.mcap "${p1:-64}" ;;
+            zoom)  /opt/tuile/bin/tuile-tape zoom /tmp/traj.mcap "${p1:-64}" ;;
             *) echo "TRAJECTORY-UNKNOWN: $kind"; exit 1 ;;
         esac
     fi
-    /opt/tuile/bin/tape-to-stage /tmp/traj.mcap "$STAGE" \
+    /opt/tuile/bin/tuile-tape-to-usd-stage /tmp/traj.mcap "$STAGE" \
         --viewport "${JOB_VIEWPORT:-1280x960}" --sse "${JOB_SSE:-3}" \
         --fps "$JOB_FPS" || { echo MANIFEST-GEN-FAILED; exit 1; }
 fi

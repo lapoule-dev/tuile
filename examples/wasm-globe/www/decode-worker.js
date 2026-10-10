@@ -14,7 +14,7 @@
 // The price is one wasm instance per worker (~a megabyte) and the Bing metadata
 // parsed once per worker. Both are paid at startup, once.
 
-import init, { ImageryDecoder } from "../pkg/wasm_globe.js";
+import init, { ImageryDecoder } from "../pkg/tuile_wasm_globe.js";
 
 let decoder = null;
 

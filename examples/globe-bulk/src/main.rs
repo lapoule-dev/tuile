@@ -8,8 +8,8 @@
 //! then rendered to a high-resolution PNG.
 //!
 //! ```text
-//! cargo run -p globe-bulk -- hemisphere [out.png] [size]
-//! cargo run -p globe-bulk -- pyrenees   [out.png] [size]
+//! cargo run -p tuile-globe-bulk -- hemisphere [out.png] [size]
+//! cargo run -p tuile-globe-bulk -- pyrenees   [out.png] [size]
 //! ```
 //! The ion token is read from `CESIUM_ION_TOKEN` (a local `.env` is loaded if
 //! present) and never stored.

@@ -28,7 +28,7 @@ Reference rendering backend. Goal: correct and readable before fast. It is the s
 Demonstration binary and daily debug tool.
 
 - winit + pollster/tokio, resizable window.
-- CLI: `wgpu-viewer <tileset.json path|URL> [--max-sse 16] [--budget-mb 512]`. In M2, `--remote ws://…` is added: the `WsStream` binding replaces the `InProcessStream` — same renderer, only the injected `GeometryStream` changes.
+- CLI: `tuile-wgpu-viewer <tileset.json path|URL> [--max-sse 16] [--budget-mb 512]`. In M2, `--remote ws://…` is added: the `WsStream` binding replaces the `InProcessStream` — same renderer, only the injected `GeometryStream` changes.
 - Orbital camera (drag = orbit, wheel = log zoom, right click = pan) initialized to frame the root bounding volume.
 - Text overlay (can be a simple `log` or an egui overlay behind the `debug-ui` feature): FPS, selected/resident tiles, in-flight requests, GPU bytes, current max SSE.
 - Keys: `W` wireframe (secondary pipeline), `B` display of bounding volumes (lines), `F` freeze the traversal (the camera moves, the selection does not — essential for debugging the LOD).

@@ -3,7 +3,7 @@
 
 //! The engine, running inside a Web Worker.
 //!
-//! This is the browser's equivalent of `wgpu-viewer`'s background thread: the
+//! This is the browser's equivalent of `tuile-wgpu-viewer`'s background thread: the
 //! **real** [`GeometryServer`], the real traversal, the real planetary loader —
 //! not a reimplementation, not a subset. The page never sees a tile coordinate;
 //! it sends a camera and receives geometry.

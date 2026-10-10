@@ -280,7 +280,7 @@ et prend le minimum.
 
 **Le premier rendu de ce pack est mort en neuf secondes, et c'est la leçon de
 l'entrée.** Lancé avec la même chaîne `pyrenees:2:24:50000:0.40` que la
-cuisson, il a régénéré un vol penché de 20° — `pyrenees-tape` a changé depuis
+cuisson, il a régénéré un vol penché de 20° — `tuile-tape pyrenees` a changé depuis
 le premier film — alors que le pack avait été cuit sur la bande nadir
 archivée. Un pack répond à une caméra par la pose, à un mètre et un
 milliradian près : l'écart lu était 0,349066 rad, pour une position juste à
@@ -412,7 +412,7 @@ Two earlier fits of this film were thrown away before this one, and say why it i
 
 The first film whose bake held no access token: every tile the shared store lacked came through a host's tile server, handed to the globe as `Sources` (`GlobeConfig::sources`), and the server alone held the sessions.
 
-- tape: `pyrenees-tape film.mcap 1 24 20000` (1 440 frames, one minute around the Pyrenees at 20 km, tilted 20°); frames 1–48, from the Basque coast inland
+- tape: `tuile-tape pyrenees film.mcap 1 24 20000` (1 440 frames, one minute around the Pyrenees at 20 km, tilted 20°); frames 1–48, from the Basque coast inland
 - bake: 640×480, `--sse 16`, embedded pack, scene `adddb0e5a320b454`, 15 distinct tiles over 537 selections, 17.7 MB; through the host's `Sources`, tile store shared with the server under a test prefix (`TUILE_TILES_PREFIX`). The two frames baked before it had asked the server for 13 969 imagery tiles and 2 744 terrain tiles; these 48 asked for 15 and 2 more — the rest was in the store.
 - render: `tuile-film-render <prefix>/packs --out film.mp4 --codec h264 --no-tone --fps 24` (built with `--features videotoolbox`), natively, 48 frames in 1.6 s; 15 tiles from the pack, none from the store; H.264 by VideoToolbox, 12 Mb/s. A first render without that feature came out as AV1 by rav1e (10.6 s), which the Mac's own player does not show: the file kept is the H.264 one.
 
@@ -424,7 +424,7 @@ To make it again one needs an implementation of `Sources` and its server, which 
 
 An orbit of Washington, baked cold with no access token: terrain and imagery both through a host's tile server (`GlobeConfig::sources`), the tile store shared with it under a test prefix.
 
-- tape: `orbit-tape orbit.mcap 48 -77.0353 38.8895 3000 2000` — 48 frames around the Washington Monument, 3 km out, 2 km up
+- tape: `tuile-tape orbit orbit.mcap 48 -77.0353 38.8895 3000 2000` — 48 frames around the Washington Monument, 3 km out, 2 km up
 - bake: 1280×720, `--sse 2`, embedded pack, scene `0cbb0a1859ace542`, 1.57 GB, 48 frames in 117 s; peak 1.5 GB of memory. It asked the server for 9 468 imagery and 4 739 terrain tiles; the ground had been baked once before at 640×480 and `--sse 16` (18 235 and 4 442 asked, 79 s), so the coarse levels were already in the store.
 - render: `tuile-film-render <prefix>/packs-precise --out washington.mp4 --codec h264 --no-tone --fps 24` (built with `--features videotoolbox`), natively on a laptop, 48 frames in 83 s; 10 799 tiles from the pack, none from the store; H.264 by VideoToolbox, 12 Mb/s
 

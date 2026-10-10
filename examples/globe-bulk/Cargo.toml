@@ -1,5 +1,5 @@
 [package]
-name = "globe-bulk"
+name = "tuile-globe-bulk"
 description = "Bulk multi-tile globe renders (terrain + Bing via ion) — hemisphere & Pyrénées — to high-res PNG"
 publish = false
 version.workspace = true

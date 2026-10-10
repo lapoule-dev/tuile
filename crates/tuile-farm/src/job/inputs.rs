@@ -71,10 +71,10 @@ pub async fn stage(c: &Config, store: Option<&dyn RunStore>, log: &Log) -> Resul
             log.line(format!("bande: fournie ({}), trajectoire ignorée", size(&tape)));
         } else {
             let t = c.trajectory.as_deref().unwrap_or("");
-            let (program, args) = generator(t, &c.fps).ok_or_else(|| {
+            let (subcommand, args) = generator(t, &c.fps).ok_or_else(|| {
                 Stop::fatal(format!("TRAJECTORY-UNKNOWN: {}", t.split(':').next().unwrap_or("")))
             })?;
-            run(&c.tools.join(program), &[&[tape.display().to_string()][..], &args].concat(), log)
+            run(&c.tools.join("tuile-tape"), &[&[subcommand.to_string(), tape.display().to_string()][..], &args].concat(), log)
                 .await
                 .map_err(|_| Stop::fatal("TAPE-GEN-FAILED"))?;
         }
@@ -88,7 +88,7 @@ pub async fn stage(c: &Config, store: Option<&dyn RunStore>, log: &Log) -> Resul
             "--fps".into(),
             c.fps.clone(),
         ];
-        run(&c.tools.join("tape-to-stage"), &args, log).await.map_err(|_| Stop::fatal("MANIFEST-GEN-FAILED"))?;
+        run(&c.tools.join("tuile-tape-to-usd-stage"), &args, log).await.map_err(|_| Stop::fatal("MANIFEST-GEN-FAILED"))?;
     }
     if std::fs::metadata(&out).map_or(true, |m| m.len() == 0) {
         return Err(Stop::fatal(format!("stage absente: {}", out.display())));
@@ -98,14 +98,15 @@ pub async fn stage(c: &Config, store: Option<&dyn RunStore>, log: &Log) -> Resul
 
 /// The generative road, with the defaults after the kind:
 /// `orbit:frames:lon:lat:radius_m:alt_m`, `pyrenees:minutes:fps:alt_m:offset_deg`,
-/// `zoom:frames_each_way`.
+/// `zoom:frames_each_way`. What comes back is the subcommand of `tuile-tape`
+/// that writes the tape, and the arguments that follow the tape's path.
 pub fn generator(trajectory: &str, fps: &str) -> Option<(&'static str, Vec<String>)> {
     let p: Vec<&str> = trajectory.split(':').collect();
     let at = |i: usize, d: &str| p.get(i).filter(|s| !s.is_empty()).map_or(d.to_string(), |s| s.to_string());
     match p.first().copied() {
-        Some("orbit") => Some(("orbit-tape", vec![at(1, "1440"), at(2, "2.17"), at(3, "42.52"), at(4, "8000"), at(5, "5000")])),
-        Some("pyrenees") => Some(("pyrenees-tape", vec![at(1, "2"), fps.to_string(), at(3, "50000"), at(4, "0.40")])),
-        Some("zoom") => Some(("zoom-tape", vec![at(1, "64")])),
+        Some("orbit") => Some(("orbit", vec![at(1, "1440"), at(2, "2.17"), at(3, "42.52"), at(4, "8000"), at(5, "5000")])),
+        Some("pyrenees") => Some(("pyrenees", vec![at(1, "2"), fps.to_string(), at(3, "50000"), at(4, "0.40")])),
+        Some("zoom") => Some(("zoom", vec![at(1, "64")])),
         _ => None,
     }
 }
@@ -192,9 +193,9 @@ mod tests {
 
     #[test]
     fn the_generators_keep_their_defaults() {
-        assert_eq!(generator("orbit", "24").expect("test"), ("orbit-tape", vec!["1440".into(), "2.17".into(), "42.52".into(), "8000".into(), "5000".into()]));
+        assert_eq!(generator("orbit", "24").expect("test"), ("orbit", vec!["1440".into(), "2.17".into(), "42.52".into(), "8000".into(), "5000".into()]));
         assert_eq!(generator("pyrenees:3::60000", "30").expect("test").1, ["3", "30", "60000", "0.40"]);
-        assert_eq!(generator("zoom:10", "24").expect("test"), ("zoom-tape", vec!["10".into()]));
+        assert_eq!(generator("zoom:10", "24").expect("test"), ("zoom", vec!["10".into()]));
         assert!(generator("spiral", "24").is_none());
     }
 

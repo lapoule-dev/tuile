@@ -11,7 +11,7 @@ Streaming mode is NOT defined here: it is defined in the core, as a trait (`Geom
 - **The serialization format for geometry on the wire is glb**: standard, compact, compressions (Draco/meshopt/KTX2) preserved. No homegrown binary format. The client binding (`WsStream`) decodes with the core's `content::decode()` — decoding always lives on the consumer side.
 - The message envelope is minimal and versioned from the first byte (compact header + payload; exact format frozen in M2).
 - Transport v1: WebSocket (axum/tokio-tungstenite native; web-sys on wasm clients — stable crates only). WebTransport/Connect = post-v1 tracks.
-- Consumers, in order: 1) `wgpu-viewer --remote ws://…` — end-to-end proof and test tool; 2) **USD, notably the Hydra renderer** via the `tuile-hydra` facade (post-v1) — the server still does not know USD: it pushes 3D Tiles, the client materializes.
+- Consumers, in order: 1) `tuile-wgpu-viewer --remote ws://…` — end-to-end proof and test tool; 2) **USD, notably the Hydra renderer** via the `tuile-hydra` facade (post-v1) — the server still does not know USD: it pushes 3D Tiles, the client materializes.
 - Sessions: state bounded per session (client-side residency tracked via `Ack`/`Evict`), inactivity timeout, configurable max number of sessions.
 - The server cache remains a source-bytes cache, shared with the static mode (the server decodes nothing in this mode: traversal + byte shuffling — a session costs little, it scales).
 - Workers: streaming requires persistent sessions → Durable Objects track, non-blocking. Streaming may be native-only in M2; Workers serve the static mode.

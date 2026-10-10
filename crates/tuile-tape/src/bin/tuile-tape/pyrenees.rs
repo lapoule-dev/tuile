@@ -9,7 +9,7 @@
 //! crest twice and miss both ends. The path below is the crest itself, offset
 //! north and then south, so the loop hugs the range instead of boxing it.
 //!
-//! **Nadir, and that is what makes it different from `border-tape`.** That one
+//! **Nadir, and that is what makes it different from `tuile-tape border`.** That one
 //! flies pitched 50° below horizontal and uses the local vertical as screen-up,
 //! which works precisely because a direction tipped 50° off the vertical is
 //! never parallel to it. Straight down, it IS parallel, and the frame is
@@ -17,7 +17,7 @@
 //! map with the direction of travel toward the top of the picture.
 //!
 //! ```text
-//! cargo run -p tuile-tape --bin pyrenees-tape -- pyrenees.mcap [minutes] [fps] [altitude_m] [offset_deg] [tilt_deg]
+//! cargo run -p tuile-tape --bin tuile-tape -- pyrenees pyrenees.mcap [minutes] [fps] [altitude_m] [offset_deg] [tilt_deg]
 //! ```
 
 use tuile_tape::path::{geodetic_to_ecef, ClosedSpline};
@@ -93,8 +93,9 @@ fn loop_points(offset: f64) -> Vec<(f64, f64)> {
     points
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
+/// `args` are the arguments after the subcommand's name.
+pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = args.iter().cloned();
     let path = args.next().unwrap_or_else(|| "pyrenees.mcap".to_owned());
     let mut next = |fallback: f64| -> Result<f64, String> {
         args.next().map_or(Ok(fallback), |a| {

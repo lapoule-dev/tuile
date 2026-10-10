@@ -3,7 +3,7 @@
 
 //! A ten-minute flight around the border of mainland France, at 50 km.
 //!
-//! Long, slow and continuous — the opposite of `zoom-tape`, and it looks for a
+//! Long, slow and continuous — the opposite of `tuile-tape zoom`, and it looks for a
 //! different failure. A zoom stresses the *depth* of the tree: the traversal
 //! crosses twenty levels in a second and the question is whether coverage keeps
 //! up. A traverse stresses its *breadth*: ground enters the frustum on one side
@@ -14,8 +14,8 @@
 //! against 26 915 uploads, and a stationary camera cannot produce that.
 //!
 //! ```text
-//! cargo run -p tuile-tape --bin border-tape -- france.mcap [minutes]
-//! TUILE_REPLAY=france.mcap cargo run --release -p wgpu-viewer
+//! cargo run -p tuile-tape --bin tuile-tape -- border france.mcap [minutes]
+//! TUILE_REPLAY=france.mcap cargo run --release -p tuile-wgpu-viewer
 //! ```
 //!
 //! **Do not trace this at full rate.** Ten minutes of frames is thirty-six
@@ -76,14 +76,16 @@ const BORDER: [(f64, f64); 27] = [
     (3.06, 50.63),  // Lille
 ];
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args()
-        .nth(1)
+/// `args` are the arguments after the subcommand's name.
+pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let path = args
+        .first()
+        .cloned()
         .unwrap_or_else(|| "france.mcap".to_owned());
-    let minutes: f64 = std::env::args()
-        .nth(2)
+    let minutes: f64 = args
+        .get(1)
         .map_or(Ok(MINUTES), |a| a.parse())
-        .map_err(|_| "usage: border-tape <path> [minutes]")?;
+        .map_err(|_| "usage: tuile-tape border <path> [minutes]")?;
 
     let path_around = ClosedPath::from_degrees(&BORDER);
     let total = (minutes * 60.0 * FPS) as usize;

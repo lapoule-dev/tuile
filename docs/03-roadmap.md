@@ -35,7 +35,7 @@ Deliverables:
 4. `protocol` module: `ClientMessage`/`ServerMessage`, `TileContent { Raw, Decoded }`, `GeometryStream` trait, `InProcessStream` (decoded) and `HttpPullStream` bindings. The viewer consumes the geometry server EXCLUSIVELY through this trait — this is what guarantees that switching to `--remote` (M2) won't touch the renderer.
 5. `TileFetcher`: `FsFetcher` (tests) and `HttpFetcher` (reqwest, native feature) impls.
 6. `tuile-wgpu`: `PrepareRenderResources` impl (buffers, textures, bind groups), minimal PBR pipeline (base color texture + factor, Depth32Float depth), relative-to-center rendering.
-7. `wgpu-viewer`: winit binary, orbital camera, loads a tileset by path/URL, displays stats (resident tiles, in-flight requests, GPU bytes).
+7. `tuile-wgpu-viewer`: winit binary, orbital camera, loads a tileset by path/URL, displays stats (resident tiles, in-flight requests, GPU bytes).
 
 Acceptance criteria:
 - [ ] `cargo test --workspace` green; traversal coverage on the hand-crafted mini-tileset (cases: camera far → root only; camera close → leaves; REPLACE never displays parent + children simultaneously after stabilization).
@@ -46,10 +46,10 @@ Acceptance criteria:
 
 ## M2 — Network middleware: WebSocket streaming + static mode + pluggable cache
 
-Scope: `tuile-server`, client `WsStream` binding, `wgpu-viewer --remote`.
+Scope: `tuile-server`, client `WsStream` binding, `tuile-wgpu-viewer --remote`.
 
 Deliverables:
-1. **Network binding of streaming mode**: WebSocket endpoint (one session = one core `GeometryServer`), envelope serialization (versioned from the first byte), geometry as glb on the wire. Client `WsStream` binding (decodes on the client side) + `wgpu-viewer --remote ws://…`.
+1. **Network binding of streaming mode**: WebSocket endpoint (one session = one core `GeometryServer`), envelope serialization (versioned from the first byte), geometry as glb on the wire. Client `WsStream` binding (decodes on the client side) + `tuile-wgpu-viewer --remote ws://…`.
 2. `tuile` native binary (axum): `tuile serve <dir|s3://|gs://>` via `object_store`. Routes: WS streaming, tileset.json, contents, health, basic metrics.
 3. `TileCache` trait + impls: `NoopCache`, `MemoryLruCache` (byte budget), `DiskCache`. Selection by config/CLI — the cache is removable depending on the environment.
 4. Correct HTTP headers (static mode): ETag, immutable Cache-Control on contents, configurable CORS, Range requests on glb.
@@ -57,7 +57,7 @@ Deliverables:
 6. Implicit tiling subtree decoding (deferred from M1 if applicable): the server can return a clean 404 on an unavailable tile.
 
 Acceptance criteria:
-- [ ] `wgpu-viewer --remote` displays the fixtures with visual AND selection parity vs local mode (same `Select` sequence for a replayed camera trajectory — programmatic test, not just visual).
+- [ ] `tuile-wgpu-viewer --remote` displays the fixtures with visual AND selection parity vs local mode (same `Select` sequence for a replayed camera trajectory — programmatic test, not just visual).
 - [ ] The main open source 3D Tiles web viewers (including three.js 3DTilesRenderer) consume a tileset served by `tuile serve` without error (manual test documented in `docs/`, test HTML pages committed).
 - [ ] The M1 wgpu viewer works against the server in static mode (`HttpPullStream` — full homemade loop).
 - [ ] Integration tests: end-to-end WS session (+ cancellation, timeout, malformed messages → Error), ETag/304, immutability, LRU respects the budget, NoopCache = passthrough.

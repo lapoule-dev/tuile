@@ -72,7 +72,7 @@ avec un soleil blanc et un ambiant scalaire, puis `aerial_perspective`. La
 sortie va directement dans une surface sRGB 8 bits (`surface.rs:152-163`) :
 **pas de cible HDR, pas d'exposition, pas de tone mapping**. Le fond est effacé
 en noir (`examples/wgpu-viewer/src/app/frame.rs:265-271`), il n'y a pas de passe
-de ciel. Le viewer place le soleil à l'heure (`app/mod.rs:169`) ; `globe-bulk`
+de ciel. Le viewer place le soleil à l'heure (`app/mod.rs:169`) ; `tuile-globe-bulk`
 le place à la verticale de l'œil.
 
 **USD / Blender** :

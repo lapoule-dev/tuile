@@ -139,7 +139,7 @@ fi
 # Une bande fournie l'emporte sur une bande générée.
 #
 # `JOB_TAPE_KEY` sert à recuire un pack **sur son propre tracé**. Les
-# générateurs évoluent — `pyrenees-tape` sortait une polyligne quand les
+# générateurs évoluent — `tuile-tape pyrenees` sortait une polyligne quand les
 # premiers films ont été tournés et sort une spline aujourd'hui — donc la même
 # chaîne d'arguments ne décrit plus le même vol. Pour demander si la traversée
 # d'aujourd'hui s'effondre encore au-dessus de la même mer, il faut survoler
@@ -156,12 +156,12 @@ if [ -n "${JOB_TAPE_KEY:-}" ]; then
 else
 IFS=: read -r kind p1 p2 p3 p4 p5 <<< "$JOB_TRAJECTORY"
 case "$kind" in
-    orbit) /opt/tuile/bin/orbit-tape "$tape" \
+    orbit) /opt/tuile/bin/tuile-tape orbit "$tape" \
                "${p1:-1440}" "${p2:-2.17}" "${p3:-42.52}" \
                "${p4:-8000}" "${p5:-5000}" ;;
-    pyrenees) /opt/tuile/bin/pyrenees-tape "$tape" \
+    pyrenees) /opt/tuile/bin/tuile-tape pyrenees "$tape" \
                   "${p1:-2}" "$JOB_FPS" "${p3:-50000}" "${p4:-0.40}" ;;
-    zoom)  /opt/tuile/bin/zoom-tape "$tape" "${p1:-64}" ;;
+    zoom)  /opt/tuile/bin/tuile-tape zoom "$tape" "${p1:-64}" ;;
     *) echo "TRAJECTORY-UNKNOWN: $kind"; exit 1 ;;
 esac
 fi

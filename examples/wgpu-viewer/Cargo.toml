@@ -1,5 +1,5 @@
 [package]
-name = "wgpu-viewer"
+name = "tuile-wgpu-viewer"
 description = "Demo viewer for tuile: winit + tuile-wgpu"
 publish = false
 version.workspace = true

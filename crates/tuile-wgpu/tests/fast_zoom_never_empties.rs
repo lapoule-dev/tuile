@@ -138,7 +138,7 @@ fn looking_down(altitude: f64) -> (ViewState, DVec3, DVec3) {
 /// `settle` is how many times the server future is polled before the frame is
 /// drawn. One is a live frame; a large number is a camera that has been sitting
 /// still. The streaming step itself is `ContentPump::advance` — the same call
-/// `wgpu-viewer` makes, not a copy of it.
+/// `tuile-wgpu-viewer` makes, not a copy of it.
 #[allow(clippy::too_many_arguments)]
 fn frame(
     server: &mut Pin<Box<dyn Future<Output = ()>>>,
