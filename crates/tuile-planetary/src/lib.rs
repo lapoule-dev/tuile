@@ -33,7 +33,7 @@ use tuile_core::offload::{self, Offload};
 use tuile_core::raster::{self, GeoRect, ImageryCoord, ImageryProvider, RasterError};
 use tuile_core::source::{LoadError, Loaded, TileId, TileLoader, TileTree};
 use tuile_terrain::{
-    decode, level_geometric_error, to_decoded, Availability, AvailabilityRange,
+    decode, level_geometric_error, to_ground, Availability, AvailabilityRange,
     GeographicTilingScheme, LayerJson, TerrainHeights, TerrainSource, TerrainTree, TileCoord,
 };
 
@@ -1260,7 +1260,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
         // The surface of the nearest ancestor already in memory, restated over
         // this tile's own rectangle. Never a plane — see `stand_in_mesh`.
         let mesh = self.stand_in_mesh(coord)?;
-        let mut content = to_decoded(&mesh, &rect, tuile_terrain::skirt_height(&rect));
+        let mut content = to_ground(&mesh, &rect);
 
         let geo = GeoRect {
             west: rect.west,
@@ -1442,7 +1442,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
         // A wall is textured by the column of texels above it and lit by the
         // same normal, so where one does show through it is the colour of the
         // ground it hangs from rather than a stripe of something else.
-        let mut content = to_decoded(&qm, &rect, tuile_terrain::skirt_height(&rect));
+        let mut content = to_ground(&qm, &rect);
         if !self.opts.no_imagery {
             let georect = GeoRect {
                 west: rect.west,

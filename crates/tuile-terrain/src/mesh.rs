@@ -140,6 +140,75 @@ pub fn skirt_height(rect: &GeoRect) -> f64 {
     geometric_error * ERRORS_OF_HEADROOM
 }
 
+/// How deep the skirt of `mesh` hangs when it is drawn over `rect`, in metres.
+///
+/// [`skirt_height`] is the references' rule for a tile drawn from its own
+/// data beside neighbours a level away. Two things it does not account for
+/// are what left seams open, and both are answered here, for every path that
+/// draws terrain:
+///
+/// - **A tile cut from an ancestor has its ancestor's surface.** Its error is
+///   the ancestor's, however small the rectangle it is restated over: a
+///   level-19 tile cut from level-13 terrain can stand as far from its
+///   neighbour as a level-13 tile can. So the depth is taken at the level of
+///   the terrain tile the surface is from — `rect` widened by
+///   [`QuantizedMesh::cut`] levels.
+/// - **Nothing keeps two neighbours within a level of each other.** The
+///   selection is bounded by screen-space error alone; a coast, an island or
+///   the edge of a source's coverage puts fine tiles against tiles several
+///   levels coarser. The step between them is the *coarser* tile's error, and
+///   where the fine tile is the higher side its own skirt is the only thing
+///   that can close it. So a skirt hangs as deep as that of a tile four
+///   levels coarser — sixteen times the rule, eighty
+///   geometric errors — which covers a neighbour up to six levels coarser
+///   (its error is 2⁶ = 64 of the tile's own). Coarse tiles need no such
+///   help and are left at the rule from level 6 up, where it already gives
+///   kilometres.
+///
+/// Depth costs nothing that shows. A wall hangs from the tile's own edge,
+/// straight down, under the line two tiles share: it is inside the ground on
+/// both sides wherever the two agree, and stands in the open exactly where
+/// they do not — which is the gap it is there to close. It is never coplanar
+/// with anything: each wall is leaned (`Side::outward`) out of its own tile, so
+/// two neighbours' walls cross under the seam instead of sharing a plane.
+pub fn skirt_depth(mesh: &QuantizedMesh, rect: &GeoRect) -> f64 {
+    skirt_depth_cut(rect, mesh.cut)
+}
+
+/// A skirt reaches as deep as that of a tile this many levels coarser.
+const LEVELS_OF_REACH: i32 = 4;
+/// …but no deeper than a tile's of this level: 6 km.
+const DEEPEST_LEVEL_REACHED: i32 = 6;
+
+/// [`skirt_depth`], for a tile over `rect` whose surface was cut `cut` levels
+/// below the terrain tile it is from — for whoever knows that without holding
+/// the mesh.
+pub fn skirt_depth_cut(rect: &GeoRect, cut: u32) -> f64 {
+    let limit = std::f64::consts::PI / 2f64.powi(DEEPEST_LEVEL_REACHED);
+    // The rectangle of the terrain tile the surface is from.
+    let source = rect.width() * 2f64.powi(cut as i32);
+    let reached = if source >= limit {
+        source
+    } else {
+        (source * 2f64.powi(LEVELS_OF_REACH)).min(limit)
+    };
+    skirt_height(&GeoRect {
+        east: rect.west + reached,
+        ..*rect
+    })
+}
+
+/// A terrain tile as ground to draw: [`to_decoded`], with the skirt
+/// [`skirt_depth`] says its surface needs.
+///
+/// **This is the one way a terrain tile becomes drawable ground.** The live
+/// loader, its stand-ins and a film built again from the tile store all come
+/// through here, so that what closes a seam is decided once and no renderer
+/// has a rule of its own.
+pub fn to_ground(mesh: &QuantizedMesh, rect: &GeoRect) -> DecodedTileContent {
+    to_decoded(mesh, rect, skirt_depth(mesh, rect))
+}
+
 /// Which side of the tile a wall stands on, and everything that follows from it.
 #[derive(Clone, Copy)]
 enum Side {
@@ -264,6 +333,7 @@ mod tests {
             normals: Some(vec![[0.0, 0.0, 1.0]; 4]),
             edges: [vec![0, 2], vec![0, 1], vec![1, 3], vec![2, 3]],
             metadata_available: None,
+            cut: 0,
         }
     }
 
@@ -444,6 +514,7 @@ mod tests {
                 vec![7, 8, 6], // north
             ],
             metadata_available: None,
+            cut: 0,
         }
     }
 
@@ -613,6 +684,37 @@ mod tests {
             ..coarse
         };
         assert!((skirt_height(&fine) - skirt_height(&coarse) / 4.0).abs() < 1.0e-9);
+    }
+
+    /// **A skirt is sized by the terrain its surface is from, and reaches
+    /// past a neighbour of another level.**
+    #[test]
+    fn skirt_depth_follows_the_source_and_reaches_coarser_neighbours() {
+        let scheme = GeographicTilingScheme::default();
+        let at = |level: u32| scheme.tile_rect(TileCoord::new(level, 0, 0));
+        let rule = |level: u32| skirt_height(&at(level));
+
+        // As deep as the rule gives a tile four levels coarser…
+        assert!((skirt_depth_cut(&at(13), 0) - rule(9)).abs() < 1.0e-6);
+        assert!((skirt_depth_cut(&at(19), 0) - rule(15)).abs() < 1.0e-6);
+        // …down to level 6's and no deeper…
+        assert!((skirt_depth_cut(&at(8), 0) - rule(6)).abs() < 1.0e-6);
+        // …and where the rule already gives that much, the rule.
+        assert!((skirt_depth_cut(&at(6), 0) - rule(6)).abs() < 1.0e-6);
+        assert!((skirt_depth_cut(&at(2), 0) - rule(2)).abs() < 1.0e-6);
+
+        // A tile cut from an ancestor hangs its ancestor's skirt, however
+        // small it is itself.
+        for level in 14..=19 {
+            let cut = level - 13;
+            assert!(
+                (skirt_depth_cut(&at(level), cut) - skirt_depth_cut(&at(13), 0)).abs() < 1.0e-6,
+                "level {level} cut from 13"
+            );
+        }
+        let mut mesh = quad_mesh([0.0; 3]);
+        mesh.cut = 3;
+        assert_eq!(skirt_depth(&mesh, &at(16)), skirt_depth_cut(&at(16), 3));
     }
 
     #[test]

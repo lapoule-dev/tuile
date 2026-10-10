@@ -69,6 +69,12 @@ pub struct QuantizedMesh {
     /// `this_tile_level + offset + 1`. The driver of multi-level refinement on
     /// Cesium World Terrain.
     pub metadata_available: Option<Vec<Vec<crate::layer::AvailabilityRange>>>,
+    /// How many levels below the terrain tile its surface is from this mesh
+    /// lies: 0 as decoded, and one more each time [`crate::upsample`] cuts a
+    /// child out of it. The surface keeps its source's accuracy however small
+    /// the tile it is restated over, and what hangs from its edges has to be
+    /// sized by that — see [`crate::skirt_depth`].
+    pub cut: u32,
 }
 
 impl QuantizedMesh {
@@ -207,6 +213,7 @@ pub fn decode(bytes: &[u8]) -> Result<QuantizedMesh, DecodeError> {
         normals,
         edges,
         metadata_available,
+        cut: 0,
     })
 }
 

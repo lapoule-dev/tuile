@@ -43,7 +43,8 @@ use tuile_core::protocol::{ClientMessage, GeometryStream, ServerMessage, StreamE
 use tuile_core::source::TileId;
 use tuile_core::traversal::TraversalStats;
 use tuile_terrain::{
-    skirt_height, to_decoded, GeoRect, GeographicTilingScheme, Header, QuantizedMesh, TileCoord,
+    skirt_height, to_decoded, to_ground, upsample, GeoRect, GeographicTilingScheme, Header,
+    QuantizedMesh, TileCoord,
 };
 use tuile_wgpu::{
     prepare, ContentPump, GpuContext, TileRenderer, ViewUniform, DEPTH_FORMAT, SAMPLES,
@@ -145,6 +146,7 @@ fn grid_mesh(rect: &GeoRect, steps: usize) -> QuantizedMesh {
             (0..n).rev().map(|col| at(col, n - 1)).collect(),
         ],
         metadata_available: None,
+        cut: 0,
     }
 }
 
@@ -633,6 +635,103 @@ fn a_lod_boundary_shows_no_seam() {
         skirted, 0,
         "{skirted} pixels of void through the ground at the boundary between \
          two levels ({bare} without skirts) — the wall did not cover the crack"
+    );
+}
+
+/// Tiles cut from two terrain tiles, drawn where they meet: `as_built` the
+/// way the engine builds them, or bare of anything hung from their edges.
+fn holes_between_cut_tiles(gpu: &GpuContext, as_built: bool) -> u64 {
+    // Two terrain tiles of level 4 side by side, the western one measured
+    // finely and the eastern in three chords: along the meridian they share,
+    // the eastern surface runs kilometres under the western one — most of
+    // all a sixth of the way up, the middle of its first chord, which the
+    // camera looks at. (Not at the middle of the edge: cutting the eastern
+    // tile in two puts a vertex there, at its true height, and closes it.) Neither is
+    // drawn as itself — the west as its level-6 descendants along that line,
+    // the east as its level-5 children — so every tile in the frame is cut
+    // from an ancestor's terrain.
+    let (west, east) = (TileCoord::new(4, 16, 10), TileCoord::new(4, 17, 10));
+    let scheme = GeographicTilingScheme::default();
+    let source = |of: TileCoord, steps: usize| grid_mesh(&scheme.tile_rect(of), steps);
+    let (west_mesh, east_mesh) = (source(west, 16), source(east, 3));
+
+    let mut tiles: Vec<(TileId, DecodedTileContent)> = Vec::new();
+    let mut cut = |mesh: &QuantizedMesh, from: TileCoord, to: TileCoord| {
+        let cut = upsample(mesh, from, to).expect("covers");
+        let rect = scheme.tile_rect(to);
+        let content = if as_built {
+            to_ground(&cut, &rect)
+        } else {
+            to_decoded(&cut, &rect, 0.0)
+        };
+        tiles.push((TileId::from_terrain(to.level, to.x, to.y), content));
+    };
+    for row in 0..4 {
+        cut(
+            &west_mesh,
+            west,
+            TileCoord::new(6, 4 * west.x + 3, 4 * west.y + row),
+        );
+    }
+    for row in 0..2 {
+        cut(
+            &east_mesh,
+            east,
+            TileCoord::new(5, 2 * east.x, 2 * east.y + row),
+        );
+    }
+
+    let ids: Vec<TileId> = tiles.iter().map(|t| t.0).collect();
+    let mut messages = VecDeque::from([ServerMessage::Select {
+        tiles: selected(&ids),
+        ancestry: tree_shape(&ids),
+        stats: TraversalStats::default(),
+        generation: 0,
+    }]);
+    for (tile, content) in tiles {
+        messages.push_back(ServerMessage::Content {
+            tile,
+            ancestry: ancestry(tile),
+            content: TileContent::Decoded(content),
+        });
+    }
+    let mut stream = Scripted(messages);
+
+    // Over the lower side, obliquely: a step is looked into from there.
+    let seam = on_the_ground(&scheme.tile_rect(east), 0.0, 1.0 / 6.0);
+    let up = seam.normalize();
+    let east_of = DVec3::Z.cross(up).normalize();
+    const STANDOFF: f64 = 60_000.0;
+    let eye = seam + up * STANDOFF + east_of * STANDOFF;
+
+    let mut pump = ContentPump::new(eye);
+    pump.pump(&mut stream, gpu, 32);
+    holes_through_the_ground(gpu, &mut pump, eye, seam)
+}
+
+/// **Tiles cut from an ancestor's terrain leave no gap either.**
+///
+/// The boundary above is between two tiles drawn from their own data. Most of
+/// what a camera sees is not that: past the level a source stops at, every
+/// tile is cut from an ancestor, and a cut tile used to carry no edge list
+/// and so no wall. Where two of them met across a line of the source's own
+/// grid, the void showed through.
+#[test]
+fn tiles_cut_from_two_terrain_tiles_show_no_seam() {
+    let Some(gpu) = gpu() else { return };
+
+    let bare = holes_between_cut_tiles(&gpu, false);
+    assert!(
+        bare > 0,
+        "the fixture opens no seam between its cut tiles even with no wall, so \
+         it guards against nothing"
+    );
+
+    let built = holes_between_cut_tiles(&gpu, true);
+    assert_eq!(
+        built, 0,
+        "{built} pixels of void between tiles cut from two terrain tiles \
+         ({bare} with no wall at all)"
     );
 }
 
