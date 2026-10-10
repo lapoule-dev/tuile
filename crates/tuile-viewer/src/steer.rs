@@ -83,6 +83,15 @@ pub(crate) enum Command {
     Imagery(usize),
     /// The layer after the present one, round the list.
     NextImagery,
+    /// Draw this diagnostic view — an index into the views `D` cycles, 0
+    /// being the real picture.
+    Diagnostic(usize),
+    /// Put a link to the present view on the clipboard.
+    CopyLink,
+    /// Go where the link on the clipboard says, if it holds one.
+    PasteLink,
+    /// Show the keys and the flags, in a window.
+    ShowKeys,
 }
 
 /// Which of `layers` a person, a flag, a URL or a script means by `text`: a

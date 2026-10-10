@@ -59,8 +59,12 @@ pub(crate) struct Snapshot {
     /// than a coarser stand-in still waiting for it: the picture has stopped
     /// refining, and a capture taken now is the one that was meant.
     pub settled: bool,
-    /// The imagery layer being draped, of the host's list.
+    /// The imagery layer being draped, of the host's list, and its index
+    /// there.
     pub imagery: Option<&'static crate::embed::ImageryChoice>,
+    pub layer: usize,
+    /// Which diagnostic view is drawn; 0 is the real picture.
+    pub diagnostic: usize,
 }
 
 impl Snapshot {
@@ -96,6 +100,8 @@ impl Snapshot {
             tiles: 0,
             settled: false,
             imagery: None,
+            layer: 0,
+            diagnostic: 0,
         }
     }
 }

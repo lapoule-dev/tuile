@@ -9,7 +9,7 @@
 //! on one the widget has taken.
 
 use super::setup::configure_surface;
-use super::{App, DIAGNOSTICS};
+use super::App;
 use crate::steer::Command;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
@@ -27,6 +27,9 @@ pub(super) struct Pointer {
     pub(super) cursor: (f64, f64),
     pub(super) dragging: bool,
     pub(super) tilting: bool,
+    /// Whether Command, Control or Option is held: a key pressed with one is
+    /// not one of the application's bare keys.
+    pub(super) chord: bool,
 }
 
 /// What the debug keys have switched on.
@@ -74,28 +77,20 @@ impl App {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 match event.logical_key {
-                    Key::Character(ref c) if c.eq_ignore_ascii_case("w") => {
-                        self.apply(Command::Wireframe(!self.views.wireframe));
-                    }
-                    Key::Character(ref c) if c.eq_ignore_ascii_case("d") => {
-                        self.views.diagnostic = (self.views.diagnostic + 1) % DIAGNOSTICS.len();
-                        let (name, reads) = DIAGNOSTICS[self.views.diagnostic];
-                        tracing::info!("view: {name} — {reads}");
-                    }
-                    Key::Character(ref c) if c.eq_ignore_ascii_case("f") => {
-                        self.apply(Command::Freeze(!self.views.freeze));
-                    }
-                    Key::Character(ref c) if c.eq_ignore_ascii_case("n") => {
-                        self.apply(Command::NorthUp);
-                    }
-                    Key::Character(ref c) if c.eq_ignore_ascii_case("l") => {
-                        self.apply(Command::Here);
-                    }
-                    Key::Character(ref c) if c.eq_ignore_ascii_case("c") => {
-                        self.copy_the_link();
-                    }
-                    Key::Character(ref c) if c.eq_ignore_ascii_case("i") => {
-                        self.apply(Command::NextImagery);
+                    // One table for the keys and the menu: see `crate::menu`.
+                    // A key held with Command, Control or Option is a
+                    // shortcut of the system's or the menu's, not one of
+                    // these.
+                    Key::Character(ref c) if !self.pointer.chord => {
+                        let mut typed = c.chars();
+                        let ask = match (typed.next(), typed.next()) {
+                            (Some(only), None) => crate::menu::key(only),
+                            _ => None,
+                        };
+                        if let Some(ask) = ask {
+                            let command = ask.command(&self.published());
+                            self.apply(command);
+                        }
                     }
                     Key::Named(NamedKey::Escape) => {
                         self.ended_by = Some("Esc was pressed");
@@ -103,6 +98,10 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                let held = modifiers.state();
+                self.pointer.chord = held.super_key() || held.control_key() || held.alt_key();
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;

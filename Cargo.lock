@@ -6680,6 +6680,7 @@ dependencies = [
  "ctrlc",
  "futures-executor",
  "glam 0.33.1",
+ "muda 0.19.3",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-core-location 0.3.2",

@@ -176,10 +176,7 @@ fn token_line(text: &str) -> Option<String> {
 ///
 /// A variable that is set but empty counts as unset — it is what an unfilled
 /// template exports, and "the token is the empty string" helps nobody.
-pub(crate) fn token(
-    host: &dyn Host,
-    variable: &str,
-) -> Result<(String, TokenFrom), MissingToken> {
+pub(crate) fn token(host: &dyn Host, variable: &str) -> Result<(String, TokenFrom), MissingToken> {
     if let Some(token) = host
         .var(variable)
         .map(|t| t.trim().to_owned())
@@ -344,7 +341,10 @@ mod tests {
         };
         assert_eq!(token_file(&moved), Some("/etc/xdg/tuile/token".into()));
         // Nowhere to look is a missing token, not a panic.
-        assert_eq!(token(&Fake::default(), TOKEN_VARIABLE), Err(MissingToken { file: None }));
+        assert_eq!(
+            token(&Fake::default(), TOKEN_VARIABLE),
+            Err(MissingToken { file: None })
+        );
     }
 
     /// The view a session left is the view the next one opens on; a file
