@@ -48,6 +48,9 @@ pub struct ViewerConfig {
     /// once there is one — see [`tuile_planetary::LayerBudget`].
     pub layer_budget: tuile_planetary::LayerBudget,
     pub title: String,
+    /// Set by `--here`: ask for the current location at start, and place the
+    /// view like this when it is known.
+    pub here: Option<crate::location::Placement>,
     /// The instant the scene is lit for, UTC seconds since the Unix epoch —
     /// which sets where the sun is, and so where the terminator falls.
     pub lit_at_unix_seconds: f64,
@@ -149,6 +152,9 @@ pub struct App {
     /// The on-screen navigation control. It sees pointer events first and, when
     /// it takes one, the globe must not also act on it.
     nav: NavWidget,
+    /// The request for the current location, from the key press or `--here`
+    /// to the frame the system's answer arrives on.
+    locator: crate::location::Locator,
     /// The window is hidden — another window covers it, the display slept, the
     /// app was minimized. Rendering while occluded leaks GPU memory on Apple
     /// platforms.
@@ -161,7 +167,14 @@ pub struct App {
 
 impl App {
     pub fn new(config: ViewerConfig) -> Self {
+        // Asked for here, on the main thread and before the loop turns, so the
+        // system's question — if it has one — is up while the globe warms.
+        let mut locator = crate::location::Locator::platform();
+        if let Some(placement) = config.here {
+            locator.request(std::time::Instant::now(), placement);
+        }
         Self {
+            locator,
             controller: config.controller.clone(),
             detail: config.detail.clone(),
             layer_budget: config.layer_budget.clone(),
@@ -213,6 +226,30 @@ impl App {
         self.stats.to_string()
     }
 
+    /// Moves the view if the location that was asked for has arrived, and
+    /// says how the request ended either way.
+    fn take_the_location(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(outcome) = self.locator.tick(now, &mut self.controller) {
+            self.say(&outcome.to_string());
+        }
+    }
+
+    /// Tells the person something they asked about, where they are looking.
+    ///
+    /// In the title bar, because that is the one piece of text this window
+    /// has, and because the log may be going nowhere: a session started with
+    /// `RUST_LOG=error`, or from an icon, has no terminal to read. The message
+    /// stays until the next one replaces it.
+    fn say(&mut self, message: &str) {
+        tracing::info!("{message}");
+        if let Some(active) = self.active.as_ref() {
+            active
+                .window
+                .set_title(&format!("{} — {message}", self.title));
+        }
+    }
+
     fn viewport(&self) -> (f64, f64) {
         self.active
             .as_ref()
@@ -248,6 +285,10 @@ impl ApplicationHandler for App {
     /// handler is what lets an occluded window stop cleanly — the loop parks on
     /// `Wait` until the next event instead of spinning.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Before anything that can return early: an answer about the current
+        // location is taken on whatever turn of the loop it arrives, hidden
+        // and warming included.
+        self.take_the_location();
         // A flown tape ends the session. Without this a replay leaves a window
         // sitting on its last frame, and the run has to be closed by hand —
         // which is exactly what stops anyone from putting it in a script.

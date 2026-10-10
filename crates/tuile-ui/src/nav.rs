@@ -41,6 +41,10 @@ const HEADING_PER_RADIAN: f64 = 1.0;
 const TILT_TRAVEL_PX: f64 = 90.0;
 /// Zoom applied per button press, in the units [`CameraController::zoom`] takes.
 const ZOOM_STEP: f64 = 2.0;
+/// How far the pointer may wander between press and release, in pixels, and
+/// the gesture still be a click rather than a drag. A hand does not hold a
+/// button perfectly still; three pixels is the usual allowance.
+const CLICK_SLOP_PX: f64 = 3.0;
 
 const IDLE: [f32; 4] = [0.10, 0.11, 0.13, 0.62];
 const HOT: [f32; 4] = [0.22, 0.24, 0.28, 0.80];
@@ -121,6 +125,9 @@ pub struct NavWidget {
     /// it outlives every press, which is the whole difference between this and
     /// the buttons above it.
     atmosphere: bool,
+    /// How far the pointer has travelled since the press, in pixels: what
+    /// tells a click on a part from a drag that started on it.
+    travelled: f64,
 }
 
 impl NavWidget {
@@ -170,6 +177,7 @@ impl NavWidget {
             return false;
         };
         self.grabbed = Some(part);
+        self.travelled = 0.0;
         match part {
             Part::ZoomIn => controller.zoom(ZOOM_STEP, centre_of(viewport), viewport),
             Part::ZoomOut => controller.zoom(-ZOOM_STEP, centre_of(viewport), viewport),
@@ -179,9 +187,19 @@ impl NavWidget {
         true
     }
 
-    /// Ends the gesture. Harmless when none is in progress.
-    pub fn release(&mut self) {
-        self.grabbed = None;
+    /// Ends the gesture, and says which part was **clicked** — pressed and
+    /// released without the pointer going anywhere — if one was. Harmless when
+    /// no gesture is in progress.
+    ///
+    /// The host decides what a click means, because the two parts that have a
+    /// meaning of their own need more than the widget holds: a click on the
+    /// compass ring is, by long convention, "put north back at the top", and
+    /// how a view is turned north-up is the host's to say. Buttons and the
+    /// checkbox already acted on the press; a host has nothing to add for them.
+    pub fn release(&mut self) -> Option<Part> {
+        self.grabbed
+            .take()
+            .filter(|_| self.travelled <= CLICK_SLOP_PX)
     }
 
     /// Continues a drag. Returns `true` while the control owns the gesture.
@@ -195,6 +213,7 @@ impl NavWidget {
         let Some(part) = self.grabbed else {
             return false;
         };
+        self.travelled += distance(from, to);
         let layout = Layout::for_viewport(viewport);
         match part {
             Part::Ring => {
@@ -502,6 +521,32 @@ mod tests {
             (c.camera.heading() - before).abs() > 1e-3,
             "a quarter turn of the ring left the heading at {before}"
         );
+    }
+
+    /// The ring is both a dial and a button, and only the distance travelled
+    /// tells them apart: a press let go where it landed is a click, the same
+    /// press dragged a quarter turn is not.
+    #[test]
+    fn a_ring_let_go_where_it_was_pressed_is_a_click_and_a_dragged_one_is_not() {
+        let mut w = NavWidget::new();
+        let mut c = controller();
+        let l = layout();
+        let start = (l.center.0, l.center.1 - RING_OUTER + 4.0);
+
+        assert!(w.press(start, VIEWPORT, &mut c));
+        // A hand that shook by a pixel still clicked.
+        assert!(w.drag(start, (start.0 + 1.0, start.1), VIEWPORT, &mut c));
+        assert_eq!(w.release(), Some(Part::Ring));
+        assert_eq!(w.release(), None, "nothing is held any more");
+
+        assert!(w.press(start, VIEWPORT, &mut c));
+        let end = (l.center.0 + RING_OUTER - 4.0, l.center.1);
+        assert!(w.drag(start, end, VIEWPORT, &mut c));
+        assert_eq!(w.release(), None, "a quarter turn is a drag");
+
+        // And the travel does not leak into the next gesture.
+        assert!(w.press(start, VIEWPORT, &mut c));
+        assert_eq!(w.release(), Some(Part::Ring));
     }
 
     /// Crossing the top of the ring must not read as an almost-full turn the

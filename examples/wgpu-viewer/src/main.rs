@@ -11,6 +11,27 @@
 //! CESIUM_ION_TOKEN=... cargo run -p tuile-wgpu-viewer
 //! ```
 //! Drag: orbit. Right-drag: pan. Wheel: zoom. W: wireframe. F: freeze. Esc: quit.
+//! N, or a click on the compass ring: north up, about the point at the centre
+//! of the view. L: centre on the current location, at the present altitude.
+//!
+//! The session opens straight down on France from 2 000 km. These flags move
+//! that, and are the only flags there are (`--help` lists them with the keys):
+//!
+//! ```text
+//! --lon <deg> --lat <deg>   where the eye is, east and north positive
+//! --altitude <m>            its height above the ellipsoid, 1 to 1e8
+//! --heading <deg>           where it looks, 0 = north, clockwise
+//! --pitch <deg>             how far below the horizon, 90 = straight down
+//! --here                    over the current location, instead of --lon/--lat
+//!
+//! CESIUM_ION_TOKEN=... cargo run -p tuile-wgpu-viewer -- \
+//!     --lon 6.86 --lat 45.83 --altitude 6000 --heading 120 --pitch 25
+//! ```
+//!
+//! The current location comes from the operating system's location service
+//! (macOS, cargo feature `current-location`, on by default), which asks the
+//! person before it answers; elsewhere `--here` and L say it is not available
+//! and change nothing. The coordinates are never logged or written anywhere.
 //!
 //! `TUILE_RECORD=path.jsonl` writes the camera path; `TUILE_REPLAY=path.jsonl`
 //! flies it again exactly. The format and the replay live in the `tuile-tape`
@@ -18,19 +39,36 @@
 
 mod app;
 mod backdrop;
+mod location;
 mod recording;
 mod session;
 mod settings;
 mod signals;
 mod sources;
+mod start;
+mod steer;
 
 use app::{App, ViewerConfig};
-use tuile_camera::{CameraController, GlobeCamera};
+use tuile_camera::CameraController;
 use tuile_core::runtime::in_process_with;
 use tuile_core::traversal::Config;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() -> anyhow::Result<()> {
+    // The command line first, before the logger, the token, the network and
+    // the window: a mistyped flag must cost nothing but the message that says
+    // so. Exit code 2 is the usual one for a command that was not understood.
+    let (view, here) = match start::parse(std::env::args().skip(1)) {
+        Ok(start::Invocation::Run { view, here }) => (view, here),
+        Ok(start::Invocation::Help) => {
+            println!("{}", start::USAGE);
+            return Ok(());
+        }
+        Err(error) => {
+            eprintln!("tuile-wgpu-viewer: {error}\n\n{}", start::USAGE);
+            std::process::exit(2);
+        }
+    };
     settings::init_tracing();
     // From the environment, and only from the environment.
     //
@@ -92,15 +130,9 @@ fn main() -> anyhow::Result<()> {
         .name("geometry-server".into())
         .spawn(move || rt.block_on(server.run()))?;
 
-    // Start looking straight down at France from ~2000 km up.
-    let camera = GlobeCamera::from_geodetic(
-        46f64.to_radians(),
-        2f64.to_radians(),
-        2_000_000.0,
-        0.0,
-        std::f64::consts::FRAC_PI_2,
-        tuile_camera::DEFAULT_GLOBE_FOVY,
-    );
+    // Where the command line said; straight down at France from ~2000 km up
+    // when it said nothing.
+    let camera = view.camera();
     // Clamp against the terrain, not the ellipsoid: a metre over the sea and a
     // metre over a summit are the same request, and only the relief tells them
     // apart. The handle is shared and live, so the floor sharpens as tiles land.
@@ -117,7 +149,8 @@ fn main() -> anyhow::Result<()> {
 
     tracing::info!(
         "tuile globe viewer — streaming Cesium World Terrain + Bing via ion\n\
-         drag: pan globe · right-drag: tilt/heading · wheel: zoom · W: wireframe · F: freeze · Esc"
+         drag: pan globe · right-drag: tilt/heading · wheel: zoom · N: north up · \
+         L: current location · W: wireframe · F: freeze · Esc"
     );
     let app_config = ViewerConfig {
         stream,
@@ -125,6 +158,14 @@ fn main() -> anyhow::Result<()> {
         detail,
         layer_budget,
         title: "tuile — globe (streaming)".into(),
+        // `--here`: the window opens on the view above, and moves over the
+        // current location — same altitude, heading and pitch — when the
+        // system says where that is.
+        here: here.then_some(location::Placement {
+            altitude: Some(view.altitude),
+            heading: view.heading,
+            pitch: view.pitch,
+        }),
         lit_at_unix_seconds: settings::lit_at()?,
     };
 
