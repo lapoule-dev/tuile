@@ -238,10 +238,12 @@ pub const LIVE_MANY: usize = 512;
 /// read, and its asker is told to ask for it alone (`413`).
 pub const LIVE_REPLY: u64 = 16 << 20;
 
-/// How many of a `POST store/live`'s objects are read from the bucket at a
-/// time. Those in flight when the reply fills are still read: the bound on
-/// the reply is passed by that many objects at most.
-const LIVE_AT_ONCE: usize = 8;
+/// How many of a `POST store/live`'s objects are read from the bucket at
+/// once, unless the host says otherwise ([`Bench::post_reading`]): a window
+/// that slides — a read that ends lets the next one start — not waves that
+/// wait for their slowest. Those in flight when the reply fills are still
+/// read: the bound on the reply is passed by that many objects at most.
+pub const LIVE_AT_ONCE: usize = 32;
 
 /// The body of a `POST store/live`: the objects asked about.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -561,6 +563,20 @@ impl Bench {
     /// GETs. A reader takes that, or a `404`, from an older server as "not
     /// here", and goes back to asking one by one.
     pub async fn post(&self, path: &str, query: &str, body: &[u8]) -> Option<Reply> {
+        self.post_reading(path, query, body, LIVE_AT_ONCE).await
+    }
+
+    /// [`Bench::post`], reading at most `at_once` objects from the bucket at
+    /// a time: the host's to choose, since it is the host that knows what
+    /// its bucket and its own limits bear — a server beside its bucket reads
+    /// many, a Worker is allowed a handful of requests in flight.
+    pub async fn post_reading(
+        &self,
+        path: &str,
+        query: &str,
+        body: &[u8],
+        at_once: usize,
+    ) -> Option<Reply> {
         // Nothing of the query is this route's: whoever serves it reads a
         // credential there.
         let _ = query;
@@ -584,19 +600,24 @@ impl Bench {
                 ),
             ));
         }
-        // What the bodies read so far come to. Reads are made a few at a
-        // time and answered in order; once the reply is full nothing more
-        // is read.
+        // What the bodies read so far come to: once the reply is full
+        // nothing more is read. Reads run `at_once` at a time and are taken
+        // as they end, whatever their order, so one slow object holds back
+        // nothing but itself; each answer goes to the place its object was
+        // asked in.
+        use futures_util::StreamExt;
         let spent = AtomicU64::new(0);
-        let mut objects = Vec::with_capacity(asked.objects.len());
-        for some in asked.objects.chunks(LIVE_AT_ONCE) {
-            objects.extend(
-                futures_util::future::join_all(
-                    some.iter().map(|ask| live_answer(store, ask, &spent)),
-                )
-                .await,
-            );
+        let spent = &spent;
+        let mut answers: Vec<Option<LiveAnswer>> = asked.objects.iter().map(|_| None).collect();
+        // Owned by the stream: each read carries its own object's key.
+        let mut reads = futures_util::stream::iter(asked.objects.into_iter().enumerate())
+            .map(|(at, ask)| async move { (at, live_answer(store, &ask, spent).await) })
+            .buffer_unordered(at_once.max(1));
+        while let Some((at, answer)) = reads.next().await {
+            answers[at] = Some(answer);
         }
+        drop(reads);
+        let objects: Vec<LiveAnswer> = answers.into_iter().flatten().collect();
         Some(Reply {
             cache_control: UNKEPT,
             ..Reply::json(&LiveAnswers { objects })
@@ -1186,6 +1207,121 @@ mod tests {
     fn post(bench: &Bench, objects: Vec<LiveAsk>) -> Reply {
         let body = serde_json::to_vec(&LiveAsked { objects }).expect("json");
         futures_executor::block_on(bench.post("/api/store/live", "k=secret", &body)).expect("reply")
+    }
+
+    /// A bucket whose reads take a moment, that counts how many are in
+    /// flight, and whose first object is not answered until a read beyond
+    /// the first window has begun.
+    #[derive(Default)]
+    struct Paced {
+        window: usize,
+        begun: std::sync::atomic::AtomicUsize,
+        flying: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+        gave_up: std::sync::atomic::AtomicBool,
+    }
+
+    /// One turn given back to whoever else has something to do.
+    async fn a_moment() {
+        let mut waited = false;
+        std::future::poll_fn(|cx| {
+            if std::mem::replace(&mut waited, true) {
+                return std::task::Poll::Ready(());
+            }
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        })
+        .await
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Objects for Paced {
+        fn label(&self) -> String {
+            "paced".into()
+        }
+        async fn list(&self, _: &str) -> Result<Vec<crate::Entry>, RepoError> {
+            Ok(Vec::new())
+        }
+        async fn browse(&self, _: &str) -> Result<crate::Listing, RepoError> {
+            Ok(crate::Listing::default())
+        }
+        async fn size(&self, key: &str) -> Result<u64, RepoError> {
+            Err(RepoError::NotFound(key.to_string()))
+        }
+        async fn read(&self, key: &str, _: Range<u64>) -> Result<Vec<u8>, RepoError> {
+            Err(RepoError::NotFound(key.to_string()))
+        }
+        async fn read_if_changed(&self, key: &str, _: Option<&str>) -> Result<Read, RepoError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.begun.fetch_add(1, SeqCst);
+            let flying = self.flying.fetch_add(1, SeqCst) + 1;
+            self.most.fetch_max(flying, SeqCst);
+            a_moment().await;
+            if key == "0/manifest.json" {
+                // The slow one: it ends once reads beyond the first window
+                // have begun — which, were reads made in waves, they never
+                // would while this one is out.
+                let mut turns = 0;
+                while self.begun.load(SeqCst) <= self.window {
+                    turns += 1;
+                    if turns > 100_000 {
+                        self.gave_up.store(true, SeqCst);
+                        break;
+                    }
+                    a_moment().await;
+                }
+            }
+            self.flying.fetch_sub(1, SeqCst);
+            Ok(Read::Changed {
+                bytes: format!("{{\"key\":\"{key}\"}}").into_bytes(),
+                etag: None,
+            })
+        }
+    }
+
+    #[test]
+    fn the_objects_of_one_request_are_read_through_a_window_that_slides() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let window = 4;
+        let paced = Arc::new(Paced {
+            window,
+            ..Paced::default()
+        });
+        let bench = Bench {
+            projects: Vec::new(),
+            tiles: None,
+            store: Some(StoreObjects {
+                live: paced.clone(),
+                archives: paced.clone(),
+            }),
+            store_at: None,
+        };
+        let asked: Vec<LiveAsk> = (0..24)
+            .map(|n| ask(&format!("{n}/manifest.json"), None))
+            .collect();
+        let body = serde_json::to_vec(&LiveAsked {
+            objects: asked.clone(),
+        })
+        .expect("json");
+        let reply =
+            futures_executor::block_on(bench.post_reading("/api/store/live", "", &body, window))
+                .expect("reply");
+        let answers: LiveAnswers = serde_json::from_slice(&reply.body).expect("answers");
+        // The slow first object held back nothing but itself…
+        assert!(!paced.gave_up.load(SeqCst), "reads waited for the slow one");
+        // …never more than the host allowed were in flight, and the window
+        // was used whole…
+        assert_eq!(paced.most.load(SeqCst), window);
+        // …and each answer is where its object was asked, whatever order
+        // the reads ended in.
+        assert_eq!(answers.objects.len(), asked.len());
+        for (asked, answer) in asked.iter().zip(&answers.objects) {
+            assert_eq!((answer.status, &answer.key), (200, &asked.key));
+            assert_eq!(
+                answer.body.as_deref(),
+                Some(format!("{{\"key\":\"{}\"}}", asked.key).as_str())
+            );
+        }
     }
 
     #[test]
