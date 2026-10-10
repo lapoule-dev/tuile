@@ -19,20 +19,20 @@ tokio = { workspace = true, features = ["fs", "io-util", "sync", "net"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header"] }
 # The contract of a store of bytes, which what packs hold is remembered in.
-tuile-core = { version = "0.3.0", path = "../tuile-core" }
-tuile-repository = { version = "0.3.0", path = "../tuile-repository" }
+tuile-core = { version = "0.3.1", path = "../tuile-core" }
+tuile-repository = { version = "0.3.1", path = "../tuile-repository" }
 tuile-tile-server = { path = "../tuile-tile-server" }
 # Where a remote store's blocks are kept once read.
-tuile-storage-foyer = { version = "0.3.0", path = "../tuile-storage-foyer" }
+tuile-storage-foyer = { version = "0.3.1", path = "../tuile-storage-foyer" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tuile-farm = { version = "0.3.0", path = "../tuile-farm" }
+tuile-farm = { version = "0.3.1", path = "../tuile-farm" }
 
 [dev-dependencies]
 image = { workspace = true }
 tempfile = { workspace = true }
-tuile-film = { version = "0.3.0", path = "../tuile-film" }
-tuile-radiometry = { version = "0.3.0", path = "../tuile-radiometry" }
+tuile-film = { version = "0.3.1", path = "../tuile-film" }
+tuile-radiometry = { version = "0.3.1", path = "../tuile-radiometry" }
 
 [lints]
 workspace = true
