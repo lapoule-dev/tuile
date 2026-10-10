@@ -28,6 +28,15 @@
 //!     --lon 6.86 --lat 45.83 --altitude 6000 --heading 120 --pitch 25
 //! ```
 //!
+//! C copies a link to the present view. A running viewer can be steered by
+//! other programs with URLs of the same form — `tuile://goto?…`, `north`,
+//! `here`, `view?…`, `report`: see `steer` for the vocabulary and what it
+//! cannot do, and `macos/README.md` for the application bundle that registers
+//! the scheme.
+//!
+//! The access token is read from the environment, or — for a session started
+//! from an icon — from one file the person owns: see `host`.
+//!
 //! The current location comes from the operating system's location service
 //! (macOS, cargo feature `current-location`, on by default), which asks the
 //! person before it answers; elsewhere `--here` and L say it is not available
@@ -39,6 +48,8 @@
 
 mod app;
 mod backdrop;
+mod desktop;
+mod host;
 mod location;
 mod recording;
 mod session;
@@ -54,7 +65,43 @@ use tuile_core::runtime::in_process_with;
 use tuile_core::traversal::Config;
 use winit::event_loop::{ControlFlow, EventLoop};
 
-fn main() -> anyhow::Result<()> {
+/// Whether this process was started from an application bundle — from an
+/// icon, most likely, with no terminal behind it.
+fn in_a_bundle() -> bool {
+    std::env::current_exe().is_ok_and(|exe| host::is_bundled(&exe))
+}
+
+fn main() {
+    if let Err(error) = session() {
+        // From an icon, stderr is the system log and nobody is reading it: an
+        // application that fails must say so in a window, or it has simply
+        // not opened. This is not hypothetical — the first bundle did exactly
+        // that, over a limit on open files that no terminal session has.
+        if in_a_bundle() {
+            desktop::alert("Tuile stopped", &format!("{error:#}"));
+        } else {
+            eprintln!("Error: {error:?}");
+        }
+        std::process::exit(1);
+    }
+}
+
+/// Lifts this process's limit on open files as far as the system allows.
+///
+/// A process started by the desktop gets 256 descriptors, where a shell hands
+/// out thousands. The tile store and a pool of connections go through 256
+/// before the first frame, and the session then dies of "too many open files"
+/// — from an icon only, which is the one place nobody sees the message. The
+/// soft limit is the process's own to raise up to the hard one, so it is
+/// raised; failing to is worth a line and not worth stopping for.
+fn lift_the_open_file_limit() {
+    #[cfg(unix)]
+    if let Err(error) = rlimit::increase_nofile_limit(8192) {
+        tracing::error!("could not raise the open-file limit: {error}");
+    }
+}
+
+fn session() -> anyhow::Result<()> {
     // The command line first, before the logger, the token, the network and
     // the window: a mistyped flag must cost nothing but the message that says
     // so. Exit code 2 is the usual one for a command that was not understood.
@@ -69,22 +116,36 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     };
-    settings::init_tracing();
-    // From the environment, and only from the environment.
+    // Started from an icon, there is no terminal: the log goes quiet and
+    // what would have been an error line becomes a window.
+    let bundled = in_a_bundle();
+    settings::init_tracing(bundled);
+    lift_the_open_file_limit();
+    // From the environment first, and always: what a session ran with should
+    // be visible in the command that started it. A `.env` in the working
+    // directory used to be read here as well, and was removed — the process
+    // then behaved differently depending on where it was launched from, a
+    // stale file silently won over the variable that was deliberately
+    // exported, and a credential sat in the working tree one `git add -A` away
+    // from being published.
     //
-    // A `.env` file used to be read here as well. That is convenient exactly
-    // once and misleading afterwards: the process then behaves differently
-    // depending on the directory it was launched from, a stale file silently
-    // wins over the variable that was deliberately exported, and a credential
-    // ends up sitting in the working tree where it is one `git add -A` away from
-    // being published. What a session ran with should be visible in the command
-    // that started it.
-    let token = std::env::var("CESIUM_ION_TOKEN").map_err(|_| {
-        anyhow::anyhow!(
-            "no CESIUM_ION_TOKEN in the environment — export it, or prefix the \
-             command: CESIUM_ION_TOKEN=... cargo run -p tuile-wgpu-viewer"
-        )
-    })?;
+    // What an application started from an icon reads instead — it has no
+    // environment to read — is one file the person owns, outside any checkout,
+    // which loses to the environment. See `host`.
+    let token = match host::token(&host::Machine) {
+        Ok((token, from)) => {
+            tracing::info!("access token from {from:?}");
+            token
+        }
+        Err(missing) if bundled => {
+            desktop::alert("Tuile cannot start yet", &missing.to_string());
+            std::process::exit(1);
+        }
+        Err(missing) => anyhow::bail!("{missing}"),
+    };
+    // Before the loop exists, so that a URL which *launched* the application
+    // is not missed.
+    let urls = desktop::listen_for_urls();
 
     // The geometry server is async (ion fetches over reqwest): build the scene
     // and run the server on a background multi-thread runtime. The window
@@ -150,7 +211,7 @@ fn main() -> anyhow::Result<()> {
     tracing::info!(
         "tuile globe viewer — streaming Cesium World Terrain + Bing via ion\n\
          drag: pan globe · right-drag: tilt/heading · wheel: zoom · N: north up · \
-         L: current location · W: wireframe · F: freeze · Esc"
+         L: current location · C: copy link · W: wireframe · F: freeze · Esc"
     );
     let app_config = ViewerConfig {
         stream,
@@ -158,6 +219,7 @@ fn main() -> anyhow::Result<()> {
         detail,
         layer_budget,
         title: "tuile — globe (streaming)".into(),
+        urls,
         // `--here`: the window opens on the view above, and moves over the
         // current location — same altitude, heading and pitch — when the
         // system says where that is.

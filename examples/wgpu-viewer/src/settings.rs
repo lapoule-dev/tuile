@@ -10,15 +10,22 @@
 
 use tuile_storage_foyer::FoyerStore;
 
-/// Logs to stderr; `RUST_LOG` overrides. Default shows tile streaming
-/// (`tuile_planetary=debug`) plus app-level info.
-pub(crate) fn init_tracing() {
+/// Logs to stderr; `RUST_LOG` overrides. From a terminal the default shows
+/// tile streaming (`tuile_planetary=debug`) plus app-level info.
+///
+/// `quiet` is for a session started from an icon: its stderr is the system
+/// log, where a line per tile is a flood nobody asked for and nobody reads.
+/// Errors only, then — unless `RUST_LOG` says otherwise, as always.
+pub(crate) fn init_tracing(quiet: bool) {
     use tracing_subscriber::EnvFilter;
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,tuile_planetary=debug".into()),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            if quiet {
+                "error".into()
+            } else {
+                "info,tuile_planetary=debug".into()
+            }
+        }))
         .without_time()
         .with_target(false)
         .init();

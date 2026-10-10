@@ -42,15 +42,27 @@ tuile-wgpu = { version = "0.4.0", path = "../../crates/tuile-wgpu" }
 wgpu = { workspace = true }
 winit = { workspace = true }
 
+# A process started from an icon gets 256 file descriptors; the tile store
+# alone wants more. The established safe wrapper over `setrlimit`, since the
+# workspace denies `unsafe_code`.
+[target.'cfg(unix)'.dependencies]
+rlimit = "0.10"
+
 # The operating system's location service, for `--here` and the `L` key.
 # macOS only, and only this example: no library crate knows where the machine
 # is. Without the feature, or on another platform, the flag and the key answer
 # "not available" and the viewer runs as it always did.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.4", optional = true }
-objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSArray", "NSDate", "NSError", "NSRunLoop", "NSString"] }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSAppleEventDescriptor", "NSAppleEventManager", "NSArray", "NSDate", "NSError", "NSRunLoop", "NSString"] }
+# The alert shown when there is no terminal, and the clipboard.
+objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSAlert", "NSApplication", "NSPasteboard", "NSResponder", "NSRunningApplication"] }
 objc2-core-location = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
 
 [features]
-default = ["current-location"]
+default = ["current-location", "application"]
 current-location = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-core-location"]
+# What makes the viewer an application on its desktop: steering URLs from
+# other programs, a message window when there is no terminal, the clipboard.
+# macOS only; elsewhere the feature compiles to nothing.
+application = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-app-kit"]

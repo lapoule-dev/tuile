@@ -36,6 +36,7 @@ members = [
     "examples/wasm-globe",
     "examples/warm-cache",
     "examples/wgpu-viewer",
+    "examples/wgpu-viewer/bundle",
 ]
 
 [workspace.package]

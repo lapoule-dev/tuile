@@ -5,6 +5,7 @@
 //! pixel gestures to the render-agnostic [`tuile_camera::CameraController`] and
 //! drives the geometry stream through the [`ContentPump`].
 
+mod command;
 mod frame;
 mod input;
 mod pacing;
@@ -51,6 +52,9 @@ pub struct ViewerConfig {
     /// Set by `--here`: ask for the current location at start, and place the
     /// view like this when it is known.
     pub here: Option<crate::location::Placement>,
+    /// Steering URLs from other programs, as they arrive. Unread and
+    /// untrusted: see [`crate::steer::parse_url`].
+    pub urls: std::sync::mpsc::Receiver<String>,
     /// The instant the scene is lit for, UTC seconds since the Unix epoch —
     /// which sets where the sun is, and so where the terminator falls.
     pub lit_at_unix_seconds: f64,
@@ -155,6 +159,11 @@ pub struct App {
     /// The request for the current location, from the key press or `--here`
     /// to the frame the system's answer arrives on.
     locator: crate::location::Locator,
+    /// Whether the view is where it is because the location service put it
+    /// there — in which case it is not reported to other programs.
+    located: bool,
+    /// Steering URLs waiting to be read.
+    urls: std::sync::mpsc::Receiver<String>,
     /// The window is hidden — another window covers it, the display slept, the
     /// app was minimized. Rendering while occluded leaks GPU memory on Apple
     /// platforms.
@@ -166,7 +175,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: ViewerConfig) -> Self {
+    pub fn new(mut config: ViewerConfig) -> Self {
+        // The queue is taken out of the configuration: there is one reader.
+        let urls = std::mem::replace(&mut config.urls, std::sync::mpsc::channel().1);
         // Asked for here, on the main thread and before the loop turns, so the
         // system's question — if it has one — is up while the globe warms.
         let mut locator = crate::location::Locator::platform();
@@ -175,6 +186,8 @@ impl App {
         }
         Self {
             locator,
+            located: false,
+            urls,
             controller: config.controller.clone(),
             detail: config.detail.clone(),
             layer_budget: config.layer_budget.clone(),
@@ -231,6 +244,7 @@ impl App {
     fn take_the_location(&mut self) {
         let now = std::time::Instant::now();
         if let Some(outcome) = self.locator.tick(now, &mut self.controller) {
+            self.located |= matches!(outcome, crate::location::Outcome::Centred { .. });
             self.say(&outcome.to_string());
         }
     }
@@ -289,6 +303,7 @@ impl ApplicationHandler for App {
         // location is taken on whatever turn of the loop it arrives, hidden
         // and warming included.
         self.take_the_location();
+        self.take_the_commands();
         // A flown tape ends the session. Without this a replay leaves a window
         // sitting on its last frame, and the run has to be closed by hand —
         // which is exactly what stops anyone from putting it in a script.

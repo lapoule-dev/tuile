@@ -316,6 +316,17 @@ location: the operating system's location service is asked (macOS; it asks you
 first), the view moves when it answers and stays put if it does not, and the
 coordinates are never logged or written anywhere.
 
+On macOS the viewer also packages as an application — `Tuile.app`, with an
+icon — that other programs can steer:
+
+```bash
+cargo run --release -p tuile-viewer-bundle -- app --out ~/Applications
+open "tuile://goto?lon=6.86&lat=45.83&altitude=6000&heading=120&pitch=25"
+```
+
+See `examples/wgpu-viewer/macos/README.md` for the token file, the URL
+vocabulary and what the signature is worth.
+
 Render a baked film to an mp4:
 
 ```bash
