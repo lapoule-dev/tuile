@@ -13,9 +13,9 @@ authors.workspace = true
 # `Objects` over an R2 binding.
 [dependencies]
 # Numbers only, no dependency of its own: the grades a store keeps.
-tuile-radiometry = { version = "0.3.1", path = "../tuile-radiometry" }
+tuile-radiometry = { version = "0.3.2", path = "../tuile-radiometry" }
 # The contract of a store of bytes, which what is kept here is kept in.
-tuile-core = { version = "0.3.1", path = "../tuile-core" }
+tuile-core = { version = "0.3.2", path = "../tuile-core" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 # PMTiles directories are gzipped; pure Rust, so it builds for a Worker.
@@ -32,7 +32,7 @@ serde_json = { workspace = true }
 sha2 = "0.11"
 thiserror = { workspace = true }
 toml = "0.8"
-tuile-pack = { version = "0.3.1", path = "../tuile-pack" }
+tuile-pack = { version = "0.3.2", path = "../tuile-pack" }
 
 # The native adapters: an S3 bucket or a directory, the on-disk chunk cache,
 # the tile store.
@@ -41,7 +41,7 @@ tuile-pack = { version = "0.3.1", path = "../tuile-pack" }
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["fs", "time"] }
 tracing = { workspace = true }
-tuile-farm = { version = "0.3.1", path = "../tuile-farm" }
+tuile-farm = { version = "0.3.2", path = "../tuile-farm" }
 tuile-tile-server = { path = "../tuile-tile-server" }
 
 [dev-dependencies]
