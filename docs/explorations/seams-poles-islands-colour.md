@@ -494,7 +494,7 @@ absent. Rendered from `main` (`9dadefd`) and from `fix/terrain-seams`, with
   level-13 tiles have 300 to 400 vertices; its **level-10 tile has 4** — the
   whole island a tilted plane from 20 km.
 - **Terrain stops at level 13** here: every tile of levels 14 to 19 is cut
-  from it (1 449 of the 1 787 shared edges within 40 km have a cut side).
+  from it (1 487 of the 1 787 shared edges within 40 km have a cut side).
 - **Level difference between neighbours**: 0 on 947 edges, 1 on 662, **2 on
   178**; never more, at this error.
 - **Steps.** Tiles from their own terrain at one level: 1 mm. Tiles cut from
