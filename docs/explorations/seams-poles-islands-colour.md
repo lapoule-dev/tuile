@@ -11,9 +11,9 @@ what was **not** established.
 Written on `explore/seams-poles-islands-colour` (from `main` at `fd4caa5`;
 file and line numbers are that commit's). The numbers are in the executed
 notebook beside this file, `seams-poles-islands-colour.ipynb`, and its `data/`.
-Nothing here is a fix, with one exception decided while this was being
-written: the seams are fixed on `fix/terrain-seams` (section 1.5). Everything
-else is a finding and a proposal.
+Nothing here is a fix. For the seams, what was built beside it is in section
+1.5: an instrument (pull request #21), a safety net kept local, and a
+proposal.
 
 **How things were measured.** No tile source was asked for anything. Three
 kinds of evidence, named each time:
@@ -26,15 +26,13 @@ kinds of evidence, named each time:
 - *computed*: the code's own formula evaluated, quoted with its place;
 - *read*: what the code says, not run.
 
-**What could not be run.** No frame of a real film. `tuile-film-render` reads
-the packs and the tile store from two buckets named by `TUILE_STORE_BUCKET`
-and `TUILE_TILES_BUCKET`; the environment file this work was given holds the
-endpoint and the keys and neither name, and they were not found anywhere they
-may be looked for. So frame 4500 of the 577d film was not rendered again —
-neither with the probes, nor after the fix — and the Paris packs, which hold
-references into a store served by a host, could be read (their tables) but
-not drawn. Every place this bites is marked **not established**, with the
-command that settles it.
+**What was run on a real film.** One frame, late in the work, once the two
+buckets' names were known: frame 4500 of the 577d film, read from the tile
+store with no source asked — `main`'s picture, the same with every pixel a
+hole touches painted, the seam meter's table of its 513 shared edges, and the
+picture from the local safety-net branch. Sections 1.2 and 1.4 rest on it.
+The Paris packs hold references into a store served by a host and were read
+(their tables) but not drawn. No calibration was run.
 
 The probes, all marked `PROBE` in the code and none a feature:
 
@@ -67,7 +65,42 @@ shell's colour, not of the far side.
 
 ### 1.2 The cause
 
-Three facts, each in the code:
+**On the real frame** (*measured*: `data/577d-f4500-shared-edges-main.csv`,
+notebook section 1b; pictures `videos/577d-f4500-seams-*.png`). 686 pixels of
+frame 4500 are touched by a hole. The frame draws 253 tiles and has 513 shared
+edges; within 30 km of the eye:
+
+| the two sides | edges | step, median | step, largest | placement apart | open |
+|---|---|---|---|---|---|
+| both from their own terrain, one level | 127 | 3 mm | 0.66 m | 2 mm | 0 |
+| both cut from terrain of one level | 109 | 0 | 3.3 cm | 0 | 10, hairs of centimetres |
+| both from their own terrain, two levels | 88 | 1.4 m | 51 m | 0.27 m | 0 — skirted on both sides |
+| one cut from an ancestor, one from its own | 40 | 0 | 3.1 m | 1 cm | **15, all the holes** |
+| both cut, from terrain of two levels | 24 | 0.8 m | 2.2 m | 7 mm | 24, none facing the eye |
+
+What this says:
+
+- **The source's tiles of one level coincide** along the edges they share:
+  millimetres, the grain of the format's quantisation. Nothing to fix there.
+- **Two levels of the source's data do not state the same ground**: 1.4 m
+  apart at the median along a shared line, tens of metres at levels 10 to 12.
+  The two sides are in the same **place** (a centimetre near the camera);
+  what differs is the **height**.
+- **The holes are an island of missing data.** All fifteen open edges facing
+  the eye are between a tile drawn from level-15 or level-16 terrain and one
+  of six level-15 tiles — 15/32243/25943 to 25945 and 15/32244/25943 to 25945
+  — that the source does not have and the loader cuts from level 14. The step
+  is 1 to 3.1 m; the cut tile has no skirt; where it is the higher side the
+  step is open. The film's terrain here goes down to level 17, in patches:
+  the frame mixes surfaces from levels 14, 15, 16 and 17 within a kilometre.
+- Rounding to `f32`, each tile about its own origin, is not in it: the same
+  table from the meshes as the GPU is handed them shows same-level pairs at
+  millimetres.
+
+With edge lists on cut tiles: 0 pixels touched. With that and the skirt at
+the source level's depth, no edge of the frame is open.
+
+**In the code**, three facts:
 
 1. **A tile cut from an ancestor's terrain is given no skirt.**
    `tuile_terrain::upsample` returns its mesh with the four edge lists empty
@@ -131,9 +164,9 @@ Two things found on the way:
 
 ### 1.3 Other seams looked for
 
-- **T-junctions between same-level neighbours of a real source**: not
-  measured — needs real tiles. Both sides are skirted there, so a step is open
-  only beyond the higher side's skirt (12 m at level 15).
+- **Same-level neighbours of the real source**: *measured* on frame 4500 —
+  3 mm at the median, 0.66 m at most (one pair of level 16), both sides
+  skirted: none open.
 - **The antimeridian**: handled, and held by a test
   (`mesh.rs`, `the_easternmost_tile_is_not_torn_by_the_branch_cut`); the seam
   meter wraps the grid there. Not rendered.
@@ -165,47 +198,70 @@ boundary between the tiles of levels 15 and 16.
   the ground around them (50, 62, 54 against 51, 69, 61). Under the low sun of
   those pictures (250°, 12°) they are 0.8 stop lighter.
 
-So it is something on that seam that a low sun from the west-south-west
-lights and a high one does not: a near-vertical face, shaded by its own face
-normal — the resolve takes the triangle's normal when a mesh has none
-(`resolve.wgsl`, `normalize(cross(e1, e2))`), and a skirt's wall has the
-normal of a wall. **Not established** which face: a skirt of a tile that has
-one (then that seam has terrain of its own level on one side), or the far
-side through a gap where it is light. One frame says:
+**It is a gap.** 171 of the line's 172 pixels are among those the hole
+painter marks on the real frame: it runs along the edge between tiles
+16/64485/51886…51889, from their own terrain, and the cut tiles
+15/32243/25943 and 25944 beside them. What shows through is the planet's far
+side where it is light — seen from behind and shaded by the low sun as if
+from the front (the resolve flips the normal of a back face), where under the
+default sun the same ground is as dark as what surrounds the gap. The haze
+leaves it alone because the resolve leaves alone any pixel it cannot place.
+Closing the seam removes it.
 
-```bash
-TUILE_PROBE_HOLES=1 tuile-film-render 1557732/20260924T221734Z-577d/packs \
-  --frames 4500:4500 --no-tone --sun 250,12 --pictures <dir> --seams <dir>
-```
+### 1.5 What exists, and what does not
 
-magenta on the line means a gap; a row of `seams.csv` with a skirted side and
-`open_px_facing` of 0 means a wall. Either way the line outlives the fix of
-the gaps unless walls are shaded as the ground they hang from: see 1.6.
+Asked for while this was being written, in three steps that did not all
+arrive.
 
-### 1.5 The fix: `fix/terrain-seams`
+**An instrument — pull request #21, branch `feat/seam-residual`.**
+`tuile_core::seam::residuals` measures, over the tiles a frame draws, how far
+each shared edge is from coinciding (metres, height and horizontal, pixels
+from the eye) and counts apart the edges with nothing drawn across them;
+`tuile-film-render --seams <dir>` logs it a frame from the meshes as the GPU
+is handed them, and `--seams-strict` fails on it. On frame 4500: 149 of 513
+shared edges over a quarter of a pixel, 25 of them in the picture, the film's
+holes first among them (`data/577d-f4500-residual-pairs.csv`).
 
-Asked for while this was being written, and made at the source of the
-geometry, so that every path inherits it and no renderer has a rule of its
-own. On that branch:
+**A safety net — local branch `fix/terrain-seams`, not pushed.** Cut tiles
+list their edges and hang a skirt as deep as their source's level, reaching
+a neighbour up to six levels coarser; one function (`to_ground`) builds every
+path's ground. Proven by ray casts in `tuile-terrain`, `tuile-planetary` and
+`tuile-film`, each seen failing with the fix removed, and on the real frame:
+686 pixels touched by a hole → 0, 722 pixels changed (those and 36 beside
+them). It **hides** the step; the residual above is unchanged by it.
 
-- `tuile_terrain::upsample` lists the four edges of the tile it cuts, and the
-  mesh counts how many levels below its source it lies (`QuantizedMesh::cut`);
-- `tuile_terrain::skirt_depth` sizes a skirt by the level the surface is from,
-  and as deep as the rule gives a tile four levels coarser — eighty geometric
-  errors where the rule gives five — which covers a neighbour up to six levels
-  coarser (a coast, an island); never deeper than a level-6 tile's 6 km;
-- `tuile_terrain::to_ground` is the one way a terrain tile becomes drawable
-  ground: the loader, its stand-ins (`tuile-planetary`) and a film built again
-  from the store (`tuile-film`) all call it;
-- `tuile_core::seam` casts rays through every step between two tiles'
-  content and says what passed: the judge of the tests, with no picture.
+**The coincidence of the two edges — not done.** It is what is wanted: no
+step to hide. The measurements say what it has to be:
 
-The per-path status, the proof and what was not proven are in that branch's
-pull request. In short: a pack of references needs **no re-bake** (its meshes
-are built at render time); a pack that carries its meshes keeps the holes it
-was baked with.
+- the mismatch is the source's own, between two **levels** of its data; so
+  one side has to take the other's edge, and which depends on what is drawn
+  beside it. A rule that looks at one tile alone cannot do it: the same tile
+  has, across the same edge, a neighbour from level-14 data in one frame and
+  from level-16 data in the next;
+- so it is decided **at selection**: for each drawn tile and each side, the
+  coarsest surface across it; the tile whose surface is from the finer data
+  puts its edge vertices on the coarser one's edge (height interpolated along
+  its segments, in the Earth's frame, before any narrowing), and the coarser
+  edge takes a vertex wherever a finer tile's corner falls on it, so that the
+  two edges have the same vertices and narrow to the same numbers about one
+  shared origin;
+- at a corner where three or four tiles meet, the corner takes the height of
+  the coarsest surface there;
+- when the selection changes, an edge moves with the neighbour's change of
+  level, in the same frame — by the metre or two the table shows, where a
+  level change already moves the whole surface by as much.
 
-### 1.6 What the fix does not do
+What that costs is why it is not in this work: a tile's mesh is no longer a
+function of the tile alone. The loader's content, the stream's messages, the
+GPU's residency, the pack's tile key (`id`, `drape`) and its references, and
+the C ABI's buffers are all keyed by the tile today. Every one gains the
+neighbour configuration; **a pack of references would need its format
+extended and every film a re-bake**, where the safety net needs none. It is a
+change to design with the owner, and the instrument is its acceptance
+measure: residual 0 at same-level pairs is already there; the target is 0 —
+or under a quarter pixel — on every pair, with no skirt.
+
+### 1.6 What the safety net does not do
 
 - **A wall that shows is lit as a wall.** Where a step is now closed, the
   wall across it has the texture of the edge it hangs from and, on a mesh
@@ -358,8 +414,8 @@ What a jump costs, *computed* (notebook, section 3): the edge of a coarse
 tile between two vertices sags under the ellipsoid by `L² / 8R`; the fine
 neighbour stands on it; the fine tile is the higher side and its skirt is
 what has to close the sag. With one segment an edge a level-8 sea tile sags
-120 m; with sixteen, half a metre. The skirts of `fix/terrain-seams` reach
-1.5 km at level 12 and close either. **Not established**: how many vertices a
+120 m; with sixteen, half a metre. The skirts of the local `fix/terrain-seams` reach
+1.5 km at level 12 and close either (the local safety net). **Not established**: how many vertices a
 source's sea tiles have along an edge, which decided whether coasts were open
 before the fix.
 
@@ -374,7 +430,7 @@ where the two surfaces disagree, instead of a hole.
 
 ### 3.4 Options
 
-1. Section 1's fix — done.
+1. Section 1's safety net, or its coincidence rule.
 2. **Tell a failure from an absence when a bake cuts a tile** (3.1): fail the
    frame on a failure, as a bake does for everything else. A few lines.
 3. **Do not drape a "no data" tile**: let the parent stand, as for a missing
@@ -505,9 +561,8 @@ reference layer, before and after. **To be decided by the owner.**
 
 | question | what it takes |
 |---|---|
-| Frame 4500 of the 577d film: the gaps attributed tile by tile, and counted at 0 after the fix | the two bucket names in the environment; then one command (1.4) on each branch. No source asked |
-| The light line: a wall or a gap | the same run |
-| Whether real same-level neighbours part by more than their skirts | `--seams` over any film's frames: `step_max_m` against the levels |
+| The coincidence of shared edges at any level difference | the selection-time rule of 1.5, designed with the owner; judged by `--seams` at 0 |
+| Whether other films' holes are the same island-of-missing-data case | `--seams` over their frames: `seam-pairs.csv`, the source columns |
 | How many vertices a source's sea tiles have along an edge | reading twenty sea tiles of levels 6 to 10 from the store |
 | A coast, an island | **a bake** — below |
 | A pole | **a bake** — below |
@@ -532,9 +587,9 @@ island or beyond 85°.
 
 ## 6. A proposed order of work
 
-1. **Seams** — done on `fix/terrain-seams`; confirm on frame 4500 as soon as
-   the store can be read. Everything below is easier to look at without
-   holes.
+1. **Seams** — the instrument first (#21); then decide between the safety
+   net as it stands (local, proven, no re-bake) and the coincidence rule
+   (1.5); the first can carry films while the second is designed.
 2. **The slate** (4.2) — a decision, then a line. Before any further
    calibration: every measurement against a reference is taken through it.
 3. **The constraint across levels** (4.4, item 2) — the tone step is on the
