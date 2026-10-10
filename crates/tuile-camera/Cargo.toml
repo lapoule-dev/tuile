@@ -11,5 +11,6 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+biquad = { workspace = true }
 glam = { workspace = true }
 tuile-core = { version = "0.3.3", path = "../tuile-core" }

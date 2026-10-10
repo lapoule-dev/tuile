@@ -18,6 +18,11 @@
 //! - **zoom** scales the *altitude* toward the point under the cursor, clamped
 //!   above the surface (never through it);
 //! - **tilt** / **heading** orbit the look-at point on the surface.
+//!
+//! Cameras that follow a subject along a route known in advance — smoothed,
+//! with bounded turns — are in [`path`].
+
+pub mod path;
 
 use glam::{DQuat, DVec3, Mat4};
 use std::sync::Arc;
