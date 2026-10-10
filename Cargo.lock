@@ -6671,6 +6671,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuile-viewer"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ctrlc",
+ "futures-executor",
+ "glam 0.33.1",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-location 0.3.2",
+ "objc2-foundation 0.3.2",
+ "pollster",
+ "rlimit",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tuile-atmosphere",
+ "tuile-camera",
+ "tuile-core",
+ "tuile-metrics",
+ "tuile-planetary",
+ "tuile-storage-foyer",
+ "tuile-tape",
+ "tuile-terrain",
+ "tuile-ui",
+ "tuile-wgpu",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
 name = "tuile-viewer-bundle"
 version = "0.4.0"
 dependencies = [
@@ -6765,32 +6797,14 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "ctrlc",
- "glam 0.33.1",
- "objc2 0.6.4",
- "objc2-app-kit 0.3.2",
- "objc2-core-location 0.3.2",
- "objc2-foundation 0.3.2",
- "pollster",
- "rlimit",
- "tokio",
  "tracing",
- "tracing-subscriber",
- "tuile-atmosphere",
  "tuile-bing",
- "tuile-camera",
  "tuile-cesium-ion",
  "tuile-core",
- "tuile-metrics",
  "tuile-native-fetchers",
  "tuile-planetary",
- "tuile-storage-foyer",
- "tuile-tape",
  "tuile-terrain",
- "tuile-ui",
- "tuile-wgpu",
- "wgpu",
- "winit",
+ "tuile-viewer",
 ]
 
 [[package]]

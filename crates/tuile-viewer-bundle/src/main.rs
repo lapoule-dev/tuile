@@ -7,13 +7,17 @@
 //! ```text
 //! cargo run -p tuile-viewer-bundle -- app                # → target/bundle/Tuile.app
 //! cargo run -p tuile-viewer-bundle -- app --out ~/Applications
-//! cargo run -p tuile-viewer-bundle -- icon               # redraw macos/icon-1024.png
+//! cargo run -p tuile-viewer-bundle -- icon               # redraw icon-1024.png
+//!
+//! # another host's application, or a second copy under another name:
+//! cargo run -p tuile-viewer-bundle -- app --out /tmp/apps --name "Tuile Test" \
+//!     --identifier dev.lapoule.tuile.viewer.test --scheme tuile-test
 //! ```
 //!
 //! `app` builds the viewer in release, lays the bundle out, writes the
 //! property list, packs the icon from the committed master, signs, and then
 //! checks its own work with the system's `plutil -lint` and
-//! `codesign --verify`. See `../macos/README.md` for what the bundle is, what
+//! `codesign --verify`. See `examples/wgpu-viewer/macos/README.md` for what the bundle is, what
 //! the signature is worth, and why this is a small program rather than an
 //! installed packaging tool.
 //!
@@ -28,32 +32,54 @@ use std::process::Command;
 
 use anyhow::{bail, ensure, Context};
 
-/// The application's name: the bundle, the menu bar, the icon file.
-const NAME: &str = "Tuile";
-/// Reverse-DNS, under the project's own domain.
-const IDENTIFIER: &str = "dev.lapoule.tuile.viewer";
-/// The viewer's package, and so its executable.
-const EXECUTABLE: &str = "tuile-wgpu-viewer";
+/// What is being packaged: the four words a bundle and the program inside it
+/// have to agree on. They are the host's (`tuile_viewer::Identity`); the
+/// defaults are the project's own application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Bundle {
+    /// The application's name: the bundle, the menu bar, the icon file.
+    name: String,
+    /// Reverse-DNS.
+    identifier: String,
+    /// The package to build, and so the executable's name.
+    executable: String,
+    /// The URL scheme the application answers to.
+    scheme: String,
+}
+
+impl Default for Bundle {
+    fn default() -> Self {
+        Self {
+            name: "Tuile".into(),
+            identifier: "dev.lapoule.tuile.viewer".into(),
+            executable: "tuile-wgpu-viewer".into(),
+            scheme: "tuile".into(),
+        }
+    }
+}
+
 /// The scripting dictionary's file name, in the bundle's resources.
 const DICTIONARY: &str = "Tuile.sdef";
-/// The URL scheme the application answers to.
-const SCHEME: &str = "tuile";
 /// The oldest system the bundle claims to run on: the first one on which the
 /// location and graphics interfaces the viewer uses are all present.
 const MINIMUM_SYSTEM: &str = "11.0";
 /// Why the application wants the machine's location, in the words the
 /// system's permission dialog will show. Neutral, and the whole truth.
-const LOCATION_PURPOSE: &str = "Tuile centres the globe on your current location when you ask \
+const LOCATION_PURPOSE: &str = "centres the globe on your current location when you ask \
      it to. The position is used for that view only; it is not stored or sent anywhere.";
 
-/// The workspace root: three directories above this package.
+/// The workspace root: two directories above this package.
 fn workspace() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn master_png() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../macos/icon-1024.png")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("icon-1024.png")
 }
+
+/// The project's icon, carried in the tool so that it packages a host's
+/// application from wherever it is installed.
+const MASTER: &[u8] = include_bytes!("../icon-1024.png");
 
 /// `Info.plist`, as the dictionary it is.
 ///
@@ -68,21 +94,28 @@ fn master_png() -> PathBuf {
 /// - `NSHighResolutionCapable`, or the window is drawn at half resolution and
 ///   scaled; `NSSupportsAutomaticGraphicsSwitching`, so a machine with two
 ///   GPUs is not forced onto the hungrier one for a window that is idle.
-fn info_plist(version: &str) -> plist::Value {
+fn info_plist(bundle: &Bundle, version: &str) -> plist::Value {
+    let Bundle {
+        name,
+        identifier,
+        executable,
+        scheme,
+    } = bundle;
+    let purpose = format!("{name} {LOCATION_PURPOSE}");
     use plist::Value::{Array, Boolean, String as Text};
     let text = |s: &str| Text(s.to_owned());
     let mut url_type = plist::Dictionary::new();
-    url_type.insert("CFBundleURLName".into(), text(IDENTIFIER));
+    url_type.insert("CFBundleURLName".into(), text(identifier));
     url_type.insert("CFBundleTypeRole".into(), text("Viewer"));
-    url_type.insert("CFBundleURLSchemes".into(), Array(vec![text(SCHEME)]));
+    url_type.insert("CFBundleURLSchemes".into(), Array(vec![text(scheme)]));
 
     let mut info = plist::Dictionary::new();
     for (key, value) in [
-        ("CFBundleName", text(NAME)),
-        ("CFBundleDisplayName", text(NAME)),
-        ("CFBundleIdentifier", text(IDENTIFIER)),
-        ("CFBundleExecutable", text(EXECUTABLE)),
-        ("CFBundleIconFile", text(NAME)),
+        ("CFBundleName", text(name)),
+        ("CFBundleDisplayName", text(name)),
+        ("CFBundleIdentifier", text(identifier)),
+        ("CFBundleExecutable", text(executable)),
+        ("CFBundleIconFile", text(name)),
         ("CFBundlePackageType", text("APPL")),
         ("CFBundleInfoDictionaryVersion", text("6.0")),
         ("CFBundleShortVersionString", text(version)),
@@ -103,17 +136,29 @@ fn info_plist(version: &str) -> plist::Value {
         // switched on, and told which file holds the dictionary.
         ("NSAppleScriptEnabled", Boolean(true)),
         ("OSAScriptingDefinition", text(DICTIONARY)),
-        ("NSLocationUsageDescription", text(LOCATION_PURPOSE)),
-        (
-            "NSLocationWhenInUseUsageDescription",
-            text(LOCATION_PURPOSE),
-        ),
+        ("NSLocationUsageDescription", text(&purpose)),
+        ("NSLocationWhenInUseUsageDescription", text(&purpose)),
         (
             "NSHumanReadableCopyright",
             text("Copyright © lapoule.dev. MIT OR Apache-2.0."),
         ),
     ] {
         info.insert(key.into(), value);
+    }
+    // A bundle that is not the project's own tells the program inside it who
+    // it is. The public viewer is one binary; packaged under another name — a
+    // test copy beside the one a person is using — it has to keep its own
+    // support directory and answer its own scheme, and the environment the
+    // launcher hands it is the only thing the two copies do not share.
+    if *bundle != Bundle::default() {
+        let mut environment = plist::Dictionary::new();
+        environment.insert("TUILE_VIEWER_NAME".into(), text(name));
+        environment.insert("TUILE_VIEWER_IDENTIFIER".into(), text(identifier));
+        environment.insert("TUILE_VIEWER_SCHEME".into(), text(scheme));
+        info.insert(
+            "LSEnvironment".into(),
+            plist::Value::Dictionary(environment),
+        );
     }
     plist::Value::Dictionary(info)
 }
@@ -157,25 +202,31 @@ fn icns(master: &image::RgbaImage) -> anyhow::Result<Vec<u8>> {
 
 /// Lays the bundle out under `out` and returns its path. Replaces a bundle of
 /// the same name: a stale file left inside one invalidates its signature.
-fn assemble(binary: &Path, master: &image::RgbaImage, out: &Path) -> anyhow::Result<PathBuf> {
-    let app = out.join(format!("{NAME}.app"));
+fn assemble(
+    bundle: &Bundle,
+    binary: &Path,
+    master: &image::RgbaImage,
+    out: &Path,
+) -> anyhow::Result<PathBuf> {
+    let name = &bundle.name;
+    let app = out.join(format!("{name}.app"));
     if app.exists() {
         std::fs::remove_dir_all(&app).with_context(|| format!("replacing {}", app.display()))?;
     }
     let contents = app.join("Contents");
     std::fs::create_dir_all(contents.join("MacOS"))?;
     std::fs::create_dir_all(contents.join("Resources"))?;
-    std::fs::copy(binary, contents.join("MacOS").join(EXECUTABLE))
+    std::fs::copy(binary, contents.join("MacOS").join(&bundle.executable))
         .with_context(|| format!("copying {}", binary.display()))?;
     std::fs::write(
-        contents.join("Resources").join(format!("{NAME}.icns")),
+        contents.join("Resources").join(format!("{name}.icns")),
         icns(master)?,
     )?;
     std::fs::write(
         contents.join("Resources").join(DICTIONARY),
-        include_str!("../../macos/Tuile.sdef"),
+        include_str!("../../tuile-viewer/macos/Tuile.sdef"),
     )?;
-    info_plist(env!("CARGO_PKG_VERSION")).to_file_xml(contents.join("Info.plist"))?;
+    info_plist(bundle, env!("CARGO_PKG_VERSION")).to_file_xml(contents.join("Info.plist"))?;
     // Eight bytes every application bundle has carried since before this
     // format had a property list: the type, and no creator.
     std::fs::write(contents.join("PkgInfo"), "APPL????")?;
@@ -195,9 +246,9 @@ fn run(command: &mut Command) -> anyhow::Result<()> {
 /// Ad hoc — an identity of `-` — is a signature with no signer: it seals the
 /// bundle and gives it a stable identity on *this* machine, which is what the
 /// system keys a permission grant on. It proves nothing to another machine.
-fn sign_and_verify(app: &Path) -> anyhow::Result<()> {
+fn sign_and_verify(bundle: &Bundle, app: &Path) -> anyhow::Result<()> {
     run(Command::new("codesign")
-        .args(["--force", "--sign", "-", "--identifier", IDENTIFIER])
+        .args(["--force", "--sign", "-", "--identifier", &bundle.identifier])
         .arg(app))?;
     run(Command::new("codesign")
         .args(["--verify", "--strict", "--verbose=2"])
@@ -212,17 +263,17 @@ fn sign_and_verify(app: &Path) -> anyhow::Result<()> {
         .stdout(std::process::Stdio::null()))
 }
 
-fn build_the_viewer() -> anyhow::Result<PathBuf> {
+fn build_the_viewer(package: &str) -> anyhow::Result<PathBuf> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     run(Command::new(cargo).current_dir(workspace()).args([
         "build",
         "--release",
         "-p",
-        EXECUTABLE,
+        package,
     ]))?;
     let target = std::env::var_os("CARGO_TARGET_DIR")
         .map_or_else(|| workspace().join("target"), PathBuf::from);
-    Ok(target.join("release").join(EXECUTABLE))
+    Ok(target.join("release").join(package))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -237,34 +288,53 @@ fn main() -> anyhow::Result<()> {
         Some("app") => {
             let mut out = None;
             let mut binary = None;
+            let mut icon = None;
+            let mut bundle = Bundle::default();
             while let Some(arg) = args.next() {
-                let value = args.next().map(PathBuf::from);
-                match (arg.as_str(), value) {
-                    ("--out", Some(dir)) => out = Some(dir),
-                    // An executable built elsewhere — by a build machine, say.
-                    ("--binary", Some(path)) => binary = Some(path),
-                    _ => bail!("unknown or incomplete argument {arg:?}"),
+                let Some(value) = args.next() else {
+                    bail!("{arg} needs a value");
+                };
+                match arg.as_str() {
+                    "--out" => out = Some(PathBuf::from(value)),
+                    // An executable built elsewhere — by a build machine, or
+                    // by a host's own workspace.
+                    "--binary" => binary = Some(PathBuf::from(value)),
+                    // The host's identity: the same four words its
+                    // `tuile_viewer::Identity` says.
+                    "--name" => bundle.name = value,
+                    "--identifier" => bundle.identifier = value,
+                    "--scheme" => bundle.scheme = value,
+                    "--package" => bundle.executable = value,
+                    // A 1024-pixel PNG, in place of the project's icon.
+                    "--icon" => icon = Some(PathBuf::from(value)),
+                    _ => bail!("unknown argument {arg:?}"),
                 }
             }
             let binary = match binary {
                 Some(binary) => binary,
-                None => build_the_viewer()?,
+                None => build_the_viewer(&bundle.executable)?,
             };
             let out = out.unwrap_or_else(|| workspace().join("target/bundle"));
             std::fs::create_dir_all(&out)?;
-            let master = image::open(master_png())
-                .context("reading the icon master")?
-                .to_rgba8();
-            let app = assemble(&binary, &master, &out)?;
+            let master = match icon {
+                Some(path) => image::open(&path)
+                    .with_context(|| format!("reading the icon {}", path.display()))?,
+                None => image::load_from_memory(MASTER).context("reading the icon master")?,
+            }
+            .to_rgba8();
+            let app = assemble(&bundle, &binary, &master, &out)?;
             if cfg!(target_os = "macos") {
-                sign_and_verify(&app)?;
+                sign_and_verify(&bundle, &app)?;
             } else {
                 eprintln!("not signed: this is not macOS");
             }
             println!("{}", app.display());
             Ok(())
         }
-        _ => bail!("usage: tuile-viewer-bundle app [--out DIR] [--binary PATH] | icon"),
+        _ => bail!(
+            "usage: tuile-viewer-bundle app [--out DIR] [--binary PATH] [--name NAME] \
+             [--identifier ID] [--scheme SCHEME] [--package PACKAGE] [--icon PNG] | icon"
+        ),
     }
 }
 
@@ -273,7 +343,7 @@ mod tests {
     use super::*;
 
     fn info() -> plist::Dictionary {
-        info_plist("1.2.3")
+        info_plist(&Bundle::default(), "1.2.3")
             .into_dictionary()
             .expect("the property list is a dictionary")
     }
@@ -335,17 +405,59 @@ mod tests {
         assert_eq!(schemes, ["tuile"]);
     }
 
-    /// The bundler and the viewer are two programs and must agree on three
-    /// words. They cannot share a constant — the viewer is a binary — so the
-    /// viewer's source is read and held to the bundler's.
+    /// The bundler and the viewer are two programs and must agree on four
+    /// words. The bundler does not link the viewer — it would drag a renderer
+    /// into a packaging tool — so the viewer's default identity is read from
+    /// its source and held to the bundler's.
     #[test]
     fn the_bundle_and_the_viewer_agree_on_their_names() {
-        let steer = include_str!("../../src/steer.rs");
-        assert!(steer.contains(&format!("const SCHEME: &str = {SCHEME:?};")));
-        let host = include_str!("../../src/host.rs");
-        assert!(host.contains(&format!("const APP_NAME: &str = {NAME:?};")));
-        let manifest = include_str!("../../Cargo.toml");
-        assert!(manifest.contains(&format!("name = {EXECUTABLE:?}")));
+        let Bundle {
+            name,
+            identifier,
+            executable,
+            scheme,
+        } = Bundle::default();
+        let embed = include_str!("../../tuile-viewer/src/embed.rs");
+        for line in [
+            format!("name: {name:?}.into(),"),
+            format!("bundle_identifier: {identifier:?}.into(),"),
+            format!("scheme: {scheme:?}.into(),"),
+            format!("executable: {executable:?}.into(),"),
+        ] {
+            assert!(embed.contains(&line), "{line}");
+        }
+        let manifest = include_str!("../../../examples/wgpu-viewer/Cargo.toml");
+        assert!(manifest.contains(&format!("name = {executable:?}")));
+    }
+
+    /// A bundle under another name tells the program inside it so, and the
+    /// project's own bundle says nothing: the second copy must not read the
+    /// first one's files or answer its URLs.
+    #[test]
+    fn a_renamed_bundle_hands_its_identity_to_the_program() {
+        assert!(!info().contains_key("LSEnvironment"));
+        let other = Bundle {
+            name: "Tuile Test".into(),
+            identifier: "dev.lapoule.tuile.viewer.test".into(),
+            scheme: "tuile-test".into(),
+            ..Bundle::default()
+        };
+        let info = info_plist(&other, "1.2.3")
+            .into_dictionary()
+            .expect("a dictionary");
+        let said = info
+            .get("LSEnvironment")
+            .and_then(plist::Value::as_dictionary)
+            .expect("the environment of a renamed bundle");
+        for (key, value) in [
+            ("TUILE_VIEWER_NAME", "Tuile Test"),
+            ("TUILE_VIEWER_IDENTIFIER", "dev.lapoule.tuile.viewer.test"),
+            ("TUILE_VIEWER_SCHEME", "tuile-test"),
+        ] {
+            assert_eq!(said.get(key).and_then(plist::Value::as_string), Some(value));
+        }
+        assert_eq!(string(&info, "CFBundleName"), "Tuile Test");
+        assert_eq!(string(&info, "CFBundleIdentifier"), other.identifier);
     }
 
     /// The layout the system expects, with an icon holding every size and a
@@ -355,7 +467,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let binary = dir.path().join("viewer");
         std::fs::write(&binary, b"not really an executable").expect("a stand-in binary");
-        let app = assemble(&binary, &icon::draw(64), dir.path()).expect("the bundle");
+        let app = assemble(&Bundle::default(), &binary, &icon::draw(64), dir.path()).expect("the bundle");
 
         assert_eq!(app, dir.path().join("Tuile.app"));
         let contents = app.join("Contents");
@@ -370,7 +482,10 @@ mod tests {
             Some(&b"APPL????"[..])
         );
         let read_back = plist::Value::from_file(contents.join("Info.plist")).expect("a plist");
-        assert_eq!(read_back, info_plist(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            read_back,
+            info_plist(&Bundle::default(), env!("CARGO_PKG_VERSION"))
+        );
 
         let icon = std::fs::File::open(contents.join("Resources/Tuile.icns")).expect("an icon");
         let family = icns::IconFamily::read(icon).expect("an icns");
@@ -394,12 +509,13 @@ mod tests {
             std::fs::read_to_string(contents.join("Resources/Tuile.sdef"))
                 .ok()
                 .as_deref(),
-            Some(include_str!("../../macos/Tuile.sdef"))
+            Some(include_str!("../../tuile-viewer/macos/Tuile.sdef"))
         );
 
         // Assembling again replaces the bundle rather than piling into it.
         std::fs::write(contents.join("Resources/stale"), b"x").expect("a stray file");
-        assemble(&binary, &icon::draw(64), dir.path()).expect("the bundle, again");
+        assemble(&Bundle::default(), &binary, &icon::draw(64), dir.path())
+            .expect("the bundle, again");
         assert!(!contents.join("Resources/stale").exists());
     }
 

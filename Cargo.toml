@@ -30,13 +30,14 @@ members = [
     "crates/tuile-usd",
     "crates/tuile-web",
     "crates/tuile-ui",
+    "crates/tuile-viewer",
+    "crates/tuile-viewer-bundle",
     "crates/tuile-wgpu",
     "examples/globe-bulk",
     "examples/orbit-probe",
     "examples/wasm-globe",
     "examples/warm-cache",
     "examples/wgpu-viewer",
-    "examples/wgpu-viewer/bundle",
 ]
 
 [workspace.package]

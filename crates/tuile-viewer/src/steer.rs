@@ -12,7 +12,7 @@
 //!
 //! # Steering from outside
 //!
-//! A running viewer takes commands as URLs of the scheme [`SCHEME`]. On macOS
+//! A running viewer takes commands as URLs of the scheme [`scheme`]. On macOS
 //! the application bundle registers the scheme, so the system delivers them:
 //!
 //! ```text
@@ -44,9 +44,13 @@ use tuile_core::geo::ecef_to_geodetic;
 
 use crate::start::StartView;
 
-/// The URL scheme a running viewer is steered by. The application bundle's
-/// `Info.plist` declares the same word; a test in the bundler holds them equal.
-pub(crate) const SCHEME: &str = "tuile";
+/// The URL scheme a running viewer is steered by: the host's
+/// ([`crate::embed::Identity::scheme`]), `tuile` for the project's own
+/// application. The bundle's `Info.plist` must declare the same word, or the
+/// system delivers the URLs elsewhere.
+pub(crate) fn scheme() -> &'static str {
+    &crate::embed::identity().scheme
+}
 
 /// No steering URL is anywhere near this long; one that is, is not one.
 pub(crate) const LONGEST_URL: usize = 512;
@@ -125,8 +129,11 @@ pub(crate) fn parse_url(url: &str) -> Result<Vec<Command>, String> {
         .trim()
         .split_once(':')
         .ok_or_else(|| "not a URL".to_owned())?;
-    if !scheme.eq_ignore_ascii_case(SCHEME) {
-        return Err(format!("the scheme is {SCHEME:?}, not {scheme:?}"));
+    if !scheme.eq_ignore_ascii_case(self::scheme()) {
+        return Err(format!(
+            "the scheme is {:?}, not {scheme:?}",
+            self::scheme()
+        ));
     }
     let rest = rest.strip_prefix("//").unwrap_or(rest);
     let (name, query) = rest.split_once('?').unwrap_or((rest, ""));
@@ -240,7 +247,8 @@ pub(crate) fn go(controller: &mut CameraController, goto: Goto) {
 /// screen shows; more digits would only make the link longer.
 pub(crate) fn link(view: &StartView) -> String {
     format!(
-        "{SCHEME}://goto?lon={:.7}&lat={:.7}&altitude={:.2}&heading={:.3}&pitch={:.3}",
+        "{}://goto?lon={:.7}&lat={:.7}&altitude={:.2}&heading={:.3}&pitch={:.3}",
+        scheme(),
         view.lon,
         view.lat,
         view.altitude,

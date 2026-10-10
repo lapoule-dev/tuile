@@ -17,7 +17,7 @@ tuile/
 │   ├── tuile-server/        # M2 — HTTP server (native axum / workers-rs)
 │   └── tuile-usd/           # M3 — USD/USDZ export (lib + standalone CLI, outside the server)
 ├── examples/
-│   └── wgpu-viewer/           # M1 — winit + tuile-wgpu binary (in-process M1, --remote M2)
+│   └── wgpu-viewer/           # M1 — the viewer binary: `tuile-viewer` (crates/) over the public connectors — see 16-embedding-the-viewer.md
 ├── integrations/              # future, non-Rust (hydra/, swift/) — empty in v1
 └── references/                # local clones of the reference implementations — GITIGNORED, never committed
 ```

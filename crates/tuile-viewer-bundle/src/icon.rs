@@ -206,7 +206,7 @@ mod tests {
     /// sine on another machine's maths library.
     #[test]
     fn the_committed_master_is_what_the_generator_draws() {
-        let committed = image::load_from_memory(include_bytes!("../../macos/icon-1024.png"))
+        let committed = image::load_from_memory(include_bytes!("../icon-1024.png"))
             .expect("the committed master is a PNG")
             .to_rgba8();
         let drawn = draw(MASTER);
