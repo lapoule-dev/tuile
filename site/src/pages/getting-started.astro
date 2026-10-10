@@ -18,9 +18,9 @@ const doc = `cargo doc --workspace --no-deps`;
 
 const site = `cd site
 npm install
-npm run docs:api     # cargo doc --workspace --no-deps, staged under /docs/api
-npm run build        # Astro SSR build → dist/
-node ./dist/server/entry.mjs`;
+npm run docs:api     # cargo doc --no-deps for the published crates, staged under /docs/api
+npm run build        # static build → dist/
+npm run preview      # serve dist/ locally`;
 ---
 
 <Base
@@ -76,7 +76,7 @@ node ./dist/server/entry.mjs`;
     viewer: it takes no path argument and instead reads a data-provider credential from the
     environment, so it will refuse to start without one. And the <code>fixtures/</code>
     directory named above is not committed yet. The viewer's own module documentation, in
-    the <a href="/docs/api">API reference</a>, carries the current controls and environment
+    the <a href="/docs">API reference</a>, carries the current controls and environment
     variables — including the ones that record a camera path and fly it again exactly.
   </p>
 
@@ -93,14 +93,14 @@ node ./dist/server/entry.mjs`;
 
   <p>
     That writes rustdoc for every crate in the workspace into <code>target/doc</code>. The
-    <a href="/docs/api">API reference</a> page explains how this site serves it.
+    <a href="/docs">API reference</a> page explains how this site serves it.
   </p>
 
   <h2>Building this site</h2>
 
   <p>
-    The site is an Astro application configured for server-side rendering with the Node
-    adapter, so the build produces a real server rather than a folder of files.
+    The site is an Astro application built statically: the build produces a folder of
+    files, the generated rustdoc among them, and no server of its own.
   </p>
 
   <pre><code>{site}</code></pre>
@@ -121,5 +121,5 @@ node ./dist/server/entry.mjs`;
     implementation of an open community standard and is unaffiliated with any vendor.
   </p>
 
-  <p class="next">Next → <a href="/docs/api">The API reference</a></p>
+  <p class="next">Next → <a href="/docs">The API reference</a></p>
 </Base>

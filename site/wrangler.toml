@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+
+# The site as a Cloudflare Worker made of static assets only: no script, the
+# build output served as files.
+#
+#   npm run build:all               rustdoc, then the static build into dist/
+#   wrangler deploy --domain tuile.lapoule.dev
+#
+# The account is not in this file: set CLOUDFLARE_ACCOUNT_ID to the one that
+# owns the zone of the domain.
+name = "tuile-site"
+compatibility_date = "2026-04-01"
+
+[assets]
+directory = "./dist"
+# `/docs` answers with `docs.html`; rustdoc's own `.html` files keep resolving,
+# their relative links untouched.
+html_handling = "auto-trailing-slash"
+# An unknown path gets `dist/404.html` with a 404 status.
+not_found_handling = "404-page"

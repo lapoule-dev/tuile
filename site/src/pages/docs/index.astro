@@ -1,0 +1,172 @@
+---
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) lapoule.dev
+
+import { existsSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import Base from '../../layouts/Base.astro';
+
+// Where `scripts/rustdoc.mjs` staged the generated HTML. This page is rendered
+// at build time (and by the development server), both started from `site/`, so
+// the crate list is whatever was staged when the build ran. If nothing was,
+// degrade gracefully — a missing tree must never hide the links.
+const staged = join(process.cwd(), 'public', 'docs', 'api');
+const stage = existsSync(join(staged, 'crates.js')) ? staged : undefined;
+
+// The crates the site documents, under the heading each belongs to. The
+// selection itself lives in `scripts/rustdoc.mjs`; a crate staged there and
+// absent here still shows, under the last heading, rather than disappearing.
+const groups: [string, string[]][] = [
+  ['Core and formats', ['tuile_core', 'tuile_b3dm', 'tuile_terrain', 'tuile_pack']],
+  [
+    'Sources and storage',
+    [
+      'tuile_native_fetchers',
+      'tuile_web',
+      'tuile_storage_foyer',
+      'tuile_tile_server',
+      'tuile_repository',
+      'tuile_bing',
+      'tuile_cesium_ion',
+    ],
+  ],
+  [
+    'Scene and rendering',
+    [
+      'tuile_planetary',
+      'tuile_camera',
+      'tuile_ui',
+      'tuile_atmosphere',
+      'tuile_radiometry',
+      'tuile_wgpu',
+    ],
+  ],
+  [
+    'Film',
+    [
+      'tuile_bake',
+      'tuile_film',
+      'tuile_film_gpu',
+      'tuile_film_native',
+      'tuile_film_web',
+      'tuile_mp4',
+    ],
+  ],
+  ['Integrations', ['tuile_usd', 'tuile_hydra', 'tuile_metrics', 'tuile_pack_worker']],
+  ['Programs', ['tuile_film_render', 'tuile_pack_api', 'wgpu_viewer']],
+];
+
+const known = groups.flatMap(([, crates]) => crates);
+
+const found = stage
+  ? readdirSync(stage, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && existsSync(join(stage, e.name, 'index.html')))
+      .map((e) => e.name)
+      .sort()
+  : known;
+
+const sections = [
+  ...groups.map(([title, crates]) => ({
+    title,
+    crates: crates.filter((c) => found.includes(c)),
+  })),
+  { title: 'Other crates', crates: found.filter((c) => !known.includes(c)) },
+].filter((s) => s.crates.length > 0);
+---
+
+<Base
+  title="API reference — Tuile"
+  description="The generated Rust API documentation of the Tuile crates, built with cargo doc and served by this site under /docs."
+  kicker="API reference"
+  heading="The crates, as rustdoc sees them."
+  lede="This is the generated Rust documentation of the crates listed below — every public type, trait and module, with the source linked. It is built by cargo, not written by hand, and it is the authority when this site and the code disagree."
+>
+  {!stage && (
+    <p class="note">
+      <strong>Not generated for this build.</strong> The links below will return 404 until
+      the rustdoc has been built and staged. From the <code>site/</code> directory run
+      <code>npm run docs:api</code>, then rebuild: <code>npm run build</code>. Nothing
+      generated is committed, so a fresh checkout always starts in this state.
+    </p>
+  )}
+
+  {sections.map((s) => (
+    <>
+      <h3>{s.title}</h3>
+      <ul class="crate-list">
+        {s.crates.map((c) => (
+          <li>
+            <span class="name"><a href={`/docs/api/${c}/index.html`}>{c}</a></span>
+            <span class="what">
+              <a href={`/docs/api/${c}/all.html`}>all items</a>
+            </span>
+          </li>
+        ))}
+      </ul>
+    </>
+  ))}
+
+  <p>
+    Crate names are the rustdoc form, with underscores; the last group documents programs
+    rather than libraries. Rustdoc's own crate switcher, in the sidebar of any page above,
+    lists the same crates, and its search box covers all of them at once.
+  </p>
+
+  <p>
+    This is a selection, not the whole workspace. The crates that record and replay camera
+    paths and the ones that drive a render farm, with their command-line tools, are held
+    back for a later publication; where a documented API mentions one of their types, the
+    name appears without a link.
+  </p>
+
+  <h2>Where to start reading</h2>
+
+  <ul>
+    <li>
+      <code>tuile_core::protocol</code> — the message types and the
+      <code>GeometryStream</code> trait. If you read one module, read this one: the shape of
+      the whole project is in it.
+    </li>
+    <li>
+      <code>tuile_core::traversal</code> — screen-space error, culling, refinement, and the
+      selection it produces.
+    </li>
+    <li>
+      <code>tuile_core::content</code> — the two content forms and the decoders that turn
+      one into the other.
+    </li>
+    <li>
+      <code>tuile_core::fetch</code> and <code>tuile_core::cache</code> — the input seams,
+      and the implementations of them that live in the transport crates.
+    </li>
+    <li>
+      <code>tuile_core::geo</code> and <code>tuile_core::math</code> — the f64 geodetic and
+      bounding-volume arithmetic everything upstream depends on.
+    </li>
+  </ul>
+
+  <h2>How this is wired</h2>
+
+  <p>
+    <code>cargo doc --no-deps</code>, given the selected packages, writes rustdoc into the
+    workspace's <code>target/doc</code>. The site's <code>npm run docs:api</code> runs that
+    and then copies the result into <code>site/public/docs/api/</code>, which the static build
+    copies into <code>dist/docs/api/</code>, which is served as plain files. There is no
+    route handler in between — rustdoc's relative links, its shared assets and its search
+    index all work unmodified, because nothing rewrites them.
+  </p>
+
+  <p>
+    This page is <code>/docs</code>; the generated tree sits one level down, at
+    <code>/docs/api/&lt;crate&gt;/</code>, and everything below that path is rustdoc's. The
+    one file deliberately not copied is a root index: <code>/docs/api</code> itself
+    redirects here.
+  </p>
+
+  <p class="note">
+    The generated tree is around 45 MB and is <strong>gitignored</strong>. Regenerating it
+    costs a couple of minutes of cold compilation and seconds thereafter. It is not part of
+    <code>npm run build</code>, so editing a page does not pay for a documentation build;
+    <code>npm run build:all</code> runs both in order.
+  </p>
+</Base>
