@@ -129,8 +129,57 @@ segments into one mp4, in Rust. `tuile-film` reads a baked film frame by frame
 with no GPU and no I/O; `tuile-film-gpu` draws it (one visibility raster, the
 rest in compute); `tuile-film-native` renders it to an mp4 through the
 machine's own encoder; `tuile-film-web` renders the same film in a browser
-worker, frames handed to WebCodecs. `tuile-radiometry` brings imagery tiles
-shot on different days to one another's light.
+worker, frames handed to WebCodecs.
+
+## Colour: radiometric calibration
+
+The tiles of an imagery pyramid do not agree in colour. A level is a mosaic of
+captures — another sensor, another season, another exposure — and the level
+below it is another mosaic; where the source changes between two levels the
+same ground comes in two colours, and a globe that draws both draws the
+boundary between them. `tuile-radiometry` makes the tiles agree.
+
+- **Tone is corrected, detail is kept.** A picture of ground is a *tone* —
+  what is left when it is blurred — and *detail*, everything the blur removes.
+  Two captures of one place differ almost only in tone. So a tile is given the
+  tone of a reference and keeps its own detail: a smooth field of gains, a few
+  numbers a tile, multiplied into its texels in linear light.
+- **The reference is the pyramid.** A tile and its parent cover the same
+  ground entirely — the best overlap there is. A tile's field is the gain that
+  brings its tone to its parent's, plus the parent's own field, chained down
+  from an anchor level that is left as it is. Where two levels are the same
+  source resampled the gain is exactly nothing, so the chain does not drift
+  across the many levels where nothing changes.
+- **Neighbours agree along the edge they share**, and every gain is bounded:
+  a calibration may fail to help, it may not repaint.
+- **What it is not**: not histogram matching, which repaints detail with the
+  reference's content; not a solve over a whole mosaic; and not a look — it
+  makes tiles agree and says nothing of how the agreed picture is graded. The
+  grade towards a look's target (exposure, contrast, saturation) is a separate,
+  explicit step of the film.
+
+It is measured on the renderer itself, not beside it. The instruments are
+observers of `tuile-film-native`, watching the light that goes in and the
+light that comes out:
+
+```bash
+# Measure: per-tile and per-frame tables, the tone found, a report.
+tuile-film-render <packs prefix> --meter <dir>
+
+# Fit the film's own grade on its imagery and write it where it is kept.
+tuile-film-render <packs prefix> --calibrate <dir>
+
+# Render with it, with part of it, with another, or with none.
+tuile-film-render <packs prefix> --out film.mp4
+tuile-film-render <packs prefix> --out film.mp4 --tone 0.5
+tuile-film-render <packs prefix> --out film.mp4 --tone-table <file>
+tuile-film-render <packs prefix> --out film.mp4 --no-tone
+```
+
+A place's table of grades is kept **in the tile store**, beside the layer it
+corrects (`<layer>/tone/…`): calibrated once, read by every film that flies
+over it. The functions of `tuile-radiometry` are pure — texels and parameters
+in, gains out — and are the reference a GPU implementation is checked against.
 
 ## The tile store
 
