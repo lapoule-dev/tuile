@@ -450,6 +450,49 @@ mod system {
             awaiting_permission: false,
         })
     }
+
+    /// The by-hand check of this module, kept where it can be run again:
+    ///
+    /// ```text
+    /// cargo test -p tuile-wgpu-viewer -- --ignored --nocapture asks_the_system
+    /// ```
+    ///
+    /// Ignored because it calls the real service: it may put a permission
+    /// dialog on screen, and its result depends on the machine's settings. It
+    /// turns the thread's run loop itself, as the window's event loop does in
+    /// the viewer, and prints how the request ended — never where.
+    #[cfg(test)]
+    mod probe {
+        use std::time::{Duration, Instant};
+
+        use objc2_foundation::{NSDate, NSRunLoop};
+
+        use crate::location::{Locator, Outcome, Placement};
+        use crate::start::StartView;
+
+        #[test]
+        #[ignore = "calls the operating system's location service"]
+        fn asks_the_system_where_the_machine_is() {
+            let mut locator = Locator::new(super::source());
+            let mut controller = tuile_camera::CameraController::new(StartView::default().camera());
+            locator.request(Instant::now(), Placement::OVERHEAD);
+            let give_up = Instant::now() + Duration::from_secs(90);
+            let outcome = loop {
+                NSRunLoop::currentRunLoop()
+                    .runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(0.1));
+                if let Some(outcome) = locator.tick(Instant::now(), &mut controller) {
+                    break outcome;
+                }
+                assert!(
+                    Instant::now() < give_up,
+                    "the locator never ended the request"
+                );
+            };
+            // The outcome's own text carries the radius and never the place.
+            println!("outcome: {outcome}");
+            assert!(!matches!(outcome, Outcome::Centred { accuracy } if accuracy < 0.0));
+        }
+    }
 }
 
 /// Everywhere the system's service is not compiled in: the request is taken

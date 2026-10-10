@@ -48,7 +48,7 @@ winit = { workspace = true }
 # "not available" and the viewer runs as it always did.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.4", optional = true }
-objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSArray", "NSError", "NSString"] }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSArray", "NSDate", "NSError", "NSRunLoop", "NSString"] }
 objc2-core-location = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
 
 [features]
