@@ -17,7 +17,8 @@ struct Frame {
     sun: vec4f,
     // xyz: towards the sun. w: the picture's saturation.
     to_sun: vec4f,
-    // x, y: internal (supersampled) size; z: supersampling factor; w: unused.
+    // x, y: internal (supersampled) size; z: supersampling factor; w: whether
+    // the frame drew overlays.
     size: vec4u,
 }
 

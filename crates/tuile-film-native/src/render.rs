@@ -9,13 +9,17 @@
 //! otherwise — and entered; the frame is drawn; tiles no longer drawn are
 //! let go. Never a hole: a tile that can be built neither way stops the
 //! render with its name.
+//!
+//! Beside the ground, a frame shows what the host's [`Overlays`] hand it:
+//! shapes placed in the world, asked for frame by frame and drawn in the
+//! same scene.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use tuile_film::from_store::{compose, imagery_texture, is_baked, terrain_mesh};
 use tuile_film::{
-    refs_of, texture_of_span, Content, Cursor, FrameCamera, Look, Mesh, Pack, TileKey,
+    refs_of, texture_of_span, Content, Cursor, FrameCamera, Look, Mesh, Overlays, Pack, TileKey,
 };
 use tuile_film_gpu::{
     DrapeLayer, FilmGpu, LayerCorner, LayerField, LayerGrade, Settings, TileMesh,
@@ -150,11 +154,13 @@ async fn read_back(film: &FilmGpu, buffer: &wgpu::Buffer) -> Result<Vec<u8>, Err
 }
 
 /// Renders `film` as `order` says, each picture to `sink`, `observer` told
-/// of everything.
+/// of everything. `overlays` is asked, frame by frame, for what the frame
+/// shows beside the ground; `&mut ()` has nothing to show.
 pub async fn render(
     sources: &Sources,
     film: &Film,
     order: &Order,
+    overlays: &mut dyn Overlays,
     sink: &mut dyn Sink,
     observer: &mut dyn Observer,
 ) -> Result<Done, Error> {
@@ -239,6 +245,8 @@ pub async fn render(
     // What is resident, and the imagery levels of each one's drape.
     let mut resident: HashMap<TileKey, Vec<u8>> = HashMap::new();
     let mut textures: HashMap<(u8, u32, u32), (wgpu::Texture, bool)> = HashMap::new();
+    // The frame's overlays, the same allocation from one frame to the next.
+    let mut shapes = Vec::new();
     let mut index = 0u32;
 
     for file in &film.packs {
@@ -631,7 +639,9 @@ pub async fn render(
 
             let t = Instant::now();
             let camera = FrameCamera::of(&diff.view, width as f32 / height as f32);
-            let mut encoder = gpu.render(&camera, &diff.selection)?;
+            shapes.clear();
+            overlays.frame(diff.frame, &diff.view, &mut shapes);
+            let mut encoder = gpu.render_with(&camera, &diff.selection, &shapes)?;
             encoder.copy_texture_to_buffer(
                 gpu.output().as_image_copy(),
                 wgpu::TexelCopyBufferInfo {

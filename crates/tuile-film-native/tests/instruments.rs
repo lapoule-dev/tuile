@@ -233,3 +233,56 @@ fn the_machines_encoder_writes_an_h264_mp4_with_every_picture() {
     let count = u32::from_be_bytes(bytes[stsz + 12..stsz + 16].try_into().expect("four bytes"));
     assert_eq!(count, 12);
 }
+
+/// A film is the packs under a prefix, or the packs named and no other: a
+/// part's pack lies beside the other parts', and is opened alone.
+#[tokio::test]
+async fn a_pack_named_is_opened_without_its_neighbours() {
+    use tuile_film::BakedView;
+    use tuile_film_native::Film;
+    use tuile_pack::PackWriter;
+
+    let dir = tempfile::tempdir().expect("dir");
+    std::fs::create_dir_all(dir.path().join("packs")).expect("packs");
+    for part in 0..3u32 {
+        let mut w = PackWriter::new("s", [0.0; 3], dir.path().join("blob")).expect("writer");
+        for frame in 1 + 3 * part..=3 + 3 * part {
+            let view = BakedView {
+                position: [7_000_000.0, 0.0, 0.0],
+                direction: [-1.0, 0.0, 0.0],
+                up: [0.0, 0.0, 1.0],
+                viewport_px: [640.0, 480.0],
+                fovy_rad: 1.0,
+            };
+            w.frame(frame, view, []);
+        }
+        w.finish_to(dir.path().join(format!("packs/c{part:04}.tuilepack")))
+            .expect("finish");
+    }
+    let objects =
+        tuile_farm::ObjectRunStore::local(dir.path(), tuile_farm::Tuning::from_env()).expect("dir");
+
+    let whole = Film::open(&objects, "packs").await.expect("open");
+    assert_eq!((whole.packs.len(), whole.frames()), (3, (1, 9)));
+
+    let part = Film::of(&objects, &["packs/c0001.tuilepack"])
+        .await
+        .expect("of");
+    assert_eq!(part.packs.len(), 1);
+    assert_eq!(part.packs[0].key, "packs/c0001.tuilepack");
+    assert_eq!(part.frames(), (4, 6));
+    assert_eq!(part.packs[0].head, whole.packs[1].head);
+
+    // Named out of order, they are a film in the order of their frames.
+    let two = Film::of(
+        &objects,
+        &["packs/c0002.tuilepack", "packs/c0000.tuilepack"],
+    )
+    .await
+    .expect("of");
+    assert_eq!((two.packs[0].first, two.packs[1].first), (1, 7));
+    assert!(Film::of(&objects, &[]).await.is_err());
+    assert!(Film::of(&objects, &["packs/c0009.tuilepack"])
+        .await
+        .is_err());
+}

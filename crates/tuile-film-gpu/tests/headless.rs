@@ -8,7 +8,7 @@
 //! pixel off it as the sky. Skipped when the machine has no adapter.
 
 use glam::Vec3;
-use tuile_film::{BakedView, FrameCamera, Imagery, Look, TileKey};
+use tuile_film::{BakedView, FrameCamera, Imagery, Look, OverlayDepth, OverlayMesh, TileKey};
 use tuile_film_gpu::{FilmGpu, Settings, TileMesh};
 
 /// The WGS84 equatorial radius: the square sits on the ground at null island.
@@ -142,8 +142,26 @@ fn render_squares(look: Look, squares: &[(f64, [u8; 4])], supersample: u32) -> O
     film.encode_i420(&mut encoder).expect("i420");
     film.queue().submit([encoder.finish()]);
 
+    let rgba = picture(&film);
+    let i420 = read(&film, |e| {
+        let size = film.i420_planes().size();
+        let buffer = film.device().create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        e.copy_buffer_to_buffer(film.i420_planes(), 0, &buffer, 0, size);
+        (buffer, size)
+    });
+    Some(Rendered { rgba, i420, width })
+}
+
+/// The picture the last frame submitted left, tightly packed.
+fn picture(film: &FilmGpu) -> Vec<u8> {
+    let (width, height) = (film.settings().width, film.settings().height);
     let padded = (width * 4).div_ceil(256) * 256;
-    let rgba = read(&film, |e| {
+    let rgba = read(film, |e| {
         let buffer = film.device().create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: u64::from(padded * height),
@@ -164,22 +182,9 @@ fn render_squares(look: Look, squares: &[(f64, [u8; 4])], supersample: u32) -> O
         );
         (buffer, 0)
     });
-    let rgba = rgba
-        .chunks(padded as usize)
+    rgba.chunks(padded as usize)
         .flat_map(|row| row[..(width * 4) as usize].to_vec())
-        .collect();
-    let i420 = read(&film, |e| {
-        let size = film.i420_planes().size();
-        let buffer = film.device().create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        e.copy_buffer_to_buffer(film.i420_planes(), 0, &buffer, 0, size);
-        (buffer, size)
-    });
-    Some(Rendered { rgba, i420, width })
+        .collect()
 }
 
 fn pixel(r: &Rendered, x: u32, y: u32) -> [u8; 3] {
@@ -886,4 +891,300 @@ fn a_layer_is_composed_through_matrices_carried_by_its_corners() {
         at(31, 5, 0),
         at(31, 5, 2)
     );
+}
+
+/// A rectangle facing the camera, `height` metres over the ground at null
+/// island: centred `at` metres east and north of the nadir, its half
+/// extents `half`. The camera hangs at 1000 m and looks straight down, east
+/// to its right and north up the picture.
+#[derive(Clone, Copy)]
+struct Panel {
+    height: f64,
+    at: [f64; 2],
+    half: [f32; 2],
+}
+
+impl Panel {
+    fn origin(&self) -> [f64; 3] {
+        [A + self.height, self.at[0], self.at[1]]
+    }
+
+    fn corners(&self) -> [[f32; 3]; 4] {
+        let [y, z] = self.half;
+        [[0.0, -y, -z], [0.0, y, -z], [0.0, y, z], [0.0, -y, z]]
+    }
+
+    /// As an overlay of one colour, display-linear and premultiplied.
+    fn overlay(&self, color: [f32; 4], depth: OverlayDepth) -> OverlayMesh {
+        OverlayMesh {
+            origin_ecef: self.origin(),
+            positions: self.corners().to_vec(),
+            colors: vec![color; 4],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            depth,
+        }
+    }
+}
+
+/// The ground under the camera, and a ridge: a wall halfway up to it, a
+/// band down the middle of the picture (columns 29 to 35).
+const GROUND: Panel = Panel {
+    height: 0.0,
+    at: [0.0, 0.0],
+    half: [200.0, 200.0],
+};
+const RIDGE: Panel = Panel {
+    height: 500.0,
+    at: [0.0, 0.0],
+    half: [30.0, 200.0],
+};
+const GROUND_SRGB: [u8; 4] = [90, 60, 30, 255];
+const RIDGE_SRGB: [u8; 4] = [30, 30, 220, 255];
+
+/// A band across the whole picture, east to west, 250 m up: between the
+/// ground and the ridge's top, so behind the ridge. `north` puts it on a
+/// row: 0 is rows 23 and 24.
+fn band_behind(north: f64) -> Panel {
+    Panel {
+        height: 250.0,
+        at: [0.0, north],
+        half: [400.0, 20.0],
+    }
+}
+
+/// The ground and the ridge, then one frame after the other on the same
+/// renderer, each with its overlays: the picture of each.
+fn frames(look: Look, supersample: u32, frames: &[&[OverlayMesh]]) -> Option<Vec<Rendered>> {
+    let (device, queue) = device()?;
+    let (width, height) = (64, 48);
+    let mut film = FilmGpu::new(
+        device,
+        queue,
+        Settings {
+            width,
+            height,
+            supersample,
+            look,
+        },
+    );
+    let mut keys = Vec::new();
+    for (at, (panel, srgb)) in [(GROUND, GROUND_SRGB), (RIDGE, RIDGE_SRGB)]
+        .into_iter()
+        .enumerate()
+    {
+        let texture = film.create_albedo(4, 4);
+        film.write_rgba(&texture, &srgb.repeat(16));
+        let key = TileKey {
+            id: at as u64 + 1,
+            drape: 0,
+        };
+        film.enter(
+            key,
+            &TileMesh {
+                origin_ecef: panel.origin(),
+                positions: &le(&panel.corners()),
+                normals: &le(&[1.0f32, 0.0, 0.0].repeat(4)),
+                uvs: &le(&[0.0f32, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]),
+                indices: &le(&[0u32, 1, 2, 0, 2, 3]),
+                index_count: 6,
+                base_color_factor: [1.0; 4],
+            },
+            Some(texture),
+        )
+        .expect("enter");
+        keys.push(key);
+    }
+    let camera = FrameCamera::of(&view(), width as f32 / height as f32);
+    let mut out = Vec::new();
+    for overlays in frames {
+        let encoder = film.render_with(&camera, &keys, overlays).expect("render");
+        film.queue().submit([encoder.finish()]);
+        out.push(Rendered {
+            rgba: picture(&film),
+            i420: Vec::new(),
+            width,
+        });
+    }
+    Some(out)
+}
+
+const MAGENTA: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
+const CYAN: [f32; 4] = [0.0, 1.0, 1.0, 1.0];
+const YELLOW: [f32; 4] = [1.0, 1.0, 0.0, 1.0];
+
+/// An overlay is in the scene, not on the picture: a band that passes
+/// behind the ridge shows before the sky and over the ground on one side,
+/// is hidden by the ridge pixel for pixel, and shows again on the other
+/// side; a band nearer than the ridge crosses it whole.
+#[test]
+fn a_band_behind_the_ridge_is_hidden_by_it_and_shows_again_past_it() {
+    let behind = band_behind(0.0).overlay(MAGENTA, OverlayDepth::Terrain);
+    // 700 m up, nearer than the ridge's 500, on rows 11 and 12.
+    let before = Panel {
+        height: 700.0,
+        at: [0.0, 63.4],
+        half: [100.0, 10.0],
+    }
+    .overlay(CYAN, OverlayDepth::Terrain);
+    let Some(r) = frames(look(), 1, &[&[], &[behind, before]]) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let (bare, r) = (&r[0], &r[1]);
+    for row in [23, 24] {
+        // Before the sky, west of the ground…
+        assert_eq!(pixel(r, 10, row), [255, 0, 255], "before the sky");
+        // …over the ground, on either side of the ridge…
+        assert_eq!(pixel(r, 24, row), [255, 0, 255], "west of the ridge");
+        assert_eq!(pixel(r, 40, row), [255, 0, 255], "east of the ridge");
+        // …and behind the ridge, every pixel of the ridge is the ridge's.
+        for column in 30..=34 {
+            assert_eq!(
+                pixel(r, column, row),
+                pixel(bare, column, row),
+                "the ridge at column {column} does not hide the band behind it"
+            );
+        }
+    }
+    assert_ne!(pixel(bare, 32, 24), [255, 0, 255]);
+    // The band nearer than the ridge is not hidden by it.
+    for column in [20, 32, 44] {
+        assert_eq!(pixel(r, column, 12), [0, 255, 255], "column {column}");
+    }
+}
+
+/// What must stay readable is tested against nothing: of two bands behind
+/// the ridge, the one never hidden crosses it.
+#[test]
+fn an_overlay_never_hidden_shows_through_the_ridge() {
+    // Rows 35 and 36, and rows 23 and 24.
+    let always = band_behind(-158.5).overlay(YELLOW, OverlayDepth::Always);
+    let hidden = band_behind(0.0).overlay(MAGENTA, OverlayDepth::Terrain);
+    let Some(r) = frames(look(), 1, &[&[hidden, always]]) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    for column in [10, 24, 32, 40] {
+        assert_eq!(pixel(&r[0], column, 36), [255, 255, 0], "column {column}");
+    }
+    assert_ne!(pixel(&r[0], 32, 24), [255, 0, 255]);
+}
+
+/// Overlays are laid over the picture once its tone is done: a colour comes
+/// out as given whatever the exposure, a translucent one lets through that
+/// share of what the display would have shown, and an edge that crosses a
+/// pixel is filtered like the ground's.
+#[test]
+fn an_overlay_is_laid_over_the_toned_picture_in_its_own_colour() {
+    // Over the ground west of the ridge: opaque on rows 23 and 24, and a
+    // translucent square further north, on rows 14 to 17.
+    let opaque = band_behind(0.0).overlay([0.5, 0.25, 0.1, 1.0], OverlayDepth::Terrain);
+    let veil = Panel {
+        height: 250.0,
+        at: [-110.0, 105.0],
+        half: [30.0, 30.0],
+    }
+    .overlay([0.2, 0.1, 0.0, 0.5], OverlayDepth::Terrain);
+    let shapes = [opaque, veil];
+    let brighter = Look {
+        exposure_ev: 3.0,
+        ..look()
+    };
+    let (Some(r), Some(bright)) = (
+        frames(look(), 1, &[&[], &shapes]),
+        frames(brighter, 1, &[&shapes]),
+    ) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let (bare, r) = (&r[0], &r[1]);
+    let given = [oetf(0.5), oetf(0.25), oetf(0.1)];
+    assert!(close(pixel(r, 24, 24), given), "{:?}", pixel(r, 24, 24));
+    // Two stops more light on the ground, and the same colour.
+    assert_eq!(pixel(&bright[0], 24, 24), pixel(r, 24, 24));
+    assert_ne!(pixel(&bright[0], 24, 30), pixel(r, 24, 30));
+
+    // Half of what the ground showed, plus the veil's own light.
+    let under = pixel(bare, 24, 16).map(|v| eotf(f32::from(v) / 255.0));
+    let wanted = [
+        oetf(under[0] * 0.5 + 0.2),
+        oetf(under[1] * 0.5 + 0.1),
+        oetf(under[2] * 0.5),
+    ];
+    assert!(
+        close(pixel(r, 24, 16), wanted),
+        "{:?}, wanted {:?}",
+        pixel(r, 24, 16),
+        wanted.map(|c| c * 255.0)
+    );
+    // A pixel no overlay touches is the pixel it was.
+    assert_eq!(pixel(r, 24, 30), pixel(bare, 24, 30));
+    assert_eq!(pixel(r, 2, 2), pixel(bare, 2, 2));
+
+    // The opaque band's edge falls across row 22, nearly half of it: one
+    // sample a pixel takes it or leaves it, sixteen give a part.
+    let Some(fine) = frames(look(), 4, &[&shapes]) else {
+        return;
+    };
+    let (edge, full, sky) = (
+        pixel(&fine[0], 10, 22),
+        pixel(&fine[0], 10, 24),
+        pixel(&fine[0], 10, 20),
+    );
+    assert!(close(full, given), "{full:?}");
+    assert!(
+        edge[2] > full[2] + 20 && edge[2] + 20 < sky[2],
+        "the edge {edge:?} is not between the band {full:?} and the sky {sky:?}"
+    );
+}
+
+/// A frame without overlays is the frame it always was, to the byte — on a
+/// renderer that never drew one, and on one that has just drawn some.
+#[test]
+fn a_frame_without_overlays_is_the_frame_it_was() {
+    let shapes = [
+        band_behind(0.0).overlay(MAGENTA, OverlayDepth::Terrain),
+        band_behind(-158.5).overlay(YELLOW, OverlayDepth::Always),
+    ];
+    for supersample in [1, 2] {
+        let (Some(never), Some(after)) = (
+            frames(look(), supersample, &[&[]]),
+            frames(look(), supersample, &[&shapes, &[]]),
+        ) else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        assert_ne!(after[0].rgba, never[0].rgba, "the overlays drew nothing");
+        assert_eq!(
+            after[1].rgba, never[0].rgba,
+            "a frame without overlays kept something of the frame before"
+        );
+    }
+}
+
+/// A mesh that would be read past its end is refused, by name, before
+/// anything is drawn.
+#[test]
+fn a_faulty_overlay_is_refused() {
+    let mut mesh = band_behind(0.0).overlay(MAGENTA, OverlayDepth::Terrain);
+    mesh.indices[5] = 4;
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mut film = FilmGpu::new(
+        device,
+        queue,
+        Settings {
+            width: 64,
+            height: 48,
+            supersample: 1,
+            look: look(),
+        },
+    );
+    let camera = FrameCamera::of(&view(), 64.0 / 48.0);
+    assert!(matches!(
+        film.render_with(&camera, &[], &[mesh]),
+        Err(tuile_film_gpu::FilmGpuError::Overlay(_))
+    ));
 }

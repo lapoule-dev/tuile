@@ -11,6 +11,7 @@ authors.workspace = true
 async-trait = { workspace = true }
 dotenvy = { workspace = true }
 futures-util = { workspace = true }
+glam = { workspace = true }
 image = { workspace = true }
 # Pure Rust, any picture size. Without its assembly it is slow; it is the
 # encoder a machine has when it has nothing else.
@@ -46,6 +47,7 @@ cudarc = { version = "0.16.4", optional = true, features = ["cuda-version-from-b
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tuile-pack = { version = "0.3.3", path = "../tuile-pack" }
 
 [features]
 # rav1e's own assembly: several times faster, and no longer Rust alone.

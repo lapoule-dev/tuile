@@ -17,6 +17,12 @@
 //! 5. **present**: supersampling box filter, exposure, sRGB curve;
 //! 6. optionally **I420**, so a native encoder reads half the bytes.
 //!
+//! A frame may also carry a host's **overlays** ([`tuile_film::OverlayMesh`]):
+//! coloured triangles placed in the world. They are the one thing rastered
+//! besides visibility — after it, into a target of their own, against the
+//! depth the ground left — and `present` lays them over the picture once
+//! its tone is done. A frame without any costs nothing more than before.
+//!
 //! Binning is what makes this portable: WebGPU has no bindless textures, so
 //! the resolve cannot pick a tile's texture per pixel — but it can run once
 //! per tile over exactly that tile's pixels.
@@ -28,7 +34,8 @@ mod frame;
 
 use std::collections::HashMap;
 
-use tuile_film::{FrameCamera, Look, TileKey};
+use glam::DVec3;
+use tuile_film::{FrameCamera, Look, OverlayDepth, OverlayMesh, TileKey};
 use wgpu::util::DeviceExt;
 
 pub use frame::{FrameUniform, TileFrame};
@@ -43,6 +50,9 @@ const SLOT_STRIDE: u64 = 256;
 const VIS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Overlays are blended in linear light before they are filtered down: a
+/// byte a channel would band their dark colours.
+const OVERLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// What `present` writes, and what a canvas or an encoder reads.
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const ALBEDO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -58,6 +68,45 @@ pub enum FilmGpuError {
     OutOfSlots,
     #[error("{0} must be a multiple of {1} for I420 output")]
     Unaligned(&'static str, u32),
+    #[error("{0}")]
+    Overlay(&'static str),
+}
+
+/// `overlay.wgsl`'s vertex: where it is from the eye, and its colour.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct OverlayVertex {
+    position: [f32; 3],
+    color: [f32; 4],
+}
+
+/// A buffer that is only ever made larger: overlays change every frame,
+/// and their size hardly does.
+#[derive(Default)]
+struct Growing(Option<wgpu::Buffer>);
+
+impl Growing {
+    fn holding(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        label: &'static str,
+        usage: wgpu::BufferUsages,
+        bytes: &[u8],
+    ) -> &wgpu::Buffer {
+        let size = bytes.len() as u64;
+        let buffer = match self.0.take() {
+            Some(buffer) if buffer.size() >= size => buffer,
+            _ => device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size.next_power_of_two().max(4096),
+                usage: usage | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        };
+        queue.write_buffer(&buffer, 0, bytes);
+        self.0.insert(buffer)
+    }
 }
 
 /// What a film is rendered at.
@@ -98,7 +147,12 @@ struct Resident {
 struct Targets {
     vis: wgpu::TextureView,
     depth: wgpu::TextureView,
+    hdr: wgpu::TextureView,
+    /// Made when a frame first carries an overlay: a film that never does
+    /// never pays for it.
+    overlay: Option<wgpu::TextureView>,
     out: wgpu::Texture,
+    out_view: wgpu::TextureView,
     list: wgpu::Buffer,
     planes: wgpu::Buffer,
     count_bg: wgpu::BindGroup,
@@ -112,6 +166,9 @@ struct Targets {
 
 struct Pipelines {
     raster: wgpu::RenderPipeline,
+    /// Overlays hidden by nearer ground, and overlays never hidden.
+    overlay_terrain: wgpu::RenderPipeline,
+    overlay_always: wgpu::RenderPipeline,
     count: wgpu::ComputePipeline,
     scan: wgpu::ComputePipeline,
     scatter: wgpu::ComputePipeline,
@@ -131,6 +188,9 @@ pub struct FilmGpu {
     pipelines: Pipelines,
     tile_bgl: wgpu::BindGroupLayout,
     raster_bg: wgpu::BindGroup,
+    overlay_bg: wgpu::BindGroup,
+    overlay_vertices: Growing,
+    overlay_indices: Growing,
     slot_bg: wgpu::BindGroup,
     frame_buf: wgpu::Buffer,
     tiles_buf: wgpu::Buffer,
@@ -485,6 +545,68 @@ impl FilmGpu {
             cache: None,
         });
 
+        let overlay_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("film overlay"),
+            entries: &[uniform(0, wgpu::ShaderStages::VERTEX, false)],
+        });
+        let overlay_module = shader(
+            &device,
+            "film overlay",
+            include_str!("shaders/overlay.wgsl"),
+        );
+        let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("film overlay"),
+            bind_group_layouts: &[Some(&overlay_bgl)],
+            immediate_size: 0,
+        });
+        let overlay = |label, depth_compare| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&overlay_layout),
+                vertex: wgpu::VertexState {
+                    module: &overlay_module,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<OverlayVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
+                    }],
+                },
+                primitive: wgpu::PrimitiveState {
+                    // A ribbon is seen from both sides.
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                // The ground's depth is read and never written: an overlay
+                // is tested against the ground, not against another.
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(depth_compare),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &overlay_module,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: OVERLAY_FORMAT,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        // Reverse-Z: an overlay shows where it is nearer than the ground,
+        // and nearer is greater.
+        let overlay_terrain = overlay("film overlay", wgpu::CompareFunction::Greater);
+        let overlay_always = overlay("film overlay, never hidden", wgpu::CompareFunction::Always);
+
         let bin = shader(&device, "film bin", include_str!("shaders/bin.wgsl"));
         let resolve_module = shader(
             &device,
@@ -510,6 +632,8 @@ impl FilmGpu {
         let i420_module = shader(&device, "film i420", include_str!("shaders/i420.wgsl"));
         let pipelines = Pipelines {
             raster,
+            overlay_terrain,
+            overlay_always,
             count: compute(&device, &bin, "count", None),
             scan: compute(&device, &bin, "scan", None),
             scatter: compute(&device, &bin, "scatter", None),
@@ -579,6 +703,29 @@ impl FilmGpu {
             ],
         });
 
+        let overlay_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("film overlay"),
+            layout: &overlay_bgl,
+            entries: &[entry(0, frame_buf.as_entire_binding())],
+        });
+        // What `present` is bound in an overlay's place until there is one.
+        let blank = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("film no overlay"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: OVERLAY_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("film albedo"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -630,6 +777,7 @@ impl FilmGpu {
             &cursor,
             &args,
             &sampler,
+            &blank,
         );
 
         Self {
@@ -639,6 +787,9 @@ impl FilmGpu {
             pipelines,
             tile_bgl,
             raster_bg,
+            overlay_bg,
+            overlay_vertices: Growing::default(),
+            overlay_indices: Growing::default(),
             slot_bg,
             frame_buf,
             tiles_buf,
@@ -669,6 +820,7 @@ impl FilmGpu {
         cursor: &wgpu::Buffer,
         args: &wgpu::Buffer,
         sampler: &wgpu::Sampler,
+        blank: &wgpu::TextureView,
     ) -> Targets {
         let k = settings.supersample.max(1);
         let (w, h) = (settings.width * k, settings.height * k);
@@ -775,15 +927,8 @@ impl FilmGpu {
                     entry(7, wgpu::BindingResource::Sampler(sampler)),
                 ],
             }),
-            present_bg: auto(
-                &pipelines.present,
-                "film present",
-                &[
-                    entry(0, frame_buf.as_entire_binding()),
-                    entry(1, wgpu::BindingResource::TextureView(&hdr)),
-                    entry(2, vis_res()),
-                    entry(3, wgpu::BindingResource::TextureView(&out_view)),
-                ],
+            present_bg: Self::present_bg(
+                device, pipelines, frame_buf, &hdr, &vis, &out_view, blank,
             ),
             y_bg: auto(
                 &pipelines.y_plane,
@@ -803,10 +948,73 @@ impl FilmGpu {
             ),
             vis,
             depth,
+            hdr,
+            overlay: None,
             out,
+            out_view,
             list,
             planes,
         }
+    }
+
+    fn present_bg(
+        device: &wgpu::Device,
+        pipelines: &Pipelines,
+        frame_buf: &wgpu::Buffer,
+        hdr: &wgpu::TextureView,
+        vis: &wgpu::TextureView,
+        out: &wgpu::TextureView,
+        overlay: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("film present"),
+            layout: &pipelines.present.get_bind_group_layout(0),
+            entries: &[
+                entry(0, frame_buf.as_entire_binding()),
+                entry(1, wgpu::BindingResource::TextureView(hdr)),
+                entry(2, wgpu::BindingResource::TextureView(vis)),
+                entry(3, wgpu::BindingResource::TextureView(out)),
+                entry(4, wgpu::BindingResource::TextureView(overlay)),
+            ],
+        })
+    }
+
+    /// The target overlays are drawn into, at the supersampled size, made
+    /// the first time a frame carries one and bound to `present` from then.
+    fn overlay_target(&mut self) -> wgpu::TextureView {
+        if let Some(view) = &self.targets.overlay {
+            return view.clone();
+        }
+        let k = self.settings.supersample.max(1);
+        let view = self
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("film overlay"),
+                size: wgpu::Extent3d {
+                    width: self.settings.width * k,
+                    height: self.settings.height * k,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: OVERLAY_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        self.targets.present_bg = Self::present_bg(
+            &self.device,
+            &self.pipelines,
+            &self.frame_buf,
+            &self.targets.hdr,
+            &self.targets.vis,
+            &self.targets.out_view,
+            &view,
+        );
+        self.targets.overlay = Some(view.clone());
+        view
     }
 
     pub fn device(&self) -> &wgpu::Device {
@@ -1141,6 +1349,54 @@ impl FilmGpu {
         camera: &FrameCamera,
         selection: &[TileKey],
     ) -> Result<wgpu::CommandEncoder, FilmGpuError> {
+        self.render_with(camera, selection, &[])
+    }
+
+    /// [`Self::render`], with a host's overlays drawn in the same scene:
+    /// through the same camera, each mesh tested against the ground as its
+    /// [`OverlayDepth`] says, in the order given. They are laid over the
+    /// picture once its tone is done and before its output curve, through
+    /// the supersampling filter — so their edges are smoothed as the
+    /// ground's are, and their colours are the ones given whatever the
+    /// look.
+    pub fn render_with(
+        &mut self,
+        camera: &FrameCamera,
+        selection: &[TileKey],
+        overlays: &[OverlayMesh],
+    ) -> Result<wgpu::CommandEncoder, FilmGpuError> {
+        // Everything of the overlays that can fail does before anything is
+        // recorded: one vertex buffer for the frame, eye-relative — each
+        // origin meets the eye in f64, and only the difference is narrowed.
+        let mut vertices: Vec<OverlayVertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        // Of each mesh: its indices, its first vertex, how it is tested.
+        let mut drawn_over = Vec::new();
+        for mesh in overlays {
+            if let Some(fault) = mesh.fault() {
+                return Err(FilmGpuError::Overlay(fault));
+            }
+            if mesh.indices.is_empty() {
+                continue;
+            }
+            let from_eye = DVec3::from_array(mesh.origin_ecef) - camera.eye;
+            let base = i32::try_from(vertices.len())
+                .map_err(|_| FilmGpuError::Overlay("a frame's overlays have too many vertices"))?;
+            vertices.extend(mesh.positions.iter().zip(&mesh.colors).map(|(p, c)| {
+                OverlayVertex {
+                    position: (from_eye + DVec3::new(p[0].into(), p[1].into(), p[2].into()))
+                        .as_vec3()
+                        .to_array(),
+                    color: *c,
+                }
+            }));
+            let first = indices.len() as u32;
+            indices.extend_from_slice(&mesh.indices);
+            drawn_over.push((first..indices.len() as u32, base, mesh.depth));
+        }
+        let overlaid = !drawn_over.is_empty();
+        let overlay_target = overlaid.then(|| self.overlay_target());
+
         // What was queued since the last frame comes first: the drapes, then
         // the mips made from them, before anything samples either.
         let mut encoder = self
@@ -1167,7 +1423,8 @@ impl FilmGpu {
         }
         let k = self.settings.supersample.max(1);
         let (w, h) = (self.settings.width * k, self.settings.height * k);
-        let uniform = FrameUniform::new(camera, &self.settings.look, [w, h, k, 0]);
+        let uniform =
+            FrameUniform::new(camera, &self.settings.look, [w, h, k, u32::from(overlaid)]);
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&uniform));
         if top > 0 {
@@ -1193,7 +1450,12 @@ impl FilmGpu {
                     view: &self.targets.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(0.0),
-                        store: wgpu::StoreOp::Discard,
+                        // Kept only for overlays to be tested against.
+                        store: if overlaid {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
                     }),
                     stencil_ops: None,
                 }),
@@ -1206,6 +1468,54 @@ impl FilmGpu {
             for r in &drawn {
                 pass.set_bind_group(1, &r.bind, &[]);
                 pass.draw(0..r.index_count, r.slot..r.slot + 1);
+            }
+        }
+
+        if let Some(target) = &overlay_target {
+            let vertices = self.overlay_vertices.holding(
+                &self.device,
+                &self.queue,
+                "film overlay vertices",
+                wgpu::BufferUsages::VERTEX,
+                bytemuck::cast_slice(&vertices),
+            );
+            let indices = self.overlay_indices.holding(
+                &self.device,
+                &self.queue,
+                "film overlay indices",
+                wgpu::BufferUsages::INDEX,
+                bytemuck::cast_slice(&indices),
+            );
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("film overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                // No operations: the ground's depth is read, never written.
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.targets.depth,
+                    depth_ops: None,
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &self.overlay_bg, &[]);
+            pass.set_vertex_buffer(0, vertices.slice(..));
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+            for (range, base, depth) in drawn_over {
+                pass.set_pipeline(match depth {
+                    OverlayDepth::Terrain => &self.pipelines.overlay_terrain,
+                    OverlayDepth::Always => &self.pipelines.overlay_always,
+                });
+                pass.draw_indexed(range, base, 0..1);
             }
         }
 
