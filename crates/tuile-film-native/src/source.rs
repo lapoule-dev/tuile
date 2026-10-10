@@ -238,7 +238,8 @@ pub struct PackFile {
     pub last: u32,
 }
 
-/// A film: the packs under one prefix, in the order of their frames.
+/// A film: packs — those under one prefix, or those named — in the order
+/// of their frames.
 pub struct Film {
     pub packs: Vec<PackFile>,
 }
@@ -253,8 +254,29 @@ impl Film {
         if listed.is_empty() {
             return Err(format!("no pack under {prefix}/").into());
         }
+        Self::of_entries(objects, listed).await
+    }
+
+    /// Reads the table of each pack named, and of no other: a part of a
+    /// film rendered on its own, whose packs lie beside the other parts'
+    /// under one prefix.
+    pub async fn of(objects: &dyn Objects, keys: &[&str]) -> Result<Self, Error> {
+        if keys.is_empty() {
+            return Err("a film of no pack".into());
+        }
+        let mut named = Vec::with_capacity(keys.len());
+        for key in keys {
+            named.push(Entry {
+                key: (*key).to_string(),
+                size: objects.size(key).await?,
+            });
+        }
+        Self::of_entries(objects, named).await
+    }
+
+    async fn of_entries(objects: &dyn Objects, entries: Vec<Entry>) -> Result<Self, Error> {
         let mut packs = Vec::new();
-        for entry in listed {
+        for entry in entries {
             // Magic, the table's length, then the table.
             let lead = objects.read(&entry.key, 0..16.min(entry.size)).await?;
             let table = lead

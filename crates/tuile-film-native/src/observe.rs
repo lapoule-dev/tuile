@@ -57,7 +57,8 @@ pub struct Timings {
     pub upload: f64,
     /// Drapes queued for composition, meshes entered.
     pub enter: f64,
-    /// The frame recorded and submitted.
+    /// The frame recorded and submitted — the host's overlays asked for
+    /// first, when it has any.
     pub draw: f64,
     /// Waiting for the GPU and reading the picture back.
     pub readback: f64,

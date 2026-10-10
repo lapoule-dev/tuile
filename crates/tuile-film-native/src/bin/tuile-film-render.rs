@@ -4,7 +4,7 @@
 //! Renders a film natively from its packs and the tile store.
 //!
 //! ```text
-//! tuile-film-render <packs prefix> [options]
+//! tuile-film-render <packs prefix | one pack's key> [options]
 //!
 //!   --out <film.mp4>      the film, in an mp4
 //!   --codec <name>        av1: rav1e, in software, anywhere.
@@ -77,13 +77,27 @@
 //!   --anchor <level>      the level --meter's own solve holds still (10)
 //!   --cache <dir>         chunks of packs and archives (default
 //!                         $TUILE_CACHE_DIR, else ./film-cache)
+//!   --ribbon <points>     an overlay to see the overlay layer by: a flat
+//!                         ribbon through these points, each
+//!                         `longitude,latitude,height` in degrees and
+//!                         metres over the ellipsoid, a space between two
+//!   --ribbon-width <m>    its width (default 30)
+//!   --ribbon-depth <terrain|always>
+//!                         hidden by nearer ground (the default), or never
 //! ```
+//!
+//! A first argument ending in `.tuilepack` is one pack, opened alone: a
+//! part of a film whose packs lie beside the other parts'.
 //!
 //! The packs are in the bucket `TUILE_STORE_BUCKET`, the tile store in
 //! `TUILE_TILES_BUCKET`, both signed for by the `TUILE_STORE_*` variables.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use glam::DVec3;
+use tuile_core::geo::{enu_frame, geodetic_to_ecef, Geodetic};
+use tuile_film::{BakedView, OverlayDepth, OverlayMesh, Overlays};
 
 use tuile_farm::{BucketConfig, ObjectRunStore, RunStore, Tuning};
 use tuile_film_native::{
@@ -107,6 +121,58 @@ fn bucket(name: &str) -> Result<Arc<dyn Objects>, Error> {
         &config,
         Tuning::from_env(),
     )?))
+}
+
+/// The same mesh in every frame: `--ribbon`.
+struct Ribbon(OverlayMesh);
+
+impl Ribbon {
+    /// A flat band `width` metres across through `points`, level at each.
+    fn through(points: &str, width: f64, depth: OverlayDepth) -> Result<Self, Error> {
+        let mut path = Vec::new();
+        for point in points.split_whitespace() {
+            let at: Vec<f64> = point.split(',').map(str::parse).collect::<Result<_, _>>()?;
+            let [lon, lat, height] = at[..] else {
+                return Err(format!("{point} is not longitude,latitude,height").into());
+            };
+            let at = Geodetic {
+                lon: lon.to_radians(),
+                lat: lat.to_radians(),
+                height,
+            };
+            path.push((geodetic_to_ecef(at), enu_frame(at).z_axis));
+        }
+        if path.len() < 2 {
+            return Err("a ribbon goes through two points at least".into());
+        }
+        let origin = path[0].0;
+        let mut mesh = OverlayMesh {
+            origin_ecef: origin.to_array(),
+            depth,
+            ..OverlayMesh::default()
+        };
+        for (i, (at, up)) in path.iter().enumerate() {
+            let along: DVec3 = path[(i + 1).min(path.len() - 1)].0 - path[i.saturating_sub(1)].0;
+            let across = along.cross(*up).normalize_or_zero() * (width / 2.0);
+            for edge in [*at - across, *at + across] {
+                mesh.positions.push((edge - origin).as_vec3().to_array());
+                // Display-linear, opaque: an orange no ground is.
+                mesh.colors.push([1.0, 0.22, 0.02, 1.0]);
+            }
+            if i > 0 {
+                let v = 2 * i as u32;
+                mesh.indices
+                    .extend_from_slice(&[v - 2, v - 1, v, v, v - 1, v + 1]);
+            }
+        }
+        Ok(Self(mesh))
+    }
+}
+
+impl Overlays for Ribbon {
+    fn frame(&mut self, _: u32, _: &BakedView, out: &mut Vec<OverlayMesh>) {
+        out.push(self.0.clone());
+    }
 }
 
 /// The pictures to several sinks at once.
@@ -256,13 +322,14 @@ async fn main() -> Result<(), Error> {
             // the film's other caches — memory over disk — for this render
             // and the next. Sized well above a film's blocks: what the store
             // gives up is downloaded again.
-            let blocks = tuile_storage_foyer::FoyerStore::keeping(tuile_storage_foyer::StoreConfig {
-                dir: PathBuf::from(&cache).join("store-blocks"),
-                memory_bytes: 256 << 20,
-                disk_bytes: 32 << 30,
-                default_ttl: None,
-            })
-            .await?;
+            let blocks =
+                tuile_storage_foyer::FoyerStore::keeping(tuile_storage_foyer::StoreConfig {
+                    dir: PathBuf::from(&cache).join("store-blocks"),
+                    memory_bytes: 256 << 20,
+                    disk_bytes: 32 << 30,
+                    default_ttl: None,
+                })
+                .await?;
             block_store = Some(blocks.clone());
             let kept = Arc::new(tuile_repository::Kept::new(get, Arc::new(blocks)));
             remote_blocks = Some(kept.clone());
@@ -271,7 +338,11 @@ async fn main() -> Result<(), Error> {
         None => bucket(&std::env::var("TUILE_TILES_BUCKET")?)?,
     };
     let sources = Sources::open(runs, tiles, &PathBuf::from(cache)).await?;
-    let film = Film::open(sources.packs.objects.as_ref(), prefix).await?;
+    let film = if prefix.ends_with(".tuilepack") {
+        Film::of(sources.packs.objects.as_ref(), &[prefix.as_str()]).await?
+    } else {
+        Film::open(sources.packs.objects.as_ref(), prefix).await?
+    };
     let (first, last) = film.frames();
     println!(
         "{prefix}: {} packs, frames {first}–{last}",
@@ -302,7 +373,27 @@ async fn main() -> Result<(), Error> {
         &mut nobody
     };
 
-    let done = render(&sources, &film, &order, &mut sink, observer).await?;
+    let mut ribbon = match value("--ribbon") {
+        Some(points) => Some(Ribbon::through(
+            &points,
+            value("--ribbon-width").map_or(Ok(30.0), |w| w.parse())?,
+            match value("--ribbon-depth").as_deref() {
+                Some("always") => OverlayDepth::Always,
+                Some("terrain") | None => OverlayDepth::Terrain,
+                Some(other) => {
+                    return Err(format!("a ribbon is tested terrain or always, not {other}").into())
+                }
+            },
+        )?),
+        None => None,
+    };
+    let mut none = ();
+    let overlays: &mut dyn Overlays = match &mut ribbon {
+        Some(ribbon) => ribbon,
+        None => &mut none,
+    };
+
+    let done = render(&sources, &film, &order, overlays, &mut sink, observer).await?;
     let megabytes = |b: u64| b as f64 / 1e6;
     println!(
         "{} frames at {}×{} in {:.1} s ({:.2} frames/s), {:.1} s of it before the first frame",
