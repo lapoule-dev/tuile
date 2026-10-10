@@ -54,9 +54,10 @@ pub trait Get: Send + Sync {
 
     /// A POST of `body` to a path under the API: how many small objects are
     /// asked about in one request (`store/live`, see
-    /// [`crate::Bench::post`]). The body is text and is sent as text
-    /// (`text/plain`), with no header a GET would not carry: from a browser,
-    /// that is what crosses origins without a preflight.
+    /// [`crate::Bench::post`]). The body is JSON and is sent as JSON
+    /// (`application/json`). From a browser, to another origin, that costs
+    /// one preflight for the route's address — one, kept by the browser for
+    /// as long as the server allows — and not one per request.
     ///
     /// A transport that cannot post answers as a server without the route
     /// does — `405` —, which is this default: its reader asks one by one.

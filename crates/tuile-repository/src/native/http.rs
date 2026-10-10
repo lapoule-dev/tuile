@@ -79,7 +79,7 @@ impl HttpGet {
                 Some(body) => self
                     .http
                     .post(&url)
-                    .header("content-type", "text/plain;charset=UTF-8")
+                    .header("content-type", "application/json")
                     .body(body.to_string()),
                 None => self.http.get(&url),
             };

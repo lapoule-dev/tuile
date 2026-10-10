@@ -90,7 +90,7 @@ impl RemoteGet {
                 Some(body) => {
                     // As a browser sends it, so one server answers both.
                     headers
-                        .set("content-type", "text/plain;charset=UTF-8")
+                        .set("content-type", "application/json")
                         .map_err(|e| e.to_string())?;
                     init.with_method(Method::Post).with_body(Some(body.into()))
                 }
@@ -510,9 +510,9 @@ pub async fn main(mut request: Request, env: Env, ctx: Context) -> Result<Respon
     let head = request.method() == Method::Head;
     // One route is a POST, and reads like the rest: many of the store's
     // small objects asked about at once, the keys and their validators in
-    // the body. Its content type is not looked at, and no header is asked
-    // of it: a browser sends it across origins as `text/plain`, with no
-    // preflight. Its reply is its asker's alone, and is not kept here.
+    // the body, as JSON. The page this Worker serves is of its own origin,
+    // so no preflight is answered here. Its reply is its asker's alone, and
+    // is not kept here.
     if request.method() == Method::Post && url.path() == "/api/store/live" {
         let bench = match bench(&env, false, true).await {
             Ok(b) => b,

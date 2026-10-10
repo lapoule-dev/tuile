@@ -546,16 +546,16 @@ impl Bench {
     /// that object's answer; only a body that cannot be read, or asks for
     /// too many, fails the request (`400`).
     ///
-    /// **It crosses origins without a preflight**, like every GET here. A
-    /// browser sends a POST to another origin without asking first only if
-    /// its content type is one of three a form could send and it carries no
-    /// header of the page's own. So the body is JSON *sent as `text/plain`*
-    /// — what `fetch` labels a string with, unasked — the content type is
-    /// not looked at here, and whoever serves this route must not require
-    /// one, nor a header: a credential travels in the query string, as it
-    /// does for the GETs. `application/json` would cost every reader in a
-    /// browser an `OPTIONS` round trip per request, which is what this
-    /// route is there to spare.
+    /// **The body is JSON and says so** (`application/json`). A browser
+    /// that sends it to another origin asks first — an `OPTIONS` for this
+    /// one address — and keeps the answer for as long as the server lets it
+    /// (`Access-Control-Max-Age`), so a film pays one preflight, not one per
+    /// request: whoever serves this route across origins answers that
+    /// `OPTIONS`, allowing the `content-type` header, with a long max-age.
+    /// The credential still travels in the query string, as it does for the
+    /// GETs, so the address — and with it the kept preflight — is the same
+    /// for every request. The content type is not required here: a body
+    /// that reads as the JSON above is answered whatever it was labelled.
     ///
     /// Any other path is answered `405`: the rest of the API is read with
     /// GETs. A reader takes that, or a `404`, from an older server as "not

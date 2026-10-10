@@ -116,8 +116,8 @@ const POSTED_LIMIT: usize = 1 << 20;
 
 /// The one route that takes a body (`POST /api/store/live`, many of the
 /// store's small objects asked about at once), handed to the bench as it
-/// came. The content type is not looked at: a browser sends this across
-/// origins as `text/plain`, which is what spares it a preflight.
+/// came: JSON, sent as `application/json`. A page of another origin asks
+/// first, once; the CORS layer answers that and lets the browser keep it.
 async fn posted(bench: Arc<Bench>, request: Request) -> Response {
     let (path, query) = (
         request.uri().path().to_string(),
@@ -369,15 +369,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .service(ServeDir::new(www)),
         );
     }
-    let cors = CorsLayer::permissive().expose_headers([
-        header::CONTENT_RANGE,
-        header::ACCEPT_RANGES,
-        header::CONTENT_LENGTH,
-        // A page served from elsewhere reads these two: a block's reader
-        // needs its object's size, and a cache its validator.
-        header::ETAG,
-        header::HeaderName::from_static("x-object-size"),
-    ]);
+    // A preflight is kept for as long as browsers agree to (two hours): the
+    // one route that is a POST of JSON then costs a page of another origin
+    // one `OPTIONS` per film, not one per request.
+    let cors = CorsLayer::permissive()
+        .max_age(std::time::Duration::from_secs(7200))
+        .expose_headers([
+            header::CONTENT_RANGE,
+            header::ACCEPT_RANGES,
+            header::CONTENT_LENGTH,
+            // A page served from elsewhere reads these two: a block's reader
+            // needs its object's size, and a cache its validator.
+            header::ETAG,
+            header::HeaderName::from_static("x-object-size"),
+        ]);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on http://{addr}");
     axum::serve(listener, app.layer(cors)).await?;

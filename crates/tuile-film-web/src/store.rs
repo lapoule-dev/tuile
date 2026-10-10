@@ -176,11 +176,10 @@ impl FetchGet {
 
 /// One `fetch`: a GET, or — given a body — a POST of it.
 ///
-/// The body is a string, and nothing says what it is: `fetch` labels a
-/// string `text/plain;charset=UTF-8` by itself, which is one of the content
-/// types a browser sends to another origin without asking first. With the
-/// credential in the address, a POST then costs one request, as a GET does;
-/// naming the content type `application/json` would cost a preflight each.
+/// A body is JSON and is sent as `application/json`. To another origin a
+/// browser asks first, once for the address, and keeps the answer for as
+/// long as the server allows; with the credential in the address every
+/// request shares that one preflight.
 async fn once(
     url: &str,
     header: Option<&(String, String)>,
@@ -190,12 +189,16 @@ async fn once(
         call(&js_sys::global(), "fetch", &[url.into()])
     } else {
         let init = js_sys::Object::new();
+        let headers = js_sys::Object::new();
         if let Some((name, value)) = header {
-            let headers = js_sys::Object::new();
             js_sys::Reflect::set(&headers, &name.as_str().into(), &value.as_str().into())
                 .map_err(text)?;
-            js_sys::Reflect::set(&init, &"headers".into(), &headers).map_err(text)?;
         }
+        if body.is_some() {
+            js_sys::Reflect::set(&headers, &"content-type".into(), &"application/json".into())
+                .map_err(text)?;
+        }
+        js_sys::Reflect::set(&init, &"headers".into(), &headers).map_err(text)?;
         if let Some(body) = body {
             js_sys::Reflect::set(&init, &"method".into(), &"POST".into()).map_err(text)?;
             js_sys::Reflect::set(&init, &"body".into(), &body.into()).map_err(text)?;
@@ -236,7 +239,7 @@ impl Get for FetchGet {
     }
 
     /// Many small objects asked about in one request: see [`once`] for what
-    /// keeps it from being preflighted.
+    /// it costs across origins.
     async fn post(&self, path: &str, body: String) -> Result<Got, String> {
         let (url, _) = self.addresses(path);
         let header = self.header();
