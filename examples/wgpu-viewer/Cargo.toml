@@ -41,3 +41,16 @@ tuile-ui = { version = "0.4.0", path = "../../crates/tuile-ui", features = ["sta
 tuile-wgpu = { version = "0.4.0", path = "../../crates/tuile-wgpu" }
 wgpu = { workspace = true }
 winit = { workspace = true }
+
+# The operating system's location service, for `--here` and the `L` key.
+# macOS only, and only this example: no library crate knows where the machine
+# is. Without the feature, or on another platform, the flag and the key answer
+# "not available" and the viewer runs as it always did.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", optional = true }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSArray", "NSError", "NSString"] }
+objc2-core-location = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
+
+[features]
+default = ["current-location"]
+current-location = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-core-location"]

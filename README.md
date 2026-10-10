@@ -301,6 +301,21 @@ CESIUM_ION_TOKEN=... cargo run -p tuile-wgpu-viewer
 Drag to orbit, right-drag to pan, wheel to zoom. `TUILE_RECORD=path.jsonl`
 writes the camera path; `TUILE_REPLAY=path.jsonl` flies it again exactly.
 
+It opens straight down on France from 2 000 km. To open somewhere else, say
+where the eye is and where it looks — degrees and metres, `--help` for the
+bounds and the keys:
+
+```bash
+CESIUM_ION_TOKEN=... cargo run -p tuile-wgpu-viewer -- \
+    --lon 6.86 --lat 45.83 --altitude 6000 --heading 120 --pitch 25
+```
+
+`N`, or a click on the compass ring, turns the view north-up about the point at
+its centre. `--here` at start, or `L` in the window, centres on the current
+location: the operating system's location service is asked (macOS; it asks you
+first), the view moves when it answers and stays put if it does not, and the
+coordinates are never logged or written anywhere.
+
 Render a baked film to an mp4:
 
 ```bash

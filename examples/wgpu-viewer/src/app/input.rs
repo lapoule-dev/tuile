@@ -82,6 +82,16 @@ impl App {
                         self.views.freeze = !self.views.freeze;
                         tracing::info!("traversal freeze: {}", self.views.freeze);
                     }
+                    Key::Character(ref c) if c.eq_ignore_ascii_case("n") => {
+                        let vp = self.viewport();
+                        crate::steer::north_up(&mut self.controller, vp);
+                    }
+                    Key::Character(ref c) if c.eq_ignore_ascii_case("l") => {
+                        self.locator.request(
+                            std::time::Instant::now(),
+                            crate::location::Placement::OVERHEAD,
+                        );
+                    }
                     Key::Named(NamedKey::Escape) => event_loop.exit(),
                     _ => {}
                 }
@@ -98,7 +108,12 @@ impl App {
                     }
                     MouseButton::Left => {
                         self.pointer.dragging = false;
-                        self.nav.release();
+                        // A ring let go where it was pressed was clicked, not
+                        // turned — and a click on a compass means north up.
+                        if self.nav.release() == Some(tuile_ui::Part::Ring) {
+                            let vp = self.viewport();
+                            crate::steer::north_up(&mut self.controller, vp);
+                        }
                     }
                     MouseButton::Right => self.pointer.tilting = pressed,
                     _ => {}
