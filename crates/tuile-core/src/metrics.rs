@@ -413,6 +413,14 @@ pub struct Metrics {
     pub present_seconds: Timer,
     pub uploads: Counter,
     pub upload_seconds: Timer,
+    /// Stitching (`crate::stitch`), on a consumer that plans when what it
+    /// draws changes: plans worked out and the time they took, tiles given
+    /// new strips, and tiles left unstitched because their plan had more
+    /// knots than the consumer holds.
+    pub stitch_plans: Counter,
+    pub stitch_seconds: Timer,
+    pub restitched: Counter,
+    pub stitch_overflows: Counter,
     /// Decoded tiles waiting for a slot in the frame's upload budget. A queue
     /// that keeps growing is content arriving later than it was asked for, and
     /// it looks from the outside exactly like a slow network.

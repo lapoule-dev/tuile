@@ -174,5 +174,21 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
             radiance = radiance * left + frame.horizon.xyz * (1.0 - left);
         }
     }
-    textureStore(hdr, xy, vec4f(radiance, 1.0));
+    // The probe of holes: a pixel whose ground is not a place, or is
+    // further than the horizon of a sphere well under any ground (6 350 km)
+    // by half again, is a ray that went through a gap — the far side of
+    // the planet seen through it. It is marked, in the alpha nothing else
+    // reads, for `present` to paint.
+    var mark = 1.0;
+    if (frame.local_up.w != 0.0) {
+        let inside = clamp(b, vec2f(0.0), vec2f(1.0));
+        let held = inside / max(inside.x + inside.y, 1.0);
+        let p = a + held.x * e1 + held.y * e2;
+        let number = all((bitcast<vec3u>(p) & vec3u(0x7f800000u)) != vec3u(0x7f800000u));
+        // The eye is `r` from the Earth's centre.
+        let r = 0.5 / frame.haze.z;
+        let far = dot(p, p) > 1.5 * (r - 6.35e6) * (r + 6.35e6);
+        if (!number || far) { mark = 2.0; }
+    }
+    textureStore(hdr, xy, vec4f(radiance, mark));
 }

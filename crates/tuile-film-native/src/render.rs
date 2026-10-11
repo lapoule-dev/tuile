@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use tuile_film::from_store::{compose, imagery_texture, is_baked, terrain_mesh};
+use tuile_film::stitching::{decoded, encoded, Stitching};
 use tuile_film::{
     refs_of, texture_of_span, Content, Cursor, FrameCamera, Look, Mesh, Overlays, Pack, TileKey,
 };
@@ -61,6 +62,14 @@ pub struct Order {
     pub tone_strength: f32,
     /// How the film is lit, exposed, and its imagery read.
     pub look: Look,
+    /// Whether the tiles of each frame are stitched to one another
+    /// (`tuile_core::stitch`): on, unless something is being compared.
+    pub stitch: bool,
+    /// Whether tiles keep their skirts. Off is a probe: it shows what
+    /// stitching closes by itself.
+    pub skirts: bool,
+    /// A probe: paint magenta what shows through a gap in the ground.
+    pub holes: bool,
 }
 
 impl Default for Order {
@@ -74,6 +83,9 @@ impl Default for Order {
             tone: Tone::OfTheFilm,
             tone_strength: 1.0,
             look: Look::default(),
+            stitch: true,
+            skirts: true,
+            holes: false,
         }
     }
 }
@@ -99,6 +111,22 @@ pub struct Done {
     pub setup_seconds: f64,
     /// The film's grade as applied, if one was.
     pub grade: Option<FilmGrade>,
+    /// Tiles stitched anew over the frames rendered, those of them whose
+    /// mesh was uploaded again, the most knots a tile held, and the bytes of
+    /// strips uploaded.
+    pub restitched: u64,
+    pub resplit: u64,
+    pub most_knots: usize,
+    pub strip_bytes: u64,
+    /// Frames whose selection was planned — those that draw other tiles
+    /// than the frame before — and the milliseconds spent planning them
+    /// (the engine's rule, and the meshes that gain vertices cut again),
+    /// apart from handing the result to the GPU.
+    pub planned: u64,
+    pub plan_ms: f64,
+    /// With the probe of holes: the pixels a hole touches, over the frames
+    /// rendered.
+    pub hole_pixels: u64,
     /// With shadows: the finest and the coarsest a texel of the sun's map
     /// was on the ground over the frames rendered, in metres.
     pub shadow_texel: Option<(f32, f32)>,
@@ -221,6 +249,8 @@ pub async fn render(
             look,
         },
     );
+    gpu.probe_holes(order.holes);
+    let mut stitching = order.stitch.then(Stitching::default);
     let padded = (width * 4).div_ceil(256) * 256;
     let picture = gpu.device().create_buffer(&wgpu::BufferDescriptor {
         label: Some("film picture readback"),
@@ -616,6 +646,16 @@ pub async fn render(
                         (mesh, texture, Origin::Pack, Vec::new())
                     }
                 };
+                let mesh = if order.skirts {
+                    mesh
+                } else {
+                    let origin = glam::DVec3::from_array(mesh.origin_ecef);
+                    encoded(
+                        &tuile_core::stitch::without_skirts(&decoded(&mesh), origin),
+                        mesh.origin_ecef,
+                        mesh.base_color_factor,
+                    )
+                };
                 let t = Instant::now();
                 observer.tile(&TileIn {
                     frame: diff.frame,
@@ -640,11 +680,48 @@ pub async fn render(
                     },
                     texture,
                 )?;
+                if let Some(stitching) = stitching.as_mut() {
+                    stitching.enter(key, terrain_of.map(|t| u32::from(t.0)), &mesh);
+                }
                 timings.enter += ms(t);
                 resident.insert(key, imagery_of.iter().map(|at| at.0).collect());
                 entered += 1;
             }
 
+            // The frame's tiles are put on one line where they meet, before
+            // anything of it is drawn.
+            let t = Instant::now();
+            if let Some(stitching) = stitching.as_mut() {
+                done.planned += u64::from(!stitching.is_planned(&diff.selection));
+                let planning = Instant::now();
+                let changed = stitching.frame(&diff.selection);
+                done.plan_ms += ms(planning);
+                for again in changed {
+                    done.restitched += 1;
+                    done.resplit += u64::from(again.mesh.is_some());
+                    done.most_knots = done.most_knots.max(again.strips.len().saturating_sub(10));
+                    done.strip_bytes += 16 * again.strips.len() as u64;
+                    gpu.stitch(
+                        &again.key,
+                        again
+                            .mesh
+                            .as_ref()
+                            .map(|mesh| TileMesh {
+                                origin_ecef: mesh.origin_ecef,
+                                positions: &mesh.positions,
+                                normals: &mesh.normals,
+                                uvs: &mesh.uvs,
+                                indices: &mesh.indices,
+                                index_count: mesh.index_count,
+                                base_color_factor: mesh.base_color_factor,
+                            })
+                            .as_ref(),
+                        &again.strips,
+                        again.reach,
+                    )?;
+                }
+            }
+            timings.stitch += ms(t);
             let t = Instant::now();
             let camera = FrameCamera::of(&diff.view, width as f32 / height as f32);
             shapes.clear();
@@ -683,6 +760,17 @@ pub async fn render(
                 None => Vec::new(),
             };
             timings.readback += ms(t);
+            if order.holes {
+                // The probe's magenta, or a part of it under the
+                // supersampling filter.
+                done.hole_pixels += rgba
+                    .chunks_exact(4)
+                    .filter(|p| {
+                        let (r, g, b) = (i32::from(p[0]), i32::from(p[1]), i32::from(p[2]));
+                        r > g + 60 && b > g + 60
+                    })
+                    .count() as u64;
+            }
             let t = Instant::now();
 
             // Let go only once the frame that no longer draws them is drawn.
@@ -694,6 +782,9 @@ pub async fn render(
                 .collect();
             for key in gone {
                 gpu.leave(&key);
+                if let Some(stitching) = stitching.as_mut() {
+                    stitching.leave(&key);
+                }
                 resident.remove(&key);
             }
 

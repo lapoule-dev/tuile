@@ -15,6 +15,12 @@
 //! `f32` about it — so a mismatch made late, by the narrowing or by two
 //! tiles narrowed about two origins, is in the number.
 //!
+//! **And as the renderer displaces them.** A render that stitches moves
+//! edges in its shaders; this plans the same frame through the same
+//! `tuile_core::stitch::plan` and measures the meshes `stitch::displaced`
+//! gives — the shaders' arithmetic on the CPU, held to the GPU's by a test
+//! of `tuile-film-gpu`.
+//!
 //! In `<dir>`:
 //!
 //! - `seams.csv`: a row a frame — shared edges, how many are over the
@@ -35,6 +41,7 @@ use glam::{DVec3, Mat4, Vec4};
 use tuile_core::content::{DecodedMesh, DecodedTileContent, MaterialDesc};
 use tuile_core::seam::{residuals, Drawn, Eye, Residuals, Tolerance};
 use tuile_core::source::TileId;
+use tuile_core::stitch;
 use tuile_film::TileKey;
 
 use crate::observe::{FrameOut, Observer, TileIn};
@@ -45,12 +52,15 @@ struct Held {
     /// The level of the terrain tile the surface is from.
     source: u32,
     content: DecodedTileContent,
+    edges: stitch::Edges,
 }
 
 /// Logs seams. See the module.
 pub struct SeamLog {
     dir: PathBuf,
     tolerance: Tolerance,
+    /// Whether the render stitches: the meshes are then measured displaced.
+    stitched: bool,
     held: HashMap<TileKey, Held>,
     frames: Option<std::fs::File>,
     pairs: Option<std::fs::File>,
@@ -79,6 +89,7 @@ impl SeamLog {
         Self {
             dir: dir.into(),
             tolerance,
+            stitched: false,
             held: HashMap::new(),
             frames: None,
             pairs: None,
@@ -93,6 +104,12 @@ impl SeamLog {
             spent: std::time::Duration::ZERO,
             failed: None,
         }
+    }
+
+    /// Measures the tiles as a render that stitches draws them.
+    pub fn stitched(mut self, stitched: bool) -> Self {
+        self.stitched = stitched;
+        self
     }
 
     /// Shared edges over the tolerance, over every frame seen.
@@ -271,7 +288,13 @@ fn content_of(tile: &TileIn<'_>) -> DecodedTileContent {
                     .map(|b| [f(&b[0..4]), f(&b[4..8])])
                     .collect()
             }),
-            indices: Vec::new(),
+            indices: tile
+                .mesh
+                .indices
+                .chunks_exact(4)
+                .take(tile.mesh.index_count as usize)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
             material: MaterialDesc::default(),
         }],
         textures: Vec::new(),
@@ -284,12 +307,14 @@ fn content_of(tile: &TileIn<'_>) -> DecodedTileContent {
 impl Observer for SeamLog {
     fn tile(&mut self, tile: &TileIn<'_>) {
         let at = TileId(tile.key.id).terrain_coord();
+        let content = content_of(tile);
         self.held.insert(
             tile.key,
             Held {
                 at,
                 source: tile.terrain.map_or(at.0, |t| u32::from(t.0)),
-                content: content_of(tile),
+                edges: stitch::Edges::of(&content),
+                content,
             },
         );
     }
@@ -299,15 +324,37 @@ impl Observer for SeamLog {
         // What the frame no longer draws is let go, as the renderer lets go.
         let drawn: std::collections::HashSet<TileKey> = frame.selection.iter().copied().collect();
         self.held.retain(|key, _| drawn.contains(key));
-        let tiles: Vec<Drawn<'_>> = frame
+        let held: Vec<&Held> = frame
             .selection
             .iter()
             .filter_map(|key| self.held.get(key))
-            .map(|held| Drawn {
+            .collect();
+        let displaced: Vec<DecodedTileContent> = if self.stitched {
+            let tiles: Vec<stitch::Tile<'_>> = held
+                .iter()
+                .map(|held| stitch::Tile {
+                    level: held.at.0,
+                    x: held.at.1,
+                    y: held.at.2,
+                    source: held.source,
+                    edges: &held.edges,
+                })
+                .collect();
+            held.iter()
+                .zip(stitch::plan(&tiles, (2, 1), stitch::BAND))
+                .map(|(held, plan)| stitch::displaced(&held.content, &plan, stitch::BAND, 1.0))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let tiles: Vec<Drawn<'_>> = held
+            .iter()
+            .enumerate()
+            .map(|(n, held)| Drawn {
                 level: held.at.0,
                 x: held.at.1,
                 y: held.at.2,
-                content: &held.content,
+                content: displaced.get(n).unwrap_or(&held.content),
             })
             .collect();
         let eye = Eye {

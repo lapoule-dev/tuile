@@ -62,6 +62,9 @@ pub struct Timings {
     pub upload: f64,
     /// Drapes queued for composition, meshes entered.
     pub enter: f64,
+    /// The frame's tiles stitched: the plan, and what it has the GPU hold
+    /// anew.
+    pub stitch: f64,
     /// The frame recorded and submitted — the host's overlays asked for
     /// first, when it has any.
     pub draw: f64,
@@ -78,7 +81,7 @@ pub struct Timings {
 
 impl Timings {
     /// Every step, named, in the order a frame goes through them.
-    pub fn steps(&self) -> [(&'static str, f64); 12] {
+    pub fn steps(&self) -> [(&'static str, f64); 13] {
         [
             ("read terrain", self.read_terrain),
             ("read imagery", self.read_imagery),
@@ -87,6 +90,7 @@ impl Timings {
             ("decode imagery", self.decode),
             ("upload textures", self.upload),
             ("enter tiles", self.enter),
+            ("stitch tiles", self.stitch),
             ("record frame", self.draw),
             ("GPU + readback", self.readback),
             ("leave tiles", self.leave),
@@ -107,6 +111,7 @@ impl Timings {
         self.decode += other.decode;
         self.upload += other.upload;
         self.enter += other.enter;
+        self.stitch += other.stitch;
         self.draw += other.draw;
         self.readback += other.readback;
         self.leave += other.leave;

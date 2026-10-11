@@ -576,6 +576,15 @@ pub fn ground_wgsl(slots: u32) -> String {
         tuile_core::raster::WGSL,
         tuile_atmosphere::WGSL,
         include_str!("shader.wgsl")
+            .replace(
+                "/*STITCH_ROWS_TWICE*/",
+                &(2 * crate::prepare::STITCH_ROWS).to_string()
+            )
+            .replace("/*STITCH_ROWS*/", &crate::prepare::STITCH_ROWS.to_string())
+            .replace(
+                "/*STITCH_BAND*/",
+                &format!("{:?}", tuile_core::stitch::BAND)
+            )
             .replace("//#IMAGERY_BINDINGS", &bindings)
             .replace("//#IMAGERY_SAMPLES", samples.trim_start()),
     )
