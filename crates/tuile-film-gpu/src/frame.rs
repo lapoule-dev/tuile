@@ -145,6 +145,7 @@ impl FrameUniform {
             haze: air.map_or([0.0; 4], |(_, at)| {
                 [at.density, at.per_height, at.curve, 1.0]
             }),
+            // `w` is the probe of holes, set by the renderer when asked.
             local_up: air.map_or([0.0; 4], |(_, at)| at.up.extend(0.0).to_array()),
             horizon: air.map_or([0.0; 4], |(haze, _)| haze.horizon.extend(0.0).to_array()),
             zenith: air.map_or([0.0; 4], |(haze, _)| haze.zenith.extend(0.0).to_array()),

@@ -31,7 +31,8 @@ struct Frame {
     // height; z: one over twice the eye's distance from the Earth's centre;
     // w: whether there is air at all.
     haze: vec4f,
-    // xyz: up at the eye.
+    // xyz: up at the eye. w: a probe — paint what no eye could see as
+    // ground, the far side of the planet through a gap.
     local_up: vec4f,
     // xyz: what the air sends to the eye, and the sky at the horizon.
     horizon: vec4f,

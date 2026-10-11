@@ -25,6 +25,14 @@
 //!   --seams-tolerance <px>  what a residual is held against (0.25)
 //!   --seams-strict        fail if, in the picture, any stretch is over it
 //!                         or any edge has nothing drawn across it
+//!                         (the tiles are measured as the render draws
+//!                         them: stitched, unless --no-stitch)
+//!   --no-stitch           draw each tile's edges as its own data states
+//!                         them, not put on one line with its neighbours'
+//!   --no-skirts           a probe: tiles without their skirts, to see what
+//!                         stitching closes by itself
+//!   --holes               a probe: paint magenta what shows through a gap
+//!                         in the ground, and count the pixels it touches
 //!   --meter <dir>         measure light going in and coming out; write
 //!                         tiles.csv, frames.csv, tone.json, report.md,
 //!                         and each place's table of grades under the key
@@ -339,6 +347,9 @@ async fn main() -> Result<(), Error> {
     if let Some(n) = value("--supersample") {
         order.supersample = n.parse()?;
     }
+    order.stitch = !flag("--no-stitch");
+    order.skirts = !flag("--no-skirts");
+    order.holes = flag("--holes");
     if let Some(n) = value("--fps") {
         order.fps = n.parse()?;
     }
@@ -486,7 +497,7 @@ async fn main() -> Result<(), Error> {
                 Some(px) => tuile_core::seam::Tolerance::Pixels(px.parse()?),
                 None => tuile_core::seam::Tolerance::QUARTER_PIXEL,
             };
-            Some(tuile_film_native::SeamLog::into(dir, tolerance))
+            Some(tuile_film_native::SeamLog::into(dir, tolerance).stitched(order.stitch))
         }
         None => None,
     };
@@ -535,6 +546,24 @@ async fn main() -> Result<(), Error> {
             )
             .into());
         }
+    }
+    if order.stitch {
+        println!(
+            "stitching: {} frames planned ({:.1} ms each, the rule and the meshes cut again), \
+             {} tiles stitched anew, {} of them given vertices; at most {} knots a tile, {} \
+             bytes of strips uploaded",
+            done.planned,
+            done.plan_ms / done.planned.max(1) as f64,
+            done.restitched,
+            done.resplit,
+            done.most_knots,
+            done.strip_bytes
+        );
+    } else {
+        println!("stitching: off (--no-stitch)");
+    }
+    if order.holes {
+        println!("holes: {} pixels touched", done.hole_pixels);
     }
     let megabytes = |b: u64| b as f64 / 1e6;
     println!(

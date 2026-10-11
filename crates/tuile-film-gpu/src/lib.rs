@@ -152,9 +152,17 @@ struct Resident {
     /// fitted to.
     centre: Vec3,
     radius: f32,
+    /// How far stitching moves its vertices at most, in metres.
+    reach: f32,
     bind: wgpu::BindGroup,
-    // Held for as long as the bind group that names them.
-    _buffers: [wgpu::Buffer; 4],
+    // Held for as long as the bind group that names them — and to make it
+    // again when the tile is stitched anew. The first is the positions the
+    // stages read; `as_meshed` is the positions the mesh came with, which
+    // stitching moves each time from where they were.
+    buffers: [wgpu::Buffer; 4],
+    as_meshed: wgpu::Buffer,
+    vertices: u32,
+    view: Option<wgpu::TextureView>,
     _texture: Option<wgpu::Texture>,
 }
 
@@ -182,6 +190,8 @@ struct Pipelines {
     raster: wgpu::RenderPipeline,
     /// The same tiles, depth alone, as the sun sees them.
     shadow: wgpu::RenderPipeline,
+    /// A tile's vertices, moved by its strips: see `stitch.wgsl`.
+    displace: wgpu::ComputePipeline,
     /// Overlays hidden by nearer ground, and overlays never hidden.
     overlay_terrain: wgpu::RenderPipeline,
     overlay_always: wgpu::RenderPipeline,
@@ -220,6 +230,11 @@ pub struct FilmGpu {
     sampler: wgpu::Sampler,
     white: wgpu::TextureView,
     empty: wgpu::Buffer,
+    /// Tiles whose vertices are to be put where stitching has them, before
+    /// the next frame is drawn.
+    pending_stitches: Vec<(wgpu::BindGroup, u32)>,
+    /// Paint what shows through a gap: see [`Self::probe_holes`].
+    probe_holes: bool,
     tiles: Vec<TileFrame>,
     resident: HashMap<TileKey, Resident>,
     free: Vec<u32>,
@@ -389,6 +404,13 @@ impl LayerField {
         }
         out
     }
+}
+
+/// The pass that puts a tile's vertices where stitching has them, its band
+/// the engine's.
+fn stitch_wgsl() -> String {
+    include_str!("shaders/stitch.wgsl")
+        .replace("/*BAND*/", &format!("{:?}", tuile_core::stitch::BAND))
 }
 
 fn shader(device: &wgpu::Device, name: &str, body: &str) -> wgpu::ShaderModule {
@@ -675,6 +697,15 @@ impl FilmGpu {
         let overlay_terrain = overlay("film overlay", wgpu::CompareFunction::Greater);
         let overlay_always = overlay("film overlay, never hidden", wgpu::CompareFunction::Always);
 
+        let displace = compute(
+            &device,
+            &device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("film stitch"),
+                source: wgpu::ShaderSource::Wgsl(stitch_wgsl().into()),
+            }),
+            "displace",
+            None,
+        );
         let bin = shader(&device, "film bin", include_str!("shaders/bin.wgsl"));
         let resolve_module = shader(
             &device,
@@ -707,6 +738,7 @@ impl FilmGpu {
         let pipelines = Pipelines {
             raster,
             shadow,
+            displace,
             overlay_terrain,
             overlay_always,
             count: compute(&device, &bin, "count", None),
@@ -839,7 +871,6 @@ impl FilmGpu {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
-
         // The sun's map, for a look that has shadows; a texel that shades
         // nothing otherwise, since a binding may not be empty.
         let shadow_side = if settings.look.shadow > 0.0 {
@@ -913,6 +944,8 @@ impl FilmGpu {
             sampler,
             white,
             empty,
+            pending_stitches: Vec::new(),
+            probe_holes: false,
             tiles: vec![TileFrame::default(); MAX_SLOTS as usize],
             resident: HashMap::new(),
             free: (0..MAX_SLOTS).rev().collect(),
@@ -1234,6 +1267,17 @@ impl FilmGpu {
     /// itself; it is public for a caller that wants the textures made without
     /// drawing a frame.
     pub fn record_pending(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if !self.pending_stitches.is_empty() {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("film stitch"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipelines.displace);
+            for (bind, vertices) in self.pending_stitches.drain(..) {
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups(vertices.div_ceil(64), 1, 1);
+            }
+        }
         self.record_drapes(encoder);
         Self::record_mips(
             &self.device,
@@ -1359,18 +1403,9 @@ impl FilmGpu {
         );
     }
 
-    /// Makes a tile resident. Its buffers are created now; it is drawn by any
-    /// later `render` whose selection names it.
-    pub fn enter(
-        &mut self,
-        key: TileKey,
-        mesh: &TileMesh<'_>,
-        albedo: Option<wgpu::Texture>,
-    ) -> Result<(), FilmGpuError> {
-        if self.resident.contains_key(&key) {
-            return Err(FilmGpuError::AlreadyResident(key));
-        }
-        let slot = self.free.pop().ok_or(FilmGpuError::OutOfSlots)?;
+    /// A mesh's four buffers, its flags, and a sphere around it from its
+    /// origin.
+    fn buffers_of(&self, mesh: &TileMesh<'_>) -> ([wgpu::Buffer; 4], u32, Vec3, f32) {
         let buffer = |label, bytes: &[u8]| {
             if bytes.is_empty() {
                 None
@@ -1409,9 +1444,6 @@ impl FilmGpu {
         if uvs.is_some() {
             flags |= 2;
         }
-        if albedo.is_some() {
-            flags |= 4;
-        }
         let empty = || self.empty.clone();
         let buffers = [
             positions.unwrap_or_else(empty),
@@ -1419,6 +1451,150 @@ impl FilmGpu {
             uvs.unwrap_or_else(empty),
             indices.unwrap_or_else(empty),
         ];
+        (buffers, flags, centre, radius)
+    }
+
+    fn bind_of(
+        &self,
+        buffers: &[wgpu::Buffer; 4],
+        view: Option<&wgpu::TextureView>,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("film tile"),
+            layout: &self.tile_bgl,
+            entries: &[
+                entry(0, buffers[0].as_entire_binding()),
+                entry(1, buffers[1].as_entire_binding()),
+                entry(2, buffers[2].as_entire_binding()),
+                entry(3, buffers[3].as_entire_binding()),
+                entry(
+                    4,
+                    wgpu::BindingResource::TextureView(view.unwrap_or(&self.white)),
+                ),
+            ],
+        })
+    }
+
+    /// Stitches a resident tile to its neighbours, as
+    /// `tuile_core::stitch::plan` decided for the frames to come: `strips`
+    /// are its `Stitch::packed`; `mesh` is the tile's mesh again when the
+    /// plan gave it vertices (`stitch::split`), `None` when its triangles
+    /// are the ones it has. `reach` is how far a vertex moves at most.
+    ///
+    /// The tile's vertices are moved by a compute pass recorded with the
+    /// next frame, once, into the positions every stage reads from then on.
+    /// The tile's drape is kept.
+    pub fn stitch(
+        &mut self,
+        key: &TileKey,
+        mesh: Option<&TileMesh<'_>>,
+        strips: &[[f32; 4]],
+        reach: f32,
+    ) -> Result<(), FilmGpuError> {
+        let made = mesh.map(|mesh| {
+            (
+                self.buffers_of(mesh),
+                mesh.index_count,
+                mesh.indices.is_empty(),
+                (mesh.positions.len() / 12) as u32,
+            )
+        });
+        let Some(r) = self.resident.get(key) else {
+            return Err(FilmGpuError::NotResident(*key));
+        };
+        let (mut buffers, as_meshed, vertices) = match &made {
+            Some(((buffers, ..), _, _, vertices)) => {
+                (buffers.clone(), buffers[0].clone(), *vertices)
+            }
+            None => (r.buffers.clone(), r.as_meshed.clone(), r.vertices),
+        };
+        let flags = made
+            .as_ref()
+            .map_or(r.flags, |((_, flags, ..), ..)| flags | (r.flags & 4));
+        // Knots on a side, or a side that laps: the rows before the knots.
+        let any = strips.iter().take(10).any(|row| *row != [0.0; 4]);
+        // Moved from where the mesh has them, never from where the last
+        // stitching left them.
+        buffers[0] = as_meshed.clone();
+        if any && flags & 2 != 0 && vertices > 0 {
+            let held = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("film stitch strips"),
+                    contents: bytemuck::cast_slice(strips),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+            let moved = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("film stitched positions"),
+                size: as_meshed.size(),
+                // Read back by whoever checks the pass against the engine.
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            self.pending_stitches.push((
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("film stitch"),
+                    layout: &self.pipelines.displace.get_bind_group_layout(0),
+                    entries: &[
+                        entry(0, as_meshed.as_entire_binding()),
+                        entry(1, buffers[2].as_entire_binding()),
+                        entry(2, held.as_entire_binding()),
+                        entry(3, moved.as_entire_binding()),
+                    ],
+                }),
+                vertices,
+            ));
+            buffers[0] = moved;
+        }
+        let bind = self.bind_of(&buffers, r.view.as_ref());
+        let Some(r) = self.resident.get_mut(key) else {
+            return Err(FilmGpuError::NotResident(*key));
+        };
+        if let Some(((_, _, centre, radius), index_count, no_indices, _)) = made {
+            (r.centre, r.radius) = (centre, radius);
+            r.index_count = if no_indices { 0 } else { index_count };
+        }
+        r.flags = flags;
+        r.reach = reach;
+        r.vertices = vertices;
+        r.as_meshed = as_meshed;
+        r.buffers = buffers;
+        r.bind = bind;
+        Ok(())
+    }
+
+    /// The positions the stages read for a tile that stitching moved, once
+    /// a frame has been recorded since: `f32` triples about the tile's
+    /// origin, in the order of the mesh it was last given. `None` for a tile
+    /// stitching leaves where its mesh has it. For an instrument or a test
+    /// to hold the pass against `tuile_core::stitch::displaced`.
+    pub fn stitched_positions(&self, key: &TileKey) -> Option<&wgpu::Buffer> {
+        let r = self.resident.get(key)?;
+        (r.buffers[0] != r.as_meshed).then_some(&r.buffers[0])
+    }
+
+    /// Paints magenta what a gap between two tiles shows: a pixel whose
+    /// ground is further than any an eye over the Earth can see — the far
+    /// side of the planet, where the frame draws it — or that no tile covers
+    /// though its ray meets the Earth. A probe, for counting holes.
+    pub fn probe_holes(&mut self, on: bool) {
+        self.probe_holes = on;
+    }
+
+    /// Makes a tile resident. Its buffers are created now; it is drawn by any
+    /// later `render` whose selection names it.
+    pub fn enter(
+        &mut self,
+        key: TileKey,
+        mesh: &TileMesh<'_>,
+        albedo: Option<wgpu::Texture>,
+    ) -> Result<(), FilmGpuError> {
+        if self.resident.contains_key(&key) {
+            return Err(FilmGpuError::AlreadyResident(key));
+        }
+        let slot = self.free.pop().ok_or(FilmGpuError::OutOfSlots)?;
+        let (buffers, flags, centre, radius) = self.buffers_of(mesh);
+        let flags = flags | if albedo.is_some() { 4 } else { 0 };
         // Decoded by the sampler through an sRGB view, or read as it lies.
         let sampled_as = match self.settings.look.imagery {
             tuile_film::Imagery::Decoded => ALBEDO_VIEW,
@@ -1432,20 +1608,7 @@ impl FilmGpu {
                 ..Default::default()
             })
         });
-        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("film tile"),
-            layout: &self.tile_bgl,
-            entries: &[
-                entry(0, buffers[0].as_entire_binding()),
-                entry(1, buffers[1].as_entire_binding()),
-                entry(2, buffers[2].as_entire_binding()),
-                entry(3, buffers[3].as_entire_binding()),
-                entry(
-                    4,
-                    wgpu::BindingResource::TextureView(view.as_ref().unwrap_or(&self.white)),
-                ),
-            ],
-        });
+        let bind = self.bind_of(&buffers, view.as_ref());
         if let Some(t) = &albedo {
             if t.mip_level_count() > 1 {
                 self.pending_mips.push(t.clone());
@@ -1465,8 +1628,12 @@ impl FilmGpu {
                 },
                 centre,
                 radius,
+                reach: 0.0,
                 bind,
-                _buffers: buffers,
+                as_meshed: buffers[0].clone(),
+                vertices: (mesh.positions.len() / 12) as u32,
+                buffers,
+                view,
                 _texture: albedo,
             },
         );
@@ -1572,7 +1739,8 @@ impl FilmGpu {
         let sun = self.shadow_map.as_ref().and_then(|(map, side)| {
             let spheres = drawn.iter().filter(|r| r.index_count > 0).map(|r| {
                 let centre = DVec3::from_array(r.origin_ecef) - camera.eye + r.centre.as_dvec3();
-                (centre, f64::from(r.radius))
+                // Stitching moves a vertex by no more than twice its reach.
+                (centre, f64::from(r.radius + 2.0 * r.reach))
             });
             SunView::fitted(
                 self.settings.look.to_sun,
@@ -1586,6 +1754,16 @@ impl FilmGpu {
         });
         if let Some((view, _, side)) = &sun {
             uniform = uniform.shadowed(view, self.settings.look.shadow, *side);
+        }
+        if self.probe_holes {
+            // Up at the eye and its distance from the Earth's centre, as a
+            // look with air sets them: the probe needs both with no air.
+            uniform.local_up[3] = 1.0;
+            if self.settings.look.haze.is_none() {
+                let up = camera.eye.normalize().as_vec3();
+                uniform.local_up = [up.x, up.y, up.z, 1.0];
+                uniform.haze[2] = (0.5 / camera.eye.length()) as f32;
+            }
         }
         self.shadow_texel = sun.as_ref().map(|(view, _, _)| view.texel);
         self.queue
