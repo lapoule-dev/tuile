@@ -44,6 +44,7 @@ pub mod report;
 pub mod runtime;
 pub mod seam;
 pub mod source;
+pub mod stitch;
 pub mod storage;
 pub mod tiles3d;
 pub mod tileset;
