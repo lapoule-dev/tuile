@@ -64,7 +64,19 @@ pub struct ContentPump {
     pub priming: Option<Priming>,
     /// Non-fatal errors reported by the server (drain freely).
     pub errors: Vec<String>,
+    /// How the tiles drawn are put on one line where they meet: see
+    /// [`Self::set_stitching`].
+    stitching: Option<u32>,
+    /// Frames pumped, the tiles the last plan was for, and those of them
+    /// still sliding to where it has them.
+    frame: u64,
+    stitched_for: Vec<TileId>,
+    sliding: Vec<TileId>,
 }
+
+/// Frames a tile takes to slide to its new edge when what is drawn beside it
+/// changes: a fifth of a second at sixty frames a second.
+pub const STITCH_SLIDE_FRAMES: u32 = 12;
 
 /// Tiles uploaded per frame by an interactive session.
 ///
@@ -98,7 +110,115 @@ impl ContentPump {
             closed: false,
             priming: None,
             errors: Vec::new(),
+            stitching: Some(STITCH_SLIDE_FRAMES),
+            frame: 0,
+            stitched_for: Vec::new(),
+            sliding: Vec::new(),
         }
+    }
+
+    /// How the tiles drawn are stitched to one another
+    /// (`tuile_core::stitch`): `None` for not at all — each tile's edges as
+    /// its own data states them — or the number of frames a tile slides
+    /// over when its neighbourhood changes. `Some(0)` is at once: what a
+    /// consumer that must draw the same picture for the same selection
+    /// asks for. The default is [`STITCH_SLIDE_FRAMES`].
+    pub fn set_stitching(&mut self, slide_frames: Option<u32>) {
+        if self.stitching.is_some() != slide_frames.is_some() {
+            // Whatever was planned is for the other setting.
+            self.stitched_for.clear();
+        }
+        self.stitching = slide_frames;
+    }
+
+    /// Puts the tiles this frame draws on one line where they meet.
+    ///
+    /// The rule follows what is really drawn at this instant: the tiles
+    /// that hold their own ground — an ancestor standing in for a tile that
+    /// has not arrived is not one of them, and an edge beside it is left as
+    /// it is, over its skirt. The plan is worked out again only when that
+    /// set changes; between two changes this moves on the tiles still
+    /// sliding, and costs nothing once they have arrived.
+    fn restitch(&mut self, gpu: &GpuContext) {
+        self.frame += 1;
+        let (frame, slide) = (self.frame, self.stitching);
+        let mut exact = match slide {
+            Some(_) => {
+                walk(
+                    &self.selection,
+                    |id| self.prepared.contains_key(&id),
+                    |id| self.ancestry.get(&id).and_then(|a| a.parent),
+                    |id| self.level(id),
+                )
+                .0
+            }
+            None => Vec::new(),
+        };
+        exact.sort_unstable();
+        if exact != self.stitched_for {
+            let m = tuile_core::metrics::metrics();
+            let began = std::time::Instant::now();
+            let located: Vec<(TileId, (u32, u64, u64))> = exact
+                .iter()
+                .filter_map(|id| Some((*id, self.prepared.get(id)?.cell?)))
+                .collect();
+            let plans = {
+                let tiles: Vec<tuile_core::stitch::Tile<'_>> = located
+                    .iter()
+                    .filter_map(|(id, at)| {
+                        Some(tuile_core::stitch::Tile {
+                            level: at.0,
+                            x: at.1,
+                            y: at.2,
+                            source: at.0,
+                            edges: &self.prepared.get(id)?.edges,
+                        })
+                    })
+                    .collect();
+                tuile_core::stitch::plan(&tiles, (2, 1), tuile_core::stitch::BAND)
+            };
+            let slide = slide.unwrap_or(0);
+            for ((id, _), plan) in located.iter().zip(&plans) {
+                // A tile that was not drawn the frame before appears where
+                // it belongs; one that was slides there.
+                let fresh = self.stitched_for.binary_search(id).is_err();
+                if let Some(tile) = self.prepared.get_mut(id) {
+                    if tile.restitch(gpu, plan, frame, slide, fresh) {
+                        m.restitched.inc();
+                        if !fresh && slide > 0 && !self.sliding.contains(id) {
+                            self.sliding.push(*id);
+                        }
+                    }
+                }
+            }
+            // A tile no longer holding its own ground is nobody's neighbour:
+            // it goes back to its own edges, at once.
+            let nothing = tuile_core::stitch::Stitch::default();
+            for id in &self.stitched_for {
+                if exact.binary_search(id).is_err() {
+                    if let Some(tile) = self.prepared.get_mut(id) {
+                        tile.restitch(gpu, &nothing, frame, 0, true);
+                    }
+                }
+            }
+            self.stitched_for = exact;
+            m.stitch_plans.inc();
+            m.stitch_seconds.record(began.elapsed());
+        }
+        if !self.sliding.is_empty() {
+            let slide = slide.unwrap_or(0);
+            let prepared = &mut self.prepared;
+            self.sliding.retain(|id| {
+                prepared
+                    .get_mut(id)
+                    .is_some_and(|tile| tile.slide(&gpu.queue, frame, slide))
+            });
+        }
+    }
+
+    /// Tiles still sliding to the edge their neighbourhood gave them.
+    pub fn sliding(&self) -> usize {
+        self.sliding.len()
     }
 
     /// Call once per frame: drains every queued server message, then
@@ -181,6 +301,9 @@ impl ContentPump {
             }
             uploaded += 1;
         }
+        // What is drawn may have changed — a selection, an upload: the
+        // tiles are stitched for this frame before anyone draws it.
+        self.restitch(gpu);
         uploaded
     }
 

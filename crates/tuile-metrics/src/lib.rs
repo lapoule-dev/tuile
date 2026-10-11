@@ -191,6 +191,9 @@ fn publish(m: &Metrics) {
     counter!("tuile_store_bytes_fetched").absolute(m.store_bytes_fetched.get());
     counter!("tuile_frames").absolute(m.frames.get());
     counter!("tuile_uploads").absolute(m.uploads.get());
+    counter!("tuile_stitch_plans").absolute(m.stitch_plans.get());
+    counter!("tuile_restitched").absolute(m.restitched.get());
+    counter!("tuile_stitch_overflows").absolute(m.stitch_overflows.get());
 
     gauge!("tuile_tiles_visited").set(m.tiles_visited.get() as f64);
     gauge!("tuile_tiles_culled").set(m.tiles_culled.get() as f64);

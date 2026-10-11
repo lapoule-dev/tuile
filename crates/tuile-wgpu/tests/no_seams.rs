@@ -184,7 +184,7 @@ fn holes_through_the_ground(
         eye,
         look_at,
         DIAGNOSTIC_OFF,
-        &|px| px[0] < 8 && px[1] < 8 && px[2] < 8,
+        &mut |px| px[0] < 8 && px[1] < 8 && px[2] < 8,
         None,
     )
 }
@@ -219,7 +219,7 @@ fn magenta_in_the_coverage_view(
         eye,
         look_at,
         DIAGNOSTIC_COVERAGE,
-        &|px| i32::from(px[0]) > i32::from(px[1]) + 40 && px[2] > 100,
+        &mut |px| i32::from(px[0]) > i32::from(px[1]) + 40 && px[2] > 100,
         Some(&shell),
     )
 }
@@ -230,7 +230,7 @@ fn render_and_count(
     eye: DVec3,
     look_at: DVec3,
     mode: f32,
-    counts: &dyn Fn([u8; 4]) -> bool,
+    counts: &mut dyn FnMut([u8; 4]) -> bool,
     backdrop: Option<&tuile_wgpu::PreparedTile>,
 ) -> u64 {
     let make = |label, format, usage, samples| {
@@ -434,6 +434,8 @@ fn magenta_at_a_lod_boundary(gpu: &GpuContext, skirts: bool) -> u64 {
     let east = DVec3::Z.cross(up).normalize();
     let eye = seam + up * 60_000.0 + east * 60_000.0;
     let mut pump = ContentPump::new(eye);
+    // Skirts are what is asked about: the tiles are not stitched.
+    pump.set_stitching(None);
     pump.pump(&mut stream, gpu, 16);
     magenta_in_the_coverage_view(gpu, &mut pump, eye, seam)
 }
@@ -474,7 +476,7 @@ fn a_lod_boundary_leaves_no_fragment_without_imagery() {
 }
 
 /// Sets the pair up and renders it, with skirts or without.
-fn holes_at_a_lod_boundary(gpu: &GpuContext, skirts: bool) -> u64 {
+fn holes_at_a_lod_boundary(gpu: &GpuContext, skirts: bool, stitched: bool) -> u64 {
     // A level-4 tile and the level-5 tile immediately west of its west edge:
     // the finer one crosses in several chords what the coarser one spans in
     // one, so their shared edge is two different curves between the same two
@@ -521,6 +523,8 @@ fn holes_at_a_lod_boundary(gpu: &GpuContext, skirts: bool) -> u64 {
     let eye = seam + up * STANDOFF + east * STANDOFF;
 
     let mut pump = ContentPump::new(eye);
+    // At once: one frame is drawn, and it is the one looked at.
+    pump.set_stitching(stitched.then_some(0));
     pump.pump(&mut stream, gpu, 16);
     holes_through_the_ground(gpu, &mut pump, eye, seam)
 }
@@ -622,7 +626,8 @@ fn no_fragment_of_the_ground_is_left_without_imagery() {
 fn a_lod_boundary_shows_no_seam() {
     let Some(gpu) = gpu() else { return };
 
-    let bare = holes_at_a_lod_boundary(&gpu, false);
+    // Skirts are what is asked about: the tiles are not stitched.
+    let bare = holes_at_a_lod_boundary(&gpu, false, false);
     assert!(
         bare > 0,
         "the fixture no longer opens a seam even without skirts, so it no \
@@ -630,7 +635,7 @@ fn a_lod_boundary_shows_no_seam() {
          about the edge they share"
     );
 
-    let skirted = holes_at_a_lod_boundary(&gpu, true);
+    let skirted = holes_at_a_lod_boundary(&gpu, true, false);
     assert_eq!(
         skirted, 0,
         "{skirted} pixels of void through the ground at the boundary between \
@@ -640,7 +645,7 @@ fn a_lod_boundary_shows_no_seam() {
 
 /// Tiles cut from two terrain tiles, drawn where they meet: `as_built` the
 /// way the engine builds them, or bare of anything hung from their edges.
-fn holes_between_cut_tiles(gpu: &GpuContext, as_built: bool) -> u64 {
+fn holes_between_cut_tiles(gpu: &GpuContext, as_built: bool, stitched: bool) -> u64 {
     // Two terrain tiles of level 4 side by side, the western one measured
     // finely and the eastern in three chords: along the meridian they share,
     // the eastern surface runs kilometres under the western one — most of
@@ -705,6 +710,7 @@ fn holes_between_cut_tiles(gpu: &GpuContext, as_built: bool) -> u64 {
     let eye = seam + up * STANDOFF + east_of * STANDOFF;
 
     let mut pump = ContentPump::new(eye);
+    pump.set_stitching(stitched.then_some(0));
     pump.pump(&mut stream, gpu, 32);
     holes_through_the_ground(gpu, &mut pump, eye, seam)
 }
@@ -720,18 +726,142 @@ fn holes_between_cut_tiles(gpu: &GpuContext, as_built: bool) -> u64 {
 fn tiles_cut_from_two_terrain_tiles_show_no_seam() {
     let Some(gpu) = gpu() else { return };
 
-    let bare = holes_between_cut_tiles(&gpu, false);
+    let bare = holes_between_cut_tiles(&gpu, false, false);
     assert!(
         bare > 0,
         "the fixture opens no seam between its cut tiles even with no wall, so \
          it guards against nothing"
     );
 
-    let built = holes_between_cut_tiles(&gpu, true);
+    let built = holes_between_cut_tiles(&gpu, true, false);
     assert_eq!(
         built, 0,
         "{built} pixels of void between tiles cut from two terrain tiles \
          ({bare} with no wall at all)"
+    );
+}
+
+/// **Stitched, two tiles of different detail meet with nothing hung between
+/// them.**
+///
+/// The same two fixtures, their skirts taken away and the tiles put on one
+/// line by the vertex stage (`tuile_core::stitch`, applied in `shader.wgsl`):
+/// the void that shows through both when neither skirts nor stitching are
+/// there — the two tests above hold that it does — does not show at all.
+#[test]
+fn stitched_tiles_show_no_seam_with_no_skirt_at_all() {
+    let Some(gpu) = gpu() else { return };
+
+    let levels = holes_at_a_lod_boundary(&gpu, false, true);
+    assert_eq!(
+        levels,
+        0,
+        "{levels} pixels of void between two levels, stitched ({} unstitched)",
+        holes_at_a_lod_boundary(&gpu, false, false)
+    );
+    let cut = holes_between_cut_tiles(&gpu, false, true);
+    assert_eq!(
+        cut,
+        0,
+        "{cut} pixels of void between tiles cut from two terrain tiles, stitched ({} unstitched)",
+        holes_between_cut_tiles(&gpu, false, false)
+    );
+}
+
+/// **When what is drawn beside a tile changes, its edge slides to its new
+/// place over a few frames, and the ground is closed in every one of them.**
+///
+/// A level-5 tile beside a level-4 tile of two chords: stitched, its east
+/// edge is on those chords, kilometres under the curve of the Earth. Then the
+/// level-4 tile is replaced by its children, which follow the curve as the
+/// level-5 tile does: the edge has to come back up, and it does so over
+/// [`tuile_wgpu::STITCH_SLIDE_FRAMES`] frames.
+///
+/// Seen twice. With no skirts, to see the slide itself: closed before, closed
+/// once arrived, and open while the edge is on its way — its new neighbours
+/// are where they belong from their first frame, it is not yet. With skirts,
+/// as tiles are drawn: closed in every frame. The skirts are the net under
+/// the slide.
+#[test]
+fn an_edge_slides_to_its_new_neighbour_and_never_gaps() {
+    let Some(gpu) = gpu() else { return };
+    let coarse = TileId::from_terrain(4, 17, 10);
+    let fine = TileId::from_terrain(5, 33, 21);
+    let children: Vec<TileId> = (0..4)
+        .map(|k| TileId::from_terrain(5, 34 + k % 2, 20 + k / 2))
+        .collect();
+    let select = |tiles: &[TileId]| ServerMessage::Select {
+        tiles: selected(tiles),
+        ancestry: tree_shape(tiles),
+        stats: TraversalStats::default(),
+        generation: 0,
+    };
+    let seam = on_the_ground(&rect_of(fine), 1.0, 0.5);
+    let up = seam.normalize();
+    let east = DVec3::Z.cross(up).normalize();
+    // From over the tile that slides: its edge starts under its new
+    // neighbours', and a step is looked into from its lower side.
+    let eye = seam + up * 60_000.0 - east * 60_000.0;
+
+    // Holes in the picture: before the change, then frame by frame after it.
+    let holes = |skirts: bool| -> Vec<u64> {
+        let content = |tile: TileId, steps: usize| ServerMessage::Content {
+            tile,
+            ancestry: ancestry(tile),
+            content: TileContent::Decoded(content_for(tile, steps, skirts)),
+        };
+        let mut messages = VecDeque::from([
+            select(&[coarse, fine]),
+            content(coarse, 2),
+            content(fine, 8),
+        ]);
+        messages.extend(children.iter().map(|child| content(*child, 8)));
+        let mut stream = Scripted(messages);
+        let mut pump = ContentPump::new(eye);
+        pump.pump(&mut stream, &gpu, 16);
+        assert_eq!(
+            pump.sliding(),
+            0,
+            "tiles that appear are where they belong at once"
+        );
+        let mut seen = vec![holes_through_the_ground(&gpu, &mut pump, eye, seam)];
+
+        let mut now: Vec<TileId> = vec![fine];
+        now.extend(&children);
+        stream.0.push_back(select(&now));
+        pump.pump(&mut stream, &gpu, 16);
+        assert_eq!(
+            pump.sliding(),
+            1,
+            "the tile that stays slides; its new neighbours do not"
+        );
+        for _ in 0..tuile_wgpu::STITCH_SLIDE_FRAMES + 2 {
+            seen.push(holes_through_the_ground(&gpu, &mut pump, eye, seam));
+            pump.pump(&mut stream, &gpu, 16);
+        }
+        assert_eq!(pump.sliding(), 0, "the slide ends");
+        seen
+    };
+
+    let bare = holes(false);
+    let (before, arrived) = (bare[0], bare[bare.len() - 1]);
+    assert_eq!(
+        (before, arrived),
+        (0, 0),
+        "stitched, both ends are closed: {bare:?}"
+    );
+    let half = bare[tuile_wgpu::STITCH_SLIDE_FRAMES as usize / 2];
+    assert!(
+        half > 0,
+        "the edge is on its way half-way through: {bare:?}"
+    );
+    // It closes as it goes: never wider than when it set off.
+    assert!(bare[1..].windows(2).all(|w| w[1] <= w[0]), "{bare:?}");
+
+    let skirted = holes(true);
+    assert!(
+        skirted.iter().all(|n| *n == 0),
+        "a frame shows the void: {skirted:?}"
     );
 }
 

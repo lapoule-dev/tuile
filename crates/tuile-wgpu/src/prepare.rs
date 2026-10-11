@@ -15,6 +15,20 @@ use wgpu::util::DeviceExt;
 /// Bytes per texel in [`TEXTURE_FORMAT`].
 const BYTES_PER_TEXEL: u32 = 4;
 
+/// Rows of strips a tile's uniform holds for one state of its stitching:
+/// `Stitch::packed`'s ten, and up to 246 knots — more than twice what the
+/// fullest tile of the films measured carried (105). A tile whose plan asks
+/// for more is drawn as its mesh has it, its skirts under it; see
+/// [`PreparedTile::restitch`].
+pub const STITCH_ROWS: usize = 256;
+
+/// Bytes of a tile's uniform: its model matrix, a row for the stitching's
+/// progress, and the strips twice — now, and before.
+const TILE_UNIFORM_BYTES: usize = 64 + 16 + 2 * STITCH_ROWS * 16;
+/// Where, in it, the progress row and the two sets of strips are.
+const STITCH_AT: u64 = 64;
+const STRIPS_AT: u64 = 80;
+
 /// Interleaved vertex layout: position, normal, uv.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -75,6 +89,16 @@ pub struct PreparedTile {
     /// the model matrix can be recomputed against a moving render origin.
     origin_ecef: DVec3,
     transform_local: Mat4,
+    /// The tile's sides as its mesh states them, and where it is in the
+    /// geographic quadtree by its own corners — `None` for content that is
+    /// not a whole tile of it, which is then never stitched.
+    pub(crate) edges: tuile_core::stitch::Edges,
+    pub(crate) cell: Option<(u32, u64, u64)>,
+    /// The meshes as they came, normals included: what a mesh that gains
+    /// vertices on an edge is made again from.
+    source: Vec<DecodedMesh>,
+    /// How the tile is stitched: see [`Self::restitch`].
+    stitching: Stitching,
     /// The render origin this tile's uniform currently holds.
     ///
     /// A `Cell` so a tile can bring itself up to date through a shared
@@ -100,7 +124,110 @@ pub struct PreparedTile {
     pub sharpest_imagery_level: Option<u32>,
 }
 
+/// A tile's stitching: what it was last told, and its slide towards it.
+#[derive(Default)]
+struct Stitching {
+    told: tuile_core::stitch::Stitch,
+    /// The frame the slide began at, while it lasts.
+    sliding_since: Option<u64>,
+}
+
 impl PreparedTile {
+    /// Stitches the tile to its neighbours as `tuile_core::stitch::plan`
+    /// decided for the tiles drawn from `frame` on: the vertex stage moves
+    /// its vertices by the plan's strips. `slide` is how many frames the
+    /// tile takes to get there from where its last strips had it; 0, or a
+    /// tile that was not drawn the frame before (`fresh`), is there at once.
+    ///
+    /// A plan that gives the tile vertices has its buffers made again from
+    /// the mesh as it came: the new ones first, the old let go after — the
+    /// tile is drawable at every instant.
+    ///
+    /// Returns whether anything changed.
+    pub(crate) fn restitch(
+        &mut self,
+        gpu: &GpuContext,
+        plan: &tuile_core::stitch::Stitch,
+        frame: u64,
+        slide: u32,
+        fresh: bool,
+    ) -> bool {
+        // More knots than the uniform holds: the tile keeps its own edges.
+        let nothing = tuile_core::stitch::Stitch::default();
+        let plan = if plan.packed().len() > STITCH_ROWS {
+            tuile_core::metrics::metrics().stitch_overflows.inc();
+            &nothing
+        } else {
+            plan
+        };
+        let told = &self.stitching.told;
+        if told.sides == plan.sides && told.inserts == plan.inserts && told.laps == plan.laps {
+            return false;
+        }
+        if told.inserts != plan.inserts {
+            for (prepared, mesh) in self.meshes.iter_mut().zip(&self.source) {
+                let cut = tuile_core::stitch::split(mesh, self.origin_ecef, &plan.inserts);
+                let (vertex_buf, index_buf, bytes) = mesh_buffers(gpu, &cut);
+                self.gpu_bytes = self.gpu_bytes + bytes
+                    - (prepared.vertex_buf.size() + prepared.index_buf.size()) as usize;
+                prepared.index_count = cut.indices.len() as u32;
+                prepared.vertex_buf = vertex_buf;
+                prepared.index_buf = index_buf;
+            }
+        }
+        // The strips it had become the ones it slides from.
+        let rows = |stitch: &tuile_core::stitch::Stitch| {
+            let mut rows = stitch.packed();
+            rows.resize(STITCH_ROWS, [0.0; 4]);
+            rows
+        };
+        let (now, was) = (rows(plan), rows(&self.stitching.told));
+        let at_once = fresh || slide == 0;
+        gpu.queue
+            .write_buffer(&self.tile_buf, STRIPS_AT, bytemuck::cast_slice(&now));
+        gpu.queue.write_buffer(
+            &self.tile_buf,
+            STRIPS_AT + (STITCH_ROWS * 16) as u64,
+            bytemuck::cast_slice(if at_once { &now } else { &was }),
+        );
+        let any = f32::from(!(plan.is_nothing() && (at_once || self.stitching.told.is_nothing())));
+        let slid = if at_once { 1.0 } else { 0.0 };
+        gpu.queue.write_buffer(
+            &self.tile_buf,
+            STITCH_AT,
+            bytemuck::cast_slice(&[slid, any, 0.0, 0.0]),
+        );
+        self.stitching.told = plan.clone();
+        self.stitching.sliding_since = (!at_once).then_some(frame);
+        true
+    }
+
+    /// Moves a sliding tile on to where `frame` has it. Returns whether it
+    /// is still on its way.
+    pub(crate) fn slide(&mut self, queue: &wgpu::Queue, frame: u64, slide: u32) -> bool {
+        let Some(since) = self.stitching.sliding_since else {
+            return false;
+        };
+        let slid = ((frame - since) as f32 / slide.max(1) as f32).clamp(0.0, 1.0);
+        // Eased at both ends: an edge sets off and arrives without a jerk.
+        let eased = slid * slid * (3.0 - 2.0 * slid);
+        let any = f32::from(!self.stitching.told.is_nothing() || slid < 1.0);
+        queue.write_buffer(
+            &self.tile_buf,
+            STITCH_AT,
+            bytemuck::cast_slice(&[eased, any, 0.0, 0.0]),
+        );
+        if slid >= 1.0 {
+            self.stitching.sliding_since = None;
+        }
+        slid < 1.0
+    }
+
+    /// How the tile is stitched: the plan it was last given.
+    pub fn stitch(&self) -> &tuile_core::stitch::Stitch {
+        &self.stitching.told
+    }
+
     /// Whether any mesh here carries more layers than one draw could bind.
     ///
     /// Asked before switching pipelines rather than discovered mesh by mesh: a
@@ -153,11 +280,14 @@ pub fn prepare(
         render_origin,
     );
 
+    // The model, and no stitching: zeros say a tile has none.
+    let mut uniform = vec![0u8; TILE_UNIFORM_BYTES];
+    uniform[..64].copy_from_slice(bytemuck::cast_slice(&model.to_cols_array()));
     let tile_buf = gpu
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tuile tile uniform"),
-            contents: bytemuck::cast_slice(&model.to_cols_array()),
+            contents: &uniform,
             // COPY_DST so the model can be rewritten on rebase (moving camera).
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -230,17 +360,35 @@ pub fn prepare(
         passes
     };
 
-    let meshes = content
+    // Each mesh with its normals, made where it has none: what is uploaded,
+    // and what a mesh that gains vertices is made again from.
+    let source: Vec<DecodedMesh> = content
         .meshes
+        .iter()
+        .map(|mesh| {
+            let mut mesh = mesh.clone();
+            if mesh.normals.is_none() {
+                mesh.normals = Some(compute_normals(&mesh.positions, &mesh.indices));
+            }
+            mesh
+        })
+        .collect();
+    let meshes = source
         .iter()
         .map(|m| prepare_mesh(gpu, m, &textures, &passes, &mut gpu_bytes))
         .collect::<Vec<_>>();
+    let edges = tuile_core::stitch::Edges::of(content);
+    let cell = edges.cell();
 
     PreparedTile {
         sharpest_imagery_level: content.imagery.iter().map(|l| l.coord.level).max(),
         meshes,
         tile_bg,
         tile_buf,
+        edges,
+        cell,
+        source,
+        stitching: Stitching::default(),
         origin_ecef: content.local_origin_ecef,
         transform_local: content.transform_local,
         // Built against this origin just above, so it starts up to date — a
@@ -316,41 +464,8 @@ fn prepare_mesh(
     passes: &[ImageryPass],
     gpu_bytes: &mut usize,
 ) -> PreparedMesh {
-    let normals = match &mesh.normals {
-        Some(n) => n.clone(),
-        None => compute_normals(&mesh.positions, &mesh.indices),
-    };
-    let vertices: Vec<Vertex> = mesh
-        .positions
-        .iter()
-        .enumerate()
-        .map(|(i, p)| Vertex {
-            position: *p,
-            normal: normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]),
-            uv: mesh
-                .uvs
-                .as_ref()
-                .and_then(|uv| uv.get(i))
-                .copied()
-                .unwrap_or([0.0, 0.0]),
-        })
-        .collect();
-
-    let vertex_buf = gpu
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tuile vertices"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-    let index_buf = gpu
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tuile indices"),
-            contents: bytemuck::cast_slice(&mesh.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-    *gpu_bytes += vertices.len() * std::mem::size_of::<Vertex>() + mesh.indices.len() * 4;
+    let (vertex_buf, index_buf, bytes) = mesh_buffers(gpu, mesh);
+    *gpu_bytes += bytes;
 
     let texture_view = mesh
         .material
@@ -426,6 +541,45 @@ fn prepare_mesh(
         material_bgs,
         _material_bufs: material_bufs,
     }
+}
+
+/// A mesh's vertex and index buffers, and their size in bytes.
+fn mesh_buffers(gpu: &GpuContext, mesh: &DecodedMesh) -> (wgpu::Buffer, wgpu::Buffer, usize) {
+    let normals = match &mesh.normals {
+        Some(n) => n.clone(),
+        None => compute_normals(&mesh.positions, &mesh.indices),
+    };
+    let vertices: Vec<Vertex> = mesh
+        .positions
+        .iter()
+        .enumerate()
+        .map(|(i, p)| Vertex {
+            position: *p,
+            normal: normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]),
+            uv: mesh
+                .uvs
+                .as_ref()
+                .and_then(|uv| uv.get(i))
+                .copied()
+                .unwrap_or([0.0, 0.0]),
+        })
+        .collect();
+    let vertex_buf = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tuile vertices"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+    let index_buf = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tuile indices"),
+            contents: bytemuck::cast_slice(&mesh.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+    let bytes = vertices.len() * std::mem::size_of::<Vertex>() + mesh.indices.len() * 4;
+    (vertex_buf, index_buf, bytes)
 }
 
 /// Area-weighted vertex normals for meshes that ship without them.
