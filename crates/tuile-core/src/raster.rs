@@ -1486,7 +1486,10 @@ impl<F: TileFetcher> TemplateProvider<F> {
         }
     }
 
-    fn tile_url(&self, c: ImageryCoord) -> Result<Url, RasterError> {
+    /// The URL a tile is fetched from: `{z}`, `{x}` and `{y}` replaced by the
+    /// coord's level, column and row, wherever they sit — in the path, or in
+    /// the query string of a key-value tile service.
+    pub fn tile_url(&self, c: ImageryCoord) -> Result<Url, RasterError> {
         Ok(Url::parse(
             &self
                 .template
@@ -2897,6 +2900,29 @@ mod tests {
             err,
             Err(RasterError::Fetch(FetchError::NotFound(_)))
         ));
+    }
+
+    /// A key-value tile service names the column and the row in its query
+    /// string, row first or column first as it pleases: each placeholder must
+    /// land on its own parameter, and the rest of the query must survive.
+    #[test]
+    fn template_placeholders_expand_in_a_query_string() {
+        let provider = TemplateProvider::new(
+            "https://tiles.example/wmts?LAYER=a&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&FORMAT=image/jpeg",
+            Arc::new(crate::fetch::FsFetcher),
+            TilingScheme::web_mercator(),
+        );
+        let url = provider
+            .tile_url(ImageryCoord {
+                level: 19,
+                x: 263_008,
+                y: 193_067,
+            })
+            .expect("a well-formed url");
+        assert_eq!(
+            url.as_str(),
+            "https://tiles.example/wmts?LAYER=a&TILEMATRIX=19&TILEROW=193067&TILECOL=263008&FORMAT=image/jpeg"
+        );
     }
 
     /// A 1×1 solid texture as a shareable layer source.

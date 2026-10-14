@@ -20,7 +20,9 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 tuile-bing = { version = "0.12.0", path = "../../crates/tuile-bing" }
 tuile-cesium-ion = { version = "0.12.0", path = "../../crates/tuile-cesium-ion" }
+tuile-core = { version = "0.12.0", path = "../../crates/tuile-core" }
 tuile-native-fetchers = { version = "0.12.0", path = "../../crates/tuile-native-fetchers" }
+tuile-terrain = { version = "0.12.0", path = "../../crates/tuile-terrain" }
 tuile-viewer = { version = "0.12.0", path = "../../crates/tuile-viewer" }
 # The catalog proxy's address, read and checked as a URL: Android's, and a
 # headless run's.
