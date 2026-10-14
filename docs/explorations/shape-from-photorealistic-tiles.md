@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
-<!-- Copyright lapoule.dev -->
+<!-- Copyright (c) lapoule.dev -->
 
 # Formes structurées à partir de tuiles maillées photoréalistes — exploration
 
@@ -8,6 +8,11 @@ et rien n'est proposé à l'implémentation ici.** Le document cadre la question
 passe en revue la littérature, liste les jeux de données de référence et dit ce
 qu'une expérience honnête demanderait. Il ne suit pas la feuille de route
 (`docs/03-roadmap.md`) : c'est une piste post-v1.
+
+> Cette note part des **maillages** photogrammétriques. La question voisine,
+> partir des **tuiles raster d'imagerie** pour synthétiser une 3D crédible, est
+> traitée, avec une bibliographie bien plus large, dans
+> [`3d-from-imagery-tiles.md`](3d-from-imagery-tiles.md).
 
 ## 0. Le verrou à lire en premier : la licence de la source
 
@@ -152,8 +157,9 @@ utilisable.
   un bon jeu d'apprentissage et d'évaluation pour la cible B.
   ([site](https://building3d.ucalgary.ca/),
   [arXiv 2307.11914](https://arxiv.org/abs/2307.11914))
-- À partir d'images satellite (DSM + ortho) : **SAT2LoD2** (Gui et al.,
-  *ISPRS Annals* 2024, segmentation en unités de toit), avec code ouvert.
+- À partir d'images satellite (DSM + ortho) : **SAT2LoD2** (Gui, Qin, Tang,
+  *ISPRS Archives* 2022 ; extension en unités de toit, *ISPRS Annals* 2024),
+  avec code ouvert.
 
 ### 2.3 Réinterprétation procédurale et générative (cible C)
 
