@@ -1,0 +1,8 @@
+# Local only: the lab's paths and bucket, the data, the environment.
+lab.json
+data/
+.venv/
+.ipynb_checkpoints/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
