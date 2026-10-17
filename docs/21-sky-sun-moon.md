@@ -84,8 +84,24 @@ the Moon from the frame's own eye.
   the relief would go. This is a photographer's choice over physics, and
   it is stated as one.
 - **Towns.** With night lights, NASA's Black Marble lights towns as the
-  ground's own light falls. The mosaic is fetched once by the production,
-  kept in the run store by its content, and read from there by the render.
+  ground's own light falls. It is a layer of the tile store like any
+  source's (`asset-1000000201`, geographic, level 3: sixteen by eight tiles
+  of 320, about 8 km a texel), declared with its licence and credit. The
+  bake writes the tiles any camera of the tape can see through the store's
+  writer; the pack names the layer (`night_layer`); the render reads the
+  tiles back through the store's reader and puts them together into one
+  texture, dark where the store holds none. The film's interactive viewer
+  does not draw them yet: that needs an emissive layer in its drape.
+
+## Ground imagery
+
+The day ground is any imagery layer of the store. With an ion token,
+`--imagery 2` (the default) drapes Bing Aerial over ion's relief.
+`--imagery 1000000101` drapes NASA's Blue Marble: Next Generation (public
+domain, about 600 m a pixel) over the same relief: only the imagery
+differs. Each is kept in the store as its own layer, with its licence.
+`--ground open-earth` takes Blue Marble over the bare ellipsoid and needs no
+token.
 
 ## Time-lapses
 

@@ -161,7 +161,8 @@ struct Args {
     #[arg(long, allow_hyphen_values = true)]
     clock: Option<String>,
     /// Towns lit at night, under --atmosphere: NASA's Black Marble (public
-    /// domain), fetched once and kept in the run store by its content.
+    /// domain), written into the tile store as its layer over the film's
+    /// footprint by the bake, and named by its packs (of references).
     #[arg(long)]
     night_lights: bool,
     /// The sun's disc drawn this many times its size (1: as it is).
@@ -316,11 +317,7 @@ fn content(text: &str) -> Result<tuile_pack::Content, String> {
 /// How the film is rendered, as the command line says.
 /// The rendering `args` ask for; the tape's clock, if it states one, when
 /// `--clock` does not give another.
-fn rendering(
-    args: &Args,
-    tape_clock: Option<tuile_tape::Clock>,
-    night_lights: Option<String>,
-) -> Result<Rendering, Error> {
+fn rendering(args: &Args, tape_clock: Option<tuile_tape::Clock>) -> Result<Rendering, Error> {
     RenderSpec {
         fps: args.fps,
         scale: args.scale,
@@ -345,7 +342,6 @@ fn rendering(
             .clock
             .clone()
             .or_else(|| tape_clock.map(|c| c.to_arg())),
-        night_lights: night_lights.clone(),
         sun_scale: args.sun_scale,
         moon_scale: args.moon_scale,
         glare: args.glare,
@@ -366,25 +362,6 @@ fn rendering(
         ..RenderSpec::default()
     }
     .rendering()
-}
-
-/// The run store, as a place a bake keeps what it fetched once.
-struct Keep(Arc<ObjectRunStore>);
-
-#[async_trait::async_trait]
-impl tuile_bake::NightLightsStore for Keep {
-    async fn keep(&self, key: &str, bytes: &[u8]) -> Result<(), String> {
-        if self.0.exists(key).await.map_err(|e| e.to_string())? {
-            return Ok(());
-        }
-        let file = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-        std::fs::write(file.path(), bytes).map_err(|e| e.to_string())?;
-        self.0
-            .put(file.path(), key)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
 }
 
 /// What it came to, as an exit code.
@@ -433,18 +410,7 @@ async fn run(args: Args) -> Result<Ended, Error> {
         return Ok(Ended::Usage);
     }
     let tape_clock = tuile_tape::Clock::of_tape(&tape).map_err(|e| e.to_string())?;
-    // The night lights, kept in the run store once, by their content: the
-    // render reads them from there and nowhere else.
-    let night_lights = if args.night_lights {
-        let keep = Keep(store.clone());
-        let cache = std::env::var_os("TUILE_CACHE_DIR").map(Into::into);
-        let key = tuile_bake::open::publish_night_lights(&keep, cache).await?;
-        println!("NIGHT-LIGHTS {key}");
-        Some(key)
-    } else {
-        None
-    };
-    let rendering = rendering(&args, tape_clock, night_lights)?;
+    let rendering = rendering(&args, tape_clock)?;
     let bake = TapeBake {
         // Needed only if a pack is to be baked: a production whose packs are
         // there renders without it, and a bake without it says so.
@@ -457,6 +423,9 @@ async fn run(args: Args) -> Result<Ended, Error> {
         imagery: args.imagery,
         content: args.content,
         ground: args.ground,
+        night_lights: args
+            .night_lights
+            .then_some(tuile_bake::open::NightLightsSource::Gibs),
     };
 
     let cache = args
@@ -595,7 +564,7 @@ mod tests {
         // H.264, the one encoding whose parts join: the machine's own encoder
         // gives it, whichever the machine has.
         assert_eq!(args.codec, "h264");
-        let rendering = rendering(&args, None, None).expect("rendering");
+        let rendering = rendering(&args, None).expect("rendering");
         assert_eq!(rendering.bitrate, 12_000_000);
         assert!(rendering.order.look.haze.is_none());
     }
@@ -624,7 +593,7 @@ mod tests {
         assert_eq!(args.content, tuile_pack::Content::Both);
         assert!(args.render_again && !args.bake_again);
         assert_eq!((args.at_once, args.step_minutes), (2, Some(30)));
-        let rendering = rendering(&args, None, None).expect("rendering");
+        let rendering = rendering(&args, None).expect("rendering");
         assert_eq!(rendering.order.fps, 25);
         assert_eq!(rendering.sun, Some((255.0, 10.0)));
         assert_eq!(rendering.bitrate, 45_000_000);
@@ -696,6 +665,6 @@ mod tests {
             assert!(parsed(line).is_err(), "{line}");
         }
         let args = parsed("tuile-film-produce t.mcap --sky-light 1,2").expect("parse");
-        assert!(rendering(&args, None, None).is_err());
+        assert!(rendering(&args, None).is_err());
     }
 }

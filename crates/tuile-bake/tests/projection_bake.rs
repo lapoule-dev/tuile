@@ -236,6 +236,7 @@ fn bake(tiles: &Tiles, out: &std::path::Path) {
         content: tuile_pack::Content::References,
         terrain_layer,
         imagery_layer,
+        night_layer: String::new(),
     };
     let poses = poses();
     let mut session = Session::globe(config).expect("a globe");

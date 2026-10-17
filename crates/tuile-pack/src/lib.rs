@@ -302,6 +302,8 @@ pub struct PackWriter {
     content: Content,
     terrain_layer: String,
     imagery_layer: String,
+    /// The store's layer of the night lights, empty for none.
+    night_layer: String,
 }
 
 /// One tile, once its payloads are already in the blob.
@@ -454,6 +456,7 @@ impl PackWriter {
             content: Content::Embedded,
             terrain_layer: String::new(),
             imagery_layer: String::new(),
+            night_layer: String::new(),
         })
     }
 
@@ -527,6 +530,14 @@ impl PackWriter {
         } else {
             VERSION
         };
+        self
+    }
+
+    /// Names the tile store's layer of the night lights a render lays under
+    /// a physical atmosphere; empty for none. Kept by a pack of references
+    /// only: one that embeds its tiles has no store to read them from.
+    pub fn with_night_layer(mut self, layer: &str) -> Self {
+        self.night_layer = layer.to_string();
         self
     }
 
@@ -782,6 +793,8 @@ impl PackWriter {
         let origin = fbb.create_vector(&self.render_origin);
         let terrain_layer = fbb.create_string(&self.terrain_layer);
         let imagery_layer = fbb.create_string(&self.imagery_layer);
+        let night_layer =
+            (!self.night_layer.is_empty()).then(|| fbb.create_string(&self.night_layer));
         let first = self.frames.first().map_or(0, |(n, _, _)| *n);
         let last = self.frames.last().map_or(0, |(n, _, _)| *n);
         let mut b = fb::PackBuilder::new(&mut fbb);
@@ -798,6 +811,9 @@ impl PackWriter {
             b.add_content(self.content);
             b.add_terrain_layer(terrain_layer);
             b.add_imagery_layer(imagery_layer);
+            if let Some(night) = night_layer {
+                b.add_night_layer(night);
+            }
         }
         let root = b.finish();
         fbb.finish(root, Some("TUIL"));
@@ -1077,6 +1093,15 @@ impl<'a> Pack<'a> {
             return None;
         }
         Some((self.root.terrain_layer()?, self.root.imagery_layer()?))
+    }
+
+    /// The tile store's layer of the night lights, `None` for a pack that
+    /// names none (every pack written before it could).
+    pub fn night_layer(&self) -> Option<&'a str> {
+        if self.content() == Content::Embedded {
+            return None;
+        }
+        self.root.night_layer().filter(|l| !l.is_empty())
     }
 
     /// From version 2 on a texture is stored as its codec produced it;
@@ -1917,6 +1942,23 @@ mod tests {
     }
 
     #[test]
+    fn a_pack_of_references_names_the_layer_of_its_night_lights() {
+        let mut w = Bake::new("s", [0.0; 3]).with(|w| {
+            w.with_content(Content::References, "terrain", "imagery")
+                .with_night_layer("night")
+        });
+        w.frame(1, a_view(0.0), [with_refs(a_tile(7, 100), 1)]);
+        let pack_bytes = w.finish();
+        let pack = Pack::open(&pack_bytes).expect("open");
+        assert_eq!(pack.night_layer(), Some("night"));
+        // One that embeds has no store to read lights from.
+        let mut w = Bake::new("s", [0.0; 3]).with(|w| w.with_night_layer("night"));
+        w.frame(1, a_view(0.0), [a_tile(7, 100)]);
+        let embedded = w.finish();
+        assert_eq!(Pack::open(&embedded).expect("open").night_layer(), None);
+    }
+
+    #[test]
     fn a_pack_of_both_carries_the_payloads_and_where_they_come_from() {
         let mut w =
             Bake::new("s", [0.0; 3]).with(|w| w.with_content(Content::Both, "terrain", "imagery"));
@@ -1927,6 +1969,7 @@ mod tests {
         assert_eq!(pack.version(), VERSION);
         assert_eq!(pack.content(), Content::Both);
         assert_eq!(pack.store_layers(), Some(("terrain", "imagery")));
+        assert_eq!(pack.night_layer(), None);
         let tiles = pack.frame(1).expect("frame");
         for (stored, written) in tiles.iter().zip([&a, &b]) {
             assert_eq!(refs_of(stored), written.refs);

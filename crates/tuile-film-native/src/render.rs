@@ -89,11 +89,6 @@ pub struct Order {
     /// by the sun of its instant, the Moon of its instant over the frame's
     /// own eye, and the stars turned to it. `None`: the look's light.
     pub clock: Option<tuile_tape::Clock>,
-    /// Towns lit at night under a physical atmosphere: the key, in the run
-    /// store, of the night-lights mosaic a bake kept there
-    /// ([`tuile_bake::open::publish_night_lights`]). A key that is not
-    /// there fails the render.
-    pub night_lights: Option<String>,
 }
 
 /// The light of `frame` under `clock`: the sun of its instant from the
@@ -146,7 +141,6 @@ impl Default for Order {
             wire: false,
             stereo: None,
             clock: None,
-            night_lights: None,
         }
     }
 }
@@ -267,6 +261,33 @@ struct Held {
 /// A tile's corners as the composition is handed them, each taken at
 /// `strength`: every number of a corner is one that blends, so a part of
 /// it is that part of each.
+/// The night lights of the store's layer `layer`, put together whole from
+/// the tiles it holds at [`tuile_bake::open::NIGHT_LEVEL`]: a tile it does
+/// not hold is one no camera of the film could see, and stays dark.
+pub async fn night_lights_of(
+    store: &tuile_repository::ArchivedTiles,
+    layer: &str,
+) -> Result<tuile_bake::open::NightLights, Error> {
+    let level = tuile_bake::open::NIGHT_LEVEL as u8;
+    let (across, down) = tuile_bake::open::night_grid();
+    let all: Vec<(u8, u32, u32)> = (0..down)
+        .flat_map(|y| (0..across).map(move |x| (level, x, y)))
+        .collect();
+    store.open_zones(layer, all.iter().copied()).await?;
+    let mut held = HashMap::new();
+    for (_, x, y) in all {
+        if let Some(tile) = store.tile(layer, level, x, y).await? {
+            held.insert((x, y), tile.bytes);
+        }
+    }
+    if held.is_empty() {
+        return Err(format!("the night layer {layer} holds no tile at level {level}").into());
+    }
+    Ok(tuile_bake::open::NightLights::from_tiles(|x, y| {
+        held.remove(&(x, y))
+    })?)
+}
+
 fn layer_field(corners: &[Blended; 4], strength: f32) -> LayerField {
     LayerField {
         corners: corners.map(|c| LayerCorner {
@@ -454,14 +475,17 @@ pub async fn render(
             look,
         },
     );
-    if let (Some(key), Some(_)) = (&order.night_lights, look.atmosphere) {
-        let png = sources
-            .packs
-            .objects
-            .read_all(key)
-            .await
-            .map_err(|e| format!("the night lights {key}: {e}"))?;
-        let lights = tuile_bake::open::NightLights::from_png(&png)?;
+    // Towns lit at night, under a physical atmosphere: the layer of the
+    // tile store the film's packs name, its tiles read as any of the
+    // store's, put together whole.
+    let night_layer = match film.packs.first() {
+        Some(file) => Pack::open_table(&file.head)?
+            .night_layer()
+            .map(str::to_string),
+        None => None,
+    };
+    if let (Some(layer), Some(_)) = (night_layer, look.atmosphere) {
+        let lights = night_lights_of(&sources.store.tiles, &layer).await?;
         gpu.set_night_lights(lights.width, lights.height, &lights.luma);
     }
     gpu.probe_holes(order.holes);
@@ -534,6 +558,11 @@ pub async fn render(
             let mut absent = Vec::new();
             for (layer, wanted) in [(terrain_layer, terrain), (imagery_layer, imagery)] {
                 let wanted: Vec<tuile_film::StoreAt> = wanted.into_iter().collect();
+                // A layer the frames read nothing of — a ground with no
+                // imagery names none — is not asked.
+                if wanted.is_empty() {
+                    continue;
+                }
                 // Their zones' manifests first, all in one exchange with
                 // the store: several hundred of them, a kilobyte each, are
                 // not worth a round trip apiece.
@@ -747,6 +776,9 @@ pub async fn render(
                     ] {
                         let t = Instant::now();
                         let wanted: Vec<(u8, u32, u32)> = wanted.into_iter().collect();
+                        if wanted.is_empty() {
+                            continue;
+                        }
                         // Held since the read ahead, and then nothing is asked;
                         // otherwise their zones' manifests come together.
                         store.open_zones(layer, wanted.iter().copied()).await?;

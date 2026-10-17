@@ -40,6 +40,10 @@ pub struct TapeBake {
     /// Where the ground comes from ([`crate::open::Ground`]): ion's assets
     /// above, or an open source that needs no token.
     pub ground: crate::open::Ground,
+    /// Towns lit at night: NASA's Black Marble, written into the tile store
+    /// as its layer over the film's footprint, and named by the pack
+    /// ([`crate::open::BlackMarble`]).
+    pub night_lights: Option<crate::open::NightLightsSource>,
 }
 
 impl TapeBake {
@@ -60,10 +64,14 @@ impl TapeBake {
     /// The tile store's layers its sources need declared.
     pub fn store_layers(&self) -> Vec<tuile_tile_server::LayerDef> {
         let config = self.config();
-        crate::open::store_layers(
+        let mut layers = crate::open::store_layers(
             self.ground,
             (config.terrain_asset_id, config.imagery_asset_id),
-        )
+        );
+        if self.night_lights.is_some() {
+            layers.push(crate::open::black_marble_layer());
+        }
+        layers
     }
 
     /// Whether a bake of it needs an ion token.
@@ -95,7 +103,11 @@ impl TapeBake {
         };
         // An open imagery over ion's relief: ion's terrain, the imagery
         // answered by the open sources.
-        if open.is_none() && config.imagery_asset_id.is_some_and(crate::open::is_open_imagery) {
+        if open.is_none()
+            && config
+                .imagery_asset_id
+                .is_some_and(crate::open::is_open_imagery)
+        {
             config.imagery_sources = Some(crate::globe::SourcesHandle(std::sync::Arc::new(
                 crate::open::OpenSources::new(self.cache_dir.clone()),
             )));
@@ -134,8 +146,26 @@ impl TapeBake {
         digest_of_scene(
             &self.poses,
             self.viewport,
-            &bake_settings(&config, &resolved),
+            &self.settings(&config, &resolved),
         )
+    }
+
+    /// What the pack is the bake of, beyond its cameras: the night layer
+    /// added only when there is one, so that a scene without names what it
+    /// always named.
+    fn settings(&self, config: &GlobeConfig, resolved: &tuile_core::traversal::Config) -> String {
+        let settings = bake_settings(config, resolved);
+        match self.night_layer() {
+            Some(layer) => format!("{settings}\nnight={layer}"),
+            None => settings,
+        }
+    }
+
+    /// The store's layer of the night lights, when the bake writes them.
+    pub fn night_layer(&self) -> Option<String> {
+        self.night_lights
+            .as_ref()
+            .map(|_| source_namespace(crate::open::BLACK_MARBLE))
     }
 
     /// The prefix of this bake's packs in a run store:
@@ -191,6 +221,35 @@ impl TapeBake {
             }
             config.tile_cache = Some(tiles.cache());
         }
+        // The night lights: the tiles any camera of the tape can see,
+        // written into the store as a source's are, before a pack names them.
+        if let Some(night) = &self.night_lights {
+            let Some(tiles) = tiles else {
+                return Err("night lights are kept in the tile store, and there is none".into());
+            };
+            if self.content == tuile_pack::Content::Embedded {
+                return Err("night lights are named by a pack of references only".into());
+            }
+            let footprint = crate::open::night_footprint(&self.poses);
+            let source = match night {
+                crate::open::NightLightsSource::Gibs => {
+                    crate::open::BlackMarble::from_gibs(self.cache_dir.clone())
+                }
+                crate::open::NightLightsSource::Given(mosaic) => {
+                    crate::open::BlackMarble::of(mosaic.as_ref().clone())
+                }
+            };
+            let kept = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("night lights runtime: {e}"))?
+                .block_on(crate::open::publish_night_layer(
+                    tiles.cache().0,
+                    source,
+                    &footprint,
+                ))?;
+            tracing::info!(tiles = kept, "NIGHT-LAYER");
+        }
         // What the pack already holds, mirrored for the loader so it never
         // fetches a drape twice.
         let packed = PackedMirror::new();
@@ -199,13 +258,14 @@ impl TapeBake {
         let scene = digest_of_scene(
             &self.poses,
             self.viewport,
-            &bake_settings(&config, &resolved),
+            &self.settings(&config, &resolved),
         );
         let culling = if resolved.cull { "full" } else { "disabled" };
         let content = PackContent {
             content: self.content,
             terrain_layer: layers.0,
             imagery_layer: layers.1.unwrap_or_default(),
+            night_layer: self.night_layer().unwrap_or_default(),
         };
         tracing::info!(
             scene,
@@ -257,6 +317,7 @@ mod tests {
             imagery: None,
             content: tuile_pack::Content::References,
             ground: crate::open::Ground::Ion,
+            night_lights: None,
         }
     }
 

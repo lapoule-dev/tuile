@@ -1990,6 +1990,7 @@ impl<'a> Pack<'a> {
   pub const VT_CONTENT: ::flatbuffers::VOffsetT = 22;
   pub const VT_TERRAIN_LAYER: ::flatbuffers::VOffsetT = 24;
   pub const VT_IMAGERY_LAYER: ::flatbuffers::VOffsetT = 26;
+  pub const VT_NIGHT_LAYER: ::flatbuffers::VOffsetT = 28;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -2002,6 +2003,7 @@ impl<'a> Pack<'a> {
   ) -> ::flatbuffers::WIPOffset<Pack<'bldr>> {
     let mut builder = PackBuilder::new(_fbb);
     builder.add_blob_digest(args.blob_digest);
+    if let Some(x) = args.night_layer { builder.add_night_layer(x); }
     if let Some(x) = args.imagery_layer { builder.add_imagery_layer(x); }
     if let Some(x) = args.terrain_layer { builder.add_terrain_layer(x); }
     if let Some(x) = args.frames { builder.add_frames(x); }
@@ -2123,6 +2125,15 @@ impl<'a> Pack<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(Pack::VT_IMAGERY_LAYER, None)}
   }
+  /// The tile store's layer of the lights a town gives at night, read
+  /// whole by a render under a physical atmosphere. Absent: no lights.
+  #[inline]
+  pub fn night_layer(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(Pack::VT_NIGHT_LAYER, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for Pack<'_> {
@@ -2143,6 +2154,7 @@ impl ::flatbuffers::Verifiable for Pack<'_> {
      .visit_field::<Content>("content", Self::VT_CONTENT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("terrain_layer", Self::VT_TERRAIN_LAYER, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("imagery_layer", Self::VT_IMAGERY_LAYER, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("night_layer", Self::VT_NIGHT_LAYER, false)?
      .finish();
     Ok(())
   }
@@ -2160,6 +2172,7 @@ pub struct PackArgs<'a> {
     pub content: Content,
     pub terrain_layer: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub imagery_layer: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub night_layer: Option<::flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for PackArgs<'a> {
   #[inline]
@@ -2177,6 +2190,7 @@ impl<'a> Default for PackArgs<'a> {
       content: Content::Embedded,
       terrain_layer: None,
       imagery_layer: None,
+      night_layer: None,
     }
   }
 }
@@ -2235,6 +2249,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> PackBuilder<'a, 'b, A> {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Pack::VT_IMAGERY_LAYER, imagery_layer);
   }
   #[inline]
+  pub fn add_night_layer(&mut self, night_layer: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Pack::VT_NIGHT_LAYER, night_layer);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> PackBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     PackBuilder {
@@ -2264,6 +2282,7 @@ impl ::core::fmt::Debug for Pack<'_> {
       ds.field("content", &self.content());
       ds.field("terrain_layer", &self.terrain_layer());
       ds.field("imagery_layer", &self.imagery_layer());
+      ds.field("night_layer", &self.night_layer());
       ds.finish()
   }
 }

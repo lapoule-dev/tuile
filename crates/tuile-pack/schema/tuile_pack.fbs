@@ -180,6 +180,10 @@ table Pack {
   /// The layers of the tile store the references are into.
   terrain_layer: string;
   imagery_layer: string;
+  // ── since version 3, added later; absent reads as none ────────────────
+  /// The tile store's layer of the lights a town gives at night, read
+  /// whole by a render under a physical atmosphere. Absent: no lights.
+  night_layer: string;
 }
 
 root_type Pack;

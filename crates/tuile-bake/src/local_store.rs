@@ -137,7 +137,10 @@ mod tests {
         let stale = store
             .put_opts(&at, "three".into(), update(first.e_tag.clone()))
             .await;
-        assert!(matches!(stale, Err(object_store::Error::Precondition { .. })), "{stale:?}");
+        assert!(
+            matches!(stale, Err(object_store::Error::Precondition { .. })),
+            "{stale:?}"
+        );
         let body = store.get(&at).await.unwrap().bytes().await.unwrap();
         assert_eq!(&body[..], b"two");
         assert_ne!(first.e_tag, second.e_tag);
@@ -145,6 +148,9 @@ mod tests {
         let none = store
             .put_opts(&Path::from("absent"), "x".into(), update(Some("1".into())))
             .await;
-        assert!(matches!(none, Err(object_store::Error::Precondition { .. })), "{none:?}");
+        assert!(
+            matches!(none, Err(object_store::Error::Precondition { .. })),
+            "{none:?}"
+        );
     }
 }

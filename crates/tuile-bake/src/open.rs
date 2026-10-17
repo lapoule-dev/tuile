@@ -78,7 +78,10 @@ pub(crate) const ELLIPSOID: i64 = 1_000_000_001;
 pub(crate) const NOTHING: i64 = 1_000_000_002;
 /// NASA Blue Marble: Next Generation, its August 2004 composite, through
 /// GIBS.
-pub(crate) const BLUE_MARBLE: i64 = 1_000_000_101;
+pub const BLUE_MARBLE: i64 = 1_000_000_101;
+/// NASA Black Marble, its 2016 composite, through GIBS: the night lights, a
+/// layer of the store a render reads whole ([`BlackMarble`]).
+pub const BLACK_MARBLE: i64 = 1_000_000_201;
 
 /// The deepest level of the ellipsoid's tiles: past it a tile would be
 /// flatter than any camera that wants it can tell.
@@ -318,6 +321,7 @@ impl<F: TileFetcher + 'static> ImageryProvider for Gibs<F> {
 /// tiles of 512, 5 120 by 2 560 texels, about 8 km a texel. **Public
 /// domain** (NASA Earth Observatory); credit "Imagery: NASA Earth
 /// Observatory, Black Marble 2016, served by NASA EOSDIS GIBS".
+#[derive(Clone, PartialEq)]
 pub struct NightLights {
     pub width: u32,
     pub height: u32,
@@ -327,55 +331,241 @@ pub struct NightLights {
 }
 
 impl NightLights {
-    /// As a grey PNG: what the run store keeps.
-    pub fn to_png(&self) -> Result<Vec<u8>, String> {
-        let mut out = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut out)
-            .write_image(
-                &self.luma,
+    /// The mosaic put together from its tiles in the store, at
+    /// [`NIGHT_LEVEL`]: `tile(x, y)` gives a tile's bytes, `None` where the
+    /// store holds none — a tile no camera of the film could see, left dark.
+    pub fn from_tiles(mut tile: impl FnMut(u32, u32) -> Option<Vec<u8>>) -> Result<Self, String> {
+        let (across, down) = night_grid();
+        let (width, height) = (across * NIGHT_SIDE, down * NIGHT_SIDE);
+        let mut luma = vec![0u8; (width * height) as usize];
+        for y in 0..down {
+            for x in 0..across {
+                let Some(png) = tile(x, y) else { continue };
+                let grey = image::load_from_memory(&png)
+                    .map_err(|e| format!("night tile {NIGHT_LEVEL}/{x}/{y}: {e}"))?
+                    .to_luma8();
+                if grey.dimensions() != (NIGHT_SIDE, NIGHT_SIDE) {
+                    return Err(format!(
+                        "night tile {NIGHT_LEVEL}/{x}/{y} is {:?}, not {NIGHT_SIDE} square",
+                        grey.dimensions()
+                    ));
+                }
+                for (row, line) in grey.rows().enumerate() {
+                    let at = ((y * NIGHT_SIDE + row as u32) * width + x * NIGHT_SIDE) as usize;
+                    for (col, p) in line.enumerate() {
+                        luma[at + col] = p.0[0];
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            width,
+            height,
+            luma,
+        })
+    }
+
+    /// The tile `(x, y)` of [`NIGHT_LEVEL`], cut out of the mosaic: a grey
+    /// PNG, as the store keeps it.
+    fn tile_png(&self, x: u32, y: u32) -> Result<Vec<u8>, String> {
+        let (across, down) = night_grid();
+        if (self.width, self.height) != (across * NIGHT_SIDE, down * NIGHT_SIDE) {
+            return Err(format!(
+                "a night mosaic of {}x{}, not {}x{}",
                 self.width,
                 self.height,
-                image::ExtendedColorType::L8,
-            )
+                across * NIGHT_SIDE,
+                down * NIGHT_SIDE
+            ));
+        }
+        let mut cut = Vec::with_capacity((NIGHT_SIDE * NIGHT_SIDE) as usize);
+        for row in 0..NIGHT_SIDE {
+            let at = ((y * NIGHT_SIDE + row) * self.width + x * NIGHT_SIDE) as usize;
+            cut.extend_from_slice(&self.luma[at..at + NIGHT_SIDE as usize]);
+        }
+        let mut out = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut out)
+            .write_image(&cut, NIGHT_SIDE, NIGHT_SIDE, image::ExtendedColorType::L8)
             .map_err(|e| e.to_string())?;
         Ok(out)
     }
+}
 
-    /// From the PNG [`Self::to_png`] wrote.
-    pub fn from_png(png: &[u8]) -> Result<Self, String> {
-        let grey = image::load_from_memory(png)
-            .map_err(|e| e.to_string())?
-            .to_luma8();
-        Ok(Self {
-            width: grey.width(),
-            height: grey.height(),
-            luma: grey.into_raw(),
-        })
+/// The level of the store's geographic grid the night lights are kept at:
+/// sixteen by eight tiles, 22.5° each.
+pub const NIGHT_LEVEL: u32 = 3;
+/// A night tile's side, in texels: the mosaic is 5 120 by 2 560, about 8 km
+/// a texel, as GIBS gives it.
+pub const NIGHT_SIDE: u32 = 320;
+
+/// The tiles across and down at [`NIGHT_LEVEL`].
+pub fn night_grid() -> (u32, u32) {
+    let (across, down) = TilingScheme::geographic().tiles_at(NIGHT_LEVEL);
+    (across as u32, down as u32)
+}
+
+/// Where a bake takes the night lights from.
+#[derive(Clone)]
+pub enum NightLightsSource {
+    /// NASA's GIBS, through the bake's cache.
+    Gibs,
+    /// A mosaic in hand: a test's, which reaches no network.
+    Given(Arc<NightLights>),
+}
+
+impl std::fmt::Debug for NightLightsSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gibs => f.write_str("Gibs"),
+            Self::Given(m) => write!(f, "Given({}x{})", m.width, m.height),
+        }
     }
 }
 
-/// Where the run store keeps a night-lights mosaic: by its content, so that
-/// a render names exactly the lights it was made with, and a film's name
-/// changes with them.
-pub fn night_lights_key(png: &[u8]) -> String {
-    // The content names it; the source (VIIRS_Black_Marble, 2016-01-01,
-    // geographic level 3) is pinned in `night_lights`.
-    format!(
-        "assets/night-lights/{}.png",
-        tuile_pack::scene_digest(&[png])
-    )
+/// The night lights as a source: the store's geographic grid at
+/// [`NIGHT_LEVEL`], each tile cut from the mosaic GIBS gives. The bake asks
+/// it through the tile store, as any source, so that its tiles are written
+/// there by the same writer ([`publish_night_layer`]).
+pub struct BlackMarble {
+    cache_dir: Option<std::path::PathBuf>,
+    mosaic: tokio::sync::OnceCell<NightLights>,
 }
 
-/// The night-lights mosaic in the run store `store`: fetched from GIBS
-/// once, under `cache_dir`, and kept by its content. Returns its key.
-pub async fn publish_night_lights(
-    store: &dyn crate::NightLightsStore,
-    cache_dir: Option<std::path::PathBuf>,
-) -> Result<String, String> {
-    let png = night_lights(cache_dir).await?.to_png()?;
-    let key = night_lights_key(&png);
-    store.keep(&key, &png).await?;
-    Ok(key)
+impl BlackMarble {
+    /// Fetched from GIBS, through the cache under `cache_dir`, when first
+    /// asked for a tile.
+    pub fn from_gibs(cache_dir: Option<std::path::PathBuf>) -> Self {
+        Self {
+            cache_dir,
+            mosaic: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Of a mosaic already in hand (a test's).
+    pub fn of(mosaic: NightLights) -> Self {
+        Self {
+            cache_dir: None,
+            mosaic: tokio::sync::OnceCell::new_with(Some(mosaic)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ImageryProvider for BlackMarble {
+    fn tiling_scheme(&self) -> TilingScheme {
+        TilingScheme {
+            tile_size: NIGHT_SIDE,
+            minimum_level: NIGHT_LEVEL,
+            maximum_level: NIGHT_LEVEL,
+            ..TilingScheme::geographic()
+        }
+    }
+
+    async fn fetch_tile_bytes(&self, coord: ImageryCoord) -> Result<Fetched<Bytes>, RasterError> {
+        let (across, down) = night_grid();
+        if coord.level != NIGHT_LEVEL || coord.x >= u64::from(across) || coord.y >= u64::from(down)
+        {
+            return Err(RasterError::Image(format!(
+                "the night lights are kept at level {NIGHT_LEVEL} only, not {coord:?}"
+            )));
+        }
+        let mosaic = self
+            .mosaic
+            .get_or_try_init(|| night_lights(self.cache_dir.clone()))
+            .await
+            .map_err(RasterError::Image)?;
+        let png = mosaic
+            .tile_png(coord.x as u32, coord.y as u32)
+            .map_err(RasterError::Image)?;
+        Ok(Fetched::undated(Bytes::from(png)))
+    }
+}
+
+/// The night tiles any of `poses` can see: those within its horizon, and a
+/// margin, of where it stands.
+pub fn night_footprint(poses: &[tuile_tape::Frame]) -> std::collections::BTreeSet<(u32, u32)> {
+    let scheme = TilingScheme::geographic();
+    let (across, down) = night_grid();
+    let mut seen = std::collections::BTreeSet::new();
+    for pose in poses {
+        let g = tuile_core::geo::ecef_to_geodetic(glam::DVec3::from_array(pose.position));
+        // The horizon's angle at the Earth's centre, and a margin so that a
+        // tile just past it is kept.
+        let reach = (WGS84_A / (WGS84_A + g.height.max(0.0))).acos() + 0.05;
+        for y in 0..down {
+            for x in 0..across {
+                let rect = scheme.tile_rect(ImageryCoord {
+                    level: NIGHT_LEVEL,
+                    x: u64::from(x),
+                    y: u64::from(y),
+                });
+                // The point of the tile nearest the eye, then its angle.
+                let lat = g.lat.clamp(rect.south, rect.north);
+                let lon = if g.lon >= rect.west && g.lon <= rect.east {
+                    g.lon
+                } else {
+                    let to = |l: f64| {
+                        let d = (l - g.lon).rem_euclid(std::f64::consts::TAU);
+                        d.min(std::f64::consts::TAU - d)
+                    };
+                    if to(rect.west) <= to(rect.east) {
+                        rect.west
+                    } else {
+                        rect.east
+                    }
+                };
+                let cos = g.lat.sin() * lat.sin() + g.lat.cos() * lat.cos() * (lon - g.lon).cos();
+                if cos.clamp(-1.0, 1.0).acos() <= reach {
+                    seen.insert((x, y));
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Writes the night tiles of `footprint` into the tile store `store`
+/// through `source`, as the store keeps any source's tiles: a tile it holds
+/// already is read, not made again. Returns how many there are.
+pub async fn publish_night_layer(
+    store: Arc<dyn tuile_core::storage::ContentStore>,
+    source: BlackMarble,
+    footprint: &std::collections::BTreeSet<(u32, u32)>,
+) -> Result<usize, String> {
+    let cached = tuile_core::raster::CachedImagery::new(
+        source,
+        store,
+        crate::source_namespace(BLACK_MARBLE),
+    );
+    for &(x, y) in footprint {
+        cached
+            .fetch_tile_bytes(ImageryCoord {
+                level: NIGHT_LEVEL,
+                x: u64::from(x),
+                y: u64::from(y),
+            })
+            .await
+            .map_err(|e| format!("night tile {NIGHT_LEVEL}/{x}/{y}: {e}"))?;
+    }
+    Ok(footprint.len())
+}
+
+/// The night lights' layer in the tile store.
+pub fn black_marble_layer() -> tuile_tile_server::LayerDef {
+    tuile_tile_server::LayerDef {
+        name: crate::source_namespace(BLACK_MARBLE),
+        grid: tuile_tile_server::Grid::Geographic,
+        tile_type: "png".into(),
+        tile_compression: "none".into(),
+        zone_level: 9,
+        expiry_days: None,
+        content_type: "image/png".into(),
+        index: false,
+        licence: Some("Public domain (NASA)".into()),
+        attribution: Some(
+            "Imagery: NASA Earth Observatory, Black Marble 2016, served by NASA EOSDIS GIBS".into(),
+        ),
+    }
 }
 
 /// The tiles across and down of the night-lights mosaic, and their side.
@@ -384,7 +574,7 @@ const NIGHT_TILE: u32 = 512;
 
 /// The night lights, fetched — through the cache under `cache_dir` — and
 /// put together.
-pub async fn night_lights(cache_dir: Option<std::path::PathBuf>) -> Result<NightLights, String> {
+async fn night_lights(cache_dir: Option<std::path::PathBuf>) -> Result<NightLights, String> {
     let transport = tuile_native_fetchers::TransportConfig {
         retry: tuile_native_fetchers::RetryConfig::patient(),
         ..match &cache_dir {
@@ -506,10 +696,7 @@ pub fn store_layers(ground: Ground, ion: (i64, Option<i64>)) -> Vec<tuile_tile_s
             layers
         }
         Ground::Empty => vec![terrain(NOTHING)],
-        Ground::OpenEarth => vec![
-            terrain(ELLIPSOID),
-            blue_marble_layer(),
-        ],
+        Ground::OpenEarth => vec![terrain(ELLIPSOID), blue_marble_layer()],
     }
 }
 
@@ -565,6 +752,87 @@ fn on_ellipsoid(p: glam::DVec3) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A night mosaic whose every texel says where it is.
+    pub(crate) fn patterned_night() -> NightLights {
+        let (across, down) = night_grid();
+        let (width, height) = (across * NIGHT_SIDE, down * NIGHT_SIDE);
+        let luma = (0..width * height)
+            .map(|n| ((n % width) / 7 + (n / width) / 3) as u8)
+            .collect();
+        NightLights {
+            width,
+            height,
+            luma,
+        }
+    }
+
+    fn eye(lon: f64, lat: f64, height: f64) -> tuile_tape::Frame {
+        let p = geodetic_to_ecef(Geodetic {
+            lon: lon.to_radians(),
+            lat: lat.to_radians(),
+            height,
+        });
+        tuile_tape::Frame {
+            position: p.to_array(),
+            direction: [0.0, 0.0, 1.0],
+            up: [1.0, 0.0, 0.0],
+            fovy: 1.0,
+        }
+    }
+
+    #[test]
+    fn night_tiles_cut_from_the_mosaic_put_it_back_together() {
+        let mosaic = patterned_night();
+        let (across, down) = night_grid();
+        assert_eq!((across, down), (16, 8));
+        let whole = NightLights::from_tiles(|x, y| Some(mosaic.tile_png(x, y).unwrap())).unwrap();
+        assert!(whole == mosaic);
+        // A tile the store does not hold stays dark, and only it.
+        let holed = NightLights::from_tiles(|x, y| {
+            (x, y).ne(&(3, 2)).then(|| mosaic.tile_png(x, y).unwrap())
+        })
+        .unwrap();
+        let at = |x: u32, y: u32| (y * holed.width + x) as usize;
+        assert_eq!(holed.luma[at(3 * NIGHT_SIDE + 5, 2 * NIGHT_SIDE + 5)], 0);
+        assert_eq!(
+            holed.luma[at(4 * NIGHT_SIDE + 5, 2 * NIGHT_SIDE + 5)],
+            mosaic.luma[at(4 * NIGHT_SIDE + 5, 2 * NIGHT_SIDE + 5)]
+        );
+    }
+
+    #[test]
+    fn a_night_footprint_holds_what_the_horizon_holds() {
+        // A summit sees its own tile; Pic du Midi's (lon 0.14, lat 42.9) is
+        // column 8 (0 to 22.5° E), row 2 (45° to 22.5° N).
+        let summit = night_footprint(&[eye(0.1423, 42.9364, 2877.0)]);
+        assert!(summit.contains(&(8, 2)), "{summit:?}");
+        assert!(summit.len() <= 4, "{summit:?}");
+        // From 300 km a wider ground, still not the far side.
+        let orbit = night_footprint(&[eye(0.1423, 42.9364, 300_000.0)]);
+        assert!(orbit.len() > summit.len(), "{orbit:?}");
+        assert!(orbit.is_superset(&summit));
+        assert!(!orbit.contains(&(0, 5)), "{orbit:?}");
+        // Across the antimeridian: a tile on the other side of it is near.
+        let dateline = night_footprint(&[eye(179.9, 0.0, 300_000.0)]);
+        assert!(
+            dateline.contains(&(0, 3)) || dateline.contains(&(0, 4)),
+            "{dateline:?}"
+        );
+    }
+
+    #[test]
+    fn the_night_layer_is_declared_with_its_licence_and_credit() {
+        let layer = black_marble_layer();
+        assert_eq!(layer.name, crate::source_namespace(BLACK_MARBLE));
+        assert_eq!(layer.grid, tuile_tile_server::Grid::Geographic);
+        assert!(layer.licence.as_deref().unwrap().contains("Public domain"));
+        assert!(layer
+            .attribution
+            .as_deref()
+            .unwrap()
+            .contains("Black Marble"));
+    }
 
     #[test]
     fn ions_default_assets_are_declared_and_no_other() {

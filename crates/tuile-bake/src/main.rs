@@ -1061,6 +1061,7 @@ fn bake_tape(token: String, args: &Args, tiles: Option<&tiles::Tiles>) -> Result
         imagery: args.imagery,
         content: args.content,
         ground: tuile_bake::open::Ground::Ion,
+        night_lights: None,
     };
     let layers = bake.layers();
     println!(
@@ -1265,6 +1266,7 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
         content: args.content,
         terrain_layer: store_layers.0.clone(),
         imagery_layer: store_layers.1.clone().unwrap_or_default(),
+        night_layer: String::new(),
     };
     tracing::info!(
         scene,

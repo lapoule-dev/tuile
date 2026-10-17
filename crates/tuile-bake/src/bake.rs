@@ -98,6 +98,8 @@ pub struct PackContent {
     pub content: tuile_pack::Content,
     pub terrain_layer: String,
     pub imagery_layer: String,
+    /// The store's layer of the night lights, empty for none.
+    pub night_layer: String,
 }
 
 impl PackContent {
@@ -107,6 +109,7 @@ impl PackContent {
             content: tuile_pack::Content::Embedded,
             terrain_layer: String::new(),
             imagery_layer: String::new(),
+            night_layer: String::new(),
         }
     }
 }
@@ -189,7 +192,8 @@ pub fn bake_frames(
                     job.content.content,
                     &job.content.terrain_layer,
                     &job.content.imagery_layer,
-                ),
+                )
+                .with_night_layer(&job.content.night_layer),
             ),
         };
 

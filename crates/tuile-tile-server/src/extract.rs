@@ -615,6 +615,8 @@ mod tests {
             expiry_days: None,
             content_type: "image/png".into(),
             index: false,
+            licence: None,
+            attribution: None,
         };
         catalog::write(memory.as_ref(), &Catalog { layers: vec![def] })
             .await
@@ -712,6 +714,8 @@ mod tests {
             expiry_days: None,
             content_type: "image/png".into(),
             index: false,
+            licence: None,
+            attribution: None,
         };
         catalog::write(
             memory.as_ref(),

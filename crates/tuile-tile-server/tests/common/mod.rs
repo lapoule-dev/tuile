@@ -59,8 +59,6 @@ pub fn imagery() -> Layer {
         expiry: Some(IMAGERY_EXPIRY),
         content_type: "image/jpeg".into(),
         index: false,
-        licence: None,
-        attribution: None,
     }
 }
 
@@ -75,8 +73,6 @@ pub fn terrain() -> Layer {
         expiry: None,
         content_type: "application/vnd.quantized-mesh".into(),
         index: false,
-        licence: None,
-        attribution: None,
     }
 }
 
