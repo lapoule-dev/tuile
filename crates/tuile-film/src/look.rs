@@ -187,6 +187,18 @@ pub struct Look {
     /// ground reflects about 0.08 of daylight — 6.5. Not read without
     /// [`Look::atmosphere`].
     pub reflectance: f32,
+    /// How many times its true size the sun's disc is drawn, and the
+    /// Moon's — a long lens's, or a photographer's composite: 1 is the sky
+    /// as it is (half a degree each), each disc keeping its own radiance,
+    /// its limb, its phase. Read only under [`Look::atmosphere`].
+    pub sun_scale: f32,
+    pub moon_scale: f32,
+    /// How much of a bright source's light the camera spreads about it —
+    /// its glare, a point-spread function of an energy-conserving core
+    /// and halo with a faint six-pointed star — as a multiple of a clean
+    /// lens's (1). 0: none. Read only under [`Look::atmosphere`], for the
+    /// sun's disc and the Moon's.
+    pub glare: f32,
 }
 
 impl Default for Look {
@@ -206,6 +218,9 @@ impl Default for Look {
             turbidity: None,
             atmosphere: None,
             reflectance: 6.5,
+            sun_scale: 1.0,
+            moon_scale: 1.0,
+            glare: 1.0,
         }
     }
 }
@@ -300,6 +315,7 @@ impl Look {
 /// light only the sun's direction, the compensation and the air are heard
 /// — the turbidity, and the haze's density as the aerosols' extinction.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct FrameLight {
     pub illumination: ReferenceIllumination,
     pub air: FrameAir,
@@ -320,6 +336,24 @@ pub struct FrameAir {
 }
 
 impl FrameLight {
+    /// A frame's light: `illumination` and what the host says of the air,
+    /// no instant stated.
+    pub fn new(illumination: ReferenceIllumination, air: FrameAir) -> Self {
+        Self {
+            illumination,
+            air,
+            instant: None,
+        }
+    }
+
+    /// With the frame's instant stated, Unix seconds UTC.
+    pub fn with_instant(self, instant: f64) -> Self {
+        Self {
+            instant: Some(instant),
+            ..self
+        }
+    }
+
     /// The light `look` already has: applied, it changes nothing.
     pub fn of(look: &Look) -> Self {
         Self {
@@ -361,8 +395,8 @@ mod tests {
         };
         // The look's own light gives the look back, bit for bit.
         assert_eq!(look.lit_by(FrameLight::of(&look)), look);
-        let light = FrameLight {
-            illumination: ReferenceIllumination {
+        let light = FrameLight::new(
+            ReferenceIllumination {
                 to_sun_ecef: glam::DVec3::new(0.0, 3.0, 4.0),
                 sun_rgb: [2.0, 1.5, 1.0],
                 sky_sh: [[0.2, 0.3, 0.5], [9.0; 3], [9.0; 3], [9.0; 3]],
@@ -373,12 +407,11 @@ mod tests {
                 night_floor: 0.1,
                 moon: None,
             },
-            air: FrameAir {
+            FrameAir {
                 turbidity: Some(3.0),
                 haze_density: Some(2.0e-5),
             },
-            instant: None,
-        };
+        );
         let lit = look.lit_by(light);
         assert!((lit.to_sun - Vec3::new(0.0, 0.6, 0.8)).length() < 1e-6);
         assert_eq!(lit.sun, Vec3::new(2.0, 1.5, 1.0));

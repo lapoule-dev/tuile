@@ -51,6 +51,11 @@ pub const DAYLIGHT_EV100: f32 = 15.0;
 /// exposure makes up.
 pub const EXPOSURE_FOLLOWS: f32 = 0.75;
 
+/// The most, in stops, a dim light's exposure was raised over daylight's,
+/// when the exposure was capped. It is not any more: see [`shown_ev`].
+#[deprecated(note = "the exposure follows `shown_ev`, one smooth curve with no cap")]
+pub const MAX_ADAPTATION_EV: f32 = 4.0;
+
 /// How dark the darkest night is shown: the scale, in stops, of
 /// [`shown_ev`]'s logarithm.
 pub const NIGHT_DEPTH_EV: f32 = 3.0;
@@ -198,6 +203,16 @@ impl ReferenceIllumination {
             moon: Some(Moonlight::of(&moon)),
             ..Self::provisional(sun.direction_ecef, sun_rgb, sky_rgb)
         })
+    }
+
+    /// The sky averaged over every facing: [`Self::sky_sh`]'s first term.
+    /// With the Moon placed: what a host adds to a light it built
+    /// without one.
+    pub fn with_moon(self, moon: Moonlight) -> Self {
+        Self {
+            moon: Some(moon),
+            ..self
+        }
     }
 
     /// The sky averaged over every facing: [`Self::sky_sh`]'s first term.

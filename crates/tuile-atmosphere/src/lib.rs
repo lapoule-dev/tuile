@@ -69,6 +69,8 @@ pub mod sun;
 
 pub use aerial::{AerialPerspective, WGSL};
 pub use hillaire::{Calibration, LutAtmosphere, SkyLight};
+#[allow(deprecated)]
+pub use illumination::MAX_ADAPTATION_EV;
 pub use illumination::{
     shown_ev, Moonlight, ReferenceIllumination, DAYLIGHT_EV100, EXPOSURE_FOLLOWS, NIGHT_DEPTH_EV,
 };

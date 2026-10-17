@@ -291,11 +291,7 @@ fn a_frames_light_is_laid_over_the_ordered_look_never_the_last_frames() {
     illumination.ev100 = DAYLIGHT_EV100 + 2.0;
     illumination.white = [1.2, 1.0, 0.8];
     illumination.adaptation = 1.0;
-    let light = FrameLight {
-        illumination,
-        air: Default::default(),
-        instant: None,
-    };
+    let light = FrameLight::new(illumination, Default::default());
     film.set_light(light);
     let first = *film.lit();
     film.set_light(light);
