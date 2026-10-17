@@ -1514,6 +1514,12 @@ impl FilmGpu {
         &self.atmosphere.sky_view
     }
 
+    /// The same table under the Moon, per unit of its own light: black
+    /// when the frame has no Moon.
+    pub fn moon_view_texture(&self) -> &wgpu::Texture {
+        &self.atmosphere.moon_view
+    }
+
     /// The look the frame last drawn was drawn with: the ordered one under
     /// the frame's light.
     pub fn lit(&self) -> &Look {
@@ -2263,6 +2269,7 @@ impl FilmGpu {
         let k = self.settings.supersample.max(1);
         let (w, h) = (self.settings.width * k, self.settings.height * k);
         let mut uniform = FrameUniform::new(camera, &self.lit, [w, h, k, u32::from(overlaid)]);
+        self.pre_expose(&mut uniform);
         if let Some((view, side)) = &sun {
             uniform = uniform.shadowed(view, self.lit.shadow, *side);
         }
@@ -2489,8 +2496,11 @@ impl FilmGpu {
         let key = atmosphere::LightKey {
             params,
             frame_eye: frame.eye,
+            view: frame.view.to_cols_array(),
             ground: ground.to_array(),
             to_sun,
+            moon: light.illumination.moon,
+            instant: light.instant,
             compensation_ev: light.illumination.compensation_ev,
         };
         if self.atmosphere.key == Some(key) {
@@ -2500,22 +2510,44 @@ impl FilmGpu {
         let geodetic = tuile_core::geo::ecef_to_geodetic(ground);
         let model = self.atmosphere.model.as_ref().expect("held above");
         let reference = self.atmosphere.reference.as_ref().expect("held above");
+        let metering = metering_points(
+            frame,
+            &tuile_atmosphere::AtmosphereFrame::at(geodetic),
+            geodetic.height,
+        );
+        // A host that states the instant and not the Moon: the Moon of that
+        // instant, from the frame's own eye — its parallax is a degree.
+        let moon = light.illumination.moon.or_else(|| {
+            let instant = light.instant?;
+            let eye = tuile_core::geo::ecef_to_geodetic(frame.eye);
+            tuile_atmosphere::Moon::seen_from(instant, eye)
+                .map(|m| tuile_atmosphere::Moonlight::of(&m))
+        });
         let sky = model.light(
             reference,
             geodetic,
-            to_sun,
+            tuile_atmosphere::hillaire::Moment {
+                to_sun_ecef: to_sun,
+                moon,
+                compensation_ev: light.illumination.compensation_ev,
+            },
+            &metering,
             tuile_atmosphere::Calibration {
                 sun: base.sun.to_array(),
                 sky: base.world.to_array(),
                 reflectance: base.reflectance,
             },
-            light.illumination.compensation_ev,
         );
         self.lit = base.lit_by(FrameLight {
             illumination: sky.illumination,
             air: light.air,
+            instant: light.instant,
         });
-        self.atmosphere.frame_uniform = AtmosphereUniform::new(&params, &sky, frame.eye);
+        let stars = light
+            .instant
+            .map(|t| tuile_atmosphere::celestial_to_ecef(t).transpose());
+        self.atmosphere.frame_uniform =
+            AtmosphereUniform::new(&params, &sky, frame.eye, self.lit.exposure_scale(), stars);
         // Written now for the sky-view, placed from each eye when drawn.
         self.queue.write_buffer(
             &self.atmosphere.uniform,
@@ -2526,6 +2558,22 @@ impl FilmGpu {
         self.atmosphere.key = Some(key);
         self.atmosphere.sky_view_stale = true;
         Ok(())
+    }
+
+    /// Under a physical atmosphere the frame's lights are pre-exposed: the
+    /// picture's exposure is already in them, so that the HDR target —
+    /// half floats — holds a night twenty stops under noon. `uniform`'s
+    /// lights are scaled, and its exposure set to one.
+    fn pre_expose(&self, uniform: &mut FrameUniform) {
+        if self.atmosphere.light.is_none() {
+            return;
+        }
+        let k = uniform.world[3];
+        for c in 0..3 {
+            uniform.world[c] *= k;
+            uniform.sun[c] *= k;
+        }
+        uniform.world[3] = 1.0;
     }
 
     /// The ground the frame's light is worked out at (ECEF): under the eye,
@@ -2644,4 +2692,50 @@ impl FilmGpu {
     pub fn pixel_list_bytes(&self) -> u64 {
         self.targets.list.size()
     }
+}
+
+/// What a frame's light is metered over: a grid of twenty-four by fourteen
+/// rays — fine enough to fall on a limb a few degrees thick —
+/// across the camera's view — the ground where one meets the sphere the air
+/// is laid on, at the height of the ground under the eye, and the sky where
+/// one does not.
+fn metering_points(
+    frame: &FrameCamera,
+    sphere: &tuile_atmosphere::AtmosphereFrame,
+    ground_height: f64,
+) -> Vec<tuile_atmosphere::hillaire::Metered> {
+    use tuile_atmosphere::hillaire::Metered;
+    let v = frame.view;
+    let p = frame.projection;
+    let right = (v.row(0).truncate() / p.x_axis.x).as_dvec3();
+    let up = (v.row(1).truncate() / p.y_axis.y).as_dvec3();
+    let fwd = (-v.row(2).truncate()).as_dvec3()
+        + right * f64::from(p.z_axis.x)
+        + up * f64::from(p.z_axis.y);
+    let radius = sphere.radius + ground_height;
+    let o = frame.eye - sphere.centre;
+    let (columns, rows) = (24, 14);
+    let mut out = Vec::with_capacity(columns * rows);
+    for j in 0..rows {
+        for i in 0..columns {
+            let x = (i as f64 + 0.5) / columns as f64 * 2.0 - 1.0;
+            let y = (j as f64 + 0.5) / rows as f64 * 2.0 - 1.0;
+            let d = (fwd + right * x + up * y).normalize();
+            let b = o.dot(d);
+            let disc = b * b - (o.length_squared() - radius * radius);
+            let t = -b - disc.max(0.0).sqrt();
+            if disc >= 0.0 && t > 0.0 {
+                out.push(Metered::Ground {
+                    eye: frame.eye,
+                    point: frame.eye + d * t,
+                });
+            } else {
+                out.push(Metered::Sky {
+                    eye: frame.eye,
+                    direction: d,
+                });
+            }
+        }
+    }
+    out
 }

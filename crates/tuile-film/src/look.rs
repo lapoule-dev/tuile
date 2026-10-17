@@ -303,6 +303,9 @@ impl Look {
 pub struct FrameLight {
     pub illumination: ReferenceIllumination,
     pub air: FrameAir,
+    /// The frame's instant, Unix seconds UTC, when the host states it:
+    /// what turns the stars of a physical sky. `None`: no stars.
+    pub instant: Option<f64>,
 }
 
 /// What a host may say of a frame's air; what it leaves unsaid is the
@@ -326,6 +329,7 @@ impl FrameLight {
                 look.world.to_array(),
             ),
             air: FrameAir::default(),
+            instant: None,
         }
     }
 }
@@ -367,11 +371,13 @@ mod tests {
                 ev100: tuile_atmosphere::DAYLIGHT_EV100 + 1.0,
                 compensation_ev: 0.5,
                 night_floor: 0.1,
+                moon: None,
             },
             air: FrameAir {
                 turbidity: Some(3.0),
                 haze_density: Some(2.0e-5),
             },
+            instant: None,
         };
         let lit = look.lit_by(light);
         assert!((lit.to_sun - Vec3::new(0.0, 0.6, 0.8)).length() < 1e-6);

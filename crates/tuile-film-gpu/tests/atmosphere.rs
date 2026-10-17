@@ -167,17 +167,14 @@ fn the_sky_view_table_is_the_cpu_sky() {
             return;
         };
         draw(&mut film, false, &[]);
-        let texels = read_texture(&film, film.sky_view_texture(), 8);
+        let texels = read_texture(&film, film.sky_view_texture(), 16);
         let gpu = |i: usize, j: usize| {
             let at = (j * SKY_VIEW_SIZE[0] + i) * 4;
-            let half = |k: usize| {
-                half::f16::from_bits(u16::from_le_bytes([
-                    texels[2 * (at + k)],
-                    texels[2 * (at + k) + 1],
-                ]))
-                .to_f64()
+            let float = |k: usize| {
+                let b = &texels[4 * (at + k)..4 * (at + k) + 4];
+                f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             };
-            [half(0), half(1), half(2)]
+            [float(0), float(1), float(2)]
         };
         // The CPU's own: the sphere under the eye, its height, the sun's.
         let eye = DVec3::new(A + 1000.0, 0.0, 0.0);
@@ -275,7 +272,7 @@ fn both_eyes_of_a_frame_share_one_light_and_one_sky() {
         let encoder = film.render_shot(&shot, &[key], &[]).expect("render");
         film.queue().submit([encoder.finish()]);
         lights.push(*film.lit());
-        skies.push(read_texture(&film, film.sky_view_texture(), 8));
+        skies.push(read_texture(&film, film.sky_view_texture(), 16));
     }
     assert_eq!(lights[0], lights[1]);
     assert_eq!(skies[0], skies[1]);
@@ -297,6 +294,7 @@ fn a_frames_light_is_laid_over_the_ordered_look_never_the_last_frames() {
     let light = FrameLight {
         illumination,
         air: Default::default(),
+        instant: None,
     };
     film.set_light(light);
     let first = *film.lit();

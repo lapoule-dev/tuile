@@ -30,7 +30,7 @@ use std::f64::consts::PI;
 use glam::{DMat3, DVec3};
 use tuile_core::geo::{enu_frame, Geodetic};
 
-use crate::illumination::{ReferenceIllumination, DAYLIGHT_EV100};
+use crate::illumination::{Moonlight, ReferenceIllumination, DAYLIGHT_EV100};
 use crate::params::{AtmosphereFrame, AtmosphereParams};
 
 /// The GPU twin: the tables' parametrisations and the marches, as WGSL
@@ -43,6 +43,11 @@ pub const TRANSMITTANCE_SIZE: [usize; 2] = [256, 64];
 pub const MULTI_SCATTERING_SIZE: [usize; 2] = [32, 32];
 /// Sky-view table, made per frame: azimuth from the sun by zenith angle.
 pub const SKY_VIEW_SIZE: [usize; 2] = [192, 108];
+/// Level-ground irradiance table: sun zenith cosine by height. Fine across,
+/// where the terminator is: a texel is under a degree of the sun's height.
+pub const IRRADIANCE_SIZE: [usize; 2] = [256, 16];
+/// Directions over which a texel of the irradiance table is summed.
+const IRRADIANCE_TABLE_DIRECTIONS: usize = 384;
 /// The planet radius the tables are laid out for. A height indexes them; the
 /// radius shapes only where the horizon falls in them, and the Earth's
 /// differ from this one by a few parts in a thousand.
@@ -67,6 +72,7 @@ pub struct LutAtmosphere {
     params: AtmosphereParams,
     transmittance: Vec<[f64; 3]>,
     multi_scattering: Vec<[f64; 3]>,
+    irradiance: Vec<[f64; 3]>,
 }
 
 /// Bruneton's half-texel remap: a table's texel `i` holds the unit value
@@ -98,6 +104,17 @@ fn bilinear(table: &[[f64; 3]], size: [usize; 2], u: f64, v: f64) -> [f64; 3] {
 fn sphere_exit(r: f64, mu: f64, radius: f64) -> Option<f64> {
     let disc = r * r * (mu * mu - 1.0) + radius * radius;
     (disc >= 0.0).then(|| -r * mu + disc.sqrt())
+}
+
+/// Where a ray from radius `r` at zenith cosine `mu` enters a sphere of
+/// radius `top` from outside it: the near crossing, if it meets it at all
+/// ahead. `Some(0)` for a ray that starts inside.
+fn sphere_entry(r: f64, mu: f64, top: f64) -> Option<f64> {
+    if r <= top {
+        return Some(0.0);
+    }
+    let disc = r * r * (mu * mu - 1.0) + top * top;
+    (mu < 0.0 && disc >= 0.0).then(|| -r * mu - disc.sqrt())
 }
 
 fn ground_hit(r: f64, mu: f64, bottom: f64) -> Option<f64> {
@@ -180,9 +197,11 @@ impl LutAtmosphere {
             params,
             transmittance: Vec::new(),
             multi_scattering: Vec::new(),
+            irradiance: Vec::new(),
         };
         atmosphere.transmittance = atmosphere.build_transmittance();
         atmosphere.multi_scattering = atmosphere.build_multi_scattering();
+        atmosphere.irradiance = atmosphere.build_irradiance();
         atmosphere
     }
 
@@ -203,6 +222,46 @@ impl LutAtmosphere {
     /// radiance every order past the first adds, per unit of scattering.
     pub fn multi_scattering_table(&self) -> &[[f64; 3]] {
         &self.multi_scattering
+    }
+
+    /// The level-ground irradiance table, row by row (height), RGB: the
+    /// sky's light alone on level ground, per unit of the sun's outside the
+    /// air, the sun's zenith cosine across.
+    pub fn irradiance_table(&self) -> &[[f64; 3]] {
+        &self.irradiance
+    }
+
+    fn build_irradiance(&self) -> Vec<[f64; 3]> {
+        let [w, h] = IRRADIANCE_SIZE;
+        let mut table = Vec::with_capacity(w * h);
+        for j in 0..h {
+            let height = irradiance_height(j as f64 / (h - 1) as f64, self.params.thickness);
+            for i in 0..w {
+                let mu_s = 2.0 * (i as f64 / (w - 1) as f64) - 1.0;
+                let sun = DVec3::new((1.0 - mu_s * mu_s).max(0.0).sqrt(), 0.0, mu_s);
+                table.push(
+                    self.sky_irradiance_with(height, sun, &[DVec3::Z], IRRADIANCE_TABLE_DIRECTIONS)
+                        [0],
+                );
+            }
+        }
+        table
+    }
+
+    /// The sky's light on level ground at `height`, the sun at zenith
+    /// cosine `mu_s`, per unit of the sun's outside the air: from the
+    /// table. What lights ground far from where a frame's light was worked
+    /// out — the night side of a terminator gets its own.
+    pub fn level_irradiance(&self, height: f64, mu_s: f64) -> [f64; 3] {
+        let [w, h] = IRRADIANCE_SIZE;
+        let x = (mu_s * 0.5 + 0.5).clamp(0.0, 1.0);
+        let y = irradiance_unit(height, self.params.thickness);
+        bilinear(
+            &self.irradiance,
+            IRRADIANCE_SIZE,
+            uv_from_unit(x, w),
+            uv_from_unit(y, h),
+        )
     }
 
     /// Bruneton's parametrisation of the transmittance table: unit
@@ -265,7 +324,19 @@ impl LutAtmosphere {
     /// cosine `mu` to the top of the air, from the table. A ray that meets
     /// the ground is read as the one that grazes it: what keeps the light
     /// out is [`sun_visible`].
+    ///
+    /// From outside the air, along the line to where it enters it: all of
+    /// it for a line that misses it.
     pub fn transmittance(&self, r: f64, mu: f64) -> [f64; 3] {
+        let top = self.top();
+        let (r, mu) = if r > top {
+            match sphere_entry(r, mu, top) {
+                Some(t) => (top, ((r * mu + t) / top).clamp(-1.0, 1.0)),
+                None => return [1.0; 3],
+            }
+        } else {
+            (r, mu)
+        };
         let (x_mu, x_r) = self.transmittance_unit(r, mu);
         let [w, h] = TRANSMITTANCE_SIZE;
         bilinear(
@@ -390,7 +461,21 @@ impl LutAtmosphere {
         steps: usize,
         quadratic: bool,
     ) -> Ray {
-        let r = LUT_RADIUS + height.max(0.0);
+        let r0 = LUT_RADIUS + height.max(0.0);
+        // From outside the air, the march starts where the ray enters it,
+        // and a ray that never does gathers nothing.
+        let Some(entry) = sphere_entry(r0, dir.z, self.top()) else {
+            return Ray {
+                inscattered: [0.0; 3],
+                transmittance: [1.0; 3],
+            };
+        };
+        let start = DVec3::new(0.0, 0.0, r0) + dir * entry;
+        let r = start.length();
+        // The frame turned so that `z` is up where the march starts.
+        let turn = glam::DQuat::from_rotation_arc(start / r, DVec3::Z);
+        let (dir, sun) = (turn * dir, turn * sun);
+        let length = length.map(|l| l - entry);
         let mu = dir.z;
         let ground = ground_hit(r, mu, LUT_RADIUS);
         let to_end = ground
@@ -468,8 +553,17 @@ impl LutAtmosphere {
     /// direction, the ground's below the horizon included, summed over the
     /// hemisphere each faces.
     pub fn sky_irradiance(&self, height: f64, sun: DVec3, normals: &[DVec3]) -> Vec<[f64; 3]> {
+        self.sky_irradiance_with(height, sun, normals, IRRADIANCE_DIRECTIONS)
+    }
+
+    fn sky_irradiance_with(
+        &self,
+        height: f64,
+        sun: DVec3,
+        normals: &[DVec3],
+        n: usize,
+    ) -> Vec<[f64; 3]> {
         let mut out = vec![[0.0; 3]; normals.len()];
-        let n = IRRADIANCE_DIRECTIONS;
         let golden = PI * (3.0 - 5f64.sqrt());
         let solid_angle = 4.0 * PI / n as f64;
         for i in 0..n {
@@ -490,43 +584,34 @@ impl LutAtmosphere {
         out
     }
 
-    /// What one moment's sun and sky give the ground at `at`, the sun along
-    /// `to_sun_ecef`, in the renderer's units — those in which, under
-    /// `reference`'s air (a clear day's), a sun 45° up gives level ground
-    /// what `calibration` gives it. Imagery is a photograph taken by such a
-    /// light: under it the picture is the renderer's as it was, and at every
-    /// other hour it follows the physical ratio (`docs/18` §6).
+    /// What one moment's sun, Moon and sky give the ground at `at`, in the
+    /// renderer's units — those in which, under `reference`'s air (a clear
+    /// day's), a sun 45° up gives level ground what `calibration` gives it.
+    /// Imagery is a photograph taken by such a light: under it the picture
+    /// is the renderer's as it was, and at every other hour it follows the
+    /// physical ratio (`docs/18` §6).
+    ///
+    /// The camera is exposed for what `metering` sees of the frame: the
+    /// light on its ground points, and its sky as bright as ground of
+    /// [`METER_REFLECTANCE`] would have to be lit to match it — their mean,
+    /// so that a frame half in daylight is exposed for its day and not for
+    /// its night, and a sunset for its sky as much as for its dim ground.
+    /// None: for the light at `at`.
+    // Three channels, read and written side by side: an index says so best.
+    #[allow(clippy::needless_range_loop)]
     pub fn light(
         &self,
         reference: &LutAtmosphere,
         at: Geodetic,
-        to_sun_ecef: DVec3,
+        moment: Moment,
+        metering: &[Metered],
         calibration: Calibration,
-        compensation_ev: f32,
     ) -> SkyLight {
         let height = at.height.max(0.0);
         let r = LUT_RADIUS + height;
         let enu: DMat3 = enu_frame(at);
-        let to_sun = to_sun_ecef.try_normalize().unwrap_or(enu.z_axis);
+        let to_sun = moment.to_sun_ecef.try_normalize().unwrap_or(enu.z_axis);
         let sun = enu.transpose() * to_sun;
-        // Horizontal axes turned to the sun's azimuth: the sky is symmetric
-        // about the sun's vertical plane, so only `x` has a gradient.
-        let toward = DVec3::new(sun.x, sun.y, 0.0)
-            .try_normalize()
-            .unwrap_or(DVec3::X);
-        let aside = DVec3::Z.cross(toward);
-        let facings = [DVec3::Z, toward, -toward, aside, -aside];
-        let e = self.sky_irradiance(height, sun, &facings);
-        // L1: a + b·n, level ground exact, the walls' mean `a`.
-        let mut a = [0.0; 3];
-        let mut b = [[0.0; 3]; 3];
-        for c in 0..3 {
-            a[c] = (e[1][c] + e[2][c] + e[3][c] + e[4][c]) / 4.0;
-            b[0][c] = (e[1][c] - e[2][c]) / 2.0;
-            b[1][c] = (e[3][c] - e[4][c]) / 2.0;
-            b[2][c] = e[0][c] - a[c];
-        }
-        let transmitted = self.sunlight(r, sun.z);
 
         // The reference: a sun 45° up through a clear day's air, here.
         let up45 = std::f64::consts::FRAC_1_SQRT_2;
@@ -540,52 +625,197 @@ impl LutAtmosphere {
             let physical = (reference_sun[c] * up45 + reference_sky[c]) / PI;
             scale[c] = calibrated[c] / physical.max(1e-12);
         }
+        // What one unit of the model's irradiance is on the ground, in the
+        // renderer's units.
+        let ground = scale.map(|s| s / PI);
+
+        // Each light's sky, as an L1 harmonic, and its beam.
+        let sun_sky = self.sky_harmonic(height, sun, enu);
+        let transmitted = self.sunlight(r, sun.z);
+        let moon = moment.moon.map(|m| {
+            let to_moon = m.to_moon_ecef.try_normalize().unwrap_or(-enu.z_axis);
+            let local = enu.transpose() * to_moon;
+            let strength = m.outside_air();
+            (
+                m,
+                to_moon,
+                local,
+                strength,
+                self.sky_harmonic(height, local, enu),
+            )
+        });
+
+        let mut sun_rgb = [0.0f32; 3];
+        let mut moon_rgb = [0.0f32; 3];
+        let mut sky_sh = [[0.0f32; 3]; 4];
+        let mut level = [0.0f64; 3];
+        for c in 0..3 {
+            sun_rgb[c] = (transmitted[c] * ground[c]) as f32;
+            let mut a = sun_sky.mean[c];
+            let mut gradient = sun_sky.gradient[c];
+            level[c] = transmitted[c] * sun.z.max(0.0) + sun_sky.level[c];
+            if let Some((_, _, local, strength, sky)) = &moon {
+                let beam = self.sunlight(r, local.z)[c] * strength;
+                moon_rgb[c] = (beam * ground[c]) as f32;
+                a += sky.mean[c] * strength;
+                gradient += sky.gradient[c] * strength;
+                level[c] += beam * local.z.max(0.0) + sky.level[c] * strength;
+            }
+            sky_sh[0][c] = (a * ground[c]) as f32;
+            let g = gradient * ground[c];
+            sky_sh[1][c] = g.x as f32;
+            sky_sh[2][c] = g.y as f32;
+            sky_sh[3][c] = g.z as f32;
+            level[c] *= ground[c];
+        }
+
+        // The level ground of anywhere, from the tables: here, and over the
+        // metered ground — set to agree with the exact sum here.
+        let moon_at = moon.map(|(_, to_moon, _, strength, _)| (to_moon, strength));
+        let tabled = |height: f64, up: DVec3| -> [f64; 3] {
+            let r = LUT_RADIUS + height.max(0.0);
+            let mu_s = to_sun.dot(up);
+            let beam = self.sunlight(r, mu_s);
+            let sky = self.level_irradiance(height, mu_s);
+            let mut out = [0.0; 3];
+            for c in 0..3 {
+                out[c] = beam[c] * mu_s.max(0.0) + sky[c];
+            }
+            if let Some((to_moon, strength)) = moon_at {
+                let mu_m = to_moon.dot(up);
+                let beam = self.sunlight(r, mu_m);
+                let sky = self.level_irradiance(height, mu_m);
+                for c in 0..3 {
+                    out[c] += (beam[c] * mu_m.max(0.0) + sky[c]) * strength;
+                }
+            }
+            for c in 0..3 {
+                out[c] *= ground[c];
+            }
+            out
+        };
+        let here = tabled(height, enu.z_axis);
+        let agree = |c: usize| {
+            if here[c] > 1e-30 {
+                level[c] / here[c]
+            } else {
+                1.0
+            }
+        };
+        let mut metered = level;
+        if !metering.is_empty() {
+            let mut sum = [0.0; 3];
+            let mut counted = 0usize;
+            for m in metering {
+                let l = match *m {
+                    Metered::Ground { eye, point } => {
+                        let g = tuile_core::geo::ecef_to_geodetic(point);
+                        let l = tabled(g.height, enu_frame(g).z_axis);
+                        // Seen through the air between: what it leaves of
+                        // the ground's light, and what it adds — as bright
+                        // as ground of the meter's grey would be lit.
+                        let from = tuile_core::geo::ecef_to_geodetic(eye);
+                        let local = enu_frame(from).transpose();
+                        let path = point - eye;
+                        let dir = (local * path).normalize_or(DVec3::NEG_Z);
+                        let length = Some(path.length());
+                        let air = self.march(from.height, dir, local * to_sun, length, 16, false);
+                        let mut through = air.transmittance;
+                        let mut added = air.inscattered;
+                        if let Some((to_moon, strength)) = moon_at {
+                            let m =
+                                self.march(from.height, dir, local * to_moon, length, 16, false);
+                            through = m.transmittance;
+                            for c in 0..3 {
+                                added[c] += m.inscattered[c] * strength;
+                            }
+                        }
+                        [0, 1, 2].map(|c| {
+                            l[c] * agree(c) * through[c] + added[c] * scale[c] / METER_REFLECTANCE
+                        })
+                    }
+                    Metered::Sky { eye, direction } => {
+                        let g = tuile_core::geo::ecef_to_geodetic(eye);
+                        let local = enu_frame(g).transpose();
+                        let dir = (local * direction).normalize_or(DVec3::Z);
+                        // Space, past the air: no light to meter, and not
+                        // counted — a frame of the limb is exposed for the
+                        // limb and the Earth, not for the black around them.
+                        if sphere_entry(LUT_RADIUS + g.height.max(0.0), dir.z, self.top()).is_none()
+                        {
+                            continue;
+                        }
+                        let mut l = self.sky_radiance(g.height, dir, local * to_sun);
+                        if let Some((to_moon, strength)) = moon_at {
+                            let m = self.sky_radiance(g.height, dir, local * to_moon);
+                            for c in 0..3 {
+                                l[c] += m[c] * strength;
+                            }
+                        }
+                        [0, 1, 2].map(|c| l[c] * scale[c] / METER_REFLECTANCE)
+                    }
+                };
+                counted += 1;
+                for c in 0..3 {
+                    sum[c] += l[c];
+                }
+            }
+            if counted > 0 {
+                metered = sum.map(|v| v / counted as f64);
+            }
+        }
+
+        // The night floor: starlight and airglow, on all ground alike — the
+        // light of a clear moonless night.
+        let luminance = |v: [f64; 3]| 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+        let wanted = luminance(calibrated);
+        let tint = NIGHT_TINT.map(f64::from);
+        let floor_light = f64::from(ReferenceIllumination::NIGHT_FLOOR) * wanted;
+        let added = tint.map(|t| t * floor_light / luminance(tint));
+        for c in 0..3 {
+            metered[c] += added[c];
+            level[c] += added[c];
+        }
+        let x = (luminance(metered) / wanted).log2() as f32;
+        let ev100 = DAYLIGHT_EV100 + x;
+        // Where the camera is exposed for brighter ground than the floor's,
+        // ground is never lit by less than what shows it at `SHOWN_FLOOR`
+        // of noon: a night side beside a day side is dark, not black. A
+        // least light, not an added one: it changes nothing lit by more.
+        let least_light = f64::from(ReferenceIllumination::SHOWN_FLOOR)
+            * wanted
+            * f64::from(x - crate::illumination::shown_ev(x)).exp2();
+        let least = tint.map(|t| t * least_light.max(floor_light) / luminance(tint));
+        for c in 0..3 {
+            sky_sh[0][c] += added[c] as f32;
+        }
+
+        // The white the camera balances to: the metered light's colour, and
+        // as night falls a warm one — balanced towards, it leaves the
+        // picture blue, as the dark-adapted eye sees a night.
+        let white_lum = luminance(metered) / wanted;
+        let night = smooth_step(-6.0, -16.0, f64::from(x));
+        let mut white = [0.0f32; 3];
+        for c in 0..3 {
+            let physical = metered[c] / calibrated[c].max(1e-12) / white_lum.max(1e-300);
+            white[c] = (physical * (1.0 - night) + f64::from(NIGHT_WHITE[c]) * night) as f32;
+        }
 
         // The air's own light against the imagery's ground: a texel of one
         // is ground of this reflectance.
         let air = f64::from(calibration.reflectance).max(1e-6);
-
-        let mut sun_rgb = [0.0f32; 3];
-        let mut sky_sh = [[0.0f32; 3]; 4];
-        let mut level = [0.0f64; 3];
-        let axes = [toward, aside, DVec3::Z].map(|axis| enu * axis);
-        for c in 0..3 {
-            sun_rgb[c] = (transmitted[c] / PI * scale[c]) as f32;
-            sky_sh[0][c] = (a[c] / PI * scale[c]) as f32;
-            // The gradient, from the local axes to ECEF ones.
-            let mut ecef = DVec3::ZERO;
-            for (k, axis) in axes.iter().enumerate() {
-                ecef += *axis * b[k][c];
-            }
-            let ecef = ecef / PI * scale[c];
-            sky_sh[1][c] = ecef.x as f32;
-            sky_sh[2][c] = ecef.y as f32;
-            sky_sh[3][c] = ecef.z as f32;
-            level[c] = transmitted[c] / PI * scale[c] * sun.z.max(0.0) + e[0][c] / PI * scale[c];
-        }
-
-        // The night floor: level ground never lit by less than this share of
-        // the reference's light. What is missing is added to the sky's light
-        // on the ground; the sky itself is raised to what dark ground shows
-        // under that light ([`NIGHT_SKY_ALBEDO`]) — raised by as much, a
-        // night sky under the camera's raised exposure would be brighter
-        // than noon's.
-        let night_floor = ReferenceIllumination::NIGHT_FLOOR;
-        let luminance = |v: [f64; 3]| 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
-        let (lit, wanted) = (luminance(level), luminance(calibrated));
-        let missing = (f64::from(night_floor) * wanted - lit).max(0.0);
-        let tint = NIGHT_TINT.map(f64::from);
-        let added = tint.map(|t| t * missing / luminance(tint));
         let floor = added.map(|a| a * NIGHT_SKY_ALBEDO);
+        // The sky's light alone on level ground here, from the tables, as a
+        // fragment reads its own: what the frame's harmonic is set against.
+        let mut level_reference = [0.0f32; 3];
+        let sky_here = self.level_irradiance(height, to_sun.dot(enu.z_axis));
+        let moon_sky = moon_at.map(|(to_moon, strength)| {
+            self.level_irradiance(height, to_moon.dot(enu.z_axis))
+                .map(|e| e * strength)
+        });
         for c in 0..3 {
-            sky_sh[0][c] += added[c] as f32;
-            level[c] += added[c];
-        }
-        let ev100 = DAYLIGHT_EV100 + (luminance(level) / wanted).log2() as f32;
-        let white_lum = luminance(level) / wanted;
-        let mut white = [0.0f32; 3];
-        for c in 0..3 {
-            white[c] = (level[c] / calibrated[c].max(1e-12) / white_lum.max(1e-12)) as f32;
+            let sky = sky_here[c] + moon_sky.map_or(0.0, |m| m[c]);
+            level_reference[c] = (sky * ground[c] + added[c]) as f32;
         }
 
         SkyLight {
@@ -596,16 +826,109 @@ impl LutAtmosphere {
                 white,
                 adaptation: ReferenceIllumination::WHITE_ADAPTATION,
                 ev100,
-                compensation_ev,
-                night_floor,
+                compensation_ev: moment.compensation_ev,
+                night_floor: ReferenceIllumination::NIGHT_FLOOR,
+                moon: moon.map(|(m, to_moon, ..)| Moonlight {
+                    to_moon_ecef: to_moon,
+                    moon_rgb,
+                    ..m
+                }),
             },
             illuminance: scale.map(|s| (s / air) as f32),
             floor: floor.map(|f| (f / air) as f32),
+            ground: ground.map(|g| g as f32),
+            added: added.map(|a| a as f32),
+            least: least.map(|l| l as f32),
+            level_reference,
+            moon_strength: moon.map_or(0.0, |m| m.3),
             frame: AtmosphereFrame::at(at),
             height,
         }
     }
+
+    /// The sky's light at `height` under one light along `light` (`z` up):
+    /// as an L1 harmonic, its constant over the facings of a wall all round
+    /// and its gradient turned to ECEF axes by `enu`, and level ground's.
+    #[allow(clippy::needless_range_loop)]
+    fn sky_harmonic(&self, height: f64, light: DVec3, enu: DMat3) -> SkyHarmonic {
+        // Horizontal axes turned to the light's azimuth: the sky is
+        // symmetric about the light's vertical plane, so only `x` has a
+        // gradient.
+        let toward = DVec3::new(light.x, light.y, 0.0)
+            .try_normalize()
+            .unwrap_or(DVec3::X);
+        let aside = DVec3::Z.cross(toward);
+        let facings = [DVec3::Z, toward, -toward, aside, -aside];
+        let e = self.sky_irradiance(height, light, &facings);
+        let axes = [toward, aside, DVec3::Z].map(|axis| enu * axis);
+        let mut out = SkyHarmonic {
+            mean: [0.0; 3],
+            gradient: [DVec3::ZERO; 3],
+            level: [0.0; 3],
+        };
+        for c in 0..3 {
+            let a = (e[1][c] + e[2][c] + e[3][c] + e[4][c]) / 4.0;
+            let b = [
+                (e[1][c] - e[2][c]) / 2.0,
+                (e[3][c] - e[4][c]) / 2.0,
+                e[0][c] - a,
+            ];
+            out.mean[c] = a;
+            out.level[c] = e[0][c];
+            for (axis, b) in axes.iter().zip(b) {
+                out.gradient[c] += *axis * b;
+            }
+        }
+        out
+    }
 }
+
+#[derive(Clone, Copy)]
+struct SkyHarmonic {
+    mean: [f64; 3],
+    gradient: [DVec3; 3],
+    level: [f64; 3],
+}
+
+fn smooth_step(from: f64, to: f64, x: f64) -> f64 {
+    let t = ((x - from) / (to - from)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The irradiance table's rows: heights bunched towards the ground, where
+/// the light changes fastest with height.
+fn irradiance_height(unit: f64, thickness: f64) -> f64 {
+    unit * unit * thickness
+}
+
+fn irradiance_unit(height: f64, thickness: f64) -> f64 {
+    (height.max(0.0) / thickness).min(1.0).sqrt()
+}
+
+/// What a camera meters: a ground point seen from an eye, or the sky along
+/// a direction from an eye, all ECEF.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Metered {
+    Ground { eye: DVec3, point: DVec3 },
+    Sky { eye: DVec3, direction: DVec3 },
+}
+
+/// The reflectance a camera's meter takes a scene for: middle grey. Sky is
+/// metered as the light that would make ground of it as bright.
+pub const METER_REFLECTANCE: f64 = 0.18;
+
+/// What one frame's light is worked out from: where the sun is, the Moon
+/// if it is placed, and the exposure chosen on top.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Moment {
+    pub to_sun_ecef: DVec3,
+    pub moon: Option<Moonlight>,
+    pub compensation_ev: f32,
+}
+
+/// The white a camera at night balances towards: warm, so that the
+/// picture it leaves is blue.
+pub const NIGHT_WHITE: [f32; 3] = [1.25, 1.0, 0.72];
 
 /// The colour of the light the night floor adds: a clear twilight's sky,
 /// blue — normalised to unit luminance where it is used.
@@ -646,6 +969,23 @@ pub struct SkyLight {
     /// units: what ground of [`NIGHT_SKY_ALBEDO`] shows under the light the
     /// floor adds. Far ground fades to it.
     pub floor: [f32; 3],
+    /// What one unit of the model's irradiance is on the ground, in the
+    /// renderer's units, RGB: what a ground fragment's own sun and sky,
+    /// read from the tables where it is, are scaled by.
+    pub ground: [f32; 3],
+    /// The night floor's light on every surface, in the renderer's units.
+    pub added: [f32; 3],
+    /// The least light any ground is lit by, in the renderer's units: what
+    /// shows it at [`ReferenceIllumination::SHOWN_FLOOR`] of noon, under
+    /// this frame's exposure. Ground lit by more is lit as it is.
+    pub least: [f32; 3],
+    /// Level ground's sky light where the light was worked out, as the
+    /// tables give it, the floor included: what a fragment's own is set
+    /// against to scale the frame's harmonic.
+    pub level_reference: [f32; 3],
+    /// The Moon's irradiance outside the air against the sun's: what the
+    /// sky it lights is scaled by.
+    pub moon_strength: f64,
     /// The sphere the air is laid on, at the place the light was worked out.
     pub frame: AtmosphereFrame,
     /// The height the light was worked out at, over the ground, in metres.
@@ -818,6 +1158,14 @@ mod tests {
         reflectance: 1.0,
     };
 
+    fn day(to_sun_ecef: DVec3) -> Moment {
+        Moment {
+            to_sun_ecef,
+            moon: None,
+            compensation_ev: 0.0,
+        }
+    }
+
     fn lit(elevation: f64, at_height: f64) -> SkyLight {
         let at = Geodetic {
             lon: 0.5f64.to_radians(),
@@ -828,15 +1176,21 @@ mod tests {
         let enu = enu_frame(at);
         let e = elevation.to_radians();
         let to_sun = enu * DVec3::new(0.0, -e.cos(), e.sin());
-        clear().light(clear(), at, to_sun, CALIBRATION, 0.0)
+        clear().light(clear(), at, day(to_sun), &[], CALIBRATION)
     }
 
     fn level(light: &SkyLight, up: DVec3) -> [f64; 3] {
         let i = &light.illumination;
         let sun = i.to_sun_ecef.dot(up).max(0.0);
         let mut out = [0.0; 3];
+        if let Some(moon) = i.moon {
+            let cos = moon.to_moon_ecef.dot(up).max(0.0);
+            for c in 0..3 {
+                out[c] += f64::from(moon.moon_rgb[c]) * cos;
+            }
+        }
         for c in 0..3 {
-            out[c] = f64::from(i.sun_rgb[c]) * sun
+            out[c] += f64::from(i.sun_rgb[c]) * sun
                 + f64::from(i.sky_sh[0][c])
                 + f64::from(i.sky_sh[1][c]) * up.x
                 + f64::from(i.sky_sh[2][c]) * up.y
@@ -879,7 +1233,8 @@ mod tests {
                 "{:?}",
                 i.white
             );
-            assert_eq!(light.floor, [0.0; 3]);
+            // The floor, a moonless night's light, is nothing by day.
+            assert!(light.floor.iter().all(|f| *f < 1e-6), "{:?}", light.floor);
             assert!(i.exposure_offset_ev().abs() < 1e-4);
         }
     }
@@ -897,12 +1252,12 @@ mod tests {
             };
             let e = f64::to_radians(elevation);
             let to_sun = enu_frame(at) * DVec3::new(0.0, -e.cos(), e.sin());
-            let white = clear().light(clear(), at, to_sun, CALIBRATION, 0.0);
+            let white = clear().light(clear(), at, day(to_sun), &[], CALIBRATION);
             let dark = Calibration {
                 reflectance: 4.0,
                 ..CALIBRATION
             };
-            let imagery = clear().light(clear(), at, to_sun, dark, 0.0);
+            let imagery = clear().light(clear(), at, day(to_sun), &[], dark);
             assert_eq!(imagery.illumination, white.illumination);
             for c in 0..3 {
                 assert!((imagery.illuminance[c] * 4.0 - white.illuminance[c]).abs() < 1e-6);
@@ -923,14 +1278,15 @@ mod tests {
             let got = luminance(level(&light, up_ecef()));
             let reference = luminance(level(&lit(45.0, 500.0), up_ecef()));
             assert!(
-                got >= f64::from(ReferenceIllumination::NIGHT_FLOOR) * reference * 0.999,
+                got >= f64::from(ReferenceIllumination::NIGHT_FLOOR) * reference * 0.97,
                 "{elevation}°: {got} against {reference}"
             );
             // On the picture, after the camera's exposure: darker than noon
-            // under the sun's dimming, never under a third of it.
+            // under the sun's dimming, a moonless night four stops under,
+            // never black.
             let shown = got / reference * f64::from(i.exposure_offset_ev()).exp2();
             assert!(
-                shown > 0.3,
+                shown > 1.0 / 22.0,
                 "{elevation}°: shown at {shown} of the reference"
             );
             if elevation > 0.0 {
@@ -969,6 +1325,303 @@ mod tests {
             }
             last = Some(light);
         }
+    }
+
+    fn full_moon_at(elevation: f64, at: Geodetic) -> Moonlight {
+        let e = elevation.to_radians();
+        Moonlight {
+            to_moon_ecef: enu_frame(at) * DVec3::new(0.0, e.cos(), e.sin()),
+            phase_angle: 0.0,
+            angular_radius: 0.0045,
+            moon_rgb: [0.0; 3],
+        }
+    }
+
+    fn place(height: f64) -> Geodetic {
+        Geodetic {
+            lon: 0.5f64.to_radians(),
+            lat: 43.0f64.to_radians(),
+            height,
+        }
+    }
+
+    #[test]
+    fn a_full_moon_lights_the_night_and_its_sky_more_than_a_moonless_one() {
+        let at = place(500.0);
+        let e = f64::to_radians(-30.0);
+        let to_sun = enu_frame(at) * DVec3::new(0.0, -e.cos(), e.sin());
+        let dark = clear().light(clear(), at, day(to_sun), &[], CALIBRATION);
+        let moonlit = clear().light(
+            clear(),
+            at,
+            Moment {
+                moon: Some(full_moon_at(50.0, at)),
+                ..day(to_sun)
+            },
+            &[],
+            CALIBRATION,
+        );
+        let (d, m) = (dark.illumination, moonlit.illumination);
+        // A full Moon 50° up: about 0.15 lx on level ground, two hundred
+        // times the moonless night's 0.002 — some seven stops.
+        assert!(m.ev100 - d.ev100 > 5.0, "{} against {}", m.ev100, d.ev100);
+        let moon = m.moon.expect("placed");
+        assert!(
+            moon.moon_rgb.iter().all(|c| *c > 0.0),
+            "{:?}",
+            moon.moon_rgb
+        );
+        let lux = luminance(level(&moonlit, up_ecef()))
+            / luminance(level(&lit(45.0, 500.0), up_ecef()))
+            * 100_000.0;
+        assert!((0.05..=0.4).contains(&lux), "{lux} lx");
+        // Shown brighter than the moonless night, never as bright as day.
+        let shown = |i: &ReferenceIllumination| i.ev100 - DAYLIGHT_EV100 + i.exposure_offset_ev();
+        assert!(
+            shown(&m) > shown(&d) + 0.5 && shown(&m) < -2.0,
+            "{} {}",
+            shown(&m),
+            shown(&d)
+        );
+        // The moonlit sky is a dimmed sky: the sky's light, scaled.
+        assert!(moonlit.moon_strength > 1e-6 && moonlit.moon_strength < 1e-5);
+        assert!(m.sky_sh[0][2] > d.sky_sh[0][2]);
+    }
+
+    #[test]
+    fn the_light_never_steps_from_day_to_night_and_back() {
+        let at = place(500.0);
+        let mut last: Option<ReferenceIllumination> = None;
+        for step in 0..=600 {
+            let elevation = 30.0 - 0.1 * f64::from(step);
+            let e = elevation.to_radians();
+            let to_sun = enu_frame(at) * DVec3::new(0.0, -e.cos(), e.sin());
+            let i = clear()
+                .light(
+                    clear(),
+                    at,
+                    Moment {
+                        moon: Some(full_moon_at(20.0, at)),
+                        ..day(to_sun)
+                    },
+                    &[],
+                    CALIBRATION,
+                )
+                .illumination;
+            if let Some(last) = last {
+                let shown = |i: &ReferenceIllumination| i.ev100 + i.exposure_offset_ev();
+                assert!(
+                    (shown(&last) - shown(&i)).abs() < 0.05,
+                    "{elevation}°: shown {} to {}",
+                    shown(&last),
+                    shown(&i)
+                );
+                for c in 0..3 {
+                    assert!(
+                        (last.white[c] - i.white[c]).abs() < 0.06 * last.white[c].max(0.3),
+                        "{elevation}°: white {:?} to {:?}",
+                        last.white,
+                        i.white
+                    );
+                }
+            }
+            last = Some(i);
+        }
+        // And night is blue: the white balanced towards is warm.
+        let night = last.expect("lit");
+        assert!(
+            night.white_balance()[2] > night.white_balance()[0],
+            "{:?}",
+            night.white_balance()
+        );
+    }
+
+    #[test]
+    fn a_frame_half_in_daylight_is_exposed_for_its_day() {
+        let at = place(70_000.0);
+        let enu = enu_frame(at);
+        // The sun on the horizon here; the metered ground on either side of
+        // the terminator, 800 km off.
+        let to_sun = enu * DVec3::new(1.0, 0.0, 0.0);
+        let east = |km: f64| {
+            let g = Geodetic {
+                lon: at.lon + (km * 1000.0 / 6.37e6 / at.lat.cos()),
+                height: 0.0,
+                ..at
+            };
+            tuile_core::geo::geodetic_to_ecef(g)
+        };
+        let eye = tuile_core::geo::geodetic_to_ecef(at);
+        let ground = |km: f64| Metered::Ground {
+            eye,
+            point: east(km),
+        };
+        let day_side = [ground(800.0)];
+        let both = [ground(800.0), ground(-800.0)];
+        let night_side = [ground(-800.0)];
+        let ev = |m: &[Metered]| clear().light(clear(), at, day(to_sun), m, CALIBRATION);
+        let (d, b, n) = (ev(&day_side), ev(&both), ev(&night_side));
+        assert!(d.illumination.ev100 > 10.0, "{}", d.illumination.ev100);
+        // Half the frame at night: the mean of its light, a stop under its day.
+        assert!(
+            (d.illumination.ev100 - b.illumination.ev100) < 1.2,
+            "{}",
+            b.illumination.ev100
+        );
+        // Space beside it, past the air: not metered, nothing changes.
+        let with_space = [
+            ground(800.0),
+            // Straight up from over the top of the air.
+            Metered::Sky {
+                eye: tuile_core::geo::geodetic_to_ecef(Geodetic {
+                    height: 300_000.0,
+                    ..at
+                }),
+                direction: enu.z_axis,
+            },
+        ];
+        assert_eq!(ev(&with_space).illumination.ev100, d.illumination.ev100);
+        // The night side alone: darker — though not night-dark, seen from
+        // 70 km through air the sun still lights.
+        assert!(
+            n.illumination.ev100 < d.illumination.ev100 - 1.0,
+            "{}",
+            n.illumination.ev100
+        );
+        // The night side under the day's exposure: lit at least to be shown
+        // at a sixteenth of noon, not left black.
+        let i = b.illumination;
+        let shown = luminance(b.least.map(f64::from))
+            / luminance(level(&lit(45.0, 0.0), up_ecef()))
+            * f64::from(i.exposure_offset_ev()).exp2();
+        assert!(
+            (shown - f64::from(ReferenceIllumination::SHOWN_FLOOR)).abs() < 0.01,
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn the_air_below_the_horizon_seen_from_high_up_is_never_black() {
+        let air = clear();
+        let lum = |l: [f64; 3]| 0.2126 * l[0] + 0.7152 * l[1] + 0.0722 * l[2];
+        for height in [3_000.0, 70_000.0] {
+            // The horizon's dip at this height, and 2° under it, and over.
+            let dip = (LUT_RADIUS / (LUT_RADIUS + height)).acos();
+            for sun_elevation in [30.0, 2.0, -4.0] {
+                let sun = up_at(sun_elevation);
+                for below in [-2.0f64, 0.5, 3.0] {
+                    let e = -dip - below.to_radians();
+                    let dir = DVec3::new(0.0, e.cos(), e.sin());
+                    let l = air.sky_radiance(height, dir, sun);
+                    assert!(
+                        lum(l) > 1e-6,
+                        "{height} m, sun {sun_elevation}°, {below}°: {l:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn from_outside_the_air_the_limb_glows_and_space_is_empty() {
+        let air = clear();
+        let height = 300_000.0;
+        let r = LUT_RADIUS + height;
+        let sun = up_at(10.0);
+        // A ray grazing the air 20 km over the ground: its tangent height.
+        let tangent = |h: f64| -((1.0 - ((LUT_RADIUS + h) / r).powi(2)).sqrt());
+        let grazing = |h: f64| {
+            let mu = tangent(h);
+            DVec3::new(0.0, (1.0 - mu * mu).sqrt(), mu)
+        };
+        let limb = air.sky_radiance(height, grazing(20_000.0), sun);
+        assert!(limb[2] > 1e-4, "{limb:?}");
+        // Over the top of the air: nothing at all.
+        assert_eq!(air.sky_radiance(height, grazing(150_000.0), sun), [0.0; 3]);
+        assert_eq!(air.sky_radiance(height, DVec3::Z, sun), [0.0; 3]);
+        // The light along a line is the same seen from outside the air as
+        // from where it enters it.
+        let mu = tangent(30_000.0);
+        let outside = air.transmittance(r, mu);
+        let top = LUT_RADIUS + air.params().thickness;
+        let t = sphere_entry(r, mu, top).expect("enters");
+        let inside = air.transmittance(top, (r * mu + t) / top);
+        assert_eq!(outside, inside);
+        assert!(outside[2] < outside[0] && outside[0] < 1.0);
+        assert_eq!(air.transmittance(r, 0.5), [1.0; 3]);
+    }
+
+    /// `hillaire.wgsl`'s `ground_light`, on the CPU: a fragment's own sun
+    /// and sky from the tables, the frame's harmonic scaled by its level
+    /// sky against the frame's.
+    fn fragment_light(
+        light: &SkyLight,
+        air: &LutAtmosphere,
+        at: Geodetic,
+        normal: DVec3,
+    ) -> [f64; 3] {
+        let i = &light.illumination;
+        let up = enu_frame(at).z_axis;
+        let r = LUT_RADIUS + at.height;
+        let mu_s = i.to_sun_ecef.dot(up);
+        let sky = air.level_irradiance(at.height, mu_s);
+        let beam = air.sunlight(r, mu_s);
+        let mut out = [0.0; 3];
+        for c in 0..3 {
+            let g = f64::from(light.ground[c]);
+            let level = g * sky[c] + f64::from(light.added[c]);
+            let ratio = level / f64::from(light.level_reference[c]).max(1e-30);
+            let frame_sky = f64::from(i.sky_sh[0][c])
+                + f64::from(i.sky_sh[1][c]) * normal.x
+                + f64::from(i.sky_sh[2][c]) * normal.y
+                + f64::from(i.sky_sh[3][c]) * normal.z;
+            let direct = g * beam[c] * normal.dot(i.to_sun_ecef).max(0.0);
+            out[c] = (frame_sky.max(0.0) * ratio + direct).max(f64::from(light.least[c]));
+        }
+        out
+    }
+
+    #[test]
+    fn a_fragment_where_the_light_was_worked_out_is_lit_as_the_frame_is() {
+        for elevation in [50.0, 20.0, 6.0, 1.0, -3.0, -20.0] {
+            let light = lit(elevation, 500.0);
+            let at = place(500.0);
+            let up = enu_frame(at).z_axis;
+            let frame = level(&light, up);
+            let fragment = fragment_light(&light, clear(), at, up);
+            for c in 0..3 {
+                assert!(
+                    (fragment[c] - frame[c]).abs() <= 0.02 * frame[c] + 1e-12,
+                    "{elevation}°, channel {c}: fragment {} against frame {}",
+                    fragment[c],
+                    frame[c]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_fragment_past_the_terminator_is_lit_by_the_night() {
+        // The light worked out where the sun is 20° up; a fragment 3 000 km
+        // towards the night, where it is 7° under the horizon.
+        let light = lit(20.0, 500.0);
+        let at = place(500.0);
+        let night = Geodetic {
+            lat: at.lat + 27f64.to_radians(),
+            ..at
+        };
+        let up = enu_frame(night).z_axis;
+        assert!(light.illumination.to_sun_ecef.dot(up) < -0.05);
+        let there = fragment_light(&light, clear(), night, up);
+        let here = level(&light, enu_frame(at).z_axis);
+        // Under the day's exposure the night is lit by the least light
+        // alone: shown at a sixteenth of noon, dark and not black.
+        assert!(
+            luminance(there) < 0.08 * luminance(here),
+            "{there:?} against {here:?}"
+        );
+        let least = light.least.map(f64::from);
+        assert!((luminance(there) - luminance(least)).abs() < 1e-3 * luminance(least));
     }
 
     #[test]

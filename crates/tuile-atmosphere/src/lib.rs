@@ -62,6 +62,7 @@
 pub mod aerial;
 pub mod hillaire;
 pub mod illumination;
+pub mod moon;
 pub mod params;
 pub mod sky;
 pub mod sun;
@@ -69,8 +70,9 @@ pub mod sun;
 pub use aerial::{AerialPerspective, WGSL};
 pub use hillaire::{Calibration, LutAtmosphere, SkyLight};
 pub use illumination::{
-    ReferenceIllumination, DAYLIGHT_EV100, EXPOSURE_FOLLOWS, MAX_ADAPTATION_EV,
+    shown_ev, Moonlight, ReferenceIllumination, DAYLIGHT_EV100, EXPOSURE_FOLLOWS, NIGHT_DEPTH_EV,
 };
+pub use moon::{celestial_to_ecef, moon_irradiance, Moon, MoonSeen};
 pub use params::{AtmosphereFrame, AtmosphereParams};
 pub use sky::SkyShell;
 pub use sun::{Sun, SunSeen};

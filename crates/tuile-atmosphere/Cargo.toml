@@ -15,3 +15,4 @@ glam.workspace = true
 bytemuck.workspace = true
 tuile-core = { path = "../tuile-core" }
 solar-positioning.workspace = true
+astro.workspace = true

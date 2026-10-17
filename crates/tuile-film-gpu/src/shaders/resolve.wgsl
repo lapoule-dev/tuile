@@ -149,20 +149,30 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
         let held = inside / max(inside.x + inside.y, 1.0);
         let p = a + held.x * e1 + held.y * e2;
         // A point that is no place — not a number, or further than any
-        // ground an eye over the Earth can see — is left as the look
-        // without sun's map or air shades it. Where two levels of tiles
-        // part by a hair, what shows through the gap is the far side of
-        // the planet, thousands of kilometres off: the air would whiten
-        // that hair, and it is the gap that is wrong, not the air. Not a
-        // number is told by its bits: a compiler free to assume no such
-        // number exists answers any comparison with it as it likes.
+        // ground an eye over the Earth can see (from 300 km, the limb is
+        // 2 000 km off) — is left as the look without sun's map or air
+        // shades it. Where two levels of tiles part by a hair, what shows
+        // through the gap is the far side of the planet, thousands of
+        // kilometres off: the air would whiten that hair, and it is the
+        // gap that is wrong, not the air. Not a number is told by its
+        // bits: a compiler free to assume no such number exists answers
+        // any comparison with it as it likes.
         let known = all((bitcast<vec3u>(p) & vec3u(0x7f800000u)) != vec3u(0x7f800000u))
-            && all(abs(p) < vec3f(2.0e6));
+            && all(abs(p) < vec3f(4.0e6));
+        var lit = 1.0;
         if (known && frame.shadow.x > 0.0 && cos > 0.0) {
             // A shadow takes the sun, and only the sun: the dome lights
             // shadowed ground as it lights any other.
-            let sun = cos * (1.0 - frame.shadow.x * (1.0 - sunlit(p, normal)));
-            radiance = base * (ambient + frame.sun.xyz * sun);
+            lit = 1.0 - frame.shadow.x * (1.0 - sunlit(p, normal));
+            radiance = base * (ambient + frame.sun.xyz * cos * lit);
+        }
+        if (known && physical) {
+            // The ground's own light, where it is: its sun and Moon through
+            // the air above it, its sky — so that a terminator a frame
+            // shows falls where it is, the night side lit by the night.
+            let x = p - atmosphere.centre.xyz;
+            let r = length(x);
+            radiance = base * ground_light(r - atmosphere.centre.w, x / r, normal, ambient, lit);
         }
         if (known && frame.haze.w != 0.0) {
             // What the air leaves of the ground, and its own light for the
@@ -174,8 +184,9 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
         if (known && physical) {
             // The air between the eye and the ground, marched over the
             // tables: what it lets through, and the light it scatters
-            // towards the eye — with, at night, the floor's share of the
-            // sky's, so that far ground fades to the night sky.
+            // towards the eye under the sun and the Moon — with, at night,
+            // the floor's share of the sky's, so that far ground fades to
+            // the night sky.
             let air = air_between(p);
             radiance = radiance * air.transmittance
                 + air.inscattered * atmosphere.illuminance.xyz

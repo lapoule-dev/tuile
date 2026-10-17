@@ -25,22 +25,56 @@ fn oetf(c: vec3f) -> vec3f {
     return select(1.055 * pow(x, vec3f(1.0 / 2.4)) - 0.055, 12.92 * x, x <= vec3f(0.0031308));
 }
 
-// The physical sky along `d` from the frame's eye: the sky-view table,
-// what the night floor adds, and the sun's disc, darkened towards its limb.
+// The physical sky along `d` from the frame's eye: what the air sends
+// under the sun and under the Moon — from the frame's sky-view tables in
+// the air, marched along the ray itself from above it, where the air is a
+// band a few degrees thick along the limb that no table row could hold —
+// what the night floor adds, and behind the air the sun's disc, darkened
+// towards its limb, the Moon's in its phase and the stars, dimmed by the
+// air before them and hidden by the planet.
 fn sky_seen(d: vec3f) -> vec3f {
-    let uv = sky_view_uv_of(d);
-    var sky = textureSampleLevel(sky_view_lut, lut_sampler, uv, 0.0).rgb
-        * atmosphere.illuminance.xyz + atmosphere.floor.xyz;
     let n = normalize(d);
+    let h = atmosphere.sun.w;
+    let up = atmosphere.up.xyz;
+    var air = vec3f(0.0);
+    if (h > atmosphere.shape.y) {
+        var axis = vec3f(0.0, 0.0, 1.0);
+        if (abs(up.z) > 0.9) { axis = vec3f(1.0, 0.0, 0.0); }
+        let east = normalize(cross(axis, up));
+        let north = cross(up, east);
+        let local = vec3f(dot(n, east), dot(n, north), dot(n, up));
+        let s = atmosphere.sun.xyz;
+        air = sky_radiance(h, local, vec3f(dot(s, east), dot(s, north), dot(s, up)));
+        if (atmosphere.moon.w > 0.0) {
+            let m = atmosphere.moon.xyz;
+            air += sky_radiance(h, local, vec3f(dot(m, east), dot(m, north), dot(m, up)))
+                * atmosphere.moon.w;
+        }
+    } else {
+        air = lut_bilinear(sky_view_lut, sky_view_uv_of(d, atmosphere.sun.xyz)).rgb;
+        if (atmosphere.moon.w > 0.0) {
+            air += lut_bilinear(moon_view_lut, sky_view_uv_of(d, atmosphere.moon.xyz)).rgb
+                * atmosphere.moon.w;
+        }
+    }
+    var sky = max(air * atmosphere.illuminance.xyz + atmosphere.floor.xyz, atmosphere.least_sky.xyz);
+    // Behind the air, unless the planet stands before it.
+    let r = LUT_RADIUS + max(h, 0.0);
+    if (ground_distance(r, dot(n, up), max(h, 0.0)) >= 0.0) { return sky; }
+    var beyond = vec3f(0.0);
     let apart = acos(clamp(dot(n, atmosphere.sun.xyz), -1.0, 1.0));
     if (apart < SUN_ANGULAR_RADIUS) {
         let x = apart / SUN_ANGULAR_RADIUS;
         let limb = 1.0 - 0.6 * (1.0 - sqrt(max(1.0 - x * x, 0.0)));
         let solid = 2.0 * ATMOSPHERE_PI * (1.0 - cos(SUN_ANGULAR_RADIUS));
-        let mu_s = dot(atmosphere.up.xyz, atmosphere.sun.xyz);
-        sky += atmosphere.illuminance.xyz * sunlight(atmosphere.sun.w, mu_s) * limb / solid;
+        let mu_s = dot(up, atmosphere.sun.xyz);
+        beyond += sunlight(h, mu_s) * limb / solid;
     }
-    return sky;
+    beyond += moon_seen(n);
+    // A star's image about a pixel wide: the pixel's angle, supersampled.
+    let pixel = 2.0 * length(frame.up.xyz) / f32(frame.size.y);
+    beyond += stars_seen(n, 0.8 * pixel);
+    return sky + beyond * atmosphere.illuminance.xyz;
 }
 
 // Where the roll-off of highlights begins, in linear luminance.
@@ -113,7 +147,10 @@ fn present(@builtin(global_invocation_id) id: vec3u) {
     // where a straight clip turned towns and beaches to flat white.
     let lit = dot(linear, luma);
     if (lit > KNEE) {
-        let bent = KNEE + (1.0 - KNEE) * tanh((lit - KNEE) / (1.0 - KNEE));
+        // tanh of a large number is 1, but written as a ratio of two
+        // exponentials some drivers make it ∞/∞: a sun's disc, thousands of
+        // times white, came out black. Past 10 it is 1 to the last bit.
+        let bent = KNEE + (1.0 - KNEE) * tanh(min((lit - KNEE) / (1.0 - KNEE), 10.0));
         linear *= bent / lit;
     }
     if (overlaid) {

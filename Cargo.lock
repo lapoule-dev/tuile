@@ -244,6 +244,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "astro"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "199632e1a87451cf771da7adeba192cab923ede42657ac3de0133ba6f4ae14be"
+
+[[package]]
 name = "async-compression"
 version = "0.4.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6340,6 +6346,7 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 name = "tuile-atmosphere"
 version = "0.7.0"
 dependencies = [
+ "astro",
  "bytemuck",
  "glam 0.33.1",
  "solar-positioning",
@@ -6503,7 +6510,6 @@ version = "0.7.0"
 dependencies = [
  "bytemuck",
  "glam 0.33.1",
- "half",
  "image",
  "pollster",
  "tempfile",
@@ -6542,6 +6548,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tuile-atmosphere",
  "tuile-bake",
  "tuile-core",
  "tuile-farm",
@@ -6552,6 +6559,7 @@ dependencies = [
  "tuile-radiometry",
  "tuile-repository",
  "tuile-storage-foyer",
+ "tuile-tape",
  "wgpu",
 ]
 
@@ -6803,6 +6811,7 @@ dependencies = [
 name = "tuile-tape"
 version = "0.7.0"
 dependencies = [
+ "glam 0.33.1",
  "image",
  "mcap",
  "splines",
