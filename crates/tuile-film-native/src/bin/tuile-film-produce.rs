@@ -159,6 +159,10 @@ struct Args {
     /// sun, Moon and stars.
     #[arg(long, allow_hyphen_values = true)]
     clock: Option<String>,
+    /// Towns lit at night, from NASA's Black Marble (public domain), under
+    /// --atmosphere.
+    #[arg(long)]
+    night_lights: bool,
     /// For two eyes, packed into one picture: `side-by-side` or `top-bottom`.
     #[arg(long, value_parser = ["side-by-side", "top-bottom"])]
     stereo: Option<String>,
@@ -321,6 +325,7 @@ fn rendering(args: &Args) -> Result<Rendering, Error> {
         atmosphere: args.atmosphere,
         turbidity: args.turbidity,
         clock: args.clock.clone(),
+        night_lights: args.night_lights,
         stereo: args.stereo.as_deref().map(|packing| StereoSpec {
             packing: if packing == "top-bottom" {
                 StereoPacking::TopBottom

@@ -44,6 +44,9 @@ pub struct AtmosphereUniform {
     pub stars_x: [f32; 4],
     pub stars_y: [f32; 4],
     pub stars_z: [f32; 4],
+    /// xyz: the Earth's centre from the eye; w: 1 when there are night
+    /// lights.
+    pub earth: [f32; 4],
 }
 
 /// The share of the full Moon's light its night side sends back by the
@@ -164,6 +167,7 @@ impl AtmosphereUniform {
             stars_x: row(0, 1.0),
             stars_y: row(1, 0.0),
             stars_z: row(2, 0.0),
+            earth: [0.0; 4],
         }
     }
 
@@ -172,6 +176,8 @@ impl AtmosphereUniform {
     pub fn seen_from(mut self, light: &SkyLight, eye: DVec3) -> Self {
         let centre = (light.frame.centre - eye).as_vec3();
         self.centre = [centre.x, centre.y, centre.z, self.centre[3]];
+        let earth = (-eye).as_vec3();
+        self.earth = [earth.x, earth.y, earth.z, self.earth[3]];
         self
     }
 }
@@ -212,6 +218,11 @@ pub struct AtmosphereGpu {
     /// picture is drawn.
     pub sky_view_stale: bool,
     pub bind: wgpu::BindGroup,
+    /// What [`Self::bind`] binds, to bind it again when the night lights
+    /// change.
+    views: Views,
+    /// The night lights: city light, a luminance on a geographic grid.
+    pub night_lights: wgpu::Texture,
     pub sky_view_bind: wgpu::BindGroup,
     pub sky_view_pipeline: wgpu::ComputePipeline,
 }
@@ -231,7 +242,8 @@ pub fn declarations(group: u32) -> String {
          @group({group}) @binding(3) var sky_view_lut: texture_2d<f32>;\n\
          @group({group}) @binding(4) var lut_sampler: sampler;\n\
          @group({group}) @binding(5) var irradiance_lut: texture_2d<f32>;\n\
-         @group({group}) @binding(6) var moon_view_lut: texture_2d<f32>;\n"
+         @group({group}) @binding(6) var moon_view_lut: texture_2d<f32>;\n\
+         @group({group}) @binding(7) var night_lights_lut: texture_2d<f32>;\n"
     )
 }
 
@@ -270,6 +282,16 @@ pub fn layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             },
             lut(5),
             lut(6),
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -332,40 +354,18 @@ impl AtmosphereGpu {
             view(&irradiance),
             view(&moon_view),
         );
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("film atmosphere"),
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&tv),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&mv),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&sv),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&iv),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::TextureView(&nv),
-                },
-            ],
-        });
+        let night_lights = night_texture(device, 1, 1);
+        let views = Views {
+            transmittance: tv.clone(),
+            multi_scattering: mv.clone(),
+            sky_view: sv.clone(),
+            irradiance: iv.clone(),
+            moon_view: nv.clone(),
+            night_lights: night_lights.create_view(&Default::default()),
+            sampler: sampler.clone(),
+            layout: layout.clone(),
+        };
+        let bind = views.bind(device, &uniform);
         let source = format!(
             "@group(0) @binding(0) var<uniform> atmosphere: Atmosphere;\n\
              @group(0) @binding(1) var transmittance_lut: texture_2d<f32>;\n\
@@ -429,6 +429,8 @@ impl AtmosphereGpu {
             frame_uniform: AtmosphereUniform::zeroed_off(),
             sky_view_stale: false,
             bind,
+            views,
+            night_lights,
             sky_view_bind,
             sky_view_pipeline,
         }
@@ -486,6 +488,100 @@ impl AtmosphereGpu {
             (SKY_VIEW_SIZE[1] as u32).div_ceil(8),
             1,
         );
+    }
+}
+
+/// What the atmosphere's bind group holds.
+struct Views {
+    transmittance: wgpu::TextureView,
+    multi_scattering: wgpu::TextureView,
+    sky_view: wgpu::TextureView,
+    irradiance: wgpu::TextureView,
+    moon_view: wgpu::TextureView,
+    night_lights: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    layout: wgpu::BindGroupLayout,
+}
+
+impl Views {
+    fn bind(&self, device: &wgpu::Device, uniform: &wgpu::Buffer) -> wgpu::BindGroup {
+        fn view(binding: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
+            wgpu::BindGroupEntry {
+                binding,
+                resource: wgpu::BindingResource::TextureView(v),
+            }
+        }
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("film atmosphere"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                view(1, &self.transmittance),
+                view(2, &self.multi_scattering),
+                view(3, &self.sky_view),
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                view(5, &self.irradiance),
+                view(6, &self.moon_view),
+                view(7, &self.night_lights),
+            ],
+        })
+    }
+}
+
+/// A night-lights texture of `width` by `height`, one luminance a texel.
+fn night_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("film night lights"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+impl AtmosphereGpu {
+    /// The night lights: `luma`, `width` by `height`, row 0 the north pole,
+    /// column 0 the antimeridian, one byte a texel — the city light of the
+    /// whole Earth on a geographic grid.
+    pub fn set_night_lights(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        luma: &[u8],
+    ) {
+        let texture = night_texture(device, width, height);
+        queue.write_texture(
+            texture.as_image_copy(),
+            luma,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.views.night_lights = texture.create_view(&Default::default());
+        self.bind = self.views.bind(device, &self.uniform);
+        self.night_lights = texture;
     }
 }
 

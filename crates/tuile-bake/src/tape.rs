@@ -20,7 +20,8 @@ use crate::{exact_traversal, source_namespace, tiles::Tiles, Finish, GlobeConfig
 /// The bake of a tape: its cameras, and every setting a pack is the bake of.
 #[derive(Debug, Clone)]
 pub struct TapeBake {
-    /// The source's token.
+    /// The source's token. Not read for the open sources
+    /// ([`crate::open`]).
     pub token: String,
     /// Where source tiles are kept between two bakes.
     pub cache_dir: Option<PathBuf>,
@@ -60,6 +61,13 @@ impl TapeBake {
         Ok(poses)
     }
 
+    /// Whether its terrain or its imagery is an open source
+    /// ([`crate::open`]): baked with no token.
+    pub fn open_sources(&self) -> bool {
+        self.terrain.is_some_and(crate::open::is_open)
+            || self.imagery.is_some_and(crate::open::is_open)
+    }
+
     /// The globe as this bake sets it, before a session is opened on it.
     fn config(&self) -> GlobeConfig {
         let mut config = GlobeConfig::new(&self.token);
@@ -73,6 +81,14 @@ impl TapeBake {
         }
         if let Some(id) = self.imagery {
             config.imagery_asset_id = if id < 0 { None } else { Some(id) };
+        }
+        // The open sources answer for themselves: no token is read.
+        if crate::open::is_open(config.terrain_asset_id)
+            || config.imagery_asset_id.is_some_and(crate::open::is_open)
+        {
+            config.sources = Some(crate::globe::SourcesHandle(std::sync::Arc::new(
+                crate::open::OpenSources::new(self.cache_dir.clone()),
+            )));
         }
         // A pack that only refers to the tile store holds no mesh and no
         // picture: its tiles are named, not drawn.
@@ -142,6 +158,9 @@ impl TapeBake {
         }
         let mut config = self.config();
         let layers = self.layers();
+        // Open sources are not the shared tile store's to keep: their tiles
+        // stay in the pack and in this machine's cache.
+        let tiles = tiles.filter(|_| config.sources.is_none());
         if let Some(tiles) = tiles {
             let mut namespaces = vec![layers.0.clone()];
             namespaces.extend(layers.1.clone());

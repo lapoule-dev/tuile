@@ -77,6 +77,9 @@ pub struct RenderSpec {
     /// `<start>,<seconds a frame>` (`Order::clock`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clock: Option<String>,
+    /// Towns lit at night (`Order::night_lights`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub night_lights: bool,
 }
 
 /// A film for two eyes, as a caller writes it: see [`tuile_film::Stereo`].
@@ -176,6 +179,7 @@ impl Default for RenderSpec {
             atmosphere: false,
             turbidity: None,
             clock: None,
+            night_lights: false,
         }
     }
 }
@@ -210,6 +214,7 @@ impl RenderSpec {
             .as_deref()
             .map(tuile_tape::timelapse::Clock::parse)
             .transpose()?;
+        order.night_lights = self.night_lights;
         if self.atmosphere || self.turbidity.is_some() {
             order.look.atmosphere = Some(tuile_film::AtmosphereParams::default());
             order.look.turbidity = self.turbidity;
@@ -402,7 +407,7 @@ impl Host for Engine {
     }
 
     fn bake(&self, frames: Stretch, out: &Path) -> Result<(), Failed> {
-        if self.bake.token.is_empty() && !self.bake.sky_only {
+        if self.bake.token.is_empty() && !self.bake.sky_only && !self.bake.open_sources() {
             return Err(Failed::for_good(
                 "a pack is to be baked and TUILE_ION_TOKEN is not set",
             ));

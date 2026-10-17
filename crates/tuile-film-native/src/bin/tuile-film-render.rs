@@ -132,6 +132,8 @@
 //!                         between two frames, as `tuile-tape timelapse`
 //!                         writes it — every frame lit by its own sun,
 //!                         Moon and stars
+//!   --night-lights        towns lit at night (NASA Black Marble, public
+//!                         domain), under --atmosphere
 //!   --shadow <0..1>       how much of the sun ground loses where other
 //!                         ground stands before it (default 0: no shadows)
 //!   --haze                air between the eye and the ground, and a sky
@@ -530,6 +532,7 @@ async fn main() -> Result<(), Error> {
     if let Some(turbidity) = value("--turbidity") {
         order.look.turbidity = Some(turbidity.parse()?);
     }
+    order.night_lights = flag("--night-lights");
     if let Some(clock) = value("--clock") {
         order.clock = Some(tuile_tape::timelapse::Clock::parse(&clock)?);
     }

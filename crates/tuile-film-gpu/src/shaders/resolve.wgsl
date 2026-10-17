@@ -66,6 +66,29 @@ fn lerp3(b: vec2f, x: vec2f, y: vec2f, z: vec2f) -> vec2f {
     return x * (1.0 - b.x - b.y) + y * b.x + z * b.y;
 }
 
+// The light of towns at night at `p` (eye-relative), in the renderer's
+// units, from the night-lights map (a geographic grid, row 0 at the north
+// pole). Towns light up as the ground's own light falls: shown at a few
+// times the night floor where the ground is lit by little more than it,
+// gone in daylight.
+fn city_light(p: vec3f, ground: vec3f) -> vec3f {
+    if (atmosphere.earth.w == 0.0) { return vec3f(0.0); }
+    let x = p - atmosphere.earth.xyz;
+    let lon = atan2(x.y, x.x);
+    // Geocentric to geodetic: the tangent over 1 − e².
+    let lat = atan(x.z / (length(x.xy) * (1.0 - 0.00669438)));
+    let uv = vec2f(lon / (2.0 * ATMOSPHERE_PI) + 0.5, 0.5 - lat / ATMOSPHERE_PI);
+    let lit = textureSampleLevel(night_lights_lut, lut_sampler, uv, 0.0).r;
+    let luma = vec3f(0.2126, 0.7152, 0.0722);
+    let floor = max(dot(atmosphere.least.xyz, luma), 1e-30);
+    let fade = 1.0 - smoothstep(2.0 * floor, 40.0 * floor, dot(ground, luma));
+    // Sodium and LED: a warm white.
+    // The brightest about eight times ground of a tenth's reflectance under
+    // the floor: a city is the brightest thing on a night side, never a
+    // flare.
+    return vec3f(1.0, 0.78, 0.5) * pow(lit, 2.2) * 0.8 * floor * fade;
+}
+
 @compute @workgroup_size(RESOLVE_GROUP)
 fn resolve(@builtin(global_invocation_id) id: vec3u) {
     let slot = current.slot;
@@ -172,7 +195,8 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
             // shows falls where it is, the night side lit by the night.
             let x = p - atmosphere.centre.xyz;
             let r = length(x);
-            radiance = base * ground_light(r - atmosphere.centre.w, x / r, normal, ambient, lit);
+            let light = ground_light(r - atmosphere.centre.w, x / r, normal, ambient, lit);
+            radiance = base * light + city_light(p, light);
         }
         if (known && frame.haze.w != 0.0) {
             // What the air leaves of the ground, and its own light for the

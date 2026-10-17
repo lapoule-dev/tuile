@@ -89,6 +89,9 @@ pub struct Order {
     /// by the sun of its instant, the Moon of its instant over the frame's
     /// own eye, and the stars turned to it. `None`: the look's light.
     pub clock: Option<tuile_tape::timelapse::Clock>,
+    /// Towns lit at night under a physical atmosphere: NASA's Black Marble
+    /// ([`tuile_bake::open::night_lights`]), fetched once a render.
+    pub night_lights: bool,
 }
 
 /// The light of `frame` under `clock`: the sun of its instant from the
@@ -125,6 +128,7 @@ impl Default for Order {
             wire: false,
             stereo: None,
             clock: None,
+            night_lights: false,
         }
     }
 }
@@ -432,6 +436,11 @@ pub async fn render(
             look,
         },
     );
+    if order.night_lights && look.atmosphere.is_some() {
+        let cache = std::env::var_os("TUILE_CACHE_DIR").map(Into::into);
+        let lights = tuile_bake::open::night_lights(cache).await?;
+        gpu.set_night_lights(lights.width, lights.height, &lights.luma);
+    }
     gpu.probe_holes(order.holes);
     gpu.smoothing_probe(order.smooth_strength, order.wire);
     let mut stitching = order.stitch.then(Stitching::default);

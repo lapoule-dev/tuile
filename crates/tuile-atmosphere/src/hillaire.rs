@@ -794,7 +794,7 @@ impl LutAtmosphere {
         // as night falls a warm one — balanced towards, it leaves the
         // picture blue, as the dark-adapted eye sees a night.
         let white_lum = luminance(metered) / wanted;
-        let night = smooth_step(-6.0, -16.0, f64::from(x));
+        let night = smooth_step(-4.0, -20.0, f64::from(x));
         let mut white = [0.0f32; 3];
         for c in 0..3 {
             let physical = metered[c] / calibrated[c].max(1e-12) / white_lum.max(1e-300);
@@ -928,7 +928,7 @@ pub struct Moment {
 
 /// The white a camera at night balances towards: warm, so that the
 /// picture it leaves is blue.
-pub const NIGHT_WHITE: [f32; 3] = [1.25, 1.0, 0.72];
+pub const NIGHT_WHITE: [f32; 3] = [1.5, 1.0, 0.55];
 
 /// The colour of the light the night floor adds: a clear twilight's sky,
 /// blue — normalised to unit luminance where it is used.

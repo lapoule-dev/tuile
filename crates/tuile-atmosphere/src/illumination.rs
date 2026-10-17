@@ -158,8 +158,9 @@ impl ReferenceIllumination {
     /// beside a day side: dark blue-grey, a sixteenth of noon.
     pub const SHOWN_FLOOR: f32 = 1.0 / 16.0;
 
-    /// How far the camera's white balance goes towards a light's white.
-    pub const WHITE_ADAPTATION: f32 = 0.6;
+    /// How far the camera's white balance goes towards a light's white:
+    /// about a third — a golden hour stays golden, a sunset red.
+    pub const WHITE_ADAPTATION: f32 = 0.35;
 
     /// **Provisional**, until an atmosphere model computes the light: the
     /// sun at `to_sun_ecef`, and the light the renderer's look already

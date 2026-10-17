@@ -76,6 +76,9 @@ struct Atmosphere {
     stars_x: vec4f,
     stars_y: vec4f,
     stars_z: vec4f,
+    // xyz: the Earth's centre from the eye; w: 1 when the renderer holds
+    // night lights.
+    earth: vec4f,
 }
 
 const ATMOSPHERE_PI: f32 = 3.14159265358979;

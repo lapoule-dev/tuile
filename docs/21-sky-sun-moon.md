@@ -55,7 +55,7 @@ the Moon from the frame's own eye.
   than daylight: three quarters made up. Dimmer: `−3·log₂(1 + |ev|/17.3)` —
   sunset about 1.7 stops under noon, civil dusk 2.7, full Moon 3.1, a
   moonless night 4. No cap, no step, nothing to pump about.
-- White balance: 0.6 of the way to the metered light's white, blended
+- White balance: 0.35 of the way (a golden hour stays golden) to the metered light's white, blended
   towards a warm white as night falls — the picture goes blue, as the
   dark-adapted eye sees it.
 - Night floor: a clear moonless night's starlight and airglow (2·10⁻⁸ of

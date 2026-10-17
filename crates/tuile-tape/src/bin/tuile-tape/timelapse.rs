@@ -23,8 +23,8 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("timelapse <path.mcap> [key=value ...]")?;
     let lapse = TimeLapse::parse(words)?;
     let mut tape = Tape::recording(path)?;
-    for frame in 1..=lapse.frames() {
-        tape.push(lapse.camera(frame));
+    for camera in lapse.cameras() {
+        tape.push(camera);
     }
     let written = tape.finish()?;
     let clock = lapse.clock().to_arg();

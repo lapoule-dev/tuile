@@ -370,6 +370,8 @@ pub struct FilmGpu {
     lit: Look,
     /// The physical atmosphere's tables, uniform and sky-view.
     atmosphere: atmosphere::AtmosphereGpu,
+    /// Whether night lights were given ([`Self::set_night_lights`]).
+    night_lights: bool,
 }
 
 /// One imagery tile of a drape and where it lies on the terrain tile.
@@ -1205,6 +1207,7 @@ impl FilmGpu {
             light: FrameLight::of(&settings.look),
             lit: settings.look,
             atmosphere,
+            night_lights: false,
             device,
             queue,
             settings,
@@ -1502,6 +1505,17 @@ impl FilmGpu {
     /// ([`Look::atmosphere`]) the light is worked out from the air when the
     /// frame is drawn, and of `light` only the sun's direction, the
     /// compensation and the air are heard.
+    /// The night lights a physical atmosphere lights towns with at night:
+    /// `luma`, `width` by `height`, a geographic grid from the antimeridian
+    /// eastwards and from the north pole southwards, one byte a texel.
+    pub fn set_night_lights(&mut self, width: u32, height: u32, luma: &[u8]) {
+        self.atmosphere
+            .set_night_lights(&self.device, &self.queue, width, height, luma);
+        self.night_lights = true;
+        // The next frame's light is worked out again, with the lights on.
+        self.atmosphere.key = None;
+    }
+
     pub fn set_light(&mut self, light: FrameLight) {
         self.light = light;
         self.lit = self.settings.look.lit_by(light);
@@ -2548,6 +2562,7 @@ impl FilmGpu {
             .map(|t| tuile_atmosphere::celestial_to_ecef(t).transpose());
         self.atmosphere.frame_uniform =
             AtmosphereUniform::new(&params, &sky, frame.eye, self.lit.exposure_scale(), stars);
+        self.atmosphere.frame_uniform.earth[3] = f32::from(u8::from(self.night_lights));
         // Written now for the sky-view, placed from each eye when drawn.
         self.queue.write_buffer(
             &self.atmosphere.uniform,

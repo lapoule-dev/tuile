@@ -48,6 +48,7 @@ mod by_index_tests;
 mod globe;
 mod ground;
 pub mod memory;
+pub mod open;
 pub mod packed;
 mod session;
 pub mod tape;
