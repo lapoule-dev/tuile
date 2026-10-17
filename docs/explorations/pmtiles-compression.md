@@ -814,6 +814,89 @@ Terrain gzip gets almost all of it, with no quality or licence question.
 WebP q90 adds 10 % on imagery, at the price of a derived work and a 5×
 CPU decode where the browser does not decode it.
 
+### Faster WebP decoders?
+
+**Method.** The same 1 000 tiles of the production `top` archive (levels
+5–9) were decoded as source JPEG and as WebP q90, one decode per tile,
+single-threaded, on Apple Silicon. Code:
+`lab/pmtiles-compression/decode-bench/` (Rust) and
+`decode_bench_inputs.py`. The laptop was heavily loaded by other builds
+(load average 20–70), so each tile keeps the fastest of 7 passes and the
+table gives the mean of those per-tile minima. Even so, settings within
+±15 % of each other are not distinguishable.
+
+| Decoder (version, licence) | Code path | ms/tile, mean of per-tile minima |
+|---|---|---|
+| **JPEG:** libjpeg-turbo 3.2 via `turbojpeg` 1.5.1 (MIT/Unlicense; C, BSD-style) | NEON SIMD, into a preallocated RGBA buffer | **0.20** |
+| — the same, YUV planes | no colour conversion | 0.19 |
+| `zune-jpeg` 0.5.15 (MIT/Apache/Zlib) | pure Rust, NEON | 0.29 |
+| `jpeg-decoder` 0.3.2 (MIT/Apache) | pure Rust, scalar | 0.56 |
+| **WebP:** libwebp (vendored by `libwebp-sys` 0.14.4, MIT; libwebp BSD) | NEON (`WEBP_HAVE_NEON`), RGBA, default fancy upsampling | 1.14 |
+| — `no_fancy_upsampling` | | 1.21 (no gain) |
+| — `use_threads` | VP8 filtering on a second thread | 1.00 |
+| — into a preallocated RGBA / RGB buffer | | 0.93 / 0.97 |
+| — YUV 4:2:0 planes (colour conversion left to a shader) | | 0.93 |
+| `image-webp` 0.2.4 (MIT/Apache), the decoder behind `image` | pure Rust, no explicit SIMD | 1.77 |
+| `zune` | no WebP decoder exists in `zune-image` 0.5 | — |
+| **Browser,** Chrome 155: `createImageBitmap(Blob)`, awaited one at a time | native, off the main thread | JPEG 1.73–1.88 / WebP 5.44 |
+| Chrome 155: `ImageDecoder` (WebCodecs), awaited one at a time | native | JPEG 2.74 / WebP 2.52 |
+
+**Encoder settings.** All are at q90, scored on 200 tiles against the
+source JPEG. Decode is libwebp, RGBA.
+
+| Setting | Size vs `-m 4` | SSIMU2 | Decode |
+|---|---|---|---|
+| `-m 4` (reference) | 1.000 | 85.6 | 1.14 ms |
+| `-m 6` | 0.990 | 85.7 | 1.02 ms |
+| `-f 0` (no loop filter) | 1.000 | 85.7 | 1.01 ms |
+| `-segments 1` | 0.998 | 85.5 | 1.27 ms |
+| `-sharp_yuv` | 1.010 | 85.8 | 1.01 ms |
+
+No alpha is written in any case: the tiles are RGB.
+
+**What this says.**
+
+- **No faster WebP decoder exists.**
+  - libwebp with NEON is the fastest: ≈ 0.95–1.15 ms per 256² tile, still
+    **≈ 5× libjpeg-turbo** (0.20 ms).
+  - The pure-Rust `image-webp`, the only decoder that suits the wasm rule,
+    is 1.6–1.9× slower than libwebp.
+  - The gap is the format itself: VP8's boolean arithmetic decoding and
+    in-loop filter, against JPEG's Huffman coding plus SIMD IDCT. It is not
+    a weak implementation.
+- **No decoder or encoder setting moves it by more than the measurement
+  noise.** Preallocated output, RGB or YUV output, and threads each gain
+  0–15 %. `-f 0`, `-segments 1`, `-m 6` and `-sharp_yuv` change size by
+  ±1 % and decode by about as much as the noise.
+- **The browser makes the native gap moot only for throughput.** One
+  decode awaited at a time costs 1.7–5.4 ms, mostly round-trip latency to
+  the decoder thread, and it is off the main thread anyway.
+  - With `createImageBitmap`, WebP costs 3× JPEG.
+  - With `ImageDecoder`, the two are equal (≈ 2.5–2.7 ms).
+  - These browser figures were taken while the native benchmark was also
+    running. A second run, with four decodes in flight, was cut short when
+    the tab was closed. To redo it, serve
+    `decode-bench/browser.html` next to `jpeg.bin` and `webp-q90-m4.bin`
+    (`python3 -m http.server`) and open it in Chrome.
+- **In wasm**, `image-webp` would run at an estimated 2–3× its native
+  1.8 ms, i.e. 4–5 ms per tile. That is a reason to hand WebP to the
+  browser's decoder rather than decode it in wasm.
+- **Avoiding the decode altogether** means GPU block formats (section 3.2,
+  KTX2). The trade-off stays the same: a transcode of 0.1–0.5 ms and a
+  quarter of the VRAM, against files 1–4× larger, a derived work, and a
+  ≈ 500 KiB transcoder.
+
+**Recommendation.** If imagery ever goes WebP:
+- **native:** decode with libwebp (`libwebp-sys` with NEON or SSE) into a
+  preallocated buffer, or straight to YUV for a shader;
+- **web:** `ImageDecoder` / `createImageBitmap` with several decodes in
+  flight;
+- **wasm:** never `image-webp` on a hot path.
+
+At about 1 ms against 0.2 ms per tile, WebP's decode cost is real but small
+next to a tile's network fetch. It is not, alone, a reason to keep JPEG. The
+licence question and the 10 % saving are.
+
 ## 8. What was not measured
 
 - **wasm decode times and binary sizes.** No wasm was built: other agents
