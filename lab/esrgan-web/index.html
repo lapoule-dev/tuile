@@ -21,18 +21,21 @@
   .ok { color: var(--ok); } .bad { color: var(--bad); }
   #log { white-space: pre-wrap; color: var(--dim); font: 12px ui-monospace, monospace; margin-top: 12px; }
   label { color: var(--dim); }
+  select, button { background: #1c1c1c; color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 2px 6px; font: inherit; }
+  #variant label { margin-right: 10px; }
 </style>
 </head>
 <body>
 <h1>Real-ESRGAN compact ×4 on WebGPU</h1>
 <div class="sub" id="what">Burn, compiled to wasm, on the browser's GPU.</div>
+<div class="sub" id="variant"></div>
 <div class="sub"><label>Zoom: <select id="zoom">
   <option value="1">whole tile</option><option value="2">×2 (centre)</option><option value="4" selected>×4 (centre)</option>
 </select></label></div>
 <div class="grid">
   <figure><canvas id="c-input"></canvas><figcaption>Input: z17 tile, 256², nearest</figcaption></figure>
   <figure><canvas id="c-bicubic"></canvas><figcaption>Bicubic ×4 (Keys, a = −0.5)</figcaption></figure>
-  <figure><canvas id="c-esrgan"></canvas><figcaption>Real-ESRGAN compact ×4, Burn on WebGPU</figcaption></figure>
+  <figure><canvas id="c-esrgan"></canvas><figcaption id="cap-esrgan">Real-ESRGAN compact ×4, Burn on WebGPU</figcaption></figure>
   <figure><canvas id="c-truth"></canvas><figcaption>Served z19 (for looking only: never scored against)</figcaption></figure>
 </div>
 <table id="facts"></table>

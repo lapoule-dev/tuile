@@ -1,3 +1,5 @@
 /target
 /data
 /pkg
+/pkg-*
+/bench-out

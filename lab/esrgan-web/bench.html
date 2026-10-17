@@ -1,0 +1,63 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!-- Copyright (c) lapoule.dev -->
+<!-- Runs the page once per variant, each in a fresh iframe (a fresh wasm instance and WebGPU device), and collects
+     what each run leaves in window.__result into window.__bench. ?runs=<query>|<query>|... overrides the list. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESRGAN variant bench</title>
+<style>
+  :root { --bg: #111; --fg: #e8e8e8; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+  iframe { width: 1200px; height: 900px; border: 0; }
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script type="module">
+const DEFAULT_RUNS = [
+  "pkg=pkg&dtype=f32&algo=direct&quant=none&w=f32",
+  "pkg=pkg&dtype=f16&algo=direct&quant=none&w=f16",
+  "pkg=pkg&dtype=f32&algo=gemm&quant=none&w=f32",
+  "pkg=pkg&dtype=f16&algo=gemm&quant=none&w=f16",
+  "pkg=pkg&dtype=f32&algo=gemm&quant=none&w=q8",
+  "pkg=pkg&dtype=f16&algo=gemm&quant=none&w=q8",
+  "pkg=pkg&dtype=f32&algo=gemm&quant=tensor&w=f32",
+  "pkg=pkg&dtype=f32&algo=gemm&quant=block&w=f32",
+  "pkg=pkg&dtype=f16&algo=gemm&quant=block&w=f32",
+  "pkg=pkg-fusion&dtype=f32&algo=direct&quant=none&w=f32",
+  "pkg=pkg-fusion&dtype=f16&algo=gemm&quant=none&w=f16",
+  "pkg=pkg-fusion&dtype=f16&algo=gemm&quant=none&w=q8",
+  "pkg=pkg-opt&dtype=f16&algo=gemm&quant=none&w=q8",
+  "pkg=pkg-fusion-opt&dtype=f16&algo=gemm&quant=none&w=q8",
+];
+const q = new URLSearchParams(location.search).get("runs");
+const runs = q ? q.split("|") : DEFAULT_RUNS;
+const log = (m) => { document.getElementById("log").textContent += m + "\n"; };
+const bench = (window.__bench = { results: [], done: false });
+for (const run of runs) {
+  const frame = document.createElement("iframe");
+  frame.src = `index.html?${run}`;
+  document.body.append(frame);
+  let r;
+  for (let i = 0; i < 240; i++) {
+    await new Promise((ok) => setTimeout(ok, 500));
+    r = frame.contentWindow?.__result;
+    if (r?.done || r?.error) break;
+  }
+  const keep = r ? { ...r, limits: undefined, features: undefined, adapter: undefined } : { error: "timeout" };
+  bench.results.push({ run, ...keep });
+  await fetch(`results/partial.json`, { method: "POST", body: JSON.stringify(bench, null, 1) }).catch(() => {});
+  log(`${run}: ${r?.error ? "ERROR " + r.error.split("\n")[0] : `warm ${r?.warmMs?.toFixed(0)} gpu ${r?.gpuMs?.toFixed(1)} psnr ${r?.diff?.psnr8?.toFixed(1)}`}`);
+  frame.remove();
+  await new Promise((ok) => setTimeout(ok, 1500));
+}
+bench.done = true;
+const name = new URLSearchParams(location.search).get("name") ?? "bench";
+await fetch(`results/${name}.json`, { method: "POST", body: JSON.stringify(bench, null, 1) }).catch(() => {});
+log("done");
+</script>
+</body>
+</html>

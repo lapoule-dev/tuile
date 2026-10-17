@@ -1,6 +1,19 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
-import init, { Upscaler } from "./pkg/esrgan_web.js";
+
+// The variant comes from the URL, since a WebGPU device's float type is fixed once Burn has used it:
+// changing a selector reloads the page with the new query.
+const CHOICES = {
+  pkg: { "pkg": "wasm: release (thin LTO, O3)", "pkg-fusion": "wasm: + fusion", "pkg-opt": "wasm: + wasm-opt -O3", "pkg-fusion-opt": "wasm: fusion + wasm-opt -O3" },
+  dtype: { f32: "compute f32", f16: "compute f16" },
+  algo: { direct: "conv: Burn direct", gemm: "conv: im2col + matmul" },
+  quant: { none: "Burn int8: off", tensor: "Burn int8: per tensor", block: "Burn int8: per block" },
+  w: { f32: "weights file f32", f16: "weights file f16", q8: "weights file int8" },
+};
+const DEFAULTS = { pkg: "pkg", dtype: "f32", algo: "direct", quant: "none", w: "f32" };
+const query = new URLSearchParams(location.search);
+const variant = Object.fromEntries(Object.entries(DEFAULTS).map(([k, d]) => [k, CHOICES[k][query.get(k)] ? query.get(k) : d]));
+const { default: init, Upscaler } = await import(`./${variant.pkg}/esrgan_web.js`);
 
 const $ = (id) => document.getElementById(id);
 const log = (msg) => { $("log").textContent += msg + "\n"; console.log("[esrgan]", msg); };
@@ -13,6 +26,31 @@ const fact = (k, v, cls = "") => {
 };
 const bytes = async (url) => new Uint8Array(await (await fetch(url)).arrayBuffer());
 const floats = async (url) => new Float32Array(await (await fetch(url)).arrayBuffer());
+
+// The weights through the Cache API: a second visit reads them from disk, not the network.
+async function cachedBytes(url) {
+  const t = performance.now();
+  let hit = false, res;
+  try {
+    const cache = await caches.open("esrgan-weights-v1");
+    res = await cache.match(url);
+    hit = !!res;
+    if (!res) { res = await fetch(url); await cache.put(url, res.clone()); }
+  } catch { res = await fetch(url); }
+  const b = new Uint8Array(await res.arrayBuffer());
+  return { bytes: b, hit, ms: performance.now() - t };
+}
+
+function selectors() {
+  const box = document.getElementById("variant");
+  for (const [k, opts] of Object.entries(CHOICES)) {
+    const label = document.createElement("label"), sel = document.createElement("select");
+    for (const [v, text] of Object.entries(opts)) sel.add(new Option(text, v, false, v === variant[k]));
+    sel.onchange = () => { const q = new URLSearchParams(variant); q.set(k, sel.value); location.search = q.toString(); };
+    label.append(sel);
+    box.append(label);
+  }
+}
 
 // Images as { w, h, rgba }.
 const fromRgb = (rgb, w, h) => {
@@ -93,39 +131,69 @@ async function main() {
   fact("Limits", Object.entries(result.limits).map(([k, v]) => `${k} ${v}`).join(", "));
   fact("Features", result.features.join(", "));
 
+  selectors();
+  result.variant = variant;
   const meta = await (await fetch("data/meta.json")).json();
   $("what").textContent = `Burn 0.22 compiled to wasm, on the browser's GPU · tile ${meta.tile} · ${meta.params.toLocaleString()} parameters · ${meta.num_conv} body convolutions`;
-  const [weights, rgb, ref] = await Promise.all([floats("data/weights.bin"), bytes("data/input.rgb"), floats("data/ref.f32")]);
+  const wfile = `data/weights.${variant.w}.esrw`;
+  const [wts, rgb, ref] = await Promise.all([cachedBytes(wfile), bytes("data/input.rgb"), floats("data/ref.f32")]);
   const w = 256, h = 256;
 
   let t = performance.now();
-  await init();
+  await init();  // given no argument, wasm-bindgen fetches the .wasm with instantiateStreaming
   const wasmMs = performance.now() - t;
   t = performance.now();
-  const net = await Upscaler.create(weights);
+  const net = await Upscaler.create(wts.bytes, variant.dtype, variant.algo, variant.quant);
   const createMs = performance.now() - t;
   const s = net.scale();
-  log(`wasm ${wasmMs.toFixed(0)} ms, device + weights ${createMs.toFixed(0)} ms`);
+  log(`weights ${wfile} ${wts.bytes.length} B (${wts.hit ? "Cache API hit" : "network"}, ${wts.ms.toFixed(0)} ms) · wasm ${wasmMs.toFixed(0)} ms · device + weights ${createMs.toFixed(0)} ms · computes in ${net.dtype()} · fusion ${Upscaler.fusion()}`);
 
   t = performance.now();
-  let out = await net.run(rgb, w, h);
+  let r = await net.run(rgb, 1, w, h);
   const cold = performance.now() - t;
-  log(`cold run ${cold.toFixed(0)} ms`);
-  const warm = [];
-  for (let i = 0; i < 5; i++) {
+  const firstResultMs = performance.now();  // since navigation start
+  log(`cold run ${cold.toFixed(0)} ms (gpu ${r.gpuMs?.toFixed(0)} ms) · first result ${firstResultMs.toFixed(0)} ms after navigation`);
+  const warm = [], gpu = [];
+  for (let i = 0; i < 7; i++) {
     t = performance.now();
-    out = await net.run(rgb, w, h);
+    r = await net.run(rgb, 1, w, h);
     warm.push(performance.now() - t);
+    gpu.push(r.gpuMs);
   }
-  warm.sort((a, b) => a - b);
-  const warmMs = warm[2];
-  log(`warm runs ${warm.map((v) => v.toFixed(0)).join(", ")} ms`);
+  const median = (a) => [...a].sort((x, y) => x - y)[a.length >> 1];
+  const warmMs = median(warm), gpuMs = median(gpu.filter((v) => v != null));
+  log(`warm runs ${warm.map((v) => v.toFixed(0)).join(", ")} ms · gpu ${gpu.map((v) => v?.toFixed(0)).join(", ")} ms`);
+  const out = r.out;
+
+  // four tiles in one batch: what a tile costs when the GPU has more to chew on
+  const rgb4 = new Uint8Array(rgb.length * 4);
+  for (let i = 0; i < 4; i++) rgb4.set(rgb, i * rgb.length);
+  // opt-in (?batch=4): the direct convolution on four tiles runs past the GPU watchdog and loses the device
+  let batch4Ms = null, batch4GpuMs = null;
+  if (query.get("batch") === "4") try {
+    await net.run(rgb4, 4, w, h);
+    t = performance.now();
+    const r4 = await net.run(rgb4, 4, w, h);
+    batch4Ms = performance.now() - t; batch4GpuMs = r4.gpuMs;
+    log(`batch of 4: ${batch4Ms.toFixed(0)} ms (gpu ${batch4GpuMs?.toFixed(0)} ms), ${(batch4Ms / 4).toFixed(0)} ms a tile`);
+  } catch (e) { log(`batch of 4 failed: ${e}`); }
+
+  // the largest |activation| after each layer, in the dtype the network computes in (f16 overflows at 65504)
+  const peaks = await net.probe(rgb, w, h);
+  const peak = Math.max(...peaks), finite = peaks.every(Number.isFinite) && out.every(Number.isFinite);
+  log(`activation peaks ${[...peaks].map((v) => v.toPrecision(3)).join(" ")}`);
 
   const d = compare(out, ref);
-  Object.assign(result, { wasmMs, createMs, coldMs: cold, warmMs, warmAll: warm, diff: d, referenceSeconds: meta.reference_seconds });
-  fact("Timings", `wasm load ${wasmMs.toFixed(0)} ms · device + weights ${createMs.toFixed(0)} ms · cold ${cold.toFixed(0)} ms · warm ${warmMs.toFixed(0)} ms (median of 5, 256² → 1024², readback included) · PyTorch CPU reference ${(meta.reference_seconds * 1000).toFixed(0)} ms`);
+  Object.assign(result, {
+    dtype: net.dtype(), fusion: Upscaler.fusion(), weightsBytes: wts.bytes.length, weightsCacheHit: wts.hit, weightsMs: wts.ms,
+    wasmMs, createMs, coldMs: cold, coldGpuMs: null, warmMs, gpuMs, warmAll: warm, gpuAll: gpu, batch4Ms, batch4GpuMs,
+    firstResultMs, peak, finite, diff: d, referenceSeconds: meta.reference_seconds,
+  });
+  fact("Variant", `${net.dtype()} · ${variant.algo} · Burn int8 ${variant.quant} · weights ${variant.w} (${(wts.bytes.length / 1e6).toFixed(2)} MB${wts.hit ? ", from Cache API" : ""}) · fusion ${Upscaler.fusion()} · ${variant.pkg}`);
+  fact("Timings", `wasm load ${wasmMs.toFixed(0)} ms · device + weights ${createMs.toFixed(0)} ms · cold ${cold.toFixed(0)} ms · warm ${warmMs.toFixed(0)} ms, GPU ${gpuMs?.toFixed(1)} ms (median of 7, 256² → 1024², readback included) · batch of 4 ${batch4Ms?.toFixed(0)} ms · first result ${firstResultMs.toFixed(0)} ms after navigation · PyTorch CPU ${(meta.reference_seconds * 1000).toFixed(0)} ms`);
+  fact("Activations", `peak |a| ${peak.toPrecision(4)} over ${peaks.length} layers · ${finite ? "all finite" : "NON-FINITE values"}`, finite && peak < 6e4 ? "ok" : "bad");
   fact("vs PyTorch", `max |Δ| ${d.max.toExponential(2)} · mean |Δ| ${d.mean.toExponential(2)} · PSNR (8-bit) ${d.psnr8 === Infinity ? "∞ (identical)" : d.psnr8.toFixed(1) + " dB"}`,
-    d.psnr8 > 50 ? "ok" : "bad");
+    d.psnr8 > 40 ? "ok" : "bad");
 
   Object.assign(shown, {
     "c-input": fromRgb(rgb, w, h),
@@ -133,6 +201,7 @@ async function main() {
     "c-esrgan": fromChw(out, w * s, h * s),
     "c-truth": await fromPng("data/truth.png"),
   });
+  $("cap-esrgan").textContent = `Real-ESRGAN compact ×4, Burn on WebGPU: ${net.dtype()}, ${variant.algo}, weights ${variant.w}${variant.quant !== "none" ? ", Burn int8 " + variant.quant : ""}`;
   draw();
   result.done = true;
   log("done");

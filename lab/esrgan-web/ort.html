@@ -1,0 +1,55 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!-- Copyright (c) lapoule.dev -->
+<!-- A yardstick, not a dependency: the same network in ONNX Runtime Web on WebGPU (data/*.onnx from export_onnx.py). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESRGAN ORT yardstick</title>
+<style>
+  :root { --bg: #111; --fg: #e8e8e8; --dim: #9a9a9a; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 13px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.webgpu.min.js"></script>
+</head>
+<body>
+<div id="log">ONNX Runtime Web 1.22.0, WebGPU execution provider (?f16=1 for the f16 graph)
+</div>
+<script type="module">
+const log = (m) => { document.getElementById("log").textContent += m + "\n"; console.log("[ort]", m); };
+const f16 = new URLSearchParams(location.search).get("f16") === "1";
+ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
+const result = (window.__result = { f16 });
+try {
+  const [rgb, ref] = await Promise.all([
+    fetch("data/input.rgb").then((r) => r.arrayBuffer()).then((b) => new Uint8Array(b)),
+    fetch("data/ref.f32").then((r) => r.arrayBuffer()).then((b) => new Float32Array(b)),
+  ]);
+  const n = 256 * 256, x = new Float32Array(3 * n);
+  for (let i = 0; i < n; i++) for (let c = 0; c < 3; c++) x[c * n + i] = rgb[3 * i + c] / 255;
+  let t = performance.now();
+  const session = await ort.InferenceSession.create(`data/realesr-general-x4v3${f16 ? ".f16" : ""}.onnx`, { executionProviders: ["webgpu"] });
+  result.createMs = performance.now() - t;
+  const feeds = { x: new ort.Tensor("float32", x, [1, 3, 256, 256]) };
+  t = performance.now();
+  let out = (await session.run(feeds)).y.data;
+  result.coldMs = performance.now() - t;
+  const warm = [];
+  for (let i = 0; i < 7; i++) { t = performance.now(); out = (await session.run(feeds)).y.data; warm.push(performance.now() - t); }
+  warm.sort((a, b) => a - b);
+  result.warmMs = warm[3];
+  let max = 0, se = 0;
+  for (let i = 0; i < out.length; i++) {
+    max = Math.max(max, Math.abs(out[i] - ref[i]));
+    const q = Math.round(Math.min(1, Math.max(0, out[i])) * 255) - Math.round(Math.min(1, Math.max(0, ref[i])) * 255);
+    se += q * q;
+  }
+  result.max = max; result.psnr8 = se === 0 ? Infinity : 10 * Math.log10(255 * 255 * out.length / se);
+  log(`session ${result.createMs.toFixed(0)} ms · cold ${result.coldMs.toFixed(0)} ms · warm ${result.warmMs.toFixed(0)} ms (median of 7, readback included)`);
+  log(`vs PyTorch: max |Δ| ${max.toExponential(2)} · PSNR (8-bit) ${result.psnr8.toFixed(1)} dB`);
+  result.done = true;
+} catch (e) { log(`error: ${e?.stack ?? e}`); result.error = String(e); }
+</script>
+</body>
+</html>
