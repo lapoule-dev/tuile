@@ -8,6 +8,11 @@
 #   TUILE_STORE_ENDPOINT, TUILE_STORE_BUCKET, TUILE_STORE_ACCESS_KEY_ID,
 #   TUILE_STORE_SECRET_ACCESS_KEY, TUILE_TILES_BUCKET
 #
+# The GCP provider reads application-default credentials; where those are a
+# person's login under a reauthentication policy, give it the token of the
+# identity gcloud runs as: GOOGLE_OAUTH_ACCESS_TOKEN=$(gcloud auth
+# print-access-token).
+#
 # The state is kept where PULUMI_BACKEND_URL says (default: a directory in
 # the operator's home); its secrets under PULUMI_CONFIG_PASSPHRASE.
 #

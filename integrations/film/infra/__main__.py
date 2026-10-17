@@ -54,7 +54,10 @@ for name, region, accelerator, cpu, memory in JOBS:
             template=gcp.cloudrunv2.JobTemplateTemplateArgs(
                 # A failed film is read, not retried blind.
                 max_retries=0,
-                timeout="21600s",
+                # The most Cloud Run gives a task with a card. A longer film
+                # is more tasks, or the same command again: a production
+                # resumes from the parts already in the store.
+                timeout="3600s",
                 service_account=service_account,
                 gpu_zonal_redundancy_disabled=True,
                 node_selector=gcp.cloudrunv2.JobTemplateTemplateNodeSelectorArgs(

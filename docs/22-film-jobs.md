@@ -8,7 +8,7 @@ that runs one execution per film and brings the film home.
 
 | Piece | Where | What |
 |---|---|---|
-| Job definitions | `integrations/film/infra/` (Pulumi, Python) | `tuile-film-oneoff` (L4, `europe-west1`: H.264, AV1) and `tuile-film-oneoff-spatial` (RTX PRO 6000, `europe-west4`: MV-HEVC). Command `tuile-film-produce`; image, identity and stores from config. One task, no retry, six hours at most. |
+| Job definitions | `integrations/film/infra/` (Pulumi, Python) | `tuile-film-oneoff` (L4, `europe-west1`: H.264, AV1) and `tuile-film-oneoff-spatial` (RTX PRO 6000, `europe-west4`: MV-HEVC). Command `tuile-film-produce`; image, identity and stores from config. One task, no retry, an hour at most (Cloud Run's limit for a task with a card): a longer film takes more tasks, or the same command again — a production resumes from the parts already in the store. |
 | Image | `integrations/film/Dockerfile` | `tuile-film-produce`, `-render`, `-serve` on Vulkan + NVENC. Tagged by commit. |
 | Launcher | `tuile-film-job` (`crates/tuile-film-native`) | Puts the tape in the run store, starts an execution with the production's flags as its arguments, follows it, reads the receipt, downloads the film to `videos/` and opens it. |
 | Production | `tuile-film-produce` | Bakes, renders in parts, joins (H.264 or spatial), writes `--receipt`. |
