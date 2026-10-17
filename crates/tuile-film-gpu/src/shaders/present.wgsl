@@ -118,7 +118,9 @@ fn glare(d: vec3f) -> vec3f {
     }
     let m = atmosphere.moon.xyz;
     if (atmosphere.moon.w > 0.0 && !hidden(m)) {
-        light += glare_of(n, m, sunlight(h, dot(atmosphere.up.xyz, m)) * atmosphere.moon.w, right, up);
+        // A fifth of the sun's: the Moon's disc, exposed for the night it
+        // lights, keeps its phase readable under its own glow.
+        light += glare_of(n, m, sunlight(h, dot(atmosphere.up.xyz, m)) * atmosphere.moon.w, right, up) * 0.2;
     }
     return light * atmosphere.illuminance.xyz;
 }

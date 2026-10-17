@@ -219,13 +219,14 @@ impl TimeLapse {
         let elevation = sun.elevation_deg * (w + rest) + moon.elevation_deg * m;
         // The body ten degrees under the picture's top edge, never under the
         // base pitch, and never so high that the horizon — the geometric
-        // one, dipped by the camera's height — leaves the bottom edge.
+        // one, dipped by the camera's height — rises out of the picture's
+        // lower quarter: the ground first, a body at its highest left out.
         let half = self.fovy_deg / 2.0;
         let radius = 6_371_000.0;
         let dip = (radius / (radius + self.height_m.max(0.0)))
             .acos()
             .to_degrees();
-        let highest = (half - dip - 2.0).max(self.pitch_deg);
+        let highest = (half - dip - 0.25 * self.fovy_deg).max(self.pitch_deg);
         let pitch = (elevation - half + 10.0).clamp(self.pitch_deg, highest) + swing;
         (heading, pitch.to_radians())
     }

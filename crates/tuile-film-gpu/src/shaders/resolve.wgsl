@@ -180,7 +180,11 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
             let x = p - atmosphere.centre.xyz;
             let r = length(x);
             let light = ground_light(r - atmosphere.centre.w, x / r, normal, ambient, lit);
-            radiance = base * light + city_light(p, light);
+            // Never darker than ground of a fortieth's reflectance: a night
+            // sea's imagery is all but black, and so would be its picture.
+            let texel_floor = 0.025 * atmosphere.illuminance.y
+                / (ATMOSPHERE_PI * max(atmosphere.ground.y, 1e-30));
+            radiance = max(base, vec3f(texel_floor)) * light + city_light(p, light);
         }
         if (known && frame.haze.w != 0.0) {
             // What the air leaves of the ground, and its own light for the

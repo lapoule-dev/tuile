@@ -98,7 +98,7 @@ mod tests {
             if sun.elevation_deg > 1.0 {
                 sun_days += 1;
                 sun_seen += usize::from(inside(sun.direction_ecef));
-            } else if sun.elevation_deg < -12.0 && (2.0..75.0).contains(&moon.elevation_deg) {
+            } else if sun.elevation_deg < -12.0 && (2.0..50.0).contains(&moon.elevation_deg) {
                 moon_nights += 1;
                 moon_seen += usize::from(inside(moon.direction_ecef));
             }
