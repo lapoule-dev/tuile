@@ -71,7 +71,7 @@ mod tests {
     fn a_tracking_camera_keeps_the_sun_by_day_and_the_moon_by_night_in_frame() {
         let t = TimeLapse::parse(&words(
             "place=0.1423,42.9364 height=4000 start=2026-10-19T00:00Z days=14 length=120 fps=60 \
-             track=sun-moon pitch=-4 fov=70",
+             track=sun-moon pitch=-4 fov=80",
         ))
         .unwrap();
         assert!(t.cameras(None).is_err(), "no ephemerides, no tracking");
@@ -98,7 +98,7 @@ mod tests {
             if sun.elevation_deg > 1.0 {
                 sun_days += 1;
                 sun_seen += usize::from(inside(sun.direction_ecef));
-            } else if sun.elevation_deg < -12.0 && (2.0..55.0).contains(&moon.elevation_deg) {
+            } else if sun.elevation_deg < -12.0 && (2.0..75.0).contains(&moon.elevation_deg) {
                 moon_nights += 1;
                 moon_seen += usize::from(inside(moon.direction_ecef));
             }

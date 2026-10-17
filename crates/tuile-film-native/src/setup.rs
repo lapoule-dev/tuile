@@ -55,7 +55,10 @@ pub async fn tile_store(cache: &Path) -> Result<TileStore, Error> {
             std::fs::write(&catalog, br#"{"layers":[]}"#)?;
         }
         return Ok(TileStore {
-            objects: Arc::new(tuile_farm::ObjectRunStore::local(dir, tuile_farm::Tuning::from_env())?),
+            objects: Arc::new(tuile_farm::ObjectRunStore::local(
+                dir,
+                tuile_farm::Tuning::from_env(),
+            )?),
             remote_blocks: None,
             block_store: None,
         });

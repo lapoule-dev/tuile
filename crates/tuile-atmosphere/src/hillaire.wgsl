@@ -492,7 +492,7 @@ fn glare_ring(theta: f32, t0: f32) -> f32 {
 
 fn glare_psf(theta: f32, phi: f32) -> f32 {
     let star = 1.0 + 0.5 * pow(abs(cos(3.0 * phi)), 64.0) * exp(-theta / 0.08);
-    return 0.04 * glare_ring(theta, 0.026) * star + 0.01 * glare_ring(theta, 0.14);
+    return 0.04 * glare_ring(theta, 0.026) * star + 0.01 * glare_ring(theta, 0.1);
 }
 
 // The glare along the unit `n` from a source along `s` whose light is
@@ -504,7 +504,9 @@ fn glare_of(n: vec3f, s: vec3f, light: vec3f, right: vec3f, up: vec3f) -> vec3f 
     let theta = acos(c);
     let off = n - s * c;
     let phi = atan2(dot(off, up), dot(off, right));
-    return light * glare_psf(theta, phi) * atmosphere.discs.z;
+    // A lens sees its glare fade to nothing at the edge of its field: the
+    // far wings tapered by cos², so no line is drawn ninety degrees off.
+    return light * glare_psf(theta, phi) * c * c * atmosphere.discs.z;
 }
 
 fn star_hash(v: vec3u) -> vec3u {

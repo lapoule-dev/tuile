@@ -216,9 +216,17 @@ impl TimeLapse {
         let rest = 1.0 - w - m;
         dir += towards(sun.azimuth_deg) * rest;
         let heading = dir.x.atan2(dir.y);
-        let elevation = sun.elevation_deg.max(-2.0) * (w + rest) + moon.elevation_deg.max(-2.0) * m;
-        let pitch =
-            (self.pitch_deg + 0.6 * elevation).clamp(self.pitch_deg, self.pitch_deg + 24.0) + swing;
+        let elevation = sun.elevation_deg * (w + rest) + moon.elevation_deg * m;
+        // The body ten degrees under the picture's top edge, never under the
+        // base pitch, and never so high that the horizon — the geometric
+        // one, dipped by the camera's height — leaves the bottom edge.
+        let half = self.fovy_deg / 2.0;
+        let radius = 6_371_000.0;
+        let dip = (radius / (radius + self.height_m.max(0.0)))
+            .acos()
+            .to_degrees();
+        let highest = (half - dip - 2.0).max(self.pitch_deg);
+        let pitch = (elevation - half + 10.0).clamp(self.pitch_deg, highest) + swing;
         (heading, pitch.to_radians())
     }
 
