@@ -1,0 +1,6 @@
+# Local only: downloaded imagery, weights, runs.
+data/
+.venv/
+.pytest_cache/
+.mypy_cache/
+__pycache__/

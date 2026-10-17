@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+
+[project]
+name = "aerial"
+version = "0.1.0"
+description = "Specialising a super-resolution network for aerial imagery: open orthophoto ground truth, benchmark, training."
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+dependencies = ["numpy>=1.24", "pillow>=10", "requests>=2.31"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src/aerial"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
