@@ -127,6 +127,15 @@ fn encode(
         .presetCfg;
     config.frameIntervalP = 1;
     config.gopLength = 2 * fps;
+    if codec == NvencCodec::H264 {
+        // An IDR a GOP: left unsaid, the preset's period is infinite, and
+        // the key frames every two seconds are plain I pictures that later
+        // ones may reach past — a player seeking to one decodes garbage.
+        // SAFETY: the preset asked for is H.264's, so the codec config is.
+        unsafe {
+            config.encodeCodecConfig.h264Config.idrPeriod = config.gopLength;
+        }
+    }
     config.rcParams.set_enableLookahead(0);
     config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
     config.rcParams.averageBitRate = bitrate;
@@ -200,10 +209,7 @@ fn encode(
             }
         }
         let lock = output.lock().map_err(told)?;
-        let key = matches!(
-            lock.picture_type(),
-            NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR | NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
-        );
+        let key = is_sync(codec, lock.picture_type());
         let data = lock.data();
         let sample = match codec {
             NvencCodec::Av1 => {
@@ -248,6 +254,21 @@ fn encode(
         .finish()
         .map_err(|e| e.to_string())?;
     Ok((film, busy))
+}
+
+/// Whether a picture of `kind` the encoder gave is a sync sample: one a
+/// player may start decoding at. For H.264 and HEVC only an IDR is — an I
+/// picture (a scene cut) does not stop later pictures from referring past
+/// it, and a seek that starts there decodes garbage. AV1's key frames are
+/// reported as either.
+fn is_sync(codec: NvencCodec, kind: NV_ENC_PIC_TYPE) -> bool {
+    match codec {
+        NvencCodec::Av1 => matches!(
+            kind,
+            NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR | NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
+        ),
+        NvencCodec::H264 | NvencCodec::MvHevc => kind == NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR,
+    }
 }
 
 /// An I420 picture as NV12 in a buffer whose rows are `pitch` wide: the
@@ -431,10 +452,7 @@ fn encode_eyes(
             let lock = output.lock().map_err(told)?;
             step(&format!("view {view}: {} bytes out", lock.data().len()));
             if view == 0 {
-                key = matches!(
-                    lock.picture_type(),
-                    NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR | NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
-                );
+                key = is_sync(NvencCodec::MvHevc, lock.picture_type());
             }
             let (parameters, units) = tuile_mp4::spatial::entry_units(lock.data());
             if muxer.is_none() {
@@ -579,5 +597,21 @@ impl Sink for NvencFilm {
             format!("encoding {:?} by NVENC, on its own thread", self.codec),
             self.seconds,
         )]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_idr_is_a_place_to_start_decoding_h264_or_hevc() {
+        use NV_ENC_PIC_TYPE::*;
+        for codec in [NvencCodec::H264, NvencCodec::MvHevc] {
+            assert!(is_sync(codec, NV_ENC_PIC_TYPE_IDR));
+            assert!(!is_sync(codec, NV_ENC_PIC_TYPE_I));
+            assert!(!is_sync(codec, NV_ENC_PIC_TYPE_P));
+        }
+        assert!(is_sync(NvencCodec::Av1, NV_ENC_PIC_TYPE_I));
     }
 }
