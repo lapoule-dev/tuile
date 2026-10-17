@@ -47,6 +47,8 @@ pub struct AtmosphereUniform {
     /// xyz: the Earth's centre from the eye; w: 1 when there are night
     /// lights.
     pub earth: [f32; 4],
+    /// x: the sun's disc's scale; y: the Moon's; z: the glare's strength.
+    pub discs: [f32; 4],
 }
 
 /// The share of the full Moon's light its night side sends back by the
@@ -65,6 +67,7 @@ impl AtmosphereUniform {
         frame_eye: DVec3,
         exposure: f32,
         stars: Option<glam::DMat3>,
+        look: &tuile_film::Look,
     ) -> Self {
         let i = &light.illumination;
         let sun = i.to_sun_ecef.as_vec3();
@@ -168,6 +171,12 @@ impl AtmosphereUniform {
             stars_y: row(1, 0.0),
             stars_z: row(2, 0.0),
             earth: [0.0; 4],
+            discs: [
+                look.sun_scale.max(0.0),
+                look.moon_scale.max(0.0),
+                look.glare.max(0.0),
+                0.0,
+            ],
         }
     }
 

@@ -32,6 +32,22 @@ use crate::Frame;
 use glam::{DMat3, DVec3};
 use tuile_core::geo::{enu_frame, geodetic_to_ecef, Geodetic};
 
+/// Where a body stands over a place: degrees from north through east, and
+/// over the horizon.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Seen {
+    pub azimuth_deg: f64,
+    pub elevation_deg: f64,
+}
+
+/// Where the sun and the Moon stand over a place at an instant (Unix
+/// seconds UTC): what a tracking camera ([`Motion::Track`]) turns to. Given
+/// by whoever computes ephemerides — the tape knows no astronomy.
+pub trait Sky {
+    fn sun(&self, utc: f64, at: Geodetic) -> Option<Seen>;
+    fn moon(&self, utc: f64, at: Geodetic) -> Option<Seen>;
+}
+
 /// The Earth's rotation rate against the stars, radians a second (IERS).
 pub const EARTH_ROTATION: f64 = 7.292_115_0e-5;
 
@@ -93,45 +109,7 @@ pub struct TimeLapse {
     pub fovy_deg: f64,
 }
 
-/// The instants of a film's frames: frame `n` (from 1) shows
-/// `start_utc + (n − 1) · seconds_per_frame`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Clock {
-    pub start_utc: f64,
-    pub seconds_per_frame: f64,
-}
-
-impl Clock {
-    /// The instant frame `frame` (from 1) shows, Unix seconds UTC.
-    pub fn instant(&self, frame: u32) -> f64 {
-        self.start_utc + f64::from(frame.saturating_sub(1)) * self.seconds_per_frame
-    }
-
-    /// As a command line writes it: `<start>,<seconds a frame>`, the start
-    /// an ISO 8601 UTC instant or Unix seconds.
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let (start, step) = text
-            .split_once(',')
-            .ok_or_else(|| format!("a clock is <start>,<seconds a frame>, not {text}"))?;
-        let start_utc = parse_utc(start).ok_or_else(|| format!("not an instant: {start}"))?;
-        let seconds_per_frame: f64 = step
-            .parse()
-            .map_err(|_| format!("not seconds a frame: {step}"))?;
-        if !(seconds_per_frame.is_finite() && seconds_per_frame >= 0.0) {
-            return Err(format!("not seconds a frame: {step}"));
-        }
-        Ok(Self {
-            start_utc,
-            seconds_per_frame,
-        })
-    }
-
-    /// `<start>,<seconds a frame>`, the start in Unix seconds: what
-    /// [`Clock::parse`] reads back exactly.
-    pub fn to_arg(&self) -> String {
-        format!("{},{}", self.start_utc, self.seconds_per_frame)
-    }
-}
+pub use crate::Clock;
 
 impl TimeLapse {
     /// How many frames the film has.
@@ -146,24 +124,28 @@ impl TimeLapse {
         }
     }
 
-    /// The camera of frame `frame`, from 1.
+    /// The camera of frame `frame`, from 1, for a camera that is not
+    /// tracking ([`Motion::Held`] or [`Motion::Spin`]); a tracking one is
+    /// aimed by [`TimeLapse::cameras`].
     pub fn camera(&self, frame: u32) -> Frame {
-        let (heading, pitch) = self.aim(frame);
+        let (heading, pitch) = self.aim(frame, None);
         self.camera_aimed(frame, heading, pitch)
     }
 
-    /// The cameras of every frame, in order — a tracking camera's aim eased
-    /// from frame to frame ([`TRACK_EASE_S`]).
-    pub fn cameras(&self) -> Vec<Frame> {
+    /// The cameras of every frame, in order — a tracking camera's aim
+    /// taken from `sky` and eased from frame to frame ([`TRACK_EASE_S`]).
+    /// A tracking camera with no sky is refused.
+    pub fn cameras(&self, sky: Option<&dyn Sky>) -> Result<Vec<Frame>, String> {
         let frames = self.frames();
         if self.motion != Motion::Track {
-            return (1..=frames).map(|f| self.camera(f)).collect();
+            return Ok((1..=frames).map(|f| self.camera(f)).collect());
         }
+        let sky = sky.ok_or("a camera tracking the sun and the Moon wants their ephemerides")?;
         let k = 1.0 - (-1.0 / (TRACK_EASE_S * f64::from(self.fps.max(1)))).exp();
         let mut eased: Option<(f64, f64)> = None;
-        (1..=frames)
+        Ok((1..=frames)
             .map(|f| {
-                let (h, p) = self.aim(f);
+                let (h, p) = self.aim(f, Some(sky));
                 let (eh, ep) = match eased {
                     None => (h, p),
                     Some((eh, ep)) => {
@@ -177,11 +159,11 @@ impl TimeLapse {
                 eased = Some((eh, ep));
                 self.camera_aimed(f, eh, ep)
             })
-            .collect()
+            .collect())
     }
 
     /// Frame `frame`'s heading and pitch, radians, before any easing.
-    pub fn aim(&self, frame: u32) -> (f64, f64) {
+    pub fn aim(&self, frame: u32, sky: Option<&dyn Sky>) -> (f64, f64) {
         let n = f64::from(frame.saturating_sub(1));
         let along = n / f64::from(self.frames());
         let seconds = n / f64::from(self.fps.max(1));
@@ -199,12 +181,18 @@ impl TimeLapse {
                 self.heading_deg.to_radians() + std::f64::consts::TAU * turns * along,
                 (self.pitch_deg + swing).to_radians(),
             ),
-            Motion::Track => self.tracked(frame, swing),
+            Motion::Track => match sky {
+                Some(sky) => self.tracked(frame, swing, sky),
+                None => (
+                    self.heading_deg.to_radians(),
+                    (self.pitch_deg + swing).to_radians(),
+                ),
+            },
         }
     }
 
     /// Where a tracking camera turns at frame `frame`: see [`Motion::Track`].
-    fn tracked(&self, frame: u32, swing: f64) -> (f64, f64) {
+    fn tracked(&self, frame: u32, swing: f64, sky: &dyn Sky) -> (f64, f64) {
         let place = Geodetic {
             lon: self.lon_deg.to_radians(),
             lat: self.lat_deg.to_radians(),
@@ -215,8 +203,8 @@ impl TimeLapse {
             let u = ((x - a) / (b - a)).clamp(0.0, 1.0);
             u * u * (3.0 - 2.0 * u)
         };
-        let sun = tuile_atmosphere::Sun::seen_from(t, place);
-        let moon = tuile_atmosphere::Moon::seen_from(t, place);
+        let sun = sky.sun(t, place);
+        let moon = sky.moon(t, place);
         let (Some(sun), Some(moon)) = (sun, moon) else {
             return (self.heading_deg.to_radians(), self.pitch_deg.to_radians());
         };
@@ -453,57 +441,6 @@ mod tests {
         };
         assert!((heading(1) - 180.0).abs() < 1e-9);
         assert!(heading(361).abs() < 1e-6, "{}", heading(361));
-    }
-
-    #[test]
-    fn a_tracking_camera_keeps_the_sun_by_day_and_the_moon_by_night_in_frame() {
-        let t = TimeLapse::parse(&words(
-            "place=0.1423,42.9364 height=4000 start=2026-10-19T00:00Z days=14 length=120 fps=60 \
-             track=sun-moon pitch=-4 fov=70",
-        ))
-        .unwrap();
-        let cameras = t.cameras();
-        let place = Geodetic {
-            lon: t.lon_deg.to_radians(),
-            lat: t.lat_deg.to_radians(),
-            height: t.height_m,
-        };
-        let horizontal = (t.fovy_deg.to_radians() / 2.0).tan() * 16.0 / 9.0;
-        let half_h = horizontal.atan();
-        let (mut sun_days, mut sun_seen, mut moon_nights, mut moon_seen) = (0, 0, 0, 0);
-        let mut ground = 0;
-        for (i, c) in cameras.iter().enumerate().step_by(7) {
-            let frame = i as u32 + 1;
-            let time = t.clock().instant(frame);
-            let d = DVec3::from_array(c.direction);
-            let up = DVec3::from_array(c.up);
-            let right = d.cross(up);
-            let inside = |to: DVec3| {
-                let (x, y, z) = (to.dot(right), to.dot(up), to.dot(d));
-                z > 0.0 && (x / z).atan().abs() < half_h && (y / z).atan().abs() < c.fovy / 2.0
-            };
-            let sun = tuile_atmosphere::Sun::seen_from(time, place).unwrap();
-            let moon = tuile_atmosphere::Moon::seen_from(time, place).unwrap();
-            if sun.elevation_deg > 1.0 {
-                sun_days += 1;
-                sun_seen += usize::from(inside(sun.direction_ecef));
-            } else if sun.elevation_deg < -12.0 && (2.0..55.0).contains(&moon.elevation_deg) {
-                moon_nights += 1;
-                moon_seen += usize::from(inside(moon.direction_ecef));
-            }
-            // The ground is always in the picture: the bottom edge looks down.
-            let bottom = (d * (c.fovy / 2.0).cos() - up * (c.fovy / 2.0).sin()).normalize();
-            ground += usize::from(bottom.dot(enu_frame(place).z_axis) < -0.05);
-        }
-        assert!(
-            sun_seen as f64 > 0.95 * sun_days as f64,
-            "sun {sun_seen} of {sun_days}"
-        );
-        assert!(
-            moon_seen as f64 > 0.9 * moon_nights as f64,
-            "moon {moon_seen} of {moon_nights}"
-        );
-        assert_eq!(ground, cameras.len().div_ceil(7));
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub mod serve;
 pub mod setup;
 pub mod sink;
 pub mod source;
+pub mod timelapse;
 #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
 pub mod videotoolbox;
 

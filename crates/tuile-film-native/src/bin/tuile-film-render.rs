@@ -129,11 +129,15 @@
 //!                         default; 4 hazy); implies --atmosphere
 //!   --clock <start>,<s>   each frame's instant: the first frame's (ISO 8601
 //!                         UTC, or Unix seconds) and the seconds of sky
-//!                         between two frames, as `tuile-tape timelapse`
-//!                         writes it — every frame lit by its own sun,
-//!                         Moon and stars
+//!                         between two frames — every frame lit by its own
+//!                         sun, Moon and stars
 //!   --night-lights        towns lit at night (NASA Black Marble, public
 //!                         domain), under --atmosphere
+//!   --sun-scale <k>, --moon-scale <k>
+//!                         the discs drawn k times their size (1: as they
+//!                         are), under --atmosphere
+//!   --glare <k>           the lens's glare about them (1: a clean lens's;
+//!                         0: none)
 //!   --shadow <0..1>       how much of the sun ground loses where other
 //!                         ground stands before it (default 0: no shadows)
 //!   --haze                air between the eye and the ground, and a sky
@@ -533,8 +537,17 @@ async fn main() -> Result<(), Error> {
         order.look.turbidity = Some(turbidity.parse()?);
     }
     order.night_lights = flag("--night-lights");
+    if let Some(scale) = value("--sun-scale") {
+        order.look.sun_scale = scale.parse()?;
+    }
+    if let Some(scale) = value("--moon-scale") {
+        order.look.moon_scale = scale.parse()?;
+    }
+    if let Some(glare) = value("--glare") {
+        order.look.glare = glare.parse()?;
+    }
     if let Some(clock) = value("--clock") {
-        order.clock = Some(tuile_tape::timelapse::Clock::parse(&clock)?);
+        order.clock = Some(tuile_tape::Clock::parse(&clock)?);
     }
     if flag("--haze") || value("--haze-density").is_some() || value("--haze-height").is_some() {
         let mut haze = tuile_film::Haze::default();

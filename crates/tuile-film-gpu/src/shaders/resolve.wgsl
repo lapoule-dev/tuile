@@ -66,6 +66,10 @@ fn lerp3(b: vec2f, x: vec2f, y: vec2f, z: vec2f) -> vec2f {
     return x * (1.0 - b.x - b.y) + y * b.x + z * b.y;
 }
 
+// How many times the light of the ground under it the air's veil may
+// reach: see `resolve`.
+const VEIL_BOUND: f32 = 6.0;
+
 // The light of towns at night at `p` (eye-relative), in the renderer's
 // units, from the night-lights map (a geographic grid, row 0 at the north
 // pole). Towns light up as the ground's own light falls: shown at a few
@@ -212,8 +216,26 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
             // the floor's share of the sky's, so that far ground fades to
             // the night sky.
             let air = air_between(p);
+            var veil = air.inscattered * atmosphere.illuminance.xyz;
+            {
+                // The veil bounded: never more than a few times the light of
+                // the ground under it, on ground of a tenth's reflectance.
+                // By day the air seldom reaches it; at twilight the air,
+                // still lit by the sky high above, would otherwise lay a
+                // uniform grey over ground lit by little — and the relief
+                // would go. A soft bound: the veil it leaves keeps its
+                // colour and its gradient with distance.
+                let luma = vec3f(0.2126, 0.7152, 0.0722);
+                let x = p - atmosphere.centre.xyz;
+                let r = length(x);
+                let lit = ground_light(r - atmosphere.centre.w, x / r, x / r, ambient, 1.0);
+                let texel = 0.1 * atmosphere.illuminance.y / (ATMOSPHERE_PI * max(atmosphere.ground.y, 1e-30));
+                let cap = VEIL_BOUND * texel * dot(lit, luma);
+                let v = dot(veil, luma);
+                veil /= sqrt(1.0 + (v / max(cap, 1e-30)) * (v / max(cap, 1e-30)));
+            }
             radiance = radiance * air.transmittance
-                + air.inscattered * atmosphere.illuminance.xyz
+                + veil
                 + atmosphere.floor.xyz * (vec3f(1.0) - air.transmittance);
         }
     }

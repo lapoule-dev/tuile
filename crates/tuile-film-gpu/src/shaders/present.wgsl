@@ -63,8 +63,10 @@ fn sky_seen(d: vec3f) -> vec3f {
     if (ground_distance(r, dot(n, up), max(h, 0.0)) >= 0.0) { return sky; }
     var beyond = vec3f(0.0);
     let apart = acos(clamp(dot(n, atmosphere.sun.xyz), -1.0, 1.0));
-    if (apart < SUN_ANGULAR_RADIUS) {
-        let x = apart / SUN_ANGULAR_RADIUS;
+    // Drawn larger by its scale, its surface as bright as it is.
+    let sun_rho = SUN_ANGULAR_RADIUS * max(atmosphere.discs.x, 0.0);
+    if (apart < sun_rho) {
+        let x = apart / sun_rho;
         let limb = 1.0 - 0.6 * (1.0 - sqrt(max(1.0 - x * x, 0.0)));
         let solid = 2.0 * ATMOSPHERE_PI * (1.0 - cos(SUN_ANGULAR_RADIUS));
         let mu_s = dot(up, atmosphere.sun.xyz);
@@ -75,6 +77,50 @@ fn sky_seen(d: vec3f) -> vec3f {
     let pixel = 2.0 * length(frame.up.xyz) / f32(frame.size.y);
     beyond += stars_seen(n, 0.8 * pixel);
     return sky + beyond * atmosphere.illuminance.xyz;
+}
+
+// Where the unit direction `s` from the eye falls on the supersampled
+// picture, in its pixels; `vec2f(-1.0)` when behind the camera.
+fn on_picture(s: vec3f) -> vec2f {
+    let r = frame.right.xyz;
+    let u = frame.up.xyz;
+    let f = frame.fwd.xyz;
+    let rr = dot(r, r);
+    let uu = dot(u, u);
+    let axis = normalize(f - r * dot(f, r) / rr - u * dot(f, u) / uu);
+    let depth = dot(s, axis);
+    if (depth <= 1e-4) { return vec2f(-1.0); }
+    let ndc = vec2f(dot(s, r) / (rr * depth) - dot(f, r) / rr, dot(s, u) / (uu * depth) - dot(f, u) / uu);
+    return (vec2f(ndc.x, -ndc.y) * 0.5 + 0.5) * vec2f(frame.size.xy);
+}
+
+// Whether ground stands before the direction `s` in this picture: its
+// pixel drew a tile. Off the picture, nothing is known to.
+fn hidden(s: vec3f) -> bool {
+    let at = on_picture(s);
+    let size = vec2f(frame.size.xy);
+    if (any(at < vec2f(0.0)) || any(at >= size)) { return false; }
+    return textureLoad(vis, vec2u(at), 0).x != 0u;
+}
+
+// The camera's glare about the sun's disc and the Moon's along `d`, in
+// the renderer's units: their light, spread by the lens.
+fn glare(d: vec3f) -> vec3f {
+    if (atmosphere.shape.w == 0.0 || atmosphere.discs.z == 0.0) { return vec3f(0.0); }
+    let n = normalize(d);
+    let right = normalize(frame.right.xyz);
+    let up = normalize(frame.up.xyz);
+    let h = atmosphere.sun.w;
+    var light = vec3f(0.0);
+    let s = atmosphere.sun.xyz;
+    if (!hidden(s)) {
+        light += glare_of(n, s, sunlight(h, dot(atmosphere.up.xyz, s)), right, up);
+    }
+    let m = atmosphere.moon.xyz;
+    if (atmosphere.moon.w > 0.0 && !hidden(m)) {
+        light += glare_of(n, m, sunlight(h, dot(atmosphere.up.xyz, m)) * atmosphere.moon.w, right, up);
+    }
+    return light * atmosphere.illuminance.xyz;
 }
 
 // Where the roll-off of highlights begins, in linear luminance.
@@ -128,7 +174,13 @@ fn present(@builtin(global_invocation_id) id: vec3u) {
             if (overlaid) { over += textureLoad(overlay, s, 0); }
         }
     }
-    var linear = sum / f32(k * k) * frame.world.w * frame.white_balance.xyz;
+    var linear = sum / f32(k * k);
+    {
+        // The lens's glare, at the pixel's centre.
+        let ndc = (vec2f(id.xy) + 0.5) / vec2f(size.xy) * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0);
+        linear += glare(frame.fwd.xyz + ndc.x * frame.right.xyz + ndc.y * frame.up.xyz);
+    }
+    linear *= frame.world.w * frame.white_balance.xyz;
     // The picture's own contrast and saturation: one setting for every
     // film, whatever its imagery. Luminance is raised to a power about
     // middle grey, colours keeping their ratios, then what is not

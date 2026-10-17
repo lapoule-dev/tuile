@@ -154,15 +154,25 @@ struct Args {
     /// The atmosphere's turbidity (2 a clear day); implies --atmosphere.
     #[arg(long)]
     turbidity: Option<f32>,
-    /// Each frame's instant, `<start>,<seconds a frame>`, as `tuile-tape
-    /// timelapse` writes it beside its tape: every frame lit by its own
-    /// sun, Moon and stars.
+    /// Each frame's instant, `<start>,<seconds a frame>`: every frame lit by
+    /// its own sun, Moon and stars. Default: the instants the tape states
+    /// (`tuile-film-timelapse` writes them into it).
     #[arg(long, allow_hyphen_values = true)]
     clock: Option<String>,
     /// Towns lit at night, from NASA's Black Marble (public domain), under
     /// --atmosphere.
     #[arg(long)]
     night_lights: bool,
+    /// The sun's disc drawn this many times its size (1: as it is).
+    #[arg(long)]
+    sun_scale: Option<f32>,
+    /// The Moon's disc drawn this many times its size (1: as it is).
+    #[arg(long)]
+    moon_scale: Option<f32>,
+    /// The lens's glare about the sun and the Moon (1: a clean lens's, 0:
+    /// none).
+    #[arg(long)]
+    glare: Option<f32>,
     /// For two eyes, packed into one picture: `side-by-side` or `top-bottom`.
     #[arg(long, value_parser = ["side-by-side", "top-bottom"])]
     stereo: Option<String>,
@@ -225,7 +235,7 @@ struct Args {
     download: Option<PathBuf>,
     /// Once the film is in the store, write at this key of the run store a
     /// receipt — `{"film": <key>, "frames": <n>}` — for whoever launched the
-    /// production elsewhere to find it by (`tuile-film-job`).
+    /// production elsewhere to find it by (`tuile-launch-job film`).
     #[arg(long)]
     receipt: Option<String>,
 }
@@ -303,7 +313,9 @@ fn content(text: &str) -> Result<tuile_pack::Content, String> {
 }
 
 /// How the film is rendered, as the command line says.
-fn rendering(args: &Args) -> Result<Rendering, Error> {
+/// The rendering `args` ask for; the tape's clock, if it states one, when
+/// `--clock` does not give another.
+fn rendering(args: &Args, tape_clock: Option<tuile_tape::Clock>) -> Result<Rendering, Error> {
     RenderSpec {
         fps: args.fps,
         scale: args.scale,
@@ -324,8 +336,14 @@ fn rendering(args: &Args) -> Result<Rendering, Error> {
         no_tone: args.no_tone,
         atmosphere: args.atmosphere,
         turbidity: args.turbidity,
-        clock: args.clock.clone(),
+        clock: args
+            .clock
+            .clone()
+            .or_else(|| tape_clock.map(|c| c.to_arg())),
         night_lights: args.night_lights,
+        sun_scale: args.sun_scale,
+        moon_scale: args.moon_scale,
+        glare: args.glare,
         stereo: args.stereo.as_deref().map(|packing| StereoSpec {
             packing: if packing == "top-bottom" {
                 StereoPacking::TopBottom
@@ -382,7 +400,8 @@ async fn run(args: Args) -> Result<Ended, Error> {
         );
         return Ok(Ended::Usage);
     }
-    let rendering = rendering(&args)?;
+    let tape_clock = tuile_tape::Clock::of_tape(&tape).map_err(|e| e.to_string())?;
+    let rendering = rendering(&args, tape_clock)?;
     let bake = TapeBake {
         // Needed only if a pack is to be baked: a production whose packs are
         // there renders without it, and a bake without it says so.
@@ -533,7 +552,7 @@ mod tests {
         // H.264, the one encoding whose parts join: the machine's own encoder
         // gives it, whichever the machine has.
         assert_eq!(args.codec, "h264");
-        let rendering = rendering(&args).expect("rendering");
+        let rendering = rendering(&args, None).expect("rendering");
         assert_eq!(rendering.bitrate, 12_000_000);
         assert!(rendering.order.look.haze.is_none());
     }
@@ -562,7 +581,7 @@ mod tests {
         assert_eq!(args.content, tuile_pack::Content::Both);
         assert!(args.render_again && !args.bake_again);
         assert_eq!((args.at_once, args.step_minutes), (2, Some(30)));
-        let rendering = rendering(&args).expect("rendering");
+        let rendering = rendering(&args, None).expect("rendering");
         assert_eq!(rendering.order.fps, 25);
         assert_eq!(rendering.sun, Some((255.0, 10.0)));
         assert_eq!(rendering.bitrate, 45_000_000);
@@ -634,6 +653,6 @@ mod tests {
             assert!(parsed(line).is_err(), "{line}");
         }
         let args = parsed("tuile-film-produce t.mcap --sky-light 1,2").expect("parse");
-        assert!(rendering(&args).is_err());
+        assert!(rendering(&args, None).is_err());
     }
 }

@@ -2552,16 +2552,20 @@ impl FilmGpu {
                 reflectance: base.reflectance,
             },
         );
-        self.lit = base.lit_by(FrameLight {
-            illumination: sky.illumination,
-            air: light.air,
-            instant: light.instant,
-        });
+        let mut lit = FrameLight::new(sky.illumination, light.air);
+        lit.instant = light.instant;
+        self.lit = base.lit_by(lit);
         let stars = light
             .instant
             .map(|t| tuile_atmosphere::celestial_to_ecef(t).transpose());
-        self.atmosphere.frame_uniform =
-            AtmosphereUniform::new(&params, &sky, frame.eye, self.lit.exposure_scale(), stars);
+        self.atmosphere.frame_uniform = AtmosphereUniform::new(
+            &params,
+            &sky,
+            frame.eye,
+            self.lit.exposure_scale(),
+            stars,
+            &self.lit,
+        );
         self.atmosphere.frame_uniform.earth[3] = f32::from(u8::from(self.night_lights));
         // Written now for the sky-view, placed from each eye when drawn.
         self.queue.write_buffer(

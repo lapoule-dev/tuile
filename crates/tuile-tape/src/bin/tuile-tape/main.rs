@@ -8,7 +8,6 @@
 //! tuile-tape merge    <out.mcap> <in.mcap> <in.mcap>...
 //! tuile-tape orbit    [path] [frames] [lon] [lat] [radius-m] [altitude-m]
 //! tuile-tape pyrenees [path] [minutes] [fps] [altitude_m] [offset_deg] [tilt_deg]
-//! tuile-tape timelapse <path> [key=value ...]
 //! tuile-tape zoom     [path] [frames-each-way]
 //! ```
 //!
@@ -22,7 +21,6 @@ mod border;
 mod merge;
 mod orbit;
 mod pyrenees;
-mod timelapse;
 mod zoom;
 
 const USAGE: &str = "\
@@ -36,11 +34,6 @@ usage: tuile-tape <subcommand> [arguments]
            a circle around a point on the ground
   pyrenees [path] [minutes] [fps] [altitude_m] [offset_deg] [tilt_deg]
            a closed loop around the Pyrenees
-  timelapse <path> [key=value ...]
-           days of sky from one place, the camera held to the Earth or
-           to the stars: place=<lon>,<lat> height=<m> start=<UTC>
-           days=<d> length=<s> fps=<n> frame=earth|inertial spin=<turns>
-           heading=<deg> pitch=<deg> swing=<deg>,<s> fov=<deg>
   zoom     [path] [frames-each-way]
            a dive from geostationary orbit to the ground, and back";
 
@@ -57,7 +50,6 @@ fn main() -> ExitCode {
         "merge" => merge::run(rest),
         "orbit" => orbit::run(rest).report(),
         "pyrenees" => pyrenees::run(rest).report(),
-        "timelapse" => timelapse::run(rest).report(),
         "zoom" => zoom::run(rest).report(),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");

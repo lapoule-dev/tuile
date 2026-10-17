@@ -79,6 +79,8 @@ struct Atmosphere {
     // xyz: the Earth's centre from the eye; w: 1 when the renderer holds
     // night lights.
     earth: vec4f,
+    // x: the sun's disc's scale; y: the Moon's; z: the glare's strength.
+    discs: vec4f,
 }
 
 const ATMOSPHERE_PI: f32 = 3.14159265358979;
@@ -454,7 +456,9 @@ fn ground_light(height: f32, up: vec3f, normal: vec3f, frame_sky: vec3f, lit: f3
 // light, all of it through the air between.
 fn moon_seen(n: vec3f) -> vec3f {
     let m = atmosphere.moon.xyz;
-    let rho = atmosphere.moon_disc.w;
+    let true_rho = atmosphere.moon_disc.w;
+    // Drawn larger by its scale, its surface as bright as it is.
+    let rho = true_rho * max(atmosphere.discs.y, 0.0);
     if (atmosphere.moon.w == 0.0 || rho <= 0.0) { return vec3f(0.0); }
     let c = dot(n, m);
     let p = (n - m * c) / rho;
@@ -466,12 +470,38 @@ fn moon_seen(n: vec3f) -> vec3f {
     let mu0 = dot(normal, atmosphere.moon_disc.xyz);
     var shade = atmosphere.moon_shade.y;
     if (mu0 > 0.0) { shade += mu0 / (mu0 + mu); }
-    let solid = 2.0 * ATMOSPHERE_PI * (1.0 - cos(rho));
+    let solid = 2.0 * ATMOSPHERE_PI * (1.0 - cos(true_rho));
     let mu_m = dot(atmosphere.up.xyz, m);
     // An edge a texel soft: the disc is not drawn as a step.
     let edge = smoothstep(1.0, 0.96, sqrt(x2));
     return sunlight(atmosphere.sun.w, mu_m) * atmosphere.moon.w * shade
         / (atmosphere.moon_shade.x * solid) * edge;
+}
+
+// A camera's point-spread function, as a share of a source's light per
+// steradian at `theta` radians from it and azimuth `phi` about it: an
+// energy-conserving core and halo — two normalised Lorentzian rings,
+// ∫ θ₀ / (2π (θ² + θ₀²)^{3/2}) dΩ = 1 — holding 4 % and 1 % of the light,
+// the core drawn into a faint six-pointed star (a six-bladed iris).
+fn glare_ring(theta: f32, t0: f32) -> f32 {
+    return t0 / (2.0 * ATMOSPHERE_PI * pow(theta * theta + t0 * t0, 1.5));
+}
+
+fn glare_psf(theta: f32, phi: f32) -> f32 {
+    let star = 1.0 + 0.5 * pow(abs(cos(3.0 * phi)), 64.0) * exp(-theta / 0.08);
+    return 0.04 * glare_ring(theta, 0.026) * star + 0.01 * glare_ring(theta, 0.14);
+}
+
+// The glare along the unit `n` from a source along `s` whose light is
+// `light` (an irradiance, the model's units), the camera's frame given by
+// `right` and `up` for the star's azimuth.
+fn glare_of(n: vec3f, s: vec3f, light: vec3f, right: vec3f, up: vec3f) -> vec3f {
+    let c = clamp(dot(n, s), -1.0, 1.0);
+    if (c <= 0.0) { return vec3f(0.0); }
+    let theta = acos(c);
+    let off = n - s * c;
+    let phi = atan2(dot(off, up), dot(off, right));
+    return light * glare_psf(theta, phi) * atmosphere.discs.z;
 }
 
 fn star_hash(v: vec3u) -> vec3u {

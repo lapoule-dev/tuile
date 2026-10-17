@@ -66,7 +66,7 @@ the Moon from the frame's own eye.
 
 ## Time-lapses
 
-`tuile-tape timelapse <tape> key=value…` writes the cameras of one generic
+`tuile-film-timelapse <tape> key=value…` writes the cameras of one generic
 time-lapse and its clock (`<tape>.clock`): place, height, start, duration,
 film length, fps, camera frame (`earth` or `inertial`), motion (`spin`
 turns or held heading), pitch and its swing, field of view.

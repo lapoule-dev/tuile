@@ -13,8 +13,6 @@ rust-version.workspace = true
 # ground it was meant to be 5 km above.
 tuile-core = { version = "0.7.0", path = "../tuile-core" }
 glam = { workspace = true }
-# The sun and the Moon a time-lapse can turn to (`Motion::Track`).
-tuile-atmosphere = { version = "0.6.1", path = "../tuile-atmosphere" }
 mcap = "0.25"
 # Catmull–Rom, plutôt qu'écrit à la main.
 #
