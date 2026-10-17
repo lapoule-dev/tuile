@@ -648,6 +648,8 @@ fn reference(path: &std::path::Path, asset: i64, cap: u32) -> Result<(), String>
         content_type: content_type.into(),
         // Measured against, never named by a pack: no index.
         index: false,
+        licence: None,
+        attribution: None,
     }))?
     .ok_or("TUILE_TILES_BUCKET is not set: there is no store to bring the reference into")?;
     // The grid the film's own imagery is addressed on, from the store.

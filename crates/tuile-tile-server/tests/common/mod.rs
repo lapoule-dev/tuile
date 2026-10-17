@@ -59,6 +59,8 @@ pub fn imagery() -> Layer {
         expiry: Some(IMAGERY_EXPIRY),
         content_type: "image/jpeg".into(),
         index: false,
+        licence: None,
+        attribution: None,
     }
 }
 
@@ -73,6 +75,8 @@ pub fn terrain() -> Layer {
         expiry: None,
         content_type: "application/vnd.quantized-mesh".into(),
         index: false,
+        licence: None,
+        attribution: None,
     }
 }
 
@@ -304,6 +308,8 @@ pub fn catalog() -> tuile_tile_server::Catalog {
                 expiry_days: Some(IMAGERY_EXPIRY.as_secs() / 86_400),
                 content_type: "image/jpeg".into(),
                 index: false,
+                licence: None,
+                attribution: None,
             },
             LayerDef {
                 name: TERRAIN.into(),
@@ -314,6 +320,8 @@ pub fn catalog() -> tuile_tile_server::Catalog {
                 expiry_days: None,
                 content_type: "application/vnd.quantized-mesh".into(),
                 index: false,
+                licence: None,
+                attribution: None,
             },
         ],
     }

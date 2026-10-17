@@ -429,6 +429,46 @@ pub async fn night_lights(cache_dir: Option<std::path::PathBuf>) -> Result<Night
     })
 }
 
+/// The tile store's layers of the open sources `ground` reads, declared
+/// with their licence and credit: their tiles are kept as any source's.
+pub fn store_layers(ground: Ground) -> Vec<tuile_tile_server::LayerDef> {
+    use tuile_tile_server::{Grid, LayerDef};
+    let terrain = |asset: i64| LayerDef {
+        name: crate::source_namespace(asset),
+        grid: Grid::Geographic,
+        tile_type: "other".into(),
+        tile_compression: "none".into(),
+        zone_level: 9,
+        expiry_days: None,
+        content_type: "application/vnd.quantized-mesh".into(),
+        index: false,
+        licence: Some("CC0-1.0 (made by tuile: the WGS84 ellipsoid)".into()),
+        attribution: None,
+    };
+    match ground {
+        Ground::Ion => Vec::new(),
+        Ground::Empty => vec![terrain(NOTHING)],
+        Ground::OpenEarth => vec![
+            terrain(ELLIPSOID),
+            LayerDef {
+                name: crate::source_namespace(BLUE_MARBLE),
+                grid: Grid::WebMercator,
+                tile_type: "jpeg".into(),
+                tile_compression: "none".into(),
+                zone_level: 10,
+                expiry_days: None,
+                content_type: "image/jpeg".into(),
+                index: false,
+                licence: Some("Public domain (NASA)".into()),
+                attribution: Some(
+                    "Imagery: NASA Earth Observatory, Blue Marble: Next Generation, served by NASA EOSDIS GIBS"
+                        .into(),
+                ),
+            },
+        ],
+    }
+}
+
 /// The open sources, answering by asset number.
 pub struct OpenSources {
     cache_dir: Option<std::path::PathBuf>,

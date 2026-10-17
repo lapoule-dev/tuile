@@ -417,7 +417,10 @@ impl Engine {
         let packs = bake.packs();
         let film = film_prefix(&packs, &rendering);
         Ok(Self {
-            tiles: OffRuntime::open(Tiles::from_env).await?,
+            tiles: {
+                let layers = bake.store_layers();
+                OffRuntime::open(move || Tiles::from_env_with_layers(layers)).await?
+            },
             sources: Sources::open(runs, tiles, cache).await?,
             bake,
             rendering,

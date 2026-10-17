@@ -84,6 +84,8 @@ fn layer(name: &str, grid: Grid, expiry_days: Option<u64>) -> LayerDef {
         expiry_days,
         content_type: "image/png".into(),
         index: false,
+        licence: None,
+        attribution: None,
     }
 }
 
