@@ -39,11 +39,27 @@ pub struct TileStore {
     pub block_store: Option<tuile_storage_foyer::FoyerStore>,
 }
 
-/// The tile store as the environment names it: somebody else's server of
+/// The tile store as the environment names it: a directory here
+/// (`TUILE_TILES_LOCAL`), somebody else's server of
 /// the store routes (`TUILE_TILES_REMOTE`, see
 /// [`tuile_repository::HttpGet::from_env`]), its blocks kept under `cache`,
 /// or the bucket `TUILE_TILES_BUCKET`.
 pub async fn tile_store(cache: &Path) -> Result<TileStore, Error> {
+    // A store on this machine, for renders of packs that carry their tiles:
+    // nothing is asked of a bucket.
+    if let Ok(dir) = std::env::var("TUILE_TILES_LOCAL") {
+        let dir = Path::new(&dir);
+        std::fs::create_dir_all(dir)?;
+        let catalog = dir.join("catalog.json");
+        if !catalog.exists() {
+            std::fs::write(&catalog, br#"{"layers":[]}"#)?;
+        }
+        return Ok(TileStore {
+            objects: Arc::new(tuile_farm::ObjectRunStore::local(dir, tuile_farm::Tuning::from_env())?),
+            remote_blocks: None,
+            block_store: None,
+        });
+    }
     match tuile_repository::HttpGet::from_env()? {
         Some(get) => {
             println!("tile store: {}/store, by its routes", get.root());
