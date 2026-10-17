@@ -714,7 +714,107 @@ deployed buckets.
    of an archive whose terrain tiles are raw. It is decided when offline
    use is built, and it has no impact on the store.
 
-## 7. What was not measured
+## 7. PoC on production archives
+
+Two archives of the production bucket `stl-tiles`, rewritten locally. Nothing
+was uploaded. Script: `lab/pmtiles-compression/poc_transform.py`, with
+`contact_sheet.py`. Archives are written with the reference Python
+`pmtiles` writer: same tile ids, same clustering, the right `tile_type` and
+`tile_compression`. Each one passes `pmtiles verify` and is read back tile by
+tile.
+
+**Which archives.** Access was wrangler's existing login. It can fetch
+objects but cannot list a bucket, and none of the 342 zone manifests known
+from local caches exists in `stl-tiles`. The archives below are therefore
+the largest of the three **`top` manifests**, the zones coarser than the
+zone level. Whether a zone archive is larger cannot be known without a
+listing.
+
+| | Imagery (`asset-2`) | Terrain (`asset-1`) |
+|---|---|---|
+| Key | `asset-2/top/202610-000001791862421972630375-a85f14746ecf6ca1.pmtiles` | `asset-1/top/d-000001791361825015576247-bd528c4e4d9e65bb.pmtiles` |
+| Size, tiles | 96.5 MB, 5 607 tiles, levels 5–9 | 60.3 MB, 1 802 tiles, levels 1–9 |
+
+The bucket itself, from `wrangler r2 bucket info`: **45.5 GB, 71 910
+objects**.
+
+### Imagery: JPEG → WebP
+
+The sources here are q≈90, as everywhere at levels ≤ 12 (section 3.2).
+
+The quality ladder was scored on a sample per level, as size/source and
+median SSIMULACRA 2:
+
+| q | z7 | z8 | z9 |
+|---|---|---|---|
+| 80 | 0.65 / 77.6 | 0.47 / 73.8 | 0.66 / 77.3 |
+| 85 | 0.78 / 81.8 | 0.60 / 78.2 | 0.77 / 82.1 |
+| **90** | 0.92 / 86.4 | 0.77 / 83.1 | 0.94 / 86.3 |
+| 95 | 1.17 / 90.4 | 1.11 / 87.5 | 1.17 / 90.1 |
+| lossless | 3.00 | 3.12 | 2.92 |
+
+Whole archive, quality measured on every 6th tile, per level:
+
+| Variant | Size | z8 (1 960 tiles) | z9 (3 432 tiles) | SSIMU2 median (p5–p75), z9 | PSNR-Y / SSIM-Y, z9 |
+|---|---|---|---|---|---|
+| **WebP q90** (closest to the source) | 96.5 → **86.5 MB (0.896)** | 0.889 | 0.901 | 86.0 (78.9–87.2) | 42.7 dB / 0.994 |
+| WebP q85 | 96.5 → 70.8 MB (0.734) | 0.724 | 0.740 | 81.8 (74.2–83.3) | 39.8 dB / 0.989 |
+
+Costs:
+- Encode: 5.7 ms of CPU per tile (method 4). That is 32 s of CPU for the
+  archive, 8 s wall on 4 processes.
+- Decode, native (Pillow/libwebp): 1.05 ms per tile median and 1.6 ms p95,
+  against **0.21 ms for the source JPEG**, i.e. 5× slower.
+- In wasm, decoding with `image-webp` would be an estimated 2–3× native. In
+  the browser, `createImageBitmap` decodes natively and off-thread.
+- Directories: 14.1 → 13.5 KB.
+
+The contact sheet is
+`~/Documents/stl-videos/pmtiles-poc-contact-z9.png`. It shows one tile each
+for the most mountain-, coast-, forest- and texture-like z9 tiles: source,
+q90, q85, a 3× crop of each, and the difference ×8. At 3× no artefact is
+visible at q90. At q85 fine relief loses a little crispness. Levels 5–9 show
+no village; that needs the zone levels.
+
+⚠ This re-encodes commercial imagery: a derived work. It is fine as a local
+measurement, never as a deployed layer without a licence decision.
+
+### Terrain: gzip-9
+
+| Level | 1 | 2 | 3 | 4 | 5 | 7 | 8 | 9 | **All** |
+|---|---|---|---|---|---|---|---|---|---|
+| Ratio | 0.164 | 0.102 | 0.064 | 0.047 | 0.040 | 0.064 | 0.078 | 0.081 | **60.3 → 3.85 MB (0.064)** |
+
+- Every one of the 1 802 tiles inflates back to the original bytes.
+- Encode takes 2 ms per tile. Decode takes 0.03 ms per tile native
+  (0.06 p95); an estimated 0.05–0.1 ms in wasm, or free through
+  `DecompressionStream` / `Content-Encoding`.
+- zopfli on 200 tiles: 0.927 of gzip-9, at 221 ms per tile.
+- Coarse terrain tiles are mostly their **water mask** (up to 64 KiB of
+  bytes per tile, extension 2, present on every tile), which deflate
+  crushes. That is why this archive shrinks 15×, against 0.526 for the
+  zones at levels 10–19 (section 3.1).
+
+### Projection on the bucket
+
+How the 45.5 GB split between layers is not known: there is no listing.
+
+- With terrain between 20 % and 60 % of the bytes, gzip terrain (×0.53 for
+  zones, much better for `top`) plus WebP q90 imagery (×0.90) saves about
+  **8 to 15 GB**.
+- At R2's $0.015 per GB-month, that is **$0.12 to $0.22 a month**. The whole
+  bucket costs ≈ $0.68 a month to store.
+- R2 egress is free.
+- Operation counts do not change: one read per tile or per range, as
+  before.
+
+The gain is therefore not in the R2 bill. It is in bytes moved: client
+download time, the disk caches (8 / 12 GiB), the farm, and mobile data.
+Terrain gzip gets almost all of it, with no quality or licence question.
+WebP q90 adds 10 % on imagery, at the price of a derived work and a 5×
+CPU decode where the browser does not decode it.
+
+## 8. What was not measured
 
 - **wasm decode times and binary sizes.** No wasm was built: other agents
   were compiling on this laptop. Native timings ×1.5–3 is the usual range
