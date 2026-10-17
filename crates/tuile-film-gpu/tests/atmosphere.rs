@@ -354,3 +354,30 @@ fn without_an_atmosphere_or_a_hosts_light_the_film_is_the_looks_own() {
         );
     }
 }
+
+/// A default film's pictures, byte for byte: no atmosphere, no host light —
+/// what every film made before the atmosphere was is drawn as. The digest is
+/// frozen from main before the sky's work (07be3d0, and the same on this
+/// branch); a change here changes
+/// every default film, and is a decision, never an accident.
+#[test]
+fn a_default_films_pictures_are_the_same_to_the_byte() {
+    let look = Look {
+        to_sun: sun_at(45.0),
+        ..Look::default()
+    };
+    let Some(mut film) = film(look) else {
+        return;
+    };
+    let key = square(&mut film);
+    let down = draw(&mut film, true, &[key]);
+    let sky = draw(&mut film, false, &[]);
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for b in down.iter().chain(&sky) {
+        hash = (hash ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    println!("DEFAULT-FILM-DIGEST {hash:016x}");
+    assert_eq!(format!("{hash:016x}"), FROZEN_DEFAULT_FILM);
+}
+
+const FROZEN_DEFAULT_FILM: &str = "c203a130175f25bd";

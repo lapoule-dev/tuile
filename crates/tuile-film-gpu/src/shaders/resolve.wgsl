@@ -184,8 +184,11 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
         // gap that is wrong, not the air. Not a number is told by its
         // bits: a compiler free to assume no such number exists answers
         // any comparison with it as it likes.
+        // Under a physical atmosphere the eye may be 300 km up, its limb
+        // 2 000 km off: twice the reach. Without one, as it always was.
+        let reach = select(2.0e6, 4.0e6, physical);
         let known = all((bitcast<vec3u>(p) & vec3u(0x7f800000u)) != vec3u(0x7f800000u))
-            && all(abs(p) < vec3f(4.0e6));
+            && all(abs(p) < vec3f(reach));
         var lit = 1.0;
         if (known && frame.shadow.x > 0.0 && cos > 0.0) {
             // A shadow takes the sun, and only the sun: the dome lights

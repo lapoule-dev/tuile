@@ -438,7 +438,9 @@ async fn run(args: Args) -> Result<Ended, Error> {
     let night_lights = if args.night_lights {
         let keep = Keep(store.clone());
         let cache = std::env::var_os("TUILE_CACHE_DIR").map(Into::into);
-        Some(tuile_bake::open::publish_night_lights(&keep, cache).await?)
+        let key = tuile_bake::open::publish_night_lights(&keep, cache).await?;
+        println!("NIGHT-LIGHTS {key}");
+        Some(key)
     } else {
         None
     };
