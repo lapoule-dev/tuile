@@ -55,6 +55,14 @@ pub struct LayerDef {
     /// reader gets of each (see [`crate::index`]). Absent means no.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub index: bool,
+    /// The source's licence, for an open source: what its tiles may be used
+    /// for. Absent: the source's own terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licence: Option<String>,
+    /// The credit a picture made from this layer shows, as a commercial
+    /// layer's attribution is shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<String>,
 }
 
 /// A bucket's layers.

@@ -67,6 +67,28 @@ pub struct RenderSpec {
     /// For two eyes, packed into one picture. Absent: one eye, as always.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stereo: Option<StereoSpec>,
+    /// The physical atmosphere (`tuile_film::Look::atmosphere`), and its
+    /// turbidity. Absent: the look's own light.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub atmosphere: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turbidity: Option<f32>,
+    /// Each frame's instant, as a time-lapse states it (`tuile_tape::Clock`):
+    /// `<start>,<seconds a frame>` (`Order::clock`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock: Option<String>,
+    /// Towns lit at night: the night-lights mosaic's key in the run store
+    /// (`Order::night_lights`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub night_lights: Option<String>,
+    /// The sun's and the Moon's discs drawn this many times their size,
+    /// and the lens's glare (`Look::sun_scale`, `moon_scale`, `glare`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sun_scale: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moon_scale: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub glare: Option<f32>,
 }
 
 /// A film for two eyes, as a caller writes it: see [`tuile_film::Stereo`].
@@ -163,6 +185,13 @@ impl Default for RenderSpec {
             smooth_bound: tuile_film::smoothing::DEFAULT_BOUND_M,
             smooth_strength: 1.0,
             stitch: true,
+            atmosphere: false,
+            turbidity: None,
+            clock: None,
+            night_lights: None,
+            sun_scale: None,
+            moon_scale: None,
+            glare: None,
         }
     }
 }
@@ -192,6 +221,35 @@ impl RenderSpec {
         };
         order.smooth_strength = self.smooth_strength;
         order.stitch = self.stitch;
+        order.clock = self
+            .clock
+            .as_deref()
+            .map(tuile_tape::Clock::parse)
+            .transpose()?;
+        order.night_lights = self.night_lights.clone();
+        if let Some(scale) = self.sun_scale {
+            order.look.sun_scale = scale;
+        }
+        if let Some(scale) = self.moon_scale {
+            order.look.moon_scale = scale;
+        }
+        if let Some(glare) = self.glare {
+            order.look.glare = glare;
+        }
+        if (self.atmosphere || self.turbidity.is_some())
+            && order.clock.is_none()
+            && self.sun.is_none()
+        {
+            return Err(
+                "a film under a physical atmosphere is lit by its frames' instants: \
+                        a tape that states them, --clock, or a sun placed by hand (--sun)"
+                    .into(),
+            );
+        }
+        if self.atmosphere || self.turbidity.is_some() {
+            order.look.atmosphere = Some(tuile_film::AtmosphereParams::default());
+            order.look.turbidity = self.turbidity;
+        }
         let look = &mut order.look;
         if let Some(stops) = self.exposure {
             look.exposure_ev = stops;
@@ -244,13 +302,38 @@ impl RenderSpec {
 /// naming everything a rendered picture depends on beside its pack — and
 /// not which frames are rendered, so that every part of a film agrees.
 pub fn film_prefix(packs: &str, rendering: &Rendering) -> String {
-    let mut rendering = rendering.clone();
-    rendering.order.frames = None;
-    let look = tuile_pack::scene_digest(&[format!("{rendering:?}").as_bytes()]);
+    let look = tuile_pack::scene_digest(&[canonical(rendering).as_bytes()]);
     format!(
         "films/{}/{look}",
         packs.trim_matches('/').trim_start_matches("packs/")
     )
+}
+
+/// Fields added to a rendering after films were named by it, each with the
+/// text its default prints as. While a field holds its default it is left
+/// out of the name, so a film made before it existed keeps its name — and
+/// a production stopped then goes on from its parts.
+#[cfg(test)]
+const FROZEN_DEFAULT_LOOK: &str = "ff9e7af3dbfa95e5";
+
+const LATER_FIELDS: [&str; 5] = [
+    ", clock: None",
+    ", night_lights: None",
+    ", sun_scale: 1.0",
+    ", moon_scale: 1.0",
+    ", glare: 1.0",
+];
+
+/// The text a rendering is named by: everything but which frames are
+/// rendered, the later fields at their defaults left out.
+fn canonical(rendering: &Rendering) -> String {
+    let mut rendering = rendering.clone();
+    rendering.order.frames = None;
+    let mut text = format!("{rendering:?}");
+    for field in LATER_FIELDS {
+        text = text.replacen(field, "", 1);
+    }
+    text
 }
 
 /// What owns a tokio runtime of its own — the shared tile store does, to
@@ -334,7 +417,10 @@ impl Engine {
         let packs = bake.packs();
         let film = film_prefix(&packs, &rendering);
         Ok(Self {
-            tiles: OffRuntime::open(Tiles::from_env).await?,
+            tiles: {
+                let layers = bake.store_layers();
+                OffRuntime::open(move || Tiles::from_env_with_layers(layers)).await?
+            },
             sources: Sources::open(runs, tiles, cache).await?,
             bake,
             rendering,
@@ -380,7 +466,7 @@ impl Host for Engine {
     }
 
     fn bake(&self, frames: Stretch, out: &Path) -> Result<(), Failed> {
-        if self.bake.token.is_empty() {
+        if self.bake.token.is_empty() && self.bake.needs_token() {
             return Err(Failed::for_good(
                 "a pack is to be baked and TUILE_ION_TOKEN is not set",
             ));
@@ -511,6 +597,13 @@ mod tests {
     #[test]
     fn a_film_is_kept_under_its_packs_and_its_look_and_not_under_its_frames() {
         let film = film_prefix("packs/abc.references", &rendering());
+        // The name of a default rendering, frozen: what it was before any
+        // later field existed. A change here renames every film.
+        assert!(!canonical(&rendering()).contains("night_lights"));
+        assert_eq!(
+            film,
+            format!("films/abc.references/{}", FROZEN_DEFAULT_LOOK)
+        );
         assert!(film.starts_with("films/abc.references/"), "{film}");
         assert_eq!(film_prefix("packs/abc.references/", &rendering()), film);
         // Whichever frames are rendered, it is the same film.

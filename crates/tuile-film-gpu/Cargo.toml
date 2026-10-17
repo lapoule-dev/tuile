@@ -11,8 +11,6 @@ authors.workspace = true
 bytemuck = { workspace = true }
 glam = { workspace = true }
 thiserror = { workspace = true }
-# The physical atmosphere's tables and its WGSL, uploaded as half floats.
-half = { workspace = true }
 tuile-atmosphere = { version = "0.7.0", path = "../tuile-atmosphere" }
 # The stitching's band and the strips of a tile that has none.
 tuile-core = { version = "0.7.0", path = "../tuile-core" }

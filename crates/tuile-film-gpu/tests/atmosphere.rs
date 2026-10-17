@@ -167,17 +167,14 @@ fn the_sky_view_table_is_the_cpu_sky() {
             return;
         };
         draw(&mut film, false, &[]);
-        let texels = read_texture(&film, film.sky_view_texture(), 8);
+        let texels = read_texture(&film, film.sky_view_texture(), 16);
         let gpu = |i: usize, j: usize| {
             let at = (j * SKY_VIEW_SIZE[0] + i) * 4;
-            let half = |k: usize| {
-                half::f16::from_bits(u16::from_le_bytes([
-                    texels[2 * (at + k)],
-                    texels[2 * (at + k) + 1],
-                ]))
-                .to_f64()
+            let float = |k: usize| {
+                let b = &texels[4 * (at + k)..4 * (at + k) + 4];
+                f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             };
-            [half(0), half(1), half(2)]
+            [float(0), float(1), float(2)]
         };
         // The CPU's own: the sphere under the eye, its height, the sun's.
         let eye = DVec3::new(A + 1000.0, 0.0, 0.0);
@@ -275,7 +272,7 @@ fn both_eyes_of_a_frame_share_one_light_and_one_sky() {
         let encoder = film.render_shot(&shot, &[key], &[]).expect("render");
         film.queue().submit([encoder.finish()]);
         lights.push(*film.lit());
-        skies.push(read_texture(&film, film.sky_view_texture(), 8));
+        skies.push(read_texture(&film, film.sky_view_texture(), 16));
     }
     assert_eq!(lights[0], lights[1]);
     assert_eq!(skies[0], skies[1]);
@@ -294,10 +291,7 @@ fn a_frames_light_is_laid_over_the_ordered_look_never_the_last_frames() {
     illumination.ev100 = DAYLIGHT_EV100 + 2.0;
     illumination.white = [1.2, 1.0, 0.8];
     illumination.adaptation = 1.0;
-    let light = FrameLight {
-        illumination,
-        air: Default::default(),
-    };
+    let light = FrameLight::new(illumination, Default::default());
     film.set_light(light);
     let first = *film.lit();
     film.set_light(light);
@@ -360,3 +354,30 @@ fn without_an_atmosphere_or_a_hosts_light_the_film_is_the_looks_own() {
         );
     }
 }
+
+/// A default film's pictures, byte for byte: no atmosphere, no host light —
+/// what every film made before the atmosphere was is drawn as. The digest is
+/// frozen from main before the sky's work (07be3d0, and the same on this
+/// branch); a change here changes
+/// every default film, and is a decision, never an accident.
+#[test]
+fn a_default_films_pictures_are_the_same_to_the_byte() {
+    let look = Look {
+        to_sun: sun_at(45.0),
+        ..Look::default()
+    };
+    let Some(mut film) = film(look) else {
+        return;
+    };
+    let key = square(&mut film);
+    let down = draw(&mut film, true, &[key]);
+    let sky = draw(&mut film, false, &[]);
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for b in down.iter().chain(&sky) {
+        hash = (hash ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    println!("DEFAULT-FILM-DIGEST {hash:016x}");
+    assert_eq!(format!("{hash:016x}"), FROZEN_DEFAULT_FILM);
+}
+
+const FROZEN_DEFAULT_FILM: &str = "c203a130175f25bd";

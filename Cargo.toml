@@ -58,6 +58,16 @@ half = "2.7"
 # wasm path through tuile-atmosphere: see that crate's `sun` module for why
 # this one. libm, no std: the same bits on every target.
 solar-positioning = { version = "0.7.1", default-features = false, features = ["libm"] }
+# The Moon: Meeus's *Astronomical Algorithms* (ch. 22, 47: nutation and the
+# ELP-2000/82 series truncated to 10" in longitude, 4" in latitude), the
+# most used Rust implementation of it. MIT, pure Rust, no dependency, builds
+# for wasm32; frozen since 2016 like the series it evaluates.
+#
+# lapoule-dev's fork, pinned: 2.0.0's `mn_oblq_IAU` evaluates its polynomial
+# in ten thousand years instead of centuries, fixed there. A git dependency:
+# crates.io refuses it, so no crate that depends on this can be published
+# there until upstream is fixed.
+astro = { git = "https://github.com/lapoule-dev/astro-rust", rev = "09bf6194fec14a57541f7dd97e03bcbca82f109c" }
 # Second-order IIR filters; the camera path smoothing runs its low-pass both
 # ways. no_std, one dependency (num-traits), MIT OR Apache-2.0.
 biquad = "0.6.0"
@@ -129,3 +139,9 @@ split-debuginfo = "packed"
 # dropped once the same change is released upstream.
 [patch.crates-io]
 pmtiles = { git = "https://github.com/lapoule-dev/pmtiles-rs.git", branch = "tuile-accessors" }
+
+# The atmosphere's tables are built by a few hundred million ray-march steps
+# on the CPU: unoptimised, a test or a debug film waits half a minute for
+# each atmosphere it makes. Its arithmetic is the same at any level.
+[profile.dev.package.tuile-atmosphere]
+opt-level = 3

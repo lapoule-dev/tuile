@@ -84,6 +84,47 @@ pub struct Order {
     /// frame is drawn twice, from the eyes its camera gives, out of the
     /// tiles the pack selected for that camera.
     pub stereo: Option<Stereo>,
+    /// The instant each frame shows ([`tuile_tape::Clock`]),
+    /// when a frame's host does not place its light: the frame is then lit
+    /// by the sun of its instant, the Moon of its instant over the frame's
+    /// own eye, and the stars turned to it. `None`: the look's light.
+    pub clock: Option<tuile_tape::Clock>,
+    /// Towns lit at night under a physical atmosphere: the key, in the run
+    /// store, of the night-lights mosaic a bake kept there
+    /// ([`tuile_bake::open::publish_night_lights`]). A key that is not
+    /// there fails the render.
+    pub night_lights: Option<String>,
+}
+
+/// The light of `frame` under `clock`: the sun of its instant from the
+/// Earth's centre (a planet's radius at an astronomical unit is 0.0025°),
+/// the instant itself for the renderer to place the Moon and the stars from
+/// the frame's own eye, and the rest the look's.
+pub fn clocked_light(clock: &tuile_tape::Clock, frame: u32, look: &Look) -> FrameLight {
+    let instant = clock.instant(frame);
+    let mut light = FrameLight::of(look);
+    let to_sun = tuile_atmosphere::Sun::at_unix_seconds(instant).direction_ecef;
+    if to_sun.is_finite() {
+        light.illumination.to_sun_ecef = to_sun;
+    }
+    light.with_instant(instant)
+}
+
+/// The light frame `frame` is lit by — one path, in this order:
+///
+/// 1. the host's, when it places it ([`tuile_film::Overlays::light`]): a
+///    host's plan is the record of its film;
+/// 2. else the instant the film's clock gives the frame ([`clocked_light`]):
+///    a tape that states its instants is lit by them;
+/// 3. else the look's own, as ordered.
+pub fn frame_light(
+    host: Option<FrameLight>,
+    clock: Option<&tuile_tape::Clock>,
+    frame: u32,
+    look: &Look,
+) -> FrameLight {
+    host.or_else(|| clock.map(|c| clocked_light(c, frame, look)))
+        .unwrap_or_else(|| FrameLight::of(look))
 }
 
 impl Default for Order {
@@ -104,6 +145,8 @@ impl Default for Order {
             smooth_strength: 1.0,
             wire: false,
             stereo: None,
+            clock: None,
+            night_lights: None,
         }
     }
 }
@@ -411,6 +454,16 @@ pub async fn render(
             look,
         },
     );
+    if let (Some(key), Some(_)) = (&order.night_lights, look.atmosphere) {
+        let png = sources
+            .packs
+            .objects
+            .read_all(key)
+            .await
+            .map_err(|e| format!("the night lights {key}: {e}"))?;
+        let lights = tuile_bake::open::NightLights::from_png(&png)?;
+        gpu.set_night_lights(lights.width, lights.height, &lights.luma);
+    }
     gpu.probe_holes(order.holes);
     gpu.smoothing_probe(order.smooth_strength, order.wire);
     let mut stitching = order.stitch.then(Stitching::default);
@@ -451,8 +504,6 @@ pub async fn render(
     let mut textures: HashMap<(u8, u32, u32), (wgpu::Texture, bool)> = HashMap::new();
     // The frame's overlays, the same allocation from one frame to the next.
     let mut shapes = Vec::new();
-    // The light of a frame whose host does not place it: the order's.
-    let ordered_light = FrameLight::of(&look);
     let mut index = 0u32;
 
     for file in &film.packs {
@@ -1009,7 +1060,12 @@ pub async fn render(
             // The frame's light, before anything of the frame is drawn or
             // fitted — the sun's map included — and the same for both eyes:
             // the host's when it places it, else the order's.
-            gpu.set_light(overlays.light(diff.frame).unwrap_or(ordered_light));
+            gpu.set_light(frame_light(
+                overlays.light(diff.frame),
+                order.clock.as_ref(),
+                diff.frame,
+                &look,
+            ));
             let camera = FrameCamera::of(&diff.view, aspect);
             let pair = stereo.as_ref().map(|stereo| stereo.eyes(&camera));
             // The frame's overlays, once for every picture of it: made for
@@ -1161,4 +1217,30 @@ pub async fn render(
     done.frames = index;
     done.seconds = began.elapsed().as_secs_f64();
     Ok(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hosts_light_wins_then_the_clock_then_the_look() {
+        let look = Look::default();
+        let clock = tuile_tape::Clock {
+            start_utc: 1_792_410_240.0,
+            seconds_per_frame: 60.0,
+        };
+        let mut host = FrameLight::of(&look);
+        host.illumination.compensation_ev = 1.5;
+        // The host's, whatever the clock says.
+        let lit = frame_light(Some(host), Some(&clock), 3, &look);
+        assert_eq!(lit, host);
+        // No host: the clock's instant, its sun.
+        let lit = frame_light(None, Some(&clock), 3, &look);
+        assert_eq!(lit.instant, Some(clock.start_utc + 120.0));
+        let sun = tuile_atmosphere::Sun::at_unix_seconds(clock.start_utc + 120.0).direction_ecef;
+        assert_eq!(lit.illumination.to_sun_ecef, sun);
+        // Neither: the look's.
+        assert_eq!(frame_light(None, None, 3, &look), FrameLight::of(&look));
+    }
 }

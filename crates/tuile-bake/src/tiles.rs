@@ -143,49 +143,76 @@ impl Tiles {
     /// it has a layer for them. A layer the store already has is left as the
     /// store describes it. Says whether the layer was added.
     pub fn from_env_with(layer: Option<LayerDef>) -> Result<Option<Self>, String> {
-        let Ok(bucket) = var("TUILE_TILES_BUCKET") else {
-            return Ok(None);
-        };
-        let s3 = AmazonS3Builder::new()
-            .with_bucket_name(&bucket)
-            .with_endpoint(var("TUILE_STORE_ENDPOINT")?)
-            .with_region(
-                std::env::var("TUILE_STORE_REGION").unwrap_or_else(|_| DEFAULT_REGION.into()),
-            )
-            .with_access_key_id(var("TUILE_STORE_ACCESS_KEY_ID")?)
-            .with_secret_access_key(var("TUILE_STORE_SECRET_ACCESS_KEY")?)
-            // The store's manifests are replaced by conditional writes only.
-            .with_conditional_put(S3ConditionalPut::ETagMatch)
-            .build()
-            .map_err(|e| format!("tile bucket {bucket}: {e}"))?;
+        Self::from_env_with_layers(layer.into_iter().collect())
+    }
+
+    /// The same, with every one of `layers` declared that the store does not
+    /// know yet. The store is the bucket `TUILE_TILES_BUCKET`, or a
+    /// directory here, `TUILE_TILES_LOCAL` — the same store, its archives,
+    /// manifests and catalog written the same way, on a disk.
+    pub fn from_env_with_layers(layers: Vec<LayerDef>) -> Result<Option<Self>, String> {
+        let (bucket, s3): (String, Arc<dyn object_store::ObjectStore>) =
+            match var("TUILE_TILES_BUCKET") {
+                Ok(bucket) => {
+                    let s3 = AmazonS3Builder::new()
+                        .with_bucket_name(&bucket)
+                        .with_endpoint(var("TUILE_STORE_ENDPOINT")?)
+                        .with_region(
+                            std::env::var("TUILE_STORE_REGION")
+                                .unwrap_or_else(|_| DEFAULT_REGION.into()),
+                        )
+                        .with_access_key_id(var("TUILE_STORE_ACCESS_KEY_ID")?)
+                        .with_secret_access_key(var("TUILE_STORE_SECRET_ACCESS_KEY")?)
+                        // The store's manifests are replaced by conditional writes only.
+                        .with_conditional_put(S3ConditionalPut::ETagMatch)
+                        .build()
+                        .map_err(|e| format!("tile bucket {bucket}: {e}"))?;
+                    (bucket, Arc::new(s3))
+                }
+                Err(_) => match std::env::var("TUILE_TILES_LOCAL") {
+                    Ok(dir) => {
+                        std::fs::create_dir_all(&dir).map_err(|e| format!("{dir}: {e}"))?;
+                        let local = object_store::local::LocalFileSystem::new_with_prefix(&dir)
+                            .map_err(|e| format!("tile store {dir}: {e}"))?;
+                        (dir, Arc::new(local))
+                    }
+                    Err(_) => return Ok(None),
+                },
+            };
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .map_err(|e| format!("tile store runtime: {e}"))?;
-        let s3: Arc<dyn object_store::ObjectStore> = Arc::new(s3);
         // A store of its own inside a bucket that holds another: a trial that
         // shares a real bucket without touching what it serves.
         let s3: Arc<dyn object_store::ObjectStore> = match var("TUILE_TILES_PREFIX") {
             Ok(prefix) => Arc::new(object_store::prefix::PrefixStore::new(s3, prefix)),
             Err(_) => s3,
         };
-        if let Some(layer) = layer {
-            let added = runtime
+        if !layers.is_empty() {
+            runtime
                 .block_on(async {
-                    let mut catalog = tuile_tile_server::catalog::read(s3.as_ref()).await?;
-                    if catalog.layers.iter().any(|l| l.name == layer.name) {
-                        return Ok::<_, tuile_tile_server::StoreError>(false);
+                    // A store with no catalog yet starts with an empty one.
+                    let mut catalog = tuile_tile_server::catalog::read(s3.as_ref())
+                        .await
+                        .unwrap_or_default();
+                    let mut added = false;
+                    for layer in layers {
+                        if catalog.layers.iter().any(|l| l.name == layer.name) {
+                            tracing::info!(layer = %layer.name, "TILES-LAYER-KNOWN");
+                            continue;
+                        }
+                        tracing::info!(layer = %layer.name, grid = ?layer.grid, "TILES-LAYER-ADDED");
+                        catalog.layers.push(layer);
+                        added = true;
                     }
-                    tracing::info!(layer = %layer.name, grid = ?layer.grid, "TILES-LAYER-ADDED");
-                    catalog.layers.push(layer);
-                    tuile_tile_server::catalog::write(s3.as_ref(), &catalog).await?;
-                    Ok(true)
+                    if added {
+                        tuile_tile_server::catalog::write(s3.as_ref(), &catalog).await?;
+                    }
+                    Ok::<_, tuile_tile_server::StoreError>(())
                 })
-                .map_err(|e| format!("tile bucket {bucket}: its catalog: {e}"))?;
-            if !added {
-                tracing::info!("TILES-LAYER-KNOWN");
-            }
+                .map_err(|e| format!("tile store {bucket}: its catalog: {e}"))?;
         }
         let store = runtime
             .block_on(TileStore::open(

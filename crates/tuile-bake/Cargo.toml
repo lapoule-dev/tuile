@@ -47,6 +47,8 @@ tuile-cesium-ion = { version = "0.7.0", path = "../tuile-cesium-ion" }
 tuile-bing = { version = "0.7.0", path = "../tuile-bing" }
 tuile-planetary = { version = "0.7.0", path = "../tuile-planetary" }
 tuile-native-fetchers = { version = "0.7.0", path = "../tuile-native-fetchers" }
+# The open sources' tile addresses (`open`), and an origin's "no such tile".
+url = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 # Several tiles asked of a source at once.
@@ -69,7 +71,7 @@ tuile-tape = { version = "0.7.0", path = "../tuile-tape" }
 # engine's `ContentStore`.
 tuile-tile-server = { version = "0.7.0", path = "../tuile-tile-server" }
 tuile-terrain = { version = "0.7.0", path = "../tuile-terrain" }
-object_store = { version = "0.14.2", default-features = false, features = ["aws"] }
+object_store = { version = "0.14.2", default-features = false, features = ["fs", "aws"] }
 
 # --- profiling, behind the feature ------------------------------------------
 # Signal sampling across EVERY thread, without `perf` and without privileges.
@@ -87,7 +89,5 @@ jemalloc_pprof = { version = "0.9", features = ["flamegraph"], optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# An origin's "no such tile" names its URL.
-url = { workspace = true }
 # The projection probe (`examples/projection_probe.rs`) runs on its own runtime.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

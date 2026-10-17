@@ -70,6 +70,107 @@ pub enum TapeError {
     NotAPath(String),
 }
 pub mod path;
+pub mod timelapse;
+
+/// The topic a tape states its frames' instants on: one message, a
+/// versioned record (`{"version":1,"start_utc":…,"seconds_per_frame":…}`).
+pub const CLOCK_TOPIC: &str = "/clock";
+const CLOCK_SCHEMA: &str = "tuile.Clock";
+const CLOCK_JSON_SCHEMA: &str = r#"{
+  "type": "object",
+  "properties": {
+    "version":           {"type": "integer", "const": 1},
+    "start_utc":         {"type": "number", "description": "the first frame's instant, Unix seconds UTC"},
+    "seconds_per_frame": {"type": "number", "description": "the seconds between two frames' instants"}
+  },
+  "required": ["version", "start_utc", "seconds_per_frame"]
+}"#;
+
+/// The instants of a tape's frames: frame `n` (from 1) shows
+/// `start_utc + (n − 1) · seconds_per_frame`. Written into the tape itself
+/// ([`Tape::set_clock`]), on the same timeline as its cameras.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Clock {
+    pub start_utc: f64,
+    pub seconds_per_frame: f64,
+}
+
+impl Clock {
+    /// The instant frame `frame` (from 1) shows, Unix seconds UTC.
+    pub fn instant(&self, frame: u32) -> f64 {
+        self.start_utc + f64::from(frame.saturating_sub(1)) * self.seconds_per_frame
+    }
+
+    /// As a command line writes it: `<start>,<seconds a frame>`, the start
+    /// an ISO 8601 UTC instant or Unix seconds.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let (start, step) = text
+            .split_once(',')
+            .ok_or_else(|| format!("a clock is <start>,<seconds a frame>, not {text}"))?;
+        let start_utc =
+            timelapse::parse_utc(start).ok_or_else(|| format!("not an instant: {start}"))?;
+        let seconds_per_frame: f64 = step
+            .parse()
+            .map_err(|_| format!("not seconds a frame: {step}"))?;
+        if !(seconds_per_frame.is_finite() && seconds_per_frame >= 0.0) {
+            return Err(format!("not seconds a frame: {step}"));
+        }
+        Ok(Self {
+            start_utc,
+            seconds_per_frame,
+        })
+    }
+
+    /// `<start>,<seconds a frame>`, the start in Unix seconds: what
+    /// [`Clock::parse`] reads back exactly.
+    pub fn to_arg(&self) -> String {
+        format!("{},{}", self.start_utc, self.seconds_per_frame)
+    }
+
+    fn to_json(self) -> String {
+        format!(
+            r#"{{"version":1,"start_utc":{},"seconds_per_frame":{}}}"#,
+            self.start_utc, self.seconds_per_frame
+        )
+    }
+
+    fn from_json(text: &str) -> Result<Self, TapeError> {
+        let field = |name: &str| -> Result<f64, TapeError> {
+            let key = format!("\"{name}\":");
+            let at = text
+                .find(&key)
+                .ok_or_else(|| TapeError::NotAPath(format!("a clock without {name}: {text}")))?;
+            let rest = &text[at + key.len()..];
+            let end = rest.find([',', '}']).unwrap_or(rest.len());
+            rest[..end].trim().parse().map_err(|_| {
+                TapeError::NotAPath(format!("a clock's {name} is not a number: {text}"))
+            })
+        };
+        if field("version")? != 1.0 {
+            return Err(TapeError::NotAPath(format!(
+                "a clock of another version: {text}"
+            )));
+        }
+        Ok(Self {
+            start_utc: field("start_utc")?,
+            seconds_per_frame: field("seconds_per_frame")?,
+        })
+    }
+
+    /// The clock the tape at `path` states, if it states one.
+    pub fn of_tape(path: impl AsRef<Path>) -> Result<Option<Self>, TapeError> {
+        let bytes = std::fs::read(path.as_ref())?;
+        for message in mcap::MessageStream::new(&bytes)? {
+            let message = message?;
+            if message.channel.topic == CLOCK_TOPIC {
+                let text = std::str::from_utf8(&message.data)
+                    .map_err(|e| TapeError::NotAPath(format!("clock message is not utf-8: {e}")))?;
+                return Self::from_json(text).map(Some);
+            }
+        }
+        Ok(None)
+    }
+}
 
 /// One frame's camera. ECEF metres; `direction` and `up` are unit vectors;
 /// `fovy` is the vertical field of view in radians.
@@ -389,6 +490,31 @@ impl Tape {
             }
             pending.clear();
         }
+    }
+
+    /// States the instants of the tape's frames: one record on
+    /// [`CLOCK_TOPIC`], before or after its cameras.
+    pub fn set_clock(&mut self, clock: Clock) -> Result<(), TapeError> {
+        let Inner::Recording { writer, .. } = &mut self.0 else {
+            return Ok(());
+        };
+        let schema = writer.add_schema(CLOCK_SCHEMA, "jsonschema", CLOCK_JSON_SCHEMA.as_bytes())?;
+        let channel = writer.add_channel(
+            schema,
+            CLOCK_TOPIC,
+            "json",
+            &std::collections::BTreeMap::new(),
+        )?;
+        writer.write_to_known_channel(
+            &mcap::records::MessageHeader {
+                channel_id: channel,
+                sequence: 0,
+                log_time: 0,
+                publish_time: 0,
+            },
+            Clock::to_json(clock).as_bytes(),
+        )?;
+        Ok(())
     }
 
     /// Appends the picture that frame produced.

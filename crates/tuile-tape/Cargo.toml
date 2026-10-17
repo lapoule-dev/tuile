@@ -12,6 +12,11 @@ rust-version.workspace = true
 # placing it on a sphere instead of the ellipsoid put one 14.8 km above the
 # ground it was meant to be 5 km above.
 tuile-core = { version = "0.7.0", path = "../tuile-core" }
+glam = { workspace = true }
+# A time-lapse's camera is built as every globe camera is.
+tuile-camera = { version = "0.7.0", path = "../tuile-camera" }
+# A time-lapse's start, as a calendar says it.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 mcap = "0.25"
 # Catmull–Rom, plutôt qu'écrit à la main.
 #

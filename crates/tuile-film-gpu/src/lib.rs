@@ -370,6 +370,8 @@ pub struct FilmGpu {
     lit: Look,
     /// The physical atmosphere's tables, uniform and sky-view.
     atmosphere: atmosphere::AtmosphereGpu,
+    /// Whether night lights were given ([`Self::set_night_lights`]).
+    night_lights: bool,
 }
 
 /// One imagery tile of a drape and where it lies on the terrain tile.
@@ -1205,6 +1207,7 @@ impl FilmGpu {
             light: FrameLight::of(&settings.look),
             lit: settings.look,
             atmosphere,
+            night_lights: false,
             device,
             queue,
             settings,
@@ -1502,6 +1505,17 @@ impl FilmGpu {
     /// ([`Look::atmosphere`]) the light is worked out from the air when the
     /// frame is drawn, and of `light` only the sun's direction, the
     /// compensation and the air are heard.
+    /// The night lights a physical atmosphere lights towns with at night:
+    /// `luma`, `width` by `height`, a geographic grid from the antimeridian
+    /// eastwards and from the north pole southwards, one byte a texel.
+    pub fn set_night_lights(&mut self, width: u32, height: u32, luma: &[u8]) {
+        self.atmosphere
+            .set_night_lights(&self.device, &self.queue, width, height, luma);
+        self.night_lights = true;
+        // The next frame's light is worked out again, with the lights on.
+        self.atmosphere.key = None;
+    }
+
     pub fn set_light(&mut self, light: FrameLight) {
         self.light = light;
         self.lit = self.settings.look.lit_by(light);
@@ -1512,6 +1526,12 @@ impl FilmGpu {
     /// in the model's units.
     pub fn sky_view_texture(&self) -> &wgpu::Texture {
         &self.atmosphere.sky_view
+    }
+
+    /// The same table under the Moon, per unit of its own light: black
+    /// when the frame has no Moon.
+    pub fn moon_view_texture(&self) -> &wgpu::Texture {
+        &self.atmosphere.moon_view
     }
 
     /// The look the frame last drawn was drawn with: the ordered one under
@@ -2263,6 +2283,7 @@ impl FilmGpu {
         let k = self.settings.supersample.max(1);
         let (w, h) = (self.settings.width * k, self.settings.height * k);
         let mut uniform = FrameUniform::new(camera, &self.lit, [w, h, k, u32::from(overlaid)]);
+        self.pre_expose(&mut uniform);
         if let Some((view, side)) = &sun {
             uniform = uniform.shadowed(view, self.lit.shadow, *side);
         }
@@ -2489,8 +2510,11 @@ impl FilmGpu {
         let key = atmosphere::LightKey {
             params,
             frame_eye: frame.eye,
+            view: frame.view.to_cols_array(),
             ground: ground.to_array(),
             to_sun,
+            moon: light.illumination.moon,
+            instant: light.instant,
             compensation_ev: light.illumination.compensation_ev,
         };
         if self.atmosphere.key == Some(key) {
@@ -2500,22 +2524,49 @@ impl FilmGpu {
         let geodetic = tuile_core::geo::ecef_to_geodetic(ground);
         let model = self.atmosphere.model.as_ref().expect("held above");
         let reference = self.atmosphere.reference.as_ref().expect("held above");
+        let metering = Self::metering_points_of(
+            frame,
+            &tuile_atmosphere::AtmosphereFrame::at(geodetic),
+            geodetic.height,
+        );
+        // A host that states the instant and not the Moon: the Moon of that
+        // instant, from the frame's own eye — its parallax is a degree.
+        let moon = light.illumination.moon.or_else(|| {
+            let instant = light.instant?;
+            let eye = tuile_core::geo::ecef_to_geodetic(frame.eye);
+            tuile_atmosphere::Moon::seen_from(instant, eye)
+                .map(|m| tuile_atmosphere::Moonlight::of(&m))
+        });
         let sky = model.light(
             reference,
             geodetic,
-            to_sun,
+            tuile_atmosphere::hillaire::Moment {
+                to_sun_ecef: to_sun,
+                moon,
+                compensation_ev: light.illumination.compensation_ev,
+            },
+            &metering,
             tuile_atmosphere::Calibration {
                 sun: base.sun.to_array(),
                 sky: base.world.to_array(),
                 reflectance: base.reflectance,
             },
-            light.illumination.compensation_ev,
         );
-        self.lit = base.lit_by(FrameLight {
-            illumination: sky.illumination,
-            air: light.air,
-        });
-        self.atmosphere.frame_uniform = AtmosphereUniform::new(&params, &sky, frame.eye);
+        let mut lit = FrameLight::new(sky.illumination, light.air);
+        lit.instant = light.instant;
+        self.lit = base.lit_by(lit);
+        let stars = light
+            .instant
+            .map(|t| tuile_atmosphere::celestial_to_ecef(t).transpose());
+        self.atmosphere.frame_uniform = AtmosphereUniform::new(
+            &params,
+            &sky,
+            frame.eye,
+            self.lit.exposure_scale(),
+            stars,
+            &self.lit,
+        );
+        self.atmosphere.frame_uniform.earth[3] = f32::from(u8::from(self.night_lights));
         // Written now for the sky-view, placed from each eye when drawn.
         self.queue.write_buffer(
             &self.atmosphere.uniform,
@@ -2526,6 +2577,38 @@ impl FilmGpu {
         self.atmosphere.key = Some(key);
         self.atmosphere.sky_view_stale = true;
         Ok(())
+    }
+
+    /// The frame camera's metering rays ([`tuile_atmosphere::hillaire::metering`]).
+    fn metering_points_of(
+        frame: &FrameCamera,
+        sphere: &tuile_atmosphere::AtmosphereFrame,
+        ground_height: f64,
+    ) -> Vec<tuile_atmosphere::hillaire::Metered> {
+        let v = frame.view;
+        let p = frame.projection;
+        let right = (v.row(0).truncate() / p.x_axis.x).as_dvec3();
+        let up = (v.row(1).truncate() / p.y_axis.y).as_dvec3();
+        let fwd = (-v.row(2).truncate()).as_dvec3()
+            + right * f64::from(p.z_axis.x)
+            + up * f64::from(p.z_axis.y);
+        tuile_atmosphere::hillaire::metering(frame.eye, fwd, right, up, sphere, ground_height)
+    }
+
+    /// Under a physical atmosphere the frame's lights are pre-exposed: the
+    /// picture's exposure is already in them, so that the HDR target —
+    /// half floats — holds a night twenty stops under noon. `uniform`'s
+    /// lights are scaled, and its exposure set to one.
+    fn pre_expose(&self, uniform: &mut FrameUniform) {
+        if self.atmosphere.light.is_none() {
+            return;
+        }
+        let k = uniform.world[3];
+        for c in 0..3 {
+            uniform.world[c] *= k;
+            uniform.sun[c] *= k;
+        }
+        uniform.world[3] = 1.0;
     }
 
     /// The ground the frame's light is worked out at (ECEF): under the eye,

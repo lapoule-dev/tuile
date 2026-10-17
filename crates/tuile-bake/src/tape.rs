@@ -20,7 +20,8 @@ use crate::{exact_traversal, source_namespace, tiles::Tiles, Finish, GlobeConfig
 /// The bake of a tape: its cameras, and every setting a pack is the bake of.
 #[derive(Debug, Clone)]
 pub struct TapeBake {
-    /// The source's token.
+    /// The source's token. Not read for the open sources
+    /// ([`crate::open`]).
     pub token: String,
     /// Where source tiles are kept between two bakes.
     pub cache_dir: Option<PathBuf>,
@@ -36,6 +37,9 @@ pub struct TapeBake {
     pub imagery: Option<i64>,
     /// What the pack carries of its tiles.
     pub content: tuile_pack::Content,
+    /// Where the ground comes from ([`crate::open::Ground`]): ion's assets
+    /// above, or an open source that needs no token.
+    pub ground: crate::open::Ground,
 }
 
 impl TapeBake {
@@ -53,6 +57,16 @@ impl TapeBake {
         Ok(poses)
     }
 
+    /// The tile store's layers its open sources need declared: none for ion.
+    pub fn store_layers(&self) -> Vec<tuile_tile_server::LayerDef> {
+        crate::open::store_layers(self.ground)
+    }
+
+    /// Whether a bake of it needs an ion token.
+    pub fn needs_token(&self) -> bool {
+        self.ground.needs_token()
+    }
+
     /// The globe as this bake sets it, before a session is opened on it.
     fn config(&self) -> GlobeConfig {
         let mut config = GlobeConfig::new(&self.token);
@@ -66,6 +80,21 @@ impl TapeBake {
         }
         if let Some(id) = self.imagery {
             config.imagery_asset_id = if id < 0 { None } else { Some(id) };
+        }
+        // The open sources answer for themselves: no token is read.
+        let open = match self.ground {
+            crate::open::Ground::Ion => None,
+            crate::open::Ground::OpenEarth => {
+                Some((crate::open::ELLIPSOID, Some(crate::open::BLUE_MARBLE)))
+            }
+            crate::open::Ground::Empty => Some((crate::open::NOTHING, None)),
+        };
+        if let Some((terrain, imagery)) = open {
+            config.terrain_asset_id = terrain;
+            config.imagery_asset_id = imagery;
+            config.sources = Some(crate::globe::SourcesHandle(std::sync::Arc::new(
+                crate::open::OpenSources::new(self.cache_dir.clone()),
+            )));
         }
         // A pack that only refers to the tile store holds no mesh and no
         // picture: its tiles are named, not drawn.
@@ -216,7 +245,29 @@ mod tests {
             terrain: None,
             imagery: None,
             content: tuile_pack::Content::References,
+            ground: crate::open::Ground::Ion,
         }
+    }
+
+    #[test]
+    fn no_ground_is_baked_through_the_same_stages_with_no_token() {
+        let sky = TapeBake {
+            token: String::new(),
+            ground: crate::open::Ground::Empty,
+            ..bake()
+        };
+        assert!(!sky.needs_token());
+        assert_ne!(sky.scene(), bake().scene());
+        assert_eq!(sky.layers().1, None);
+        let dir = tempfile::tempdir().expect("dir");
+        let out = dir.path().join("sky.tuilepack");
+        let done = sky.bake(2, 3, &out, None).expect("baked with no token");
+        assert_eq!(done.poses.len(), 2);
+        let bytes = std::fs::read(&out).expect("read");
+        let pack = tuile_pack::Pack::open(&bytes).expect("open");
+        assert_eq!(pack.frame_range(), (2, 3));
+        // The two roots, and no triangle in either.
+        assert!(pack.tile_count() <= 2, "{}", pack.tile_count());
     }
 
     #[test]

@@ -154,6 +154,8 @@ fn bucket() -> Arc<dyn object_store::ObjectStore> {
                 expiry_days: None,
                 content_type: "application/vnd.quantized-mesh".into(),
                 index: false,
+                licence: None,
+                attribution: None,
             },
             LayerDef {
                 name: imagery,
@@ -166,6 +168,8 @@ fn bucket() -> Arc<dyn object_store::ObjectStore> {
                 // Indexed: the targeted bake knows its imagery by the
                 // archives' indexes, as a bake by reference does.
                 index: true,
+                licence: None,
+                attribution: None,
             },
         ],
     };

@@ -6,7 +6,12 @@
 //! ```text
 //! tuile-launch-job bake   --trajectory orbit:4:2.17:42.52:8000:5000 --frames 1:4 --viewport 960x540 --sse 16
 //! tuile-launch-job render --engine hydra --trajectory … --frames 1:4 --tasks 2 --width 960 --extra '--height 540'
+//! tuile-launch-job film --tape sky.mcap [--spatial] [--name <film>] -- <tuile-film-produce flags>
 //! ```
+//!
+//! `film` runs on the film jobs (`TUILE_FILM_JOB`, `TUILE_FILM_SPATIAL_JOB`,
+//! the spatial one where `TUILE_FILM_SPATIAL_REGION` says, `europe-west4` by
+//! default).
 //!
 //! The same verbs and shared flags as every other launcher built on
 //! `tuile_farm::launch`; the scene flags are the engine's. It starts an
@@ -52,14 +57,24 @@ enum Verb {
         #[command(flatten)]
         scene: tuile::SceneArgs,
     },
+    /// A whole film of the engine's own render, on a film job.
+    Film {
+        #[command(flatten)]
+        common: CommonArgs,
+        #[command(flatten)]
+        film: tuile::FilmArgs,
+    },
 }
 
-fn farm() -> Result<Farm, String> {
+/// The farm, its jobs where `region` says, else `TUILE_GCP_REGION`.
+fn farm_in(region: Option<String>) -> Result<Farm, String> {
     let project = std::env::var("TUILE_GCP_PROJECT").map_err(|_| {
         "TUILE_GCP_PROJECT is not set: the Google Cloud project that runs the render jobs"
             .to_string()
     })?;
-    let region = std::env::var("TUILE_GCP_REGION").unwrap_or_else(|_| "europe-west1".into());
+    let region = region
+        .or_else(|| std::env::var("TUILE_GCP_REGION").ok())
+        .unwrap_or_else(|| "europe-west1".into());
     let transport = Arc::new(HttpTransport::new().map_err(|e| e.to_string())?);
     let tokens = default_tokens().map_err(|e| e.to_string())?;
     let jobs = JobsApi::new(
@@ -89,7 +104,13 @@ fn videos() -> PathBuf {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let farm = match farm() {
+    let region = match &cli.verb {
+        Verb::Film { film, .. } if film.spatial => Some(
+            std::env::var("TUILE_FILM_SPATIAL_REGION").unwrap_or_else(|_| "europe-west4".into()),
+        ),
+        _ => None,
+    };
+    let farm = match farm_in(region) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("tuile-launch-job: {e}");
@@ -99,6 +120,7 @@ async fn main() -> ExitCode {
     let result = match &cli.verb {
         Verb::Bake { common, scene } => tuile::bake(&farm, scene, common).await.map(|_| ()),
         Verb::Render { common, scene } => tuile::render(&farm, scene, common, &videos()).await,
+        Verb::Film { common, film } => tuile::film(&farm, film, common, &videos()).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
