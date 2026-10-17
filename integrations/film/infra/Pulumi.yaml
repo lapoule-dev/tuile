@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+name: tuile-film-jobs
+description: One-off film jobs on Cloud Run GPUs, apart from any service (docs/22-film-jobs.md)
+runtime:
+  name: python
+  options:
+    toolchain: pip
+    virtualenv: venv

@@ -83,6 +83,11 @@ struct Args {
     /// The terrain layer, as its source's asset. Default: the engine's.
     #[arg(long)]
     terrain: Option<i64>,
+    /// No ground: packs of the tape's cameras alone, baked without a
+    /// source, rendered as sky over the atmosphere's own smooth planet —
+    /// what a sky is checked by. Needs `--atmosphere` to show anything.
+    #[arg(long)]
+    sky_only: bool,
     /// What a pack carries of its tiles: `references` into the tile store,
     /// the tiles themselves (`embedded`), or `both`.
     #[arg(long, default_value = "references", value_parser = content)]
@@ -99,9 +104,11 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     supersample: u32,
     /// The encoder: `h264` — the machine's own (NVENC on an NVIDIA card,
-    /// VideoToolbox on a Mac) — or `nvenc-h264`. H.264 only: a film is joined
-    /// from its parts, and the join reads H.264.
-    #[arg(long, default_value = "h264", value_parser = ["h264", "nvenc-h264"])]
+    /// VideoToolbox on a Mac) — or `nvenc-h264`; for a film of two eyes,
+    /// `mv-hevc` (spatial video: AVFoundation on a Mac, NVENC on a card
+    /// that encodes it). A film is joined from its parts, and the join
+    /// reads H.264 and spatial films.
+    #[arg(long, default_value = "h264", value_parser = ["h264", "nvenc-h264", "mv-hevc", "nvenc-mv-hevc"])]
     codec: String,
     /// Megabits a second.
     #[arg(long, default_value_t = 12.0)]
@@ -140,6 +147,18 @@ struct Args {
     /// The imagery as stored, without the film's tone correction.
     #[arg(long)]
     no_tone: bool,
+    /// The physical atmosphere: sky, sun, Moon, air and light from the
+    /// air (`tuile_film::Look::atmosphere`).
+    #[arg(long)]
+    atmosphere: bool,
+    /// The atmosphere's turbidity (2 a clear day); implies --atmosphere.
+    #[arg(long)]
+    turbidity: Option<f32>,
+    /// Each frame's instant, `<start>,<seconds a frame>`, as `tuile-tape
+    /// timelapse` writes it beside its tape: every frame lit by its own
+    /// sun, Moon and stars.
+    #[arg(long, allow_hyphen_values = true)]
+    clock: Option<String>,
     /// For two eyes, packed into one picture: `side-by-side` or `top-bottom`.
     #[arg(long, value_parser = ["side-by-side", "top-bottom"])]
     stereo: Option<String>,
@@ -200,6 +219,11 @@ struct Args {
     /// Also bring the film here once it is in the store.
     #[arg(long)]
     download: Option<PathBuf>,
+    /// Once the film is in the store, write at this key of the run store a
+    /// receipt — `{"film": <key>, "frames": <n>}` — for whoever launched the
+    /// production elsewhere to find it by (`tuile-film-job`).
+    #[arg(long)]
+    receipt: Option<String>,
 }
 
 fn stretch(text: &str) -> Result<Stretch, String> {
@@ -294,6 +318,9 @@ fn rendering(args: &Args) -> Result<Rendering, Error> {
         sun_light: args.sun_light.clone(),
         sky_light: args.sky_light.clone(),
         no_tone: args.no_tone,
+        atmosphere: args.atmosphere,
+        turbidity: args.turbidity,
+        clock: args.clock.clone(),
         stereo: args.stereo.as_deref().map(|packing| StereoSpec {
             packing: if packing == "top-bottom" {
                 StereoPacking::TopBottom
@@ -362,6 +389,7 @@ async fn run(args: Args) -> Result<Ended, Error> {
         terrain: args.terrain,
         imagery: args.imagery,
         content: args.content,
+        sky_only: args.sky_only,
     };
 
     let cache = args
@@ -407,6 +435,12 @@ async fn run(args: Args) -> Result<Ended, Error> {
                 println!("FILM-HERE {}", dest.display());
             }
             println!("FILM {} {} frames", film.key, film.frames);
+            if let Some(key) = &args.receipt {
+                let receipt = serde_json::json!({"film": film.key, "frames": film.frames});
+                let here = scratch.path().join("receipt.json");
+                std::fs::write(&here, receipt.to_string())?;
+                store.put(&here, key).await?;
+            }
             Ok(Ended::Film)
         }
         Err(ProduceError::Order(why)) => {

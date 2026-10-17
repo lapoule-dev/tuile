@@ -36,6 +36,13 @@ pub struct TapeBake {
     pub imagery: Option<i64>,
     /// What the pack carries of its tiles.
     pub content: tuile_pack::Content,
+    /// No ground at all: a pack of the tape's cameras and nothing else,
+    /// baked without a source. A renderer draws such a frame as sky alone
+    /// — the air, the sun, the Moon and the stars over the atmosphere's own
+    /// smooth planet — which is what a sky is checked by where no source is
+    /// at hand. Never a film's ground: its packs are named apart
+    /// (`….sky`).
+    pub sky_only: bool,
 }
 
 impl TapeBake {
@@ -89,6 +96,9 @@ impl TapeBake {
     /// resolved settings — not over the frames baked, so that every pack of
     /// one film agrees on it.
     pub fn scene(&self) -> String {
+        if self.sky_only {
+            return digest_of_scene(&self.poses, self.viewport, "sky-only");
+        }
         let config = self.config();
         let resolved = exact_traversal(config.session.traversal.clone());
         digest_of_scene(
@@ -102,6 +112,7 @@ impl TapeBake {
     /// `packs/<scene>[.references|.both]`.
     pub fn packs(&self) -> String {
         let kind = match self.content {
+            _ if self.sky_only => ".sky",
             tuile_pack::Content::References => ".references",
             tuile_pack::Content::Both => ".both",
             _ => "",
@@ -125,6 +136,9 @@ impl TapeBake {
                 "frames {first}:{last} of a tape that holds {}",
                 self.poses.len()
             ));
+        }
+        if self.sky_only {
+            return self.bake_sky(first, wanted as u32, out);
         }
         let mut config = self.config();
         let layers = self.layers();
@@ -193,6 +207,39 @@ impl TapeBake {
     }
 }
 
+impl TapeBake {
+    /// [`TapeBake::sky_only`]'s pack: the cameras of `first..=last`, no tile.
+    fn bake_sky(&self, first: u32, last: u32, out: &Path) -> Result<BakeOutcome, String> {
+        let scene = self.scene();
+        let blob = out.with_extension("blob.part");
+        let mut writer = tuile_pack::PackWriter::new(scene.clone(), [0.0; 3], &blob)
+            .map_err(|e| format!("{}: {e}", blob.display()))?
+            .culling("sky-only");
+        for number in first..=last {
+            let pose = self.poses[number as usize - 1];
+            writer.frame(
+                number,
+                tuile_pack::BakedView {
+                    position: pose.position,
+                    direction: pose.direction,
+                    up: pose.up,
+                    viewport_px: [self.viewport.0, self.viewport.1],
+                    fovy_rad: pose.fovy,
+                },
+                [],
+            );
+        }
+        let bytes = writer
+            .finish_to(out)
+            .map_err(|e| format!("{}: {e}", out.display()))?;
+        Ok(BakeOutcome {
+            scene,
+            poses: self.poses[first as usize - 1..last as usize].to_vec(),
+            bytes,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,7 +263,28 @@ mod tests {
             terrain: None,
             imagery: None,
             content: tuile_pack::Content::References,
+            sky_only: false,
         }
+    }
+
+    #[test]
+    fn a_sky_pack_is_baked_without_a_source_and_named_apart() {
+        let sky = TapeBake {
+            token: String::new(),
+            sky_only: true,
+            ..bake()
+        };
+        assert!(sky.packs().ends_with(".sky"), "{}", sky.packs());
+        assert_ne!(sky.scene(), bake().scene());
+        let dir = tempfile::tempdir().expect("dir");
+        let out = dir.path().join("sky.tuilepack");
+        let done = sky.bake(2, 3, &out, None).expect("baked with no token");
+        assert_eq!(done.poses.len(), 2);
+        let bytes = std::fs::read(&out).expect("read");
+        let pack = tuile_pack::Pack::open(&bytes).expect("open");
+        assert_eq!(pack.frame_range(), (2, 3));
+        assert_eq!(pack.tile_count(), 0);
+        assert_eq!(pack.culling(), "sky-only");
     }
 
     #[test]

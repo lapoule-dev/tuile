@@ -34,3 +34,6 @@ videos/*
 
 # The bench's local configuration: it names a deployment's buckets.
 film-bench.toml
+# The film jobs' Pulumi virtualenv and stack config (written by up.sh).
+integrations/film/infra/venv/
+integrations/film/infra/Pulumi.*.yaml

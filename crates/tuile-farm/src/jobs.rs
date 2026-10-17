@@ -444,6 +444,31 @@ impl Execution {
     }
 }
 
+/// The body of a `:run`: the environment and, when given, the arguments
+/// of the one container, the task count, and whether only to validate.
+pub fn run_body(
+    env: &[(String, String)],
+    args: Option<&[String]>,
+    tasks: u32,
+    validate_only: bool,
+) -> serde_json::Value {
+    let env: Vec<_> = env
+        .iter()
+        .map(|(k, v)| serde_json::json!({"name": k, "value": v}))
+        .collect();
+    let mut container = serde_json::json!({ "env": env });
+    if let Some(args) = args {
+        container["args"] = serde_json::json!(args);
+    }
+    let mut body = serde_json::json!({
+        "overrides": {"containerOverrides": [container], "taskCount": tasks}
+    });
+    if validate_only {
+        body["validateOnly"] = serde_json::Value::Bool(true);
+    }
+    body
+}
+
 /// HTTP statuses of a service that hiccuped rather than refused.
 pub const TRANSIENT: [u16; 5] = [429, 500, 502, 503, 504];
 
@@ -604,16 +629,22 @@ impl JobsApi {
         tasks: u32,
         validate_only: bool,
     ) -> Result<Option<String>> {
-        let env: Vec<_> = env
-            .iter()
-            .map(|(k, v)| serde_json::json!({"name": k, "value": v}))
-            .collect();
-        let mut body = serde_json::json!({
-            "overrides": {"containerOverrides": [{"env": env}], "taskCount": tasks}
-        });
-        if validate_only {
-            body["validateOnly"] = serde_json::Value::Bool(true);
-        }
+        self.run_with_args(job, env, None, tasks, validate_only)
+            .await
+    }
+
+    /// [`JobsApi::run`], the container's arguments replaced by `args` when
+    /// given: one job definition, its command fixed, each execution a
+    /// different film.
+    pub async fn run_with_args(
+        &self,
+        job: &str,
+        env: &[(String, String)],
+        args: Option<&[String]>,
+        tasks: u32,
+        validate_only: bool,
+    ) -> Result<Option<String>> {
+        let body = run_body(env, args, tasks, validate_only);
         let path = format!("{}:run", self.job_path(job));
         let op = self.call(Method::Post, &path, Some(body)).await?;
         if validate_only {
@@ -713,6 +744,28 @@ impl JobsApi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_execution_may_replace_the_containers_arguments_and_nothing_else() {
+        let env = [("A".to_string(), "1".to_string())];
+        let plain = super::run_body(&env, None, 2, false);
+        assert!(plain["overrides"]["containerOverrides"][0]
+            .get("args")
+            .is_none());
+        assert_eq!(plain["overrides"]["taskCount"], 2);
+        assert!(plain.get("validateOnly").is_none());
+        let args = ["store:tapes/t.mcap".to_string(), "--atmosphere".to_string()];
+        let with = super::run_body(&env, Some(&args), 1, true);
+        assert_eq!(
+            with["overrides"]["containerOverrides"][0]["args"],
+            serde_json::json!(["store:tapes/t.mcap", "--atmosphere"])
+        );
+        assert_eq!(
+            with["overrides"]["containerOverrides"][0]["env"][0]["name"],
+            "A"
+        );
+        assert_eq!(with["validateOnly"], true);
+    }
+
     #[test]
     fn a_key_asks_for_an_access_token_by_scope_and_an_identity_token_by_audience() {
         let access = serde_json::to_value(super::Grant::Access.claims("me@x", "https://t", 10))

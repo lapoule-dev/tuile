@@ -1058,6 +1058,7 @@ fn bake_tape(token: String, args: &Args, tiles: Option<&tiles::Tiles>) -> Result
         terrain: args.terrain,
         imagery: args.imagery,
         content: args.content,
+        sky_only: false,
     };
     let layers = bake.layers();
     println!(

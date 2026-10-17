@@ -127,6 +127,11 @@
 //!                         --haze is then not read
 //!   --turbidity <t>       the atmosphere's turbidity (2 a clear day, the
 //!                         default; 4 hazy); implies --atmosphere
+//!   --clock <start>,<s>   each frame's instant: the first frame's (ISO 8601
+//!                         UTC, or Unix seconds) and the seconds of sky
+//!                         between two frames, as `tuile-tape timelapse`
+//!                         writes it — every frame lit by its own sun,
+//!                         Moon and stars
 //!   --shadow <0..1>       how much of the sun ground loses where other
 //!                         ground stands before it (default 0: no shadows)
 //!   --haze                air between the eye and the ground, and a sky
@@ -524,6 +529,9 @@ async fn main() -> Result<(), Error> {
     }
     if let Some(turbidity) = value("--turbidity") {
         order.look.turbidity = Some(turbidity.parse()?);
+    }
+    if let Some(clock) = value("--clock") {
+        order.clock = Some(tuile_tape::timelapse::Clock::parse(&clock)?);
     }
     if flag("--haze") || value("--haze-density").is_some() || value("--haze-height").is_some() {
         let mut haze = tuile_film::Haze::default();

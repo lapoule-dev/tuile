@@ -27,6 +27,10 @@ axum = "0.8"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tuile-core = { version = "0.7.0", path = "../tuile-core" }
+# The sun of a frame's instant, when a clock is given (`Order::clock`).
+tuile-atmosphere = { version = "0.7.0", path = "../tuile-atmosphere" }
+# The clock of a time-lapse, as its tape's maker writes it.
+tuile-tape = { version = "0.7.0", path = "../tuile-tape" }
 tuile-farm = { version = "0.7.0", path = "../tuile-farm" }
 tuile-film = { version = "0.7.0", path = "../tuile-film" }
 tuile-film-gpu = { version = "0.7.0", path = "../tuile-film-gpu" }

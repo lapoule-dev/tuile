@@ -70,6 +70,7 @@ pub enum TapeError {
     NotAPath(String),
 }
 pub mod path;
+pub mod timelapse;
 
 /// One frame's camera. ECEF metres; `direction` and `up` are unit vectors;
 /// `fovy` is the vertical field of view in radians.

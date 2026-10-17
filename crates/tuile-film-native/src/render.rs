@@ -84,6 +84,26 @@ pub struct Order {
     /// frame is drawn twice, from the eyes its camera gives, out of the
     /// tiles the pack selected for that camera.
     pub stereo: Option<Stereo>,
+    /// The instant each frame shows ([`tuile_tape::timelapse::Clock`]),
+    /// when a frame's host does not place its light: the frame is then lit
+    /// by the sun of its instant, the Moon of its instant over the frame's
+    /// own eye, and the stars turned to it. `None`: the look's light.
+    pub clock: Option<tuile_tape::timelapse::Clock>,
+}
+
+/// The light of `frame` under `clock`: the sun of its instant from the
+/// Earth's centre (a planet's radius at an astronomical unit is 0.0025°),
+/// the instant itself for the renderer to place the Moon and the stars from
+/// the frame's own eye, and the rest the look's.
+pub fn clocked_light(clock: &tuile_tape::timelapse::Clock, frame: u32, look: &Look) -> FrameLight {
+    let instant = clock.instant(frame);
+    let mut light = FrameLight::of(look);
+    let to_sun = tuile_atmosphere::Sun::at_unix_seconds(instant).direction_ecef;
+    if to_sun.is_finite() {
+        light.illumination.to_sun_ecef = to_sun;
+    }
+    light.instant = Some(instant);
+    light
 }
 
 impl Default for Order {
@@ -104,6 +124,7 @@ impl Default for Order {
             smooth_strength: 1.0,
             wire: false,
             stereo: None,
+            clock: None,
         }
     }
 }
@@ -1009,7 +1030,12 @@ pub async fn render(
             // The frame's light, before anything of the frame is drawn or
             // fitted — the sun's map included — and the same for both eyes:
             // the host's when it places it, else the order's.
-            gpu.set_light(overlays.light(diff.frame).unwrap_or(ordered_light));
+            gpu.set_light(
+                overlays
+                    .light(diff.frame)
+                    .or_else(|| order.clock.map(|c| clocked_light(&c, diff.frame, &look)))
+                    .unwrap_or(ordered_light),
+            );
             let camera = FrameCamera::of(&diff.view, aspect);
             let pair = stereo.as_ref().map(|stereo| stereo.eyes(&camera));
             // The frame's overlays, once for every picture of it: made for

@@ -67,6 +67,16 @@ pub struct RenderSpec {
     /// For two eyes, packed into one picture. Absent: one eye, as always.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stereo: Option<StereoSpec>,
+    /// The physical atmosphere (`tuile_film::Look::atmosphere`), and its
+    /// turbidity. Absent: the look's own light.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub atmosphere: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turbidity: Option<f32>,
+    /// Each frame's instant, as `tuile-tape timelapse` writes it:
+    /// `<start>,<seconds a frame>` (`Order::clock`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock: Option<String>,
 }
 
 /// A film for two eyes, as a caller writes it: see [`tuile_film::Stereo`].
@@ -163,6 +173,9 @@ impl Default for RenderSpec {
             smooth_bound: tuile_film::smoothing::DEFAULT_BOUND_M,
             smooth_strength: 1.0,
             stitch: true,
+            atmosphere: false,
+            turbidity: None,
+            clock: None,
         }
     }
 }
@@ -192,6 +205,15 @@ impl RenderSpec {
         };
         order.smooth_strength = self.smooth_strength;
         order.stitch = self.stitch;
+        order.clock = self
+            .clock
+            .as_deref()
+            .map(tuile_tape::timelapse::Clock::parse)
+            .transpose()?;
+        if self.atmosphere || self.turbidity.is_some() {
+            order.look.atmosphere = Some(tuile_film::AtmosphereParams::default());
+            order.look.turbidity = self.turbidity;
+        }
         let look = &mut order.look;
         if let Some(stops) = self.exposure {
             look.exposure_ev = stops;
@@ -380,7 +402,7 @@ impl Host for Engine {
     }
 
     fn bake(&self, frames: Stretch, out: &Path) -> Result<(), Failed> {
-        if self.bake.token.is_empty() {
+        if self.bake.token.is_empty() && !self.bake.sky_only {
             return Err(Failed::for_good(
                 "a pack is to be baked and TUILE_ION_TOKEN is not set",
             ));
