@@ -57,9 +57,13 @@ impl TapeBake {
         Ok(poses)
     }
 
-    /// The tile store's layers its open sources need declared: none for ion.
+    /// The tile store's layers its sources need declared.
     pub fn store_layers(&self) -> Vec<tuile_tile_server::LayerDef> {
-        crate::open::store_layers(self.ground)
+        let config = self.config();
+        crate::open::store_layers(
+            self.ground,
+            (config.terrain_asset_id, config.imagery_asset_id),
+        )
     }
 
     /// Whether a bake of it needs an ion token.

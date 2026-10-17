@@ -429,9 +429,13 @@ pub async fn night_lights(cache_dir: Option<std::path::PathBuf>) -> Result<Night
     })
 }
 
-/// The tile store's layers of the open sources `ground` reads, declared
-/// with their licence and credit: their tiles are kept as any source's.
-pub fn store_layers(ground: Ground) -> Vec<tuile_tile_server::LayerDef> {
+/// The tile store's layers of the sources `ground` reads, declared with
+/// their licence and credit: their tiles are kept as any source's. For ion,
+/// `ion` names the terrain and imagery assets the bake reads; only the
+/// default two are known well enough to declare, the others are left to a
+/// store that already describes them. A layer a store already has is never
+/// redeclared ([`crate::tiles::Tiles::from_env_with_layers`]).
+pub fn store_layers(ground: Ground, ion: (i64, Option<i64>)) -> Vec<tuile_tile_server::LayerDef> {
     use tuile_tile_server::{Grid, LayerDef};
     let terrain = |asset: i64| LayerDef {
         name: crate::source_namespace(asset),
@@ -446,7 +450,33 @@ pub fn store_layers(ground: Ground) -> Vec<tuile_tile_server::LayerDef> {
         attribution: None,
     };
     match ground {
-        Ground::Ion => Vec::new(),
+        Ground::Ion => {
+            let proprietary = || Some("Proprietary: the source's terms of service".into());
+            let mut layers = Vec::new();
+            if ion.0 == crate::CESIUM_WORLD_TERRAIN {
+                layers.push(LayerDef {
+                    licence: proprietary(),
+                    content_type: "application/vnd.quantized-mesh".into(),
+                    ..terrain(ion.0)
+                });
+            }
+            if ion.1 == Some(crate::BING_AERIAL) {
+                layers.push(LayerDef {
+                    name: crate::source_namespace(crate::BING_AERIAL),
+                    grid: Grid::WebMercator,
+                    tile_type: "jpeg".into(),
+                    tile_compression: "none".into(),
+                    zone_level: 10,
+                    expiry_days: None,
+                    content_type: "image/jpeg".into(),
+                    index: false,
+                    licence: proprietary(),
+                    // Credited per view, as the source's session lists it.
+                    attribution: None,
+                });
+            }
+            layers
+        }
         Ground::Empty => vec![terrain(NOTHING)],
         Ground::OpenEarth => vec![
             terrain(ELLIPSOID),
@@ -521,6 +551,25 @@ fn on_ellipsoid(p: glam::DVec3) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ions_default_assets_are_declared_and_no_other() {
+        let names = |ion| -> Vec<String> {
+            store_layers(Ground::Ion, ion)
+                .into_iter()
+                .map(|l| {
+                    assert!(l.licence.is_some(), "{} has no licence", l.name);
+                    l.name
+                })
+                .collect()
+        };
+        assert_eq!(
+            names((crate::CESIUM_WORLD_TERRAIN, Some(crate::BING_AERIAL))),
+            ["asset-1", "asset-2"]
+        );
+        assert!(names((7, Some(9))).is_empty());
+        assert_eq!(names((crate::CESIUM_WORLD_TERRAIN, None)), ["asset-1"]);
+    }
 
     #[test]
     fn an_ellipsoid_tile_lies_on_the_ellipsoid_and_closes_on_its_neighbours() {

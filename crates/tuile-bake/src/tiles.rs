@@ -171,9 +171,8 @@ impl Tiles {
                 }
                 Err(_) => match std::env::var("TUILE_TILES_LOCAL") {
                     Ok(dir) => {
-                        std::fs::create_dir_all(&dir).map_err(|e| format!("{dir}: {e}"))?;
-                        let local = object_store::local::LocalFileSystem::new_with_prefix(&dir)
-                            .map_err(|e| format!("tile store {dir}: {e}"))?;
+                        // Its manifests replaced on condition, as a bucket's.
+                        let local = crate::local_store::LocalStore::new(dir.as_ref())?;
                         (dir, Arc::new(local))
                     }
                     Err(_) => return Ok(None),
