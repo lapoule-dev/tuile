@@ -83,11 +83,12 @@ struct Args {
     /// The terrain layer, as its source's asset. Default: the engine's.
     #[arg(long)]
     terrain: Option<i64>,
-    /// No ground: packs of the tape's cameras alone, baked without a
-    /// source, rendered as sky over the atmosphere's own smooth planet —
-    /// what a sky is checked by. Needs `--atmosphere` to show anything.
-    #[arg(long)]
-    sky_only: bool,
+    /// Where the ground comes from: `ion` (its terrain and imagery assets,
+    /// --terrain and --imagery; a token), `open-earth` (the ellipsoid and
+    /// NASA's Blue Marble; no token) or `empty` (no ground: a sky, checked
+    /// on its own; only with --atmosphere).
+    #[arg(long, default_value = "ion", value_parser = tuile_bake::open::Ground::parse)]
+    ground: tuile_bake::open::Ground,
     /// What a pack carries of its tiles: `references` into the tile store,
     /// the tiles themselves (`embedded`), or `both`.
     #[arg(long, default_value = "references", value_parser = content)]
@@ -400,6 +401,10 @@ async fn run(args: Args) -> Result<Ended, Error> {
         );
         return Ok(Ended::Usage);
     }
+    if args.ground == tuile_bake::open::Ground::Empty && !(args.atmosphere || args.turbidity.is_some()) {
+        eprintln!("tuile-film-produce: --ground empty draws nothing but a sky: it wants --atmosphere");
+        return Ok(Ended::Usage);
+    }
     let tape_clock = tuile_tape::Clock::of_tape(&tape).map_err(|e| e.to_string())?;
     let rendering = rendering(&args, tape_clock)?;
     let bake = TapeBake {
@@ -413,7 +418,7 @@ async fn run(args: Args) -> Result<Ended, Error> {
         terrain: args.terrain,
         imagery: args.imagery,
         content: args.content,
-        sky_only: args.sky_only,
+        ground: args.ground,
     };
 
     let cache = args

@@ -35,15 +35,48 @@ use tuile_terrain::{
 
 use crate::globe::Sources;
 
-/// The terrain that is the ellipsoid.
-pub const ELLIPSOID: i64 = 1_000_000_001;
-/// NASA Blue Marble: Next Generation, through GIBS.
-pub const BLUE_MARBLE: i64 = 1_000_000_101;
-
-/// Whether `asset` is one of these.
-pub fn is_open(asset: i64) -> bool {
-    asset == ELLIPSOID || asset == BLUE_MARBLE
+/// Where a bake's ground comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Ground {
+    /// Cesium ion: its terrain and imagery assets (World Terrain and Bing
+    /// Aerial unless the bake names others). Needs a token.
+    #[default]
+    Ion,
+    /// The open Earth: the ellipsoid draped with NASA's Blue Marble. No
+    /// token.
+    OpenEarth,
+    /// No ground at all: every frame baked through the same stages, its
+    /// selection empty — a sky over the atmosphere's own smooth planet,
+    /// what a sky is checked by. Only under a physical atmosphere.
+    Empty,
 }
+
+impl Ground {
+    /// From a command line's word: `ion`, `open-earth` or `empty`.
+    pub fn parse(word: &str) -> Result<Self, String> {
+        match word {
+            "ion" => Ok(Self::Ion),
+            "open-earth" => Ok(Self::OpenEarth),
+            "empty" => Ok(Self::Empty),
+            _ => Err(format!("ground is ion, open-earth or empty, not {word}")),
+        }
+    }
+
+    /// Whether its sources need an ion token.
+    pub fn needs_token(self) -> bool {
+        self == Self::Ion
+    }
+}
+
+// The open sources keep asset numbers of their own, in a range no ion asset
+// uses: a tile cache and a tile store name every source's tiles by them.
+// They are this module's; a bake chooses a [`Ground`].
+/// The terrain that is the ellipsoid.
+pub(crate) const ELLIPSOID: i64 = 1_000_000_001;
+/// The terrain of no tile at all.
+pub(crate) const NOTHING: i64 = 1_000_000_002;
+/// NASA Blue Marble: Next Generation, through GIBS.
+pub(crate) const BLUE_MARBLE: i64 = 1_000_000_101;
 
 /// The deepest level of the ellipsoid's tiles: past it a tile would be
 /// flatter than any camera that wants it can tell.
@@ -163,6 +196,52 @@ impl Ellipsoid {
         let edges = edges.map(|e| e.into_iter().map(|i| order[i as usize]).collect());
         let heights = vec![0.0; n * n];
         encode(&header, &uu, &vv, &heights, &indices, None, &edges)
+    }
+}
+
+/// Terrain of no ground: the two root tiles, each a mesh of no triangle,
+/// and nothing under them.
+pub struct Nothing;
+
+impl Nothing {
+    pub fn layer() -> LayerJson {
+        LayerJson {
+            available: vec![vec![AvailabilityRange {
+                start_x: 0,
+                start_y: 0,
+                end_x: 1,
+                end_y: 0,
+            }]],
+            maxzoom: 0,
+            ..Ellipsoid::layer()
+        }
+    }
+
+    /// A root tile's mesh: its header, and no vertex.
+    pub fn tile(coord: TileCoord) -> Vec<u8> {
+        let rect = GeographicTilingScheme::default().tile_rect(coord);
+        let (lon, lat) = rect.center();
+        let centre = geodetic_to_ecef(Geodetic {
+            lon,
+            lat,
+            height: 0.0,
+        });
+        let header = Header {
+            center: centre.to_array(),
+            min_height: 0.0,
+            max_height: 0.0,
+            bounding_sphere_center: centre.to_array(),
+            bounding_sphere_radius: WGS84_A,
+            horizon_occlusion: (centre / WGS84_A).to_array(),
+        };
+        encode(&header, &[], &[], &[], &[], None, &[Vec::new(), Vec::new(), Vec::new(), Vec::new()])
+    }
+}
+
+#[async_trait::async_trait]
+impl TerrainSource for Nothing {
+    async fn fetch_tile(&self, coord: TileCoord) -> Result<Fetched<Vec<u8>>, TerrainSourceError> {
+        Ok(Fetched::undated(Self::tile(coord)))
     }
 }
 
@@ -299,6 +378,7 @@ impl Sources for OpenSources {
     async fn terrain(&self, asset: i64) -> Result<(LayerJson, Arc<dyn TerrainSource>), String> {
         match asset {
             ELLIPSOID => Ok((Ellipsoid::layer(), Arc::new(Ellipsoid))),
+            NOTHING => Ok((Nothing::layer(), Arc::new(Nothing))),
             other => Err(format!("terrain asset {other} is not an open source")),
         }
     }
@@ -353,7 +433,8 @@ mod tests {
             assert!(mesh.edges.iter().all(|e| e.len() == ELLIPSOID_STEPS + 1));
         }
         assert!(!layer.is_available(TileCoord::new(ELLIPSOID_LEVELS + 1, 0, 0)));
-        assert!(is_open(ELLIPSOID) && is_open(BLUE_MARBLE) && !is_open(1));
+        assert_eq!(Ground::parse("open-earth"), Ok(Ground::OpenEarth));
+        assert!(Ground::Ion.needs_token() && !Ground::Empty.needs_token());
     }
 
     #[test]

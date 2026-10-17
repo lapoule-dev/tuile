@@ -462,7 +462,7 @@ impl Host for Engine {
     }
 
     fn bake(&self, frames: Stretch, out: &Path) -> Result<(), Failed> {
-        if self.bake.token.is_empty() && !self.bake.sky_only && !self.bake.open_sources() {
+        if self.bake.token.is_empty() && self.bake.needs_token() {
             return Err(Failed::for_good(
                 "a pack is to be baked and TUILE_ION_TOKEN is not set",
             ));

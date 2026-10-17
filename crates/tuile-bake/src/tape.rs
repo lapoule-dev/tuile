@@ -37,13 +37,9 @@ pub struct TapeBake {
     pub imagery: Option<i64>,
     /// What the pack carries of its tiles.
     pub content: tuile_pack::Content,
-    /// No ground at all: a pack of the tape's cameras and nothing else,
-    /// baked without a source. A renderer draws such a frame as sky alone
-    /// — the air, the sun, the Moon and the stars over the atmosphere's own
-    /// smooth planet — which is what a sky is checked by where no source is
-    /// at hand. Never a film's ground: its packs are named apart
-    /// (`….sky`).
-    pub sky_only: bool,
+    /// Where the ground comes from ([`crate::open::Ground`]): ion's assets
+    /// above, or an open source that needs no token.
+    pub ground: crate::open::Ground,
 }
 
 impl TapeBake {
@@ -61,11 +57,9 @@ impl TapeBake {
         Ok(poses)
     }
 
-    /// Whether its terrain or its imagery is an open source
-    /// ([`crate::open`]): baked with no token.
-    pub fn open_sources(&self) -> bool {
-        self.terrain.is_some_and(crate::open::is_open)
-            || self.imagery.is_some_and(crate::open::is_open)
+    /// Whether a bake of it needs an ion token.
+    pub fn needs_token(&self) -> bool {
+        self.ground.needs_token()
     }
 
     /// The globe as this bake sets it, before a session is opened on it.
@@ -83,9 +77,16 @@ impl TapeBake {
             config.imagery_asset_id = if id < 0 { None } else { Some(id) };
         }
         // The open sources answer for themselves: no token is read.
-        if crate::open::is_open(config.terrain_asset_id)
-            || config.imagery_asset_id.is_some_and(crate::open::is_open)
-        {
+        let open = match self.ground {
+            crate::open::Ground::Ion => None,
+            crate::open::Ground::OpenEarth => {
+                Some((crate::open::ELLIPSOID, Some(crate::open::BLUE_MARBLE)))
+            }
+            crate::open::Ground::Empty => Some((crate::open::NOTHING, None)),
+        };
+        if let Some((terrain, imagery)) = open {
+            config.terrain_asset_id = terrain;
+            config.imagery_asset_id = imagery;
             config.sources = Some(crate::globe::SourcesHandle(std::sync::Arc::new(
                 crate::open::OpenSources::new(self.cache_dir.clone()),
             )));
@@ -112,9 +113,6 @@ impl TapeBake {
     /// resolved settings — not over the frames baked, so that every pack of
     /// one film agrees on it.
     pub fn scene(&self) -> String {
-        if self.sky_only {
-            return digest_of_scene(&self.poses, self.viewport, "sky-only");
-        }
         let config = self.config();
         let resolved = exact_traversal(config.session.traversal.clone());
         digest_of_scene(
@@ -128,7 +126,6 @@ impl TapeBake {
     /// `packs/<scene>[.references|.both]`.
     pub fn packs(&self) -> String {
         let kind = match self.content {
-            _ if self.sky_only => ".sky",
             tuile_pack::Content::References => ".references",
             tuile_pack::Content::Both => ".both",
             _ => "",
@@ -153,14 +150,8 @@ impl TapeBake {
                 self.poses.len()
             ));
         }
-        if self.sky_only {
-            return self.bake_sky(first, wanted as u32, out);
-        }
         let mut config = self.config();
         let layers = self.layers();
-        // Open sources are not the shared tile store's to keep: their tiles
-        // stay in the pack and in this machine's cache.
-        let tiles = tiles.filter(|_| config.sources.is_none());
         if let Some(tiles) = tiles {
             let mut namespaces = vec![layers.0.clone()];
             namespaces.extend(layers.1.clone());
@@ -226,39 +217,6 @@ impl TapeBake {
     }
 }
 
-impl TapeBake {
-    /// [`TapeBake::sky_only`]'s pack: the cameras of `first..=last`, no tile.
-    fn bake_sky(&self, first: u32, last: u32, out: &Path) -> Result<BakeOutcome, String> {
-        let scene = self.scene();
-        let blob = out.with_extension("blob.part");
-        let mut writer = tuile_pack::PackWriter::new(scene.clone(), [0.0; 3], &blob)
-            .map_err(|e| format!("{}: {e}", blob.display()))?
-            .culling("sky-only");
-        for number in first..=last {
-            let pose = self.poses[number as usize - 1];
-            writer.frame(
-                number,
-                tuile_pack::BakedView {
-                    position: pose.position,
-                    direction: pose.direction,
-                    up: pose.up,
-                    viewport_px: [self.viewport.0, self.viewport.1],
-                    fovy_rad: pose.fovy,
-                },
-                [],
-            );
-        }
-        let bytes = writer
-            .finish_to(out)
-            .map_err(|e| format!("{}: {e}", out.display()))?;
-        Ok(BakeOutcome {
-            scene,
-            poses: self.poses[first as usize - 1..last as usize].to_vec(),
-            bytes,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,19 +240,20 @@ mod tests {
             terrain: None,
             imagery: None,
             content: tuile_pack::Content::References,
-            sky_only: false,
+            ground: crate::open::Ground::Ion,
         }
     }
 
     #[test]
-    fn a_sky_pack_is_baked_without_a_source_and_named_apart() {
+    fn no_ground_is_baked_through_the_same_stages_with_no_token() {
         let sky = TapeBake {
             token: String::new(),
-            sky_only: true,
+            ground: crate::open::Ground::Empty,
             ..bake()
         };
-        assert!(sky.packs().ends_with(".sky"), "{}", sky.packs());
+        assert!(!sky.needs_token());
         assert_ne!(sky.scene(), bake().scene());
+        assert_eq!(sky.layers().1, None);
         let dir = tempfile::tempdir().expect("dir");
         let out = dir.path().join("sky.tuilepack");
         let done = sky.bake(2, 3, &out, None).expect("baked with no token");
@@ -302,8 +261,8 @@ mod tests {
         let bytes = std::fs::read(&out).expect("read");
         let pack = tuile_pack::Pack::open(&bytes).expect("open");
         assert_eq!(pack.frame_range(), (2, 3));
-        assert_eq!(pack.tile_count(), 0);
-        assert_eq!(pack.culling(), "sky-only");
+        // The two roots, and no triangle in either.
+        assert!(pack.tile_count() <= 2, "{}", pack.tile_count());
     }
 
     #[test]
