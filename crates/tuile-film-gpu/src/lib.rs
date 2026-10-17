@@ -2524,7 +2524,7 @@ impl FilmGpu {
         let geodetic = tuile_core::geo::ecef_to_geodetic(ground);
         let model = self.atmosphere.model.as_ref().expect("held above");
         let reference = self.atmosphere.reference.as_ref().expect("held above");
-        let metering = metering_points(
+        let metering = Self::metering_points_of(
             frame,
             &tuile_atmosphere::AtmosphereFrame::at(geodetic),
             geodetic.height,
@@ -2577,6 +2577,22 @@ impl FilmGpu {
         self.atmosphere.key = Some(key);
         self.atmosphere.sky_view_stale = true;
         Ok(())
+    }
+
+    /// The frame camera's metering rays ([`tuile_atmosphere::hillaire::metering`]).
+    fn metering_points_of(
+        frame: &FrameCamera,
+        sphere: &tuile_atmosphere::AtmosphereFrame,
+        ground_height: f64,
+    ) -> Vec<tuile_atmosphere::hillaire::Metered> {
+        let v = frame.view;
+        let p = frame.projection;
+        let right = (v.row(0).truncate() / p.x_axis.x).as_dvec3();
+        let up = (v.row(1).truncate() / p.y_axis.y).as_dvec3();
+        let fwd = (-v.row(2).truncate()).as_dvec3()
+            + right * f64::from(p.z_axis.x)
+            + up * f64::from(p.z_axis.y);
+        tuile_atmosphere::hillaire::metering(frame.eye, fwd, right, up, sphere, ground_height)
     }
 
     /// Under a physical atmosphere the frame's lights are pre-exposed: the
@@ -2711,50 +2727,4 @@ impl FilmGpu {
     pub fn pixel_list_bytes(&self) -> u64 {
         self.targets.list.size()
     }
-}
-
-/// What a frame's light is metered over: a grid of twenty-four by fourteen
-/// rays — fine enough to fall on a limb a few degrees thick —
-/// across the camera's view — the ground where one meets the sphere the air
-/// is laid on, at the height of the ground under the eye, and the sky where
-/// one does not.
-fn metering_points(
-    frame: &FrameCamera,
-    sphere: &tuile_atmosphere::AtmosphereFrame,
-    ground_height: f64,
-) -> Vec<tuile_atmosphere::hillaire::Metered> {
-    use tuile_atmosphere::hillaire::Metered;
-    let v = frame.view;
-    let p = frame.projection;
-    let right = (v.row(0).truncate() / p.x_axis.x).as_dvec3();
-    let up = (v.row(1).truncate() / p.y_axis.y).as_dvec3();
-    let fwd = (-v.row(2).truncate()).as_dvec3()
-        + right * f64::from(p.z_axis.x)
-        + up * f64::from(p.z_axis.y);
-    let radius = sphere.radius + ground_height;
-    let o = frame.eye - sphere.centre;
-    let (columns, rows) = (24, 14);
-    let mut out = Vec::with_capacity(columns * rows);
-    for j in 0..rows {
-        for i in 0..columns {
-            let x = (i as f64 + 0.5) / columns as f64 * 2.0 - 1.0;
-            let y = (j as f64 + 0.5) / rows as f64 * 2.0 - 1.0;
-            let d = (fwd + right * x + up * y).normalize();
-            let b = o.dot(d);
-            let disc = b * b - (o.length_squared() - radius * radius);
-            let t = -b - disc.max(0.0).sqrt();
-            if disc >= 0.0 && t > 0.0 {
-                out.push(Metered::Ground {
-                    eye: frame.eye,
-                    point: frame.eye + d * t,
-                });
-            } else {
-                out.push(Metered::Sky {
-                    eye: frame.eye,
-                    direction: d,
-                });
-            }
-        }
-    }
-    out
 }

@@ -13,7 +13,10 @@
 //   var transmittance_lut: texture_2d<f32>;
 //   var multi_scattering_lut: texture_2d<f32>;
 //   var irradiance_lut: texture_2d<f32>;
-//   var lut_sampler: sampler;   // unused by the tables, kept for the host
+//   var night_lights_lut: texture_2d<f32>;   // filterable
+//   var lut_sampler: sampler;   // filtering: the night lights'
+//
+// `hillaire::wgsl_bindings` writes them.
 //
 // The tables are 32-bit floats, read by `lut_bilinear`: a night's light is
 // ten orders of magnitude under a day's, and half floats flush it to steps
@@ -561,3 +564,27 @@ fn stars_seen(n: vec3f, sigma: f32) -> vec3f {
     let mu = dot(atmosphere.up.xyz, n);
     return spot * tint * transmittance(atmosphere.sun.w, mu);
 }
+
+// The light of towns at night at `p` (eye-relative), in the renderer's
+// units, from the night-lights map (a geographic grid, row 0 at the north
+// pole). Towns light up as the ground's own light falls: shown at a few
+// times the night floor where the ground is lit by little more than it,
+// gone in daylight.
+fn city_light(p: vec3f, ground: vec3f) -> vec3f {
+    if (atmosphere.earth.w == 0.0) { return vec3f(0.0); }
+    let x = p - atmosphere.earth.xyz;
+    let lon = atan2(x.y, x.x);
+    // Geocentric to geodetic: the tangent over 1 − e².
+    let lat = atan(x.z / (length(x.xy) * (1.0 - 0.00669438)));
+    let uv = vec2f(lon / (2.0 * ATMOSPHERE_PI) + 0.5, 0.5 - lat / ATMOSPHERE_PI);
+    let lit = textureSampleLevel(night_lights_lut, lut_sampler, uv, 0.0).r;
+    let luma = vec3f(0.2126, 0.7152, 0.0722);
+    let floor = max(dot(atmosphere.least.xyz, luma), 1e-30);
+    let fade = 1.0 - smoothstep(2.0 * floor, 40.0 * floor, dot(ground, luma));
+    // Sodium and LED: a warm white.
+    // The brightest about eight times ground of a tenth's reflectance under
+    // the floor: a city is the brightest thing on a night side, never a
+    // flare.
+    return vec3f(1.0, 0.78, 0.5) * pow(lit, 2.2) * 0.8 * floor * fade;
+}
+

@@ -37,6 +37,23 @@ use crate::params::{AtmosphereFrame, AtmosphereParams};
 /// functions over an `Atmosphere` uniform the including module binds.
 pub const WGSL: &str = include_str!("hillaire.wgsl");
 
+/// The bindings [`WGSL`] reads, at `group`: what any renderer — a film's or
+/// a viewer's — declares before including it, its bind group laid out the
+/// same. Binding 4 is a filtering sampler; 7, the night lights, a filterable
+/// texture; every other a 32-bit float table, read by hand.
+pub fn wgsl_bindings(group: u32) -> String {
+    format!(
+        "@group({group}) @binding(0) var<uniform> atmosphere: Atmosphere;\n\
+         @group({group}) @binding(1) var transmittance_lut: texture_2d<f32>;\n\
+         @group({group}) @binding(2) var multi_scattering_lut: texture_2d<f32>;\n\
+         @group({group}) @binding(3) var sky_view_lut: texture_2d<f32>;\n\
+         @group({group}) @binding(4) var lut_sampler: sampler;\n\
+         @group({group}) @binding(5) var irradiance_lut: texture_2d<f32>;\n\
+         @group({group}) @binding(6) var moon_view_lut: texture_2d<f32>;\n\
+         @group({group}) @binding(7) var night_lights_lut: texture_2d<f32>;\n"
+    )
+}
+
 /// Transmittance table: width (zenith cosine) by height.
 pub const TRANSMITTANCE_SIZE: [usize; 2] = [256, 64];
 /// Multiple-scattering table: sun zenith cosine by height.
@@ -911,6 +928,45 @@ fn irradiance_unit(height: f64, thickness: f64) -> f64 {
 pub enum Metered {
     Ground { eye: DVec3, point: DVec3 },
     Sky { eye: DVec3, direction: DVec3 },
+}
+
+/// What a camera at `eye` (ECEF) meters: a grid of twenty-four by fourteen
+/// rays across its view — `fwd + x·right + y·up` for `x`, `y` in [−1, 1],
+/// fine enough to fall on a limb a few degrees thick — the ground where one
+/// meets `sphere` raised by `ground_height`, the sky where one does not. The
+/// same for a film's frame and a viewer's: [`LutAtmosphere::light`] takes
+/// it.
+pub fn metering(
+    eye: DVec3,
+    fwd: DVec3,
+    right: DVec3,
+    up: DVec3,
+    sphere: &AtmosphereFrame,
+    ground_height: f64,
+) -> Vec<Metered> {
+    let radius = sphere.radius + ground_height;
+    let o = eye - sphere.centre;
+    let (columns, rows) = (24, 14);
+    let mut out = Vec::with_capacity(columns * rows);
+    for j in 0..rows {
+        for i in 0..columns {
+            let x = (i as f64 + 0.5) / columns as f64 * 2.0 - 1.0;
+            let y = (j as f64 + 0.5) / rows as f64 * 2.0 - 1.0;
+            let d = (fwd + right * x + up * y).normalize();
+            let b = o.dot(d);
+            let disc = b * b - (o.length_squared() - radius * radius);
+            let t = -b - disc.max(0.0).sqrt();
+            if disc >= 0.0 && t > 0.0 {
+                out.push(Metered::Ground {
+                    eye,
+                    point: eye + d * t,
+                });
+            } else {
+                out.push(Metered::Sky { eye, direction: d });
+            }
+        }
+    }
+    out
 }
 
 /// The reflectance a camera's meter takes a scene for: middle grey. Sky is

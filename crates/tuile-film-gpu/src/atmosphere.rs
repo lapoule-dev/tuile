@@ -244,16 +244,7 @@ pub const LUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 /// The declarations `hillaire.wgsl` asks of the module that includes it, at
 /// `group`, with the sky-view table beside them.
 pub fn declarations(group: u32) -> String {
-    format!(
-        "@group({group}) @binding(0) var<uniform> atmosphere: Atmosphere;\n\
-         @group({group}) @binding(1) var transmittance_lut: texture_2d<f32>;\n\
-         @group({group}) @binding(2) var multi_scattering_lut: texture_2d<f32>;\n\
-         @group({group}) @binding(3) var sky_view_lut: texture_2d<f32>;\n\
-         @group({group}) @binding(4) var lut_sampler: sampler;\n\
-         @group({group}) @binding(5) var irradiance_lut: texture_2d<f32>;\n\
-         @group({group}) @binding(6) var moon_view_lut: texture_2d<f32>;\n\
-         @group({group}) @binding(7) var night_lights_lut: texture_2d<f32>;\n"
-    )
+    tuile_atmosphere::hillaire::wgsl_bindings(group)
 }
 
 pub fn layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -382,6 +373,8 @@ impl AtmosphereGpu {
              @group(0) @binding(4) var sky_view_out: texture_storage_2d<rgba32float, write>;\n\
              @group(0) @binding(5) var moon_view_out: texture_storage_2d<rgba32float, write>;\n\
              @group(0) @binding(6) var irradiance_lut: texture_2d<f32>;\n\
+             @group(0) @binding(7) var night_lights_lut: texture_2d<f32>;\n\
+             @group(0) @binding(8) var lut_sampler: sampler;\n\
              {}\n{}",
             tuile_atmosphere::hillaire::WGSL,
             include_str!("shaders/sky_view.wgsl")
