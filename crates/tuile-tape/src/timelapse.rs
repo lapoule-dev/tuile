@@ -30,7 +30,7 @@
 
 use crate::Frame;
 use glam::{DMat3, DVec3};
-use tuile_core::geo::{enu_frame, geodetic_to_ecef, Geodetic};
+use tuile_core::geo::Geodetic;
 
 /// Where a body stands over a place: degrees from north through east, and
 /// over the horizon.
@@ -224,17 +224,17 @@ impl TimeLapse {
 
     /// The camera of frame `frame` aimed at `heading` and `pitch`, radians.
     fn camera_aimed(&self, frame: u32, heading: f64, pitch: f64) -> Frame {
-        let place = Geodetic {
-            lon: self.lon_deg.to_radians(),
-            lat: self.lat_deg.to_radians(),
-            height: self.height_m,
-        };
-        let eye = geodetic_to_ecef(place);
-        let enu: DMat3 = enu_frame(place);
+        // Built as every globe camera is: over its place, its heading from
+        // north, its pitch under the horizon.
+        let camera = tuile_camera::GlobeCamera::from_geodetic(
+            self.lat_deg.to_radians(),
+            self.lon_deg.to_radians(),
+            self.height_m,
+            heading,
+            -pitch,
+            self.fovy_deg.to_radians(),
+        );
         let n = f64::from(frame.saturating_sub(1));
-        let level = enu.x_axis * heading.sin() + enu.y_axis * heading.cos();
-        let direction = level * pitch.cos() + enu.z_axis * pitch.sin();
-        let up = (enu.z_axis - direction * direction.dot(enu.z_axis)).normalize();
         // Held to the stars: everything turned back by as much as the Earth
         // has turned since the first frame.
         let turn = match self.frame {
@@ -243,12 +243,11 @@ impl TimeLapse {
                 DMat3::from_rotation_z(-EARTH_ROTATION * n * self.clock().seconds_per_frame)
             }
         };
-        let (eye, direction, up) = (turn * eye, turn * direction, turn * up);
         Frame {
-            position: eye.to_array(),
-            direction: direction.normalize().to_array(),
-            up: up.normalize().to_array(),
-            fovy: self.fovy_deg.to_radians(),
+            position: (turn * camera.position).to_array(),
+            direction: (turn * camera.direction).normalize().to_array(),
+            up: (turn * camera.up).normalize().to_array(),
+            fovy: camera.fovy,
         }
     }
 
@@ -352,25 +351,16 @@ pub fn parse_utc(text: &str) -> Option<f64> {
         return seconds.is_finite().then_some(seconds);
     }
     let text = text.strip_suffix('Z').unwrap_or(text);
-    let (date, time) = text.split_once('T').unwrap_or((text, "00:00"));
-    let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
-    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
-    if d.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&day) {
-        return None;
-    }
-    let mut t = time.split(':');
-    let hour: i64 = t.next()?.parse().ok()?;
-    let minute: i64 = t.next()?.parse().ok()?;
-    let second: f64 = t.next().map_or(Some(0.0), |s| s.parse().ok())?;
-    // Days from 1970-01-01, by Howard Hinnant's days-from-civil.
-    let yy = if m <= 2 { y - 1 } else { y };
-    let era = if yy >= 0 { yy } else { yy - 399 } / 400;
-    let yoe = yy - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some((days * 86_400 + hour * 3_600 + minute * 60) as f64 + second)
+    let at = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M"]
+        .iter()
+        .find_map(|f| chrono::NaiveDateTime::parse_from_str(text, f).ok())
+        .or_else(|| {
+            chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+        })?;
+    let utc = at.and_utc();
+    Some(utc.timestamp() as f64 + f64::from(utc.timestamp_subsec_nanos()) * 1e-9)
 }
 
 /// The eye of `camera` as a vector.
@@ -381,7 +371,7 @@ pub fn eye(camera: &Frame) -> DVec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tuile_core::geo::ecef_to_geodetic;
+    use tuile_core::geo::{ecef_to_geodetic, enu_frame};
 
     fn words(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_owned).collect()
