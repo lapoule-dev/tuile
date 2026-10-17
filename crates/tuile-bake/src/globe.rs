@@ -107,6 +107,9 @@ pub struct GlobeConfig {
     /// The host's own sources, in place of the built-in ones: see
     /// [`Sources`]. With one, the token is not read.
     pub sources: Option<SourcesHandle>,
+    /// Sources for the imagery alone, the terrain staying ion's: an open
+    /// imagery over ion's relief. Ignored when [`Self::sources`] is set.
+    pub imagery_sources: Option<SourcesHandle>,
     pub session: SessionConfig,
 }
 
@@ -155,6 +158,7 @@ impl GlobeConfig {
             held_drape: None,
             tile_cache: None,
             sources: None,
+            imagery_sources: None,
             session: SessionConfig::default(),
         }
     }
@@ -504,6 +508,38 @@ async fn resolve(
         );
         return Ok((tree, loader, detail, heights, provenance));
     };
+
+    // An imagery of the host's over ion's terrain: asked of it, as a
+    // host's sources are, and cached the same way.
+    if let Some(sources) = &config.imagery_sources {
+        let imagery = sources
+            .0
+            .imagery(imagery_asset_id)
+            .await
+            .map_err(GlobeError::Sources)?;
+        let imagery = Cached::wrap_imagery(
+            Held(imagery),
+            config.tile_cache.clone().map(|c| c.0),
+            imagery_asset_id,
+        );
+        let options = GlobeOptions {
+            no_imagery: false,
+            max_level: max_level(),
+            imagery_slots,
+            imagery_boost_cap: imagery_boost_cap(),
+            deterministic_floor: true,
+            held_drape: config.held_drape.clone(),
+            composed_at: config.session.bake_max_size,
+            imagery_by_stamp: names_only(config),
+        };
+        return Ok(globe_with_provenance(
+            terrain,
+            imagery,
+            layer,
+            options,
+            offload::threaded(),
+        ));
+    }
 
     let ion = IonClient::new(Arc::clone(&http), config.ion_token.clone());
     let endpoint = match ion

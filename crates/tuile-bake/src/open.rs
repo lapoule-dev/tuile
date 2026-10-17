@@ -435,6 +435,31 @@ pub async fn night_lights(cache_dir: Option<std::path::PathBuf>) -> Result<Night
 /// default two are known well enough to declare, the others are left to a
 /// store that already describes them. A layer a store already has is never
 /// redeclared ([`crate::tiles::Tiles::from_env_with_layers`]).
+/// Whether the imagery asset `asset` is one of the open sources': it can
+/// drape ion's terrain as well as the open ellipsoid.
+pub fn is_open_imagery(asset: i64) -> bool {
+    asset == BLUE_MARBLE
+}
+
+/// Blue Marble's layer in the tile store.
+fn blue_marble_layer() -> tuile_tile_server::LayerDef {
+    tuile_tile_server::LayerDef {
+        name: crate::source_namespace(BLUE_MARBLE),
+        grid: tuile_tile_server::Grid::WebMercator,
+        tile_type: "jpeg".into(),
+        tile_compression: "none".into(),
+        zone_level: 10,
+        expiry_days: None,
+        content_type: "image/jpeg".into(),
+        index: false,
+        licence: Some("Public domain (NASA)".into()),
+        attribution: Some(
+            "Imagery: NASA Earth Observatory, Blue Marble: Next Generation, served by NASA EOSDIS GIBS"
+                .into(),
+        ),
+    }
+}
+
 pub fn store_layers(ground: Ground, ion: (i64, Option<i64>)) -> Vec<tuile_tile_server::LayerDef> {
     use tuile_tile_server::{Grid, LayerDef};
     let terrain = |asset: i64| LayerDef {
@@ -460,6 +485,9 @@ pub fn store_layers(ground: Ground, ion: (i64, Option<i64>)) -> Vec<tuile_tile_s
                     ..terrain(ion.0)
                 });
             }
+            if ion.1.is_some_and(is_open_imagery) {
+                layers.push(blue_marble_layer());
+            }
             if ion.1 == Some(crate::BING_AERIAL) {
                 layers.push(LayerDef {
                     name: crate::source_namespace(crate::BING_AERIAL),
@@ -480,21 +508,7 @@ pub fn store_layers(ground: Ground, ion: (i64, Option<i64>)) -> Vec<tuile_tile_s
         Ground::Empty => vec![terrain(NOTHING)],
         Ground::OpenEarth => vec![
             terrain(ELLIPSOID),
-            LayerDef {
-                name: crate::source_namespace(BLUE_MARBLE),
-                grid: Grid::WebMercator,
-                tile_type: "jpeg".into(),
-                tile_compression: "none".into(),
-                zone_level: 10,
-                expiry_days: None,
-                content_type: "image/jpeg".into(),
-                index: false,
-                licence: Some("Public domain (NASA)".into()),
-                attribution: Some(
-                    "Imagery: NASA Earth Observatory, Blue Marble: Next Generation, served by NASA EOSDIS GIBS"
-                        .into(),
-                ),
-            },
+            blue_marble_layer(),
         ],
     }
 }
@@ -569,6 +583,11 @@ mod tests {
         );
         assert!(names((7, Some(9))).is_empty());
         assert_eq!(names((crate::CESIUM_WORLD_TERRAIN, None)), ["asset-1"]);
+        // An open imagery over ion's relief: declared with its own licence.
+        assert_eq!(
+            names((crate::CESIUM_WORLD_TERRAIN, Some(BLUE_MARBLE))),
+            ["asset-1", "asset-1000000101"]
+        );
     }
 
     #[test]

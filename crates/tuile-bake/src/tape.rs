@@ -93,6 +93,13 @@ impl TapeBake {
             }
             crate::open::Ground::Empty => Some((crate::open::NOTHING, None)),
         };
+        // An open imagery over ion's relief: ion's terrain, the imagery
+        // answered by the open sources.
+        if open.is_none() && config.imagery_asset_id.is_some_and(crate::open::is_open_imagery) {
+            config.imagery_sources = Some(crate::globe::SourcesHandle(std::sync::Arc::new(
+                crate::open::OpenSources::new(self.cache_dir.clone()),
+            )));
+        }
         if let Some((terrain, imagery)) = open {
             config.terrain_asset_id = terrain;
             config.imagery_asset_id = imagery;
@@ -272,6 +279,23 @@ mod tests {
         assert_eq!(pack.frame_range(), (2, 3));
         // The two roots, and no triangle in either.
         assert!(pack.tile_count() <= 2, "{}", pack.tile_count());
+    }
+
+    #[test]
+    fn an_open_imagery_drapes_ions_relief_and_names_its_own_scene() {
+        let nasa = TapeBake {
+            imagery: Some(crate::open::BLUE_MARBLE),
+            ..bake()
+        };
+        let config = nasa.config();
+        // Ion's relief, the open imagery: only the imagery is asked elsewhere.
+        assert!(config.sources.is_none());
+        assert!(config.imagery_sources.is_some());
+        assert_eq!(config.terrain_asset_id, crate::CESIUM_WORLD_TERRAIN);
+        assert!(nasa.needs_token());
+        assert_eq!(nasa.layers().1.as_deref(), Some("asset-1000000101"));
+        assert_ne!(nasa.scene(), bake().scene());
+        assert!(bake().config().imagery_sources.is_none());
     }
 
     #[test]
