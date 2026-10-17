@@ -1,0 +1,42 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!-- Copyright (c) lapoule.dev -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESRGAN on WebGPU</title>
+<style>
+  :root { --bg: #111; --fg: #e8e8e8; --dim: #9a9a9a; --ok: #7fd18b; --bad: #ff7b72; --line: #2a2a2a; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.45 ui-sans-serif, system-ui, sans-serif; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--dim); margin-bottom: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+  figure { margin: 0; }
+  figcaption { color: var(--dim); font-size: 12px; margin-top: 4px; }
+  canvas { width: 100%; aspect-ratio: 1; image-rendering: pixelated; background: #000; display: block; }
+  table { border-collapse: collapse; margin-top: 12px; }
+  td { padding: 2px 14px 2px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td:first-child { color: var(--dim); }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  #log { white-space: pre-wrap; color: var(--dim); font: 12px ui-monospace, monospace; margin-top: 12px; }
+  label { color: var(--dim); }
+</style>
+</head>
+<body>
+<h1>Real-ESRGAN compact ×4 on WebGPU</h1>
+<div class="sub" id="what">Burn, compiled to wasm, on the browser's GPU.</div>
+<div class="sub"><label>Zoom: <select id="zoom">
+  <option value="1">whole tile</option><option value="2">×2 (centre)</option><option value="4" selected>×4 (centre)</option>
+</select></label></div>
+<div class="grid">
+  <figure><canvas id="c-input"></canvas><figcaption>Input: z17 tile, 256², nearest</figcaption></figure>
+  <figure><canvas id="c-bicubic"></canvas><figcaption>Bicubic ×4 (Keys, a = −0.5)</figcaption></figure>
+  <figure><canvas id="c-esrgan"></canvas><figcaption>Real-ESRGAN compact ×4, Burn on WebGPU</figcaption></figure>
+  <figure><canvas id="c-truth"></canvas><figcaption>Served z19 (for looking only: never scored against)</figcaption></figure>
+</div>
+<table id="facts"></table>
+<div id="log"></div>
+<script type="module" src="main.js"></script>
+</body>
+</html>
