@@ -64,16 +64,57 @@ the Moon from the frame's own eye.
   ground and no sky — space included — is drawn darker than a sixteenth of
   noon. Never black.
 
+## Discs, glare, veil and towns
+
+- **Discs.** `Look::sun_scale` and `Look::moon_scale` draw the sun's and
+  the Moon's discs that many times their size, each keeping its own
+  radiance, limb and phase. 1 is the sky as it is (half a degree); the
+  time-lapse films use 3 and 5.
+- **Glare.** `Look::glare` (1 by default; 0 for none) spreads a disc's
+  light by a camera point-spread function: two normalised Lorentzian rings
+  (4 % of the light in a 1.5° core, 1 % in an 8° halo) and a faint
+  six-pointed star. It is an energy-conserving convolution of a point
+  source, computed analytically per pixel. It is hidden where ground
+  stands before the disc. The meter reads the air, never the discs: the
+  exposure does not crash when the sun is in frame.
+- **Veil.** The air's light between eye and ground is bounded softly at six
+  times the ground's own light (on ground of a tenth's reflectance). By
+  day the bound is seldom reached. At twilight, air still lit by the sky
+  high above would otherwise lay one grey over ground lit by little, and
+  the relief would go. This is a photographer's choice over physics, and
+  it is stated as one.
+- **Towns.** With night lights, NASA's Black Marble lights towns as the
+  ground's own light falls. The mosaic is fetched once by the production,
+  kept in the run store by its content, and read from there by the render.
+
 ## Time-lapses
 
 `tuile-film-timelapse <tape> key=value…` writes the cameras of one generic
-time-lapse and its clock (`<tape>.clock`): place, height, start, duration,
-film length, fps, camera frame (`earth` or `inertial`), motion (`spin`
-turns or held heading), pitch and its swing, field of view.
-`tuile-film-produce --atmosphere --clock <start>,<seconds a frame>` lights
-each frame by its instant. `--sky-only` bakes packs of cameras with no
-ground — the sky over the atmosphere's own smooth planet — without any
-tile source: what a sky is checked by.
+time-lapse and the frames' instants, as a versioned `/clock` record in the
+tape itself. Its parameters are:
+
+- place and height, start and duration, film length and fps;
+- the camera's frame (`earth` or `inertial`);
+- its motion (`spin=<turns>`, `track=sun-moon` or a held heading);
+- pitch and its swing, and the vertical field of view.
+
+`track=sun-moon` turns the camera to the sun by day and through twilight
+and to the Moon at night, raised to keep it in frame with ground below.
+The tape asks a `Sky` trait for the bodies; the ephemerides answer from
+`tuile-film-native`.
+
+`tuile-film-produce` reads the instants from the tape (`--clock` overrides
+them). A frame's light comes from one path: the host's
+(`Overlays::light`), else the tape's instant, else the look's. A film
+under a physical atmosphere with neither instants nor a sun placed by hand
+is refused.
+
+`--ground ion|open-earth|empty` chooses the ground:
+
+- `ion`: Cesium World Terrain and Bing Aerial;
+- `open-earth`: the ellipsoid draped with NASA's Blue Marble, no token;
+- `empty`: no ground, two root tiles of no triangle, baked through the
+  same stages, only under `--atmosphere`.
 
 A camera held to the stars (`frame=inertial`) sees the Earth turn beneath
 it, but the sun does not move in its sky: the terminator stays put in the
