@@ -264,6 +264,15 @@ pub fn concat(segments: &[PathBuf], out: &Path) -> Result<u64, ConcatError> {
         offset += end;
     }
     writer.write_end().map_err(out_mp4)?;
+    drop(writer);
+    // The writer sums the movie's duration a sample at a time, each cut to
+    // a whole millisecond: a 60 fps film came out 4 % short in every
+    // player. Its exact length, written over that sum.
+    let mut bytes = std::fs::read(out).map_err(out_io)?;
+    let millis =
+        (offset * 1000 + u64::from(format.timescale) / 2) / u64::from(format.timescale.max(1));
+    tuile_mp4::set_movie_duration(&mut bytes, millis);
+    std::fs::write(out, bytes).map_err(out_io)?;
     Ok(frames)
 }
 
@@ -375,6 +384,13 @@ mod tests {
         let out = dir.path().join("film.mp4");
         assert_eq!(concat(&[a, b], &out).expect("concat"), 19);
         assert_eq!(count_frames(&out).expect("count"), 19);
+        // The film lasts its frames: 19 of 256 ticks at 15 360 a second,
+        // 316.7 ms — not 19 times a frame cut to a whole millisecond (304).
+        let bytes = std::fs::read(&out).expect("read");
+        let size = bytes.len() as u64;
+        let header =
+            mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), size).expect("header");
+        assert_eq!(header.duration().as_millis(), 317);
 
         let (mut reader, id, _) = open(&out).expect("open film");
         let mut previous_end = 0;

@@ -141,6 +141,7 @@ enum Writer {
 pub struct Muxer {
     writer: Writer,
     next: u64,
+    fps: u32,
 }
 
 /// Ticks per frame. 512 is what FFmpeg picks for common rates and divides
@@ -186,7 +187,11 @@ impl Muxer {
                 Writer::Avc(writer, sets)
             }
         };
-        Ok(Self { writer, next: 0 })
+        Ok(Self {
+            writer,
+            next: 0,
+            fps,
+        })
     }
 
     /// Fails unless a slice encoded as `codec` can join this film: the same
@@ -244,15 +249,87 @@ impl Muxer {
             Writer::Av1(writer) => Ok(writer.finish()),
             Writer::Avc(mut writer, _) => {
                 writer.write_end()?;
-                Ok(writer.into_writer().into_inner())
+                let mut bytes = writer.into_writer().into_inner();
+                // The `mp4` crate adds up the movie's duration a sample at a
+                // time, each one cut to a whole millisecond: 16 ms a frame at
+                // 60 fps instead of 16.67, and a player stops the film 4 %
+                // early — 288 frames of a two-minute film never shown (1 %
+                // at 30 fps). The exact duration, written over its sum.
+                let millis =
+                    (self.next * 1000 + u64::from(self.fps) / 2) / u64::from(self.fps.max(1));
+                set_movie_duration(&mut bytes, millis);
+                Ok(bytes)
             }
         }
     }
 }
 
+/// Writes `millis` as the duration of the movie header and of every track
+/// header of the film in `bytes`, whose movie timescale is the millisecond:
+/// what the `mp4` crate's writer gets wrong (see [`Muxer::finish`]).
+pub fn set_movie_duration(bytes: &mut [u8], millis: u64) {
+    fn walk(bytes: &mut [u8], from: usize, to: usize, millis: u64) {
+        let mut at = from;
+        while at + 8 <= to {
+            let size = u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+                as usize;
+            let kind = [bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]];
+            if size < 8 || at + size > to {
+                return;
+            }
+            let body = at + 8;
+            match &kind {
+                b"moov" | b"trak" => walk(bytes, body, at + size, millis),
+                b"mvhd" | b"tkhd" => {
+                    let v1 = bytes[body] == 1;
+                    let offset = match (&kind, v1) {
+                        (b"mvhd", false) => 16,
+                        (b"mvhd", true) => 24,
+                        (_, false) => 20,
+                        (_, true) => 28,
+                    };
+                    let field = body + offset;
+                    if v1 {
+                        bytes[field..field + 8].copy_from_slice(&millis.to_be_bytes());
+                    } else {
+                        let ms = u32::try_from(millis).unwrap_or(u32::MAX);
+                        bytes[field..field + 4].copy_from_slice(&ms.to_be_bytes());
+                    }
+                }
+                _ => {}
+            }
+            at += size;
+        }
+    }
+    let len = bytes.len();
+    walk(bytes, 0, len, millis);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_film_at_sixty_frames_a_second_lasts_as_long_as_its_frames() {
+        let sets = ParameterSets::from_avcc(&avcc(SPS, PPS)).expect("parse");
+        for (fps, frames, millis) in [(60u32, 450u64, 7_500u64), (30, 8_094, 269_800)] {
+            let mut m = Muxer::new(64, 48, fps, sets.clone()).expect("muxer");
+            for i in 0..frames {
+                m.push(
+                    i,
+                    vec![0, 0, 0, 2, if i == 0 { 0x65 } else { 0x41 }, 0],
+                    i == 0,
+                )
+                .expect("push");
+            }
+            let bytes = m.finish().expect("finish");
+            let size = bytes.len() as u64;
+            let r = mp4::Mp4Reader::read_header(Cursor::new(bytes), size).expect("read");
+            assert_eq!(r.duration().as_millis() as u64, millis, "{fps} fps");
+            let track = r.tracks().values().next().expect("track");
+            assert_eq!(track.trak.tkhd.duration, millis, "{fps} fps track header");
+        }
+    }
 
     const SPS: &[u8] = &[0x67, 0x64, 0x00, 0x28, 0xac, 0xd9];
     const PPS: &[u8] = &[0x68, 0xeb, 0xe3, 0xcb];
