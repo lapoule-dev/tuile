@@ -1,0 +1,72 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!-- Copyright (c) lapoule.dev -->
+<!--
+  Per-tile decode time in the browser, for the same records the native
+  benchmark reads (served next to this page: jpeg.bin, webp-q90-m4.bin).
+  One decode at a time, awaited, best of PASSES passes (and once with four
+  in flight, for throughput):
+  - createImageBitmap(Blob) — the path tuile-film-web takes;
+  - ImageDecoder (WebCodecs), where the browser has it.
+  Open it from a local server: python3 -m http.server, then /browser.html.
+-->
+<html><head><meta charset="utf-8"><title>Decode bench</title>
+<style>body{font:14px ui-monospace,monospace;margin:16px;background:#fff;color:#111}</style></head>
+<body><pre id="out">running…</pre>
+<script>
+const PASSES = 5;
+const out = document.getElementById("out");
+const log = (s) => { out.textContent += "\n" + s; };
+async function records(url) {
+  const buf = new Uint8Array(await (await fetch(url)).arrayBuffer());
+  const dv = new DataView(buf.buffer);
+  const recs = [];
+  for (let at = 0; at + 4 <= buf.length;) {
+    const n = dv.getUint32(at, true);
+    recs.push(buf.slice(at + 4, at + 4 + n));
+    at += 4 + n;
+  }
+  return recs;
+}
+async function bench(name, recs, f) {
+  let best = Infinity;
+  for (let p = 0; p < PASSES; p++) {
+    const t0 = performance.now();
+    for (const r of recs) await f(r);
+    best = Math.min(best, performance.now() - t0);
+  }
+  const ms = best / recs.length;
+  log(`${name.padEnd(44)} ${ms.toFixed(3)} ms/tile (${recs.length} tiles)`);
+  return ms;
+}
+(async () => {
+  out.textContent = navigator.userAgent;
+  const results = {};
+  for (const [file, type] of [["jpeg.bin", "image/jpeg"], ["webp-q90-m4.bin", "image/webp"]]) {
+    const recs = await records(file);
+    results[`${type} createImageBitmap`] = await bench(`${type} createImageBitmap`, recs, async (r) => {
+      const bmp = await createImageBitmap(new Blob([r], { type }));
+      bmp.close();
+    });
+    // Throughput, four decodes in flight: what a loader that does not
+    // await each tile sees.
+    results[`${type} createImageBitmap x4`] = await bench(`${type} createImageBitmap, 4 in flight`, [0], async () => {
+      for (let i = 0; i < recs.length; i += 4) {
+        await Promise.all(recs.slice(i, i + 4).map(async (r) => (await createImageBitmap(new Blob([r], { type }))).close()));
+      }
+    }) / recs.length;
+    log(`  (per tile: ${results[`${type} createImageBitmap x4`].toFixed(3)} ms)`);
+    if ("ImageDecoder" in self && await ImageDecoder.isTypeSupported(type)) {
+      results[`${type} ImageDecoder`] = await bench(`${type} ImageDecoder (WebCodecs)`, recs, async (r) => {
+        const dec = new ImageDecoder({ data: r, type });
+        const { image } = await dec.decode();
+        image.close();
+        dec.close();
+      });
+    } else {
+      log(`${type}: ImageDecoder not available`);
+    }
+  }
+  log("DONE " + JSON.stringify(results));
+})();
+</script></body></html>
