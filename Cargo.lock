@@ -246,8 +246,7 @@ dependencies = [
 [[package]]
 name = "astro"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "199632e1a87451cf771da7adeba192cab923ede42657ac3de0133ba6f4ae14be"
+source = "git+https://github.com/lapoule-dev/astro-rust?rev=09bf6194fec14a57541f7dd97e03bcbca82f109c#09bf6194fec14a57541f7dd97e03bcbca82f109c"
 
 [[package]]
 name = "async-compression"

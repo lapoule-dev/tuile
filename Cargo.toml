@@ -61,10 +61,13 @@ solar-positioning = { version = "0.7.1", default-features = false, features = ["
 # The Moon: Meeus's *Astronomical Algorithms* (ch. 22, 47: nutation and the
 # ELP-2000/82 series truncated to 10" in longitude, 4" in latitude), the
 # most used Rust implementation of it. MIT, pure Rust, no dependency, builds
-# for wasm32; frozen since 2016 like the series it evaluates. Chosen over
-# younger crates (`lunar-position`, `solar-ephemeris`) for its adoption: see
-# tuile-atmosphere's `moon` module.
-astro = "2.0.0"
+# for wasm32; frozen since 2016 like the series it evaluates.
+#
+# lapoule-dev's fork, pinned: 2.0.0's `mn_oblq_IAU` evaluates its polynomial
+# in ten thousand years instead of centuries, fixed there. A git dependency:
+# crates.io refuses it, so no crate that depends on this can be published
+# there until upstream is fixed.
+astro = { git = "https://github.com/lapoule-dev/astro-rust", rev = "09bf6194fec14a57541f7dd97e03bcbca82f109c" }
 # Second-order IIR filters; the camera path smoothing runs its low-pass both
 # ways. no_std, one dependency (num-traits), MIT OR Apache-2.0.
 biquad = "0.6.0"

@@ -30,10 +30,15 @@
 //! bindings do not build for the browser. One thing it does not give: the
 //! bit-identical arithmetic `solar-positioning` has through `libm` — `astro`
 //! calls the platform's `sin` and `cos`, which may differ in the last bit
-//! between targets. A picture cannot show a difference of 10⁻¹⁶ rad. And
-//! one function of it is not used: its `mn_oblq_IAU` evaluates the IAU
-//! polynomial in units of ten thousand years instead of centuries (2.5″ of
-//! declination in Meeus's example); Laskar's, which it also gives, is right.
+//! between targets. A picture cannot show a difference of 10⁻¹⁶ rad.
+//!
+//! The crate is taken from lapoule-dev's fork, pinned: the release's
+//! `mn_oblq_IAU` evaluated the IAU 1980 polynomial in ten thousand years
+//! instead of centuries (2.5″ of declination in Meeus's example). The mean
+//! obliquity used here is Laskar's all the same — good to 0.01″ over a
+//! thousand years where the IAU 1980 formula drifts to 1″ over two thousand,
+//! and the one `astro`'s own apparent sidereal time is written with — so the
+//! Moon's place and the stars' turn agree on one obliquity.
 //!
 //! # Light
 //!
@@ -321,6 +326,19 @@ mod tests {
         // A quarter Moon is about a tenth as bright as a full one.
         assert!((0.06..=0.12).contains(&ratio), "{ratio}");
         assert!(moon_irradiance(170f64.to_radians(), MOON_MEAN_DISTANCE) < 1e-3 * full);
+    }
+
+    /// The fork's fix, held: the IAU 1980 mean obliquity of Meeus's example
+    /// 22.a (1987 April 10, 0h TD) is 23°26′27.407″. The crates.io release
+    /// of `astro` gives 23°26′21.508″.
+    #[test]
+    fn the_iau_obliquity_is_meeuss_worked_example() {
+        let iau = astro::ecliptic::mn_oblq_IAU(2_446_895.5).to_degrees();
+        let seconds = (iau - 23.0 - 26.0 / 60.0) * 3600.0;
+        assert!((seconds - 27.407).abs() < 0.001, "{seconds}″");
+        // And Laskar's, the one used, agrees there.
+        let laskar = astro::ecliptic::mn_oblq_laskar(2_446_895.5).to_degrees();
+        assert!((laskar - iau).abs() * 3600.0 < 0.01);
     }
 
     #[test]
