@@ -24,6 +24,16 @@ Data and results stayed in a scratch directory and are not committed.
 - **Dedup** buys nothing: 0 duplicates within an archive, under 1 % across a
   zone's epochs.
 - **GPU texture formats** are a load-time question, not a storage one.
+- **The container as a whole** (section 6) is a different question.
+  - **Packs** are where it pays. A per-block re-encoding inside the pack
+    (pack v4) halves an embedded pack: textures go from PNG to lossless
+    WebP, and meshes from LZ4 to zstd with a dictionary. Random access
+    stays, and the farm's ≈ 2.4 GB download per task drops to ≈ 1.1 GB.
+  - **PMTiles archives** need no whole-file compression once their tiles
+    are compressed: 0.3–0.5 % is left. A whole-file zstd/xz is for **one**
+    use, a zone shipped to a phone as a unit.
+  - Never set `Content-Encoding` on a stored `.pmtiles` or `.tuilepack`
+    object: Cloudflare then ignores ranges.
 
 ## 1. What the code writes today
 
@@ -448,7 +458,263 @@ reconstruction does.
 | Dedup across epochs | −1 % | — | — | not worth it |
 | GPU block compression at load (mobile, headset) | 0 | 0 | +GPU encode at load | VRAM ÷4 to ÷8 |
 
-## 6. What was not measured
+## 6. Compressing the container itself
+
+Sections 1–5 compress what is *inside* an archive. This section asks the
+other question: compress the archive, or the film pack, **as a file**.
+
+### 6.1 Where a container moves whole, and where it is read by ranges
+
+| Use | Unit moved | Code |
+|---|---|---|
+| Farm job, pack in | the **whole pack**, ≈ 2.3–2.4 GB, as ranged GETs of 16 MiB parts, 16 in flight (≈ 150 GETs) | `tuile-farm/src/lib.rs:13-19` (88 s for 2.3 GB with one stream), `:142-156` (`part_bytes` 16 MiB × 16), `:360-404` (download in ordered parts); `job/config.rs:237` (`/tmp/scene.tuilepack`) |
+| Pack integrity | FNV-1a over the **whole blob region as stored**, once per open: "seconds per gigabyte" | `tuile-pack/src/lib.rs:351-353`, `:779-790`, `:900-915` |
+| Pack migration | the **table only**, by ranges: payloads never downloaded | `tuile-farm/src/bin/tuile-migrate-packs.rs:17-23` |
+| Tile server disk cache | **whole archives** copied to local disk and mmapped: awaited if ≤ 4 MiB, in the background if larger, ranges above 256 MiB; 8 GiB budget | `tuile-tile-server/src/disk.rs:4-23`, `:42-58` |
+| stl-tiles disk cache | the same mechanism, **12 GiB** | `stl-tiles/src/config.rs:56` (deploying repo) |
+| Compaction | reads every tile of a zone's archives, writes one new archive (8 MiB upload parts) | `tuile-tile-server/src/store.rs:98`; `archive.rs:42-102` |
+| R2/S3 at rest, backups | whole objects, immutable | — |
+| Offline/mobile bundle (future) | a zone, whole | — |
+| **Read by ranges** | | |
+| Tile reads from the bucket | header + root (16 KiB), leaf, tile | `tuile-repository/src/archives.rs:43`, `:483` |
+| Browser film and Worker | packs and archives in **fixed 8 MiB chunks**, each its own URL answered whole and cached at the edge and in the browser — "never a range" | `tuile-repository/src/cached.rs:13-16`, `:33-40`; `tuile-film-web/src/source.rs:36-47` |
+| Browser film, a frame's tiles | `Pack::span_of` + `payload_in`: a tile's blocks are contiguous | `tuile-pack/src/lib.rs:960-1030` |
+
+### 6.2 What is in the containers measured
+
+- **Terrain archives:** see section 2. Two zones were measured whole, 10.3
+  and 9.4 MB.
+- **Imagery archive** z10/503/335, 32.5 MB. **8.0 % of its bytes are JPEG
+  headers**: 623 bytes per tile, two distinct headers across 4 179 tiles,
+  repeated in every tile.
+- **Embedded packs** (`Content::Embedded`, v2): two one-frame packs of 17.2
+  and 10.2 MB from a recent sky render, 57 and 47 tiles. These are the kind
+  the farm downloads.
+  - The table is 10 KB.
+  - **PNG textures** (RGBA, 405–779 px) are **83–88 % of the blob**.
+  - LZ4 mesh blocks are the rest: positions 4–6 %, indices 6–8 %, uvs 2–3 %.
+  - Normals are empty.
+- **Reference pack** (`Content::References`, v3): one frame, 874 tiles, all
+  table, 474 KB.
+
+No farm-size pack (2.4 GB) was on the laptop. The tuile buckets are not among
+the configured credentials (the only R2 profile belongs to another account),
+so nothing was downloaded. The farm numbers below are **extrapolated** from
+the two embedded packs, on the assumption that a long film's blob has the
+same mix of textures and meshes.
+
+### 6.3 Whole-file compression
+
+Ratio of the whole file. Encode and decode MB/s are native and
+single-threaded.
+
+| File | gzip-6 | zstd-3 | zstd-19 | zstd-19 long (2²⁷) | brotli-9 | xz-6 |
+|---|---|---|---|---|---|---|
+| terrain zone, tiles raw (today) | 0.52 | 0.50–0.51 | **0.43–0.44** | 0.43–0.44 | 0.45–0.46 | **0.38–0.39** |
+| same, **tiles gzip-9** (section 5) | 0.996 | 0.996 | 0.995 | 0.995 | 0.995 | 0.996 |
+| imagery zone (JPEG) | 0.918 | 0.921 | 0.916 | 0.916 | 0.916 | 0.914 |
+| embedded pack (PNG + LZ4) | 0.77–0.79 | 0.78–0.80 | **0.65–0.66** | 0.65–0.66 | 0.71–0.73 | 0.65–0.66 |
+| reference pack (table only) | 0.23 | 0.21 | **0.17** | 0.17 | 0.17 | 0.15 |
+| decode MB/s (terrain raw) | 530–640 | 820 | 680–850 | 720–850 | 250–390 | 26–30 |
+| encode MB/s (terrain raw) | 19–20 | 220–250 | 2.8–3.7 | 3.3–3.4 | 11–16 | 1.4 |
+
+What this says:
+
+- **Whole-file beats per-tile on raw terrain**, 0.43 (zstd-19) and 0.39 (xz)
+  against 0.526 for per-tile gzip-9. Neighbouring tiles share structure that
+  a per-tile codec cannot see.
+- **Once tiles are compressed, nothing is left to a whole-file codec**:
+  0.995–0.997. The two layers of compression do not add up.
+- **Imagery's whole-file gain is exactly the repeated JPEG headers** (8.0 %
+  of bytes, 8.4 % saved). No codec finds anything else in it.
+- **Long-range mode adds nothing** at these sizes: nothing repeats beyond
+  the default window.
+- **A pack is the one container with a lot left in it**, 34–35 % with
+  zstd-19. Section 6.5 shows where that comes from and how to get more while
+  keeping random access.
+- **A reference pack's table compresses 6×.** Such a table "can run to more
+  than a hundred megabytes" (`tuile-pack/src/lib.rs:2289-2290`).
+
+### 6.4 Seekable framings: random access kept
+
+The file is cut into independently compressed frames of a fixed
+uncompressed size. That is what the zstd seekable format does (zstd frames
+plus a seek-table skippable frame, 8–12 bytes per frame), and what BGZF does
+(gzip members of ≤ 64 KiB). The ratio counts the seek table. A "30 KB read"
+is a 30 KiB span at a random offset: the compressed bytes fetched, as a
+multiple of 30 KiB, and the native CPU to decode the frames it touches.
+
+| File | Frame | zstd-19 ratio | BGZF-6 ratio | 30 KB read: fetch (×) | decode | index |
+|---|---|---|---|---|---|---|
+| terrain raw | 64 KiB | 0.49–0.50 | 0.53 | 46 KiB (×1.5) | 0.15 ms | 1.7–1.9 KB |
+| terrain raw | 256 KiB | 0.47 | — | 133 KiB (×4.4) | 0.4 ms | 0.45 KB |
+| terrain raw | 1 MiB | 0.45–0.46 | — | 475 KiB (×16) | 1.3–1.6 ms | 0.1 KB |
+| terrain raw | 8 MiB | 0.43–0.44 | — | 2.0–2.2 MiB (×67–75) | 6–7 ms | 33 B |
+| imagery | 64 KiB | 0.924 | 0.926 | 87 KiB (×2.9) | 0.05 ms | 6 KB |
+| imagery | 8 MiB | 0.916 | — | 7.1 MiB (×243) | 3.5 ms | 57 B |
+| embedded pack | 64 KiB | 0.75–0.77 | 0.80 | 70–73 KiB (×2.4) | 0.12 ms | 1.9–3.2 KB |
+| embedded pack | 1 MiB | 0.69–0.71 | — | 0.7 MiB (×23–24) | 1.4 ms | 0.1–0.2 KB |
+| embedded pack | 8 MiB | 0.66–0.68 | — | 3.2–3.7 MiB (×110–127) | 6.6–8 ms | 33–45 B |
+
+zstd-9 frames are 3–8 % larger than zstd-19 frames everywhere. On terrain
+whose tiles are already gzip, every framing stays at 0.996–0.997, and a read
+fetches 3–9× more compressed bytes for nothing.
+
+What this says:
+
+- **Small frames keep random access at a modest price.** At 64 KiB, a terrain
+  archive keeps 85 % of whole-file zstd's gain (0.49 against 0.43) for ×1.5
+  read amplification and 0.15 ms of CPU. But per-tile brotli-11 reaches 0.435
+  with **no** amplification at all, and in a format every reader knows. For
+  PMTiles, per-tile compression is the seekable framing that already exists:
+  a tile is the natural frame.
+- **8 MiB frames match the unit the Worker and the browser film already use**
+  (`cached.rs:16`, `source.rs:42`). A chunk is fetched whole anyway, so
+  compressing each chunk adds no amplification on that path. It does on the
+  range path: a 30 KB tile costs a 2–4 MiB download plus 6–8 ms of decode. The
+  same effect is reached with no new format by serving each chunk URL with
+  `Content-Encoding: zstd` or `br`, decoded by the browser itself.
+- **Aligning frames on tile or directory boundaries** (never splitting a tile)
+  would bring the expected frames per read from (F + 30 KiB)/F down to 1. That
+  is worth it only if a seekable container is adopted, which this study does
+  not recommend for PMTiles.
+- **A dictionary per layer** does for a whole-file codec what it does per tile
+  (section 3.1): a few percent. For imagery, a 1 KiB dictionary holding the
+  two JPEG headers would recover the 8 % per tile, bit-exact. But PMTiles has
+  no field for a dictionary, so this is a tuile-only extension. Not
+  recommended now.
+
+**Crates.**
+
+| Crate | Status |
+|---|---|
+| `zeekstd` 0.6 | the seekable format; pre-1.0, on `zstd-safe`, i.e. C libzstd |
+| `zstd-seekable` 0.1 | C bindings, last release 2023 |
+| `noodles-bgzf` 0.52 | BGZF, widely used in bioinformatics, on flate2 |
+| `ruzstd` 0.9 | pure Rust, 72 M downloads, decodes any zstd frame |
+
+No seekable writer is pure Rust and 1.0. On the read side, ruzstd can decode
+seekable frames in wasm, and the seek table is a few lines to parse. Rule 8
+admits ruzstd and noodles-bgzf in the wasm path, not zeekstd.
+
+### 6.5 Packs: what is inside, and a pack v4
+
+The pack already **is** a seekable container. Each payload is an
+independent `Block { offset, stored, raw }` (`schema/tuile_pack.fbs`,
+`struct Block`). Meshes are LZ4 (`lib.rs:614-632`). Textures are PNG
+"stored as produced" (`TextureFormat::Png`). What is left is to choose a
+better codec **per block**:
+
+| Block kind (both packs) | Stored today | Re-encoded, per block | Ratio | Check |
+|---|---|---|---|---|
+| textures, PNG (83–88 % of blob) | 15.06 + 8.39 MB | **WebP lossless**, method 4 | **0.46–0.49** | pixel-exact, asserted |
+| | | PNG re-encoded at maximum effort | 0.79–0.80 | pixel-exact |
+| | | zstd-19 over raw RGBA | 1.08–1.12 | — |
+| positions, LZ4 | 0.72 + 0.59 MB | zstd-19 / + 64 KiB dictionary | 0.72 / 0.70 | — |
+| uvs, LZ4 | 0.38 + 0.31 MB | zstd-19 / + dictionary | 0.07 / **0.012** | — |
+| indices, LZ4 | 1.04 + 0.86 MB | zstd-19 / + dictionary | 0.27 / **0.008** | — |
+| table (FlatBuffers) | 10 KB | zstd-19 | 0.35 | — |
+
+The mesh dictionary was checked out of sample: trained on one pack, it gives
+the same 0.008–0.012 on the other. uvs and indices barely vary between tiles
+of the same topology.
+
+Time:
+
+| Codec | Encode | Decode |
+|---|---|---|
+| WebP lossless, method 4 | 0.23 s per texture | ≈ PNG's, 4.5 vs 5 ms per texture (Pillow) |
+| WebP lossless, method 6 | 2.5 s per texture, for 0.5 % more | — |
+| method 0 | 35 ms | — (ratio 0.59) |
+| zstd, meshes | — | 0.03–0.2 ms per block |
+
+Decoders: `image-webp`, already part of the `image` family, in pure Rust;
+`createImageBitmap` in the browser; `zstd` natively, `ruzstd` in wasm.
+
+**Result: a whole pack, re-encoded per block, weighs 0.45–0.46 of today's**
+(17.2 → 7.9 MB, 10.2 → 4.6 MB). Whole-file zstd-19 reaches only 0.65–0.66,
+and loses random access. Whole-file zstd on top of the per-block
+re-encoding would gain almost nothing, by the same logic as terrain.
+
+**Fingerprints.** Two digests are involved, and the rule for both is
+"compress around them, never under them".
+
+- `blob_digest` is FNV-1a over the blob region **as stored**
+  (`lib.rs:351-353`, `:779-790`). It checks the integrity of what crossed the
+  wire, so it stays over the stored bytes of a v4 pack. A blob of half the
+  size also halves its "seconds per gigabyte".
+- The store digests in `TerrainRef` / `ImageryRef` are FNV-1a over the
+  **store tile's bytes** (`tuile-film/src/from_store.rs:54-63`). They must
+  stay over the decoded tile (section 5, step 1). A pack never re-encodes
+  a store tile anyway: references are not payloads.
+
+**What a pack v4 would look like.** Not v3.1: the layout must say "a reader
+of v3 cannot read this", and `READABLE` (`lib.rs:93`) is the mechanism.
+
+- `Tile.texture_format` gains `WebpLossless = 2`. The enum is additive, and
+  `raw` stays the decoded size.
+- A mesh codec is named once for the pack: a new `Pack.mesh_codec`, LZ4 or
+  zstd. A per-block byte is impossible, because `Block` is a fixed-size
+  struct.
+- A new field `Pack.mesh_dictionary: Block` points at the dictionary, stored
+  as the first payload of the blob.
+- `VERSION` becomes 4. Readers ship first (1..=4), writers later. A v1–v3
+  pack stays readable for ever, as the constant's doc promises.
+- Everything else is unchanged: preamble, table, offsets relative to the
+  blob, contiguous blocks per tile (so `span_of` still coalesces), FNV over
+  the stored blob.
+
+### 6.6 Cloudflare R2 and `Content-Encoding` on a stored object
+
+These points come from the documentation and were not tested against the
+deployed buckets.
+
+- R2 never compresses on upload. An object uploaded with
+  `Content-Encoding: gzip` is stored as such.
+- Through Cloudflare's HTTP front (public bucket, custom domain, a Worker
+  `fetch`): "if Cloudflare must decompress a complete encoded response, it
+  **ignores `Range`** … and sends the complete, uncompressed body as
+  `200 OK`". This applies to cached responses and to origin responses.
+  Cloudflare decompresses when the client does not accept the encoding.
+- An encoded `206` from an origin is not cached.
+- Through the S3 API, a ranged `GetObject` follows S3 semantics: the range
+  is over the **stored (encoded) bytes**. This was not verified on R2.
+- **Consequence:** an archive or pack object must never carry
+  `Content-Encoding`. Ranges and the 8 MiB chunks would break, or be served
+  as a 200 of the whole decoded object. Compression lives inside the
+  container (per tile, per block). A **transfer** compression goes on
+  separate URLs whose body is answered whole: the API's 8 MiB chunk URLs,
+  tile URLs.
+
+### 6.7 Decision, per use
+
+| Use | What to compress | Granularity | Format | Expected saving | Range reads |
+|---|---|---|---|---|---|
+| **Farm transfer** (pack in) | the pack's payloads | per block, inside the pack | **pack v4**: WebP lossless textures, zstd + dictionary meshes | ≈ **2.4 → 1.1 GB per task** (−1.3 GB), GETs ≈ 150 → ≈ 70 at 16 MiB, download time −55 % at the same throughput; FNV −55 % | kept: block = payload |
+| Farm transfer, reference packs | the table | whole table, on the wire | the API answers its chunk URLs with `Content-Encoding: zstd` (or `br`) | table ÷6 on the wire, 100 MB → ≈ 17 MB | unchanged: chunks are answered whole |
+| **Tile-server and stl-tiles disk caches** | nothing more | — | the store's own per-tile compression (terrain gzip) | the terrain share of 8 / 12 GiB holds ≈ 1.9× more zones | mmap random access kept; whole-file compression would kill it, so no |
+| **At rest (R2/S3)** | tiles (section 5); packs (v4) | per tile, per block | gzip terrain, JPEG as is, pack v4 | terrain −47 %, packs −55 %; imagery 0 % | kept |
+| Backups, superseded archives (cold) | whole object | whole file | zstd-19 of the archive | 0.4 % on gzip-tiled archives, 8 % on imagery (headers). Not worth an extra format | n/a |
+| **CDN ranges** (browser, Worker) | nothing on the object | — | never `Content-Encoding` on `.pmtiles` or `.tuilepack` | — | kept; the 8 MiB chunk URLs may carry `Content-Encoding` (gains only on raw content, ≈ 0 after v4 and gzip tiles) |
+| **Mobile/offline bundle** (a zone) | the bundle file | whole file, for the download only | zstd-19 (`zstd` native on iOS/Android, `ruzstd` in wasm; ≥ 680 MB/s decode). The phone unpacks it to a plain archive and mmaps it | over gzip-tiled archives: imagery −8 %, terrain ≈ 0. **Better:** the bundle builder writes terrain tiles **raw** and zstd-19's the whole file, 0.43 against 0.52 (−17 % more on terrain). xz gives 0.39 but decodes at 26–30 MB/s, too slow for a phone | none during the download; the unpacked archive is random-access |
+
+**Migration and compatibility.**
+
+1. **Packs v4.** Teach `tuile-pack` to read v4 first: `READABLE = 1..=4`, a
+   WebP texture decode, zstd meshes with a dictionary. Deploy it to the
+   farm image, film-native and film-web. Only then let `tuile-bake` write
+   v4.
+   - Old v2/v3 packs remain readable. Re-baking is not needed; a converter
+     (v2 → v4, block by block, payloads only) can shrink the stored ones.
+   - **Test:** a v2 pack and its v4 conversion must render the same frame
+     to the byte. Then break the WebP decode and watch it fail.
+2. **PMTiles archives.** Nothing beyond section 5. No seekable container,
+   no whole-file encoding, no `Content-Encoding` on objects.
+3. **Mobile bundle.** A bundle format is a new artefact: a whole-file zstd
+   of an archive whose terrain tiles are raw. It is decided when offline
+   use is built, and it has no impact on the store.
+
+## 7. What was not measured
 
 - **wasm decode times and binary sizes.** No wasm was built: other agents
   were compiling on this laptop. Native timings ×1.5–3 is the usual range
@@ -467,3 +733,16 @@ reconstruction does.
   byte counts that determine it were measured.
 - **zopfli** on more than one zone, and brotli or zstd decoders in an actual
   Worker.
+- **A farm-size pack** (2.4 GB). The pack figures come from two one-frame
+  embedded packs (27 MB in total) and are extrapolated. A long film's blob
+  may hold a different mix of textures and meshes, and repeat textures
+  across frames differently. The pack v4 ratio should be measured on one
+  real farm pack before any decision.
+- **Cloudflare's actual behaviour** with ranges on an encoded object, on the
+  deployed buckets (section 6.6). The S3-API case is S3 semantics,
+  unverified on R2.
+- **The seekable writers** (`zeekstd`): neither built nor run. The framings
+  were simulated with independent zstd/gzip frames plus the seek table's
+  documented size.
+- **WebP lossless decode in wasm.** The textures' decode cost was measured
+  with Pillow, native.
