@@ -2,7 +2,7 @@
 
 ## What you are building
 
-An open-source Cargo workspace implementing the **OGC 3D Tiles** standard (both consumption AND serving), with a 100% render-agnostic core and multiple backends. The product goal: to be the "Martin of 3D Tiles" — a lightweight dynamic server, deployable from a native binary to a Cloudflare Worker, plus a reusable client rendering engine (wgpu today, RealityKit/Hydra tomorrow).
+An open-source Cargo workspace: **one foundation for the geospatial 3D scene (the terrain + imagery globe and OGC 3D Tiles content) that runs everywhere and draws in every way** — browser (wasm), desktop, mobile, headset (stereo, spatial video), offline film, and serving to others (both consumption AND serving of 3D Tiles). A 100% render-agnostic core, multiple backends. **No render mode is the product; the foundation is**: a film is one mode among the others, and a feature built for one mode lands in the shared layers so every mode gets it. See `docs/00-vision.md`.
 
 **There is no equivalent.** The 3D Tiles ecosystem has only tilers (pg2b3dm, py3dtiles) and clients (web and native) tied to their own ecosystems. Dynamic serving with a pluggable cache does not exist. You are breaking new ground.
 
