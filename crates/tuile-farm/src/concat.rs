@@ -268,11 +268,10 @@ pub fn concat(segments: &[PathBuf], out: &Path) -> Result<u64, ConcatError> {
     // The writer sums the movie's duration a sample at a time, each cut to
     // a whole millisecond: a 60 fps film came out 4 % short in every
     // player. Its exact length, written over that sum.
-    let mut bytes = std::fs::read(out).map_err(out_io)?;
     let millis =
         (offset * 1000 + u64::from(format.timescale) / 2) / u64::from(format.timescale.max(1));
-    tuile_mp4::set_movie_duration(&mut bytes, millis);
-    std::fs::write(out, bytes).map_err(out_io)?;
+    // In place: the movie's header, not the pictures, read and written.
+    tuile_mp4::set_movie_duration_in_file(out, millis).map_err(out_io)?;
     Ok(frames)
 }
 

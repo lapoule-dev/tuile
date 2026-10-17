@@ -305,6 +305,44 @@ pub fn set_movie_duration(bytes: &mut [u8], millis: u64) {
     walk(bytes, 0, len, millis);
 }
 
+/// [`set_movie_duration`] on the film at `path`, in place: only its `moov`
+/// box is read and written again — never the pictures.
+pub fn set_movie_duration_in_file(path: &std::path::Path, millis: u64) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let len = file.metadata()?.len();
+    let mut at = 0u64;
+    while at + 8 <= len {
+        file.seek(SeekFrom::Start(at))?;
+        let mut head = [0u8; 16];
+        file.read_exact(&mut head[..8])?;
+        let mut size = u64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]]));
+        if size == 1 {
+            file.read_exact(&mut head[8..16])?;
+            size = u64::from_be_bytes(head[8..16].try_into().expect("eight bytes"));
+        } else if size == 0 {
+            size = len - at;
+        }
+        if size < 8 || at + size > len {
+            return Ok(());
+        }
+        if &head[4..8] == b"moov" {
+            let mut moov = vec![0u8; size as usize];
+            file.seek(SeekFrom::Start(at))?;
+            file.read_exact(&mut moov)?;
+            set_movie_duration(&mut moov, millis);
+            file.seek(SeekFrom::Start(at))?;
+            file.write_all(&moov)?;
+            return file.flush();
+        }
+        at += size;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
