@@ -34,6 +34,8 @@ owner's decisions of 2026-10-17:
 | I11 | Protected set is never evicted | P = drawn ∪ the fallback chain (terrain **and** imagery) of every needed-but-absent tile ∪ in transit to the GPU ∪ the pinned floor |
 | I12 | Determinism | the same sequence of inputs (camera states, arrivals with their generation, pressure, thermal) ⇒ the same decision stream, bit for bit (digest); no decision reads a wall clock or a hash-map iteration order |
 | I13 | Batch exactness (films) | under `Policy::Batch`, each frame is drawn only once every tile and drape it needs is drawable; nothing it needs is ever evicted; the frame is a function of the frame's inputs only |
+| I14 | Nothing already held is fetched again | no network request is ever issued for a resource present in a local tier (GPU, CPU-decoded, local store); a resource present on the GPU is never re-uploaded; a resource decoded in memory is never re-decoded |
+| I15 | Local before remote | a resource held in the local store is served from it within its own quota, without consuming a network slot; local reads never wait behind network work |
 
 ## 2. Where it lives
 
@@ -199,6 +201,86 @@ pub struct Decisions {
   - under pressure, a drape above `need + 1` may be replaced by a coarser one, built first.
 - **Replaces:** `ImageryDetail` (the global altitude texel target) and the load-time freeze.
 
+## 4b. What is already held: residency tiers
+
+The budget knows, for every resource, the cheapest place it already lives in, and never asks
+for more than the step from there to "drawn".
+
+```rust
+pub enum Tier {
+    Gpu,      // uploaded and drawable: nothing to do
+    Decoded,  // decoded in memory, not on the GPU: upload only
+    Stored,   // in a local store (tile store, HTTP disk cache): local read + decode
+    Remote,   // nowhere local: network fetch + decode
+}
+```
+
+- **Where the tier comes from:**
+  - `Gpu` and `Decoded` from the budget's own state machine;
+  - `Stored` from a cheap, non-loading presence query on the stores, through a trait the
+    fetchers and stores implement: `fn holds(&self, key) -> Presence`. It answers from the
+    store's index, never by reading the payload, and is batched per decision step.
+    The local tile store (foyer) and the HTTP disk cache both answer it.
+  - A `Stored` answer that turns out wrong on read degrades to `Remote` and is counted as a
+    store miss: the presence answer is a hint, never a promise.
+- **What the tier changes:**
+  - the cost (bytes to move, expected latency) and the work to schedule;
+  - a request is created only for the steps that are missing (I14);
+  - **separate quotas:** `max_local_reads` for `Stored` work, distinct from the network
+    `max_in_flight`. Local reads never wait behind network work (I15), and never count
+    against the network quota;
+  - priority: at equal tier and score, a cheaper tier goes first, because it closes a hole
+    sooner.
+- **After a relaunch:** a store that survived (desktop exit, iOS suspend) puts its contents
+  back at `Stored`. A relaunch then fills the view from disk without network, which is what
+  made iOS cover its first view in 6 s instead of 35 s.
+- **Stats:**
+  - per tier: resources served, bytes and latency;
+  - store hit rate, and store misses after a positive presence answer;
+  - network bytes avoided.
+
+## 4c. The headless viewer and its control API (for tests)
+
+The tests drive **the real viewer**, the same app on the same frame loop, not a test-only
+renderer.
+
+**Headless mode**
+- `tuile-viewer --headless`: no window. It renders into an offscreen surface of a given size
+  and scale factor, with the same `Profile` (desktop or handheld, selectable, so iOS
+  budgets can be exercised on a Mac or Linux runner), the same pump, budget and renderer.
+- **A stepped clock:** in headless mode, time advances only when told (`step`), so a test is
+  deterministic. A real-time mode exists for soak and latency measurements.
+- **The network** can be the real fetchers, a recorded trace, or a simulated network (the
+  `SimNet` of §8) injected through the same loader trait.
+
+**Control API**
+- It is in-process (a Rust API for tests in the workspace), and the same commands are
+  available over a local socket for scripts and agents: Unix socket, or 127.0.0.1 HTTP with
+  JSON, **localhost only**.
+- It is versioned, and documented with its schema.
+
+| Kind | Commands |
+|---|---|
+| **Read the budget** | `budget()` returns `BudgetStats` and the ledger per class and tier; `resource(id)` returns state, tier, generation, bytes, priority and the reason it is protected or not; `need()` returns the current `NeedSet` and `DrawSet` |
+| **Read the GPU** | `gpu()`: bytes per class, texture and buffer counts, uploads this frame (count, bytes, µs), drift between estimated and actual cost |
+| **Read the picture** | `frame()`: framebuffer readback, PNG or raw RGBA. `frame(layer)`: diagnostic layers, such as the tile terrain level, the imagery level, exact, fallback or stand-in, and the tier as colour. `coverage()`: lost pixels and holes |
+| **Move** | `set_view(camera)`, `fly_to(target, duration)`, `orbit(angle, duration)`, `zoom(factor, duration)`, `look(heading, pitch)`; touch-equivalent gestures for the handheld profile |
+| **Series** | `run(script)`: a list of timed commands, or a `tuile-tape` file. `step(frames)` and `advance(seconds)` move the stepped clock. `wait_until(condition, timeout)`, with conditions `converged`, `idle`, `no_holes` and `bytes_below(class, n)` |
+| **Inject** | `pressure(level)`, `thermal(state)`, `background()` / `foreground()`, `network(profile)` to change the latency, failure rate or stall of a simulated network, `kill_and_relaunch()` to test persistence |
+| **Record** | `observe(path)`: start the JSONL `BudgetObserver` log; `snapshot(path)`: frame plus budget plus GPU state in one bundle, for a failing test's artefacts |
+
+**Uses**
+- The headless real-GPU tests of §8 are written against this API.
+- So are the symptom reproductions of the AS-IS document (§4.2), as scripts, and the device
+  sessions, in real-time mode, with the same scripts as on the simulator.
+- An agent can inspect a running viewer without screenshots of a window.
+
+**Constraints**
+- No new code path for rendering: headless only swaps the surface.
+- The API is read-mostly and side-effect-free except for the explicit commands.
+- It is off unless `--headless` or `--control` is passed.
+- On iOS the socket API is not compiled in release builds.
+
 ## 5. Interfaces with GeometryStream and ContentPump
 
 **Protocol (protocol.rs)**
@@ -338,6 +420,10 @@ What must stay identical, and is tested:
 - The imagery need is monotone in distance and obliquity, its hysteresis holds, and it stays
   within the cap.
 - Batch: nothing needed is evicted, and a frame is drawn only when complete.
+- Tiers:
+  - no network request for a resource at `Stored`, `Decoded` or `Gpu` (I14);
+  - a wrong `Stored` hint degrades to `Remote` exactly once;
+  - local reads never wait behind network work (I15).
 
 **Deterministic simulation (`tuile-core/tests/budget_sim/`)**
 - A synthetic globe with terrain and imagery pyramids of different depths: plains (shallow
@@ -361,8 +447,12 @@ What must stay identical, and is tested:
 **Golden decision traces**
 - One digest per step for each scenario, stored. A change requires a reviewed update.
 
-**Real GPU, headless (`tuile-wgpu/tests`)**
-- `still_camera_cancels_nothing`;
+**Real GPU, headless**
+- Written against the headless viewer and its control API (§4c), so they exercise the real
+  app.
+- Tests:
+  - `relaunch_fills_from_the_store_without_network` (I14, I15);
+  - `still_camera_cancels_nothing`;
 - `zoom_back_redrapes_sharp`;
 - `rotation_converges`;
 - `coast_imagery_sharper_than_terrain`;

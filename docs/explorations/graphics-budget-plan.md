@@ -34,7 +34,7 @@ imagery chosen independently of terrain, proven by simulation before it touches 
      called once per frame by the pump;
    - JSONL sink (`TUILE_BUDGET_LOG`) and `/metrics`;
    - the fields of AS-IS §4.1, plus `underdraped` and the imagery-over-terrain histogram.
-3. **Symptom tests on today's code, committed red** (documented as expected failures, so CI
+3. **Symptom tests on today's code, written against the headless control API (Step 0b), committed red** (documented as expected failures, so CI
    stays green: `#[ignore = "red until budget-core"]`), each seen failing:
    - `still_camera_cancels_nothing` (S2, M2.1);
    - `zoom_back_redrapes_sharp` (S3, M3.1);
@@ -46,6 +46,33 @@ imagery chosen independently of terrain, proven by simulation before it touches 
      parameters in `videos/README.md`.
 5. **Device baseline:** the Mac replay and the iPhone touch script from AS-IS §4.2, run for
    30 min with the JSONL log. Save the logs. They are the "before" curves.
+
+### Step 0b — The headless viewer and its control API (M)
+Built first, on today's code, because every later test and reproduction drives the viewer
+through it (spec §4c).
+- **`tuile-viewer --headless`:**
+  - an offscreen surface of a given size and scale;
+  - the desktop or handheld profile, selectable;
+  - a stepped clock, plus a real-time mode;
+  - a pluggable network: real fetchers, a recorded trace, or `SimNet`, through the loader
+    trait.
+- **The control API:**
+  - an in-process Rust API, and the same commands over a localhost socket (JSON, versioned,
+    with a schema doc);
+  - read: budget, resource, need, GPU, frame (PNG or RGBA plus diagnostic layers), coverage;
+  - move: `set_view`, `fly_to`, `orbit`, `zoom`, `look`, gestures;
+  - series: `run(script | tape)`, `step`, `advance`, `wait_until(converged | idle |
+    no_holes | bytes_below)`;
+  - inject: `pressure`, `thermal`, `background`/`foreground`, `network`,
+    `kill_and_relaunch`;
+  - record: `observe`, `snapshot`.
+- Until Step 4, `budget()` and `resource()` read the current cache and pump. After the
+  cut-over they read `Budget`. The API shape stays the same.
+- **Tests:**
+  - the API itself: the commands are deterministic under the stepped clock, the frame
+    readback matches a known scene, and `kill_and_relaunch` keeps the store;
+  - it never compiles into iOS release builds.
+- **Docs:** a short page on driving the viewer from a script or an agent.
 
 ### Step 1 — The pure module (M)
 Create `tuile-core/src/budget/`, unused by the runtime, so the build stays green:
@@ -60,7 +87,9 @@ Create `tuile-core/src/budget/`, unused by the runtime, so the build stays green
 - `evict.rs`: ordering and sweep;
 - `relax.rs`: time-based LOD relaxation with hysteresis;
 - `upload.rs`: the byte-capped plan and the swap groups (both directions);
-- `batch.rs`: the Batch rules (unbounded, complete-or-wait, `release_beyond`).
+- `batch.rs`: the Batch rules (unbounded, complete-or-wait, `release_beyond`);
+- `tier.rs`: `Tier` (Gpu, Decoded, Stored, Remote), the `Presence` hint, the separate local
+  read quota, and tier-aware cost and priority (spec §4b).
 
 Tests:
 - unit tests plus `proptest` for every property in spec §8;
@@ -121,6 +150,8 @@ In one commit, which is reviewed in pieces on the branch beforehand:
   - no retraversal per arrival;
   - `camera_moved` cancellation removed.
 - **Offload:** cancel tokens and generations on jobs.
+- **Stores:** `holds(key) -> Presence` on the tile store (foyer index) and on the HTTP disk
+  cache, batched per step. Local reads get their own quota.
 - **Planetary:** drapes built at the level asked; `ImageryDetail` and the load-time choice
   removed.
 - **Pump:** `advance(plan, …)`, the priority-keyed pending queue, the pruned ancestry,
@@ -178,7 +209,7 @@ crate that claims wasm); all tests green; the iOS sim and device targets build.
 ## Sizes and order
 
 ```
-0 Baseline (S) ─► 1 Module (M) ─► 2 Imagery need (M) ─► 3 Simulation (M)
+0b Headless viewer + control API (M) ─► 0 Baseline (S) ─► 1 Module (M) ─► 2 Imagery need (M) ─► 3 Simulation (M)
                                                               │
                                    4 Cut-over (L) ◄───────────┘
                                          │
