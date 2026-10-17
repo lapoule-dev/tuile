@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+
+# Measurement scripts for docs/explorations/pmtiles-compression.md.
+# Data never lives here: archives and results go to a scratch directory.
+#
+#   uv venv /scratch/venv && VIRTUAL_ENV=/scratch/venv uv pip install -e .
+#   python -I directories.py OUT.json A.pmtiles...      # header, directories, dedup
+#   python -I epochs.py OUT.json ZONE/*.pmtiles         # dedup across a zone's archives
+#   python -I terrain.py OUT.json TERRAIN/*.pmtiles     # per-tile codecs, zstd dictionaries
+#   python -I zopfli_and_jpeg_gzip.py T.pmtiles I.pmtiles
+#   python -I imagery.py WORK OUT.json IMAGERY/*.pmtiles  # needs jpegtran and basisu on PATH
+#   python -I summarize_imagery.py OUT.json --by-level
+
+[project]
+name = "pmtstudy"
+version = "0.1.0"
+description = "PMTiles compression study: tile codecs, directory compression, dedup."
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+dependencies = [
+    "numpy>=1.24",
+    "pillow>=11",            # WebP and AVIF, built in
+    "pillow-jxl-plugin>=1.3", # libjxl, JPEG reconstruction included
+    "scikit-image>=0.22",    # SSIM
+    "ssimulacra2>=0.1",      # SSIMULACRA 2, Python port
+    "zstandard>=0.22",
+    "brotli>=1.1",
+    "zopfli>=0.2",
+]
+
+[tool.setuptools]
+packages = ["pmtstudy"]
