@@ -13,7 +13,15 @@ Config (set by `up.sh` from the environment):
   gcp:project            the project
   image                  the film image, `<registry>/film:<commit>`
   serviceAccount         the identity the jobs run as
-  store*, tilesBucket    the run store and the tile store (secret)
+  storeEndpoint          the run store's S3 endpoint (not a secret)
+  storeBucket, tilesBucket
+
+The keys are never in this program, its state or an execution: each job's
+definition names Secret Manager secrets that already exist in the project —
+`farm-store-access-key-id`, `farm-store-secret-access-key` (the run and
+tile stores' S3 key) and `farm-cesium-ion-token` (the bake's sources) — and
+the service account reads them (`roles/secretmanager.secretAccessor`, as the
+project's farm already grants it).
 """
 
 import pulumi
@@ -23,16 +31,29 @@ config = pulumi.Config()
 image = config.require("image")
 service_account = config.require("serviceAccount")
 
-env = [
-    gcp.cloudrunv2.JobTemplateTemplateContainerEnvArgs(name=name, value=value)
-    for name, value in [
-        ("TUILE_STORE_ENDPOINT", config.require_secret("storeEndpoint")),
-        ("TUILE_STORE_BUCKET", config.require("storeBucket")),
-        ("TUILE_STORE_ACCESS_KEY_ID", config.require_secret("storeAccessKeyId")),
-        ("TUILE_STORE_SECRET_ACCESS_KEY", config.require_secret("storeSecretAccessKey")),
-        ("TUILE_TILES_BUCKET", config.require("tilesBucket")),
-        ("RUST_LOG", "info"),
-    ]
+env = gcp.cloudrunv2.JobTemplateTemplateContainerEnvArgs
+
+
+def secret(name, secret_id):
+    """An environment variable whose value is a secret, by reference."""
+    return env(
+        name=name,
+        value_source=gcp.cloudrunv2.JobTemplateTemplateContainerEnvValueSourceArgs(
+            secret_key_ref=gcp.cloudrunv2.JobTemplateTemplateContainerEnvValueSourceSecretKeyRefArgs(
+                secret=secret_id, version="latest"
+            )
+        ),
+    )
+
+
+envs = [
+    env(name="TUILE_STORE_ENDPOINT", value=config.require("storeEndpoint")),
+    env(name="TUILE_STORE_BUCKET", value=config.require("storeBucket")),
+    env(name="TUILE_TILES_BUCKET", value=config.require("tilesBucket")),
+    env(name="RUST_LOG", value="info"),
+    secret("TUILE_STORE_ACCESS_KEY_ID", "farm-store-access-key-id"),
+    secret("TUILE_STORE_SECRET_ACCESS_KEY", "farm-store-secret-access-key"),
+    secret("TUILE_ION_TOKEN", "farm-cesium-ion-token"),
 ]
 
 # One job a card. The L4 encodes H.264 and AV1; MV-HEVC — two eyes in one
@@ -67,7 +88,7 @@ for name, region, accelerator, cpu, memory in JOBS:
                     gcp.cloudrunv2.JobTemplateTemplateContainerArgs(
                         image=image,
                         commands=["tuile-film-produce"],
-                        envs=env,
+                        envs=envs,
                         resources=gcp.cloudrunv2.JobTemplateTemplateContainerResourcesArgs(
                             limits={"cpu": cpu, "memory": memory, "nvidia.com/gpu": "1"}
                         ),
