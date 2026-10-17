@@ -49,6 +49,14 @@ mod globe;
 mod ground;
 pub mod memory;
 pub mod open;
+
+/// Where a bake keeps what it fetched once for a film's renders — a
+/// night-lights mosaic — by key: the run store, as the host has it.
+#[async_trait::async_trait]
+pub trait NightLightsStore: Send + Sync {
+    /// Keeps `bytes` at `key`, unless something is there already.
+    async fn keep(&self, key: &str, bytes: &[u8]) -> Result<(), String>;
+}
 pub mod packed;
 mod session;
 pub mod tape;

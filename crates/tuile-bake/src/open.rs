@@ -34,6 +34,7 @@ use tuile_terrain::{
 };
 
 use crate::globe::Sources;
+use image::ImageEncoder as _;
 
 /// Where a bake's ground comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -75,7 +76,8 @@ impl Ground {
 pub(crate) const ELLIPSOID: i64 = 1_000_000_001;
 /// The terrain of no tile at all.
 pub(crate) const NOTHING: i64 = 1_000_000_002;
-/// NASA Blue Marble: Next Generation, through GIBS.
+/// NASA Blue Marble: Next Generation, its August 2004 composite, through
+/// GIBS.
 pub(crate) const BLUE_MARBLE: i64 = 1_000_000_101;
 
 /// The deepest level of the ellipsoid's tiles: past it a tile would be
@@ -234,7 +236,15 @@ impl Nothing {
             bounding_sphere_radius: WGS84_A,
             horizon_occlusion: (centre / WGS84_A).to_array(),
         };
-        encode(&header, &[], &[], &[], &[], None, &[Vec::new(), Vec::new(), Vec::new(), Vec::new()])
+        encode(
+            &header,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        )
     }
 }
 
@@ -256,6 +266,9 @@ impl TerrainSource for Ellipsoid {
 pub struct Gibs<F> {
     fetcher: Arc<F>,
     layer: &'static str,
+    /// The composite's date, pinned: another date is other imagery, under
+    /// another asset number ([`BLUE_MARBLE`]).
+    date: &'static str,
     extension: &'static str,
     maximum_level: u32,
 }
@@ -266,16 +279,18 @@ impl<F: TileFetcher> Gibs<F> {
         Self {
             fetcher,
             layer: "BlueMarble_NextGeneration",
+            date: "2004-08-01",
             extension: "jpeg",
             maximum_level: 8,
         }
     }
 
-    /// The tile's address: GIBS's REST form, row from the north.
+    /// The tile's address: GIBS's REST form, its date pinned, row from the
+    /// north.
     pub fn url(&self, coord: ImageryCoord) -> String {
         format!(
-            "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/{}/default/GoogleMapsCompatible_Level{}/{}/{}/{}.{}",
-            self.layer, self.maximum_level, coord.level, coord.y, coord.x, self.extension
+            "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/{}/default/{}/GoogleMapsCompatible_Level{}/{}/{}/{}.{}",
+            self.layer, self.date, self.maximum_level, coord.level, coord.y, coord.x, self.extension
         )
     }
 }
@@ -309,6 +324,58 @@ pub struct NightLights {
     /// One luminance a texel, row 0 at the north pole, column 0 at the
     /// antimeridian.
     pub luma: Vec<u8>,
+}
+
+impl NightLights {
+    /// As a grey PNG: what the run store keeps.
+    pub fn to_png(&self) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut out)
+            .write_image(
+                &self.luma,
+                self.width,
+                self.height,
+                image::ExtendedColorType::L8,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    }
+
+    /// From the PNG [`Self::to_png`] wrote.
+    pub fn from_png(png: &[u8]) -> Result<Self, String> {
+        let grey = image::load_from_memory(png)
+            .map_err(|e| e.to_string())?
+            .to_luma8();
+        Ok(Self {
+            width: grey.width(),
+            height: grey.height(),
+            luma: grey.into_raw(),
+        })
+    }
+}
+
+/// Where the run store keeps a night-lights mosaic: by its content, so that
+/// a render names exactly the lights it was made with, and a film's name
+/// changes with them.
+pub fn night_lights_key(png: &[u8]) -> String {
+    // The content names it; the source (VIIRS_Black_Marble, 2016-01-01,
+    // geographic level 3) is pinned in `night_lights`.
+    format!(
+        "assets/night-lights/{}.png",
+        tuile_pack::scene_digest(&[png])
+    )
+}
+
+/// The night-lights mosaic in the run store `store`: fetched from GIBS
+/// once, under `cache_dir`, and kept by its content. Returns its key.
+pub async fn publish_night_lights(
+    store: &dyn crate::NightLightsStore,
+    cache_dir: Option<std::path::PathBuf>,
+) -> Result<String, String> {
+    let png = night_lights(cache_dir).await?.to_png()?;
+    let key = night_lights_key(&png);
+    store.keep(&key, &png).await?;
+    Ok(key)
 }
 
 /// The tiles across and down of the night-lights mosaic, and their side.
@@ -449,7 +516,7 @@ mod tests {
         let gibs = Gibs::blue_marble(Arc::new(Never));
         assert_eq!(
             gibs.url(ImageryCoord { level: 3, x: 4, y: 2 }),
-            "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/BlueMarble_NextGeneration/default/GoogleMapsCompatible_Level8/3/2/4.jpeg"
+            "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/BlueMarble_NextGeneration/default/2004-08-01/GoogleMapsCompatible_Level8/3/2/4.jpeg"
         );
         assert_eq!(gibs.tiling_scheme().maximum_level, 8);
     }

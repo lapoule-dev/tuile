@@ -89,9 +89,11 @@ pub struct Order {
     /// by the sun of its instant, the Moon of its instant over the frame's
     /// own eye, and the stars turned to it. `None`: the look's light.
     pub clock: Option<tuile_tape::Clock>,
-    /// Towns lit at night under a physical atmosphere: NASA's Black Marble
-    /// ([`tuile_bake::open::night_lights`]), fetched once a render.
-    pub night_lights: bool,
+    /// Towns lit at night under a physical atmosphere: the key, in the run
+    /// store, of the night-lights mosaic a bake kept there
+    /// ([`tuile_bake::open::publish_night_lights`]). A key that is not
+    /// there fails the render.
+    pub night_lights: Option<String>,
 }
 
 /// The light of `frame` under `clock`: the sun of its instant from the
@@ -144,7 +146,7 @@ impl Default for Order {
             wire: false,
             stereo: None,
             clock: None,
-            night_lights: false,
+            night_lights: None,
         }
     }
 }
@@ -452,9 +454,14 @@ pub async fn render(
             look,
         },
     );
-    if order.night_lights && look.atmosphere.is_some() {
-        let cache = std::env::var_os("TUILE_CACHE_DIR").map(Into::into);
-        let lights = tuile_bake::open::night_lights(cache).await?;
+    if let (Some(key), Some(_)) = (&order.night_lights, look.atmosphere) {
+        let png = sources
+            .packs
+            .objects
+            .read_all(key)
+            .await
+            .map_err(|e| format!("the night lights {key}: {e}"))?;
+        let lights = tuile_bake::open::NightLights::from_png(&png)?;
         gpu.set_night_lights(lights.width, lights.height, &lights.luma);
     }
     gpu.probe_holes(order.holes);

@@ -131,8 +131,9 @@
 //!                         UTC, or Unix seconds) and the seconds of sky
 //!                         between two frames — every frame lit by its own
 //!                         sun, Moon and stars
-//!   --night-lights        towns lit at night (NASA Black Marble, public
-//!                         domain), under --atmosphere
+//!   --night-lights <key>  towns lit at night, under --atmosphere: the
+//!                         night-lights mosaic a production kept in the run
+//!                         store (NASA Black Marble, public domain)
 //!   --sun-scale <k>, --moon-scale <k>
 //!                         the discs drawn k times their size (1: as they
 //!                         are), under --atmosphere
@@ -536,7 +537,7 @@ async fn main() -> Result<(), Error> {
     if let Some(turbidity) = value("--turbidity") {
         order.look.turbidity = Some(turbidity.parse()?);
     }
-    order.night_lights = flag("--night-lights");
+    order.night_lights = value("--night-lights");
     if let Some(scale) = value("--sun-scale") {
         order.look.sun_scale = scale.parse()?;
     }

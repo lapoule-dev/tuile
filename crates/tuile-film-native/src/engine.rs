@@ -77,9 +77,10 @@ pub struct RenderSpec {
     /// `<start>,<seconds a frame>` (`Order::clock`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clock: Option<String>,
-    /// Towns lit at night (`Order::night_lights`).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub night_lights: bool,
+    /// Towns lit at night: the night-lights mosaic's key in the run store
+    /// (`Order::night_lights`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub night_lights: Option<String>,
     /// The sun's and the Moon's discs drawn this many times their size,
     /// and the lens's glare (`Look::sun_scale`, `moon_scale`, `glare`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -187,7 +188,7 @@ impl Default for RenderSpec {
             atmosphere: false,
             turbidity: None,
             clock: None,
-            night_lights: false,
+            night_lights: None,
             sun_scale: None,
             moon_scale: None,
             glare: None,
@@ -225,7 +226,7 @@ impl RenderSpec {
             .as_deref()
             .map(tuile_tape::Clock::parse)
             .transpose()?;
-        order.night_lights = self.night_lights;
+        order.night_lights = self.night_lights.clone();
         if let Some(scale) = self.sun_scale {
             order.look.sun_scale = scale;
         }
@@ -317,7 +318,7 @@ const FROZEN_DEFAULT_LOOK: &str = "ff9e7af3dbfa95e5";
 
 const LATER_FIELDS: [&str; 5] = [
     ", clock: None",
-    ", night_lights: false",
+    ", night_lights: None",
     ", sun_scale: 1.0",
     ", moon_scale: 1.0",
     ", glare: 1.0",
