@@ -251,6 +251,112 @@ fn the_ground_dims_and_warms_as_the_sun_sets_and_is_never_black() {
 }
 
 #[test]
+fn a_night_side_beside_a_sunset_is_never_drawn_below_the_night_sky() {
+    // 70 km over the Pyrenees at a sunset of 2026-10-19, facing the glow:
+    // the camera is exposed for the lit limb, and black ground lies on the
+    // night side at the frame's left, some 500 km off at a grazing angle —
+    // where the air leaves next to nothing of it and, unlit, scatters next
+    // to nothing. It was drawn black under a sky drawn at its least.
+    let to_sun = DVec3::new(-0.047_520_53, -0.983_125_53, -0.176_652_15).normalize();
+    let eye = DVec3::new(4_728_002.21, 11_742.51, 4_370_014.76);
+    let forward = DVec3::new(0.551_144_46, 0.246_035_83, -0.797_311_83).normalize();
+    let up = DVec3::new(0.816_761_18, 0.036_414_22, 0.575_825_65).normalize();
+    let right = forward.cross(up).normalize();
+    assert!(to_sun.dot(right) > 0.0, "the sun is on the frame's right");
+    let (width, height) = (64u32, 36u32);
+    let aspect = f64::from(width) / f64::from(height);
+    let Some((device, queue)) = device() else {
+        return;
+    };
+    let mut film = FilmGpu::new(
+        device,
+        queue,
+        Settings {
+            width,
+            height,
+            supersample: 1,
+            look: Look {
+                to_sun: to_sun.as_vec3(),
+                atmosphere: Some(AtmosphereParams::default()),
+                ..Look::default()
+            },
+        },
+    );
+    // The ray through the frame's left, a little under the horizon, and
+    // where it meets the ground.
+    let (px, py) = (10u32, 20u32);
+    let (nx, ny) = (
+        (f64::from(px) + 0.5) / f64::from(width) * 2.0 - 1.0,
+        1.0 - (f64::from(py) + 0.5) / f64::from(height) * 2.0,
+    );
+    let ray = (forward + right * nx * aspect + up * ny).normalize();
+    let radius = 6_368_000.0f64;
+    let b = eye.dot(ray);
+    let c = eye.length_squared() - radius * radius;
+    let hit = eye + ray * (-b - (b * b - c).max(0.0).sqrt());
+    assert!((hit - eye).length() > 400_000.0, "{}", (hit - eye).length());
+    let normal = hit.normalize();
+    let east = DVec3::Z.cross(normal).normalize();
+    let north = normal.cross(east);
+    let half = 300_000.0f64;
+    let corner = |a: f64, b: f64| (east * a + north * b).as_vec3();
+    let p: Vec<f32> = [
+        corner(-half, -half),
+        corner(half, -half),
+        corner(half, half),
+        corner(-half, half),
+    ]
+    .iter()
+    .flat_map(|v| v.to_array())
+    .collect();
+    let n: Vec<f32> = normal.as_vec3().to_array().repeat(4);
+    let uv = [0.0f32, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0];
+    let i = [0u32, 1, 2, 0, 2, 3];
+    let texture = film.create_albedo(4, 4);
+    film.write_rgba(&texture, &[0u8, 0, 0, 255].repeat(16));
+    let key = TileKey { id: 9, drape: 0 };
+    film.enter(
+        key,
+        &TileMesh {
+            origin_ecef: hit.to_array(),
+            positions: &le(&p),
+            normals: &le(&n),
+            uvs: &le(&uv),
+            indices: &le(&i),
+            index_count: 6,
+            base_color_factor: [1.0; 4],
+        },
+        Some(texture),
+    )
+    .expect("enter");
+    let view = BakedView {
+        position: eye.to_array(),
+        direction: forward.to_array(),
+        up: up.to_array(),
+        viewport_px: [f64::from(width), f64::from(height)],
+        fovy_rad: std::f64::consts::FRAC_PI_2,
+    };
+    let camera = FrameCamera::of(&view, aspect as f32);
+    let encoder = film.render(&camera, &[key]).expect("render");
+    film.queue().submit([encoder.finish()]);
+    let output = film.output().clone();
+    let rgba = read_texture(&film, &output, 4);
+    let pixel = |x: u32, y: u32| {
+        let i = ((y * width + x) * 4) as usize;
+        let c = [rgba[i], rgba[i + 1], rgba[i + 2]].map(f32::from);
+        0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    };
+    let ground = pixel(px, py);
+    // The night sky at the frame's top left, drawn at its least.
+    let sky = pixel(2, 2);
+    assert!(sky > 5.0, "the night sky is drawn: {sky}");
+    assert!(
+        ground >= 0.5 * sky,
+        "night ground {ground} under a night sky of {sky}: a black band"
+    );
+}
+
+#[test]
 fn both_eyes_of_a_frame_share_one_light_and_one_sky() {
     let Some(mut film) = film(atmospheric(15.0)) else {
         return;

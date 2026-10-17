@@ -221,6 +221,22 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
             radiance = radiance * air.transmittance
                 + veil
                 + atmosphere.floor.xyz * (vec3f(1.0) - air.transmittance);
+            // Where the camera is exposed for a day side, the night side is
+            // shown no darker than the night sky beside it: ground of a
+            // tenth's reflectance at the sky's least, its own imagery
+            // scaling it (a sea darker, snow brighter), fading with
+            // distance to the sky's least itself. Without it, ground the
+            // least light shows at a sixteenth of noon times its
+            // reflectance is all but black, and across a night side seen
+            // at a grazing angle the air leaves next to nothing of it — a
+            // black band under a sky drawn no darker than its least.
+            let luma = vec3f(0.2126, 0.7152, 0.0722);
+            let texel_floor = 0.025 * atmosphere.illuminance.y
+                / (ATMOSPHERE_PI * max(atmosphere.ground.y, 1e-30));
+            let tenths = dot(max(base, vec3f(texel_floor)), luma)
+                / max(0.1 * atmosphere.illuminance.y / (ATMOSPHERE_PI * max(atmosphere.ground.y, 1e-30)), 1e-30);
+            let shown = atmosphere.least_sky.xyz * (min(tenths, 3.0) * air.transmittance + (vec3f(1.0) - air.transmittance));
+            radiance = max(radiance, shown);
         }
     }
     // The probe of holes: a pixel whose ground is not a place, or is
