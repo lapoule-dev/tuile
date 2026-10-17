@@ -715,3 +715,139 @@ mod tests {
         );
     }
 }
+
+/// A whole film of the engine's own render, as one execution of a film job:
+/// `tuile-film-produce` on a card, its flags as the execution's arguments
+/// (`docs/22-film-jobs.md`).
+#[derive(clap::Args, Debug, Clone)]
+pub struct FilmArgs {
+    /// The tape of cameras — its frames' instants in it when it states them.
+    #[arg(long)]
+    pub tape: PathBuf,
+    /// A film for a headset (MV-HEVC): on the spatial job, whose card
+    /// encodes it.
+    #[arg(long)]
+    pub spatial: bool,
+    /// The film's name under `videos/`. Default: the run's.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// `tuile-film-produce`'s flags, after `--`.
+    #[arg(last = true)]
+    pub produce: Vec<String>,
+}
+
+/// The film job, by its definition's name: mono or spatial.
+pub fn film_job(spatial: bool) -> String {
+    let var = |name: &str, or: &str| std::env::var(name).unwrap_or_else(|_| or.to_string());
+    if spatial {
+        var("TUILE_FILM_SPATIAL_JOB", "tuile-film-oneoff-spatial")
+    } else {
+        var("TUILE_FILM_JOB", "tuile-film-oneoff")
+    }
+}
+
+/// The production's arguments: the tape where the run keeps it, the flags
+/// as given, and where its receipt goes.
+pub fn film_args(tape_key: &str, flags: &[String], receipt: &str) -> Vec<String> {
+    let mut args = vec![format!("store:{tape_key}")];
+    args.extend(flags.iter().cloned());
+    args.push("--receipt".into());
+    args.push(receipt.to_string());
+    args
+}
+
+/// Launches a film, follows it, brings it home: the run's tape, manifest and
+/// receipt under `renders/<run>/`, as every launch keeps its own.
+pub async fn film(farm: &Farm, args: &FilmArgs, common: &CommonArgs, videos: &Path) -> Result<()> {
+    let git = git_state();
+    let run = common.attach.as_ref().map_or_else(
+        || run_id(&git),
+        |_| std::env::var("TUILE_RUN").unwrap_or_else(|_| run_id(&git)),
+    );
+    let prefix = format!("{RUN_PREFIX}/{run}");
+    let tape_key = format!("{prefix}/traj.mcap");
+    let receipt = format!("{prefix}/receipt.json");
+    let job = film_job(args.spatial);
+    let launch = Launch {
+        job: job.clone(),
+        env: Vec::new(),
+        tasks: common.tasks.unwrap_or(1),
+    };
+    let execution = match &common.attach {
+        Some(name) if name.contains('/') => name.clone(),
+        Some(name) => format!("{}/executions/{name}", farm.jobs.job_path(&job)),
+        None => {
+            farm.store.put(&args.tape, &tape_key).await?;
+            let produce = film_args(&tape_key, &args.produce, &receipt);
+            farm.put_json(
+                &format!("{prefix}/config.json"),
+                &manifest(
+                    &run,
+                    &git,
+                    "film",
+                    &[],
+                    serde_json::json!({"job": job, "args": produce}),
+                ),
+            )
+            .await?;
+            println!("job:     {job}, run {run}");
+            match farm
+                .jobs
+                .run_with_args(&job, &[], Some(&produce), launch.tasks, common.dry_run)
+                .await?
+            {
+                Some(name) => name,
+                None => {
+                    println!("validateOnly: the request is accepted; nothing ran.");
+                    return Ok(());
+                }
+            }
+        }
+    };
+    println!("execution: {execution}");
+    if common.no_watch {
+        println!("attach:  TUILE_RUN={run} tuile-launch-job film --tape … --attach {execution}");
+        return Ok(());
+    }
+    let ex = farm.follow(&execution).await?;
+    if ex.bad() > 0 {
+        return Err(LaunchError::Refused(format!(
+            "{} task(s) failed: read the execution's logs",
+            ex.bad()
+        )));
+    }
+    let text = farm.read_text(&receipt).await?.ok_or_else(|| {
+        LaunchError::Refused(format!("every task succeeded and {receipt} does not exist"))
+    })?;
+    let receipt: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| LaunchError::Refused(e.to_string()))?;
+    let film = receipt["film"]
+        .as_str()
+        .ok_or_else(|| LaunchError::Refused("a receipt without a film".into()))?;
+    std::fs::create_dir_all(videos).map_err(|e| LaunchError::Refused(e.to_string()))?;
+    let out = videos.join(format!("{}.mp4", args.name.as_deref().unwrap_or(&run)));
+    farm.fetch_film(film, &out).await
+}
+
+#[cfg(test)]
+mod film_tests {
+    use super::*;
+
+    #[test]
+    fn a_film_is_given_its_tape_its_flags_and_where_its_receipt_goes() {
+        let flags = ["--atmosphere".to_string(), "--fps".into(), "60".into()];
+        assert_eq!(
+            film_args("renders/r/traj.mcap", &flags, "renders/r/receipt.json"),
+            [
+                "store:renders/r/traj.mcap",
+                "--atmosphere",
+                "--fps",
+                "60",
+                "--receipt",
+                "renders/r/receipt.json"
+            ]
+        );
+        assert_eq!(film_job(false), "tuile-film-oneoff");
+        assert_eq!(film_job(true), "tuile-film-oneoff-spatial");
+    }
+}
