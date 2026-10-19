@@ -576,8 +576,9 @@ with the invariant or obligation it proves — is `graphics-budget-test-plan.md`
 | **D2** | Recommended | The module lives in `tuile-core` |
 | **D3** | Decided 2026-10-19 | Stand-ins go, and become the budget's `Role::Held`: `Fill`/`Retire`, `Class::StandIn` and the stand-in builders are deleted at the cut-over (§7), and a wanted tile that is not drawable is shown by the draw set's roles. Note for the review: by the definitions in `decisions.rs`, `Role::Held` is the finer descendants kept on a zoom-out, while the stand-ins' job today — coarser ground under a tile not yet drawable — is `Role::Fallback` under the fallback pass; both roles together replace them. `tuile-wgpu/tests/stand_ins.rs` and `no_two_surfaces.rs` must keep proving that the fallback pass never paints over drawn siblings |
 | **D4** | Later | Imagery texture arrays or atlases (phase 2) |
-| **D5** | Open | iOS budget fractions, credit size, imagery-over-terrain cap (3 proposed). Interim default split of the terrain and imagery pool: 40/60 (D-A3) |
+| **D5** | Open | iOS budget fractions, credit size, imagery-over-terrain cap (3 proposed). Profile values found in Phase 3, accepted 2026-10-20 for the cut-over: the desktop reads its local store 32 at a time (`max_local_reads`; at 8 a warm start converged later than a cold one, P1.3); the ground pool's floors and ceilings (D-A3) |
 | **Skirts** | Deferred | Skirts are deferred (see the header) |
+| **D-A3** | Decided 2026-10-20 | The ledger is pooled: terrain and imagery share one pool, terrain between 25 % and 60 % of it, imagery between 40 % and 75 %, one eviction sweep over both (architecture §7). The fixed per-class split goes; the pooled policy is the only one |
 | **D-A0…D-A8** | Decided 2026-10-19 | `graphics-budget-architecture.md` §6: one arbiter; I1 extended; imagery its own content; a pooled ledger simulated in Phase 3; per-layer drapes; the budget with `GeometryServer`, which runs where its budget's inputs are (locally on interactive devices, in a `tuile-server` session for a declared budget); side channels folded into the stream; `ViewState::from_fov` and the incremental decide for P6; the executor's `FrameDeadline` |
 | **Cut-over** | Decided 2026-10-19 | One PR, reviewed in pieces, with no bridge: no flag, no shadow, no adapter between the old protocol and the new |
 | **Deadband** | Decided 2026-10-19 | The refine deadband of #86 (`1ba0d77`, what the last pass *chose*) stays in the traversal; the budget does not re-decide the cut |
@@ -706,7 +707,7 @@ Profiles: desktop, handheld, handheld-low, web, headset, batch (a film's first f
 
 | | Obligation | Predicate | Bound |
 |---|---|---|---|
-| P1.1 | The floor first; coarse ground before any refinement | (a) in every `D_k.start` and every `D_k.upload_plan.items`, each floor resource comes before every other resource; (b) for every k, from k = 0: if R_k holds an item with lvl(x) > `pinned_level`, then every t in N_k.drawn is covered_k and every item of R_k is dressed_k — no area refines while wanted ground anywhere is lost or bare | k_F ≤ T_F(π) = the larger, over the mesh and drape classes, of ⌈#F_c / max_in_flight[c]⌉ × the p95 latency of c; plus ⌈bytes(F) / upload_bytes_per_frame⌉ steps, plus 2 steps. With no host stalled; a failed floor load adds its backoff |
+| P1.1 | The floor first; coarse ground before any refinement | (a) in every `D_k.start` and every `D_k.upload_plan.items`, each floor resource comes before every other resource; (b) for every k, from k = 0: if R_k holds an item with lvl(x) > `pinned_level`, then every t in N_k.drawn is covered_k and every item of R_k is dressed_k — no area refines while wanted ground anywhere is lost or bare | k_F ≤ T_F(π) = the larger, over the mesh and drape classes, of ⌈#F_c / max_in_flight[c]⌉ × the latency the slowest of the floor's #F_c loads of c stays under 95 % of the time (amended 2026-10-20: not one load's p95, which the slowest of 21 exceeds two times in three; for the simulation's exponential jitter, base + ln(#F_c / 0.05) × the mean jitter + the transfer); plus ⌈bytes(F) / upload_bytes_per_frame⌉ steps, plus 2 steps. With no host stalled; a failed floor load adds its backoff |
 | P1.2 | Refinement is monotone while still | over any still[k0, k1] in which `sse_scale_milli` does not rise: for every x in R_{k−1} drawn `Exact`, every item covering x's ground at step k has lvl ≥ lvl(x) and, per layer, img_ℓ ≥ img_ℓ(x). No ground goes coarser, terrain or imagery | every step of the interval |
 | P1.3 | Convergence within the target | conv(k) holds for some k ≤ max(k_stop, k_F) + T_conv(π) and from then to the end of the still interval. P1-warm also: no network start for a resource the store holds (I14), and it converges no later than P1-cold | T_conv(π) |
 | P1.4 | Network work in priority order | (a) `D_k.start` is sorted by `PriorityKey`; (b) for each class c, a network job left unstarted at step k while in_flight(c) < max_in_flight[c] implies that no job of class c with a larger key started at k — nothing waits while a slot is free, apart from the preemption of §11.3; (c) local reads run under `max_local_reads` and never wait behind a network job (I15) | every step |
@@ -912,17 +913,23 @@ impl Budget {
 pub struct FrameDeadline { pub bytes: Bytes, pub time: Micros }
 impl FrameDeadline {
     pub fn from_refresh(hz: u32, upload_share_permille: u16, bytes_per_ms: u64) -> Self;
-    /// The prefix of `plan` this frame uploads after `done` bytes: the first item always goes,
-    /// and a swap group goes whole when it fits.
-    pub fn take<'p>(&self, plan: &'p [ResourceId], done: Bytes, cost: impl Fn(ResourceId) -> Bytes)
-        -> &'p [ResourceId];
+    /// The prefix of `queue` this frame uploads after `done` bytes: the first item always goes,
+    /// and a swap group of `groups` goes whole when it fits, or waits whole (amended 2026-10-20:
+    /// the plan's swap groups are an argument, since a group cannot go whole without them).
+    pub fn take<'p>(&self, queue: &'p [ResourceId], groups: &[SwapGroup], done: Bytes,
+        cost: impl Fn(ResourceId) -> Bytes) -> &'p [ResourceId];
 }
 ```
 
-- `BudgetConfig::interactive`, interim split (D-A3): the terrain and imagery pool is 82 % of
-  the device total (the 80 % they had, plus `StandIn`'s 2 %), split 40/60: `TerrainMesh`
-  33 %, `Drape` 49 % (was 35 % and 45 %). Phase 3 simulates the pooled ledger before D-A3 is
-  closed.
+- `BudgetConfig::interactive`, the pooled ground (D-A3, decided 2026-10-20): terrain and
+  imagery share one `Pool` of 82 % of the device total (the 80 % they had, plus `StandIn`'s
+  2 %) — its target, overflow and hard limit — each member between a floor (percent of the
+  pool: terrain 25 %, imagery 40 %) and a ceiling (its own `target`, `overflow`,
+  `hard_limit`: terrain 60 %, imagery 75 % of the pool's). A member's effective target is
+  what the pool leaves once the other members' bytes are counted, between its floor and its
+  ceiling; one eviction sweep runs over the members in the one eviction order, no member
+  below its floor, none left above its ceiling; the relaxation reads the pool's protected
+  bytes. 3D Tiles and overlays keep their own targets.
 - `BudgetStats` gains the fields the observability contract needs (§16): `bare`, the
   per-class split of drawable and in-transit bytes, the work counter.
 - `FrameDeadline` is in the core so that every executor — the wgpu pump, the web page, the
@@ -983,6 +990,10 @@ impl ViewState {
     pub fn focal_px(&self) -> f64;                 // §13.2
 }
 ```
+
+`ViewStateParams`, the serialised form of a view (the wire, the tape), carries a symmetric
+perspective at scale 1 only; at the cut-over it gains the four angles and the scale, so an
+asymmetric eye and a logical-pixel lens cross a wire and a tape (recorded 2026-10-20).
 
 The architecture document writes `from_fov(position, orientation, …)`. The orientation is
 the pair `direction`, `up` that `perspective` already takes; a host turns an OpenXR pose's
@@ -1078,7 +1089,10 @@ pub struct FrameRecord<'a> {
 /// The signals, accumulated: atomics in `tuile_core::metrics`, as the engine's other numbers.
 pub struct BudgetMeter { /* bounded per-tile maps for flaps and convergence */ }
 impl BudgetObserver for BudgetMeter {}
-impl BudgetMeter { pub fn signals(&self) -> BudgetSignals; }
+impl BudgetMeter {
+    pub fn signals(&self) -> BudgetSignals;          // a snapshot
+    pub fn publish(&mut self) -> BudgetSignals;      // the same, the peaks reset
+}
 /// A snapshot of every signal of §16.3, by the same names: what tests assert on.
 pub struct BudgetSignals { /* … */ }
 
@@ -1087,6 +1101,11 @@ pub struct BudgetSignals { /* … */ }
 pub fn check(s: &StepRecord<'_>, cfg: &BudgetConfig, out: &mut Violations);
 ```
 
+- **As built (Phase 3, accepted 2026-10-20).** The meter keeps plain integers and is read as a
+  snapshot; the Prometheus sink copies the snapshot into `tuile_core::metrics`'s atomics when
+  it publishes (4.2), rather than the meter writing atomics on every step. Durations are kept
+  in integer microseconds and converted to seconds at publication; histograms are of
+  integers, in power-of-two buckets, so no float decides a bucket.
 - `BudgetEvent` is what the host passes to `on_loaded`, `on_failed`, `on_store_miss`,
   `on_drawable`, `on_discarded`, `set_pressure`, `set_thermal`, `retarget`, `new_epoch` and
   `release_beyond`, recorded by the host as it calls them. Their order does not matter: the
@@ -1131,16 +1150,16 @@ Prefix `tuile_budget_`. Bytes in bytes, durations in seconds, ratios unitless.
 | `starts_total` | counter | class, source | starts |
 | `wasted_starts_total` | counter | class | started, then out of the need before delivered |
 | `local_waits_total` | counter | — | a stored resource left waiting while a network job of a lower key started (I15) |
-| `cancels_total` | counter | reason | cancels |
+| `cancels_total` | counter | reason | cancels: `grace`, `timeout`, and `preempted` (an urgent load took the slot; added 2026-10-20) |
 | `completions_total`; `failures_total`; `stale_results_total` | counter | class; class, kind; — | arrivals |
-| `load_seconds` | histogram | class | load latency, from `Micros` |
+| `load_seconds` | histogram | — | load latency, from `Micros`, all classes (no class label: the step's statistics count it for all classes; 2026-10-20) |
 | `in_flight` | gauge | class, source | stats |
 | `request_heap_entries`, `tracked_resources`, `duplicates_in_flight` | gauge | — | stats |
 | `decide_seconds`; `decide_peak_seconds` | histogram; gauge | — | wall clock around `decide`; the worst since the last publish |
 | `decide_share_seconds` | gauge | — | the profile's share of a frame for `decide` |
 | `decide_work`; `decide_work_total` | gauge; counter | — | resources visited, deterministic |
 | `evictions_total`; `releases_total` | counter | class, reason; class | GPU evictions; decoded copies released |
-| `thrash_total`, `rereads_total` | counter | class | network refetches, and local re-reads, within 10 s of an eviction |
+| `thrash_total`, `rereads_total` | counter | — | network refetches, and local re-reads, within 10 s of an eviction, all classes (no class label, 2026-10-20) |
 | `network_bytes_avoided_total`, `store_misses_total` | counter | — | tiers |
 | `upload_plan_bytes` | gauge | — | the step's plan |
 | `uploads_total`; `upload_bytes_total` | counter | class | executor |
@@ -1207,7 +1226,7 @@ The decision digest and the stats digest are not metrics: they are the MCAP tape
 | state | `drawable`, `in_transit` |
 | source | `local`, `network` |
 | role | `exact`, `held`, `fallback` |
-| reason (cancels) | `grace`, `timeout` |
+| reason (cancels) | `grace`, `timeout`, `preempted` |
 | reason (evictions) | `sweep`, `pressure`, `admission`, `release_beyond` |
 | kind (failures; flaps; swaps) | `transient`, `permanent`; `terrain`, `imagery`; `refine`, `coarsen`, `mesh_drape`, `layer` |
 | gap | `-8` to `8` |
