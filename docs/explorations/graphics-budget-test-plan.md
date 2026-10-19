@@ -268,7 +268,7 @@ devices.
 | L3 | `a_film_does_not_depend_on_the_network` | I13 | B | exists: sim | — | the digest |
 | L3 | `a_film_does_not_depend_on_how_frames_are_split` | I13 | B | exists: sim | — | the digest |
 | L3 | `architecture_shared_arbiter_against_split_budgets` | D-A0's evidence (an experiment, ignored) | D, H, Hl | exists: sim (`architecture.rs`) | — | — |
-| L3 | `architecture_pooled_ledger_against_fixed_split` | D-A3's evidence (an experiment, ignored) | D, H, Hl | new | 3 | — |
+| L3 | `architecture_pooled_ledger_against_fixed_split` | D-A3's evidence (an experiment, ignored) | D, H, Hl | done in Phase 3 (`fc31f81`), then removed with the fixed split once D-A3 was decided (pooled, 2026-10-20); its results are the architecture document's §7 | 3 | — |
 | L3 | `a_remote_session_stays_within_its_declared_memory` | I2 and the ledger from `Ack` bytes, with decisions and acks a round trip late (D-A5) | R | new | 3 | `bytes`, `hard_limit_bytes` |
 | L3 | `a_remote_film_is_exact_with_acks_a_round_trip_late` | I13 under a remote session | R, B | new | 3 | `batch_steps_per_frame` |
 | L4 | `upload_plan_respects_bytes` | I18 with the plan's cap (spec §8) | D, H | new | 4.1, green at 5 | `upload_plan_bytes`, `frame_upload_bytes` |
@@ -558,8 +558,8 @@ Read against this plan:
   in MCAP, which also calibrate the simulation's network model;
   `a_still_camera_converges_within_four_seconds_on_a_phone` stays red and ignored until then.
 - **D-L1**, logical pixels: P5.5's cells assume it.
-- **D-A3**, the pooled ledger: `architecture_pooled_ledger_against_fixed_split` gives the
-  evidence; the goldens are re-recorded once if the split changes.
+- **D-A3**, the pooled ledger: decided on 2026-10-20 (pooled, architecture §7); the goldens
+  were re-recorded once, in the commit that made the pool the policy.
 - **D3's wording** (`Role::Held` against `Role::Fallback`, spec §10): the cells of P1 and P3
   assume both roles stay as `decisions.rs` defines them.
 - **P2's fallback climb** has no bound yet; the first green run proposes one, for review.

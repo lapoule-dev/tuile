@@ -13,6 +13,8 @@ was reformulated by Laurent: the budget lives with `GeometryServer`, and
 devices, in a `tuile-server` session for a consumer that declares its budget
 (§4.3, docs/12). The transport is an open decision, D-T1.
 
+D-A3 was decided on 2026-10-20, on the evidence of §7: the ledger is pooled.
+
 Three questions:
 
 1. **Streams.** Is imagery a stream of its own beside the terrain geometry
@@ -621,7 +623,7 @@ and §12–§15).
 | **D-A0** | One arbiter (A) or two budgets (B)? | **A**, on §3 | **Yes**: one arbiter over one GPU pool | Two ledgers evict worn drapes, overshoot the pool and miss convergence at the low clamp, at any split (§3.3) |
 | **D-A1** | Bare floor meshes at start-up (4–8 tile-steps in every scenario, every architecture): make "every drawn item wears a drape" part of I1, the floor mesh and drape one swap group? | Yes, test first | **Yes**: I1 extended, every drawn item wears a drape; the floor mesh and its drape are one swap group; the test is written first, in Phase 3 | Bare ground is black ground, and the per-step check could not see it because I1 counted meshes only |
 | **D-A2** | Imagery as its own `Content` in the same session (A), not a payload (C), not a second stream with its own budget (B′)? | Yes | **Yes**: imagery is its own `Content` in the same session, not a payload of the terrain tile | A payload cannot meet I10 and turns every redrape into a mesh swap; a stream keyed on what terrain drew leaves ground bare (§3.3) |
-| **D-A3** | Keep fixed per-class targets, or pool the ledger with per-class floors and ceilings so the split follows the view? The ratio moves the low-clamp convergence 2.0–3.3 s and the blur under a warning 19–49 %. | Open: simulate a pooled ledger in Phase 3 before deciding; until then, 40/60 for the default split looks better than 44/56 under pressure | **As proposed**: open; a pooled ledger with per-class floors and ceilings is simulated in Phase 3; the interim default split is 40/60 terrain/imagery | The ratio matters in both shapes, and 40/60 was the best of the three splits measured, under pressure and at the low clamp |
+| **D-A3** | Keep fixed per-class targets, or pool the ledger with per-class floors and ceilings so the split follows the view? The ratio moves the low-clamp convergence 2.0–3.3 s and the blur under a warning 19–49 %. | Open: simulate a pooled ledger in Phase 3 before deciding; until then, 40/60 for the default split looks better than 44/56 under pressure | **Decided 2026-10-20: pooled** (§7). Terrain and imagery share one pool, terrain between 25 % and 60 % of it, imagery between 40 % and 75 %, one eviction sweep over both; the fixed per-class targets of the two classes are deleted, and the pooled policy is the only one, with no feature and no switch | The fixed split never converges on the low-end phone's fast dive, and the pooled ledger is never blurrier; its cost — +29 % network on the desktop's zoom out and back, and overflow used above the pool's target at the low clamp (protected bytes only, within every hard limit) — is tracked by the observer (`bytes`, `over_target_seconds_total`, `starts_total{source="network"}`) |
 | **D-A4** | Several layers: per-layer drapes (`Drape { tile, layer, level }`, composed by the executor; USD composes once all are drawable), or one composed drape per tile keyed by the layer set? | Per layer | **Yes**: per-layer drapes `Drape { tile, layer, level }`, composed by the executor | Each layer picks its level, falls back and refreshes on its own; one ledger keeps N layers from needing N splits |
 | **D-A5** | The WebSocket binding: budget in the server session (docs/12) with `Ack { bytes }` and `Held`, and "budget client-side, server stateless" understood as the static HTTP mode? | Yes; correct the plan's wording | **Reformulated**: the budget lives with `GeometryServer`, which runs where its budget's inputs are — locally (in-process or in a worker) on interactive devices; in a `tuile-server` session, its budget fed by `Ack { resource, gen, bytes }` and the declared memory, for a consumer that declares its budget (a render node, a farm, a simulator cluster, one that cannot link the core). `Held` is open: only for a remote consumer with local tiers (§4.3, docs/12) | Pressure must act at once, the local store's presence oracle is synchronous and a head-rate rotation cannot wait a round trip; a declared budget and a batch or LAN latency tolerate one |
 | **D-A6** | Host side channels: `ToWorker::Detail` and `Budget` fold into the stream (`ViewerState`, `Retarget`); `Pause` and the layer switch stay host messages for now? | Yes | **Yes**: `ToWorker::Detail` disappears (the imagery need comes per tile from the views, I10); `ToWorker::Budget { reported }` becomes `ClientMessage::Retarget`; `Pause` and the layer switch stay host messages for now (the layer switch may fold in with several layers) | One path, native and web; no second source of truth for the imagery level; ordered with the acks, so a session replays |
@@ -631,13 +633,18 @@ and §12–§15).
 
 ## 7. D-A3's evidence: a pooled ledger against the fixed split (Phase 3, 2026-10-20)
 
-**Status: open, for Laurent to decide.** The evidence below does not make the
-choice clear-cut.
+**Status: decided on 2026-10-20 — pooled (option 2 of §7.4), T25–60/D40–75.**
+The reason: the fixed split never converges on the low-end phone's fast
+dive, and the pooled ledger is never blurrier; its cost, +29 % network on
+the desktop's zoom out and back and overflow used above the pool's target
+(protected bytes only, under every hard limit), is tracked by the observer.
+The experiment's code is removed with the fixed split; its results stay
+here, as text.
 
 ### 7.1 Method
 
 `crates/tuile-core/tests/budget_sim/pooled.rs` on `feat/budget-core`
-(`fc31f81`), run with
+(`fc31f81`; removed once decided), run with
 `cargo test --release -p tuile-core --features budget-experiments --test budget_sim -- --ignored pooled --nocapture`.
 The pooled policy is compiled only under the `budget-experiments` feature
 (`Pool`, `BudgetConfig::pool`): never a runtime switch, absent from every
