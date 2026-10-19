@@ -1,0 +1,918 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!-- Copyright (c) lapoule.dev -->
+<!--
+  A functional presentation, in French, of the GPU and tile budget and of the
+  XR path (docs/explorations/xr-foundation-study.md). One <section> per 16:9
+  slide; printed to PDF with Chrome headless:
+
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless \
+      --no-pdf-header-footer --print-to-pdf=socle-gpu-xr.pdf socle-gpu-xr.html
+
+  Self-contained: system fonts, inline SVG, no network resource.
+-->
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1920">
+<title>tuile — le socle GPU et la voie XR</title>
+<style>
+  :root {
+    --ink: #17202b;
+    --muted: #5d6877;
+    --faint: #8a94a3;
+    --accent: #1d5ea8;
+    --accent-soft: #e6eef8;
+    --warm: #b8661a;
+    --warm-soft: #fbefe2;
+    --ok: #2d7a4c;
+    --ok-soft: #e5f2ea;
+    --bad: #b03535;
+    --bad-soft: #f8e6e6;
+    --panel: #f3f5f8;
+    --line: #d3dae3;
+    --bg: #ffffff;
+  }
+  @page { size: 1920px 1080px; margin: 0; }
+  html, body { margin: 0; padding: 0; background: var(--bg); }
+  body {
+    font-family: -apple-system, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .slide {
+    width: 1920px; height: 1080px; box-sizing: border-box;
+    padding: 84px 120px 96px; position: relative; overflow: hidden;
+    break-after: page; page-break-after: always;
+    background: var(--bg);
+  }
+  .slide:last-child { break-after: auto; page-break-after: auto; }
+  .kicker {
+    font-size: 24px; font-weight: 600; letter-spacing: 3px; text-transform: uppercase;
+    color: var(--accent); margin: 0 0 12px;
+  }
+  h1 { font-size: 60px; line-height: 1.12; margin: 0 0 40px; font-weight: 700; letter-spacing: -0.5px; }
+  h2 { font-size: 40px; margin: 0 0 18px; font-weight: 650; }
+  p, li { font-size: 32px; line-height: 1.38; margin: 0; }
+  ul { margin: 0; padding-left: 34px; }
+  li + li { margin-top: 14px; }
+  .muted { color: var(--muted); }
+  .small { font-size: 28px; line-height: 1.4; }
+  .tiny { font-size: 22px; line-height: 1.4; color: var(--muted); }
+  .footer {
+    position: absolute; left: 120px; right: 120px; bottom: 38px;
+    display: flex; justify-content: space-between; font-size: 20px; color: var(--faint);
+  }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 48px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 40px; }
+  .grid4 { display: grid; grid-template-columns: 1fr 1fr; gap: 36px 44px; }
+  .grid4 .card { padding: 40px 44px; min-height: 250px; }
+  .card { background: var(--panel); border-radius: 18px; padding: 32px 36px; box-sizing: border-box; }
+  .card h3 { font-size: 34px; margin: 0 0 12px; line-height: 1.2; }
+  .card p, .card li { font-size: 29px; line-height: 1.42; }
+  .card .tag { font-size: 20px; font-weight: 600; letter-spacing: 1.5px; text-transform: uppercase; color: var(--accent); margin-bottom: 10px; }
+  .card.accent { background: var(--accent-soft); }
+  .card.warm { background: var(--warm-soft); }
+  .card.ok { background: var(--ok-soft); }
+  .card.bad { background: var(--bad-soft); }
+  .big { font-size: 76px; font-weight: 700; letter-spacing: -1px; line-height: 1; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; vertical-align: top; padding: 18px 18px; border-bottom: 1px solid var(--line); font-size: 29px; line-height: 1.35; }
+  .card td { font-size: 26px; padding: 14px 10px; }
+  th { font-size: 21px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--muted); font-weight: 600; }
+  td b { font-weight: 650; }
+  .pill { display: inline-block; white-space: nowrap; font-size: 21px; font-weight: 600; padding: 4px 14px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); vertical-align: middle; }
+  .card .pill { background: #ffffff; }
+  .decisions td { font-size: 28px; padding: 14px 10px; }
+  .decisions .pill { font-size: 23px; }
+  .decisions h3 { font-size: 38px; margin-bottom: 8px; }
+  .pill.warm { background: var(--warm-soft); color: var(--warm); }
+  .pill.ok { background: var(--ok-soft); color: var(--ok); }
+  .pill.bad { background: var(--bad-soft); color: var(--bad); }
+  svg text { font-family: -apple-system, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif; }
+  .title-slide { display: flex; flex-direction: column; justify-content: center; padding-left: 160px; }
+  .title-slide h1 { font-size: 92px; margin-bottom: 28px; }
+  .title-slide .sub { font-size: 40px; color: var(--muted); line-height: 1.35; }
+  .title-slide .meta { margin-top: 64px; font-size: 26px; color: var(--faint); }
+  .section-slide { display: flex; flex-direction: column; justify-content: center; padding-left: 160px; background: var(--accent-soft); }
+  .section-slide .num { font-size: 140px; font-weight: 700; color: var(--accent); line-height: 1; }
+  .section-slide h1 { font-size: 80px; margin: 20px 0 24px; }
+  .section-slide p { font-size: 36px; color: var(--muted); max-width: 1400px; }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5d6877"/>
+    </marker>
+  </defs>
+</svg>
+
+<!-- ===================================================== 1. Title -->
+<section class="slide title-slide">
+  <div class="kicker">tuile · présentation fonctionnelle</div>
+  <h1>Le socle GPU<br>et la voie XR</h1>
+  <div class="sub">Un budget graphique qui tient sur chaque appareil,<br>puis le même globe dans un casque et dans un simulateur.</div>
+  <div class="meta">19 octobre 2026 · lapoule.dev</div>
+</section>
+
+<!-- ===================================================== Summary -->
+<section class="slide">
+  <div class="kicker">En bref</div>
+  <h1>Un socle, tous les modes de rendu</h1>
+  <div class="grid3">
+    <div class="card accent">
+      <div class="tag">1 · Le budget</div>
+      <h3>Un arbitre décide</h3>
+      <ul>
+        <li>Ce qui est chargé, gardé, dessiné et envoyé au GPU, image après image.</li>
+        <li>Jamais de sol noir, convergence, rien de rechargé, mémoire bornée.</li>
+        <li><b>État :</b> construit et simulé ; la bascule reste à faire.</li>
+      </ul>
+    </div>
+    <div class="card accent">
+      <div class="tag">2 · La voie XR</div>
+      <h3>Des vues de plus</h3>
+      <ul>
+        <li>Un casque, deux vues ; un simulateur, N vues : la même traversée.</li>
+        <li>OpenXR, Vulkan et wgpu 29 : faisable sans fork.</li>
+        <li><b>Quest d'abord.</b> Ce qui manque : la fovéation.</li>
+      </ul>
+    </div>
+    <div class="card warm">
+      <div class="tag">À décider</div>
+      <h3>Onze questions</h3>
+      <ul>
+        <li><b>Budget :</b> sol nu au démarrage, partage par classe, cible du téléphone.</li>
+        <li><b>XR :</b> ordre des plateformes, stéréo, Z inversé, fovéation, store, simulateurs.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="card" style="margin-top:44px">
+    <p>Le casque n'est pas un produit à part : c'est un mode de rendu de plus, construit dans les couches partagées pour que tous les modes en profitent.</p>
+  </div>
+  <div class="footer"><span>Synthèse</span><span>graphics-budget-*.md · xr-foundation-study.md</span></div>
+</section>
+
+<!-- ===================================================== Why -->
+<section class="slide">
+  <div class="kicker">1 · Le budget</div>
+  <h1>Pourquoi un budget</h1>
+  <div class="grid2">
+    <div>
+      <h2>Ce qu'on voit</h2>
+      <ul>
+        <li>Le chargement ralentit au fil d'une session.</li>
+        <li>Après une rotation ou un dézoom, des tuiles restent floues.</li>
+        <li>Sur le téléphone, la mémoire n'a pas de plafond qui tienne.</li>
+      </ul>
+    </div>
+    <div>
+      <h2>Ce qu'il y a dessous</h2>
+      <ul>
+        <li>Aucun budget GPU : un cache CPU compté en octets décodés.</li>
+        <li>Quatre files sans borne, dans quatre ordres différents.</li>
+        <li>L'imagerie figée au chargement, choisie d'après une altitude globale.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="card accent" style="margin-top:56px">
+    <p><b>L'objectif :</b> un module pur et déterministe qui pilote tous les modes de rendu, l'imagerie choisie indépendamment du terrain, prouvé en simulation avant de toucher un pixel.</p>
+  </div>
+  <div class="footer"><span>Le budget</span><span>graphics-budget-plan.md</span></div>
+</section>
+
+<!-- ===================================================== Promises -->
+<section class="slide">
+  <div class="kicker">Ce qu'il garantit</div>
+  <h1>Quatre promesses</h1>
+  <div class="grid4">
+    <div class="card ok">
+      <div class="tag">I1 · I9 · I11</div>
+      <h3>Jamais de sol noir</h3>
+      <p>Le nouveau maillage et sa texture sont actifs avant que l'ancien parte. Ce que l'image montre, ou ce qui la remplace, n'est jamais évincé.</p>
+    </div>
+    <div class="card ok">
+      <div class="tag">I3 · I4 · I10</div>
+      <h3>Convergence</h3>
+      <p>Caméra immobile : l'image exacte en 2 s sur le bureau, sans aucune oscillation, l'imagerie au niveau que la vue demande.</p>
+    </div>
+    <div class="card ok">
+      <div class="tag">I14 · I15</div>
+      <h3>Rien n'est rechargé</h3>
+      <p>Ce qui est déjà tenu (GPU, mémoire, disque) ne repart jamais sur le réseau, et le local passe avant le distant.</p>
+    </div>
+    <div class="card ok">
+      <div class="tag">I2 · I7 · I8</div>
+      <h3>Mémoire bornée par appareil</h3>
+      <p>Un plafond dur par classe, réglé sur l'appareil. Une alerte mémoire ramène sous la cible en temps borné, sans trou.</p>
+    </div>
+  </div>
+  <p class="tiny" style="margin-top:30px">18 invariants (I1 à I18), chacun vérifié à chaque pas de la simulation ; I16 à I18 pour la stéréo et l'échéance par frame.</p>
+  <div class="footer"><span>Le budget</span><span>graphics-budget-to-be-and-spec.md §1</span></div>
+</section>
+
+<!-- ===================================================== How it decides -->
+<section class="slide">
+  <div class="kicker">Le fonctionnement</div>
+  <h1>Une boucle : besoin, décision, exécution</h1>
+  <svg width="1680" height="660" viewBox="0 0 1680 660">
+    <!-- views -->
+    <rect x="0" y="80" width="300" height="170" rx="16" fill="#f3f5f8"/>
+    <text x="150" y="150" font-size="32" font-weight="650" text-anchor="middle" fill="#17202b">Vues</text>
+    <text x="150" y="196" font-size="24" text-anchor="middle" fill="#5d6877">1 écran, 2 yeux,</text>
+    <text x="150" y="228" font-size="24" text-anchor="middle" fill="#5d6877">N canaux</text>
+    <line x1="300" y1="165" x2="380" y2="165" stroke="#5d6877" stroke-width="3" marker-end="url(#arr)"/>
+    <!-- traversal -->
+    <rect x="390" y="80" width="330" height="170" rx="16" fill="#f3f5f8"/>
+    <text x="555" y="150" font-size="32" font-weight="650" text-anchor="middle" fill="#17202b">Traversée</text>
+    <text x="555" y="196" font-size="24" text-anchor="middle" fill="#5d6877">le besoin : l'union</text>
+    <text x="555" y="228" font-size="24" text-anchor="middle" fill="#5d6877">des vues, par tuile</text>
+    <line x1="720" y1="165" x2="800" y2="165" stroke="#5d6877" stroke-width="3" marker-end="url(#arr)"/>
+    <!-- budget -->
+    <rect x="810" y="40" width="380" height="250" rx="18" fill="#1d5ea8"/>
+    <text x="1000" y="120" font-size="38" font-weight="700" text-anchor="middle" fill="#ffffff">Budget</text>
+    <text x="1000" y="170" font-size="26" text-anchor="middle" fill="#dbe7f5">decide()</text>
+    <text x="1000" y="220" font-size="22" text-anchor="middle" fill="#dbe7f5">pur · déterministe · sans horloge</text>
+    <text x="1000" y="252" font-size="22" text-anchor="middle" fill="#dbe7f5">compile en wasm32</text>
+    <!-- outputs -->
+    <line x1="1190" y1="165" x2="1270" y2="165" stroke="#5d6877" stroke-width="3" marker-end="url(#arr)"/>
+    <rect x="1280" y="20" width="400" height="290" rx="16" fill="#f3f5f8"/>
+    <text x="1310" y="72" font-size="26" fill="#17202b">• démarrer, annuler</text>
+    <text x="1310" y="118" font-size="26" fill="#17202b">• livrer, évincer</text>
+    <text x="1310" y="164" font-size="26" fill="#17202b">• ce qui est dessiné</text>
+    <text x="1310" y="210" font-size="26" fill="#17202b">• le plan d'upload</text>
+    <text x="1310" y="256" font-size="26" fill="#17202b">• la détente du LOD</text>
+    <!-- executor -->
+    <line x1="1480" y1="310" x2="1480" y2="400" stroke="#5d6877" stroke-width="3" marker-end="url(#arr)"/>
+    <rect x="1130" y="410" width="550" height="200" rx="16" fill="#e5f2ea"/>
+    <text x="1405" y="475" font-size="32" font-weight="650" text-anchor="middle" fill="#17202b">Exécuteur GPU</text>
+    <text x="1405" y="522" font-size="24" text-anchor="middle" fill="#5d6877">envoie au GPU dans l'échéance</text>
+    <text x="1405" y="556" font-size="24" text-anchor="middle" fill="#5d6877">de la frame, dans l'ordre du plan</text>
+    <!-- ack back -->
+    <path d="M1130,510 L1000,510 L1000,300" fill="none" stroke="#2d7a4c" stroke-width="3" stroke-dasharray="10 8" marker-end="url(#arr)"/>
+    <text x="1020" y="352" font-size="24" fill="#2d7a4c">accusé : dessinable,</text>
+    <text x="1020" y="384" font-size="24" fill="#2d7a4c">avec ses octets réels</text>
+    <!-- loads -->
+    <rect x="390" y="410" width="330" height="200" rx="16" fill="#f3f5f8"/>
+    <text x="555" y="475" font-size="32" font-weight="650" text-anchor="middle" fill="#17202b">Chargements</text>
+    <text x="555" y="522" font-size="24" text-anchor="middle" fill="#5d6877">disque d'abord,</text>
+    <text x="555" y="556" font-size="24" text-anchor="middle" fill="#5d6877">réseau ensuite</text>
+    <path d="M880,290 L880,360 L555,360 L555,400" fill="none" stroke="#5d6877" stroke-width="3" marker-end="url(#arr)"/>
+    <path d="M720,580 L940,580 L940,300" fill="none" stroke="#5d6877" stroke-width="3" marker-end="url(#arr)"/>
+    <text x="760" y="630" font-size="24" fill="#5d6877">arrivées</text>
+  </svg>
+  <div class="footer"><span>Le budget</span><span>graphics-budget-architecture.md §4.1</span></div>
+</section>
+
+<!-- ===================================================== Decided architecture -->
+<section class="slide">
+  <div class="kicker">L'architecture décidée</div>
+  <h1>Quatre choix structurants</h1>
+  <div class="grid4">
+    <div class="card accent">
+      <h3>Un arbitre, un pool GPU</h3>
+      <p>Une seule comptabilité, un seul ordre de priorité, des remplacements conjoints maillage + texture. La mémoire GPU est un seul pool physique.</p>
+    </div>
+    <div class="card accent">
+      <h3>L'imagerie, un contenu à part, par couche</h3>
+      <p>Chaque drapé {tuile, couche, niveau} est chargé, compté et évincé seul. Son niveau suit la vue, pas le niveau du terrain.</p>
+    </div>
+    <div class="card accent">
+      <h3>Le budget côté client</h3>
+      <p>Le serveur reste sans état et cachable : des octets derrière un CDN. Le client sait ce que son GPU tient. <span class="small muted">(Le mode WebSocket fait tourner le même budget dans la session.)</span></p>
+    </div>
+    <div class="card accent">
+      <h3>Une échéance par frame</h3>
+      <p>Les envois au GPU d'une frame tiennent dans une part de la période d'affichage : 11,1 ms à 90 Hz. Ce qui déborde est reporté et signalé.</p>
+    </div>
+  </div>
+  <div class="footer"><span>Le budget</span><span>décisions D-A0, D-A2, D-A4, D-A5, D-A8</span></div>
+</section>
+
+<!-- ===================================================== Motion P1-P3 -->
+<section class="slide">
+  <div class="kicker">Comportement par mouvement · 1/2</div>
+  <h1>Charger, zoomer, dézoomer</h1>
+  <div class="grid3">
+    <div class="card">
+      <div class="tag">P1</div>
+      <h3>Chargement progressif</h3>
+      <p>Un sol grossier complet d'abord (le plancher), puis un raffinement qui ne recule jamais tant que la caméra est immobile.</p>
+    </div>
+    <div class="card">
+      <div class="tag">P2</div>
+      <h3>Zoom avant</h3>
+      <p>Les enfants ne remplacent le parent que lorsqu'ils sont tous dessinables. L'imagerie s'affine de son côté.</p>
+    </div>
+    <div class="card">
+      <div class="tag">P3</div>
+      <h3>Zoom arrière</h3>
+      <p>Le parent redevient dessinable avant que les enfants partent. Une réserve de 15 % sert à ces échanges au plafond.</p>
+    </div>
+  </div>
+  <svg width="1680" height="320" viewBox="0 0 1680 320" style="margin-top:48px">
+    <text x="0" y="40" font-size="26" font-weight="650" fill="#17202b">Un remplacement atomique (zoom avant)</text>
+    <!-- step 1 -->
+    <rect x="0" y="80" width="360" height="160" rx="10" fill="#1d5ea8"/>
+    <text x="180" y="170" font-size="26" text-anchor="middle" fill="#fff">parent dessiné</text>
+    <text x="180" y="280" font-size="22" text-anchor="middle" fill="#5d6877">frame n</text>
+    <!-- step 2 -->
+    <rect x="440" y="80" width="360" height="160" rx="10" fill="#1d5ea8"/>
+    <rect x="460" y="98" width="150" height="56" rx="6" fill="#2d7a4c"/>
+    <rect x="630" y="98" width="150" height="56" rx="6" fill="#dfe5ec" stroke="#8a94a3" stroke-dasharray="6 5"/>
+    <rect x="460" y="166" width="150" height="56" rx="6" fill="#2d7a4c"/>
+    <rect x="630" y="166" width="150" height="56" rx="6" fill="#dfe5ec" stroke="#8a94a3" stroke-dasharray="6 5"/>
+    <text x="620" y="280" font-size="22" text-anchor="middle" fill="#5d6877">2 enfants sur 4 prêts : le parent reste</text>
+    <!-- step 3 -->
+    <rect x="880" y="80" width="360" height="160" rx="10" fill="#1d5ea8"/>
+    <rect x="900" y="98" width="150" height="56" rx="6" fill="#2d7a4c"/>
+    <rect x="1070" y="98" width="150" height="56" rx="6" fill="#2d7a4c"/>
+    <rect x="900" y="166" width="150" height="56" rx="6" fill="#2d7a4c"/>
+    <rect x="1070" y="166" width="150" height="56" rx="6" fill="#2d7a4c"/>
+    <text x="1060" y="280" font-size="22" text-anchor="middle" fill="#5d6877">4 sur 4 : échange dans le même pas</text>
+    <!-- step 4 -->
+    <rect x="1320" y="80" width="175" height="78" rx="8" fill="#2d7a4c"/>
+    <rect x="1505" y="80" width="175" height="78" rx="8" fill="#2d7a4c"/>
+    <rect x="1320" y="162" width="175" height="78" rx="8" fill="#2d7a4c"/>
+    <rect x="1505" y="162" width="175" height="78" rx="8" fill="#2d7a4c"/>
+    <text x="1500" y="276" font-size="22" text-anchor="middle" fill="#5d6877">enfants dessinés,</text>
+    <text x="1500" y="302" font-size="22" text-anchor="middle" fill="#5d6877">le parent reste en mémoire</text>
+    <line x1="365" y1="160" x2="432" y2="160" stroke="#5d6877" stroke-width="3" marker-end="url(#arr)"/>
+    <line x1="805" y1="160" x2="872" y2="160" stroke="#5d6877" stroke-width="3" marker-end="url(#arr)"/>
+    <line x1="1245" y1="160" x2="1312" y2="160" stroke="#5d6877" stroke-width="3" marker-end="url(#arr)"/>
+  </svg>
+  <div class="footer"><span>Le budget</span><span>motifs P1 à P3, invariant I9</span></div>
+</section>
+
+<!-- ===================================================== Motion P4-P6 -->
+<section class="slide">
+  <div class="kicker">Comportement par mouvement · 2/2</div>
+  <h1>Tourner, changer d'orientation, voir en stéréo</h1>
+  <div class="grid3">
+    <div class="card">
+      <div class="tag">P4</div>
+      <h3>Rotation</h3>
+      <p>Jusqu'à 180°/s à la main et 300°/s à la tête. Le secteur découvert se comble d'abord par l'anneau et le plancher ; rien de visible n'est évincé ; aucun battement au retour.</p>
+    </div>
+    <div class="card">
+      <div class="tag">P5</div>
+      <h3>Changement d'orientation</h3>
+      <p>Portrait ↔ paysage, redimensionnement. L'ancien ensemble reste tant que le nouveau cadre n'est pas couvert ; le besoin est recalculé dans la frame ; pas de rafale.</p>
+    </div>
+    <div class="card">
+      <div class="tag">P6</div>
+      <h3>Stéréo</h3>
+      <p>Une ressource chargée et envoyée une seule fois pour les deux yeux (I16), les deux yeux dessinent la même décision (I17), l'envoi tient dans l'échéance (I18).</p>
+    </div>
+  </div>
+  <svg width="1680" height="320" viewBox="0 0 1680 320" style="margin-top:40px">
+    <text x="0" y="36" font-size="26" font-weight="650" fill="#17202b">Deux yeux, un besoin, une décision</text>
+    <!-- eyes -->
+    <path d="M150,150 L560,64 L560,214 Z" fill="none" stroke="#1d5ea8" stroke-width="3"/>
+    <path d="M150,190 L560,126 L560,276 Z" fill="none" stroke="#b8661a" stroke-width="3"/>
+    <circle cx="150" cy="150" r="16" fill="#1d5ea8"/>
+    <circle cx="150" cy="190" r="16" fill="#b8661a"/>
+    <text x="40" y="160" font-size="22" fill="#1d5ea8">gauche</text>
+    <text x="40" y="200" font-size="22" fill="#b8661a">droit</text>
+    <text x="300" y="300" font-size="22" text-anchor="middle" fill="#5d6877">deux frustums asymétriques</text>
+    <line x1="600" y1="170" x2="690" y2="170" stroke="#5d6877" stroke-width="3" marker-end="url(#arr)"/>
+    <rect x="700" y="105" width="300" height="130" rx="14" fill="#f3f5f8"/>
+    <text x="850" y="162" font-size="28" font-weight="650" text-anchor="middle" fill="#17202b">1 besoin</text>
+    <text x="850" y="200" font-size="22" text-anchor="middle" fill="#5d6877">union, max par tuile</text>
+    <line x1="1000" y1="170" x2="1090" y2="170" stroke="#5d6877" stroke-width="3" marker-end="url(#arr)"/>
+    <rect x="1100" y="105" width="260" height="130" rx="14" fill="#1d5ea8"/>
+    <text x="1230" y="162" font-size="28" font-weight="700" text-anchor="middle" fill="#fff">1 décision</text>
+    <text x="1230" y="200" font-size="22" text-anchor="middle" fill="#dbe7f5">1 coût par ressource</text>
+    <line x1="1360" y1="170" x2="1450" y2="170" stroke="#5d6877" stroke-width="3" marker-end="url(#arr)"/>
+    <rect x="1460" y="80" width="220" height="80" rx="12" fill="#e6eef8"/>
+    <text x="1570" y="130" font-size="24" text-anchor="middle" fill="#17202b">œil gauche</text>
+    <rect x="1460" y="180" width="220" height="80" rx="12" fill="#fbefe2"/>
+    <text x="1570" y="230" font-size="24" text-anchor="middle" fill="#17202b">œil droit</text>
+  </svg>
+  <div class="footer"><span>Le budget</span><span>motifs P4 à P6, invariants I16 à I18</span></div>
+</section>
+
+<!-- ===================================================== Evidence -->
+<section class="slide">
+  <div class="kicker">La preuve par la simulation</div>
+  <h1>Un arbitre contre deux budgets</h1>
+  <div class="grid2" style="grid-template-columns: 1.05fr 0.95fr; gap:56px">
+    <div>
+      <svg width="860" height="560" viewBox="0 0 860 560">
+        <text x="0" y="30" font-size="26" font-weight="650" fill="#17202b">Téléphone au plafond bas (160 Mio) : convergence</text>
+        <text x="0" y="64" font-size="21" fill="#5d6877">secondes après l'arrêt de la caméra, pire des 3 graines</text>
+        <!-- axis -->
+        <line x1="260" y1="100" x2="260" y2="470" stroke="#d3dae3" stroke-width="2"/>
+        <g font-size="22" fill="#5d6877">
+          <text x="260" y="500" text-anchor="middle">0</text>
+          <text x="420" y="500" text-anchor="middle">2</text>
+          <text x="580" y="500" text-anchor="middle">4</text>
+          <text x="740" y="500" text-anchor="middle">6</text>
+        </g>
+        <line x1="420" y1="100" x2="420" y2="470" stroke="#eef1f5" stroke-width="2"/>
+        <line x1="580" y1="100" x2="580" y2="470" stroke="#eef1f5" stroke-width="2"/>
+        <line x1="740" y1="100" x2="740" y2="470" stroke="#eef1f5" stroke-width="2"/>
+        <!-- bars: 80 px per second -->
+        <text x="244" y="148" font-size="24" text-anchor="end" fill="#17202b" font-weight="650">un arbitre</text>
+        <rect x="260" y="118" width="266" height="46" rx="6" fill="#2d7a4c"/>
+        <text x="540" y="150" font-size="24" fill="#17202b">3,3 s</text>
+        <text x="244" y="238" font-size="24" text-anchor="end" fill="#17202b">deux, 40/60</text>
+        <rect x="260" y="208" width="580" height="46" rx="6" fill="#b03535" fill-opacity="0.75"/>
+        <text x="830" y="240" font-size="24" text-anchor="end" fill="#fff">8,0 s</text>
+        <text x="244" y="328" font-size="24" text-anchor="end" fill="#17202b">deux, 44/56</text>
+        <rect x="260" y="298" width="580" height="46" rx="6" fill="#b03535"/>
+        <text x="830" y="330" font-size="24" text-anchor="end" fill="#fff">jamais (1/3)</text>
+        <text x="244" y="418" font-size="24" text-anchor="end" fill="#17202b">deux, 60/40</text>
+        <rect x="260" y="388" width="580" height="46" rx="6" fill="#b03535"/>
+        <text x="830" y="420" font-size="24" text-anchor="end" fill="#fff">jamais (3/3)</text>
+        <text x="0" y="548" font-size="20" fill="#8a94a3">barres rouges coupées : au-delà de l'échelle</text>
+      </svg>
+    </div>
+    <div>
+      <table>
+        <tr><th>mesure</th><th>un arbitre</th><th>deux budgets</th></tr>
+        <tr><td>drapés évincés alors que portés</td><td><b>0</b></td><td>4 à 11</td></tr>
+        <tr><td>pas au-dessus de la cible (plafond bas)</td><td><b>0</b></td><td>536 à 956, jusqu'à 10,5 Mio</td></tr>
+        <tr><td>convergence, bureau immobile</td><td><b>0,22 s</b></td><td>0,72 s</td></tr>
+        <tr><td>coût de décision</td><td><b>×1</b></td><td>×1,5 à ×4,6</td></tr>
+      </table>
+      <p class="small" style="margin-top:28px">Une imagerie qui ne suivrait que le terrain déjà dessiné laisse 911 à 1 970 tuiles nues par scénario : réfutée.</p>
+    </div>
+  </div>
+  <div class="footer"><span>Le budget</span><span>graphics-budget-architecture.md §3, 3 graines par cas</span></div>
+</section>
+
+<!-- ===================================================== Observe -->
+<section class="slide">
+  <div class="kicker">L'observation</div>
+  <h1>Un observateur, plusieurs sorties</h1>
+  <svg width="1680" height="560" viewBox="0 0 1680 560">
+    <rect x="0" y="190" width="420" height="180" rx="18" fill="#1d5ea8"/>
+    <text x="210" y="265" font-size="34" font-weight="700" text-anchor="middle" fill="#fff">Observateur</text>
+    <text x="210" y="310" font-size="23" text-anchor="middle" fill="#dbe7f5">dans le cœur · sans I/O</text>
+    <text x="210" y="342" font-size="23" text-anchor="middle" fill="#dbe7f5">compatible wasm</text>
+    <g stroke="#5d6877" stroke-width="3" fill="none">
+      <path d="M420,280 C520,280 520,60 610,60" marker-end="url(#arr)"/>
+      <path d="M420,280 C520,280 520,200 610,200" marker-end="url(#arr)"/>
+      <path d="M420,280 C520,280 520,340 610,340" marker-end="url(#arr)"/>
+      <path d="M420,280 C520,280 520,480 610,480" marker-end="url(#arr)"/>
+    </g>
+    <rect x="620" y="10" width="1060" height="100" rx="14" fill="#f3f5f8"/>
+    <text x="650" y="55" font-size="28" font-weight="650" fill="#17202b">Prometheus et Grafana</text>
+    <text x="650" y="92" font-size="23" fill="#5d6877">un panneau par invariant ; alertes : plafond dur approché, sol perdu, tuile nue, décision lente</text>
+    <rect x="620" y="150" width="1060" height="100" rx="14" fill="#f3f5f8"/>
+    <text x="650" y="195" font-size="28" font-weight="650" fill="#17202b">Canal de session MCAP</text>
+    <text x="650" y="232" font-size="23" fill="#5d6877">les décisions sur la même ligne de temps que la caméra et les images : rejouable</text>
+    <rect x="620" y="290" width="1060" height="100" rx="14" fill="#f3f5f8"/>
+    <text x="650" y="335" font-size="28" font-weight="650" fill="#17202b">Calque à l'écran</text>
+    <text x="650" y="372" font-size="23" fill="#5d6877">barres par classe face à la cible, en vol, exactes, de repli ; niveau d'imagerie en couleur</text>
+    <rect x="620" y="430" width="1060" height="100" rx="14" fill="#f3f5f8"/>
+    <text x="650" y="475" font-size="28" font-weight="650" fill="#17202b">API de contrôle du viewer sans fenêtre</text>
+    <text x="650" y="512" font-size="23" fill="#5d6877">les tests lisent l'état par ces mêmes signaux, jamais par des accesseurs privés</text>
+  </svg>
+  <p class="small muted" style="margin-top:20px">Chaque signal a un test qui le voit bouger avec le comportement, et rester immobile quand on annule le comportement.</p>
+  <div class="footer"><span>Le budget</span><span>contrat d'observabilité, plan du 19 oct.</span></div>
+</section>
+
+<!-- ===================================================== Tests -->
+<section class="slide">
+  <div class="kicker">La vérification</div>
+  <h1>Cinq niveaux de tests</h1>
+  <svg width="1680" height="640" viewBox="0 0 1680 640">
+    <g>
+      <polygon points="560,20 1120,20 1180,130 500,130" fill="#e6eef8"/>
+      <text x="840" y="70" font-size="28" font-weight="650" text-anchor="middle" fill="#17202b">L5 · appareils</text>
+      <text x="840" y="108" font-size="24" text-anchor="middle" fill="#5d6877">Mac, simulateur iOS, iPhone, émulateur Android ; plus tard Quest</text>
+      <polygon points="495,140 1185,140 1245,250 435,250" fill="#d8e5f4"/>
+      <text x="840" y="190" font-size="28" font-weight="650" text-anchor="middle" fill="#17202b">L4 · viewer sans fenêtre, vrai GPU</text>
+      <text x="840" y="228" font-size="24" text-anchor="middle" fill="#5d6877">Metal sur Mac, lavapipe sous Linux ; pixels noirs scannés à chaque frame et par œil</text>
+      <polygon points="430,260 1250,260 1310,370 370,370" fill="#c9dbf0"/>
+      <text x="840" y="310" font-size="28" font-weight="650" text-anchor="middle" fill="#17202b">L3 · simulation déterministe</text>
+      <text x="840" y="348" font-size="24" text-anchor="middle" fill="#5d6877">monde, réseau, GPU simulés ; empreintes dorées identiques sur toute plateforme ; une heure d'endurance</text>
+      <polygon points="365,380 1315,380 1375,490 305,490" fill="#b8d0ea"/>
+      <text x="840" y="430" font-size="28" font-weight="650" text-anchor="middle" fill="#17202b">L2 · propriétés</text>
+      <text x="840" y="468" font-size="24" text-anchor="middle" fill="#5d6877">13 propriétés à 10 000 cas ; trajets de caméra continus ; modèle de référence pas à pas</text>
+      <polygon points="300,500 1380,500 1440,610 240,610" fill="#a6c4e4"/>
+      <text x="840" y="550" font-size="28" font-weight="650" text-anchor="middle" fill="#17202b">L1 · unitaires et mutation</text>
+      <text x="840" y="588" font-size="24" text-anchor="middle" fill="#5d6877">la mutation valide le plan : 24 mutants sur 24 tués ; chaque survivant révèle un trou de la spec</text>
+    </g>
+  </svg>
+  <div class="footer"><span>Le budget</span><span>plan de test, phases 2 à 6</span></div>
+</section>
+
+<!-- ===================================================== Status -->
+<section class="slide">
+  <div class="kicker">L'état, honnêtement</div>
+  <h1>Construit et simulé, pas encore branché</h1>
+  <div class="grid3">
+    <div class="card ok">
+      <h3>Fait</h3>
+      <ul class="small">
+        <li>Le module pur dans le cœur, wasm32 compris.</li>
+        <li>La simulation : invariants vérifiés à chaque pas, goldens.</li>
+        <li>L'arbitre unique confirmé contre deux budgets.</li>
+      </ul>
+    </div>
+    <div class="card warm">
+      <h3>À faire</h3>
+      <ul class="small">
+        <li>Le viewer sans fenêtre et son API de contrôle.</li>
+        <li>La bascule : un seul PR, l'ancien code supprimé.</li>
+        <li>La stéréo, le cadre de vue, l'échéance par frame.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Chiffres</h3>
+      <ul class="small">
+        <li>Décision : 1,1 ms en moyenne immobile ; 2,3 ms et 6,9 ms au p99 en zoom.</li>
+        <li>Téléphone à froid : 6,4 s, cible 4 s, réseau simulé : 6,3 s au mieux.</li>
+        <li>Au démarrage : 4 à 8 tuiles-pas sans drapé (D-A1).</li>
+      </ul>
+    </div>
+  </div>
+  <div class="card accent" style="margin-top:40px">
+    <p class="small"><b>Pour le casque :</b> la décision coûte encore O(vue · log N). À 90 Hz elle doit devenir incrémentale, O(changements · log N) : une exigence de P6, plus une suite.</p>
+  </div>
+  <div class="footer"><span>Le budget</span><span>spec §11.7, architecture §4.6</span></div>
+</section>
+
+<!-- ===================================================== Platforms -->
+<section class="slide">
+  <div class="kicker">2 · La voie XR</div>
+  <h1>Les plateformes visées</h1>
+  <table>
+    <tr><th style="width:24%">plateforme</th><th style="width:26%">interface</th><th style="width:18%">rendu</th><th>pour tuile</th></tr>
+    <tr><td><b>Meta Quest 3 / 3S</b></td><td>OpenXR sur Android</td><td>Vulkan</td><td><span class="pill ok">cible n°1</span> la coquille Android existe</td></tr>
+    <tr><td><b>Android XR, Pico</b></td><td>OpenXR sur Android</td><td>Vulkan</td><td>le même code, les mêmes extensions</td></tr>
+    <tr><td><b>Casques sur PC</b></td><td>OpenXR (SteamVR, Monado…)</td><td>Vulkan</td><td>le même code ; OpenXR 1.0 sur SteamVR</td></tr>
+    <tr><td><b>Apple Vision Pro</b></td><td>Compositor Services</td><td>Metal</td><td>une coquille Swift, le même rendu wgpu</td></tr>
+    <tr><td><b>Navigateurs</b></td><td>WebXR</td><td>WebGL2, puis WebGPU</td><td>la coquille web, deux passes</td></tr>
+    <tr><td><b>Simulateurs</b></td><td>canaux, CIGI</td><td>Vulkan, plusieurs GPU</td><td><span class="pill warm">plus tard</span> warp, synchro, hauteurs</td></tr>
+  </table>
+  <p class="small muted" style="margin-top:34px">Une seule liaison graphique est acceptée par tous les casques sous OpenXR : Vulkan. C'est le chemin de wgpu.</p>
+  <div class="footer"><span>La voie XR</span><span>xr-foundation-study.md §4 à §8</span></div>
+</section>
+
+<!-- ===================================================== Already there -->
+<section class="slide">
+  <div class="kicker">Le point de départ</div>
+  <h1>Ce que tuile a déjà</h1>
+  <div class="grid3">
+    <div class="card ok">
+      <h3>Plusieurs vues</h3>
+      <p>La traversée prend une liste de vues et sélectionne leur union ; le protocole porte déjà une vue par œil.</p>
+    </div>
+    <div class="card ok">
+      <h3>La stéréo du film</h3>
+      <p>Deux yeux décentrés, hyperstéréo réglée sur la scène, jamais une tuile de moins que la sélection ; vidéo spatiale MV-HEVC.</p>
+    </div>
+    <div class="card ok">
+      <h3>La précision</h3>
+      <p>Tout en f64 jusqu'au rebasage, chaque tuile ramenée à une origine de rendu proche de l'œil.</p>
+    </div>
+    <div class="card ok">
+      <h3>Une coquille Android</h3>
+      <p>APK sans Gradle, activité native, cargo-ndk : un Quest est un appareil Android.</p>
+    </div>
+    <div class="card ok">
+      <h3>wgpu 29</h3>
+      <p>Multiview sur Vulkan, Metal et DX12 ; accès aux objets Vulkan et Metal bruts pour envelopper des images fournies par le casque.</p>
+    </div>
+    <div class="card warm">
+      <h3>Ce qui manque</h3>
+      <p>Les frustums asymétriques, une vue par œil dans le moteur de rendu, le Z inversé dans le viewer, une boucle hors winit.</p>
+    </div>
+  </div>
+  <div class="footer"><span>La voie XR</span><span>traversal.rs, stereo.rs, prepare.rs, android/build.sh</span></div>
+</section>
+
+<!-- ===================================================== OpenXR + wgpu -->
+<section class="slide">
+  <div class="kicker">OpenXR et wgpu</div>
+  <h1>Ce qui marche, ce qui manque</h1>
+  <div class="grid2">
+    <div class="card ok">
+      <h3>Ce qui marche, sans fork</h3>
+      <ul class="small">
+        <li>Le casque crée le device Vulkan avec les extensions que wgpu demande ; wgpu l'enveloppe.</li>
+        <li>Les images du casque deviennent des textures wgpu.</li>
+        <li>Le multiview Vulkan à deux vues.</li>
+        <li>Déjà en production : le module XR de Bevy (wgpu 29), un jeu Rust livré sur Quest et PC (wgpu 30).</li>
+      </ul>
+    </div>
+    <div class="card bad">
+      <h3>Ce qui manque</h3>
+      <ul class="small">
+        <li><b>La fovéation :</b> aucune carte de densité dans wgpu, ni issue ni PR.</li>
+        <li>Aucune résolution de profondeur multi-échantillonnée.</li>
+        <li>La version Vulkan mal lue sur Quest (#10564) : contournement connu.</li>
+        <li>Les dessins indirects cassés sur Adreno (#8801) : rester en direct.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer"><span>La voie XR</span><span>openxr 0.22.0 · wgpu 29.0.3 · étude §3</span></div>
+</section>
+
+<!-- ===================================================== Quest numbers -->
+<section class="slide">
+  <div class="kicker">Meta Quest 3</div>
+  <h1>Les chiffres qui comptent</h1>
+  <div class="grid3" style="gap:36px">
+    <div class="card"><div class="big">5,75 Gio</div><p class="small muted" style="margin-top:14px">mémoire de l'application</p></div>
+    <div class="card warm"><div class="big">&lt; 200–300</div><p class="small muted" style="margin-top:14px">dessins par image recommandés</p></div>
+    <div class="card"><div class="big">~1,5 M</div><p class="small muted" style="margin-top:14px">triangles par image</p></div>
+    <div class="card"><div class="big">72–120 Hz</div><p class="small muted" style="margin-top:14px">affichage ; plancher de 60 images/s</p></div>
+    <div class="card"><div class="big">2064×2208</div><p class="small muted" style="margin-top:14px">pixels par œil</p></div>
+    <div class="card"><div class="big">SDK 34</div><p class="small muted" style="margin-top:14px">exigé pour les apps créées depuis mars 2026</p></div>
+  </div>
+  <div class="card accent" style="margin-top:36px">
+    <p class="small"><b>La première limite sera le nombre de dessins, pas la mémoire :</b> ~500 tuiles × passes × 2 yeux. Réponses : multiview, SSE propre au casque, bundles, imagerie en tableaux de textures.</p>
+  </div>
+  <div class="footer"><span>La voie XR</span><span>documentation Meta Horizon, oct. 2026 · étude §4.3</span></div>
+</section>
+
+<!-- ===================================================== Target architecture -->
+<section class="slide">
+  <div class="kicker">L'architecture cible</div>
+  <h1>Un socle, une coquille de plus</h1>
+  <svg width="1680" height="720" viewBox="0 0 1680 720">
+    <!-- shells row -->
+    <g font-size="26">
+      <rect x="0" y="0" width="300" height="120" rx="14" fill="#f3f5f8"/>
+      <text x="150" y="52" text-anchor="middle" font-weight="650" fill="#17202b">bureau</text>
+      <text x="150" y="88" text-anchor="middle" font-size="22" fill="#5d6877">winit</text>
+      <rect x="320" y="0" width="300" height="120" rx="14" fill="#f3f5f8"/>
+      <text x="470" y="52" text-anchor="middle" font-weight="650" fill="#17202b">téléphones</text>
+      <text x="470" y="88" text-anchor="middle" font-size="22" fill="#5d6877">iOS, Android</text>
+      <rect x="640" y="0" width="300" height="120" rx="14" fill="#f3f5f8"/>
+      <text x="790" y="52" text-anchor="middle" font-weight="650" fill="#17202b">navigateur</text>
+      <text x="790" y="88" text-anchor="middle" font-size="22" fill="#5d6877">WebGPU, WebGL2</text>
+      <rect x="960" y="0" width="340" height="120" rx="14" fill="#1d5ea8"/>
+      <text x="1130" y="52" text-anchor="middle" font-weight="700" fill="#fff">casque</text>
+      <text x="1130" y="88" text-anchor="middle" font-size="22" fill="#dbe7f5">nouvelle coquille XR</text>
+      <rect x="1320" y="0" width="360" height="120" rx="14" fill="#fbefe2"/>
+      <text x="1500" y="52" text-anchor="middle" font-weight="650" fill="#17202b">simulateur</text>
+      <text x="1500" y="88" text-anchor="middle" font-size="22" fill="#5d6877">N canaux, plus tard</text>
+    </g>
+    <!-- session layer -->
+    <rect x="960" y="150" width="340" height="110" rx="14" fill="#e6eef8"/>
+    <text x="1130" y="196" text-anchor="middle" font-size="25" font-weight="650" fill="#17202b">session OpenXR</text>
+    <text x="1130" y="230" text-anchor="middle" font-size="21" fill="#5d6877">images, frame, poses</text>
+    <rect x="1320" y="150" width="360" height="110" rx="14" fill="#fbefe2"/>
+    <text x="1500" y="196" text-anchor="middle" font-size="25" font-weight="650" fill="#17202b">canaux, synchro</text>
+    <text x="1500" y="230" text-anchor="middle" font-size="21" fill="#5d6877">géométrie, warp, CIGI</text>
+    <!-- shared frame core -->
+    <rect x="0" y="290" width="1680" height="120" rx="14" fill="#f3f5f8"/>
+    <text x="840" y="340" text-anchor="middle" font-size="28" font-weight="650" fill="#17202b">l'application partagée, sans winit au centre</text>
+    <text x="840" y="378" text-anchor="middle" font-size="22" fill="#5d6877">session, pompe, globe, profil, cycle de vie — pilotée par winit ou par la boucle du casque</text>
+    <!-- renderer -->
+    <rect x="0" y="440" width="820" height="120" rx="14" fill="#e5f2ea"/>
+    <text x="410" y="490" text-anchor="middle" font-size="28" font-weight="650" fill="#17202b">rendu wgpu</text>
+    <text x="410" y="528" text-anchor="middle" font-size="22" fill="#5d6877">N vues : multiview ou une passe par vue ; Z inversé</text>
+    <rect x="860" y="440" width="820" height="120" rx="14" fill="#e5f2ea"/>
+    <text x="1270" y="490" text-anchor="middle" font-size="28" font-weight="650" fill="#17202b">budget</text>
+    <text x="1270" y="528" text-anchor="middle" font-size="22" fill="#5d6877">une décision pour tous les yeux ; échéance tirée du casque</text>
+    <!-- core -->
+    <rect x="0" y="590" width="1680" height="120" rx="14" fill="#1d5ea8"/>
+    <text x="840" y="642" text-anchor="middle" font-size="30" font-weight="700" fill="#fff">tuile-core — inchangé dans ses règles</text>
+    <text x="840" y="682" text-anchor="middle" font-size="22" fill="#dbe7f5">traversée multi-vues, frustums asymétriques, f64, aucun wgpu, aucun OpenXR, wasm32</text>
+  </svg>
+  <div class="footer"><span>La voie XR</span><span>xr-foundation-study.md §10</span></div>
+</section>
+
+<!-- ===================================================== Frame loop -->
+<section class="slide">
+  <div class="kicker">Une frame dans le casque</div>
+  <h1>Le casque donne l'heure</h1>
+  <svg width="1680" height="560" viewBox="0 0 1680 560">
+    <g font-size="24">
+      <rect x="0" y="40" width="250" height="170" rx="14" fill="#1d5ea8"/>
+      <text x="125" y="105" text-anchor="middle" font-weight="700" font-size="27" fill="#fff">attendre</text>
+      <text x="125" y="140" text-anchor="middle" fill="#dbe7f5">l'heure prévue</text>
+      <text x="125" y="172" text-anchor="middle" fill="#dbe7f5">de l'affichage</text>
+      <rect x="290" y="40" width="250" height="170" rx="14" fill="#f3f5f8"/>
+      <text x="415" y="105" text-anchor="middle" font-weight="650" font-size="27" fill="#17202b">situer</text>
+      <text x="415" y="140" text-anchor="middle" fill="#5d6877">les deux yeux</text>
+      <text x="415" y="172" text-anchor="middle" fill="#5d6877">à cette heure</text>
+      <rect x="580" y="40" width="250" height="170" rx="14" fill="#f3f5f8"/>
+      <text x="705" y="105" text-anchor="middle" font-weight="650" font-size="27" fill="#17202b">composer</text>
+      <text x="705" y="140" text-anchor="middle" fill="#5d6877">ancre f64 sur</text>
+      <text x="705" y="172" text-anchor="middle" fill="#5d6877">le globe + tête</text>
+      <rect x="870" y="40" width="250" height="170" rx="14" fill="#f3f5f8"/>
+      <text x="995" y="105" text-anchor="middle" font-weight="650" font-size="27" fill="#17202b">demander</text>
+      <text x="995" y="140" text-anchor="middle" fill="#5d6877">2 vues à la</text>
+      <text x="995" y="172" text-anchor="middle" fill="#5d6877">traversée</text>
+      <rect x="1160" y="40" width="250" height="170" rx="14" fill="#e5f2ea"/>
+      <text x="1285" y="105" text-anchor="middle" font-weight="650" font-size="27" fill="#17202b">envoyer</text>
+      <text x="1285" y="140" text-anchor="middle" fill="#5d6877">au GPU dans</text>
+      <text x="1285" y="172" text-anchor="middle" fill="#5d6877">l'échéance</text>
+      <rect x="1450" y="40" width="230" height="170" rx="14" fill="#e5f2ea"/>
+      <text x="1565" y="105" text-anchor="middle" font-weight="650" font-size="27" fill="#17202b">dessiner</text>
+      <text x="1565" y="140" text-anchor="middle" fill="#5d6877">les 2 yeux,</text>
+      <text x="1565" y="172" text-anchor="middle" fill="#5d6877">rendre la main</text>
+    </g>
+    <g stroke="#5d6877" stroke-width="3">
+      <line x1="250" y1="125" x2="284" y2="125" marker-end="url(#arr)"/>
+      <line x1="540" y1="125" x2="574" y2="125" marker-end="url(#arr)"/>
+      <line x1="830" y1="125" x2="864" y2="125" marker-end="url(#arr)"/>
+      <line x1="1120" y1="125" x2="1154" y2="125" marker-end="url(#arr)"/>
+      <line x1="1410" y1="125" x2="1444" y2="125" marker-end="url(#arr)"/>
+    </g>
+    <!-- timeline -->
+    <text x="0" y="300" font-size="26" font-weight="650" fill="#17202b">À 90 Hz : 11,1 ms par image</text>
+    <rect x="0" y="330" width="1680" height="56" rx="8" fill="#f3f5f8"/>
+    <rect x="0" y="330" width="210" height="56" rx="8" fill="#1d5ea8"/>
+    <text x="105" y="366" text-anchor="middle" font-size="22" fill="#fff">CPU</text>
+    <rect x="210" y="330" width="300" height="56" fill="#2d7a4c"/>
+    <text x="360" y="366" text-anchor="middle" font-size="22" fill="#fff">envois GPU (part bornée)</text>
+    <rect x="510" y="330" width="900" height="56" fill="#9fc3a9"/>
+    <text x="960" y="366" text-anchor="middle" font-size="22" fill="#17202b">dessin des deux yeux</text>
+    <rect x="1410" y="330" width="270" height="56" rx="8" fill="#fbefe2"/>
+    <text x="1545" y="366" text-anchor="middle" font-size="22" fill="#17202b">marge</text>
+    <text x="0" y="440" font-size="24" fill="#5d6877">La sélection et le budget tournent à côté, sur leur propre tâche : ils ne tiennent jamais la frame.</text>
+    <text x="0" y="480" font-size="24" fill="#5d6877">Une image manquée est reprojetée par le casque — à partir de la profondeur, si on la lui donne.</text>
+  </svg>
+  <div class="footer"><span>La voie XR</span><span>xrWaitFrame · xrLocateViews · xrEndFrame</span></div>
+</section>
+
+<!-- ===================================================== Head, ground, comfort -->
+<section class="slide">
+  <div class="kicker">Le globe à la tête</div>
+  <h1>Un sol stable, une tête rapide</h1>
+  <div class="grid2" style="grid-template-columns: 0.9fr 1.1fr; gap:48px">
+    <svg width="760" height="700" viewBox="0 0 760 700">
+      <circle cx="380" cy="330" r="290" fill="none" stroke="#b8661a" stroke-width="4" stroke-dasharray="14 10"/>
+      <path d="M380,330 L158.3,214.5 A250,250 0 0,1 601.7,214.5 Z" fill="#1d5ea8" fill-opacity="0.14"/>
+      <path d="M380,330 L188.5,169.3 A250,250 0 0,1 571.5,169.3 Z" fill="#1d5ea8" fill-opacity="0.38"/>
+      <path d="M533.2,201.4 A200,200 0 0,1 577,364.7" fill="none" stroke="#17202b" stroke-width="4" marker-end="url(#arr)"/>
+      <circle cx="380" cy="330" r="30" fill="#17202b"/>
+      <text x="380" y="160" font-size="26" text-anchor="middle" fill="#17202b" font-weight="650">~100°</text>
+      <text x="500" y="430" font-size="26" fill="#17202b" font-weight="650">300°/s</text>
+      <g font-size="22" fill="#17202b">
+        <rect x="20" y="636" width="26" height="26" fill="#1d5ea8" fill-opacity="0.38"/>
+        <text x="56" y="657">champ de vue</text>
+        <rect x="230" y="636" width="26" height="26" fill="#1d5ea8" fill-opacity="0.14"/>
+        <text x="266" y="657">marge +25 %</text>
+        <line x1="440" y1="649" x2="476" y2="649" stroke="#b8661a" stroke-width="4" stroke-dasharray="10 6"/>
+        <text x="486" y="657">vues de garde</text>
+      </g>
+    </svg>
+    <div>
+      <ul class="small">
+        <li><b>Précision.</b> Une ancre f64 sur le globe, la pose de la tête en f32 locale. Z inversé, plan proche à 5 cm.</li>
+        <li><b>Échelle.</b> À taille humaine, ou le globe sur la table : la SSE ne change pas avec l'échelle.</li>
+        <li><b>Rotation.</b> À 300°/s, 300 ms de chargement balaient 90°. Des vues de garde, six petites vues autour de la tête, gardent partout un sol grossier.</li>
+        <li><b>Confort.</b> L'ancre ne bouge que sur un geste. Horizon fixe, virages par crans, fondus plutôt que glissades. Jamais de trou sous les pieds.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer"><span>La voie XR</span><span>étude §9</span></div>
+</section>
+
+<!-- ===================================================== Vision Pro, WebXR -->
+<section class="slide">
+  <div class="kicker">Apple et les navigateurs</div>
+  <h1>Vision Pro et WebXR</h1>
+  <div class="grid2">
+    <div class="card">
+      <h3>Apple Vision Pro</h3>
+      <ul class="small">
+        <li><b>Compositor Services</b> a une API C. Sa couche « layered » est du multiview, en Z inversé. Le rendu wgpu peut très probablement y dessiner, ce qui reste à démontrer. Il faut une coquille Swift ; la fovéation est coupée sans fork.</li>
+        <li><b>RealityKit</b> (la façade prévue) : un globe en volume, à côté d'autres apps.</li>
+        <li><b>Depuis un Mac</b> (macOS 26) : le viewer actuel diffusé au casque, en pis-aller.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Navigateurs</h3>
+      <ul class="small">
+        <li><b>WebGL2, deux passes</b> : Quest Browser et Chrome, aujourd'hui.</li>
+        <li><b>Liaison WebGPU</b> : livrée dans Safari sur visionOS, expérimentale sur Quest, derrière un drapeau dans Chrome.</li>
+        <li><b>wgpu</b> : il manque l'adaptateur « compatible XR », un petit patch.</li>
+        <li>Une URL plutôt qu'un store : le globe au casque sans installation.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer"><span>La voie XR</span><span>visionOS 27 · WebXR CR 2026 · étude §6 et §7</span></div>
+</section>
+
+<!-- ===================================================== Simulators -->
+<section class="slide">
+  <div class="kicker">Les simulateurs</div>
+  <h1>Un canal est une vue</h1>
+  <div class="grid2" style="grid-template-columns: 0.85fr 1.15fr; gap:44px">
+    <svg width="720" height="600" viewBox="0 0 720 600">
+      <path d="M360,500 L50,300 L220,130 Z" fill="#1d5ea8" fill-opacity="0.12"/>
+      <path d="M360,500 L220,130 L500,130 Z" fill="#1d5ea8" fill-opacity="0.26"/>
+      <path d="M360,500 L500,130 L670,300 Z" fill="#1d5ea8" fill-opacity="0.12"/>
+      <g stroke="#17202b" stroke-width="7" stroke-linecap="round">
+        <line x1="50" y1="300" x2="220" y2="130"/>
+        <line x1="220" y1="130" x2="500" y2="130"/>
+        <line x1="500" y1="130" x2="670" y2="300"/>
+      </g>
+      <circle cx="220" cy="130" r="20" fill="#b8661a" fill-opacity="0.85"/>
+      <circle cx="500" cy="130" r="20" fill="#b8661a" fill-opacity="0.85"/>
+      <circle cx="360" cy="500" r="18" fill="#17202b"/>
+      <g font-size="24" fill="#17202b" text-anchor="middle">
+        <text x="360" y="104">canal 2</text>
+        <text x="96" y="196">canal 1</text>
+        <text x="624" y="196">canal 3</text>
+        <text x="360" y="548">un œil, trois frustums décentrés</text>
+      </g>
+      <text x="360" y="62" font-size="22" text-anchor="middle" fill="#b8661a">zones de fondu : là où naissent les coutures</text>
+    </svg>
+    <ul class="small" style="font-size:25px">
+      <li>Le frustum décentré vient des coins de l'écran.</li>
+      <li>Plusieurs canaux par processus, <b>un budget par GPU</b>.</li>
+      <li>Warp et fondu par projecteur (VESA MPCDI), dans la même image.</li>
+      <li>Synchro : une barrière logicielle d'abord, matérielle ensuite.</li>
+      <li>CIGI : vues, entités, hauteurs du terrain (~43 µs la requête).</li>
+      <li>Coutures : même résolution angulaire, détente diffusée, activation commune.</li>
+      <li>CDB X et One World Terrain convergent vers 3D Tiles.</li>
+    </ul>
+  </div>
+  <div class="footer"><span>La voie XR</span><span>CIGI SISO-STD-013 · OGC CDB 2.0 · 14 CFR 60 · étude §8</span></div>
+</section>
+
+<!-- ===================================================== Roadmap -->
+<section class="slide">
+  <div class="kicker">La feuille de route</div>
+  <h1>Quest d'abord, sur un banc de bureau</h1>
+  <div class="grid3" style="gap:30px">
+    <div class="card accent"><div class="tag">X0 · sans casque</div><h3>Le socle partagé</h3><p class="small">Vues asymétriques, N vues au rendu, Z inversé, stéréo sans fenêtre, budget stéréo.</p></div>
+    <div class="card ok"><div class="tag">X1 · Quest 3, 72 Hz</div><h3>Le globe au casque</h3><p class="small">Deux passes, attribution visible. Un tour de 10 min sans trou ni image perdue.</p></div>
+    <div class="card"><div class="tag">X2</div><h3>Confort et performance</h3><p class="small">Multiview, 90 Hz, space warp, passthrough, globe sur la table ; fovéation si fork.</p></div>
+    <div class="card"><div class="tag">X3</div><h3>Les autres casques</h3><p class="small">PC VR (SteamVR, Monado), Android XR, Pico : le même code.</p></div>
+    <div class="card warm"><div class="tag">X4</div><h3>Les simulateurs</h3><p class="small">Canaux, warp et fondu, synchro, CIGI, coutures cohérentes.</p></div>
+    <div class="card"><div class="tag">X5</div><h3>Vision Pro et WebXR</h3><p class="small">Coquille Swift sur le rendu wgpu ; WebGL2 puis WebGPU.</p></div>
+  </div>
+  <p class="small muted" style="margin-top:30px">Pourquoi Quest d'abord : la coquille Android existe, la contrainte la plus dure dimensionne le budget, un seul code Vulkan sert aussi le PC. Le banc : Monado en CI, le simulateur sur Mac.</p>
+  <div class="footer"><span>La voie XR</span><span>étude §11</span></div>
+</section>
+
+<!-- ===================================================== Testing XR -->
+<section class="slide">
+  <div class="kicker">La vérification</div>
+  <h1>Tester sans casque, puis avec</h1>
+  <table>
+    <tr><th style="width:22%">niveau</th><th>ce qu'on vérifie</th><th style="width:26%">où</th></tr>
+    <tr><td><b>Simulation</b></td><td>le budget stéréo sur des traces de tête à 72, 90 et 120 Hz</td><td>CI, chaque PR</td></tr>
+    <tr><td><b>Sans fenêtre</b></td><td>N yeux, pixels noirs scannés par œil ; multiview identique aux deux passes, au pixel près</td><td>Mac (Metal), Linux (lavapipe)</td></tr>
+    <tr><td><b>Session OpenXR</b></td><td>device partagé, images, boucle de frame, états de session</td><td>Monado sur lavapipe, CI sans GPU</td></tr>
+    <tr><td><b>Runtimes de bureau</b></td><td>la coquille de bout en bout, à la main</td><td>simulateur Meta (Mac), SteamVR (Windows)</td></tr>
+    <tr><td><b>Appareil</b></td><td>la cadence, la mémoire, la chaleur, le confort ; l'enregistrement ouvert</td><td>Quest par adb : métriques, Perfetto, RenderDoc</td></tr>
+  </table>
+  <div class="footer"><span>La voie XR</span><span>Monado 25.1.0 · étude §12</span></div>
+</section>
+
+<!-- ===================================================== Risks -->
+<section class="slide">
+  <div class="kicker">Les risques</div>
+  <h1>Ce qui peut coûter cher</h1>
+  <table>
+    <tr><th style="width:44%">risque</th><th>parade</th></tr>
+    <tr><td><b>Pas de fovéation dans wgpu</b></td><td>livrer sans, mesurer sur l'appareil, puis un fork contenu de wgpu-hal</td></tr>
+    <tr><td><b>Trop de dessins pour le Quest</b></td><td>multiview, SSE du casque, bundles, imagerie en tableaux</td></tr>
+    <tr><td><b>Décision trop lente à 90 Hz</b></td><td>le besoin incrémental ; les vues de garde rendent un retard flou, pas vide</td></tr>
+    <tr><td><b>Bande passante d'un GPU à tuiles</b></td><td>ne stocker ni l'échantillonnage multiple ni la profondeur</td></tr>
+    <tr><td><b>API brutes de wgpu qui bougent</b></td><td>toute l'interopérabilité dans une seule crate</td></tr>
+    <tr><td><b>Coutures entre canaux</b></td><td>détente diffusée, activation commune des raffinements</td></tr>
+  </table>
+  <div class="footer"><span>La voie XR</span><span>étude §13</span></div>
+</section>
+
+<!-- ===================================================== Decisions -->
+<section class="slide">
+  <div class="kicker">À décider</div>
+  <h1>Les décisions de Laurent</h1>
+  <div class="grid2 decisions" style="gap:40px">
+    <div class="card">
+      <h3>Budget</h3>
+      <table>
+        <tr><td><b>D-A1</b> pas de maillage nu au démarrage</td><td><span class="pill">oui, test d'abord</span></td></tr>
+        <tr><td><b>D-A3</b> cibles fixes par classe ou pool à planchers</td><td><span class="pill warm">à simuler</span></td></tr>
+        <tr><td><b>Cible téléphone à froid</b> 4 s, 6,3 s au mieux</td><td><span class="pill warm">cible ou quotas</span></td></tr>
+        <tr><td><b>D3</b> les remplaçants restent une classe</td><td><span class="pill warm">sur preuve</span></td></tr>
+        <tr><td><b>D5</b> fractions iOS, plafond imagerie de 3</td><td><span class="pill">à l'étape 6</span></td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h3>XR</h3>
+      <table>
+        <tr><td><b>D-X1</b> ordre des plateformes</td><td><span class="pill">Quest d'abord</span></td></tr>
+        <tr><td><b>D-X3</b> stéréo</td><td><span class="pill">2 passes, puis multiview</span></td></tr>
+        <tr><td><b>D-X4</b> Z inversé partout</td><td><span class="pill">oui</span></td></tr>
+        <tr><td><b>D-X5</b> fovéation par fork de wgpu</td><td><span class="pill warm">après mesure</span></td></tr>
+        <tr><td><b>D-X7</b> diffusion</td><td><span class="pill">sideload, puis store</span></td></tr>
+        <tr><td><b>D-X8</b> ambition simulateur</td><td><span class="pill warm">multi-canal d'abord</span></td></tr>
+      </table>
+    </div>
+  </div>
+  <p class="small muted" style="margin-top:26px">Les autres questions de l'étude — la découpe en crates, les vues de garde, les hauteurs pour CIGI, Vision Pro, WebXR — ont une recommandation sans enjeu immédiat : §14.</p>
+  <div class="footer"><span>Décisions</span><span>architecture §6 · spec §10–11 · étude §14</span></div>
+</section>
+
+</body>
+</html>
