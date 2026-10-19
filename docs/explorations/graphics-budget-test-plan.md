@@ -267,7 +267,7 @@ devices.
 | L3 | `a_300_frame_film_is_exact_every_frame` | I13 | B | exists: sim | — | `batch_steps_per_frame` |
 | L3 | `a_film_does_not_depend_on_the_network` | I13 | B | exists: sim | — | the digest |
 | L3 | `a_film_does_not_depend_on_how_frames_are_split` | I13 | B | exists: sim | — | the digest |
-| L3 | `architecture_shared_arbiter_against_split_budgets` | D-A0's evidence (an experiment, ignored) | D, H, Hl | exists: sim (`architecture.rs`) | — | — |
+| L3 | `architecture_shared_arbiter_against_split_budgets` | D-A0's evidence (an experiment, ignored) | D, H, Hl | removed in Phase 3 with the fixed per-class split it re-split (D-A3 decided, 2026-10-20); its results are the architecture document's §3 and appendix | — | — |
 | L3 | `architecture_pooled_ledger_against_fixed_split` | D-A3's evidence (an experiment, ignored) | D, H, Hl | done in Phase 3 (`fc31f81`), then removed with the fixed split once D-A3 was decided (pooled, 2026-10-20); its results are the architecture document's §7 | 3 | — |
 | L3 | `a_remote_session_stays_within_its_declared_memory` | I2 and the ledger from `Ack` bytes, with decisions and acks a round trip late (D-A5) | R | new | 3 | `bytes`, `hard_limit_bytes` |
 | L3 | `a_remote_film_is_exact_with_acks_a_round_trip_late` | I13 under a remote session | R, B | new | 3 | `batch_steps_per_frame` |

@@ -122,7 +122,7 @@ what that resend costs.
 ### 3.1 Method
 
 `crates/tuile-core/tests/budget_sim/architecture.rs` on `feat/budget-core`
-(commit `b9eda88`, test-only, `#[ignore]`d; run with
+(commit `b9eda88`, test-only, `#[ignore]`d, removed once D-A3 was decided; run with
 `cargo test --release -p tuile-core --test budget_sim -- --ignored architecture --nocapture`).
 It replays the simulation's world, network, GPU and traversal unchanged, with:
 
