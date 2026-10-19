@@ -629,6 +629,94 @@ and §12–§15).
 | **D-A8** | Per-frame deadline: the executor's `FrameDeadline` from the display rate, with `upload_bytes_per_frame` kept as the plan's per-step cap? | Yes | **Yes**: the executor's `FrameDeadline`, from the display rate, caps uploads per frame; `upload_bytes_per_frame` stays the plan's deterministic per-step cap; what is deferred is reported as a deviation and never feeds `decide` | Only the render side knows its frame; decisions stay a function of their inputs (I12) |
 | **D-T1** | The transport of the session binding | — | **Open.** docs/12 says WebSocket in v1, WebTransport later. Under discussion: QUIC (`quinn`) / WebTransport first, shared-memory IPC on the same machine (zero-copy glb), WebSocket as the fallback; Workers keep the static mode (WebTransport on Workers to verify). The protocol stays transport-agnostic | Multiplexed streams give priorities and a cancel per content, no TCP head-of-line blocking behind a 22 MB drape, and connection migration between Wi-Fi and cellular |
 
+## 7. D-A3's evidence: a pooled ledger against the fixed split (Phase 3, 2026-10-20)
+
+**Status: open, for Laurent to decide.** The evidence below does not make the
+choice clear-cut.
+
+### 7.1 Method
+
+`crates/tuile-core/tests/budget_sim/pooled.rs` on `feat/budget-core`
+(`fc31f81`), run with
+`cargo test --release -p tuile-core --features budget-experiments --test budget_sim -- --ignored pooled --nocapture`.
+The pooled policy is compiled only under the `budget-experiments` feature
+(`Pool`, `BudgetConfig::pool`): never a runtime switch, absent from every
+product build.
+
+- **fixed-40/60**: the interim default (terrain 33 %, imagery 49 % of the
+  device), each class swept to its own target.
+- **pooled-T25-60/D40-75** and **pooled-T20-70/D30-80**: the same one
+  arbiter, terrain and imagery sharing one pool (the sum of their targets,
+  overflows and hard limits). A member's effective target is what the pool
+  leaves once the other members' bytes are counted, clamped between its
+  floor and its ceiling (percent of the pool); one eviction sweep runs over
+  both members in the one eviction order, no member below its floor, none
+  left above its ceiling; the relaxation reads the pool's protected bytes.
+- Every run goes through the simulation's `Sim` with its lenses, eyes and
+  deadlines, so every invariant is checked at every step in every variant;
+  none broke. Two seeds a cell; blurry % is exact item-steps more than a
+  level coarser than the unrelaxed need; over-target is the pool's bytes
+  above the fixed pool target (the overflow in use).
+
+### 7.2 Results
+
+| scenario | profile | variant | blurry % | converged s (max) | over-target steps (max MiB) | flapping | scale peak | decide mean / p99 µs | net MiB |
+|---|---|---|---|---|---|---|---|---|---|
+| P1 still | desktop | fixed-40/60 | 3.2 | 0.13 | 0 (0.0) | 1 | 1000 | 1196 / 1554 | 103.9 |
+| P1 still | desktop | pooled | 3.2 | 0.13 | 0 (0.0) | 1 | 1000 | 1180 / 1618 | 103.9 |
+| P1 still | handheld, handheld-low | all three | 1.6, 2.1 | 3.28, 3.17 | 0 | 1 | 1000 | alike | 24.7, 15.6 |
+| P2 fast dive | desktop, handheld | all three | 2.3, 0.2 | 0.00, never (2/2) | 0 | ≤ 1 | 1000 | alike | 194.5, 49.2 |
+| P2 fast dive | handheld-low | fixed-40/60 | 3.8 | **never (2/2)** | 2 (0.2) | 2 | 7766 | 317 / 633 | 27.8 |
+| P2 fast dive | handheld-low | pooled | 3.6 | **5.52** | **98 (3.4)** | 2 | 6316 | 406 / 917 | 31.6 |
+| P3 zoom out and back | desktop | fixed-40/60 | 2.7 | 0.03 | 0 | 0 | 1516 | 2385 / 7678 | 298.7 |
+| P3 zoom out and back | desktop | pooled | **1.3** | 0.03 | 0 | 0 | 1000 | 2658 / 7703 | **386.5** |
+| P3 zoom out and back | handheld | fixed / pooled | 1.4 / 1.3 | 1.42 | 0 | 1 | 1000 | alike | 55.2 |
+| P4 head-rate yaw | desktop | fixed / pooled | 6.1 / **3.6** | 0.00 | 0 | 0 | 1000 | alike | 125.4 / 125.6 |
+| P4 head-rate yaw | headset-90 | fixed / pooled | 6.9 / 6.1 | 2.74 / 2.67 | 0 | 1 | 1000 | alike | 51.9 |
+| P5 rotation | handheld | all three | 0.3 | 0.33 | 0 | 0 | 1000 | alike | 23.1 |
+| P5 rotation | handheld-low | fixed / pooled | 0.6 / 0.4 | 0.43 / 0.33–0.53 | 0 | 1 / 0 | 1000–1100 | alike | 15.2 / 14.7–15.3 |
+| P6 look around | headset-90 | fixed / pooled | 0.4 / 0.2 | 0.74 / 0.66–0.70 | 0 | 1 / 0–1 | 1000 | 1016 / 2276 against 917–973 / 1354–1799 | 44.7 |
+| memory warning | handheld | fixed / pooled | 3.3 / **2.3** | 0.05 / 0.10 | 0 | 0 / 1 | 1733 / 1850 | 352 / 834 against 353–379 / 812–1039 | 43.6 / **46.5** |
+
+Thrash was 0 everywhere. The two pooled settings decide alike but for the
+low clamp's rotation; the rows marked "pooled" are the first,
+T25–60/D40–75.
+
+### 7.3 What the numbers say
+
+- **For pooling:** no cell blurs more, five blur less (zoom out and back
+  2.7 → 1.3 %, head-rate yaw 6.1 → 3.6 %, memory warning 3.3 → 2.3 %); the
+  low clamp's fast dive converges (5.5 s) where the fixed split never did,
+  with less relaxation (scale peak 7.8 → 6.3); the desktop's zoom out and
+  back needs no relaxation at all.
+- **Against it:** it spends what it frees — 29 % more network on the
+  desktop's zoom out and back, 14 % more at the low clamp's dive, 7 % more
+  after a memory warning; at the low clamp's dive it runs on the overflow
+  (above the pool's target) for 98 steps, up to 3.4 MiB, where the fixed
+  split did 2 steps and 0.2 MiB — protected bytes, within every hard limit,
+  but on the device with the least to spare; it converges a little later
+  after a memory warning (0.05 → 0.10 s); `decide` costs up to 28 % more on
+  the low clamp's dive.
+- **Not measured:** several imagery layers (the simulation drapes one), 3D
+  Tiles and overlays (their classes stay outside the pool here), a real
+  device's memory signals.
+
+### 7.4 The decision to take
+
+1. **Keep the fixed 40/60 split** — the simplest, frugal with the network
+   and the overflow, but it leaves the low clamp's fast dive unconverged and
+   blurs more where the view is imagery-heavy.
+2. **Pool terrain and imagery** with floors and ceilings (T25–60/D40–75 as
+   the first setting) — sharper and convergent everywhere measured, at the
+   cost of bandwidth and of overflow use at the low clamp; it would replace
+   the fixed targets of the two classes (no switch), and its floors and
+   ceilings become profile values.
+3. **Pool with a frugal guard** — pooling, but a member may grow above its
+   fixed share only while the network is not the bottleneck (or not under
+   pressure); not simulated yet.
+
+The goldens move once if the policy changes.
+
 ## Appendix: the full table
 
 From `cargo test --release -p tuile-core --test budget_sim -- --ignored architecture --nocapture`
