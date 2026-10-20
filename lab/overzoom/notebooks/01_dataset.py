@@ -5,15 +5,18 @@
 # deepest level that has its neighbours and its parent context), checks every parent/child pair, and opens the
 # before/after browser. Then it pushes the index to the bucket for `02_inference` (GPU) to read.
 #
-# Two families of inputs on the same tiles:
+# Two families of inputs on the same tiles, at ×2, ×4 and ×8:
 #
-# - **synthetic** — the tile damaged by us (reduction ×2, blur, noise, JPEG at the source's quality), the control;
-# - **levels** — the real parent one zoom up, brought to the child's colours, then checked: same structure and
-#   little remaining colour difference, or it is *another acquisition* and is flagged, never measured.
+# - **synthetic** — the tile damaged by us (reduction, blur, noise, JPEG at the source's quality), the control;
+# - **levels** — the real ancestor 1, 2 or 3 zooms up (z18, z17, z16), brought to the child's colours, then checked:
+#   same detail and little remaining colour difference, or it is *another acquisition* and is flagged, never measured.
 #
 # Nothing image-sized is written: inputs are rebuilt on demand from the archives, deterministically.
 
 # %%
+%load_ext autoreload
+%autoreload 2
+
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -25,7 +28,7 @@ from overzoom.dataset import Dataset, DatasetSpec, build_index
 from overzoom.view import browse
 
 lab = Lab.load(Path("../lab.json"))
-NAME = "luchon-z19-v1"
+NAME = "luchon-z19-v3"
 spec = DatasetSpec(zoom=19)
 print(lab.data, "→", lab.remote)
 
@@ -41,34 +44,44 @@ pd.DataFrame([(i.key, i.tiles, i.min_zoom, i.max_zoom) for i in infos], columns=
 # %% [markdown]
 # ## 2. The index
 #
-# Every textured tile of z19 with its neighbours (for the halo) and its parent context, and the check of its pair.
+# Every textured tile of z19 with its neighbours (for the halo) and its ancestors' context, and the check of each pair.
 
 # %%
-index = build_index(store, spec)
-ds = Dataset(store, spec, index)
-print(f"{len(ds)} samples, {int(index.level_valid.sum())} with a valid z18 pair "
-      f"({100 * index.level_valid.mean():.0f} %)")
+saved = lab.data / "datasets" / NAME
+if (saved / "index.parquet").exists():  # already built: load it, to browse at once
+    ds = Dataset.load(saved, store)
+    spec, index = ds.spec, ds.index
+    print("loaded", saved)
+else:
+    index = build_index(store, spec)
+    ds = Dataset(store, spec, index)
+print(f"{len(ds)} samples")
+print(pd.DataFrame({lv: index[f"{lv}_class"].value_counts() for lv in spec.levels}).fillna(0).astype(int))
 print(f"{len(ds) * len(spec.inputs)} comparisons in all")
 
 # %% [markdown]
-# ## 3. Do the two levels match?
+# ## 3. Do the levels match?
 #
-# Before and after colour equalisation, per pair: structure (SSIM on luminance) and colour (ΔE). The thresholds of the
-# policy are the dashed lines; set them by looking at the rejected pairs in the browser below, not by eye on the
-# histogram.
+# Per ancestor, per pair: the correlation of the luminance detail (blind to colour; unrelated ground gives about 0),
+# the tint difference as served (ΔE of the mean colours: above the line, the pair is *tinted*), and the colour left
+# after equalisation (above the line, *another acquisition*). Set the thresholds by looking at the pairs in the browser
+# below, not on the histograms.
 
 # %%
-fig, ax = plt.subplots(1, 2, figsize=(12, 4))
-ax[0].hist(index.level_ssim_y_raw, 60, alpha=0.5, label="as served")
-ax[0].hist(index.level_ssim_y, 60, alpha=0.5, label="equalised")
-ax[0].axvline(spec.policy.min_ssim_y, ls="--", c="k")
-ax[0].set_title("SSIM-Y, parent vs reduced child", loc="left")
-ax[0].legend()
-ax[1].hist(index.level_delta_e_raw, 60, alpha=0.5, label="as served")
-ax[1].hist(index.level_delta_e, 60, alpha=0.5, label="equalised")
-ax[1].axvline(spec.policy.max_delta_e, ls="--", c="k")
-ax[1].set_title("ΔE (CIEDE2000, low-passed)", loc="left")
-ax[1].legend()
+fig, ax = plt.subplots(len(spec.levels), 3, figsize=(16, 3.2 * len(spec.levels)), squeeze=False)
+for row, lv in enumerate(spec.levels):
+    ax[row, 0].hist(index[f"{lv}_structure"], 60)
+    ax[row, 0].axvline(spec.policy.min_structure, ls="--", c="k")
+    ax[row, 0].set_title(f"{lv}: detail correlation with the reduced z{spec.zoom}", loc="left")
+    ax[row, 1].hist(index[f"{lv}_cast_raw"], 60)
+    ax[row, 1].axvline(spec.policy.max_cast, ls="--", c="k")
+    ax[row, 1].set_title(f"{lv}: tint ΔE as served (mean colours)", loc="left")
+    ax[row, 2].hist(index[f"{lv}_delta_e_raw"], 60, alpha=0.5, label="as served")
+    ax[row, 2].hist(index[f"{lv}_delta_e"], 60, alpha=0.5, label="equalised")
+    ax[row, 2].axvline(spec.policy.max_delta_e, ls="--", c="k")
+    ax[row, 2].set_title(f"{lv}: ΔE, low-passed", loc="left")
+    ax[row, 2].legend()
+plt.tight_layout()
 plt.show()
 
 # %% [markdown]

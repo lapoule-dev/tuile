@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # Copyright (c) lapoule.dev
-"""The methods under test, all behind one protocol: a batch of images in, the same batch enlarged out.
+"""The networks under test, behind one protocol: a batch of images in, the same batch enlarged out.
 
-Needs the ``[infer]`` extra (torch, spandrel, huggingface_hub). Weights come from the Hugging Face Hub pinned to a
-revision, so two runs load the same bytes; they are never stored with the code.
+Only what needs a GPU lives here; the bicubic floor and the back-projection on the input are computed elsewhere
+(``score``), from the networks' saved outputs. Needs the ``[infer]`` extra (torch, spandrel, huggingface_hub).
+Weights come from the Hugging Face Hub pinned to a revision, so two runs load the same bytes; they are never stored
+with the code.
 """
 
 from __future__ import annotations
@@ -31,21 +33,15 @@ class Weights:
     filename: str
 
 
-# Two families and a floor: invention (GAN, trained on real-world damage) and fidelity (L1, clean reduction).
-REGISTRY: dict[str, Weights] = {
-    "realesrgan-x2": Weights("ai-forever/Real-ESRGAN", "8110204ebf8d25c031b66c26c2d1098aa831157e",
-                             "RealESRGAN_x2.pth"),
-    "swinir-classic-x2": Weights("licyk/sd-upscaler-models", "3a2094a57f456c41b79e5a4d196f2222c9940b89",
-                                 "SwinIR/001_classicalSR_DF2K_s64w8_SwinIR-M_x2.pth"),
+_ESRGAN = ("ai-forever/Real-ESRGAN", "8110204ebf8d25c031b66c26c2d1098aa831157e")
+_UPSCALERS = ("licyk/sd-upscaler-models", "3a2094a57f456c41b79e5a4d196f2222c9940b89")
+
+# Two families, each with a native model per factor: fidelity (SwinIR, L1 on a clean bicubic reduction: it does not
+# invent) and invention (Real-ESRGAN, a GAN trained on simulated real-world damage: blur, noise, JPEG).
+REGISTRY: dict[str, dict[int, Weights]] = {
+    "swinir": {s: Weights(*_UPSCALERS, f"SwinIR/001_classicalSR_DF2K_s64w8_SwinIR-M_x{s}.pth") for s in (2, 4, 8)},
+    "realesrgan": {s: Weights(*_ESRGAN, f"RealESRGAN_x{s}.pth") for s in (2, 4, 8)},
 }
-
-
-class Bicubic:
-    def __init__(self, scale: int = 2) -> None:
-        self.name, self.scale = "bicubic", scale
-
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        return F.interpolate(x, scale_factor=self.scale, mode="bicubic", align_corners=False).clamp(0, 1)
 
 
 class Network:
@@ -55,7 +51,10 @@ class Network:
 
         path = hf_hub_download(weights.repo, weights.filename, revision=weights.revision, cache_dir=cache_dir)
         self._model = ModelLoader().load_from_file(path).to(device).eval()
-        self._half = device == "cuda" and bool(self._model.supports_half)
+        cuda = device.startswith("cuda")
+        self._half = cuda and bool(self._model.supports_half)
+        # without fp16 (SwinIR overflows in it), bf16 autocast: the tensor cores, at 0.1 of a level on average
+        self._bf16 = cuda and not self._half and bool(self._model.supports_bfloat16)
         if self._half:
             self._model = self._model.half()
         self.name, self.scale = name, int(self._model.scale)
@@ -67,35 +66,14 @@ class Network:
         with torch.no_grad():
             if ph or pw:
                 x = F.pad(x, (0, pw, 0, ph), mode="reflect")
-            y = self._model(x.half() if self._half else x).float()
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self._bf16):
+                y: torch.Tensor = self._model(x.half() if self._half else x).float()
             return y[..., :h * self.scale, :w * self.scale].clamp(0, 1)
 
 
-class Consistent:
-    """Wrap a x2 method so that its output, reduced 2x2, gives back its input exactly (CEM-style back-projection).
-
-    It only removes what contradicts the input; it never adds detail.
-    """
-
-    def __init__(self, inner: Upscaler, iterations: int = 20) -> None:
-        if inner.scale != 2:
-            raise ValueError("consistency is defined for x2 only")
-        self._inner, self._iterations = inner, iterations
-        self.name, self.scale = f"{inner.name}+cem", 2
-
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            y = self._inner(x)
-            for _ in range(self._iterations):
-                y = y + F.interpolate(x - F.avg_pool2d(y, 2), scale_factor=2, mode="bicubic", align_corners=False)
-            return y.clamp(0, 1)
-
-
-def build(names: list[str], device: str, cache_dir: str | None = None) -> list[Upscaler]:
-    """Methods by name: ``bicubic``, a ``REGISTRY`` key, or either followed by ``+cem``."""
-    out: list[Upscaler] = []
-    for name in names:
-        base, _, suffix = name.partition("+")
-        m: Upscaler = Bicubic() if base == "bicubic" else Network(base, REGISTRY[base], device, cache_dir)
-        out.append(Consistent(m) if suffix == "cem" else m)
-    return out
+def network(family: str, scale: int, device: str, cache_dir: str | None = None) -> Network:
+    """The ``REGISTRY`` model of ``family`` for ``scale``, loaded on ``device``."""
+    net = Network(family, REGISTRY[family][scale], device, cache_dir)
+    if net.scale != scale:
+        raise ValueError(f"{family} x{scale}: the weights are x{net.scale}")
+    return net

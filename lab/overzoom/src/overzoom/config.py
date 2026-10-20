@@ -41,7 +41,14 @@ class Lab:
         subprocess.run(self.aws() + ["s3", "sync", str(local), f"{self.remote}/{remote_name}",
                                      "--only-show-errors"], check=True)
 
-    def pull(self, remote_name: str, local: Path) -> None:
+    def put(self, local: Path, remote_name: str) -> None:
+        """Copy one file to ``remote/remote_name``."""
+        subprocess.run(self.aws() + ["s3", "cp", str(local), f"{self.remote}/{remote_name}", "--only-show-errors"],
+                       check=True)
+
+    def pull(self, remote_name: str, local: Path, include: list[str] | None = None) -> None:
+        """Mirror ``remote/remote_name`` here; with ``include``, only the keys matching those patterns."""
         local.mkdir(parents=True, exist_ok=True)
-        subprocess.run(self.aws() + ["s3", "sync", f"{self.remote}/{remote_name}", str(local),
+        only = ["--exclude", "*", *[a for p in include for a in ("--include", p)]] if include else []
+        subprocess.run(self.aws() + ["s3", "sync", f"{self.remote}/{remote_name}", str(local), *only,
                                      "--only-show-errors"], check=True)

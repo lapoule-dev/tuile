@@ -18,13 +18,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Only on the GPU machine.
+# Only on the GPU machine: the networks.
 infer = [
     "torch>=2.1",
     "spandrel>=0.4",
     "huggingface_hub>=0.24",
-    "lpips>=0.1.4",
 ]
+# On the laptop, to measure a run: LPIPS needs torch, on the CPU.
+score = ["torch>=2.1", "lpips>=0.1.4"]
 explore = ["matplotlib>=3.8", "ipywidgets>=8", "jupyterlab>=4"]
 dev = ["pytest>=8", "mypy>=1.10", "ruff>=0.6", "pandas-stubs>=2"]
 
@@ -46,7 +47,7 @@ ignore_missing_imports = true
 
 # pmtiles and scikit-image ship no annotations: calling them is allowed, what comes back is cast at the boundary.
 [[tool.mypy.overrides]]
-module = ["overzoom.archives", "overzoom.metrics", "overzoom.view"]
+module = ["overzoom.archives", "overzoom.metrics", "overzoom.view", "overzoom.score", "overzoom.infer"]
 disallow_untyped_calls = false
 
 [tool.ruff]
