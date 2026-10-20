@@ -85,31 +85,21 @@ enum Cells {
 
 impl Drawn {
     /// Tile `key`, its vertices `positions` about `origin` making the
-    /// triangles `indices`.
-    pub(crate) fn of(
+    /// triangles `indices`, and `places[i]` where vertex `i` is
+    /// ([`place_of`]) — whoever worked it out, and whenever: a vertex's
+    /// place is a function of its bits.
+    pub(crate) fn placed(
         key: &TileKey,
         origin: DVec3,
         positions: Vec<[f32; 3]>,
         indices: Vec<u32>,
+        places: &[Geodetic],
     ) -> Self {
-        let (level, x, y) = TileId(key.id).terrain_coord();
-        let rect = GeographicTilingScheme::default().tile_rect(TileCoord::new(level, x, y));
+        let rect = rect_of(key);
         let triangles = indices.as_chunks::<3>().0;
-        let middle = (rect.west + rect.east) / 2.0;
-        let places: Vec<Geodetic> = positions
-            .iter()
-            .map(|p| {
-                let mut g = geodetic(origin + DVec3::from(p.map(f64::from)));
-                // Longitudes on the tile's side of the antimeridian.
-                let off = g.lon - middle;
-                g.lon =
-                    middle + (off - std::f64::consts::TAU * (off / std::f64::consts::TAU).round());
-                g
-            })
-            .collect();
         let boxes: Vec<Option<[f64; 4]>> = triangles
             .iter()
-            .map(|t| span(&positions, &places, t))
+            .map(|t| span(&positions, places, t))
             .collect();
         let everywhere = (0..triangles.len() as u32)
             .filter(|t| boxes[*t as usize].is_none())
@@ -170,6 +160,40 @@ impl Drawn {
     }
 }
 
+/// The rectangle of the terrain tile `key` names.
+fn rect_of(key: &TileKey) -> GeoRect {
+    let (level, x, y) = TileId(key.id).terrain_coord();
+    GeographicTilingScheme::default().tile_rect(TileCoord::new(level, x, y))
+}
+
+/// The middle longitude of tile `key`: what its vertices' longitudes are
+/// taken on the side of ([`place_of`]).
+pub(crate) fn middle_of(key: &TileKey) -> f64 {
+    let rect = rect_of(key);
+    (rect.west + rect.east) / 2.0
+}
+
+/// The coordinates a ground reads vertex `p` of a tile at, `p` about
+/// `origin`: its longitude on the side of the antimeridian `middle` is,
+/// latitude and height ([`geodetic`]). A function of the vertex's bits and
+/// nothing else, so a vertex worked out once is worked out for good.
+pub(crate) fn place_of(middle: f64, origin: DVec3, p: [f32; 3]) -> Geodetic {
+    let mut g = geodetic(origin + DVec3::from(p.map(f64::from)));
+    // Longitudes on the tile's side of the antimeridian.
+    let off = g.lon - middle;
+    g.lon = middle + (off - std::f64::consts::TAU * (off / std::f64::consts::TAU).round());
+    g
+}
+
+/// [`place_of`] every vertex of tile `key`.
+pub(crate) fn places_of(key: &TileKey, origin: DVec3, positions: &[[f32; 3]]) -> Vec<Geodetic> {
+    let middle = middle_of(key);
+    positions
+        .iter()
+        .map(|p| place_of(middle, origin, *p))
+        .collect()
+}
+
 /// About how many triangles a cell lists: fewer cells a tile is less to
 /// keep, and more triangles read a height. On 64 × 64 tiles drawn as the
 /// render service draws them (`what_a_height_costs`), 2, 4, 8 and 16 read a
@@ -213,6 +237,35 @@ impl Ground {
                 .filter_map(|key| stitching.ground(key, false))
                 .collect(),
         )
+    }
+
+    /// [`Self::of`] — or [`Self::unstitched`] when not `stitched` — with
+    /// the tiles not yet built handed to `build` first, with the function
+    /// that builds one: a caller with threads to spare builds them on all
+    /// of them. Each tile is built from its own mesh and its own plan, so
+    /// the ground is the same whichever thread built which tile, and in
+    /// whatever order.
+    pub fn built_with(
+        stitching: &Stitching,
+        selection: &[TileKey],
+        stitched: bool,
+        build: impl FnOnce(&[TileKey], &(dyn Fn(&TileKey) + Sync)),
+    ) -> Self {
+        let missing: Vec<TileKey> = selection
+            .iter()
+            .filter(|key| !stitching.is_built(key, stitched))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            build(&missing, &|key| {
+                stitching.ground(key, stitched);
+            });
+        }
+        if stitched {
+            Self::of(stitching, selection)
+        } else {
+            Self::unstitched(stitching, selection)
+        }
     }
 
     fn made_of(tiles: Vec<Arc<Drawn>>) -> Self {
@@ -1221,5 +1274,101 @@ mod tests {
         let (lon, lat) = place(15, 18002, 12400, 0.6, 0.5);
         let inside = sewn.height_at(lon, lat).expect("ground");
         assert!((inside - 105.0).abs() < 0.05, "{inside}");
+    }
+
+    /// Everything a drawn tile is made of — its vertices, its triangles,
+    /// which triangles each cell lists and which are read everywhere —
+    /// bit for bit.
+    fn bits(drawn: &Drawn) -> Vec<u64> {
+        let mut out: Vec<u64> = drawn
+            .positions
+            .iter()
+            .flatten()
+            .map(|c| u64::from(c.to_bits()))
+            .collect();
+        out.extend(drawn.indices.iter().map(|i| u64::from(*i)));
+        out.extend(drawn.everywhere.iter().map(|i| u64::from(*i)));
+        match &drawn.cells {
+            Cells::Narrow(grid) => {
+                out.extend(grid.starts.iter().map(|i| u64::from(*i)));
+                out.extend(grid.listed.iter().map(|i| u64::from(*i)));
+            }
+            Cells::Wide(grid) => {
+                out.extend(grid.starts.iter().map(|i| u64::from(*i)));
+                out.extend(grid.listed.iter().map(|i| u64::from(*i)));
+            }
+        }
+        out
+    }
+
+    /// A tile drawn again for another plan reads the places of the
+    /// vertices that plan left where they were rather than working them
+    /// out: what it draws is, bit for bit, what working out every vertex's
+    /// place draws — whichever selections came before, and built on
+    /// whichever thread.
+    #[test]
+    fn a_tile_drawn_again_reads_the_places_of_the_vertices_left_alone() {
+        let mut dice = Dice(0x0B5E_55ED);
+        let tiles = landscape(&mut dice);
+        let how = Prepare {
+            skirts: true,
+            smooth: Smooth::Geometry {
+                bound: smoothing::DEFAULT_BOUND_M,
+            },
+        };
+        let prepared_tiles: Vec<(TileKey, Mesh)> = tiles
+            .iter()
+            .map(|(key, mesh)| (*key, prepared(mesh.clone(), how).0))
+            .collect();
+        let all: Vec<TileKey> = tiles.iter().map(|(k, _)| *k).collect();
+        // The coarse tile alone with its regular neighbour, then the whole
+        // landscape, then the fine block without the coarse tile: each
+        // tile's plan changes at least once along the way.
+        let selections = [
+            vec![all[0], all[5]],
+            all.clone(),
+            all[1..5].to_vec(),
+            all.clone(),
+        ];
+        let mut stitching = Stitching::default();
+        for (key, mesh) in &prepared_tiles {
+            stitching.enter(*key, None, mesh);
+        }
+        let (mut rebuilt, mut moved) = (0, 0);
+        for selection in &selections {
+            stitching.frame(selection);
+            let ground = Ground::built_with(&stitching, selection, true, |missing, build| {
+                rebuilt += missing.len();
+                std::thread::scope(|scope| {
+                    for key in missing {
+                        scope.spawn(move || build(key));
+                    }
+                });
+            });
+            // Each tile as drawn for this plan, every vertex's place
+            // worked out afresh.
+            let afresh: Vec<Drawn> = selection
+                .iter()
+                .map(|key| {
+                    let (origin, mesh) = stitching.drawn(key).expect("held");
+                    let places = places_of(key, origin, &mesh.positions);
+                    Drawn::placed(key, origin, mesh.positions, mesh.indices, &places)
+                })
+                .collect();
+            assert_eq!(ground.len(), afresh.len());
+            for (again, once) in ground.tiles.iter().zip(&afresh) {
+                assert!(bits(again) == bits(once), "a tile drawn again differs");
+            }
+            moved += selection
+                .iter()
+                .filter(|key| {
+                    let (_, mesh) = stitching.drawn(key).expect("held");
+                    let (_, entered) = stitching.held(key).expect("held");
+                    mesh.positions.len() > entered.positions.len()
+                })
+                .count();
+        }
+        assert!(rebuilt > all.len(), "tiles were drawn again: {rebuilt}");
+        assert!(moved > 0, "some plan gave a tile vertices");
     }
 }

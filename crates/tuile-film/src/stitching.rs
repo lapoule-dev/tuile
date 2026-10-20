@@ -20,7 +20,9 @@ use tuile_core::content::{DecodedMesh, MaterialDesc};
 use tuile_core::source::TileId;
 use tuile_core::stitch::{self, Edges, Stitch};
 
-use crate::ground::Drawn;
+use tuile_core::geo::Geodetic;
+
+use crate::ground::{middle_of, place_of, places_of, Drawn};
 use crate::{Mesh, TileKey};
 
 struct Held {
@@ -36,10 +38,73 @@ struct Held {
     /// asked for and kept while what it is built from stays: the second
     /// is let go when `told` changes, both when the tile enters again.
     ground: [OnceLock<Arc<Drawn>>; 2],
+    /// Where each vertex of `mesh` is, as a ground reads it
+    /// ([`crate::ground::place_of`]): worked out the first time a ground is
+    /// built of the tile, and read again for every vertex a plan leaves
+    /// where it was — a plan moves the vertices within a band of the sides
+    /// it corrects and adds some on them; the others, and their
+    /// trigonometry, stay.
+    places: OnceLock<Arc<[Geodetic]>>,
+}
+
+impl Held {
+    fn heap_bytes(&self) -> usize {
+        heap_bytes(&self.mesh)
+            + self
+                .edges
+                .sides
+                .iter()
+                .map(|side| std::mem::size_of_val(side.as_slice()))
+                .sum::<usize>()
+            + self
+                .ground
+                .iter()
+                .filter_map(OnceLock::get)
+                .map(|drawn| drawn.heap_bytes())
+                .sum::<usize>()
+            + self
+                .places
+                .get()
+                .map_or(0, |places| std::mem::size_of_val(&places[..]))
+    }
+}
+
+/// A tile on its way into a [`Stitching`]: everything entering it works
+/// out, worked out ([`Stitching::entering`]) — on any thread, since it
+/// reads nothing of the stitching — and taken in by
+/// [`Stitching::admit`].
+pub struct Entering {
+    key: TileKey,
+    held: Held,
 }
 
 /// Which of [`Held::ground`] is the tile drawn by `told`.
 const STITCHED: usize = 1;
+
+/// Whether two plans move a tile's sides alike, bit for bit: their knots
+/// and their laps.
+fn same_knots(a: &Stitch, b: &Stitch) -> bool {
+    let laps = |s: &Stitch| s.laps.map(|lap| lap.map(f32::to_bits));
+    laps(a) == laps(b)
+        && a.sides.iter().zip(&b.sides).all(|(a, b)| {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|(a, b)| {
+                    a.along.to_bits() == b.along.to_bits()
+                        && a.delta.map(f32::to_bits) == b.delta.map(f32::to_bits)
+                })
+        })
+}
+
+/// Whether two plans give a tile the same vertices, bit for bit.
+fn same_inserts(a: &[Vec<stitch::Insert>; 4], b: &[Vec<stitch::Insert>; 4]) -> bool {
+    a.iter().zip(b).all(|(a, b)| {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(a, b)| {
+                a.along.to_bits() == b.along.to_bits()
+                    && a.local.map(f32::to_bits) == b.local.map(f32::to_bits)
+            })
+    })
+}
 
 /// What a renderer does for one tile before it draws the frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -133,24 +198,12 @@ impl Stitching {
     /// The bytes the meshes and edges it holds take, and the tiles it keeps
     /// for the grounds read off it.
     pub fn heap_bytes(&self) -> usize {
-        self.held
-            .values()
-            .map(|held| {
-                heap_bytes(&held.mesh)
-                    + held
-                        .edges
-                        .sides
-                        .iter()
-                        .map(|side| std::mem::size_of_val(side.as_slice()))
-                        .sum::<usize>()
-                    + held
-                        .ground
-                        .iter()
-                        .filter_map(OnceLock::get)
-                        .map(|drawn| drawn.heap_bytes())
-                        .sum::<usize>()
-            })
-            .sum()
+        self.held.values().map(Held::heap_bytes).sum()
+    }
+
+    /// [`Self::heap_bytes`] of one tile: 0 for a tile not held.
+    pub fn held_bytes(&self, key: &TileKey) -> usize {
+        self.held.get(key).map_or(0, Held::heap_bytes)
     }
 
     /// With corrections reaching `band` of a tile inward.
@@ -169,6 +222,11 @@ impl Stitching {
     /// A tile enters, with the mesh the renderer is handed. `source` is the
     /// level of the terrain its surface is from, when the pack says.
     pub fn enter(&mut self, key: TileKey, source: Option<u32>, mesh: &Mesh) {
+        self.admit(Self::entering(key, source, mesh));
+    }
+
+    /// What [`Self::enter`] works out of a tile, before it takes it in.
+    pub fn entering(key: TileKey, source: Option<u32>, mesh: &Mesh) -> Entering {
         let at = TileId(key.id).terrain_coord();
         let decoded = decoded(mesh);
         let edges = match &decoded.uvs {
@@ -177,9 +235,9 @@ impl Stitching {
             }
             None => Edges::default(),
         };
-        self.held.insert(
+        Entering {
             key,
-            Held {
+            held: Held {
                 at,
                 source: source.unwrap_or(at.0),
                 mesh: decoded,
@@ -187,10 +245,30 @@ impl Stitching {
                 edges,
                 told: Stitch::default(),
                 ground: Default::default(),
+                places: OnceLock::new(),
             },
-        );
+        }
+    }
+
+    /// Takes in a tile [`Self::entering`] worked out: [`Self::enter`].
+    pub fn admit(&mut self, entering: Entering) {
+        self.held.insert(entering.key, entering.held);
         // A tile that enters is one the last plan did not know.
         self.planned.clear();
+    }
+
+    /// Whether `key` is held.
+    pub fn holds(&self, key: &TileKey) -> bool {
+        self.held.contains_key(key)
+    }
+
+    /// How many tiles it holds.
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
     }
 
     /// The mesh of `key` as the stitch pass leaves it for the frame last
@@ -227,15 +305,30 @@ impl Stitching {
     /// Tile `key` as a ground reads it: drawn as last planned when
     /// `stitched` ([`Self::drawn`]), as it entered otherwise. Built once and
     /// shared until the tile's mesh changes. `None` for a tile not held.
+    ///
+    /// A plan that moves nothing draws the tile as it entered, and the two
+    /// are then one build.
     pub(crate) fn ground(&self, key: &TileKey, stitched: bool) -> Option<Arc<Drawn>> {
         let held = self.held.get(key)?;
+        let stitched = stitched && !held.told.is_nothing();
         let kept = &held.ground[usize::from(stitched)];
         Some(Arc::clone(kept.get_or_init(|| {
             tuile_core::metrics::metrics().ground_tiles.inc();
             let mesh = &held.mesh;
-            let (positions, indices) = if !stitched {
-                (mesh.positions.clone(), mesh.indices.clone())
-            } else if held.told.inserts.iter().all(Vec::is_empty) {
+            let origin = held.edges.origin;
+            let entered = held
+                .places
+                .get_or_init(|| places_of(key, origin, &mesh.positions).into());
+            if !stitched {
+                return Arc::new(Drawn::placed(
+                    key,
+                    origin,
+                    mesh.positions.clone(),
+                    mesh.indices.clone(),
+                    entered,
+                ));
+            }
+            let (positions, indices) = if held.told.inserts.iter().all(Vec::is_empty) {
                 // As `drawn_mesh`, without copying what heights do not read.
                 let mut positions = mesh.positions.clone();
                 self.offset(held, &mut positions, mesh.uvs.as_deref());
@@ -244,8 +337,31 @@ impl Stitching {
                 let drawn = self.drawn_mesh(held);
                 (drawn.positions, drawn.indices)
             };
-            Arc::new(Drawn::of(key, held.edges.origin, positions, indices))
+            // A vertex the plan left where it was — the same bits — is
+            // where it was: its place is read, not worked out again. A
+            // plan's inserts come after the mesh's own vertices.
+            let middle = middle_of(key);
+            let places: Vec<Geodetic> = positions
+                .iter()
+                .enumerate()
+                .map(|(i, p)| match (mesh.positions.get(i), entered.get(i)) {
+                    (Some(was), Some(place)) if was.map(f32::to_bits) == p.map(f32::to_bits) => {
+                        *place
+                    }
+                    _ => place_of(middle, origin, *p),
+                })
+                .collect();
+            Arc::new(Drawn::placed(key, origin, positions, indices, &places))
         })))
+    }
+
+    /// Whether [`Self::ground`] of `key` is built — or not to be, the tile
+    /// not being held.
+    pub(crate) fn is_built(&self, key: &TileKey, stitched: bool) -> bool {
+        self.held.get(key).is_none_or(|held| {
+            let stitched = stitched && !held.told.is_nothing();
+            held.ground[usize::from(stitched)].get().is_some()
+        })
     }
 
     /// The mesh of `key` as it entered, about its origin: as drawn when
@@ -286,23 +402,22 @@ impl Stitching {
             })
             .collect();
         let plans = stitch::plan(&tiles, (2, 1), self.band);
-        let changed: Vec<(TileKey, Stitch)> = drawn
-            .iter()
-            .zip(plans)
-            .filter(|((_, held), plan)| {
-                // What is across a side is told for the record; a renderer
-                // has work only when a strip or a vertex changes.
-                held.told.sides != plan.sides
-                    || held.told.inserts != plan.inserts
-                    || held.told.laps != plan.laps
-            })
-            .map(|((key, _), plan)| (*key, plan))
-            .collect();
-        changed
-            .into_iter()
-            .filter_map(|(key, plan)| {
-                let held = self.held.get_mut(&key)?;
-                let mesh = (held.told.inserts != plan.inserts).then(|| {
+        let keys: Vec<TileKey> = drawn.iter().map(|(key, _)| *key).collect();
+        let mut told = Vec::new();
+        for (key, plan) in keys.into_iter().zip(plans) {
+            let Some(held) = self.held.get_mut(&key) else {
+                continue;
+            };
+            // What is across a side is told for the record; a renderer has
+            // work only when a strip or a vertex changes — compared bit for
+            // bit, so that what a tile is drawn by is its last plan's,
+            // whatever plans came before.
+            let (moves, splits) = (
+                !same_knots(&held.told, &plan),
+                !same_inserts(&held.told.inserts, &plan.inserts),
+            );
+            if moves || splits {
+                let mesh = splits.then(|| {
                     encoded(
                         &stitch::split(&held.mesh, held.edges.origin, &plan.inserts),
                         held.edges.origin.to_array(),
@@ -315,17 +430,17 @@ impl Stitching {
                     .flatten()
                     .map(|k| glam::Vec3::from(k.delta).length())
                     .fold(0.0, f32::max);
-                let strips = plan.packed();
-                held.told = plan;
-                held.ground[STITCHED].take();
-                Some(Restitch {
+                told.push(Restitch {
                     key,
                     mesh,
-                    strips,
+                    strips: plan.packed(),
                     reach,
-                })
-            })
-            .collect()
+                });
+                held.ground[STITCHED].take();
+            }
+            held.told = plan;
+        }
+        told
     }
 }
 
