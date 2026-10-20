@@ -20,7 +20,7 @@
 //! taken over the poses actually baked, once the last one is in
 //! ([`SceneName::OfPoses`]).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -84,7 +84,9 @@ impl PackedMirror {
         HeldDrape::new(move |id, drape| packed.lock().is_ok_and(|held| held.contains(&(id, drape))))
     }
 
-    fn insert(&self, id: u64, drape: u64) {
+    /// Says the pack holds tile `id` with drape `drape`: what a bake says
+    /// as soon as the frame that adds it is selected.
+    pub fn hold(&self, id: u64, drape: u64) {
         if let Ok(mut held) = self.0.lock() {
             held.insert((id, drape));
         }
@@ -135,10 +137,55 @@ pub struct BakeOutcome {
     pub scene: String,
     /// The poses baked, frame `first` first.
     pub poses: Vec<tuile_tape::Frame>,
+    /// What each frame converged on ([`Session::selection_digest`]), frame
+    /// `first` first: two bakes that agree on these selected the same tiles
+    /// every frame.
+    pub selections: Vec<u64>,
     pub bytes: u64,
 }
 
+/// How many frames may be selected and not yet written: the most frames'
+/// tiles a bake holds at once beyond the one being written.
+const WRITE_LEAD: usize = 8;
+
+/// One tile of a frame as the writer takes it: one the pack will already
+/// hold by then, or one to add.
+enum Entry {
+    Known { id: u64, drape: u64 },
+    New(Box<BakedTile>),
+}
+
+/// A frame, made ready for the writer.
+struct Ready {
+    number: u32,
+    view: tuile_pack::BakedView,
+    /// The first pose: the render origin a pack is opened with.
+    origin: [f64; 3],
+    entries: Result<Vec<Entry>, String>,
+    selected: usize,
+    reused: usize,
+    selected_in: std::time::Duration,
+    pose_in: std::time::Duration,
+}
+
 /// Bakes `job.first..=job.last` into `job.out`, asking `source` for each pose.
+///
+/// # Three stages
+///
+/// Each frame's pose is decided and its selection converged here, frame
+/// after frame — the one thing that has to happen in order, since a frame
+/// selects against what the frames before it chose. Its tiles are then made
+/// ready for the pack (a drape composed and encoded, for a pack that
+/// carries its tiles) on the rayon pool, while the next frame converges;
+/// and a writer takes the frames in order, whichever was made ready first.
+///
+/// What the pack holds is decided where the order is: a tile is new to the
+/// pack if no frame before it, nor any tile before it in its frame, has
+/// the same tile and drape — exactly what the writer will find
+/// (`FrameWriter::push_known`) — so only new tiles are made ready, and the
+/// loader is told the pack holds them ([`PackedMirror`]) as soon as their
+/// frame is selected, as it was told when frames were written one by one.
+/// The pack is the one writing each frame in turn writes, byte for byte.
 pub fn bake_frames(
     session: &mut Session,
     job: &BakeFrames<'_>,
@@ -159,94 +206,127 @@ pub fn bake_frames(
     // aussi le cache de tuiles. Le déversoir rend le pic indépendant de la
     // longueur : 1440 frames coûtent ce que coûtent 48.
     let spill = job.out.with_extension("blob.part");
-    let mut writer: Option<PackWriter> = None;
-    let mut poses = Vec::with_capacity((job.last - job.first + 1) as usize);
-
+    let frames = (job.last - job.first + 1) as usize;
+    let mut poses = Vec::with_capacity(frames);
+    let mut selections = Vec::with_capacity(frames);
     let metrics = tuile_core::metrics::metrics();
-    for number in job.first..=job.last {
-        let posing = Instant::now();
-        let pose = source.pose(number, session);
-        let pose_seconds = posing.elapsed();
-        metrics.pose_seconds.record(pose_seconds);
-        let pose = pose.map_err(|e| format!("frame {number}: {e}"))?;
-        let at = Instant::now();
-        let frame = session
-            .frame_for_pose(&pose, job.viewport)
-            .map_err(|e| format!("frame {number}: {e}"))?;
+    let content = job.content.content;
 
-        // The writer is opened on the first pose, which is the render origin
-        // the pack's positions are relative to. The pack stores each tile's own
-        // ECEF origin, so this is carried for the consumer that rebases, not
-        // used to move anything here.
-        let writer = match &mut writer {
-            Some(w) => w,
-            None => writer.insert(
-                PackWriter::new(
-                    match &job.scene {
-                        SceneName::Given(scene) => scene.clone(),
-                        SceneName::OfPoses { .. } => String::new(),
-                    },
-                    pose.position,
-                    &spill,
-                )
-                .map_err(|e| format!("opening {}: {e}", spill.display()))?
-                .culling(job.culling)
-                .with_content(
-                    job.content.content,
-                    &job.content.terrain_layer,
-                    &job.content.imagery_layer,
-                )
-                .with_night_layer(&job.content.night_layer),
-            ),
-        };
+    let (writer, failed) = std::thread::scope(|scope| {
+        let (ready, readied) = std::sync::mpsc::channel::<Ready>();
+        // Frames selected and not yet written: one slot each.
+        let (slot, freed) = std::sync::mpsc::sync_channel::<()>(WRITE_LEAD);
+        let writer = scope.spawn(move || {
+            write_in_order(job, &spill, readied, || {
+                // Its slot, for a frame still to be selected.
+                let _ = freed.recv();
+            })
+        });
 
-        // The camera goes in beside the tiles, because that is what a render
-        // will address this frame by: a renderer hands the session a camera,
-        // never a frame number.
-        let mut open = writer.begin_frame(
-            number,
-            tuile_pack::BakedView {
+        let mut failed: Option<String> = None;
+        // What the pack will hold once every frame selected so far is
+        // written: the writer's index, ahead of it.
+        let mut will_hold: HashSet<(u64, u64)> = HashSet::new();
+        for number in job.first..=job.last {
+            let posing = Instant::now();
+            let pose = source.pose(number, session);
+            let pose_in = posing.elapsed();
+            metrics.pose_seconds.record(pose_in);
+            let pose = match pose {
+                Ok(pose) => pose,
+                Err(e) => {
+                    failed = Some(format!("frame {number}: {e}"));
+                    break;
+                }
+            };
+            let at = Instant::now();
+            let frame = match session.frame_for_pose(&pose, job.viewport) {
+                Ok(frame) => frame,
+                Err(e) => {
+                    failed = Some(format!("frame {number}: {e}"));
+                    break;
+                }
+            };
+            let selected_in = at.elapsed();
+            metrics.bake_frame_seconds.record(selected_in);
+            selections.push(tuile_core::determinism::digest(
+                frame.tiles.iter().map(|t| t.tile.0),
+            ));
+            let new: Vec<bool> = frame
+                .tiles
+                .iter()
+                .map(|tile| {
+                    let key = (tile.tile.0, tile.drape());
+                    let new = will_hold.insert(key);
+                    if new {
+                        job.packed.hold(key.0, key.1);
+                    }
+                    new
+                })
+                .collect();
+            let reused = new.iter().filter(|new| !**new).count();
+            let origin = poses
+                .first()
+                .map_or(pose.position, |p: &tuile_tape::Frame| p.position);
+            let view = tuile_pack::BakedView {
                 position: pose.position,
                 direction: pose.direction,
                 up: pose.up,
                 viewport_px: [job.viewport.0, job.viewport.1],
                 fovy_rad: pose.fovy,
-            },
-        );
-        // One tile at a time, and only the ones the pack does not already
-        // hold: an orbit re-selects almost the same ground every frame, and
-        // after frame 1 this touches nothing but the index for those.
-        let mut selected = 0usize;
-        let mut reused = 0usize;
-        for (index, tile) in frame.tiles.iter().enumerate() {
-            selected += 1;
-            if open.push_known(tile.tile.0, tile.drape()) {
-                reused += 1;
-                continue;
+            };
+            poses.push(pose);
+            // A slot, or wait for the writer to free one.
+            if slot.send(()).is_err() {
+                break;
             }
-            let packed = packed_tile(&frame, index, tile, job.content.content)?;
-            open.push(packed);
-            job.packed.insert(tile.tile.0, tile.drape());
+            let ready = ready.clone();
+            rayon::spawn(move || {
+                let entries = frame
+                    .tiles
+                    .iter()
+                    .zip(new)
+                    .enumerate()
+                    .map(|(index, (tile, new))| {
+                        if new {
+                            packed_tile(&frame, index, tile, content)
+                                .map(|t| Entry::New(Box::new(t)))
+                        } else {
+                            Ok(Entry::Known {
+                                id: tile.tile.0,
+                                drape: tile.drape(),
+                            })
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                let _ = ready.send(Ready {
+                    number,
+                    view,
+                    origin,
+                    entries,
+                    selected: frame.tiles.len(),
+                    reused,
+                    selected_in,
+                    pose_in,
+                });
+            });
         }
-        open.end();
-        poses.push(pose);
-        let seconds = at.elapsed();
-        metrics.bake_frame_seconds.record(seconds);
-        tracing::info!(
-            frame = number,
-            selected,
-            reused,
-            seconds = seconds.as_secs_f64(),
-            pose_seconds = pose_seconds.as_secs_f64(),
-            "BAKE-FRAME"
-        );
+        drop(ready);
+        drop(slot);
+        let writer = writer
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (writer, failed)
+    });
+    if let Some(failed) = failed {
+        return Err(failed);
     }
+    let mut writer = writer?.ok_or("no frame was baked")?;
 
     let scene = match &job.scene {
         SceneName::Given(scene) => scene.clone(),
         SceneName::OfPoses { settings } => digest_of_scene(&poses, job.viewport, settings),
     };
-    let mut writer = writer.ok_or("no frame was baked")?;
     writer.set_scene_digest(scene.clone());
     let bytes = writer
         .finish_to(job.out)
@@ -262,8 +342,92 @@ pub fn bake_frames(
     Ok(BakeOutcome {
         scene,
         poses,
+        selections,
         bytes,
     })
+}
+
+/// The writer's stage: frames as they are made ready, written in the order
+/// of their numbers — each one as soon as every frame before it is.
+fn write_in_order(
+    job: &BakeFrames<'_>,
+    spill: &Path,
+    readied: impl IntoIterator<Item = Ready>,
+    mut written: impl FnMut(),
+) -> Result<Option<PackWriter>, String> {
+    let mut writer: Option<PackWriter> = None;
+    let mut waiting: BTreeMap<u32, Ready> = BTreeMap::new();
+    let mut next = job.first;
+    for ready in readied {
+        waiting.insert(ready.number, ready);
+        while let Some(ready) = waiting.remove(&next) {
+            let entries = ready
+                .entries
+                .map_err(|e| format!("frame {}: {e}", ready.number))?;
+            // The writer is opened on the first pose, which is the render
+            // origin the pack's positions are relative to. The pack stores
+            // each tile's own ECEF origin, so this is carried for the
+            // consumer that rebases, not used to move anything here.
+            let writer = match &mut writer {
+                Some(w) => w,
+                None => writer.insert(
+                    PackWriter::new(
+                        match &job.scene {
+                            SceneName::Given(scene) => scene.clone(),
+                            SceneName::OfPoses { .. } => String::new(),
+                        },
+                        ready.origin,
+                        spill,
+                    )
+                    .map_err(|e| format!("opening {}: {e}", spill.display()))?
+                    .culling(job.culling)
+                    .with_content(
+                        job.content.content,
+                        &job.content.terrain_layer,
+                        &job.content.imagery_layer,
+                    )
+                    .with_night_layer(&job.content.night_layer),
+                ),
+            };
+            // The camera goes in beside the tiles, because that is what a
+            // render will address this frame by: a renderer hands the
+            // session a camera, never a frame number.
+            let mut open = writer.begin_frame(ready.number, ready.view);
+            for entry in entries {
+                match entry {
+                    Entry::Known { id, drape } => {
+                        if !open.push_known(id, drape) {
+                            return Err(format!(
+                                "frame {}: tile {id} with drape {drape:016x} was to be in \
+                                 the pack by now, and is not",
+                                ready.number
+                            ));
+                        }
+                    }
+                    Entry::New(tile) => open.push(*tile),
+                }
+            }
+            open.end();
+            tracing::info!(
+                frame = ready.number,
+                selected = ready.selected,
+                reused = ready.reused,
+                seconds = ready.selected_in.as_secs_f64(),
+                pose_seconds = ready.pose_in.as_secs_f64(),
+                "BAKE-FRAME"
+            );
+            written();
+            next += 1;
+        }
+    }
+    // Every frame selected was made ready, or the bake stopped short of
+    // one and says why elsewhere: one left waiting is a frame lost.
+    if let Some(number) = waiting.keys().next() {
+        return Err(format!(
+            "frame {next} never came to be written, frame {number} waits for it"
+        ));
+    }
+    Ok(writer)
 }
 
 /// Tout ce qui décide du contenu d'un pack hors trajectoire, en une chaîne.
@@ -649,12 +813,113 @@ mod tests {
         assert!(packed_tile(&frame, 0, &tile, tuile_pack::Content::References).is_err());
     }
 
+    /// Frame `number`'s tiles as the writer takes them: a tile of its own,
+    /// and the tile of the frame before, which the pack holds by then.
+    fn ready(number: u32) -> Ready {
+        let tile = |id: u64| BakedTile {
+            id,
+            drape: 0,
+            origin_ecef: [f64::from(number), 0.0, 0.0],
+            positions: vec![number as u8; 36],
+            normals: Vec::new(),
+            uvs: Vec::new(),
+            indices: vec![0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0],
+            vertex_count: 3,
+            index_count: 3,
+            base_color_factor: [1.0; 4],
+            texture_format: TextureFormat::None,
+            refs: None,
+            texture: None,
+        };
+        let mut entries = vec![Entry::New(Box::new(tile(u64::from(number))))];
+        if number > 1 {
+            entries.push(Entry::Known {
+                id: u64::from(number - 1),
+                drape: 0,
+            });
+        }
+        Ready {
+            number,
+            view: tuile_pack::BakedView {
+                position: [f64::from(number), 2.0, 3.0],
+                direction: [0.0, 0.0, -1.0],
+                up: [0.0, 1.0, 0.0],
+                viewport_px: [540.0, 960.0],
+                fovy_rad: std::f64::consts::FRAC_PI_4,
+            },
+            origin: [1.0, 2.0, 3.0],
+            entries: Ok(entries),
+            selected: 2,
+            reused: 1,
+            selected_in: std::time::Duration::ZERO,
+            pose_in: std::time::Duration::ZERO,
+        }
+    }
+
+    /// The writer writes frame after frame whatever order they are made
+    /// ready in: the pack of frames made ready backwards, or shuffled, is
+    /// the pack of frames made ready in order — and a frame that refers to
+    /// a tile of the frame before finds it there.
+    #[test]
+    fn frames_made_ready_in_any_order_are_written_in_theirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = PackContent::embedded();
+        let packed = PackedMirror::new();
+        let pack_of = |order: &[u32]| -> Vec<u8> {
+            let out = dir.path().join("p.tuilepack");
+            let job = BakeFrames {
+                first: 1,
+                last: 6,
+                viewport: (540.0, 960.0),
+                out: &out,
+                scene: SceneName::Given("scene".into()),
+                culling: "full",
+                content: &content,
+                packed: &packed,
+            };
+            let mut written = 0;
+            let writer = write_in_order(
+                &job,
+                &dir.path().join("blob.part"),
+                order.iter().map(|n| ready(*n)),
+                || written += 1,
+            )
+            .expect("written")
+            .expect("a writer");
+            assert_eq!(written, order.len());
+            writer.finish_to(&out).expect("finished");
+            std::fs::read(&out).expect("read")
+        };
+        let in_order = pack_of(&[1, 2, 3, 4, 5, 6]);
+        assert!(pack_of(&[6, 5, 4, 3, 2, 1]) == in_order, "backwards");
+        assert!(pack_of(&[2, 1, 4, 6, 3, 5]) == in_order, "shuffled");
+        // A frame that never came is not written past.
+        let dir_out = dir.path().join("q.tuilepack");
+        let job = BakeFrames {
+            first: 1,
+            last: 3,
+            viewport: (540.0, 960.0),
+            out: &dir_out,
+            scene: SceneName::Given("scene".into()),
+            culling: "full",
+            content: &content,
+            packed: &packed,
+        };
+        assert!(write_in_order(
+            &job,
+            &dir.path().join("blob.part"),
+            [1, 3].map(ready),
+            || ()
+        )
+        .is_err());
+    }
+
     #[test]
     fn the_mirror_answers_for_what_was_inserted_only() {
         let mirror = PackedMirror::new();
         let held = mirror.held_drape();
         assert!(!(held.0)(7, 9));
-        mirror.insert(7, 9);
+        mirror.hold(7, 9);
         assert!((held.0)(7, 9));
         assert!(!(held.0)(7, 10));
     }

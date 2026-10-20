@@ -53,7 +53,9 @@ pub mod memory;
 pub mod open;
 
 pub mod packed;
+pub mod scout;
 mod session;
+pub mod settle;
 pub mod tape;
 pub mod tiles;
 

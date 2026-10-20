@@ -579,6 +579,11 @@ pub struct Metrics {
     /// Height queries against a frame's ground, counted by samples standing
     /// for many (`tuile_film::ground::SAMPLED`).
     pub height_queries: Counter,
+    /// Frames a bake's scouts converged ahead of it, to fetch their tiles
+    /// into the store before the bake reads them (`tuile_bake::scout`).
+    pub scout_frames: Counter,
+    /// Of those, frames a scout gave up: their tiles the bake fetches itself.
+    pub scout_frames_given_up: Counter,
     /// What a height query costs, timed by the same samples.
     pub height_query_seconds: Timer,
 
