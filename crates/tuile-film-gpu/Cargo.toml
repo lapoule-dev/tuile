@@ -16,6 +16,10 @@ tuile-atmosphere = { version = "0.12.0", path = "../tuile-atmosphere" }
 tuile-core = { version = "0.12.0", path = "../tuile-core" }
 tuile-film = { version = "0.12.0", path = "../tuile-film" }
 wgpu = { workspace = true }
+# The card's own clock on each pass, through timestamp queries: the queries
+# in flight resolved a few frames late, never waited for. 0.27 is the line
+# for wgpu 29; it compiles and runs on wasm32 too (no process id asked there).
+wgpu-profiler = "0.27"
 
 [dev-dependencies]
 image = { workspace = true }

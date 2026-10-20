@@ -26,20 +26,27 @@
 //! [`NoOverlays`], whose order says nothing.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::de::DeserializeOwned;
+use tuile_farm::receipt::{Instance, Io, Profile, Stages, RECEIPT_VERSION};
 use tuile_farm::{ObjectRunStore, RunStore};
 use tuile_film::Overlays;
 
 use crate::engine::RenderSpec;
 use crate::extract::{local_key, ExtractRef, Fetched};
 use crate::observe::Timings;
+use crate::profile::Sampling;
 use crate::render::render;
 use crate::setup::{film_sink, placed_sun};
 use crate::source::{Film, Sources};
 use crate::Error;
+
+/// What a segment came to, and where a render's time went: the receipt's
+/// own types, which the service's callers read too ([`tuile_farm::receipt`]).
+pub use tuile_farm::receipt::{RenderTimes, SegmentDone};
 
 /// A segment to render, and `O`, what the host's overlays are to be made
 /// of ([`OverlayFactory::Order`]).
@@ -144,61 +151,39 @@ pub trait Notify<O = NoOrder>: Send + Sync {
     async fn segment_done(&self, order: &SegmentOrder<O>, outcome: Result<&SegmentDone, String>);
 }
 
-/// Where a render's time went, as it measured it.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct RenderTimes {
-    /// Opening the adapter and the sink.
-    pub setup_seconds: f64,
-    /// The first frame, which enters every tile it draws…
-    pub opening: Timings,
-    /// …and every frame after it, together.
-    pub frames: Timings,
-    pub tiles_from_store: u64,
-    pub tiles_from_pack: u64,
-}
-
-/// What a segment came to.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct SegmentDone {
-    pub out: String,
-    pub frames: u64,
-    pub bytes: u64,
-    /// Seconds waiting for the pack, then rendering.
-    pub waited_seconds: f64,
-    pub render_seconds: f64,
-    /// The extracts fetched before the first frame, if the store is a
-    /// server's.
-    #[serde(default)]
-    pub extract: Option<Fetched>,
-    #[serde(default)]
-    pub render: RenderTimes,
-}
+/// When a request arrived, as the host's outermost layer saw it.
+///
+/// A host whose own layers run before the service reads the order sets it
+/// as an extension of the request (`request.extensions_mut().insert(..)`):
+/// their time is then the receipt's [`Stages::before_seconds`], and the
+/// arrival its [`SegmentDone::received_at_unix`]. Without it the service
+/// counts from its own handler.
+#[derive(Debug, Clone, Copy)]
+pub struct Arrived(pub Instant);
 
 /// How often the pack is looked for.
 const LOOK_EVERY: Duration = Duration::from_secs(2);
 
-/// A render's phases, the costliest first, in seconds.
+/// A render's steps, the costliest first, in seconds.
 fn phases(t: &Timings) -> String {
-    let mut all = [
-        ("read terrain", t.read_terrain),
-        ("read imagery", t.read_imagery),
-        ("read pack", t.read_pack),
-        ("mesh", t.mesh),
-        ("decode", t.decode),
-        ("upload", t.upload),
-        ("enter", t.enter),
-        ("stitch", t.stitch),
-        ("draw", t.draw),
-        ("readback", t.readback),
-        ("leave", t.leave),
-        ("observe", t.observe),
-        ("sink", t.sink),
-    ];
+    let mut all = t.steps();
     all.sort_by(|a, b| b.1.total_cmp(&a.1));
     all.iter()
-        .map(|(name, s)| format!("{name} {s:.1}"))
+        .map(|(name, ms)| format!("{name} {:.1}", ms / 1000.0))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Seconds since `t`.
+fn since(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64()
+}
+
+/// Now, in Unix seconds.
+fn unix_now() -> f64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
 }
 
 /// What a render service holds for as long as it lives, and `F`, what
@@ -220,6 +205,15 @@ pub struct Service<F: OverlayFactory = NoOverlays> {
     /// Renders at once on this instance.
     renders: tokio::sync::Semaphore,
     overlays: F,
+    /// When the service began opening, by both clocks, and how long it
+    /// took: what a receipt says of its instance.
+    started: Instant,
+    started_at_unix: f64,
+    opened_seconds: f64,
+    /// Segments begun on this instance.
+    begun: AtomicU64,
+    /// The platform's name for this revision of the service (`K_REVISION`).
+    revision: String,
 }
 
 /// When a generation of caches is let go, and how many renders share the
@@ -312,15 +306,20 @@ impl<F: OverlayFactory> Service<F> {
             kept: tokio::sync::Mutex::new(None),
             renders: tokio::sync::Semaphore::new(limits.renders_at_once.max(1)),
             overlays,
+            started: Instant::now(),
+            started_at_unix: unix_now(),
+            opened_seconds: 0.0,
+            begun: AtomicU64::new(0),
+            revision: std::env::var("K_REVISION").unwrap_or_default(),
         }
     }
 
     /// The generation a segment begins in: the one kept, unless it is
-    /// spent.
-    async fn generation(&self) -> Result<Arc<Generation>, Error> {
+    /// spent; and whether it was the one kept.
+    async fn generation(&self) -> Result<(Arc<Generation>, bool), Error> {
         let mut kept = self.kept.lock().await;
         if let Some(generation) = kept.as_ref().filter(|g| !g.spent(&self.limits)) {
-            return Ok(generation.clone());
+            return Ok((generation.clone(), true));
         }
         std::fs::create_dir_all(&self.cache)?;
         let dir = tempfile::tempdir_in(&self.cache)?;
@@ -331,7 +330,7 @@ impl<F: OverlayFactory> Service<F> {
             opened: Instant::now(),
         });
         *kept = Some(generation.clone());
-        Ok(generation)
+        Ok((generation, false))
     }
 }
 
@@ -408,13 +407,54 @@ impl<F: OverlayFactory> Service<F> {
 
     /// Renders `order` to the store, once its pack is there.
     pub async fn segment(&self, order: &SegmentOrder<F::Order>) -> Result<SegmentDone, Error> {
+        self.segment_arrived(order, Arrived(Instant::now())).await
+    }
+
+    /// [`Self::segment`], for a request that arrived at `arrived`: the
+    /// time before it is the receipt's [`Stages::before_seconds`].
+    pub async fn segment_arrived(
+        &self,
+        order: &SegmentOrder<F::Order>,
+        arrived: Arrived,
+    ) -> Result<SegmentDone, Error> {
         let began = Instant::now();
+        let before_seconds = began.saturating_duration_since(arrived.0).as_secs_f64();
+        let received_at_unix = unix_now() - arrived.0.elapsed().as_secs_f64();
+        let segments_before = self.begun.fetch_add(1, Ordering::Relaxed);
+        let mut instance = Instance {
+            started_at_unix: self.started_at_unix,
+            opened_seconds: self.opened_seconds,
+            uptime_seconds: arrived
+                .0
+                .saturating_duration_since(self.started)
+                .as_secs_f64(),
+            segments_before,
+            cold: segments_before == 0,
+            revision: self.revision.clone(),
+            ..Instance::default()
+        };
+        let mut stages = Stages {
+            before_seconds,
+            ..Stages::default()
+        };
+        // The segment's CPU, from here to its answer.
+        let sampling = Sampling::start();
         // Before anything is waited for: an order the host cannot draw
         // fails now, not an hour on.
+        let t = Instant::now();
         let mut overlays = self.overlays_of(order).await?;
+        stages.overlays_seconds = since(t);
         let within = Duration::from_secs(order.pack_within_seconds.unwrap_or(3600));
-        let generation = self.generation().await?;
+        let t = Instant::now();
+        let (generation, reused) = self.generation().await?;
+        stages.generation_seconds = since(t);
+        instance.generation_reused = reused;
+        instance.generation_age_seconds = since(generation.opened);
         let sources = &generation.sources;
+        // What the generation's sources read so far: the segment's are
+        // what it adds.
+        let read_before = reads(sources);
+        let t = Instant::now();
         loop {
             if self.runs.exists(&order.pack).await? {
                 break;
@@ -426,6 +466,8 @@ impl<F: OverlayFactory> Service<F> {
             }
             tokio::time::sleep(LOOK_EVERY).await;
         }
+        stages.pack_wait_seconds = since(t);
+        let t = Instant::now();
         // The pack's tiles were published before it: zones read before they
         // were, by an earlier segment of this generation, are read again —
         // its clock stands still, and a manifest held is believed.
@@ -448,14 +490,17 @@ impl<F: OverlayFactory> Service<F> {
                 render_order.look.to_sun = placed_sun(eye, sun);
             }
         }
+        stages.film_seconds = since(t);
         // Under the cache: on a serverless container, the disk it was given
         // rather than a /tmp in memory.
         std::fs::create_dir_all(&self.cache)?;
         let scratch = tempfile::tempdir_in(&self.cache)?;
         let local = scratch.path().join("segment.mp4");
+        let t = Instant::now();
         let extract = self
             .fetch_extracts(sources, &film, order, &scratch.path().join("store"))
             .await?;
+        stages.fetch_seconds = since(t);
         if let Some(fetched) = &extract {
             eprintln!(
                 "segment {}: {} extracts, {} parts, {:.1} MB in {:.1} s ({:.0} MB/s)",
@@ -467,7 +512,9 @@ impl<F: OverlayFactory> Service<F> {
                 fetched.mb_per_second()
             );
         }
+        let t = Instant::now();
         let _card = self.renders.acquire().await.map_err(|e| e.to_string())?;
+        stages.card_wait_seconds = since(t);
         let waited_seconds = began.elapsed().as_secs_f64();
 
         // The render holds its thread: on one of its own, its reads waited
@@ -475,23 +522,27 @@ impl<F: OverlayFactory> Service<F> {
         let rendered = Instant::now();
         let runtime = tokio::runtime::Handle::current();
         let (to, kept) = (local.clone(), generation.clone());
-        let done = tokio::task::spawn_blocking(move || -> Result<crate::render::Done, Error> {
-            let mut sink = film_sink(
-                to.to_string_lossy().into_owned(),
-                rendering.bitrate,
-                rendering.codec.as_deref(),
-            )?;
-            let done = runtime.block_on(render(
-                &kept.sources,
-                &film,
-                &render_order,
-                overlays.as_mut(),
-                sink.as_mut(),
-                &mut (),
-            ))?;
-            drop(sink);
-            Ok(done)
-        })
+        let (done, spent) = tokio::task::spawn_blocking(
+            move || -> Result<(crate::render::Done, Vec<(String, f64)>), Error> {
+                let mut sink = film_sink(
+                    to.to_string_lossy().into_owned(),
+                    rendering.bitrate,
+                    rendering.codec.as_deref(),
+                )?;
+                let done = runtime.block_on(render(
+                    &kept.sources,
+                    &film,
+                    &render_order,
+                    overlays.as_mut(),
+                    sink.as_mut(),
+                    &mut (),
+                ))?;
+                // The encoder's own thread, beside the render's.
+                let spent = sink.spent();
+                drop(sink);
+                Ok((done, spent))
+            },
+        )
         .await
         .map_err(|e| e.to_string())??;
         let render_seconds = rendered.elapsed().as_secs_f64();
@@ -502,19 +553,41 @@ impl<F: OverlayFactory> Service<F> {
             frames: done.timings,
             tiles_from_store: done.tiles_from_store,
             tiles_from_pack: done.tiles_from_pack,
+            seconds: done.seconds,
+            ahead: done.ahead,
+            encode_seconds: spent.iter().map(|s| s.1).sum(),
+            encoder: spent
+                .iter()
+                .map(|s| s.0.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+            gpu: done.gpu,
+            adapter: done.adapter,
         };
         eprintln!(
-            "segment {}: {} frames in {render_seconds:.1} s — setup {:.1} s; frames: {}",
+            "segment {}: {} frames in {render_seconds:.1} s — setup {:.1} s, ahead {:.1} s, encoder {:.1} s, card {:.1} s; frames: {}",
             order.out,
             done.frames,
             render.setup_seconds,
+            render.ahead.seconds,
+            render.encode_seconds,
+            render.gpu.seconds(),
             phases(&render.frames)
         );
         let frames = done.frames;
 
         let store = self.store(order.store);
+        let t = Instant::now();
         let bytes = store.put(&local, &order.out).await?;
+        stages.put_seconds = since(t);
+        let stem = order.out.trim_end_matches(".mp4");
+        let profile = match sampling {
+            Some(sampling) => Self::put_profile(store, sampling, stem, scratch.path()).await,
+            None => None,
+        };
+        let read = read_since(reads(sources), &read_before);
         let receipt = SegmentDone {
+            version: RECEIPT_VERSION,
             out: order.out.clone(),
             frames: u64::from(frames),
             bytes,
@@ -522,16 +595,93 @@ impl<F: OverlayFactory> Service<F> {
             render_seconds,
             extract,
             render,
+            received_at_unix,
+            service_seconds: arrived.0.elapsed().as_secs_f64(),
+            stages,
+            instance,
+            io: Io {
+                put_bytes: bytes + profile.as_ref().map_or(0, |p| p.bytes),
+                ..read
+            },
+            profile,
         };
         let receipt_path = scratch.path().join("segment.json");
         std::fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
-        store
-            .put(
-                &receipt_path,
-                &format!("{}.json", order.out.trim_end_matches(".mp4")),
-            )
-            .await?;
+        store.put(&receipt_path, &format!("{stem}.json")).await?;
         Ok(receipt)
+    }
+
+    /// The segment's CPU profile, beside it as `<stem>.pprof` in the store it
+    /// went to; none if it could not be made or put — a segment never fails
+    /// for its profile.
+    async fn put_profile(
+        store: &ObjectRunStore,
+        sampling: Sampling,
+        stem: &str,
+        dir: &Path,
+    ) -> Option<Profile> {
+        let t = Instant::now();
+        let key = format!("{stem}.pprof");
+        let made = tokio::task::spawn_blocking(move || sampling.pprof_gz()).await;
+        let gz = match made {
+            Ok(Ok(gz)) => gz,
+            Ok(Err(e)) => {
+                eprintln!("segment {stem}: no profile: {e}");
+                return None;
+            }
+            Err(e) => {
+                eprintln!("segment {stem}: no profile: {e}");
+                return None;
+            }
+        };
+        let path = dir.join("segment.pprof");
+        let put = async {
+            std::fs::write(&path, &gz)?;
+            store.put(&path, &key).await?;
+            Ok::<_, Error>(())
+        };
+        if let Err(e) = put.await {
+            eprintln!("segment {stem}: profile not put: {e}");
+            return None;
+        }
+        Some(Profile {
+            key,
+            bytes: gz.len() as u64,
+            hz: crate::profile::HZ,
+            seconds: since(t),
+        })
+    }
+}
+
+/// What was read between `before` and `now`.
+fn read_since(now: Io, before: &Io) -> Io {
+    Io {
+        pack_asked_bytes: now.pack_asked_bytes.saturating_sub(before.pack_asked_bytes),
+        pack_fetched_bytes: now
+            .pack_fetched_bytes
+            .saturating_sub(before.pack_fetched_bytes),
+        archive_asked_bytes: now
+            .archive_asked_bytes
+            .saturating_sub(before.archive_asked_bytes),
+        archive_fetched_bytes: now
+            .archive_fetched_bytes
+            .saturating_sub(before.archive_fetched_bytes),
+        live_bytes: now.live_bytes.saturating_sub(before.live_bytes),
+        put_bytes: 0,
+    }
+}
+
+/// What a generation's sources have read so far, as [`Io`]'s reads.
+fn reads(sources: &Sources) -> Io {
+    let (pack_asked, pack_fetched) = sources.packs.reads();
+    let (archive_asked, archive_fetched) = sources.archives.reads();
+    Io {
+        pack_asked_bytes: pack_asked.bytes,
+        pack_fetched_bytes: pack_fetched.bytes,
+        archive_asked_bytes: archive_asked.bytes,
+        archive_fetched_bytes: archive_fetched.bytes,
+        live_bytes: sources.live.so_far().bytes,
+        put_bytes: 0,
     }
 }
 
@@ -689,6 +839,7 @@ pub async fn service_from_env() -> Result<Service, Error> {
 
 /// [`service_from_env`], its segments' overlays made by `overlays`.
 pub async fn service_from_env_with<F: OverlayFactory>(overlays: F) -> Result<Service<F>, Error> {
+    let (started, started_at_unix) = (Instant::now(), unix_now());
     let runs = Arc::new(ObjectRunStore::from_env()?);
     let cache: PathBuf = std::env::var("TUILE_SERVE_CACHE")
         .map(Into::into)
@@ -700,6 +851,10 @@ pub async fn service_from_env_with<F: OverlayFactory>(overlays: F) -> Result<Ser
     // The tile store's server, when the store is one: extracts come from it.
     service.remote = tuile_repository::HttpGet::from_env()?
         .map(|get| Arc::new(get) as Arc<dyn tuile_repository::Get>);
+    // The instance began with this function: what its receipts say of it.
+    service.started = started;
+    service.started_at_unix = started_at_unix;
+    service.opened_seconds = since(started);
     Ok(service)
 }
 
@@ -722,8 +877,10 @@ pub fn router<F: OverlayFactory>(
     );
     async fn segment<F: OverlayFactory>(
         State((service, notify)): State<Held<F>>,
+        arrived: Option<axum::Extension<Arrived>>,
         Json(order): Json<SegmentOrder<F::Order>>,
     ) -> axum::response::Response {
+        let arrived = arrived.map_or_else(|| Arrived(Instant::now()), |a| a.0);
         eprintln!(
             "segment {} ← {} {}:{}",
             order.out, order.pack, order.frames.0, order.frames.1
@@ -738,7 +895,7 @@ pub fn router<F: OverlayFactory>(
                 )
                     .into_response()
             }
-            None => match service.segment(&order).await {
+            None => match service.segment_arrived(&order, arrived).await {
                 Ok(done) => {
                     eprintln!(
                         "segment {} done: {} frames, waited {:.0} s, rendered in {:.0} s",
@@ -949,19 +1106,20 @@ mod tests {
             ..Limits::default()
         };
         let service = Service::new(runs, tiles, dir.path().join("cache"), limits);
-        let first = service.generation().await.expect("first");
-        let again = service.generation().await.expect("again");
+        let (first, kept) = service.generation().await.expect("first");
+        assert!(!kept, "the first is opened");
+        let (again, kept) = service.generation().await.expect("again");
         assert!(
-            Arc::ptr_eq(&first, &again),
+            Arc::ptr_eq(&first, &again) && kept,
             "a generation under its budget is kept"
         );
 
         // Past its budget: the next segment begins in another, and the old
         // directory goes with the last segment that holds it.
         std::fs::write(first.dir.path().join("big"), vec![0u8; 2 << 20]).expect("fill");
-        let other = service.generation().await.expect("other");
+        let (other, kept) = service.generation().await.expect("other");
         assert!(
-            !Arc::ptr_eq(&first, &other),
+            !Arc::ptr_eq(&first, &other) && !kept,
             "a generation past its budget is let go"
         );
         let old = first.dir.path().to_path_buf();

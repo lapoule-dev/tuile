@@ -45,80 +45,9 @@ pub struct TileIn<'a> {
     pub mesh: &'a Mesh,
 }
 
-/// Where time went, in milliseconds, step by step.
-#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Timings {
-    /// Reading terrain tiles from the store (cache or network).
-    pub read_terrain: f64,
-    /// Reading imagery tiles from the store.
-    pub read_imagery: f64,
-    /// Reading payloads from the pack.
-    pub read_pack: f64,
-    /// Terrain tiles made into meshes.
-    pub mesh: f64,
-    /// Imagery decoded and laid on the terrain's spacing.
-    pub decode: f64,
-    /// Textures written to the GPU.
-    pub upload: f64,
-    /// Drapes queued for composition, meshes entered.
-    pub enter: f64,
-    /// The frame's tiles stitched: the plan, and what it has the GPU hold
-    /// anew.
-    pub stitch: f64,
-    /// The frame recorded and submitted — the host's overlays asked for
-    /// first, when it has any.
-    pub draw: f64,
-    /// Waiting for the GPU and reading the picture back.
-    pub readback: f64,
-    /// Tiles let go.
-    pub leave: f64,
-    /// The observers.
-    pub observe: f64,
-    /// Handing the picture to the sink (for an encoder on its own thread:
-    /// the wait for room, not the encoding).
-    pub sink: f64,
-}
-
-impl Timings {
-    /// Every step, named, in the order a frame goes through them.
-    pub fn steps(&self) -> [(&'static str, f64); 13] {
-        [
-            ("read terrain", self.read_terrain),
-            ("read imagery", self.read_imagery),
-            ("read pack", self.read_pack),
-            ("build meshes", self.mesh),
-            ("decode imagery", self.decode),
-            ("upload textures", self.upload),
-            ("enter tiles", self.enter),
-            ("stitch tiles", self.stitch),
-            ("record frame", self.draw),
-            ("GPU + readback", self.readback),
-            ("leave tiles", self.leave),
-            ("observers", self.observe),
-            ("sink", self.sink),
-        ]
-    }
-
-    pub fn total(&self) -> f64 {
-        self.steps().iter().map(|s| s.1).sum()
-    }
-
-    pub fn add(&mut self, other: &Timings) {
-        self.read_terrain += other.read_terrain;
-        self.read_imagery += other.read_imagery;
-        self.read_pack += other.read_pack;
-        self.mesh += other.mesh;
-        self.decode += other.decode;
-        self.upload += other.upload;
-        self.enter += other.enter;
-        self.stitch += other.stitch;
-        self.draw += other.draw;
-        self.readback += other.readback;
-        self.leave += other.leave;
-        self.observe += other.observe;
-        self.sink += other.sink;
-    }
-}
+/// Where time went, in milliseconds, step by step: the receipt's own
+/// type, which a render service's callers read too.
+pub use tuile_farm::receipt::Timings;
 
 /// A picture, as it leaves.
 pub struct FrameOut<'a> {

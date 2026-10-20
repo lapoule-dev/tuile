@@ -65,13 +65,14 @@
 mod atmosphere;
 mod frame;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use glam::{DVec3, Vec3};
 use tuile_film::{
     Eye, EyePair, FrameCamera, FrameLight, Look, OverlayBlend, OverlayDepth, OverlayMesh, TileKey,
 };
 use wgpu::util::DeviceExt;
+use wgpu_profiler::{GpuProfiler, GpuProfilerSettings};
 
 pub use atmosphere::AtmosphereUniform;
 pub use frame::{shadow_reach, FrameUniform, SunView, TileFrame};
@@ -126,6 +127,8 @@ pub enum FilmGpuError {
     Unaligned(&'static str, u32),
     #[error("{0}")]
     Overlay(&'static str),
+    #[error("waiting for the card: {0}")]
+    Poll(String),
 }
 
 /// `overlay.wgsl`'s vertex: where it is from the eye, its colour, its
@@ -416,6 +419,17 @@ pub struct FilmGpu {
     atmosphere: atmosphere::AtmosphereGpu,
     /// Whether night lights were given ([`Self::set_night_lights`]).
     night_lights: bool,
+    /// The card's clock on each pass, where the device writes timestamps:
+    /// the queries in flight, and what came back of them by pass.
+    profiler: GpuProfiler,
+    pass_times: BTreeMap<String, PassTime>,
+}
+
+/// One kind of pass, timed by the card: its seconds and how many there were.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PassTime {
+    pub seconds: f64,
+    pub count: u64,
 }
 
 /// One imagery tile of a drape and where it lies on the terrain tile.
@@ -1407,11 +1421,25 @@ impl FilmGpu {
             bytemuck::bytes_of(&AtmosphereUniform::zeroed_off()),
         );
 
+        // Every pass is timed by the card when the device writes
+        // timestamps (`wgpu::Features::TIMESTAMP_QUERY`); a device without
+        // them reserves no query and times nothing.
+        let profiler = GpuProfiler::new(
+            &device,
+            GpuProfilerSettings {
+                enable_timer_queries: true,
+                enable_debug_groups: false,
+                max_num_pending_frames: 4,
+            },
+        )
+        .expect("the profiler's settings are valid");
         Self {
             light: FrameLight::of(&settings.look),
             lit: settings.look,
             atmosphere,
             night_lights: false,
+            profiler,
+            pass_times: BTreeMap::new(),
             device,
             queue,
             settings,
@@ -1873,22 +1901,31 @@ impl FilmGpu {
     /// drawing a frame.
     pub fn record_pending(&mut self, encoder: &mut wgpu::CommandEncoder) {
         if !self.pending_stitches.is_empty() {
+            let timed = self.profiler.begin_pass_query("stitch", encoder);
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("film stitch"),
-                timestamp_writes: None,
+                timestamp_writes: timed.compute_pass_timestamp_writes(),
             });
             pass.set_pipeline(&self.pipelines.displace);
             for (bind, vertices) in self.pending_stitches.drain(..) {
                 pass.set_bind_group(0, &bind, &[]);
                 pass.dispatch_workgroups(vertices.div_ceil(64), 1, 1);
             }
+            drop(pass);
+            self.profiler.end_query(encoder, timed);
         }
         self.record_drapes(encoder);
         if !self.pending_tails.is_empty() {
             // The whole chains first: a tail is cut from a level they made.
             let whole: Vec<wgpu::Texture> =
                 self.pending_tails.iter().map(|t| t.0.clone()).collect();
-            Self::record_mips(&self.device, &self.pipelines.mips, encoder, &whole);
+            Self::record_mips(
+                &self.device,
+                &self.profiler,
+                &self.pipelines.mips,
+                encoder,
+                &whole,
+            );
             for (whole, kept, level) in self.pending_tails.drain(..) {
                 encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo {
@@ -1902,6 +1939,7 @@ impl FilmGpu {
         }
         Self::record_mips(
             &self.device,
+            &self.profiler,
             &self.pipelines.mips,
             encoder,
             &self.pending_mips,
@@ -1995,15 +2033,18 @@ impl FilmGpu {
                 );
             }
         }
+        let timed = self.profiler.begin_pass_query("compose", encoder);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("film compose"),
-            timestamp_writes: None,
+            timestamp_writes: timed.compute_pass_timestamp_writes(),
         });
         pass.set_pipeline(&self.pipelines.compose);
         for (group, x, y) in &dispatches {
             pass.set_bind_group(0, group, &[]);
             pass.dispatch_workgroups(*x, *y, 1);
         }
+        drop(pass);
+        self.profiler.end_query(encoder, timed);
     }
 
     /// Uploads tightly packed sRGB-encoded RGBA8 into level 0.
@@ -2515,7 +2556,8 @@ impl FilmGpu {
                 label: Some("film frame"),
             });
         self.record_pending(&mut encoder);
-        self.atmosphere.record_sky_view(&mut encoder);
+        self.atmosphere
+            .record_sky_view(&self.profiler, &mut encoder);
         let mut drawn = Vec::with_capacity(selection.len());
         let mut top = 0usize;
         for key in selection {
@@ -2574,6 +2616,7 @@ impl FilmGpu {
         };
         for (layer, map) in maps.iter().enumerate() {
             let at = [layer as u32 * self.sun_map_stride];
+            let timed = self.profiler.begin_pass_query("shadow", &mut encoder);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("film shadow"),
                 color_attachments: &[],
@@ -2585,7 +2628,7 @@ impl FilmGpu {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: timed.render_pass_timestamp_writes(),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2619,9 +2662,12 @@ impl FilmGpu {
                     }
                 }
             }
+            drop(pass);
+            self.profiler.end_query(&mut encoder, timed);
         }
 
         {
+            let timed = self.profiler.begin_pass_query("visibility", &mut encoder);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("film visibility"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2647,7 +2693,7 @@ impl FilmGpu {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: timed.render_pass_timestamp_writes(),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2657,6 +2703,8 @@ impl FilmGpu {
                 pass.set_bind_group(1, &r.bind, &[]);
                 pass.draw(0..r.index_count, r.slot..r.slot + 1);
             }
+            drop(pass);
+            self.profiler.end_query(&mut encoder, timed);
         }
 
         {
@@ -2695,6 +2743,9 @@ impl FilmGpu {
                     ],
                 })
             });
+            let timed = self
+                .profiler
+                .begin_pass_query("projected shadows", &mut encoder);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("film projected shadows"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2707,7 +2758,7 @@ impl FilmGpu {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: timed.render_pass_timestamp_writes(),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2716,6 +2767,8 @@ impl FilmGpu {
                 pass.set_bind_group(0, bind, &[]);
                 pass.draw(0..36, 0..(projected.len() / 3) as u32);
             }
+            drop(pass);
+            self.profiler.end_query(&mut encoder, timed);
         }
 
         if let (Some((target, depth, bind)), Some(vertices), Some(indices)) = (
@@ -2723,6 +2776,7 @@ impl FilmGpu {
             &self.overlay_vertices.0,
             &self.overlay_indices.0,
         ) {
+            let timed = self.profiler.begin_pass_query("overlay", &mut encoder);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("film overlay"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2744,7 +2798,7 @@ impl FilmGpu {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: timed.render_pass_timestamp_writes(),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2755,11 +2809,17 @@ impl FilmGpu {
                 pass.set_pipeline(self.pipelines.overlay.of(depth, blend));
                 pass.draw_indexed(range, base, 0..1);
             }
+            drop(pass);
+            self.profiler.end_query(&mut encoder, timed);
         }
 
         {
             let groups = (w.div_ceil(8), h.div_ceil(8));
-            let mut pass = encoder.begin_compute_pass(&Default::default());
+            let timed = self.profiler.begin_pass_query("resolve", &mut encoder);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("film resolve"),
+                timestamp_writes: timed.compute_pass_timestamp_writes(),
+            });
             pass.set_pipeline(&self.pipelines.count);
             pass.set_bind_group(0, &self.targets.count_bg, &[]);
             pass.dispatch_workgroups(groups.0, groups.1, 1);
@@ -2787,8 +2847,57 @@ impl FilmGpu {
                 self.settings.height.div_ceil(8),
                 1,
             );
+            drop(pass);
+            self.profiler.end_query(&mut encoder, timed);
         }
         Ok(encoder)
+    }
+
+    /// Submits `encoder` — a frame's, ready to finish — with what reads
+    /// back the card's clock on its passes, and takes in whatever earlier
+    /// frames' clocks have come back. A caller that times nothing may
+    /// submit an encoder itself: the queries of its passes are then read
+    /// back with the next one submitted here.
+    pub fn submit(&mut self, mut encoder: wgpu::CommandEncoder) {
+        self.profiler.resolve_queries(&mut encoder);
+        self.queue.submit([encoder.finish()]);
+        // Nothing open: every query a pass began was ended with its pass.
+        let _ = self.profiler.end_frame();
+        self.take_pass_times();
+    }
+
+    /// Whether the device writes timestamps, so that its passes are timed.
+    pub fn timestamps(&self) -> bool {
+        self.device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY)
+    }
+
+    /// The card's time on each kind of pass so far, by the pass's name:
+    /// waits for the frames submitted to come back first. Empty where the
+    /// device writes no timestamps.
+    pub fn pass_times(&mut self) -> Result<BTreeMap<String, PassTime>, FilmGpuError> {
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| FilmGpuError::Poll(e.to_string()))?;
+        self.take_pass_times();
+        Ok(self.pass_times.clone())
+    }
+
+    /// Takes in every frame whose clocks have come back.
+    fn take_pass_times(&mut self) {
+        let period = self.queue.get_timestamp_period();
+        while let Some(results) = self.profiler.process_finished_frame(period) {
+            let mut stack: Vec<_> = results.iter().collect();
+            while let Some(result) = stack.pop() {
+                if let Some(time) = &result.time {
+                    let pass = self.pass_times.entry(result.label.clone()).or_default();
+                    pass.seconds += (time.end - time.start).max(0.0);
+                    pass.count += 1;
+                }
+                stack.extend(&result.nested_queries);
+            }
+        }
     }
 
     /// The frame's light under a physical atmosphere, worked out from the
@@ -2967,6 +3076,7 @@ impl FilmGpu {
 
     fn record_mips(
         device: &wgpu::Device,
+        profiler: &GpuProfiler,
         pipeline: &wgpu::ComputePipeline,
         encoder: &mut wgpu::CommandEncoder,
         textures: &[wgpu::Texture],
@@ -2975,9 +3085,10 @@ impl FilmGpu {
             return;
         }
         let layout = pipeline.get_bind_group_layout(0);
+        let timed = profiler.begin_pass_query("mips", encoder);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("film mips"),
-            timestamp_writes: None,
+            timestamp_writes: timed.compute_pass_timestamp_writes(),
         });
         pass.set_pipeline(pipeline);
         for t in textures {
@@ -3010,6 +3121,8 @@ impl FilmGpu {
                 pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
             }
         }
+        drop(pass);
+        profiler.end_query(encoder, timed);
     }
 
     /// Appends the conversion of [`Self::output`] to planar I420 (Y, then U,
@@ -3022,9 +3135,10 @@ impl FilmGpu {
         if h % 2 != 0 {
             return Err(FilmGpuError::Unaligned("height", 2));
         }
+        let timed = self.profiler.begin_pass_query("i420", encoder);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("film i420"),
-            timestamp_writes: None,
+            timestamp_writes: timed.compute_pass_timestamp_writes(),
         });
         pass.set_pipeline(&self.pipelines.y_plane);
         pass.set_bind_group(0, &self.targets.y_bg, &[]);
@@ -3032,6 +3146,8 @@ impl FilmGpu {
         pass.set_pipeline(&self.pipelines.uv_planes);
         pass.set_bind_group(0, &self.targets.uv_bg, &[]);
         pass.dispatch_workgroups((w / 8).div_ceil(8), (h / 2).div_ceil(8), 1);
+        drop(pass);
+        self.profiler.end_query(encoder, timed);
         Ok(())
     }
 

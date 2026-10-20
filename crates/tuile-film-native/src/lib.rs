@@ -33,6 +33,7 @@ pub mod meter;
 #[cfg(all(target_os = "linux", feature = "nvenc"))]
 pub mod nvenc;
 pub mod observe;
+pub mod profile;
 pub mod reference;
 pub mod render;
 pub mod seams;

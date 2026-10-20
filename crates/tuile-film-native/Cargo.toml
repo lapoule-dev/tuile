@@ -40,6 +40,13 @@ tuile-repository = { version = "0.12.0", path = "../tuile-repository" }
 # Where the store's small objects are kept between two renders.
 tuile-storage-foyer = { version = "0.12.0", path = "../tuile-storage-foyer" }
 wgpu = { workspace = true }
+# A segment's profile, gzipped like any pprof.
+flate2 = { workspace = true }
+
+# A segment's CPU sampled while the service makes it (`profile`), written as
+# pprof: the prost codec reads its pre-generated types, no protoc needed.
+[target.'cfg(unix)'.dependencies]
+pprof = { version = "0.15", default-features = false, features = ["prost-codec"] }
 
 # The system's frameworks, for the `videotoolbox` feature.
 [target.'cfg(target_os = "macos")'.dependencies]

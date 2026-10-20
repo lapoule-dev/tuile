@@ -51,25 +51,8 @@ impl ExtractRef {
     }
 }
 
-/// What fetching a render's extracts took.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Fetched {
-    pub extracts: u64,
-    pub parts: u64,
-    pub bytes: u64,
-    pub seconds: f64,
-}
-
-impl Fetched {
-    /// Megabytes a second, over the whole fetch.
-    pub fn mb_per_second(&self) -> f64 {
-        if self.seconds > 0.0 {
-            self.bytes as f64 / 1e6 / self.seconds
-        } else {
-            0.0
-        }
-    }
-}
+/// What fetching a render's extracts took: the receipt's own type.
+pub use tuile_farm::receipt::Fetched;
 
 /// The local key an extract is written to, under the render's directory.
 pub fn local_key(extract: &ExtractRef) -> String {

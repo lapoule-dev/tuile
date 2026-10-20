@@ -29,6 +29,7 @@ use tuile_film::{
 use tuile_film_gpu::{
     DrapeLayer, FilmGpu, LayerCorner, LayerField, LayerGrade, Settings, Shot, TileMesh,
 };
+use tuile_farm::receipt::{Ahead, GpuPass, GpuTimes};
 use tuile_radiometry::{linear_of, through, Affine, Blended, FilmGrade, Local, MatrixField, SAME};
 use tuile_repository::TileRepository;
 
@@ -198,6 +199,13 @@ pub struct Done {
     /// entered again with more of it, having come closer.
     pub drapes_reduced: u64,
     pub drapes_regrown: u64,
+    /// Every store tile of each pack's frames asked for once, before them.
+    pub ahead: Ahead,
+    /// The card's own clock on each kind of pass, where the adapter has
+    /// timestamps.
+    pub gpu: GpuTimes,
+    /// The adapter, as its driver names it.
+    pub adapter: String,
 }
 
 /// Tiles a stretch of frames names that the tile store does not hold. A
@@ -358,7 +366,7 @@ async fn shoot(
         gpu.encode_i420(&mut encoder)?;
         encoder.copy_buffer_to_buffer(gpu.i420_planes(), 0, planes, 0, planes.size());
     }
-    gpu.queue().submit([encoder.finish()]);
+    gpu.submit(encoder);
     if let Some(texel) = gpu.shadow_texel() {
         let (fine, coarse) = shadow_texel.unwrap_or((texel, texel));
         *shadow_texel = Some((fine.min(texel), coarse.max(texel)));
@@ -455,12 +463,20 @@ pub async fn render(
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, None).await?;
     let info = adapter.get_info();
-    println!(
-        "adapter: {} ({:?}, driver {} {})",
+    let adapter_name = format!(
+        "{} ({:?}, driver {} {})",
         info.name, info.backend, info.driver, info.driver_info
+    );
+    // Timestamps where the adapter writes them: every pass is then timed
+    // by the card's own clock (`FilmGpu::pass_times`).
+    let timestamps = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+    println!(
+        "adapter: {adapter_name}; timestamps {}",
+        if timestamps.is_empty() { "none" } else { "on" }
     );
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
+            required_features: timestamps,
             required_limits: adapter.limits(),
             ..Default::default()
         })
@@ -521,6 +537,7 @@ pub async fn render(
         height: picture_height,
         grade: film_grade.clone(),
         setup_seconds: began.elapsed().as_secs_f64(),
+        adapter: adapter_name,
         ..Done::default()
     };
     // What is resident, and the imagery levels of each one's drape.
@@ -585,10 +602,11 @@ pub async fn render(
                     tiles: absent,
                 }));
             }
-            println!(
-                "ahead of frames {a}–{b}: {count} tiles of the store asked for in {:.1} s",
-                ahead.elapsed().as_secs_f64()
-            );
+            let seconds = ahead.elapsed().as_secs_f64();
+            done.ahead.packs += 1;
+            done.ahead.tiles += count as u64;
+            done.ahead.seconds += seconds;
+            println!("ahead of frames {a}–{b}: {count} tiles of the store asked for in {seconds:.1} s");
         }
         // A tile's own gain: the same wherever the film draws it.
         let corners = |at: (u8, u32, u32)| film_grade.as_ref().and_then(|g| g.field.corners(at));
@@ -685,12 +703,16 @@ pub async fn render(
         let wanted: Vec<u32> = (a..=b).filter(|f| (f - first) % every == 0).collect();
         let mut walking = (every == 1).then(|| Cursor::new(&pack, a, b)).transpose()?;
         for frame in wanted {
+            let t = Instant::now();
             let diff = match walking.as_mut() {
                 Some(cursor) => cursor.advance(&pack),
                 None => Cursor::new(&pack, frame, frame)?.advance(&pack),
             }
             .ok_or("the pack ended before its last frame")??;
-            let mut timings = Timings::default();
+            let mut timings = Timings {
+                advance: ms(t),
+                ..Timings::default()
+            };
             let mut entered = 0usize;
 
             // The pixels a tile's sphere can span in this frame's picture, as
@@ -1089,6 +1111,7 @@ pub async fn render(
                 }
             }
             timings.stitch += ms(t);
+            let t = Instant::now();
             // The frame's light, before anything of the frame is drawn or
             // fitted — the sun's map included — and the same for both eyes:
             // the host's when it places it, else the order's.
@@ -1110,6 +1133,7 @@ pub async fn render(
                 shadow_texel: gpu.shadow_texel_for(&camera, &diff.selection)?,
             };
             overlays.frame(diff.frame, &seen, &mut shapes);
+            timings.overlays += ms(t);
             // For two eyes: each eye apart, the pair, the left eye's camera.
             let mut apart = None;
             let (rgba, i420) = match (&stereo, &pair) {
@@ -1246,6 +1270,19 @@ pub async fn render(
     let t = Instant::now();
     sink.close()?;
     done.timings.sink += ms(t);
+    // What the card's clock said of every frame, the last ones waited for.
+    done.gpu = GpuTimes {
+        timestamps: gpu.timestamps(),
+        passes: gpu
+            .pass_times()?
+            .into_iter()
+            .map(|(pass, time)| GpuPass {
+                pass,
+                seconds: time.seconds,
+                count: time.count,
+            })
+            .collect(),
+    };
     done.frames = index;
     done.seconds = began.elapsed().as_secs_f64();
     Ok(done)
