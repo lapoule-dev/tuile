@@ -28,8 +28,14 @@ def main() -> None:
     tag = part.replace(":", "-") + (f"-{shard[0]}of{shard[1]}" if shard[1] > 1 else "")
     (root / "journal").mkdir(parents=True, exist_ok=True)
     journal = root / "journal" / f"{tag}.jsonl"
-    journal.unlink(missing_ok=True)
+    done: dict[str, dict[str, object]] = {}
+    if journal.exists():
+        for line in journal.read_text().splitlines():
+            row = json.loads(line)
+            done[str(row.get("id"))] = row
+        journal.rename(journal.with_suffix(f".{int(time.time())}.prev"))
     w = Writer(root, Coastline(DATA / "geo" / "ne_10m_coastline.geojson"), journal)
+    w.done = done
 
     def log(msg: str) -> None:
         print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
@@ -44,6 +50,21 @@ def main() -> None:
     elif part == "oam":
         cat = json.loads((DATA / "catalogues" / "oam-usable.json").read_text())
         harvest_oam(cat, w, shard=shard, log=log)
+    elif part == "bing":
+        from .harvest import harvest_bing
+        from .world import draw_places
+
+        places = draw_places(DATA / "geo" / "ne_10m_coastline.geojson", n_mountain=2400, n_coast=2000,
+                             n_curated=330, n_rest=1200)
+        harvest_bing(places, DATA / "bing" / "tiles", journal, w.coast, shard=shard, log=log)
+    elif part == "anchors":
+        import glob
+
+        from .harvest import harvest_anchors
+
+        rows = [json.loads(line) for f in glob.glob(str(root / "journal" / "xyz-*.jsonl"))
+                for line in open(f)]
+        harvest_anchors(rows, DATA / "bing" / "tiles", journal, n=2500, log=log)
     log(f"done: {len(w.rows)} samples")
 
 

@@ -103,7 +103,16 @@ class Writer:
         """``journal``: rows are appended there as JSON lines as they come, so a stopped harvest loses nothing."""
         self.root, self.coast, self.journal = root, coast, journal
         self.rows: list[dict[str, object]] = []
+        self.done: dict[str, dict[str, object]] = {}
+        """Rows of a previous run of the same part: a sample already recorded is not fetched again (its image may
+        have left the laptop for the bucket already)."""
         self._place_cache: dict[tuple[int, int], Place] = {}
+
+    def resume(self, row: dict[str, object]) -> None:
+        self.rows.append(row)
+        if self.journal is not None:
+            with open(self.journal, "a") as f:
+                f.write(json.dumps(row) + "\n")
 
     def place(self, lon: float, lat: float) -> Place:
         key = (round(lon * 200), round(lat * 200))  # 500 m cells: relief is a 3 km measure
@@ -142,8 +151,16 @@ def xyz_block(session: requests.Session, url: str, z: int, x: int, y: int, pause
     out = np.empty((SIZE, SIZE, 3), np.uint8)
     for dy in (0, 1):
         for dx in (0, 1):
-            r = session.get(url.format(z=z, x=x + dx, y=y + dy), timeout=60)
+            r = None
+            for attempt in range(5):  # a dropped connection is retried, never fatal to a harvest of hours
+                try:
+                    r = session.get(url.format(z=z, x=x + dx, y=y + dy), timeout=60)
+                    break
+                except requests.RequestException:
+                    time.sleep(5.0 * (attempt + 1))
             time.sleep(pause)
+            if r is None:
+                return None
             if r.status_code != 200 or not r.headers.get("Content-Type", "").startswith("image"):
                 return None
             t = np.asarray(Image.open(io.BytesIO(r.content)).convert("RGB"))
@@ -167,6 +184,11 @@ def harvest_site(site: Site, w: Writer, pause: float = 0.12, tries: int = 4,
         x, y = lonlat_to_tile(lon, lat, z)
         x, y = x // 2 * 2, y // 2 * 2
         if site.split == "train" and held_out(z, x, y):
+            continue
+        prev = w.done.get(_id(site.source, z, x, y))
+        if prev is not None:
+            w.resume(prev)
+            got += 1
             continue
         img = xyz_block(s, src.url, z, x, y, pause)
         if img is None:
@@ -284,10 +306,18 @@ def linz_tiffs(prefix: str) -> list[str]:
 
 
 def harvest_linz(c: Collection, w: Writer, tries: int = 4, log: Callable[[str], None] = print) -> int:
-    rng = random.Random(f"{c.name}/17501")
+    # windows are drawn at random inside files: a resumed run keeps what it has and draws only the rest, from a
+    # generator seeded by how much it already has (so a rerun is deterministic, and never reads a window twice)
+    prev = [r for r in w.done.values() if r.get("site") == c.name]
+    for r in prev:
+        w.resume(r)
+    if len(prev) >= c.n:
+        log(f"{c.name}: {len(prev)}/{c.n} already")
+        return len(prev)
+    rng = random.Random(f"{c.name}/17501" + (f"/resume{len(prev)}" if prev else ""))
     urls = linz_tiffs(c.prefix)
     native = float(re.search(r"_([0-9.]+)m/", c.prefix).group(1))  # type: ignore[union-attr]
-    got, attempts = 0, 0
+    got, attempts = len(prev), 0
     while got < c.n and attempts < c.n * tries and urls:
         attempts += 1
         url = rng.choice(urls)
@@ -377,3 +407,110 @@ def harvest_all(root: Path, coast: Coastline, which: set[str], log: Callable[[st
         cat = json.loads((root.parent / "catalogues" / "oam-usable.json").read_text())
         harvest_oam(cat, w, log=log)
     return w
+
+
+# ------------------------------------------------------------------------------------------- commercial layer ---
+
+
+def bing_block(b: "Bing", z: int, x: int, y: int, cache: Path) -> U8 | None:  # noqa: F821
+    """2 x 2 tiles of the commercial layer as served (decoded only to be checked; the cache keeps the bytes)."""
+    out = np.empty((SIZE, SIZE, 3), np.uint8)
+    for dy in (0, 1):
+        for dx in (0, 1):
+            data = b.tile(z, x + dx, y + dy, cache)
+            if data is None:
+                return None
+            t = np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
+            if t.shape != (256, 256, 3):
+                return None
+            out[dy * 256:(dy + 1) * 256, dx * 256:(dx + 1) * 256] = t
+    return out
+
+
+def harvest_bing(places: list["Place"], cache: Path, journal: Path, coast: Coastline,  # noqa: F821
+                 shard: tuple[int, int] = (0, 1), log: Callable[[str], None] = print) -> int:
+    """For each place, the deepest level among z19, z18, z17 where the commercial layer has a full 2 x 2 block.
+    One row per kept block in ``journal``; the tiles stay as served in ``cache``. Over open water (land cover
+    above 95 % water and far from the coast) nothing is asked."""
+    from .bing import Bing
+    from .geo import classify
+    from .world import region_of, split_of
+
+    b = Bing.connect()
+    got = 0
+    for k, pl in enumerate(places):
+        if k % shard[1] != shard[0]:
+            continue
+        place = classify(pl.lon, pl.lat, coast)
+        if place.cover.get("water", 0.0) > 0.95 and place.coast_m > 3000:
+            continue
+        if not place.cover:
+            continue  # outside the land cover map: open ocean
+        split = split_of(pl.lon, pl.lat)
+        for z in (19, 18, 17):
+            x, y = lonlat_to_tile(pl.lon, pl.lat, z)
+            x, y = x // 2 * 2, y // 2 * 2
+            if split == "train" and held_out(z, x, y):
+                break
+            img = bing_block(b, z, x, y, cache)
+            if img is None:
+                continue
+            tex = texture(img)
+            if tex < MIN_TEXTURE:
+                break
+            row = {"id": _id("bing", z, x, y), "source": "commercial-ion-asset-2", "site": pl.group,
+                   "drawn_as": pl.drawn_as, "split": split, "region": region_of(pl.lon, pl.lat), "lon": pl.lon,
+                   "lat": pl.lat, "zoom": z, "x": x, "y": y, "gsd_m": gsd_at(z, pl.lat), "texture": tex,
+                   "native_db": native_psnr(img), "stratum": place.stratum, "elevation": place.elevation,
+                   "relief": place.relief, "coast_m": place.coast_m, "cover": json.dumps(place.cover),
+                   "dominant": place.dominant}
+            with open(journal, "a") as f:
+                f.write(json.dumps(row) + "\n")
+            got += 1
+            break
+        if k % 100 == shard[0]:
+            log(f"bing: {k}/{len(places)} places, {got} blocks, {b.requests_made} requests")
+    log(f"bing: done, {got} blocks, {b.requests_made} requests")
+    return got
+
+
+def harvest_anchors(rows: list[dict[str, object]], cache: Path, journal: Path, n: int,
+                    log: Callable[[str], None] = print) -> int:
+    """The commercial layer over the same ground as open-orthophoto samples of web-mercator sources: its tiles at
+    the sample's own zoom and one and two levels up. Real cross-sensor pairs, aligned on the same grid; never scored
+    as full-reference (another acquisition: see the judge's misregistration control)."""
+    from .bing import Bing
+
+    b = Bing.connect()
+    rng = random.Random("anchors/17501")
+    pool = [r for r in rows if r.get("zoom") is not None and r["source"] in
+            ("ign-bdortho-20cm", "swisstopo-swissimage", "ign-es-pnoa-ma", "pdok-luchtfoto-hr")]
+    by: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for r in pool:
+        by.setdefault((str(r["stratum"]), str(r["source"])), []).append(r)
+    picks: list[dict[str, object]] = []
+    for group in by.values():
+        rng.shuffle(group)
+    while len(picks) < n and any(by.values()):
+        for key in list(by):
+            if by[key]:
+                picks.append(by[key].pop())
+    got = 0
+    for k, r in enumerate(picks[:n]):
+        z = int(r["zoom"])  # type: ignore[call-overload]
+        n_ = 2**z
+        x = int((float(r["lon"]) + 180) / 360 * n_) // 2 * 2  # type: ignore[arg-type]
+        lat = math.radians(float(r["lat"]))  # type: ignore[arg-type]
+        y = int((1 - math.asinh(math.tan(lat)) / math.pi) / 2 * n_) // 2 * 2
+        have = {}
+        for d in (0, 1, 2):
+            have[d] = b.tile(z - d, x >> d, y >> d, cache) is not None
+        with open(journal, "a") as f:
+            f.write(json.dumps({"sample": r["id"], "source": r["source"], "split": r["split"],
+                                "stratum": r["stratum"], "zoom": z, "x": x, "y": y,
+                                "bing_levels": [z - d for d, ok in have.items() if ok]}) + "\n")
+        got += 1
+        if k % 100 == 0:
+            log(f"anchors: {k}/{min(n, len(picks))}, {b.requests_made} requests")
+    log(f"anchors: done, {got}, {b.requests_made} requests")
+    return got
