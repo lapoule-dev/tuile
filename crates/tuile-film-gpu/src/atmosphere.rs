@@ -484,14 +484,18 @@ impl AtmosphereGpu {
     }
 
     /// Makes the sky-view table of the frame's uniform, if it is stale.
-    pub fn record_sky_view(&mut self, encoder: &mut wgpu::CommandEncoder) {
+    pub fn record_sky_view(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+    ) {
         if !self.sky_view_stale {
             return;
         }
         self.sky_view_stale = false;
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("film sky view"),
-            timestamp_writes: None,
+            timestamp_writes,
         });
         pass.set_pipeline(&self.sky_view_pipeline);
         pass.set_bind_group(0, &self.sky_view_bind, &[]);

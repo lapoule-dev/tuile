@@ -64,6 +64,7 @@
 
 mod atmosphere;
 mod frame;
+pub mod prof;
 
 use std::collections::HashMap;
 
@@ -349,6 +350,16 @@ struct Pipelines {
 
 /// The film renderer: resident tiles, targets and pipelines on one device.
 pub struct FilmGpu {
+    /// LAB PROBE: where a frame's time goes.
+    pub prof: prof::Prof,
+    /// LAB PROBE: the frame's tiles for sun rays, and each tile's BLAS
+    /// with the positions buffer it was built from.
+    rq_tlas: Option<wgpu::Tlas>,
+    rq_blas: std::collections::HashMap<TileKey, (wgpu::Blas, wgpu::Buffer)>,
+    rq_usage: wgpu::BufferUsages,
+    rq_instances: usize,
+    /// LAB PROBE: one jittered sun ray a sample, within the disc (`ROPP_RQ_CONE`).
+    rq_cone: bool,
     device: wgpu::Device,
     queue: wgpu::Queue,
     settings: Settings,
@@ -713,6 +724,17 @@ impl FilmGpu {
                 storage(1, wgpu::ShaderStages::VERTEX, true),
             ],
         });
+        let rq = device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY)
+            && std::env::var("ROPP_RAYQUERY").is_ok_and(|v| v == "1");
+        let rq_tlas = rq.then(|| {
+            device.create_tlas(&wgpu::CreateTlasDescriptor {
+                label: Some("probe frame tlas"),
+                max_instances: MAX_SLOTS,
+                flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+            })
+        });
+        eprintln!("PROBE ray query: {}", if rq { "on" } else { "off" });
         let resolve_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("film resolve"),
             entries: &[
@@ -753,7 +775,15 @@ impl FilmGpu {
                     count: None,
                 },
                 texture(10, wgpu::TextureSampleType::Float { filterable: false }),
-            ],
+            ]
+            .into_iter()
+            .chain(rq.then_some(wgpu::BindGroupLayoutEntry {
+                binding: 11,
+                visibility: compute_only,
+                ty: wgpu::BindingType::AccelerationStructure { vertex_return: false },
+                count: None,
+            }))
+            .collect::<Vec<_>>(),
         });
         let slot_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("film slot"),
@@ -1125,18 +1155,29 @@ impl FilmGpu {
             None,
         );
         let bin = shader(&device, "film bin", include_str!("shaders/bin.wgsl"));
-        let resolve_module = shader(
-            &device,
-            "film resolve",
-            &format!(
-                "{}{}{}{}{}",
-                atmosphere::declarations(3),
-                tuile_atmosphere::hillaire::WGSL,
-                include_str!("shaders/air.wgsl"),
-                include_str!("shaders/sunlit.wgsl"),
-                include_str!("shaders/resolve.wgsl")
-            ),
+        let resolve_body = format!(
+            "{}{}{}{}{}",
+            atmosphere::declarations(3),
+            tuile_atmosphere::hillaire::WGSL,
+            include_str!("shaders/air.wgsl"),
+            include_str!("shaders/sunlit.wgsl"),
+            include_str!("shaders/resolve.wgsl")
         );
+        let resolve_module = if rq {
+            let cone = std::env::var("ROPP_RQ_CONE").is_ok_and(|v| v == "1");
+            let body = resolve_body.replace("sunlit(p, normal, xy)", "sun_ray(p, normal, xy)");
+            let source = format!(
+                "enable wgpu_ray_query;\n{}\n{body}\n{}",
+                include_str!("shaders/common.wgsl"),
+                RQ_WGSL.replace("CONE_ON", if cone { "true" } else { "false" })
+            );
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("film resolve (ray query)"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            })
+        } else {
+            shader(&device, "film resolve", &resolve_body)
+        };
         let resolve_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("film resolve"),
             bind_group_layouts: &[
@@ -1384,6 +1425,7 @@ impl FilmGpu {
         });
 
         let targets = Self::targets(
+            rq_tlas.as_ref(),
             &device,
             &pipelines,
             &resolve_bgl,
@@ -1408,6 +1450,12 @@ impl FilmGpu {
         );
 
         Self {
+            prof: prof::Prof::new(&device, &queue),
+            rq_tlas,
+            rq_blas: std::collections::HashMap::new(),
+            rq_usage: if rq { wgpu::BufferUsages::BLAS_INPUT } else { wgpu::BufferUsages::empty() },
+            rq_instances: 0,
+            rq_cone: std::env::var("ROPP_RQ_CONE").is_ok_and(|v| v == "1"),
             light: FrameLight::of(&settings.look),
             lit: settings.look,
             atmosphere,
@@ -1456,6 +1504,7 @@ impl FilmGpu {
 
     #[allow(clippy::too_many_arguments)]
     fn targets(
+        rq_tlas: Option<&wgpu::Tlas>,
         device: &wgpu::Device,
         pipelines: &Pipelines,
         resolve_bgl: &wgpu::BindGroupLayout,
@@ -1592,7 +1641,10 @@ impl FilmGpu {
                     entry(8, wgpu::BindingResource::TextureView(shadow_map)),
                     entry(9, wgpu::BindingResource::Sampler(shadow_sampler)),
                     entry(10, wgpu::BindingResource::TextureView(&projected)),
-                ],
+                ]
+                .into_iter()
+                .chain(rq_tlas.map(|t| entry(11, t.as_binding())))
+                .collect::<Vec<_>>(),
             }),
             present_bg: Self::present_bg(
                 device, pipelines, frame_buf, &hdr, &vis, &out_view, blank,
@@ -2036,7 +2088,7 @@ impl FilmGpu {
                         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                             label: Some(label),
                             contents: bytes,
-                            usage: wgpu::BufferUsages::STORAGE,
+                            usage: wgpu::BufferUsages::STORAGE | self.rq_usage,
                         }),
                 )
             }
@@ -2149,7 +2201,7 @@ impl FilmGpu {
                 label: Some("film stitched positions"),
                 size: as_meshed.size(),
                 // Read back by whoever checks the pass against the engine.
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | self.rq_usage,
                 mapped_at_creation: false,
             });
             self.pending_stitches.push((
@@ -2269,9 +2321,112 @@ impl FilmGpu {
         Ok(())
     }
 
+    /// LAB PROBE: the BLAS of every drawn tile whose positions moved or
+    /// that has none, then the TLAS of the drawn tiles as this camera
+    /// places them — each in a submission of its own (wgpu#9215 on Metal).
+    fn rq_build(&mut self, camera: &FrameCamera, selection: &[TileKey]) -> Result<(), FilmGpuError> {
+        // The displaced positions first.
+        let mut pending = self.device.create_command_encoder(&Default::default());
+        self.record_pending(&mut pending);
+        let t = std::time::Instant::now();
+        let mut built = Vec::new();
+        let mut sizes = Vec::new();
+        for key in selection {
+            let r = self.resident.get(key).ok_or(FilmGpuError::NotResident(*key))?;
+            if r.index_count == 0 || r.vertices == 0 {
+                continue;
+            }
+            let fresh = self.rq_blas.get(key).is_some_and(|(_, b)| *b == r.buffers[0]);
+            if fresh {
+                continue;
+            }
+            let size = wgpu::BlasTriangleGeometrySizeDescriptor {
+                vertex_format: wgpu::VertexFormat::Float32x3,
+                vertex_count: r.vertices,
+                index_format: Some(wgpu::IndexFormat::Uint32),
+                index_count: Some(r.index_count),
+                flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+            };
+            let blas = self.device.create_blas(
+                &wgpu::CreateBlasDescriptor {
+                    label: Some("probe tile blas"),
+                    flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                    update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+                },
+                wgpu::BlasGeometrySizeDescriptors::Triangles { descriptors: vec![size.clone()] },
+            );
+            built.push((*key, blas, r.buffers[0].clone(), r.buffers[3].clone()));
+            sizes.push(size);
+        }
+        self.queue.submit([pending.finish()]);
+        if !built.is_empty() {
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            let geometries: Vec<Vec<wgpu::BlasTriangleGeometry<'_>>> = built
+                .iter()
+                .zip(&sizes)
+                .map(|((_, _, positions, indices), size)| {
+                    vec![wgpu::BlasTriangleGeometry {
+                        size,
+                        vertex_buffer: positions,
+                        first_vertex: 0,
+                        vertex_stride: 12,
+                        index_buffer: Some(indices),
+                        first_index: Some(0),
+                        transform_buffer: None,
+                        transform_buffer_offset: None,
+                    }]
+                })
+                .collect();
+            let entries: Vec<wgpu::BlasBuildEntry<'_>> = built
+                .iter()
+                .zip(geometries)
+                .map(|((_, blas, _, _), g)| wgpu::BlasBuildEntry {
+                    blas,
+                    geometry: wgpu::BlasGeometries::TriangleGeometries(g),
+                })
+                .collect();
+            encoder.build_acceleration_structures(entries.iter(), std::iter::empty::<&wgpu::Tlas>());
+            drop(entries);
+            self.queue.submit([encoder.finish()]);
+            {
+                let mut c = std::time::Instant::now();
+                c -= std::time::Duration::from_micros(built.len() as u64 * 1000);
+                self.prof.cpu("COUNT rq BLAS built", c);
+            }
+            for (key, blas, positions, _) in built {
+                self.rq_blas.insert(key, (blas, positions));
+            }
+        }
+        self.prof.cpu("draw: rq BLAS record", t);
+        let tlas = self.rq_tlas.as_mut().expect("rq on");
+        let mut n = 0usize;
+        for key in selection {
+            let (Some(r), Some((blas, _))) = (self.resident.get(key), self.rq_blas.get(key)) else {
+                continue;
+            };
+            let o = camera.offset(r.origin_ecef);
+            tlas[n] = Some(wgpu::TlasInstance::new(
+                blas,
+                [1.0, 0.0, 0.0, o.x, 0.0, 1.0, 0.0, o.y, 0.0, 0.0, 1.0, o.z],
+                r.slot,
+                0xff,
+            ));
+            n += 1;
+        }
+        for i in n..self.rq_instances {
+            tlas[i] = None;
+        }
+        self.rq_instances = n;
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.build_acceleration_structures(std::iter::empty::<&wgpu::BlasBuildEntry<'_>>(), [&*tlas]);
+        self.queue.submit([encoder.finish()]);
+        Ok(())
+    }
+
     /// Releases a tile. Call after the frame that no longer draws it has been
     /// recorded, never before.
     pub fn leave(&mut self, key: &TileKey) {
+        self.rq_blas.remove(key);
         if let Some(r) = self.resident.remove(key) {
             self.tiles[r.slot as usize] = TileFrame::default();
             self.free.push(r.slot);
@@ -2366,9 +2521,12 @@ impl FilmGpu {
         overlays: &[OverlayMesh],
     ) -> Result<wgpu::CommandEncoder, FilmGpuError> {
         let camera = &shot.camera;
+        let probe_t = std::time::Instant::now();
         // The frame's light, from the air, before anything reads the sun:
         // worked out once from the frame's own camera, so both eyes share it.
         self.light_frame(&shot.frame, selection)?;
+        self.prof.cpu("draw: light_frame", probe_t);
+        let probe_t = std::time::Instant::now();
         // The sun's view, fitted to the frame's own camera and placed for
         // this one: the same map, ground for ground, in either eye.
         let sun = self
@@ -2379,6 +2537,9 @@ impl FilmGpu {
                 (view, side)
             });
         let to_sun = self.lit.to_sun.normalize_or_zero();
+        self.prof.cpu("draw: sun_of", probe_t);
+        let probe_t = std::time::Instant::now();
+        let probe_vertices: usize = overlays.iter().map(|m| m.positions.len()).sum();
         // Everything of the overlays that can fail does before anything is
         // recorded: one vertex buffer for the frame, eye-relative — each
         // origin meets the eye in f64, and only the difference is narrowed.
@@ -2477,6 +2638,17 @@ impl FilmGpu {
                 cast_edges.push((first..edges.len() as u32, base));
             }
         }
+        self.prof.cpu("draw: overlay build", probe_t);
+        if probe_vertices > 0 {
+            let mut cpu_v = std::time::Instant::now();
+            // counts, not times: vertices handed by the host (abuse the ms field)
+            cpu_v -= std::time::Duration::from_micros(probe_vertices as u64);
+            self.prof.cpu("COUNT overlay vertices /1000", cpu_v);
+            let mut cpu_p = std::time::Instant::now();
+            cpu_p -= std::time::Duration::from_micros((projected.len() / 3) as u64);
+            self.prof.cpu("COUNT projected tris /1000", cpu_p);
+        }
+        let probe_t = std::time::Instant::now();
         // Opaque meshes first, each kind in the order given.
         drawn_over.sort_by_key(|(_, _, _, blend)| *blend == OverlayBlend::Translucent);
         let overlaid = !drawn_over.is_empty();
@@ -2507,6 +2679,13 @@ impl FilmGpu {
             }
         }
 
+        self.prof.cpu("draw: overlay upload", probe_t);
+        if self.rq_tlas.is_some() {
+            let probe_t = std::time::Instant::now();
+            self.rq_build(camera, selection)?;
+            self.prof.cpu("draw: rq BLAS+TLAS (record+submit)", probe_t);
+        }
+        let probe_t = std::time::Instant::now();
         // What was queued since the last frame comes first: the drapes, then
         // the mips made from them, before anything samples either.
         let mut encoder = self
@@ -2515,7 +2694,9 @@ impl FilmGpu {
                 label: Some("film frame"),
             });
         self.record_pending(&mut encoder);
-        self.atmosphere.record_sky_view(&mut encoder);
+        self.prof.cpu("draw: record pending", probe_t);
+        let probe_t = std::time::Instant::now();
+        self.atmosphere.record_sky_view(&mut encoder, self.prof.compute("sky view"));
         let mut drawn = Vec::with_capacity(selection.len());
         let mut top = 0usize;
         for key in selection {
@@ -2585,7 +2766,7 @@ impl FilmGpu {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self.prof.render("sun maps (all)"),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2647,7 +2828,7 @@ impl FilmGpu {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self.prof.render("visibility raster"),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2707,7 +2888,7 @@ impl FilmGpu {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.prof.render("projected shadows"),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2744,7 +2925,7 @@ impl FilmGpu {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self.prof.render("overlays"),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2759,7 +2940,7 @@ impl FilmGpu {
 
         {
             let groups = (w.div_ceil(8), h.div_ceil(8));
-            let mut pass = encoder.begin_compute_pass(&Default::default());
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("bin"), timestamp_writes: self.prof.compute("bin (count/scan/scatter)") });
             pass.set_pipeline(&self.pipelines.count);
             pass.set_bind_group(0, &self.targets.count_bg, &[]);
             pass.dispatch_workgroups(groups.0, groups.1, 1);
@@ -2769,6 +2950,8 @@ impl FilmGpu {
             pass.set_pipeline(&self.pipelines.scatter);
             pass.set_bind_group(0, &self.targets.scatter_bg, &[]);
             pass.dispatch_workgroups(groups.0, groups.1, 1);
+            drop(pass);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("resolve"), timestamp_writes: self.prof.compute("resolve (shade+air)") });
 
             pass.set_pipeline(&self.pipelines.resolve);
             pass.set_bind_group(0, &self.targets.resolve_bg, &[]);
@@ -2778,6 +2961,8 @@ impl FilmGpu {
                 pass.set_bind_group(2, &self.slot_bg, &[r.slot * SLOT_STRIDE as u32]);
                 pass.dispatch_workgroups_indirect(&self.args, u64::from(r.slot) * 12);
             }
+            drop(pass);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("present"), timestamp_writes: self.prof.compute("present (sky+filter)") });
 
             pass.set_pipeline(&self.pipelines.present);
             pass.set_bind_group(0, &self.targets.present_bg, &[]);
@@ -2788,6 +2973,7 @@ impl FilmGpu {
                 1,
             );
         }
+        self.prof.cpu("draw: record passes", probe_t);
         Ok(encoder)
     }
 
@@ -2840,7 +3026,10 @@ impl FilmGpu {
         if self.atmosphere.key == Some(key) {
             return Ok(());
         }
+        let probe_t = std::time::Instant::now();
         self.atmosphere.hold(&self.queue, params);
+        self.prof.cpu("light: atmosphere hold (LUTs)", probe_t);
+        let probe_t = std::time::Instant::now();
         let geodetic = tuile_core::geo::ecef_to_geodetic(ground);
         let model = self.atmosphere.model.as_ref().expect("held above");
         let reference = self.atmosphere.reference.as_ref().expect("held above");
@@ -2873,6 +3062,7 @@ impl FilmGpu {
                 camera: base.camera,
             },
         );
+        self.prof.cpu("light: model.light (metering)", probe_t);
         let mut lit = FrameLight::new(sky.illumination, light.air);
         lit.instant = light.instant;
         self.lit = base.lit_by(lit);
@@ -3024,7 +3214,7 @@ impl FilmGpu {
         }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("film i420"),
-            timestamp_writes: None,
+            timestamp_writes: self.prof.compute("i420"),
         });
         pass.set_pipeline(&self.pipelines.y_plane);
         pass.set_bind_group(0, &self.targets.y_bg, &[]);
@@ -3049,3 +3239,32 @@ impl FilmGpu {
         self.targets.list.size()
     }
 }
+
+/// LAB PROBE: one sun ray from a resolved ground sample, against the frame's
+/// tiles; with `CONE_ON`, aimed at a point of the sun's disc picked by the
+/// sample's place in the supersampled picture.
+const RQ_WGSL: &str = r#"
+@group(0) @binding(11) var rq_scene: acceleration_structure;
+fn rq_hash(v: vec2u) -> f32 {
+    var h = v.x * 1664525u + v.y * 1013904223u;
+    h ^= h >> 16u; h *= 2246822519u; h ^= h >> 13u;
+    return f32(h & 0xffffffu) / 16777216.0;
+}
+fn sun_ray(p: vec3f, n: vec3f, xy: vec2u) -> f32 {
+    var dir = normalize(frame.to_sun.xyz);
+    if (CONE_ON) {
+        let tangent = 0.00465 * 4.0;
+        let a = rq_hash(xy) * 6.2831853;
+        let r = sqrt(rq_hash(xy.yx + vec2u(7u, 3u))) * tangent;
+        let side = normalize(cross(dir, select(vec3f(0.0, 0.0, 1.0), vec3f(1.0, 0.0, 0.0), abs(dir.z) > 0.9)));
+        let up = cross(dir, side);
+        dir = normalize(dir + side * (r * cos(a)) + up * (r * sin(a)));
+    }
+    let o = p + n * (0.05 + 2.0e-6 * length(p));
+    var rq: ray_query;
+    rayQueryInitialize(&rq, rq_scene, RayDesc(RAY_FLAG_TERMINATE_ON_FIRST_HIT, 0xffu, 0.0, 1.0e7, o, dir));
+    rayQueryProceed(&rq);
+    let hit = rayQueryGetCommittedIntersection(&rq);
+    return select(0.0, 1.0, hit.kind == RAY_QUERY_INTERSECTION_NONE);
+}
+"#;

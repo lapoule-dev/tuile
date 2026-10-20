@@ -358,24 +358,42 @@ async fn shoot(
         gpu.encode_i420(&mut encoder)?;
         encoder.copy_buffer_to_buffer(gpu.i420_planes(), 0, planes, 0, planes.size());
     }
+    gpu.prof.resolve(&mut encoder);
+    let probe_t = Instant::now();
     gpu.queue().submit([encoder.finish()]);
+    gpu.prof.cpu("draw: submit", probe_t);
     if let Some(texel) = gpu.shadow_texel() {
         let (fine, coarse) = shadow_texel.unwrap_or((texel, texel));
         *shadow_texel = Some((fine.min(texel), coarse.max(texel)));
     }
     timings.draw += ms(t);
     let t = Instant::now();
+    // LAB PROBE: the GPU's work first, waited for alone, then the copies.
+    gpu.device().poll(wgpu::PollType::wait_indefinitely())?;
+    gpu.prof.cpu("readback: GPU wait", t);
+    let probe_t = Instant::now();
     let rows = read_back(gpu, &back.picture).await?;
     let mut rgba = Vec::with_capacity((back.width * back.height * 4) as usize);
     for row in rows.chunks(back.padded as usize) {
         rgba.extend_from_slice(&row[..(back.width * 4) as usize]);
     }
+    gpu.prof.cpu("readback: rgba map+copy", probe_t);
+    let probe_t = Instant::now();
     let i420 = match &back.planes {
         Some(planes) => read_back(gpu, planes).await?,
         None => Vec::new(),
     };
+    gpu.prof.cpu("readback: i420 map+copy", probe_t);
+    gpu.prof.collect(gpu.device());
     timings.readback += ms(t);
     Ok((rgba, i420))
+}
+
+/// LAB PROBE: wgpu's experimental features (ray queries) opted into.
+#[allow(unsafe_code)]
+fn probe_experimental() -> wgpu::ExperimentalFeatures {
+    // SAFETY: lab probe only; the experimental ray-query feature.
+    unsafe { wgpu::ExperimentalFeatures::enabled() }
 }
 
 async fn read_back(film: &FilmGpu, buffer: &wgpu::Buffer) -> Result<Vec<u8>, Error> {
@@ -462,6 +480,14 @@ pub async fn render(
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             required_limits: adapter.limits(),
+            required_features: adapter.features()
+                & (wgpu::Features::TIMESTAMP_QUERY
+                    | if std::env::var("ROPP_RAYQUERY").is_ok_and(|v| v == "1") {
+                        wgpu::Features::EXPERIMENTAL_RAY_QUERY
+                    } else {
+                        wgpu::Features::empty()
+                    }),
+            experimental_features: probe_experimental(),
             ..Default::default()
         })
         .await?;
@@ -685,11 +711,13 @@ pub async fn render(
         let wanted: Vec<u32> = (a..=b).filter(|f| (f - first) % every == 0).collect();
         let mut walking = (every == 1).then(|| Cursor::new(&pack, a, b)).transpose()?;
         for frame in wanted {
+            let probe_t = Instant::now();
             let diff = match walking.as_mut() {
                 Some(cursor) => cursor.advance(&pack),
                 None => Cursor::new(&pack, frame, frame)?.advance(&pack),
             }
             .ok_or("the pack ended before its last frame")??;
+            gpu.prof.cpu("frame: cursor advance", probe_t);
             let mut timings = Timings::default();
             let mut entered = 0usize;
 
@@ -996,6 +1024,7 @@ pub async fn render(
                         done.smooth_mean_sum += f64::from(did.mean);
                         done.smoothed_tiles += 1;
                         done.smooth_ms += ms(began);
+                        gpu.prof.cpu("enter: smooth/skirts (prepared)", began);
                         out
                     };
                     let t = Instant::now();
@@ -1103,13 +1132,17 @@ pub async fn render(
             // The frame's overlays, once for every picture of it: made for
             // the frame's own camera, drawn into each eye through its own.
             shapes.clear();
+            let probe_t = Instant::now();
             let seen = OverlayCamera {
                 view: diff.view,
                 camera,
                 eyes: pair,
                 shadow_texel: gpu.shadow_texel_for(&camera, &diff.selection)?,
             };
+            gpu.prof.cpu("frame: shadow_texel_for", probe_t);
+            let probe_t = Instant::now();
             overlays.frame(diff.frame, &seen, &mut shapes);
+            gpu.prof.cpu("frame: host overlays (CPU)", probe_t);
             // For two eyes: each eye apart, the pair, the left eye's camera.
             let mut apart = None;
             let (rgba, i420) = match (&stereo, &pair) {
@@ -1248,6 +1281,7 @@ pub async fn render(
     done.timings.sink += ms(t);
     done.frames = index;
     done.seconds = began.elapsed().as_secs_f64();
+    eprintln!("{}", gpu.prof.report(index));
     Ok(done)
 }
 
