@@ -3,8 +3,10 @@
 
 # GPU-compressed imagery in the viewer
 
-Status: design, 21 Oct. 2026. Nothing is built yet. This note is the first PR of
-roadmap item A6. The PRs that follow it are listed in §10.
+Status: design, 21 Oct. 2026, revised the same day with Laurent's answers
+(§1) and the first measurements (§9.5). The GPU encoder is built, in the
+`texcomp` repository (§4); nothing is wired into the viewer yet. This note is
+the first PR of roadmap item A6. The PRs that follow it are listed in §10.
 Scope: the interactive viewer, native and web (`tuile-wgpu`, `tuile-viewer`,
 `tuile-web`, the decode jobs in `tuile-planetary`). The film renderer
 (`tuile-film*`) is out of scope, and its goldens must stay byte-identical (§8.4).
@@ -19,19 +21,42 @@ measurements, and the measurement plan in §9 exists to replace them.
   format just before upload. Nothing is stored compressed, and the stocks and
   stl-tiles don't change. No derived imagery layer is stored anywhere, which
   keeps Bing imagery within its terms.
-- **Two encoders.**
-  1. A **WGSL compute encoder** in `tuile-wgpu` is the fast path wherever the
-     adapter has compute and a block format the encoder writes.
-  2. A **pure-Rust CPU encoder ported from Basis Universal**, running in the
-     decode workers, covers the rest (WebGL2, adapters without compute, block
-     formats the GPU encoder doesn't write yet).
+- **Two encoders, both in one crate of their own,
+  [`lapoule-dev/texcomp`](https://github.com/lapoule-dev/texcomp)**, which
+  tuile depends on by git tag (tags cut by the main session):
+  1. a **WGSL compute encoder**, behind texcomp's `gpu` feature (wgpu 29, the
+     same major as tuile). It is the fast path wherever the adapter has compute
+     and a block format the kernels write;
+  2. a **pure-Rust CPU encoder ported from Basis Universal**, texcomp's default
+     build, dependency-light and `wasm32-unknown-unknown` clean. It runs in the
+     decode workers and covers the rest (WebGL2, adapters without compute,
+     formats the kernels don't write).
 - **Selection comes strictly from what wgpu reports** (features, downlevel
   capabilities, limits): the GPU encoder, else the CPU encoder, else
   uncompressed. There is no flag and no switch. Environment variables may tune
   quality and effort, and never choose a path.
-- **The CPU encoder is its own crate in its own repository** under the
-  lapoule-dev organisation (coordinator message, 21 Oct.). tuile depends on it
-  by git tag. §5.1 covers the repository and its name.
+- **Target platforms:** Metal (macOS and iOS), Meta Quest (Android, Vulkan,
+  Adreno), WebGPU, Vulkan. The Quest and iOS expose ASTC and ETC2 but no BC,
+  so ASTC is not left for last (§4.3).
+- **÷4 only:** BC7 and ASTC 4×4, 8 bits per texel. No 4-bit tier (BC1, ETC2
+  RGB8) for now.
+- **UASTC only** in the CPU port; no ETC1S.
+- **ΔE2000 from `palette`**, as a dev-dependency.
+- **Fixtures:** NASA imagery (public domain) and synthetic patterns. Never Bing.
+
+### Where each part lives
+
+| Part | Where |
+|---|---|
+| `BlockFormat`, block sizes | `texcomp` (default build) |
+| WGSL kernels (BC7, ASTC 4×4; ETC2 later), pipelines, buffers, the buffer→texture copy | `texcomp::gpu` (feature `gpu`) |
+| What a device needs to run the kernels (`texcomp::gpu::runs_on`) | `texcomp::gpu` |
+| Quality instruments (PSNR, ΔE2000), NASA and synthetic fixtures, encoder tests, the pass-leak measurement | `texcomp` tests and examples |
+| CPU encoder and transcoders (the port) | `texcomp` (default build) |
+| `select`: the plan for a device, from its capabilities | `tuile-wgpu` |
+| Integration: the decode job's target, `Texels::Blocks`, the wire format, `upload_texture`'s branch, the device's requested features | `tuile-planetary`, `tuile-core`, `tuile-web`, `tuile-wgpu`, `tuile-viewer` |
+| The budget's real bytes (cost inputs) | `tuile-core` (`content.rs`) |
+| Headless and web-bench measurements, the PNG decode bench | tuile |
 
 ## 2. Where the viewer stands today
 
@@ -79,16 +104,11 @@ Formats the viewer uses, all sRGB so that sampling stays exactly what
 | Format | wgpu name | bpp | vs RGBA8 | Alpha | Use |
 |---|---|---|---|---|---|
 | BC7 | `Bc7RgbaUnormSrgb` | 8 | 4× | full | default where BC exists |
-| ASTC 4×4 | `Astc { B4x4, UnormSrgb }` | 8 | 4× | full | default where ASTC exists and BC does not |
-| ETC2 RGBA8 (EAC alpha) | `Etc2Rgba8UnormSrgb` | 8 | 4× | full | ETC2-only adapters, tiles with alpha |
-| ETC2 RGB8 | `Etc2Rgb8UnormSrgb` | 4 | 8× | none | ETC2-only adapters, opaque tiles |
-| BC1 | `Bc1RgbaUnormSrgb` | 4 | 8× | 1-bit | opaque tiles, only if the 8× tier is wanted (⚑2) |
+| ASTC 4×4 | `Astc { B4x4, UnormSrgb }` | 8 | 4× | full | default where ASTC exists and BC does not (iOS, Quest, Android, mobile WebGPU) |
+| ETC2 RGBA8 (EAC alpha) | `Etc2Rgba8UnormSrgb` | 8 | 4× | full | later, for adapters with ETC2 alone, which none of the targets is |
 
-Order of preference for one adapter: **BC7, then ASTC 4×4, then ETC2**, then
-uncompressed. The decode job already scans each tile for opaque black, so it can
-flag "fully opaque" in the same scan. An opaque tile may then take the 4 bpp
-tier (BC1 or ETC2 RGB8) when ⚑2 allows it. A tile with alpha always takes an
-alpha-capable 8 bpp format.
+Order of preference for one adapter: **BC7, then ASTC 4×4**, then
+uncompressed. The 4-bit formats (BC1, ETC2 RGB8, 8×) are out for now (§1).
 
 Constraints these formats impose, which the plan honours:
 
@@ -103,102 +123,129 @@ Constraints these formats impose, which the plan honours:
   gains the selected compression feature, intersected with the adapter's
   features as the timestamp features already are.
 
-## 4. The GPU encoder (WGSL, `tuile-wgpu`)
+## 4. The GPU encoder (WGSL, `texcomp::gpu`)
 
-### 4.1 Shape
+### 4.1 Shape (as built)
 
-- **Input:** the RGBA8 levels as they are uploaded today, written once into a
-  per-frame scratch texture or buffer (staging is unchanged, §7).
+- **Input:** the RGBA8 levels, mips included, written with `queue.write_buffer`
+  into a storage buffer for the batch.
 - **Kernel:** one invocation per 4×4 block, in 8×8 workgroups (64 invocations,
-  within every downlevel limit). It writes `vec4<u32>` per BC7 block (or
-  `vec2<u32>` per BC1 block) into a storage buffer.
-- **Copy:** `copy_buffer_to_texture` into the final `Bc7RgbaUnormSrgb` texture,
-  in the same command buffer.
-- **Batching:** every imagery tile the pump uploads in one frame is encoded in
-  **one compute pass**: one dispatch per (tile, level), or one dispatch over a
-  block table. This keeps the pass count at one per frame, whatever the Metal
-  leak turns out to do with compute passes (⚑5).
-- **Mips:** the CPU `mip_chain` stays as it is, and the encoder runs on each
-  level. Building mips by compute (as `tuile-film-gpu` does) is a later
-  optimisation, and it is not needed to get the bytes down.
+  within every downlevel limit that has compute). It writes `vec4<u32>` per
+  block into a second storage buffer, rows padded to 256 bytes.
+- **Copy:** `copy_buffer_to_texture` into the final sRGB texture, one copy per
+  level at its physical (block-rounded) size, in the caller's command buffer.
+- **Batching:** `GpuEncoder::encode` takes every tile of a call and records
+  **one compute pass**: one dispatch per (tile, level), each with its job
+  uniform at a dynamic offset. Tiles beyond one storage binding go into a
+  second batch in the same pass.
+- **Mips:** the CPU `mip_chain` stays as it is, and the kernels run on each
+  level. Building mips by compute is a later optimisation.
+- **Failure:** a tile that can't be encoded (not a multiple of 4, not a mip
+  chain, larger than a binding) gets an `EncodeError` and no texture. The
+  caller uploads it uncompressed (§8.1).
 
-### 4.2 BC7 mode subset
+### 4.2 BC7: modes 6 and 1
 
 Imagery is mostly opaque and photographic: smooth gradients, with some sharp
 edges (roads, coastlines, field boundaries).
 
-| Mode | Subsets | Endpoints | Indices | Why |
+| Mode | Subsets | Endpoints | Indices | Use |
 |---|---|---|---|---|
-| 6 | 1 | RGBA 7.7.7.7 + p-bit | 4-bit | smooth blocks, and alpha. The workhorse |
-| 1 | 2 (64 partitions) | RGB 6.6.6 + shared p-bit | 3-bit | edge blocks |
-| 5 | 1, rotation | RGB 7.7.7, A 8 | 2+2-bit | blocks with non-trivial alpha (layer edges) |
+| 6 | 1 | RGBA 7.7.7.7 + p-bit | 4-bit | every block first, and every block with alpha |
+| 1 | 2 (64 partitions) | RGB 6.6.6 + shared p-bit | 3-bit | opaque blocks mode 6 fits badly |
 
-- **Per block:** PCA or bounding-box endpoints for mode 6, then least-squares
-  refinement (two iterations).
-- **Mode 1:** a cheap partition shortlist, the 8–16 partitions with the best
-  luma split, then the same fit.
-- **Mode 5:** tried only when the block's alpha isn't constant.
-- **Choice:** the lowest RGB error wins.
+- **Fit:** principal axis by power iteration, endpoints at the extreme
+  projections, then quantise, assign indices, and refine by least squares,
+  three rounds, keeping the best.
+- **Mode 1:** the partition is chosen by an estimate, the variance each
+  subset leaves off its principal axis plus the quantisation noise of 8 steps.
+  Both subsets' moments come from one pass (the second is the total minus the
+  first). The chosen partition is then fitted fully.
+- **Early out:** a block that mode 6 fits within an RMS of about one code per
+  channel skips the partition search.
+- **Opaque alpha stays 255:** mode 6's p-bit is shared by all four channels,
+  so an opaque block weighs alpha heavily when choosing it. Without that,
+  opaque tiles came back at alpha 254 in places.
+- **Mode 5**, planned in the first version of this note, was not needed: the
+  alpha-edge tile decodes at 62 dB alpha PSNR with mode 6 alone.
 
-Modes 0, 2, 3, 4 and 7 are left out. They help mostly on alpha-heavy or
-three-colour content, which imagery rarely is. Expected quality is about
-40–44 dB PSNR on photographic 256² tiles, vs about 45–47 for the slow offline
-encoders *(to measure)*.
+The WGSL is our own, written from the Khronos Data Format Specification 1.3
+(tables 111–119). Nothing is transliterated from another encoder.
 
-**BC1** is range fit on the principal axis plus one refinement, done in the same
-pass. It ships with the BC7 kernel because it is small and gives the 8× tier on
-BC adapters (⚑2).
+### 4.3 ASTC 4×4: in the GPU encoder from the start
 
-The WGSL is our own code. Published compute and ISPC encoders inform the
-algorithm, which creates no obligation (rule 4); nothing is transliterated.
+The Quest and iOS are priority targets and expose ASTC, not BC. Two ways led
+to ASTC there: the CPU path (UASTC → ASTC is lossless) or a GPU kernel.
+**The GPU kernel is in the first texcomp PR**, for three reasons:
 
-### 4.3 ETC2 and ASTC in compute
+1. By the selection rule, a Quest or an iPhone (compute and ASTC) ends up on
+   the GPU encoder anyway. The CPU path would only be a stopgap there.
+2. The CPU path needs the UASTC encoder (series 3c), the largest part of the
+   port, plus the integration. The GPU kernel needed one more WGSL file.
+3. It costs less per tile: 1.7–2 ms against 5 ms for BC7 on the M2, wall
+   clock (§9.5).
 
-- **ETC2 RGB8 (and EAC alpha): feasible.**
-  - ETC1 individual/differential modes plus the ETC2 planar mode cover most
-    photographic blocks. T and H modes add little on imagery and can come
-    later.
-  - EAC alpha is a separate 64-bit half-block with a small search.
-  - Cost: about one BC7-sized kernel.
-- **ASTC 4×4 LDR: feasible for a fixed configuration.**
-  - Configuration: a single partition, CEM 8 (RGB direct) or CEM 12 (RGBA
-    direct), a 4×4 weight grid with one fixed quantisation chosen to fill the
-    128 bits, and fixed BISE packing.
-  - This is the subset UASTC's simplest modes use.
-  - Quality is below a full ASTC search, but it is uniform and fast.
-- **Order:** BC7/BC1 first (PR 2), because that covers macOS, Windows and
-  desktop WebGPU. ETC2 and ASTC come in a later PR (PR 5). Until then iOS,
-  Android and ETC2/ASTC-only WebGPU go through the CPU encoder, as the
-  selection rule already says: "a compressed format the GPU encoder writes".
+Two fixed configurations, both one partition with a 4×4 weight grid:
 
-### 4.4 Capability detection
+| Block | CEM | Weight range | Weight bits | Endpoints | Block mode |
+|---|---|---|---|---|---|
+| opaque | 8 (RGB direct) | 0..11 (trit + 2 bits) | 58 | 0..255, plain bytes, 48 bits | `0x251` |
+| with alpha | 12 (RGBA direct) | 0..5 (trit + 1 bit) | 42 | 0..255, plain bytes, 64 bits | `0x043` |
 
-`tuile_wgpu::texcomp::select(features, downlevel, limits, format_features)`
-returns one of:
+- The endpoints are ordered so the decoder never applies blue contraction.
+- The trit packing table and the weight unquantisation are generated from the
+  spec's own decoding procedure (§23.12, §23.17) and checked against its
+  published values.
+- Its weakness is a single partition: bright points on black (night lights)
+  are its worst tile, at 36.4 dB (§9.5). A two-partition mode is the obvious
+  next step if that matters on screen.
 
-- `Gpu(BlockFormat)`: `DownlevelFlags::COMPUTE_SHADERS`, at least one storage
-  buffer per compute stage, and workgroup limits of 64 or more. The format's
-  feature must be present and `get_texture_format_features` must report it
-  filterable. The GPU encoder must implement the format.
-- `Cpu(BlockFormat)`: the format's feature is present and filterable, and the
-  CPU crate implements it.
+**ETC2** stays for later (PR 5). None of the four targets needs it: every one
+that has ETC2 also has ASTC or BC.
+
+### 4.4 Capability detection (in tuile)
+
+`tuile_wgpu::texcomp::select(report, cpu_formats)` returns one of:
+
+- `Gpu(BlockFormat)`: `texcomp::gpu::runs_on(downlevel, limits)` holds
+  (compute shaders, two storage buffers per compute stage, an 8×8 workgroup,
+  1,024 workgroups per dimension, a 16 MiB storage binding), and the adapter
+  samples one of `texcomp::gpu::GPU_FORMATS` filtered behind its feature;
+- `Cpu(BlockFormat)`: the adapter samples a format the CPU encoder writes;
 - `Uncompressed`.
 
-`select` is a pure function of what the adapter reported, so the capability
-matrix (Metal macOS, Metal iOS, Vulkan desktop, Vulkan Android, DX12, GL,
-WebGL2 with and without the BC extensions, WebGPU desktop and Android) is a unit
-test over synthetic `Features`/`DownlevelCapabilities`. A forced-backend run
-(`TUILE_BACKEND=gl`, and WebGL2 in web-bench) checks the live path.
+`select` is a pure function of what the adapter reported. The capability
+matrix is a unit test over synthetic reports, and names the four target
+platforms explicitly:
+
+| Report | Plan |
+|---|---|
+| Metal, macOS (BC, ASTC, ETC2) | `Gpu(Bc7)` |
+| Metal, iOS (ASTC, ETC2, no BC) | `Gpu(Astc4x4)` |
+| Quest: Vulkan on Adreno (ASTC, ETC2, no BC) | `Gpu(Astc4x4)` |
+| Vulkan desktop (BC) | `Gpu(Bc7)` |
+| WebGPU desktop (`texture-compression-bc`) | `Gpu(Bc7)` |
+| WebGPU mobile / Quest browser (`-astc`, `-etc2`) | `Gpu(Astc4x4)` |
+| WebGL2 with the four BC extensions | `Cpu(Bc7)` once the CPU encoder lands, `Uncompressed` before |
+| WebGL2 on mobile (ASTC) | `Cpu(Astc4x4)` once the CPU encoder lands |
+| No block format | `Uncompressed` |
+
+A live test asks every adapter the machine enumerates for its plan and builds
+a device with the plan's features. The M2 answers `Gpu(Bc7)` on Metal.
 
 ## 5. The CPU encoder: a Rust port of Basis Universal
 
 ### 5.1 Repository, name and licence
 
-- **Repository:** `lapoule-dev/texcomp`, private. Apache-2.0 doesn't require
-  publishing a port, and nothing in the licence analysis argues for public
-  (⚑1 has the name).
-- **Crate:** `texcomp`. Free on crates.io as of 21 Oct. Its public surface is
-  our own types: `BlockFormat`, `Image<'_>`, `Quality`, `encode(..) -> Blocks`.
+- **Repository:** [`lapoule-dev/texcomp`](https://github.com/lapoule-dev/texcomp),
+  private, created 21 Oct. Apache-2.0 doesn't require publishing a port, and
+  nothing in the licence analysis argues for public.
+- **Crate:** `texcomp`. Its public surface is our own types (`BlockFormat`,
+  and in `gpu` `GpuEncoder`, `Level`, `EncodeError`). The CPU side adds its
+  own (`encode(..) -> Blocks`) with the port.
+- **Features:** the default build is the CPU side, `std` only. `gpu` adds
+  wgpu 29 (no default features: the application picks its backends) and
+  bytemuck.
 - **Licensing:**
   - our code: dual MIT OR Apache-2.0, with SPDX headers;
   - every ported item: an Apache-2.0 attribution comment at its head, and a
@@ -209,13 +256,15 @@ test over synthetic `Features`/`DownlevelCapabilities`. A forced-backend run
 - **Naming:** the README names Basis Universal nominatively, as the project it
   ports. The crate name and every type stay generic. ("Basis Universal" is a
   Binomial trademark; nominative use only.)
-- **CI:** test, clippy `-D warnings`, `cargo check --target wasm32-unknown-unknown`,
-  fmt. Pure Rust, no `build.rs`, no C toolchain, no `unsafe`. No dependencies
-  beyond `thiserror`; `rayon` stays out because the callers own the threads.
+- **CI:** fmt, clippy `-D warnings` with and without `gpu`, tests on Linux and
+  macOS with and without `gpu`, `cargo check --target wasm32-unknown-unknown`
+  with and without `gpu`, docs. Pure Rust, no `build.rs`, no C toolchain,
+  `unsafe` forbidden. The CPU side depends on `thiserror` alone; `rayon` stays
+  out because the callers own the threads.
 - **tuile's side:** tuile depends on it by git tag, and the main session tags
-  its releases. Inside tuile it is used only by `tuile-planetary` (the decode
-  job). `tuile-core` gets the enum and the texel container (§6), never the
-  encoder.
+  its releases. `tuile-planetary` (the decode job) uses the CPU side,
+  `tuile-wgpu` the `gpu` side. `tuile-core` gets the format enum and the texel
+  container (§6), never an encoder.
 
 ### 5.2 What gets ported
 
@@ -230,10 +279,10 @@ container layer:
 | UASTC LDR 4×4 encoder | `encoder/basisu_uastc_enc.cpp` (≈150 KB) + the ASTC/BC7 helpers it uses | **yes**, effort levels 0–2 first, higher levels later | the high-quality intermediate, about 8 bpp |
 | UASTC → ASTC 4×4 | `transcoder/basisu_transcoder.cpp` (UASTC part), `basisu_astc_helpers.h` | **yes** | lossless by construction (UASTC is an ASTC subset) |
 | UASTC → BC7 | same | **yes** | upstream states 0.75–1.5 dB below ASTC |
-| UASTC → ETC1 / ETC2 RGB(A) + EAC | same, with the ETC1 hint bits | **yes** | |
-| UASTC → BC1 | same, with the BC1 hint bits | **yes** (cheap, ⚑2) | |
+| UASTC → ETC2 RGBA + EAC | same, with the ETC1 hint bits | **later** | no target needs it (§4.3) |
+| UASTC → BC1 | same, with the BC1 hint bits | **no** | ÷4 only (§1) |
 | UASTC unpack (reference decode) | transcoder | **yes**, in tests and as the quality instrument | |
-| ETC1S encoder (frontend, backend, codebooks) | `basisu_frontend.cpp`, `basisu_backend.cpp`, `basisu_etc.cpp` | **no** (⚑3) | heavy clustering encoder, lower quality; its only benefit is a small file |
+| ETC1S encoder (frontend, backend, codebooks) | `basisu_frontend.cpp`, `basisu_backend.cpp`, `basisu_etc.cpp` | **no** (decided 21 Oct.) | heavy clustering encoder, lower quality; its only benefit is a small file |
 | RDO, Zstd, KTX2/.basis/.DDS, XUASTC, XUBC7, HDR, PVRTC, ATC, FXT1, OpenCL, SSE/SPMD kernels, resamplers, image loaders | | **no** | containers, transmission and formats wgpu doesn't expose |
 
 Sizing *(to measure)*: about 6–9k lines of Rust plus generated tables.
@@ -246,7 +295,7 @@ tables in `transcoder/` serve ETC1S and aren't needed.
   remote builder (never in CI, never on the laptop's critical path). For each
   fixture tile and each effort level:
   - the raw UASTC blocks (`-uastc -uastc_level N`, no RDO, no Zstd);
-  - each transcode to ASTC 4×4, BC7, ETC1, ETC2 RGBA and BC1.
+  - each transcode to ASTC 4×4 and BC7 (ETC2 RGBA when it is ported).
 
   They are committed as fixtures with the exact command lines and the commit
   hash.
@@ -297,7 +346,7 @@ already covers (§8.1).
   path's output, with the mips already encoded.
 
 `TextureFormat` is the one the budget already has (`budget/cost.rs:65`), grown
-to name the concrete formats (BC7, BC1, ASTC 4×4, ETC2 RGB8/RGBA8) while keeping
+to name the concrete formats (BC7, ASTC 4×4) while keeping
 its 16-byte/8-byte block arithmetic. Core gains no dependency. Film reads
 `Texels::Rgba8` only and is handed exactly the bytes it has today (§8.4).
 
@@ -341,8 +390,8 @@ The budget code itself doesn't change. Its **cost inputs** do:
 - `DrapeContent::cost` (`content.rs:223`) and `DecodedTileContent::cost`
   (`content.rs:161`) stop hard-coding `Rgba8`.
 - **CPU path:** the format comes from `Texels::Blocks`. Then
-  `gpu = drape_cost(w, h, Block16|Block8).gpu` and the staging is the blocks'
-  staging. Both drop 4× or 8×.
+  `gpu = drape_cost(w, h, Block16).gpu` and the staging is the blocks'
+  staging. Both drop 4×.
 - **GPU path:** the texels are RGBA, but the resident texture is `f`. The
   runtime holds the host's plan (§6.1) and passes it to `cost`. Then
   `gpu = drape_cost(.., f).gpu` (resident) and
@@ -379,7 +428,7 @@ The budget code itself doesn't change. Its **cost inputs** do:
   written, encoded and copied in the same submission that first binds it, and
   the replaced tile is released only after.
 - **Test:** `no_black_ground.rs` and `fast_zoom_never_empties.rs` run under
-  each plan the test machine can produce (`Gpu(Bc7)`, `Cpu(Bc7)`, `Cpu(Etc2)` /
+  each plan the test machine can produce (`Gpu(Bc7)`, `Gpu(Astc4x4)`, `Cpu(Bc7)` /
   `Cpu(Astc)` where the adapter has them, and `Uncompressed`). One more case
   injects an encode failure on every second tile.
 
@@ -408,41 +457,57 @@ are stored in, and the hardware decodes to linear exactly as it does for
 
 ### 9.1 Instruments
 
-Add `tuile_core::raster::quality` (or a test-support module), pure Rust, wasm
-clean, with:
+In texcomp's tests (`tests/gpu_quality.rs`):
 
-- **PSNR** over RGB, and over Y;
-- **ΔE2000** (CIEDE2000) per texel from sRGB through CIELAB D65, giving the
-  mean, the p99 and the max.
+- **PSNR** over RGB, and over alpha;
+- **ΔE2000** (CIEDE2000) per texel, sRGB → CIELAB D65 by `palette`
+  (dev-dependency), giving the mean, the p99 and the max;
+- **holes**: texels the source draws (opaque, not near black) that decode to
+  black or transparent. Any hole fails, on every tile and every level;
+- a sheet per tile (source | decoded | |difference|×8) in
+  `target/test-renders/`, for a human to open.
 
-The arithmetic for both is a few lines, and colour-space conversion is
-reference math, not a numeric kernel (cf. "established crates for numerics").
-If `palette` is acceptable as a dev-dependency, ΔE comes from it instead (⚑4).
+The blocks are decoded **by the GPU** (`textureLoad` on the linear variant of
+the format in a compute pass), so the gate measures what the hardware decodes,
+not what a reference decoder of ours believes.
 
 ### 9.2 Fixtures
 
-Committed imagery tiles with clear licences:
+In `texcomp/tests/fixtures/imagery`, with provenance in its README: five NASA
+GIBS tiles (Blue Marble NG over the Alps and the Nile, the shaded-relief
+bathymetry, a MODIS true-colour day, VIIRS Black Marble over Paris), 512² as
+served and cut into four 256² tiles each. Plus four synthetic tiles: a gradient,
+hard stripes, an alpha edge and white noise. Bing is never committed.
 
-- NASA Blue Marble / GIBS tiles (public domain);
-- IGN BD ORTHO tiles (Licence Ouverte 2.0);
-- three synthetic patterns: a gradient, a checker with edges, and an
-  alpha-edged layer.
+### 9.3 Gates (measured, Apple M2, 21 Oct.)
 
-Bing tiles are never committed (⚑6).
+Each gate sits about 1 dB or 20 % beyond the worst measured tile:
 
-### 9.3 Gates, per encoder and format, on every fixture tile and every mip level
+| | PSNR RGB ≥ | ΔE2000 mean ≤ | ΔE2000 p99 ≤ | alpha PSNR ≥ |
+|---|---|---|---|---|
+| BC7, NASA tiles, levels ≥ 8×8 | 39.0 dB (worst 40.30) | 2.5 (2.09) | 6.5 (5.35) | |
+| BC7, synthetic, level 0 | 45.0 (48.13) | 0.5 (0.36) | 1.5 (1.18) | 55.0 (62.44) |
+| ASTC 4×4, NASA tiles, levels ≥ 8×8 | 35.0 (36.41) | 3.0 (2.43) | 11.5 (9.40) | |
+| ASTC 4×4, synthetic, level 0 | 48.0 (51.14) | 0.4 (0.26) | 1.5 (1.14) | 50.0 (56.65) |
 
-| Format | PSNR RGB ≥ | ΔE2000 mean ≤ | ΔE2000 p99 ≤ |
-|---|---|---|---|
-| BC7, ASTC 4×4 | 38 dB | 1.0 | 4.0 |
-| ETC2 RGBA8 | 36 dB | 1.5 | 5.0 |
-| ETC2 RGB8, BC1 | 33 dB | 2.5 | 7.0 |
+The first version of this note proposed 38 dB for both formats. BC7 clears it
+by 2 dB. ASTC misses it on one tile, night lights (bright points on black),
+for the reason in §4.3; its other NASA tiles are 40–60 dB at level 0.
 
-These are starting values *(to calibrate)*. The first PR that implements each
-encoder measures it on the fixtures. It then sets the gate about 1 dB below the
-measured worst tile, so the gate catches regressions without being a wish. A
-GPU encoder test reads the texture back through a decode-to-RGBA render (the
-hardware decoder), so the gate measures what is actually sampled.
+Not gated, only held to the hole check:
+
+- levels below 8×8 (one to four blocks, drawn only where a tile covers a few
+  pixels, with statistics over at most 64 texels);
+- the synthetic tiles' small levels, which are steep 2-D colour ramps that no
+  one-line-per-block format fits and no imagery has;
+- the noise tile, incompressible by construction (16.6 dB BC7, 13.9 dB ASTC).
+
+Typical level 0 on the NASA tiles: BC7 46–59 dB, ΔE mean 0.03–0.9; ASTC 41–60
+dB, ΔE mean 0.03–1.2. The sheets show no visible difference at 1:1.
+
+**The test fails when the encoder is broken:** with the kernels' `encode()`
+call removed (all-zero blocks), it fails with 214 hole reports and every PSNR
+below 14 dB. It was run that way before the gate was committed.
 
 ### 9.4 Viewer measurements (PR 4)
 
@@ -453,71 +518,105 @@ Each measurement is taken before and after, on the same trajectory:
 - `scripts/web-bench.py`, under WebGPU and WebGL2.
 
 Recorded per run: GPU imagery bytes resident (live and by level), bytes moved
-per frame, upload time per tile (CPU `write_texture` time plus GPU encode
-timestamps), decode-worker time per tile, and frame time p50/p99.
+per frame, upload time per tile, decode-worker time per tile, and frame time
+p50/p99.
 
 **Visual check:** the same view, uncompressed and compressed, screenshots side
 by side, a ΔE2000 map of the drape region, both opened before the PR asks for
 review.
 
-### 9.5 Expected gains *(to measure)*
+### 9.5 Measured so far, and expected gains
 
-256² tile with its full mip chain:
+**Encode time** (Apple M2, Metal, release; twenty 256² tiles with their mips in
+one call, wall clock from `write_buffer` to the GPU's completion, mean of 5):
 
-| | RGBA8 | BC7 / ASTC 4×4 / ETC2 RGBA | BC1 / ETC2 RGB |
+| | per tile |
+|---|---|
+| BC7 | 5.1 ms (11.0 ms before the partition-search optimisations of §4.2) |
+| ASTC 4×4 | 1.7–2.0 ms |
+
+This is wall clock and includes the upload and the copy. It is a cost on the
+GPU queue, not on the CPU thread. At a pump pacing of a few tiles per frame,
+BC7's 5 ms per tile is too much for one frame. PR 4 spreads it (a frame's
+batch is bounded by the pump's upload pacing) and measures GPU time with
+timestamps.
+
+**Pass leak (gfx-rs/wgpu#8768)**, measured with `examples/pass-footprint`
+(process footprint by `footprint -p`, after a warm-up tenth):
+
+| Run | Footprint growth |
+|---|---|
+| 80,000 clear-only render passes | none (−0.2 KiB per 1,000 passes) |
+| 80,000 compute passes | none (−0.2 KiB per 1,000) |
+| 30,000 encoder calls (one 256² tile each) | none: ±0.7 MiB of noise, no trend |
+
+The render-pass leak does not show in this harness on this machine (macOS 27,
+M2), so the harness doesn't reproduce whatever triggered it (clear-only passes,
+nothing sampled). Compute passes and the encoder show no growth either. The
+CPU mips stay as they are; nothing here argues for or against moving them.
+
+**PNG decoding** (`examples/decode-bench` in tuile, 25 VIIRS Black Marble
+tiles, 512² RGB, 270 KiB average; outputs checked identical):
+
+| | `png` 0.18 via `image` 0.25 | `zune-png` 0.5.2 | ratio |
 |---|---|---|---|
-| Resident GPU bytes | 349,524 | 87,408 (4×) | 43,704 (8×) |
-| Staging per tile, CPU path | 360,192 | 90,368 | ≈45 k |
-| Staging per tile, GPU path | 360,192 | 360,192 (+ fixed scratch) | 360,192 |
-| Web worker → page post | 262,144 (level 0 only) | 87,408 (all levels) | 43,704 |
+| native, M2 | 1.63 ms/tile | 2.11 ms | 0.78× |
+| wasm32-wasip1 (Node 26) | 2.17 ms | 2.38 ms | 0.91× |
+| wasm32-wasip1 + `simd128` | 2.25 ms | 2.49 ms | 0.91× |
 
-At a fixed budget, the imagery share holds 4× (or 8×) as many tiles, which
-means a sharper ground at the same memory. Upload bandwidth drops 4× on the
-CPU path. On the GPU path it stays the same, and the encode adds about
-0.05–0.2 ms of GPU time per tile *(to measure)*.
+`zune-png` is slower on both. **Dropped**: PNG keeps `image` and `png` 0.18.
+
+**Expected gains** (arithmetic), 256² tile with its full mip chain:
+
+| | RGBA8 | BC7 / ASTC 4×4 |
+|---|---|---|
+| Resident GPU bytes | 349,524 | 87,408 (4×) |
+| Staging per tile, CPU path | 360,192 | 90,368 |
+| Staging per tile, GPU path | 360,192 | 360,192 (plus a transient block buffer) |
+| Web worker → page post | 262,144 (level 0 only) | 87,408 (all levels) |
+
+At a fixed budget, the imagery share holds 4× as many tiles, which means a
+sharper ground at the same memory. Upload bandwidth drops 4× on the CPU path
+and stays the same on the GPU path.
 
 ## 10. Order of the PRs
 
-1. **This note.**
-2. **tuile: GPU compute encoder (BC7 modes 6/1/5, BC1), `texcomp::select`, the
-   quality instruments and fixtures.** Built in `tuile-wgpu`, not wired into
-   upload yet. Tests: round trip through hardware decode within §9.3, the
-   capability matrix, and a forced-backend GL run.
-3. **`lapoule-dev/texcomp`: the port, split into several PRs in that
-   repository.**
-   - 3a: skeleton, CI, licence/NOTICE, reference vectors, UASTC unpack and
-     UASTC → ASTC;
-   - 3b: UASTC → BC7, ETC1/ETC2 + EAC, BC1;
+1. **This note** (tuile).
+2. **texcomp: the GPU module** (the PR formerly planned as tuile's PR 2). The
+   BC7 and ASTC 4×4 kernels, their dispatch, the quality gate and fixtures,
+   the pass-leak example, and CI. Covers macOS, iOS, the Quest, Vulkan and
+   WebGPU.
+3. **texcomp: the CPU port**, in several PRs:
+   - 3a: reference vectors captured from upstream v2.50, the Basis
+     attribution and NOTICE entries, UASTC unpack and UASTC → ASTC;
+   - 3b: UASTC → BC7;
    - 3c: the UASTC encoder, levels 0–2.
 
-   The main session tags `v0.1.0` after 3c.
-4. **tuile integration**: `Texels`, the job target, the wire, upload, device
-   features, the cost inputs, the measurements and the visual check. May split
-   into 4a (native) and 4b (web) if the diff passes about 800 lines.
-5. **tuile: GPU ETC2 and ASTC kernels**, which move iOS, Android and mobile
-   WebGPU off the CPU path.
-
-PR 2 and the 3x PRs don't depend on each other and proceed in parallel. PR 4
-needs PR 2 and `texcomp` v0.1.0.
+   The main session tags `v0.1.0` when the GPU module lands. That tag is all
+   PR 4 needs for every target except WebGL2. It tags the next version after
+   3c.
+4. **tuile integration**: `select` and its capability matrix, the device's
+   requested features, `Texels`, the job target, the wire, `upload_texture`'s
+   branch, the cost inputs, the measurements and the visual check. It needs
+   texcomp `v0.1.0` and may split into 4a (native) and 4b (web).
+5. **tuile: the PNG decode bench**, which records why `zune-png` was dropped
+   (§9.5).
+6. **Later:** ETC2 in the kernels, an ASTC two-partition mode if night lights
+   need it, and the CPU path into the decode workers for WebGL2 once 3c lands.
 
 ## ⚑ Open questions for Laurent
 
-1. **Repository name.** The proposal is `lapoule-dev/texcomp` (crate
-   `texcomp`), private. Alternatives: `blockcomp`, `gpu-texcomp`. Until the
-   name is settled, work proceeds under `texcomp` as the working name, and the
-   repository is not created until it is confirmed.
-2. **The 8× tier.** Should opaque tiles take BC1 / ETC2 RGB8 (4 bpp, about
-   5 dB below BC7) to halve again, or does BC7/ASTC (4×) stay the only tier?
-   The proposal is 4× only, with the 8× tier left for the budget to pick under
-   pressure later. As a quality tuning it could be an env value, not a switch.
-3. **ETC1S.** The decision named "UASTC/ETC1S". Nothing is transmitted, so
-   ETC1S only costs quality and encoder time. The proposal is UASTC only, with
-   ETC1S left out unless you want a stored or transmitted form later.
-4. **ΔE source.** Hand-written CIEDE2000 in a test-support module (small,
-   reference formula), or `palette` as a dev-dependency?
-5. **Metal and compute passes.** The render-pass leak (gfx-rs/wgpu#8768): is it
-   known whether compute passes leak too? The plan batches one compute pass
-   per frame either way. PR 2 measures it.
-6. **Fixture imagery.** NASA (public domain) + IGN BD ORTHO (Licence Ouverte)
-   + synthetic patterns. Is that acceptable, and is there an orthophoto set
-   you prefer?
+Answered on 21 Oct.: the repository name (`lapoule-dev/texcomp`), ÷4 only,
+UASTC only, `palette`, NASA fixtures, the target platforms. Still open:
+
+1. **ASTC on night lights.** The single-partition ASTC kernel gives 36.4 dB on
+   the Black Marble tile over Paris, against 42 dB for BC7 (other tiles: 40–60
+   dB). Good enough for the Quest and iOS, or should a two-partition mode come
+   before PR 4?
+2. **BC7 cost per tile.** 5 ms of GPU time per 256² tile (wall clock on an M2)
+   is affordable at one or two tiles a frame but not at ten. PR 4 measures it
+   with timestamps in the real pump. If it bites, the next lever is a cheaper
+   partition estimate or mode 6 only (both cost quality, and both can be
+   measured with the gate).
+3. **The `v0.1.0` tag** of texcomp after the GPU module lands, so PR 4 can
+   start before the CPU port is done.
