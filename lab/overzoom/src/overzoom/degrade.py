@@ -93,11 +93,15 @@ class Damage:
         return out
 
 
-# A small catalogue, one variable at a time, then everything together. All at x2: the overzoom question.
+# One variable at a time at x2, then everything together; and the aggressive factors, bare and with everything.
 CATALOGUE: tuple[Damage, ...] = (
-    Damage("reduce", reduce=1),
-    Damage("reduce+blur", blur=1.0, reduce=1),
-    Damage("reduce+noise", reduce=1, noise=0.02),
-    Damage("reduce+jpeg", reduce=1, jpeg=0),
-    Damage("reduce+all", blur=1.0, reduce=1, noise=0.02, jpeg=0),
+    Damage("x2", reduce=1),
+    Damage("x2+blur", blur=1.0, reduce=1),
+    Damage("x2+noise", reduce=1, noise=0.02),
+    Damage("x2+jpeg", reduce=1, jpeg=0),
+    Damage("x2+all", blur=1.0, reduce=1, noise=0.02, jpeg=0),
+    Damage("x4", reduce=2),
+    Damage("x4+all", blur=1.0, reduce=2, noise=0.02, jpeg=0),
+    Damage("x8", reduce=3),
+    Damage("x8+all", blur=1.0, reduce=3, noise=0.02, jpeg=0),
 )

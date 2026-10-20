@@ -6,3 +6,5 @@ data/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+# Executed notebooks carry imagery in their outputs.
+*.executed.ipynb

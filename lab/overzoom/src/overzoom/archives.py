@@ -2,8 +2,8 @@
 # Copyright (c) lapoule.dev
 """Whole PMTiles archives of one zone, fetched through a list of read-only presigned URLs.
 
-The list is a JSON array of ``{key, url, expires_at}``; the zone's ``manifest.json``, when present, gives the
-archives newest first, which is the merge order.
+The list is a JSON array of ``{key, url, expires_at}``; the zone's ``manifest.json``, when present, lists the
+archives oldest first (the last one wins, as the server reads it); they are merged newest first.
 """
 
 from __future__ import annotations
@@ -43,13 +43,18 @@ def download(url: str, dst: Path, chunk: int = 1 << 20) -> Path:
 def fetch_listed(url_list: Path, dest: Path) -> list[Path]:
     """Download every object of the list under ``dest``, keeping their keys as paths. Returns archives newest first."""
     entries: list[dict[str, str]] = json.loads(url_list.read_text())
-    local = {e["key"]: download(e["url"], dest / e["key"]) for e in entries}
-    order: list[str] = []
-    for key, path in local.items():
-        if key.endswith("manifest.json"):
-            order += [a["key"] for a in json.loads(path.read_text()).get("archives", [])]
-    order += [k for k in local if k.endswith(".pmtiles") and k not in order]
-    return [local[k] for k in order if k in local]
+    for e in entries:
+        download(e["url"], dest / e["key"])
+    return listed(dest)
+
+
+def listed(root: Path) -> list[Path]:
+    """The archives under ``root``, laid out by key, newest first: the zone manifest's list reversed, then any other."""
+    order: list[Path] = []
+    for manifest in sorted(root.rglob("manifest.json")):
+        order += [root / a["key"] for a in reversed(json.loads(manifest.read_text()).get("archives", []))]
+    order += sorted(p for p in root.rglob("*.pmtiles") if p not in order)
+    return [p for p in order if p.exists()]
 
 
 def read_archive(path: Path) -> tuple[dict[TileKey, bytes], ArchiveInfo]:

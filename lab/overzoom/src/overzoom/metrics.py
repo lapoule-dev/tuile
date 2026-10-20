@@ -44,6 +44,13 @@ def delta_e(a: Rgb, b: Rgb, sigma: float = 2.0) -> float:
     return float(np.mean(deltaE_ciede2000(rgb2lab(lowpass(a, sigma)), rgb2lab(lowpass(b, sigma)))))
 
 
+def colour_cast(a: Rgb, b: Rgb) -> float:
+    """CIEDE2000 between the mean colours of two images: their difference of tint, every detail left out."""
+    la = rgb2lab(a.reshape(-1, 1, 3).mean(axis=0, keepdims=True))
+    lb = rgb2lab(b.reshape(-1, 1, 3).mean(axis=0, keepdims=True))
+    return float(deltaE_ciede2000(la, lb).item())
+
+
 def box_down2(img: Rgb) -> Rgb:
     """2x2 box reduction — the assumed kernel of the pyramid."""
     h, w = img.shape[0] // 2 * 2, img.shape[1] // 2 * 2
