@@ -45,6 +45,7 @@
 pub mod bake;
 #[cfg(test)]
 mod by_index_tests;
+mod drawer;
 mod globe;
 mod ground;
 pub mod local_store;
@@ -56,6 +57,7 @@ mod session;
 pub mod tape;
 pub mod tiles;
 
+pub use drawer::{GroundDrawer, Selected};
 pub use globe::{
     asset_of_namespace, duration_or, imagery_boost_cap, source_namespace, GlobeConfig, GlobeError,
     ReferenceFetched, ReferenceImagery, Sources, SourcesHandle, TileCache, BING_AERIAL,

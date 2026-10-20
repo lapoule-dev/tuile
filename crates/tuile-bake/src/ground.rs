@@ -338,6 +338,67 @@ impl Kept {
         }
     }
 
+    /// Whether `other` keeps the same mesh, bit for bit: what a tile that
+    /// came again is kept as, when it came again unchanged.
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        let f32s = |a: &[[f32; 3]], b: &[[f32; 3]]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(a, b)| a.map(f32::to_bits) == b.map(f32::to_bits))
+        };
+        let same_vertices = match (&self.vertices, &other.vertices) {
+            (
+                Vertices::Grid {
+                    places,
+                    span,
+                    heights,
+                    exceptions,
+                },
+                Vertices::Grid {
+                    places: their_places,
+                    span: their_span,
+                    heights: their_heights,
+                    exceptions: their_exceptions,
+                },
+            ) => {
+                places == their_places
+                    && span.lowest.to_bits() == their_span.lowest.to_bits()
+                    && span.step.to_bits() == their_span.step.to_bits()
+                    && heights == their_heights
+                    && exceptions.len() == their_exceptions.len()
+                    && exceptions
+                        .iter()
+                        .zip(their_exceptions)
+                        .all(|(a, b)| a.0 == b.0 && a.1.map(f32::to_bits) == b.1.map(f32::to_bits))
+            }
+            (
+                Vertices::AsCame { positions, uvs },
+                Vertices::AsCame {
+                    positions: their_positions,
+                    uvs: their_uvs,
+                },
+            ) => {
+                f32s(positions, their_positions)
+                    && match (uvs, their_uvs) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => {
+                            a.len() == b.len()
+                                && a.iter()
+                                    .zip(b)
+                                    .all(|(a, b)| a.map(f32::to_bits) == b.map(f32::to_bits))
+                        }
+                        _ => false,
+                    }
+            }
+            _ => false,
+        };
+        self.origin.to_array().map(f64::to_bits) == other.origin.to_array().map(f64::to_bits)
+            && self.index_count == other.index_count
+            && self.indices == other.indices
+            && same_vertices
+    }
+
     /// The bytes it holds.
     pub(crate) fn heap_bytes(&self) -> usize {
         use std::mem::size_of_val;

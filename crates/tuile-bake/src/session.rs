@@ -6,7 +6,7 @@
 //! Everything the C ABI exposes is a thin projection of what is here, so this
 //! module is testable in plain Rust without going through the boundary.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -596,9 +596,7 @@ pub(crate) struct Live {
     grounds: Option<Grounds>,
     /// The ground last drawn, tile by tile, prepared and held for
     /// stitching: a tile selected again is not prepared again.
-    drawn: Drawn,
-    /// The bytes of the ground the last [`Session::ground`] returned.
-    ground_built: usize,
+    drawer: crate::drawer::GroundDrawer,
     /// Kept alive for as long as the session: dropping it ends the server.
     _server: std::thread::JoinHandle<()>,
 }
@@ -780,81 +778,56 @@ impl Session {
         how: tuile_film::ground::Prepare,
         stitch: bool,
     ) -> Option<tuile_film::ground::Ground> {
+        let selected = self.selected_ground()?;
         let Source::Live(live) = &mut self.0 else {
             return None;
         };
-        let grounds = live.grounds.as_ref()?;
-        let started = tuile_core::metrics::stamp();
-        let selected: Vec<TileId> = live
-            .scene
-            .selected()
-            .iter()
-            .map(|(tile, _)| *tile)
-            .filter(|tile| grounds.kept.contains_key(tile))
-            .collect();
-        let key = |tile: TileId| tuile_film::TileKey {
-            id: tile.0,
-            drape: 0,
-        };
-        let drawn = &mut live.drawn;
-        if drawn.how != Some(how) {
-            *drawn = Drawn {
-                how: Some(how),
-                ..Drawn::default()
-            };
-        }
-        // What the last ground drew and this one does not, let go — and a
-        // tile that came again since, prepared again; what it drew too,
-        // kept as it was prepared.
-        let wanted: HashSet<TileId> = selected.iter().copied().collect();
-        let gone: Vec<TileId> = drawn
-            .entered
-            .iter()
-            .filter(|(tile, arrival)| {
-                !wanted.contains(*tile) || grounds.kept.get(*tile).map(|(a, _)| a) != Some(*arrival)
-            })
-            .map(|(tile, _)| *tile)
-            .collect();
-        for tile in gone {
-            drawn.entered.remove(&tile);
-            drawn.stitching.leave(&key(tile));
-        }
-        let mut keys = Vec::with_capacity(selected.len());
-        for tile in selected {
-            if let (Some((arrival, kept)), false) =
-                (grounds.kept.get(&tile), drawn.entered.contains_key(&tile))
-            {
-                let mesh = tuile_film::stitching::encoded(
-                    &kept.mesh(tile),
-                    kept.origin().to_array(),
-                    [1.0; 4],
-                );
-                let mut mesh = tuile_film::ground::prepared(mesh, how).0;
-                // Heights read no normals, and nothing a vertex is stitched
-                // by depends on them.
-                mesh.normals = Vec::new();
-                let source = live
-                    .resident
-                    .get(&tile)
-                    .and_then(|g| g.refs.as_ref())
-                    .map(|refs| u32::from(refs.terrain.level));
-                drawn.stitching.enter(key(tile), source, &mesh);
-                drawn.entered.insert(tile, *arrival);
-            }
-            keys.push(key(tile));
-        }
-        let ground = if stitch {
-            drawn.stitching.frame(&keys);
-            tuile_film::ground::Ground::of(&drawn.stitching, &keys)
-        } else {
-            tuile_film::ground::Ground::unstitched(&drawn.stitching, &keys)
-        };
-        live.ground_built = ground.heap_bytes();
-        tuile_core::metrics::metrics()
-            .ground_seconds
-            .record(started.elapsed());
+        let ground = live.drawer.ground(&selected, how, stitch);
         tracing::debug!(memory = ?self.ground_memory(), "ground");
         Some(ground)
+    }
+
+    /// The last frame's selection, frozen for its ground: each selected
+    /// tile whose terrain the session keeps, with that terrain. A
+    /// [`crate::GroundDrawer`] builds its ground — anywhere, any time
+    /// after — exactly as [`Self::ground`] would have now. `None` where
+    /// [`Self::ground`] answers none.
+    pub fn selected_ground(&self) -> Option<crate::drawer::Selected> {
+        let Source::Live(live) = &self.0 else {
+            return None;
+        };
+        let grounds = live.grounds.as_ref()?;
+        Some(crate::drawer::Selected::new(
+            live.scene
+                .selected()
+                .iter()
+                .filter_map(|(tile, _)| {
+                    let kept = grounds.kept.get(tile)?;
+                    Some(crate::drawer::SelectedTile {
+                        tile: *tile,
+                        kept: Arc::clone(kept),
+                        source: live
+                            .resident
+                            .get(tile)
+                            .and_then(|g| g.refs.as_ref())
+                            .map(|refs| u32::from(refs.terrain.level)),
+                    })
+                })
+                .collect(),
+        ))
+    }
+
+    /// What the last frame converged on, as one number: its selected tiles,
+    /// in order ([`tuile_core::determinism::digest`]). Two runs that agree
+    /// on every frame's digest selected the same tiles every frame. `None`
+    /// for a packed session.
+    pub fn selection_digest(&self) -> Option<u64> {
+        match &self.0 {
+            Source::Live(live) => Some(tuile_core::determinism::digest(
+                live.scene.selected().iter().map(|(t, _)| t.0),
+            )),
+            Source::Packed(_) => None,
+        }
     }
 
     /// The bytes the ground a camera is kept over takes: what is kept of
@@ -866,12 +839,13 @@ impl Session {
             return None;
         };
         let grounds = live.grounds.as_ref()?;
+        let (prepared_tiles, prepared_bytes) = live.drawer.prepared();
         Some(GroundMemory {
             kept_tiles: grounds.kept.len(),
-            kept_bytes: grounds.kept.values().map(|(_, k)| k.heap_bytes()).sum(),
-            prepared_tiles: live.drawn.entered.len(),
-            prepared_bytes: live.drawn.stitching.heap_bytes(),
-            drawn_bytes: live.ground_built,
+            kept_bytes: grounds.kept.values().map(|k| k.heap_bytes()).sum(),
+            prepared_tiles,
+            prepared_bytes,
+            drawn_bytes: live.drawer.built(),
         })
     }
 
@@ -949,11 +923,9 @@ pub struct GroundMemory {
 /// What is kept of the resident tiles' terrain ([`Session::keep_ground`]).
 #[derive(Default)]
 struct Grounds {
-    /// Each tile's, with the arrival it came by.
-    kept: HashMap<TileId, (u64, crate::ground::Kept)>,
-    /// Counts the tiles that came, so that one that came again is told from
-    /// the one before it.
-    arrivals: u64,
+    /// Each tile's: shared with the grounds being built of it
+    /// ([`Session::selected_ground`]).
+    kept: HashMap<TileId, Arc<crate::ground::Kept>>,
     /// Each tile's mesh as it came, when asked
     /// ([`Session::keep_ground_and_meshes`]).
     as_it_came: Option<HashMap<TileId, (DVec3, DecodedMesh)>>,
@@ -963,15 +935,6 @@ struct Grounds {
 struct KeptTile {
     kept: crate::ground::Kept,
     as_it_came: Option<DecodedMesh>,
-}
-
-/// The ground last drawn ([`Session::ground`]): each tile prepared as
-/// `how` says, held for stitching, with the arrival it was prepared from.
-#[derive(Default)]
-struct Drawn {
-    how: Option<tuile_film::ground::Prepare>,
-    stitching: tuile_film::stitching::Stitching,
-    entered: HashMap<TileId, u64>,
 }
 
 /// A tape pose as the traversal's own camera.
@@ -1091,8 +1054,7 @@ impl Live {
             scene: SceneState::default(),
             generation: 0,
             grounds: None,
-            drawn: Drawn::default(),
-            ground_built: 0,
+            drawer: crate::drawer::GroundDrawer::new(),
             _server: server_thread,
         })
     }
@@ -1345,8 +1307,7 @@ async fn converge(
                                 {
                                     meshes.insert(tile, (kept.kept.origin(), mesh));
                                 }
-                                grounds.arrivals += 1;
-                                grounds.kept.insert(tile, (grounds.arrivals, kept.kept));
+                                grounds.kept.insert(tile, Arc::new(kept.kept));
                             }
                         }
                     }
