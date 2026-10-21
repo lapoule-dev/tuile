@@ -18,16 +18,10 @@
 @group(0) @binding(2) var shadow_map: texture_depth_2d_array;
 @group(0) @binding(3) var shadow_samp: sampler_comparison;
 
-// What a vertex's mesh asks for: `OverlayVertex::flags`.
-const LIT: u32 = 1u;
-const RECEIVES: u32 = 2u;
-const BEHIND_GROUND: u32 = 4u;
-
-// How much of a lit shape's colour it keeps facing away from the light, and
-// how strong and how tight its highlight is.
-const AMBIENT: f32 = 0.45;
-const HIGHLIGHT: f32 = 0.2;
-const SHININESS: f32 = 24.0;
+// The flags a vertex carries and the light a lit mesh is given come from
+// `tuile_overlay::gpu::LIGHT_WGSL`, concatenated ahead of this: the viewer
+// draws the same meshes under the same light, and the film's HUD has to
+// come out of both alike.
 
 struct Out {
     @builtin(position) clip: vec4f,
@@ -55,7 +49,7 @@ fn vs(
 
 @fragment
 fn fs(in: Out) -> @location(0) vec4f {
-    if ((in.flags & BEHIND_GROUND) != 0u) {
+    if ((in.flags & OVERLAY_BEHIND_GROUND) != 0u) {
         // Reverse-Z: nearer is greater.
         let ground_at = textureLoad(ground, vec2i(in.clip.xy), 0);
         if (in.clip.z <= ground_at) {
@@ -65,29 +59,10 @@ fn fs(in: Out) -> @location(0) vec4f {
     var color = in.color;
     // The camera's own axes: the same for both eyes, which share a
     // rotation, so a shape is lit alike in each.
-    let right = normalize(frame.right.xyz);
-    let up = normalize(frame.up.xyz);
-    let back = cross(right, up);
-    var n = in.normal;
-    if ((in.flags & LIT) != 0u && dot(n, n) > 0.0) {
-        // A light that goes with the camera: above it, a little to its
-        // left, mostly from behind it.
-        let light = normalize(-0.35 * right + 0.55 * up + 0.75 * back);
-        let towards_eye = normalize(-in.at);
-        n = normalize(n);
-        // Either face is lit as the face the eye sees.
-        if (dot(n, towards_eye) < 0.0) {
-            n = -n;
-        }
-        let diffuse = max(dot(n, light), 0.0);
-        let half_way = normalize(light + towards_eye);
-        let shine = select(0.0, pow(max(dot(n, half_way), 0.0), SHININESS), diffuse > 0.0);
-        color = vec4f(
-            color.rgb * (AMBIENT + (1.0 - AMBIENT) * diffuse) + HIGHLIGHT * shine * color.a,
-            color.a,
-        );
+    if ((in.flags & OVERLAY_LIT) != 0u) {
+        color = overlay_lit(color, in.normal, in.at, frame.right.xyz, frame.up.xyz);
     }
-    if ((in.flags & RECEIVES) != 0u && frame.shadow.x > 0.0) {
+    if ((in.flags & OVERLAY_RECEIVES) != 0u && frame.shadow.x > 0.0) {
         // Looked up from a little towards the sun, as ground is from off
         // its surface: a shape does not shade itself where it stands.
         let sun = sunlit(in.at, frame.to_sun.xyz, vec2u(in.clip.xy));

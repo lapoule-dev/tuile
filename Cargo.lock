@@ -6564,6 +6564,7 @@ dependencies = [
  "tuile-atmosphere",
  "tuile-core",
  "tuile-film",
+ "tuile-overlay",
  "tuile-terrain",
  "wgpu",
 ]
@@ -6719,6 +6720,7 @@ dependencies = [
 name = "tuile-overlay"
 version = "0.12.0"
 dependencies = [
+ "bytemuck",
  "glam 0.33.1",
 ]
 

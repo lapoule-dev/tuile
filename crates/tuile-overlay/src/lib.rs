@@ -24,6 +24,8 @@
 //! `OverlayCamera` carries a `BakedView` and the frame's own camera, which
 //! are a film's own vocabulary.
 
+pub mod gpu;
+
 /// Which eye of a stereo pair is being drawn.
 ///
 /// Here rather than in `tuile-film` because [`OverlayEyes`] answers questions
