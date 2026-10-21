@@ -39,6 +39,7 @@ mod surface;
 mod targets;
 #[cfg(test)]
 mod webgl2;
+mod world_overlay;
 
 pub use context::{ContextError, GpuContext, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT};
 pub use overlay::{OverlayRenderer, OverlayVertex};
@@ -50,6 +51,7 @@ pub use readback::Readback;
 pub use renderer::{LineVertex, TileRenderer, ViewUniform};
 pub use surface::{
     draw_to_surface, draw_to_texture, preferred_format, surface_format, FrameOnSurface,
-    FrameOnTexture, Presented, SurfaceFormat,
+    FrameOnTexture, FramePass, Presented, SurfaceFormat,
 };
 pub use targets::FrameTargets;
+pub use world_overlay::{Picture, WorldOverlayError, WorldOverlayRenderer, WorldOverlayView};

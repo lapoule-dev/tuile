@@ -87,6 +87,16 @@ fn every_viewer_shader_runs_on_webgl2() {
     }
     webgl2("overlay", include_str!("overlay.wgsl"));
     webgl2("lines", include_str!("lines.wgsl"));
+    // A host's shapes in the world, with the light it shares with the film:
+    // the same text the film compiles, so a WebGL2 browser draws the HUD.
+    webgl2(
+        "world overlay",
+        &[
+            tuile_overlay::gpu::LIGHT_WGSL,
+            include_str!("world_overlay.wgsl"),
+        ]
+        .concat(),
+    );
 }
 
 /// At the budget WebGL2 reports, the ground's fragment stage fits the

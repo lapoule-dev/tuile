@@ -96,14 +96,25 @@ impl App {
             return;
         };
         let (w, h) = self.viewport();
-        let mut camera = crate::frame_host::HostCamera::new(self.controller.camera);
+        let mut camera =
+            crate::frame_host::HostCamera::new(self.controller.camera, self.fixed_aspect);
         let mut preload = std::mem::take(&mut self.preload);
         preload.clear();
+        // Overlays are the other way round: taken out and put back as they
+        // are, because a layer the host does not touch this frame keeps what
+        // it had.
+        let mut overlays = std::mem::take(&mut self.overlays);
         {
             let mut frame = crate::frame_host::HostFrame {
                 camera: &mut camera,
                 preload: &mut preload,
+                overlays: &mut overlays,
                 viewport: (w as u32, h as u32),
+                // The viewer's own relief, the one the controller keeps its
+                // floor against: a host placing anything on the ground
+                // measures the same terrain the viewer is drawing, not a
+                // second idea of it.
+                ground: self.controller.ground().map(|g| g.as_ref()),
             };
             host.before_frame(dt.as_secs_f64(), &mut frame);
         }
@@ -119,8 +130,42 @@ impl App {
             Some(crate::frame_host::Asked::Release) => self.controller.release(),
             None => {}
         }
+        // A shape the host set survives the frame; one it said nothing about
+        // is whatever it was.
+        if let (aspect, true) = camera.taken_aspect() {
+            self.fixed_aspect = aspect;
+        }
         self.preload = preload;
+        self.overlays = overlays;
         self.frame_host = Some(host);
+        self.upload_the_world_overlays();
+    }
+
+    /// Hands this frame's overlay layers to the renderer, rebased onto the
+    /// render origin — the camera, as every tile is.
+    ///
+    /// Only when a host changed something: a layer set once and left alone is
+    /// drawn every frame from the buffers it is already in, which is the
+    /// whole point of layers.
+    ///
+    /// A faulty mesh is reported and the **previous** set stays on screen.
+    /// The alternative is a frame with no overlays in it, which for a host
+    /// whose HUD is an overlay is a frame with no HUD.
+    fn upload_the_world_overlays(&mut self) {
+        if !self.overlays.changed() {
+            return;
+        }
+        let origin = self.controller.camera.position;
+        let meshes = self.overlays.taken();
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        if let Err(e) = active
+            .world_overlay
+            .set_meshes(&active.gpu, &meshes, origin, None)
+        {
+            tracing::warn!("the host's overlays were refused, keeping the last set: {e}");
+        }
     }
 
     /// Moves the eye toward where the gestures have put it, and watches how it
@@ -290,6 +335,11 @@ impl App {
     fn draw_and_present(&mut self) -> Option<(usize, tuile_wgpu::Resolution, usize)> {
         let serving = self.imagery.generation;
         let views = self.view_uniforms();
+        let picture = self.picture();
+        let viewport = self.viewport();
+        // The same clearance the tiles' view uniform is built with, so an
+        // overlay and the ground share one clip space.
+        let clearance = self.controller.height_above_ground();
         let active = self.active.as_mut()?;
         // For any selected tile not yet uploaded, fall back to its nearest ready
         // ancestor so refinement never flashes the background.
@@ -325,7 +375,34 @@ impl App {
         let renderer = &active.renderer;
         let overlay = &active.overlay;
         let shell = &active.shell;
+        // In a cell because the frame's two hooks are handed over together
+        // and want it differently: the pass borrows it to draw, and the pass
+        // that follows — the overlays' own depth — takes it mutably. The two
+        // never run at once, which a cell says and the borrow checker cannot
+        // see through two closures.
+        active.world_overlay.set_view(
+            &active.gpu.queue,
+            &super::world_overlay_view(self.controller.camera, picture.aspect(), clearance),
+        );
+        let world = std::cell::RefCell::new(&mut active.world_overlay);
+        let world_gpu = &active.gpu;
+        // The picture, inside whatever the window is: everything of the scene
+        // is drawn in it, and the bars around it keep the clear.
+        let box_ = picture;
         let paint = |pass: &mut wgpu::RenderPass<'_>| {
+            if box_.width != 0 && box_.height != 0 {
+                // A plain clear outside, the scene in full inside: the
+                // scissor keeps the bars, and the viewport maps the picture.
+                pass.set_viewport(
+                    box_.x as f32,
+                    box_.y as f32,
+                    box_.width as f32,
+                    box_.height as f32,
+                    0.0,
+                    1.0,
+                );
+                pass.set_scissor_rect(box_.x, box_.y, box_.width, box_.height);
+            }
             renderer.paint(
                 pass,
                 // The shell first — the only thing that can cover ground
@@ -343,8 +420,39 @@ impl App {
                 // borrowing ground it does not own must be occluded by the
                 // planet in front of it. See `TileRenderer::render_fallback`.
                 drawn.fallback.iter().copied(),
-                Some(overlay),
+                // The 2-D control is drawn after the world overlays, below,
+                // because it owns the last word in the picture.
+                None,
                 wireframe,
+            );
+            // A host's shapes, after the ground that may hide them. What asked
+            // for `OverlaysOnly` is not here: it goes in the pass that
+            // follows, which has a depth of its own.
+            world.borrow().render(pass);
+            // The on-screen control, over everything and in the whole frame:
+            // it is laid out in device pixels, not in the picture.
+            if box_.width != 0 && box_.height != 0 {
+                let (w, h) = (viewport.0 as f32, viewport.1 as f32);
+                pass.set_viewport(0.0, 0.0, w, h, 0.0, 1.0);
+                pass.set_scissor_rect(0, 0, w as u32, h as u32);
+            }
+            overlay.render(pass);
+        };
+        // The overlays' own pass, on the frame's encoder once its pass has
+        // closed: the HUD's mode needs a depth attachment the ground never
+        // reached, and that is a second pass or nothing.
+        let after = |encoder: &mut wgpu::CommandEncoder, frame: &tuile_wgpu::FramePass<'_>| {
+            world.borrow_mut().render_overlays_only(
+                world_gpu,
+                encoder,
+                frame.colour,
+                Some(frame.resolve),
+                frame.size,
+                // The picture, not the frame: this pass is held to the same
+                // rectangle the frame's own pass was, or a HUD laid out in
+                // fractions of the film would be laid out in fractions of
+                // the window instead.
+                box_.into(),
             );
         };
         let outcome = match &mut active.screen {
@@ -366,6 +474,7 @@ impl App {
                     || super::setup::configure(surface, &active.gpu, active.format, active.size),
                     || window.pre_present_notify(),
                     paint,
+                    after,
                 )
             }
             // Every eye, from the one resolved set of tiles, each with its own
@@ -380,7 +489,7 @@ impl App {
                     &views,
                     |view| renderer.set_view(&gpu.queue, view),
                     clear,
-                    paint,
+                    (paint, after),
                 );
                 tuile_wgpu::Presented::Yes
             }
@@ -507,10 +616,22 @@ impl App {
         }
     }
 
-    /// The frame's aspect ratio, in device pixels.
+    /// The **picture's** aspect ratio: the fixed shape a host asked for with
+    /// `HostCamera::set_aspect`, or the frame's own in device pixels.
+    ///
+    /// The picture, not the window, because this is what reaches the
+    /// projection: a camera held to 16:9 in a tall window sees 16:9 of world,
+    /// and the bars above and below it are outside the picture entirely.
     fn aspect(&self) -> f32 {
+        self.picture().aspect() as f32
+    }
+
+    /// Where the picture sits in the frame: the whole frame unless a host
+    /// held the camera to an aspect, and then the largest rectangle of that
+    /// shape, centred.
+    fn picture(&self) -> crate::frame_host::Letterbox {
         let (w, h) = self.viewport();
-        (w / h.max(1.0)) as f32
+        crate::frame_host::Letterbox::of((w as u32, h as u32), self.fixed_aspect)
     }
 
     /// Counts, and shouts about, ground the traversal asked for and nothing

@@ -68,9 +68,12 @@ mod frame;
 use std::collections::HashMap;
 
 use glam::{DVec3, Vec3};
+// The vertex every renderer of overlays packs, and the light they share: the
+// viewer draws these same meshes, and the HUD has to come out of both alike.
 use tuile_film::{
     Eye, EyePair, FrameCamera, FrameLight, Look, OverlayBlend, OverlayDepth, OverlayMesh, TileKey,
 };
+use tuile_overlay::gpu::OverlayVertex;
 use wgpu::util::DeviceExt;
 
 pub use atmosphere::AtmosphereUniform;
@@ -128,29 +131,10 @@ pub enum FilmGpuError {
     Overlay(&'static str),
 }
 
-/// `overlay.wgsl`'s vertex: where it is from the eye, its colour, its
-/// normal (zero for none), and what its mesh asks for.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct OverlayVertex {
-    position: [f32; 3],
-    color: [f32; 4],
-    normal: [f32; 3],
-    flags: u32,
-    /// How far a caster's edges are pushed away from the sun in its map,
-    /// in metres: see `OverlayPipelines::cast_edges`.
-    sunk: f32,
-}
-
 /// The steepest slope to the sun a caster's edges are pushed back for, as
 /// a tangent: past it, a face all but edge-on to the sun is pushed back no
 /// further.
 const EDGE_SLOPE_MAX: f32 = 8.0;
-
-/// `OverlayVertex::flags`, as `overlay.wgsl` reads them.
-const OVERLAY_LIT: u32 = 1;
-const OVERLAY_RECEIVES: u32 = 2;
-const OVERLAY_BEHIND_GROUND: u32 = 4;
 
 /// A buffer that is only ever made larger: overlays change every frame,
 /// and their size hardly does.
@@ -904,10 +888,12 @@ impl FilmGpu {
         let overlay_module = shader(
             &device,
             "film overlay",
-            concat!(
+            &[
+                tuile_overlay::gpu::LIGHT_WGSL,
                 include_str!("shaders/sunlit.wgsl"),
-                include_str!("shaders/overlay.wgsl")
-            ),
+                include_str!("shaders/overlay.wgsl"),
+            ]
+            .concat(),
         );
         let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("film overlay"),
@@ -2428,9 +2414,7 @@ impl FilmGpu {
                     }
                 }
             }
-            let flags = u32::from(lit) * OVERLAY_LIT
-                + u32::from(mesh.shadow.receives()) * OVERLAY_RECEIVES
-                + u32::from(mesh.depth == OverlayDepth::Terrain) * OVERLAY_BEHIND_GROUND;
+            let flags = tuile_overlay::gpu::flags(mesh);
             vertices.extend(mesh.positions.iter().zip(&mesh.colors).enumerate().map(
                 |(i, (p, c))| {
                     OverlayVertex {

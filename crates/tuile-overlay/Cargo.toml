@@ -12,6 +12,8 @@ authors.workspace = true
 # viewer, a simulator — needs them without the film's camera, its pack or its
 # look.
 [dependencies]
+# A vertex a renderer uploads is plain bytes: a derive, not a GPU.
+bytemuck = { workspace = true }
 glam = { workspace = true }
 
 [lints]

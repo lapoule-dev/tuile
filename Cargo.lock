@@ -6660,6 +6660,7 @@ dependencies = [
  "tuile-atmosphere",
  "tuile-core",
  "tuile-film",
+ "tuile-overlay",
  "tuile-terrain",
  "wgpu",
 ]
@@ -6815,6 +6816,7 @@ dependencies = [
 name = "tuile-overlay"
 version = "0.12.0"
 dependencies = [
+ "bytemuck",
  "glam 0.33.1",
 ]
 
@@ -7035,6 +7037,7 @@ dependencies = [
  "tuile-cesium-ion",
  "tuile-core",
  "tuile-metrics",
+ "tuile-overlay",
  "tuile-planetary",
  "tuile-storage-foyer",
  "tuile-tape",
@@ -7119,6 +7122,7 @@ dependencies = [
  "tracing-subscriber",
  "tuile-atmosphere",
  "tuile-core",
+ "tuile-overlay",
  "tuile-planetary",
  "tuile-terrain",
  "url",
