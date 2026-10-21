@@ -135,6 +135,23 @@ impl Frame {
     }
 }
 
+/// Where the picture goes in the frame, as the viewer sets it: a plain
+/// rectangle the pass is scissored to.
+#[derive(Clone, Copy)]
+struct Box_ {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+const WHOLE: Box_ = Box_ {
+    x: 0,
+    y: 0,
+    width: SIZE,
+    height: SIZE,
+};
+
 /// Draws `meshes` through `view`, over `clear`, and reads the frame back.
 ///
 /// `ground` is a depth value written over the whole frame before the overlays
@@ -143,9 +160,23 @@ impl Frame {
 fn render(
     gpu: &GpuContext,
     meshes: &[OverlayMesh],
+    camera: (WorldOverlayView, DVec3),
+    clear: wgpu::Color,
+    ground: Option<&OverlayMesh>,
+) -> Frame {
+    render_in(gpu, meshes, camera, clear, ground, WHOLE)
+}
+
+/// As [`render`], with the picture held to `box_`: the pass is scissored to
+/// it and the bars around it keep the clear, as the viewer letterboxes a
+/// fixed aspect.
+fn render_in(
+    gpu: &GpuContext,
+    meshes: &[OverlayMesh],
     (view, origin): (WorldOverlayView, DVec3),
     clear: wgpu::Color,
     ground: Option<&OverlayMesh>,
+    box_: Box_,
 ) -> Frame {
     let mut overlay = WorldOverlayRenderer::new(gpu, TEXTURE_FORMAT);
     let texture = |sample_count, usage, format| {
@@ -232,6 +263,15 @@ fn render(
             }),
             ..Default::default()
         });
+        pass.set_viewport(
+            box_.x as f32,
+            box_.y as f32,
+            box_.width as f32,
+            box_.height as f32,
+            0.0,
+            1.0,
+        );
+        pass.set_scissor_rect(box_.x, box_.y, box_.width, box_.height);
         stand_in.render(&mut pass);
         overlay.render(&mut pass);
     }
@@ -555,5 +595,68 @@ fn a_faulty_batch_leaves_the_last_one_drawn() {
     assert!(
         !overlay.is_empty(),
         "the good batch is still there: a refused one draws nothing new, not nothing at all"
+    );
+}
+
+/// A picture held to a shape, letterboxed: the scene fills the picture and
+/// the bars around it are the clear and nothing else.
+///
+/// This is the drawing half of `HostCamera::set_aspect`. The viewer sets the
+/// same viewport and scissor on the frame's pass; what is checked here is
+/// that an overlay covering the whole view lands inside the picture and
+/// never in a bar.
+#[test]
+fn a_letterboxed_picture_keeps_its_bars_clear() {
+    let Some(gpu) = gpu() else { return };
+    let earth = 6_378_137.0;
+    let eye = DVec3::new(earth + 1_000.0, 0.0, 0.0);
+    let camera = view(eye, DVec3::new(earth, 0.0, 0.0), Vec3::Z);
+    // Big enough to cover everything the camera can see.
+    let everything = plate(
+        DVec3::new(earth + 500.0, 0.0, 0.0),
+        40_000.0,
+        [0.0, 1.0, 0.0, 1.0],
+        OverlayDepth::Always,
+        OverlayBlend::Opaque,
+    );
+    // 2:1 in a square frame: a band down the middle, bars above and below.
+    let height = SIZE / 2;
+    let box_ = Box_ {
+        x: 0,
+        y: (SIZE - height) / 2,
+        width: SIZE,
+        height,
+    };
+    let frame = render_in(
+        &gpu,
+        std::slice::from_ref(&everything),
+        camera,
+        BLACK,
+        None,
+        box_,
+    );
+    // Inside: the scene.
+    assert!(
+        frame.at(SIZE / 2, SIZE / 2)[1] > 200,
+        "the picture is drawn in full inside the box"
+    );
+    // The bars: the clear, untouched. Nothing of the scene reaches them,
+    // which is what makes a HUD laid out for the film's viewport the film's.
+    for y in [0, box_.y - 1, box_.y + box_.height, SIZE - 1] {
+        for x in [0, SIZE / 2, SIZE - 1] {
+            let p = frame.at(x, y);
+            assert_eq!(
+                p,
+                [0, 0, 0, 255],
+                "a bar at ({x}, {y}) is the clear, not {p:?}"
+            );
+        }
+    }
+    // And the whole frame, unboxed, is covered: the box is what crops it,
+    // not the geometry.
+    let full = render(&gpu, std::slice::from_ref(&everything), camera, BLACK, None);
+    assert!(
+        full.covered(1, 128) as u32 > SIZE * SIZE * 9 / 10,
+        "unboxed, the same mesh covers the frame"
     );
 }
