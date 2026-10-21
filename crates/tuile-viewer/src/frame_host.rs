@@ -828,7 +828,11 @@ mod tests {
             viewport: (1920, 1080),
         };
         assert!(frame.has_ground());
-        assert_eq!(frame.ground_at(0.5, 0.1), Some(1200.0), "where it has loaded");
+        assert_eq!(
+            frame.ground_at(0.5, 0.1),
+            Some(1200.0),
+            "where it has loaded"
+        );
         assert_eq!(frame.ground_at(-0.5, 0.1), None, "where it has not");
 
         let mut camera = HostCamera::new(pose(1000.0), None);
