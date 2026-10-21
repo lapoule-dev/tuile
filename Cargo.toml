@@ -33,6 +33,7 @@ members = [
     "crates/tuile-viewer-bundle",
     "crates/tuile-wgpu",
     "examples/catalog-proxy",
+    "examples/decode-bench",
     "examples/globe-bulk",
     "examples/orbit-probe",
     "examples/warm-cache",
