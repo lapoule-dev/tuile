@@ -91,7 +91,10 @@ mod tests {
 
     #[test]
     fn a_flat_mesh_on_the_ground_is_unlit_and_tested_against_it() {
-        let mesh = OverlayMesh { depth: OverlayDepth::Terrain, ..Default::default() };
+        let mesh = OverlayMesh {
+            depth: OverlayDepth::Terrain,
+            ..Default::default()
+        };
         assert_eq!(flags(&mesh), BEHIND_GROUND);
     }
 
@@ -137,7 +140,10 @@ mod tests {
         // Vertex and fragment arithmetic only: anything of a binding or a
         // compute stage here would not reach WebGL2.
         for forbidden in ["@group", "@binding", "@compute", "var<storage"] {
-            assert!(!LIGHT_WGSL.contains(forbidden), "{forbidden} is not WebGL2-safe here");
+            assert!(
+                !LIGHT_WGSL.contains(forbidden),
+                "{forbidden} is not WebGL2-safe here"
+            );
         }
     }
 }

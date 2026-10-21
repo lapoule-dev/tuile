@@ -7025,6 +7025,7 @@ dependencies = [
  "tracing-subscriber",
  "tuile-atmosphere",
  "tuile-core",
+ "tuile-overlay",
  "tuile-planetary",
  "tuile-terrain",
  "url",
