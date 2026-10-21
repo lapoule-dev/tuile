@@ -30,7 +30,7 @@ A2. Ledger hardening: cargo-mutants on crates/tuile-core/src/budget/ (1 141 muta
     tuile_budget_audit_failures + alert); the MCAP corpus of real sessions replayed in the simulation;
     the 1 h soak with resizes and stereo.
 A3. Budget code audit fixes — BEFORE the algorithm work (Laurent, 2026-10-20). Read-only audit of origin/main
-    7b0ac83 (report: scratchpad/budget-antipatterns.md, 64 findings; clippy perf lints find nothing — the
+    7b0ac83 (report: docs/explorations/graphics-budget-audit.md, 64 findings; clippy perf lints find nothing — the
     cost is structural): ~8–10k allocations per decide at 500 drawn tiles (estimate, to measure).
     Fixes, keeping Decisions::digest bit-identical (goldens.txt, pattern_goldens.txt):
     a. select() linear and allocation-free: an ancestor→held index built once per step instead of scanning
