@@ -55,6 +55,20 @@
 //! once a film frame should not rebuild it sixty times a second to keep it on
 //! screen.
 //!
+//! # The ground under it
+//!
+//! [`HostFrame::ground_at`] answers how high the relief is at a place, from
+//! the viewer's own terrain — the surface its camera controller keeps a floor
+//! against. A host that puts something *on* the ground needs this, and needs
+//! it from here rather than from a model of its own: two ideas of where the
+//! ground is show up as geometry that floats or sinks into it.
+//!
+//! It is read fresh every frame on purpose. Terrain streams, so the answer is
+//! `None` over ground that has not arrived and a whole region's summit over
+//! ground that has arrived only coarsely, and it refines as tiles land. A
+//! host that reads it once has placed its shapes against whatever happened to
+//! be resident that frame.
+//!
 //! # A fixed drawing aspect
 //!
 //! [`HostCamera::set_aspect`] holds the picture to a shape of the host's
@@ -398,9 +412,43 @@ pub struct HostFrame<'a> {
     /// The drawn frame's size in device pixels — the whole frame, bars
     /// included when the camera is held to a fixed aspect.
     pub viewport: (u32, u32),
+    /// The relief the viewer itself stands on, read through
+    /// [`Self::ground_at`].
+    ///
+    /// `None` before a session has come up, or for a scene with no terrain.
+    pub(crate) ground: Option<&'a dyn tuile_core::ground::GroundHeight>,
 }
 
 impl HostFrame<'_> {
+    /// How high the ground is at `lon`/`lat` (radians), metres above the
+    /// ellipsoid, or `None` where nothing is known there **yet**.
+    ///
+    /// The viewer's own relief: what the camera controller keeps its floor
+    /// against, recorded tile by tile as the terrain is decoded — the
+    /// quantized mesh states its own highest point, so this is a tile's
+    /// maximum at the finest level resident, not a sampled surface. It
+    /// refines as the ground arrives and is coarse, or absent, until it
+    /// does.
+    ///
+    /// So a host that places anything against it must expect the answer to
+    /// change, and must not read it once and keep the answer: over ground
+    /// that has not loaded it is `None`, over ground that has only loaded
+    /// coarsely it is a whole region's summit. A host that needs the relief
+    /// settled should ask again as tiles land, which is what the viewer's own
+    /// controller does with it.
+    pub fn ground_at(&self, lon: f64, lat: f64) -> Option<f64> {
+        self.ground?.height_at(lon, lat)
+    }
+
+    /// Whether the viewer has any relief at all to answer with — a scene with
+    /// terrain, in a session that has come up.
+    ///
+    /// Not whether it knows a given place: that is `ground_at` returning
+    /// `None`, and the two are different questions. A host that waits for
+    /// terrain it will never get wants this one.
+    pub fn has_ground(&self) -> bool {
+        self.ground.is_some()
+    }
     /// Width over height of the **picture**: the fixed shape the host asked
     /// for with [`HostCamera::set_aspect`], or the frame's own.
     ///
@@ -542,6 +590,7 @@ mod tests {
             camera: &mut camera,
             preload: &mut preload,
             overlays: &mut overlays,
+            ground: None,
             viewport: (1920, 1080),
         };
         let seen = host.window_event(
@@ -563,6 +612,7 @@ mod tests {
             camera: &mut camera,
             preload: &mut preload,
             overlays: &mut overlays,
+            ground: None,
             viewport: (1920, 1080),
         };
         assert!((frame.aspect() - 16.0 / 9.0).abs() < 1e-12);
@@ -576,6 +626,7 @@ mod tests {
             camera: &mut camera,
             preload: &mut preload,
             overlays: &mut overlays,
+            ground: None,
             viewport: (0, 0),
         };
         assert!(frame.aspect().is_finite());
@@ -752,6 +803,49 @@ mod tests {
     }
 
     #[test]
+    fn a_host_reads_the_viewer_s_own_relief_and_can_tell_it_has_none() {
+        // A scene with terrain answers where it has loaded, `None` where it
+        // has not — the distinction a host placing things on the ground has
+        // to act on. A scene with no terrain at all answers nothing anywhere,
+        // and says so separately, because waiting for ground that will never
+        // arrive is a hang and not a load.
+        struct Ridge;
+        impl tuile_core::ground::GroundHeight for Ridge {
+            fn height_at(&self, lon: f64, _lat: f64) -> Option<f64> {
+                (lon > 0.0).then_some(1200.0)
+            }
+        }
+
+        let mut camera = HostCamera::new(pose(1000.0), None);
+        let mut preload = Vec::new();
+        let mut overlays = OverlayLayers::default();
+        let ridge = Ridge;
+        let frame = HostFrame {
+            camera: &mut camera,
+            preload: &mut preload,
+            overlays: &mut overlays,
+            ground: Some(&ridge),
+            viewport: (1920, 1080),
+        };
+        assert!(frame.has_ground());
+        assert_eq!(frame.ground_at(0.5, 0.1), Some(1200.0), "where it has loaded");
+        assert_eq!(frame.ground_at(-0.5, 0.1), None, "where it has not");
+
+        let mut camera = HostCamera::new(pose(1000.0), None);
+        let mut preload = Vec::new();
+        let mut overlays = OverlayLayers::default();
+        let bare = HostFrame {
+            camera: &mut camera,
+            preload: &mut preload,
+            overlays: &mut overlays,
+            ground: None,
+            viewport: (1920, 1080),
+        };
+        assert!(!bare.has_ground(), "a scene with no terrain");
+        assert_eq!(bare.ground_at(0.5, 0.1), None);
+    }
+
+    #[test]
     fn a_frames_aspect_is_the_pictures_not_the_windows() {
         // What a host measures its overlays against: a HUD laid out for 16:9
         // in a tall window is laid out for 16:9, and the bars are outside it.
@@ -762,6 +856,7 @@ mod tests {
             camera: &mut camera,
             preload: &mut preload,
             overlays: &mut overlays,
+            ground: None,
             viewport: (1000, 1000),
         };
         assert!(

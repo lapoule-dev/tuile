@@ -110,6 +110,11 @@ impl App {
                 preload: &mut preload,
                 overlays: &mut overlays,
                 viewport: (w as u32, h as u32),
+                // The viewer's own relief, the one the controller keeps its
+                // floor against: a host placing anything on the ground
+                // measures the same terrain the viewer is drawing, not a
+                // second idea of it.
+                ground: self.controller.ground().map(|g| g.as_ref()),
             };
             host.before_frame(dt.as_secs_f64(), &mut frame);
         }
