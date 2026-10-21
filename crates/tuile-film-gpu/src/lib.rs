@@ -70,10 +70,10 @@ use std::collections::HashMap;
 use glam::{DVec3, Vec3};
 // The vertex every renderer of overlays packs, and the light they share: the
 // viewer draws these same meshes, and the HUD has to come out of both alike.
-use tuile_overlay::gpu::OverlayVertex;
 use tuile_film::{
     Eye, EyePair, FrameCamera, FrameLight, Look, OverlayBlend, OverlayDepth, OverlayMesh, TileKey,
 };
+use tuile_overlay::gpu::OverlayVertex;
 use wgpu::util::DeviceExt;
 
 pub use atmosphere::AtmosphereUniform;

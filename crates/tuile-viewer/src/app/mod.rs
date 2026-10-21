@@ -165,6 +165,10 @@ struct Active {
     gpu: GpuContext,
     renderer: TileRenderer,
     overlay: OverlayRenderer,
+    /// A host's shapes in the world: `tuile_overlay::OverlayMesh`, through
+    /// the frame's own camera. Nothing is drawn through it in a session with
+    /// no host, and it costs three pipelines.
+    world_overlay: tuile_wgpu::WorldOverlayRenderer,
     pump: ContentPump,
     /// The multisampled colour target and its depth buffer. The surface itself
     /// has one sample, so the scene is drawn here and *resolved* into it —
@@ -325,6 +329,12 @@ pub struct App {
     /// Poses the host asked to be traversed without drawing, from the last
     /// frame it spoke. Replaced wholesale each time it does.
     preload: Vec<crate::frame_host::PreloadView>,
+    /// The shapes the host added to the scene, by layer. **Kept** between
+    /// frames: a layer is drawn until it is set again or cleared.
+    overlays: crate::frame_host::OverlayLayers,
+    /// The shape the picture is held to, letterboxed, when the host asked for
+    /// one: see `HostCamera::set_aspect`.
+    fixed_aspect: Option<f64>,
     /// Tiles drawn in the last frame, and whether all were the ones selected.
     drawn: (usize, bool),
     /// The last thing said to the person, and when.
@@ -387,6 +397,8 @@ impl App {
             flight: None,
             frame_host: config.frame_host.take(),
             preload: Vec::new(),
+            overlays: crate::frame_host::OverlayLayers::default(),
+            fixed_aspect: None,
             drawn: (0, false),
             notice: None,
             title_shown: String::new(),
@@ -922,4 +934,34 @@ impl Drop for App {
     fn drop(&mut self) {
         self.close_the_tape();
     }
+}
+
+/// The view a host's world overlays are drawn through: the camera's own, at
+/// the picture's aspect, against the render origin every tile was prepared
+/// with — the eye.
+///
+/// `clearance` is the height above the **ground**, as the tiles' own view
+/// uniform is given it: the near plane comes from it, and a near plane of
+/// its own would put an overlay and the ridge it stands against a pixel
+/// apart at every edge. One projection, both.
+///
+/// The camera's axes go with it because the overlays' light goes with the
+/// camera, as the film's does: `tuile_overlay::gpu::LIGHT_WGSL` is the same
+/// text in both, so a shape's relief comes out the same way.
+fn world_overlay_view(
+    camera: tuile_camera::GlobeCamera,
+    aspect: f64,
+    clearance: f64,
+) -> tuile_wgpu::WorldOverlayView {
+    let origin = camera.position;
+    let view_proj = glam::Mat4::from_cols_array(&camera.view_proj_with_clearance(
+        origin,
+        aspect as f32,
+        clearance,
+    ));
+    // The axes the light is built on, orthonormalised from the pose: the
+    // film takes the same three from its own frame.
+    let fwd = camera.direction.as_vec3().normalize_or_zero();
+    let right = fwd.cross(camera.up.as_vec3()).normalize_or_zero();
+    tuile_wgpu::WorldOverlayView::new(view_proj, right, right.cross(fwd))
 }

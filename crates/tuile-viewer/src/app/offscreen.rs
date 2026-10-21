@@ -100,8 +100,15 @@ impl Offscreen {
         views: &[tuile_wgpu::ViewUniform],
         set_view: impl Fn(&tuile_wgpu::ViewUniform),
         clear: wgpu::Color,
-        paint: impl Fn(&mut wgpu::RenderPass<'_>),
+        // The frame's pass and what follows it, together: one frame is drawn
+        // in two, and splitting them into two arguments only to count them
+        // separately is not a clearer signature.
+        draw: (
+            impl Fn(&mut wgpu::RenderPass<'_>),
+            impl Fn(&mut wgpu::CommandEncoder, &tuile_wgpu::FramePass<'_>),
+        ),
     ) {
+        let (paint, after) = draw;
         for (eye, view) in self.eyes.iter_mut().zip(views) {
             // Written before the eye's submit, so the eye's pass reads it:
             // a queue write lands at the start of the next submission.
@@ -115,6 +122,7 @@ impl Offscreen {
                     capture: Some(&mut eye.readback),
                 },
                 &paint,
+                &after,
             );
         }
     }

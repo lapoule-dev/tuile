@@ -45,6 +45,24 @@
 //! arrive on an empty globe. They go through the same eyes/union mechanism a
 //! stereo pair uses, which is why they cost traversal and not a second frame.
 //!
+//! # Overlay layers
+//!
+//! [`HostFrame::overlays`] takes the shapes the host adds to the scene,
+//! grouped into **layers** it names. A layer is set and then left alone: what
+//! was set last is drawn every frame until it is set again or cleared. That
+//! is the opposite of [`HostFrame::preload`], which is wanted only for the
+//! frame it is asked for, and it is deliberate — a host whose HUD changes
+//! once a film frame should not rebuild it sixty times a second to keep it on
+//! screen.
+//!
+//! # A fixed drawing aspect
+//!
+//! [`HostCamera::set_aspect`] holds the picture to a shape of the host's
+//! choosing, letterboxed inside whatever the window happens to be. A host
+//! whose overlays were laid out for a film's viewport needs this: a HUD laid
+//! out for 16:9 and drawn into a tall window is not the film's HUD. Outside
+//! the picture is a plain clear; inside it the ground is drawn in full.
+//!
 //! # One contract, two shells
 //!
 //! The same trait is handed to the native embedding and to the web start, so a
@@ -53,6 +71,7 @@
 //! loop is single-threaded anyway.
 
 use tuile_camera::GlobeCamera;
+use tuile_overlay::OverlayMesh;
 
 /// A camera pose: ECEF metres, a unit direction and up, and a vertical field
 /// of view in radians — all `f64`.
@@ -126,6 +145,11 @@ pub struct HostCamera {
     drawn: Pose,
     /// What the host asked for this frame, and which door it used.
     asked: Option<Asked>,
+    /// The shape the picture is held to, letterboxed: see
+    /// [`HostCamera::set_aspect`]. `None` is the window's own.
+    aspect: Option<f64>,
+    /// Whether the host said anything about it this frame.
+    aspect_set: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -139,9 +163,15 @@ pub(crate) enum Asked {
 }
 
 impl HostCamera {
-    /// For the frame about to be prepared, drawn last from `drawn`.
-    pub(crate) fn new(drawn: Pose) -> Self {
-        Self { drawn, asked: None }
+    /// For the frame about to be prepared, drawn last from `drawn` at
+    /// `aspect` — the fixed shape in force, if any.
+    pub(crate) fn new(drawn: Pose, aspect: Option<f64>) -> Self {
+        Self {
+            drawn,
+            asked: None,
+            aspect,
+            aspect_set: false,
+        }
     }
 
     /// The camera the last frame was drawn from.
@@ -175,9 +205,183 @@ impl HostCamera {
         self.asked = Some(Asked::Release);
     }
 
+    /// Holds the drawn picture to a fixed width over height, letterboxed
+    /// inside the frame: `None` gives the window's own shape back.
+    ///
+    /// Everything of the scene is drawn inside the picture — the ground in
+    /// full, every overlay through the same camera — and outside it is a
+    /// plain clear. So a host whose overlays were laid out for a film's
+    /// viewport sees them laid out as the film lays them out, whatever shape
+    /// the window is.
+    ///
+    /// It survives the frame: the shape stays until it is set again. A value
+    /// that is not finite and positive is refused, because an aspect reaches
+    /// the projection matrix and a NaN there loses the frame.
+    pub fn set_aspect(&mut self, aspect: Option<f64>) {
+        match aspect {
+            Some(a) if !a.is_finite() || a <= 0.0 => return,
+            _ => {}
+        }
+        self.aspect = aspect;
+        self.aspect_set = true;
+    }
+
+    /// The fixed shape in force, or `None` when the picture is the window's
+    /// own shape.
+    pub fn aspect(&self) -> Option<f64> {
+        self.aspect
+    }
+
     /// What the host asked for, for the shell to apply.
     pub(crate) fn taken(&self) -> Option<Asked> {
         self.asked
+    }
+
+    /// The shape in force after the host had its say, and whether it said
+    /// anything: the shell keeps it for the next frame either way.
+    pub(crate) fn taken_aspect(&self) -> (Option<f64>, bool) {
+        (self.aspect, self.aspect_set)
+    }
+}
+
+/// Where the picture goes inside a frame held to a fixed shape.
+///
+/// A plain rectangle in device pixels, from the frame's top-left. The bars
+/// around it are cleared and nothing else is drawn in them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Letterbox {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Letterbox {
+    /// The largest rectangle of `aspect` that fits a frame of `viewport`,
+    /// centred in it. `None` for no fixed shape at all: the frame itself.
+    ///
+    /// A frame too small to hold a pixel of the shape still gets one pixel:
+    /// a viewport of zero width is a render pass wgpu refuses, and a window
+    /// being dragged to nothing is not an error.
+    pub fn of(viewport: (u32, u32), aspect: Option<f64>) -> Self {
+        let (w, h) = (viewport.0.max(1), viewport.1.max(1));
+        let whole = Self {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        let Some(aspect) = aspect else { return whole };
+        if !aspect.is_finite() || aspect <= 0.0 {
+            return whole;
+        }
+        let frame = f64::from(w) / f64::from(h);
+        if aspect > frame {
+            // Wider than the frame: bars above and below.
+            let height = ((f64::from(w) / aspect).round() as u32).clamp(1, h);
+            Self {
+                x: 0,
+                y: (h - height) / 2,
+                width: w,
+                height,
+            }
+        } else {
+            let width = ((f64::from(h) * aspect).round() as u32).clamp(1, w);
+            Self {
+                x: (w - width) / 2,
+                y: 0,
+                width,
+                height: h,
+            }
+        }
+    }
+
+    /// Width over height of the picture itself, never dividing by zero.
+    pub fn aspect(&self) -> f64 {
+        f64::from(self.width.max(1)) / f64::from(self.height.max(1))
+    }
+}
+
+/// The shapes a host adds to the scene, by layer.
+///
+/// A **layer** is a name the host chooses — `"flight"`, `"paths"`, `"hud"` —
+/// and a set of meshes. A layer that is set is drawn every frame until it is
+/// set again or cleared; a layer the host does not touch this frame keeps
+/// what it had. A host whose HUD changes once a film frame therefore builds
+/// it once, not sixty times a second.
+///
+/// Layers are drawn in the order they were first set, and within a layer in
+/// the order the meshes were given. Across the whole frame, every opaque mesh
+/// goes before every translucent one, as `tuile_overlay::OverlayMesh` says.
+#[derive(Debug, Default)]
+pub struct OverlayLayers {
+    /// By name, in the order the names first arrived.
+    layers: Vec<(String, Vec<OverlayMesh>)>,
+    /// Whether anything changed since the renderer last read it.
+    changed: bool,
+}
+
+impl OverlayLayers {
+    /// Replaces `layer` with `meshes`. An empty `meshes` is a layer that
+    /// draws nothing, which is not the same as one that was never set — but
+    /// it looks the same, so prefer [`Self::clear`] when it is done with.
+    pub fn set(&mut self, layer: &str, meshes: Vec<OverlayMesh>) {
+        self.changed = true;
+        match self.layers.iter_mut().find(|(name, _)| name == layer) {
+            Some((_, held)) => *held = meshes,
+            None => self.layers.push((layer.to_owned(), meshes)),
+        }
+    }
+
+    /// Forgets `layer` entirely. Clearing a layer that was never set does
+    /// nothing, so a host may clear unconditionally.
+    pub fn clear(&mut self, layer: &str) {
+        let before = self.layers.len();
+        self.layers.retain(|(name, _)| name != layer);
+        self.changed |= self.layers.len() != before;
+    }
+
+    /// Forgets every layer.
+    pub fn clear_all(&mut self) {
+        self.changed |= !self.layers.is_empty();
+        self.layers.clear();
+    }
+
+    /// What `layer` holds, or `None` when it was never set.
+    pub fn get(&self, layer: &str) -> Option<&[OverlayMesh]> {
+        self.layers
+            .iter()
+            .find(|(name, _)| name == layer)
+            .map(|(_, meshes)| meshes.as_slice())
+    }
+
+    /// Every layer's name, in the order they were first set.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.layers.iter().map(|(name, _)| name.as_str())
+    }
+
+    /// Whether anything has been set at all.
+    pub fn is_empty(&self) -> bool {
+        self.layers.iter().all(|(_, meshes)| meshes.is_empty())
+    }
+
+    /// Whether a host changed anything since the renderer last took it.
+    pub(crate) fn changed(&self) -> bool {
+        self.changed
+    }
+
+    /// Every mesh of every layer, in drawing order, and the change mark
+    /// cleared: the renderer has it now.
+    ///
+    /// The new set is uploaded **before** the old one is let go, which is the
+    /// renderer's job and the reason this hands over a borrow rather than
+    /// draining: a frame between the two would have no overlays at all.
+    pub(crate) fn taken(&mut self) -> Vec<OverlayMesh> {
+        self.changed = false;
+        self.layers
+            .iter()
+            .flat_map(|(_, meshes)| meshes.iter().cloned())
+            .collect()
     }
 }
 
@@ -187,16 +391,30 @@ pub struct HostFrame<'a> {
     /// Poses to traverse without drawing. Replaced wholesale each frame the
     /// host touches it: what is not asked for again is no longer wanted.
     pub preload: &'a mut Vec<PreloadView>,
-    /// The drawn frame's size in device pixels.
+    /// The shapes the host adds to the scene, by layer. Unlike
+    /// [`Self::preload`], a layer is **kept** until it is set again or
+    /// cleared.
+    pub overlays: &'a mut OverlayLayers,
+    /// The drawn frame's size in device pixels — the whole frame, bars
+    /// included when the camera is held to a fixed aspect.
     pub viewport: (u32, u32),
 }
 
 impl HostFrame<'_> {
-    /// Width over height of the drawn frame, for a preload view that will be
-    /// drawn at the same shape.
+    /// Width over height of the **picture**: the fixed shape the host asked
+    /// for with [`HostCamera::set_aspect`], or the frame's own.
+    ///
+    /// This is what a preload view wants, and what a host laying out its own
+    /// overlays should measure against — not the window, which may be
+    /// letterboxed around it.
     pub fn aspect(&self) -> f64 {
-        let (w, h) = self.viewport;
-        f64::from(w.max(1)) / f64::from(h.max(1))
+        self.picture().aspect()
+    }
+
+    /// Where the picture sits inside the frame. The whole frame unless the
+    /// host held the camera to an aspect.
+    pub fn picture(&self) -> Letterbox {
+        Letterbox::of(self.viewport, self.camera.aspect())
     }
 }
 
@@ -282,7 +500,7 @@ mod tests {
 
     #[test]
     fn a_host_that_says_nothing_leaves_the_frame_alone() {
-        let camera = HostCamera::new(pose(1000.0));
+        let camera = HostCamera::new(pose(1000.0), None);
         assert!(
             camera.taken().is_none(),
             "nothing asked for is nothing applied"
@@ -295,7 +513,7 @@ mod tests {
         // The distinction matters to a host that reads the camera to decide
         // where to put it: it must see where it *was*, or it reads back its
         // own answer and the feedback loop is on itself.
-        let mut camera = HostCamera::new(pose(1000.0));
+        let mut camera = HostCamera::new(pose(1000.0), None);
         camera.drive(pose(5000.0));
         assert_eq!(camera.get().position, pose(1000.0).position);
     }
@@ -304,7 +522,7 @@ mod tests {
     fn the_last_word_in_a_frame_wins() {
         // A host may change its mind within one `before_frame`; the frame can
         // only be drawn once, so the last call is what happens.
-        let mut camera = HostCamera::new(pose(1000.0));
+        let mut camera = HostCamera::new(pose(1000.0), None);
         camera.drive(pose(5000.0));
         camera.release();
         assert!(matches!(camera.taken(), Some(Asked::Release)));
@@ -317,11 +535,13 @@ mod tests {
             fn before_frame(&mut self, _dt: f64, _frame: &mut HostFrame<'_>) {}
         }
         let mut host = Quiet;
-        let mut camera = HostCamera::new(pose(1000.0));
+        let mut camera = HostCamera::new(pose(1000.0), None);
         let mut preload = Vec::new();
+        let mut overlays = OverlayLayers::default();
         let frame = HostFrame {
             camera: &mut camera,
             preload: &mut preload,
+            overlays: &mut overlays,
             viewport: (1920, 1080),
         };
         let seen = host.window_event(
@@ -336,22 +556,26 @@ mod tests {
 
     #[test]
     fn the_frame_s_aspect_is_its_pixels_and_never_divides_by_zero() {
-        let mut camera = HostCamera::new(pose(1000.0));
+        let mut camera = HostCamera::new(pose(1000.0), None);
         let mut preload = Vec::new();
+        let mut overlays = OverlayLayers::default();
         let frame = HostFrame {
             camera: &mut camera,
             preload: &mut preload,
+            overlays: &mut overlays,
             viewport: (1920, 1080),
         };
         assert!((frame.aspect() - 16.0 / 9.0).abs() < 1e-12);
 
-        let mut camera = HostCamera::new(pose(1000.0));
+        let mut camera = HostCamera::new(pose(1000.0), None);
         let mut preload = Vec::new();
         // A window collapsed to nothing still has to answer something finite:
         // a NaN aspect reaches the projection matrix and loses the frame.
+        let mut overlays = OverlayLayers::default();
         let frame = HostFrame {
             camera: &mut camera,
             preload: &mut preload,
+            overlays: &mut overlays,
             viewport: (0, 0),
         };
         assert!(frame.aspect().is_finite());
@@ -400,6 +624,152 @@ mod tests {
             ctrl.camera.position, high.position,
             "release must not move the eye"
         );
+    }
+
+    /// The layer contract, and the one thing that separates it from
+    /// `preload`: a layer stays until it is spoken about again.
+    #[test]
+    fn a_layer_is_drawn_until_it_is_replaced() {
+        let mut layers = OverlayLayers::default();
+        layers.set("hud", vec![OverlayMesh::default()]);
+        layers.set("paths", vec![OverlayMesh::default(); 3]);
+        // A frame in which the host says nothing: both are still there.
+        assert_eq!(layers.get("hud").map(<[_]>::len), Some(1));
+        assert_eq!(layers.get("paths").map(<[_]>::len), Some(3));
+        // Set again, and it is the new set, not both.
+        layers.set("paths", vec![OverlayMesh::default()]);
+        assert_eq!(layers.get("paths").map(<[_]>::len), Some(1));
+        assert_eq!(layers.taken().len(), 2, "one of each, in one batch");
+    }
+
+    #[test]
+    fn clearing_a_layer_forgets_it_and_leaves_the_others() {
+        let mut layers = OverlayLayers::default();
+        layers.set("hud", vec![OverlayMesh::default()]);
+        layers.set("trail", vec![OverlayMesh::default()]);
+        layers.clear("hud");
+        assert!(layers.get("hud").is_none());
+        assert_eq!(layers.get("trail").map(<[_]>::len), Some(1));
+        // Clearing what was never set is not an error: a host switching view
+        // clears unconditionally.
+        layers.clear("mascot");
+        assert_eq!(layers.names().count(), 1);
+    }
+
+    #[test]
+    fn layers_are_drawn_in_the_order_they_were_first_set() {
+        // The order matters for translucency, and "first set" rather than
+        // "last set" so that re-setting a layer every frame does not shuffle
+        // the frame under the host.
+        let mut layers = OverlayLayers::default();
+        layers.set("a", vec![OverlayMesh::default()]);
+        layers.set("b", vec![OverlayMesh::default()]);
+        layers.set("a", vec![OverlayMesh::default()]);
+        assert_eq!(layers.names().collect::<Vec<_>>(), ["a", "b"]);
+    }
+
+    #[test]
+    fn the_renderer_is_told_only_when_something_changed() {
+        // A layer set once and left alone is drawn from the buffers it is
+        // already in: that is what makes keeping a layer cheap.
+        let mut layers = OverlayLayers::default();
+        assert!(!layers.changed(), "nothing said is nothing to upload");
+        layers.set("hud", vec![OverlayMesh::default()]);
+        assert!(layers.changed());
+        let _ = layers.taken();
+        assert!(!layers.changed(), "taken once is taken");
+        layers.clear("absent");
+        assert!(!layers.changed(), "clearing nothing changes nothing");
+        layers.clear("hud");
+        assert!(layers.changed());
+    }
+
+    #[test]
+    fn a_fixed_aspect_survives_the_frame_and_a_nonsense_one_is_refused() {
+        let mut camera = HostCamera::new(pose(1000.0), None);
+        assert_eq!(camera.aspect(), None, "the window's own shape by default");
+        camera.set_aspect(Some(16.0 / 9.0));
+        assert_eq!(camera.aspect(), Some(16.0 / 9.0));
+        let (aspect, said) = camera.taken_aspect();
+        assert_eq!((aspect, said), (Some(16.0 / 9.0), true));
+        // The next frame starts with it in force, and a host that says
+        // nothing keeps it.
+        let camera = HostCamera::new(pose(1000.0), Some(16.0 / 9.0));
+        assert_eq!(camera.taken_aspect(), (Some(16.0 / 9.0), false));
+        // A NaN aspect reaches the projection matrix and loses the frame.
+        let mut camera = HostCamera::new(pose(1000.0), Some(1.5));
+        camera.set_aspect(Some(f64::NAN));
+        camera.set_aspect(Some(0.0));
+        camera.set_aspect(Some(-2.0));
+        assert_eq!(camera.aspect(), Some(1.5), "nonsense never reaches it");
+        // And `None` gives the window back.
+        camera.set_aspect(None);
+        assert_eq!(camera.aspect(), None);
+    }
+
+    #[test]
+    fn the_letterbox_is_the_largest_picture_of_its_shape_centred() {
+        // 16:9 in a square window: bars above and below.
+        let box_ = Letterbox::of((1000, 1000), Some(16.0 / 9.0));
+        assert_eq!(box_.width, 1000);
+        assert_eq!(box_.height, 563);
+        assert_eq!(box_.x, 0);
+        assert_eq!(box_.y, (1000 - 563) / 2);
+        assert!((box_.aspect() - 16.0 / 9.0).abs() < 0.01);
+
+        // 16:9 in a wider window: bars left and right.
+        let box_ = Letterbox::of((2000, 500), Some(16.0 / 9.0));
+        assert_eq!(box_.height, 500);
+        assert_eq!(box_.width, 889);
+        assert_eq!(box_.y, 0);
+        assert_eq!(box_.x, (2000 - 889) / 2);
+
+        // No fixed shape: the frame itself, with nothing cropped.
+        let box_ = Letterbox::of((1920, 1080), None);
+        assert_eq!(
+            (box_.x, box_.y, box_.width, box_.height),
+            (0, 0, 1920, 1080)
+        );
+    }
+
+    #[test]
+    fn a_letterbox_is_never_zero_wide_whatever_it_is_asked() {
+        // A render pass of zero width is one wgpu refuses, and a window being
+        // dragged to nothing is not an error.
+        for viewport in [(0, 0), (1, 1000), (1000, 1)] {
+            for aspect in [None, Some(16.0 / 9.0), Some(0.01), Some(100.0)] {
+                let box_ = Letterbox::of(viewport, aspect);
+                assert!(
+                    box_.width >= 1 && box_.height >= 1,
+                    "{viewport:?} {aspect:?}"
+                );
+                assert!(box_.aspect().is_finite());
+            }
+        }
+        // And a shape that is not a shape is the frame, not a panic.
+        let box_ = Letterbox::of((1920, 1080), Some(f64::NAN));
+        assert_eq!((box_.width, box_.height), (1920, 1080));
+    }
+
+    #[test]
+    fn a_frames_aspect_is_the_pictures_not_the_windows() {
+        // What a host measures its overlays against: a HUD laid out for 16:9
+        // in a tall window is laid out for 16:9, and the bars are outside it.
+        let mut camera = HostCamera::new(pose(1000.0), Some(16.0 / 9.0));
+        let mut preload = Vec::new();
+        let mut overlays = OverlayLayers::default();
+        let frame = HostFrame {
+            camera: &mut camera,
+            preload: &mut preload,
+            overlays: &mut overlays,
+            viewport: (1000, 1000),
+        };
+        assert!(
+            (frame.aspect() - 16.0 / 9.0).abs() < 0.01,
+            "the picture's shape, not the window's: {}",
+            frame.aspect()
+        );
+        assert_eq!(frame.picture().height, 563);
     }
 
     #[test]

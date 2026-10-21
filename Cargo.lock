@@ -6941,6 +6941,7 @@ dependencies = [
  "tuile-cesium-ion",
  "tuile-core",
  "tuile-metrics",
+ "tuile-overlay",
  "tuile-planetary",
  "tuile-storage-foyer",
  "tuile-tape",

@@ -23,6 +23,8 @@ tracing-subscriber = { workspace = true }
 tuile-atmosphere = { version = "0.12.0", path = "../tuile-atmosphere" }
 tuile-camera = { version = "0.12.0", path = "../tuile-camera" }
 tuile-core = { version = "0.12.0", path = "../tuile-core" }
+# The shapes a host hands over, for `HostFrame::overlays`.
+tuile-overlay = { version = "0.12.0", path = "../tuile-overlay" }
 tuile-planetary = { version = "0.12.0", path = "../tuile-planetary" }
 tuile-tape = { version = "0.12.0", path = "../tuile-tape" }
 tuile-terrain = { version = "0.12.0", path = "../tuile-terrain" }

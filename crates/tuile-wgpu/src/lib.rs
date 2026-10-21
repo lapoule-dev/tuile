@@ -51,7 +51,7 @@ pub use readback::Readback;
 pub use renderer::{LineVertex, TileRenderer, ViewUniform};
 pub use surface::{
     draw_to_surface, draw_to_texture, preferred_format, surface_format, FrameOnSurface,
-    FrameOnTexture, Presented, SurfaceFormat,
+    FrameOnTexture, FramePass, Presented, SurfaceFormat,
 };
 pub use targets::FrameTargets;
 pub use world_overlay::{WorldOverlayError, WorldOverlayRenderer, WorldOverlayView};

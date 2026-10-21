@@ -59,6 +59,24 @@ pub struct FrameOnSurface<'a, 'w> {
     pub trace: Option<&'a mut Readback>,
 }
 
+/// The attachments the frame's own pass used, for a pass that follows it on
+/// the same encoder.
+///
+/// A second pass over the same picture — one that needs a depth attachment
+/// the frame's own cannot be, such as overlays tested against overlays alone
+/// — draws into `colour` and resolves into `resolve` exactly as the frame's
+/// pass did, loading rather than clearing. Every attachment of a pass shares
+/// its sample count, so the multisampled target is the one to draw into and
+/// not the drawable.
+pub struct FramePass<'a> {
+    /// The multisampled colour target the frame was drawn into.
+    pub colour: &'a wgpu::TextureView,
+    /// What it resolves into.
+    pub resolve: &'a wgpu::TextureView,
+    /// The frame in device pixels.
+    pub size: (u32, u32),
+}
+
 /// Draws one frame onto the surface and presents it.
 ///
 /// `paint` receives a render pass whose colour attachment is the multisampled
@@ -67,6 +85,10 @@ pub struct FrameOnSurface<'a, 'w> {
 ///
 /// `on_lost` reconfigures the surface. It is a callback because only the host
 /// knows the configuration it wants — usage flags, present mode, size.
+///
+/// `after` runs on the same encoder once the frame's pass has closed, with the
+/// attachments it used ([`FramePass`]): that is where a second pass belongs. A
+/// host with none passes `|_, _| {}`.
 ///
 /// `before_present` is the one place a windowing library still gets a word in:
 /// winit's `pre_present_notify`, which lets the compositor start its own work.
@@ -81,6 +103,7 @@ pub fn draw_to_surface(
     on_lost: impl FnOnce(),
     before_present: impl FnOnce(),
     paint: impl FnOnce(&mut wgpu::RenderPass<'_>),
+    after: impl FnOnce(&mut wgpu::CommandEncoder, &FramePass<'_>),
 ) -> Presented {
     let FrameOnSurface {
         gpu,
@@ -118,6 +141,7 @@ pub fn draw_to_surface(
         surface_view.as_ref(),
         clear,
         paint,
+        after,
     );
     // Before the frame is handed to the compositor: afterwards the texture
     // belongs to the surface again and there is nothing left to copy.
@@ -153,7 +177,11 @@ pub struct FrameOnTexture<'a> {
 /// Draws one frame into a texture: [`draw_to_surface`] without a surface to
 /// acquire, so without the ways acquiring one fails — and without a present.
 /// `paint` receives the same pass.
-pub fn draw_to_texture(into: FrameOnTexture<'_>, paint: impl FnOnce(&mut wgpu::RenderPass<'_>)) {
+pub fn draw_to_texture(
+    into: FrameOnTexture<'_>,
+    paint: impl FnOnce(&mut wgpu::RenderPass<'_>),
+    after: impl FnOnce(&mut wgpu::CommandEncoder, &FramePass<'_>),
+) {
     let FrameOnTexture {
         gpu,
         texture,
@@ -161,7 +189,7 @@ pub fn draw_to_texture(into: FrameOnTexture<'_>, paint: impl FnOnce(&mut wgpu::R
         clear,
         capture,
     } = into;
-    let mut encoder = encode_frame(gpu, targets, texture, None, clear, paint);
+    let mut encoder = encode_frame(gpu, targets, texture, None, clear, paint, after);
     if let Some(capture) = capture {
         capture.capture(gpu, &mut encoder, texture, targets.size());
     }
@@ -179,6 +207,7 @@ fn encode_frame(
     encoded: Option<&wgpu::TextureView>,
     clear: wgpu::Color,
     paint: impl FnOnce(&mut wgpu::RenderPass<'_>),
+    after: impl FnOnce(&mut wgpu::CommandEncoder, &FramePass<'_>),
 ) -> wgpu::CommandEncoder {
     let drawable_view;
     let resolve = match targets.encode.as_ref() {
@@ -225,6 +254,17 @@ fn encode_frame(
         });
         paint(&mut pass);
     }
+    // A pass of its own, on the same encoder and before the frame is
+    // encoded: what needs a depth attachment the frame's own pass cannot
+    // offer. See [`FramePass`].
+    after(
+        &mut encoder,
+        &FramePass {
+            colour: &targets.colour,
+            resolve,
+            size: targets.size(),
+        },
+    );
     if let (Some(encode), Some(view)) = (targets.encode.as_ref(), encoded) {
         encode.encode(&mut encoder, view);
     }

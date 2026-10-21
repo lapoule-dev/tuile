@@ -362,6 +362,9 @@ impl App {
         let renderer = TileRenderer::new(&gpu, surface_format);
         // The viewer's pass carries depth, so the overlay must declare it too.
         let overlay = OverlayRenderer::new(&gpu, surface_format, Some(DEPTH_FORMAT));
+        // A host's shapes in the world, drawn into the same frame with the
+        // film's own overlay light: see `tuile_wgpu::WorldOverlayRenderer`.
+        let world_overlay = tuile_wgpu::WorldOverlayRenderer::new(&gpu, surface_format);
         // The render origin tracks the eye (set each frame); start there.
         // The display's refresh, which each frame's upload deadline is made
         // of; sixty when the window cannot say.
@@ -394,6 +397,7 @@ impl App {
             gpu,
             renderer,
             overlay,
+            world_overlay,
             pump,
             targets,
             size,
