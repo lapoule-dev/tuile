@@ -1,54 +1,147 @@
 # 00 — Vision and scope
 
-## Why this project exists
+## What tuile is
 
-**The end goal of the project: a geometry server that produces renders of global tiles** — a terrain globe (Cesium World Terrain in quantized-mesh) draped with imagery (Bing), served and rendered in pure Rust, end to end. The 3D Tiles engine (glTF/b3dm geometry, photogrammetry, digital twins) is the foundation; the terrain+imagery globe is the target it scales up toward. Both pipelines share the same logical geometry server, the same f64 rebasing, the same cache, the same `GeometryStream`.
+**One foundation for the geospatial 3D scene, that runs everywhere and draws
+in every way.** Tuile streams, decodes and renders the globe (terrain draped
+with imagery) and OGC 3D Tiles content (glTF/b3dm geometry, photogrammetry,
+digital twins), in pure Rust, from the same core, wherever a GPU or a browser
+exists:
 
-The OGC 3D Tiles standard is the dominant format for geospatial 3D streaming. Its ecosystem is lopsided:
+| Target | How it draws |
+|---|---|
+| **Browser** | the core in wasm in a Web Worker; WebGPU, or a JavaScript scene library on the page |
+| **Desktop** | the native viewer (wgpu: Metal, Vulkan, DX12) |
+| **Mobile** | the same viewer embedded in a phone app, with budgets, threading and lifecycle sized for it |
+| **Headset** | two converged eyes from one scene: stereo frames, spatial video (MV-HEVC), and later live headset rendering |
+| **Film** | frame-exact offline rendering of a camera path, on a laptop or a farm of GPUs |
+| **Server** | the same geometry served to others: streaming over the wire, or static, cacheable 3D Tiles over HTTP |
 
-- **Production**: rich (pg2b3dm, py3dtiles, mago 3DTiler, PLATEAU converter…) — all produce static files.
-- **Consumption**: concentrated in a single commercial vendor (JS web client, C++ engine), plus a three.js renderer (NASA AMMOS).
-- **Serving**: nonexistent. Either static on S3/nginx, or the SaaS from the same vendor (commercial self-hosted, Kubernetes).
-- **Terrain+imagery globe**: no Rust engine consumes quantized-mesh terrain + raster imagery to produce a globe render. That is where we are going.
+**None of these is the product; the foundation is.** A film is one render mode
+among the others, not a specialisation. Interactive, film, headset and mobile
+share one traversal, one cache, one f64 rebasing, one atmosphere, one camera
+model and one shading. A feature built for one mode (a physical sky, a per-frame
+light, an overlay API for hosts, a stereo pair) is built in the core or in a
+shared crate, so that every mode gets it. When two modes disagree about what is
+on screen, the disagreement is a bug in a renderer, not a difference by design.
 
-The 2D world solved the serving problem with **Martin** (MapLibre, Rust): a lightweight dynamic server, multiple sources, cache, one binary. Nobody has done it in 3D, neither for 3D Tiles nor for the terrain globe. And no mature native Rust/wgpu renderer exists for either.
+## Why it exists
 
-**Data sources: ion AND non-ion.** The globe feeds on Cesium ion (Cesium World Terrain + Bing imagery, via a token supplied at runtime — never committed, cf. `tuile-cesium-ion`) as well as on equivalent free sources (open quantized-mesh terrain, slippy-map imagery). The core knows neither ion nor Bing: it consumes abstract terrain and imagery sources.
+The OGC 3D Tiles standard is the dominant format for geospatial 3D streaming.
+Its ecosystem is lopsided:
 
-## Goals (in order)
+- **Production** is rich (pg2b3dm, py3dtiles, mago 3DTiler, PLATEAU
+  converter…), and all of it produces static files.
+- **Consumption** is concentrated in a few clients, each tied to its own
+  ecosystem and language, and none of them runs the same engine across browser,
+  native, mobile, headset and offline rendering.
+- **Serving** is static files on object storage, or a hosted service.
+- **The terrain + imagery globe**: no Rust engine consumes quantized-mesh
+  terrain with raster imagery to draw a globe.
 
-1. **`tuile-core`**: the complete 3D Tiles logic (parsing, SSE traversal, scheduling, memory cache) in pure Rust, render-agnostic, wasm-compatible, structured as a **logical geometry server**: the streaming mode is a core trait (`GeometryStream`), not a networking matter. This is the central asset — everything else is a façade or a binding.
-2. **`tuile-wgpu`**: a reference native + wasm renderer proving the core end to end.
-3. **`tuile-server`**: the **network middleware** of the geometry server, plus the static mode. **Streaming mode (the primary mode)**: WebSocket binding of the `GeometryStream` trait — the server runs the traversal per session and pushes geometry, **serialized as glb on the wire**; first consumer the wgpu viewer (end-to-end tests), second consumer USD, notably the Hydra renderer. The geometry server owns the graphics budget and runs where that budget's inputs are: locally on interactive devices (desktop, phone, headset, browser), in a session here for a consumer that declares its budget (a render node, a farm) — decided on 2026-10-19. **Static mode**: tileset.json + glb contents over cacheable HTTP GET (pluggable cache Noop/LRU/disk/R2, abstract storage fs/S3/R2) — interop with the existing ecosystem, and the pull implementation of the same protocol as seen from the consumer. Native binary (axum) and Cloudflare Worker (workers-rs, static mode).
-4. **`tuile-usd`**: USDZ export of a region (`bbox → USDZ`) as a standalone lib + CLI, including animations via time samples (replay of GPS trajectories). This is the differentiating feature: the only bridge from 3D Tiles to the Apple ecosystem (AR Quick Look iOS, RealityKit, visionOS). Strict separation: the tile server does not know about USD; export is a tileset consumer like any other.
+The 2D world has lightweight, portable building blocks: a small dynamic tile
+server, renderers on every platform. 3D has none that is open, portable and
+renderer-independent. Tuile aims to be that block for 3D: small, embeddable,
+compiled for every target, and owned by no renderer.
 
-## The terrain + imagery globe (structuring target)
+## Principles that make "everywhere" possible
 
-Flagship goal: display Cesium World Terrain draped with Bing imagery, as a globe render. What this implies, added on top of the 3D Tiles engine without undoing it:
+1. **A render-agnostic, I/O-agnostic core.** `tuile-core` holds the 3D Tiles
+   and globe logic (parsing, screen-space-error traversal, scheduling, memory
+   cache) and depends on no GPU API, runtime or network stack. Fetching,
+   storing and drawing plug in through traits (`TileFetcher`,
+   `PrepareRenderResources`, `GeometryStream`). It compiles to
+   `wasm32-unknown-unknown` on every change.
+2. **A logical geometry server.** Streaming is a core trait (`GeometryStream`),
+   not a networking matter. It has three bindings: in-process and decoded (the
+   viewers, the film renderer), over a WebSocket with glb on the wire (remote
+   hosts), and static HTTP pull (CDN interop and existing clients). The
+   geometry server owns the graphics budget and runs where that budget's inputs
+   are: locally on interactive devices (desktop, phone, headset, browser), and
+   in a server session for a consumer that declares its budget (a render node,
+   a farm) — decided on 2026-10-19.
+3. **One renderer family.** wgpu is the reference backend, native and WebGPU.
+   Other hosts (OpenUSD/Hydra, platform scene graphs, game engines) get a
+   specialised façade over the geometry server. There is no generic FFI.
+4. **Precision by construction.** All geospatial arithmetic stays in f64 until
+   the switch to a local frame. Raw Earth-centred coordinates never reach f32.
+5. **Embedded-first resource discipline.** Every cache, pool and queue is
+   bounded and sized from the device it runs on. The main thread never blocks.
+   Ground is never black: a coarser ancestor stays drawn until its replacement
+   is resident.
+6. **Determinism where it is needed.** A camera path can be recorded and
+   replayed exactly (`tuile-tape`). Film rendering is frame-exact and
+   independent of how the frames are split across machines.
+7. **Hosts stay outside.** A product that builds on tuile (its overlays, its
+   data, its camera rules) plugs in through typed, neutral interfaces
+   (overlays, per-frame light, segment orders). No downstream product is named
+   in tuile, and downstream conventions are configuration.
 
-1. **quantized-mesh decoding** (`tuile-terrain`): 88-byte header, u/v/height vertices in u16 zigzag-delta, high-water-mark indices, skirts on the 4 edges, octvertexnormals extension. A `.terrain` tile → a `DecodedTileContent` (rebased ECEF positions, normals) — the same type as glTF content, so `tuile-wgpu` renders it without any change.
-2. **Geographic implicit tiling**: TMS quadtree in EPSG:4326 (2 root tiles, whole world), availability described by a `layer.json` (not a `tileset.json`). Geometric error per level. The core's SSE traversal applies via a common source abstraction (3D Tiles and terrain are two `TileSource`).
-3. **Draped raster imagery** (`core::raster`, already started): providers (slippy-map, Bing via ion, ion direct), WebMercator/Geographic projections, per-terrain-tile UV mapping. Geometry↔imagery crossover at a single point (`OverlayAttachment`).
-4. **ion connectors** (`tuile-cesium-ion`): TERRAIN assets (endpoint resolution + layer.json + `.terrain` tiles, asset token refresh on expiry) and IMAGERY/BING (metadata → tile templates). ion attributions displayed (obligation).
+## Goals
 
-## Non-goals (v1)
+1. **`tuile-core`**: the complete 3D Tiles and globe logic, render-agnostic and
+   wasm-compatible. This is the central asset; everything else is a façade, a
+   binding or a renderer.
+2. **The globe**: quantized-mesh terrain (`tuile-terrain`) crossed with raster
+   imagery (`tuile-planetary`), from interchangeable sources. Commercial
+   sources come through connector crates with runtime credentials, never
+   committed; open sources (open terrain, open orthophotos, slippy maps) are
+   first-class, not a fallback.
+3. **Renderers for every mode** on one shading and one scene:
+   - interactive native and browser (`tuile-wgpu`, `tuile-viewer`, `tuile-web`);
+   - mobile;
+   - stereo and spatial video;
+   - offline film (`tuile-film-*`).
+4. **A physically grounded look shared by every mode**:
+   - an atmosphere and sky that follow the time and the place (`tuile-atmosphere`);
+   - radiometric calibration of imagery (`tuile-radiometry`);
+   - per-frame light.
+5. **Serving** (`tuile-tile-server`, `tuile-pack-*`): the geometry server's
+   network middleware, a tile store of PMTiles archives, and static 3D Tiles
+   over cacheable HTTP. Deployable as a native binary or at the edge.
+6. **Bridges to other ecosystems**, as consumers of the geometry server like
+   any other: OpenUSD export and Hydra (`tuile-usd`, `tuile-hydra`), later
+   platform-native façades.
 
-- **No tiling/tile generation** from raw sources (PostGIS, mesh). We serve and consume existing data. (On-the-fly generation = post-v1 track.)
-- **No live Hydra/OpenUSD delegate** nor RealityKit client in v1 — but Hydra is the **designated second consumer of the streaming mode** (after the wgpu viewer): the `GeometryStream` trait and the future specialized façade `tuile-hydra` (there is no generic FFI façade — each host has its own: hydra, swift, unity) must be designed for it from the start, without refactoring the core.
-- **No gRPC in v1.** The static mode is HTTP GET (CDN-cacheable); the streaming mode goes over WebSocket. Connect RPC is the chosen track for later (control plane), never pure gRPC as the sole interface.
-- **No pnts point clouds** in v1 (a natural extension afterward).
+## Non-goals (for now)
+
+- **No tile generation** from raw sources (PostGIS, meshes). Tuile serves and
+  consumes existing data, and on-the-fly generation stays a later track.
+  Caching, re-packing and calibrating existing tiles are in scope.
+- **No gRPC as the sole interface.** Static mode is HTTP GET (CDN-cacheable)
+  and streaming is a WebSocket. Connect RPC is the chosen path for a control
+  plane.
+- **No pnts point clouds** yet. They are a natural extension.
+- **No mode-specific fork of the engine.** A render mode that needs its own
+  traversal, cache or shading is a design error to fix in the shared layers.
 
 ## Legal and naming constraints
 
-- The project is called **Tuile** (crates `tuile-core`, `tuile-wgpu`, `tuile-server`, `tuile-usd`; binary `tuile`). Name verified free on crates.io — to be reserved quickly (publish a 0.0.1 skeleton); check the GitHub org `tuile` / `tuile-rs` and possibly `tuile.dev`.
-- The 3D Tiles spec is a community OGC standard, free to implement. No obligation.
-- The open-source reference implementations of the standard are Apache-2.0: algorithmic inspiration is free and without obligation; literal porting (to be avoided) requires attribution (NOTICE + comment at the head of the ported code).
-- No third-party brand in crate/type/binary names nor in public documentation: the project defines itself by the OGC standard, not relative to other products. Single exception: **connector** crates name the service they connect to (nominative use, e.g. `tuile-cesium-ion`) — and only them.
-- No tokens or data from proprietary services (tile SaaS, Google, Bing) in the repo, the fixtures, or the examples. Fixtures = free tilesets only.
+- The project is called **Tuile**: crates `tuile-*`, binary `tuile`.
+- The 3D Tiles spec is a community OGC standard, free to implement.
+- The open-source reference implementations of the standard are Apache-2.0.
+  Algorithmic inspiration is free and creates no obligation. Literal porting,
+  to be avoided, requires attribution: NOTICE plus a comment at the head of the
+  ported code.
+- No third-party brand in crate, type or binary names, nor in public
+  documentation: the project defines itself by the OGC standard, not relative
+  to other products. Single exception: **connector** crates name the service
+  they connect to (nominative use, e.g. `tuile-cesium-ion`), and only them.
+- No tokens or data from proprietary services in the repository, the fixtures
+  or the examples. Fixtures are free tilesets only. Derived layers built from
+  commercial imagery are checked against its licence before they are stored or
+  served.
 - License: `MIT OR Apache-2.0`. Copyright lapoule.dev.
 
-## Target user v1
+## Who it is for
 
-1. A dev who has a tileset (out of pg2b3dm or a photogrammetry pipeline) and wants to serve it cleanly: `tuile serve ./my-tileset/` and that's it.
-2. A Rust dev who wants to display a tileset in their wgpu/Bevy app without embedding C++.
-3. An iOS dev who wants a USDZ of a geographic area for AR Quick Look / RealityKit.
+1. **A web developer** who wants a globe or a tileset in a page, without a
+   proprietary client.
+2. **A Rust or game-engine developer** who wants geospatial 3D in a native, mobile
+   or headset app, without embedding C++.
+3. **A product** that needs the same scene interactive in its app, as a film
+   for sharing, and in a headset, from one engine and one look.
+4. **Someone with a tileset** who wants to serve it cleanly: `tuile serve
+   ./my-tileset/` and that's it.
+5. **A host ecosystem** (OpenUSD, platform scene graphs) that wants the
+   geometry streamed in and drawn its own way.
