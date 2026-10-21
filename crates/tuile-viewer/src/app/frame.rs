@@ -448,6 +448,11 @@ impl App {
                 frame.colour,
                 Some(frame.resolve),
                 frame.size,
+                // The picture, not the frame: this pass is held to the same
+                // rectangle the frame's own pass was, or a HUD laid out in
+                // fractions of the film would be laid out in fractions of
+                // the window instead.
+                box_.into(),
             );
         };
         let outcome = match &mut active.screen {

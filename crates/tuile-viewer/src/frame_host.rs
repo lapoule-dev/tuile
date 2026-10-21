@@ -316,6 +316,18 @@ impl Letterbox {
     }
 }
 
+/// The same rectangle, as the renderer scissors a pass to it.
+impl From<Letterbox> for tuile_wgpu::Picture {
+    fn from(box_: Letterbox) -> Self {
+        Self {
+            x: box_.x,
+            y: box_.y,
+            width: box_.width,
+            height: box_.height,
+        }
+    }
+}
+
 /// The shapes a host adds to the scene, by layer.
 ///
 /// A **layer** is a name the host chooses — `"flight"`, `"paths"`, `"hud"` —

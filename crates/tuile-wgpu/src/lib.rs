@@ -54,4 +54,4 @@ pub use surface::{
     FrameOnTexture, FramePass, Presented, SurfaceFormat,
 };
 pub use targets::FrameTargets;
-pub use world_overlay::{WorldOverlayError, WorldOverlayRenderer, WorldOverlayView};
+pub use world_overlay::{Picture, WorldOverlayError, WorldOverlayRenderer, WorldOverlayView};

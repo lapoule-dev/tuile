@@ -229,6 +229,33 @@ impl Growing {
     }
 }
 
+/// Where the picture sits inside the frame it is drawn into, in device
+/// pixels from the top-left.
+///
+/// The whole frame unless the camera is held to a fixed shape, and then the
+/// largest rectangle of that shape, centred — the bars around it belong to
+/// no pass. The viewer builds one from its own letterbox; a host drawing
+/// into a frame it owns outright passes [`Picture::whole`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Picture {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Picture {
+    /// The whole of a frame of `size`: no bars, nothing cropped.
+    pub fn whole(size: (u32, u32)) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width: size.0,
+            height: size.1,
+        }
+    }
+}
+
 /// Draws `tuile_overlay::OverlayMesh` in the world, through the frame's
 /// camera.
 ///
@@ -473,6 +500,15 @@ impl WorldOverlayRenderer {
     /// The depth is this renderer's, cleared to the far plane, so the ground
     /// is nothing to these shapes.
     ///
+    /// `picture` is where the picture sits in that attachment — the whole of
+    /// it unless the frame is letterboxed to a fixed shape. The pass is held
+    /// to it exactly as the frame's own pass is, because these shapes are
+    /// laid out in fractions of the *picture*: a HUD band at 0.9 of the
+    /// height is 0.9 of the film, not 0.9 of a window that happens to be
+    /// taller. Given the whole frame instead, a badge stretches to the
+    /// window's shape and a band meant for the foot of the picture lands in
+    /// the bar below it.
+    ///
     /// Nothing happens when no mesh asked for it, and resizing the frame is
     /// simply calling it at the new size.
     pub fn render_overlays_only(
@@ -482,6 +518,7 @@ impl WorldOverlayRenderer {
         colour: &wgpu::TextureView,
         resolve: Option<&wgpu::TextureView>,
         size: (u32, u32),
+        picture: Picture,
     ) {
         if !self.needs_own_depth() {
             return;
@@ -538,6 +575,17 @@ impl WorldOverlayRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        if picture.width != 0 && picture.height != 0 {
+            pass.set_viewport(
+                picture.x as f32,
+                picture.y as f32,
+                picture.width as f32,
+                picture.height as f32,
+                0.0,
+                1.0,
+            );
+            pass.set_scissor_rect(picture.x, picture.y, picture.width, picture.height);
+        }
         self.draw(&mut pass, |p| p == Pass::OverlaysOnly);
     }
 

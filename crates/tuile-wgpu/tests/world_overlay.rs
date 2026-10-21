@@ -284,6 +284,12 @@ fn render_in(
         &msaa_view,
         Some(&resolved_view),
         (SIZE, SIZE),
+        tuile_wgpu::Picture {
+            x: box_.x,
+            y: box_.y,
+            width: box_.width,
+            height: box_.height,
+        },
     );
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
@@ -659,4 +665,59 @@ fn a_letterboxed_picture_keeps_its_bars_clear() {
         full.covered(1, 128) as u32 > SIZE * SIZE * 9 / 10,
         "unboxed, the same mesh covers the frame"
     );
+}
+
+/// The same, for the pass that draws against overlays alone.
+///
+/// `OverlayDepth::OverlaysOnly` runs in a pass of its own, after the frame's
+/// — and that pass used to be given the whole frame while the frame's was
+/// scissored to the picture. Everything in it, which is every instrument a
+/// film puts over its picture, was laid out in fractions of the *window*: a
+/// badge took the window's shape instead of the film's, and a band meant for
+/// the foot of the picture was drawn in the bar below it. One pass obeying
+/// the letterbox and the other ignoring it is the bug this holds shut.
+#[test]
+fn the_overlays_own_pass_is_held_to_the_picture_too() {
+    let Some(gpu) = gpu() else { return };
+    let earth = 6_378_137.0;
+    let eye = DVec3::new(earth + 1_000.0, 0.0, 0.0);
+    let camera = view(eye, DVec3::new(earth, 0.0, 0.0), Vec3::Z);
+    // Big enough to cover everything the camera can see, in the overlays'
+    // own pass rather than the frame's.
+    let everything = plate(
+        DVec3::new(earth + 500.0, 0.0, 0.0),
+        40_000.0,
+        [0.0, 1.0, 0.0, 1.0],
+        OverlayDepth::OverlaysOnly,
+        OverlayBlend::Opaque,
+    );
+    let height = SIZE / 2;
+    let box_ = Box_ {
+        x: 0,
+        y: (SIZE - height) / 2,
+        width: SIZE,
+        height,
+    };
+    let frame = render_in(
+        &gpu,
+        std::slice::from_ref(&everything),
+        camera,
+        BLACK,
+        None,
+        box_,
+    );
+    assert!(
+        frame.at(SIZE / 2, SIZE / 2)[1] > 200,
+        "the overlays are drawn in full inside the box"
+    );
+    for y in [0, box_.y - 1, box_.y + box_.height, SIZE - 1] {
+        for x in [0, SIZE / 2, SIZE - 1] {
+            let p = frame.at(x, y);
+            assert_eq!(
+                p,
+                [0, 0, 0, 255],
+                "a bar at ({x}, {y}) is the clear, not {p:?}"
+            );
+        }
+    }
 }
