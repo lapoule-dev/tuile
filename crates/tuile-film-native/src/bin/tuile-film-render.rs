@@ -22,6 +22,11 @@
 //!                         share, as the renderer is handed them; write
 //!                         seams.csv (a row a frame) and seam-pairs.csv (the
 //!                         stretches over the tolerance)
+//!   --discs <dir>         measure the light of the sun's and the Moon's
+//!                         discs in each frame against what the air lets
+//!                         through (`discs::DiscEnergy`); write
+//!                         discs.parquet (a row a disc a frame). Under
+//!                         --atmosphere.
 //!   --seams-tolerance <px>  what a residual is held against (0.25)
 //!   --seams-strict        fail if, in the picture, any stretch is over it
 //!                         or any edge has nothing drawn across it
@@ -396,6 +401,9 @@ impl Observer for Two<'_> {
         self.0.frame(frame);
         self.1.frame(frame);
     }
+    fn wants_light(&self) -> bool {
+        self.0.wants_light() || self.1.wants_light()
+    }
 }
 
 /// The pictures to several sinks at once.
@@ -678,6 +686,17 @@ async fn main() -> Result<(), Error> {
         (None, true) => &mut meter,
         (None, false) => &mut nobody,
     };
+    // The light of the sun's and the Moon's discs, beside whatever else
+    // watches.
+    let mut discs = value("--discs").map(tuile_film_native::DiscEnergy::into);
+    let mut with_discs;
+    let observer: &mut dyn Observer = match discs.as_mut() {
+        Some(discs) => {
+            with_discs = Two(discs, observer);
+            &mut with_discs
+        }
+        None => observer,
+    };
 
     let mut shapes = Shapes(Vec::new());
     if let Some(points) = value("--ribbon") {
@@ -739,6 +758,12 @@ async fn main() -> Result<(), Error> {
         let store = ObjectRunStore::bucket(&config, Tuning::from_env())?;
         let bytes = store.put(std::path::Path::new(&out), &key).await?;
         println!("film written to the bucket: {key} ({bytes} bytes)");
+    }
+    if let Some(discs) = &discs {
+        println!("{}", discs.summary());
+        if let Some(path) = discs.write()? {
+            println!("discs: {}", path.display());
+        }
     }
     if let Some(seams) = &seams {
         println!("{}", seams.summary());

@@ -13,6 +13,8 @@ async-trait = { workspace = true }
 dotenvy = { workspace = true }
 futures-util = { workspace = true }
 glam = { workspace = true }
+# The disc instrument's table (`discs.parquet`).
+parquet = { workspace = true }
 image = { workspace = true }
 # Pure Rust, any picture size. Without its assembly it is slow; it is the
 # encoder a machine has when it has nothing else.
@@ -28,7 +30,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tuile-core = { version = "0.14.0", path = "../tuile-core" }
 # The sun of a frame's instant, when a clock is given (`Order::clock`).
-tuile-atmosphere = { version = "0.14.0", path = "../tuile-atmosphere" }
+tuile-atmosphere = { version = "0.14.0", path = "../tuile-atmosphere", features = ["wgpu"] }
 # The clock of a time-lapse, as its tape's maker writes it.
 tuile-tape = { version = "0.14.0", path = "../tuile-tape" }
 tuile-farm = { version = "0.14.0", path = "../tuile-farm" }
