@@ -784,9 +784,9 @@ impl LutAtmosphere {
         let meter = calibration.camera.meter_reflectance;
         if !metering.is_empty() {
             let mut sum = [0.0; 3];
-            let mut counted = 0usize;
+            let mut weights = 0.0;
             for m in metering {
-                let l = match *m {
+                let (l, weight) = match *m {
                     Metered::Ground { eye, point } => {
                         let g = tuile_core::geo::ecef_to_geodetic(point);
                         let l = tabled(g.height, enu_frame(g).z_axis);
@@ -809,18 +809,25 @@ impl LutAtmosphere {
                                 added[c] += m.inscattered[c] * strength;
                             }
                         }
-                        [0, 1, 2]
-                            .map(|c| l[c] * agree(c) * through[c] + added[c] * scale[c] / meter)
+                        (
+                            [0, 1, 2].map(|c| {
+                                l[c] * agree(c) * through[c] + added[c] * scale[c] / meter
+                            }),
+                            1.0,
+                        )
                     }
                     Metered::Sky { eye, direction } => {
                         let g = tuile_core::geo::ecef_to_geodetic(eye);
                         let local = enu_frame(g).transpose();
                         let dir = (local * direction).normalize_or(DVec3::Z);
-                        // Space, past the air: no light to meter, and not
-                        // counted — a frame of the limb is exposed for the
-                        // limb and the Earth, not for the black around them.
-                        if sphere_entry(LUT_RADIUS + g.height.max(0.0), dir.z, self.top()).is_none()
-                        {
+                        // As much as the air it crosses: a ray through the
+                        // air counts whole, one past it into space not at
+                        // all, and one between by its air — so that a frame
+                        // of the limb is exposed for the limb and the Earth,
+                        // not for the black around them, and an eye that
+                        // climbs out of the air meets no step.
+                        let weight = self.meter_weight(g.height, dir.z);
+                        if weight <= 0.0 {
                             continue;
                         }
                         let mut l = self.sky_radiance(g.height, dir, local * to_sun);
@@ -830,16 +837,19 @@ impl LutAtmosphere {
                                 l[c] += m[c] * strength;
                             }
                         }
-                        [0, 1, 2].map(|c| l[c] * scale[c] / meter)
+                        ([0, 1, 2].map(|c| l[c] * scale[c] / meter), weight)
                     }
                 };
-                counted += 1;
+                weights += weight;
                 for c in 0..3 {
-                    sum[c] += l[c];
+                    sum[c] += l[c] * weight;
                 }
             }
-            if counted > 0 {
-                metered = sum.map(|v| v / counted as f64);
+            // A frame that sees nothing but space is exposed for the light
+            // here, and one that sees a little air for that air: the two
+            // joined continuously.
+            for c in 0..3 {
+                metered[c] = (sum[c] + level[c] * METER_FLOOR) / (weights + METER_FLOOR);
             }
         }
 
@@ -922,6 +932,17 @@ impl LutAtmosphere {
             frame: AtmosphereFrame::at(at),
             height,
         }
+    }
+
+    /// How much a meter's ray of the sky from `height` at zenith cosine
+    /// `mu` counts: by the air it crosses, whole once its optical depth is
+    /// [`METER_AIR`] of the air's from the ground straight up, nothing past
+    /// the air — continuous in the eye and the ray.
+    pub fn meter_weight(&self, height: f64, mu: f64) -> f64 {
+        let depth = |r: f64, mu: f64| -self.transmittance(r, mu)[1].max(1e-30).ln();
+        let column = depth(LUT_RADIUS, 1.0);
+        let r = LUT_RADIUS + height.max(0.0);
+        (depth(r, mu) / (METER_AIR * column)).clamp(0.0, 1.0)
     }
 
     /// The sky's light at `height` under one light along `light` (`z` up):
@@ -1033,6 +1054,17 @@ pub fn metering(
 /// The reflectance a camera's meter takes a scene for: middle grey. Sky is
 /// metered as the light that would make ground of it as bright.
 pub const METER_REFLECTANCE: f64 = 0.18;
+
+/// The share of the air's optical depth from the ground straight up a
+/// meter's ray of the sky must cross to count whole
+/// ([`LutAtmosphere::meter_weight`]): a hundredth, which every ray from
+/// under some 35 km crosses — there, every ray of the sky counts whole.
+pub const METER_AIR: f64 = 0.01;
+
+/// How many rays' worth the light at the eye's ground weighs in the meter:
+/// what exposes a frame of space alone, and nothing beside a frame that
+/// holds any air or ground.
+pub const METER_FLOOR: f64 = 1e-3;
 
 /// What one frame's light is worked out from: where the sun is, the Moon
 /// if it is placed, and the exposure chosen on top.

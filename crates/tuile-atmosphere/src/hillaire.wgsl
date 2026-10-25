@@ -330,9 +330,13 @@ fn air_between(p: vec3f) -> AirRay {
 // Where a ray from radius `r` at zenith cosine `mu` meets the ground, or a
 // negative number.
 fn ground_distance(r: f32, mu: f32, height: f32) -> f32 {
-    let disc = r * r * mu * mu - height * (2.0 * LUT_RADIUS + height);
+    let c = height * (2.0 * LUT_RADIUS + height);
+    let disc = r * r * mu * mu - c;
     if (mu >= 0.0 || disc < 0.0) { return -1.0; }
-    return -r * mu - sqrt(disc);
+    // The near root as the product of the roots over the far one: no
+    // cancellation, so an eye on the ground meets it at once rather than
+    // a rounding short of it.
+    return c / (-r * mu + sqrt(disc));
 }
 
 // The sky seen from `height` along `dir` under one light along `light`,

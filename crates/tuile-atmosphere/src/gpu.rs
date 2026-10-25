@@ -438,7 +438,10 @@ impl AtmosphereGpu {
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("atmosphere"),
             size: std::mem::size_of::<AtmosphereUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            // Copied from, for a test that reads back what a frame drew with.
+            usage: wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {

@@ -8,6 +8,10 @@
 // says what the sky or the lit ground is. Included after `hillaire.wgsl`,
 // whose bindings it reads: the sky's the sky-view tables besides.
 
+// The share of the air's thickness from which the sky is blended from the
+// tables towards the march, all of it march at the top.
+const SKY_BLEND: f32 = 0.7;
+
 // The physical sky along `d` from the frame's eye: what the air sends
 // under the sun and under the Moon — from the frame's sky-view tables in
 // the air, marched along the ray itself from above it, where the air is a
@@ -20,8 +24,14 @@ fn sky_seen(d: vec3f, star_sigma: f32) -> vec3f {
     let n = normalize(d);
     let h = atmosphere.sun.w;
     let up = atmosphere.up.xyz;
+    // In the air, from the sky-view tables; from above it, marched along
+    // the ray, where the air is a band a few degrees thick along the limb
+    // that no table row could hold. Between the two a band of heights where
+    // both are summed and blended, so that an eye climbing out of the air
+    // meets no step: one sky, continuous in the eye's height.
+    let marched = smoothstep(SKY_BLEND * atmosphere.shape.y, atmosphere.shape.y, h);
     var air = vec3f(0.0);
-    if (h > atmosphere.shape.y) {
+    if (marched > 0.0) {
         var axis = vec3f(0.0, 0.0, 1.0);
         if (abs(up.z) > 0.9) { axis = vec3f(1.0, 0.0, 0.0); }
         let east = normalize(cross(axis, up));
@@ -34,12 +44,15 @@ fn sky_seen(d: vec3f, star_sigma: f32) -> vec3f {
             air += sky_radiance(h, local, vec3f(dot(m, east), dot(m, north), dot(m, up)))
                 * atmosphere.moon.w;
         }
-    } else {
-        air = lut_bilinear(sky_view_lut, sky_view_uv_of(d, atmosphere.sun.xyz)).rgb;
+        air *= marched;
+    }
+    if (marched < 1.0) {
+        var tabled = lut_bilinear(sky_view_lut, sky_view_uv_of(d, atmosphere.sun.xyz)).rgb;
         if (atmosphere.moon.w > 0.0) {
-            air += lut_bilinear(moon_view_lut, sky_view_uv_of(d, atmosphere.moon.xyz)).rgb
+            tabled += lut_bilinear(moon_view_lut, sky_view_uv_of(d, atmosphere.moon.xyz)).rgb
                 * atmosphere.moon.w;
         }
+        air += tabled * (1.0 - marched);
     }
     var sky = max(air * atmosphere.illuminance.xyz + atmosphere.floor.xyz, atmosphere.least_sky.xyz);
     // Behind the air, unless the planet stands before it.

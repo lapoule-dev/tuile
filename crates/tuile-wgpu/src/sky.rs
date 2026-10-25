@@ -8,65 +8,35 @@
 //! The model and the code that draws it are `tuile_atmosphere`'s — its
 //! tables, its sky-view pass, its uniform, and `sky_seen`/`ground_seen` in
 //! WGSL — the very ones a film renders with. What is this renderer's own is
-//! when the light is worked out again:
+//! how a frame is lit: every frame, from that frame alone.
 //!
 //! - **the sun and the Moon** are one direction each at the instant (ECEF),
 //!   from their ephemerides. Every ground fragment and every line of sight
 //!   is lit by them where it is, so one frame holds a day side and a night
 //!   side, a terminator, a midnight sun near the pole;
 //! - **the frame's light** — the exposure, the white balance, the sky's
-//!   harmonic, all metered over what the camera sees
-//!   ([`tuile_atmosphere::LutAtmosphere::light`], some milliseconds of CPU)
-//!   — is worked out again when the sun or the Moon has moved by
-//!   [`LIGHT_SUN_STEP`], the eye by a share of its height, or the view has
-//!   turned, and never more often than [`LIGHT_INTERVAL`]: a sun hurried a
-//!   thousandfold by a host's clock still costs four of them a second;
-//! - **the sky-view tables** (Hillaire's per-eye table) are made again on
-//!   the GPU with each light, and in between when the eye has climbed,
-//!   descended or travelled enough that the horizon it holds would be off;
+//!   harmonic, all metered over what the camera sees — is made on the GPU
+//!   every frame ([`tuile_atmosphere::frame_light`]), as a continuous
+//!   function of the frame's eye, view, ground, sun and Moon: no threshold
+//!   to cross, no interval to wait, nothing kept from the frame before;
+//! - **the sky-view tables** (Hillaire's per-eye table) are made on the
+//!   GPU every frame, from the frame's own eye;
 //! - the tables of the air itself are a clear day's, read rather than
 //!   computed ([`tuile_atmosphere::LutAtmosphere::of`]).
 //!
-//! Between those, a frame writes one uniform: the air's sphere placed from
-//! its eye, and the stars turned to its instant.
+//! The CPU writes the frame's geometry — the air's sphere placed from its
+//! eye, the sun, the Moon, the stars turned to its instant — and the GPU
+//! the light over it: nothing is read back.
 
 use glam::DMat3;
 use glam::{DMat4, DVec3, Mat4};
+use tuile_atmosphere::frame_light::{FrameLightInputs, FrameLightPass};
 use tuile_atmosphere::gpu::{AtmosphereGpu, AtmosphereUniform, SkyViewPass};
 use tuile_atmosphere::hillaire::{metering, Moment};
 use tuile_atmosphere::{
     AtmosphereFrame, AtmosphereParams, LutAtmosphere, Moon, Moonlight, SkyLook, Sun,
 };
 use tuile_core::geo::{ecef_to_geodetic, geodetic_to_ecef, Geodetic};
-
-/// How far, in radians, the sun or the Moon moves before a frame's light
-/// is worked out again: a fifth of the sun's disc, twelve seconds of a real
-/// sun's day.
-pub const LIGHT_SUN_STEP: f64 = 0.05 * std::f64::consts::PI / 180.0;
-
-/// The shortest time between two lights, wall seconds, however fast the sun
-/// moves or the eye travels: a quarter of a second.
-pub const LIGHT_INTERVAL: f64 = 0.25;
-
-/// How far the view may turn, in radians, before the light is metered
-/// again over what it now sees.
-const LIGHT_VIEW_STEP: f64 = 4.0 * std::f64::consts::PI / 180.0;
-
-/// The share of its height over the ground the eye may move before the
-/// light — and the sky-view, its horizon — is worked out again.
-const EYE_STEP: f64 = 0.02;
-
-/// How far, as a log of the ratio, the eye's height over the ground under
-/// it may change before the light is metered again: a tenth.
-const GROUND_STEP: f64 = 0.1;
-
-/// How far the sun moves in one frame, radians, for a jump: a degree,
-/// four minutes of a real sun — what a host setting its clock does, and no
-/// clock running does from one frame to the next.
-const JUMP_SUN: f64 = std::f64::consts::PI / 180.0;
-
-/// How many times [`EYE_STEP`] the eye moves in one frame for a jump.
-const JUMP_EYE: f64 = 10.0;
 
 /// Where the lights of one frame are: towards the sun and the Moon from
 /// the planet, and the stars' turn — whichever [`Lights`] put them there.
@@ -418,37 +388,15 @@ impl Atmosphere {
     }
 }
 
-/// What a frame's light was worked out from.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct LightKey {
-    to_sun: DVec3,
-    to_moon: Option<DVec3>,
-    eye: DVec3,
-    forward: DVec3,
-    clearance: f64,
-    at: f64,
-}
-
-/// What the sky-view was made from.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct ViewKey {
-    eye: DVec3,
-    clearance: f64,
-}
-
 pub(crate) struct Sky {
     pub(crate) atmosphere: AtmosphereGpu,
+    /// The frame's light, made on the GPU every frame.
+    pub(crate) light: FrameLightPass,
     params: AtmosphereParams,
     look: SkyLook,
-    light_key: Option<LightKey>,
-    view_key: Option<ViewKey>,
-    /// The last frame's sun and eye: what tells a jump — a host's clock set
-    /// forward, a camera sent across the globe — from motion.
-    last: Option<(DVec3, DVec3)>,
-    exposure: f32,
     on: bool,
-    /// How many times the light was worked out, and the sky-view made: what
-    /// a test or a profile reads to see the budget kept.
+    /// How many times the light was worked out, and the sky-view made:
+    /// once a frame each.
     pub(crate) lights: u64,
     pub(crate) views: u64,
 }
@@ -456,20 +404,19 @@ pub(crate) struct Sky {
 impl Sky {
     pub(crate) fn new(device: &wgpu::Device, full_layout: &wgpu::BindGroupLayout) -> Self {
         // Made in compute where the device has compute; drawn where it has
-        // not (WebGL2). The same texel sums either way.
+        // not (WebGL2). The same sums either way.
         let pass = if device_has_compute(device) {
             SkyViewPass::Compute
         } else {
             SkyViewPass::Render
         };
+        let atmosphere = AtmosphereGpu::new(device, full_layout, pass);
+        let light = FrameLightPass::new(device, &atmosphere, pass);
         Self {
-            atmosphere: AtmosphereGpu::new(device, full_layout, pass),
+            atmosphere,
+            light,
             params: AtmosphereParams::default(),
             look: SkyLook::default(),
-            light_key: None,
-            view_key: None,
-            last: None,
-            exposure: 1.0,
             on: false,
             lights: 0,
             views: 0,
@@ -480,16 +427,9 @@ impl Sky {
         self.on
     }
 
-    pub(crate) fn exposure(&self) -> f32 {
-        self.exposure
-    }
-
     pub(crate) fn set_air(&mut self, params: AtmosphereParams, look: SkyLook) {
-        if (params, look) != (self.params, self.look) {
-            self.params = params;
-            self.look = look;
-            self.light_key = None;
-        }
+        self.params = params;
+        self.look = look;
     }
 
     pub(crate) fn off(&mut self, queue: &wgpu::Queue) {
@@ -503,10 +443,12 @@ impl Sky {
         }
     }
 
-    /// The frame's uniform, and — when the sun, the Moon or the eye moved
-    /// enough — its light and its sky-view made again.
+    /// The frame's uniform, its light and its sky-view, all of this frame:
+    /// the geometry written from the CPU, the light made on the GPU over
+    /// it, the sky-view made from it — nothing kept from the last frame,
+    /// so that the picture follows the eye, the view and the clock
+    /// continuously.
     pub(crate) fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &SkyFrame) {
-        let now = frame.wall;
         let bodies = frame.bodies;
         let frame = &frame.view;
         let to_sun = bodies.to_sun;
@@ -514,122 +456,58 @@ impl Sky {
             self.off(queue);
             return;
         }
-        let at_eye = ecef_to_geodetic(frame.eye);
-        let moon = bodies.moon;
-        let to_moon = moon.map(|m| m.to_moon_ecef);
-        let clearance = (at_eye.height - frame.ground_height).max(1.0);
-        let moved = |key: &LightKey| {
-            let angle = |a: DVec3, b: DVec3| a.angle_between(b);
-            let moon_moved = match (key.to_moon, to_moon) {
-                (Some(a), Some(b)) => angle(a, b) > LIGHT_SUN_STEP,
-                (None, None) => false,
-                _ => true,
-            };
-            angle(key.to_sun, to_sun) > LIGHT_SUN_STEP
-                || moon_moved
-                || (frame.eye - key.eye).length() > EYE_STEP * key.clearance.min(clearance)
-                || angle(key.forward, frame.forward) > LIGHT_VIEW_STEP
-                // The ground under the eye found to be elsewhere — terrain
-                // streaming in: the meter met the wrong ground.
-                || (clearance / key.clearance).ln().abs() > GROUND_STEP
-        };
-        // A jump since the last frame is answered at once; motion, however
-        // fast, once an interval.
-        let jumped = self.last.is_some_and(|(sun, eye)| {
-            sun.angle_between(to_sun) > JUMP_SUN
-                || (frame.eye - eye).length() > JUMP_EYE * EYE_STEP * clearance
-        });
-        self.last = Some((to_sun, frame.eye));
-        let due = match &self.light_key {
-            None => true,
-            Some(key) => moved(key) && (jumped || now - key.at >= LIGHT_INTERVAL),
-        };
         self.atmosphere
             .hold_with(queue, self.params, LutAtmosphere::of);
-        if due {
-            let model = self.atmosphere.model.as_ref().expect("held above");
-            let reference = self.atmosphere.reference.as_ref().expect("held above");
-            let ground = Geodetic {
-                height: frame.ground_height.clamp(0.0, at_eye.height.max(0.0)),
-                ..at_eye
-            };
-            let (right, up) = view_axes(frame);
-            let metered = metering(
-                frame.eye,
-                frame.forward,
-                right,
-                up,
-                &AtmosphereFrame::at(ground),
-                ground.height,
-            );
-            let light = model.light(
-                reference,
-                ground,
-                Moment {
-                    to_sun_ecef: to_sun,
-                    moon,
-                    compensation_ev: 0.0,
-                },
-                &metered,
-                self.look.calibration,
-            );
-            self.exposure = self.look.exposure_scale(&light);
-            self.atmosphere.light = Some(light);
-            self.light_key = Some(LightKey {
-                to_sun,
-                to_moon,
-                eye: frame.eye,
-                forward: frame.forward,
-                clearance,
-                at: now,
-            });
-            self.view_key = None;
-            self.lights += 1;
-        }
-        let light = self.atmosphere.light.expect("worked out above");
-        // The sky-view's eye: the light's, or a newer one where the eye has
-        // gone far enough from it that the table's horizon would be off.
-        let view_stale = match &self.view_key {
-            None => true,
-            Some(key) => (frame.eye - key.eye).length() > EYE_STEP * key.clearance.min(clearance),
+        let at_eye = ecef_to_geodetic(frame.eye);
+        let ground = Geodetic {
+            height: frame.ground_height.clamp(0.0, at_eye.height.max(0.0)),
+            ..at_eye
         };
-        if view_stale {
-            self.view_key = Some(ViewKey {
-                eye: frame.eye,
-                clearance,
-            });
-        }
-        let view_eye = self.view_key.expect("set above").eye;
+        let (right, up) = view_axes(frame);
+        let metered = metering(
+            frame.eye,
+            frame.forward,
+            right,
+            up,
+            &AtmosphereFrame::at(ground),
+            ground.height,
+        );
+        let inputs = FrameLightInputs::new(
+            ground,
+            frame.eye,
+            Moment {
+                to_sun_ecef: to_sun,
+                moon: bodies.moon,
+                compensation_ev: 0.0,
+            },
+            &metered,
+            self.look.calibration,
+            self.look.exposure_ev,
+            self.look.white_balance,
+            [1.0; 3],
+        );
         let stars = bodies.stars.transpose();
-        let uniform = AtmosphereUniform::new(
-            &self.params,
-            &light,
-            view_eye,
-            self.exposure,
-            stars,
-            &self.look,
-        )
-        .with_planets(&bodies.planets);
-        if view_stale {
-            // Written for the table's own pass, from its own eye, then made.
-            queue.write_buffer(
-                &self.atmosphere.uniform,
-                0,
-                bytemuck::bytes_of(&uniform.seen_from(&light, view_eye)),
-            );
-            self.atmosphere.sky_view_stale = true;
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("tuile sky view"),
-            });
-            self.atmosphere.record_sky_view(&mut encoder);
-            queue.submit([encoder.finish()]);
-            self.views += 1;
-        }
-        let placed = uniform
-            .seen_from(&light, frame.eye)
+        let placed = inputs
+            .uniform(&self.params, frame.eye, stars, &self.look)
+            .with_planets(&bodies.planets)
             .with_eye_from_origin((frame.eye - frame.render_origin).as_vec3());
+        // The geometry, written for this frame's submissions; the light
+        // copied over it on the GPU, then the sky-view made from both.
         queue.write_buffer(&self.atmosphere.uniform, 0, bytemuck::bytes_of(&placed));
+        self.light.write(queue, &inputs);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tuile sky"),
+        });
+        self.light.record(&mut encoder);
+        self.light
+            .copy_into_uniform(&mut encoder, &self.atmosphere.uniform);
+        self.atmosphere.sky_view_stale = true;
+        self.atmosphere.record_sky_view(&mut encoder);
+        queue.submit([encoder.finish()]);
+        self.atmosphere.light = Some(inputs.light);
         self.atmosphere.frame_uniform = placed;
+        self.lights += 1;
+        self.views += 1;
         self.on = true;
     }
 }

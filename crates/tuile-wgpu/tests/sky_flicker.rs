@@ -29,6 +29,9 @@ use tuile_wgpu::{
 const WIDTH: u32 = 384;
 const HEIGHT: u32 = 256;
 const FOV_Y: f64 = 50.0 * std::f64::consts::PI / 180.0;
+/// The limb's pictures: larger, for a band a few pixels thick.
+const LIMB_WIDTH: u32 = 768;
+const LIMB_HEIGHT: u32 = 512;
 const GROUND: f32 = 0.08;
 const PIC_LON: f64 = 0.1418;
 const PIC_LAT: f64 = 42.9365;
@@ -101,6 +104,7 @@ struct Eye {
     at: DVec3,
     forward: DVec3,
     up: DVec3,
+    fov_y: f64,
 }
 
 /// An eye over a place, heading from north and pitch from the horizon,
@@ -120,15 +124,16 @@ fn eye_at(lon: f64, lat: f64, height: f64, heading: f64, pitch: f64) -> Eye {
         at: geodetic_to_ecef(g),
         forward,
         up,
+        fov_y: FOV_Y,
     }
 }
 
-fn clip_from_world(eye: &Eye, clearance: f64) -> DMat4 {
+fn clip_from_world(eye: &Eye, clearance: f64, size: (u32, u32)) -> DMat4 {
     let near = (clearance * 0.25).clamp(0.5, 1.0e6);
     let far = eye.at.length() + 2.0e7;
     glam::dcamera::rh::proj::directx::perspective(
-        FOV_Y,
-        f64::from(WIDTH) / f64::from(HEIGHT),
+        eye.fov_y,
+        f64::from(size.0) / f64::from(size.1),
         near,
         far,
     ) * glam::dcamera::rh::view::look_at_mat4(eye.at, eye.at + eye.forward, eye.up)
@@ -162,30 +167,33 @@ struct Traced {
     views: u64,
     sky: f64,
     ground: f64,
+    /// The brightest the limb is: the largest luma of the central columns
+    /// over the horizon, which is the picture's middle row.
+    limb: f64,
 }
 
-fn luma(rgba: &[u8], rows: std::ops::Range<u32>) -> f64 {
+fn luma_at(rgba: &[u8], width: u32, x: u32, y: u32) -> f64 {
+    let i = ((y * width + x) * 4) as usize;
+    let [r, g, b] = [rgba[i], rgba[i + 1], rgba[i + 2]].map(f64::from);
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+fn luma(rgba: &[u8], width: u32, rows: std::ops::Range<u32>) -> f64 {
     let mut sum = 0.0;
     let mut n = 0.0;
     for y in rows {
-        for x in 0..WIDTH {
-            let i = ((y * WIDTH + x) * 4) as usize;
-            let [r, g, b] = [rgba[i], rgba[i + 1], rgba[i + 2]].map(f64::from);
-            sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        for x in 0..width {
+            sum += luma_at(rgba, width, x, y);
             n += 1.0;
         }
     }
     sum / n
 }
 
-/// Draws `eyes` one after the other through one renderer at `FPS`, its
-/// clock stopped an hour before the Pic's sunset, and traces each frame.
-fn fly(gpu: &GpuContext, eyes: &[Eye], trace: Option<&std::path::Path>) -> Vec<Traced> {
-    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let mut renderer = TileRenderer::new(gpu, format);
-    let tiles = ground(gpu, eyes[0].at, 3, 8, 6);
+/// The instant an hour before the Pic's sunset on midsummer's day 2026.
+fn before_sunset() -> f64 {
     let start = 1_782_043_200.0; // 2026-06-21 12:00 UTC
-    let sunset = tuile_atmosphere::Sun::next_sunset(
+    tuile_atmosphere::Sun::next_sunset(
         start,
         Geodetic {
             lon: PIC_LON.to_radians(),
@@ -193,14 +201,30 @@ fn fly(gpu: &GpuContext, eyes: &[Eye], trace: Option<&std::path::Path>) -> Vec<T
             height: 0.0,
         },
     )
-    .expect("the sun sets over the Pyrenees in June");
-    let instant = sunset - 3_600.0;
-    let targets = FrameTargets::new(gpu, format, (WIDTH, HEIGHT));
+    .expect("the sun sets over the Pyrenees in June")
+        - 3_600.0
+}
+
+/// Draws `eyes` one after the other through one renderer at `FPS`, its
+/// clock stopped at `instant`, over `tiles` at `size`, and traces each
+/// frame — into `trace`'s `trace.csv` and `frame-NNNN.png`, if given.
+fn fly(
+    gpu: &GpuContext,
+    tiles: &[PreparedTile],
+    eyes: &[Eye],
+    instant: f64,
+    size: (u32, u32),
+    trace: Option<&std::path::Path>,
+) -> Vec<Traced> {
+    let (width, height_px) = size;
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let mut renderer = TileRenderer::new(gpu, format);
+    let targets = FrameTargets::new(gpu, format, size);
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("flicker"),
         size: wgpu::Extent3d {
-            width: WIDTH,
-            height: HEIGHT,
+            width,
+            height: height_px,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -217,7 +241,7 @@ fn fly(gpu: &GpuContext, eyes: &[Eye], trace: Option<&std::path::Path>) -> Vec<T
         let clearance = (height - TERRAIN).max(1.0);
         // The viewer's render origin is its camera, every frame.
         let origin = eye.at;
-        for tile in &tiles {
+        for tile in tiles {
             tile.rebase(&gpu.queue, origin);
         }
         let sun = tuile_atmosphere::Sun::at_unix_seconds(instant);
@@ -225,7 +249,7 @@ fn fly(gpu: &GpuContext, eyes: &[Eye], trace: Option<&std::path::Path>) -> Vec<T
         renderer.set_view(
             &gpu.queue,
             &ViewUniform {
-                view_proj: view_proj_from_world(clip_from_world(eye, clearance), origin),
+                view_proj: view_proj_from_world(clip_from_world(eye, clearance, size), origin),
                 sun_dir: [travel.x, travel.y, travel.z, 0.0],
                 params: [0.25, 0.0, 0.0, 0.0],
                 atmosphere: tuile_atmosphere::AerialPerspective::new(eye.at, origin, &sun, 0.0),
@@ -236,9 +260,9 @@ fn fly(gpu: &GpuContext, eyes: &[Eye], trace: Option<&std::path::Path>) -> Vec<T
             render_origin: origin,
             forward: eye.forward,
             up: eye.up,
-            fov_y: FOV_Y,
-            aspect: f64::from(WIDTH) / f64::from(HEIGHT),
-            height_px: HEIGHT,
+            fov_y: eye.fov_y,
+            aspect: f64::from(width) / f64::from(height_px),
+            height_px,
             ground_height: TERRAIN,
         };
         renderer.set_sky(gpu, Some(&view.at(instant, wall)));
@@ -263,22 +287,30 @@ fn fly(gpu: &GpuContext, eyes: &[Eye], trace: Option<&std::path::Path>) -> Vec<T
             },
             |_, _| {},
         );
-        let pixels = readback.take(gpu, (WIDTH, HEIGHT)).expect("read back");
-        let u = renderer.sky_uniform().expect("the sky is on");
+        let pixels = readback.take(gpu, size).expect("read back");
+        let light = renderer.read_sky_light(gpu).expect("the sky is on");
+        let u = light.uniform;
         let (lights, views) = renderer.sky_updates();
+        let mut limb = 0.0f64;
+        for y in 0..=height_px / 2 {
+            for x in width * 9 / 20..width * 11 / 20 {
+                limb = limb.max(luma_at(&pixels, width, x, y));
+            }
+        }
         let traced = Traced {
             height,
-            exposure: renderer.sky_exposure().expect("the sky is on"),
+            exposure: light.exposure,
             grade: [u.grade[0], u.grade[1], u.grade[2]],
             ambient: u.ambient[1],
             lights,
             views,
             // The top eighth is sky all the way; the bottom quarter ground.
-            sky: luma(&pixels, 0..HEIGHT / 8),
-            ground: luma(&pixels, HEIGHT * 3 / 4..HEIGHT),
+            sky: luma(&pixels, width, 0..height_px / 8),
+            ground: luma(&pixels, width, height_px * 3 / 4..height_px),
+            limb,
         };
         if let Some(dir) = trace {
-            image::RgbaImage::from_raw(WIDTH, HEIGHT, pixels)
+            image::RgbaImage::from_raw(width, height_px, pixels)
                 .expect("image")
                 .save(dir.join(format!("frame-{n:04}.png")))
                 .expect("save frame");
@@ -287,11 +319,11 @@ fn fly(gpu: &GpuContext, eyes: &[Eye], trace: Option<&std::path::Path>) -> Vec<T
     }
     if let Some(dir) = trace {
         let mut csv = String::from(
-            "frame,wall,height,exposure,wb_r,wb_g,wb_b,ambient_g,lights,views,sky_luma,ground_luma\n",
+            "frame,wall,height,exposure,wb_r,wb_g,wb_b,ambient_g,lights,views,sky_luma,ground_luma,limb_luma\n",
         );
         for (n, t) in out.iter().enumerate() {
             csv += &format!(
-                "{n},{:.4},{:.1},{:.6},{:.6},{:.6},{:.6},{:.6},{},{},{:.3},{:.3}\n",
+                "{n},{:.4},{:.1},{:.6},{:.6},{:.6},{:.6},{:.6},{},{},{:.3},{:.3},{:.3}\n",
                 n as f64 / FPS,
                 t.height,
                 t.exposure,
@@ -302,7 +334,8 @@ fn fly(gpu: &GpuContext, eyes: &[Eye], trace: Option<&std::path::Path>) -> Vec<T
                 t.lights,
                 t.views,
                 t.sky,
-                t.ground
+                t.ground,
+                t.limb
             );
         }
         std::fs::write(dir.join("trace.csv"), csv).expect("write trace");
@@ -331,7 +364,15 @@ fn a_moving_camera_under_a_stopped_clock_does_not_blink() {
         std::fs::create_dir_all(dir).expect("trace dir");
     }
     let eyes = path(240, 120);
-    let traced = fly(&gpu, &eyes, trace.as_deref());
+    let tiles = ground(&gpu, eyes[0].at, 3, 8, 6);
+    let traced = fly(
+        &gpu,
+        &tiles,
+        &eyes,
+        before_sunset(),
+        (WIDTH, HEIGHT),
+        trace.as_deref(),
+    );
     let (sky_at, sky_step) = worst_step(&traced, |t| t.sky);
     let (ground_at, ground_step) = worst_step(&traced, |t| t.ground);
     let last = traced.last().expect("frames");
@@ -351,5 +392,89 @@ fn a_moving_camera_under_a_stopped_clock_does_not_blink() {
         "the ground blinks: {ground_step:.2} levels of luma at frame {ground_at} ({:?} → {:?})",
         traced[ground_at - 1],
         traced[ground_at]
+    );
+}
+
+/// Over Europe, where the sun sets at the instant: lon, lat, degrees.
+const EUROPE: (f64, f64) = (5.0, 46.0);
+
+/// The climb: from 10 km to 36 000 km over Europe in `frames` frames, the
+/// height growing by one ratio a frame, the camera looking north at the
+/// horizon — along the terminator, so that the limb holds a lit side, a
+/// twilight band and a dark side. The field narrows with the Earth's
+/// disc, so that the limb stays a band of the picture.
+fn climb(frames: usize) -> Vec<Eye> {
+    let (lon, lat) = EUROPE;
+    (0..frames)
+        .map(|i| {
+            let t = i as f64 / (frames - 1) as f64;
+            let height = 10_000.0 * 3_600f64.powf(t);
+            let r = tuile_core::geo::WGS84_A;
+            let dip = (r / (r + height)).acos().to_degrees();
+            let mut eye = eye_at(lon, lat, height, 0.0, -dip);
+            eye.fov_y = (40.0 * (1.0 - 0.5 * t)).to_radians();
+            eye
+        })
+        .collect()
+}
+
+fn sunset_over_europe() -> f64 {
+    let (lon, lat) = EUROPE;
+    tuile_atmosphere::Sun::next_sunset(
+        1_782_043_200.0,
+        Geodetic {
+            lon: lon.to_radians(),
+            lat: lat.to_radians(),
+            height: 0.0,
+        },
+    )
+    .expect("the sun sets over Europe in June")
+}
+
+/// From 10 km to geostationary height at sunset, the limb — the thin shell
+/// of lit air around the globe — stays in the picture: never darker than
+/// a band the eye picks out against space, and never vanishing from one
+/// frame to the next.
+#[test]
+fn the_limb_stays_from_ten_kilometres_to_geostationary_height() {
+    let Some(gpu) = gpu() else { return };
+    let trace = std::env::var_os("TUILE_LIMB_TRACE").map(std::path::PathBuf::from);
+    if let Some(dir) = &trace {
+        std::fs::create_dir_all(dir).expect("trace dir");
+    }
+    let eyes = climb(181);
+    let tiles = ground(&gpu, eyes[0].at, 3, 8, 6);
+    let traced = fly(
+        &gpu,
+        &tiles,
+        &eyes,
+        sunset_over_europe(),
+        (LIMB_WIDTH, LIMB_HEIGHT),
+        trace.as_deref(),
+    );
+    for (n, t) in traced.iter().enumerate() {
+        eprintln!("{n:3} {:>10.0} m limb {:6.1} exposure {:.4}", t.height, t.limb, t.exposure);
+    }
+    let faintest = traced
+        .iter()
+        .enumerate()
+        .min_by(|a, b| a.1.limb.total_cmp(&b.1.limb))
+        .expect("frames");
+    let (step_at, step) = worst_step(&traced, |t| t.limb);
+    eprintln!(
+        "faintest limb {:.1} at frame {} ({:.0} m); worst step {step:.1} at frame {step_at}",
+        faintest.1.limb, faintest.0, faintest.1.height
+    );
+    assert!(
+        faintest.1.limb >= 40.0,
+        "the limb is gone at {:.0} m: its brightest is {:.1} levels of luma",
+        faintest.1.height,
+        faintest.1.limb
+    );
+    assert!(
+        step <= 12.0,
+        "the limb jumps by {step:.1} levels of luma at frame {step_at} ({:.0} m → {:.0} m)",
+        traced[step_at - 1].height,
+        traced[step_at].height
     );
 }
