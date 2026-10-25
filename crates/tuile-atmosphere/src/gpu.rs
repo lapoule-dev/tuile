@@ -90,6 +90,24 @@ pub struct AtmosphereUniform {
     pub planets: [[f32; 4]; 6],
     /// Their colours, in units of the sun's (rgb).
     pub planet_colours: [[f32; 4]; 6],
+    /// The sun's disc: x its true angular radius, y its solid angle — both
+    /// worked out in f64 here, never folded by a shader — z its linear limb
+    /// darkening's coefficient, w that law's mean over the disc.
+    pub sun_disc: [f32; 4],
+    /// x: the sun's distance from the eye, y: the Moon's — metres, 0 for
+    /// none — what orders the discs near to far; zw: nothing.
+    pub bodies: [f32; 4],
+}
+
+/// The sun's linear limb darkening, `1 − u (1 − μ)`: grey, `u = 0.6`.
+pub const SUN_LIMB_DARKENING: f64 = 0.6;
+
+/// The solid angle of a disc of angular radius `rho`, radians: `2π (1 −
+/// cos ρ)`, written as `4π sin²(ρ/2)` — the same in f64, and a disc a
+/// quarter of a degree across keeps its digits.
+pub fn disc_solid_angle(rho: f64) -> f64 {
+    let s = (0.5 * rho).sin();
+    4.0 * std::f64::consts::PI * s * s
 }
 
 /// The share of the full Moon's light its night side sends back by the
@@ -143,13 +161,16 @@ impl AtmosphereUniform {
                     [
                         crate::moon::disc_shading_mean(a) as f32,
                         EARTHSHINE * 0.5 * (1.0 - a.cos() as f32),
-                        0.0,
+                        disc_solid_angle(f64::from(m.angular_radius)) as f32,
                         0.0,
                     ],
                 )
             }
             None => ([0.0; 4], [0.0; 4], [1.0, 0.0, 0.0, 0.0]),
         };
+        let moon_distance = i.moon.map_or(0.0, |m| {
+            crate::moon::MOON_RADIUS / f64::from(m.angular_radius).sin().max(1e-9)
+        });
         let star_rows = stars.transpose();
         let row = |n: usize| {
             let c = star_rows.col(n).as_vec3();
@@ -231,6 +252,18 @@ impl AtmosphereUniform {
             },
             planets: [[0.0; 4]; 6],
             planet_colours: [[0.0; 4]; 6],
+            sun_disc: [
+                crate::hillaire::SUN_ANGULAR_RADIUS as f32,
+                disc_solid_angle(crate::hillaire::SUN_ANGULAR_RADIUS) as f32,
+                SUN_LIMB_DARKENING as f32,
+                (1.0 - SUN_LIMB_DARKENING / 3.0) as f32,
+            ],
+            bodies: [
+                crate::moon::ASTRONOMICAL_UNIT as f32,
+                moon_distance as f32,
+                0.0,
+                0.0,
+            ],
         }
     }
 

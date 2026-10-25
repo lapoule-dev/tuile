@@ -18,9 +18,11 @@ const SKY_BLEND: f32 = 0.7;
 // band a few degrees thick along the limb that no table row could hold —
 // what the night floor adds, and behind the air the sun's disc, darkened
 // towards its limb, the Moon's in its phase and the stars, dimmed by the
-// air before them and hidden by the planet. `star_sigma`: the radius of a
-// star's image, in radians — about a pixel.
-fn sky_seen(d: vec3f, star_sigma: f32) -> vec3f {
+// air before them and hidden by the planet — the nearer body hiding the
+// farther (`disc_seen`). `pixel`: the angular size of the pixel the line
+// of sight is drawn for, in radians — what a disc's edge is spread over
+// and a star's image is as wide as.
+fn sky_seen(d: vec3f, pixel: f32) -> vec3f {
     let n = normalize(d);
     let h = atmosphere.sun.w;
     let up = atmosphere.up.xyz;
@@ -41,11 +43,11 @@ fn sky_seen(d: vec3f, star_sigma: f32) -> vec3f {
         let north = cross(up, east);
         let local = vec3f(dot(nl, east), dot(nl, north), dot(nl, up));
         let s = atmosphere.sun.xyz;
-        air = sky_radiance(h, local, vec3f(dot(s, east), dot(s, north), dot(s, up)));
+        air = sky_radiance(h, local, vec3f(dot(s, east), dot(s, north), dot(s, up)), SUN_ANGULAR_RADIUS);
         if (atmosphere.moon.w > 0.0) {
             let m = atmosphere.moon.xyz;
-            air += sky_radiance(h, local, vec3f(dot(m, east), dot(m, north), dot(m, up)))
-                * atmosphere.moon.w;
+            air += sky_radiance(h, local, vec3f(dot(m, east), dot(m, north), dot(m, up)),
+                atmosphere.moon_disc.w) * atmosphere.moon.w;
         }
         air *= marched;
     }
@@ -62,19 +64,132 @@ fn sky_seen(d: vec3f, star_sigma: f32) -> vec3f {
     let r = LUT_RADIUS + max(h, 0.0);
     if (ground_distance(r, dot(nl, up), max(h, 0.0)) >= 0.0) { return sky; }
     var beyond = vec3f(0.0);
-    let apart = acos(clamp(dot(n, atmosphere.sun.xyz), -1.0, 1.0));
-    // Drawn larger by its scale, its surface as bright as it is.
-    let sun_rho = SUN_ANGULAR_RADIUS * max(atmosphere.discs.x, 0.0);
-    if (apart < sun_rho) {
-        let x = apart / sun_rho;
-        let limb = 1.0 - 0.6 * (1.0 - sqrt(max(1.0 - x * x, 0.0)));
-        let solid = 2.0 * ATMOSPHERE_PI * (1.0 - cos(SUN_ANGULAR_RADIUS));
-        let mu_s = dot(up, atmosphere.sun.xyz);
-        beyond += sunlight(h, mu_s) * limb / solid;
+    // The discs, the nearer in front of the farther.
+    let sun = disc_seen(n, pixel, body_of(0u));
+    let moon = disc_seen(n, pixel, body_of(1u));
+    var near = moon;
+    var far = sun;
+    if (atmosphere.bodies.x < atmosphere.bodies.y) {
+        near = sun;
+        far = moon;
     }
-    beyond += moon_seen(n);
-    beyond += stars_seen(n, star_sigma);
+    beyond += near.radiance + far.radiance * (1.0 - near.cover);
+    beyond += stars_seen(n, 0.8 * pixel);
     return sky + beyond * atmosphere.illuminance.xyz;
+}
+
+// A body of the sky as its disc is drawn: towards its centre, its drawn
+// angular radius (its own times its scale) and its own, its solid angle,
+// its light outside the air against the sun's, and its kind — an emitter,
+// darkened towards its limb, or a reflector, lit in its phase.
+struct Body {
+    towards: vec3f,
+    rho: f32,
+    true_rho: f32,
+    solid: f32,
+    weight: f32,
+    reflector: bool,
+}
+
+// The frame's bodies: 0 the sun, 1 the Moon (weight 0 when there is none).
+fn body_of(i: u32) -> Body {
+    var b: Body;
+    if (i == 0u) {
+        b.towards = atmosphere.sun.xyz;
+        b.true_rho = atmosphere.sun_disc.x;
+        b.rho = b.true_rho * max(atmosphere.discs.x, 0.0);
+        b.solid = atmosphere.sun_disc.y;
+        b.weight = 1.0;
+        b.reflector = false;
+    } else {
+        b.towards = atmosphere.moon.xyz;
+        b.true_rho = atmosphere.moon_disc.w;
+        b.rho = b.true_rho * max(atmosphere.discs.y, 0.0);
+        b.solid = atmosphere.moon_shade.z;
+        b.weight = atmosphere.moon.w;
+        b.reflector = true;
+    }
+    return b;
+}
+
+// A disc along a line of sight: the radiance it sends the eye there, and
+// how much of the pixel it covers — what it leaves of a farther disc.
+struct DiscSeen {
+    radiance: vec3f,
+    cover: f32,
+}
+
+// The body's law at the point `p` of its disc (a unit vector's share of
+// the disc's radius, from its centre, `mu` the cosine of its surface's
+// slope to the eye there), divided by its mean over the disc, so that the
+// disc carries its light: an emitter's limb darkening, a reflector's
+// Lommel-Seeliger shading μ₀/(μ₀ + μ) — the full Moon about as bright at
+// its limb as at its centre — and its night side's earthshine. And the
+// law's sum over the disc, per unit of its light: 1, and for a reflector
+// with its earthshine a little more.
+fn disc_law(b: Body, p: vec3f, mu: f32) -> vec2f {
+    if (!b.reflector) {
+        let u = atmosphere.sun_disc.z;
+        return vec2f((1.0 - u * (1.0 - mu)) / atmosphere.sun_disc.w, 1.0);
+    }
+    // The surface's normal, towards the eye's side: −towards is the eye.
+    let normal = p - b.towards * mu;
+    let mu0 = dot(normal, atmosphere.moon_disc.xyz);
+    var shade = atmosphere.moon_shade.y;
+    if (mu0 > 0.0) { shade += mu0 / (mu0 + mu); }
+    let mean = atmosphere.moon_shade.x;
+    return vec2f(shade / mean, 1.0 + atmosphere.moon_shade.y / mean);
+}
+
+// The disc of `b` along the unit `n` from the frame's eye, in the model's
+// units, drawn for a pixel `pixel` radians wide. Each of its points is
+// seen through the air along its own line of sight — the lower limb of a
+// setting sun redder and dimmer than its upper — and cut by the planet
+// where the sky is (`sky_seen` draws nothing behind it). Its edge is the
+// share of the pixel it covers, to first order a ramp a pixel wide,
+// scaled so the disc keeps its light whatever its size; a disc a few
+// pixels across is drawn as a star is, a Gaussian as wide as a star's
+// image and the disc's own spread, carrying the disc's light, and the two
+// laws meet in a blend on the disc's size against the pixel's — never a
+// switch.
+fn disc_seen(n: vec3f, pixel: f32, b: Body) -> DiscSeen {
+    var out: DiscSeen;
+    out.radiance = vec3f(0.0);
+    out.cover = 0.0;
+    if (b.weight <= 0.0 || b.rho <= 0.0) { return out; }
+    let c = dot(n, b.towards);
+    if (c <= 0.0) { return out; }
+    let off = n - b.towards * c;
+    let apart = length(off);
+    let sigma = 0.8 * pixel;
+    let spread = sqrt(sigma * sigma + 0.25 * b.rho * b.rho);
+    if (apart > b.rho + pixel + 5.0 * spread) { return out; }
+    // The point of the disc the pixel stands for — past the edge, the point
+    // as far inside it: the ramp's light outside the disc is then the light
+    // it takes from inside, whatever the law's slope at the limb.
+    let x = clamp(min(apart, 2.0 * b.rho - apart) / b.rho, 0.0, 1.0);
+    let p = off / max(apart, 1e-30) * x;
+    let mu = sqrt(max(1.0 - x * x, 0.0));
+    let law = disc_law(b, p, mu);
+    let through = transmittance(atmosphere.sun.w, dot(atmosphere.up.xyz, n));
+    let cover = clamp((b.rho - apart) / pixel + 0.5, 0.0, 1.0);
+    // ∫ cover = π ρ² + π p²/12 for a disc wider than half a pixel.
+    let sharp = b.weight * law.x / b.solid * cover
+        / (1.0 + pixel * pixel / (12.0 * b.rho * b.rho));
+    // Its light — its law's sum, its drawn size against its own — over a
+    // Gaussian as wide as a star's image and the disc's own spread.
+    let scale = b.rho / b.true_rho;
+    let flux = b.weight * law.y * scale * scale;
+    let soft = flux * exp(-apart * apart / (2.0 * spread * spread))
+        / (2.0 * ATMOSPHERE_PI * spread * spread);
+    // A disc sampled once a pixel keeps its light, to a few thousandths,
+    // as the Gaussian up to five pixels across and as the ramp from ten:
+    // a ramp a pixel wide, sampled at the pixels, is out by a percent or two
+    // on a disc a few pixels across, depending on where it falls on them.
+    let k = clamp((b.rho / pixel - 2.5) / 2.5, 0.0, 1.0);
+    out.radiance = through * mix(soft, sharp, k);
+    out.cover = cover;
+    return out;
 }
 
 // A ground point as the eye sees it, in the renderer's units: `base` its

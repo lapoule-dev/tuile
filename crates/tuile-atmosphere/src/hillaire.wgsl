@@ -61,7 +61,8 @@ struct Atmosphere {
     // disc's angular radius.
     moon_disc: vec4f,
     // x: what the disc's shading is divided by (its mean over the disc);
-    // y: earthshine, against the full disc's light; zw: nothing.
+    // y: earthshine, against the full disc's light; z: the disc's true
+    // solid angle; w: nothing.
     moon_shade: vec4f,
     // xyz: one unit of the model's irradiance on the ground, in the
     // renderer's units.
@@ -103,6 +104,13 @@ struct Atmosphere {
     // over the sun's — 0 for none; and their colours.
     planets: array<vec4f, 6>,
     planet_colours: array<vec4f, 6>,
+    // The sun's disc: x its true angular radius, y its solid angle, z its
+    // linear limb darkening's coefficient, w that law's mean over the disc
+    // — all from the CPU, in f64.
+    sun_disc: vec4f,
+    // x: the sun's distance from the eye, y: the Moon's, metres (0: none):
+    // what orders the discs near to far; zw: nothing.
+    bodies: vec4f,
 }
 
 const ATMOSPHERE_PI: f32 = 3.14159265358979;
@@ -208,17 +216,30 @@ fn transmittance(height: f32, mu: f32) -> vec3f {
     return lut_bilinear(transmittance_lut, transmittance_uv(h, m)).rgb;
 }
 
-// How much of the sun's disc stands over the horizon: `sun_visible`.
-fn sun_visible(height: f32, mu_s: f32) -> f32 {
+// How much of a body's disc, of angular radius `rho`, stands over the
+// horizon from `height`, its centre at zenith cosine `mu`: `body_visible`.
+fn body_visible(height: f32, mu: f32, rho: f32) -> f32 {
     let h = max(height, 0.0);
     let r = LUT_RADIUS + h;
     let horizon = -sqrt(h * (2.0 * LUT_RADIUS + h)) / r;
-    let over = asin(clamp(mu_s, -1.0, 1.0)) - asin(horizon);
-    return smoothstep(-SUN_ANGULAR_RADIUS, SUN_ANGULAR_RADIUS, over);
+    let over = asin(clamp(mu, -1.0, 1.0)) - asin(horizon);
+    return smoothstep(-rho, rho, over);
+}
+
+// How much of the sun's disc stands over the horizon: `sun_visible`.
+fn sun_visible(height: f32, mu_s: f32) -> f32 {
+    return body_visible(height, mu_s, SUN_ANGULAR_RADIUS);
 }
 
 fn sunlight(height: f32, mu_s: f32) -> vec3f {
     return transmittance(height, mu_s) * sun_visible(height, mu_s);
+}
+
+// A body's light at `height` — the sun's or the Moon's, per unit of it
+// outside the air — its centre at zenith cosine `mu`, its disc of angular
+// radius `rho` cut by the horizon: each body by its own size.
+fn body_light(height: f32, mu: f32, rho: f32) -> vec3f {
+    return transmittance(height, mu) * body_visible(height, mu, rho);
 }
 
 // The sky's light on level ground at `height`, the light at zenith cosine
@@ -249,26 +270,29 @@ struct AirRay {
     transmittance: vec3f,
 }
 
-// The phases of one light along one ray, and its weight: 1 for the sun,
-// the Moon's share of it for the Moon, 0 for none.
+// The phases of one light along one ray, its weight — 1 for the sun, the
+// Moon's share of it for the Moon, 0 for none — and its disc's angular
+// radius, which its horizon is cut by.
 struct Light {
     rayleigh: f32,
     mie: f32,
     weight: f32,
+    radius: f32,
 }
 
-fn light_along(c: f32, weight: f32) -> Light {
+fn light_along(c: f32, weight: f32, radius: f32) -> Light {
     var l: Light;
     l.rayleigh = rayleigh_phase(c);
     l.mie = mie_phase(c);
     l.weight = weight;
+    l.radius = radius;
     return l;
 }
 
 // What one light scatters towards the eye at a point, per unit of path.
 fn source(m: Medium, height: f32, mu: f32, l: Light) -> vec3f {
     if (l.weight == 0.0) { return vec3f(0.0); }
-    let light = sunlight(height, mu);
+    let light = body_light(height, mu, l.radius);
     let multi = multi_scattering(height, mu);
     return (m.rayleigh * l.rayleigh * light + vec3f(m.mie * l.mie) * light
         + (m.rayleigh + vec3f(m.mie)) * multi) * l.weight;
@@ -300,8 +324,8 @@ fn air_between(p: vec3f) -> AirRay {
     let d = p / length_;
     let sun_dir = atmosphere.sun.xyz;
     let moon_dir = atmosphere.moon.xyz;
-    let sun = light_along(dot(d, sun_dir), 1.0);
-    let moon = light_along(dot(d, moon_dir), atmosphere.moon.w);
+    let sun = light_along(dot(d, sun_dir), 1.0, SUN_ANGULAR_RADIUS);
+    let moon = light_along(dot(d, moon_dir), atmosphere.moon.w, atmosphere.moon_disc.w);
     let o = -atmosphere.centre.xyz;
     let eye_height = length(o) - atmosphere.centre.w;
     let t0 = max(air_entry(eye_height, dot(normalize(o), d)), 0.0);
@@ -371,10 +395,11 @@ fn ground_distance(r: f32, mu: f32, height: f32) -> f32 {
 
 // The sky seen from `height` along `dir` under one light along `light`,
 // all unit in a frame whose z is up: `LutAtmosphere::sky_radiance`, without
-// the light's disc, per unit of that light. From above the air, from where
-// the ray enters it, and nothing for a ray that misses it. Steps spread
-// quadratically; the ground, met, lit and seen.
-fn sky_radiance(height: f32, dir: vec3f, light: vec3f) -> vec3f {
+// the light's disc, per unit of that light, whose disc's angular radius is
+// `radius`. From above the air, from where the ray enters it, and nothing
+// for a ray that misses it. Steps spread quadratically; the ground, met,
+// lit and seen.
+fn sky_radiance(height: f32, dir: vec3f, light: vec3f, radius: f32) -> vec3f {
     let entry = air_entry(height, dir.z);
     if (entry < 0.0) { return vec3f(0.0); }
     var origin = vec3f(0.0, 0.0, LUT_RADIUS + max(height, 0.0));
@@ -404,8 +429,8 @@ fn sky_radiance(height: f32, dir: vec3f, light: vec3f) -> vec3f {
     var ray: AirRay;
     ray.inscattered = vec3f(0.0);
     ray.transmittance = vec3f(1.0);
-    let one = light_along(dot(d, l), 1.0);
-    let none = light_along(0.0, 0.0);
+    let one = light_along(dot(d, l), 1.0, radius);
+    let none = light_along(0.0, 0.0, radius);
     var t_prev = 0.0;
     for (var s = 0u; s < SKY_STEPS; s++) {
         let a = (f32(s) + 0.3) / f32(SKY_STEPS);
@@ -422,7 +447,7 @@ fn sky_radiance(height: f32, dir: vec3f, light: vec3f) -> vec3f {
         let x = origin + d * t_max;
         let up = normalize(x);
         let mu_s = dot(up, l);
-        ray.inscattered += ray.transmittance * sunlight(0.0, mu_s) * max(mu_s, 0.0)
+        ray.inscattered += ray.transmittance * body_light(0.0, mu_s, radius) * max(mu_s, 0.0)
             * atmosphere.shape.z / ATMOSPHERE_PI;
     }
     return ray.inscattered;
@@ -498,40 +523,12 @@ fn ground_light(height: f32, up: vec3f, normal: vec3f, frame_sky: vec3f, lit: f3
     var direct = g * sunlight(height, mu_s) * max(dot(normal, sun_dir), 0.0) * lit;
     if (atmosphere.moon.w > 0.0) {
         level += g * level_irradiance(height, mu_m) * atmosphere.moon.w;
-        direct += g * sunlight(height, mu_m) * atmosphere.moon.w * max(dot(normal, moon_dir), 0.0);
+        direct += g * body_light(height, mu_m, atmosphere.moon_disc.w) * atmosphere.moon.w
+            * max(dot(normal, moon_dir), 0.0);
     }
     let ratio = level / max(atmosphere.level_ref.xyz, vec3f(1e-30));
     let sky = max(frame_sky, vec3f(0.0)) * ratio;
     return max(sky + direct, atmosphere.least.xyz);
-}
-
-// The Moon's disc along the unit `n` from the eye, in the model's units
-// (per unit of the sun outside the air): lit as the Lommel-Seeliger law
-// lights a dusty surface — μ₀/(μ₀ + μ), which leaves the full Moon about
-// as bright at its limb as at its centre — its night side by the Earth's
-// light, all of it through the air between.
-fn moon_seen(n: vec3f) -> vec3f {
-    let m = atmosphere.moon.xyz;
-    let true_rho = atmosphere.moon_disc.w;
-    // Drawn larger by its scale, its surface as bright as it is.
-    let rho = true_rho * max(atmosphere.discs.y, 0.0);
-    if (atmosphere.moon.w == 0.0 || rho <= 0.0) { return vec3f(0.0); }
-    let c = dot(n, m);
-    let p = (n - m * c) / rho;
-    let x2 = dot(p, p);
-    if (c <= 0.0 || x2 >= 1.0) { return vec3f(0.0); }
-    let mu = sqrt(1.0 - x2);
-    // The surface's normal, towards the eye's side: −m is towards the eye.
-    let normal = p - m * mu;
-    let mu0 = dot(normal, atmosphere.moon_disc.xyz);
-    var shade = atmosphere.moon_shade.y;
-    if (mu0 > 0.0) { shade += mu0 / (mu0 + mu); }
-    let solid = 2.0 * ATMOSPHERE_PI * (1.0 - cos(true_rho));
-    let mu_m = dot(atmosphere.up.xyz, m);
-    // An edge a texel soft: the disc is not drawn as a step.
-    let edge = smoothstep(1.0, 0.96, sqrt(x2));
-    return sunlight(atmosphere.sun.w, mu_m) * atmosphere.moon.w * shade
-        / (atmosphere.moon_shade.x * solid) * edge;
 }
 
 // A camera's point-spread function, as a share of a source's light per

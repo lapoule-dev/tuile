@@ -638,7 +638,10 @@ fn a_films_discs_are_the_same_to_the_byte() {
     assert_eq!(format!("{hash:016x}"), FROZEN_DISCS_FILM);
 }
 
-// Moved from bb928e8fcb652789 by the per-frame GPU light (#149), which
-// moved the atmosphere film's digest too: the light worked out on the GPU
-// in f32, not on the CPU in f64. No pixel of S0's own.
-const FROZEN_DISCS_FILM: &str = "0b6af27f5457a2cf";
+// Moved by S1 (docs/explorations/sun-and-moon.md), deliberately, from
+// 0b6af27f5457a2cf: the discs carry their light — the sun's limb law
+// normalised (+25 %), each disc pixel through the air along it, no second
+// dimming at the horizon (the half-set sun's upper half at its own
+// brightness), the Moon's soft edge replaced by the pixel's footprint —
+// and the Moon's own radius for its horizon in the light.
+const FROZEN_DISCS_FILM: &str = "1832830f5cde7b5a";

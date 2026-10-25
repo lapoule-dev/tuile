@@ -13,7 +13,8 @@
 struct SkyUniform {
     // `view_proj`, inverted: from a pixel back to the line of sight.
     inverse_view_proj: mat4x4f,
-    // x: the radius of a star's image, radians; yzw: nothing.
+    // x: the angular size of a pixel, radians — what a disc's edge is
+    // spread over and a star's image is as wide as; yzw: nothing.
     stars: vec4f,
 }
 @group(0) @binding(0) var<uniform> sky: SkyUniform;

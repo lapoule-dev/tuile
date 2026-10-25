@@ -7,7 +7,7 @@
 //! not by the camera alone.
 //!
 //! Each probe is a line of sight from an eye on the Pic du Midi; the sky is
-//! drawn twice along it, with stars and without (`sky_seen(d, 0)`), and the
+//! drawn along it, with stars and without (less `stars_seen`'s), and the
 //! difference is the stars' light. A star is put where a test wants it by
 //! turning the catalogue: the brightest star, Sirius, is turned onto the
 //! line of sight. What the display shows is the frame's own response: its
@@ -93,8 +93,12 @@ const PROBE: &str = r"
 fn probe(@builtin(global_invocation_id) id: vec3u) {
     let p = probes[id.x];
     let n = normalize(p.xyz);
-    results[3u * id.x] = vec4f(sky_seen(n, p.w), 0.0);
-    results[3u * id.x + 1u] = vec4f(sky_seen(n, 0.0), 0.0);
+    // `sky_seen` takes the pixel's angle, a star's image 0.8 of it — and its
+    // discs are drawn for that pixel too: the sky without the stars is the
+    // same line of sight less what `sky_seen` adds of them.
+    let seen = sky_seen(n, p.w / 0.8);
+    results[3u * id.x] = vec4f(seen, 0.0);
+    results[3u * id.x + 1u] = vec4f(seen - stars_seen(n, p.w) * atmosphere.illuminance.xyz, 0.0);
     results[3u * id.x + 2u] = vec4f(transmittance(atmosphere.sun.w, dot(atmosphere.up.xyz, n)), 0.0);
 }
 ";
