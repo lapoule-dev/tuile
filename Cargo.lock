@@ -8668,6 +8668,7 @@ dependencies = [
  "pollster",
  "tokio",
  "tracing",
+ "tuile-atmosphere",
  "tuile-camera",
  "tuile-core",
  "tuile-native-fetchers",

@@ -278,3 +278,73 @@ fn the_host_reads_the_ground_it_sees() {
         "{hit:?} vs {under:?}"
     );
 }
+
+/// With the host's atmosphere on, the sky is drawn over what was space and
+/// the ground is still ground; the sun the host reads back is the one it
+/// set; turned off at a later frame, the sky goes.
+#[test]
+fn the_hosts_atmosphere_draws_a_sky_and_says_where_the_sun_is() {
+    if !support::has_gpu() {
+        eprintln!("no GPU: skipped");
+        return;
+    }
+    use tuile_bevy::{Lights, TuileAtmosphere};
+    use tuile_core::geo::{enu_frame, Geodetic};
+    let target = Target {
+        msaa: Msaa::Off,
+        hdr: false,
+        size: 256,
+    };
+    // Towards the horizon, from 3 km: sky in the top of the frame, ground
+    // in the bottom.
+    let horizon = TuileCamera::looking(LON, LAT, ALTITUDE, 0.0, 8.0, FOVY_DEG);
+    let mut app = Headless::new(support::plugin(), horizon, target);
+    // The sun high in the north-east, as the host sets it.
+    let enu = enu_frame(Geodetic {
+        lon: LON.to_radians(),
+        lat: LAT.to_radians(),
+        height: 0.0,
+    });
+    let to_sun = (enu.col(2) * 2.0 + enu.col(0) + enu.col(1)).normalize();
+    app.world().insert_resource(
+        TuileAtmosphere::default()
+            .enabled(true)
+            .with_lights(Lights::fixed(to_sun, None)),
+    );
+    let status = app.settle(SETTLE_S);
+    assert!(status.is_settled(), "never settled: {status:?}");
+    let picture = app.picture();
+    picture.save(&out_dir().join("atmosphere-on.png"));
+    let read = app.world().resource::<TuileAtmosphere>().to_sun();
+    assert!((read - to_sun).length() < 1e-9, "{read} vs {to_sun}");
+    let row = |p: &support::Picture, y: u32| -> [f64; 3] {
+        let mut sum = [0.0; 3];
+        for x in 0..p.width {
+            let c = p.at(x, y);
+            for k in 0..3 {
+                sum[k] += f64::from(c[k]) / f64::from(p.width);
+            }
+        }
+        sum
+    };
+    let sky = row(&picture, 4);
+    assert!(
+        sky[2] > 60.0 && sky[2] > sky[0],
+        "a sky at the top of the frame: {sky:?}"
+    );
+    let black = picture.black_pixels(8);
+    assert_eq!(black, 0, "{black} black pixels with the atmosphere on");
+
+    // Off again: the clear colour where the sky was.
+    app.world().resource_mut::<TuileAtmosphere>().enabled = false;
+    for _ in 0..3 {
+        app.update();
+    }
+    let picture = app.picture();
+    picture.save(&out_dir().join("atmosphere-off.png"));
+    let top = row(&picture, 4);
+    assert!(
+        top.iter().all(|c| *c < 8.0),
+        "no sky once it is off: {top:?}"
+    );
+}

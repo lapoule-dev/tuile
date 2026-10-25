@@ -3,6 +3,7 @@
 
 #![doc = include_str!("../README.md")]
 
+pub mod atmosphere;
 pub mod budget;
 pub mod camera;
 pub mod ground;
@@ -18,6 +19,7 @@ use std::sync::Arc;
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
 
+pub use atmosphere::{Lights, TuileAtmosphere};
 pub use budget::TuileBudget;
 pub use camera::{
     local_frame, FloatingOrigin, GeoAnchor, PreloadView, PreloadViews, Priority, TuileCamera,
@@ -83,13 +85,16 @@ impl Plugin for TuilePlugin {
         app.init_resource::<FloatingOrigin>()
             .init_resource::<PreloadViews>()
             .init_resource::<TuileLight>()
+            .init_resource::<TuileAtmosphere>()
             .init_resource::<TuileStatus>()
             .init_resource::<status::SharedStatus>()
             .add_systems(First, camera::clear_preload_views)
             .add_systems(First, status::publish_status)
             .add_systems(
                 PostUpdate,
-                camera::place_in_world.before(TransformSystems::Propagate),
+                (camera::place_in_world, atmosphere::advance_atmosphere)
+                    .chain()
+                    .before(TransformSystems::Propagate),
             );
     }
 

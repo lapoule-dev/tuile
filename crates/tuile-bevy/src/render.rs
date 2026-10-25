@@ -49,6 +49,7 @@ use tuile_wgpu::{
     PreparedTile, TargetLayout, TileRenderer, ViewUniform,
 };
 
+use crate::atmosphere::TuileAtmosphere;
 use crate::budget::BACKDROP_LEVEL;
 use crate::camera::{FloatingOrigin, PreloadViews, TuileCamera};
 use crate::ground::SharedSurface;
@@ -79,6 +80,11 @@ pub(crate) struct GlobeFrame {
     origin: FloatingOrigin,
     preload: PreloadViews,
     light: TuileLight,
+    /// The atmosphere as it runs this frame and the wall instant it is drawn
+    /// at, or `None` before the main world has started it.
+    sky: Option<(tuile_wgpu::Atmosphere, f64)>,
+    /// The air the ground is seen through, with the atmosphere on.
+    aerial: tuile_atmosphere::AerialAir,
 }
 
 /// The session, as far as the render world has it.
@@ -163,6 +169,7 @@ fn extract_globe(
     origin: Extract<Res<FloatingOrigin>>,
     preload: Extract<Res<PreloadViews>>,
     light: Extract<Res<TuileLight>>,
+    atmosphere: Extract<Res<TuileAtmosphere>>,
     mut frame: ResMut<GlobeFrame>,
 ) {
     for (entity, camera, bevy_camera) in &cameras {
@@ -178,6 +185,8 @@ fn extract_globe(
     frame.origin = **origin;
     frame.preload.clone_from(&preload);
     frame.light = **light;
+    frame.sky = atmosphere.running();
+    frame.aerial = atmosphere.tuning.viewer;
 }
 
 /// The pump's frame, before anything is drawn: the GPU context on the first
@@ -311,16 +320,68 @@ fn draw_globe(
     let clip_from_ecef = extracted.clip_from_view.as_dmat4()
         * view_from_world.as_dmat4()
         * DMat4::from_translation(-frame.origin.ecef);
-    let light = frame.light.travel(pump.render_origin);
-    renderer.set_view(
-        &gpu.queue,
-        &ViewUniform {
-            view_proj: view_proj_from_world(clip_from_ecef, pump.render_origin),
-            sun_dir: [light.x as f32, light.y as f32, light.z as f32, 0.0],
-            params: [frame.light.ambient, 0.0, 0.0, 0.0],
-            atmosphere: Default::default(),
-        },
-    );
+    let view_proj = view_proj_from_world(clip_from_ecef, pump.render_origin);
+    let ambient = [frame.light.ambient, 0.0, 0.0, 0.0];
+    match (frame.sky, globe_view) {
+        // The host's atmosphere: the sun where its lights put it, the air
+        // before the ground, the sky behind it — tuile-wgpu's, as the viewer
+        // and the film draw it.
+        (Some((atmosphere, wall)), Some(view)) if atmosphere.enabled => {
+            let eye = view.pose.position;
+            let sun = tuile_atmosphere::Sun::from_direction(
+                atmosphere.lights.at(atmosphere.instant(wall), eye).to_sun,
+            );
+            let travel = sun.light_travel_direction().as_vec3();
+            renderer.set_view(
+                &gpu.queue,
+                &ViewUniform {
+                    view_proj,
+                    sun_dir: [travel.x, travel.y, travel.z, 0.0],
+                    params: ambient,
+                    atmosphere: tuile_atmosphere::AerialPerspective::of_air(
+                        eye,
+                        pump.render_origin,
+                        &sun,
+                        &frame.aerial,
+                        1.0,
+                    ),
+                },
+            );
+            let place = tuile_core::geo::ecef_to_geodetic(eye);
+            let (width, height) = view.viewport;
+            renderer.draw_atmosphere(
+                gpu,
+                &atmosphere,
+                &tuile_wgpu::SkyView {
+                    eye,
+                    render_origin: pump.render_origin,
+                    forward: view.pose.direction,
+                    up: view.pose.up,
+                    fov_y: view.pose.fovy,
+                    aspect: f64::from(width.max(1)) / f64::from(height.max(1)),
+                    height_px: height,
+                    ground_height: surface.height_at(place.lon, place.lat).height,
+                },
+                wall,
+            );
+        }
+        // The flat light: no sky, the clear colour past the ground.
+        (sky, _) => {
+            let light = frame.light.travel(pump.render_origin);
+            renderer.set_view(
+                &gpu.queue,
+                &ViewUniform {
+                    view_proj,
+                    sun_dir: [light.x as f32, light.y as f32, light.z as f32, 0.0],
+                    params: ambient,
+                    atmosphere: Default::default(),
+                },
+            );
+            if sky.is_some() {
+                renderer.set_sky(gpu, None);
+            }
+        }
+    }
 
     let facts = PumpFacts::of(pump);
     let (drawn, resolution) = pump.resolve(gpu);

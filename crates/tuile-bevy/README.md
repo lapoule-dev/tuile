@@ -45,6 +45,10 @@ App::new()
   [`ground`].
 - **Says what it will need** with [`PreloadViews`]: poses traversed this
   frame and never drawn.
+- **Sets the sky** with a [`TuileAtmosphere`]: on or off, where the light
+  comes from ([`Lights`]: the real sun and Moon, a world's own day, or
+  directions it sets), the air, the clock — and reads back where the sun
+  is for its own lights. See [`atmosphere`].
 - **Sizes the globe's share** of the device with a [`TuileBudget`], and
   chooses whether imagery is held compressed
   ([`ImageryCompression`], off unless asked).

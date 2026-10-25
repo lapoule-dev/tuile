@@ -31,6 +31,11 @@
 //! --compression C            off | auto | bc7 | astc | uastc (default: off)
 //! --gpu-mib N                the globe's GPU budget
 //! --screenshot PATH          once the globe has settled, save the window and quit
+//! --no-atmosphere            the flat light and no sky (the atmosphere is on)
+//! --time T                   now | sunset | sunrise | an RFC 3339 instant (default: now)
+//! --time-offset D            added to it: -3h30m, +45m, 90s
+//! --time-rate R              scene seconds a wall second (default: 1)
+//! --day S                    a world of its own: a day of S clock seconds
 //! ```
 //!
 //! In a browser (`web/build.sh`, then `web/check.py` for the headless run)
@@ -45,8 +50,9 @@ use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::render::view::Msaa;
 use glam::DVec3;
 use tuile_bevy::{
-    local_frame, FloatingOrigin, GeoAnchor, GlobeCamera, GlobeSources, ImageryCompression, LonLat,
-    TuileBudget, TuileCamera, TuileGround, TuilePlugin, TuileStatus, XyzTemplate,
+    local_frame, FloatingOrigin, GeoAnchor, GlobeCamera, GlobeSources, ImageryCompression, Lights,
+    LonLat, TuileAtmosphere, TuileBudget, TuileCamera, TuileGround, TuilePlugin, TuileStatus,
+    XyzTemplate,
 };
 use tuile_core::geo::{enu_frame, geodetic_to_ecef, Geodetic};
 
@@ -67,6 +73,8 @@ struct Options {
     compression: ImageryCompression,
     gpu_mib: Option<u64>,
     screenshot: Option<std::path::PathBuf>,
+    /// The sky and its sun, or the flat light.
+    atmosphere: TuileAtmosphere,
 }
 
 fn number(flag: &str, value: Option<String>) -> Result<f64, String> {
@@ -126,6 +134,9 @@ fn options() -> Result<Options, String> {
     let mut compression = ImageryCompression::Off;
     let mut gpu_mib = None;
     let mut screenshot = None;
+    let mut sky = true;
+    let (mut time, mut offset, mut rate) = (None, None, None);
+    let mut day = None;
     let mut args = words().into_iter();
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -156,6 +167,16 @@ fn options() -> Result<Options, String> {
                 };
             }
             "--hdr" => hdr = true,
+            "--no-atmosphere" => sky = false,
+            "--time" => {
+                time = Some(
+                    args.next()
+                        .ok_or("--time needs now, sunset, sunrise or an instant")?,
+                )
+            }
+            "--time-offset" => offset = Some(args.next().ok_or("--time-offset needs a duration")?),
+            "--time-rate" => rate = Some(args.next().ok_or("--time-rate needs a number")?),
+            "--day" => day = Some(number(&flag, args.next())?),
             "--compression" => {
                 compression = tuile_bevy::compression_named(
                     &args.next().ok_or("--compression needs a value")?,
@@ -181,6 +202,15 @@ fn options() -> Result<Options, String> {
     };
     imagery.max_level = max_level;
     imagery.check()?;
+    let clock = tuile_bevy::atmosphere::ClockSettings::parse(
+        time.as_deref(),
+        offset.as_deref(),
+        rate.as_deref(),
+    )?;
+    let mut atmosphere = TuileAtmosphere::earth(clock).enabled(sky);
+    if let Some(day) = day {
+        atmosphere = atmosphere.with_lights(Lights::orbit(day.max(1.0)));
+    }
     Ok(Options {
         terrain,
         imagery,
@@ -190,6 +220,7 @@ fn options() -> Result<Options, String> {
         compression,
         gpu_mib,
         screenshot,
+        atmosphere,
     })
 }
 
@@ -248,6 +279,7 @@ fn main() {
     )
     .add_plugins(globe)
     .insert_resource(options.view)
+    .insert_resource(options.atmosphere.clone())
     .insert_resource(options)
     .add_systems(Startup, setup)
     .add_systems(
@@ -257,6 +289,7 @@ fn main() {
             aim,
             stand_on_the_ground,
             follow_the_cursor,
+            follow_the_sun,
             report,
             screenshot_when_settled,
         )
@@ -331,14 +364,15 @@ fn setup(
     if options.hdr {
         camera.insert(Hdr);
     }
-    // The application's own light, for its own meshes: the ground is lit by
-    // the globe's.
+    // The application's own light, for its own meshes, kept on tuile's sun
+    // (`follow_the_sun`): the pillars are lit as the ground is.
     commands.spawn((
         DirectionalLight {
             illuminance: 8_000.0,
             ..default()
         },
         Transform::from_rotation(Quat::from_rotation_x(-1.0)),
+        Sunlight,
     ));
     // Pillars of the application's own, 300 m tall, stood on the drawn
     // ground every frame (`stand_on_the_ground`): they follow it as it
@@ -386,6 +420,34 @@ fn setup(
         Visibility::Hidden,
         Cursor,
     ));
+}
+
+/// The application's sun.
+#[derive(Component)]
+struct Sunlight;
+
+/// The application's light along tuile's sun, as bright as the sun is high
+/// over the camera — out at night, when only an ambient term is left.
+fn follow_the_sun(
+    atmosphere: Res<TuileAtmosphere>,
+    cameras: Query<&TuileCamera>,
+    mut lights: Query<(&mut Transform, &mut DirectionalLight), With<Sunlight>>,
+) {
+    let Some(eye) = cameras.iter().next().map(|c| c.pose.position) else {
+        return;
+    };
+    let to_sun = if atmosphere.enabled {
+        atmosphere.to_sun()
+    } else {
+        // The flat light's sun: straight over the camera.
+        eye.normalize()
+    };
+    let up = eye.normalize();
+    let elevation = to_sun.dot(up).clamp(-1.0, 1.0);
+    for (mut transform, mut light) in &mut lights {
+        *transform = Transform::default().looking_to((-to_sun).as_vec3(), up.as_vec3());
+        light.illuminance = (10_000.0 * elevation.max(0.0).sqrt()) as f32;
+    }
 }
 
 /// A pillar's height, metres.

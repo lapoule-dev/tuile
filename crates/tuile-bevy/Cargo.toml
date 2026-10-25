@@ -16,6 +16,9 @@ workspace = true
 # no audio, no asset formats: a host brings those.
 bevy = { version = "0.20.0", default-features = false, features = ["std", "bevy_render", "bevy_core_pipeline", "bevy_camera", "bevy_log"] }
 glam = { workspace = true }
+# The air and the clock the atmosphere is set with: the same values the
+# film and the viewer take.
+tuile-atmosphere = { version = "0.14.0", path = "../tuile-atmosphere" }
 tracing = { workspace = true }
 tuile-camera = { version = "0.14.0", path = "../tuile-camera" }
 tuile-core = { version = "0.14.0", path = "../tuile-core" }
@@ -23,6 +26,8 @@ tuile-planetary = { version = "0.14.0", path = "../tuile-planetary" }
 tuile-terrain = { version = "0.14.0", path = "../tuile-terrain" }
 tuile-wgpu = { version = "0.14.0", path = "../tuile-wgpu" }
 url = { workspace = true }
+# The wall clock the scene's clock runs on, on every target.
+web-time = { workspace = true }
 wgpu = { workspace = true }
 
 # A desktop or a phone: loads as tasks on a runtime of the plugin's own, and
@@ -40,7 +45,6 @@ tuile-web = { version = "0.14.0", path = "../tuile-web" }
 wasm-bindgen = "0.2.99"
 wasm-bindgen-futures = "0.4.49"
 web-sys = { version = "0.3.76", features = ["Window", "Worker", "WorkerOptions", "WorkerType"] }
-web-time = { workspace = true }
 
 [dev-dependencies]
 # The tests' host: meshes and unlit materials of its own, drawn in the same
