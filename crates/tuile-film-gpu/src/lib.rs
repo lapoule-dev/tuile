@@ -40,6 +40,9 @@ pub const SUN_ANGULAR_RADIUS: f32 = 4.65e-3;
 /// Overlays are blended in linear light before they are filtered down: a
 /// byte a channel would band their dark colours.
 const OVERLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// What [`FilmGpu::write_linear`] writes: 32-bit floats, a disc thousands of
+/// times white kept as it is.
+pub const LINEAR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 /// The side of the sun's map, in texels, where the device allows it.
 const SHADOW_SIDE: u32 = 4096;
 /// The most maps of the sun a frame draws: one for each sample of a
@@ -266,6 +269,9 @@ struct Pipelines {
     scatter: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
     present: wgpu::ComputePipeline,
+    /// `present`'s average before the lens and the grade, for an
+    /// instrument: see [`FilmGpu::write_linear`].
+    linear: wgpu::ComputePipeline,
     mips: wgpu::ComputePipeline,
     compose: wgpu::ComputePipeline,
     y_plane: wgpu::ComputePipeline,
@@ -349,6 +355,11 @@ pub struct FilmGpu {
     light_key: Option<atmosphere::LightKey>,
     /// Whether night lights were given ([`Self::set_night_lights`]).
     night_lights: bool,
+    /// The picture's light for an instrument ([`Self::write_linear`]),
+    /// made the first time one asks: a film no instrument measures never
+    /// pays for it.
+    linear: Option<(wgpu::Texture, wgpu::BindGroup)>,
+    linear_bgl: wgpu::BindGroupLayout,
 }
 
 /// One imagery tile of a drape and where it lies on the terrain tile.
@@ -1101,6 +1112,24 @@ impl FilmGpu {
             bind_group_layouts: &[Some(&present_bgl), Some(&atmosphere_bgl)],
             immediate_size: 0,
         });
+        let linear_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("film linear"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: compute_only,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: LINEAR_FORMAT,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            }],
+        });
+        let linear_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("film linear"),
+            bind_group_layouts: &[Some(&present_bgl), Some(&atmosphere_bgl), Some(&linear_bgl)],
+            immediate_size: 0,
+        });
         let mips_module = shader(&device, "film mips", include_str!("shaders/mips.wgsl"));
         let compose_module = shader(
             &device,
@@ -1119,6 +1148,7 @@ impl FilmGpu {
             scatter: compute(&device, &bin, "scatter", None),
             resolve: compute(&device, &resolve_module, "resolve", Some(&resolve_layout)),
             present: compute(&device, &present_module, "present", Some(&present_layout)),
+            linear: compute(&device, &present_module, "linear", Some(&linear_layout)),
             mips: compute(&device, &mips_module, "downsample", None),
             compose: compute(&device, &compose_module, "compose", None),
             y_plane: compute(&device, &i420_module, "y_plane", None),
@@ -1362,6 +1392,8 @@ impl FilmGpu {
             light_pending: false,
             light_key: None,
             night_lights: false,
+            linear: None,
+            linear_bgl,
             device,
             queue,
             settings,
@@ -1735,6 +1767,64 @@ impl FilmGpu {
     /// The display-resolution picture `render` writes, in [`OUTPUT_FORMAT`].
     pub fn output(&self) -> &wgpu::Texture {
         &self.targets.out
+    }
+
+    /// Records, after a frame's own commands in `encoder`, the frame's
+    /// light as its picture averages it — each pixel's samples, the sky
+    /// where no tile was drawn, before the lens's glare, the exposure and
+    /// the grade — into a [`LINEAR_FORMAT`] texture of the picture's size,
+    /// returned to be read back. In the renderer's units: pre-exposed under
+    /// a physical atmosphere ([`Self::sky_seen`] says what one unit of the
+    /// model's radiance is in them). For instruments, which measure a
+    /// disc's light where the picture rolls it off; the picture is not
+    /// touched.
+    pub fn write_linear(&mut self, encoder: &mut wgpu::CommandEncoder) -> &wgpu::Texture {
+        if self.linear.is_none() {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("film linear"),
+                size: self.targets.out.size(),
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: LINEAR_FORMAT,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("film linear"),
+                layout: &self.linear_bgl,
+                entries: &[entry(0, wgpu::BindingResource::TextureView(&view))],
+            });
+            self.linear = Some((texture, bind));
+        }
+        let (texture, bind) = self.linear.as_ref().expect("made above");
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipelines.linear);
+            pass.set_bind_group(0, &self.targets.present_bg, &[]);
+            pass.set_bind_group(1, &self.atmosphere.bind, &[]);
+            pass.set_bind_group(2, bind, &[]);
+            pass.dispatch_workgroups(
+                self.settings.width.div_ceil(8),
+                self.settings.height.div_ceil(8),
+                1,
+            );
+        }
+        texture
+    }
+
+    /// The physical atmosphere the frame last drawn was lit by: its
+    /// uniform as the frame's eye has it — the sun's and the Moon's
+    /// directions, the discs, what one unit of the model's radiance is in
+    /// the renderer's (`illuminance`, pre-exposed) — and the model whose
+    /// tables it reads. `None` without one.
+    pub fn sky_seen(&self) -> Option<(&AtmosphereUniform, &tuile_atmosphere::LutAtmosphere)> {
+        self.atmosphere.light.as_ref()?;
+        Some((
+            &self.atmosphere.frame_uniform,
+            self.atmosphere.model.as_ref()?,
+        ))
     }
 
     /// An albedo texture to fill, sized for its full mip chain. Its level 0 is

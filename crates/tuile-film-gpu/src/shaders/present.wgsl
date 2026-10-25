@@ -79,6 +79,23 @@ fn glare(d: vec3f) -> vec3f {
     return light * atmosphere.illuminance.xyz;
 }
 
+// The sky a supersample `s` no tile covers shows, in the renderer's units:
+// under a physical atmosphere `sky_seen` along its own ray, else the
+// look's air or its dome.
+fn sky_sample(s: vec2u) -> vec3f {
+    if (atmosphere.shape.w != 0.0) {
+        let ndc = (vec2f(s) + 0.5) / vec2f(frame.size.xy) * vec2f(2.0, -2.0)
+            + vec2f(-1.0, 1.0);
+        return sky_seen(frame.fwd.xyz + ndc.x * frame.right.xyz + ndc.y * frame.up.xyz, star_sigma());
+    } else if (frame.haze.w != 0.0) {
+        // The sample's own ray, as the resolve builds it.
+        let ndc = (vec2f(s) + 0.5) / vec2f(frame.size.xy) * vec2f(2.0, -2.0)
+            + vec2f(-1.0, 1.0);
+        return sky(frame.fwd.xyz + ndc.x * frame.right.xyz + ndc.y * frame.up.xyz);
+    }
+    return frame.world.xyz;
+}
+
 // Where the roll-off of highlights begins, in linear luminance: the
 // frame's `white_balance.w` (0.5 by default, `Look::highlight_knee`).
 
@@ -108,18 +125,7 @@ fn present(@builtin(global_invocation_id) id: vec3u) {
                     let inside = towards * towards - (r - 6.35e6) * (r + 6.35e6) * dot(d, d);
                     hole = hole || (towards < 0.0 && inside > 0.0);
                 }
-                if (atmosphere.shape.w != 0.0) {
-                    let ndc = (vec2f(s) + 0.5) / vec2f(frame.size.xy) * vec2f(2.0, -2.0)
-                        + vec2f(-1.0, 1.0);
-                    sum += sky_seen(frame.fwd.xyz + ndc.x * frame.right.xyz + ndc.y * frame.up.xyz, star_sigma());
-                } else if (frame.haze.w != 0.0) {
-                    // The sample's own ray, as the resolve builds it.
-                    let ndc = (vec2f(s) + 0.5) / vec2f(frame.size.xy) * vec2f(2.0, -2.0)
-                        + vec2f(-1.0, 1.0);
-                    sum += sky(frame.fwd.xyz + ndc.x * frame.right.xyz + ndc.y * frame.up.xyz);
-                } else {
-                    sum += frame.world.xyz;
-                }
+                sum += sky_sample(s);
             } else {
                 let shaded = textureLoad(hdr, s, 0);
                 // The probe: a sample the resolve marked as seen through a
@@ -160,4 +166,29 @@ fn present(@builtin(global_invocation_id) id: vec3u) {
     }
     if (hole) { linear = vec3f(1.0, 0.0, 1.0); }
     textureStore(out, id.xy, vec4f(oetf(linear), 1.0));
+}
+
+// The picture's light as `present` averages it over each pixel's samples,
+// before the lens's glare, the exposure and the grade: the renderer's
+// units, pre-exposed. For an instrument (`FilmGpu::write_linear`) — what a
+// disc's light is measured on — never for the picture.
+@group(2) @binding(0) var linear_out: texture_storage_2d<rgba32float, write>;
+
+@compute @workgroup_size(8, 8)
+fn linear(@builtin(global_invocation_id) id: vec3u) {
+    let size = textureDimensions(linear_out);
+    if (id.x >= size.x || id.y >= size.y) { return; }
+    let k = frame.size.z;
+    var sum = vec3f(0.0);
+    for (var j = 0u; j < k; j++) {
+        for (var i = 0u; i < k; i++) {
+            let s = id.xy * k + vec2u(i, j);
+            if (textureLoad(vis, s, 0).x == 0u) {
+                sum += sky_sample(s);
+            } else {
+                sum += textureLoad(hdr, s, 0).rgb;
+            }
+        }
+    }
+    textureStore(linear_out, id.xy, vec4f(sum / f32(k * k), 1.0));
 }
