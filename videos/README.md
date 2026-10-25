@@ -540,3 +540,22 @@ Looked at (`zoom-out.mp4`, `sunset.mp4`, `replay-1.mp4`, and the pictures at fra
 - The headless replay of frames 860–889 differs from the live pictures by 0.7–2.3 / 255 (JPEG included), and shows the same step (frame 876 in the replay).
 - **Two replays are identical from frame 876 on, and not before.** The sky on main carries a history (when the light was last worked out), which a replay that seeks into the session does not share. Its first light recompute brings both runs together. With #149, which makes each frame's light from that frame alone, the replay should be deterministic from the first frame.
 - No black ground in the scripted sessions. In Laurent's session, 15–28 pixels of the ground's clear colour come back frame after frame between 8 000 and 10 700 km, looking straight down at 20° N 5° E.
+
+## stars-metering-west-vs-east-pic-du-midi-2026-06-21.png — why the viewer shows stars in some directions only (2026-10-25)
+
+The Pic du Midi (lon 0.1418, lat 42.9365, altitude 3100), 2026-06-21. Four crops (the top-left quarter of a 2880×1620 frame at scale 2) of the viewer's own frame, headless, at pitch 0:
+- +60 min after sunset (20:41:54 UTC), looking east (heading 90) and west (heading 270);
+- the same two headings at +90 min.
+
+The stars and the sky are the same physics in both directions. The camera is not:
+- The viewer meters its exposure on the whole frame (`hillaire::metering`, 24×14 rays).
+- Looking west it meters the afterglow, and exposes 4.2 stops less than looking east at +60 min (2.8 stops at +90). That leaves 11 stars against 74 at +60.
+
+```bash
+TUILE_ION_TOKEN=… cargo run --release -p tuile-wgpu-viewer --example stars_scan -- \
+  --at 2026-06-21T20:41:54Z,2026-06-21T21:11:54Z --step 30 --pitches 0 \
+  --places 0.1418:42.9365:3100 --width 2880 --height 1620 --scale 2 --save 1 --out /tmp/scan
+cargo run --release -p tuile-atmosphere --example metered_exposure   # the stops per heading
+```
+
+The points are counted in the rows above the horizon (y < 700): pixels 4 code values over their ring of neighbours.
