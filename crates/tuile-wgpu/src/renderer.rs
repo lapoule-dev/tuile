@@ -562,6 +562,13 @@ impl TileRenderer {
             .then_some(self.sky.atmosphere.frame_uniform)
     }
 
+    /// The exposure the physical atmosphere was last drawn with: the linear
+    /// multiplier every light in [`Self::sky_uniform`] is pre-exposed by.
+    /// For a test or a host that traces the camera's response over frames.
+    pub fn sky_exposure(&self) -> Option<f32> {
+        self.sky.is_on().then_some(self.sky.exposure())
+    }
+
     /// How many times the frame's light was worked out and its sky-view
     /// made since this renderer was built: the budget, counted.
     pub fn sky_updates(&self) -> (u64, u64) {

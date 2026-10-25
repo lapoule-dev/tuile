@@ -480,6 +480,10 @@ impl Sky {
         self.on
     }
 
+    pub(crate) fn exposure(&self) -> f32 {
+        self.exposure
+    }
+
     pub(crate) fn set_air(&mut self, params: AtmosphereParams, look: SkyLook) {
         if (params, look) != (self.params, self.look) {
             self.params = params;
