@@ -565,3 +565,77 @@ fn an_atmosphere_films_pictures_are_the_same_to_the_byte() {
 }
 
 const FROZEN_ATMOSPHERE_FILM: &str = "03dae0e8df4bcad9";
+
+/// A film's discs under the physical atmosphere, byte for byte: the sun a
+/// few degrees up over the horizon, the sun half set on it, and a gibbous
+/// Moon high in a night sky, each aimed at with a long lens — the discs,
+/// their limbs, their glare and the air about them. Frozen before the
+/// discs' work (`docs/explorations/sun-and-moon.md`, S0) on the adapter
+/// [`a_default_films_pictures_are_the_same_to_the_byte`] is frozen on:
+/// what it moves by is said, with its reason, where it moves.
+#[test]
+fn a_films_discs_are_the_same_to_the_byte() {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let to_moon = DVec3::new(20f64.to_radians().sin(), 0.6, -0.8).normalize();
+    for (sun, moon, at, fovy) in [
+        (sun_at(2.0), None, sun_at(2.0), 0.1),
+        (sun_at(-0.9), None, sun_at(-0.9), 0.05),
+        (sun_at(-20.0), Some(to_moon), to_moon.as_vec3(), 0.05),
+    ] {
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let look = Look {
+            to_sun: sun,
+            atmosphere: Some(AtmosphereParams::default()),
+            ..Look::default()
+        };
+        let mut film = FilmGpu::new(
+            device,
+            queue,
+            Settings {
+                width: 64,
+                height: 48,
+                supersample: 2,
+                look,
+            },
+        );
+        if let Some(to_moon) = moon {
+            let mut light = FrameLight::of(&look);
+            light.illumination.moon = Some(tuile_atmosphere::Moonlight {
+                to_moon_ecef: to_moon,
+                phase_angle: 1.0,
+                angular_radius: 0.0045,
+                moon_rgb: [0.0; 3],
+            });
+            film.set_light(light);
+        }
+        let at = at.as_dvec3();
+        let up = (DVec3::X - at * at.x).normalize();
+        let view = BakedView {
+            position: [A + 1000.0, 0.0, 0.0],
+            direction: at.to_array(),
+            up: up.to_array(),
+            viewport_px: [64.0, 48.0],
+            fovy_rad: fovy,
+        };
+        let camera = FrameCamera::of(&view, 64.0 / 48.0);
+        let encoder = film.render(&camera, &[]).expect("render");
+        film.queue().submit([encoder.finish()]);
+        let output = film.output().clone();
+        for b in read_texture(&film, &output, 4) {
+            hash = (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    let (backend, name) = adapter().unwrap_or((wgpu::Backend::Noop, String::new()));
+    println!("DISCS-FILM-DIGEST {hash:016x} on {backend:?} {name}");
+    if backend != wgpu::Backend::Metal || !name.starts_with("Apple") {
+        eprintln!(
+            "SKIP: the discs film's digest is frozen on an Apple GPU, not on {backend:?} {name}"
+        );
+        return;
+    }
+    assert_eq!(format!("{hash:016x}"), FROZEN_DISCS_FILM);
+}
+
+const FROZEN_DISCS_FILM: &str = "bb928e8fcb652789";
