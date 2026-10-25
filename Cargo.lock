@@ -9562,10 +9562,13 @@ name = "tuile-wgpu-viewer"
 version = "0.14.0"
 dependencies = [
  "anyhow",
+ "arrow-array",
+ "arrow-schema",
  "async-trait",
  "axum",
  "glam 0.33.2",
  "image",
+ "parquet",
  "serde_json",
  "tempfile",
  "tokio",
