@@ -89,7 +89,7 @@ fn cpu(shot: &Shot, model: &LutAtmosphere, look: &SkyLook) -> Light {
     Light {
         exposure,
         white: look.white_balance_under(&light),
-        uniform: AtmosphereUniform::new(&AtmosphereParams::default(), &light, eye, exposure, None, look)
+        uniform: AtmosphereUniform::new(&AtmosphereParams::default(), &light, eye, exposure, glam::DMat3::IDENTITY, look)
             .seen_from(&light, eye),
     }
 }
@@ -149,7 +149,7 @@ fn gpu_light(
         look.white_balance,
         [1.0, 1.0, 1.0],
     );
-    let geometry = inputs.uniform(&AtmosphereParams::default(), eye, None, look);
+    let geometry = inputs.uniform(&AtmosphereParams::default(), eye, glam::DMat3::IDENTITY, look);
     queue.write_buffer(&atmosphere.uniform, 0, bytemuck::bytes_of(&geometry));
     pass.write(queue, &inputs);
     let mut encoder = device.create_command_encoder(&Default::default());

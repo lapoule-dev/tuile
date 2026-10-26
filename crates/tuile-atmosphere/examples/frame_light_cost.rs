@@ -94,7 +94,7 @@ fn main() {
             look.white_balance,
             [1.0; 3],
         );
-        let geometry = inputs.uniform(&AtmosphereParams::default(), eye, None, &look);
+        let geometry = inputs.uniform(&AtmosphereParams::default(), eye, glam::DMat3::IDENTITY, &look);
         queue.write_buffer(&atmosphere.uniform, 0, bytemuck::bytes_of(&geometry));
         pass.write(&queue, &inputs);
         let time = |what: &str, record: &mut dyn FnMut(&mut wgpu::CommandEncoder)| {

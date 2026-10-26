@@ -856,6 +856,7 @@ pub fn wgsl(pass: SkyViewPass) -> String {
          {outputs}\
          @group(0) @binding(9) var night_lights_lut: texture_2d<f32>;\n\
          @group(0) @binding(10) var lut_sampler: sampler;\n\
+         @group(0) @binding(13) var star_table: texture_2d<f32>;\n\
          {}\n{}\n{}\n{}\n",
         constants(),
         crate::hillaire::WGSL,
