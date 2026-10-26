@@ -52,6 +52,7 @@ impl App {
         if self.active.is_none() {
             return;
         }
+        self.note_the_input(&event);
         match event {
             WindowEvent::CloseRequested => {
                 self.ended_by = Some("the window was closed");

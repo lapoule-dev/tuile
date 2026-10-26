@@ -52,6 +52,8 @@ tuile-storage-foyer = { version = "0.14.0", path = "../tuile-storage-foyer" }
 # The sources the command line names by address (`--terrain-url`,
 # `--imagery-template`), fetched with no token over the native HTTP stack.
 tuile-native-fetchers = { version = "0.14.0", path = "../tuile-native-fetchers" }
+# A recording's pictures, encoded on its own threads: JPEG or PNG.
+image = { workspace = true }
 # Ctrl-C, SIGTERM and SIGHUP have to end the *session*, not the process: a
 # recording is most valuable in exactly the run that ends badly. A safe wrapper
 # rather than raw `libc::signal`, because the workspace denies `unsafe_code`.
@@ -60,9 +62,6 @@ ctrlc = { version = "3.5", features = ["termination"] }
 # nothing about publishing the engine's counters is specific to a wgpu window:
 # the headless probes and the warm-up job want exactly the same endpoint.
 tuile-metrics = { version = "0.14.0", path = "../tuile-metrics" }
-# The control API's, and only with its feature: it writes an eye's picture as
-# PNG.
-image = { workspace = true, optional = true }
 
 # The browser: the page and the worker are one wasm module (see `web`). Each
 # crate below is the wasm-bindgen project's own or the workspace's:
@@ -189,4 +188,4 @@ application = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-app-kit", "dep:mu
 # and for debug builds a device is driven through; never in a build that
 # ships, and refused outright in an iOS release build. A build feature and
 # never a runtime switch: a binary either has it or does not.
-control = ["dep:image"]
+control = []

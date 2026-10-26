@@ -115,4 +115,30 @@ impl App {
             crate::steer::jump(&mut self.controller, camera);
         }
     }
+
+    /// Holds a recorded frame in place of the camera and the clocks, from
+    /// the next frame drawn on; `None` lets go.
+    pub(crate) fn hold(&mut self, replayed: Option<super::Replayed>) {
+        self.recording.replay = replayed;
+    }
+
+    /// Draws a frame now, whether or not the loop asked for one. Says
+    /// whether it reached the eyes.
+    pub(crate) fn draw_now(&mut self) -> bool {
+        let before = self.presented;
+        self.render();
+        self.presented > before
+    }
+
+    /// What the atmosphere lit the last frame with.
+    pub(crate) fn sky(&self) -> Option<tuile_tape::session::SkyState> {
+        self.active
+            .as_ref()
+            .and_then(|active| super::tape::sky_state(&active.renderer))
+    }
+
+    /// The instant the last frame was lit for, and the wall it was drawn at.
+    pub(crate) fn lit(&self) -> (f64, f64) {
+        (self.instant, self.recording.wall)
+    }
 }

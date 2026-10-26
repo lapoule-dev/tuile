@@ -37,6 +37,15 @@ impl App {
         }
     }
 
+    /// A steering URL from inside the process — a steering script's — read
+    /// as one from outside is.
+    pub(super) fn queue_url(&mut self, url: String) {
+        match steer::parse_url_among(&url, self.imagery.layers) {
+            Ok(commands) => commands.into_iter().for_each(|c| self.apply(c)),
+            Err(why) => tracing::error!("steering URL ignored: {why}"),
+        }
+    }
+
     pub(super) fn apply(&mut self, command: Command) {
         match command {
             Command::Goto(goto) => {
@@ -109,6 +118,7 @@ impl App {
                     self.resume_rate = rate;
                 }
             }
+            Command::Record(on) => self.record(on),
             Command::ClockNow => {
                 self.atmosphere.clock.now(super::wall_seconds());
                 self.resume_rate = 1.0;
@@ -203,6 +213,7 @@ impl App {
                 layer: self.imagery.layer,
                 layers,
                 clock: self.clock_state(),
+                recording: self.is_recording(),
             },
             |snapshot| crate::menu::State::of(&snapshot, layers),
         )
@@ -228,6 +239,7 @@ impl App {
             layer: self.imagery.layer,
             diagnostic: self.views.diagnostic,
             clock: self.clock_state(),
+            recording: self.is_recording(),
             ..Snapshot::of(&self.controller, size)
         };
         crate::snapshot::publish(snapshot);

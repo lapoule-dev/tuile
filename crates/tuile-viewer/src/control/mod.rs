@@ -427,6 +427,24 @@ impl State {
     }
 }
 
+/// A recorded frame drawn again ([`Headless::replay`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Replayed {
+    /// The run's state once the frame was drawn for the last time.
+    pub state: State,
+    /// Whether the picture was complete and nothing loading before the
+    /// bound.
+    pub settled: bool,
+    /// How many times the frame was drawn.
+    pub draws: u32,
+    /// The scene instant it was lit for, and the wall instant it was drawn
+    /// at: the recording's.
+    pub instant: f64,
+    pub wall: f64,
+    /// What the atmosphere lit it with.
+    pub sky: Option<tuile_tape::session::SkyState>,
+}
+
 /// What a wait came to.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settled {
@@ -579,6 +597,8 @@ impl Headless {
             controls: true,
             backends: None,
             imagery_compression: start.imagery_compression,
+            // A headless run writes its own session log (`Start::log`).
+            record: Default::default(),
         };
         let mut app = App::new(config, launch);
         app.speak_through(said);
@@ -800,6 +820,72 @@ impl Headless {
             }
         }
         &self.history[first..]
+    }
+
+    /// Draws one frame of a recorded session again (`tuile_tape::session`):
+    /// its camera, lit at its own scene instant from its own wall instant,
+    /// through the renderer a window draws with — and draws it again, the
+    /// camera and the clocks held, until the picture is complete and nothing
+    /// is loading, or `bound` seconds have passed.
+    ///
+    /// No refresh is waited for: the clocks are the recording's, not the
+    /// wall's, so the frame is the same frame however long it takes to
+    /// load. A frame recorded without its context (a plain tape) is lit at
+    /// the run's own instant ([`Start::lit_at`]), held.
+    pub fn replay(&mut self, frame: &tuile_tape::session::Recorded, bound: f64) -> Replayed {
+        let (wall, instant, rate) = frame.context.map_or(
+            (self.start.lit_at, self.start.lit_at, 0.0),
+            |c| (c.wall, c.instant, c.rate),
+        );
+        self.app.hold(Some(crate::app::Replayed {
+            camera: frame.camera,
+            wall,
+            instant,
+            rate,
+        }));
+        let began = Instant::now();
+        let mut draws = 0;
+        let mut drew;
+        let settled = loop {
+            let turned = Instant::now();
+            drew = match self.app.turn() {
+                Turn::End => false,
+                Turn::Flow(_) => self.app.draw_now(),
+            };
+            draws += u32::from(drew);
+            let state = self.read(drew, turned.elapsed().as_secs_f64());
+            if state.complete() && state.idle() {
+                break true;
+            }
+            if began.elapsed().as_secs_f64() >= bound {
+                break false;
+            }
+            if !drew {
+                // Nothing to draw yet — the session still coming up: give
+                // its threads the time a refresh would.
+                std::thread::sleep(self.interval);
+            }
+        };
+        self.app.hold(None);
+        self.frame += 1;
+        let mut state = self.read(drew, began.elapsed().as_secs_f64());
+        for observer in &mut self.observers {
+            let reading = observer.observe(&state);
+            state.observed.insert(observer.topic().to_owned(), reading);
+        }
+        if let Some(log) = self.log.as_mut() {
+            log.write(&state, &self.app);
+        }
+        self.history.push(state.clone());
+        let (lit, drawn_at) = self.app.lit();
+        Replayed {
+            state,
+            settled,
+            draws,
+            instant: lit,
+            wall: drawn_at,
+            sky: self.app.sky(),
+        }
     }
 
     /// Flies a recorded camera path, one camera a frame, as `TUILE_REPLAY`

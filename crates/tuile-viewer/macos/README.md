@@ -50,7 +50,7 @@ something the other does not.
 | menu | items (key) |
 |---|---|
 | *application* | About, Services, Hide, Hide Others, Show All, Quit (⌘Q) |
-| View | Wireframe (W) ✓, Freeze Selection (F) ✓, Diagnostic View: Normal / Unlit / Coverage / Geometry ✓, Next Diagnostic View (D) |
+| View | Wireframe (W) ✓, Freeze Selection (F) ✓, Diagnostic View: Normal / Unlit / Coverage / Geometry ✓, Next Diagnostic View (D), Record Session (O) ✓ |
 | Go | North Up (N), Centre on Current Location (L), Copy Link to This View (C), Go to Copied Link (V) |
 | Imagery | one item per layer ✓, Next Layer (I) |
 | Window | Minimize, Zoom, Enter Full Screen, Bring All to Front |

@@ -58,6 +58,11 @@ pub struct FrameOnSurface<'a, 'w> {
     pub clear: wgpu::Color,
     /// When given, the drawn frame is copied into it before the submit.
     pub trace: Option<&'a mut Readback>,
+    /// When given, the drawn frame is copied into a slot of the ring,
+    /// tagged with the number beside it, and mapped once submitted: a
+    /// recording that never waits for its pictures
+    /// ([`crate::ReadbackRing`]).
+    pub record: Option<(&'a mut crate::ReadbackRing, u64)>,
 }
 
 /// The attachments the frame's own pass used, for a pass that follows it on
@@ -112,6 +117,7 @@ pub fn draw_to_surface(
         targets,
         clear,
         trace,
+        record,
     } = into;
     let frame = match surface.get_current_texture() {
         wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -149,7 +155,14 @@ pub fn draw_to_surface(
     if let Some(trace) = trace {
         trace.capture(gpu, &mut encoder, &frame.texture, targets.size());
     }
+    let record = record.map(|(ring, tag)| {
+        ring.capture(gpu, &mut encoder, &frame.texture, targets.size(), tag);
+        ring
+    });
     gpu.queue.submit([encoder.finish()]);
+    if let Some(ring) = record {
+        ring.submitted();
+    }
     before_present();
     gpu.queue.present(frame);
     Presented::Yes

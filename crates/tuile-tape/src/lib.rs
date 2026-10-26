@@ -20,6 +20,7 @@ pub enum TapeError {
 }
 pub mod path;
 pub mod scan;
+pub mod session;
 pub mod timelapse;
 
 /// The topic a tape states its frames' instants on: one message, a
@@ -171,7 +172,7 @@ const CAMERA_SCHEMA: &str = "tuile.Camera";
 /// Frames are indexed, not timed, but a reader wants a clock. Sixty a second is
 /// what a viewer runs at, so a path opened in any MCAP tool spans the wall time
 /// it actually took to fly.
-const NANOS_PER_FRAME: u64 = 1_000_000_000 / 60;
+pub(crate) const NANOS_PER_FRAME: u64 = 1_000_000_000 / 60;
 
 /// Enough for a reader to interpret the channel without asking anyone.
 const CAMERA_JSON_SCHEMA: &str = r#"{
@@ -530,7 +531,7 @@ impl Tape {
     /// The writer, the channel of `topic` — declared now if this is its
     /// first message — and the frame a message written now belongs to.
     /// `None` on a replay, or when the channel cannot be declared.
-    fn channel_for(
+    pub(crate) fn channel_for(
         &mut self,
         topic: &str,
         schema: &str,
@@ -714,13 +715,13 @@ fn parse_camera(text: &str) -> Result<(Frame, u32), TapeError> {
 }
 
 /// The topic the rendered frames are published on.
-const IMAGE_TOPIC: &str = "/frame";
+pub const IMAGE_TOPIC: &str = "/frame";
 
 /// Foxglove's own name for it, so any MCAP viewer shows the pictures without
 /// being taught anything.
-const IMAGE_SCHEMA: &str = "foxglove.CompressedImage";
+pub(crate) const IMAGE_SCHEMA: &str = "foxglove.CompressedImage";
 
-const IMAGE_JSON_SCHEMA: &str = r#"{
+pub(crate) const IMAGE_JSON_SCHEMA: &str = r#"{
   "type": "object",
   "properties": {
     "timestamp": {"type": "object", "properties": {"sec": {"type": "integer"}, "nsec": {"type": "integer"}}},
@@ -957,13 +958,24 @@ fn write_image<W: std::io::Write + std::io::Seek>(
     image::codecs::png::PngEncoder::new(&mut png)
         .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
         .map_err(|e| TapeError::NotAPath(format!("cannot encode a trace frame: {e}")))?;
+    write_encoded(writer, channel, "png", &png, frame_index)
+}
 
+/// Writes one picture, already encoded as `format` (`png`, `jpeg`), to an
+/// image channel on frame `frame_index`.
+pub(crate) fn write_encoded<W: std::io::Write + std::io::Seek>(
+    writer: &mut mcap::Writer<W>,
+    channel: u16,
+    format: &str,
+    encoded: &[u8],
+    frame_index: u64,
+) -> Result<(), TapeError> {
     let stamp = frame_index * NANOS_PER_FRAME;
     let json = format!(
-        r#"{{"timestamp":{{"sec":{},"nsec":{}}},"frame_id":"globe","format":"png","data":"{}"}}"#,
+        r#"{{"timestamp":{{"sec":{},"nsec":{}}},"frame_id":"globe","format":"{format}","data":"{}"}}"#,
         stamp / 1_000_000_000,
         stamp % 1_000_000_000,
-        base64(&png),
+        base64(encoded),
     );
     writer.write_to_known_channel(
         &mcap::records::MessageHeader {

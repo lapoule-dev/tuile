@@ -190,6 +190,8 @@ fn start_viewer_with(
         // The host's choice: resolved against the page's adapter when its
         // device comes up, and passed to the worker in its start message.
         imagery_compression: options.imagery_compression,
+        // A page has no file to record into.
+        record: Default::default(),
     };
     let app = App::new(config, launch);
     let id = CURRENT.with(|c| c.get()) + 1;

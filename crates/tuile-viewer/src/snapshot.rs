@@ -67,6 +67,8 @@ pub(crate) struct Snapshot {
     pub diagnostic: usize,
     /// The scene's clock: the instant drawn, and how it runs.
     pub clock: crate::menu::Clock,
+    /// Whether the session is being recorded.
+    pub recording: bool,
 }
 
 impl Snapshot {
@@ -105,6 +107,7 @@ impl Snapshot {
             layer: 0,
             diagnostic: 0,
             clock: crate::menu::Clock::default(),
+            recording: false,
         }
     }
 }

@@ -9275,6 +9275,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuile-record"
+version = "0.14.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "glam 0.33.2",
+ "image",
+ "parquet",
+ "tempfile",
+ "tuile-atmosphere",
+ "tuile-camera",
+ "tuile-core",
+ "tuile-film-native",
+ "tuile-tape",
+]
+
+[[package]]
 name = "tuile-repository"
 version = "0.14.0"
 dependencies = [
@@ -9336,6 +9353,8 @@ dependencies = [
  "glam 0.33.2",
  "image",
  "mcap",
+ "serde",
+ "serde_json",
  "splines",
  "tempfile",
  "thiserror 2.0.18",
@@ -9545,6 +9564,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "glam 0.33.2",
  "image",
  "serde_json",
  "tempfile",
@@ -9553,9 +9573,11 @@ dependencies = [
  "tracing-subscriber",
  "tuile-atmosphere",
  "tuile-bing",
+ "tuile-camera",
  "tuile-cesium-ion",
  "tuile-core",
  "tuile-native-fetchers",
+ "tuile-tape",
  "tuile-viewer",
  "url",
 ]

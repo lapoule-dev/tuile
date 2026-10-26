@@ -244,3 +244,105 @@ mod tests {
         );
     }
 }
+
+/// A scripted steering, for a session that can be recorded again:
+/// `TUILE_STEER_SCRIPT=<file>`, one line an action — seconds after the
+/// first view is covered, then a steering URL (`tuile://goto?…&seconds=20`)
+/// or `quit`. Blank lines and `#` comments are skipped.
+///
+/// The URLs go where every URL goes ([`crate::steer::Request::Url`]): a
+/// script can do nothing a link cannot.
+pub(super) struct SteerScript {
+    lines: Vec<(f64, String)>,
+    next: usize,
+    started: Option<Instant>,
+}
+
+impl SteerScript {
+    /// The script `TUILE_STEER_SCRIPT` names, if any.
+    pub(super) fn from_environment() -> Option<Self> {
+        let path = std::env::var("TUILE_STEER_SCRIPT").ok()?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::error!(path, "cannot read the steering script: {e}");
+                return None;
+            }
+        };
+        match Self::parse(&text) {
+            Ok(script) => Some(script),
+            Err(why) => {
+                tracing::error!(path, "the steering script is not read: {why}");
+                None
+            }
+        }
+    }
+
+    pub(super) fn parse(text: &str) -> Result<Self, String> {
+        let mut lines = Vec::new();
+        for (n, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (at, what) = line
+                .split_once(char::is_whitespace)
+                .ok_or_else(|| format!("line {}: <seconds> <url|quit>", n + 1))?;
+            let at: f64 = at
+                .parse()
+                .map_err(|_| format!("line {}: {at:?} is not seconds", n + 1))?;
+            lines.push((at, what.trim().to_owned()));
+        }
+        lines.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Ok(Self {
+            lines,
+            next: 0,
+            started: None,
+        })
+    }
+
+    /// Whether lines are still to come: the loop keeps turning for them.
+    pub(super) fn pending(&self) -> bool {
+        self.next < self.lines.len()
+    }
+
+    /// The lines due by `now`, once the first view is `covered`.
+    pub(super) fn due(&mut self, now: Instant, covered: bool) -> Vec<String> {
+        if !covered && self.started.is_none() {
+            return Vec::new();
+        }
+        let started = *self.started.get_or_insert(now);
+        let at = now.duration_since(started).as_secs_f64();
+        let mut out = Vec::new();
+        while let Some((when, what)) = self.lines.get(self.next) {
+            if *when > at {
+                break;
+            }
+            out.push(what.clone());
+            self.next += 1;
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod steer_tests {
+    use super::*;
+
+    #[test]
+    fn a_steering_script_plays_its_lines_in_time_once_covered() {
+        let mut script = SteerScript::parse(
+            "# zoom out\n2 tuile://goto?altitude=1e8&seconds=20\n\n0 tuile://goto?lat=1\n30 quit\n",
+        )
+        .expect("reads");
+        let t0 = Instant::now();
+        assert!(script.due(t0, false).is_empty());
+        assert_eq!(script.due(t0, true), vec!["tuile://goto?lat=1"]);
+        assert_eq!(
+            script.due(t0 + Duration::from_secs(3), true),
+            vec!["tuile://goto?altitude=1e8&seconds=20"]
+        );
+        assert_eq!(script.due(t0 + Duration::from_secs(31), true), vec!["quit"]);
+        assert!(SteerScript::parse("soon tuile://goto?lat=1").is_err());
+    }
+}

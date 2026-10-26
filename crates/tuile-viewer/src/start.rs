@@ -45,6 +45,17 @@ FLAGS (each takes one number; `--flag value` or `--flag=value`):
                        timeRate=, a sunset being the one where it leads:
                        tuile://goto?lon=0.1418&lat=42.9365&altitude=3100
                          &heading=290&pitch=0&time=sunset&timeOffset=-30m&timeRate=30
+    --record <file>    record the session into an MCAP file: per frame the
+                       camera, the wall and scene clocks, the viewport, the
+                       atmosphere's state and the input events (the format
+                       `tuile_tape::session` reads, and a replay flies),
+                       and the pictures drawn, as they were on the screen.
+                       O, or View > Record Session, starts and stops one
+    --record-fps <hz>  pictures a second of a recording: 30 (the default),
+                       0 for every frame drawn
+    --record-scale <s> a picture's size over the frame's: 0.5 (the default),
+                       1 for the frame as drawn, 0.25
+    --record-codec <c> jpeg (the default) or png (every bit kept)
 IMAGERY_LAYERS
     --imagery-compression <off|auto|bc7|astc>
                        how imagery is held on the GPU: off (RGBA8, the
@@ -94,6 +105,7 @@ KEYS:
     R                  the clock faster
     P                  pause the clock, or run it again
     T                  back to the present, in real time
+    O                  record the session, the pictures drawn included, or stop
 ";
 
 /// What only an application that is its own window answers.
@@ -252,6 +264,9 @@ pub(crate) enum Invocation {
         clock: tuile_atmosphere::ClockSettings,
         /// `--max-altitude`, metres: the camera's ceiling, when said.
         max_altitude: Option<f64>,
+        /// `--record` and its pictures' `--record-fps`, `--record-scale`
+        /// and `--record-codec`.
+        record: crate::recording::RecordSettings,
     },
     /// Print [`usage`] and leave.
     Help,
@@ -438,7 +453,7 @@ where
     let mut here = false;
     let mut imagery: Option<String> = None;
     // The flags that take text: each at most once.
-    let mut texts: [(&str, Option<String>); 8] = [
+    let mut texts: [(&str, Option<String>); 12] = [
         ("--terrain-url", None),
         ("--imagery-template", None),
         ("--imagery-scheme", None),
@@ -447,6 +462,10 @@ where
         ("--time-offset", None),
         ("--time-rate", None),
         ("--max-altitude", None),
+        ("--record", None),
+        ("--record-fps", None),
+        ("--record-scale", None),
+        ("--record-codec", None),
     ];
     let mut compression: Option<tuile_wgpu::ImageryCompression> = None;
     let mut seen = [false; FLAGS.len()];
@@ -533,7 +552,7 @@ where
     if here && (seen[0] || seen[1]) {
         return Err("--here and --lon/--lat both say where to start; give one".to_owned());
     }
-    let [(_, terrain), (_, template), (_, scheme), (_, max_level), (_, time), (_, offset), (_, rate), (_, ceiling)] =
+    let [(_, terrain), (_, template), (_, scheme), (_, max_level), (_, time), (_, offset), (_, rate), (_, ceiling), (_, record), (_, record_fps), (_, record_scale), (_, record_codec)] =
         texts;
     // Read as an altitude is, with the same bounds: it is one.
     let max_altitude = ceiling
@@ -564,6 +583,14 @@ where
         compression,
         clock,
         max_altitude,
+        record: crate::recording::RecordSettings {
+            path: record.map(std::path::PathBuf::from),
+            pictures: crate::recording::PictureSettings::parse(
+                record_fps.as_deref(),
+                record_scale.as_deref(),
+                record_codec.as_deref(),
+            )?,
+        },
     })
 }
 
@@ -633,6 +660,7 @@ mod tests {
             compression: None,
             clock: _,
             max_altitude: None,
+            record: _,
         }) = parsed
         else {
             unreachable!("{args:?} should start a session, got {parsed:?}");
@@ -955,6 +983,28 @@ mod tests {
         assert!(FLAGS_TEXT.contains("--imagery-compression <off|auto|bc7|astc>"));
     }
 
+    /// `--record` names the file a session is recorded into, once.
+    #[test]
+    fn record_names_the_session_file() {
+        let recorded = |args: &[&str]| match parse(args) {
+            Ok(Invocation::Run { record, .. }) => Ok(record.path),
+            Ok(Invocation::Help) => Err("help".to_owned()),
+            Err(e) => Err(e),
+        };
+        assert_eq!(recorded(&[]), Ok(None));
+        assert_eq!(
+            recorded(&["--record", "flicker.mcap"]),
+            Ok(Some(std::path::PathBuf::from("flicker.mcap")))
+        );
+        assert_eq!(
+            recorded(&["--record=a b.mcap", "--lon", "0.14"]),
+            Ok(Some(std::path::PathBuf::from("a b.mcap")))
+        );
+        assert!(recorded(&["--record"]).is_err());
+        assert!(recorded(&["--record", "a", "--record", "b"]).is_err());
+        assert!(FLAGS_TEXT.contains("--record <file>"));
+    }
+
     #[test]
     fn here_replaces_the_position_and_refuses_to_share_it() {
         assert_eq!(
@@ -971,6 +1021,7 @@ mod tests {
                 compression: None,
                 clock: Default::default(),
                 max_altitude: None,
+                record: Default::default(),
             })
         );
         // Either order, either coordinate.

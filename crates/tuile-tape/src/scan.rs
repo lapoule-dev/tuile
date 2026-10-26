@@ -92,6 +92,110 @@ pub fn bare_ground(rgba: &[u8], width: u32, height: u32, camera: &Frame, step: u
     bare
 }
 
+/// What a picture shows, measured for a diagnosis: how bright its sky and
+/// its ground are, how many star-like points the sky holds, and how much
+/// of it is the clear colour.
+///
+/// Brightness is luma (Rec. 709 weights over the picture's own sRGB-coded
+/// values, 0–1): what an eye compares between two frames, and what a
+/// flicker moves.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PictureStats {
+    /// Pixels whose ray meets the globe for certain, and the others.
+    pub ground_pixels: u64,
+    pub sky_pixels: u64,
+    /// Mean luma of each; 0 where there are none.
+    pub ground_luma: f64,
+    pub sky_luma: f64,
+    /// Mean luma of the whole picture.
+    pub luma: f64,
+    /// Sky pixels brighter than all eight neighbours by [`STAR_CONTRAST`]
+    /// over their mean: points of light, stars and planets.
+    pub stars: u64,
+    /// Pixels of the whole picture at the clear colour ([`BLACK`]).
+    pub black: u64,
+    /// Ground pixels at the clear colour: the bare ground [`bare_ground`]
+    /// counts.
+    pub black_ground: u64,
+}
+
+/// How far over its neighbours' mean, in luma (0–1), a sky pixel must be to
+/// count as a point of light: a star a pixel wide on a dark sky, never the
+/// grain of a gradient.
+pub const STAR_CONTRAST: f64 = 0.08;
+
+fn luma(rgba: &[u8], i: usize) -> f64 {
+    (0.2126 * f64::from(rgba[i]) + 0.7152 * f64::from(rgba[i + 1]) + 0.0722 * f64::from(rgba[i + 2]))
+        / 255.0
+}
+
+/// Measures tightly packed RGBA8 of `width × height`, drawn by `camera`:
+/// see [`PictureStats`]. Every pixel; the ground is told from the sky as
+/// [`bare_ground`] tells it, a pixel on the limb counted as sky.
+pub fn picture_stats(rgba: &[u8], width: u32, height: u32, camera: &Frame) -> PictureStats {
+    let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+        return PictureStats::default();
+    }
+    let eye = camera.position;
+    let f = normalise(camera.direction);
+    let r = normalise(cross(f, camera.up));
+    let u = cross(r, f);
+    let half_v = (camera.fovy * 0.5).tan();
+    let half_h = half_v * (w as f64 / h as f64);
+    let ground: Vec<bool> = (0..w * h)
+        .map(|p| {
+            let (x, y) = ((p % w) as f64, (p / w) as f64);
+            let ndc_x = (x + 0.5) / w as f64 * 2.0 - 1.0;
+            let ndc_y = 1.0 - (y + 0.5) / h as f64 * 2.0;
+            hits_globe(
+                eye,
+                normalise([
+                    f[0] + r[0] * ndc_x * half_h + u[0] * ndc_y * half_v,
+                    f[1] + r[1] * ndc_x * half_h + u[1] * ndc_y * half_v,
+                    f[2] + r[2] * ndc_x * half_h + u[2] * ndc_y * half_v,
+                ]),
+            )
+        })
+        .collect();
+    let mut s = PictureStats::default();
+    let (mut sum, mut sum_ground, mut sum_sky) = (0.0, 0.0, 0.0);
+    for p in 0..w * h {
+        let i = p * 4;
+        let l = luma(rgba, i);
+        sum += l;
+        let black = rgba[i] < BLACK && rgba[i + 1] < BLACK && rgba[i + 2] < BLACK;
+        s.black += u64::from(black);
+        if ground[p] {
+            s.ground_pixels += 1;
+            sum_ground += l;
+            s.black_ground += u64::from(black);
+            continue;
+        }
+        s.sky_pixels += 1;
+        sum_sky += l;
+        let (x, y) = (p % w, p / w);
+        if x == 0 || y == 0 || x + 1 == w || y + 1 == h {
+            continue;
+        }
+        let mut most = 0.0f64;
+        let mut around = 0.0;
+        for (dx, dy) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+            let q = ((y as i64 + dy) as usize * w + (x as i64 + dx) as usize) * 4;
+            let n = luma(rgba, q);
+            most = most.max(n);
+            around += n;
+        }
+        if l > most && l - around / 8.0 >= STAR_CONTRAST {
+            s.stars += 1;
+        }
+    }
+    s.luma = sum / (w * h) as f64;
+    s.ground_luma = sum_ground / s.ground_pixels.max(1) as f64;
+    s.sky_luma = sum_sky / s.sky_pixels.max(1) as f64;
+    s
+}
+
 /// Whether a ray from `eye` along `dir` meets the ellipsoid shrunk by
 /// [`INSIDE`], in front of the camera.
 fn hits_globe(eye: [f64; 3], dir: [f64; 3]) -> bool {
@@ -158,6 +262,44 @@ mod tests {
         assert_eq!(cleared.ground, drawn.ground);
         assert_eq!(cleared.black, cleared.ground);
         assert!((cleared.fraction() - 1.0).abs() < 1e-12);
+    }
+
+    /// A dark sky with three single-pixel stars, over ground: the stars are
+    /// counted, the ground's luma is the ground's, and a grey gradient has
+    /// no star in it.
+    #[test]
+    fn stars_and_the_two_regions_are_measured_apart() {
+        // Looking along the horizon from low: the lower half is ground.
+        let camera = Frame {
+            position: [EQUATORIAL + 2_000.0, 0.0, 0.0],
+            direction: [0.0, 1.0, 0.0],
+            up: [1.0, 0.0, 0.0],
+            fovy: 45f64.to_radians(),
+        };
+        let (w, h) = (64u32, 64u32);
+        let mut rgba = filled(w, h, [4, 4, 10]);
+        for y in 32..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                rgba[i..i + 3].copy_from_slice(&[100, 100, 100]);
+            }
+        }
+        for (x, y) in [(10, 5), (30, 12), (50, 20)] {
+            let i = ((y * w + x) * 4) as usize;
+            rgba[i..i + 3].copy_from_slice(&[230, 230, 230]);
+        }
+        let s = picture_stats(&rgba, w, h, &camera);
+        assert_eq!(s.stars, 3, "{s:?}");
+        assert!(s.ground_pixels > 0 && s.sky_pixels > 0, "{s:?}");
+        assert!((s.ground_luma - 100.0 / 255.0).abs() < 1e-9, "{s:?}");
+        assert!(s.sky_luma < 0.1, "{s:?}");
+        let gradient: Vec<u8> = (0..w * h)
+            .flat_map(|p| {
+                let v = (p % w) as u8 * 3;
+                [v, v, v, 255]
+            })
+            .collect();
+        assert_eq!(picture_stats(&gradient, w, h, &camera).stars, 0);
     }
 
     /// Looking away from the planet there is no ground at all, so a black
