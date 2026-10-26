@@ -11,8 +11,10 @@
 //! pictures are compared only when the camera between them barely moved —
 //! turned less than [`Bounds::max_turn_deg`], climbed less than
 //! [`Bounds::max_climb`] of its altitude — and they are at most
-//! [`Bounds::max_gap`] frames apart. What the camera's own motion explains
-//! is not a flicker.
+//! [`Bounds::max_gap`] frames apart, the scene's clock moved less than
+//! [`Bounds::max_scene_step`] between them; and a step is flagged only when
+//! it stands out from its neighbours' ([`Bounds::trend`]). What the camera's
+//! motion or the time of day explains is not a flicker.
 
 use crate::Row;
 
@@ -36,6 +38,16 @@ pub struct Bounds {
     pub max_turn_deg: f64,
     /// The most its altitude may change between them, as a share of it.
     pub max_climb: f64,
+    /// The most the scene's clock may move between them, seconds: an
+    /// accelerated clock changes the light on its own.
+    pub max_scene_step: f64,
+    /// How many times its neighbours' median step a step must be to stand
+    /// out from the trend.
+    pub trend: f64,
+    /// Ground pixels at the clear colour a frame may have before it is
+    /// flagged: a few pixels of night ground under 8 of 255 are dark, not
+    /// missing.
+    pub min_black: u64,
 }
 
 impl Default for Bounds {
@@ -50,6 +62,9 @@ impl Default for Bounds {
             max_gap: 2,
             max_turn_deg: 0.5,
             max_climb: 0.02,
+            max_scene_step: 900.0,
+            trend: 3.0,
+            min_black: 16,
         }
     }
 }
@@ -88,39 +103,84 @@ pub struct Flagged {
 /// The frames of `rows` that break `bounds`, in order. Frames without a
 /// picture are skipped; each picture is compared with the last one.
 pub fn flag(rows: &[Row], bounds: &Bounds) -> Vec<Flagged> {
-    let mut out = Vec::new();
+    // Each picture's step from the last one, where the two compare: the
+    // sky's, the ground's, and the stars before and after.
+    struct Step {
+        row: usize,
+        sky: Option<f64>,
+        ground: Option<f64>,
+        stars: Option<(u64, u64)>,
+    }
+    let mut steps = Vec::new();
     let mut last: Option<&Row> = None;
     for (i, row) in rows.iter().enumerate() {
         if !row.pictured {
             continue;
         }
-        let mut why = Vec::new();
+        let mut step = Step {
+            row: i,
+            sky: None,
+            ground: None,
+            stars: None,
+        };
         if let Some(prev) = last.filter(|prev| still(prev, row, bounds)) {
             let both = |a: u64, b: u64| a >= bounds.min_pixels && b >= bounds.min_pixels;
-            let sky = row.sky_luma - prev.sky_luma;
-            if both(row.sky_pixels, prev.sky_pixels) && sky.abs() > bounds.luma_step {
-                why.push(Why::Sky(sky));
-            }
-            let ground = row.ground_luma - prev.ground_luma;
-            if both(row.ground_pixels, prev.ground_pixels) && ground.abs() > bounds.luma_step {
-                why.push(Why::Ground(ground));
-            }
-            if prev.stars >= bounds.min_stars
-                && (row.stars as f64) < (1.0 - bounds.star_drop) * prev.stars as f64
+            step.sky = both(row.sky_pixels, prev.sky_pixels).then(|| row.sky_luma - prev.sky_luma);
+            step.ground = both(row.ground_pixels, prev.ground_pixels)
+                .then(|| row.ground_luma - prev.ground_luma);
+            step.stars = Some((prev.stars, row.stars));
+        }
+        steps.push(step);
+        last = Some(row);
+    }
+    // A step stands out from the trend when it is larger than
+    // [`Bounds::trend`] times the median of its neighbours' — a sunset run
+    // fast changes every picture, a flicker changes one.
+    let trend = |n: usize, of: &dyn Fn(&Step) -> Option<f64>| -> f64 {
+        let lo = n.saturating_sub(TREND_WINDOW);
+        let hi = (n + TREND_WINDOW + 1).min(steps.len());
+        let mut around: Vec<f64> = (lo..hi)
+            .filter(|m| *m != n)
+            .filter_map(|m| of(&steps[m]).map(f64::abs))
+            .collect();
+        if around.is_empty() {
+            return 0.0;
+        }
+        around.sort_by(f64::total_cmp);
+        around[around.len() / 2]
+    };
+    let mut out = Vec::new();
+    for (n, step) in steps.iter().enumerate() {
+        let row = &rows[step.row];
+        let mut why = Vec::new();
+        let stands_out = |d: f64, of: &dyn Fn(&Step) -> Option<f64>| {
+            d.abs() > bounds.luma_step && d.abs() > bounds.trend * trend(n, of)
+        };
+        if let Some(d) = step.sky.filter(|d| stands_out(*d, &|s: &Step| s.sky)) {
+            why.push(Why::Sky(d));
+        }
+        if let Some(d) = step.ground.filter(|d| stands_out(*d, &|s: &Step| s.ground)) {
+            why.push(Why::Ground(d));
+        }
+        if let Some((before, after)) = step.stars {
+            if before >= bounds.min_stars
+                && (after as f64) < (1.0 - bounds.star_drop) * before as f64
             {
-                why.push(Why::Stars(prev.stars, row.stars));
+                why.push(Why::Stars(before, after));
             }
         }
-        if row.black_ground > 0 {
+        if row.black_ground >= bounds.min_black.max(1) {
             why.push(Why::Black(row.black_ground));
         }
         if !why.is_empty() {
-            out.push(Flagged { row: i, why });
+            out.push(Flagged { row: step.row, why });
         }
-        last = Some(row);
     }
     out
 }
+
+/// Pictures on each side a step is held against.
+const TREND_WINDOW: usize = 5;
 
 /// Whether the camera barely moved from `a` to `b`, and they are close
 /// enough in frames to be compared: see the module.
@@ -137,6 +197,8 @@ pub fn still(a: &Row, b: &Row, bounds: &Bounds) -> bool {
         && turn(a.direction, b.direction) <= bounds.max_turn_deg
         && turn(a.up, b.up) <= bounds.max_turn_deg
         && climb <= bounds.max_climb
+        // Unknown clocks compare: a plain tape has none.
+        && !((b.instant - a.instant).abs() > bounds.max_scene_step)
 }
 
 /// The link that brings the viewer back to `row`'s view at its instant,

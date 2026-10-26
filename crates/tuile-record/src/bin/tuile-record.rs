@@ -7,9 +7,12 @@
 //! tuile-record export   <session.mcap> [--mp4 F] [--parquet F] [--plots F.png]
 //!                       [--codec h264|av1] [--fps N] [--burn-in]
 //! tuile-record diagnose <session.parquet | session.mcap> [--luma-step X]
-//!                       [--star-drop X] [--min-stars N] [--plots F.png]
+//!                       [--star-drop X] [--min-stars N] [--min-black N]
+//!                       [--max-turn DEG] [--max-climb X] [--max-scene-step S]
+//!                       [--plots F.png]
 //! tuile-record goto     <session.parquet | session.mcap> <frame> [--open]
 //! tuile-record film-tape <session.mcap> <film.mcap>
+//! tuile-record picture  <session.mcap> <frame> <out.png>
 //! ```
 
 use std::collections::BTreeMap;
@@ -21,9 +24,12 @@ const USAGE: &str = "\
 tuile-record export   <session.mcap> [--mp4 F] [--parquet F] [--plots F.png]
                       [--codec h264|av1] [--fps N] [--burn-in]
 tuile-record diagnose <session.parquet | session.mcap> [--luma-step X]
-                      [--star-drop X] [--min-stars N] [--plots F.png]
+                      [--star-drop X] [--min-stars N] [--min-black N]
+                      [--max-turn DEG] [--max-climb X] [--max-scene-step S]
+                      [--plots F.png]
 tuile-record goto     <session.parquet | session.mcap> <frame> [--open]
-tuile-record film-tape <session.mcap> <film.mcap>";
+tuile-record film-tape <session.mcap> <film.mcap>
+tuile-record picture  <session.mcap> <frame> <out.png>";
 
 struct Args {
     positional: Vec<String>,
@@ -87,6 +93,10 @@ fn bounds(args: &Args) -> Result<Bounds, String> {
         luma_step: args.number("--luma-step", d.luma_step)?,
         star_drop: args.number("--star-drop", d.star_drop)?,
         min_stars: args.number("--min-stars", d.min_stars as f64)? as u64,
+        min_black: args.number("--min-black", d.min_black as f64)? as u64,
+        max_turn_deg: args.number("--max-turn", d.max_turn_deg)?,
+        max_climb: args.number("--max-climb", d.max_climb)?,
+        max_scene_step: args.number("--max-scene-step", d.max_scene_step)?,
         ..d
     })
 }
@@ -95,12 +105,18 @@ fn report(rows: &[Row], bounds: &Bounds) -> Vec<usize> {
     let flagged = tuile_record::flag(rows, bounds);
     let pictured = rows.iter().filter(|r| r.pictured).count();
     println!(
-        "{} frames, {pictured} pictured, {} flagged (luma step > {}, stars dropping by > {:.0} % of >= {}, black ground)",
+        "{} frames, {pictured} pictured, {} flagged (camera still: turn <= {} deg, climb <= {:.0} %, gap <= {} frames, clock <= {} s; \
+         luma step > {}, stars dropping by > {:.0} % of >= {}; >= {} black ground pixels)",
         rows.len(),
         flagged.len(),
+        bounds.max_turn_deg,
+        bounds.max_climb * 100.0,
+        bounds.max_gap,
+        bounds.max_scene_step,
         bounds.luma_step,
         bounds.star_drop * 100.0,
-        bounds.min_stars
+        bounds.min_stars,
+        bounds.min_black
     );
     for f in &flagged {
         println!("{}", diagnose::line(&rows[f.row], &f.why));
@@ -179,6 +195,26 @@ fn run() -> Result<(), String> {
                     .status()
                     .map_err(|e| format!("{opener}: {e}"))?;
             }
+        }
+        "picture" => {
+            let (session, frame, out) = match rest {
+                [s, f, o, ..] => (Path::new(s), f, Path::new(o)),
+                _ => return Err(USAGE.to_owned()),
+            };
+            let frame: u64 = frame.parse().map_err(|_| "a frame is a number".to_owned())?;
+            let mut found = None;
+            tuile_tape::session::for_each_picture(session, |p| {
+                if p.index == frame {
+                    found = Some(p.rgba()?);
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+            let (rgba, (w, h)) =
+                found.ok_or_else(|| format!("frame {frame} has no recorded picture"))?;
+            image::save_buffer(out, &rgba, w, h, image::ExtendedColorType::Rgba8)
+                .map_err(|e| format!("{}: {e}", out.display()))?;
+            println!("{}: frame {frame}, {w}x{h}", out.display());
         }
         "film-tape" => {
             let (from, to) = match rest {
