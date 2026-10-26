@@ -41,5 +41,7 @@ tuile-atmosphere = { path = "../tuile-atmosphere" }
 tuile-core = { path = "../tuile-core" }
 tuile-terrain = { path = "../tuile-terrain" }
 tuile-planetary = { path = "../tuile-planetary" }
+# The flights of `tests/sky_flicker.rs` traced to MCAP, as every tape is.
+tuile-tape = { path = "../tuile-tape" }
 async-trait = { workspace = true }
 url = { workspace = true }

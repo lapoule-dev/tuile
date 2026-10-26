@@ -473,6 +473,7 @@ impl Sky {
             ground.height,
         );
         let inputs = FrameLightInputs::new(
+            &self.params,
             ground,
             frame.eye,
             Moment {
