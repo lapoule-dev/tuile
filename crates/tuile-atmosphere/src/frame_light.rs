@@ -99,7 +99,10 @@ fn light_slots() -> [(&'static str, u32); 12] {
     use std::mem::offset_of;
     let s = |o: usize| (o / 16) as u32;
     [
-        ("SLOT_ILLUMINANCE", s(offset_of!(AtmosphereUniform, illuminance))),
+        (
+            "SLOT_ILLUMINANCE",
+            s(offset_of!(AtmosphereUniform, illuminance)),
+        ),
         ("SLOT_FLOOR", s(offset_of!(AtmosphereUniform, floor))),
         ("SLOT_SH_X", s(offset_of!(AtmosphereUniform, sh_x))),
         ("SLOT_SH_Y", s(offset_of!(AtmosphereUniform, sh_y))),
@@ -107,8 +110,14 @@ fn light_slots() -> [(&'static str, u32); 12] {
         ("SLOT_GROUND", s(offset_of!(AtmosphereUniform, ground))),
         ("SLOT_ADDED", s(offset_of!(AtmosphereUniform, added))),
         ("SLOT_LEAST", s(offset_of!(AtmosphereUniform, least))),
-        ("SLOT_LEAST_SKY", s(offset_of!(AtmosphereUniform, least_sky))),
-        ("SLOT_LEVEL_REF", s(offset_of!(AtmosphereUniform, level_ref))),
+        (
+            "SLOT_LEAST_SKY",
+            s(offset_of!(AtmosphereUniform, least_sky)),
+        ),
+        (
+            "SLOT_LEVEL_REF",
+            s(offset_of!(AtmosphereUniform, level_ref)),
+        ),
         ("SLOT_AMBIENT", s(offset_of!(AtmosphereUniform, ambient))),
         ("SLOT_GRADE", s(offset_of!(AtmosphereUniform, grade))),
     ]
@@ -230,7 +239,8 @@ pub fn reference_physical_exact(reference: &LutAtmosphere, height: f64) -> [f64;
     let up45 = std::f64::consts::FRAC_1_SQRT_2;
     let r = crate::hillaire::LUT_RADIUS + height.max(0.0);
     let sun = reference.sunlight(r, up45);
-    let sky = reference.sky_irradiance(height.max(0.0), DVec3::new(up45, 0.0, up45), &[DVec3::Z])[0];
+    let sky =
+        reference.sky_irradiance(height.max(0.0), DVec3::new(up45, 0.0, up45), &[DVec3::Z])[0];
     [0, 1, 2].map(|c| (sun[c] * up45 + sky[c]) / std::f64::consts::PI)
 }
 
@@ -243,7 +253,7 @@ pub struct FrameLightInputs {
     rays: Vec<[f32; 4]>,
     /// The light's frame: where the air's sphere is laid, the ground under
     /// the eye, the sun and the Moon — what the uniform's geometry is
-    /// written from ([`Self::placed`]).
+    /// written from ([`Self::uniform`]).
     pub light: SkyLight,
 }
 
@@ -270,7 +280,13 @@ impl FrameLightInputs {
         let to_sun = moment.to_sun_ecef.try_normalize().unwrap_or(enu.z_axis);
         let moon = moment.moon.map(|m| {
             let to_moon = m.to_moon_ecef.try_normalize().unwrap_or(-enu.z_axis);
-            (Moonlight { to_moon_ecef: to_moon, ..m }, m.outside_air())
+            (
+                Moonlight {
+                    to_moon_ecef: to_moon,
+                    ..m
+                },
+                m.outside_air(),
+            )
         });
         let strength = moon.map_or(0.0, |(_, s)| s);
         let to_moon = moon.map_or(-enu.z_axis, |(m, _)| m.to_moon_ecef);
@@ -297,7 +313,10 @@ impl FrameLightInputs {
             // A point of the ground or of the sky is a cell of no extent.
             let (across, from, to) = match *m {
                 Metered::Cell(cell) => (cell.across, cell.from, cell.to),
-                Metered::Ground { point, .. } | Metered::Sky { direction: point, .. } => {
+                Metered::Ground { point, .. }
+                | Metered::Sky {
+                    direction: point, ..
+                } => {
                     let d = match *m {
                         Metered::Ground { .. } => (point - eye).normalize_or(toward),
                         _ => point.normalize_or(toward),
@@ -637,20 +656,28 @@ impl FrameLightPass {
             builder.stage(
                 "frame light meter",
                 "light_meters",
-                [&base[..], &[
-                    (5, Kind::Texture(&rays_view)),
-                    (6, Kind::Texture(&partials_view)),
-                ]].concat(),
+                [
+                    &base[..],
+                    &[
+                        (5, Kind::Texture(&rays_view)),
+                        (6, Kind::Texture(&partials_view)),
+                    ],
+                ]
+                .concat(),
                 (12, &meters_view),
                 (LIGHT_THREADS, METER_ROWS),
             ),
             builder.stage(
                 "frame light slots",
                 "light_slots",
-                [&base[..], &[
-                    (6, Kind::Texture(&partials_view)),
-                    (11, Kind::Texture(&meters_view)),
-                ]].concat(),
+                [
+                    &base[..],
+                    &[
+                        (6, Kind::Texture(&partials_view)),
+                        (11, Kind::Texture(&meters_view)),
+                    ],
+                ]
+                .concat(),
                 (8, &slots_view),
                 (SLOTS, 1),
             ),
@@ -762,7 +789,11 @@ impl FrameLightPass {
             wgpu::TexelCopyTextureInfo {
                 texture: &self.slots,
                 mip_level: 0,
-                origin: wgpu::Origin3d { x: start, y: 0, z: 0 },
+                origin: wgpu::Origin3d {
+                    x: start,
+                    y: 0,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {

@@ -2476,7 +2476,10 @@ impl FilmGpu {
             for (extra, offset) in [
                 (Extra::Ambient, std::mem::offset_of!(FrameUniform, world)),
                 (Extra::Sun, std::mem::offset_of!(FrameUniform, sun)),
-                (Extra::White, std::mem::offset_of!(FrameUniform, white_balance)),
+                (
+                    Extra::White,
+                    std::mem::offset_of!(FrameUniform, white_balance),
+                ),
             ] {
                 self.frame_light
                     .copy_extra(&mut encoder, extra, &self.frame_buf, offset as u64);

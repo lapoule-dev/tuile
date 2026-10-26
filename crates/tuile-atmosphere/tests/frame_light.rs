@@ -70,9 +70,36 @@ fn shots() -> Vec<Shot> {
         shot("summit night", 2_877.0, 10.0, s + 7_200.0, true),
         shot("low orbit golden hour", 300_000.0, -30.0, s - 3_600.0, true),
         shot("geostationary sunset", 36_000_000.0, -80.0, s, true),
-        Shot { name: "far 61.8 Mm", lon: 5.0, lat: 46.0, height: 61_825_891.8, heading: 0.0, pitch: -89.999, instant: s, moon: true },
-        Shot { name: "far 62.2 Mm", lon: 5.0, lat: 46.0, height: 62_168_548.8, heading: 0.0, pitch: -89.999, instant: s, moon: true },
-        Shot { name: "far 62.5 Mm", lon: 5.0, lat: 46.0, height: 62_513_105.0, heading: 0.0, pitch: -89.999, instant: s, moon: true },
+        Shot {
+            name: "far 61.8 Mm",
+            lon: 5.0,
+            lat: 46.0,
+            height: 61_825_891.8,
+            heading: 0.0,
+            pitch: -89.999,
+            instant: s,
+            moon: true,
+        },
+        Shot {
+            name: "far 62.2 Mm",
+            lon: 5.0,
+            lat: 46.0,
+            height: 62_168_548.8,
+            heading: 0.0,
+            pitch: -89.999,
+            instant: s,
+            moon: true,
+        },
+        Shot {
+            name: "far 62.5 Mm",
+            lon: 5.0,
+            lat: 46.0,
+            height: 62_513_105.0,
+            heading: 0.0,
+            pitch: -89.999,
+            instant: s,
+            moon: true,
+        },
     ]
 }
 
@@ -89,12 +116,26 @@ fn cpu(shot: &Shot, model: &LutAtmosphere, look: &SkyLook) -> Light {
     Light {
         exposure,
         white: look.white_balance_under(&light),
-        uniform: AtmosphereUniform::new(&AtmosphereParams::default(), &light, eye, exposure, glam::DMat3::IDENTITY, look)
-            .seen_from(&light, eye),
+        uniform: AtmosphereUniform::new(
+            &AtmosphereParams::default(),
+            &light,
+            eye,
+            exposure,
+            glam::DMat3::IDENTITY,
+            look,
+        )
+        .seen_from(&light, eye),
     }
 }
 
-fn setting(shot: &Shot) -> (Geodetic, DVec3, Moment, Vec<tuile_atmosphere::hillaire::Metered>) {
+fn setting(
+    shot: &Shot,
+) -> (
+    Geodetic,
+    DVec3,
+    Moment,
+    Vec<tuile_atmosphere::hillaire::Metered>,
+) {
     let g = Geodetic {
         lon: shot.lon.to_radians(),
         lat: shot.lat.to_radians(),
@@ -149,7 +190,12 @@ fn gpu_light(
         look.white_balance,
         [1.0, 1.0, 1.0],
     );
-    let geometry = inputs.uniform(&AtmosphereParams::default(), eye, glam::DMat3::IDENTITY, look);
+    let geometry = inputs.uniform(
+        &AtmosphereParams::default(),
+        eye,
+        glam::DMat3::IDENTITY,
+        look,
+    );
     queue.write_buffer(&atmosphere.uniform, 0, bytemuck::bytes_of(&geometry));
     pass.write(queue, &inputs);
     let mut encoder = device.create_command_encoder(&Default::default());
@@ -159,7 +205,12 @@ fn gpu_light(
     let read = pass.read(device, queue);
     // What the frame's shaders read: the uniform itself, as the copy left it.
     let drawn = read_uniform(device, queue, &atmosphere.uniform);
-    assert_eq!(drawn, read.over(geometry), "{}: the uniform holds the light", shot.name);
+    assert_eq!(
+        drawn,
+        read.over(geometry),
+        "{}: the uniform holds the light",
+        shot.name
+    );
     let e = read.extra(Extra::Exposure);
     let w = read.extra(Extra::White);
     Light {
@@ -169,7 +220,11 @@ fn gpu_light(
     }
 }
 
-fn read_uniform(device: &wgpu::Device, queue: &wgpu::Queue, uniform: &wgpu::Buffer) -> AtmosphereUniform {
+fn read_uniform(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    uniform: &wgpu::Buffer,
+) -> AtmosphereUniform {
     let size = std::mem::size_of::<AtmosphereUniform>() as u64;
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
@@ -181,8 +236,14 @@ fn read_uniform(device: &wgpu::Device, queue: &wgpu::Queue, uniform: &wgpu::Buff
     encoder.copy_buffer_to_buffer(uniform, 0, &staging, 0, size);
     queue.submit([encoder.finish()]);
     staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
-    let data = staging.slice(..).get_mapped_range().expect("mapped").to_vec();
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    let data = staging
+        .slice(..)
+        .get_mapped_range()
+        .expect("mapped")
+        .to_vec();
     bytemuck::pod_read_unaligned(&data)
 }
 
@@ -201,7 +262,8 @@ fn the_gpu_light_is_the_cpus(pass_kind: SkyViewPass) {
         eprintln!("skipping GPU test: no usable adapter");
         return;
     };
-    if pass_kind == SkyViewPass::Compute && device.limits().max_compute_workgroups_per_dimension == 0
+    if pass_kind == SkyViewPass::Compute
+        && device.limits().max_compute_workgroups_per_dimension == 0
     {
         eprintln!("skipping: no compute on this device");
         return;
@@ -220,7 +282,11 @@ fn the_gpu_light_is_the_cpus(pass_kind: SkyViewPass) {
             "{:28} exposure CPU {:.5} GPU {:.5} ({ev:+.4} EV); white CPU {:?} GPU {:?}",
             shot.name, c.exposure, g.exposure, c.white, g.white
         );
-        assert!(ev.abs() <= 0.02, "{}: the exposure is {ev:+.4} EV off", shot.name);
+        assert!(
+            ev.abs() <= 0.02,
+            "{}: the exposure is {ev:+.4} EV off",
+            shot.name
+        );
         for i in 0..3 {
             assert!(
                 (g.white[i] / c.white[i] - 1.0).abs() <= 0.005,
@@ -233,17 +299,41 @@ fn the_gpu_light_is_the_cpus(pass_kind: SkyViewPass) {
         let (gu, cu) = (g.uniform, c.uniform);
         let scale = cu.ambient[0].abs().max(cu.ambient[1].abs());
         let name = shot.name;
-        close(&format!("{name} illuminance"), gu.illuminance, cu.illuminance, 0.02, 0.0);
+        close(
+            &format!("{name} illuminance"),
+            gu.illuminance,
+            cu.illuminance,
+            0.02,
+            0.0,
+        );
         close(&format!("{name} ground"), gu.ground, cu.ground, 0.02, 0.0);
-        close(&format!("{name} ambient"), gu.ambient, cu.ambient, 0.02, 0.0);
+        close(
+            &format!("{name} ambient"),
+            gu.ambient,
+            cu.ambient,
+            0.02,
+            0.0,
+        );
         close(&format!("{name} sh_x"), gu.sh_x, cu.sh_x, 0.02, scale);
         close(&format!("{name} sh_y"), gu.sh_y, cu.sh_y, 0.02, scale);
         close(&format!("{name} sh_z"), gu.sh_z, cu.sh_z, 0.02, scale);
         close(&format!("{name} floor"), gu.floor, cu.floor, 0.02, 0.0);
         close(&format!("{name} added"), gu.added, cu.added, 0.02, 0.0);
         close(&format!("{name} least"), gu.least, cu.least, 0.02, 0.0);
-        close(&format!("{name} least sky"), gu.least_sky, cu.least_sky, 0.02, 0.0);
-        close(&format!("{name} level"), gu.level_ref, cu.level_ref, 0.02, 0.0);
+        close(
+            &format!("{name} least sky"),
+            gu.least_sky,
+            cu.least_sky,
+            0.02,
+            0.0,
+        );
+        close(
+            &format!("{name} level"),
+            gu.level_ref,
+            cu.level_ref,
+            0.02,
+            0.0,
+        );
         close(&format!("{name} grade"), gu.grade, cu.grade, 0.005, 0.0);
         // The geometry is the CPU's own, untouched by the copy.
         assert_eq!(gu.sun, cu.sun, "{name}: the sun");

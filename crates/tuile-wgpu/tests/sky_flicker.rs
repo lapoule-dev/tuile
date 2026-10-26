@@ -407,7 +407,10 @@ fn record(tape: &mut tuile_tape::Tape, eye: &Eye, t: &Traced, light: &tuile_wgpu
         "/atmosphere/exposure",
         "tuile.Exposure",
         number,
-        &json(&[("exposure", f64::from(t.exposure)), ("ev100", f64::from(light.ev100))]),
+        &json(&[
+            ("exposure", f64::from(t.exposure)),
+            ("ev100", f64::from(light.ev100)),
+        ]),
     );
     tape.push_json(
         "/atmosphere/white_balance",
@@ -684,7 +687,10 @@ fn the_limb_never_blinks_on_a_slow_way_out() {
         exposure_step <= 0.05,
         "zoom out: the exposure steps by {exposure_step:.4} EV at frame {exposure_at}"
     );
-    assert!(ring_step <= 3.0, "zoom out: the limb jumps by {ring_step:.2} at frame {ring_at}");
+    assert!(
+        ring_step <= 3.0,
+        "zoom out: the limb jumps by {ring_step:.2} at frame {ring_at}"
+    );
 }
 
 /// At geostationary height a pan of a hundredth of a degree a frame —
@@ -710,14 +716,26 @@ fn a_slow_pan_far_away_keeps_the_limb_on_the_globe() {
 
 /// The camera held still on the Pic du Midi, looking west, the clock run
 /// at `rate` across the sunset for `frames` frames at 60 a second.
-fn run_the_clock(gpu: &GpuContext, rate: f64, frames: usize, trace: Option<&std::path::Path>) -> Vec<Traced> {
+fn run_the_clock(
+    gpu: &GpuContext,
+    rate: f64,
+    frames: usize,
+    trace: Option<&std::path::Path>,
+) -> Vec<Traced> {
     let eye = eye_at(PIC_LON, PIC_LAT, 2_877.0, 290.0, -2.0);
     let eyes = vec![eye; frames];
     let tiles = ground(gpu, eye.at, 3, 8, 6);
     let sunset = before_sunset() + 3_600.0;
     // Centred on the sunset.
     let start = sunset - rate * frames as f64 / FPS / 2.0;
-    fly_clock(gpu, &tiles, &eyes, |wall| start + rate * wall, (WIDTH, HEIGHT), trace)
+    fly_clock(
+        gpu,
+        &tiles,
+        &eyes,
+        |wall| start + rate * wall,
+        (WIDTH, HEIGHT),
+        trace,
+    )
 }
 
 /// Under a clock run fast — thirty and six hundred times — across the
@@ -736,8 +754,7 @@ fn a_fast_clock_turns_the_light_smoothly() {
             // The sun turns 2π a day about the axis: per frame, `rate / FPS`
             // seconds of it, on a circle of its declination.
             let declination = w[0].to_sun.z.asin();
-            let expected =
-                rate / FPS * std::f64::consts::TAU / 86_400.0 * declination.cos();
+            let expected = rate / FPS * std::f64::consts::TAU / 86_400.0 * declination.cos();
             let turned = w[0].to_sun.angle_between(w[1].to_sun);
             assert!(
                 (turned / expected - 1.0).abs() < 0.05,

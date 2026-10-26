@@ -835,9 +835,8 @@ impl LutAtmosphere {
         let luminance = |v: [f64; 3]| 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
         let wanted = luminance(calibrated);
         // The meter's floor ε: under it every part of a frame counts alike.
-        let epsilon = calibration.camera.meter_floor
-            * f64::from(ReferenceIllumination::NIGHT_FLOOR)
-            * wanted;
+        let epsilon =
+            calibration.camera.meter_floor * f64::from(ReferenceIllumination::NIGHT_FLOOR) * wanted;
         let ln = |v: [f64; 3]| (epsilon + luminance(v).max(0.0)).ln();
         if !metering.is_empty() {
             // The frame's light: its colour the mean's, its luminance the
@@ -1178,7 +1177,11 @@ impl MeterCell {
         };
         let width = self.to - self.from;
         if width <= 1e-12 {
-            let piece = if self.from < limb { Piece::Ground } else { Piece::Sky };
+            let piece = if self.from < limb {
+                Piece::Ground
+            } else {
+                Piece::Sky
+            };
             return if self.from < edge || piece == Piece::Ground {
                 vec![(self.from, 1.0, piece)]
             } else {
@@ -1189,7 +1192,11 @@ impl MeterCell {
         let (a, b) = (self.from, self.to.min(limb));
         if b > a {
             for (x, w) in GROUND_NODES {
-                out.push((a + (b - a) * (x + 1.0) / 2.0, w * (b - a) / 2.0 / width, Piece::Ground));
+                out.push((
+                    a + (b - a) * (x + 1.0) / 2.0,
+                    w * (b - a) / 2.0 / width,
+                    Piece::Ground,
+                ));
             }
         }
         let (a, b) = (self.from.max(limb), self.to.min(edge));

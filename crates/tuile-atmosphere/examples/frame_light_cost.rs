@@ -52,7 +52,10 @@ fn main() {
     let right = forward.cross(enu.z_axis).normalize();
     let up = right.cross(forward);
     let half = 25f64.to_radians().tan();
-    let ground = Geodetic { height: 600.0, ..at };
+    let ground = Geodetic {
+        height: 600.0,
+        ..at
+    };
     let metered = metering(
         eye,
         forward,
@@ -94,7 +97,12 @@ fn main() {
             look.white_balance,
             [1.0; 3],
         );
-        let geometry = inputs.uniform(&AtmosphereParams::default(), eye, glam::DMat3::IDENTITY, &look);
+        let geometry = inputs.uniform(
+            &AtmosphereParams::default(),
+            eye,
+            glam::DMat3::IDENTITY,
+            &look,
+        );
         queue.write_buffer(&atmosphere.uniform, 0, bytemuck::bytes_of(&geometry));
         pass.write(&queue, &inputs);
         let time = |what: &str, record: &mut dyn FnMut(&mut wgpu::CommandEncoder)| {
@@ -155,7 +163,8 @@ fn main() {
                         .expect("poll");
                     let data = read.slice(..).get_mapped_range().expect("mapped").to_vec();
                     let t: [u64; 2] = bytemuck::pod_read_unaligned(&data);
-                    gpu_ns += (t[1].saturating_sub(t[0])) as f64 * f64::from(queue.get_timestamp_period());
+                    gpu_ns += (t[1].saturating_sub(t[0])) as f64
+                        * f64::from(queue.get_timestamp_period());
                     read.unmap();
                 } else {
                     device

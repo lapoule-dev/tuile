@@ -73,7 +73,10 @@ fn film() -> Option<FilmGpu> {
                 let texture = film.create_albedo(4, 4);
                 film.write_rgba(&texture, &[52u8, 52, 52, 255].repeat(16));
                 let normals = mesh.normals.clone().unwrap_or_default();
-                let uvs = mesh.uvs.clone().unwrap_or_else(|| vec![[0.0; 2]; mesh.positions.len()]);
+                let uvs = mesh
+                    .uvs
+                    .clone()
+                    .unwrap_or_else(|| vec![[0.0; 2]; mesh.positions.len()]);
                 film.enter(
                     TileKey { id, drape: 0 },
                     &TileMesh {
@@ -96,7 +99,9 @@ fn film() -> Option<FilmGpu> {
 }
 
 fn keys(film_tiles: u64) -> Vec<TileKey> {
-    (1..=film_tiles).map(|id| TileKey { id, drape: 0 }).collect()
+    (1..=film_tiles)
+        .map(|id| TileKey { id, drape: 0 })
+        .collect()
 }
 
 fn sunset_over_europe() -> f64 {
@@ -182,7 +187,11 @@ fn read(film: &FilmGpu, texture: &wgpu::Texture) -> Vec<u8> {
     film.device()
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    let data = buffer.slice(..).get_mapped_range().expect("mapped").to_vec();
+    let data = buffer
+        .slice(..)
+        .get_mapped_range()
+        .expect("mapped")
+        .to_vec();
     let mut out = Vec::with_capacity((WIDTH * HEIGHT * 4) as usize);
     for y in 0..HEIGHT as usize {
         out.extend_from_slice(&data[y * row as usize..][..(WIDTH * 4) as usize]);
@@ -261,8 +270,15 @@ fn a_films_limb_stays_from_ten_kilometres_to_geostationary_height() {
         .windows(2)
         .map(|w| (w[1].1 / w[0].1).ln().abs())
         .fold(0.0f64, f64::max);
-    eprintln!("the film's climb: worst limb step {:.1} %", 100.0 * (worst.exp() - 1.0));
-    assert!(worst <= 0.25f64.ln_1p(), "the film's limb jumps by {:.1} %", 100.0 * (worst.exp() - 1.0));
+    eprintln!(
+        "the film's climb: worst limb step {:.1} %",
+        100.0 * (worst.exp() - 1.0)
+    );
+    assert!(
+        worst <= 0.25f64.ln_1p(),
+        "the film's limb jumps by {:.1} %",
+        100.0 * (worst.exp() - 1.0)
+    );
 }
 
 /// Two farm segments in two films: the first renders frames 0 to 29, the
@@ -293,5 +309,56 @@ fn two_segments_join_without_a_seam() {
             picture == shared[k - 20],
             "frame {k} differs between the segment that drew frames 0 to {k} and the one that began at frame 20"
         );
+    }
+}
+
+/// The Pic du Midi at sunset through the film, looking west over the
+/// Pyrenees, 4° down, from 2 877 m: with `TUILE_FILM_PIC_DUMP` set to a
+/// directory, the picture goes there — what a change of the light is
+/// looked at on. The ground is never black, nor the sky over it.
+#[test]
+fn the_pic_du_midi_at_sunset_through_the_film() {
+    let Some(mut film) = film() else {
+        eprintln!("skipping GPU test: no usable adapter");
+        return;
+    };
+    let tiles = keys(2 * 64);
+    let pic = Geodetic {
+        lon: 0.1418f64.to_radians(),
+        lat: 42.9365f64.to_radians(),
+        height: 2_877.0,
+    };
+    let sunset = Sun::next_sunset(1_782_043_200.0, Geodetic { height: 0.0, ..pic })
+        .expect("the sun sets over the Pyrenees in June");
+    let enu = enu_frame(pic);
+    let pitch = (-4.0f64).to_radians();
+    let forward = -enu.x_axis * pitch.cos() + enu.z_axis * pitch.sin();
+    let up = (enu.z_axis - forward * enu.z_axis.dot(forward)).normalize();
+    let view = BakedView {
+        position: geodetic_to_ecef(pic).to_array(),
+        direction: forward.to_array(),
+        up: up.to_array(),
+        viewport_px: [f64::from(WIDTH), f64::from(HEIGHT)],
+        fovy_rad: 50f64.to_radians(),
+    };
+    for (name, instant) in [
+        ("sunset-1h", sunset - 3_600.0),
+        ("sunset", sunset),
+        ("sunset+30min", sunset + 1_800.0),
+    ] {
+        let picture = shoot(&mut film, &view, instant, &tiles);
+        if let Some(dir) = std::env::var_os("TUILE_FILM_PIC_DUMP") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).expect("dump dir");
+            image::RgbaImage::from_raw(WIDTH, HEIGHT, picture.clone())
+                .expect("picture")
+                .save(dir.join(format!("pic-{name}.png")))
+                .expect("save");
+        }
+        let black = picture
+            .chunks_exact(4)
+            .filter(|p| p[0].max(p[1]).max(p[2]) < 2)
+            .count();
+        assert_eq!(black, 0, "{name}: black pixels");
     }
 }
