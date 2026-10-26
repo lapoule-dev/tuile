@@ -515,11 +515,18 @@ fn a_default_films_pictures_are_the_same_to_the_byte() {
 const FROZEN_DEFAULT_FILM: &str = "c203a130175f25bd";
 
 /// A film under the physical atmosphere, byte for byte: the ground through
-/// a day's air, the horizon at noon and at a low sun. Frozen from main
-/// before the air's settings became tuning values (44ccf58): with no
-/// `TUILE_AIR_*` value set, every one of them is today's constant, and the
-/// pictures must not move by a bit. Held on the adapter it was frozen on
-/// only, as [`a_default_films_pictures_are_the_same_to_the_byte`].
+/// a day's air, the horizon at noon and at a low sun. Held on the adapter it
+/// was frozen on only, as [`a_default_films_pictures_are_the_same_to_the_byte`].
+///
+/// Re-frozen on 2026-10-26 (#149), from `bbb7a58f3eecfc7d`: the frame's
+/// light is now made on the GPU every frame by the pass the viewer uses, in
+/// f32, and the meter reads its cells across the limb by their log-average
+/// luminance (Laurent's decision) rather than the mean of 336 rays. Of the
+/// four 64×48 pictures, the two at a sun 45° up and the one looking down at
+/// 3° move by at most 2 levels (mean 0.0, 1.0 and 0.0); the horizon at a
+/// sun 3° up is exposed 8.5 levels brighter on average (14 at most), as the
+/// log-average meters a frame of bright sky over dark ground. `TUILE_FILM_DIGEST_DUMP`
+/// writes the pictures out.
 #[test]
 fn an_atmosphere_films_pictures_are_the_same_to_the_byte() {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -557,4 +564,4 @@ fn an_atmosphere_films_pictures_are_the_same_to_the_byte() {
     assert_eq!(format!("{hash:016x}"), FROZEN_ATMOSPHERE_FILM);
 }
 
-const FROZEN_ATMOSPHERE_FILM: &str = "bbb7a58f3eecfc7d";
+const FROZEN_ATMOSPHERE_FILM: &str = "a9f9c4da35ebe645";
