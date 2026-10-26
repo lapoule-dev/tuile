@@ -63,8 +63,12 @@ impl DiscScene {
     }
 }
 
-/// The Pic du Midi de Bigorre's observatory: the place of three scenes.
-const PIC_DU_MIDI: (f64, f64, f64) = (0.1418, 42.9365, 2_900.0);
+/// Over the Pic du Midi de Bigorre: the place of every scene. 3 100 m over
+/// the ellipsoid, some 175 m over the summit — 2 877 m over the sea, about
+/// 2 926 m over the ellipsoid: at 2 900 m the eye stood inside the
+/// summit's relief, and the film drew its nearest faces as walls of
+/// stretched imagery across the frame.
+const PIC_DU_MIDI: (f64, f64, f64) = (0.1418, 42.9365, 3_100.0);
 
 /// 2026-06-21T12:00:00Z, 2026-10-26T00:00:00Z, 2026-11-07T00:00:00Z and
 /// 2026-12-15T00:00:00Z, Unix seconds: where each search starts.

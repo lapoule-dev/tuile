@@ -577,7 +577,12 @@ a 10° lens drawn at 35° and 3460×1946 and its middle cut out),
 `sheets/<scene>.png` side by side (before = after here: S0 moves no pixel).
 
 - `pic-du-midi-sunset`: 0.1418°E 42.9365°N, 2 900 m, heading 290°, pitch −3°,
-  35°, 2026-06-21T19:41:54Z (the ephemeris's sunset).
+  35°, 2026-06-21T19:41:54Z (the ephemeris's sunset). Every scene stood at
+  2 900 m over the ellipsoid for these renders, some 25 m under the summit
+  (2 877 m over the sea, ≈ 2 926 m over the ellipsoid): the film's frames
+  show the summit's nearest faces as walls of stretched imagery at the
+  lower right (the hole probe counts 0 pixels; at 3 100 m they are gone).
+  The scenes now stand at 3 100 m; renders from then on are made there.
 - `full-moon-rise`: same place, heading 63.89° (the Moon's azimuth), pitch −2°,
   10°, 2026-10-26T16:53:46Z (its centre on the eye's horizontal).
 - `crescent-at-dusk`: heading 225.92°, pitch −0.37°, 10°, 2026-11-11T17:10:12Z
