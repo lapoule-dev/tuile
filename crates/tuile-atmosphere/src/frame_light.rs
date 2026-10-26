@@ -379,7 +379,7 @@ impl FrameLightInputs {
         &self,
         params: &AtmosphereParams,
         eye: DVec3,
-        stars: Option<DMat3>,
+        stars: DMat3,
         look: &crate::SkyLook,
     ) -> AtmosphereUniform {
         AtmosphereUniform::new(params, &self.light, eye, 1.0, stars, look)

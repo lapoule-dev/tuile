@@ -25,6 +25,8 @@ image = { workspace = true }
 tuile-terrain = { version = "0.14.0", path = "../tuile-terrain" }
 pollster = { workspace = true }
 tempfile = { workspace = true }
+# The climb of tests/continuous.rs traced to MCAP, as every tape is.
+tuile-tape = { version = "0.14.0", path = "../tuile-tape" }
 
 [lints]
 workspace = true

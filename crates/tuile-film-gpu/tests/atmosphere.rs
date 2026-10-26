@@ -530,6 +530,18 @@ fn an_atmosphere_films_pictures_are_the_same_to_the_byte() {
         let key = square(&mut film);
         let down = draw(&mut film, true, &[key]);
         let along = draw(&mut film, false, &[]);
+        // `TUILE_FILM_DIGEST_DUMP=<dir>`: the pictures the digest is of, to
+        // look at and to compare when it moves.
+        if let Some(dir) = std::env::var_os("TUILE_FILM_DIGEST_DUMP") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).expect("dump dir");
+            for (name, rgba) in [("down", &down), ("along", &along)] {
+                image::RgbaImage::from_raw(64, 48, rgba.clone())
+                    .expect("picture")
+                    .save(dir.join(format!("sun{elevation}-{name}.png")))
+                    .expect("save");
+            }
+        }
         for b in down.iter().chain(&along) {
             hash = (hash ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
         }
