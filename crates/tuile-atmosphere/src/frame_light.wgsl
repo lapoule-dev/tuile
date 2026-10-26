@@ -43,11 +43,38 @@ struct LightInputs {
     calibrated: vec4f,
     // The look's white balance; w: how far the camera adapts to the white.
     look_white: vec4f,
-    // x: the look's exposure, stops; yzw: nothing.
+    // x: the look's exposure, stops; y: the meter's floor, in night
+    // floors; zw: nothing.
     look: vec4f,
     // The w of the extras: the sky's ambient, the sun, the white balance.
     extras_w: vec4f,
+    // The meter's cells: towards the centre of the ground's sphere, in the
+    // eye's frame, w its distance; x: the ground's radius, y: the top of
+    // the air's.
+    meter_toward: vec4f,
+    meter_radii: vec4f,
+    // The eye's frame, ECEF: its east, north and up.
+    eye_x: vec4f,
+    eye_y: vec4f,
+    eye_z: vec4f,
 }
+
+const GROUND_NODES: array<vec2f, 4> = array<vec2f, 4>(
+    vec2f(-0.8611363115940526, 0.3478548451374539),
+    vec2f(-0.3399810435848563, 0.6521451548625461),
+    vec2f(0.3399810435848563, 0.6521451548625461),
+    vec2f(0.8611363115940526, 0.3478548451374539),
+);
+const SKY_NODES: array<vec2f, 8> = array<vec2f, 8>(
+    vec2f(-0.9602898564975363, 0.1012285362903763),
+    vec2f(-0.7966664774136267, 0.2223810344533745),
+    vec2f(-0.5255324099163290, 0.3137066458778873),
+    vec2f(-0.1834346424956498, 0.3626837833783620),
+    vec2f(0.1834346424956498, 0.3626837833783620),
+    vec2f(0.5255324099163290, 0.3137066458778873),
+    vec2f(0.7966664774136267, 0.2223810344533745),
+    vec2f(0.9602898564975363, 0.1012285362903763),
+);
 
 const LIGHT_LUMA: vec3f = vec3f(0.2126, 0.7152, 0.0722);
 
@@ -163,10 +190,8 @@ fn light_tabled(height: f32, up: vec3f) -> vec3f {
     return out * ground;
 }
 
-// One share of the frame's sums. Rows 0–4: the sky under the sun on the
-// five facings; 5–9: under the Moon; 10: the meter's ground light through
-// the air before it, w the rays counted; 11: what the air adds before the
-// meter's ground and the meter's sky.
+// One share of the sky's sums: rows 0–4 the sky under the sun on the five
+// facings, 5–9 under the Moon.
 fn light_partial(x: u32, row: u32) -> vec4f {
     let height = light_in.enu_x.w;
     let strength = light_in.enu_z.w;
@@ -188,41 +213,129 @@ fn light_partial(x: u32, row: u32) -> vec4f {
         }
         return vec4f(sum, 0.0);
     }
+    return vec4f(0.0);
+}
+
+// The level light here, from the five facings' sums: the sun's beam and
+// sky, and the Moon's, in the renderer's units — and what the meter's
+// ground, read from the tables, is set to agree with.
+fn light_level() -> vec3f {
+    let height = light_in.enu_x.w;
+    let strength = light_in.enu_z.w;
+    let sun_l = light_ground_light(light_in.to_sun.xyz);
+    var level = sunlight(height, sun_l.z) * max(sun_l.z, 0.0) + light_sum(0u).xyz;
+    if (strength > 0.0) {
+        let moon_l = light_ground_light(light_in.to_moon.xyz);
+        level += sunlight(height, moon_l.z) * strength * max(moon_l.z, 0.0)
+            + light_sum(5u).xyz * strength;
+    }
+    return level * light_in.scale.xyz / ATMOSPHERE_PI;
+}
+
+fn light_agree() -> vec3f {
+    let level = light_level();
+    let here = light_tabled(light_in.enu_x.w, light_in.enu_z.xyz);
+    return select(vec3f(1.0), level / max(here, vec3f(1e-30)), here > vec3f(1e-30));
+}
+
+// One share of the meter, over its cells: row 0 the light seen — its mean's
+// sum, rgb — and the weight counted; row 1 the sum of the log of its
+// luminance over the floor ε, for the log-average.
+fn light_meter(x: u32, row: u32) -> vec4f {
+    let strength = light_in.enu_z.w;
     let eye_height = light_in.to_sun.w;
     let rays = u32(light_in.to_moon.w);
+    let scale = light_in.scale.xyz;
+    let meter = light_in.eye_moon.w;
+    let agree = light_agree();
+    let epsilon = light_in.look.y * NIGHT_FLOOR * dot(light_in.calibrated.xyz, LIGHT_LUMA);
     var seen = vec3f(0.0);
-    var added = vec3f(0.0);
+    var logs = 0.0;
     var counted = 0.0;
+    let toward = light_in.meter_toward.xyz;
+    let distance = light_in.meter_toward.w;
+    let ground_radius = light_in.meter_radii.x;
+    let top = light_in.meter_radii.y;
+    var limb = ATMOSPHERE_PI;
+    if (distance > ground_radius) { limb = asin(ground_radius / distance); }
+    var edge = 1e30;
+    if (distance > top) { edge = asin(top / distance); }
     for (var j = x; j < rays; j += LIGHT_THREADS) {
         let a = textureLoad(light_rays, vec2i(i32(j), 0), 0);
-        if (a.w >= 0.0) {
-            let b = textureLoad(light_rays, vec2i(i32(j), 1), 0);
-            let l = light_tabled(b.w, b.xyz);
-            let sun = light_march(eye_height, a.xyz, light_in.eye_sun.xyz, a.w, METER_STEPS);
-            var through = sun.transmittance;
-            var air = sun.inscattered;
-            if (strength > 0.0) {
-                let moon = light_march(eye_height, a.xyz, light_in.eye_moon.xyz, a.w, METER_STEPS);
-                through = moon.transmittance;
-                air += moon.inscattered * strength;
+        let across = a.xyz;
+        let start = a.w;
+        let stop = textureLoad(light_rays, vec2i(i32(j), 1), 0).x;
+        let width = stop - start;
+        // The cell's pieces, as `MeterCell::nodes` lays them: the ground
+        // under the limb, the air between it and its top, nothing past.
+        var g0 = start;
+        var g1 = min(stop, limb);
+        var s0 = max(start, limb);
+        var s1 = min(stop, edge);
+        var point_cell = width <= 1e-12;
+        for (var k = 0u; k < 12u; k++) {
+            var theta = 0.0;
+            var w = 0.0;
+            var on_ground = false;
+            if (point_cell) {
+                if (k > 0u) { break; }
+                theta = start;
+                w = 1.0;
+                on_ground = start < limb;
+                if (!on_ground && start >= edge) { break; }
+            } else if (k < 4u) {
+                if (g1 <= g0) { continue; }
+                let node = GROUND_NODES[k];
+                theta = g0 + (g1 - g0) * (node.x + 1.0) / 2.0;
+                w = node.y * (g1 - g0) / 2.0 / width;
+                on_ground = true;
+            } else {
+                if (s1 <= s0) { break; }
+                let node = SKY_NODES[k - 4u];
+                let u = (node.x + 1.0) / 2.0;
+                theta = s0 + (s1 - s0) * u * u;
+                w = 2.0 * (s1 - s0) * u * (node.y / 2.0) / width;
             }
-            seen += l * through;
-            added += air;
-            counted += 1.0;
-        } else {
-            // By the air it crosses: `LutAtmosphere::meter_weight`.
-            let weight = light_meter_weight(eye_height, a.z);
-            if (weight <= 0.0) { continue; }
-            var l = sky_radiance(eye_height, a.xyz, light_in.eye_sun.xyz);
-            if (strength > 0.0) {
-                l += sky_radiance(eye_height, a.xyz, light_in.eye_moon.xyz) * strength;
+            let d = toward * cos(theta) + across * sin(theta);
+            if (on_ground) {
+                let b = distance * sin(theta);
+                let t = max(distance * cos(theta) - sqrt(max(ground_radius * ground_radius - b * b, 0.0)), 0.0);
+                let p = d * t;
+                let up = normalize(p - toward * distance);
+                // The ground's up in ECEF: the eye's frame turned back.
+                let up_ecef = light_in.eye_x.xyz * up.x + light_in.eye_y.xyz * up.y + light_in.eye_z.xyz * up.z;
+                let l = light_tabled(light_in.enu_x.w, up_ecef);
+                let sun = light_march(eye_height, d, light_in.eye_sun.xyz, t, METER_STEPS);
+                var through = sun.transmittance;
+                var air = sun.inscattered;
+                if (strength > 0.0) {
+                    let moon = light_march(eye_height, d, light_in.eye_moon.xyz, t, METER_STEPS);
+                    through = moon.transmittance;
+                    air += moon.inscattered * strength;
+                }
+                let v = l * agree * through + air * scale / meter;
+                seen += v * w;
+                logs += log(epsilon + max(dot(v, LIGHT_LUMA), 0.0)) * w;
+                counted += w;
+            } else {
+                // Grazing the air over the ground it grazes (`lut_direction`),
+                // and counted by the air it crosses (`meter_weight`).
+                let dir = lut_direction(d, vec3f(0.0, 0.0, 1.0), eye_height);
+                let weight = light_meter_weight(eye_height, dir.z);
+                if (weight <= 0.0) { continue; }
+                var l = sky_radiance(eye_height, dir, light_in.eye_sun.xyz);
+                if (strength > 0.0) {
+                    l += sky_radiance(eye_height, dir, light_in.eye_moon.xyz) * strength;
+                }
+                let v = l * scale / meter;
+                seen += v * weight * w;
+                logs += log(epsilon + max(dot(v, LIGHT_LUMA), 0.0)) * weight * w;
+                counted += weight * w;
             }
-            added += l * weight;
-            counted += weight;
         }
     }
-    if (row == 10u) { return vec4f(seen, counted); }
-    return vec4f(added, 0.0);
+    if (row == 0u) { return vec4f(seen, counted); }
+    return vec4f(logs, 0.0, 0.0, 0.0);
 }
 
 // The sum of one row's shares.
@@ -230,6 +343,14 @@ fn light_sum(row: u32) -> vec4f {
     var sum = vec4f(0.0);
     for (var x = 0u; x < LIGHT_THREADS; x++) {
         sum += textureLoad(light_partials, vec2i(i32(x), i32(row)), 0);
+    }
+    return sum;
+}
+
+fn light_meter_sum(row: u32) -> vec4f {
+    var sum = vec4f(0.0);
+    for (var x = 0u; x < LIGHT_THREADS; x++) {
+        sum += textureLoad(light_meters, vec2i(i32(x), i32(row)), 0);
     }
     return sum;
 }
@@ -242,7 +363,7 @@ fn light_shown_ev(ev: f32) -> f32 {
     return -depth * log2(1.0 - ev / b);
 }
 
-// A light's sky as an L1 harmonic, from its five facings' sums: the
+// A light's sky as an L1 harmonic, start its five facings' sums: the
 // constant, the gradient (rows of ECEF x, y and z, one channel a
 // component), and level ground's.
 struct LightHarmonic {
@@ -316,19 +437,20 @@ fn light_slot(j: u32) -> vec4f {
     gz *= ground;
     level *= ground;
 
-    // The meter: its ground set to agree with the exact sum here.
-    let here = light_tabled(height, light_in.enu_z.xyz);
-    let agree = select(vec3f(1.0), level / max(here, vec3f(1e-30)), here > vec3f(1e-30));
-    let seen = light_sum(10u);
-    let added_air = light_sum(11u).xyz;
+    // The meter: its colour the mean's, its luminance the log-average's.
+    let wanted = dot(light_in.calibrated.xyz, LIGHT_LUMA);
     var metered = level;
     if (light_in.to_moon.w > 0.0) {
-        metered = (agree * seen.xyz + added_air * scale / light_in.eye_moon.w + level * METER_FLOOR)
-            / (seen.w + METER_FLOOR);
+        let seen = light_meter_sum(0u);
+        let logs = light_meter_sum(1u).x;
+        let epsilon = light_in.look.y * NIGHT_FLOOR * wanted;
+        metered = (seen.xyz + level * METER_FLOOR) / (seen.w + METER_FLOOR);
+        let geometric = exp((logs + log(epsilon + max(dot(level, LIGHT_LUMA), 0.0)) * METER_FLOOR)
+            / (seen.w + METER_FLOOR));
+        metered *= geometric / max(dot(metered, LIGHT_LUMA), 1e-30);
     }
 
     // The night floor, the exposure, the least light.
-    let wanted = dot(light_in.calibrated.xyz, LIGHT_LUMA);
     let tint = NIGHT_TINT;
     let floor_light = NIGHT_FLOOR * wanted;
     let added = tint * floor_light / dot(tint, LIGHT_LUMA);

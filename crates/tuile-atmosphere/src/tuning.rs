@@ -159,6 +159,13 @@ pub const METER_REFLECTANCE: Knob = knob(
     1,
     "the reflectance the meter takes the scene for; the air's own light is metered as ground that bright, so a higher value counts the haze for less",
 );
+pub const METER_FLOOR: Knob = knob(
+    "TUILE_AIR_METER_FLOOR",
+    "1.0",
+    (1e-3, 1e6),
+    1,
+    "the floor of the meter's log-average luminance, in units of the night floor's light: under it every part of the frame counts as dark as any other",
+);
 pub const VEIL_BOUND: Knob = knob(
     "TUILE_AIR_VEIL_BOUND",
     "6.0",
@@ -252,7 +259,7 @@ pub const LOOK_HIGHLIGHT_KNEE: Knob = knob(
 );
 
 /// Every tuning value, in the order they are documented.
-pub const KNOBS: [Knob; 27] = [
+pub const KNOBS: [Knob; 28] = [
     TURBIDITY,
     AOD_550,
     MIE_SCALE_HEIGHT,
@@ -266,6 +273,7 @@ pub const KNOBS: [Knob; 27] = [
     NIGHT_DEPTH_EV,
     WHITE_ADAPTATION,
     METER_REFLECTANCE,
+    METER_FLOOR,
     VEIL_BOUND,
     MARCH_STEPS,
     MARCH_STEPS_HIGH,
@@ -422,6 +430,7 @@ impl AirTuning {
             night_depth_ev: f(one(&NIGHT_DEPTH_EV)?, c.night_depth_ev),
             white_adaptation: f(one(&WHITE_ADAPTATION)?, c.white_adaptation),
             meter_reflectance: one(&METER_REFLECTANCE)?.unwrap_or(c.meter_reflectance),
+            meter_floor: one(&METER_FLOOR)?.unwrap_or(c.meter_floor),
         };
         let steps = |k: &Knob, or: u32| -> Result<u32, TuningError> {
             match one(k)? {
@@ -541,6 +550,7 @@ mod tests {
             ("TUILE_AIR_NIGHT_DEPTH_EV", "4"),
             ("TUILE_AIR_WHITE_ADAPTATION", "0.5"),
             ("TUILE_AIR_METER_REFLECTANCE", "0.25"),
+            ("TUILE_AIR_METER_FLOOR", "4"),
             ("TUILE_AIR_VEIL_BOUND", "3"),
             ("TUILE_AIR_MARCH_STEPS", "16"),
             ("TUILE_AIR_MARCH_STEPS_HIGH", "32"),
@@ -573,6 +583,7 @@ mod tests {
                 night_depth_ev: 4.0,
                 white_adaptation: 0.5,
                 meter_reflectance: 0.25,
+                meter_floor: 4.0,
             }
         );
         assert_eq!((t.veil_bound, t.march_steps), (3.0, [16, 32]));

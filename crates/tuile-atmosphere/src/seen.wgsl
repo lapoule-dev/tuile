@@ -24,6 +24,9 @@ fn sky_seen(d: vec3f, star_sigma: f32) -> vec3f {
     let n = normalize(d);
     let h = atmosphere.sun.w;
     let up = atmosphere.up.xyz;
+    // The line of sight as the tables' planet has it: grazing the air the
+    // drawn globe's limb holds (`lut_direction`).
+    let nl = lut_direction(n, up, h);
     // In the air, from the sky-view tables; from above it, marched along
     // the ray, where the air is a band a few degrees thick along the limb
     // that no table row could hold. Between the two a band of heights where
@@ -36,7 +39,7 @@ fn sky_seen(d: vec3f, star_sigma: f32) -> vec3f {
         if (abs(up.z) > 0.9) { axis = vec3f(1.0, 0.0, 0.0); }
         let east = normalize(cross(axis, up));
         let north = cross(up, east);
-        let local = vec3f(dot(n, east), dot(n, north), dot(n, up));
+        let local = vec3f(dot(nl, east), dot(nl, north), dot(nl, up));
         let s = atmosphere.sun.xyz;
         air = sky_radiance(h, local, vec3f(dot(s, east), dot(s, north), dot(s, up)));
         if (atmosphere.moon.w > 0.0) {
@@ -47,9 +50,9 @@ fn sky_seen(d: vec3f, star_sigma: f32) -> vec3f {
         air *= marched;
     }
     if (marched < 1.0) {
-        var tabled = lut_bilinear(sky_view_lut, sky_view_uv_of(d, atmosphere.sun.xyz)).rgb;
+        var tabled = lut_bilinear(sky_view_lut, sky_view_uv_of(nl, atmosphere.sun.xyz)).rgb;
         if (atmosphere.moon.w > 0.0) {
-            tabled += lut_bilinear(moon_view_lut, sky_view_uv_of(d, atmosphere.moon.xyz)).rgb
+            tabled += lut_bilinear(moon_view_lut, sky_view_uv_of(nl, atmosphere.moon.xyz)).rgb
                 * atmosphere.moon.w;
         }
         air += tabled * (1.0 - marched);
@@ -57,7 +60,7 @@ fn sky_seen(d: vec3f, star_sigma: f32) -> vec3f {
     var sky = max(air * atmosphere.illuminance.xyz + atmosphere.floor.xyz, atmosphere.least_sky.xyz);
     // Behind the air, unless the planet stands before it.
     let r = LUT_RADIUS + max(h, 0.0);
-    if (ground_distance(r, dot(n, up), max(h, 0.0)) >= 0.0) { return sky; }
+    if (ground_distance(r, dot(nl, up), max(h, 0.0)) >= 0.0) { return sky; }
     var beyond = vec3f(0.0);
     let apart = acos(clamp(dot(n, atmosphere.sun.xyz), -1.0, 1.0));
     // Drawn larger by its scale, its surface as bright as it is.

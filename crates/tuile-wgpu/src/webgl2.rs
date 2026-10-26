@@ -111,6 +111,11 @@ fn every_viewer_shader_runs_on_webgl2() {
             tuile_atmosphere::gpu::SKY_VIEW_RENDER_WGSL
         ),
     );
+    // The frame's light, made every frame, drawn by two render passes.
+    webgl2(
+        "frame light",
+        &tuile_atmosphere::frame_light::wgsl(tuile_atmosphere::gpu::SkyViewPass::Render),
+    );
     // A host's shapes in the world, with the light it shares with the film:
     // the same text the film compiles, so a WebGL2 browser draws the HUD.
     webgl2(

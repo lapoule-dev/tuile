@@ -51,8 +51,10 @@ pub const LIGHT_THREADS: u32 = 256;
 pub const LIGHT_DIRECTIONS: u32 = 1024;
 /// The steps of the air between the eye and a metered ground point.
 pub const METER_STEPS: u32 = 16;
-/// The rows of shares: five facings under each light, and the meter's two.
-const PARTIAL_ROWS: u32 = 12;
+/// The rows of the sky's shares: five facings under each light.
+const PARTIAL_ROWS: u32 = 10;
+/// The rows of the meter's shares: its light, and its logs.
+const METER_ROWS: u32 = 2;
 /// How many rays the meter has at most: [`crate::hillaire::metering`]'s
 /// grid.
 pub const METER_RAYS: usize = 24 * 14;
@@ -148,6 +150,8 @@ fn constants() -> String {
          const LIGHT_DIRECTIONS: u32 = {LIGHT_DIRECTIONS}u;\n\
          const METER_STEPS: u32 = {METER_STEPS}u;\n\
          const LIGHT_SLOTS: u32 = {SLOTS}u;\n\
+         const PARTIAL_ROWS: u32 = {PARTIAL_ROWS}u;\n\
+         const METER_ROWS: u32 = {METER_ROWS}u;\n\
          const NIGHT_TINT: vec3f = {};\n\
          const NIGHT_WHITE: vec3f = {};\n\
          const NIGHT_FLOOR: f32 = {:?};\n\
@@ -184,6 +188,11 @@ struct LightInputs {
     look_white: [f32; 4],
     look: [f32; 4],
     extras_w: [f32; 4],
+    meter_toward: [f32; 4],
+    meter_radii: [f32; 4],
+    eye_x: [f32; 4],
+    eye_y: [f32; 4],
+    eye_z: [f32; 4],
 }
 
 /// How many rows the calibration's table has: heights from the ground to
@@ -239,13 +248,14 @@ pub struct FrameLightInputs {
 }
 
 impl FrameLightInputs {
-    /// The light at the ground `at` under the eye `eye` (ECEF), at
+    /// The light of the air `params` at the ground `at` under the eye `eye` (ECEF), at
     /// `moment`, the camera metering `metering`, calibrated by
     /// `calibration`, exposed `exposure_ev` stops over the camera's own
     /// and balanced by `white_balance` on top of it. `extras_w`: the w
     /// of each [`Extra`] slot, the host's (`Extra::Exposure`'s is not).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        params: &AtmosphereParams,
         at: Geodetic,
         eye: DVec3,
         moment: Moment,
@@ -275,24 +285,33 @@ impl FrameLightInputs {
         }
 
         let from = ecef_to_geodetic(eye);
-        let local = enu_frame(from).transpose();
+        let eye_frame = enu_frame(from);
+        let local = eye_frame.transpose();
+        let sphere = AtmosphereFrame::at(at);
+        let to_centre = sphere.centre - eye;
+        let distance = to_centre.length();
+        let toward = to_centre / distance.max(1e-9);
         let mut rays = vec![[0.0f32; 4]; 2 * METER_RAYS];
         let counted = metering.len().min(METER_RAYS);
         for (j, m) in metering.iter().take(METER_RAYS).enumerate() {
-            match *m {
-                Metered::Ground { eye, point } => {
-                    let path = point - eye;
-                    let dir = (local * path).normalize_or(DVec3::NEG_Z);
-                    let g = ecef_to_geodetic(point);
-                    let up = enu_frame(g).z_axis;
-                    rays[j] = [dir.x as f32, dir.y as f32, dir.z as f32, path.length() as f32];
-                    rays[METER_RAYS + j] = [up.x as f32, up.y as f32, up.z as f32, g.height as f32];
+            // A point of the ground or of the sky is a cell of no extent.
+            let (across, from, to) = match *m {
+                Metered::Cell(cell) => (cell.across, cell.from, cell.to),
+                Metered::Ground { point, .. } | Metered::Sky { direction: point, .. } => {
+                    let d = match *m {
+                        Metered::Ground { .. } => (point - eye).normalize_or(toward),
+                        _ => point.normalize_or(toward),
+                    };
+                    let cos = d.dot(toward).clamp(-1.0, 1.0);
+                    let across = (d - toward * cos)
+                        .try_normalize()
+                        .unwrap_or_else(|| toward.any_orthonormal_vector());
+                    (across, cos.acos(), cos.acos())
                 }
-                Metered::Sky { direction, .. } => {
-                    let dir = (local * direction).normalize_or(DVec3::Z);
-                    rays[j] = [dir.x as f32, dir.y as f32, dir.z as f32, -1.0];
-                }
-            }
+            };
+            let a = local * across;
+            rays[j] = [a.x as f32, a.y as f32, a.z as f32, from as f32];
+            rays[METER_RAYS + j] = [to as f32, 0.0, 0.0, 0.0];
         }
         let v3 = |v: DVec3, w: f64| [v.x as f32, v.y as f32, v.z as f32, w as f32];
         let camera = calibration.camera;
@@ -322,8 +341,18 @@ impl FrameLightInputs {
                 white_balance[2],
                 camera.white_adaptation,
             ],
-            look: [exposure_ev, 0.0, 0.0, 0.0],
+            look: [exposure_ev, camera.meter_floor as f32, 0.0, 0.0],
             extras_w: [extras_w[0], extras_w[1], extras_w[2], 0.0],
+            meter_toward: v3(local * toward, distance),
+            meter_radii: [
+                (sphere.radius + height) as f32,
+                (sphere.radius + params.thickness) as f32,
+                0.0,
+                0.0,
+            ],
+            eye_x: v3(eye_frame.x_axis, 0.0),
+            eye_y: v3(eye_frame.y_axis, 0.0),
+            eye_z: v3(eye_frame.z_axis, 0.0),
         };
         let mut illumination = ReferenceIllumination::provisional(to_sun, [0.0; 3], [0.0; 3]);
         illumination.moon = moon.map(|(m, _)| m);
@@ -358,33 +387,159 @@ impl FrameLightInputs {
     }
 }
 
-/// How the light's two passes are made.
-enum Maker {
+/// One of the light's passes: its pipeline, what it binds, and what it
+/// covers — invocations in compute, texels drawn otherwise.
+enum Stage {
     Compute {
-        partials: wgpu::ComputePipeline,
-        slots: wgpu::ComputePipeline,
-        partials_bind: wgpu::BindGroup,
-        slots_bind: wgpu::BindGroup,
+        pipeline: wgpu::ComputePipeline,
+        bind: wgpu::BindGroup,
+        groups: (u32, u32),
     },
     Render {
-        partials: wgpu::RenderPipeline,
-        slots: wgpu::RenderPipeline,
-        partials_bind: wgpu::BindGroup,
-        slots_bind: wgpu::BindGroup,
-        partials_view: wgpu::TextureView,
-        slots_view: wgpu::TextureView,
+        pipeline: wgpu::RenderPipeline,
+        bind: wgpu::BindGroup,
+        target: wgpu::TextureView,
     },
 }
 
+/// What a pass binds.
+#[derive(Clone, Copy)]
+enum Kind<'a> {
+    Uniform(&'a wgpu::Buffer),
+    Texture(&'a wgpu::TextureView),
+    Output(&'a wgpu::TextureView),
+}
+
+/// What every pass is made with.
+struct Builder<'a> {
+    device: &'a wgpu::Device,
+    module: &'a wgpu::ShaderModule,
+    compute: bool,
+    visibility: wgpu::ShaderStages,
+}
+
+impl Builder<'_> {
+    /// The pass of entry point `entry` (`…_main` in compute, `…_fragment`
+    /// drawn), binding `bindings` and writing `output` — over `size`.
+    fn stage<'b>(
+        &self,
+        label: &str,
+        entry: &str,
+        mut bindings: Vec<(u32, Kind<'b>)>,
+        output: (u32, &'b wgpu::TextureView),
+        size: (u32, u32),
+    ) -> Stage {
+        let (device, module, compute, visibility) =
+            (self.device, self.module, self.compute, self.visibility);
+        if compute {
+            bindings.push((output.0, Kind::Output(output.1)));
+        }
+        let layout_entries: Vec<wgpu::BindGroupLayoutEntry> = bindings
+            .iter()
+            .map(|(binding, kind)| wgpu::BindGroupLayoutEntry {
+                binding: *binding,
+                visibility,
+                ty: match kind {
+                    Kind::Uniform(_) => wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    Kind::Texture(_) => wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    Kind::Output(_) => wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: LUT_FORMAT,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                },
+                count: None,
+            })
+            .collect();
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(label),
+            entries: &layout_entries,
+        });
+        let entries: Vec<wgpu::BindGroupEntry> = bindings
+            .iter()
+            .map(|(binding, kind)| wgpu::BindGroupEntry {
+                binding: *binding,
+                resource: match kind {
+                    Kind::Uniform(b) => b.as_entire_binding(),
+                    Kind::Texture(v) | Kind::Output(v) => wgpu::BindingResource::TextureView(v),
+                },
+            })
+            .collect();
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &layout,
+            entries: &entries,
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(label),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        if compute {
+            Stage::Compute {
+                pipeline: device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&pipeline_layout),
+                    module,
+                    entry_point: Some(&format!("{entry}_main")),
+                    compilation_options: Default::default(),
+                    cache: None,
+                }),
+                bind,
+                groups: (size.0.div_ceil(64), size.1),
+            }
+        } else {
+            let target = [Some(wgpu::ColorTargetState {
+                format: LUT_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })];
+            Stage::Render {
+                pipeline: device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module,
+                        entry_point: Some("light_vertex"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    primitive: Default::default(),
+                    depth_stencil: None,
+                    multisample: Default::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module,
+                        entry_point: Some(&format!("{entry}_fragment")),
+                        compilation_options: Default::default(),
+                        targets: &target,
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                }),
+                bind,
+                target: output.1.clone(),
+            }
+        }
+    }
+}
+
 /// The frame's light on the GPU: its inputs, its shares, its slots, and the
-/// passes that make them.
+/// passes that make them — the sky's sums, the meter's, then the slots.
 pub struct FrameLightPass {
     inputs: wgpu::Buffer,
     rays: wgpu::Texture,
     /// The finished slots: the uniform's, then the [`Extra`]s — one texel
     /// a slot, `LUT_FORMAT`.
     pub slots: wgpu::Texture,
-    maker: Maker,
+    stages: Vec<Stage>,
     runs: Vec<(u32, u32)>,
 }
 
@@ -399,9 +554,11 @@ impl FrameLightPass {
             mapped_at_creation: false,
         });
         use wgpu::TextureUsages as U;
-        let made = match pass {
-            SkyViewPass::Compute => U::STORAGE_BINDING,
-            SkyViewPass::Render => U::RENDER_ATTACHMENT,
+        let compute = pass == SkyViewPass::Compute;
+        let made = if compute {
+            U::STORAGE_BINDING
+        } else {
+            U::RENDER_ATTACHMENT
         };
         let texture = |label, w: u32, h: u32, usage| {
             device.create_texture(&wgpu::TextureDescriptor {
@@ -426,237 +583,83 @@ impl FrameLightPass {
             U::TEXTURE_BINDING | U::COPY_DST,
         );
         let partials = texture(
-            "frame light shares",
+            "frame light sky",
             LIGHT_THREADS,
             PARTIAL_ROWS,
             U::TEXTURE_BINDING | made,
         );
+        let meters = texture(
+            "frame light meter",
+            LIGHT_THREADS,
+            METER_ROWS,
+            U::TEXTURE_BINDING | made,
+        );
         let slots = texture("frame light slots", SLOTS, 1, U::COPY_SRC | made);
         let view = |t: &wgpu::Texture| t.create_view(&Default::default());
-        let (rays_view, partials_view, slots_view) = (view(&rays), view(&partials), view(&slots));
+        let (rays_view, partials_view, meters_view, slots_view) =
+            (view(&rays), view(&partials), view(&meters), view(&slots));
         let (tv, mv, iv) = (
             view(&atmosphere.transmittance),
             view(&atmosphere.multi_scattering),
             view(&atmosphere.irradiance),
         );
-
-        let stage = match pass {
-            SkyViewPass::Compute => wgpu::ShaderStages::COMPUTE,
-            SkyViewPass::Render => wgpu::ShaderStages::FRAGMENT,
+        let visibility = if compute {
+            wgpu::ShaderStages::COMPUTE
+        } else {
+            wgpu::ShaderStages::FRAGMENT
         };
-        let uniform_entry = |binding| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: stage,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: stage,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        };
-        let storage_entry = |binding| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: stage,
-            ty: wgpu::BindingType::StorageTexture {
-                access: wgpu::StorageTextureAccess::WriteOnly,
-                format: LUT_FORMAT,
-                view_dimension: wgpu::TextureViewDimension::D2,
-            },
-            count: None,
-        };
-        let compute = pass == SkyViewPass::Compute;
-        // The shares read the tables and the rays; the slots read the
-        // tables and the shares.
-        let mut partials_entries = vec![
-            uniform_entry(0),
-            texture_entry(1),
-            texture_entry(2),
-            texture_entry(3),
-            uniform_entry(4),
-            texture_entry(5),
-        ];
-        let mut slots_entries = vec![
-            uniform_entry(0),
-            texture_entry(1),
-            texture_entry(2),
-            texture_entry(3),
-            uniform_entry(4),
-            texture_entry(6),
-        ];
-        if compute {
-            partials_entries.push(storage_entry(7));
-            slots_entries.push(storage_entry(8));
-        }
-        let layout = |label, entries: &[wgpu::BindGroupLayoutEntry]| {
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some(label),
-                entries,
-            })
-        };
-        let partials_layout = layout("frame light shares", &partials_entries);
-        let slots_layout = layout("frame light slots", &slots_entries);
-        fn entry(binding: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
-            wgpu::BindGroupEntry {
-                binding,
-                resource: wgpu::BindingResource::TextureView(v),
-            }
-        }
-        fn buffer(binding: u32, b: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
-            wgpu::BindGroupEntry {
-                binding,
-                resource: b.as_entire_binding(),
-            }
-        }
-        let mut partials_bind_entries = vec![
-            buffer(0, &atmosphere.uniform),
-            entry(1, &tv),
-            entry(2, &mv),
-            entry(3, &iv),
-            buffer(4, &inputs),
-            entry(5, &rays_view),
-        ];
-        let mut slots_bind_entries = vec![
-            buffer(0, &atmosphere.uniform),
-            entry(1, &tv),
-            entry(2, &mv),
-            entry(3, &iv),
-            buffer(4, &inputs),
-            entry(6, &partials_view),
-        ];
-        if compute {
-            partials_bind_entries.push(entry(7, &partials_view));
-            slots_bind_entries.push(entry(8, &slots_view));
-        }
-        let partials_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("frame light shares"),
-            layout: &partials_layout,
-            entries: &partials_bind_entries,
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("frame light"),
+            source: wgpu::ShaderSource::Wgsl(wgsl(pass).into()),
         });
-        let slots_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("frame light slots"),
-            layout: &slots_layout,
-            entries: &slots_bind_entries,
-        });
-
-        let declarations = |outputs: &str| {
-            format!(
-                "@group(0) @binding(0) var<uniform> atmosphere: Atmosphere;\n\
-                 @group(0) @binding(1) var transmittance_lut: texture_2d<f32>;\n\
-                 @group(0) @binding(2) var multi_scattering_lut: texture_2d<f32>;\n\
-                 @group(0) @binding(3) var irradiance_lut: texture_2d<f32>;\n\
-                 @group(0) @binding(4) var<uniform> light_in: LightInputs;\n\
-                 @group(0) @binding(5) var light_rays: texture_2d<f32>;\n\
-                 @group(0) @binding(6) var light_partials: texture_2d<f32>;\n\
-                 {outputs}\
-                 @group(0) @binding(9) var night_lights_lut: texture_2d<f32>;\n\
-                 @group(0) @binding(10) var lut_sampler: sampler;\n\
-                 {}\n{}\n{}\n",
-                constants(),
-                crate::hillaire::WGSL,
-                FRAME_LIGHT_WGSL,
-            )
+        let builder = Builder {
+            device,
+            module: &module,
+            compute,
+            visibility,
         };
-        let pipeline_layout = |label, layout: &wgpu::BindGroupLayout| {
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(label),
-                bind_group_layouts: &[Some(layout)],
-                immediate_size: 0,
-            })
-        };
-        let maker = match pass {
-            SkyViewPass::Compute => {
-                let source = format!(
-                    "{}\n{}",
-                    declarations(
-                        "@group(0) @binding(7) var partials_out: texture_storage_2d<rgba32float, write>;\n\
-                         @group(0) @binding(8) var slots_out: texture_storage_2d<rgba32float, write>;\n"
-                    ),
-                    COMPUTE_WGSL
-                );
-                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("frame light"),
-                    source: wgpu::ShaderSource::Wgsl(source.into()),
-                });
-                let pipeline = |label, layout: &wgpu::BindGroupLayout, entry: &str| {
-                    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(label),
-                        layout: Some(&pipeline_layout(label, layout)),
-                        module: &module,
-                        entry_point: Some(entry),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    })
-                };
-                Maker::Compute {
-                    partials: pipeline("frame light shares", &partials_layout, "light_partials_main"),
-                    slots: pipeline("frame light slots", &slots_layout, "light_slots_main"),
-                    partials_bind,
-                    slots_bind,
-                }
-            }
-            SkyViewPass::Render => {
-                let source = format!("{}\n{}", declarations(""), RENDER_WGSL);
-                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("frame light"),
-                    source: wgpu::ShaderSource::Wgsl(source.into()),
-                });
-                let target = [Some(wgpu::ColorTargetState {
-                    format: LUT_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })];
-                let pipeline = |label, layout: &wgpu::BindGroupLayout, entry: &str| {
-                    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                        label: Some(label),
-                        layout: Some(&pipeline_layout(label, layout)),
-                        vertex: wgpu::VertexState {
-                            module: &module,
-                            entry_point: Some("light_vertex"),
-                            compilation_options: Default::default(),
-                            buffers: &[],
-                        },
-                        primitive: Default::default(),
-                        depth_stencil: None,
-                        multisample: Default::default(),
-                        fragment: Some(wgpu::FragmentState {
-                            module: &module,
-                            entry_point: Some(entry),
-                            compilation_options: Default::default(),
-                            targets: &target,
-                        }),
-                        multiview_mask: None,
-                        cache: None,
-                    })
-                };
-                Maker::Render {
-                    partials: pipeline(
-                        "frame light shares",
-                        &partials_layout,
-                        "light_partials_fragment",
-                    ),
-                    slots: pipeline("frame light slots", &slots_layout, "light_slots_fragment"),
-                    partials_bind,
-                    slots_bind,
-                    partials_view,
-                    slots_view,
-                }
-            }
-        };
+        // The tables and the inputs every pass reads, then its own.
+        let base = [
+            (0, Kind::Uniform(&atmosphere.uniform)),
+            (1, Kind::Texture(&tv)),
+            (2, Kind::Texture(&mv)),
+            (3, Kind::Texture(&iv)),
+            (4, Kind::Uniform(&inputs)),
+        ];
+        let stages = vec![
+            builder.stage(
+                "frame light sky",
+                "light_partials",
+                base.to_vec(),
+                (7, &partials_view),
+                (LIGHT_THREADS, PARTIAL_ROWS),
+            ),
+            builder.stage(
+                "frame light meter",
+                "light_meters",
+                [&base[..], &[
+                    (5, Kind::Texture(&rays_view)),
+                    (6, Kind::Texture(&partials_view)),
+                ]].concat(),
+                (12, &meters_view),
+                (LIGHT_THREADS, METER_ROWS),
+            ),
+            builder.stage(
+                "frame light slots",
+                "light_slots",
+                [&base[..], &[
+                    (6, Kind::Texture(&partials_view)),
+                    (11, Kind::Texture(&meters_view)),
+                ]].concat(),
+                (8, &slots_view),
+                (SLOTS, 1),
+            ),
+        ];
         Self {
             inputs,
             rays,
             slots,
-            maker,
+            stages,
             runs: light_runs(),
         }
     }
@@ -680,44 +683,34 @@ impl FrameLightPass {
         );
     }
 
-    /// Makes the frame's light: its shares, then its slots. Reads the
-    /// atmosphere's uniform for the air and where its lights are — written
-    /// before the submission this is recorded into.
+    /// Makes the frame's light: the sky's sums, the meter's, then its
+    /// slots. Reads the atmosphere's uniform for the air and where its
+    /// lights are — written before the submission this is recorded into.
     pub fn record(&self, encoder: &mut wgpu::CommandEncoder) {
-        match &self.maker {
-            Maker::Compute {
-                partials,
-                slots,
-                partials_bind,
-                slots_bind,
-            } => {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("frame light"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(partials);
-                pass.set_bind_group(0, partials_bind, &[]);
-                pass.dispatch_workgroups(LIGHT_THREADS.div_ceil(64), PARTIAL_ROWS, 1);
-                pass.set_pipeline(slots);
-                pass.set_bind_group(0, slots_bind, &[]);
-                pass.dispatch_workgroups(SLOTS.div_ceil(64), 1, 1);
-            }
-            Maker::Render {
-                partials,
-                slots,
-                partials_bind,
-                slots_bind,
-                partials_view,
-                slots_view,
-            } => {
-                for (pipeline, bind, view, label) in [
-                    (partials, partials_bind, partials_view, "frame light shares"),
-                    (slots, slots_bind, slots_view, "frame light slots"),
-                ] {
+        for stage in &self.stages {
+            match stage {
+                Stage::Compute {
+                    pipeline,
+                    bind,
+                    groups,
+                } => {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("frame light"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, bind, &[]);
+                    pass.dispatch_workgroups(groups.0, groups.1, 1);
+                }
+                Stage::Render {
+                    pipeline,
+                    bind,
+                    target,
+                } => {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some(label),
+                        label: Some("frame light"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view,
+                            view: target,
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
@@ -839,11 +832,52 @@ impl FrameLightReadout {
     }
 }
 
+/// The light's module as `pass` makes it: its bindings, the constants,
+/// [`crate::hillaire::WGSL`], [`FRAME_LIGHT_WGSL`] and the entry points —
+/// in compute, or drawn, as a device without compute (WebGL2) draws it.
+pub fn wgsl(pass: SkyViewPass) -> String {
+    let outputs = match pass {
+        SkyViewPass::Compute => {
+            "@group(0) @binding(7) var partials_out: texture_storage_2d<rgba32float, write>;\n\
+             @group(0) @binding(8) var slots_out: texture_storage_2d<rgba32float, write>;\n\
+             @group(0) @binding(12) var meters_out: texture_storage_2d<rgba32float, write>;\n"
+        }
+        SkyViewPass::Render => "",
+    };
+    format!(
+        "@group(0) @binding(0) var<uniform> atmosphere: Atmosphere;\n\
+         @group(0) @binding(1) var transmittance_lut: texture_2d<f32>;\n\
+         @group(0) @binding(2) var multi_scattering_lut: texture_2d<f32>;\n\
+         @group(0) @binding(3) var irradiance_lut: texture_2d<f32>;\n\
+         @group(0) @binding(4) var<uniform> light_in: LightInputs;\n\
+         @group(0) @binding(5) var light_rays: texture_2d<f32>;\n\
+         @group(0) @binding(6) var light_partials: texture_2d<f32>;\n\
+         @group(0) @binding(11) var light_meters: texture_2d<f32>;\n\
+         {outputs}\
+         @group(0) @binding(9) var night_lights_lut: texture_2d<f32>;\n\
+         @group(0) @binding(10) var lut_sampler: sampler;\n\
+         {}\n{}\n{}\n{}\n",
+        constants(),
+        crate::hillaire::WGSL,
+        FRAME_LIGHT_WGSL,
+        match pass {
+            SkyViewPass::Compute => COMPUTE_WGSL,
+            SkyViewPass::Render => RENDER_WGSL,
+        },
+    )
+}
+
 const COMPUTE_WGSL: &str = "
 @compute @workgroup_size(64)
 fn light_partials_main(@builtin(global_invocation_id) id: vec3u) {
-    if (id.x >= LIGHT_THREADS) { return; }
+    if (id.x >= LIGHT_THREADS || id.y >= PARTIAL_ROWS) { return; }
     textureStore(partials_out, id.xy, light_partial(id.x, id.y));
+}
+
+@compute @workgroup_size(64)
+fn light_meters_main(@builtin(global_invocation_id) id: vec3u) {
+    if (id.x >= LIGHT_THREADS || id.y >= METER_ROWS) { return; }
+    textureStore(meters_out, id.xy, light_meter(id.x, id.y));
 }
 
 @compute @workgroup_size(64)
@@ -863,6 +897,11 @@ fn light_vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
 @fragment
 fn light_partials_fragment(@builtin(position) at: vec4f) -> @location(0) vec4f {
     return light_partial(u32(at.x), u32(at.y));
+}
+
+@fragment
+fn light_meters_fragment(@builtin(position) at: vec4f) -> @location(0) vec4f {
+    return light_meter(u32(at.x), u32(at.y));
 }
 
 @fragment

@@ -70,6 +70,9 @@ fn shots() -> Vec<Shot> {
         shot("summit night", 2_877.0, 10.0, s + 7_200.0, true),
         shot("low orbit golden hour", 300_000.0, -30.0, s - 3_600.0, true),
         shot("geostationary sunset", 36_000_000.0, -80.0, s, true),
+        Shot { name: "far 61.8 Mm", lon: 5.0, lat: 46.0, height: 61_825_891.8, heading: 0.0, pitch: -89.999, instant: s, moon: true },
+        Shot { name: "far 62.2 Mm", lon: 5.0, lat: 46.0, height: 62_168_548.8, heading: 0.0, pitch: -89.999, instant: s, moon: true },
+        Shot { name: "far 62.5 Mm", lon: 5.0, lat: 46.0, height: 62_513_105.0, heading: 0.0, pitch: -89.999, instant: s, moon: true },
     ]
 }
 
@@ -136,6 +139,7 @@ fn gpu_light(
 ) -> Light {
     let (at, eye, moment, metered) = setting(shot);
     let inputs = FrameLightInputs::new(
+        &AtmosphereParams::default(),
         at,
         eye,
         moment,
