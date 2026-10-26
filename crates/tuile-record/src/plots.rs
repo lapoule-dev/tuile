@@ -22,20 +22,78 @@ pub struct Axis {
 
 /// The poses the measures are plotted against.
 pub const POSES: [Axis; 5] = [
-    Axis { name: "FRAME", of: |r| r.frame as f64, log: false },
-    Axis { name: "ALT M", of: |r| r.altitude, log: true },
-    Axis { name: "HDG", of: |r| r.heading, log: false },
-    Axis { name: "PITCH", of: |r| r.pitch, log: false },
-    Axis { name: "ORIGIN STEP M", of: |r| r.origin_step, log: true },
+    Axis {
+        name: "FRAME",
+        of: |r| r.frame as f64,
+        log: false,
+    },
+    Axis {
+        name: "ALT M",
+        of: |r| r.altitude,
+        log: true,
+    },
+    Axis {
+        name: "HDG",
+        of: |r| r.heading,
+        log: false,
+    },
+    Axis {
+        name: "PITCH",
+        of: |r| r.pitch,
+        log: false,
+    },
+    Axis {
+        name: "ORIGIN STEP M",
+        of: |r| r.origin_step,
+        log: true,
+    },
 ];
 
 /// The measures plotted.
 pub const MEASURES: [Axis; 5] = [
-    Axis { name: "SKY LUMA", of: |r| if r.sky_pixels >= 1000 { r.sky_luma } else { f64::NAN }, log: false },
-    Axis { name: "GROUND LUMA", of: |r| if r.ground_pixels >= 1000 { r.ground_luma } else { f64::NAN }, log: false },
-    Axis { name: "DELTA", of: |r| r.delta, log: false },
-    Axis { name: "STARS", of: |r| r.stars as f64, log: false },
-    Axis { name: "SKY DELTA", of: |r| if r.sky_pixels >= 1000 { r.sky_delta } else { f64::NAN }, log: false },
+    Axis {
+        name: "SKY LUMA",
+        of: |r| {
+            if r.sky_pixels >= 1000 {
+                r.sky_luma
+            } else {
+                f64::NAN
+            }
+        },
+        log: false,
+    },
+    Axis {
+        name: "GROUND LUMA",
+        of: |r| {
+            if r.ground_pixels >= 1000 {
+                r.ground_luma
+            } else {
+                f64::NAN
+            }
+        },
+        log: false,
+    },
+    Axis {
+        name: "DELTA",
+        of: |r| r.delta,
+        log: false,
+    },
+    Axis {
+        name: "STARS",
+        of: |r| r.stars as f64,
+        log: false,
+    },
+    Axis {
+        name: "SKY DELTA",
+        of: |r| {
+            if r.sky_pixels >= 1000 {
+                r.sky_delta
+            } else {
+                f64::NAN
+            }
+        },
+        log: false,
+    },
 ];
 
 const PANEL: (u32, u32) = (420, 240);
@@ -58,7 +116,11 @@ fn range(values: impl Iterator<Item = f64>) -> Option<(f64, f64)> {
     if !lo.is_finite() {
         return None;
     }
-    Some(if hi - lo < 1e-12 { (lo - 0.5, hi + 0.5) } else { (lo, hi) })
+    Some(if hi - lo < 1e-12 {
+        (lo - 0.5, hi + 0.5)
+    } else {
+        (lo, hi)
+    })
 }
 
 fn shown(axis: &Axis, v: f64) -> String {
@@ -79,7 +141,11 @@ pub fn grid(rows: &[Row], flagged: &[usize]) -> (Vec<u8>, (u32, u32)) {
         .flat_map(|_| [250, 250, 250, 255])
         .collect();
     let red: std::collections::HashSet<usize> = flagged.iter().copied().collect();
-    let pictured: Vec<(usize, &Row)> = rows.iter().enumerate().filter(|(_, r)| r.pictured).collect();
+    let pictured: Vec<(usize, &Row)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.pictured)
+        .collect();
     for (my, measure) in MEASURES.iter().enumerate() {
         for (px, pose) in POSES.iter().enumerate() {
             let at = (px as u32 * PANEL.0, my as u32 * PANEL.1);
@@ -122,7 +188,12 @@ fn panel(
         range(points.iter().map(|p| p.0)),
         range(points.iter().map(|p| p.1)),
     ) else {
-        label(rgba, size, (x0, at.1 + 4), &format!("{}: NO DATA", y_axis.name));
+        label(
+            rgba,
+            size,
+            (x0, at.1 + 4),
+            &format!("{}: NO DATA", y_axis.name),
+        );
         return;
     };
     // Unflagged first, so a red dot is never covered.
@@ -142,7 +213,12 @@ fn panel(
         rgba,
         size,
         (x0, at.1 + 4),
-        &format!("{} {}..{}", y_axis.name, shown(y_axis, yl), shown(y_axis, yh)),
+        &format!(
+            "{} {}..{}",
+            y_axis.name,
+            shown(y_axis, yl),
+            shown(y_axis, yh)
+        ),
     );
     label(
         rgba,
@@ -162,7 +238,7 @@ fn panel(
 fn label(rgba: &mut [u8], size: (u32, u32), at: (u32, u32), text: &str) {
     let (w, h) = (text.chars().count() as u32 * 4 + 2, 7);
     let mut band = vec![0u8; (w * h * 4) as usize];
-    for p in band.chunks_exact_mut(4) {
+    for p in band.as_chunks_mut::<4>().0.iter_mut() {
         p.copy_from_slice(&[90, 90, 90, 255]);
     }
     burn(&mut band, (w, h), text);

@@ -498,3 +498,45 @@ Looked at (`sheet-noon-and-twilight.png`):
 - **Jupiter**, reddened low in the glow, shows from +70–80 min.
 - **The first stars** come after Venus.
 - No black.
+
+## record-flicker/ — the first recorded interactive sessions, pictures included (2026-10-26)
+
+Recorded by the windowed viewer with `--record` (branch `feat/record-interactive`, #156). This was before the flicker fix (#149), so the defect is in them. Each `.mcap` holds, frame by frame:
+- `/camera`, the exact pose;
+- `/viewer/frame`: wall instant, scene instant, rate, offset, viewport, scale and render origin;
+- `/viewer/sky`;
+- `/viewer/input`;
+- `/frame`, the picture drawn (JPEG, half the frame's size).
+
+The `.mp4`, `.parquet` and `-plots.png` are `tuile-record export` of them. `*-diagnose.txt` is `tuile-record diagnose`. Viewport 1600×1200 points at scale 2, 30 pictures a second, JPEG q90. The machine's load average was 110–200 throughout (other agents' builds), so the viewer ran at 37–54 fps, and some pictures were dropped. Dropped pictures are counted, and the frame indices stay exact.
+
+```bash
+export CESIUM_ION_TOKEN=…   # or ~/Library/Application Support/Tuile/token
+# zoom-out: Pic du Midi, clock held, 3 km → 100 000 km, then a pan (zoom-out.steer)
+TUILE_STEER_SCRIPT=videos/record-flicker/zoom-out.steer tuile-wgpu-viewer \
+  --lon 0.1418 --lat 42.9365 --altitude 3000 --heading 290 --pitch 10 \
+  --time 2026-10-25T17:35:00Z --time-rate 0 --record zoom-out.mcap
+# sunset: 3.1 km, the clock at 120× (sunset.steer). Laurent pressed R during it: 600×, then 3600× from frame 1001
+TUILE_STEER_SCRIPT=videos/record-flicker/sunset.steer tuile-wgpu-viewer \
+  --lon 0.1418 --lat 42.9365 --altitude 3100 --heading 250 --pitch 5 \
+  --time 2026-10-25T16:40:00Z --time-rate 120 --record sunset.mcap
+tuile-record export zoom-out.mcap --mp4 zoom-out.mp4 --parquet zoom-out.parquet --plots zoom-out-plots.png --burn-in
+tuile-record diagnose zoom-out.parquet
+# replay of frames 860–889 through the viewer's renderer, headless, twice
+TUILE_ION_TOKEN=… cargo run --release -p tuile-wgpu-viewer --example replay -- \
+  zoom-out.mcap --out replay-1.mcap --seek 860 --frames 30 --bound 20
+```
+
+- `zoom-out.mcap`: 2979 frames, 1243 pictures, 37 MB (40 MB/min). Recording cost 0.04 ms a frame on the render thread.
+- `sunset.mcap`: 2378 frames, 923 pictures, 83 MB.
+- `laurent-session.mcap`: 8613 frames, 2007 pictures, 246 MB. It is the same command line as zoom-out, but driven by hand: wheel and drags to about 990 000 km and back. On that build the script did not run on a desktop (fixed since). At 60 pictures a second it dropped 5807 pictures under the load.
+
+Looked at (`zoom-out.mp4`, `sunset.mp4`, `replay-1.mp4`, and the pictures at frames 877 and 879 via `tuile-record picture`):
+- **The flicker, caught on frame 879 of zoom-out** (793 km, clock held, camera climbing 0.6 % a frame).
+  - The ground's mean luma jumps from 0.65 to 0.96, and the limb goes from pink to white.
+  - In the same frame `light_updates` steps from 56 to 57, and the pre-exposed illuminance from 9.7 to 85.6 (×8.8).
+  - That is one light recompute: the exposure stepping. It is the defect #149 removes.
+- Star counts drop at 378 km (30 → 12) and 488 km (36 → 17).
+- The headless replay of frames 860–889 differs from the live pictures by 0.7–2.3 / 255 (JPEG included), and shows the same step (frame 876 in the replay).
+- **Two replays are identical from frame 876 on, and not before.** The sky on main carries a history (when the light was last worked out), which a replay that seeks into the session does not share. Its first light recompute brings both runs together. With #149, which makes each frame's light from that frame alone, the replay should be deterministic from the first frame.
+- No black ground in the scripted sessions. In Laurent's session, 15–28 pixels of the ground's clear colour come back frame after frame between 8 000 and 10 700 km, looking straight down at 20° N 5° E.

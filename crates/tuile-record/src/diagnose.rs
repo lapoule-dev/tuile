@@ -125,9 +125,10 @@ pub fn flag(rows: &[Row], bounds: &Bounds) -> Vec<Flagged> {
         };
         if let Some(prev) = last.filter(|prev| still(prev, row, bounds)) {
             let both = |a: u64, b: u64| a >= bounds.min_pixels && b >= bounds.min_pixels;
-            step.sky = both(row.sky_pixels, prev.sky_pixels).then(|| row.sky_luma - prev.sky_luma);
+            step.sky =
+                both(row.sky_pixels, prev.sky_pixels).then_some(row.sky_luma - prev.sky_luma);
             step.ground = both(row.ground_pixels, prev.ground_pixels)
-                .then(|| row.ground_luma - prev.ground_luma);
+                .then_some(row.ground_luma - prev.ground_luma);
             step.stars = Some((prev.stars, row.stars));
         }
         steps.push(step);
@@ -198,7 +199,8 @@ pub fn still(a: &Row, b: &Row, bounds: &Bounds) -> bool {
         && turn(a.up, b.up) <= bounds.max_turn_deg
         && climb <= bounds.max_climb
         // Unknown clocks compare: a plain tape has none.
-        && !((b.instant - a.instant).abs() > bounds.max_scene_step)
+        && ((b.instant - a.instant).abs() <= bounds.max_scene_step
+            || !(b.instant - a.instant).is_finite())
 }
 
 /// The link that brings the viewer back to `row`'s view at its instant,
@@ -210,7 +212,11 @@ pub fn link(row: &Row) -> String {
         row.lon,
         row.lat,
         row.altitude,
-        if row.heading > 359.9995 { 0.0 } else { row.heading },
+        if row.heading > 359.9995 {
+            0.0
+        } else {
+            row.heading
+        },
         row.pitch.clamp(0.0, 90.0)
     );
     if row.instant.is_finite() {

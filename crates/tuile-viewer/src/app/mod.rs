@@ -35,6 +35,7 @@ mod touch;
 mod warmup;
 
 pub(crate) use eyes::Rig;
+#[cfg(feature = "control")]
 pub(crate) use tape::Replayed;
 #[cfg(feature = "control")]
 pub(crate) use touch::Phase as Finger;

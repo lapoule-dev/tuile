@@ -125,7 +125,9 @@ pub struct PictureStats {
 pub const STAR_CONTRAST: f64 = 0.08;
 
 fn luma(rgba: &[u8], i: usize) -> f64 {
-    (0.2126 * f64::from(rgba[i]) + 0.7152 * f64::from(rgba[i + 1]) + 0.0722 * f64::from(rgba[i + 2]))
+    (0.2126 * f64::from(rgba[i])
+        + 0.7152 * f64::from(rgba[i + 1])
+        + 0.0722 * f64::from(rgba[i + 2]))
         / 255.0
 }
 
@@ -160,13 +162,13 @@ pub fn picture_stats(rgba: &[u8], width: u32, height: u32, camera: &Frame) -> Pi
         .collect();
     let mut s = PictureStats::default();
     let (mut sum, mut sum_ground, mut sum_sky) = (0.0, 0.0, 0.0);
-    for p in 0..w * h {
+    for (p, &on_ground) in ground.iter().enumerate() {
         let i = p * 4;
         let l = luma(rgba, i);
         sum += l;
         let black = rgba[i] < BLACK && rgba[i + 1] < BLACK && rgba[i + 2] < BLACK;
         s.black += u64::from(black);
-        if ground[p] {
+        if on_ground {
             s.ground_pixels += 1;
             sum_ground += l;
             s.black_ground += u64::from(black);
@@ -180,7 +182,16 @@ pub fn picture_stats(rgba: &[u8], width: u32, height: u32, camera: &Frame) -> Pi
         }
         let mut most = 0.0f64;
         let mut around = 0.0;
-        for (dx, dy) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+        for (dx, dy) in [
+            (-1, -1),
+            (0, -1),
+            (1, -1),
+            (-1, 0),
+            (1, 0),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+        ] {
             let q = ((y as i64 + dy) as usize * w + (x as i64 + dx) as usize) * 4;
             let n = luma(rgba, q);
             most = most.max(n);

@@ -147,7 +147,15 @@ fn session(
             max_altitude,
             record,
             ..
-        }) => (view, here, imagery, compression, clock, max_altitude, record),
+        }) => (
+            view,
+            here,
+            imagery,
+            compression,
+            clock,
+            max_altitude,
+            record,
+        ),
         Ok(start::Invocation::Help) => {
             println!("{}", start::usage());
             return Ok(());

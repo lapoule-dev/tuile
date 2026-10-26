@@ -156,7 +156,9 @@ impl Measure {
     pub fn picture(&mut self, row: &mut Row, rgba: &[u8], size: (u32, u32)) {
         let stats = picture_stats(rgba, size.0, size.1, &row.camera());
         let luma: Vec<f32> = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| {
                 (0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]))
                     / 255.0

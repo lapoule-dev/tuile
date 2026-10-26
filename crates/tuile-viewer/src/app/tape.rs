@@ -104,12 +104,8 @@ impl App {
             // Set at the frame's own wall instant, the scene clock reads
             // back exactly the instant recorded: `at(wall)` is
             // `instant + 0 · rate`.
-            self.atmosphere
-                .clock
-                .set(replayed.instant, replayed.wall);
-            self.atmosphere
-                .clock
-                .set_rate(replayed.rate, replayed.wall);
+            self.atmosphere.clock.set(replayed.instant, replayed.wall);
+            self.atmosphere.clock.set_rate(replayed.rate, replayed.wall);
             return;
         }
         let Some(tape) = self.recording.tape.as_mut() else {
@@ -284,7 +280,11 @@ impl App {
             return;
         }
         if !on {
-            let frames = self.recording.tape.as_ref().map_or(0, tuile_tape::Tape::frames);
+            let frames = self
+                .recording
+                .tape
+                .as_ref()
+                .map_or(0, tuile_tape::Tape::frames);
             self.close_the_tape();
             self.say(&format!("recording closed: {frames} frames"));
             return;
@@ -337,7 +337,8 @@ impl App {
     fn finish_the_pictures(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(mut pictures) = self.recording.pictures.take() {
-            if let (Some(active), Some(tape)) = (self.active.as_ref(), self.recording.tape.as_mut()) {
+            if let (Some(active), Some(tape)) = (self.active.as_ref(), self.recording.tape.as_mut())
+            {
                 pictures.pump(&active.gpu, tape, true);
             }
             let (wall, frames) = self.recording.began.unwrap_or((super::wall_seconds(), 0));

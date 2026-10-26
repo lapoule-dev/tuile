@@ -151,7 +151,12 @@ fn a_step_averages_its_block() {
 fn a_full_ring_drops_rather_than_waits() {
     let Some(gpu) = gpu() else { return };
     let size = (16, 16);
-    let t = texture(&gpu, wgpu::TextureFormat::Rgba8Unorm, size, &pattern(size, 1));
+    let t = texture(
+        &gpu,
+        wgpu::TextureFormat::Rgba8Unorm,
+        size,
+        &pattern(size, 1),
+    );
     let mut ring = ReadbackRing::new(2);
     assert!(capture(&gpu, &mut ring, &t, 0));
     assert!(capture(&gpu, &mut ring, &t, 1));
@@ -175,7 +180,12 @@ fn a_full_ring_drops_rather_than_waits() {
 fn recording_a_frame_costs_the_frame_little() {
     let Some(gpu) = gpu() else { return };
     let size = (1920, 1080);
-    let t = texture(&gpu, wgpu::TextureFormat::Rgba8Unorm, size, &pattern(size, 3));
+    let t = texture(
+        &gpu,
+        wgpu::TextureFormat::Rgba8Unorm,
+        size,
+        &pattern(size, 3),
+    );
     let mut ring = ReadbackRing::new(6);
     // Three readers, as the viewer's recording has.
     let (frames_tx, frames_rx) = std::sync::mpsc::channel::<tuile_wgpu::MappedFrame>();

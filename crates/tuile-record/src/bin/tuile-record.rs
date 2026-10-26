@@ -189,7 +189,11 @@ fn run() -> Result<(), String> {
             if args.flags.contains_key("--open") {
                 // The system hands the link to the viewer that registered
                 // the scheme.
-                let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+                let opener = if cfg!(target_os = "macos") {
+                    "open"
+                } else {
+                    "xdg-open"
+                };
                 std::process::Command::new(opener)
                     .arg(&link)
                     .status()
@@ -201,7 +205,9 @@ fn run() -> Result<(), String> {
                 [s, f, o, ..] => (Path::new(s), f, Path::new(o)),
                 _ => return Err(USAGE.to_owned()),
             };
-            let frame: u64 = frame.parse().map_err(|_| "a frame is a number".to_owned())?;
+            let frame: u64 = frame
+                .parse()
+                .map_err(|_| "a frame is a number".to_owned())?;
             let mut found = None;
             tuile_tape::session::for_each_picture(session, |p| {
                 if p.index == frame {

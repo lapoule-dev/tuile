@@ -121,6 +121,7 @@ pub(crate) struct PictureSettings {
 }
 
 /// What a recorded picture is encoded as.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PictureCodec {
     Jpeg { quality: u8 },
@@ -139,6 +140,8 @@ impl Default for PictureSettings {
     }
 }
 
+// A page records no pictures: it has no threads to encode them on.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 impl PictureSettings {
     /// The side of the block of frame pixels a picture's pixel averages.
     pub(crate) fn step(&self) -> u32 {
@@ -195,6 +198,7 @@ pub(crate) struct RecordSettings {
 /// is configured, so it is set before a recording's first frame.
 static CAPTURING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn set_capturing(on: bool) {
     CAPTURING.store(on, std::sync::atomic::Ordering::Release);
 }
@@ -209,10 +213,13 @@ pub(crate) fn capturing() -> bool {
 pub(crate) fn new_recording_path() -> std::path::PathBuf {
     let dir = std::env::var_os("TUILE_RECORD_DIR")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join("tuile-recordings")))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join("tuile-recordings"))
+        })
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let _ = std::fs::create_dir_all(&dir);
-    let stamp = tuile_atmosphere::clock::format_rfc3339(crate::app::wall_seconds()).replace(':', "-");
+    let stamp =
+        tuile_atmosphere::clock::format_rfc3339(crate::app::wall_seconds()).replace(':', "-");
     dir.join(format!("tuile-session-{stamp}.mcap"))
 }
 
@@ -222,10 +229,16 @@ mod tests {
 
     #[test]
     fn picture_settings_read_their_three_flags() {
-        assert_eq!(PictureSettings::parse(None, None, None), Ok(PictureSettings::default()));
+        assert_eq!(
+            PictureSettings::parse(None, None, None),
+            Ok(PictureSettings::default())
+        );
         let s = PictureSettings::parse(Some("0"), Some("1"), Some("png")).expect("reads");
         assert_eq!((s.fps, s.step(), s.codec), (0.0, 1, PictureCodec::Png));
-        assert_eq!(PictureSettings::parse(None, Some("0.25"), None).map(|s| s.step()), Ok(4));
+        assert_eq!(
+            PictureSettings::parse(None, Some("0.25"), None).map(|s| s.step()),
+            Ok(4)
+        );
         for (fps, scale, codec) in [
             (Some("-1"), None, None),
             (Some("x"), None, None),
@@ -233,7 +246,10 @@ mod tests {
             (None, Some("2"), None),
             (None, None, Some("h264")),
         ] {
-            assert!(PictureSettings::parse(fps, scale, codec).is_err(), "{fps:?} {scale:?} {codec:?}");
+            assert!(
+                PictureSettings::parse(fps, scale, codec).is_err(),
+                "{fps:?} {scale:?} {codec:?}"
+            );
         }
     }
 }

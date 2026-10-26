@@ -155,12 +155,21 @@ fn a_flicker_in_the_pictures_is_flagged_on_its_frame() {
     // The link back holds the instant, the clock held.
     let link = tuile_record::link(&rows[STEP as usize]);
     assert!(link.starts_with("tuile://goto?lon="), "{link}");
-    assert!(link.contains("&time=2026-") && link.ends_with("&timeRate=0"), "{link}");
+    assert!(
+        link.contains("&time=2026-") && link.ends_with("&timeRate=0"),
+        "{link}"
+    );
 
     // The plots are drawn.
     let (rgba, (w, h)) = tuile_record::plots::grid(&rows, &[STEP as usize]);
     assert_eq!(rgba.len(), (w * h * 4) as usize);
-    assert!(rgba.chunks_exact(4).any(|p| p[..3] == [220, 30, 30]), "a red dot");
+    assert!(
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[..3] == [220, 30, 30]),
+        "a red dot"
+    );
 }
 
 /// The film's tape of a recording flies the same cameras, frame for frame,
@@ -174,7 +183,9 @@ fn the_film_tape_flies_the_recorded_poses_at_their_instants() {
     let made = tuile_record::film_tape(&session, &film).expect("writes");
     assert_eq!(made.frames, FRAMES);
     assert!(made.worst_instant < 1e-6, "{made:?}");
-    let clock = tuile_tape::Clock::of_tape(&film).expect("reads").expect("a clock");
+    let clock = tuile_tape::Clock::of_tape(&film)
+        .expect("reads")
+        .expect("a clock");
     assert_eq!(Some(clock), made.clock);
     let mut tape = Tape::replaying(&film).expect("replays");
     for n in 0..FRAMES {
@@ -203,7 +214,10 @@ fn a_step_the_camera_explains_is_not_flagged() {
         ..held.clone()
     };
     let bounds = tuile_record::Bounds::default();
-    assert_eq!(tuile_record::flag(&[held.clone(), stepped.clone()], &bounds).len(), 1);
+    assert_eq!(
+        tuile_record::flag(&[held.clone(), stepped.clone()], &bounds).len(),
+        1
+    );
     let turned = tuile_record::Row {
         direction: [0.0, 1.0, 0.1],
         ..stepped.clone()

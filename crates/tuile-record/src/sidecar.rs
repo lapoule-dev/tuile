@@ -10,8 +10,7 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float64Array, RecordBatch, StringArray, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, BooleanArray, Float64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 
@@ -55,13 +54,33 @@ const F64S: &[F64] = f64s![
 
 const U64S: &[U64] = &[
     ("frame", |r| Some(r.frame), |r, v| r.frame = v),
-    ("light_updates", |r| r.light_updates, |r, v| r.light_updates = Some(v)),
-    ("view_updates", |r| r.view_updates, |r, v| r.view_updates = Some(v)),
-    ("sky_pixels", |r| Some(r.sky_pixels), |r, v| r.sky_pixels = v),
-    ("ground_pixels", |r| Some(r.ground_pixels), |r, v| r.ground_pixels = v),
+    (
+        "light_updates",
+        |r| r.light_updates,
+        |r, v| r.light_updates = Some(v),
+    ),
+    (
+        "view_updates",
+        |r| r.view_updates,
+        |r, v| r.view_updates = Some(v),
+    ),
+    (
+        "sky_pixels",
+        |r| Some(r.sky_pixels),
+        |r, v| r.sky_pixels = v,
+    ),
+    (
+        "ground_pixels",
+        |r| Some(r.ground_pixels),
+        |r, v| r.ground_pixels = v,
+    ),
     ("stars", |r| Some(r.stars), |r, v| r.stars = v),
     ("black", |r| Some(r.black), |r, v| r.black = v),
-    ("black_ground", |r| Some(r.black_ground), |r, v| r.black_ground = v),
+    (
+        "black_ground",
+        |r| Some(r.black_ground),
+        |r, v| r.black_ground = v,
+    ),
 ];
 
 /// Writes `rows` to `path`.
@@ -73,7 +92,10 @@ pub fn write(path: &std::path::Path, rows: &[Row]) -> Result<(), String> {
         columns.push(Arc::new(rows.iter().map(get).collect::<UInt64Array>()));
     }
     for (name, get) in [
-        ("viewport_width", (|r: &Row| r.viewport[0]) as fn(&Row) -> u32),
+        (
+            "viewport_width",
+            (|r: &Row| r.viewport[0]) as fn(&Row) -> u32,
+        ),
         ("viewport_height", |r: &Row| r.viewport[1]),
         ("picture_width", |r: &Row| r.picture[0]),
         ("picture_height", |r: &Row| r.picture[1]),
@@ -91,11 +113,15 @@ pub fn write(path: &std::path::Path, rows: &[Row]) -> Result<(), String> {
     ));
     fields.push(Field::new("pictured", DataType::Boolean, false));
     columns.push(Arc::new(
-        rows.iter().map(|r| Some(r.pictured)).collect::<BooleanArray>(),
+        rows.iter()
+            .map(|r| Some(r.pictured))
+            .collect::<BooleanArray>(),
     ));
     fields.push(Field::new("input", DataType::Utf8, false));
     columns.push(Arc::new(
-        rows.iter().map(|r| Some(r.input.as_str())).collect::<StringArray>(),
+        rows.iter()
+            .map(|r| Some(r.input.as_str()))
+            .collect::<StringArray>(),
     ));
     let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(|e| e.to_string())?;

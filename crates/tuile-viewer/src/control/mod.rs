@@ -833,10 +833,11 @@ impl Headless {
     /// load. A frame recorded without its context (a plain tape) is lit at
     /// the run's own instant ([`Start::lit_at`]), held.
     pub fn replay(&mut self, frame: &tuile_tape::session::Recorded, bound: f64) -> Replayed {
-        let (wall, instant, rate) = frame.context.map_or(
-            (self.start.lit_at, self.start.lit_at, 0.0),
-            |c| (c.wall, c.instant, c.rate),
-        );
+        let (wall, instant, rate) = frame
+            .context
+            .map_or((self.start.lit_at, self.start.lit_at, 0.0), |c| {
+                (c.wall, c.instant, c.rate)
+            });
         self.app.hold(Some(crate::app::Replayed {
             camera: frame.camera,
             wall,

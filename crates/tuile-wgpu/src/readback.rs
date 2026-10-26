@@ -171,8 +171,7 @@ impl MappedFrame {
             .ok()
             .map(|data| data.to_vec());
         self.buffer.unmap();
-        self.state
-            .store(FREE, std::sync::atomic::Ordering::Release);
+        self.state.store(FREE, std::sync::atomic::Ordering::Release);
         Some(self.unpadded(&raw?, step.max(1)))
     }
 
@@ -190,7 +189,12 @@ impl MappedFrame {
         if step == 1 {
             for (y, row) in out.chunks_exact_mut(w * 4).enumerate() {
                 let src = &data[y * padded..y * padded + w * 4];
-                for (d, s) in row.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                for (d, s) in row
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(src.as_chunks::<4>().0.iter())
+                {
                     d.copy_from_slice(&[s[order[0]], s[order[1]], s[order[2]], s[order[3]]]);
                 }
             }
@@ -203,7 +207,7 @@ impl MappedFrame {
             for dy in 0..step {
                 let src = &data[(y * step + dy) * padded..][..w * step * 4];
                 for (x, block) in src.chunks_exact(step * 4).enumerate() {
-                    for px in block.chunks_exact(4) {
+                    for px in block.as_chunks::<4>().0.iter() {
                         for c in 0..4 {
                             sums[x * 4 + c] += u32::from(px[order[c]]);
                         }

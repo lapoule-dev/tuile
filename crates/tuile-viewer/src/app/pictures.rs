@@ -214,7 +214,9 @@ pub(crate) fn encode(
         PictureCodec::Jpeg { quality } => {
             // No alpha in a JPEG: the frame is opaque anyway.
             let rgb: Vec<u8> = rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|p| [p[0], p[1], p[2]])
                 .collect();
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
@@ -277,7 +279,9 @@ mod tests {
             .zip(&rgba)
             .enumerate()
             .filter(|(i, _)| i % 4 != 3)
-            .fold((0u64, 0u64), |(s, n), (_, (a, b))| (s + u64::from(a.abs_diff(*b)), n + 1));
+            .fold((0u64, 0u64), |(s, n), (_, (a, b))| {
+                (s + u64::from(a.abs_diff(*b)), n + 1)
+            });
         let mean = sum as f64 / n as f64;
         assert!(mean < 2.0, "mean error {mean:.2} of 255");
     }

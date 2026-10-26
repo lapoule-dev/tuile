@@ -97,7 +97,8 @@ impl Film {
         let mut rgba = if even == open {
             crop(rgba, size, even)
         } else {
-            fit(rgba, size, open).ok_or_else(|| format!("frame {}: a picture of the wrong length", row.frame))?
+            fit(rgba, size, open)
+                .ok_or_else(|| format!("frame {}: a picture of the wrong length", row.frame))?
         };
         let even = open;
         if self.burn_in {

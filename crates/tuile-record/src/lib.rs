@@ -99,9 +99,9 @@ pub fn recorded_fps(rows: &[Row]) -> u32 {
         .map(|r| r.wall)
         .collect();
     match (walls.first(), walls.last()) {
-        (Some(a), Some(b)) if b > a && walls.len() > 1 => {
-            ((walls.len() - 1) as f64 / (b - a)).round().clamp(1.0, 240.0) as u32
-        }
+        (Some(a), Some(b)) if b > a && walls.len() > 1 => ((walls.len() - 1) as f64 / (b - a))
+            .round()
+            .clamp(1.0, 240.0) as u32,
         _ => 30,
     }
 }

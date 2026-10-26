@@ -69,8 +69,16 @@ fn read(args: &[String]) -> Result<Asked, String> {
         frames: number("--frames", f64::from(u32::MAX))? as usize,
         every: (number("--every", 1.0)? as usize).max(1),
         bound: number("--bound", 30.0)?,
-        store: PathBuf::from(flags.get("--store").copied().unwrap_or("target/replay-store")),
-        scale: flags.contains_key("--scale").then(|| number("--scale", 1.0)).transpose()?,
+        store: PathBuf::from(
+            flags
+                .get("--store")
+                .copied()
+                .unwrap_or("target/replay-store"),
+        ),
+        scale: flags
+            .contains_key("--scale")
+            .then(|| number("--scale", 1.0))
+            .transpose()?,
         session,
     })
 }
@@ -94,8 +102,11 @@ fn main() {
     }
 }
 
+/// A decoded picture: tightly packed RGBA8, and its size.
+type Decoded = (Vec<u8>, (u32, u32));
+
 /// The recorded pictures, decoded, by frame.
-fn recorded_pictures(path: &std::path::Path) -> Result<BTreeMap<u64, (Vec<u8>, (u32, u32))>, String> {
+fn recorded_pictures(path: &std::path::Path) -> Result<BTreeMap<u64, Decoded>, String> {
     let mut out = BTreeMap::new();
     session::for_each_picture(path, |p| {
         let decoded = p.rgba()?;
@@ -141,7 +152,9 @@ fn digest(rgba: &[u8]) -> u64 {
 fn run(asked: &Asked) -> Result<(), String> {
     let frames: Vec<Recorded> = session::read(&asked.session).map_err(|e| e.to_string())?;
     let recorded = recorded_pictures(&asked.session)?;
-    let first = frames.get(asked.seek).ok_or("--seek is past the recording")?;
+    let first = frames
+        .get(asked.seek)
+        .ok_or("--seek is past the recording")?;
     let ([w, h], scale) = first
         .context
         .map_or(([1280, 800], 2.0), |c| (c.viewport, c.scale));
@@ -177,7 +190,10 @@ fn run(asked: &Asked) -> Result<(), String> {
         },
         size: (w, h),
         scale,
-        ..Start::new(proxy.host(asked.store.join("http")), asked.store.join("tiles"))
+        ..Start::new(
+            proxy.host(asked.store.join("http")),
+            asked.store.join("tiles"),
+        )
     })
     .map_err(|e| e.to_string())?;
     let mut out = tuile_tape::Tape::recording(&asked.out).map_err(|e| e.to_string())?;
@@ -242,7 +258,11 @@ fn run(asked: &Asked) -> Result<(), String> {
             frame.index,
             tuile_atmosphere::clock::format_rfc3339(replayed.instant),
             replayed.draws,
-            if replayed.settled { "settled" } else { "BOUND  " },
+            if replayed.settled {
+                "settled"
+            } else {
+                "BOUND  "
+            },
             diff.map_or("-".to_owned(), |d| format!("{d:.2}")),
             digest(&small)
         );

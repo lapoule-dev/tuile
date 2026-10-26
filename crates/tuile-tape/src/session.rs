@@ -172,11 +172,7 @@ struct Versioned<T> {
 }
 
 fn json<T: Serialize>(record: T) -> String {
-    serde_json::to_string(&Versioned {
-        version: 1,
-        record,
-    })
-    .unwrap_or_default()
+    serde_json::to_string(&Versioned { version: 1, record }).unwrap_or_default()
 }
 
 impl Tape {
@@ -399,9 +395,13 @@ mod tests {
                 11_169.471_000_000_1,
                 4_487_348.409_866_7 - k / 3.0,
             ],
-            direction: [-0.707_106_781_186_547_5, 0.1 / 3.0, 0.707_106_781_186_547_6],
+            direction: [
+                -std::f64::consts::FRAC_1_SQRT_2,
+                0.1 / 3.0,
+                0.707_106_781_186_547_7,
+            ],
             up: [0.0, 1.0, std::f64::consts::PI / 1e17],
-            fovy: 0.785_398_163_397_448_3,
+            fovy: std::f64::consts::FRAC_PI_4 + 1e-17,
         };
         let context = FrameContext {
             wall: 1_782_043_200.123_456_7 + k / 60.0,
@@ -419,7 +419,7 @@ mod tests {
             harmonic: [[1e-30, 2.0, 3.0]; 3],
             illuminance: [5.0 / 3.0; 3],
             to_sun: [0.6, 0.0, 0.8],
-            to_moon: (n % 2 == 0).then_some([0.0, 0.6, 0.8]),
+            to_moon: n.is_multiple_of(2).then_some([0.0, 0.6, 0.8]),
             light_updates: n,
             view_updates: n / 2,
             stars_drawn: None,
@@ -446,7 +446,7 @@ mod tests {
             tape.push(camera);
             tape.push_context(&context);
             tape.push_sky(&sky);
-            let input = if n % 7 == 0 {
+            let input = if n.is_multiple_of(7) {
                 vec![format!("key {n} pressed")]
             } else {
                 Vec::new()
@@ -516,7 +516,10 @@ mod tests {
             assert_eq!(size, (6, 4));
             assert_eq!(rgba, pixels(picture.index), "picture {}", picture.index);
             // The camera of its frame is the camera it was drawn under.
-            assert_eq!(frames[picture.index as usize].camera, awkward(picture.index).0);
+            assert_eq!(
+                frames[picture.index as usize].camera,
+                awkward(picture.index).0
+            );
             seen.push(picture.index);
             Ok(())
         })
