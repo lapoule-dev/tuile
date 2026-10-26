@@ -18,7 +18,8 @@
 // of the frame's own inputs, and a camera that moves a little moves it a
 // little. Included after `hillaire.wgsl`, with `atmosphere` (the frame's
 // uniform: the air and where the sun and the Moon are), the tables, and
-// `light_in` and `light_rays` declared; `light_slot` reads `light_partials`.
+// `light_in` and `light_rays` declared, and the shares' textures each pass
+// reads (`light_sky_*`, `light_meter_*`).
 
 struct LightInputs {
     // Unit east, north and up at the ground under the eye, ECEF; w of
@@ -190,30 +191,89 @@ fn light_tabled(height: f32, up: vec3f) -> vec3f {
     return out * ground;
 }
 
-// One share of the sky's sums: rows 0–4 the sky under the sun on the five
-// facings, 5–9 under the Moon.
-fn light_partial(x: u32, row: u32) -> vec4f {
+// One share of the sky's sums under one light (0 the sun, 1 the Moon):
+// its light on the five facings, over every LIGHT_THREADS-th direction,
+// one radiance read for all five — packed in four vec4s, the facings' rgb
+// one after the other.
+struct SkyShare {
+    a: vec4f,
+    b: vec4f,
+    c: vec4f,
+    d: vec4f,
+}
+
+fn light_sky(x: u32, light: u32) -> SkyShare {
+    var share: SkyShare;
+    share.a = vec4f(0.0);
+    share.b = vec4f(0.0);
+    share.c = vec4f(0.0);
+    share.d = vec4f(0.0);
     let height = light_in.enu_x.w;
-    let strength = light_in.enu_z.w;
-    if (row < 10u) {
-        var l = light_ground_light(light_in.to_sun.xyz);
-        if (row >= 5u) {
-            if (strength <= 0.0) { return vec4f(0.0); }
-            l = light_ground_light(light_in.to_moon.xyz);
-        }
-        let n = light_facing(l, row % 5u);
-        let solid = 4.0 * ATMOSPHERE_PI / f32(LIGHT_DIRECTIONS);
-        var sum = vec3f(0.0);
-        for (var i = x; i < LIGHT_DIRECTIONS; i += LIGHT_THREADS) {
-            let dir = light_direction(i);
-            let c = dot(n, dir);
-            if (c > 0.0) {
-                sum += sky_radiance(height, dir, l) * c * solid;
-            }
-        }
-        return vec4f(sum, 0.0);
+    var l = light_ground_light(light_in.to_sun.xyz);
+    if (light == 1u) {
+        if (light_in.enu_z.w <= 0.0) { return share; }
+        l = light_ground_light(light_in.to_moon.xyz);
     }
-    return vec4f(0.0);
+    let solid = 4.0 * ATMOSPHERE_PI / f32(LIGHT_DIRECTIONS);
+    var e0 = vec3f(0.0);
+    var e1 = vec3f(0.0);
+    var e2 = vec3f(0.0);
+    var e3 = vec3f(0.0);
+    var e4 = vec3f(0.0);
+    let n1 = light_facing(l, 1u);
+    let n3 = light_facing(l, 3u);
+    for (var i = x; i < LIGHT_DIRECTIONS; i += LIGHT_THREADS) {
+        let dir = light_direction(i);
+        let radiance = sky_radiance(height, dir, l) * solid;
+        e0 += radiance * max(dir.z, 0.0);
+        e1 += radiance * max(dot(n1, dir), 0.0);
+        e2 += radiance * max(-dot(n1, dir), 0.0);
+        e3 += radiance * max(dot(n3, dir), 0.0);
+        e4 += radiance * max(-dot(n3, dir), 0.0);
+    }
+    share.a = vec4f(e0, e1.x);
+    share.b = vec4f(e1.yz, e2.xy);
+    share.c = vec4f(e2.z, e3);
+    share.d = vec4f(e4, 0.0);
+    return share;
+}
+
+// The sky's shares added up a slice at a time: row `4 l + part` of the
+// totals, slice `x` of LIGHT_TOTALS, under light `l`.
+fn light_sky_total(x: u32, row: u32) -> vec4f {
+    let light = i32(row / 4u);
+    let part = row % 4u;
+    let per = LIGHT_THREADS / LIGHT_TOTALS;
+    var sum = vec4f(0.0);
+    for (var i = x * per; i < (x + 1u) * per; i++) {
+        let at = vec2i(i32(i), light);
+        if (part == 0u) {
+            sum += textureLoad(light_sky_a, at, 0);
+        } else if (part == 1u) {
+            sum += textureLoad(light_sky_b, at, 0);
+        } else if (part == 2u) {
+            sum += textureLoad(light_sky_c, at, 0);
+        } else {
+            sum += textureLoad(light_sky_d, at, 0);
+        }
+    }
+    return sum;
+}
+
+// The five facings' sums under `light`, the totals added up.
+fn light_facings(light: u32) -> array<vec3f, 5> {
+    var a = vec4f(0.0);
+    var b = vec4f(0.0);
+    var c = vec4f(0.0);
+    var d = vec4f(0.0);
+    let first = i32(light * 4u);
+    for (var x = 0; x < i32(LIGHT_TOTALS); x++) {
+        a += textureLoad(light_sky_totals, vec2i(x, first), 0);
+        b += textureLoad(light_sky_totals, vec2i(x, first + 1), 0);
+        c += textureLoad(light_sky_totals, vec2i(x, first + 2), 0);
+        d += textureLoad(light_sky_totals, vec2i(x, first + 3), 0);
+    }
+    return array<vec3f, 5>(a.xyz, vec3f(a.w, b.xy), vec3f(b.zw, c.x), c.yzw, d.xyz);
 }
 
 // The level light here, from the five facings' sums: the sun's beam and
@@ -223,11 +283,11 @@ fn light_level() -> vec3f {
     let height = light_in.enu_x.w;
     let strength = light_in.enu_z.w;
     let sun_l = light_ground_light(light_in.to_sun.xyz);
-    var level = sunlight(height, sun_l.z) * max(sun_l.z, 0.0) + light_sum(0u).xyz;
+    var level = sunlight(height, sun_l.z) * max(sun_l.z, 0.0) + light_facings(0u)[0];
     if (strength > 0.0) {
         let moon_l = light_ground_light(light_in.to_moon.xyz);
         level += sunlight(height, moon_l.z) * strength * max(moon_l.z, 0.0)
-            + light_sum(5u).xyz * strength;
+            + light_facings(1u)[0] * strength;
     }
     return level * light_in.scale.xyz / ATMOSPHERE_PI;
 }
@@ -238,20 +298,26 @@ fn light_agree() -> vec3f {
     return select(vec3f(1.0), level / max(here, vec3f(1e-30)), here > vec3f(1e-30));
 }
 
-// One share of the meter, over its cells: row 0 the light seen — its mean's
-// sum, rgb — and the weight counted; row 1 the sum of the log of its
-// luminance over the floor ε, for the log-average.
-fn light_meter(x: u32, row: u32) -> vec4f {
+// One share of the meter, over its cells: the light seen — its mean's sum,
+// rgb — and the weight counted; and the sum of the log of its luminance
+// over the floor ε, for the log-average.
+struct MeterShare {
+    seen: vec4f,
+    logs: vec4f,
+}
+
+fn light_meter(k: u32, j: u32) -> MeterShare {
+    var share: MeterShare;
+    share.seen = vec4f(0.0);
+    share.logs = vec4f(0.0);
+    let rays = u32(light_in.to_moon.w);
+    if (j >= rays || k >= METER_NODES) { return share; }
     let strength = light_in.enu_z.w;
     let eye_height = light_in.to_sun.w;
-    let rays = u32(light_in.to_moon.w);
     let scale = light_in.scale.xyz;
     let meter = light_in.eye_moon.w;
-    let agree = light_agree();
+    let agree = textureLoad(light_levels, vec2i(0, 0), 0).xyz;
     let epsilon = light_in.look.y * NIGHT_FLOOR * dot(light_in.calibrated.xyz, LIGHT_LUMA);
-    var seen = vec3f(0.0);
-    var logs = 0.0;
-    var counted = 0.0;
     let toward = light_in.meter_toward.xyz;
     let distance = light_in.meter_toward.w;
     let ground_radius = light_in.meter_radii.x;
@@ -260,97 +326,100 @@ fn light_meter(x: u32, row: u32) -> vec4f {
     if (distance > ground_radius) { limb = asin(ground_radius / distance); }
     var edge = 1e30;
     if (distance > top) { edge = asin(top / distance); }
-    for (var j = x; j < rays; j += LIGHT_THREADS) {
-        let a = textureLoad(light_rays, vec2i(i32(j), 0), 0);
-        let across = a.xyz;
-        let start = a.w;
-        let stop = textureLoad(light_rays, vec2i(i32(j), 1), 0).x;
-        let width = stop - start;
-        // The cell's pieces, as `MeterCell::nodes` lays them: the ground
-        // under the limb, the air between it and its top, nothing past.
-        var g0 = start;
-        var g1 = min(stop, limb);
-        var s0 = max(start, limb);
-        var s1 = min(stop, edge);
-        var point_cell = width <= 1e-12;
-        for (var k = 0u; k < 12u; k++) {
-            var theta = 0.0;
-            var w = 0.0;
-            var on_ground = false;
-            if (point_cell) {
-                if (k > 0u) { break; }
-                theta = start;
-                w = 1.0;
-                on_ground = start < limb;
-                if (!on_ground && start >= edge) { break; }
-            } else if (k < 4u) {
-                if (g1 <= g0) { continue; }
-                let node = GROUND_NODES[k];
-                theta = g0 + (g1 - g0) * (node.x + 1.0) / 2.0;
-                w = node.y * (g1 - g0) / 2.0 / width;
-                on_ground = true;
-            } else {
-                if (s1 <= s0) { break; }
-                let node = SKY_NODES[k - 4u];
-                let u = (node.x + 1.0) / 2.0;
-                theta = s0 + (s1 - s0) * u * u;
-                w = 2.0 * (s1 - s0) * u * (node.y / 2.0) / width;
-            }
-            let d = toward * cos(theta) + across * sin(theta);
-            if (on_ground) {
-                let b = distance * sin(theta);
-                let t = max(distance * cos(theta) - sqrt(max(ground_radius * ground_radius - b * b, 0.0)), 0.0);
-                let p = d * t;
-                let up = normalize(p - toward * distance);
-                // The ground's up in ECEF: the eye's frame turned back.
-                let up_ecef = light_in.eye_x.xyz * up.x + light_in.eye_y.xyz * up.y + light_in.eye_z.xyz * up.z;
-                let l = light_tabled(light_in.enu_x.w, up_ecef);
-                let sun = light_march(eye_height, d, light_in.eye_sun.xyz, t, METER_STEPS);
-                var through = sun.transmittance;
-                var air = sun.inscattered;
-                if (strength > 0.0) {
-                    let moon = light_march(eye_height, d, light_in.eye_moon.xyz, t, METER_STEPS);
-                    through = moon.transmittance;
-                    air += moon.inscattered * strength;
-                }
-                let v = l * agree * through + air * scale / meter;
-                seen += v * w;
-                logs += log(epsilon + max(dot(v, LIGHT_LUMA), 0.0)) * w;
-                counted += w;
-            } else {
-                // Grazing the air over the ground it grazes (`lut_direction`),
-                // and counted by the air it crosses (`meter_weight`).
-                let dir = lut_direction(d, vec3f(0.0, 0.0, 1.0), eye_height);
-                let weight = light_meter_weight(eye_height, dir.z);
-                if (weight <= 0.0) { continue; }
-                var l = sky_radiance(eye_height, dir, light_in.eye_sun.xyz);
-                if (strength > 0.0) {
-                    l += sky_radiance(eye_height, dir, light_in.eye_moon.xyz) * strength;
-                }
-                let v = l * scale / meter;
-                seen += v * weight * w;
-                logs += log(epsilon + max(dot(v, LIGHT_LUMA), 0.0)) * weight * w;
-                counted += weight * w;
-            }
-        }
+    let a = textureLoad(light_rays, vec2i(i32(j), 0), 0);
+    let across = a.xyz;
+    let start = a.w;
+    let stop = textureLoad(light_rays, vec2i(i32(j), 1), 0).x;
+    let width = stop - start;
+    // The cell's pieces, as `MeterCell::nodes` lays them: the ground under
+    // the limb, the air between it and its top, nothing past — and this
+    // invocation's node on them.
+    let g0 = start;
+    let g1 = min(stop, limb);
+    let s0 = max(start, limb);
+    let s1 = min(stop, edge);
+    var theta = 0.0;
+    var w = 0.0;
+    var on_ground = false;
+    if (width <= 1e-12) {
+        if (k > 0u) { return share; }
+        theta = start;
+        w = 1.0;
+        on_ground = start < limb;
+        if (!on_ground && start >= edge) { return share; }
+    } else if (k < 4u) {
+        if (g1 <= g0) { return share; }
+        let node = GROUND_NODES[k];
+        theta = g0 + (g1 - g0) * (node.x + 1.0) / 2.0;
+        w = node.y * (g1 - g0) / 2.0 / width;
+        on_ground = true;
+    } else {
+        if (s1 <= s0) { return share; }
+        let node = SKY_NODES[k - 4u];
+        let u = (node.x + 1.0) / 2.0;
+        theta = s0 + (s1 - s0) * u * u;
+        w = 2.0 * (s1 - s0) * u * (node.y / 2.0) / width;
     }
-    if (row == 0u) { return vec4f(seen, counted); }
-    return vec4f(logs, 0.0, 0.0, 0.0);
+    let d = toward * cos(theta) + across * sin(theta);
+    if (on_ground) {
+        let b = distance * sin(theta);
+        let t = max(distance * cos(theta) - sqrt(max(ground_radius * ground_radius - b * b, 0.0)), 0.0);
+        let p = d * t;
+        let up = normalize(p - toward * distance);
+        // The ground's up in ECEF: the eye's frame turned back.
+        let up_ecef = light_in.eye_x.xyz * up.x + light_in.eye_y.xyz * up.y + light_in.eye_z.xyz * up.z;
+        let l = light_tabled(light_in.enu_x.w, up_ecef);
+        let sun = light_march(eye_height, d, light_in.eye_sun.xyz, t, METER_STEPS);
+        var through = sun.transmittance;
+        var air = sun.inscattered;
+        if (strength > 0.0) {
+            let moon = light_march(eye_height, d, light_in.eye_moon.xyz, t, METER_STEPS);
+            through = moon.transmittance;
+            air += moon.inscattered * strength;
+        }
+        let v = l * agree * through + air * scale / meter;
+        share.seen = vec4f(v * w, w);
+        share.logs = vec4f(log(epsilon + max(dot(v, LIGHT_LUMA), 0.0)) * w, 0.0, 0.0, 0.0);
+    } else {
+        // Grazing the air over the ground it grazes (`lut_direction`), and
+        // counted by the air it crosses (`meter_weight`).
+        let dir = lut_direction(d, vec3f(0.0, 0.0, 1.0), eye_height);
+        let weight = light_meter_weight(eye_height, dir.z);
+        if (weight <= 0.0) { return share; }
+        var l = sky_radiance(eye_height, dir, light_in.eye_sun.xyz);
+        if (strength > 0.0) {
+            l += sky_radiance(eye_height, dir, light_in.eye_moon.xyz) * strength;
+        }
+        let v = l * scale / meter;
+        share.seen = vec4f(v * weight * w, weight * w);
+        share.logs = vec4f(log(epsilon + max(dot(v, LIGHT_LUMA), 0.0)) * weight * w, 0.0, 0.0, 0.0);
+    }
+    return share;
 }
 
-// The sum of one row's shares.
-fn light_sum(row: u32) -> vec4f {
+// The meter's shares added up a slice of its cells at a time: its light
+// seen (row 0) or its logs (row 1), every node of the slice `x`.
+fn light_meter_total(x: u32, row: u32) -> vec4f {
+    let per = (METER_RAYS + LIGHT_TOTALS - 1u) / LIGHT_TOTALS;
+    let rays = min(u32(light_in.to_moon.w), (x + 1u) * per);
     var sum = vec4f(0.0);
-    for (var x = 0u; x < LIGHT_THREADS; x++) {
-        sum += textureLoad(light_partials, vec2i(i32(x), i32(row)), 0);
+    for (var j = x * per; j < rays; j++) {
+        for (var k = 0u; k < METER_NODES; k++) {
+            let at = vec2i(i32(k), i32(j));
+            if (row == 0u) {
+                sum += textureLoad(light_meter_seen, at, 0);
+            } else {
+                sum += textureLoad(light_meter_logs, at, 0);
+            }
+        }
     }
     return sum;
 }
 
 fn light_meter_sum(row: u32) -> vec4f {
     var sum = vec4f(0.0);
-    for (var x = 0u; x < LIGHT_THREADS; x++) {
-        sum += textureLoad(light_meters, vec2i(i32(x), i32(row)), 0);
+    for (var x = 0; x < i32(LIGHT_TOTALS); x++) {
+        sum += textureLoad(light_meter_totals, vec2i(x, i32(row)), 0);
     }
     return sum;
 }
@@ -363,7 +432,7 @@ fn light_shown_ev(ev: f32) -> f32 {
     return -depth * log2(1.0 - ev / b);
 }
 
-// A light's sky as an L1 harmonic, start its five facings' sums: the
+// A light's sky as an L1 harmonic, from its five facings' sums: the
 // constant, the gradient (rows of ECEF x, y and z, one channel a
 // component), and level ground's.
 struct LightHarmonic {
@@ -374,12 +443,13 @@ struct LightHarmonic {
     level: vec3f,
 }
 
-fn light_harmonic(first: u32, l: vec3f) -> LightHarmonic {
-    let e0 = light_sum(first).xyz;
-    let e1 = light_sum(first + 1u).xyz;
-    let e2 = light_sum(first + 2u).xyz;
-    let e3 = light_sum(first + 3u).xyz;
-    let e4 = light_sum(first + 4u).xyz;
+fn light_harmonic(light: u32, l: vec3f) -> LightHarmonic {
+    let e = light_facings(light);
+    let e0 = e[0];
+    let e1 = e[1];
+    let e2 = e[2];
+    let e3 = e[3];
+    let e4 = e[4];
     let mean = (e1 + e2 + e3 + e4) / 4.0;
     let b0 = (e1 - e2) / 2.0;
     let b1 = (e3 - e4) / 2.0;
@@ -423,7 +493,7 @@ fn light_slot(j: u32) -> vec4f {
     var level = transmitted * max(sun_l.z, 0.0) + sun_sky.level;
     if (strength > 0.0) {
         let moon_l = light_ground_light(light_in.to_moon.xyz);
-        let moon_sky = light_harmonic(5u, moon_l);
+        let moon_sky = light_harmonic(1u, moon_l);
         let beam = sunlight(height, moon_l.z) * strength;
         mean += moon_sky.mean * strength;
         gx += moon_sky.gx * strength;

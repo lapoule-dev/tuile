@@ -564,4 +564,4 @@ fn an_atmosphere_films_pictures_are_the_same_to_the_byte() {
     assert_eq!(format!("{hash:016x}"), FROZEN_ATMOSPHERE_FILM);
 }
 
-const FROZEN_ATMOSPHERE_FILM: &str = "a9f9c4da35ebe645";
+const FROZEN_ATMOSPHERE_FILM: &str = "03dae0e8df4bcad9";

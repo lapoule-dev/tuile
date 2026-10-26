@@ -43,18 +43,24 @@ use crate::{AtmosphereFrame, AtmosphereParams, LutAtmosphere, Moonlight, SkyLigh
 /// [`crate::hillaire::WGSL`].
 pub const FRAME_LIGHT_WGSL: &str = include_str!("frame_light.wgsl");
 
-/// How many shares each sum is cut into: one invocation, or one texel, a
-/// share.
-pub const LIGHT_THREADS: u32 = 256;
+/// How many shares the sky's sums are cut into: one invocation, or one
+/// texel, a direction.
+pub const LIGHT_THREADS: u32 = 1024;
+/// The nodes of a meter's cell: four on its ground, eight on its air
+/// ([`crate::hillaire::MeterCell::nodes`]); one invocation a node.
+pub const METER_NODES: u32 = 12;
+/// How many slices every share is added up in before the slots read the
+/// totals: a reduction in two steps, every slot then reading this many.
+pub const LIGHT_TOTALS: u32 = 64;
 /// How many directions a facing's sky is summed over:
 /// [`crate::LutAtmosphere::sky_irradiance`]'s.
 pub const LIGHT_DIRECTIONS: u32 = 1024;
 /// The steps of the air between the eye and a metered ground point.
 pub const METER_STEPS: u32 = 16;
-/// The rows of the sky's shares: five facings under each light.
-const PARTIAL_ROWS: u32 = 10;
-/// The rows of the meter's shares: its light, and its logs.
-const METER_ROWS: u32 = 2;
+/// The rows of the sky's shares: one a light, the sun's and the Moon's —
+/// their five facings packed in four textures.
+const PARTIAL_ROWS: u32 = 2;
+
 /// How many rays the meter has at most: [`crate::hillaire::metering`]'s
 /// grid.
 pub const METER_RAYS: usize = 24 * 14;
@@ -160,7 +166,9 @@ fn constants() -> String {
          const METER_STEPS: u32 = {METER_STEPS}u;\n\
          const LIGHT_SLOTS: u32 = {SLOTS}u;\n\
          const PARTIAL_ROWS: u32 = {PARTIAL_ROWS}u;\n\
-         const METER_ROWS: u32 = {METER_ROWS}u;\n\
+         const METER_NODES: u32 = {METER_NODES}u;\n\
+         const LIGHT_TOTALS: u32 = {LIGHT_TOTALS}u;\n\
+         const METER_RAYS: u32 = {METER_RAYS}u;\n\
          const NIGHT_TINT: vec3f = {};\n\
          const NIGHT_WHITE: vec3f = {};\n\
          const NIGHT_FLOOR: f32 = {:?};\n\
@@ -417,7 +425,7 @@ enum Stage {
     Render {
         pipeline: wgpu::RenderPipeline,
         bind: wgpu::BindGroup,
-        target: wgpu::TextureView,
+        targets: Vec<wgpu::TextureView>,
     },
 }
 
@@ -439,19 +447,23 @@ struct Builder<'a> {
 
 impl Builder<'_> {
     /// The pass of entry point `entry` (`…_main` in compute, `…_fragment`
-    /// drawn), binding `bindings` and writing `output` — over `size`.
+    /// drawn), binding `bindings` and writing `outputs` — storage textures
+    /// at their bindings in compute, colour targets in order drawn — over
+    /// `size`.
     fn stage<'b>(
         &self,
         label: &str,
         entry: &str,
         mut bindings: Vec<(u32, Kind<'b>)>,
-        output: (u32, &'b wgpu::TextureView),
+        outputs: &[(u32, &'b wgpu::TextureView)],
         size: (u32, u32),
     ) -> Stage {
         let (device, module, compute, visibility) =
             (self.device, self.module, self.compute, self.visibility);
         if compute {
-            bindings.push((output.0, Kind::Output(output.1)));
+            for (binding, view) in outputs {
+                bindings.push((*binding, Kind::Output(view)));
+            }
         }
         let layout_entries: Vec<wgpu::BindGroupLayoutEntry> = bindings
             .iter()
@@ -516,11 +528,16 @@ impl Builder<'_> {
                 groups: (size.0.div_ceil(64), size.1),
             }
         } else {
-            let target = [Some(wgpu::ColorTargetState {
-                format: LUT_FORMAT,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })];
+            let target: Vec<Option<wgpu::ColorTargetState>> = outputs
+                .iter()
+                .map(|_| {
+                    Some(wgpu::ColorTargetState {
+                        format: LUT_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })
+                })
+                .collect();
             Stage::Render {
                 pipeline: device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some(label),
@@ -544,7 +561,7 @@ impl Builder<'_> {
                     cache: None,
                 }),
                 bind,
-                target: output.1.clone(),
+                targets: outputs.iter().map(|(_, v)| (*v).clone()).collect(),
             }
         }
     }
@@ -601,22 +618,55 @@ impl FrameLightPass {
             2,
             U::TEXTURE_BINDING | U::COPY_DST,
         );
-        let partials = texture(
-            "frame light sky",
-            LIGHT_THREADS,
-            PARTIAL_ROWS,
+        let view_of = |t: &wgpu::Texture| t.create_view(&Default::default());
+        let shares = |label| {
+            texture(
+                label,
+                LIGHT_THREADS,
+                PARTIAL_ROWS,
+                U::TEXTURE_BINDING | made,
+            )
+        };
+        let sky = [
+            shares("frame light sky a"),
+            shares("frame light sky b"),
+            shares("frame light sky c"),
+            shares("frame light sky d"),
+        ];
+        let meter = |label| {
+            texture(
+                label,
+                METER_NODES,
+                METER_RAYS as u32,
+                U::TEXTURE_BINDING | made,
+            )
+        };
+        let levels = texture("frame light level", 1, 1, U::TEXTURE_BINDING | made);
+        let levels_view = view_of(&levels);
+        let sky_totals = texture(
+            "frame light sky totals",
+            LIGHT_TOTALS,
+            4 * PARTIAL_ROWS,
             U::TEXTURE_BINDING | made,
         );
-        let meters = texture(
-            "frame light meter",
-            LIGHT_THREADS,
-            METER_ROWS,
+        let sky_totals_view = view_of(&sky_totals);
+        let meter_totals = texture(
+            "frame light meter totals",
+            LIGHT_TOTALS,
+            2,
             U::TEXTURE_BINDING | made,
         );
+        let meter_totals_view = view_of(&meter_totals);
+        let meters = [
+            meter("frame light meter seen"),
+            meter("frame light meter logs"),
+        ];
         let slots = texture("frame light slots", SLOTS, 1, U::COPY_SRC | made);
-        let view = |t: &wgpu::Texture| t.create_view(&Default::default());
-        let (rays_view, partials_view, meters_view, slots_view) =
-            (view(&rays), view(&partials), view(&meters), view(&slots));
+        let view = view_of;
+        let rays_view = view(&rays);
+        let sky_views = sky.each_ref().map(view);
+        let meter_views = meters.each_ref().map(view);
+        let slots_view = view(&slots);
         let (tv, mv, iv) = (
             view(&atmosphere.transmittance),
             view(&atmosphere.multi_scattering),
@@ -645,13 +695,61 @@ impl FrameLightPass {
             (3, Kind::Texture(&iv)),
             (4, Kind::Uniform(&inputs)),
         ];
-        let stages = vec![
-            builder.stage(
+        let sky_read = [
+            (6, Kind::Texture(&sky_views[0])),
+            (14, Kind::Texture(&sky_views[1])),
+            (15, Kind::Texture(&sky_views[2])),
+            (16, Kind::Texture(&sky_views[3])),
+        ];
+        // The sky's shares: four textures from one invocation in compute;
+        // drawn, two passes of two targets each — a colour attachment holds
+        // 32 bytes a sample, two of these texels.
+        let mut stages = if compute {
+            vec![builder.stage(
                 "frame light sky",
-                "light_partials",
+                "light_sky",
                 base.to_vec(),
-                (7, &partials_view),
+                &[
+                    (7, &sky_views[0]),
+                    (18, &sky_views[1]),
+                    (19, &sky_views[2]),
+                    (20, &sky_views[3]),
+                ],
                 (LIGHT_THREADS, PARTIAL_ROWS),
+            )]
+        } else {
+            vec![
+                builder.stage(
+                    "frame light sky ab",
+                    "light_sky_ab",
+                    base.to_vec(),
+                    &[(7, &sky_views[0]), (18, &sky_views[1])],
+                    (LIGHT_THREADS, PARTIAL_ROWS),
+                ),
+                builder.stage(
+                    "frame light sky cd",
+                    "light_sky_cd",
+                    base.to_vec(),
+                    &[(19, &sky_views[2]), (20, &sky_views[3])],
+                    (LIGHT_THREADS, PARTIAL_ROWS),
+                ),
+            ]
+        };
+        let sky_totals_read = (24, Kind::Texture(&sky_totals_view));
+        stages.extend([
+            builder.stage(
+                "frame light sky totals",
+                "light_sky_totals",
+                [&base[..], &sky_read[..]].concat(),
+                &[(25, &sky_totals_view)],
+                (LIGHT_TOTALS, 4 * PARTIAL_ROWS),
+            ),
+            builder.stage(
+                "frame light level",
+                "light_levels",
+                [&base[..], &[sky_totals_read]].concat(),
+                &[(23, &levels_view)],
+                (1, 1),
             ),
             builder.stage(
                 "frame light meter",
@@ -660,28 +758,39 @@ impl FrameLightPass {
                     &base[..],
                     &[
                         (5, Kind::Texture(&rays_view)),
-                        (6, Kind::Texture(&partials_view)),
+                        (22, Kind::Texture(&levels_view)),
                     ],
                 ]
                 .concat(),
-                (12, &meters_view),
-                (LIGHT_THREADS, METER_ROWS),
+                &[(12, &meter_views[0]), (21, &meter_views[1])],
+                (METER_NODES, METER_RAYS as u32),
+            ),
+            builder.stage(
+                "frame light meter totals",
+                "light_meter_totals",
+                [
+                    &base[..],
+                    &[
+                        (11, Kind::Texture(&meter_views[0])),
+                        (17, Kind::Texture(&meter_views[1])),
+                    ],
+                ]
+                .concat(),
+                &[(27, &meter_totals_view)],
+                (LIGHT_TOTALS, 2),
             ),
             builder.stage(
                 "frame light slots",
                 "light_slots",
                 [
                     &base[..],
-                    &[
-                        (6, Kind::Texture(&partials_view)),
-                        (11, Kind::Texture(&meters_view)),
-                    ],
+                    &[sky_totals_read, (26, Kind::Texture(&meter_totals_view))],
                 ]
                 .concat(),
-                (8, &slots_view),
+                &[(8, &slots_view)],
                 (SLOTS, 1),
             ),
-        ];
+        ]);
         Self {
             inputs,
             rays,
@@ -732,19 +841,25 @@ impl FrameLightPass {
                 Stage::Render {
                     pipeline,
                     bind,
-                    target,
+                    targets,
                 } => {
+                    let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = targets
+                        .iter()
+                        .map(|view| {
+                            Some(wgpu::RenderPassColorAttachment {
+                                view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })
+                        })
+                        .collect();
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("frame light"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: target,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
+                        color_attachments: &attachments,
                         depth_stencil_attachment: None,
                         timestamp_writes: None,
                         occlusion_query_set: None,
@@ -869,9 +984,16 @@ impl FrameLightReadout {
 pub fn wgsl(pass: SkyViewPass) -> String {
     let outputs = match pass {
         SkyViewPass::Compute => {
-            "@group(0) @binding(7) var partials_out: texture_storage_2d<rgba32float, write>;\n\
+            "@group(0) @binding(7) var sky_out_a: texture_storage_2d<rgba32float, write>;\n\
+             @group(0) @binding(18) var sky_out_b: texture_storage_2d<rgba32float, write>;\n\
+             @group(0) @binding(19) var sky_out_c: texture_storage_2d<rgba32float, write>;\n\
+             @group(0) @binding(20) var sky_out_d: texture_storage_2d<rgba32float, write>;\n\
              @group(0) @binding(8) var slots_out: texture_storage_2d<rgba32float, write>;\n\
-             @group(0) @binding(12) var meters_out: texture_storage_2d<rgba32float, write>;\n"
+             @group(0) @binding(12) var meter_out_seen: texture_storage_2d<rgba32float, write>;\n\
+             @group(0) @binding(21) var meter_out_logs: texture_storage_2d<rgba32float, write>;\n\
+             @group(0) @binding(23) var levels_out: texture_storage_2d<rgba32float, write>;\n\
+             @group(0) @binding(25) var sky_totals_out: texture_storage_2d<rgba32float, write>;\n\
+             @group(0) @binding(27) var meter_totals_out: texture_storage_2d<rgba32float, write>;\n"
         }
         SkyViewPass::Render => "",
     };
@@ -882,8 +1004,15 @@ pub fn wgsl(pass: SkyViewPass) -> String {
          @group(0) @binding(3) var irradiance_lut: texture_2d<f32>;\n\
          @group(0) @binding(4) var<uniform> light_in: LightInputs;\n\
          @group(0) @binding(5) var light_rays: texture_2d<f32>;\n\
-         @group(0) @binding(6) var light_partials: texture_2d<f32>;\n\
-         @group(0) @binding(11) var light_meters: texture_2d<f32>;\n\
+         @group(0) @binding(6) var light_sky_a: texture_2d<f32>;\n\
+         @group(0) @binding(14) var light_sky_b: texture_2d<f32>;\n\
+         @group(0) @binding(15) var light_sky_c: texture_2d<f32>;\n\
+         @group(0) @binding(16) var light_sky_d: texture_2d<f32>;\n\
+         @group(0) @binding(11) var light_meter_seen: texture_2d<f32>;\n\
+         @group(0) @binding(17) var light_meter_logs: texture_2d<f32>;\n\
+         @group(0) @binding(22) var light_levels: texture_2d<f32>;\n\
+         @group(0) @binding(24) var light_sky_totals: texture_2d<f32>;\n\
+         @group(0) @binding(26) var light_meter_totals: texture_2d<f32>;\n\
          {outputs}\
          @group(0) @binding(9) var night_lights_lut: texture_2d<f32>;\n\
          @group(0) @binding(10) var lut_sampler: sampler;\n\
@@ -901,15 +1030,39 @@ pub fn wgsl(pass: SkyViewPass) -> String {
 
 const COMPUTE_WGSL: &str = "
 @compute @workgroup_size(64)
-fn light_partials_main(@builtin(global_invocation_id) id: vec3u) {
+fn light_sky_main(@builtin(global_invocation_id) id: vec3u) {
     if (id.x >= LIGHT_THREADS || id.y >= PARTIAL_ROWS) { return; }
-    textureStore(partials_out, id.xy, light_partial(id.x, id.y));
+    let share = light_sky(id.x, id.y);
+    textureStore(sky_out_a, id.xy, share.a);
+    textureStore(sky_out_b, id.xy, share.b);
+    textureStore(sky_out_c, id.xy, share.c);
+    textureStore(sky_out_d, id.xy, share.d);
+}
+
+@compute @workgroup_size(64)
+fn light_sky_totals_main(@builtin(global_invocation_id) id: vec3u) {
+    if (id.x >= LIGHT_TOTALS || id.y >= 4u * PARTIAL_ROWS) { return; }
+    textureStore(sky_totals_out, id.xy, light_sky_total(id.x, id.y));
+}
+
+@compute @workgroup_size(64)
+fn light_meter_totals_main(@builtin(global_invocation_id) id: vec3u) {
+    if (id.x >= LIGHT_TOTALS || id.y >= 2u) { return; }
+    textureStore(meter_totals_out, id.xy, light_meter_total(id.x, id.y));
+}
+
+@compute @workgroup_size(64)
+fn light_levels_main(@builtin(global_invocation_id) id: vec3u) {
+    if (id.x > 0u || id.y > 0u) { return; }
+    textureStore(levels_out, vec2u(0u, 0u), vec4f(light_agree(), 0.0));
 }
 
 @compute @workgroup_size(64)
 fn light_meters_main(@builtin(global_invocation_id) id: vec3u) {
-    if (id.x >= LIGHT_THREADS || id.y >= METER_ROWS) { return; }
-    textureStore(meters_out, id.xy, light_meter(id.x, id.y));
+    if (id.x >= METER_NODES || id.y >= METER_RAYS) { return; }
+    let share = light_meter(id.x, id.y);
+    textureStore(meter_out_seen, id.xy, share.seen);
+    textureStore(meter_out_logs, id.xy, share.logs);
 }
 
 @compute @workgroup_size(64)
@@ -926,14 +1079,56 @@ fn light_vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
     return vec4f(xy, 0.0, 1.0);
 }
 
-@fragment
-fn light_partials_fragment(@builtin(position) at: vec4f) -> @location(0) vec4f {
-    return light_partial(u32(at.x), u32(at.y));
+struct SkyTargets {
+    @location(0) first: vec4f,
+    @location(1) second: vec4f,
 }
 
 @fragment
-fn light_meters_fragment(@builtin(position) at: vec4f) -> @location(0) vec4f {
-    return light_meter(u32(at.x), u32(at.y));
+fn light_sky_ab_fragment(@builtin(position) at: vec4f) -> SkyTargets {
+    let share = light_sky(u32(at.x), u32(at.y));
+    var out: SkyTargets;
+    out.first = share.a;
+    out.second = share.b;
+    return out;
+}
+
+@fragment
+fn light_sky_cd_fragment(@builtin(position) at: vec4f) -> SkyTargets {
+    let share = light_sky(u32(at.x), u32(at.y));
+    var out: SkyTargets;
+    out.first = share.c;
+    out.second = share.d;
+    return out;
+}
+
+struct MeterTargets {
+    @location(0) seen: vec4f,
+    @location(1) logs: vec4f,
+}
+
+@fragment
+fn light_sky_totals_fragment(@builtin(position) at: vec4f) -> @location(0) vec4f {
+    return light_sky_total(u32(at.x), u32(at.y));
+}
+
+@fragment
+fn light_meter_totals_fragment(@builtin(position) at: vec4f) -> @location(0) vec4f {
+    return light_meter_total(u32(at.x), u32(at.y));
+}
+
+@fragment
+fn light_levels_fragment(@builtin(position) at: vec4f) -> @location(0) vec4f {
+    return vec4f(light_agree(), 0.0);
+}
+
+@fragment
+fn light_meters_fragment(@builtin(position) at: vec4f) -> MeterTargets {
+    let share = light_meter(u32(at.x), u32(at.y));
+    var out: MeterTargets;
+    out.seen = share.seen;
+    out.logs = share.logs;
+    return out;
 }
 
 @fragment

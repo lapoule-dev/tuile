@@ -356,7 +356,9 @@ fn the_pic_du_midi_at_sunset_through_the_film() {
                 .expect("save");
         }
         let black = picture
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0].max(p[1]).max(p[2]) < 2)
             .count();
         assert_eq!(black, 0, "{name}: black pixels");
