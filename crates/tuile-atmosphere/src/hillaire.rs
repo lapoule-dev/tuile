@@ -1879,10 +1879,13 @@ mod tests {
         let ev = |m: &[Metered]| clear().light(clear(), at, day(to_sun), m, CALIBRATION);
         let (d, b, n) = (ev(&day_side), ev(&both), ev(&night_side));
         assert!(d.illumination.ev100 > 10.0, "{}", d.illumination.ev100);
-        // Half the frame at night: the mean of its light, a stop under its day.
+        // Half the frame at night: the log-average of its light, halfway in
+        // stops between its day and its night — not the mean's one stop
+        // under its day, which the bright half would drive.
+        let halfway = (d.illumination.ev100 + n.illumination.ev100) / 2.0;
         assert!(
-            (d.illumination.ev100 - b.illumination.ev100) < 1.2,
-            "{}",
+            (b.illumination.ev100 - halfway).abs() < 0.1,
+            "{} against {halfway}",
             b.illumination.ev100
         );
         // Space beside it, past the air: not metered, nothing changes.
