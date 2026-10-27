@@ -238,5 +238,15 @@ fn recording_a_frame_costs_the_frame_little() {
     );
     assert!(median < 2.0, "median {median:.3} ms");
     assert!(worst < 5.0, "p95 {worst:.3} ms");
-    assert!(read >= 100, "{read} of 120 frames read back");
+    // Every frame read back or counted as dropped, none lost.
+    assert_eq!(ring.failed(), 0);
+    assert_eq!(u64::from(read) + ring.dropped(), 120, "{read} read");
+    // More frames read than slots: the readers gave theirs back.
+    assert!(read > 6, "{read} of 120 frames read back");
+    // Keeping up with 60 Hz is the readers' speed, not the ring's: an
+    // unoptimised build on a software rasterizer reads a quarter of the
+    // frames, and drops the rest as it should.
+    if !cfg!(debug_assertions) {
+        assert!(read >= 100, "{read} of 120 frames read back");
+    }
 }
