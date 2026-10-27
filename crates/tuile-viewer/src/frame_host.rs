@@ -493,7 +493,9 @@ pub struct HostFrame<'a> {
     /// is `atmosphere.clock.at(wall)`. A host sets any of it, every frame if
     /// it likes ([`tuile_wgpu::Atmosphere`]); a host that leaves it alone
     /// leaves it as the viewer's flags and keys set it — the Earth, the
-    /// present, in real time.
+    /// present, in real time. Turned off, there is no air at all: neither
+    /// the physical atmosphere nor the closed-form haze that stands in for
+    /// it when the person unticks its checkbox.
     pub atmosphere: &'a mut tuile_wgpu::Atmosphere,
     /// The wall's present, Unix seconds UTC: what the clock's methods take.
     pub wall: f64,

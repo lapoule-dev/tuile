@@ -314,7 +314,12 @@ impl App {
         let aspect = self.aspect();
         let clearance = self.controller.height_above_ground();
         let sun = self.sun.light_travel_direction().as_vec3();
-        let strength = if self.nav.atmosphere_enabled() {
+        // The closed-form haze is the path without the physical atmosphere
+        // when the person turned it off; a host that turns the atmosphere
+        // off (`HostFrame::atmosphere`) asks for no air at all, as the
+        // checkbox does. With the physical atmosphere drawn, the shader
+        // never reads this strength.
+        let strength = if self.nav.atmosphere_enabled() && self.atmosphere.enabled {
             ATMOSPHERE_STRENGTH
         } else {
             0.0
