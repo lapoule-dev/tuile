@@ -155,6 +155,8 @@ pub(crate) enum Command {
     },
     /// The scene's clock back to the present, in real time.
     ClockNow,
+    /// The session recorded, or the recording closed.
+    Record(bool),
 }
 
 /// Which of `layers` a person, a flag, a URL or a script means by `text`: a

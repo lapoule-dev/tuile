@@ -256,7 +256,8 @@ Routing, authentication and limits belong to whoever deploys it.
 | Rendering | `tuile-wgpu` | The reference wgpu backend, native and wasm |
 | | `tuile-hydra` | C ABI over the geometry server, for a Hydra plugin |
 | | `tuile-usd` | A recorded camera path and a globe, as a USD stage |
-| Films | `tuile-tape` | Record a camera path and fly it again, exactly |
+| Films | `tuile-tape` | Record a camera path — or a whole viewer session, its pictures included — and fly it again, exactly |
+| | `tuile-record` | A recorded session read: its pictures to an mp4, their measures to Parquet, plots, the frames that flicker flagged |
 | | `tuile-bake` | Bake a frame range into a pack |
 | | `tuile-pack` | The pack container |
 | | `tuile-film` | A baked film read frame by frame — no GPU, no I/O |
@@ -296,8 +297,9 @@ a token you supply at run time and never commit:
 CESIUM_ION_TOKEN=... cargo run -p tuile-wgpu-viewer
 ```
 
-Drag to orbit, right-drag to pan, wheel to zoom. `TUILE_RECORD=path.jsonl`
-writes the camera path; `TUILE_REPLAY=path.jsonl` flies it again exactly.
+Drag to orbit, right-drag to pan, wheel to zoom. `--record path.mcap` (or
+`O`) records the session, pictures included; `TUILE_REPLAY=path.mcap` flies
+its camera path again exactly, and `tuile-record` reads it.
 
 It opens straight down on France from 2 000 km. To open somewhere else, say
 where the eye is and where it looks — degrees and metres, `--help` for the

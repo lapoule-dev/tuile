@@ -32,7 +32,7 @@ pub use prepare::{
     prepare, prepare_drape, PreparedDrape, PreparedMesh, PreparedTile, Vertex, STITCH_ROWS,
 };
 pub use pump::{ContentPump, Drawn, Resolution, STITCH_SLIDE_FRAMES, UPLOAD_SHARE_PERMILLE};
-pub use readback::Readback;
+pub use readback::{MappedFrame, Readback, ReadbackRing};
 pub use renderer::{sky_wgsl, LineVertex, TileRenderer, ViewUniform};
 pub use sky::{
     ecef_of, Atmosphere, AtmosphereConfig, Bodies, Lights, SkyFrame, SkyView, LIGHT_INTERVAL,

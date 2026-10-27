@@ -259,6 +259,32 @@ impl App {
         }
     }
 
+    /// Plays what is due of `TUILE_STEER_SCRIPT`, once the window is drawing:
+    /// each line a steering URL, as one from outside would arrive, or the
+    /// end of the session. See [`super::script::SteerScript`].
+    pub(super) fn play_the_steering(&mut self, now: Instant) {
+        let covered = self.active.is_some() && !self.warmup.holding;
+        let steered = self
+            .steer_script
+            .as_mut()
+            .map_or_else(Vec::new, |s| s.due(now, covered));
+        for line in steered {
+            if line == "quit" {
+                self.ended_by = Some("the steering script ended");
+            } else {
+                self.queue_url(line);
+            }
+            self.demand.poke();
+        }
+        if self
+            .steer_script
+            .as_ref()
+            .is_some_and(super::script::SteerScript::pending)
+        {
+            self.demand.poke();
+        }
+    }
+
     /// Plays what is due of `TUILE_TOUCH_SCRIPT`, through the same path as
     /// the window's touches. See [`super::script`].
     fn play_the_script(&mut self, now: Instant) {

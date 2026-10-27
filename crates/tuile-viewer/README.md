@@ -94,9 +94,18 @@ The current location comes from the operating system's location service
 person before it answers; elsewhere `--here` and L say it is not available
 and change nothing. The coordinates are never logged or written anywhere.
 
-`TUILE_RECORD=path.mcap` writes the camera path; `TUILE_REPLAY=path.mcap`
-flies it again exactly. The format and the replay live in the `tuile-tape`
-crate.
+`--record path.mcap` (or `TUILE_RECORD`, or `O` / View > Record Session)
+records the session: each frame's camera, wall and scene clocks, viewport,
+render origin, atmosphere and input, and the pictures drawn — read back from
+the GPU through a ring of staging buffers, never waiting for one, and
+encoded on threads of their own (`--record-fps`, `--record-scale`,
+`--record-codec`). `TUILE_REPLAY=path.mcap` flies the camera path again
+exactly; the control API's `Headless::replay` draws any recorded frame
+again, at its own clocks. The format lives in `tuile-tape`
+(`tuile_tape::session`); `tuile-record` makes a film, a Parquet sidecar, plots
+and a diagnosis of a recording. `TUILE_STEER_SCRIPT=<file>` plays steering
+URLs on a timeline (`<seconds> <tuile://…>` or `<seconds> quit`), for a
+session that can be recorded again.
 
 With the `control` feature — tests and debug builds only — `control` runs
 the same application headless, steps it frame by frame and reads it back:

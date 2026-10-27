@@ -560,7 +560,7 @@ pub(super) fn configure(
             // for on every backend that matters, and asking for capabilities a
             // session does not use is how a viewer stops working on someone
             // else's GPU.
-            usage: if crate::recording::trace_path().is_some() {
+            usage: if crate::recording::trace_path().is_some() || crate::recording::capturing() {
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
             } else {
                 wgpu::TextureUsages::RENDER_ATTACHMENT

@@ -56,11 +56,28 @@ while let Some(frame) = tape.next_frame() {
 # Ok::<(), tuile_tape::TapeError>(())
 ```
 
+# A session, recorded
+
+A tape can carry a whole interactive session ([`session`]): beside each
+frame's camera, the wall and scene clocks it was drawn at, its viewport and
+render origin (`/viewer/frame`), what the atmosphere lit it with
+(`/viewer/sky`), the input before it (`/viewer/input`) — and the picture the
+viewer drew, as it was on the screen (`/frame`, `foxglove.CompressedImage`,
+JPEG or PNG), carrying the index of the frame it shows. The viewer writes
+one with `--record <file.mcap>`; `session::read` and
+`session::for_each_picture` read it back, every number to the bit. The
+camera and the clocks are what a replay needs to put the renderer back at any
+frame; the pictures are what was seen. `tuile-record` makes a film, a
+Parquet sidecar and a diagnosis of one.
+
+[`scan::picture_stats`] measures a picture against the camera that drew it:
+the sky's and the ground's mean luma, the star-like points, the black pixels.
+
 ## Where it sits
 
 Depends on `tuile-core` and `tuile-camera`. Used by `tuile-viewer` (record and
-replay), `tuile-bake` and `tuile-film-native` (camera paths), and `tuile-usd`
-(a tape as a USD stage).
+replay), `tuile-bake` and `tuile-film-native` (camera paths), `tuile-record`
+(a recorded session read), and `tuile-usd` (a tape as a USD stage).
 
 ## Command-line tools
 

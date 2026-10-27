@@ -137,7 +137,7 @@ fn session(
 ) -> anyhow::Result<()> {
     // The command line, read by `main`. Exit code 2 is the usual one for a
     // command that was not understood.
-    let (view, here, imagery, compression, clock, max_altitude) = match invocation {
+    let (view, here, imagery, compression, clock, max_altitude, record) = match invocation {
         Ok(start::Invocation::Run {
             view,
             here,
@@ -145,8 +145,17 @@ fn session(
             compression,
             clock,
             max_altitude,
+            record,
             ..
-        }) => (view, here, imagery, compression, clock, max_altitude),
+        }) => (
+            view,
+            here,
+            imagery,
+            compression,
+            clock,
+            max_altitude,
+            record,
+        ),
         Ok(start::Invocation::Help) => {
             println!("{}", start::usage());
             return Ok(());
@@ -350,6 +359,7 @@ fn session(
         controls: true,
         backends,
         imagery_compression: compression,
+        record,
     };
 
     // Everything the engine counts, scrapeable, so the log can stop being a

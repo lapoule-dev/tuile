@@ -46,7 +46,7 @@ One application, four shells:
 
 CLI (desktop): `--lon --lat --altitude --heading --pitch`, `--here`, `--imagery <layer>`, `--imagery-compression off|auto|bc7|astc` (off by default), and sources by address with no catalog and no token: `--terrain-url <layer.json URL>`, `--imagery-template <{z}/{x}/{y} URL>`, `--imagery-scheme webmercator|geographic`, `--imagery-max-level <n>` (`examples/heightfield-serve` prints a working set). `--help` lists them all.
 
-Keys: drag moves the globe, right-drag tilts and turns, wheel zooms; `N` north up, `L` current location, `C`/`V` copy/go to a view link, `I` next imagery layer, `W` wireframe, `D` diagnostic views, `F` freeze the traversal (the camera moves, the selection does not — essential for debugging the LOD). Touch gestures on phones. `TUILE_RECORD` / `TUILE_REPLAY` record a camera path and fly it again exactly.
+Keys: drag moves the globe, right-drag tilts and turns, wheel zooms; `N` north up, `L` current location, `C`/`V` copy/go to a view link, `I` next imagery layer, `W` wireframe, `D` diagnostic views, `F` freeze the traversal (the camera moves, the selection does not — essential for debugging the LOD). Touch gestures on phones. `O` (or `--record <file.mcap>`) records the session — camera, clocks, atmosphere, input and the pictures drawn — and `TUILE_REPLAY` flies a recorded camera path again exactly; `tuile-record` exports and diagnoses a recording.
 
 Headless: `cargo run --release -p tuile-wgpu-viewer --example headless -- run all` plays the graphics budget's motion patterns on the real application without a window and holds each run to the specification's obligations (it needs the network, a GPU and a token served by a catalog proxy).
 

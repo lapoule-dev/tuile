@@ -65,6 +65,7 @@ impl App {
         // pump.
         self.note_what_could_not_be_drawn(resolution);
         self.record_the_traced_frame();
+        self.record_the_session_frame();
         self.publish_the_view(Some((
             rendered,
             resolution.coarser == 0 && resolution.lost == 0,
@@ -264,8 +265,9 @@ impl App {
     /// is a window's only one.
     fn upload_the_view(&mut self) {
         // The frame's instant, from the scene's clock — after the host, which
-        // may have set it.
-        let wall = super::wall_seconds();
+        // may have set it. The wall a replayed frame was drawn at, in a
+        // replay.
+        let wall = self.frame_wall();
         self.instant = self.atmosphere.instant(wall);
         let sky = self.sky_view();
         let mut atmosphere = self.atmosphere;
@@ -396,6 +398,9 @@ impl App {
         // The same clearance the tiles' view uniform is built with, so an
         // overlay and the ground share one clip space.
         let clearance = self.controller.height_above_ground();
+        // Whether this frame is due a picture of the recording, and the
+        // frame index it carries.
+        let snap = self.picture_due();
         let active = self.active.as_mut()?;
         // For any selected tile not yet uploaded, fall back to its nearest ready
         // ancestor so refinement never flashes the background.
@@ -531,6 +536,18 @@ impl App {
                         targets: &active.targets,
                         clear,
                         trace: trace.then_some(&mut active.readback),
+                        record: {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                let ring = self.recording.pictures.as_mut().map(|p| &mut p.ring);
+                                ring.zip(snap)
+                            }
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                let _ = snap;
+                                None
+                            }
+                        },
                     },
                     || super::setup::configure(surface, &active.gpu, active.format, active.size),
                     || window.pre_present_notify(),

@@ -43,3 +43,7 @@ tuile-viewer = { version = "0.14.0", path = "../../crates/tuile-viewer", feature
 # The sunset sequence (`examples/sunset`): its instants, from the ephemeris.
 tuile-atmosphere = { version = "0.14.0", path = "../../crates/tuile-atmosphere" }
 tuile-core = { version = "0.14.0", path = "../../crates/tuile-core" }
+# The replay (`examples/replay`): a recorded session read, and written again.
+glam = { workspace = true }
+tuile-camera = { version = "0.14.0", path = "../../crates/tuile-camera" }
+tuile-tape = { version = "0.14.0", path = "../../crates/tuile-tape" }

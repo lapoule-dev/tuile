@@ -66,6 +66,9 @@ pub(crate) enum Ask {
     Faster,
     /// Paused, or running again.
     Pause,
+    /// The session recorded — camera, clocks, atmosphere and the pictures
+    /// drawn — or the recording closed.
+    ToggleRecording,
 }
 
 /// The rates the clock steps through, scene seconds a second: backwards an
@@ -97,6 +100,8 @@ pub(crate) struct State {
     pub layer: usize,
     pub layers: usize,
     pub clock: Clock,
+    /// Whether the session is being recorded.
+    pub recording: bool,
 }
 
 impl State {
@@ -108,6 +113,7 @@ impl State {
             layer: snapshot.layer,
             layers,
             clock: snapshot.clock,
+            recording: snapshot.recording,
         }
     }
 
@@ -132,6 +138,7 @@ impl Ask {
             Self::Do(command) => command,
             Self::ToggleWireframe => Command::Wireframe(!now.wireframe),
             Self::ToggleFreeze => Command::Freeze(!now.frozen),
+            Self::ToggleRecording => Command::Record(!now.recording),
             Self::Diagnostic(view) => Command::Diagnostic(view),
             Self::NextDiagnostic => Command::Diagnostic((now.diagnostic + 1) % DIAGNOSTICS.len()),
             Self::Imagery(layer) => Command::Imagery(layer),
@@ -183,6 +190,7 @@ impl Ask {
             Self::Diagnostic(view) => Some(now.diagnostic == view),
             Self::Imagery(layer) => Some(now.layer == layer),
             Self::Pause => Some(now.clock.rate == 0.0),
+            Self::ToggleRecording => Some(now.recording),
             Self::Do(_)
             | Self::NextDiagnostic
             | Self::NextImagery
@@ -195,7 +203,7 @@ impl Ask {
 
 /// The letter keys. Lower case; the window reads a key without regard to
 /// case.
-pub(crate) const KEYS: [(char, Ask); 16] = [
+pub(crate) const KEYS: [(char, Ask); 17] = [
     ('w', Ask::ToggleWireframe),
     ('f', Ask::ToggleFreeze),
     ('d', Ask::NextDiagnostic),
@@ -214,6 +222,8 @@ pub(crate) const KEYS: [(char, Ask); 16] = [
     ('r', Ask::Faster),
     ('p', Ask::Pause),
     ('t', Ask::Do(Command::ClockNow)),
+    // O, as in "on the record": R was taken by the clock.
+    ('o', Ask::ToggleRecording),
 ];
 
 /// What the key `c` asks for; `None` for a key that is not one of the
@@ -276,6 +286,8 @@ pub(crate) fn layout(layers: &[ImageryChoice]) -> Vec<(&'static str, Vec<Entry>)
             .map(|(index, name)| item(&format!("Diagnostic View: {name}"), Ask::Diagnostic(index))),
     );
     view.push(item("Next Diagnostic View", Ask::NextDiagnostic));
+    view.push(Entry::Separator);
+    view.push(item("Record Session", Ask::ToggleRecording));
 
     let go = vec![
         item("North Up", Ask::Do(Command::NorthUp)),
@@ -552,6 +564,7 @@ impl Default for State {
                 resume: 1.0,
                 event: None,
             },
+            recording: false,
         }
     }
 }
@@ -678,6 +691,7 @@ mod tests {
             layer: 1,
             layers: layers.len(),
             clock: State::default().clock,
+            recording: false,
         };
         let marked: Vec<String> = items(&layers)
             .into_iter()
@@ -767,6 +781,7 @@ mod tests {
                 resume: 60.0,
                 event: None,
             },
+            recording: false,
         };
         for (ask, command) in [
             (Ask::ToggleWireframe, Command::Wireframe(true)),

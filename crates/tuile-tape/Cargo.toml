@@ -29,6 +29,11 @@ mcap = { version = "0.25", default-features = false }
 # figure. BSD-3-Clause, un million de téléchargements.
 splines = "5.0"
 image = { workspace = true }
+# The session's records beside the camera (`session`): typed, versioned, and
+# every `f64` read back to the bit — hence `float_roundtrip`, without which a
+# wall time or an instant may come back one unit in the last place off.
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

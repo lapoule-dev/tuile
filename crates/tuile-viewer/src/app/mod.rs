@@ -21,6 +21,8 @@ mod messages;
 #[cfg(feature = "control")]
 pub(crate) mod offscreen;
 mod pacing;
+#[cfg(not(target_arch = "wasm32"))]
+mod pictures;
 mod readout;
 mod screen;
 mod script;
@@ -33,6 +35,8 @@ mod touch;
 mod warmup;
 
 pub(crate) use eyes::Rig;
+#[cfg(feature = "control")]
+pub(crate) use tape::Replayed;
 #[cfg(feature = "control")]
 pub(crate) use touch::Phase as Finger;
 
@@ -115,6 +119,10 @@ pub struct ViewerConfig {
     /// How the imagery is held on the GPU: the person's choice, off unless
     /// they asked (`--imagery-compression`, or the phone's settings page).
     pub(crate) imagery_compression: tuile_wgpu::ImageryCompression,
+    /// Where the session is recorded (`--record`): the camera and, frame by
+    /// frame, what the picture was drawn under — see `tuile_tape::session`.
+    /// `TUILE_RECORD` says the same where there is no command line.
+    pub(crate) record: crate::recording::RecordSettings,
 }
 
 /// Where the on-screen controls live: the part of the frame not under a
@@ -291,6 +299,8 @@ pub struct App {
     touches: touch::Touches,
     /// A scripted hand, when `TUILE_TOUCH_SCRIPT` names one.
     script: Option<script::TouchScript>,
+    /// `TUILE_STEER_SCRIPT`: steering URLs on a timeline.
+    steer_script: Option<script::SteerScript>,
     /// The last frame's resolution, which the next frame's indicator reads.
     resolution: Option<tuile_wgpu::Resolution>,
     /// Tiles uploaded on the last frame.
@@ -457,6 +467,7 @@ impl App {
             demand: demand::Demand::default(),
             touches: touch::Touches::default(),
             script: script::TouchScript::from_environment(),
+            steer_script: script::SteerScript::from_environment(),
             resolution: None,
             uploaded: 0,
             thermal: crate::profile::Thermal::Nominal,
@@ -469,9 +480,16 @@ impl App {
             pointer: input::Pointer::default(),
             views: input::Views::default(),
             recording: tape::Recording {
-                tape: crate::recording::open_tape(),
+                tape: crate::recording::open_tape(config.record.path.as_deref()),
                 trace: crate::recording::open_trace(),
                 finished: false,
+                inputs: Vec::new(),
+                wall,
+                replay: None,
+                settings: config.record.clone(),
+                #[cfg(not(target_arch = "wasm32"))]
+                pictures: None,
+                began: None,
             },
             warmup: warmup::Warmup {
                 // Only a desktop holds its window shut; a phone opens at once
@@ -518,6 +536,7 @@ impl App {
             presented: 0,
         };
         app.retries = config.retries;
+        app.start_the_pictures();
         // A desktop's launch has already arrived: adopt it before the first
         // turn of the loop, as the session always did.
         app.take_the_session();
@@ -870,6 +889,7 @@ impl App {
             self.pump_while_hidden();
             return Turn::Flow(ControlFlow::Poll);
         }
+        self.play_the_steering(web_time::Instant::now());
         // A phone draws on demand, and only in the foreground.
         if self.profile.render_on_demand {
             return Turn::Flow(self.pace_the_frames());
