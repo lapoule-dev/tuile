@@ -482,6 +482,8 @@ fn near_ground_and_relief_are_drawn_as_they_were() {
     }
     let (backend, name) = adapter().unwrap_or((wgpu::Backend::Noop, String::new()));
     let frozen_here = backend == wgpu::Backend::Metal && name.starts_with("Apple");
+    // Every look compared before any fails: what moved is read in one run.
+    let mut failed = Vec::new();
     for (what, drawn) in pictures {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(format!("tests/frozen/hill-{what}.png"));
@@ -500,15 +502,14 @@ fn near_ground_and_relief_are_drawn_as_they_were() {
             "{what}: {moved} pixels moved ({:.3} %), by at most {most} on {backend:?} {name}",
             100.0 * share
         );
-        if !frozen_here {
-            continue;
+        if frozen_here && !(most <= 1 && share <= 0.005) {
+            failed.push(format!(
+                "{what}: {moved} pixels moved ({:.3} %), by up to {most} levels",
+                100.0 * share
+            ));
         }
-        assert!(
-            most <= 1 && share <= 0.005,
-            "{what}: {moved} pixels moved ({:.3} %), by up to {most} levels",
-            100.0 * share
-        );
     }
+    assert!(failed.is_empty(), "{}", failed.join("; "));
     if !frozen_here {
         eprintln!("SKIP: the near ground is frozen on an Apple GPU, not on {backend:?} {name}");
     }
