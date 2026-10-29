@@ -119,7 +119,9 @@ fn light_facing(l: vec3f, f: u32) -> vec3f {
 // A ray from `height` along `dir`, the light along `light` (unit, z up at
 // the start), for `length` metres at most: `LutAtmosphere::march` with a
 // length, its steps even. From above the air, from where it enters it.
-fn light_march(height: f32, dir: vec3f, light: vec3f, length_: f32, steps: u32) -> AirRay {
+// The light's disc of angular radius `radius` is cut by the planet's
+// horizon (`LutAtmosphere::march_under`): the sun's, or the Moon's own.
+fn light_march(height: f32, dir: vec3f, light: vec3f, radius: f32, length_: f32, steps: u32) -> AirRay {
     var ray: AirRay;
     ray.inscattered = vec3f(0.0);
     ray.transmittance = vec3f(1.0);
@@ -153,8 +155,8 @@ fn light_march(height: f32, dir: vec3f, light: vec3f, length_: f32, steps: u32) 
         if (exit_disc >= 0.0) { to_end = -r * mu + sqrt(exit_disc); }
     }
     let t_max = max(min(length_ - entry, max(to_end, 0.0)), 0.0);
-    let one = light_along(dot(d, l), 1.0);
-    let none = light_along(0.0, 0.0);
+    let one = light_along(dot(d, l), 1.0, radius);
+    let none = light_along(0.0, 0.0, radius);
     let origin = vec3f(0.0, 0.0, r);
     var t_prev = 0.0;
     for (var s = 0u; s < steps; s++) {
@@ -186,7 +188,8 @@ fn light_tabled(height: f32, up: vec3f) -> vec3f {
     let strength = light_in.enu_z.w;
     if (strength > 0.0) {
         let mu_m = dot(light_in.to_moon.xyz, up);
-        out += (sunlight(height, mu_m) * max(mu_m, 0.0) + level_irradiance(height, mu_m)) * strength;
+        out += (body_light(height, mu_m, atmosphere.moon_disc.w) * max(mu_m, 0.0)
+            + level_irradiance(height, mu_m)) * strength;
     }
     return out * ground;
 }
@@ -210,9 +213,11 @@ fn light_sky(x: u32, light: u32) -> SkyShare {
     share.d = vec4f(0.0);
     let height = light_in.enu_x.w;
     var l = light_ground_light(light_in.to_sun.xyz);
+    var radius = SUN_ANGULAR_RADIUS;
     if (light == 1u) {
         if (light_in.enu_z.w <= 0.0) { return share; }
         l = light_ground_light(light_in.to_moon.xyz);
+        radius = atmosphere.moon_disc.w;
     }
     let solid = 4.0 * ATMOSPHERE_PI / f32(LIGHT_DIRECTIONS);
     var e0 = vec3f(0.0);
@@ -224,7 +229,7 @@ fn light_sky(x: u32, light: u32) -> SkyShare {
     let n3 = light_facing(l, 3u);
     for (var i = x; i < LIGHT_DIRECTIONS; i += LIGHT_THREADS) {
         let dir = light_direction(i);
-        let radiance = sky_radiance(height, dir, l) * solid;
+        let radiance = sky_radiance(height, dir, l, radius) * solid;
         e0 += radiance * max(dir.z, 0.0);
         e1 += radiance * max(dot(n1, dir), 0.0);
         e2 += radiance * max(-dot(n1, dir), 0.0);
@@ -286,7 +291,7 @@ fn light_level() -> vec3f {
     var level = sunlight(height, sun_l.z) * max(sun_l.z, 0.0) + light_facings(0u)[0];
     if (strength > 0.0) {
         let moon_l = light_ground_light(light_in.to_moon.xyz);
-        level += sunlight(height, moon_l.z) * strength * max(moon_l.z, 0.0)
+        level += body_light(height, moon_l.z, atmosphere.moon_disc.w) * strength * max(moon_l.z, 0.0)
             + light_facings(1u)[0] * strength;
     }
     return level * light_in.scale.xyz / ATMOSPHERE_PI;
@@ -369,11 +374,12 @@ fn light_meter(k: u32, j: u32) -> MeterShare {
         // The ground's up in ECEF: the eye's frame turned back.
         let up_ecef = light_in.eye_x.xyz * up.x + light_in.eye_y.xyz * up.y + light_in.eye_z.xyz * up.z;
         let l = light_tabled(light_in.enu_x.w, up_ecef);
-        let sun = light_march(eye_height, d, light_in.eye_sun.xyz, t, METER_STEPS);
+        let sun = light_march(eye_height, d, light_in.eye_sun.xyz, SUN_ANGULAR_RADIUS, t, METER_STEPS);
         var through = sun.transmittance;
         var air = sun.inscattered;
         if (strength > 0.0) {
-            let moon = light_march(eye_height, d, light_in.eye_moon.xyz, t, METER_STEPS);
+            let moon = light_march(
+                eye_height, d, light_in.eye_moon.xyz, atmosphere.moon_disc.w, t, METER_STEPS);
             through = moon.transmittance;
             air += moon.inscattered * strength;
         }
@@ -386,9 +392,9 @@ fn light_meter(k: u32, j: u32) -> MeterShare {
         let dir = lut_direction(d, vec3f(0.0, 0.0, 1.0), eye_height);
         let weight = light_meter_weight(eye_height, dir.z);
         if (weight <= 0.0) { return share; }
-        var l = sky_radiance(eye_height, dir, light_in.eye_sun.xyz);
+        var l = sky_radiance(eye_height, dir, light_in.eye_sun.xyz, SUN_ANGULAR_RADIUS);
         if (strength > 0.0) {
-            l += sky_radiance(eye_height, dir, light_in.eye_moon.xyz) * strength;
+            l += sky_radiance(eye_height, dir, light_in.eye_moon.xyz, atmosphere.moon_disc.w) * strength;
         }
         let v = l * scale / meter;
         share.seen = vec4f(v * weight * w, weight * w);
@@ -494,7 +500,7 @@ fn light_slot(j: u32) -> vec4f {
     if (strength > 0.0) {
         let moon_l = light_ground_light(light_in.to_moon.xyz);
         let moon_sky = light_harmonic(1u, moon_l);
-        let beam = sunlight(height, moon_l.z) * strength;
+        let beam = body_light(height, moon_l.z, atmosphere.moon_disc.w) * strength;
         mean += moon_sky.mean * strength;
         gx += moon_sky.gx * strength;
         gy += moon_sky.gy * strength;

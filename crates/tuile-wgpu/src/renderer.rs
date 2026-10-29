@@ -515,7 +515,7 @@ impl TileRenderer {
                 gpu.queue.write_buffer(
                     &self.sky_buf,
                     64,
-                    bytemuck::bytes_of(&[crate::sky::star_sigma(&frame.view), 0.0, 0.0, 0.0]),
+                    bytemuck::bytes_of(&[crate::sky::pixel_angle(&frame.view), 0.0, 0.0, 0.0]),
                 );
             }
         }

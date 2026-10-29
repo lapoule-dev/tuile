@@ -152,9 +152,18 @@ fn ground_hit(r: f64, mu: f64, bottom: f64) -> Option<f64> {
 /// sun at zenith cosine `mu_s`: a smooth step across the disc's diameter, so
 /// that a sun setting dims over the minutes it takes rather than at once.
 pub fn sun_visible(r: f64, mu_s: f64) -> f64 {
+    body_visible(r, mu_s, SUN_ANGULAR_RADIUS)
+}
+
+/// How much of a body's disc of angular radius `rho` stands over the
+/// horizon of radius `r`, its centre at zenith cosine `mu`: as
+/// [`sun_visible`], each body by its own size — the Moon's a little smaller
+/// than the sun's, and changing with its distance.
+pub fn body_visible(r: f64, mu: f64, rho: f64) -> f64 {
     let horizon = -(1.0 - (LUT_RADIUS / r).min(1.0).powi(2)).max(0.0).sqrt();
-    let over = mu_s.clamp(-1.0, 1.0).asin() - horizon.asin();
-    let x = ((over + SUN_ANGULAR_RADIUS) / (2.0 * SUN_ANGULAR_RADIUS)).clamp(0.0, 1.0);
+    let over = mu.clamp(-1.0, 1.0).asin() - horizon.asin();
+    let rho = rho.max(1e-9);
+    let x = ((over + rho) / (2.0 * rho)).clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
 }
 
@@ -318,8 +327,13 @@ impl LutAtmosphere {
                 let mu_s = 2.0 * (i as f64 / (w - 1) as f64) - 1.0;
                 let sun = DVec3::new((1.0 - mu_s * mu_s).max(0.0).sqrt(), 0.0, mu_s);
                 table.push(
-                    self.sky_irradiance_with(height, sun, &[DVec3::Z], IRRADIANCE_TABLE_DIRECTIONS)
-                        [0],
+                    self.sky_irradiance_with(
+                        height,
+                        sun,
+                        SUN_ANGULAR_RADIUS,
+                        &[DVec3::Z],
+                        IRRADIANCE_TABLE_DIRECTIONS,
+                    )[0],
                 );
             }
         }
@@ -428,8 +442,15 @@ impl LutAtmosphere {
     /// The sun's light reaching radius `r`, the sun at zenith cosine `mu_s`:
     /// the transmittance, the planet's shadow taken.
     pub fn sunlight(&self, r: f64, mu_s: f64) -> [f64; 3] {
-        let v = sun_visible(r, mu_s);
-        self.transmittance(r, mu_s).map(|t| t * v)
+        self.body_light(r, mu_s, SUN_ANGULAR_RADIUS)
+    }
+
+    /// A body's light reaching radius `r`, its centre at zenith cosine
+    /// `mu` and its disc of angular radius `rho` cut by the planet: the
+    /// sun's ([`Self::sunlight`]) or the Moon's, each by its own size.
+    pub fn body_light(&self, r: f64, mu: f64, rho: f64) -> [f64; 3] {
+        let v = body_visible(r, mu, rho);
+        self.transmittance(r, mu).map(|t| t * v)
     }
 
     /// Ψ at `height`, the sun at zenith cosine `mu_s`.
@@ -539,6 +560,30 @@ impl LutAtmosphere {
         steps: usize,
         quadratic: bool,
     ) -> Ray {
+        self.march_under(
+            height,
+            dir,
+            sun,
+            SUN_ANGULAR_RADIUS,
+            length,
+            steps,
+            quadratic,
+        )
+    }
+
+    /// [`Self::march`] under a light whose disc's angular radius is
+    /// `radius` — the Moon's, say: its horizon cut by its own size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn march_under(
+        &self,
+        height: f64,
+        dir: DVec3,
+        sun: DVec3,
+        radius: f64,
+        length: Option<f64>,
+        steps: usize,
+        quadratic: bool,
+    ) -> Ray {
         let r0 = LUT_RADIUS + height.max(0.0);
         // From outside the air, the march starts where the ray enters it,
         // and a ray that never does gathers nothing.
@@ -589,7 +634,7 @@ impl LutAtmosphere {
             let h = pr - LUT_RADIUS;
             let medium = self.params.medium(h);
             let mu_s = p.dot(sun) / pr;
-            let sunlight = self.sunlight(pr, mu_s);
+            let sunlight = self.body_light(pr, mu_s, radius);
             let multi = self.multi_scattering(h, mu_s);
             for c in 0..3 {
                 let scattering = medium.rayleigh[c] + medium.mie;
@@ -606,7 +651,7 @@ impl LutAtmosphere {
             let p = origin + dir * t_max;
             let up = p.normalize();
             let mu_s = up.dot(sun);
-            let lit = self.sunlight(p.length(), mu_s);
+            let lit = self.body_light(p.length(), mu_s, radius);
             for c in 0..3 {
                 inscattered[c] +=
                     through[c] * lit[c] * mu_s.max(0.0) * self.params.ground_albedo / PI;
@@ -622,7 +667,19 @@ impl LutAtmosphere {
     /// `sun` (unit vectors, `z` up): what the sky-view table holds, without
     /// the sun's disc.
     pub fn sky_radiance(&self, height: f64, dir: DVec3, sun: DVec3) -> [f64; 3] {
-        self.march(height, dir, sun, None, SKY_STEPS, true)
+        self.sky_radiance_under(height, dir, sun, SUN_ANGULAR_RADIUS)
+    }
+
+    /// [`Self::sky_radiance`] under a light whose disc's angular radius is
+    /// `radius`.
+    pub fn sky_radiance_under(
+        &self,
+        height: f64,
+        dir: DVec3,
+        light: DVec3,
+        radius: f64,
+    ) -> [f64; 3] {
+        self.march_under(height, dir, light, radius, None, SKY_STEPS, true)
             .inscattered
     }
 
@@ -631,13 +688,20 @@ impl LutAtmosphere {
     /// direction, the ground's below the horizon included, summed over the
     /// hemisphere each faces.
     pub fn sky_irradiance(&self, height: f64, sun: DVec3, normals: &[DVec3]) -> Vec<[f64; 3]> {
-        self.sky_irradiance_with(height, sun, normals, IRRADIANCE_DIRECTIONS)
+        self.sky_irradiance_with(
+            height,
+            sun,
+            SUN_ANGULAR_RADIUS,
+            normals,
+            IRRADIANCE_DIRECTIONS,
+        )
     }
 
     fn sky_irradiance_with(
         &self,
         height: f64,
         sun: DVec3,
+        radius: f64,
         normals: &[DVec3],
         n: usize,
     ) -> Vec<[f64; 3]> {
@@ -649,7 +713,7 @@ impl LutAtmosphere {
             let ring = (1.0 - z * z).max(0.0).sqrt();
             let phi = golden * i as f64;
             let dir = DVec3::new(ring * phi.cos(), ring * phi.sin(), z);
-            let l = self.sky_radiance(height, dir, sun);
+            let l = self.sky_radiance_under(height, dir, sun, radius);
             for (o, normal) in out.iter_mut().zip(normals) {
                 let cos = normal.dot(dir);
                 if cos > 0.0 {
@@ -708,7 +772,7 @@ impl LutAtmosphere {
         let ground = scale.map(|s| s / PI);
 
         // Each light's sky, as an L1 harmonic, and its beam.
-        let sun_sky = self.sky_harmonic(height, sun, enu);
+        let sun_sky = self.sky_harmonic(height, sun, SUN_ANGULAR_RADIUS, enu);
         let transmitted = self.sunlight(r, sun.z);
         let moon = moment.moon.map(|m| {
             let to_moon = m.to_moon_ecef.try_normalize().unwrap_or(-enu.z_axis);
@@ -719,7 +783,7 @@ impl LutAtmosphere {
                 to_moon,
                 local,
                 strength,
-                self.sky_harmonic(height, local, enu),
+                self.sky_harmonic(height, local, f64::from(m.angular_radius), enu),
             )
         });
 
@@ -732,8 +796,8 @@ impl LutAtmosphere {
             let mut a = sun_sky.mean[c];
             let mut gradient = sun_sky.gradient[c];
             level[c] = transmitted[c] * sun.z.max(0.0) + sun_sky.level[c];
-            if let Some((_, _, local, strength, sky)) = &moon {
-                let beam = self.sunlight(r, local.z)[c] * strength;
+            if let Some((m, _, local, strength, sky)) = &moon {
+                let beam = self.body_light(r, local.z, f64::from(m.angular_radius))[c] * strength;
                 moon_rgb[c] = (beam * ground[c]) as f32;
                 a += sky.mean[c] * strength;
                 gradient += sky.gradient[c] * strength;
@@ -749,7 +813,8 @@ impl LutAtmosphere {
 
         // The level ground of anywhere, from the tables: here, and over the
         // metered ground — set to agree with the exact sum here.
-        let moon_at = moon.map(|(_, to_moon, _, strength, _)| (to_moon, strength));
+        let moon_at = moon
+            .map(|(m, to_moon, _, strength, _)| (to_moon, strength, f64::from(m.angular_radius)));
         let tabled = |height: f64, up: DVec3| -> [f64; 3] {
             let r = LUT_RADIUS + height.max(0.0);
             let mu_s = to_sun.dot(up);
@@ -759,9 +824,9 @@ impl LutAtmosphere {
             for c in 0..3 {
                 out[c] = beam[c] * mu_s.max(0.0) + sky[c];
             }
-            if let Some((to_moon, strength)) = moon_at {
+            if let Some((to_moon, strength, rho)) = moon_at {
                 let mu_m = to_moon.dot(up);
-                let beam = self.sunlight(r, mu_m);
+                let beam = self.body_light(r, mu_m, rho);
                 let sky = self.level_irradiance(height, mu_m);
                 for c in 0..3 {
                     out[c] += (beam[c] * mu_m.max(0.0) + sky[c]) * strength;
@@ -796,8 +861,8 @@ impl LutAtmosphere {
             let air = self.march(from.height, dir, local * to_sun, length, 16, false);
             let mut through = air.transmittance;
             let mut added = air.inscattered;
-            if let Some((to_moon, strength)) = moon_at {
-                let m = self.march(from.height, dir, local * to_moon, length, 16, false);
+            if let Some((to_moon, strength, rho)) = moon_at {
+                let m = self.march_under(from.height, dir, local * to_moon, rho, length, 16, false);
                 through = m.transmittance;
                 for c in 0..3 {
                     added[c] += m.inscattered[c] * strength;
@@ -824,8 +889,8 @@ impl LutAtmosphere {
                 return ([0.0; 3], 0.0);
             }
             let mut l = self.sky_radiance(g.height, dir, local * to_sun);
-            if let Some((to_moon, strength)) = moon_at {
-                let m = self.sky_radiance(g.height, dir, local * to_moon);
+            if let Some((to_moon, strength, rho)) = moon_at {
+                let m = self.sky_radiance_under(g.height, dir, local * to_moon, rho);
                 for c in 0..3 {
                     l[c] += m[c] * strength;
                 }
@@ -942,7 +1007,7 @@ impl LutAtmosphere {
         // fragment reads its own: what the frame's harmonic is set against.
         let mut level_reference = [0.0f32; 3];
         let sky_here = self.level_irradiance(height, to_sun.dot(enu.z_axis));
-        let moon_sky = moon_at.map(|(to_moon, strength)| {
+        let moon_sky = moon_at.map(|(to_moon, strength, _)| {
             self.level_irradiance(height, to_moon.dot(enu.z_axis))
                 .map(|e| e * strength)
         });
@@ -994,7 +1059,7 @@ impl LutAtmosphere {
     /// as an L1 harmonic, its constant over the facings of a wall all round
     /// and its gradient turned to ECEF axes by `enu`, and level ground's.
     #[allow(clippy::needless_range_loop)]
-    fn sky_harmonic(&self, height: f64, light: DVec3, enu: DMat3) -> SkyHarmonic {
+    fn sky_harmonic(&self, height: f64, light: DVec3, radius: f64, enu: DMat3) -> SkyHarmonic {
         // Horizontal axes turned to the light's azimuth: the sky is
         // symmetric about the light's vertical plane, so only `x` has a
         // gradient.
@@ -1003,7 +1068,7 @@ impl LutAtmosphere {
             .unwrap_or(DVec3::X);
         let aside = DVec3::Z.cross(toward);
         let facings = [DVec3::Z, toward, -toward, aside, -aside];
-        let e = self.sky_irradiance(height, light, &facings);
+        let e = self.sky_irradiance_with(height, light, radius, &facings, IRRADIANCE_DIRECTIONS);
         let axes = [toward, aside, DVec3::Z].map(|axis| enu * axis);
         let mut out = SkyHarmonic {
             mean: [0.0; 3],

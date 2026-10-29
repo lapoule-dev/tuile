@@ -31,11 +31,12 @@ fn sky_view_texel(xy: vec2u) -> SkyViewTexel {
     let mu_s = dot(atmosphere.sun.xyz, atmosphere.up.xyz);
     let sun = vec3f(sqrt(max(1.0 - mu_s * mu_s, 0.0)), 0.0, mu_s);
     var texel: SkyViewTexel;
-    texel.sun = sky_radiance(height, dir, sun);
+    texel.sun = sky_radiance(height, dir, sun, SUN_ANGULAR_RADIUS);
     texel.moon = vec3f(0.0);
     if (atmosphere.moon.w > 0.0) {
         let mu_m = dot(atmosphere.moon.xyz, atmosphere.up.xyz);
-        texel.moon = sky_radiance(height, dir, vec3f(sqrt(max(1.0 - mu_m * mu_m, 0.0)), 0.0, mu_m));
+        texel.moon = sky_radiance(height, dir, vec3f(sqrt(max(1.0 - mu_m * mu_m, 0.0)), 0.0, mu_m),
+            atmosphere.moon_disc.w);
     }
     return texel;
 }

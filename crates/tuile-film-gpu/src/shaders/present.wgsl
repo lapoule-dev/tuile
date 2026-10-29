@@ -26,11 +26,10 @@ fn oetf(c: vec3f) -> vec3f {
 }
 
 // The physical sky is `sky_seen` (`tuile_atmosphere`'s `seen.wgsl`, the
-// viewer's too), a star's image about a pixel wide: the pixel's angle,
-// supersampled.
-fn star_sigma() -> f32 {
-    let pixel = 2.0 * length(frame.up.xyz) / f32(frame.size.y);
-    return 0.8 * pixel;
+// viewer's too), drawn for a supersample: its angle, what a disc's edge is
+// spread over and a star's image is as wide as.
+fn sample_angle() -> f32 {
+    return 2.0 * length(frame.up.xyz) / f32(frame.size.y);
 }
 
 // Where the unit direction `s` from the eye falls on the supersampled
@@ -74,7 +73,8 @@ fn glare(d: vec3f) -> vec3f {
     if (atmosphere.moon.w > 0.0 && !hidden(m)) {
         // A fifth of the sun's: the Moon's disc, exposed for the night it
         // lights, keeps its phase readable under its own glow.
-        light += glare_of(n, m, sunlight(h, dot(atmosphere.up.xyz, m)) * atmosphere.moon.w, right, up) * 0.2;
+        light += glare_of(n, m, body_light(h, dot(atmosphere.up.xyz, m), atmosphere.moon_disc.w)
+            * atmosphere.moon.w, right, up) * 0.2;
     }
     return light * atmosphere.illuminance.xyz;
 }
@@ -86,7 +86,7 @@ fn sky_sample(s: vec2u) -> vec3f {
     if (atmosphere.shape.w != 0.0) {
         let ndc = (vec2f(s) + 0.5) / vec2f(frame.size.xy) * vec2f(2.0, -2.0)
             + vec2f(-1.0, 1.0);
-        return sky_seen(frame.fwd.xyz + ndc.x * frame.right.xyz + ndc.y * frame.up.xyz, star_sigma());
+        return sky_seen(frame.fwd.xyz + ndc.x * frame.right.xyz + ndc.y * frame.up.xyz, sample_angle());
     } else if (frame.haze.w != 0.0) {
         // The sample's own ray, as the resolve builds it.
         let ndc = (vec2f(s) + 0.5) / vec2f(frame.size.xy) * vec2f(2.0, -2.0)

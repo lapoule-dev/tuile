@@ -606,3 +606,33 @@ cargo build --release -p tuile-wgpu-viewer --example discs
 TUILE_ENV_FILE=~/Projects/tuile/.env scripts/discs-scenes.sh videos/discs-s0-2026-10-25
 scripts/discs-sheet.py videos/discs-s0-2026-10-25 videos/discs-s0-2026-10-25 videos/discs-s0-2026-10-25/sheets
 ```
+
+## discs-s1-2026-10-25/ — the discs carry their light (S1, 2026-10-25)
+
+PR S1 (branch `feat/sun-moon-s1`) against the S0 baseline above, the same
+four scenes, the same commands (`scripts/discs-scenes.sh`, then
+`scripts/discs-sheet.py ../discs-s0-2026-10-25 . sheets`). `sheets/<scene>.png`:
+viewer before | viewer after | film before | film after, the disc
+instrument's ratio under the film's; `sheets/zoom-sun-viewer.png`: the
+viewer's sunset disc, 8× (before | after).
+
+- Disc instrument, film (light measured over expected): sunset sun 0.693 →
+  0.998; full-Moon rise 0.964 → 1.017; crescent 0.514 → 1.011; the sun before
+  the ridge 0.80 → 1.000, then over the ridge 0.899, 0.636, 0.274, 0.000
+  (before: 0.681, 0.423, 0.151, 0.000).
+- Looked at: the viewer's setting sun was a faint dot the colour of the sky;
+  it is now a disc, yellow above and orange at its lower limb, cut by the
+  horizon with no second dimming; the film's sunset brighter in its glare;
+  the Moon's edge no longer soft. No black anywhere. The viewer's first
+  crescent render came out on placeholder ground (the tiles had not
+  arrived; the run's settle said settled): rendered again, the one in the
+  sheet.
+- Known, not changed here: the sun's core clips yellow-white in both
+  renderers (the tone of highlights, Laurent's decision); the viewer has no
+  glare (S4); the film's glare still switches off when the sun's centre
+  crosses the ridge (S4).
+
+```bash
+TUILE_ENV_FILE=~/Projects/tuile/.env scripts/discs-scenes.sh videos/discs-s1-2026-10-25
+scripts/discs-sheet.py videos/discs-s0-2026-10-25 videos/discs-s1-2026-10-25 videos/discs-s1-2026-10-25/sheets
+```

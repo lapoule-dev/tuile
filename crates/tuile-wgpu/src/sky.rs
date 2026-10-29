@@ -525,10 +525,11 @@ fn view_axes(frame: &SkyView) -> (DVec3, DVec3) {
     (right * half * frame.aspect, up * half)
 }
 
-/// The radius of a star's image, radians: about a pixel.
-pub(crate) fn star_sigma(frame: &SkyView) -> f32 {
-    let pixel = 2.0 * (frame.fov_y * 0.5).tan() / f64::from(frame.height_px.max(1));
-    (0.8 * pixel) as f32
+/// The angular size of a pixel at the picture's middle, radians: what the
+/// sky's discs spread their edge over and a star's image is as wide as
+/// (`sky_seen`).
+pub(crate) fn pixel_angle(frame: &SkyView) -> f32 {
+    (2.0 * (frame.fov_y * 0.5).tan() / f64::from(frame.height_px.max(1))) as f32
 }
 
 /// Whether the device runs compute shaders: everything but WebGL2.
