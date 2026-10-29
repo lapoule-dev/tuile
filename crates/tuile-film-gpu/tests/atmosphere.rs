@@ -638,4 +638,7 @@ fn a_films_discs_are_the_same_to_the_byte() {
     assert_eq!(format!("{hash:016x}"), FROZEN_DISCS_FILM);
 }
 
-const FROZEN_DISCS_FILM: &str = "bb928e8fcb652789";
+// Moved from bb928e8fcb652789 by the per-frame GPU light (#149), which
+// moved the atmosphere film's digest too: the light worked out on the GPU
+// in f32, not on the CPU in f64. No pixel of S0's own.
+const FROZEN_DISCS_FILM: &str = "0b6af27f5457a2cf";
