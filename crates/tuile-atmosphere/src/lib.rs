@@ -15,6 +15,7 @@ pub mod look;
 pub mod moon;
 pub mod params;
 pub mod planets;
+pub mod scenes;
 pub mod sky;
 pub mod stars;
 pub mod sun;

@@ -564,3 +564,45 @@ Looked at:
 - **+15 to +45 min.** At most 3 stars in any direction under this meter.
 
 The stars' path is the same in every direction. What moves with the heading is the exposure the frame meter picks, and that is the camera's response.
+
+## discs-s0-2026-10-25/ — the sun's and the Moon's discs as they are drawn today (S0, 2026-10-25)
+
+The baseline of the discs' work (`docs/explorations/sun-and-moon.md`, PR S0,
+branch `feat/sun-moon-s0`): the four acceptance scenes of
+`tuile_atmosphere::scenes`, unchanged pixels, in the film and in the viewer.
+`film/<scene>/frame-NNNNN.png` (960×540, supersample 2, the film's stages:
+tape → `tuile-film-produce` → `tuile-film-render --atmosphere --discs`, with
+`discs.parquet` beside), `viewer/<scene>/NNN.png` (960×540, the viewer headless;
+a 10° lens drawn at 35° and 3460×1946 and its middle cut out),
+`sheets/<scene>.png` side by side (before = after here: S0 moves no pixel).
+
+- `pic-du-midi-sunset`: 0.1418°E 42.9365°N, 2 900 m, heading 290°, pitch −3°,
+  35°, 2026-06-21T19:41:54Z (the ephemeris's sunset). Every scene stood at
+  2 900 m over the ellipsoid for these renders, some 25 m under the summit
+  (2 877 m over the sea, ≈ 2 926 m over the ellipsoid): the film's frames
+  show the summit's nearest faces as walls of stretched imagery at the
+  lower right (the hole probe counts 0 pixels; at 3 100 m they are gone).
+  The scenes now stand at 3 100 m; renders from then on are made there.
+- `full-moon-rise`: same place, heading 63.89° (the Moon's azimuth), pitch −2°,
+  10°, 2026-10-26T16:53:46Z (its centre on the eye's horizontal).
+- `crescent-at-dusk`: heading 225.92°, pitch −0.37°, 10°, 2026-11-11T17:10:12Z
+  (civil dusk, the Moon 3.1° up, 5.5 % lit; on the 10th, 1.5 days after the
+  new Moon of 2026-11-09T06:52:38Z, it is under the horizon at civil dusk).
+- `sun-behind-ridge`: heading 235.63°, pitch −1°, 10°, 2026-12-15 from
+  16:10:22Z, 16 frames a minute apart (the sun's centre from 1.5° up to under
+  the Vignemale's ridge).
+
+Looked at: imaged ground in every frame, no black. The disc instrument reads
+today's defects: the sunset's sun at 0.693 of its light, the setting sun
+behind the ridge at 0.80 (the unnormalised limb law) falling to 0 over four
+frames, the full Moon at 0.964, the crescent at 0.514. The film's glare
+switches off in one frame as the sun's centre crosses the ridge (frames 12 →
+13). In the viewer the sun is a faint clipped dot with no glare.
+
+```bash
+cargo build --release -p tuile-film-native --features videotoolbox \
+  --bin tuile-film-render --bin tuile-film-produce --bin tuile-film-scene
+cargo build --release -p tuile-wgpu-viewer --example discs
+TUILE_ENV_FILE=~/Projects/tuile/.env scripts/discs-scenes.sh videos/discs-s0-2026-10-25
+scripts/discs-sheet.py videos/discs-s0-2026-10-25 videos/discs-s0-2026-10-25 videos/discs-s0-2026-10-25/sheets
+```

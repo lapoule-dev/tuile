@@ -56,6 +56,9 @@ parameters; a backend draws with them.
 - [`sky`] — the air with nothing behind it but space. A colour of its own,
   drawn as a shell, turning over from blue through orange to dark with the
   hour.
+- [`scenes`] — the sun's and the Moon's discs' acceptance scenes: places,
+  aims and instants worked out from the ephemeris, one description for a
+  film's tape and a viewer's script.
 
 ## Not here yet
 

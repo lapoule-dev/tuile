@@ -324,13 +324,17 @@ fn ms(since: Instant) -> f64 {
 struct Readback {
     picture: wgpu::Buffer,
     planes: Option<wgpu::Buffer>,
+    /// The picture's light, for an observer that reads it, and its rows'
+    /// stride in bytes.
+    linear: Option<(wgpu::Buffer, u32)>,
     width: u32,
     height: u32,
     padded: u32,
 }
 
-/// One picture of the frame, drawn and read back: its RGBA, and its I420
-/// when the sink takes it.
+/// One picture of the frame, drawn and read back: its RGBA, its I420
+/// when the sink takes it, and its light ([`FilmGpu::write_linear`]) when
+/// an observer reads it — empty otherwise.
 async fn shoot(
     gpu: &mut FilmGpu,
     shot: &Shot,
@@ -339,9 +343,24 @@ async fn shoot(
     back: &Readback,
     timings: &mut Timings,
     shadow_texel: &mut Option<(f32, f32)>,
-) -> Result<(Vec<u8>, Vec<u8>), Error> {
+) -> Result<(Vec<u8>, Vec<u8>, Vec<f32>), Error> {
     let t = Instant::now();
     let mut encoder = gpu.render_shot(shot, selection, shapes)?;
+    if let Some((buffer, padded)) = &back.linear {
+        let texture = gpu.write_linear(&mut encoder);
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(*padded),
+                    rows_per_image: Some(back.height),
+                },
+            },
+            texture.size(),
+        );
+    }
     encoder.copy_texture_to_buffer(
         gpu.output().as_image_copy(),
         wgpu::TexelCopyBufferInfo {
@@ -374,8 +393,22 @@ async fn shoot(
         Some(planes) => read_back(gpu, planes).await?,
         None => Vec::new(),
     };
+    let mut linear = Vec::new();
+    if let Some((buffer, padded)) = &back.linear {
+        let rows = read_back(gpu, buffer).await?;
+        linear.reserve((back.width * back.height * 4) as usize);
+        for row in rows.chunks(*padded as usize) {
+            linear.extend(
+                row[..(back.width * 16) as usize]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b)),
+            );
+        }
+    }
     timings.readback += ms(t);
-    Ok((rgba, i420))
+    Ok((rgba, i420, linear))
 }
 
 async fn read_back(film: &FilmGpu, buffer: &wgpu::Buffer) -> Result<Vec<u8>, Error> {
@@ -506,6 +539,16 @@ pub async fn render(
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             })
+        }),
+        linear: (observer.wants_light() && stereo.is_none()).then(|| {
+            let padded = (width * 16).div_ceil(256) * 256;
+            let buffer = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("film light readback"),
+                size: u64::from(padded * height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            (buffer, padded)
         }),
         width,
         height,
@@ -1117,7 +1160,7 @@ pub async fn render(
             overlays.frame(diff.frame, &seen, &mut shapes);
             // For two eyes: each eye apart, the pair, the left eye's camera.
             let mut apart = None;
-            let (rgba, i420) = match (&stereo, &pair) {
+            let (rgba, i420, linear) = match (&stereo, &pair) {
                 (None, _) | (_, None) => {
                     shoot(
                         &mut gpu,
@@ -1157,6 +1200,7 @@ pub async fn render(
                     let packed = (
                         tuile_film::pack_rgba(stereo.packing, &left.0, &right.0, width, height),
                         i420,
+                        Vec::new(),
                     );
                     apart = Some((eyes, *pair, camera.eye(pair, Eye::Left)));
                     packed
@@ -1200,6 +1244,13 @@ pub async fn render(
             }
             let layers: Vec<(u8, u32)> = layers_drawn.into_iter().collect();
             let t = Instant::now();
+            // The light the GPU worked out, read back only for an instrument
+            // that reads the frame's linear light: a film's loop never waits.
+            let sky = if linear.is_empty() {
+                None
+            } else {
+                gpu.sky_seen()
+            };
             observer.frame(&FrameOut {
                 frame: diff.frame,
                 index,
@@ -1212,6 +1263,10 @@ pub async fn render(
                 selection: &diff.selection,
                 camera: &camera,
                 timings,
+                linear: (!linear.is_empty()).then_some(linear.as_slice()),
+                sky: sky
+                    .as_ref()
+                    .map(|(uniform, model)| crate::observe::SkyOut { uniform, model }),
             });
             timings.observe += ms(t);
             let t = Instant::now();

@@ -140,6 +140,23 @@ pub struct FrameOut<'a> {
     pub camera: &'a FrameCamera,
     /// Up to the picture's readback: what follows has not happened yet.
     pub timings: Timings,
+    /// The picture's light as its pixels average it, before the lens's
+    /// glare, the exposure and the grade — RGBA, 32-bit floats, row after
+    /// row, in the renderer's units — when an observer asked for it
+    /// ([`Observer::wants_light`]) and the frame has one eye.
+    pub linear: Option<&'a [f32]>,
+    /// The physical atmosphere the frame was lit by, when it has one.
+    pub sky: Option<SkyOut<'a>>,
+}
+
+/// The physical atmosphere a frame was lit by: its uniform as the frame's
+/// eye has it — where the sun and the Moon are, how large their discs are
+/// drawn, what one unit of the model's radiance is in the renderer's — and
+/// the model whose tables it read.
+#[derive(Clone, Copy)]
+pub struct SkyOut<'a> {
+    pub uniform: &'a tuile_atmosphere::gpu::AtmosphereUniform,
+    pub model: &'a tuile_atmosphere::LutAtmosphere,
 }
 
 /// An instrument on a render. Every method does nothing unless overridden.
@@ -147,6 +164,11 @@ pub trait Observer {
     fn imagery(&mut self, _tile: &ImageryIn<'_>) {}
     fn tile(&mut self, _tile: &TileIn<'_>) {}
     fn frame(&mut self, _frame: &FrameOut<'_>) {}
+    /// Whether it reads a frame's light ([`FrameOut::linear`]): read back
+    /// only when an observer does.
+    fn wants_light(&self) -> bool {
+        false
+    }
 }
 
 /// Watches nothing.
@@ -162,5 +184,8 @@ impl Observer for Vec<Box<dyn Observer>> {
     }
     fn frame(&mut self, frame: &FrameOut<'_>) {
         self.iter_mut().for_each(|o| o.frame(frame));
+    }
+    fn wants_light(&self) -> bool {
+        self.iter().any(|o| o.wants_light())
     }
 }

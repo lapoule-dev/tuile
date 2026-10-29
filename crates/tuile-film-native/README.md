@@ -21,7 +21,9 @@ Three things, kept apart:
   imagery tile that comes in, every tile built, every picture that comes
   out. The render knows nothing of what an observer does with it;
   [`meter::LightMeter`] is one, and measures light; [`seams::SeamLog`]
-  another, and measures what is left between the tiles a frame draws.
+  another, and measures what is left between the tiles a frame draws;
+  [`discs::DiscEnergy`] a third, and measures the light of the sun's and
+  the Moon's discs against what the air lets through.
 
 Beside them, [`reference`](mod@reference) reads another layer of the store under a
 film's imagery, for its tiles to be measured against.
