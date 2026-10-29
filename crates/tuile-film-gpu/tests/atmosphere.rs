@@ -643,5 +643,6 @@ fn a_films_discs_are_the_same_to_the_byte() {
 // normalised (+25 %), each disc pixel through the air along it, no second
 // dimming at the horizon (the half-set sun's upper half at its own
 // brightness), the Moon's soft edge replaced by the pixel's footprint —
-// and the Moon's own radius for its horizon in the light.
-const FROZEN_DISCS_FILM: &str = "1832830f5cde7b5a";
+// and the Moon's own radius for its horizon in the light, on the GPU's
+// frame light too. Frozen on main's per-frame GPU light (#149).
+const FROZEN_DISCS_FILM: &str = "81e7c1be92feb75c";
