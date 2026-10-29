@@ -369,14 +369,14 @@ fn pic_du_midi(gpu: &GpuContext) -> (Vec<PreparedTile>, DVec3, Eye) {
 }
 
 /// The sun's direction the frame was lit by is the ephemeris's at the
-/// instant, to the step the light is worked out again at.
+/// instant, to what an f32 holds of it: the light is the frame's own.
 fn assert_sun_is_the_ephemeris(picture: &Picture, instant: f64) {
     let s = picture.uniform.sun;
     let drawn = DVec3::new(f64::from(s[0]), f64::from(s[1]), f64::from(s[2]));
     let ephemeris = tuile_atmosphere::Sun::at_unix_seconds(instant).direction_ecef;
     let off = drawn.angle_between(ephemeris);
     assert!(
-        off <= tuile_wgpu::LIGHT_SUN_STEP,
+        off <= 1e-5,
         "the sun drawn is {:.3}° from the ephemeris's",
         off.to_degrees()
     );
@@ -628,41 +628,31 @@ fn a_low_view_shows_sky_over_the_horizon() {
 }
 
 /// However the instant runs — a real second a frame or a thousand times
-/// faster — the light is worked out again only as the sun moves, and never
-/// more often than its interval.
+/// faster — the light is worked out every frame, and every frame's sun is
+/// the clock's at that frame: no step to wait for, no interval.
 #[test]
-fn the_light_is_worked_out_as_the_sun_moves_and_no_more() {
+fn the_light_is_worked_out_every_frame_and_follows_the_clock() {
     let Some(gpu) = gpu() else { return };
     let eye = eye_at(PIC_LON, PIC_LAT, 2_877.0, 270.0, -4.0);
     let origin = eye.at;
     let view = view_of(&eye, origin);
-    let frame = |instant: f64, wall: f64| view.at(instant, wall);
     let start = utc(2026, 6, 21, 18, 0);
-    // Real time at sixty frames a second, for a simulated ten seconds: the
-    // sun moves 0.04°, under the step.
-    let mut renderer = TileRenderer::new(&gpu, wgpu::TextureFormat::Rgba8UnormSrgb);
-    for f in 0..600 {
-        let wall = f64::from(f) / 60.0;
-        renderer.set_sky(&gpu, Some(&frame(start + wall, wall)));
+    for rate in [1.0, 1000.0] {
+        let mut renderer = TileRenderer::new(&gpu, wgpu::TextureFormat::Rgba8UnormSrgb);
+        for f in 0..240 {
+            let wall = f64::from(f) / 240.0;
+            let instant = start + wall * rate;
+            renderer.set_sky(&gpu, Some(&view.at(instant, wall)));
+            let s = renderer.sky_uniform().expect("on").sun;
+            let drawn = DVec3::new(f64::from(s[0]), f64::from(s[1]), f64::from(s[2]));
+            let ephemeris = tuile_atmosphere::Sun::at_unix_seconds(instant).direction_ecef;
+            assert!(
+                drawn.angle_between(ephemeris) < 1e-5,
+                "rate {rate}, frame {f}: the sun drawn is not the clock's"
+            );
+        }
+        assert_eq!(renderer.sky_updates(), (240, 240), "rate {rate}");
     }
-    let (lights, views) = renderer.sky_updates();
-    assert_eq!((lights, views), (1, 1), "real time for ten seconds");
-    // A thousand times faster, at 240 frames a second: the sun moves
-    // degrees, and the light follows at most once an interval of the wall.
-    let mut renderer = TileRenderer::new(&gpu, wgpu::TextureFormat::Rgba8UnormSrgb);
-    for f in 0..600 {
-        let wall = f64::from(f) / 240.0;
-        renderer.set_sky(&gpu, Some(&frame(start + wall * 1000.0, wall)));
-    }
-    let elapsed = 600.0 / 240.0;
-    let (lights, _) = renderer.sky_updates();
-    let allowed = 2 + (elapsed / tuile_wgpu::LIGHT_INTERVAL) as u64;
-    eprintln!("{lights} lights in {elapsed:.2} s at a thousand times");
-    assert!(lights >= 2, "the light follows a moving sun");
-    assert!(
-        lights <= allowed,
-        "{lights} lights in {elapsed:.2} s: over budget"
-    );
 }
 
 /// A host setting its clock forward a quarter of an hour is answered at
@@ -740,7 +730,8 @@ fn the_same_clock_gives_the_same_sky() {
             let wall = f64::from(f) / 60.0;
             renderer.set_sky(&gpu, Some(&view.at(start + wall * 120.0, wall)));
         }
-        (renderer.sky_updates(), renderer.sky_uniform().expect("on"))
+        let light = renderer.read_sky_light(&gpu).expect("on");
+        (renderer.sky_updates(), light.uniform, light.exposure)
     };
     assert_eq!(run(), run());
 }

@@ -9032,6 +9032,7 @@ dependencies = [
  "tuile-core",
  "tuile-film",
  "tuile-overlay",
+ "tuile-tape",
  "tuile-terrain",
  "wgpu",
 ]
@@ -9551,6 +9552,7 @@ dependencies = [
  "tuile-core",
  "tuile-overlay",
  "tuile-planetary",
+ "tuile-tape",
  "tuile-terrain",
  "url",
  "web-time",

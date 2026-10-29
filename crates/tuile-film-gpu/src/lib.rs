@@ -339,6 +339,11 @@ pub struct FilmGpu {
     lit: Look,
     /// The physical atmosphere's tables, uniform and sky-view.
     atmosphere: atmosphere::AtmosphereGpu,
+    /// The frame's light, made on the GPU — the viewer's own pass
+    /// ([`tuile_atmosphere::frame_light`]) — and whether the frame being
+    /// drawn has yet to make it.
+    frame_light: tuile_atmosphere::frame_light::FrameLightPass,
+    light_pending: bool,
     /// What the frame's light under the physical atmosphere was worked out
     /// from.
     light_key: Option<atmosphere::LightKey>,
@@ -1343,11 +1348,18 @@ impl FilmGpu {
             0,
             bytemuck::bytes_of(&AtmosphereUniform::zeroed_off()),
         );
+        let frame_light = tuile_atmosphere::frame_light::FrameLightPass::new(
+            &device,
+            &atmosphere,
+            atmosphere::SkyViewPass::Compute,
+        );
 
         Self {
             light: FrameLight::of(&settings.look),
             lit: settings.look,
             atmosphere,
+            frame_light,
+            light_pending: false,
             light_key: None,
             night_lights: false,
             device,
@@ -2451,6 +2463,28 @@ impl FilmGpu {
                 label: Some("film frame"),
             });
         self.record_pending(&mut encoder);
+        if self.atmosphere.light.is_some() {
+            // The frame's light, made once a frame, then laid over each
+            // picture's uniforms as they are written for it: the
+            // atmosphere's light fields and the frame's own light.
+            if std::mem::take(&mut self.light_pending) {
+                self.frame_light.record(&mut encoder);
+            }
+            self.frame_light
+                .copy_into_uniform(&mut encoder, &self.atmosphere.uniform);
+            use tuile_atmosphere::frame_light::Extra;
+            for (extra, offset) in [
+                (Extra::Ambient, std::mem::offset_of!(FrameUniform, world)),
+                (Extra::Sun, std::mem::offset_of!(FrameUniform, sun)),
+                (
+                    Extra::White,
+                    std::mem::offset_of!(FrameUniform, white_balance),
+                ),
+            ] {
+                self.frame_light
+                    .copy_extra(&mut encoder, extra, &self.frame_buf, offset as u64);
+            }
+        }
         self.atmosphere.record_sky_view(&mut encoder);
         let mut drawn = Vec::with_capacity(selection.len());
         let mut top = 0usize;
@@ -2778,8 +2812,6 @@ impl FilmGpu {
         }
         self.atmosphere.hold(&self.queue, params);
         let geodetic = tuile_core::geo::ecef_to_geodetic(ground);
-        let model = self.atmosphere.model.as_ref().expect("held above");
-        let reference = self.atmosphere.reference.as_ref().expect("held above");
         let metering = Self::metering_points_of(
             frame,
             &tuile_atmosphere::AtmosphereFrame::at(geodetic),
@@ -2793,9 +2825,10 @@ impl FilmGpu {
             tuile_atmosphere::Moon::seen_from(instant, eye)
                 .map(|m| tuile_atmosphere::Moonlight::of(&m))
         });
-        let sky = model.light(
-            reference,
+        let inputs = tuile_atmosphere::frame_light::FrameLightInputs::new(
+            &params,
             geodetic,
+            frame.eye,
             tuile_atmosphere::hillaire::Moment {
                 to_sun_ecef: to_sun,
                 moon,
@@ -2808,7 +2841,14 @@ impl FilmGpu {
                 reflectance: base.reflectance,
                 camera: base.camera,
             },
+            base.exposure_ev,
+            base.white_balance.to_array(),
+            [1.0, base.contrast, base.highlight_knee],
         );
+        let sky = inputs.light;
+        // The look's sun and ordered exposure; its light — the sky, the sun's
+        // strength, the exposure and the white balance the meter calls for —
+        // is the GPU's, copied over the frame's uniform as it is drawn.
         let mut lit = FrameLight::new(sky.illumination, light.air);
         lit.instant = light.instant;
         self.lit = base.lit_by(lit);
@@ -2817,22 +2857,19 @@ impl FilmGpu {
         // show.
         let instant = light.instant.unwrap_or(tuile_atmosphere::stars::J2000_UNIX);
         let stars = tuile_atmosphere::stars::j2000_to_ecef(instant).transpose();
-        self.atmosphere.frame_uniform = AtmosphereUniform::new(
-            &params,
-            &sky,
-            frame.eye,
-            self.lit.exposure_scale(),
-            stars,
-            &atmosphere::sky_look(&base),
-        )
-        .with_planets(&tuile_atmosphere::planets::lights_at(instant));
+        self.atmosphere.frame_uniform = inputs
+            .uniform(&params, frame.eye, stars, &atmosphere::sky_look(&base))
+            .with_planets(&tuile_atmosphere::planets::lights_at(instant));
         self.atmosphere.frame_uniform.earth[3] = f32::from(u8::from(self.night_lights));
-        // Written now for the sky-view, placed from each eye when drawn.
+        // Written now for the light and the sky-view, placed from each eye
+        // when drawn.
         self.queue.write_buffer(
             &self.atmosphere.uniform,
             0,
-            bytemuck::bytes_of(&self.atmosphere.frame_uniform.seen_from(&sky, frame.eye)),
+            bytemuck::bytes_of(&self.atmosphere.frame_uniform),
         );
+        self.frame_light.write(&self.queue, &inputs);
+        self.light_pending = true;
         self.atmosphere.light = Some(sky);
         self.light_key = Some(key);
         self.atmosphere.sky_view_stale = true;

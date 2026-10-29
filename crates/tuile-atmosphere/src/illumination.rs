@@ -92,7 +92,19 @@ pub struct CameraResponse {
     /// between eye and ground — is metered as the light that would make
     /// ground of it as bright.
     pub meter_reflectance: f64,
+    /// [`METER_FLOOR`]: the floor ε of the meter's log-average — the light
+    /// under which a part of the frame counts as dark as any other —, in
+    /// units of the night floor's light on level ground.
+    pub meter_floor: f64,
 }
+
+/// The meter's statistic is the log-average luminance over the frame —
+/// `exp(mean(ln(ε + L)))`, the geometric mean, as a physically based
+/// camera meters — so that a bright part of the frame, a sunset's glow,
+/// weighs by its stops and not by its light: ε, the floor under which every
+/// part counts alike, in units of the night floor's light on level ground
+/// ([`ReferenceIllumination::NIGHT_FLOOR`]).
+pub const METER_FLOOR: f64 = 1.0;
 
 impl Default for CameraResponse {
     fn default() -> Self {
@@ -107,6 +119,7 @@ impl CameraResponse {
         night_depth_ev: NIGHT_DEPTH_EV,
         white_adaptation: ReferenceIllumination::WHITE_ADAPTATION,
         meter_reflectance: crate::hillaire::METER_REFLECTANCE,
+        meter_floor: METER_FLOOR,
     };
 
     /// [`shown_ev`] under this camera's `follows` and `night_depth_ev`.

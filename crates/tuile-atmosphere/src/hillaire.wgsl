@@ -327,12 +327,46 @@ fn air_between(p: vec3f) -> AirRay {
     return ray;
 }
 
+// The zenith cosine over the tables' planet (LUT_RADIUS) of a line of
+// sight from `height` over the frame's sphere (radius `centre.w`, the
+// ground drawn) at zenith cosine `mu`: the one whose lowest point stands
+// as high over the tables' ground as the line's over the sphere's. The air
+// a line grazes is then the air over the ground it grazes, so that the
+// limb drawn stands on the globe drawn — not sixteen kilometres under it,
+// where the two radii part — at every height alike, and the identity
+// where the radii are one. `hillaire::lut_mu`.
+fn lut_mu(height: f32, mu: f32) -> f32 {
+    let h = max(height, 0.0);
+    let s = sqrt(max(1.0 - mu * mu, 0.0));
+    // How far under the eye's distance the line passes, without
+    // cancellation: (R + h)(1 − s).
+    let drop = (atmosphere.centre.w + h) * mu * mu / (1.0 + s);
+    let one_minus = min(drop / (LUT_RADIUS + h), 1.0);
+    let m = sqrt(max(one_minus * (2.0 - one_minus), 0.0));
+    return select(m, -m, mu < 0.0);
+}
+
+// The unit `n` with its zenith cosine from `up` turned by `lut_mu`, its
+// azimuth kept.
+fn lut_direction(n: vec3f, up: vec3f, height: f32) -> vec3f {
+    let mu = dot(n, up);
+    let flat_n = n - up * mu;
+    let l = length(flat_n);
+    if (l < 1e-12) { return n; }
+    let m = lut_mu(height, mu);
+    return flat_n / l * sqrt(max(1.0 - m * m, 0.0)) + up * m;
+}
+
 // Where a ray from radius `r` at zenith cosine `mu` meets the ground, or a
 // negative number.
 fn ground_distance(r: f32, mu: f32, height: f32) -> f32 {
-    let disc = r * r * mu * mu - height * (2.0 * LUT_RADIUS + height);
+    let c = height * (2.0 * LUT_RADIUS + height);
+    let disc = r * r * mu * mu - c;
     if (mu >= 0.0 || disc < 0.0) { return -1.0; }
-    return -r * mu - sqrt(disc);
+    // The near root as the product of the roots over the far one: no
+    // cancellation, so an eye on the ground meets it at once rather than
+    // a rounding short of it.
+    return c / (-r * mu + sqrt(disc));
 }
 
 // The sky seen from `height` along `dir` under one light along `light`,

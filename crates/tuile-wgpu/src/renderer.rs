@@ -505,9 +505,8 @@ impl TileRenderer {
     /// and every ground fragment is lit by the sun and the Moon of the
     /// instant where it is, through the air between it and the eye — the
     /// film's own model and code (`tuile_atmosphere::gpu`). Call it every
-    /// frame, after [`Self::set_view`]: what it costs is a uniform write,
-    /// and the light and the sky-view are worked out again only as the sun,
-    /// the Moon or the eye move (see `sky.rs`).
+    /// frame, after [`Self::set_view`]: the light and the sky-view are made
+    /// on the GPU every frame, from that frame alone (see `sky.rs`).
     pub fn set_sky(&mut self, gpu: &GpuContext, sky: Option<&crate::sky::SkyFrame>) {
         match sky {
             None => self.sky.off(&gpu.queue),
@@ -553,17 +552,33 @@ impl TileRenderer {
         self.sky.set_air(params, look);
     }
 
-    /// The uniform the physical atmosphere was last drawn with: where the
-    /// sun and the Moon stood, the exposure, the grade. For a test or a
-    /// host that wants to know what the frame was lit by.
+    /// The uniform the physical atmosphere was last drawn with, as the CPU
+    /// wrote it: where the sun and the Moon stood, the air's sphere, the
+    /// stars. Its light is made on the GPU ([`Self::read_sky_light`]).
     pub fn sky_uniform(&self) -> Option<tuile_atmosphere::gpu::AtmosphereUniform> {
         self.sky
             .is_on()
             .then_some(self.sky.atmosphere.frame_uniform)
     }
 
+    /// The light the physical atmosphere was last drawn with, as the GPU
+    /// made it, read back — blocking: for a test, a trace or an instrument,
+    /// never a frame's loop. None without an atmosphere.
+    pub fn read_sky_light(&self, gpu: &GpuContext) -> Option<SkyLightRead> {
+        if !self.sky.is_on() {
+            return None;
+        }
+        let read = self.sky.light.read(&gpu.device, &gpu.queue);
+        let exposure = read.extra(tuile_atmosphere::frame_light::Extra::Exposure);
+        Some(SkyLightRead {
+            uniform: read.over(self.sky.atmosphere.frame_uniform),
+            exposure: exposure[0],
+            ev100: exposure[1],
+        })
+    }
+
     /// How many times the frame's light was worked out and its sky-view
-    /// made since this renderer was built: the budget, counted.
+    /// made since this renderer was built: once a frame each.
     pub fn sky_updates(&self) -> (u64, u64) {
         (self.sky.lights, self.sky.views)
     }
@@ -861,4 +876,16 @@ pub fn sky_wgsl(far_depth: f32) -> String {
         tuile_atmosphere::gpu::SEEN_WGSL,
         include_str!("sky.wgsl").replace("/*SKY_DEPTH*/", &format!("{far_depth:?}")),
     )
+}
+
+/// The light a frame of the physical atmosphere was drawn with, read back
+/// from the GPU ([`TileRenderer::read_sky_light`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SkyLightRead {
+    /// The frame's uniform, its light as the GPU made it.
+    pub uniform: tuile_atmosphere::gpu::AtmosphereUniform,
+    /// The exposure's linear multiplier, every light pre-exposed by it.
+    pub exposure: f32,
+    /// The EV100 the camera metered.
+    pub ev100: f32,
 }

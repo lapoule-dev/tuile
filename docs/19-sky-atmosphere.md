@@ -535,6 +535,7 @@ other settings is another film, never a cached one.
 | `TUILE_AIR_NIGHT_DEPTH_EV` | 3.0 | 0.5 – 8 | how much darker a dim light is shown |
 | `TUILE_AIR_WHITE_ADAPTATION` | 0.35 | 0 – 1 | how far the white balance goes to the light's white |
 | `TUILE_AIR_METER_REFLECTANCE` | 0.18 | 0.05 – 0.5 | the reflectance the meter takes the scene for |
+| `TUILE_AIR_METER_FLOOR` | 1.0 | 0.001 – 10⁶ | the floor ε of the meter's log-average, in night-floor lights |
 | `TUILE_AIR_VEIL_BOUND` | 6.0 | 1 – 100 | soft cap of the veil, in ground-of-0.1 lights |
 | `TUILE_AIR_MARCH_STEPS` | 12 | 4 – 64, whole | steps of the eye-to-ground march under 10 km |
 | `TUILE_AIR_MARCH_STEPS_HIGH` | 24 | 4 – 128, whole | the same from over 10 km |

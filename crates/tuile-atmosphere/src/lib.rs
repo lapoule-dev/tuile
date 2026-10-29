@@ -6,6 +6,8 @@
 pub mod aerial;
 pub mod clock;
 #[cfg(feature = "wgpu")]
+pub mod frame_light;
+#[cfg(feature = "wgpu")]
 pub mod gpu;
 pub mod hillaire;
 pub mod illumination;

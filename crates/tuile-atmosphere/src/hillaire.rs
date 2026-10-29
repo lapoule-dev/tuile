@@ -782,71 +782,126 @@ impl LutAtmosphere {
         };
         let mut metered = level;
         let meter = calibration.camera.meter_reflectance;
+        let frame_radius = AtmosphereFrame::at(at).radius;
+        // One ground point seen from `eye`, its height and up `height`, `up`:
+        // its light through the air between — what the air leaves of it and
+        // what it adds, as bright as ground of the meter's grey would be lit.
+        let ground_seen = |eye: DVec3, point: DVec3, height: f64, up: DVec3| -> [f64; 3] {
+            let l = tabled(height, up);
+            let from = tuile_core::geo::ecef_to_geodetic(eye);
+            let local = enu_frame(from).transpose();
+            let path = point - eye;
+            let dir = (local * path).normalize_or(DVec3::NEG_Z);
+            let length = Some(path.length());
+            let air = self.march(from.height, dir, local * to_sun, length, 16, false);
+            let mut through = air.transmittance;
+            let mut added = air.inscattered;
+            if let Some((to_moon, strength)) = moon_at {
+                let m = self.march(from.height, dir, local * to_moon, length, 16, false);
+                through = m.transmittance;
+                for c in 0..3 {
+                    added[c] += m.inscattered[c] * strength;
+                }
+            }
+            [0, 1, 2].map(|c| l[c] * agree(c) * through[c] + added[c] * scale[c] / meter)
+        };
+        // The sky along `direction` from `eye`, and how much it counts: as
+        // much as the air it crosses — a ray through the air whole, one past
+        // it into space not at all, one between by its air — so that a frame
+        // of the limb is exposed for the limb and the Earth, not for the
+        // black around them, and an eye that climbs out of the air meets no
+        // step. Grazing the air over the ground it grazes (`lut_direction`).
+        let sky_seen = |eye: DVec3, direction: DVec3| -> ([f64; 3], f64) {
+            let g = tuile_core::geo::ecef_to_geodetic(eye);
+            let local = enu_frame(g).transpose();
+            let dir = lut_direction(
+                (local * direction).normalize_or(DVec3::Z),
+                frame_radius,
+                g.height,
+            );
+            let weight = self.meter_weight(g.height, dir.z);
+            if weight <= 0.0 {
+                return ([0.0; 3], 0.0);
+            }
+            let mut l = self.sky_radiance(g.height, dir, local * to_sun);
+            if let Some((to_moon, strength)) = moon_at {
+                let m = self.sky_radiance(g.height, dir, local * to_moon);
+                for c in 0..3 {
+                    l[c] += m[c] * strength;
+                }
+            }
+            ([0, 1, 2].map(|c| l[c] * scale[c] / meter), weight)
+        };
+        let luminance = |v: [f64; 3]| 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+        let wanted = luminance(calibrated);
+        // The meter's floor ε: under it every part of a frame counts alike.
+        let epsilon =
+            calibration.camera.meter_floor * f64::from(ReferenceIllumination::NIGHT_FLOOR) * wanted;
+        let ln = |v: [f64; 3]| (epsilon + luminance(v).max(0.0)).ln();
         if !metering.is_empty() {
+            // The frame's light: its colour the mean's, its luminance the
+            // log-average's — the geometric mean of the luminance over the
+            // frame, so that a bright part of it weighs by its stops.
             let mut sum = [0.0; 3];
-            let mut counted = 0usize;
+            let mut logs = 0.0;
+            let mut weights = 0.0;
+            let ground_radius = frame_radius + at.height.max(0.0);
+            let top = frame_radius + self.params.thickness;
             for m in metering {
-                let l = match *m {
+                let (l, log, weight) = match *m {
                     Metered::Ground { eye, point } => {
                         let g = tuile_core::geo::ecef_to_geodetic(point);
-                        let l = tabled(g.height, enu_frame(g).z_axis);
-                        // Seen through the air between: what it leaves of
-                        // the ground's light, and what it adds — as bright
-                        // as ground of the meter's grey would be lit.
-                        let from = tuile_core::geo::ecef_to_geodetic(eye);
-                        let local = enu_frame(from).transpose();
-                        let path = point - eye;
-                        let dir = (local * path).normalize_or(DVec3::NEG_Z);
-                        let length = Some(path.length());
-                        let air = self.march(from.height, dir, local * to_sun, length, 16, false);
-                        let mut through = air.transmittance;
-                        let mut added = air.inscattered;
-                        if let Some((to_moon, strength)) = moon_at {
-                            let m =
-                                self.march(from.height, dir, local * to_moon, length, 16, false);
-                            through = m.transmittance;
-                            for c in 0..3 {
-                                added[c] += m.inscattered[c] * strength;
-                            }
-                        }
-                        [0, 1, 2]
-                            .map(|c| l[c] * agree(c) * through[c] + added[c] * scale[c] / meter)
+                        let v = ground_seen(eye, point, g.height, enu_frame(g).z_axis);
+                        (v, ln(v), 1.0)
                     }
                     Metered::Sky { eye, direction } => {
-                        let g = tuile_core::geo::ecef_to_geodetic(eye);
-                        let local = enu_frame(g).transpose();
-                        let dir = (local * direction).normalize_or(DVec3::Z);
-                        // Space, past the air: no light to meter, and not
-                        // counted — a frame of the limb is exposed for the
-                        // limb and the Earth, not for the black around them.
-                        if sphere_entry(LUT_RADIUS + g.height.max(0.0), dir.z, self.top()).is_none()
-                        {
-                            continue;
-                        }
-                        let mut l = self.sky_radiance(g.height, dir, local * to_sun);
-                        if let Some((to_moon, strength)) = moon_at {
-                            let m = self.sky_radiance(g.height, dir, local * to_moon);
+                        let (v, weight) = sky_seen(eye, direction);
+                        ([0, 1, 2].map(|c| v[c] * weight), ln(v) * weight, weight)
+                    }
+                    Metered::Cell(cell) => {
+                        let mut l = [0.0; 3];
+                        let mut log = 0.0;
+                        let mut weight = 0.0;
+                        for (theta, w, piece) in cell.nodes(ground_radius, top) {
+                            let (v, w) = match piece {
+                                Piece::Ground => {
+                                    let point = cell.ground_point(theta, ground_radius);
+                                    let up = (point - cell.centre()).normalize();
+                                    (ground_seen(cell.eye, point, at.height.max(0.0), up), w)
+                                }
+                                Piece::Sky => {
+                                    let (v, ww) = sky_seen(cell.eye, cell.direction(theta));
+                                    (v, ww * w)
+                                }
+                            };
                             for c in 0..3 {
-                                l[c] += m[c] * strength;
+                                l[c] += v[c] * w;
                             }
+                            log += ln(v) * w;
+                            weight += w;
                         }
-                        [0, 1, 2].map(|c| l[c] * scale[c] / meter)
+                        (l, log, weight)
                     }
                 };
-                counted += 1;
+                weights += weight;
+                logs += log;
                 for c in 0..3 {
                     sum[c] += l[c];
                 }
             }
-            if counted > 0 {
-                metered = sum.map(|v| v / counted as f64);
+            // A frame that sees nothing but space is exposed for the light
+            // here, and one that sees a little air for that air: the two
+            // joined continuously.
+            for c in 0..3 {
+                metered[c] = (sum[c] + level[c] * METER_FLOOR) / (weights + METER_FLOOR);
             }
+            let geometric = ((logs + ln(level) * METER_FLOOR) / (weights + METER_FLOOR)).exp();
+            let mean = luminance(metered).max(1e-300);
+            metered = metered.map(|v| v * geometric / mean);
         }
 
         // The night floor: starlight and airglow, on all ground alike — the
         // light of a clear moonless night.
-        let luminance = |v: [f64; 3]| 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
-        let wanted = luminance(calibrated);
         let tint = NIGHT_TINT.map(f64::from);
         let floor_light = f64::from(ReferenceIllumination::NIGHT_FLOOR) * wanted;
         let added = tint.map(|t| t * floor_light / luminance(tint));
@@ -924,6 +979,17 @@ impl LutAtmosphere {
         }
     }
 
+    /// How much a meter's ray of the sky from `height` at zenith cosine
+    /// `mu` counts: by the air it crosses, whole once its optical depth is
+    /// [`METER_AIR`] of the air's from the ground straight up, nothing past
+    /// the air — continuous in the eye and the ray.
+    pub fn meter_weight(&self, height: f64, mu: f64) -> f64 {
+        let depth = |r: f64, mu: f64| -self.transmittance(r, mu)[1].max(1e-30).ln();
+        let column = depth(LUT_RADIUS, 1.0);
+        let r = LUT_RADIUS + height.max(0.0);
+        (depth(r, mu) / (METER_AIR * column)).clamp(0.0, 1.0)
+    }
+
     /// The sky's light at `height` under one light along `light` (`z` up):
     /// as an L1 harmonic, its constant over the facings of a wall all round
     /// and its gradient turned to ECEF axes by `enu`, and level ground's.
@@ -983,20 +1049,176 @@ fn irradiance_unit(height: f64, thickness: f64) -> f64 {
     (height.max(0.0) / thickness).min(1.0).sqrt()
 }
 
-/// What a camera meters: a ground point seen from an eye, or the sky along
-/// a direction from an eye, all ECEF.
+/// The zenith cosine over the tables' planet ([`LUT_RADIUS`]) of a line of
+/// sight from `height` over a sphere of `radius` — the ground drawn — at
+/// zenith cosine `mu`: the one whose lowest point stands as high over the
+/// tables' ground as the line's over the sphere's, so that the air a line
+/// grazes is the air over the ground it grazes. The identity where the two
+/// radii are one; `lut_mu` in `hillaire.wgsl`.
+pub fn lut_mu(radius: f64, height: f64, mu: f64) -> f64 {
+    let h = height.max(0.0);
+    let s = (1.0 - mu * mu).max(0.0).sqrt();
+    let drop = (radius + h) * mu * mu / (1.0 + s);
+    let one_minus = (drop / (LUT_RADIUS + h)).min(1.0);
+    let m = (one_minus * (2.0 - one_minus)).max(0.0).sqrt();
+    if mu < 0.0 {
+        -m
+    } else {
+        m
+    }
+}
+
+/// The unit `dir` (`z` up) with its zenith cosine turned by [`lut_mu`],
+/// its azimuth kept.
+pub fn lut_direction(dir: DVec3, radius: f64, height: f64) -> DVec3 {
+    let flat = DVec3::new(dir.x, dir.y, 0.0);
+    let l = flat.length();
+    if l < 1e-12 {
+        return dir;
+    }
+    let m = lut_mu(radius, height, dir.z);
+    flat / l * (1.0 - m * m).max(0.0).sqrt() + DVec3::new(0.0, 0.0, m)
+}
+
+/// What a camera meters: a ground point seen from an eye, the sky along a
+/// direction from an eye, all ECEF — or, as [`metering`] makes them, one
+/// cell of its grid, averaged over its extent.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Metered {
     Ground { eye: DVec3, point: DVec3 },
     Sky { eye: DVec3, direction: DVec3 },
+    Cell(MeterCell),
+}
+
+/// One cell of a camera's meter, as the planet's limb crosses it: the
+/// lines of sight from `eye` in the plane of `toward` — the direction of
+/// the sphere's centre, `distance` away — and `across`, at angles `from`
+/// to `to` from `toward`: the cell's extent across the limb.
+///
+/// The meter reads a cell as the mean of its light over that extent — the
+/// ground's where its lines meet the ground, the air's above it, nothing
+/// past the air — integrated at nodes laid on each of the three pieces.
+/// The pieces' ends are the limb's and the air's top, fixed on the globe,
+/// and the cell's, fixed in the picture: as the camera moves, every node
+/// moves continuously, and the meter with it. A limb far thinner than a
+/// cell weighs what it covers of it, not all or nothing as a ray falls on
+/// it or beside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeterCell {
+    pub eye: DVec3,
+    pub toward: DVec3,
+    pub across: DVec3,
+    pub distance: f64,
+    pub from: f64,
+    pub to: f64,
+}
+
+/// Which piece of a cell a node is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Piece {
+    Ground,
+    Sky,
+}
+
+/// Gauss–Legendre's nodes and weights on [−1, 1]: four for the ground,
+/// eight for the air, whose light is bunched towards the ground.
+const GROUND_NODES: [(f64, f64); 4] = [
+    (-0.861_136_311_594_052_6, 0.347_854_845_137_453_9),
+    (-0.339_981_043_584_856_3, 0.652_145_154_862_546_1),
+    (0.339_981_043_584_856_3, 0.652_145_154_862_546_1),
+    (0.861_136_311_594_052_6, 0.347_854_845_137_453_9),
+];
+const SKY_NODES: [(f64, f64); 8] = [
+    (-0.960_289_856_497_536_3, 0.101_228_536_290_376_3),
+    (-0.796_666_477_413_626_7, 0.222_381_034_453_374_5),
+    (-0.525_532_409_916_329, 0.313_706_645_877_887_3),
+    (-0.183_434_642_495_649_8, 0.362_683_783_378_362),
+    (0.183_434_642_495_649_8, 0.362_683_783_378_362),
+    (0.525_532_409_916_329, 0.313_706_645_877_887_3),
+    (0.796_666_477_413_626_7, 0.222_381_034_453_374_5),
+    (0.960_289_856_497_536_3, 0.101_228_536_290_376_3),
+];
+
+impl MeterCell {
+    /// The sphere's centre.
+    pub fn centre(&self) -> DVec3 {
+        self.eye + self.toward * self.distance
+    }
+
+    /// The line of sight at `theta` from `toward`.
+    pub fn direction(&self, theta: f64) -> DVec3 {
+        self.toward * theta.cos() + self.across * theta.sin()
+    }
+
+    /// Where the line at `theta` meets the sphere of `radius`, the near
+    /// side: for a line on the ground piece.
+    pub fn ground_point(&self, theta: f64, radius: f64) -> DVec3 {
+        let (s, c) = theta.sin_cos();
+        let b = self.distance * s;
+        let t = self.distance * c - (radius * radius - b * b).max(0.0).sqrt();
+        self.eye + self.direction(theta) * t.max(0.0)
+    }
+
+    /// The nodes the cell's light is summed at: each line's angle, its
+    /// weight — the share of the cell's extent it stands for — and its
+    /// piece. The ground's under the limb, of radius `ground`; the air's
+    /// between it and its top, of radius `top`; nothing past it. A cell of
+    /// no extent is its one line.
+    pub fn nodes(&self, ground: f64, top: f64) -> Vec<(f64, f64, Piece)> {
+        let limb = if self.distance > ground {
+            (ground / self.distance).asin()
+        } else {
+            std::f64::consts::PI
+        };
+        let edge = if self.distance > top {
+            (top / self.distance).asin()
+        } else {
+            f64::INFINITY
+        };
+        let width = self.to - self.from;
+        if width <= 1e-12 {
+            let piece = if self.from < limb {
+                Piece::Ground
+            } else {
+                Piece::Sky
+            };
+            return if self.from < edge || piece == Piece::Ground {
+                vec![(self.from, 1.0, piece)]
+            } else {
+                Vec::new()
+            };
+        }
+        let mut out = Vec::with_capacity(12);
+        let (a, b) = (self.from, self.to.min(limb));
+        if b > a {
+            for (x, w) in GROUND_NODES {
+                out.push((
+                    a + (b - a) * (x + 1.0) / 2.0,
+                    w * (b - a) / 2.0 / width,
+                    Piece::Ground,
+                ));
+            }
+        }
+        let (a, b) = (self.from.max(limb), self.to.min(edge));
+        if b > a {
+            // Bunched towards the piece's start, where the air is densest:
+            // θ = a + (b − a)·u², u in [0, 1].
+            for (x, w) in SKY_NODES {
+                let u = (x + 1.0) / 2.0;
+                let dtheta = 2.0 * (b - a) * u * (w / 2.0);
+                out.push((a + (b - a) * u * u, dtheta / width, Piece::Sky));
+            }
+        }
+        out
+    }
 }
 
 /// What a camera at `eye` (ECEF) meters: a grid of twenty-four by fourteen
-/// rays across its view — `fwd + x·right + y·up` for `x`, `y` in [−1, 1],
-/// fine enough to fall on a limb a few degrees thick — the ground where one
-/// meets `sphere` raised by `ground_height`, the sky where one does not. The
-/// same for a film's frame and a viewer's: [`LutAtmosphere::light`] takes
-/// it.
+/// cells across its view — about `fwd + x·right + y·up` for `x`, `y` in
+/// [−1, 1] — each read over its extent across the limb of `sphere` raised
+/// by `ground_height` ([`MeterCell`]) — the light reads that height from
+/// the place it is worked out for. The same for a film's frame and a
+/// viewer's: [`LutAtmosphere::light`] takes it.
 pub fn metering(
     eye: DVec3,
     fwd: DVec3,
@@ -1005,26 +1227,42 @@ pub fn metering(
     sphere: &AtmosphereFrame,
     ground_height: f64,
 ) -> Vec<Metered> {
-    let radius = sphere.radius + ground_height;
-    let o = eye - sphere.centre;
+    let _ = ground_height; // The light's own place holds it.
+    let to_centre = sphere.centre - eye;
+    let distance = to_centre.length();
+    let toward = to_centre / distance.max(1e-9);
     let (columns, rows) = (24, 14);
     let mut out = Vec::with_capacity(columns * rows);
     for j in 0..rows {
         for i in 0..columns {
-            let x = (i as f64 + 0.5) / columns as f64 * 2.0 - 1.0;
-            let y = (j as f64 + 0.5) / rows as f64 * 2.0 - 1.0;
-            let d = (fwd + right * x + up * y).normalize();
-            let b = o.dot(d);
-            let disc = b * b - (o.length_squared() - radius * radius);
-            let t = -b - disc.max(0.0).sqrt();
-            if disc >= 0.0 && t > 0.0 {
-                out.push(Metered::Ground {
-                    eye,
-                    point: eye + d * t,
-                });
-            } else {
-                out.push(Metered::Sky { eye, direction: d });
+            let at = |di: f64, dj: f64| {
+                let x = (i as f64 + 0.5 + di) / columns as f64 * 2.0 - 1.0;
+                let y = (j as f64 + 0.5 + dj) / rows as f64 * 2.0 - 1.0;
+                (fwd + right * x + up * y).normalize()
+            };
+            let d = at(0.0, 0.0);
+            let cos = d.dot(toward).clamp(-1.0, 1.0);
+            let across = (d - toward * cos)
+                .try_normalize()
+                .unwrap_or_else(|| toward.any_orthonormal_vector());
+            let theta = cos.acos();
+            // The cell's corners, as angles from `toward` along `across`.
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for (di, dj) in [(-0.5, -0.5), (0.5, -0.5), (-0.5, 0.5), (0.5, 0.5)] {
+                let k = at(di, dj);
+                let angle = k.dot(across).atan2(k.dot(toward));
+                lo = lo.min(angle);
+                hi = hi.max(angle);
             }
+            out.push(Metered::Cell(MeterCell {
+                eye,
+                toward,
+                across,
+                distance,
+                from: lo.min(theta),
+                to: hi.max(theta),
+            }));
         }
     }
     out
@@ -1033,6 +1271,17 @@ pub fn metering(
 /// The reflectance a camera's meter takes a scene for: middle grey. Sky is
 /// metered as the light that would make ground of it as bright.
 pub const METER_REFLECTANCE: f64 = 0.18;
+
+/// The share of the air's optical depth from the ground straight up a
+/// meter's ray of the sky must cross to count whole
+/// ([`LutAtmosphere::meter_weight`]): a hundredth, which every ray from
+/// under some 35 km crosses — there, every ray of the sky counts whole.
+pub const METER_AIR: f64 = 0.01;
+
+/// How many rays' worth the light at the eye's ground weighs in the meter:
+/// what exposes a frame of space alone, and nothing beside a frame that
+/// holds any air or ground.
+pub const METER_FLOOR: f64 = 1e-3;
 
 /// What one frame's light is worked out from: where the sun is, the Moon
 /// if it is placed, and the exposure chosen on top.
@@ -1630,10 +1879,13 @@ mod tests {
         let ev = |m: &[Metered]| clear().light(clear(), at, day(to_sun), m, CALIBRATION);
         let (d, b, n) = (ev(&day_side), ev(&both), ev(&night_side));
         assert!(d.illumination.ev100 > 10.0, "{}", d.illumination.ev100);
-        // Half the frame at night: the mean of its light, a stop under its day.
+        // Half the frame at night: the log-average of its light, halfway in
+        // stops between its day and its night — not the mean's one stop
+        // under its day, which the bright half would drive.
+        let halfway = (d.illumination.ev100 + n.illumination.ev100) / 2.0;
         assert!(
-            (d.illumination.ev100 - b.illumination.ev100) < 1.2,
-            "{}",
+            (b.illumination.ev100 - halfway).abs() < 0.1,
+            "{} against {halfway}",
             b.illumination.ev100
         );
         // Space beside it, past the air: not metered, nothing changes.

@@ -341,7 +341,7 @@ const LATER_FIELDS: [&str; 10] = [
     // The air's settings as tuning values (`tuile_atmosphere::tuning`):
     // at today's constants, the name a film had before they were.
     ", mie_albedo: 0.8999999999999999",
-    ", camera: CameraResponse { follows: 0.75, night_depth_ev: 3.0, white_adaptation: 0.35, meter_reflectance: 0.18 }",
+    ", camera: CameraResponse { follows: 0.75, night_depth_ev: 3.0, white_adaptation: 0.35, meter_reflectance: 0.18, meter_floor: 1.0 }",
     ", veil_bound: 6.0",
     ", march_steps: [12, 24]",
     ", highlight_knee: 0.5",

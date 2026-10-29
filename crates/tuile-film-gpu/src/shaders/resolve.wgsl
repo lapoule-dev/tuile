@@ -193,11 +193,18 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
         // gap that is wrong, not the air. Not a number is told by its
         // bits: a compiler free to assume no such number exists answers
         // any comparison with it as it likes.
-        // Under a physical atmosphere the eye may be 300 km up, its limb
-        // 2 000 km off: twice the reach. Without one, as it always was.
-        let reach = select(2.0e6, 4.0e6, physical);
-        let known = all((bitcast<vec3u>(p) & vec3u(0x7f800000u)) != vec3u(0x7f800000u))
-            && all(abs(p) < vec3f(reach));
+        // Under a physical atmosphere the eye may be anywhere up to the
+        // Moon: the ground it can see is within its horizon over a sphere
+        // well under any ground (6 350 km), by half again — what the probe
+        // of holes reads below — a reach that grows with the eye, so that
+        // no height draws the far ground of its limb without its air.
+        // Without one, as it always was.
+        let number = all((bitcast<vec3u>(p) & vec3u(0x7f800000u)) != vec3u(0x7f800000u));
+        var known = number && all(abs(p) < vec3f(2.0e6));
+        if (physical) {
+            let r = length(atmosphere.centre.xyz);
+            known = number && dot(p, p) < 1.5 * (r - 6.35e6) * (r + 6.35e6);
+        }
         // The ground the triangle means, where the air reads it: its own
         // light, the air between, the veil's bound. Shadows, city lights
         // and the probe of holes keep the drawn point — the sun's map was
