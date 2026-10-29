@@ -540,3 +540,27 @@ Looked at (`zoom-out.mp4`, `sunset.mp4`, `replay-1.mp4`, and the pictures at fra
 - The headless replay of frames 860–889 differs from the live pictures by 0.7–2.3 / 255 (JPEG included), and shows the same step (frame 876 in the replay).
 - **Two replays are identical from frame 876 on, and not before.** The sky on main carries a history (when the light was last worked out), which a replay that seeks into the session does not share. Its first light recompute brings both runs together. With #149, which makes each frame's light from that frame alone, the replay should be deterministic from the first frame.
 - No black ground in the scripted sessions. In Laurent's session, 15–28 pixels of the ground's clear colour come back frame after frame between 8 000 and 10 700 km, looking straight down at 20° N 5° E.
+
+## stars-scan-pic-du-midi-2026-06-21/ and stars-metering-west-vs-east-pic-du-midi-2026-06-21.png — why the viewer shows stars in some directions only (2026-10-26)
+
+The viewer's own frame, headless, at 2880×1620 and scale 2 (Laurent's Retina window), from the Pic du Midi (lon 0.1418, lat 42.9365, altitude 3100, ground 2877), pitch 0. The scan covers every 30° of heading at seven instants on 2026-06-21: +15, +30, +45, +60, +90 and +120 min after sunset (19:41:54 UTC), and 23:30 UTC.
+
+- `scan.mcap` holds, per view: the camera's pose (`/camera`), the scene's clock (`/clock`), the frame (`/frame`, `foxglove.CompressedImage`) and the count with the view asked for (`/stars`).
+- `scan.parquet` holds one row a view: instant, place, heading, pitch, `metered_exposure_ev` (the exposure the viewer's sky meters, its own rays and calibration) and `points` (point sources 4 code values over their ring, above the horizon, controls left out).
+- `scan.png` plots the two columns of the Parquet against heading.
+- `stars-metering-west-vs-east-…png` shows four crops: +60 and +90 min, looking east (heading 90) and west (heading 270).
+
+```bash
+TUILE_ION_TOKEN=… cargo run --release -p tuile-wgpu-viewer --example stars_scan -- \
+  --at 2026-06-21T19:56:54Z,2026-06-21T20:11:54Z,2026-06-21T20:26:54Z,2026-06-21T20:41:54Z,2026-06-21T21:11:54Z,2026-06-21T21:41:54Z,2026-06-21T23:30:00Z \
+  --step 30 --pitches 0 --places 0.1418:42.9365:3100:2877 --rows 0.43 \
+  --width 2880 --height 1620 --scale 2 --out videos/stars-scan-pic-du-midi-2026-06-21
+```
+
+Looked at:
+- **Night (+120 min and 23:30).** Stars in every direction: 105 to 336 a view. None of the 84 views is empty at night. The same holds at the other places and heights scanned: the plain, Paris, 20 km, 300 km.
+- **+60 min.** The meter exposes 16.0 stops looking east and 11.1 looking west-north-west (300–330°), where the afterglow is. The view shows 86 stars east and 5–11 west.
+- **+90 min.** The gap is 19.5 against 15.5 stops, and the west still shows fewer stars.
+- **+15 to +45 min.** At most 3 stars in any direction under this meter.
+
+The stars' path is the same in every direction. What moves with the heading is the exposure the frame meter picks, and that is the camera's response.

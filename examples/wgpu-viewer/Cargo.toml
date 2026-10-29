@@ -44,6 +44,11 @@ tuile-viewer = { version = "0.14.0", path = "../../crates/tuile-viewer", feature
 tuile-atmosphere = { version = "0.14.0", path = "../../crates/tuile-atmosphere" }
 tuile-core = { version = "0.14.0", path = "../../crates/tuile-core" }
 # The replay (`examples/replay`): a recorded session read, and written again.
+# The stars scan (`examples/stars_scan`): its views as MCAP, its counts as
+# Parquet.
 glam = { workspace = true }
 tuile-camera = { version = "0.14.0", path = "../../crates/tuile-camera" }
 tuile-tape = { version = "0.14.0", path = "../../crates/tuile-tape" }
+arrow-array = "58.4.0"
+arrow-schema = "58.4.0"
+parquet = { version = "58.4.0", default-features = false, features = ["arrow", "snap"] }
