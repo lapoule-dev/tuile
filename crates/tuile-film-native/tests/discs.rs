@@ -92,7 +92,10 @@ fn shoot(
         W,
         H,
         &camera,
-        SkyOut { uniform, model },
+        SkyOut {
+            uniform: &uniform,
+            model,
+        },
     ))
 }
 

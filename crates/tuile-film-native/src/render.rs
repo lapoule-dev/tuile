@@ -1244,6 +1244,13 @@ pub async fn render(
             }
             let layers: Vec<(u8, u32)> = layers_drawn.into_iter().collect();
             let t = Instant::now();
+            // The light the GPU worked out, read back only for an instrument
+            // that reads the frame's linear light: a film's loop never waits.
+            let sky = if linear.is_empty() {
+                None
+            } else {
+                gpu.sky_seen()
+            };
             observer.frame(&FrameOut {
                 frame: diff.frame,
                 index,
@@ -1257,8 +1264,8 @@ pub async fn render(
                 camera: &camera,
                 timings,
                 linear: (!linear.is_empty()).then_some(linear.as_slice()),
-                sky: gpu
-                    .sky_seen()
+                sky: sky
+                    .as_ref()
                     .map(|(uniform, model)| crate::observe::SkyOut { uniform, model }),
             });
             timings.observe += ms(t);

@@ -1819,12 +1819,15 @@ impl FilmGpu {
     /// directions, the discs, what one unit of the model's radiance is in
     /// the renderer's (`illuminance`, pre-exposed) — and the model whose
     /// tables it reads. `None` without one.
-    pub fn sky_seen(&self) -> Option<(&AtmosphereUniform, &tuile_atmosphere::LutAtmosphere)> {
+    ///
+    /// The light's fields are the GPU's, read back over the uniform's
+    /// geometry — **blocking**: for an instrument or a test, after the
+    /// frame was submitted, never a frame's loop.
+    pub fn sky_seen(&self) -> Option<(AtmosphereUniform, &tuile_atmosphere::LutAtmosphere)> {
         self.atmosphere.light.as_ref()?;
-        Some((
-            &self.atmosphere.frame_uniform,
-            self.atmosphere.model.as_ref()?,
-        ))
+        let model = self.atmosphere.model.as_ref()?;
+        let read = self.frame_light.read(&self.device, &self.queue);
+        Some((read.over(self.atmosphere.frame_uniform), model))
     }
 
     /// An albedo texture to fill, sized for its full mip chain. Its level 0 is
