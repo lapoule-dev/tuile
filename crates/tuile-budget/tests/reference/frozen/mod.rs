@@ -19,8 +19,10 @@
 // the real engine; record each one below, with its PR.
 //
 // Adaptations to the copy, none of them in the decision path:
-// - the public items of src/lib.rs (`FrameInput`, `Ledger`, `Released`) are
-//   the real crate's, imported, not copied;
+// - the public items of src/lib.rs (`Ledger`, `Released`) are the real
+//   crate's, imported, not copied; `FrameInput` was too, until the real one
+//   took a need delta (O1.3): the shim below is its field-for-field twin as
+//   frozen, the whole need by reference;
 // - the crate-private helpers `types::sat_u32` and `imagery::drape_rank` are
 //   copied into the `types` and `imagery` shims below (the rest of those
 //   modules is the real crate's, re-exported);
@@ -44,9 +46,23 @@ use tuile_budget::AuditError;
 use tuile_budget::{config, cost, decisions, error, need, priority, stats, tier};
 use tuile_budget::{
     BudgetConfig, BudgetStats, Bytes, Class, ConfigError, Decisions, DrapeChoice, Failure,
-    FrameInput, Generation, GeoRect, LayerId, Ledger, Micros, PerClass, Policy, Pressure, Released,
-    ResourceId, SessionError, Thermal, TileId,
+    Generation, GeoRect, LayerId, Ledger, Micros, PerClass, Policy, Pressure, Released, ResourceId,
+    SessionError, Thermal, TileId,
 };
+
+/// Field for field, `tuile_budget::FrameInput` as frozen at 3d1a028e: one
+/// step's input, the whole need by reference.
+#[derive(Clone, Copy)]
+pub struct FrameInput<'a> {
+    /// The frame number (Batch: the film frame).
+    pub frame: u64,
+    /// The time of this step, simulated or real. Never read inside.
+    pub now: Micros,
+    /// What the traversal wants.
+    pub need: &'a need::NeedSet,
+    /// The local stores' presence index.
+    pub presence: &'a dyn tier::PresenceOracle,
+}
 
 /// `tuile_budget::types`, plus its crate-private helper (copied).
 mod types {

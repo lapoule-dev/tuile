@@ -4,7 +4,10 @@
 //! What one `decide` costs (A3), on the simulation's world:
 //!
 //! - `decide/still`: a converged still view, 484 tiles drawn, the
-//!   same need every step: the steady state;
+//!   same need every step, told as what changed (nothing): the steady
+//!   state;
+//! - `decide/still-full`: the same, the whole need told every step (a
+//!   host with whole needs only, or a resynchronisation);
 //! - `decide/motion`: the soak's tour, the step's `decide` alone timed;
 //! - `decide/pressure`: the tour's orbit, looped, under memory pressure
 //!   (`soak::pressure_profile`: over target on nearly every step, so the
@@ -47,7 +50,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use tuile_budget::{FrameInput, Micros, NeedSet};
+use tuile_budget::{FrameInput, Micros, NeedDelta, NeedSet};
 
 use server::{Profile, Sim};
 use world::{Camera, SIDE};
@@ -75,10 +78,18 @@ fn converged() -> (Sim, NeedSet) {
     (sim, need)
 }
 
-/// One more step of the same need, `decide` alone.
-fn decide_still(sim: &mut Sim, need: &NeedSet) -> usize {
-    let input = FrameInput::new(sim.frame, sim.now, need).with_presence(&sim.net.store);
-    let d = sim.budget.decide(input);
+/// One more step of the same need, `decide` alone: told whole, or as what
+/// changed (nothing).
+fn decide_still(sim: &mut Sim, need: &NeedSet, whole: bool) -> usize {
+    static NOTHING: std::sync::OnceLock<NeedDelta> = std::sync::OnceLock::new();
+    let nothing = NOTHING.get_or_init(NeedDelta::new);
+    let input = if whole {
+        FrameInput::new(sim.frame, sim.now, need)
+    } else {
+        FrameInput::from_delta(sim.frame, sim.now, nothing)
+    }
+    .with_presence(&sim.net.store);
+    let d = sim.budget.decide_delta(input, need);
     sim.frame += 1;
     sim.now = sim.now.plus(sim.profile.dt);
     d.draw.items.len()
@@ -100,15 +111,17 @@ fn percentiles(name: &str, mut us: Vec<f64>, drawn: usize) {
 
 /// The percentiles, from individually timed calls.
 fn report() {
-    let (mut sim, need) = converged();
-    let mut drawn = 0;
-    let mut us = Vec::with_capacity(2_000);
-    for _ in 0..2_000 {
-        let t = Instant::now();
-        drawn = black_box(decide_still(&mut sim, &need));
-        us.push(t.elapsed().as_secs_f64() * 1e6);
+    for (name, whole) in [("still", false), ("still-full", true)] {
+        let (mut sim, need) = converged();
+        let mut drawn = 0;
+        let mut us = Vec::with_capacity(2_000);
+        for _ in 0..2_000 {
+            let t = Instant::now();
+            drawn = black_box(decide_still(&mut sim, &need, whole));
+            us.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        percentiles(name, us, drawn);
     }
-    percentiles("still", us, drawn);
 
     for (name, pressed) in [("motion", false), ("pressure", true)] {
         let mut sim = tour_sim(pressed);
@@ -150,10 +163,12 @@ fn tour_sim(pressed: bool) -> Sim {
 fn bench(c: &mut Criterion) {
     report();
     let mut g = c.benchmark_group("decide");
-    let (mut sim, need) = converged();
-    g.bench_function("still", |b| {
-        b.iter(|| black_box(decide_still(&mut sim, &need)))
-    });
+    for (name, whole) in [("still", false), ("still-full", true)] {
+        let (mut sim, need) = converged();
+        g.bench_function(name, |b| {
+            b.iter(|| black_box(decide_still(&mut sim, &need, whole)))
+        });
+    }
     for (name, pressed) in [("motion", false), ("pressure", true)] {
         let mut sim = tour_sim(pressed);
         g.bench_function(name, |b| {

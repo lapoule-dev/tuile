@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use tuile_budget::cost::{drape_cost, Cost, TextureFormat};
 use tuile_budget::{
     Budget, BudgetConfig, Bytes, Class, Decisions, FrameInput, GeoRect, ImageryNeed, LayerId,
-    LayerReach, Micros, Need, NeedSet, Presence, PresenceOracle, ResourceId, TexelFootprint,
-    TileId,
+    LayerReach, Micros, Need, NeedDelta, NeedSet, Presence, PresenceOracle, ResourceId,
+    TexelFootprint, TileId,
 };
 
 /// The estimated bytes of every test mesh.
@@ -178,6 +178,8 @@ pub struct Rig {
     pub delivered: BTreeMap<ResourceId, tuile_budget::Generation>,
     /// Loads started and not yet completed by the rig.
     pub pending: BTreeMap<ResourceId, tuile_budget::Generation>,
+    /// The need of the last step, `None` before the first.
+    pub need_last: Option<NeedSet>,
 }
 
 impl Rig {
@@ -191,6 +193,7 @@ impl Rig {
             store: Store::default(),
             delivered: BTreeMap::new(),
             pending: BTreeMap::new(),
+            need_last: None,
         }
     }
 
@@ -213,10 +216,21 @@ impl Rig {
         Rig::new(c)
     }
 
-    /// One step: decide at `now`, then advance the clock.
+    /// One step: decide at `now`, then advance the clock. The first step
+    /// reads the whole need; every later one what changed since the step
+    /// before, as the geometry server does.
     pub fn step(&mut self, need: &NeedSet) -> Decisions {
-        let input = FrameInput::new(self.frame, self.now, need).with_presence(&self.store);
+        let mut delta = NeedDelta::new();
+        let input = match &self.need_last {
+            Some(last) => {
+                delta.diff(last, need);
+                FrameInput::from_delta(self.frame, self.now, &delta)
+            }
+            None => FrameInput::new(self.frame, self.now, need),
+        }
+        .with_presence(&self.store);
         let d = self.b.decide(input);
+        self.need_last = Some(need.clone());
         for (r, g) in &d.deliver {
             self.delivered.insert(*r, *g);
         }
