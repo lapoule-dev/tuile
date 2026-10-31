@@ -725,8 +725,8 @@ fn a_web_resize_and_a_device_pixel_ratio_change() {
     assert_eq!(digests(false), digests(true), "P5.5 on the web");
 }
 
-/// P6.4's constants (spec §12, "a and b are set in Phase 3 and kept"):
-/// provisional until O1.4 lands the incremental `decide` they bound.
+/// P6.4's constants (spec §12, "a and b are set in Phase 3 and kept"),
+/// held by O1.4's incremental `decide`.
 const P64_A: u64 = 16;
 const P64_B: u64 = 256;
 
@@ -752,11 +752,12 @@ fn need_delta(before: &NeedSet, after: &NeedSet) -> u64 {
 /// W_k ≤ a · (#ΔN_k + #E_k) · log2(tracked + 2) + b, on every step of a
 /// converged still view (nothing changes: W_k ≤ b) and of the soak's tour.
 ///
-/// Red today: `decide` reads the whole need, ranks every want and scans the
-/// tracked entries each step, so W_k is O(need + tracked) even when nothing
-/// changed. O1.4 (dirty sets) turns it green.
+/// `work` counts every element a step walks, the passes after the need
+/// included (drape levels, selection, draw set, wants, ranking, marks,
+/// protection). Red before O1.4: every pass after the need walked all of
+/// it, so W_k was O(need + tracked) even when nothing changed.
 #[test]
-#[ignore = "red until O1.4 (incremental decide): work is O(need) today"]
+#[ignore = "red until O1.4's dirty sets: W ≈ 15 700 a still step, 1 499 of 5 100 steps over"]
 fn decide_work_grows_with_changes_not_with_the_view() {
     use tuile_budget::{BudgetMeter, BudgetObserver, Pressure, StepRecord, Thermal};
 

@@ -21,6 +21,11 @@ impl<T: Ord + Copy> SortedSet<T> {
         self.0.binary_search(x).is_ok()
     }
 
+    /// How many members.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     /// The members, in order.
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.0.iter()
