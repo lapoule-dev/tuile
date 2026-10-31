@@ -5,6 +5,10 @@
 # Secrets — ion token etc. Never commit.
 .env
 .env.*
+# A viewer configuration file holds an access token: only the examples are
+# committed (docs/try-tuile.md).
+*.tuile
+!*.example.tuile
 
 # Python bytecode from the spike assertion.
 __pycache__/

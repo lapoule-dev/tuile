@@ -5,6 +5,8 @@
 
 mod app;
 mod backdrop;
+#[cfg(not(target_arch = "wasm32"))]
+mod config_file;
 mod desktop;
 mod device;
 pub mod embed;
@@ -12,6 +14,8 @@ pub mod frame_host;
 mod gate;
 mod globe;
 mod host;
+#[cfg(not(target_arch = "wasm32"))]
+mod import;
 mod journal;
 mod launch;
 mod location;
@@ -19,6 +23,8 @@ mod menu;
 mod open;
 mod profile;
 mod recording;
+#[cfg(not(target_arch = "wasm32"))]
+mod secrets;
 mod session;
 mod signals;
 // Only a script asks; without the desktop glue the answers have no reader.

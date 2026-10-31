@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# Tuile's configuration file. Make a copy of it (any name ending in
+# `.tuile`), put your own Cesium ion access token below, and open the copy
+# in the application — see docs/try-tuile.md. Opening it once sets
+# everything up: the token goes to the system's secure storage (the Keychain
+# on a Mac or an iPhone, the Keystore on Android) and the rest to the
+# application's settings.
+#
+# This is TOML (https://toml.io). Lines starting with # are comments.
+# Your copy holds your token: keep it to yourself. `*.tuile` files are
+# ignored by git in this repository, except the examples.
+
+[ion]
+# Required. Your access token, from https://ion.cesium.com/tokens
+# — a token with the default `assets:read` scope is enough.
+token = "YOUR-ION-TOKEN"
+
+# Optional. The service's API base; the public service by default.
+# api = "https://api.cesium.com/"
+
+# Optional. The terrain's asset id: 1 is Cesium World Terrain.
+# terrain = 1
+
+# Optional. The imagery layers, in the order the application offers them
+# (the I key, the Imagery menu). Leave them out to keep the application's
+# own three. Every layer is an asset your token can read; its attribution
+# is shown on screen for as long as the layer is.
+#
+# [[ion.imagery]]
+# key = "aerial"
+# name = "Aerial"
+# asset = 2
+# attribution = "© Microsoft and its data suppliers"
+#
+# [[ion.imagery]]
+# key = "satellite"
+# name = "Satellite"
+# asset = 3954
+# attribution = "Contains modified Copernicus Sentinel data"
+
+# Optional. Where the first session opens, in the command line's units:
+# degrees, metres above the ground, degrees from north, degrees below the
+# horizon. A flag on the command line wins over these.
+# [start]
+# lon = 6.86
+# lat = 45.83
+# altitude = 6000
+# heading = 120
+# pitch = 25

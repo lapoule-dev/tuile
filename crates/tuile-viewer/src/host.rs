@@ -10,6 +10,14 @@
 //! be visible in the command that started it; that rule is unchanged, and a
 //! variable that is set is never overridden by anything.
 //!
+//! **Then, from the configuration file the session was started with** —
+//! `--config <file>`, or `config.tuile` in the support directory — read for
+//! that session and not kept (`crate::import`).
+//!
+//! **Then, from the system's secure storage**, where opening a
+//! configuration file in the application keeps its token: the Keychain on
+//! macOS and iOS, the Keystore-sealed store on Android (`crate::secrets`).
+//!
 //! **Then, on a phone, from what the person typed** in the system's settings
 //! page for the application (*Settings › Tuile*), under the variable's name.
 //!
@@ -77,6 +85,14 @@ pub(crate) trait Host {
     fn bundled(&self, _key: &str) -> Option<String> {
         None
     }
+    /// The token of the configuration file this session was started with.
+    fn configured(&self) -> Option<String> {
+        None
+    }
+    /// A value in the system's secure storage, under `key`.
+    fn secret(&self, _key: &str) -> Option<String> {
+        None
+    }
 }
 
 /// The `Info.plist` key a build-time credential for `variable` is written
@@ -137,6 +153,17 @@ impl Host for Machine {
 
     fn bundled(&self, key: &str) -> Option<String> {
         system::bundled(key)
+    }
+
+    fn configured(&self) -> Option<String> {
+        crate::import::session_token().map(|t| t.expose().to_owned())
+    }
+
+    fn secret(&self, key: &str) -> Option<String> {
+        use crate::secrets::Secrets;
+        crate::secrets::System
+            .get(key)
+            .map(|t| t.expose().to_owned())
     }
 }
 
@@ -240,6 +267,11 @@ pub(crate) fn token_file(host: &dyn Host) -> Option<PathBuf> {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TokenFrom {
     Environment,
+    /// The configuration file the session was started with.
+    ConfigFile,
+    /// The system's secure storage, where an opened configuration file
+    /// keeps its token.
+    SecureStorage,
     /// The system's settings page for the application.
     Settings,
     /// Written into the bundle at build time.
@@ -269,11 +301,13 @@ fn token_line(text: &str) -> Option<String> {
 /// Finds the token, first found wins:
 ///
 /// 1. the environment variable — what a command line said;
-/// 2. the system's settings page (a phone's *Settings › Tuile*), under the
+/// 2. the configuration file the session was started with;
+/// 3. the system's secure storage, where an opened file kept its token;
+/// 4. the system's settings page (a phone's *Settings › Tuile*), under the
 ///    variable's name — what the person typed there;
-/// 3. a value written into the bundle at build time (a developer's own
+/// 5. a value written into the bundle at build time (a developer's own
 ///    device only — see [`bundled_key`]);
-/// 4. the person's file ([`token_file`]).
+/// 6. the person's file ([`token_file`]).
 ///
 /// A value that is set but blank counts as unset — it is what an unfilled
 /// template, or a settings field cleared by hand, holds.
@@ -281,6 +315,12 @@ pub(crate) fn token(host: &dyn Host, variable: &str) -> Result<(String, TokenFro
     let filled = |v: Option<String>| v.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
     if let Some(token) = filled(host.var(variable)) {
         return Ok((token, TokenFrom::Environment));
+    }
+    if let Some(token) = filled(host.configured()) {
+        return Ok((token, TokenFrom::ConfigFile));
+    }
+    if let Some(token) = filled(host.secret(variable)) {
+        return Ok((token, TokenFrom::SecureStorage));
     }
     if let Some(token) = filled(host.setting(variable)) {
         return Ok((token, TokenFrom::Settings));
@@ -329,6 +369,8 @@ mod tests {
         handheld: bool,
         settings: HashMap<String, &'static str>,
         bundle: HashMap<String, &'static str>,
+        configured: Option<&'static str>,
+        secrets: HashMap<String, &'static str>,
     }
 
     impl Host for Fake {
@@ -358,6 +400,45 @@ mod tests {
         fn bundled(&self, key: &str) -> Option<String> {
             self.bundle.get(key).map(|v| (*v).to_owned())
         }
+
+        fn configured(&self) -> Option<String> {
+            self.configured.map(str::to_owned)
+        }
+
+        fn secret(&self, key: &str) -> Option<String> {
+            self.secrets.get(key).map(|v| (*v).to_owned())
+        }
+    }
+
+    /// A configuration file opened in the application keeps its token in
+    /// secure storage, which comes after the environment and the session's
+    /// own file, and before everything a phone or a file on disk holds.
+    #[test]
+    fn the_configured_and_kept_tokens_sit_between_the_environment_and_the_rest() {
+        let mut host = mac(&[], Some("from-file"));
+        host.secrets.insert(TOKEN_VARIABLE.into(), "from-keychain");
+        host.settings.insert(TOKEN_VARIABLE.into(), "from-settings");
+        assert_eq!(
+            token(&host, TOKEN_VARIABLE),
+            Ok(("from-keychain".into(), TokenFrom::SecureStorage))
+        );
+        host.configured = Some("from-config");
+        assert_eq!(
+            token(&host, TOKEN_VARIABLE),
+            Ok(("from-config".into(), TokenFrom::ConfigFile))
+        );
+        host.vars.insert(TOKEN_VARIABLE, "from-env");
+        assert_eq!(
+            token(&host, TOKEN_VARIABLE),
+            Ok(("from-env".into(), TokenFrom::Environment))
+        );
+        // A blank one is no token, as everywhere else.
+        let mut blank = mac(&[], Some("from-file"));
+        blank.secrets.insert(TOKEN_VARIABLE.into(), "  ");
+        assert_eq!(
+            token(&blank, TOKEN_VARIABLE),
+            Ok(("from-file".into(), TokenFrom::File(PathBuf::from(FILE))))
+        );
     }
 
     const TOKEN_VARIABLE: &str = "SOME_TOKEN";
@@ -574,6 +655,7 @@ mod tests {
                     .map(|t| (bundled_key(TOKEN_VARIABLE), t))
                     .into_iter()
                     .collect(),
+                ..Fake::default()
             }
         };
         let got = |h: Fake| token(&h, TOKEN_VARIABLE);

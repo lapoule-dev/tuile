@@ -43,15 +43,22 @@ impl ViewerHost for Public {
             // after this change starts as warm as the one before it.
             store: tuile_bing::cache_name("Aerial"),
             credentials: if cfg!(target_os = "android") {
-                "No token on this device: the catalog is asked through a proxy that holds it \
+                "The access token is the one a configuration file opened in the application \
+                 kept; without one, the catalog is asked through a proxy that holds it \
                  (TUILE_CATALOG_URL)."
                     .to_owned()
             } else {
                 format!(
-                    "The access token is read from {TOKEN_VARIABLE}, or from the file `token` \
+                    "The access token is read from {TOKEN_VARIABLE}, from --config's file, from \
+                     a configuration file opened in the application, or from the file `token` \
                      in the application's support directory."
                 )
             },
+            // A configuration file's `[ion]` table: the token, kept under
+            // the variable's name in the system's secure storage, the API
+            // address, the terrain and the layers.
+            credential_variable: TOKEN_VARIABLE.to_owned(),
+            config_section: "ion".to_owned(),
             ..Identity::default()
         })
     }
@@ -95,8 +102,16 @@ impl ViewerHost for Public {
             NativeHttp::shared().await
         };
         let http = Arc::new(http.map_err(|e| e.to_string())?);
+        // The API address a configuration file set, read at each
+        // connection: an import takes effect at the next one.
+        let api = tuile_viewer::embed::configured_api();
         #[cfg(target_os = "android")]
         {
+            // A token a configuration file brought, kept in the Keystore;
+            // without one, the catalog proxy that holds it.
+            if let Ok(token) = tuile_viewer::credential(TOKEN_VARIABLE) {
+                return Ok(ion(http, token, api));
+            }
             let catalog = catalog_url()?;
             tracing::info!(%catalog, "catalog proxy");
             Ok(through_catalog(http, catalog))
@@ -104,9 +119,19 @@ impl ViewerHost for Public {
         #[cfg(not(target_os = "android"))]
         {
             let token = tuile_viewer::credential(TOKEN_VARIABLE).map_err(|e| e.to_string())?;
-            Ok(Arc::new(IonSources::new(Arc::clone(&http), http, token)))
+            Ok(ion(http, token, api))
         }
     }
+}
+
+/// The sources over the service, with `token`, at `api` when a
+/// configuration file named one.
+fn ion(http: Arc<NativeHttp>, token: String, api: Option<url::Url>) -> Arc<dyn Sources> {
+    let sources = IonSources::new(Arc::clone(&http), http, token);
+    Arc::new(match api {
+        Some(api) => sources.with_api_base(api),
+        None => sources,
+    })
 }
 
 /// The sources through a catalog proxy that holds the token, at `catalog`

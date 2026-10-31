@@ -9,10 +9,17 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.database.Cursor;
 import android.graphics.Color;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.PowerManager;
+import android.provider.OpenableColumns;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
+import android.util.Base64;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -20,6 +27,16 @@ import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.widget.PopupWindow;
 import android.widget.TextView;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyStore;
+
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
 
 /**
  * The viewer's activity: the platform's own native activity, which hands the
@@ -36,6 +53,12 @@ import android.widget.TextView;
  *       work there.
  *   <li>The temperature, the battery saver and the launch's settings are read
  *       through the system's services.
+ *   <li>A configuration file opened or shared with the application, or an
+ *       import link, is held here as it arrives ({@code onCreate},
+ *       {@code onNewIntent}) and taken by the application once a second
+ *       ({@link #takeImport}); whether it is any good is decided in Rust.
+ *   <li>The access token it brings is sealed with a key that lives in the
+ *       Android Keystore ({@link #sealSecret}, {@link #openSecret}).
  * </ul>
  *
  * Nothing here decides anything: every policy — what a trim level means, what
@@ -51,6 +74,185 @@ public class TuileActivity extends NativeActivity {
     /** The last caption asked for: shown once the window can carry it. UI thread only. */
     private String captionWanted = "";
     private boolean captionRetrying = false;
+
+    /** The largest configuration file read: a configuration is a few hundred bytes. */
+    private static final int LONGEST_FILE = 64 * 1024;
+    /** The Keystore key the secrets are sealed with, and where the sealed values are kept. */
+    private static final String SECRET_KEY = "tuile-secrets";
+    private static final String SECRET_STORE = "tuile-secrets";
+
+    /** A configuration that arrived and is not taken yet: see {@link #takeImport}. */
+    private static String pendingImport = null;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        // Not again when the system recreates the activity: the intent was
+        // taken the first time.
+        if (savedInstanceState == null) {
+            receive(getIntent());
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        receive(intent);
+    }
+
+    /**
+     * What a view or a share brought: an import link ({@code link\n<url>}),
+     * or a file's name and text ({@code file\n<name>\n<text>}), read off the
+     * UI thread — a provider may be remote.
+     */
+    private void receive(final Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        String action = intent.getAction();
+        Uri uri = null;
+        if (Intent.ACTION_VIEW.equals(action)) {
+            uri = intent.getData();
+        } else if (Intent.ACTION_SEND.equals(action)) {
+            Object stream = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+            if (stream instanceof Uri) {
+                uri = (Uri) stream;
+            } else {
+                CharSequence text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT);
+                if (text != null && text.length() <= LONGEST_FILE) {
+                    hold("file\nshared text\n" + text);
+                }
+                return;
+            }
+        }
+        if (uri == null) {
+            return;
+        }
+        String scheme = uri.getScheme();
+        if (!"content".equals(scheme) && !"file".equals(scheme)) {
+            // The application's own scheme: the link, as it came.
+            hold("link\n" + uri.toString());
+            return;
+        }
+        final Uri file = uri;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String text = read(file);
+                if (text != null) {
+                    hold("file\n" + displayName(file) + "\n" + text);
+                }
+            }
+        }, "tuile-import").start();
+    }
+
+    private static synchronized void hold(String what) {
+        pendingImport = what;
+    }
+
+    /** The configuration that arrived since the last call, or null. */
+    public String takeImport() {
+        synchronized (TuileActivity.class) {
+            String taken = pendingImport;
+            pendingImport = null;
+            return taken;
+        }
+    }
+
+    private String read(Uri uri) {
+        try (InputStream in = getContentResolver().openInputStream(uri)) {
+            if (in == null) {
+                return null;
+            }
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            int n;
+            while ((n = in.read(chunk)) > 0) {
+                out.write(chunk, 0, n);
+                if (out.size() > LONGEST_FILE) {
+                    // Too large to be a configuration: Rust says so.
+                    break;
+                }
+            }
+            return new String(out.toByteArray(), StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String displayName(Uri uri) {
+        if ("content".equals(uri.getScheme())) {
+            try (Cursor cursor = getContentResolver().query(
+                    uri, new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    String name = cursor.getString(0);
+                    if (name != null && !name.isEmpty()) {
+                        return name.replace('\n', ' ');
+                    }
+                }
+            } catch (Exception e) {
+                // The address's last part, below.
+            }
+        }
+        String last = uri.getLastPathSegment();
+        return last == null ? "the configuration" : last.replace('\n', ' ');
+    }
+
+    /** The Keystore's key for the secrets, made the first time. */
+    private static SecretKey secretKey() throws Exception {
+        KeyStore store = KeyStore.getInstance("AndroidKeyStore");
+        store.load(null);
+        if (store.containsAlias(SECRET_KEY)) {
+            return ((KeyStore.SecretKeyEntry) store.getEntry(SECRET_KEY, null)).getSecretKey();
+        }
+        KeyGenerator generator =
+                KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore");
+        generator.init(new KeyGenParameterSpec.Builder(
+                        SECRET_KEY, KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(256)
+                .build());
+        return generator.generateKey();
+    }
+
+    /** Seals {@code value} under {@code name}: AES-GCM, the key in the Keystore. */
+    public boolean sealSecret(String name, String value) {
+        try {
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey());
+            byte[] iv = cipher.getIV();
+            byte[] sealed = cipher.doFinal(value.getBytes(StandardCharsets.UTF_8));
+            byte[] both = new byte[iv.length + sealed.length];
+            System.arraycopy(iv, 0, both, 0, iv.length);
+            System.arraycopy(sealed, 0, both, iv.length, sealed.length);
+            return getSharedPreferences(SECRET_STORE, Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(name, Base64.encodeToString(both, Base64.NO_WRAP))
+                    .commit();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** The value sealed under {@code name}, or null. */
+    public String openSecret(String name) {
+        SharedPreferences store = getSharedPreferences(SECRET_STORE, Context.MODE_PRIVATE);
+        String kept = store.getString(name, null);
+        if (kept == null) {
+            return null;
+        }
+        try {
+            byte[] both = Base64.decode(kept, Base64.NO_WRAP);
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, secretKey(), new GCMParameterSpec(128, both, 0, 12));
+            byte[] open = cipher.doFinal(both, 12, both.length - 12);
+            return new String(open, StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return null;
+        }
+    }
 
     @Override
     public void onTrimMemory(int level) {

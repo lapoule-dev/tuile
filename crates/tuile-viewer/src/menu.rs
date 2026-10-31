@@ -406,11 +406,25 @@ mod platform {
             ])?;
             menu.append(&app)?;
 
+            // File: the one item that opens something — a configuration
+            // file, the way a double-click on one does. ⌘O, the platform's
+            // key for it; the window's own O (recording) has no modifier.
+            let mut asks = Vec::new();
+            let file = Submenu::new("File", true);
+            let open = asks.len().to_string();
+            asks.push(Ask::Do(Command::OpenConfiguration));
+            file.append(&MenuItem::with_id(
+                open,
+                "Open Configuration…",
+                true,
+                "CmdOrCtrl+O".parse::<Accelerator>().ok(),
+            ))?;
+            menu.append(&file)?;
+
             // The application's own: every item is found again by its place
             // in the layout, which is its id.
             let sections = layout(layers);
             let mut marks = Vec::new();
-            let mut asks = Vec::new();
             for (title, entries) in &sections {
                 let submenu = Submenu::new(title, true);
                 for entry in entries {
