@@ -675,24 +675,67 @@ mod tests {
     /// had not reached the disk yet — which is the fate of any process killed
     /// rather than shut down, and was silently the fate of the viewer until it
     /// learned to flush on exit.
-    #[tokio::test]
-    async fn a_store_that_is_never_closed_loses_its_entries() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let cfg = StoreConfig {
-            memory_bytes: 4 << 10,
-            ..config(dir.path())
-        };
-        let payload = Bytes::from(vec![9u8; 512 << 10]);
+    ///
+    /// The kill is modelled, not raced. Foyer's flusher is a task on the
+    /// runtime that built the store, and it outlives the store's handles:
+    /// once the last one is dropped it drains its queue and shuts down
+    /// gracefully, so a store merely dropped inside a runtime that keeps
+    /// running does reach the disk — whenever the flusher is next scheduled,
+    /// sometimes before the reopen, sometimes not, which is how this test
+    /// once failed on CI. Nothing awaits that drain, though: a process that
+    /// is killed, or that returns from `main` and tears its runtime down,
+    /// never gets it. So the first store lives on a runtime of its own, the
+    /// put is the last thing that runtime polls (nothing awaits after it, so
+    /// no task runs in between), and the runtime is then torn down with the
+    /// flusher's work still queued. The same kill after `close()` keeps the entry: what is lost
+    /// is lost for want of `close`, not to the way the process died.
+    #[test]
+    fn a_store_that_is_never_closed_loses_its_entries() {
+        fn found_after_a_kill(closed: bool) -> Option<Bytes> {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cfg = StoreConfig {
+                memory_bytes: 4 << 10,
+                ..config(dir.path())
+            };
+            let payload = Bytes::from(vec![9u8; 512 << 10]);
+            let runtime = || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+            };
 
-        let first = FoyerStore::with_config(cfg.clone()).await.expect("store");
-        first.put("dropped", payload.clone(), None).await;
-        drop(first); // no close: exactly what a killed process leaves behind
+            let dying = runtime();
+            dying.block_on(async {
+                let first = FoyerStore::with_config(cfg.clone()).await.expect("store");
+                first.put("dropped", payload.clone(), None).await;
+                if closed {
+                    first.close().await.expect("flush");
+                }
+            });
+            // The kill: every task still queued on the runtime, the flusher
+            // among them, is dropped without being polled again.
+            drop(dying);
 
-        let second = FoyerStore::with_config(cfg).await.expect("reopen");
+            runtime().block_on(async {
+                let second = FoyerStore::with_config(cfg).await.expect("reopen");
+                let found = second.get("dropped").await;
+                assert!(
+                    found.is_none() || found.as_ref() == Some(&payload),
+                    "a torn entry read back"
+                );
+                found
+            })
+        }
+
+        assert!(
+            found_after_a_kill(true).is_some(),
+            "closed before the kill: the entry must be on the disk"
+        );
         assert_eq!(
-            second.get("dropped").await,
+            found_after_a_kill(false),
             None,
-            "if this now survives, foyer flushes on drop and close() is optional"
+            "if this now survives a kill, foyer writes as it goes and close() is optional"
         );
     }
 
