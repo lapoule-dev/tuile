@@ -63,6 +63,7 @@ pub fn to_decoded(mesh: &QuantizedMesh, rect: &GeoRect, skirt_height: f64) -> De
 
     DecodedTileContent {
         withheld_drape: None,
+        copyright: None,
         meshes: vec![DecodedMesh {
             positions,
             normals,
@@ -834,6 +835,7 @@ pub fn fill_content(
 
     DecodedTileContent {
         withheld_drape: None,
+        copyright: None,
         meshes: vec![DecodedMesh {
             positions,
             normals: Some(normals),
@@ -1004,6 +1006,7 @@ pub fn globe_shell(colour: [f32; 4]) -> DecodedTileContent {
 
     DecodedTileContent {
         withheld_drape: None,
+        copyright: None,
         meshes: vec![DecodedMesh {
             positions,
             normals: Some(normals),

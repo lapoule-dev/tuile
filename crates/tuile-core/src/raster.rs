@@ -2146,6 +2146,7 @@ mod tests {
         };
         let mut content = DecodedTileContent {
             withheld_drape: None,
+            copyright: None,
             meshes: vec![DecodedMesh {
                 positions: vec![p(0.009, 0.011), p(0.011, 0.011), p(0.009, 0.009)],
                 normals: None,
@@ -3034,6 +3035,7 @@ mod tests {
         let uvs = uvs_geographic(&positions, origin, &rect);
         let mut content = DecodedTileContent {
             withheld_drape: None,
+            copyright: None,
             meshes: vec![DecodedMesh {
                 positions,
                 normals: None,

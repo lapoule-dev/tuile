@@ -1,0 +1,24 @@
+{
+  "asset": { "version": "1.0" },
+  "geometricError": 1e+100,
+  "root": {
+    "boundingVolume": { "box": [0, 0, 0, 7645212, 0, 0, 0, 7645212, 0, 0, 0, 7645212] },
+    "geometricError": 1e+100,
+    "refine": "REPLACE",
+    "children": [
+      {
+        "boundingVolume": { "box": [-2384134.08, -2384134.08, -3341432.29, -831569.15, -831569.15, -1176016.37, 3206796.69, -3206796.69, 0, -2267547.68, -2267547.68, 3206796.69] },
+        "geometricError": 525957.5361033019,
+        "refine": "REPLACE",
+        "content": { "uri": "/v1/3dtiles/datasets/CgIYAQ/files/AJVsH2xy0OPn.glb?session=FAKE_SESSION" },
+        "children": [
+          {
+            "boundingVolume": { "box": [-2069621.67, -4996508.72, -2294802.37, -186469.89, -450178.14, -201833.56, 2262073.69, -936981.60, 0, -2069621.67, -4996508.72, 2294802.37] },
+            "geometricError": 262978.76,
+            "content": { "uri": "/v1/3dtiles/datasets/CgIYAQ/files/AJVsH2wvcF7v.json?session=FAKE_SESSION" }
+          }
+        ]
+      }
+    ]
+  }
+}
