@@ -20,8 +20,8 @@ use budget_common::*;
 use proptest::prelude::*;
 use reference::Lockstep;
 use tuile_budget::{
-    BudgetConfig, Bytes, Class, Decisions, Failure, FrameInput, Generation, Micros, NeedSet,
-    Pressure, ResourceId, Role, Source, Thermal, TileId,
+    BudgetConfig, Bytes, Class, Decisions, Failure, FrameInput, Generation, Micros, NeedDelta,
+    NeedSet, Pressure, ResourceId, Role, Source, Thermal, TileId,
 };
 
 /// One scripted event.
@@ -155,6 +155,8 @@ struct Harness {
     delivered: BTreeMap<ResourceId, Generation>,
     gpu: BTreeSet<ResourceId>,
     fresh: BTreeSet<(ResourceId, Generation)>,
+    /// The need of the last step (empty before the first).
+    need_last: NeedSet,
 }
 
 impl Harness {
@@ -181,6 +183,7 @@ impl Harness {
             delivered: BTreeMap::new(),
             gpu: BTreeSet::new(),
             fresh: BTreeSet::new(),
+            need_last: NeedSet::new(),
         }
     }
 
@@ -200,9 +203,18 @@ impl Harness {
                     // The floor (D-A1): the root's mesh and its drape.
                     let floor_in = self.gpu.contains(&ResourceId::Mesh(t(0, 0, 0)))
                         && self.gpu.contains(&dr(t(0, 0, 0), 0));
-                    let input =
-                        FrameInput::new(self.frame, self.now, &need).with_presence(&self.store);
-                    let d = self.b.decide(input);
+                    // A step reads the whole need one time in four (the
+                    // first step, a resynchronisation), else what changed
+                    // since the step before: the same decisions either way.
+                    let delta = NeedDelta::between(&self.need_last, &need);
+                    let input = if seed % 4 == 0 {
+                        FrameInput::new(self.frame, self.now, &need)
+                    } else {
+                        FrameInput::from_delta(self.frame, self.now, &delta)
+                    }
+                    .with_presence(&self.store);
+                    let d = self.b.decide_delta(input, &need);
+                    self.need_last = need.clone();
                     for (r, g) in &d.cancel {
                         if self.in_flight.get(r).map(|x| x.0) == Some(*g) {
                             self.in_flight.remove(r);

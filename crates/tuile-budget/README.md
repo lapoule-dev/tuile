@@ -22,6 +22,14 @@ Between two calls to [`Budget::decide`], arrivals are recorded
 next `decide` applies them in a canonical order, whatever order they came
 in, then decides.
 
+The view comes as the need ([`NeedSet`]): told whole
+([`FrameInput::new`]), or as what changed since the step before
+([`FrameInput::from_delta`], [`NeedDelta`]). The budget keeps the need it
+last read, each wanted tile's best entry; a delta is applied to it, so a
+step reads only the tiles that entered, changed or left. Both decide alike:
+a delta built from two needs ([`NeedDelta::diff`]) gives the decisions of
+the second.
+
 ## Where it sits
 
 At the bottom of the workspace: it depends on no other tuile crate, and on

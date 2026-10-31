@@ -81,6 +81,76 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
         self.0.binary_search_by(|e| e.0.cmp(k)).ok()
     }
 
+    /// The entries, to change in place: kept sorted by key and distinct
+    /// by whoever changes them.
+    pub fn values_mut(&mut self) -> &mut Vec<(K, V)> {
+        &mut self.0
+    }
+
+    /// Keeps the entries `f` keeps, in order. A map left with more than an
+    /// eighth of its room unused gives back most of it.
+    pub fn retain(&mut self, mut f: impl FnMut(&K, &mut V) -> bool) {
+        self.0.retain_mut(|(k, v)| f(k, v));
+        let len = self.0.len();
+        if self.0.capacity() > 64 && self.0.capacity() > len + len / 8 {
+            self.0.shrink_to(len + len / 16);
+        }
+    }
+
+    /// Adds `new`'s entries — sorted, distinct, of keys not in the map —
+    /// `new` left empty. When `spilled`, entries of new keys were also
+    /// pushed at the map's end: it is sorted once, whole; otherwise `new`
+    /// is merged in from the back.
+    pub fn add_new(&mut self, new: &mut Vec<(K, V)>, spilled: bool)
+    where
+        V: Default,
+    {
+        if spilled {
+            for e in new.drain(..) {
+                push_grown(&mut self.0, e);
+            }
+            // Distinct keys: unstable is stable.
+            self.0.sort_unstable_by_key(|a| a.0);
+        } else {
+            self.merge_new(new);
+        }
+        debug_assert!(
+            self.0.windows(2).all(|w| w[0].0 < w[1].0),
+            "sorted, distinct"
+        );
+    }
+
+    /// Adds `new`'s entries — sorted, distinct, of keys not in the map —
+    /// in one pass from the back, `new` left empty: each takes a
+    /// placeholder's place as the old entries move up past it.
+    fn merge_new(&mut self, new: &mut Vec<(K, V)>)
+    where
+        V: Default,
+    {
+        let Some(&(k0, _)) = new.first() else {
+            return;
+        };
+        let (mut i, mut j) = (self.0.len(), new.len());
+        grow(&mut self.0, j);
+        self.0.resize_with(i + j, || (k0, V::default()));
+        let mut w = self.0.len();
+        while j > 0 {
+            w -= 1;
+            if i > 0 && self.0[i - 1].0 > new[j - 1].0 {
+                i -= 1;
+                self.0.swap(w, i);
+            } else {
+                j -= 1;
+                std::mem::swap(&mut self.0[w], &mut new[j]);
+            }
+        }
+        new.clear();
+        debug_assert!(
+            self.0.windows(2).all(|w| w[0].0 < w[1].0),
+            "sorted, distinct"
+        );
+    }
+
     /// The value at `k`.
     pub fn get(&self, k: &K) -> Option<&V> {
         self.find(k).map(|i| &self.0[i].1)
@@ -126,14 +196,18 @@ impl<'a, K: Ord + Copy, V> IntoIterator for &'a SortedMap<K, V> {
     }
 }
 
-/// `v`'s allocation, emptied, for elements of another type: a per-step
-/// buffer whose elements borrow the step's input keeps its capacity across
-/// steps. When the layouts differ it is simply a new, empty vector.
-pub(super) fn recycle<T, U>(mut v: Vec<T>) -> Vec<U> {
-    v.clear();
-    // An empty source: the closure never runs. The standard library
-    // collects a mapped `IntoIter` in place, in the source's allocation.
-    v.into_iter().map(|_| unreachable!("empty")).collect()
+/// Makes room in `v` for `extra` more: by an eighth of its room at least,
+/// so it grows rarely and with little slack.
+fn grow<T>(v: &mut Vec<T>, extra: usize) {
+    if v.len() + extra > v.capacity() {
+        v.reserve_exact(extra.max(v.capacity() / 8));
+    }
+}
+
+/// Pushes `x` on `v`, grown as [`grow`] does.
+pub(super) fn push_grown<T>(v: &mut Vec<T>, x: T) {
+    grow(v, 1);
+    v.push(x);
 }
 
 /// The distinct members of four sorted, deduplicated streams, in order:
@@ -186,13 +260,6 @@ mod tests {
         assert_eq!(m.keys().copied().collect::<Vec<_>>(), [1, 3, 7]);
         assert_eq!(m.len(), 3);
         assert_eq!(m.into_buffer().capacity(), 3);
-    }
-
-    #[test]
-    fn a_recycled_buffer_keeps_its_allocation() {
-        let v: Vec<(u64, u64)> = Vec::with_capacity(64);
-        let w: Vec<(u64, i64)> = recycle(v);
-        assert!(w.is_empty() && w.capacity() >= 64);
     }
 
     #[test]

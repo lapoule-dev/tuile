@@ -17,6 +17,7 @@ mod engine;
 pub mod error;
 pub mod imagery;
 pub mod need;
+mod need_state;
 pub mod observe;
 pub mod priority;
 mod sorted;
@@ -34,7 +35,7 @@ pub use decisions::{
 };
 pub use error::{AuditError, ConfigError, SessionError};
 pub use imagery::{DrapeCandidate, GeoRect, LevelClamp, TexelFootprint, UvTransform};
-pub use need::{ImageryNeed, LayerReach, Membership, Need, NeedSet};
+pub use need::{ImageryNeed, LayerReach, Membership, Need, NeedDelta, NeedSet};
 pub use observe::{
     check, BudgetEvent, BudgetMeter, BudgetObserver, BudgetSignals, EyeCoverage, FrameRecord,
     Histogram, StepRecord, Violations,
@@ -56,21 +57,47 @@ pub struct FrameInput<'a> {
     pub frame: u64,
     /// The time of this step, simulated or real. Never read inside.
     pub now: Micros,
-    /// What the traversal wants.
-    pub need: &'a NeedSet,
+    /// What the traversal wants: the whole need, or what changed in it.
+    pub need: NeedInput<'a>,
     /// The local stores' presence index.
     pub presence: &'a dyn PresenceOracle,
+}
+
+/// What a step is told of the need.
+#[derive(Clone, Copy, Debug)]
+pub enum NeedInput<'a> {
+    /// The whole need: what the budget kept of the last one is replaced.
+    /// The first step, a resynchronisation, or a host that only has whole
+    /// needs.
+    Full(&'a NeedSet),
+    /// What changed since the need of the step before, which the budget
+    /// kept: applied to it, it gives this step's need. Only valid when that
+    /// step was this budget's, and the delta is from its need.
+    Delta(&'a NeedDelta),
 }
 
 static NO_STORE: NoStore = NoStore;
 
 impl<'a> FrameInput<'a> {
-    /// A step at `now` for `need`, with no local store.
+    /// A step at `now` for the whole need `need`, with no local store.
     pub fn new(frame: u64, now: Micros, need: &'a NeedSet) -> Self {
         FrameInput {
             frame,
             now,
-            need,
+            need: NeedInput::Full(need),
+            presence: &NO_STORE,
+        }
+    }
+
+    /// A step at `now` for the need of the step before changed by `delta`,
+    /// with no local store. It decides exactly as [`FrameInput::new`] on
+    /// the whole need the delta leads to, without reading what did not
+    /// change.
+    pub fn from_delta(frame: u64, now: Micros, delta: &'a NeedDelta) -> Self {
+        FrameInput {
+            frame,
+            now,
+            need: NeedInput::Delta(delta),
             presence: &NO_STORE,
         }
     }
@@ -117,12 +144,52 @@ const RECENT_CAP: usize = 4_096;
 /// The thrash window.
 const THRASH_WINDOW: Micros = Micros::from_secs(10);
 
-/// What the budget knows of a tile's place in its tree.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// What the budget knows of a tile's place in its tree: its parent, level
+/// and footprint, packed (48 bytes, not 64: the budget keeps one per tile
+/// it knows of).
+#[derive(Clone, Copy, Debug, Default)]
 struct TileInfo {
-    parent: Option<TileId>,
+    /// The parent's id, when `has_parent`.
+    parent: u64,
+    /// West, south, east, north, when `has_rect`.
+    rect: [f64; 4],
     level: u32,
-    rect: Option<GeoRect>,
+    has_parent: bool,
+    has_rect: bool,
+}
+
+impl TileInfo {
+    fn new(parent: Option<TileId>, level: u32, rect: Option<GeoRect>) -> Self {
+        TileInfo {
+            parent: parent.map_or(0, |p| p.0),
+            rect: rect.map_or([0.0; 4], |r| [r.west, r.south, r.east, r.north]),
+            level,
+            has_parent: parent.is_some(),
+            has_rect: rect.is_some(),
+        }
+    }
+
+    fn parent(&self) -> Option<TileId> {
+        self.has_parent.then_some(TileId(self.parent))
+    }
+
+    fn rect(&self) -> Option<GeoRect> {
+        let [west, south, east, north] = self.rect;
+        self.has_rect.then_some(GeoRect {
+            west,
+            south,
+            east,
+            north,
+        })
+    }
+}
+
+/// Bit for bit: a position told again is the same position.
+impl PartialEq for TileInfo {
+    fn eq(&self, o: &Self) -> bool {
+        let key = |i: &Self| (i.parent(), i.level, i.rect.map(f64::to_bits), i.has_rect);
+        key(self) == key(o)
+    }
 }
 
 /// The budget. See the [module documentation](self).
@@ -136,7 +203,13 @@ pub struct Budget {
     events: Vec<Event>,
     /// Every tracked resource's state, by slot.
     arena: state::Arena,
-    tiles: std::collections::BTreeMap<TileId, TileInfo>,
+    /// Every tile the budget knows the place of: what the need told it, as
+    /// long as the tile or a descendant is referenced. A sorted vector: it
+    /// changes only by what the need changes.
+    tiles: sorted::SortedMap<TileId, TileInfo>,
+    /// The need last read, each wanted tile's best entry: a step changes
+    /// it by what changed.
+    need: need_state::NeedState,
     imagery_prev: std::collections::BTreeMap<(TileId, LayerId), u32>,
     held_last: sorted::SortedSet<TileId>,
     drawn_last: sorted::SortedSet<ResourceId>,
@@ -189,6 +262,7 @@ impl Budget {
             factor: (1, 1),
             events: Vec::new(),
             tiles: Default::default(),
+            need: Default::default(),
             imagery_prev: Default::default(),
             held_last: Default::default(),
             drawn_last: Default::default(),
@@ -357,6 +431,7 @@ impl Budget {
     /// Decides nothing.
     pub fn release_scratch(&mut self) {
         self.scratch = Default::default();
+        self.need.release_scratch();
     }
 }
 

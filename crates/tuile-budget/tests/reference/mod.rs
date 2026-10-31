@@ -22,7 +22,8 @@ pub mod frozen;
 
 use tuile_budget::{
     cost::Cost, AuditError, Budget, BudgetConfig, Bytes, Class, ConfigError, Decisions, Failure,
-    FrameInput, Generation, LayerId, Micros, NeedSet, Pressure, Released, ResourceId, Thermal,
+    FrameInput, Generation, LayerId, Micros, NeedInput, NeedSet, Pressure, Released, ResourceId,
+    Thermal,
 };
 
 /// The real budget and the frozen reference, in lockstep. Reads go to the
@@ -81,22 +82,44 @@ impl Lockstep {
         })
     }
 
-    /// One step on both, compared.
+    /// One step on both, compared: a step given the whole need.
     pub fn decide(&mut self, input: FrameInput<'_>) -> Decisions {
-        self.decide_with(input, |b, i| (b.decide(i), ())).0
+        let NeedInput::Full(need) = input.need else {
+            panic!("lockstep: a delta step goes through decide_delta, with its whole need");
+        };
+        self.decide_with(input, need, |b, i| (b.decide(i), ())).0
+    }
+
+    /// One step on both, compared: the real budget is given `input` (whole
+    /// or a delta), the frozen one `need`, the whole need `input` stands for.
+    pub fn decide_delta(&mut self, input: FrameInput<'_>, need: &NeedSet) -> Decisions {
+        self.decide_with(input, need, |b, i| (b.decide(i), ())).0
     }
 
     /// One step on both, compared; `run` makes the real budget's call, so a
     /// caller can measure it (time, heap) without counting the reference's.
+    /// `need` is the whole need `input` stands for, the frozen one's input.
     pub fn decide_with<R>(
         &mut self,
         input: FrameInput<'_>,
+        need: &NeedSet,
         run: impl FnOnce(&mut Budget, FrameInput<'_>) -> (Decisions, R),
     ) -> (Decisions, R) {
+        if let NeedInput::Full(n) = input.need {
+            assert!(
+                std::ptr::eq(n, need),
+                "lockstep: a whole need's step compares on that need"
+            );
+        }
         let (d, r) = run(&mut self.real, input);
         if let Some(frozen) = &mut self.frozen {
-            let f = frozen.decide(input);
-            Self::compare(self.steps, &self.real, frozen, input.need, &d, &f);
+            let f = frozen.decide(frozen::FrameInput {
+                frame: input.frame,
+                now: input.now,
+                need,
+                presence: input.presence,
+            });
+            Self::compare(self.steps, &self.real, frozen, need, &d, &f);
         }
         self.steps += 1;
         (d, r)
