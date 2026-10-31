@@ -11,10 +11,10 @@ pub mod water;
 
 pub use edit::{Brush, Edit, EditOp, EditSeq, TileChanged};
 pub use frame::{
-    tiles_over, Column, Frame, Geodetic, GeodeticFrame, PlanarFrame, Position, TileKey, Version,
-    EARTH_RADIUS,
+    tiles_over, Column, Frame, Geodetic, GeodeticFrame, InvalidFrame, PlanarFrame, Position,
+    TileKey, Version, EARTH_RADIUS, MAX_LEVEL,
 };
-pub use heightfield::Heightfield;
+pub use heightfield::{Heightfield, InvalidGround};
 pub use query::{
     BatchMismatch, EditGround, Ground, GroundError, Hit, Ray, Span, SpanBuffer, Surface,
 };

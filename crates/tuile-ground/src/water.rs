@@ -8,8 +8,14 @@
 //! body's level, and the depth is the level minus the highest solid surface.
 //! A renderer draws the same bodies, so the shoreline it shows is the one a
 //! simulation walks to.
+//!
+//! Coverage is part of the ground's source, not of its edits: digging below
+//! a body's level beside it does not flood the hole, and raising land in a
+//! lake only makes the column dry where the land rises above the level.
 
-/// A water body's index in [`Ground::water_bodies`](crate::query::Ground::water_bodies).
+/// A water body: its index in
+/// [`Ground::water_bodies`](crate::query::Ground::water_bodies), the one
+/// place a body is named.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WaterBodyId(pub u32);
 
@@ -21,12 +27,12 @@ pub enum WaterKind {
     River,
 }
 
-/// One body of water with a flat surface.
+/// One body of water with a flat surface. Its id is its index in the
+/// ground's list of bodies.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WaterBody {
-    pub id: WaterBodyId,
     pub kind: WaterKind,
-    /// The surface's height, metres.
+    /// The surface's height, metres; finite.
     pub level: f64,
 }
 

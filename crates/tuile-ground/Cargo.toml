@@ -6,13 +6,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lints]
 workspace = true
 
 # At the bottom of the graph: no other tuile crate, no GPU API, no async
-# runtime, no I/O. It builds for
-# `wasm32-unknown-unknown`.
+# runtime, no I/O. It builds for `wasm32-unknown-unknown`.
 [dependencies]
 thiserror = { workspace = true }
 glam = { workspace = true }

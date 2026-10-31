@@ -19,17 +19,27 @@
 //! place on the globe; an abstract world has none.
 //!
 //! The tile grid is the quadtree of the frame's bounds: level 0 is the whole
-//! rectangle, level `l` splits it into `2^l × 2^l` tiles. Edits are versioned
-//! per tile at one level ([`Frame::edit_level`]); data derived from the
-//! ground uses tiles of the same grid.
+//! rectangle, level `l` splits it into `2^l × 2^l` tiles, up to
+//! [`MAX_LEVEL`]. Tile `x` along `u` covers `[edge(x), edge(x + 1))`, with
+//! `edge(x) = min + (max − min) × (x / 2^l)` computed in `f64` exactly that
+//! way, so [`Frame::tile_of`] and [`Frame::tile_bounds`] agree to the bit on
+//! any bounds: `tile_of(tile_bounds(k).0) == k`, and a tile's max corner
+//! belongs to the next tile. Edits are versioned per tile at one level
+//! ([`Frame::edit_level`]); data derived from the ground uses tiles of the
+//! same grid.
 
 use glam::{DVec2, DVec3};
+use thiserror::Error;
 
 /// A column: the frame's horizontal coordinates.
 pub type Column = DVec2;
 
 /// A position: the column and the height in metres.
 pub type Position = DVec3;
+
+/// The deepest level of the tile grid: `2^30` tiles per side, indices that
+/// fit a `u32` with room to name the next edge.
+pub const MAX_LEVEL: u8 = 30;
 
 /// Longitude and latitude in radians, height in metres above the ellipsoid.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,13 +49,28 @@ pub struct Geodetic {
     pub height: f64,
 }
 
+/// Why a frame cannot hold a ground.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum InvalidFrame {
+    #[error("the bounds are not finite, or min is not below max on both axes")]
+    Bounds,
+    #[error("edit level {0} is above the deepest level, {MAX_LEVEL}")]
+    Level(u8),
+    /// Beyond ±90° of latitude, or more than 360° of longitude.
+    #[error("a geodetic region lies within ±90° of latitude and 360° of longitude")]
+    Geodetic,
+    #[error("the anchor is not finite")]
+    Anchor,
+}
+
 /// The coordinates a ground's source declares.
 pub trait Frame: Send + Sync + std::fmt::Debug {
     /// The rectangle of columns the ground covers, min and max corners;
     /// the max edges are excluded.
     fn bounds(&self) -> (Column, Column);
 
-    /// The level of the grid whose tiles carry versions and change events.
+    /// The level of the grid whose tiles carry versions and change events,
+    /// at most [`MAX_LEVEL`].
     fn edit_level(&self) -> u8;
 
     /// Metres per unit of `u` and of `v` at a column. Authoritative paths
@@ -60,60 +85,127 @@ pub trait Frame: Send + Sync + std::fmt::Debug {
     /// the globe.
     fn geodetic_to_position(&self, g: Geodetic) -> Option<Position>;
 
+    /// Whether the frame can hold a ground: finite bounds with min below
+    /// max, and an edit level at most [`MAX_LEVEL`]. A ground checks its
+    /// frame when it is built.
+    fn validate(&self) -> Result<(), InvalidFrame> {
+        let (lo, hi) = self.bounds();
+        if !(lo.is_finite() && hi.is_finite() && lo.x < hi.x && lo.y < hi.y) {
+            return Err(InvalidFrame::Bounds);
+        }
+        if self.edit_level() > MAX_LEVEL {
+            return Err(InvalidFrame::Level(self.edit_level()));
+        }
+        Ok(())
+    }
+
     /// Whether a column lies inside the bounds.
     fn contains(&self, c: Column) -> bool {
         let (lo, hi) = self.bounds();
         c.x >= lo.x && c.y >= lo.y && c.x < hi.x && c.y < hi.y
     }
 
-    /// The tile of `level` holding a column (clamped to the bounds).
-    fn tile_of(&self, c: Column, level: u8) -> TileKey {
+    /// The tile of `level` holding a column; a column outside the bounds
+    /// gets the nearest tile. `None` for a level above [`MAX_LEVEL`] or a
+    /// NaN column.
+    fn tile_of(&self, c: Column, level: u8) -> Option<TileKey> {
+        if level > MAX_LEVEL || c.is_nan() {
+            return None;
+        }
         let (lo, hi) = self.bounds();
-        let n = 1u32 << level.min(30);
-        let index = |v: f64, a: f64, b: f64| -> u32 {
-            let t = ((v - a) / (b - a) * f64::from(n)).floor();
-            if t.is_nan() || t < 0.0 {
-                0
-            } else if t >= f64::from(n - 1) {
-                n - 1
-            } else {
-                // In 0..n-1 and integral after the checks above.
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let i = t as u32;
-                i
-            }
+        let n = 1u64 << level;
+        let index = |v: f64, a: f64, b: f64| {
+            // Below 2^30 by construction.
+            u32::try_from(grid_index(v, a, b, n)).unwrap_or(u32::MAX)
         };
-        TileKey {
+        Some(TileKey {
             level,
             x: index(c.x, lo.x, hi.x),
             y: index(c.y, lo.y, hi.y),
-        }
+        })
     }
 
-    /// A tile's min and max corners.
-    fn tile_bounds(&self, key: TileKey) -> (Column, Column) {
+    /// A tile's min corner (included) and max corner (excluded: it belongs
+    /// to the next tile). `None` for a key outside the grid.
+    fn tile_bounds(&self, key: TileKey) -> Option<(Column, Column)> {
+        if key.level > MAX_LEVEL {
+            return None;
+        }
+        let n = 1u64 << key.level;
+        let (x, y) = (u64::from(key.x), u64::from(key.y));
+        if x >= n || y >= n {
+            return None;
+        }
         let (lo, hi) = self.bounds();
-        let n = f64::from(1u32 << key.level.min(30));
-        let step = (hi - lo) / n;
-        let a = lo + step * DVec2::new(f64::from(key.x), f64::from(key.y));
-        (a, a + step)
+        let corner =
+            |x: u64, y: u64| DVec2::new(grid_edge(lo.x, hi.x, x, n), grid_edge(lo.y, hi.y, y, n));
+        Some((corner(x, y), corner(x + 1, y + 1)))
     }
 }
 
-/// The tiles of `level` overlapping the rectangle `[lo, hi]`, west to east
-/// then south to north.
+/// Edge `i` of a grid of `count` equal divisions of `[lo, hi]`, computed one
+/// way everywhere so that [`grid_index`] agrees with it to the bit.
+pub(crate) fn grid_edge(lo: f64, hi: f64, i: u64, count: u64) -> f64 {
+    lo + (hi - lo) * (to_f64(i) / to_f64(count))
+}
+
+/// The division `i` of a grid of `count` (at least 1) with
+/// `grid_edge(i) <= v < grid_edge(i + 1)`, clamped to `0..count`.
+pub(crate) fn grid_index(v: f64, lo: f64, hi: f64, count: u64) -> u64 {
+    let last = count - 1;
+    let guess = ((v - lo) / (hi - lo) * to_f64(count)).floor();
+    let mut i = if guess.is_nan() || guess <= 0.0 {
+        0
+    } else if guess >= to_f64(last) {
+        last
+    } else {
+        // In 0..last and integral after the checks above.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let i = guess as u64;
+        i
+    };
+    // The guess is a division away at most; the edges decide.
+    while i > 0 && v < grid_edge(lo, hi, i, count) {
+        i -= 1;
+    }
+    while i < last && v >= grid_edge(lo, hi, i + 1, count) {
+        i += 1;
+    }
+    i
+}
+
+pub(crate) fn to_f64(n: u64) -> f64 {
+    // Grid sizes stay far below 2^53.
+    #[allow(clippy::cast_precision_loss)]
+    let f = n as f64;
+    f
+}
+
+/// The tiles of `level` overlapping the rectangle `[lo, hi]` (both corners
+/// included), west to east then south to north.
+///
+/// Lazy: it yields `(Δx + 1) × (Δy + 1)` keys, up to `4^level` for a
+/// rectangle over the whole frame, and costs nothing until iterated. Empty
+/// for a level above [`MAX_LEVEL`] or a NaN corner.
 pub fn tiles_over<F: Frame + ?Sized>(
     frame: &F,
     lo: Column,
     hi: Column,
     level: u8,
 ) -> impl Iterator<Item = TileKey> + use<F> {
-    let a = frame.tile_of(lo, level);
-    let b = frame.tile_of(hi, level);
-    (a.y..=b.y).flat_map(move |y| (a.x..=b.x).map(move |x| TileKey { level, x, y }))
+    frame
+        .tile_of(lo, level)
+        .zip(frame.tile_of(hi, level))
+        .into_iter()
+        .flat_map(move |(a, b)| {
+            (a.y..=b.y).flat_map(move |y| (a.x..=b.x).map(move |x| TileKey { level, x, y }))
+        })
 }
 
 /// A tile of the frame's quadtree.
+///
+/// Indices count from the frame's min corner. This grid is the frame's own:
+/// it does not share edges with the globe's tiling schemes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TileKey {
     pub level: u8,
@@ -123,7 +215,7 @@ pub struct TileKey {
     pub y: u32,
 }
 
-/// A tile's edit generation: 0 until an edit touches it, then +1 per edit.
+/// A tile's edit generation: 0 until an edit changes it, then +1 per edit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version(pub u64);
 
@@ -142,6 +234,12 @@ pub struct PlanarFrame {
 /// geodetic metric use (a sphere, not the ellipsoid; see
 /// [`GeodeticFrame::metres_per_unit`]).
 pub const EARTH_RADIUS: f64 = 6_378_137.0;
+
+/// The cosine of an anchor's latitude, kept away from zero at the poles; the
+/// same value both ways so the two conversions stay inverse.
+fn anchor_cos(lat: f64) -> f64 {
+    libm::cos(lat).max(1e-9)
+}
 
 impl Frame for PlanarFrame {
     fn bounds(&self) -> (Column, Column) {
@@ -164,9 +262,8 @@ impl Frame for PlanarFrame {
     /// flat; this only says where.
     fn to_geodetic(&self, p: Position) -> Option<Geodetic> {
         let a = self.anchor?;
-        let cos = libm::cos(a.lat).max(1e-9);
         Some(Geodetic {
-            lon: a.lon + p.x / (EARTH_RADIUS * cos),
+            lon: a.lon + p.x / (EARTH_RADIUS * anchor_cos(a.lat)),
             lat: a.lat + p.y / EARTH_RADIUS,
             height: a.height + p.z,
         })
@@ -174,17 +271,38 @@ impl Frame for PlanarFrame {
 
     fn geodetic_to_position(&self, g: Geodetic) -> Option<Position> {
         let a = self.anchor?;
-        let cos = libm::cos(a.lat);
         Some(DVec3::new(
-            (g.lon - a.lon) * EARTH_RADIUS * cos,
+            (g.lon - a.lon) * EARTH_RADIUS * anchor_cos(a.lat),
             (g.lat - a.lat) * EARTH_RADIUS,
             g.height - a.height,
         ))
+    }
+
+    fn validate(&self) -> Result<(), InvalidFrame> {
+        let (lo, hi) = self.bounds();
+        if !(lo.is_finite() && hi.is_finite() && lo.x < hi.x && lo.y < hi.y) {
+            return Err(InvalidFrame::Bounds);
+        }
+        if self.edit_level > MAX_LEVEL {
+            return Err(InvalidFrame::Level(self.edit_level));
+        }
+        if self
+            .anchor
+            .is_some_and(|a| !(a.lon.is_finite() && a.lat.is_finite() && a.height.is_finite()))
+        {
+            return Err(InvalidFrame::Anchor);
+        }
+        Ok(())
     }
 }
 
 /// A region of the globe: `u` longitude and `v` latitude in radians,
 /// heights above the ellipsoid.
+///
+/// The region does not wrap the antimeridian (`min.x < max.x`) and stays
+/// within ±90° of latitude. Near a pole a degree of longitude shrinks to
+/// nothing: a brush there reaches across a huge range of longitudes, and one
+/// at the pole itself is refused as invalid.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GeodeticFrame {
     /// West-south corner (radians).
@@ -221,6 +339,21 @@ impl Frame for GeodeticFrame {
     fn geodetic_to_position(&self, g: Geodetic) -> Option<Position> {
         Some(DVec3::new(g.lon, g.lat, g.height))
     }
+
+    fn validate(&self) -> Result<(), InvalidFrame> {
+        let (lo, hi) = (self.min, self.max);
+        if !(lo.is_finite() && hi.is_finite() && lo.x < hi.x && lo.y < hi.y) {
+            return Err(InvalidFrame::Bounds);
+        }
+        if self.edit_level > MAX_LEVEL {
+            return Err(InvalidFrame::Level(self.edit_level));
+        }
+        let half_pi = core::f64::consts::FRAC_PI_2;
+        if lo.y < -half_pi || hi.y > half_pi || hi.x - lo.x > core::f64::consts::TAU {
+            return Err(InvalidFrame::Geodetic);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -238,32 +371,106 @@ mod tests {
     #[test]
     fn tiles_cover_the_bounds_without_gaps() {
         let f = planar();
+        let key = |x, y| TileKey { level: 8, x, y };
+        assert_eq!(f.tile_of(DVec2::splat(-65_536.0), 8), Some(key(0, 0)));
+        assert_eq!(f.tile_of(DVec2::splat(65_535.999), 8), Some(key(255, 255)));
+        let k = key(17, 200);
+        let (lo, hi) = f.tile_bounds(k).unwrap();
+        assert_eq!(hi - lo, DVec2::splat(512.0));
+        assert_eq!(f.tile_of(lo, 8), Some(k));
+        assert_eq!(f.tile_of(hi - DVec2::splat(1e-6), 8), Some(k));
+        assert_ne!(f.tile_of(hi, 8), Some(k));
+    }
+
+    /// Bounds in radians are not powers of two: the tile a corner falls in
+    /// must still be the tile whose corner it is, at every level.
+    #[test]
+    fn tile_corners_round_trip_on_arbitrary_bounds() {
+        let lat = 45f64.to_radians();
+        let f = GeodeticFrame {
+            min: DVec2::new(0.1, lat),
+            max: DVec2::new(0.1 + 0.000_909_4, lat + 0.000_642_2),
+            edit_level: 4,
+        };
+        for level in 0..=12u8 {
+            let n = 1u32 << level;
+            for x in (0..n).step_by(usize::try_from((n / 64).max(1)).unwrap()) {
+                for y in [0, n / 3, n - 1] {
+                    let k = TileKey { level, x, y };
+                    let (lo, hi) = f.tile_bounds(k).unwrap();
+                    assert_eq!(f.tile_of(lo, level), Some(k), "{k:?}");
+                    if x + 1 < n && y + 1 < n {
+                        assert_eq!(
+                            f.tile_of(hi, level),
+                            Some(TileKey {
+                                level,
+                                x: x + 1,
+                                y: y + 1
+                            }),
+                            "the max corner belongs to the next tile: {k:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn levels_beyond_the_deepest_are_refused() {
+        let f = planar();
+        assert_eq!(f.tile_of(DVec2::ZERO, MAX_LEVEL + 1), None);
+        assert!(f.tile_of(DVec2::ZERO, MAX_LEVEL).is_some());
         assert_eq!(
-            f.tile_of(DVec2::splat(-65_536.0), 8),
-            TileKey {
-                level: 8,
+            f.tile_bounds(TileKey {
+                level: 31,
                 x: 0,
                 y: 0
-            }
+            }),
+            None
         );
         assert_eq!(
-            f.tile_of(DVec2::splat(65_535.999), 8),
-            TileKey {
-                level: 8,
-                x: 255,
-                y: 255
-            }
+            f.tile_bounds(TileKey {
+                level: 2,
+                x: 4,
+                y: 0
+            }),
+            None,
+            "outside the grid"
         );
-        let k = TileKey {
-            level: 8,
-            x: 17,
-            y: 200,
+        assert_eq!(
+            tiles_over(&f, DVec2::ZERO, DVec2::ONE, MAX_LEVEL + 1).count(),
+            0
+        );
+        assert_eq!(
+            PlanarFrame {
+                edit_level: 31,
+                ..f
+            }
+            .validate(),
+            Err(InvalidFrame::Level(31))
+        );
+    }
+
+    #[test]
+    fn frames_are_validated() {
+        assert_eq!(planar().validate(), Ok(()));
+        let bad = PlanarFrame {
+            half_extent: -1.0,
+            ..planar()
         };
-        let (lo, hi) = f.tile_bounds(k);
-        assert_eq!(hi - lo, DVec2::splat(512.0));
-        assert_eq!(f.tile_of(lo, 8), k);
-        assert_eq!(f.tile_of(hi - DVec2::splat(1e-6), 8), k);
-        assert_ne!(f.tile_of(hi, 8), k);
+        assert_eq!(bad.validate(), Err(InvalidFrame::Bounds));
+        let wrap = GeodeticFrame {
+            min: DVec2::new(3.0, 0.0),
+            max: DVec2::new(-3.0, 0.1),
+            edit_level: 2,
+        };
+        assert_eq!(wrap.validate(), Err(InvalidFrame::Bounds));
+        let polar = GeodeticFrame {
+            min: DVec2::new(0.0, 1.5),
+            max: DVec2::new(0.1, 1.6),
+            edit_level: 2,
+        };
+        assert_eq!(polar.validate(), Err(InvalidFrame::Geodetic));
     }
 
     #[test]
