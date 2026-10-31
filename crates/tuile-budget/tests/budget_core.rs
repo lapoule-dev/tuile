@@ -3166,6 +3166,36 @@ mod dirty_sets {
         );
     }
 
+    /// The prune's whole walk: two tiles told as each other's parent close a
+    /// cycle, which counts of what keeps each tile cannot see through (each
+    /// would keep the other). The cycle sends the prune back to the whole
+    /// walk, and once nothing references them the two tiles are let go.
+    #[test]
+    fn tiles_whose_parents_close_a_cycle_are_let_go_once_unreferenced() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        r.settle(&drawn(&[root]), 10);
+        let [a, b, ..] = children(root);
+        let mut ask = drawn(&[root]);
+        ask.drawn.push((a, need(a).with_parent(b)));
+        ask.drawn.push((b, need(b).with_parent(a)));
+        r.step(&ask);
+        r.step(&ask);
+        let known = |r: &Rig| -> Vec<tuile_budget::TileId> {
+            r.b.snapshot().tiles.iter().map(|x| x.0).collect()
+        };
+        assert!(known(&r).contains(&a) && known(&r).contains(&b));
+        // Unreferenced: their loads cancelled past the grace, their slots
+        // freed, then the tiles.
+        r.idle_for(&drawn(&[root]), Micros::from_secs(2));
+        assert_eq!(r.b.tracked(), 1, "only the root's mesh is tracked");
+        let left = known(&r);
+        assert!(
+            !left.contains(&a) && !left.contains(&b),
+            "{RED}: the tiles of a cycle are kept: {left:?}"
+        );
+    }
+
     /// The worn rule: a tile reads the drapes an ancestor's mesh wore last
     /// step (a layer switch: an old layer stands in while the new one is
     /// drawable nowhere), so it is read again when that mesh's item
