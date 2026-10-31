@@ -92,8 +92,8 @@ no longer folds the whole order on every delivery to learn whether room can be m
 to date. An eviction key moves whenever the view touches a resource — every step for everything drawn — so the
 arena files only what the view left alone: the resources needed at the two most recent times are *grouped*
 (listed by that time, outside the index); every other resource holding a copy outside transit is *filed* in a
-treap per class and per copies held (both, GPU only, decoded only), keyed by `(EvictKey, slot)`, its links a
-column of the arena (8 B a slot, nothing allocated as resources come and go), and its GPU bytes counted as its
+`BTreeSet<(EvictKey, slot)>` per class and per copies held (both, GPU only, decoded only) — a hand-written
+intrusive treap at first (#168), replaced by std's ordered set in the debt pass (#170) — and its GPU bytes counted as its
 class's *idle bytes* unless it is of the floor. A third time files the older group's resources not needed since;
 a resource needed again leaves the index. A step that draws what it drew moves nothing; one that turns files what
 it left. Walks merge the index with the grouped resources, sorted once a step when a walk needs them; nothing
@@ -188,9 +188,11 @@ bit-identical (lockstep green, goldens and pattern goldens untouched, ratchets o
 - the lockstep compares the whole internal state each step (`tuile_budget::snapshot`), not only outputs (#165):
   seen red with a failure count not reset on success, which the old lockstep passed on all 61 `budget_sim` runs and
   the new one fails on 54;
-- the eviction index on `std::collections::BTreeSet` instead of the hand-written treap (#168) was tried and
-  reverted: decisions identical, but bytes per tracked resource 432 → 470 and motion allocations p99 38 → 39; the
-  treap stays until Laurent decides;
+- the eviction index on `std::collections::BTreeSet` instead of the hand-written treap (#168), Laurent's decision:
+  decisions identical, `decide` within noise (still +4.9 % by criterion, motion and pressure unchanged), bytes per
+  tracked resource 432 → 470 and motion allocations p99 38 → 39. About 76 KB and one allocation a step for the
+  view's ~2,000 tracked resources, against an established structure in place of a hand-written balanced tree and
+  its audit: the two ratchets were raised deliberately, once, in that change;
 - the host's diff (`NeedDelta::diff`, what the runtime computes before `decide`) measured (#169): about 22 µs
   still, 33 µs in motion, and about 640 heap blocks a step on the tour (each changed tile's `Need` cloned);
 - motion back under O1.2 (#169): the kept tiles and the tree positions as key/value columns (`SortedCols`, lookups

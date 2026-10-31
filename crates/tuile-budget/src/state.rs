@@ -196,25 +196,13 @@ struct Group {
     slots: Vec<Slot>,
 }
 
-/// No slot: the end of a branch of the eviction index.
-const NIL: u32 = u32::MAX;
-
-/// A filed slot's place in its treap's heap order: a fixed hash of its
-/// number, the number breaking ties. It shapes the tree, never the order.
-fn heap_rank(n: u32) -> (u32, u32) {
-    let mut x = n.wrapping_mul(0x9e37_79b9);
-    x ^= x >> 16;
-    x = x.wrapping_mul(0x85eb_ca6b);
-    x ^= x >> 13;
-    (x, n)
-}
-
 /// The eviction order, kept up to date (see the module documentation).
 #[derive(Debug)]
 struct EvictIndex {
-    /// The filed resources, by class and copies held: the root of a treap
-    /// keyed by `(EvictKey, Slot)`, whose links are a column of the arena.
-    roots: PerClass<[u32; 3]>,
+    /// The filed resources, by class and copies held, each set ordered by
+    /// `(EvictKey, Slot)`: the standard library's ordered set, no
+    /// structure of our own.
+    filed: PerClass<[BTreeSet<(EvictKey, Slot)>; 3]>,
     /// By class, the GPU bytes of the filed resources outside the floor:
     /// none of them was needed this step, so all of them can be evicted.
     idle: PerClass<Bytes>,
@@ -226,7 +214,7 @@ struct EvictIndex {
 impl Default for EvictIndex {
     fn default() -> Self {
         EvictIndex {
-            roots: PerClass::splat([NIL; 3]),
+            filed: PerClass::default(),
             idle: PerClass::splat(Bytes::ZERO),
             cur: Group::default(),
             prev: Group::default(),
@@ -347,10 +335,6 @@ pub(super) struct Arena {
     urgency: Vec<Option<Urgency>>,
     priority: Vec<Option<Rank>>,
     cold: Vec<Cold>,
-    /// A filed slot's children in its treap of the eviction index (`NIL`
-    /// for none): the index costs its slots eight bytes each, and nothing
-    /// to allocate as resources come and go.
-    links: Vec<[u32; 2]>,
     /// The drapes with a GPU copy, in resource order: a tile's drawable
     /// drapes of one layer are a range of it, by level.
     gpu_drapes: BTreeSet<ResourceId>,
@@ -373,10 +357,9 @@ pub(super) const SLOT_BYTES: usize = std::mem::size_of::<ResourceId>()
     + std::mem::size_of::<LoadPayload>()
     + std::mem::size_of::<Option<Urgency>>()
     + std::mem::size_of::<Option<Rank>>()
-    + std::mem::size_of::<Cold>()
-    + std::mem::size_of::<[u32; 2]>();
+    + std::mem::size_of::<Cold>();
 const _: () = assert!(SLOT_BYTES <= MAX_SLOT_BYTES);
-const MAX_SLOT_BYTES: usize = 219;
+const MAX_SLOT_BYTES: usize = 211;
 
 impl Default for Arena {
     fn default() -> Self {
@@ -396,7 +379,6 @@ impl Default for Arena {
             urgency: Vec::new(),
             priority: Vec::new(),
             cold: Vec::new(),
-            links: Vec::new(),
             gpu_drapes: BTreeSet::new(),
             pinned: None,
             evict: EvictIndex::default(),
@@ -452,7 +434,6 @@ impl Arena {
                 self.urgency[i] = None;
                 self.priority[i] = None;
                 self.cold[i] = Cold::default();
-                self.links[i] = [NIL; 2];
                 s
             }
             None => {
@@ -471,7 +452,6 @@ impl Arena {
                 self.urgency.push(None);
                 self.priority.push(None);
                 self.cold.push(Cold::default());
-                self.links.push([NIL; 2]);
                 s
             }
         };
@@ -505,7 +485,6 @@ impl Arena {
         grow(&mut self.urgency);
         grow(&mut self.priority);
         grow(&mut self.cold);
-        grow(&mut self.links);
     }
 
     /// Stops tracking the resource of `s`, which holds nothing; its slot
@@ -686,9 +665,9 @@ impl Arena {
             return;
         };
         let (k, class, idle) = (self.node_key(s.0), self.class(s), self.idle_bytes(s, h));
-        let root = self.evict.roots[class][h.i()];
-        self.evict.roots[class][h.i()] = self.tree_remove(root, &k);
         let e = &mut self.evict;
+        let was = e.filed[class][h.i()].remove(&k);
+        debug_assert!(was, "a filed slot is in the index");
         e.idle[class] = e.idle[class].minus(idle);
     }
 
@@ -701,9 +680,8 @@ impl Arena {
             return;
         };
         let (k, class, idle) = (self.node_key(s.0), self.class(s), self.idle_bytes(s, h));
-        let root = self.evict.roots[class][h.i()];
-        self.evict.roots[class][h.i()] = self.tree_insert(root, s.0, &k);
         let e = &mut self.evict;
+        e.filed[class][h.i()].insert(k);
         e.idle[class] = e.idle[class].plus(idle);
     }
 
@@ -723,7 +701,14 @@ impl Arena {
         let mut best: Option<(EvictKey, Slot)> = None;
         for c in Class::ALL.into_iter().filter(|c| class(*c)) {
             for h in held {
-                let n = self.tree_next(self.evict.roots[c][h.i()], after);
+                let set = &self.evict.filed[c][h.i()];
+                let n = match after {
+                    Some(a) => set
+                        .range((std::ops::Bound::Excluded(a), std::ops::Bound::Unbounded))
+                        .next(),
+                    None => set.first(),
+                }
+                .copied();
                 if let Some(n) = n.filter(|n| best.as_ref().is_none_or(|b| n < b)) {
                     best = Some(n);
                 }
@@ -732,126 +717,13 @@ impl Arena {
         best
     }
 
-    // The treaps: binary search trees on `(EvictKey, Slot)`, heaps on
-    // `heap_rank`, linked through `links`. A filed slot's key does not move
-    // while it is filed (`unfile` comes first), so a tree stays ordered.
-
     fn node_key(&self, n: u32) -> (EvictKey, Slot) {
         let s = Slot(n);
         (self.evict_key(s), s)
     }
 
-    fn link(&self, n: u32, side: usize) -> u32 {
-        self.links[Slot(n).i()][side]
-    }
-
-    fn set_link(&mut self, n: u32, side: usize, to: u32) {
-        self.links[Slot(n).i()][side] = to;
-    }
-
-    /// Splits the tree at `t` into the nodes below `k` and those above
-    /// (`k` is in neither).
-    fn tree_split(&mut self, t: u32, k: &(EvictKey, Slot)) -> (u32, u32) {
-        if t == NIL {
-            return (NIL, NIL);
-        }
-        if self.node_key(t) < *k {
-            let (l, r) = self.tree_split(self.link(t, 1), k);
-            self.set_link(t, 1, l);
-            (t, r)
-        } else {
-            let (l, r) = self.tree_split(self.link(t, 0), k);
-            self.set_link(t, 0, r);
-            (l, t)
-        }
-    }
-
-    /// Joins two trees, every node of `a` below every node of `b`.
-    fn tree_merge(&mut self, a: u32, b: u32) -> u32 {
-        if a == NIL {
-            return b;
-        }
-        if b == NIL {
-            return a;
-        }
-        if heap_rank(a) > heap_rank(b) {
-            let m = self.tree_merge(self.link(a, 1), b);
-            self.set_link(a, 1, m);
-            a
-        } else {
-            let m = self.tree_merge(a, self.link(b, 0));
-            self.set_link(b, 0, m);
-            b
-        }
-    }
-
-    /// Puts `n`, of key `k`, into the tree at `t`; returns its root.
-    fn tree_insert(&mut self, t: u32, n: u32, k: &(EvictKey, Slot)) -> u32 {
-        if t == NIL {
-            self.links[Slot(n).i()] = [NIL; 2];
-            return n;
-        }
-        if heap_rank(n) > heap_rank(t) {
-            let (l, r) = self.tree_split(t, k);
-            self.links[Slot(n).i()] = [l, r];
-            return n;
-        }
-        let side = usize::from(self.node_key(t) < *k);
-        let c = self.tree_insert(self.link(t, side), n, k);
-        self.set_link(t, side, c);
-        t
-    }
-
-    /// Takes the node of key `k` out of the tree at `t`; returns its root.
-    fn tree_remove(&mut self, t: u32, k: &(EvictKey, Slot)) -> u32 {
-        if t == NIL {
-            debug_assert!(false, "a filed slot is in the index");
-            return NIL;
-        }
-        match k.cmp(&self.node_key(t)) {
-            std::cmp::Ordering::Equal => self.tree_merge(self.link(t, 0), self.link(t, 1)),
-            o => {
-                let side = usize::from(o == std::cmp::Ordering::Greater);
-                let c = self.tree_remove(self.link(t, side), k);
-                self.set_link(t, side, c);
-                t
-            }
-        }
-    }
-
-    /// The least node of the tree at `t` above `after` (any, if none).
-    fn tree_next(&self, mut t: u32, after: Option<&(EvictKey, Slot)>) -> Option<(EvictKey, Slot)> {
-        let mut best = None;
-        while t != NIL {
-            let k = self.node_key(t);
-            if after.is_none_or(|a| k > *a) {
-                best = Some(k);
-                t = self.link(t, 0);
-            } else {
-                t = self.link(t, 1);
-            }
-        }
-        best
-    }
-
-    /// Appends the tree at `t` in order to `out`, if it is a treap: ordered,
-    /// and each node above its children in the heap order.
-    fn tree_walk(&self, t: u32, out: &mut Vec<(EvictKey, Slot)>) -> bool {
-        if t == NIL {
-            return true;
-        }
-        let [l, r] = self.links[Slot(t).i()];
-        let heap = [l, r]
-            .iter()
-            .all(|c| *c == NIL || heap_rank(*c) < heap_rank(t));
-        heap && self.tree_walk(l, out) && {
-            out.push(self.node_key(t));
-            self.tree_walk(r, out)
-        }
-    }
-
     /// The eviction index is exactly the filed slots holding a copy outside
-    /// transit, each in its class's and holdings' treap by its key, the idle
+    /// transit, each in its class's and holdings' ordered set by its key, the idle
     /// bytes their sum, and every grouped slot listed in the group of its
     /// time: checked by `audit` in debug builds against a recomputation.
     pub fn evict_index_consistent(&self) -> bool {
@@ -871,15 +743,10 @@ impl Arena {
                 idle[class] = idle[class].plus(self.idle_bytes(s, h));
             }
         }
-        let mut got = Vec::new();
         for c in Class::ALL {
             for h in Held::ALL {
-                got.clear();
-                if !self.tree_walk(self.evict.roots[c][h.i()], &mut got) {
-                    return false;
-                }
                 want[c][h.i()].sort_unstable();
-                if got != want[c][h.i()] {
+                if !self.evict.filed[c][h.i()].iter().eq(want[c][h.i()].iter()) {
                     return false;
                 }
             }
