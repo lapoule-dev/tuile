@@ -10,6 +10,27 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # No assistant attribution in the history: every commit of a pull request
+  # goes through the same check as the local hook (`.githooks/commit-msg`).
+  commit-messages:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Refuse commits that carry an assistant attribution
+        run: |
+          status=0
+          for c in $(git rev-list ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}); do
+            git log -1 --format=%B "$c" > "$RUNNER_TEMP/msg"
+            if ! sh .githooks/commit-msg "$RUNNER_TEMP/msg"; then
+              echo "::error::commit $c carries an assistant attribution"
+              status=1
+            fi
+          done
+          exit $status
+
   lint:
     runs-on: ubuntu-latest
     steps:
