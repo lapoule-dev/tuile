@@ -235,8 +235,8 @@ impl Residency for BudgetResidency<'_> {
 pub struct Sim {
     /// The profile.
     pub profile: Profile,
-    /// The budget under test, in lockstep with today's engine frozen
-    /// (`tests/reference/`): every step is compared to it.
+    /// The budget under test, checked step by step against the reference
+    /// recorded from the engine before O1 (`tests/reference/`).
     pub budget: Lockstep,
     /// The network.
     pub net: SimNet,
@@ -274,6 +274,11 @@ pub struct Sim {
     pub decide_us: Vec<(Micros, f64)>,
     /// What the heap saw during each `decide` call, with the step's time.
     pub decide_allocs: Vec<DecideAllocs>,
+    /// The host's side of a delta step (O1.3): wall time of building the
+    /// delta from the last need and this one (`NeedDelta::diff`, what the
+    /// runtime computes before `decide`), µs, and the blocks it allocated,
+    /// with the step's time. Absent on a whole-need step.
+    pub diff_us: Vec<(Micros, f64, u64)>,
     /// Also count the allocations of the step's output alone (a clone of
     /// its `Decisions`), for [`DecideAllocs::output`]: off by default, it
     /// costs a clone per step.
@@ -296,8 +301,8 @@ pub struct Sim {
 }
 
 impl Sim {
-    /// A simulation on `profile`, seeded, its budget in lockstep with the
-    /// frozen reference.
+    /// A simulation on `profile`, seeded, its budget checked against the
+    /// recorded reference.
     pub fn new(profile: Profile, seed: u64) -> Self {
         let budget = Lockstep::new(profile.budget.clone()).expect("a valid profile");
         Self::with(profile, seed, budget)
@@ -336,6 +341,7 @@ impl Sim {
             wanted_at: BTreeMap::new(),
             waits: Vec::new(),
             decide_us: Vec::new(),
+            diff_us: Vec::new(),
             decide_allocs: Vec::new(),
             count_output: false,
             levels: BTreeMap::new(),
@@ -418,7 +424,10 @@ impl Sim {
         // since the step before (built outside what is timed and counted).
         let input = match &self.need_last {
             Some(last) => {
-                self.delta.diff(last, &need);
+                let clock = std::time::Instant::now();
+                let ((), heap) = super::alloc::counted(|| self.delta.diff(last, &need));
+                let us = clock.elapsed().as_secs_f64() * 1e6;
+                self.diff_us.push((self.now, us, heap.allocs));
                 FrameInput::from_delta(self.frame, self.now, &self.delta)
             }
             None => FrameInput::new(self.frame, self.now, &need),
@@ -426,9 +435,8 @@ impl Sim {
         .with_presence(&self.net.store);
         self.step_events = self.fed - self.fed_at_decide;
         self.fed_at_decide = self.fed;
-        // The real budget's call alone is timed and counted; the frozen
-        // reference decides after it, on the whole need, and the two are
-        // compared.
+        // The budget's call alone is timed and counted; its digests are
+        // folded after it, and compared with the recorded reference.
         let (d, (heap, us)) = self.budget.decide_with(input, &need, |b, i| {
             let clock = std::time::Instant::now();
             let (d, heap) = super::alloc::counted(|| b.decide(i));

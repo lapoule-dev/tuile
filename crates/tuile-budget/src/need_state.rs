@@ -21,19 +21,21 @@ use std::cmp::Reverse;
 use super::imagery::TexelFootprint;
 use super::need::{DeltaOp, ImageryNeed, LayerReach, Membership, Need, NeedDelta, NeedSet};
 use super::priority::Quantised;
-use super::sorted::{push_grown, SortedMap};
+use super::sorted::SortedCols;
 use super::types::{sat_u32, Class, TileId};
 use super::TileInfo;
 
 /// What a step reads of a wanted tile's need: its best entry's.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Wanted {
+    /// The tile's parent's id, when `has_parent` (0 otherwise): packed
+    /// apart from its flag, so a kept record is 80 bytes, not 88.
+    parent: u64,
     /// The tile's level in its tree.
     pub level: u32,
-    /// The tile's parent.
-    pub parent: Option<TileId>,
     /// The mesh's class.
     pub class: Class,
+    has_parent: bool,
     /// The imagery the tile wants.
     pub imagery: Option<WantedImagery>,
 }
@@ -55,7 +57,10 @@ impl WantedImagery {
 }
 
 /// A list of layers: up to two in place — a tile wears one or two — more
-/// on the heap. A kept need holds no allocation of its own for them.
+/// on the heap. A kept need holds no allocation of its own for them: a
+/// boxed list for every tile costs a block each time a tile enters or its
+/// layers change (measured on the tour: internal allocations per step p99
+/// 38 -> 49).
 #[derive(Clone, Debug, PartialEq)]
 enum Layers {
     Inline(u8, [LayerReach; 2]),
@@ -96,19 +101,26 @@ impl Layers {
 impl Default for Wanted {
     fn default() -> Self {
         Wanted {
+            parent: 0,
             level: 0,
-            parent: None,
             class: Class::TerrainMesh,
+            has_parent: false,
             imagery: None,
         }
     }
 }
 
 impl Wanted {
+    /// The tile's parent.
+    pub fn parent(&self) -> Option<TileId> {
+        self.has_parent.then_some(TileId(self.parent))
+    }
+
     /// Becomes `n`'s.
     fn assign(&mut self, n: &Need) {
         self.level = n.level;
-        self.parent = n.parent;
+        self.parent = n.parent.map_or(0, |p| p.0);
+        self.has_parent = n.parent.is_some();
         self.class = n.class;
         match (&mut self.imagery, &n.imagery) {
             (Some(w), Some(i)) => {
@@ -154,6 +166,10 @@ impl Default for TileNeed {
         }
     }
 }
+
+// A kept record's size: the budget keeps one per wanted tile, and the step
+// reads them all. It holds no `usize`, so the bound holds on wasm32 too.
+const _: () = assert!(std::mem::size_of::<TileNeed>() <= 80);
 
 /// The order of a tile's entries, larger first: the order the whole need's
 /// sort gave them.
@@ -219,13 +235,10 @@ enum Source<'s> {
     Full(&'s NeedSet, &'s [(TileId, u32)]),
 }
 
-/// The tiles that enter in one change merged in from a buffer, at most.
-const BUFFERED: usize = 64;
-
 /// The need the budget keeps, and the buffers that change it.
 #[derive(Debug, Default)]
 pub(crate) struct NeedState {
-    tiles: SortedMap<TileId, TileNeed>,
+    tiles: SortedCols<TileId, TileNeed>,
     listed: usize,
     rejected: usize,
     blockers: usize,
@@ -241,15 +254,11 @@ pub(crate) struct NeedState {
 struct Scratch {
     /// A delta's words, sorted, when it does not come sorted.
     ops: Vec<(TileId, DeltaOp)>,
-    /// The tiles that entered, in order, merged in at the end.
-    inserted: Vec<(TileId, TileNeed)>,
-    /// The tree positions of the tiles that entered, likewise.
-    positions: Vec<(TileId, TileInfo)>,
 }
 
 impl NeedState {
     /// Each wanted tile's best entry, in tile order.
-    pub fn tiles(&self) -> &SortedMap<TileId, TileNeed> {
+    pub fn tiles(&self) -> &SortedCols<TileId, TileNeed> {
         &self.tiles
     }
 
@@ -273,7 +282,7 @@ impl NeedState {
     pub fn apply_delta(
         &mut self,
         d: &NeedDelta,
-        positions: &mut SortedMap<TileId, TileInfo>,
+        positions: &mut SortedCols<TileId, TileInfo>,
     ) -> u32 {
         let named = sat_u32(d.tiles());
         match d.sorted_ops() {
@@ -296,7 +305,7 @@ impl NeedState {
     /// Becomes the whole need `n`: every tile resolved again, those it no
     /// longer lists gone; `positions` gets every tile's tree position.
     /// Returns its entries.
-    pub fn apply_full(&mut self, n: &NeedSet, positions: &mut SortedMap<TileId, TileInfo>) -> u32 {
+    pub fn apply_full(&mut self, n: &NeedSet, positions: &mut SortedCols<TileId, TileInfo>) -> u32 {
         // A whole need is the first step's, or a resynchronisation's: its
         // grouping is not kept.
         let mut grouped = Vec::new();
@@ -304,10 +313,10 @@ impl NeedState {
         // An empty map takes its tiles as they come: room for exactly them.
         let runs = (Runs { g: &grouped, i: 0 }).count();
         if self.tiles.len() == 0 {
-            self.tiles.values_mut().reserve_exact(runs);
+            self.tiles.reserve_exact(runs);
         }
         if positions.len() == 0 {
-            positions.values_mut().reserve_exact(runs);
+            positions.reserve_exact(runs);
         }
         let runs = Runs { g: &grouped, i: 0 };
         self.apply(runs, Source::Full(n, &grouped), true, positions);
@@ -326,31 +335,24 @@ impl NeedState {
         ops: impl Iterator<Item = (TileId, DeltaOp)>,
         src: Source<'_>,
         whole: bool,
-        positions: &mut SortedMap<TileId, TileInfo>,
+        positions: &mut SortedCols<TileId, TileInfo>,
     ) {
-        let mut inserted = std::mem::take(&mut self.scratch.inserted);
-        let mut entered = std::mem::take(&mut self.scratch.positions);
-        inserted.clear();
-        entered.clear();
-        // An empty map takes its tiles as they come, in order. Otherwise the
-        // first tiles that enter wait in a buffer to be merged in; beyond
-        // it (a burst: a jump, a first view) they go to the map's end, and
-        // the map is sorted once.
+        // The tiles that enter go to the end of the map, and their tree
+        // positions to the end of theirs: `ops` come in tile order, so each
+        // tail is sorted, and is merged in place once the change is done.
         let old = self.tiles.len();
         let old_positions = positions.len();
-        let (direct, direct_positions) = (old == 0, old_positions == 0);
-        let (mut spilled, mut spilled_positions) = (false, false);
-        let mut cursor = 0;
+        let (mut cursor, mut at_position) = (0, 0);
         let mut removed = false;
         for (t, op) in ops {
-            let at = cursor + self.tiles.values_mut()[cursor..old].partition_point(|e| e.0 < t);
+            let at = cursor + self.tiles.key_column()[cursor..old].partition_point(|k| *k < t);
             if whole {
                 for k in cursor..at {
                     self.uncount(k);
                     removed = true;
                 }
             }
-            let found = at < old && self.tiles.values_mut()[at].0 == t;
+            let found = at < old && self.tiles.key_column()[at] == t;
             cursor = if found { at + 1 } else { at };
             let mut r = Resolve::default();
             match (op, src) {
@@ -371,7 +373,7 @@ impl NeedState {
             }
             let info = if found {
                 self.uncount(at);
-                let info = r.finish(&mut self.tiles.values_mut()[at].1);
+                let info = r.finish(self.tiles.value_at_mut(at));
                 match info {
                     Some(_) => self.count(at),
                     None => removed = true,
@@ -385,24 +387,19 @@ impl NeedState {
                     self.listed += n(rec.listed);
                     self.rejected += n(rec.rejected);
                     self.blockers += n(rec.blockers);
-                    if direct || inserted.len() == BUFFERED {
-                        spilled |= !direct;
-                        push_grown(self.tiles.values_mut(), (t, rec));
-                    } else {
-                        inserted.push((t, rec));
-                    }
+                    self.tiles.push(t, rec);
                 }
                 info
             };
             if let Some(info) = info {
-                let p = positions.values_mut();
-                match p[..old_positions].binary_search_by(|e| e.0.cmp(&t)) {
-                    Ok(i) => p[i].1 = info,
-                    Err(_) if direct_positions || entered.len() == BUFFERED => {
-                        spilled_positions |= !direct_positions;
-                        push_grown(p, (t, info));
-                    }
-                    Err(_) => entered.push((t, info)),
+                let keys = &positions.key_column()[at_position..old_positions];
+                let i = at_position + keys.partition_point(|k| *k < t);
+                if i < old_positions && positions.key_column()[i] == t {
+                    *positions.value_at_mut(i) = info;
+                    at_position = i + 1;
+                } else {
+                    positions.push(t, info);
+                    at_position = i;
                 }
             }
         }
@@ -412,17 +409,12 @@ impl NeedState {
                 removed = true;
             }
         }
+        let entered = self.tiles.len() - old;
         if removed {
             self.compact();
         }
-        self.tiles.add_new(&mut inserted, spilled);
-        positions.add_new(&mut entered, spilled_positions);
-        debug_assert!(
-            self.tiles.values_mut().windows(2).all(|w| w[0].0 < w[1].0),
-            "the wanted tiles stay sorted and distinct"
-        );
-        self.scratch.inserted = inserted;
-        self.scratch.positions = entered;
+        self.tiles.merge_tail(self.tiles.len() - entered);
+        positions.merge_tail(old_positions);
     }
 
     /// Drops the records marked to go (no entry), in one pass.
@@ -432,7 +424,7 @@ impl NeedState {
 
     /// Takes a record's entries off the counts, and marks it to go.
     fn uncount(&mut self, i: usize) {
-        let rec = &mut self.tiles.values_mut()[i].1;
+        let rec = self.tiles.value_at_mut(i);
         let n = |x: u32| usize::try_from(x).unwrap_or(usize::MAX);
         let (l, r, b) = (n(rec.listed), n(rec.rejected), n(rec.blockers));
         rec.listed = 0;
@@ -443,7 +435,7 @@ impl NeedState {
 
     /// Counts a record's entries.
     fn count(&mut self, i: usize) {
-        let rec = &self.tiles.values_mut()[i].1;
+        let rec = self.tiles.value_at(i);
         let n = |x: u32| usize::try_from(x).unwrap_or(usize::MAX);
         let (l, r, b) = (n(rec.listed), n(rec.rejected), n(rec.blockers));
         self.listed += l;
@@ -456,7 +448,7 @@ impl NeedState {
     #[cfg(debug_assertions)]
     fn check(&self) {
         let mut fresh = NeedState::default();
-        let mut positions = SortedMap::default();
+        let mut positions = SortedCols::default();
         let mut grouped = Vec::new();
         self.shadow.grouped_into(&mut grouped);
         fresh.apply(
@@ -620,7 +612,7 @@ mod tests {
     fn the_need_kept_through_deltas_is_the_whole_needs() {
         let mut m = Mix(7);
         let mut by_delta = NeedState::default();
-        let mut positions = SortedMap::default();
+        let mut positions = SortedCols::default();
         let mut prev = NeedSet::new();
         let mut delta = NeedDelta::new();
         for step in 0..400 {
@@ -658,7 +650,7 @@ mod tests {
             delta.diff(&prev, &next);
             by_delta.apply_delta(&delta, &mut positions);
             let mut whole = NeedState::default();
-            let mut fresh = SortedMap::default();
+            let mut fresh = SortedCols::default();
             whole.apply_full(&next, &mut fresh);
             assert_eq!(seen(&by_delta), seen(&whole), "step {step}");
             for (t, info) in fresh.iter() {
@@ -674,13 +666,13 @@ mod tests {
     fn a_whole_need_resynchronises() {
         let mut m = Mix(11);
         let mut s = NeedState::default();
-        let mut positions = SortedMap::default();
+        let mut positions = SortedCols::default();
         let a = need(&mut m);
         let b = need(&mut m);
         s.apply_delta(&NeedDelta::between(&NeedSet::new(), &a), &mut positions);
         s.apply_full(&b, &mut positions);
         let mut whole = NeedState::default();
-        let mut fresh = SortedMap::default();
+        let mut fresh = SortedCols::default();
         whole.apply_full(&b, &mut fresh);
         assert_eq!(seen(&s), seen(&whole));
         for (t, info) in fresh.iter() {
@@ -702,7 +694,7 @@ mod tests {
         n.drawn.push((t, b.clone()));
         n.ring.push((t, ring.clone()));
         let mut s = NeedState::default();
-        let mut positions = SortedMap::default();
+        let mut positions = SortedCols::default();
         s.apply_full(&n, &mut positions);
         let rec = s.tiles().get(&t).unwrap();
         assert_eq!(rec.membership, Membership::Drawn);
