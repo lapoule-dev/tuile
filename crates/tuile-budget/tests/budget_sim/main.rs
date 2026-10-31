@@ -34,3 +34,16 @@ mod world;
 /// on a thread that armed it (`alloc::counted`).
 #[global_allocator]
 static HEAP: alloc::Counting = alloc::Counting;
+
+/// Joins the runs' lines recorded under `TUILE_BLESS_REFERENCE=1` into
+/// `tests/reference/recorded.txt`: run after `budget_sim` and
+/// `budget_properties` have recorded (see `tests/reference/mod.rs`).
+#[test]
+#[ignore = "records the reference: TUILE_BLESS_REFERENCE=1, after the suites"]
+fn assemble_the_recorded_reference() {
+    let runs = reference::assemble();
+    eprintln!(
+        "{runs} runs assembled into {}",
+        reference::recorded_path().display()
+    );
+}

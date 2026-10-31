@@ -22,6 +22,7 @@
 // Not every binary that includes the harness uses all of it.
 #![allow(dead_code)]
 
+pub mod digest;
 pub mod frozen;
 
 use tuile_budget::{
@@ -43,6 +44,114 @@ pub struct Lockstep {
     pub frozen: Option<frozen::Budget>,
     /// Steps compared so far.
     pub steps: u64,
+    /// The frozen engine's per-step digests, recorded for the reference
+    /// file (`recorded.txt`) under `TUILE_BLESS_REFERENCE=1`.
+    record: Option<Recorder>,
+}
+
+/// A run's recorded digests: its key, its chains, its checkpoint lines.
+#[derive(Debug)]
+struct Recorder {
+    key: String,
+    chains: digest::Chains,
+    lines: Vec<String>,
+}
+
+impl Recorder {
+    fn new(key: String) -> Self {
+        assert!(
+            !key.contains('\t') && !key.contains('\n'),
+            "a run's key is one field"
+        );
+        Recorder {
+            key,
+            chains: digest::Chains::default(),
+            lines: Vec::new(),
+        }
+    }
+
+    fn line(&mut self, at: &str) {
+        let c = self.chains.0;
+        self.lines.push(format!(
+            "{}\t{at}\t{:016x} {:016x} {:016x} {:016x}",
+            self.key, c[0], c[1], c[2], c[3]
+        ));
+    }
+}
+
+/// Where the recorded reference lives.
+pub fn recorded_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reference/recorded.txt")
+}
+
+/// Where each run writes its lines while the reference is recorded, before
+/// they are assembled into [`recorded_path`] (`assemble`): a directory of
+/// the system's temporary one, to empty before recording.
+pub fn parts_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("tuile-budget-reference-parts")
+}
+
+/// Whether this run records the reference.
+pub fn blessing() -> bool {
+    std::env::var_os("TUILE_BLESS_REFERENCE").is_some()
+}
+
+/// The key of a run made on this thread: the test's name (libtest names a
+/// test's thread after it), and the how-manyth run of the test it is.
+pub fn thread_key(prefix: &str) -> String {
+    thread_local! {
+        static RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    let name = std::thread::current()
+        .name()
+        .map(str::to_owned)
+        .filter(|n| n != "main")
+        .expect(
+            "the recorded reference keys a run by its test's thread name: run the tests \
+             with libtest's threads (not --test-threads=1)",
+        );
+    let n = RUNS.with(|r| {
+        let n = r.get();
+        r.set(n + 1);
+        n
+    });
+    format!("{prefix}/{name}#{n}")
+}
+
+/// Joins every run's lines, by key, into the recorded reference.
+pub fn assemble() -> usize {
+    let mut runs: Vec<(String, String)> = std::fs::read_dir(parts_dir())
+        .expect("recorded parts")
+        .map(|e| {
+            let text = std::fs::read_to_string(e.expect("a part").path()).expect("a part");
+            let key = text.split('\t').next().unwrap_or_default().to_owned();
+            (key, text)
+        })
+        .collect();
+    runs.sort();
+    let mut out = String::new();
+    for (_, text) in &runs {
+        out.push_str(text);
+    }
+    std::fs::write(recorded_path(), out).expect("the recorded reference written");
+    runs.len()
+}
+
+impl Drop for Lockstep {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        if let Some(mut r) = self.record.take() {
+            r.line(&format!("end:{:08}", self.steps));
+            let dir = parts_dir();
+            std::fs::create_dir_all(&dir).expect("the parts directory");
+            let name = format!("{:016x}.txt", digest::of(r.key.as_bytes()));
+            let mut text = r.lines.join("\n");
+            text.push('\n');
+            std::fs::write(dir.join(name), text).expect("a run's part written");
+        }
+    }
 }
 
 impl std::ops::Deref for Lockstep {
@@ -62,6 +171,7 @@ impl Lockstep {
                 real,
                 frozen: Some(frozen),
                 steps: 0,
+                record: blessing().then(|| Recorder::new(thread_key("sim"))),
             }),
             (Err(a), Err(b)) => {
                 assert_eq!(a, b, "lockstep: the configuration is refused differently");
@@ -83,7 +193,18 @@ impl Lockstep {
             real: Budget::new(cfg)?,
             frozen: None,
             steps: 0,
+            record: None,
         })
+    }
+
+    /// Both budgets on `cfg`, the run recorded under `key` (not its
+    /// thread's name): for a fixed corpus run from one test.
+    pub fn keyed(cfg: BudgetConfig, key: String) -> Result<Self, ConfigError> {
+        let mut l = Lockstep::new(cfg)?;
+        if blessing() {
+            l.record = Some(Recorder::new(key));
+        }
+        Ok(l)
     }
 
     /// One step on both, compared: a step given the whole need.
@@ -124,8 +245,16 @@ impl Lockstep {
                 presence: input.presence,
             });
             Self::compare(self.steps, &self.real, frozen, need, &d, &f);
+            if let Some(rec) = &mut self.record {
+                rec.chains.fold(frozen_parts(frozen, need, &f));
+            }
         }
         self.steps += 1;
+        if let Some(rec) = &mut self.record {
+            if self.steps.is_multiple_of(digest::CHECKPOINT) {
+                rec.line(&format!("{:08}", self.steps));
+            }
+        }
         (d, r)
     }
 
@@ -287,6 +416,14 @@ impl Lockstep {
                 "lockstep: after apply_arrivals before step {}: the ledgers diverge",
                 self.steps
             );
+            if let Some(rec) = &mut self.record {
+                rec.chains.fold([
+                    0,
+                    digest::ledger(&f.ledger(), &f.audit(), f.tracked()),
+                    0,
+                    0,
+                ]);
+            }
         }
     }
 
@@ -309,6 +446,14 @@ impl Lockstep {
                 self.steps,
                 rs.diff(&fs).join("; ")
             );
+            if let Some(rec) = &mut self.record {
+                rec.chains.fold([
+                    digest::of(&(&b.gpu, &b.decoded)),
+                    digest::ledger(&f.ledger(), &f.audit(), f.tracked()),
+                    0,
+                    digest::of(&fs),
+                ]);
+            }
         }
         a
     }
@@ -329,6 +474,42 @@ impl Lockstep {
         }
         a
     }
+}
+
+/// The frozen engine's parts of a step (`digest`): its decisions, its
+/// ledger, the residency and views of every tile the need names and of
+/// every resource the step names, its whole internal state.
+fn frozen_parts(f: &frozen::Budget, need: &NeedSet, d: &Decisions) -> [u64; 4] {
+    let mut views = digest::Fnv::default();
+    let res = f.residency();
+    for (_, t, _) in need.entries() {
+        use digest::Feed;
+        (res.resident(t), res.drawable(t), res.loaded(t)).feed(&mut views);
+        let r = ResourceId::Mesh(t);
+        digest::feed_view(&mut views, r, f.resource(r).map(frozen_view_fields));
+    }
+    for r in named(d) {
+        digest::feed_view(&mut views, r, f.resource(r).map(frozen_view_fields));
+    }
+    [
+        digest::decisions(d),
+        digest::ledger(&f.ledger(), &f.audit(), f.tracked()),
+        views.finish(),
+        digest::of(&f.snapshot()),
+    ]
+}
+
+/// Every resource a step names: drawn meshes and the drapes they wear,
+/// starts, deliveries, evictions, releases.
+fn named(d: &Decisions) -> impl Iterator<Item = ResourceId> + '_ {
+    d.draw
+        .items
+        .iter()
+        .flat_map(|i| std::iter::once(i.mesh).chain(i.drapes.iter().map(|x| x.resource)))
+        .chain(d.start.iter().map(|s| s.resource))
+        .chain(d.deliver.iter().map(|(r, _)| *r))
+        .chain(d.evict.iter().copied())
+        .chain(d.release.iter().copied())
 }
 
 /// The view's fields as a tuple, comparable with the frozen twin's.
