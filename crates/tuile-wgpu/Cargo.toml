@@ -15,11 +15,11 @@ bytemuck = { workspace = true }
 futures-util = { workspace = true }
 glam = { workspace = true }
 thiserror = { workspace = true }
-tuile-atmosphere = { version = "0.14.0", path = "../tuile-atmosphere", features = ["wgpu"] }
-tuile-core = { version = "0.14.0", path = "../tuile-core" }
+tuile-atmosphere = { version = "0.15.0", path = "../tuile-atmosphere", features = ["wgpu"] }
+tuile-core = { version = "0.15.0", path = "../tuile-core" }
 # The shapes a host hands over, their vertex packing and the light they share
 # with the film: data and WGSL text, no GPU of its own.
-tuile-overlay = { version = "0.14.0", path = "../tuile-overlay" }
+tuile-overlay = { version = "0.15.0", path = "../tuile-overlay" }
 # The GPU block encoder (feature `gpu`, the workspace's wgpu), used only when
 # the consumer chose compression.
 texcomp = { workspace = true, features = ["gpu"] }

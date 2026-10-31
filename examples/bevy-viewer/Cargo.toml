@@ -14,8 +14,8 @@ workspace = true
 [dependencies]
 bevy = { version = "0.20.0", default-features = false, features = ["std", "bevy_render", "bevy_core_pipeline", "bevy_camera", "bevy_log", "bevy_pbr", "bevy_window", "bevy_winit", "bevy_asset", "png", "multi_threaded", "x11", "tonemapping_luts", "ktx2", "zstd_rust"] }
 glam = { workspace = true }
-tuile-core = { version = "0.14.0", path = "../../crates/tuile-core" }
-tuile-bevy = { version = "0.14.0", path = "../../crates/tuile-bevy" }
+tuile-core = { version = "0.15.0", path = "../../crates/tuile-core" }
+tuile-bevy = { version = "0.15.0", path = "../../crates/tuile-bevy" }
 url = { workspace = true }
 
 # A page: the JS bindings, and the page's address the options are read from.

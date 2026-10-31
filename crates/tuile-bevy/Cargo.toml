@@ -17,11 +17,11 @@ workspace = true
 bevy = { version = "0.20.0", default-features = false, features = ["std", "bevy_render", "bevy_core_pipeline", "bevy_camera", "bevy_log"] }
 glam = { workspace = true }
 tracing = { workspace = true }
-tuile-camera = { version = "0.14.0", path = "../tuile-camera" }
-tuile-core = { version = "0.14.0", path = "../tuile-core" }
-tuile-planetary = { version = "0.14.0", path = "../tuile-planetary" }
-tuile-terrain = { version = "0.14.0", path = "../tuile-terrain" }
-tuile-wgpu = { version = "0.14.0", path = "../tuile-wgpu" }
+tuile-camera = { version = "0.15.0", path = "../tuile-camera" }
+tuile-core = { version = "0.15.0", path = "../tuile-core" }
+tuile-planetary = { version = "0.15.0", path = "../tuile-planetary" }
+tuile-terrain = { version = "0.15.0", path = "../tuile-terrain" }
+tuile-wgpu = { version = "0.15.0", path = "../tuile-wgpu" }
 url = { workspace = true }
 wgpu = { workspace = true }
 
@@ -29,14 +29,14 @@ wgpu = { workspace = true }
 # sources named by address fetched over the native HTTP stack.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-tuile-core = { version = "0.14.0", path = "../tuile-core", features = ["rt-tokio"] }
-tuile-native-fetchers = { version = "0.14.0", path = "../tuile-native-fetchers" }
+tuile-core = { version = "0.15.0", path = "../tuile-core", features = ["rt-tokio"] }
+tuile-native-fetchers = { version = "0.15.0", path = "../tuile-native-fetchers" }
 
 # A page: fetch for the sources, the decode workers of tuile's web viewer,
 # and the server as a future on the page's thread.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3.76"
-tuile-web = { version = "0.14.0", path = "../tuile-web" }
+tuile-web = { version = "0.15.0", path = "../tuile-web" }
 wasm-bindgen = "0.2.99"
 wasm-bindgen-futures = "0.4.49"
 web-sys = { version = "0.3.76", features = ["Window", "Worker", "WorkerOptions", "WorkerType"] }

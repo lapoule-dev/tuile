@@ -11,22 +11,22 @@ authors.workspace = true
 bytemuck = { workspace = true }
 glam = { workspace = true }
 thiserror = { workspace = true }
-tuile-atmosphere = { version = "0.14.0", path = "../tuile-atmosphere", features = ["wgpu"] }
+tuile-atmosphere = { version = "0.15.0", path = "../tuile-atmosphere", features = ["wgpu"] }
 # The stitching's band and the strips of a tile that has none.
-tuile-core = { version = "0.14.0", path = "../tuile-core" }
-tuile-film = { version = "0.14.0", path = "../tuile-film" }
+tuile-core = { version = "0.15.0", path = "../tuile-core" }
+tuile-film = { version = "0.15.0", path = "../tuile-film" }
 # The overlay vertex and the light a lit mesh is given, shared with the viewer.
-tuile-overlay = { version = "0.14.0", path = "../tuile-overlay" }
+tuile-overlay = { version = "0.15.0", path = "../tuile-overlay" }
 wgpu = { workspace = true }
 
 [dev-dependencies]
 image = { workspace = true }
 # The made-up terrain of tests/no_seams.rs.
-tuile-terrain = { version = "0.14.0", path = "../tuile-terrain" }
+tuile-terrain = { version = "0.15.0", path = "../tuile-terrain" }
 pollster = { workspace = true }
 tempfile = { workspace = true }
 # The climb of tests/continuous.rs traced to MCAP, as every tape is.
-tuile-tape = { version = "0.14.0", path = "../tuile-tape" }
+tuile-tape = { version = "0.15.0", path = "../tuile-tape" }
 
 [lints]
 workspace = true

@@ -26,5 +26,5 @@ tokio-rustls = { version = "0.26", default-features = false }
 rustls-pki-types = { version = "1", features = ["std"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tuile-cesium-ion = { version = "0.14.0", path = "../../crates/tuile-cesium-ion", features = ["proxy"] }
+tuile-cesium-ion = { version = "0.15.0", path = "../../crates/tuile-cesium-ion", features = ["proxy"] }
 url = { workspace = true }
