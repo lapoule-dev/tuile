@@ -20,6 +20,8 @@ pub mod need;
 mod need_state;
 pub mod observe;
 pub mod priority;
+#[doc(hidden)]
+pub mod snapshot;
 mod sorted;
 mod state;
 pub mod stats;
@@ -206,7 +208,7 @@ pub struct Budget {
     /// Every tile the budget knows the place of: what the need told it, as
     /// long as the tile or a descendant is referenced. A sorted vector: it
     /// changes only by what the need changes.
-    tiles: sorted::SortedMap<TileId, TileInfo>,
+    tiles: sorted::SortedCols<TileId, TileInfo>,
     /// The need last read, each wanted tile's best entry: a step changes
     /// it by what changed.
     need: need_state::NeedState,
@@ -423,6 +425,89 @@ impl Budget {
     /// How many resources the budget tracks.
     pub fn tracked(&self) -> usize {
         self.arena.len()
+    }
+
+    /// The whole internal state, in a canonical form: for the tests that
+    /// compare it against a reference step by step. Not part of the API.
+    #[doc(hidden)]
+    pub fn snapshot(&self) -> snapshot::Snapshot {
+        let a = &self.arena;
+        let mut resources: Vec<snapshot::ResourceSnapshot> = a
+            .iter()
+            .map(|s| {
+                let id = a.id(s);
+                let (level, distance, last_needed) = a.order_fields(s);
+                let c = a.cold(s);
+                snapshot::ResourceSnapshot {
+                    id,
+                    class: a.class(s),
+                    level,
+                    distance,
+                    last_needed,
+                    first_wanted: c.first_wanted(),
+                    unneeded_since: c.unneeded_since(),
+                    load: match a.load(s) {
+                        state::Load::Idle => None,
+                        state::Load::Loading {
+                            gen,
+                            source,
+                            started,
+                            epoch,
+                        } => Some((gen, source, started, epoch)),
+                    },
+                    cpu: a
+                        .cpu(s)
+                        .map(|c| (c.gen, c.cost, c.epoch, c.delivered_before)),
+                    transit: a.transit(s).map(|t| (t.gen, t.cost, t.epoch)),
+                    gpu: a.gpu(s).map(|g| (g.gen, g.bytes, g.epoch)),
+                    presence: c.presence,
+                    store_missed: c.store_missed,
+                    failures: c.failures,
+                    retry_at: c.retry_at,
+                    discards: c.discards,
+                    deliver_after: c.deliver_after,
+                    urgency: a.urgency(s),
+                    priority: a.priority(s).map(|p| p.key(id)),
+                }
+            })
+            .collect();
+        resources.sort_unstable_by_key(|r| r.id);
+        snapshot::Snapshot {
+            resources,
+            tiles: self
+                .tiles
+                .iter()
+                .map(|(t, i)| (*t, i.parent(), i.level, i.rect().map(snapshot::rect_bits)))
+                .collect(),
+            imagery_prev: self.imagery_prev.iter().map(|(k, v)| (*k, *v)).collect(),
+            held_last: self.held_last.iter().copied().collect(),
+            drawn_last: self.drawn_last.iter().copied().collect(),
+            worn_last: self.worn_last.clone(),
+            swap_last: self.swap_last.iter().copied().collect(),
+            chain_last: self.chain_last.iter().copied().collect(),
+            active: self.active.iter().copied().collect(),
+            floor_set: self.floor_set.iter().copied().collect(),
+            ranked_last: self.ranked_last.clone(),
+            wanted_last: self.wanted_last.iter().copied().collect(),
+            recent: self.recent.iter().map(|(k, v)| (*k, *v)).collect(),
+            epochs: self.epochs,
+            layer_epochs: self.layer_epochs.iter().map(|(k, v)| (*k, *v)).collect(),
+            next_gen: self.next_gen,
+            last_now: self.last_now,
+            scale: self.scale,
+            scale_fine: self.scale_fine,
+            ledger: self.ledger,
+            in_flight: self.in_flight,
+            local_reads: self.local_reads,
+            underflows: self.underflows,
+            fatal: self.fatal.clone(),
+            pending: self.pending.clone(),
+            pressure: self.pressure,
+            thermal: self.thermal,
+            factor: self.factor,
+            steps: self.steps,
+            events: self.events.len(),
+        }
     }
 
     /// Drops the buffers a step reuses from one step to the next, which

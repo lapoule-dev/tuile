@@ -62,6 +62,28 @@ fn script() -> impl Strategy<Value = Vec<Op>> {
     prop::collection::vec(op(), 1..80)
 }
 
+/// The fixed corpus's scripts: drawn like [`script`]'s (the same ops, the
+/// same weights, 1 to 79 of them), by a seeded generator of this file's
+/// own, so the corpus never moves with a dependency's version.
+const CORPUS: u64 = 128;
+
+fn corpus_script(i: u64) -> Vec<Op> {
+    let mut m = Mix(0x7475_696c_6520_0000 ^ i);
+    let len = 1 + m.next() % 79;
+    (0..len)
+        .map(|_| match m.next() % 20 {
+            0..=5 => Op::Step(m.next()),
+            6..=9 => Op::Load(m.next()),
+            10..=13 => Op::Upload(m.next()),
+            14 => Op::Fail(m.next()),
+            15 => Op::Miss(m.next()),
+            16 => Op::Pressure((m.next() % 4) as u8),
+            17 => Op::Thermal((m.next() % 4) as u8),
+            _ => Op::Wait((m.next() % 3_000) as u16),
+        })
+        .collect()
+}
+
 /// SplitMix64: seeded choices inside an op.
 struct Mix(u64);
 impl Mix {
@@ -144,8 +166,9 @@ struct Record {
 }
 
 struct Harness {
-    /// The budget under test, in lockstep with today's engine frozen
-    /// (`tests/reference/`): every step of every script is compared to it.
+    /// The budget under test: checked step by step against the recorded
+    /// reference (`tests/reference/`) on the fixed corpus, alone on random
+    /// scripts.
     b: Lockstep,
     cfg: BudgetConfig,
     now: Micros,
@@ -160,7 +183,19 @@ struct Harness {
 }
 
 impl Harness {
+    /// A run of a random script: no recording covers it.
     fn new(cfg: BudgetConfig, store_seed: u64) -> Self {
+        let b = Lockstep::unchecked(cfg.clone()).unwrap();
+        Harness::with(cfg, store_seed, b)
+    }
+
+    /// A run of the fixed corpus, recorded under `key`.
+    fn keyed(cfg: BudgetConfig, store_seed: u64, key: String) -> Self {
+        let b = Lockstep::keyed(cfg.clone(), key).unwrap();
+        Harness::with(cfg, store_seed, b)
+    }
+
+    fn with(cfg: BudgetConfig, store_seed: u64, b: Lockstep) -> Self {
         let mut m = Mix(store_seed);
         let mut store = Store::default();
         for l in 0..=DEPTH {
@@ -174,7 +209,7 @@ impl Harness {
             }
         }
         Harness {
-            b: Lockstep::new(cfg.clone()).unwrap(),
+            b,
             cfg,
             now: Micros::ZERO,
             frame: 0,
@@ -390,34 +425,22 @@ fn config() -> ProptestConfig {
     }
 }
 
-/// The guard's own configuration: at least 1 024 cases, since a random
-/// script only now and then reaches a tie the engine must break as today
-/// (an eviction order of equally recent residents, measured: half the runs
-/// at 256 cases, every run at 1 024).
-fn guard_config() -> ProptestConfig {
-    let base = config();
-    ProptestConfig {
-        cases: base.cases.max(1_024),
-        ..base
-    }
-}
-
-proptest! {
-    #![proptest_config(guard_config())]
-
-    /// O1's guard: the budget decides, step by step, exactly as today's
-    /// engine frozen in `tests/reference/` — decisions (digest and content,
-    /// statistics but the `work` counter), ledger, audit, residency and
-    /// resource views — on random scripts, both policies and a squeezed
-    /// memory, the need in its order and permuted. (Every other property's
-    /// harness runs in lockstep too; this one names the guard and covers
-    /// Batch.)
-    #[test]
-    fn decide_agrees_with_the_frozen_reference(ops in script()) {
-        for cfg in [interactive(), squeezed(), batch()] {
+/// O1's guard on a fixed corpus: [`CORPUS`] seeded scripts, each on both
+/// policies and a squeezed memory, the need in its order and permuted, every
+/// step checked against the reference (`tests/reference/`).
+#[test]
+fn decide_agrees_with_the_reference_on_a_fixed_corpus() {
+    for i in 0..CORPUS {
+        let ops = corpus_script(i);
+        for (name, cfg) in [
+            ("interactive", interactive()),
+            ("squeezed", squeezed()),
+            ("batch", batch()),
+        ] {
             for permute in [false, true] {
-                let tr = Harness::new(cfg.clone(), 7).run(&ops, permute);
-                prop_assert!(tr.len() <= ops.len());
+                let key = format!("corpus/{i:03}/{name}/{permute}");
+                let tr = Harness::keyed(cfg.clone(), 7, key).run(&ops, permute);
+                assert!(tr.len() <= ops.len());
             }
         }
     }

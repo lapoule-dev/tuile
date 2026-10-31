@@ -48,7 +48,7 @@ use super::imagery::{drape_rank, needed_level, DrapeCandidate, GeoRect, LevelCla
 use super::need::{LayerReach, Membership};
 use super::need_state::{NeedState, TileNeed, WantedImagery};
 use super::priority::{score, PriorityKey, Quantised, Urgency};
-use super::sorted::{union4, SortedMap};
+use super::sorted::{union4, SortedCols, SortedMap};
 use super::state::{Arena, CpuCopy, EvictKey, Gpu, Held, Load, Rank, Slot, Transit};
 use super::stats::{BudgetStats, CancelReason, EvictReason, GAP_BUCKETS, LATENCY_BUCKETS};
 use super::tier::{Presence, PresenceOracle, Source, Tier};
@@ -271,7 +271,7 @@ fn tile_layers(tile: TileId) -> std::ops::RangeInclusive<(TileId, LayerId)> {
 /// The floor swap group `r` belongs to (D-A1), if any: a floor tile's mesh
 /// and its floor drape of every layer it wears, in stacking order.
 fn floor_group<'t>(
-    tiles: &'t SortedMap<TileId, TileNeed>,
+    tiles: &'t SortedCols<TileId, TileNeed>,
     r: ResourceId,
     is_floor: impl Fn(u32) -> bool,
 ) -> Option<impl Iterator<Item = ResourceId> + Clone + 't> {
@@ -616,7 +616,7 @@ impl Budget {
     /// (I14, I15). Batch takes the exact level, a function of the frame.
     fn drape_needs(
         &mut self,
-        tiles: &SortedMap<TileId, TileNeed>,
+        tiles: &SortedCols<TileId, TileNeed>,
         presence: &dyn PresenceOracle,
     ) -> SortedMap<(TileId, LayerId), u32> {
         let mut out = std::mem::take(&mut self.scratch.drapes);
@@ -685,7 +685,7 @@ impl Budget {
 
     /// Every floor tile the need lists is drawable with its floor drape
     /// of every layer it wears (P1.1), and the need lists one at least.
-    fn floor_in(&self, tiles: &SortedMap<TileId, TileNeed>) -> bool {
+    fn floor_in(&self, tiles: &SortedCols<TileId, TileNeed>) -> bool {
         let mut any = false;
         let all = tiles
             .iter()
@@ -878,7 +878,7 @@ impl Budget {
     /// ancestor.
     fn select(
         &self,
-        tiles: &SortedMap<TileId, TileNeed>,
+        tiles: &SortedCols<TileId, TileNeed>,
         drapes: &SortedMap<(TileId, LayerId), u32>,
         ancestry: &[(TileId, TileId, u32)],
         cap: Option<u32>,
@@ -931,7 +931,7 @@ impl Budget {
     // 3. The draw set.
     fn build_draw(
         &self,
-        tiles: &SortedMap<TileId, TileNeed>,
+        tiles: &SortedCols<TileId, TileNeed>,
         drapes: &SortedMap<(TileId, LayerId), u32>,
         ancestry: &[(TileId, TileId, u32)],
         floor_in: bool,
@@ -1048,7 +1048,7 @@ impl Budget {
     /// What the step wants loaded or delivered.
     fn wants(
         &self,
-        tiles: &SortedMap<TileId, TileNeed>,
+        tiles: &SortedCols<TileId, TileNeed>,
         drapes: &SortedMap<(TileId, LayerId), u32>,
         draw: &DrawSet,
         raw: &mut Vec<(ResourceId, u32, Want)>,
@@ -1941,7 +1941,7 @@ impl Budget {
         now: Micros,
         eff: &Eff,
         jobs: &[(PriorityKey, ResourceId, Job, Want)],
-        tiles: &SortedMap<TileId, TileNeed>,
+        tiles: &SortedCols<TileId, TileNeed>,
         coarsening: &BTreeSet<TileId>,
         wants: &SortedMap<ResourceId, Want>,
         d: &mut Decisions,
@@ -2098,14 +2098,14 @@ impl Budget {
         &self,
         eff: &Eff,
         keys: &SortedMap<ResourceId, PriorityKey>,
-        tiles: &SortedMap<TileId, TileNeed>,
+        tiles: &SortedCols<TileId, TileNeed>,
     ) -> UploadPlan {
         // Group: the blockers of one parent (meshes and drapes), else a
         // tile's mesh and its drape.
         let group_of = |r: ResourceId| -> (u8, TileId) {
             let t = r.tile();
             match tiles.get(&t) {
-                Some(tn) if tn.membership == Membership::Blocker => match tn.need.parent {
+                Some(tn) if tn.membership == Membership::Blocker => match tn.need.parent() {
                     Some(p) => (0, p),
                     None => (1, t),
                 },
@@ -2487,7 +2487,7 @@ impl Budget {
     fn prune(
         &mut self,
         now: Micros,
-        tiles: &SortedMap<TileId, TileNeed>,
+        tiles: &SortedCols<TileId, TileNeed>,
         wants: &SortedMap<ResourceId, Want>,
         drapes: &SortedMap<(TileId, LayerId), u32>,
     ) -> u32 {
