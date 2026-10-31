@@ -22,8 +22,8 @@ url = { workspace = true }
 # The decode pool's timings: `performance.now()` in a browser.
 web-time = { workspace = true }
 
-tuile-core = { version = "0.14.0", path = "../tuile-core" }
-tuile-cesium-ion = { version = "0.14.0", path = "../tuile-cesium-ion" }
+tuile-core = { version = "0.15.0", path = "../tuile-core" }
+tuile-cesium-ion = { version = "0.15.0", path = "../tuile-cesium-ion" }
 
 # The browser is the only target this crate has: everything below exists solely
 # there, and building it for a native host would produce a library that cannot

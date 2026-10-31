@@ -19,8 +19,8 @@ serde = { workspace = true }
 tracing = { workspace = true }
 # The CPU encode's clock, in a browser's decode worker as natively.
 web-time = { workspace = true }
-tuile-core = { version = "0.14.0", path = "../tuile-core" }
-tuile-terrain = { version = "0.14.0", path = "../tuile-terrain" }
+tuile-core = { version = "0.15.0", path = "../tuile-core" }
+tuile-terrain = { version = "0.15.0", path = "../tuile-terrain" }
 
 [dev-dependencies]
 image = { workspace = true }

@@ -18,10 +18,10 @@ workspace = true
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-tuile-bing = { version = "0.14.0", path = "../../crates/tuile-bing" }
-tuile-cesium-ion = { version = "0.14.0", path = "../../crates/tuile-cesium-ion" }
-tuile-native-fetchers = { version = "0.14.0", path = "../../crates/tuile-native-fetchers" }
-tuile-viewer = { version = "0.14.0", path = "../../crates/tuile-viewer" }
+tuile-bing = { version = "0.15.0", path = "../../crates/tuile-bing" }
+tuile-cesium-ion = { version = "0.15.0", path = "../../crates/tuile-cesium-ion" }
+tuile-native-fetchers = { version = "0.15.0", path = "../../crates/tuile-native-fetchers" }
+tuile-viewer = { version = "0.15.0", path = "../../crates/tuile-viewer" }
 # The catalog proxy's address, read and checked as a URL: Android's, and a
 # headless run's.
 url = { workspace = true }
@@ -38,18 +38,18 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 tracing-subscriber = { workspace = true }
-tuile-cesium-ion = { version = "0.14.0", path = "../../crates/tuile-cesium-ion", features = ["proxy"] }
-tuile-viewer = { version = "0.14.0", path = "../../crates/tuile-viewer", features = ["control"] }
+tuile-cesium-ion = { version = "0.15.0", path = "../../crates/tuile-cesium-ion", features = ["proxy"] }
+tuile-viewer = { version = "0.15.0", path = "../../crates/tuile-viewer", features = ["control"] }
 # The sunset sequence (`examples/sunset`) and the discs' acceptance scenes
 # (`examples/discs`): their instants, from the ephemeris.
-tuile-atmosphere = { version = "0.14.0", path = "../../crates/tuile-atmosphere" }
-tuile-core = { version = "0.14.0", path = "../../crates/tuile-core" }
+tuile-atmosphere = { version = "0.15.0", path = "../../crates/tuile-atmosphere" }
+tuile-core = { version = "0.15.0", path = "../../crates/tuile-core" }
 # The replay (`examples/replay`): a recorded session read, and written again.
 # The stars scan (`examples/stars_scan`): its views as MCAP, its counts as
 # Parquet.
 glam = { workspace = true }
-tuile-camera = { version = "0.14.0", path = "../../crates/tuile-camera" }
-tuile-tape = { version = "0.14.0", path = "../../crates/tuile-tape" }
+tuile-camera = { version = "0.15.0", path = "../../crates/tuile-camera" }
+tuile-tape = { version = "0.15.0", path = "../../crates/tuile-tape" }
 arrow-array = "58.4.0"
 arrow-schema = "58.4.0"
 parquet = { version = "58.4.0", default-features = false, features = ["arrow", "snap"] }

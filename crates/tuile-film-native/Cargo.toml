@@ -21,26 +21,26 @@ image = { workspace = true }
 rav1e = { version = "0.8", default-features = false, features = ["threading"] }
 tokio = { workspace = true }
 # The film's own bake, called by `tuile-film-produce` as a function.
-tuile-bake = { version = "0.14.0", path = "../tuile-bake" }
-tuile-pack = { version = "0.14.0", path = "../tuile-pack" }
+tuile-bake = { version = "0.15.0", path = "../tuile-bake" }
+tuile-pack = { version = "0.15.0", path = "../tuile-pack" }
 clap = { version = "4.6", features = ["derive"] }
 # The render as a service (`tuile-film-serve`): its requests and receipts.
 axum = "0.8"
 serde = { workspace = true }
 serde_json = { workspace = true }
-tuile-core = { version = "0.14.0", path = "../tuile-core" }
+tuile-core = { version = "0.15.0", path = "../tuile-core" }
 # The sun of a frame's instant, when a clock is given (`Order::clock`).
-tuile-atmosphere = { version = "0.14.0", path = "../tuile-atmosphere", features = ["wgpu"] }
+tuile-atmosphere = { version = "0.15.0", path = "../tuile-atmosphere", features = ["wgpu"] }
 # The clock of a time-lapse, as its tape's maker writes it.
-tuile-tape = { version = "0.14.0", path = "../tuile-tape" }
-tuile-farm = { version = "0.14.0", path = "../tuile-farm" }
-tuile-film = { version = "0.14.0", path = "../tuile-film" }
-tuile-film-gpu = { version = "0.14.0", path = "../tuile-film-gpu" }
-tuile-mp4 = { version = "0.14.0", path = "../tuile-mp4" }
-tuile-radiometry = { version = "0.14.0", path = "../tuile-radiometry" }
-tuile-repository = { version = "0.14.0", path = "../tuile-repository" }
+tuile-tape = { version = "0.15.0", path = "../tuile-tape" }
+tuile-farm = { version = "0.15.0", path = "../tuile-farm" }
+tuile-film = { version = "0.15.0", path = "../tuile-film" }
+tuile-film-gpu = { version = "0.15.0", path = "../tuile-film-gpu" }
+tuile-mp4 = { version = "0.15.0", path = "../tuile-mp4" }
+tuile-radiometry = { version = "0.15.0", path = "../tuile-radiometry" }
+tuile-repository = { version = "0.15.0", path = "../tuile-repository" }
 # Where the store's small objects are kept between two renders.
-tuile-storage-foyer = { version = "0.14.0", path = "../tuile-storage-foyer" }
+tuile-storage-foyer = { version = "0.15.0", path = "../tuile-storage-foyer" }
 wgpu = { workspace = true }
 
 # The system's frameworks, for the `videotoolbox` feature.

@@ -17,8 +17,8 @@ workspace = true
 statusbar = ["dep:tray-icon", "dep:muda"]
 
 [dependencies]
-tuile-camera = { version = "0.14.0", path = "../tuile-camera" }
-tuile-core = { version = "0.14.0", path = "../tuile-core" }
+tuile-camera = { version = "0.15.0", path = "../tuile-camera" }
+tuile-core = { version = "0.15.0", path = "../tuile-core" }
 # The menu bar's item on macOS, the notification area on Windows. No default
 # features: those are the GTK 3 backends on Linux (AppIndicator for the item,
 # GTK 3 for the menu), and GTK 3's bindings are unmaintained.

@@ -22,7 +22,7 @@ serde_json = { workspace = true }
 # Tile addresses resolved against their layer.json (`LayerJson::tile_request_url`).
 url = { workspace = true }
 thiserror = { workspace = true }
-tuile-core = { version = "0.14.0", path = "../tuile-core" }
+tuile-core = { version = "0.15.0", path = "../tuile-core" }
 
 [dev-dependencies]
 # A gzip stream, to be refused (`decode`).
@@ -32,4 +32,4 @@ glam = { workspace = true }
 # The HTTP source against a server on a local port (`http`), through the
 # core's plain HTTP fetcher.
 tokio = { workspace = true, features = ["rt", "net", "io-util", "macros"] }
-tuile-core = { version = "0.14.0", path = "../tuile-core", features = ["http"] }
+tuile-core = { version = "0.15.0", path = "../tuile-core", features = ["http"] }

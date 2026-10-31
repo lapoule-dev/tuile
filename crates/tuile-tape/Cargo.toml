@@ -11,10 +11,10 @@ rust-version.workspace = true
 # For `geo::geodetic_to_ecef`. A tape places a camera on the Earth, and
 # placing it on a sphere instead of the ellipsoid put one 14.8 km above the
 # ground it was meant to be 5 km above.
-tuile-core = { version = "0.14.0", path = "../tuile-core" }
+tuile-core = { version = "0.15.0", path = "../tuile-core" }
 glam = { workspace = true }
 # A time-lapse's camera is built as every globe camera is.
-tuile-camera = { version = "0.14.0", path = "../tuile-camera" }
+tuile-camera = { version = "0.15.0", path = "../tuile-camera" }
 # A time-lapse's start, as a calendar says it.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Without its compressors in a browser: they are C, and a wasm32 module has no

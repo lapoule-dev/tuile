@@ -19,19 +19,19 @@ arrow-schema = "58.4.0"
 # Snappy only: pure Rust, no C codec to build.
 parquet = { version = "58.4.0", default-features = false, features = ["arrow", "snap"] }
 glam = { workspace = true }
-tuile-camera = { version = "0.14.0", path = "../tuile-camera" }
-tuile-core = { version = "0.14.0", path = "../tuile-core" }
+tuile-camera = { version = "0.15.0", path = "../tuile-camera" }
+tuile-core = { version = "0.15.0", path = "../tuile-core" }
 # The instant of a frame, as a link writes it.
-tuile-atmosphere = { version = "0.14.0", path = "../tuile-atmosphere" }
+tuile-atmosphere = { version = "0.15.0", path = "../tuile-atmosphere" }
 # The film's encoders: H.264 by VideoToolbox on a Mac, AV1 by rav1e
 # anywhere — the film's own, into an mp4 by tuile-mp4. Never ffmpeg.
-tuile-film-native = { version = "0.14.0", path = "../tuile-film-native" }
-tuile-tape = { version = "0.14.0", path = "../tuile-tape" }
+tuile-film-native = { version = "0.15.0", path = "../tuile-film-native" }
+tuile-tape = { version = "0.15.0", path = "../tuile-tape" }
 # The plots, written as PNG.
 image = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-tuile-film-native = { version = "0.14.0", path = "../tuile-film-native", features = ["videotoolbox"] }
+tuile-film-native = { version = "0.15.0", path = "../tuile-film-native", features = ["videotoolbox"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

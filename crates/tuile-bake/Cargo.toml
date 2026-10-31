@@ -43,10 +43,10 @@ tracing-subscriber = { workspace = true }
 # linked a crate named after one particular OpenUSD host to produce a container
 # that no host is named in. The dependency graph said the pack was a Hydra
 # artefact. It is not.
-tuile-cesium-ion = { version = "0.14.0", path = "../tuile-cesium-ion" }
-tuile-bing = { version = "0.14.0", path = "../tuile-bing" }
-tuile-planetary = { version = "0.14.0", path = "../tuile-planetary" }
-tuile-native-fetchers = { version = "0.14.0", path = "../tuile-native-fetchers" }
+tuile-cesium-ion = { version = "0.15.0", path = "../tuile-cesium-ion" }
+tuile-bing = { version = "0.15.0", path = "../tuile-bing" }
+tuile-planetary = { version = "0.15.0", path = "../tuile-planetary" }
+tuile-native-fetchers = { version = "0.15.0", path = "../tuile-native-fetchers" }
 # The open sources' tile addresses (`open`), and an origin's "no such tile".
 url = { workspace = true }
 async-trait = { workspace = true }
@@ -61,19 +61,19 @@ tokio = { workspace = true, features = ["time", "sync"] }
 # bounded at the source rather than behind a semaphore.
 rayon = "1"
 thiserror = { workspace = true }
-tuile-core = { version = "0.14.0", path = "../tuile-core", features = ["rt-tokio"] }
+tuile-core = { version = "0.15.0", path = "../tuile-core", features = ["rt-tokio"] }
 # The engine's metrics on a Prometheus endpoint, when `TUILE_METRICS_ADDR`
 # asks for one (`memory::export_metrics_if_asked`).
-tuile-metrics = { version = "0.14.0", path = "../tuile-metrics" }
+tuile-metrics = { version = "0.15.0", path = "../tuile-metrics" }
 # The ground a film draws, for a camera kept over it (`Session::ground`).
-tuile-film = { version = "0.14.0", path = "../tuile-film" }
-tuile-pack = { version = "0.14.0", path = "../tuile-pack" }
-tuile-tape = { version = "0.14.0", path = "../tuile-tape" }
+tuile-film = { version = "0.15.0", path = "../tuile-film" }
+tuile-pack = { version = "0.15.0", path = "../tuile-pack" }
+tuile-tape = { version = "0.15.0", path = "../tuile-tape" }
 # Source tiles kept once, on the bucket every bake and the tile server share.
 # The binary opens it (`TUILE_TILES_BUCKET`); the library only sees the
 # engine's `ContentStore`.
-tuile-tile-server = { version = "0.14.0", path = "../tuile-tile-server" }
-tuile-terrain = { version = "0.14.0", path = "../tuile-terrain" }
+tuile-tile-server = { version = "0.15.0", path = "../tuile-tile-server" }
+tuile-terrain = { version = "0.15.0", path = "../tuile-terrain" }
 object_store = { version = "0.14.2", default-features = false, features = ["fs", "aws"] }
 
 # --- profiling, behind the feature ------------------------------------------
