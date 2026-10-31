@@ -3,11 +3,44 @@
 
 //! The soak (I6, I7): a long scripted tour; the slopes must be flat.
 
-use tuile_budget::Micros;
+use tuile_budget::{Bytes, Micros};
 
 use super::detmath;
 use super::server::{Profile, Sim};
 use super::world::{Camera, SIDE};
+
+/// The memory-pressure scenario (O1's baseline for the eviction index,
+/// O1.2): the desktop on 384 MiB of its 2 GiB, the LOD relaxation capped at
+/// none (`relax.max_scale` 1000), so the view keeps its tiles instead of
+/// shedding them, and the tour's resident set stays over its target: the
+/// sweep builds and sorts the eviction order on nearly every step, and
+/// deliveries make room. Retargeting alone, the relaxation shrinks the view
+/// to a few dozen tiles and the scenario measures nothing.
+pub fn pressure_profile() -> Profile {
+    let mut p = Profile::desktop();
+    p.name = "desktop-pressure";
+    p.budget.relax.max_scale = 1_000;
+    p
+}
+
+/// [`pressure_profile`]'s whole budget, in MiB.
+pub const PRESSURE_MIB: u64 = 384;
+
+/// Puts a simulation on [`pressure_profile`] under its memory pressure: its
+/// budget retargeted to [`PRESSURE_MIB`].
+pub fn under_pressure(sim: &mut Sim) {
+    sim.budget.retarget(Bytes::mib(PRESSURE_MIB));
+}
+
+/// The pressure scenario's camera: the tour's orbit (its first minute, a
+/// full turn, so it loops without a jump), forever. The tour's zoom-out under
+/// [`pressure_profile`] breaks the simulation's I7 bound on tracked state
+/// (at t ≈ 105 s: 1 968 tracked, bound 1 284 — the bound does not count the
+/// decoded copies an eviction demotes to), a finding left to the eviction
+/// work (O1.2, B), not to the baseline.
+pub fn pressure_tour(t: f64) -> Camera {
+    tour(t % 60.0)
+}
 
 /// A tour that orbits, pans, zooms and turns, looping every four minutes.
 pub fn tour(t: f64) -> Camera {

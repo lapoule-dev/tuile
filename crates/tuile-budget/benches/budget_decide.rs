@@ -5,7 +5,13 @@
 //!
 //! - `decide/still`: a converged still view, 484 tiles drawn, the
 //!   same need every step: the steady state;
-//! - `decide/motion`: the soak's tour, the step's `decide` alone timed.
+//! - `decide/motion`: the soak's tour, the step's `decide` alone timed;
+//! - `decide/pressure`: the tour's orbit, looped, under memory pressure
+//!   (`soak::pressure_profile`: over target on nearly every step, so the
+//!   eviction order is built and sorted every step), `decide` alone timed.
+//!
+//! The simulation runs its budget alone here (`Sim::unchecked`): the frozen
+//! reference the tests run beside it (`tests/reference/`) is left out.
 //!
 //! Criterion gives the means; the percentiles are printed first
 //! (`decide still: mean … p50 … p99 …`), from individually timed calls,
@@ -26,6 +32,8 @@ mod detmath;
 mod gpu;
 #[path = "../tests/budget_sim/net.rs"]
 mod net;
+#[path = "../tests/reference/mod.rs"]
+mod reference;
 #[path = "../tests/budget_sim/rng.rs"]
 mod rng;
 #[path = "../tests/budget_sim/server.rs"]
@@ -58,7 +66,7 @@ fn still_camera() -> Camera {
 /// A desktop simulation converged on the still camera, and the need it
 /// keeps asking.
 fn converged() -> (Sim, NeedSet) {
-    let mut sim = Sim::new(Profile::desktop(), 7);
+    let mut sim = Sim::unchecked(Profile::desktop(), 7);
     let cam = still_camera();
     let mut need = NeedSet::new();
     while sim.now < Micros::from_secs(30) {
@@ -102,19 +110,41 @@ fn report() {
     }
     percentiles("still", us, drawn);
 
-    let mut sim = Sim::new(Profile::desktop(), 11);
-    while sim.now < Micros::from_secs(240) {
-        let t = sim.now.0 as f64 / 1e6;
-        sim.step(soak::tour(t));
+    for (name, pressed) in [("motion", false), ("pressure", true)] {
+        let mut sim = tour_sim(pressed);
+        while sim.now < Micros::from_secs(240) {
+            let t = sim.now.0 as f64 / 1e6;
+            sim.step(camera(pressed, t));
+        }
+        let us: Vec<f64> = sim
+            .decide_us
+            .iter()
+            .filter(|(t, _)| *t >= Micros::from_secs(10))
+            .map(|(_, d)| *d)
+            .collect();
+        let drawn = sim.decide_allocs.iter().map(|a| a.drawn).max().unwrap_or(0);
+        percentiles(name, us, drawn as usize);
     }
-    let us: Vec<f64> = sim
-        .decide_us
-        .iter()
-        .filter(|(t, _)| *t >= Micros::from_secs(10))
-        .map(|(_, d)| *d)
-        .collect();
-    let drawn = sim.decide_allocs.iter().map(|a| a.drawn).max().unwrap_or(0);
-    percentiles("motion", us, drawn as usize);
+}
+
+/// The tour's camera at `t`; under pressure, its orbit, looped
+/// (`soak::pressure_tour`).
+fn camera(pressed: bool, t: f64) -> world::Camera {
+    if pressed {
+        soak::pressure_tour(t)
+    } else {
+        soak::tour(t)
+    }
+}
+
+/// The tour's simulation, under memory pressure or not.
+fn tour_sim(pressed: bool) -> Sim {
+    if !pressed {
+        return Sim::unchecked(Profile::desktop(), 11);
+    }
+    let mut sim = Sim::unchecked(soak::pressure_profile(), 11);
+    soak::under_pressure(&mut sim);
+    sim
 }
 
 fn bench(c: &mut Criterion) {
@@ -124,19 +154,21 @@ fn bench(c: &mut Criterion) {
     g.bench_function("still", |b| {
         b.iter(|| black_box(decide_still(&mut sim, &need)))
     });
-    let mut sim = Sim::new(Profile::desktop(), 11);
-    g.bench_function("motion", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                let t = sim.now.0 as f64 / 1e6;
-                sim.step(soak::tour(t));
-                let us = sim.decide_us.last().map_or(0.0, |(_, d)| *d);
-                total += Duration::from_secs_f64(us / 1e6);
-            }
-            total
-        })
-    });
+    for (name, pressed) in [("motion", false), ("pressure", true)] {
+        let mut sim = tour_sim(pressed);
+        g.bench_function(name, |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let t = sim.now.0 as f64 / 1e6;
+                    sim.step(camera(pressed, t));
+                    let us = sim.decide_us.last().map_or(0.0, |(_, d)| *d);
+                    total += Duration::from_secs_f64(us / 1e6);
+                }
+                total
+            })
+        });
+    }
     g.finish();
 }
 

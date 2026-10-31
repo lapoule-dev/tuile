@@ -25,6 +25,35 @@ PRs — numbered B1–B8 in that plan, unrelated to section B below — fixes it
 signals, and a measured acceptance (imagery peak ≤ 15.5 MB, BC7 settle ≤ 6.0 s, Off goldens unchanged). It comes
 before A2 and A4.
 
+### O1 — the budget's algorithms, before CB (status: O1 baseline, 2026-10-31)
+
+The budget is its own crate, `tuile-budget` (#163). O1 optimises its `decide` before the compression budget,
+decisions bit-identical throughout. The guard comes first (O1.0): today's engine frozen at 3d1a028e in
+`crates/tuile-budget/tests/reference/` (engine, state, sorted and the `Budget` methods, a mechanical copy) and
+driven step by step beside the real one (`Lockstep`) in every `budget_sim` run and in the properties' random
+scripts — `Decisions` (digest and content; statistics but the `work` counter), ledger, audit, residency and
+resource views compared every step. O1.1–O1.5 change the real engine and keep the lockstep green.
+
+The baseline on an Apple M2 (16 GB), `cargo bench -p tuile-budget --bench budget_decide` and the release
+`budget_sim` ratchets:
+
+| Measure | Value |
+|---|---|
+| `decide` still view (484 drawn) | mean 1 098 µs, p50 1 086 µs, p99 1 188 µs |
+| `decide` motion (soak tour, ≤ 1 022 drawn) | mean 902 µs, p50 797 µs, p99 2 174 µs |
+| `decide` pressure (desktop on 384 MiB, LOD relaxation capped, the tour's orbit looped; ≤ 293 drawn) | mean 911 µs, p50 879 µs, p99 1 650 µs |
+| allocations per step, still (internal / output) | 13 / 649 |
+| allocations per step, motion p99 (internal) | 43 |
+| allocations per step, pressure p50 / p99 (internal) | 21 / 76 |
+| step buffers after the tour | 381 056 B |
+| bytes per tracked resource | 534 (2 927 tracked) |
+
+The pressure scenario (`soak::pressure_profile`) is over its target on 2 879 of 3 000 steps and evicts on 551:
+the eviction order is built and sorted nearly every step, for a view a third the size of the motion one at the
+same cost. P6.4 (`decide_work_grows_with_changes_not_with_the_view`) is written and ignored: on a converged
+still view, with nothing changing, W_k is about 3 550 (up to 4 646) against a bound of 256 — `work` is
+O(need + tracked) until the incremental decide (O1.4).
+
 
 Order is strict: A before B, B before C. Every step of A, B and C goes through the same battery before
 the next starts — tests seen red, mutants killed, the reference model extended, Kani proofs of its

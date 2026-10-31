@@ -15,6 +15,7 @@ use tuile_budget::{
 
 use super::gpu::SimGpu;
 use super::net::{Arrival, NetProfile, SimNet};
+use super::reference::Lockstep;
 use super::world::{children, parent, sight, traverse, Camera, Lens, Residency, View};
 
 /// One eye of a profile's rig: where it sits along the camera's right
@@ -234,8 +235,9 @@ impl Residency for BudgetResidency<'_> {
 pub struct Sim {
     /// The profile.
     pub profile: Profile,
-    /// The budget under test.
-    pub budget: Budget,
+    /// The budget under test, in lockstep with today's engine frozen
+    /// (`tests/reference/`): every step is compared to it.
+    pub budget: Lockstep,
     /// The network.
     pub net: SimNet,
     /// The GPU.
@@ -279,13 +281,34 @@ pub struct Sim {
     /// Per tile: (mesh level drawn, drape level worn, last change time),
     /// tracked while the camera is still (I4).
     levels: BTreeMap<TileId, (u32, u32, Vec<Micros>)>,
+    /// Arrivals and acknowledgements fed to the budget so far.
+    fed: u64,
+    /// Those fed at the last `decide`, which it applied.
+    fed_at_decide: u64,
+    /// The events the last `decide` applied: those fed since the one
+    /// before (P6.4's #E_k).
+    pub step_events: u64,
 }
 
 impl Sim {
-    /// A simulation on `profile`, seeded.
+    /// A simulation on `profile`, seeded, its budget in lockstep with the
+    /// frozen reference.
     pub fn new(profile: Profile, seed: u64) -> Self {
+        let budget = Lockstep::new(profile.budget.clone()).expect("a valid profile");
+        Self::with(profile, seed, budget)
+    }
+
+    /// The same simulation, the real budget alone, the reference left out:
+    /// for the bench, whose timings must not include it.
+    #[allow(dead_code)] // The bench's only (`benches/budget_decide.rs`).
+    pub fn unchecked(profile: Profile, seed: u64) -> Self {
+        let budget = Lockstep::unchecked(profile.budget.clone()).expect("a valid profile");
+        Self::with(profile, seed, budget)
+    }
+
+    fn with(profile: Profile, seed: u64, budget: Lockstep) -> Self {
         Sim {
-            budget: Budget::new(profile.budget.clone()).expect("a valid profile"),
+            budget,
             net: SimNet::new(profile.net, seed),
             gpu: {
                 let mut g = SimGpu::new(profile.deadline, profile.eyes.len());
@@ -311,6 +334,9 @@ impl Sim {
             decide_allocs: Vec::new(),
             count_output: false,
             levels: BTreeMap::new(),
+            fed: 0,
+            fed_at_decide: 0,
+            step_events: 0,
             profile,
         }
     }
@@ -352,13 +378,18 @@ impl Sim {
                 Arrival::Loaded(r, g, b) => {
                     self.fresh.insert(r, g);
                     self.decoded.insert(r);
+                    self.fed += 1;
                     self.budget.on_loaded(r, g, b);
                 }
                 Arrival::Failed(r, g) => {
+                    self.fed += 1;
                     self.budget
                         .on_failed(r, g, tuile_budget::Failure::Transient)
                 }
-                Arrival::StoreMiss(r, g) => self.budget.on_store_miss(r, g),
+                Arrival::StoreMiss(r, g) => {
+                    self.fed += 1;
+                    self.budget.on_store_miss(r, g);
+                }
             }
         }
         // A film's frame is a function of its own inputs: no hysteresis on
@@ -377,10 +408,16 @@ impl Sim {
             self.pinned(),
         );
         let input = FrameInput::new(self.frame, self.now, &need).with_presence(&self.net.store);
-        let clock = std::time::Instant::now();
-        let (d, heap) = super::alloc::counted(|| self.budget.decide(input));
-        self.decide_us
-            .push((self.now, clock.elapsed().as_secs_f64() * 1e6));
+        self.step_events = self.fed - self.fed_at_decide;
+        self.fed_at_decide = self.fed;
+        // The real budget's call alone is timed and counted; the frozen
+        // reference decides after it, and the two are compared.
+        let (d, (heap, us)) = self.budget.decide_with(input, |b, i| {
+            let clock = std::time::Instant::now();
+            let (d, heap) = super::alloc::counted(|| b.decide(i));
+            (d, (heap, clock.elapsed().as_secs_f64() * 1e6))
+        });
+        self.decide_us.push((self.now, us));
         let output = if self.count_output {
             super::alloc::counted(|| d.clone()).1.allocs
         } else {
@@ -434,6 +471,7 @@ impl Sim {
                 self.waits
                     .push((self.now, self.now.since(at).0 as f64 / 1_000.0));
             }
+            self.fed += 1;
             self.budget.on_drawable(r, g, b);
         }
         self.sse_scale = f64::from(d.sse_scale_milli) / 1000.0;
