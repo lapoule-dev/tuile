@@ -1,6 +1,6 @@
 [package]
 name = "tuile-ui"
-description = "Render-agnostic on-screen controls for tuile viewers (navigation compass, tilt, zoom)"
+description = "Render-agnostic on-screen controls for tuile viewers (navigation compass, tilt, zoom, a credits bar)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -21,6 +21,10 @@ workspace = true
 statusbar = ["dep:tray-icon", "dep:muda"]
 
 [dependencies]
+# Glyphs, for the one line of text a viewer draws (the credits bar). Pure
+# Rust, wasm-clean, no system font lookup; the version winit already locks.
+# No variable-font support: the bundled font is a static instance.
+ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
 tuile-camera = { version = "0.15.1", path = "../tuile-camera" }
 tuile-core = { version = "0.15.1", path = "../tuile-core" }
 # The menu bar's item on macOS, the notification area on Windows. No default
