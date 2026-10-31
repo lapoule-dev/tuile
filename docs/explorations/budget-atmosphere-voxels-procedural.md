@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!-- Copyright (c) lapoule.dev -->
+
 # The graphics budget beyond streamed tiles: atmosphere, voxels, procedural — and GPU time
 
 Status: **study** (2026-10-31), no code. Question from Laurent: the budget
