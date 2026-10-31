@@ -99,7 +99,7 @@ fn motion() -> (u64, i64, i64, usize) {
         diff.get(diff.len() * 99 / 100).copied().unwrap_or(0)
     );
     let tracked = sim.budget.tracked();
-    // The real budget alone: the frozen reference beside it is not measured.
+    // The budget alone: the reference's digests are not measured.
     let ((), t) = super::alloc::counted(|| sim.budget.real.release_scratch());
     let scratch = -t.live;
     let cfg = sim.budget.config().clone();

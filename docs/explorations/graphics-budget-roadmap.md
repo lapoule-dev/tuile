@@ -32,7 +32,12 @@ decisions bit-identical throughout. The guard comes first (O1.0): today's engine
 `crates/tuile-budget/tests/reference/` (engine, state, sorted and the `Budget` methods, a mechanical copy) and
 driven step by step beside the real one (`Lockstep`) in every `budget_sim` run and in the properties' random
 scripts — `Decisions` (digest and content; statistics but the `work` counter), ledger, audit, residency and
-resource views compared every step. O1.1–O1.5 change the real engine and keep the lockstep green.
+resource views compared every step. O1.1–O1.5 change the real engine and keep the lockstep green. The debt pass after O1.3
+extended the lockstep to the whole internal state, then retired the frozen copy: before it went (at af19a3e9) it
+recorded, per step, digests of its decisions, ledger, views and internal state on every `budget_sim` run and on a
+fixed corpus of 128 property scripts (`tests/reference/recorded.txt`, 195 KB); the real engine is now checked
+against that file, every 256 steps and at each run's end. Random property scripts are no longer compared with a
+reference.
 
 The baseline on an Apple M2 (16 GB), `cargo bench -p tuile-budget --bench budget_decide` and the release
 `budget_sim` ratchets:
@@ -191,6 +196,10 @@ bit-identical (lockstep green, goldens and pattern goldens untouched, ratchets o
 - motion back under O1.2 (#169): the kept tiles and the tree positions as key/value columns (`SortedCols`, lookups
   in a dense key column), entering tiles merged in place (no buffer), the kept record 88 → 80 bytes;
 - the need state's memory rules each kept with the number that justifies it (#169).
+- the frozen copy of the old engine retired (debt of the whole guard): its per-step digests recorded first, then
+  the engine and its `FrameInput` twin deleted; the file-based check seen red on an internal mutation (54 of 61
+  `budget_sim` runs and the corpus, part `state`) and on an output one (60 of 61, parts `decisions`, `ledger`,
+  `views`, `state`).
 
 `budget_decide` per layer, the same binaries run back to back five times on the same (shared, loaded) Apple M2,
 best of five (noise only adds time); `decide+diff` is a delta step's whole cost to the host:

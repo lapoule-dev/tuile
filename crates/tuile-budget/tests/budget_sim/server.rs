@@ -235,8 +235,8 @@ impl Residency for BudgetResidency<'_> {
 pub struct Sim {
     /// The profile.
     pub profile: Profile,
-    /// The budget under test, in lockstep with today's engine frozen
-    /// (`tests/reference/`): every step is compared to it.
+    /// The budget under test, checked step by step against the reference
+    /// recorded from the engine before O1 (`tests/reference/`).
     pub budget: Lockstep,
     /// The network.
     pub net: SimNet,
@@ -301,8 +301,8 @@ pub struct Sim {
 }
 
 impl Sim {
-    /// A simulation on `profile`, seeded, its budget in lockstep with the
-    /// frozen reference.
+    /// A simulation on `profile`, seeded, its budget checked against the
+    /// recorded reference.
     pub fn new(profile: Profile, seed: u64) -> Self {
         let budget = Lockstep::new(profile.budget.clone()).expect("a valid profile");
         Self::with(profile, seed, budget)
@@ -435,9 +435,8 @@ impl Sim {
         .with_presence(&self.net.store);
         self.step_events = self.fed - self.fed_at_decide;
         self.fed_at_decide = self.fed;
-        // The real budget's call alone is timed and counted; the frozen
-        // reference decides after it, on the whole need, and the two are
-        // compared.
+        // The budget's call alone is timed and counted; its digests are
+        // folded after it, and compared with the recorded reference.
         let (d, (heap, us)) = self.budget.decide_with(input, &need, |b, i| {
             let clock = std::time::Instant::now();
             let (d, heap) = super::alloc::counted(|| b.decide(i));
