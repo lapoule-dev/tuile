@@ -758,7 +758,7 @@ fn a_ball_at_the_pole_carves_a_disc_over_every_longitude() {
     )
     .unwrap();
     // The disc's angular radius: tangent-plane distance R·sin θ ≤ r.
-    let theta = (r / EARTH_RADIUS).asin();
+    let theta = libm::asin(r / EARTH_RADIUS);
     let (mut inside, mut outside) = (0, 0);
     for j in 0..257 {
         for i in (0..257).step_by(4) {
@@ -1115,7 +1115,7 @@ fn arb_script<F: Frame + Copy + 'static>(frame: F) -> impl Strategy<Value = Vec<
 /// Edits on a frame over every longitude, in its own coordinates: longitudes
 /// often within 0.2 rad of the antimeridian; on a polar frame, distances
 /// from the pole often under 400 m or nil; radii scaled to the frame's
-/// cells (`scale`, metres).
+/// cells (`scale`, metres); long thin capsules along a parallel too.
 fn arb_globe_script(frame: GeodeticFrame, near_pole: bool) -> impl Strategy<Value = Vec<Edit>> {
     let lon = prop_oneof![-PI..PI, (PI - 0.2)..PI, -PI..(-PI + 0.2)];
     let place = if near_pole {
@@ -1133,7 +1133,7 @@ fn arb_globe_script(frame: GeodeticFrame, near_pole: bool) -> impl Strategy<Valu
         40.0f64..2500.0,
         -1.0f64..1.0,
         any::<bool>(),
-        0u8..13,
+        0u8..15,
     );
     proptest::collection::vec(one, 1..8).prop_map(move |v| {
         v.into_iter()
@@ -1159,6 +1159,13 @@ fn arb_globe_script(frame: GeodeticFrame, near_pole: bool) -> impl Strategy<Valu
                     11 => Brush::Sphere {
                         centre: DVec3::new(lon, 1.6, dz),
                         radius: r,
+                    },
+                    // A long thin capsule along a parallel: its great circle
+                    // bulges toward the pole, far beyond its radius.
+                    12 | 13 => Brush::Capsule {
+                        a: p,
+                        b: DVec3::new(lon + 3.0 * slope / scale, lat, dz),
+                        radius: r / 20.0,
                     },
                     _ => Brush::Sphere {
                         centre: DVec3::new(lon, frame.min.y - 10.0 * dlat - 0.01, dz),
@@ -1269,30 +1276,63 @@ fn answers(g: &impl Ground, columns: &[DVec2]) -> Vec<[u64; 6]> {
         .collect()
 }
 
+/// Hits as bits: `-0.0` and `0.0` differ, as two replicas' bits would.
+fn hit_bits(hits: &[Option<Hit>]) -> Vec<Option<[u64; 4]>> {
+    hits.iter()
+        .map(|h| {
+            h.map(|h| {
+                [
+                    h.fraction.to_bits(),
+                    h.at.x.to_bits(),
+                    h.at.y.to_bits(),
+                    h.at.z.to_bits(),
+                ]
+            })
+        })
+        .collect()
+}
+
+fn span_bits(b: &SpanBuffer) -> (Vec<[u64; 2]>, Vec<(usize, usize)>) {
+    (
+        b.spans
+            .iter()
+            .map(|s| [s.bottom.to_bits(), s.top.to_bits()])
+            .collect(),
+        b.ranges.clone(),
+    )
+}
+
 fn hits(g: &impl Ground, rays: &[Ray]) -> Vec<Option<Hit>> {
     let mut out = vec![None; rays.len()];
     g.raycast(rays, &mut out).unwrap();
     out
 }
 
-/// A sea over the low samples, so water answers move too.
-fn wet<F: Frame>(g: Heightfield<F>, level: f64) -> Heightfield<F> {
+/// A sea over some samples, so water answers move too.
+fn wet<F: Frame>(
+    g: Heightfield<F>,
+    level: f64,
+    covered: impl Fn(usize, usize) -> bool,
+) -> Heightfield<F> {
     g.with_water(
         vec![WaterBody {
             kind: WaterKind::Sea,
             level,
         }],
-        |i, _| (i < 100).then_some(WaterBodyId(0)),
+        |i, j| covered(i, j).then_some(WaterBodyId(0)),
     )
     .unwrap()
 }
 
+/// The ramp, with a sea over its low samples.
 fn wet_ramp<F: Frame>(frame: F) -> Heightfield<F> {
-    wet(ramp(frame), 100.0)
+    wet(ramp(frame), 100.0, |i, _| i < 100)
 }
 
+/// Flat ground with a sea over its southern rows: the same along a pole row
+/// and on both seam meridians.
 fn wet_flat<F: Frame>(frame: F) -> Heightfield<F> {
-    wet(flat(frame, 0.0), 1.0)
+    wet(flat(frame, 0.0), 1.0, |_, j| j < 100)
 }
 
 fn replicas_agree<G: EditGround>(
@@ -1525,11 +1565,14 @@ fn the_double_answers_like_the_heightfield<F: Frame + Copy>(
         prop_assert_eq!(plain.apply(e, &mut a), paged.apply(e, &mut b));
         prop_assert_eq!(a, b);
         prop_assert_eq!(answers(&plain, &columns), answers(&paged, &columns));
-        prop_assert_eq!(hits(&plain, &rays), hits(&paged, &rays));
+        prop_assert_eq!(
+            hit_bits(&hits(&plain, &rays)),
+            hit_bits(&hits(&paged, &rays))
+        );
         let (mut sa, mut sb) = (SpanBuffer::default(), SpanBuffer::default());
         plain.spans(&columns, &mut sa);
         paged.spans(&columns, &mut sb);
-        prop_assert_eq!(sa, sb);
+        prop_assert_eq!(span_bits(&sa), span_bits(&sb));
     }
     Ok(())
 }
@@ -1645,7 +1688,9 @@ proptest! {
 // a drift in any arithmetic path on one of them fails here. wasm32 is not
 // run yet. Every input is built with `+ − × ÷ sqrt` and `libm`, never the
 // platform's transcendentals; a deliberate change of arithmetic re-records
-// them in the same commit, saying why.
+// them in the same commit, saying why. Last re-recorded with the capsule's
+// great-circle footprint, pole rows and seams decided once, and normals
+// measured at the cell's centre (planar unchanged; geodetic: answers only).
 
 /// A deterministic script of edits from a fixed linear congruential
 /// sequence.
@@ -1734,12 +1779,12 @@ fn golden_digests_are_recorded() {
         (
             "geodetic",
             golden(wet_ramp(geodetic()), &script(&geodetic(), &golden_specs())),
-            (0x6f92_c77b_6f59_c82e, 0x1713_dab3_be21_28cb),
+            (0x6f92_c77b_6f59_c82e, 0x3b36_808b_a543_db82),
         ),
         (
             "polar",
             golden(wet_flat(polar()), &golden_polar_script()),
-            (0xbc83_dd69_a56e_7c64, 0x53c0_3bb6_ac0f_5895),
+            (0x9f19_6aa1_040a_8ff6, 0x047a_89b4_4b88_bfa2),
         ),
     ];
     let wrong: Vec<String> = recorded
@@ -1840,4 +1885,312 @@ fn cells_too_narrow_to_tell_apart_are_refused() {
         Heightfield::new(f, 17, |_, _| 0.0).err(),
         Some(InvalidGround::DegenerateCells)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Great circles, one place at a pole, longitudes modulo a turn.
+
+/// A unit vector's column, longitude and latitude, with `libm`.
+fn column_of(v: DVec3) -> DVec2 {
+    let horizontal = (v.x * v.x + v.y * v.y).sqrt();
+    DVec2::new(libm::atan2(v.y, v.x), libm::atan2(v.z, horizontal))
+}
+
+fn unit(c: DVec2) -> DVec3 {
+    DVec3::new(
+        libm::cos(c.y) * libm::cos(c.x),
+        libm::cos(c.y) * libm::sin(c.x),
+        libm::sin(c.y),
+    )
+}
+
+/// A capsule whose two ends sit 3 km from the pole, 3 radians of longitude
+/// apart: its axis follows the great circle, which passes about 210 m from
+/// the pole, not the parallel of its ends.
+#[test]
+fn a_capsule_near_the_pole_carves_along_its_great_circle() {
+    let mut g = flat(polar(), 0.0);
+    let lat = FRAC_PI_2 - 3000.0 / EARTH_RADIUS;
+    let capsule = Edit {
+        seq: EditSeq(1),
+        op: EditOp::Remove,
+        brush: Brush::Capsule {
+            a: DVec3::new(0.0, lat, 0.0),
+            b: DVec3::new(3.0, lat, 0.0),
+            radius: 150.0,
+        },
+    };
+    g.apply(&capsule, &mut Vec::new()).unwrap();
+    // Meridian 189 is at longitude 1.497, row 250 192 m from the pole: about
+    // 20 m from the axis.
+    let c = g.sample_column(189, 250);
+    assert!(
+        capsule.brush.column_extent(g.frame(), c).is_some(),
+        "the axis passes by"
+    );
+    assert!(top(&g, c).unwrap() < 0.0, "carved");
+}
+
+/// A 6.4 km capsule along the 60th parallel with a 1 m radius: its great
+/// circle bulges 1.4 m north of the parallel, beyond the box of its ends.
+#[test]
+fn a_capsule_footprint_holds_its_great_circle() {
+    let f = GeodeticFrame {
+        min: DVec2::new(-0.01, 1.0),
+        max: DVec2::new(0.01, 1.1),
+        edit_level: 2,
+    };
+    let lat = 60f64.to_radians();
+    let dlon = 6400.0 / (EARTH_RADIUS * libm::cos(lat));
+    let (a, b) = (DVec2::new(-dlon / 2.0, lat), DVec2::new(dlon / 2.0, lat));
+    let brush = Brush::Capsule {
+        a: a.extend(0.0),
+        b: b.extend(0.0),
+        radius: 1.0,
+    };
+    let middle = column_of(unit(a) + unit(b));
+    assert!(brush.column_extent(&f, middle).is_some());
+    let (lo, hi) = brush.footprint(&f);
+    assert!(
+        middle.cmpge(lo).all() && middle.cmple(hi).all(),
+        "{middle:?} in {lo:?}..{hi:?}"
+    );
+}
+
+/// Whether a column falls in a footprint, a whole period of `u` away
+/// included.
+fn in_footprint(frame: &dyn Frame, c: DVec2, lo: DVec2, hi: DVec2) -> bool {
+    if c.y < lo.y || c.y > hi.y {
+        return false;
+    }
+    match frame.u_period() {
+        Some(p) if hi.x - lo.x >= p => true,
+        Some(p) => (-3..=3).any(|k| {
+            let x = c.x + p * f64::from(k);
+            x >= lo.x && x <= hi.x
+        }),
+        None => c.x >= lo.x && c.x <= hi.x,
+    }
+}
+
+/// No sample outside a brush's footprint is reached by it: the footprint
+/// bounds the samples an edit visits.
+fn footprints_hold_their_brushes(
+    g: &Heightfield<impl Frame>,
+    edits: &[Edit],
+) -> Result<(), TestCaseError> {
+    let f = g.frame();
+    let n = g.samples_per_side();
+    for e in edits {
+        if !e.brush.is_valid_in(f) {
+            continue;
+        }
+        let (lo, hi) = e.brush.footprint(f);
+        for j in 0..n {
+            for i in 0..n {
+                let c = g.sample_column(i, j);
+                if !in_footprint(f, c, lo, hi) {
+                    prop_assert!(
+                        e.brush.column_extent(f, c).is_none(),
+                        "sample ({}, {}) at {:?} outside the footprint {:?}..{:?} of {:?}",
+                        i,
+                        j,
+                        c,
+                        lo,
+                        hi,
+                        e.brush
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The samples of one place — a pole row, the two seam meridians of a frame
+/// over a whole turn — stay equal to the bit.
+fn one_place_stays_one<F: Frame>(
+    make: impl Fn() -> Heightfield<F>,
+    edits: &[Edit],
+) -> Result<(), TestCaseError> {
+    let mut g = make();
+    let n = g.samples_per_side();
+    let (lo, hi) = g.frame().bounds();
+    let seam = hi.x - lo.x == core::f64::consts::TAU;
+    for e in edits {
+        let _ = g.apply(e, &mut Vec::new());
+        for j in [0, n - 1] {
+            if g.sample_column(0, j).y.abs() == FRAC_PI_2 {
+                let first = g.sample_height(0, j).unwrap().to_bits();
+                for i in 0..n {
+                    prop_assert_eq!(
+                        g.sample_height(i, j).unwrap().to_bits(),
+                        first,
+                        "pole row {} at {}",
+                        j,
+                        i
+                    );
+                }
+            }
+        }
+        if seam {
+            for j in 0..n {
+                prop_assert_eq!(
+                    g.sample_height(0, j).unwrap().to_bits(),
+                    g.sample_height(n - 1, j).unwrap().to_bits(),
+                    "seam at row {}",
+                    j
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    #[test]
+    fn footprints_hold_their_brushes_everywhere(
+        planar_edits in arb_script(planar()),
+        geodetic_edits in arb_script(geodetic()),
+        polar_edits in arb_globe_script(polar(), true),
+        global_edits in arb_globe_script(global(), false),
+    ) {
+        footprints_hold_their_brushes(&flat(planar(), 0.0), &planar_edits)?;
+        footprints_hold_their_brushes(&flat(geodetic(), 0.0), &geodetic_edits)?;
+        footprints_hold_their_brushes(&flat(polar(), 0.0), &polar_edits)?;
+        footprints_hold_their_brushes(&flat(polar_window(), 0.0), &polar_edits)?;
+        footprints_hold_their_brushes(&flat(global(), 0.0), &global_edits)?;
+    }
+
+    #[test]
+    fn pole_rows_and_seams_stay_one_place(
+        polar_edits in arb_globe_script(polar(), true),
+        global_edits in arb_globe_script(global(), false),
+    ) {
+        one_place_stays_one(|| wet_flat(polar()), &polar_edits)?;
+        one_place_stays_one(|| wet_flat(global()), &global_edits)?;
+    }
+}
+
+#[test]
+fn a_source_must_agree_with_itself_at_one_place() {
+    // A pole row that varies with longitude.
+    assert_eq!(
+        Heightfield::new(polar(), 257, |i, _| i as f64).err(),
+        Some(InvalidGround::NotOnePlace { i: 1, j: 256 })
+    );
+    // Seam meridians that differ.
+    assert_eq!(
+        Heightfield::new(global(), 257, |i, _| i as f64).err(),
+        Some(InvalidGround::NotOnePlace { i: 256, j: 0 })
+    );
+}
+
+/// Near the south pole a cell's east-west width is measured at its centre,
+/// not at the query's latitude, where it vanishes.
+#[test]
+fn normals_near_a_pole_stay_upright() {
+    let f = GeodeticFrame {
+        min: DVec2::new(0.0, -FRAC_PI_2),
+        max: DVec2::new(0.5, -FRAC_PI_2 + 0.01),
+        edit_level: 2,
+    };
+    // The pole row is flat; the next rows rise gently eastwards.
+    let g = Heightfield::new(f, 257, |i, j| 0.1 * i as f64 * j as f64).unwrap_or_else(|_| {
+        Heightfield::new(f, 257, |i, j| {
+            if j == 0 {
+                0.0
+            } else {
+                0.1 * i as f64 * j as f64
+            }
+        })
+        .unwrap()
+    });
+    let s = surface(&g, DVec3::new(0.25, -FRAC_PI_2 + 1e-9, 1e6)).unwrap();
+    assert!(s.normal.z > 0.5, "{:?}", s.normal);
+}
+
+#[test]
+fn a_ray_leaving_through_a_max_edge_does_not_hit_there() {
+    let g = flat(planar(), 0.0);
+    let (lo, hi) = (
+        DVec3::new(2048.0, 0.0, -10.0),
+        DVec3::new(2100.0, 0.0, -10.0),
+    );
+    assert_eq!(cast(&g, lo, hi), None, "outward from the max edge");
+    let mut solid = [true];
+    g.solid(&[lo], &mut solid).unwrap();
+    assert!(!solid[0], "the max edge is outside the ground");
+    let inward = cast(&g, lo, DVec3::new(2000.0, 0.0, -10.0)).expect("inward");
+    assert_eq!(inward.fraction, 0.0);
+}
+
+/// A longitude and the same plus or minus whole turns name one place: the
+/// same samples change, to the rounding of `lon ± k·2π` itself.
+#[test]
+fn longitudes_are_taken_modulo_a_turn() {
+    use core::f64::consts::TAU;
+    for (frame, lon) in [(global(), 0.4), (global(), 3.0), (polar_window(), 0.1)] {
+        let lat = (frame.min.y + frame.max.y) / 2.0;
+        let r = if frame.max.y == FRAC_PI_2 {
+            300.0
+        } else {
+            200_000.0
+        };
+        let mut reference = flat(frame, 0.0);
+        let mut expected = Vec::new();
+        reference
+            .apply(
+                &sphere(1, EditOp::Remove, DVec3::new(lon, lat, 0.0), r),
+                &mut expected,
+            )
+            .unwrap();
+        assert!(!expected.is_empty());
+        let columns = probe_columns(&frame);
+        for turns in [-2.0, -1.0, 1.0, 2.0] {
+            let mut g = flat(frame, 0.0);
+            let far = DVec3::new(lon + turns * TAU, lat, 0.0);
+            let mut changed = Vec::new();
+            assert_eq!(
+                g.apply(&sphere(1, EditOp::Remove, far, r), &mut changed),
+                Ok(()),
+                "{far:?}"
+            );
+            assert_eq!(changed, expected, "{far:?}");
+            for c in &columns {
+                let (a, b) = (top(&g, *c), top(&reference, *c));
+                let close = match (a, b) {
+                    (Some(a), Some(b)) => (a - b).abs() < 1e-6,
+                    _ => a == b,
+                };
+                assert!(close, "{far:?} at {c:?}: {a:?} vs {b:?}");
+            }
+        }
+    }
+}
+
+/// Found by the Linux CI run: a segment entering through the min edge below
+/// the surface, whose entry point rounds a hair inside the face. The hit is
+/// on the face exactly.
+#[test]
+fn an_entry_hit_lies_on_its_face_exactly() {
+    let edits = [Edit {
+        seq: EditSeq(1),
+        op: EditOp::Remove,
+        brush: Brush::Sphere {
+            centre: DVec3::new(0.000_454_099_586_719_460_3, 0.785_719_260_294_551_6, 256.0),
+            radius: 3.0,
+        },
+    }];
+    let ends = [(
+        -0.064_963_967_219_121_65,
+        0.986_085_637_025_66,
+        -39.578_830_339_842_426,
+        0.955_298_101_597_490_2,
+        0.0,
+        0.0,
+    )];
+    rays_agree_with_the_surface(|| wet_ramp(geodetic()), &edits, &ends).unwrap();
 }

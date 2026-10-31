@@ -108,18 +108,17 @@ impl Brush {
     }
 
     /// The rectangle of columns the brush can reach (both corners
-    /// included), from [`Frame::reach`]: it may extend beyond the bounds,
-    /// and spans a whole period of `u` when the brush covers a pole.
+    /// included), from [`Frame::reach`] and [`Frame::reach_segment`]: it may
+    /// extend beyond the bounds, and spans more than a period of `u` when the
+    /// brush covers a pole. No column outside it is reached.
     pub fn footprint<F: Frame + ?Sized>(&self, frame: &F) -> (Column, Column) {
         match *self {
             Brush::Sphere { centre, radius } => {
                 frame.reach(centre.truncate(), centre.truncate(), radius)
             }
-            Brush::Capsule { a, b, radius } => frame.reach(
-                a.truncate().min(b.truncate()),
-                a.truncate().max(b.truncate()),
-                radius,
-            ),
+            Brush::Capsule { a, b, radius } => {
+                frame.reach_segment(a.truncate(), b.truncate(), radius)
+            }
             Brush::Box { min, max } => (min.truncate(), max.truncate()),
         }
     }

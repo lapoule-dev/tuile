@@ -17,10 +17,11 @@
 //! volumetric implementation of the same contract. Authoritative arithmetic
 //! uses only `+ − × ÷ sqrt` and the frame's metric.
 //!
-//! On a frame that wraps around `u` (a geodetic frame over the whole globe),
-//! the first and last sample meridians are the same place, held as two
-//! samples: edits measure both the same way and keep them equal up to
-//! rounding. Rays do not wrap.
+//! Some samples are one place: a row at a pole, and the first and last
+//! meridians of a frame whose bounds span exactly one period of `u` (a
+//! geodetic frame over the whole globe). The source must give them the same
+//! values (checked at build), and an edit decides each place once, at its
+//! first sample, and copies the bits to the others. Rays do not wrap.
 //!
 //! # Costs
 //!
@@ -50,6 +51,9 @@ const DRY: u32 = u32::MAX;
 /// Why a heightfield could not be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum InvalidGround {
+    /// A pole row, or the two seam meridians of a frame over a whole period.
+    #[error("sample ({i}, {j}) differs from the other samples of its place")]
+    NotOnePlace { i: usize, j: usize },
     #[error("cells or edit-level tiles too narrow for their edges to be told apart")]
     DegenerateCells,
     #[error(transparent)]
@@ -129,7 +133,7 @@ impl<F: Frame> Heightfield<F> {
                 heights.push(h);
             }
         }
-        Ok(Heightfield {
+        let g = Heightfield {
             frame,
             n,
             heights,
@@ -137,7 +141,11 @@ impl<F: Frame> Heightfield<F> {
             bodies: Vec::new(),
             versions: BTreeMap::new(),
             last: EditSeq(0),
-        })
+        };
+        if let Some((i, j)) = g.first_split(|i, j| g.heights[g.at(i, j)].to_bits()) {
+            return Err(InvalidGround::NotOnePlace { i, j });
+        }
+        Ok(g)
     }
 
     /// Adds water: `bodies`, each named by its index, and `covered(i, j)`
@@ -166,6 +174,9 @@ impl<F: Frame> Heightfield<F> {
                 self.water[k] = id;
             }
         }
+        if let Some((i, j)) = self.first_split(|i, j| self.water[self.at(i, j)]) {
+            return Err(InvalidGround::NotOnePlace { i, j });
+        }
         self.bodies = bodies;
         Ok(self)
     }
@@ -173,6 +184,11 @@ impl<F: Frame> Heightfield<F> {
     /// Samples per side.
     pub fn samples_per_side(&self) -> usize {
         self.n
+    }
+
+    /// The height of sample `(i, j)`, `None` outside the grid.
+    pub fn sample_height(&self, i: usize, j: usize) -> Option<f64> {
+        (i < self.n && j < self.n).then(|| self.heights[self.at(i, j)])
     }
 
     /// The column of sample `(i, j)`.
@@ -224,12 +240,13 @@ impl<F: Frame> Heightfield<F> {
             return DVec3::Z;
         };
         let h = |a: usize, b: usize| self.heights[self.at(a, b)];
-        let step = DVec2::new(
-            self.edge(i + 1, 0) - self.edge(i, 0),
-            self.edge(j + 1, 1) - self.edge(j, 1),
-        ) * self.frame.metres_per_unit(c);
-        // A cell with no width in metres (a row of samples at a pole, where
-        // every longitude is one place) has no slope across it.
+        let (x0, x1) = (self.edge(i, 0), self.edge(i + 1, 0));
+        let (y0, y1) = (self.edge(j, 1), self.edge(j + 1, 1));
+        // The cell's size in metres, measured at its centre: near a pole the
+        // metric at the query's own latitude may all but vanish.
+        let centre = DVec2::new((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+        let step = DVec2::new(x1 - x0, y1 - y0) * self.frame.metres_per_unit(centre);
+        // A cell with no width in metres has no slope across it.
         let slope = |dh: f64, w: f64| if w > 0.0 { dh / (2.0 * w) } else { 0.0 };
         let gx = slope(
             h(i + 1, j) - h(i, j) + h(i + 1, j + 1) - h(i, j + 1),
@@ -270,6 +287,8 @@ impl<F: Frame> Heightfield<F> {
         let d = r.to - r.from;
         // The parameters inside the bounds.
         let (mut t0, mut t1) = (0.0f64, 1.0f64);
+        // The face the segment enters through, when it starts outside.
+        let mut face: Option<(usize, f64)> = None;
         for axis in 0..2 {
             let (o, dd) = (r.from[axis], d[axis]);
             if dd == 0.0 {
@@ -278,14 +297,24 @@ impl<F: Frame> Heightfield<F> {
                 }
             } else {
                 let (a, b) = ((lo[axis] - o) / dd, (hi[axis] - o) / dd);
-                t0 = t0.max(a.min(b));
+                if a.min(b) > t0 {
+                    t0 = a.min(b);
+                    face = Some((axis, if dd > 0.0 { lo[axis] } else { hi[axis] }));
+                }
                 t1 = t1.min(a.max(b));
             }
         }
         if t0 > t1 {
             return None;
         }
-        let start = r.from + d * t0;
+        // The entry point, on its face exactly (not a rounding either side),
+        // and within the bounds on the other axis.
+        let mut start = r.from + d * t0;
+        if let Some((axis, v)) = face {
+            start[axis] = v;
+            let other = 1 - axis;
+            start[other] = start[other].clamp(lo[other], hi[other]);
+        }
         // Solid at the start agrees with `solid` wherever that answers.
         if self.is_solid(start) {
             return Some(Hit {
@@ -311,9 +340,11 @@ impl<F: Frame> Heightfield<F> {
             let (tx, ty) = (crossing(i, 0), crossing(j, 1));
             let end = tx.min(ty).min(t1).max(t);
             if let Some(th) = self.enter_patch(r, d, i, j, t, end) {
-                let at = r.from + d * th;
-                // The max edges belong to no cell, except as the entry face.
-                return (th == t0 || self.frame.contains(at.truncate()))
+                let at = if th == t0 { start } else { r.from + d * th };
+                // The max edges belong to no cell, except as the face a
+                // segment enters through, moving inward.
+                let inward = (0..2).all(|a| at[a] < hi[a] || d[a] < 0.0);
+                return (self.frame.contains(at.truncate()) || (th == t0 && inward))
                     .then_some(Hit { at, fraction: th });
             }
             if end >= t1 {
@@ -393,35 +424,97 @@ impl<F: Frame> Heightfield<F> {
         }
     }
 
+    /// Whether the first and last sample meridians are one place: a frame
+    /// whose `u` is periodic and whose bounds span exactly one period.
+    fn seam(&self) -> bool {
+        let (lo, hi) = self.frame.bounds();
+        self.frame.u_period().is_some_and(|p| hi.x - lo.x == p)
+    }
+
+    /// The first sample of `(i, j)`'s place, which decides it: the first of
+    /// a pole row, the first meridian for the last one of a seam.
+    fn canonical(&self, i: usize, j: usize, seam: bool) -> usize {
+        if self.frame.is_pole(self.edge(j, 1)) || (seam && i == self.n - 1) {
+            0
+        } else {
+            i
+        }
+    }
+
+    /// Where the samples of one place disagree, the first that does.
+    fn first_split<T: PartialEq>(
+        &self,
+        value: impl Fn(usize, usize) -> T,
+    ) -> Option<(usize, usize)> {
+        let n = self.n;
+        let seam = self.seam();
+        for j in [0, n - 1] {
+            if self.frame.is_pole(self.edge(j, 1)) {
+                if let Some(i) = (1..n).find(|&i| value(i, j) != value(0, j)) {
+                    return Some((i, j));
+                }
+            }
+        }
+        if seam {
+            if let Some(j) = (0..n).find(|&j| value(n - 1, j) != value(0, j)) {
+                return Some((n - 1, j));
+            }
+        }
+        None
+    }
+
+    /// The height an edit leaves at sample `(i, j)`, decided at its place's
+    /// first sample, so every sample of one place gets the same bits.
+    fn edited(&self, edit: &Edit, i: usize, j: usize, seam: bool) -> f64 {
+        let ci = self.canonical(i, j, seam);
+        let h = self.heights[self.at(ci, j)];
+        let Some((bottom, top)) = edit
+            .brush
+            .column_extent(&self.frame, self.sample_column(ci, j))
+        else {
+            return h;
+        };
+        match edit.op {
+            // Grows the column only where the brush rests on it.
+            EditOp::Add if bottom <= h => h.max(top),
+            // Carves the column only where the brush opens to the sky.
+            EditOp::Remove if top >= h => h.min(bottom),
+            _ => h,
+        }
+    }
+
     /// The samples an edit changes, and the rectangle of columns whose
-    /// answers they decide: every cell with a changed corner.
+    /// answers they decide: every cell with a changed corner. A pole row is
+    /// edited whole, and the two seam meridians together.
     fn carve(&mut self, edit: &Edit, lo: Column, hi: Column) -> Option<(Column, Column)> {
+        let n = self.n;
+        let seam = self.seam();
         let (i0, i1) = (self.cell_index(lo.x, 0), self.cell_index(hi.x, 0) + 1);
         let (j0, j1) = (self.cell_index(lo.y, 1), self.cell_index(hi.y, 1) + 1);
-        let mut changed: Option<(usize, usize, usize, usize)> = None;
+        // Decided on the state before the edit, then written.
+        let mut writes = Vec::new();
         for j in j0..=j1 {
-            for i in i0..=i1 {
-                let Some((bottom, top)) = edit
-                    .brush
-                    .column_extent(&self.frame, self.sample_column(i, j))
-                else {
-                    continue;
-                };
-                let k = self.at(i, j);
-                let h = self.heights[k];
-                let new = match edit.op {
-                    // Grows the column only where the brush rests on it.
-                    EditOp::Add if bottom <= h => h.max(top),
-                    // Carves the column only where the brush opens to the sky.
-                    EditOp::Remove if top >= h => h.min(bottom),
-                    _ => h,
-                };
-                if new.to_bits() != h.to_bits() {
-                    self.heights[k] = new;
-                    changed = Some(changed.map_or((i, i, j, j), |(a, b, c, e)| {
-                        (a.min(i), b.max(i), c.min(j), e.max(j))
-                    }));
+            let range = if self.frame.is_pole(self.edge(j, 1)) {
+                0..=n - 1
+            } else {
+                i0..=i1
+            };
+            for i in range {
+                let v = self.edited(edit, i, j, seam);
+                writes.push((i, j, v));
+                if seam && (i == 0 || i == n - 1) {
+                    writes.push((n - 1 - i, j, v));
                 }
+            }
+        }
+        let mut changed: Option<(usize, usize, usize, usize)> = None;
+        for (i, j, v) in writes {
+            let k = self.at(i, j);
+            if v.to_bits() != self.heights[k].to_bits() {
+                self.heights[k] = v;
+                changed = Some(changed.map_or((i, i, j, j), |(a, b, c, e)| {
+                    (a.min(i), b.max(i), c.min(j), e.max(j))
+                }));
             }
         }
         // A sample is a corner of the cells on each side of it: columns from
@@ -429,7 +522,7 @@ impl<F: Frame> Heightfield<F> {
         // line after the last.
         let (ia, ib, ja, jb) = changed?;
         let before = |k: usize| k.saturating_sub(1);
-        let after = |k: usize| (k + 1).min(self.n - 1);
+        let after = |k: usize| (k + 1).min(n - 1);
         Some((
             DVec2::new(self.edge(before(ia), 0), self.edge(before(ja), 1)),
             DVec2::new(
@@ -571,8 +664,11 @@ impl<F: Frame> EditGround for Heightfield<F> {
                 take(DVec2::new(blo.x, lo.y), DVec2::new(bhi.x, hi.y));
             }
             Some(p) => {
-                for shift in [0.0, -p, p] {
-                    let s = DVec2::new(shift, 0.0);
+                // The whole number of periods that brings the footprint
+                // nearest the bounds, and one either side.
+                let k = ((blo.x + bhi.x - lo.x - hi.x) / 2.0 / p).round();
+                for m in [k, k - 1.0, k + 1.0] {
+                    let s = DVec2::new(m * p, 0.0);
                     take(lo + s, hi + s);
                 }
             }

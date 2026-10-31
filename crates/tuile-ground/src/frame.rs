@@ -109,10 +109,25 @@ pub trait Frame: Send + Sync + std::fmt::Debug {
         (lo - d, hi + d)
     }
 
-    /// The period of `u` when the frame wraps around it (a geodetic frame
-    /// spanning the whole globe: 2π); `None` for a frame with edges.
+    /// The rectangle of columns within `r` metres of the axis `a`–`b` of a
+    /// capsule, as [`Brush::column_extent`](crate::Brush::column_extent)
+    /// measures it. The default is the box of the two ends widened by
+    /// [`Self::reach`], exact where the axis is straight in the frame's
+    /// coordinates; a frame where it is not overrides it.
+    fn reach_segment(&self, a: Column, b: Column, r: f64) -> (Column, Column) {
+        self.reach(a.min(b), a.max(b), r)
+    }
+
+    /// The period of `u` when `u` is periodic (a longitude: 2π): a brush a
+    /// whole number of periods away is the same brush. `None` for a frame
+    /// whose `u` is not.
     fn u_period(&self) -> Option<f64> {
         None
+    }
+
+    /// Whether the samples of the row at `v` are all one place (a pole).
+    fn is_pole(&self, _v: f64) -> bool {
+        false
     }
 
     /// Whether a column names a place in the frame, inside its bounds or
@@ -275,6 +290,25 @@ pub struct PlanarFrame {
 /// [`GeodeticFrame::metres_per_unit`]).
 pub const EARTH_RADIUS: f64 = 6_378_137.0;
 
+/// The unit vector of a longitude and latitude on the sphere, with `libm`.
+fn unit(c: Column) -> DVec3 {
+    let cl = libm::cos(c.y);
+    DVec3::new(cl * libm::cos(c.x), cl * libm::sin(c.x), libm::sin(c.y))
+}
+
+/// Written out: no fused multiply-add, whatever a library might do.
+fn cross(a: DVec3, b: DVec3) -> DVec3 {
+    DVec3::new(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    )
+}
+
+fn dot(a: DVec3, b: DVec3) -> f64 {
+    a.x * b.x + a.y * b.y + a.z * b.z
+}
+
 /// The cosine of an anchor's latitude, kept away from zero at the poles; the
 /// same value both ways so the two conversions stay inverse.
 fn anchor_cos(lat: f64) -> f64 {
@@ -340,13 +374,19 @@ impl Frame for PlanarFrame {
 /// heights above the ellipsoid.
 ///
 /// Its longitudes lie within ±2π with `min.x < max.x` and span at most 2π,
-/// and its latitudes within ±90° (poles included). A region spanning exactly
-/// 2π of longitude is the whole globe: brushes wrap around it
-/// ([`Frame::u_period`]); a narrower region has edges, and a brush is
-/// clipped to them. Brushes are measured in each column's tangent plane, so
-/// a ball at a pole carves a disc, not a longitude-latitude rectangle;
-/// segments (rays, a capsule's axis) are straight in longitude and latitude
-/// and do not wrap.
+/// and its latitudes within ±90° (poles included). Longitudes are periodic
+/// ([`Frame::u_period`]): a brush whole turns away is the same brush, a brush
+/// across the antimeridian edits both sides of it, and a region narrower than
+/// a turn clips a brush to its edges. A region whose `max.x − min.x` is
+/// exactly 2π is the whole globe: its first and last sample meridians are one
+/// place (a region a rounding short of it has two, a hair apart). A row of
+/// samples at ±90° is one place too ([`Frame::is_pole`]).
+///
+/// Brushes are measured in each column's tangent plane, so a ball at a pole
+/// carves a disc, not a longitude-latitude rectangle, and a capsule's axis
+/// follows the great circle between its ends, the short way, across the
+/// antimeridian if that is shorter. Rays are straight in longitude and
+/// latitude and do not wrap.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GeodeticFrame {
     /// West-south corner (radians).
@@ -392,10 +432,11 @@ impl Frame for GeodeticFrame {
     /// the rectangle's latitude closest to a pole, and every longitude when
     /// the cap contains a pole.
     fn reach(&self, lo: Column, hi: Column, r: f64) -> (Column, Column) {
-        use core::f64::consts::{FRAC_PI_2, PI};
+        use core::f64::consts::{FRAC_PI_2, TAU};
         let s = r / EARTH_RADIUS;
+        // Every longitude: more than a whole turn, whatever the rounding.
         let every =
-            |south: f64, north: f64| (DVec2::new(lo.x - PI, south), DVec2::new(hi.x + PI, north));
+            |south: f64, north: f64| (DVec2::new(lo.x - TAU, south), DVec2::new(hi.x + TAU, north));
         if s >= 1.0 {
             return every(-FRAC_PI_2, FRAC_PI_2);
         }
@@ -412,9 +453,52 @@ impl Frame for GeodeticFrame {
         )
     }
 
+    /// The great-circle arc from `a` to `b`, the short way: latitudes from
+    /// its ends and, where the arc passes it, its vertex closest to a pole
+    /// (Clairaut); longitudes the short way between its ends. Widened by
+    /// [`Frame::reach`] with `r / cos(θ/2)`: the axis is the chord under the
+    /// arc, `cos(θ/2)` of the radius at its middle for an arc of `θ`.
+    fn reach_segment(&self, a: Column, b: Column, r: f64) -> (Column, Column) {
+        use core::f64::consts::{FRAC_PI_2, TAU};
+        let (ua, ub) = (unit(a), unit(b));
+        let n = cross(ua, ub);
+        let half = (ua + ub) / 2.0;
+        let m = dot(half, half).sqrt();
+        if m <= 0.0 {
+            // Antipodal ends: any great circle joins them.
+            return (
+                DVec2::new(a.x.min(b.x) - TAU, -FRAC_PI_2),
+                DVec2::new(a.x.max(b.x) + TAU, FRAC_PI_2),
+            );
+        }
+        let d = b.x - a.x;
+        let d = d - TAU * (d / TAU).round();
+        let (mut lo, mut hi) = (
+            DVec2::new(a.x.min(a.x + d), a.y.min(b.y)),
+            DVec2::new(a.x.max(a.x + d), a.y.max(b.y)),
+        );
+        let h2 = n.x * n.x + n.y * n.y;
+        if h2 > 0.0 {
+            // The great circle's highest point, toward +z, and its lowest.
+            let north = DVec3::new(-n.x * n.z, -n.y * n.z, h2);
+            let on_arc = |v: DVec3| dot(cross(ua, v), n) >= 0.0 && dot(cross(v, ub), n) >= 0.0;
+            let vertex = libm::atan2(h2.sqrt(), n.z.abs());
+            if on_arc(north) {
+                hi.y = hi.y.max(vertex);
+            }
+            if on_arc(-north) {
+                lo.y = lo.y.min(-vertex);
+            }
+        }
+        self.reach(lo, hi, r / m)
+    }
+
     fn u_period(&self) -> Option<f64> {
-        let tau = core::f64::consts::TAU;
-        (self.max.x - self.min.x == tau).then_some(tau)
+        Some(core::f64::consts::TAU)
+    }
+
+    fn is_pole(&self, v: f64) -> bool {
+        v.abs() == core::f64::consts::FRAC_PI_2
     }
 
     fn is_place(&self, c: Column) -> bool {
