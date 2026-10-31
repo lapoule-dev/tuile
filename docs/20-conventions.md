@@ -37,7 +37,7 @@
   - merge bottom-up with the **merge commit** method only — never squash, never rebase-merge;
   - when `main` moves, rebase the whole stack — never merge `main` into a branch of the stack; a layer the rebase leaves empty is dropped;
   - a contributor's PR from a fork cannot join a stack: it is rebased onto `main` and merged on its own.
-- Releases are cumulative and in order: a `chore: version X.Y.Z` PR, merged, then the tag.
+- Releases are cumulative and in order: a `chore: version X.Y.Z` PR, merged, then the tag. The tag triggers the release workflows — the viewer applications, and crates.io when it is turned on — which never tag or bump a version themselves: see `docs/releasing.md`.
 
 ## Tests
 
@@ -57,6 +57,8 @@ Jobs:
 6. `web-package`: the wasm build and bindings of `packages/tuile-viewer` (wasm-bindgen at the locked version), its typings, and a bundler build of `examples/web-viewer-vite`.
 7. `android`: clippy for `aarch64-linux-android` and the APK through `crates/tuile-viewer/android/build.sh`.
 8. `docs`: `cargo doc --workspace --no-deps` with `-D warnings`.
+
+Release workflows, on a `vX.Y.Z` tag: `release-apps.yml` (macOS, iOS, Android) and `release-crates.yml` (crates.io, behind the `CRATES_IO_PUBLISH` variable) — `docs/releasing.md`.
 
 No Windows CI (to be added on demand), no bench in CI (criterion locally).
 

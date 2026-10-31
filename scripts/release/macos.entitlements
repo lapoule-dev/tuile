@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!-- Copyright (c) lapoule.dev -->
+<!--
+  The Developer ID build's entitlements, under the hardened runtime that
+  notarisation requires. One resource is asked for: the current location
+  (the L key, tuile://here). The system still asks the person first, with
+  the sentence in Info.plist. Nothing else is relaxed: no JIT, no
+  unsigned memory, no library validation exception.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.personal-information.location</key>
+    <true/>
+</dict>
+</plist>

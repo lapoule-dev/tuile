@@ -1,5 +1,8 @@
 [package]
 name = "tuile-hydra"
+# A static library for the OpenUSD/Hydra plugin, linked by its C++ build:
+# nothing for a Rust crate to depend on.
+publish = false
 description = "C ABI over the tuile geometry server, for an OpenUSD/Hydra plugin"
 version.workspace = true
 edition.workspace = true

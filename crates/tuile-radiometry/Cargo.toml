@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # No backend and nothing heavy: numbers in, numbers out. It compiles to
 # wasm32, where a renderer applies a field it read, and runs natively, where

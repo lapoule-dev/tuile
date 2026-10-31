@@ -52,6 +52,13 @@ edition = "2021"
 rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 authors = ["lapoule.dev"]
+# Shared by every crate that is published (docs/releasing.md). `readme` is
+# each crate's own README.md, found by cargo; `documentation` is docs.rs's
+# page, which crates.io links by default.
+repository = "https://github.com/lapoule-dev/tuile"
+homepage = "https://tuile.lapoule.dev"
+keywords = ["3d-tiles", "geospatial", "globe", "terrain", "ogc"]
+categories = ["science::geo", "rendering", "graphics"]
 
 [workspace.dependencies]
 # Single source of truth for shared external crates, so the whole workspace

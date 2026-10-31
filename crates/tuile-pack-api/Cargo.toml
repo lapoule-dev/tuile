@@ -1,5 +1,7 @@
 [package]
 name = "tuile-pack-api"
+# A service (one binary), deployed, not depended on.
+publish = false
 description = "A local, read-only HTTP API over the buckets a film is made from: packs, camera tapes, source tiles"
 version.workspace = true
 edition.workspace = true
@@ -20,7 +22,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 # The contract of a store of bytes, which what packs hold is remembered in.
 tuile-core = { version = "0.15.1", path = "../tuile-core" }
 tuile-repository = { version = "0.15.1", path = "../tuile-repository" }
-tuile-tile-server = { path = "../tuile-tile-server" }
+tuile-tile-server = { version = "0.15.1", path = "../tuile-tile-server" }
 # Where a remote store's blocks are kept once read.
 tuile-storage-foyer = { version = "0.15.1", path = "../tuile-storage-foyer" }
 tracing = { workspace = true }

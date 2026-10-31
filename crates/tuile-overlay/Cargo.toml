@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # Data and arithmetic. No GPU, no I/O, and deliberately not `tuile-film`:
 # these types say what to draw, and a host that is not making a film — a

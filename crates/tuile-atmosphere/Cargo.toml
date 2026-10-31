@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Sun position, aerial perspective and sky for a rendered globe — renderer-agnostic"
 
 [dependencies]
@@ -13,7 +17,7 @@ glam.workspace = true
 # to restate their layout — a restatement is exactly the drift this crate exists
 # to prevent. bytemuck is plain-data plumbing, not a renderer.
 bytemuck.workspace = true
-tuile-core = { path = "../tuile-core" }
+tuile-core = { version = "0.15.1", path = "../tuile-core" }
 solar-positioning.workspace = true
 astro.workspace = true
 # The tables, the sky-view and the uniform on a GPU, shared by every wgpu

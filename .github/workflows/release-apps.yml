@@ -1,0 +1,375 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# The viewer applications, built, signed and handed out when a release tag is
+# pushed — so that anyone can download them and try tuile on their own Mac or
+# phone (docs/try-tuile.md).
+#
+#   macOS    a universal, Developer ID-signed, notarised and stapled .dmg,
+#            attached to the GitHub Release
+#   Android  a signed .apk attached to the GitHub Release (sideloading), and
+#            an .aab sent to the Play internal track when a Play account is set
+#   iOS      an App Store-signed build sent to TestFlight; testers join by
+#            the public link (repository variable TESTFLIGHT_PUBLIC_LINK)
+#
+# The tag is the release: it is pushed by hand on main after the version
+# PR, and must equal the workspace version. This workflow never creates a
+# tag and never changes a version. `workflow_dispatch` is a dry run: it
+# builds, signs when the secrets exist, and uploads nothing anywhere but this
+# run's artefacts.
+#
+# Secrets and variables are named here and described in docs/releasing.md;
+# a missing secret skips its step with a warning instead of failing the run.
+# No public build carries a credential: scripts/release/no-bundled-credential.sh
+# fails the job if one would.
+name: Release apps
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-apps-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # What is being released, checked against the workspace.
+  meta:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: version
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_TYPE" == tag ]]; then
+            if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version"
+              exit 1
+            fi
+            echo "publish=yes" >>"$GITHUB_OUTPUT"
+          else
+            echo "publish=no" >>"$GITHUB_OUTPUT"
+            echo "::notice::dry run of $version: nothing is uploaded"
+          fi
+
+  # The GitHub Release of the tag, as a draft until the downloads are on it.
+  # Notes: a header written here, then GitHub's own notes from the merged
+  # pull requests since the previous tag.
+  release:
+    needs: meta
+    if: needs.meta.outputs.publish == 'yes'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          TESTFLIGHT_PUBLIC_LINK: ${{ vars.TESTFLIGHT_PUBLIC_LINK }}
+        run: |
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::notice::the release $tag exists already: its notes are left as they are"
+            exit 0
+          fi
+          previous="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$tag^" 2>/dev/null || true)"
+          guide="https://github.com/$GITHUB_REPOSITORY/blob/$tag/docs/try-tuile.md"
+          {
+            echo "## Try it"
+            echo
+            echo "Download the viewer for your device, then follow [Try tuile]($guide): your own Cesium ion token, one config file, opened in the app."
+            echo
+            echo "- **macOS** (Apple silicon and Intel): \`Tuile-$VERSION-macos-universal.dmg\` below."
+            echo "- **Android** (arm64): \`Tuile-$VERSION-android-arm64.apk\` below, installed by sideloading — see the guide."
+            if [[ -n "$TESTFLIGHT_PUBLIC_LINK" ]]; then
+              echo "- **iOS**: through TestFlight, [$TESTFLIGHT_PUBLIC_LINK]($TESTFLIGHT_PUBLIC_LINK). A new version appears there once Apple's beta review has passed."
+            fi
+            echo
+          } >notes.md
+          args=(--draft --verify-tag --title "tuile $VERSION" --notes-file notes.md --generate-notes)
+          [[ -n "$previous" ]] && args+=(--notes-start-tag "$previous")
+          gh release create "$tag" "${args[@]}"
+
+  macos:
+    # After the draft release exists (on a tag); on a dry run there is none.
+    needs: [meta, release]
+    if: ${{ !cancelled() && needs.meta.result == 'success' && needs.release.result != 'failure' }}
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release-macos
+      - name: Signing keychain
+        id: keychain
+        env:
+          P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          if [[ -z "$P12_BASE64" ]]; then
+            echo "::warning::MACOS_DEVELOPER_ID_P12_BASE64 is not set: the app is not signed with a Developer ID, and nothing is attached to the release"
+            exit 0
+          fi
+          keychain="$(scripts/release/apple-keychain.sh)"
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          if [[ -z "$identity" ]]; then
+            echo "::error::the certificate holds no Developer ID Application identity"
+            exit 1
+          fi
+          echo "identity=$identity" >>"$GITHUB_OUTPUT"
+          echo "keychain=$keychain" >>"$GITHUB_OUTPUT"
+      - name: App Store Connect key
+        id: asc
+        env:
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          if [[ -z "$ASC_KEY_P8_BASE64" || -z "$ASC_KEY_ID" ]]; then
+            echo "::warning::no App Store Connect API key: the app is not notarised"
+            exit 0
+          fi
+          umask 077
+          path="$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
+          printf '%s' "$ASC_KEY_P8_BASE64" | base64 --decode >"$path"
+          echo "path=$path" >>"$GITHUB_OUTPUT"
+      - name: Build, sign, notarise
+        env:
+          OUT: ${{ runner.temp }}/dist
+          MACOS_SIGNING_IDENTITY: ${{ steps.keychain.outputs.identity }}
+          ASC_KEY_PATH: ${{ steps.asc.outputs.path }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: scripts/release/macos.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos
+          path: ${{ runner.temp }}/dist/*.dmg*
+          retention-days: 14
+      - name: Attach to the release
+        if: needs.meta.outputs.publish == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          dmg="$RUNNER_TEMP/dist/Tuile-$VERSION-macos-universal.dmg"
+          if [[ ! -f "$dmg" ]]; then
+            echo "::warning::no signed and notarised disk image: nothing attached"
+            exit 0
+          fi
+          gh release upload "v$VERSION" "$dmg" "$dmg.sha256" --clobber
+      - name: Remove the keychain
+        if: always() && steps.keychain.outputs.keychain != ''
+        run: security delete-keychain "${{ steps.keychain.outputs.keychain }}"
+    permissions:
+      contents: write
+
+  ios:
+    needs: meta
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release-ios
+      - run: brew install xcodegen
+      - name: Signing keychain and profile
+        id: keychain
+        env:
+          P12_BASE64: ${{ secrets.IOS_DISTRIBUTION_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_P12_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          if [[ -z "$P12_BASE64" || -z "$PROFILE_BASE64" ]]; then
+            echo "::warning::IOS_DISTRIBUTION_P12_BASE64 or IOS_PROVISIONING_PROFILE_BASE64 is not set: the archive is built unsigned and not sent to TestFlight"
+            exit 0
+          fi
+          keychain="$(scripts/release/apple-keychain.sh)"
+          echo "keychain=$keychain" >>"$GITHUB_OUTPUT"
+          profile="$RUNNER_TEMP/tuile.mobileprovision"
+          printf '%s' "$PROFILE_BASE64" | base64 --decode >"$profile"
+          uuid="$(security cms -D -i "$profile" | plutil -extract UUID raw -)"
+          for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" \
+                     "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$dir"
+            cp "$profile" "$dir/$uuid.mobileprovision"
+          done
+          echo "profile=$uuid" >>"$GITHUB_OUTPUT"
+      - name: App Store Connect key
+        id: asc
+        env:
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          PUBLISH: ${{ needs.meta.outputs.publish }}
+        run: |
+          if [[ -z "$ASC_KEY_P8_BASE64" || -z "$ASC_KEY_ID" || -z "$ASC_ISSUER_ID" ]]; then
+            echo "::warning::no App Store Connect API key: nothing is sent to TestFlight"
+            exit 0
+          fi
+          umask 077
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          printf '%s' "$ASC_KEY_P8_BASE64" | base64 --decode \
+            >"$HOME/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8"
+          [[ "$PUBLISH" == yes ]] && echo "upload=yes" >>"$GITHUB_OUTPUT"
+          exit 0
+      - name: Archive, export, upload
+        env:
+          OUT: ${{ runner.temp }}/dist
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          IOS_PROFILE_UUID: ${{ steps.keychain.outputs.profile }}
+          IOS_UPLOAD: ${{ steps.asc.outputs.upload }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: scripts/release/ios.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ios
+          path: ${{ runner.temp }}/dist/export/*.ipa
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Remove the keychain and the key
+        if: always()
+        run: |
+          [[ -n "${{ steps.keychain.outputs.keychain }}" ]] && security delete-keychain "${{ steps.keychain.outputs.keychain }}"
+          rm -rf "$HOME/.appstoreconnect/private_keys"
+
+  android:
+    # After the draft release exists (on a tag); on a dry run there is none.
+    needs: [meta, release]
+    if: ${{ !cancelled() && needs.meta.result == 'success' && needs.release.result != 'failure' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release-android
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 17
+      # No Gradle: what is worth keeping between runs is Kotlin's standard
+      # library and bundletool, both fetched by digest into ~/.cache/tuile.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/tuile
+          key: android-tools-${{ hashFiles('crates/tuile-viewer/android/build.sh', 'scripts/release/android.sh') }}
+      - run: cargo install cargo-ndk --version 4.1.2 --locked
+      - name: Upload keystore
+        id: keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
+        run: |
+          if [[ -z "$KEYSTORE_BASE64" ]]; then
+            echo "::warning::ANDROID_UPLOAD_KEYSTORE_BASE64 is not set: the packages are not release-signed, and nothing is attached or sent"
+            exit 0
+          fi
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode >"$RUNNER_TEMP/upload.jks"
+          echo "path=$RUNNER_TEMP/upload.jks" >>"$GITHUB_OUTPUT"
+      - name: Build and sign
+        env:
+          OUT: ${{ runner.temp }}/dist
+          ANDROID_KEYSTORE: ${{ steps.keystore.outputs.path }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
+          TUILE_CATALOG_URL: ${{ vars.ANDROID_CATALOG_URL }}
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          [[ -n "$TUILE_CATALOG_URL" ]] || unset TUILE_CATALOG_URL
+          scripts/release/android.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android
+          path: |
+            ${{ runner.temp }}/dist/*.apk
+            ${{ runner.temp }}/dist/*.apk.sha256
+            ${{ runner.temp }}/dist/*.aab
+          retention-days: 14
+      - name: Attach to the release
+        if: needs.meta.outputs.publish == 'yes' && steps.keystore.outputs.path != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          apk="$RUNNER_TEMP/dist/Tuile-$VERSION-android-arm64.apk"
+          gh release upload "v$VERSION" "$apk" "$apk.sha256" --clobber
+      - name: Play service account
+        id: play
+        if: needs.meta.outputs.publish == 'yes' && steps.keystore.outputs.path != ''
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [[ -z "$PLAY_SERVICE_ACCOUNT_JSON" ]]; then
+            echo "::notice::PLAY_SERVICE_ACCOUNT_JSON is not set: the bundle is not sent to Google Play (optional)"
+            exit 0
+          fi
+          echo "set=yes" >>"$GITHUB_OUTPUT"
+      - name: Google Play, internal track
+        if: steps.play.outputs.set == 'yes'
+        uses: r0adkll/upload-google-play@e738b9dd8f2476ea806d921b64aacd24f34515a5 # v1.1.5
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: dev.lapoule.tuile.viewer
+          releaseFiles: ${{ runner.temp }}/dist/Tuile-${{ needs.meta.outputs.version }}-android-arm64.aab
+          releaseName: ${{ needs.meta.outputs.version }}
+          track: internal
+          # "draft" until the app has been published once on Play.
+          status: ${{ vars.PLAY_RELEASE_STATUS || 'completed' }}
+      - name: Remove the keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/upload.jks"
+
+  # The release goes public once its downloads are on it. iOS is not waited
+  # for: TestFlight is reached by its own link.
+  publish:
+    needs: [meta, release, macos, android]
+    if: ${{ !cancelled() && needs.meta.outputs.publish == 'yes' && needs.release.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          assets="$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')"
+          for want in "Tuile-$VERSION-macos-universal.dmg" "Tuile-$VERSION-android-arm64.apk"; do
+            if ! grep -qx "$want" <<<"$assets"; then
+              echo "::warning::$want is not on the release: it stays a draft (publish it by hand once it is complete)"
+              exit 0
+            fi
+          done
+          gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false
