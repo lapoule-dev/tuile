@@ -399,6 +399,10 @@ pub struct MaterialDesc {
     pub base_color_factor: [f32; 4],
     /// Index into [`DecodedTileContent::textures`].
     pub base_color_texture: Option<usize>,
+    /// The material declares `KHR_materials_unlit`: its colour already
+    /// carries its light (photogrammetry), and it is not to be shaded by its
+    /// own facets.
+    pub unlit: bool,
 }
 
 impl Default for MaterialDesc {
@@ -406,6 +410,7 @@ impl Default for MaterialDesc {
         Self {
             base_color_factor: [1.0; 4],
             base_color_texture: None,
+            unlit: false,
         }
     }
 }
@@ -553,6 +558,7 @@ fn walk_node(
                 base_color_texture: pbr
                     .base_color_texture()
                     .map(|info| info.texture().source().index()),
+                unlit: prim.material().unlit(),
             };
 
             out.push(DecodedMesh {
@@ -685,6 +691,15 @@ pub(crate) mod tests {
 
     /// [`test_glb`], with `asset` as its glTF `asset` object.
     fn glb_with_asset(asset: serde_json::Value) -> Vec<u8> {
+        glb_with(
+            asset,
+            serde_json::json!({ "pbrMetallicRoughness": { "baseColorFactor": [1.0, 0.5, 0.25, 1.0] } }),
+        )
+    }
+
+    /// [`test_glb`], with `asset` as its glTF `asset` object and `material`
+    /// as its one material.
+    fn glb_with(asset: serde_json::Value, material: serde_json::Value) -> Vec<u8> {
         let positions: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]];
         let indices: [u16; 3] = [0, 1, 2];
 
@@ -712,7 +727,7 @@ pub(crate) mod tests {
                 "indices": 1,
                 "material": 0
             }]}],
-            "materials": [{ "pbrMetallicRoughness": { "baseColorFactor": [1.0, 0.5, 0.25, 1.0] } }],
+            "materials": [material],
             "buffers": [{ "byteLength": bin.len() }],
             "bufferViews": [
                 { "buffer": 0, "byteOffset": 0, "byteLength": idx_offset, "target": 34962 },
@@ -804,6 +819,24 @@ pub(crate) mod tests {
         let empty = glb_with_asset(serde_json::json!({ "version": "2.0", "copyright": "  " }));
         let d = decode(&empty, &hints(DVec3::ZERO)).expect("decode");
         assert_eq!(d.copyright, None);
+    }
+
+    /// A material that declares `KHR_materials_unlit` is decoded as unlit —
+    /// what the photorealistic 3D Tiles declare, and require — and one that
+    /// does not, as lit.
+    #[test]
+    fn an_unlit_material_is_decoded_unlit() {
+        let unlit = glb_with(
+            serde_json::json!({ "version": "2.0" }),
+            serde_json::json!({
+                "pbrMetallicRoughness": { "baseColorFactor": [1.0, 1.0, 1.0, 1.0] },
+                "extensions": { "KHR_materials_unlit": {} }
+            }),
+        );
+        let d = decode(&unlit, &hints(DVec3::ZERO)).expect("decode");
+        assert!(d.meshes[0].material.unlit);
+        let lit = decode(&test_glb(), &hints(DVec3::ZERO)).expect("decode");
+        assert!(!lit.meshes[0].material.unlit);
     }
 
     #[test]
