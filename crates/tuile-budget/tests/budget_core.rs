@@ -3019,3 +3019,150 @@ mod deadline {
         assert_eq!(cap(250).take(&queue, &[], Bytes(100), cost), &[a]);
     }
 }
+
+/// O1.4: a step reads again only what may have changed (`downstream`). Each
+/// test pins one propagation rule with a tile that nothing else would read
+/// again: left out, the tile keeps last step's answer (red in a release
+/// build; a debug build's full recomputation fails first).
+mod dirty_sets {
+    use super::*;
+
+    /// The parent's rule: a tile standing on an ancestor is read again when
+    /// a finer tile below it starts being drawn — the held set changes at
+    /// the step's end — though nothing of its own changed; it is then held
+    /// by that tile, no longer falling back.
+    #[test]
+    fn a_tile_is_held_by_a_finer_tile_drawn_since() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        r.settle(&drawn(&[root]), 10);
+        let p = children(root)[0];
+        let k = children(p)[0];
+        let ask = drawn(&[p, k]);
+        let d = r.step(&ask);
+        assert_eq!(d.stats.fallback, 2, "both stand on the root first");
+        r.load_where(|x| x == mesh(k));
+        for _ in 0..4 {
+            let d = r.step(&ask);
+            r.upload(&d);
+        }
+        let d = r.step(&ask);
+        assert!(r.b.residency().drawable(k));
+        assert!(!r.b.residency().drawable(p));
+        assert_eq!(
+            d.draw.get(mesh(k)).map(|i| i.serves.clone()),
+            Some(vec![p, k]),
+            "{RED}: the finer tile drawn since holds its ancestor"
+        );
+        assert_eq!(d.stats.fallback, 0, "{RED}");
+    }
+
+    /// The descendants' rule: a tile falling back is read again when a
+    /// nearer ancestor becomes drawable, and stands on it.
+    #[test]
+    fn a_tile_falling_back_moves_to_a_nearer_ancestor_drawn_since() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        r.settle(&drawn(&[root]), 10);
+        let p = children(root)[0];
+        let k = children(p)[0];
+        let mut ask = drawn(&[k]);
+        ask.ancestors.push((p, need(p)));
+        let d = r.step(&ask);
+        assert_eq!(
+            d.draw.get(mesh(root)).map(|i| i.serves.clone()),
+            Some(vec![k])
+        );
+        r.load_where(|x| x == mesh(p));
+        for _ in 0..4 {
+            let d = r.step(&ask);
+            r.upload(&d);
+        }
+        let d = r.step(&ask);
+        assert!(r.b.residency().drawable(p));
+        assert!(!r.b.residency().drawable(k));
+        assert_eq!(
+            d.draw.get(mesh(p)).map(|i| (i.role, i.serves.clone())),
+            Some((Role::Fallback, vec![k])),
+            "{RED}: the tile stands on its nearest drawable ancestor"
+        );
+        assert!(!d.draw.draws(root), "{RED}");
+    }
+
+    /// The drapes' rule: a drawn mesh wearing an ancestor's drape is read
+    /// again when a nearer ancestor's drape becomes drawable, and wears it.
+    /// The nearer ancestor is a blocker: its drape is wanted, it is not
+    /// drawn, so nothing else reads the mesh again.
+    #[test]
+    fn a_mesh_wears_a_nearer_ancestors_drape_drawn_since() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        r.settle(&drawn_draped(&[root], 0), 10);
+        let p = children(root)[0];
+        let k = children(p)[0];
+        let mut ask = drawn_draped(&[k], 2);
+        ask.blockers.push((p, draped(p, 1)));
+        r.step(&ask);
+        r.load_where(|x| x == mesh(k));
+        for _ in 0..4 {
+            let d = r.step(&ask);
+            r.upload(&d);
+        }
+        let worn = |d: &tuile_budget::Decisions| {
+            d.draw.get(mesh(k)).and_then(base_drape).map(|c| c.resource)
+        };
+        let d = r.step(&ask);
+        assert_eq!(worn(&d), Some(dr(root, 0)), "the root's drape first");
+        r.load_where(|x| x == dr(p, 1));
+        for _ in 0..4 {
+            let d = r.step(&ask);
+            r.upload(&d);
+        }
+        let d = r.step(&ask);
+        assert!(r.b.residency().drawable(k));
+        assert_eq!(
+            worn(&d),
+            Some(dr(p, 1)),
+            "{RED}: the mesh wears the nearer drape"
+        );
+    }
+
+    /// The place's rule: a mesh wearing an ancestor's drape is read again
+    /// when that ancestor's place in the tree changes (here its footprint),
+    /// and maps the drape into the new footprint. The ancestor is a
+    /// blocker, not drawn: nothing else reads the mesh again.
+    #[test]
+    fn a_mesh_maps_an_ancestors_drape_into_its_new_footprint() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        r.settle(&drawn(&[root]), 10);
+        let p = children(root)[0];
+        let k = children(p)[0];
+        let mut ask = drawn_draped(&[k], 2);
+        ask.blockers.push((p, draped(p, 1)));
+        r.step(&ask);
+        r.load_where(|x| x == mesh(k) || x == dr(p, 1));
+        for _ in 0..4 {
+            let d = r.step(&ask);
+            r.upload(&d);
+        }
+        let uv = |d: &tuile_budget::Decisions| {
+            d.draw
+                .get(mesh(k))
+                .and_then(base_drape)
+                .map(|c| (c.resource, c.uv))
+        };
+        let d = r.step(&ask);
+        let between = tuile_budget::UvTransform::between;
+        assert_eq!(uv(&d), Some((dr(p, 1), between(rect(k), rect(p)).unwrap())));
+        // The ancestor's footprint, told differently: its root's.
+        ask.blockers[0].1 = draped(p, 1).with_rect(rect(root));
+        r.step(&ask);
+        let d = r.step(&ask);
+        assert_eq!(
+            uv(&d),
+            Some((dr(p, 1), between(rect(k), rect(root)).unwrap())),
+            "{RED}: the drape mapped into the footprint the need tells"
+        );
+    }
+}
