@@ -18,6 +18,18 @@ thiserror = { workspace = true }
 # (`state::Arena`).
 hashbrown = { workspace = true }
 foldhash = { workspace = true }
+# The kept maps (`sorted::SortedMap`): a B-tree whose nodes live in a slab,
+# so a change costs its path in the tree (never a shift of the entries after
+# it) and a node freed is the next one taken (nothing allocated once the
+# maps have grown). Pre-1.0 in the wasm path (rule 8): see `sorted.rs`.
+#
+# lapoule-dev's fork, pinned: 0.6.1's `range` runs off the tree when a bound
+# is not a key of it (and steps `next_back` from the wrong end), and its
+# `retain` stops early; both fixed there, with random tests against the
+# standard map. A git dependency: crates.io refuses
+# it, so `tuile-budget` cannot be published there until upstream is fixed
+# (docs/releasing.md).
+btree-slab = { git = "https://github.com/lapoule-dev/btree-slab", rev = "0d1412cc9623231a7b90807d2c716d01cffa04b1" }
 
 [dev-dependencies]
 # The budget's properties (protection, total order, ledger, determinism,

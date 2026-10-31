@@ -2424,6 +2424,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "btree-slab"
+version = "0.6.1"
+source = "git+https://github.com/lapoule-dev/btree-slab?rev=0d1412cc9623231a7b90807d2c716d01cffa04b1#0d1412cc9623231a7b90807d2c716d01cffa04b1"
+dependencies = [
+ "cc-traits",
+ "slab",
+ "smallvec",
+]
+
+[[package]]
 name = "built"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2524,6 +2534,15 @@ dependencies = [
  "jobserver",
  "libc",
  "shlex",
+]
+
+[[package]]
+name = "cc-traits"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "060303ef31ef4a522737e1b1ab68c67916f2a787bb2f4f54f383279adba962b5"
+dependencies = [
+ "slab",
 ]
 
 [[package]]
@@ -8888,6 +8907,7 @@ dependencies = [
 name = "tuile-budget"
 version = "0.15.1"
 dependencies = [
+ "btree-slab",
  "criterion",
  "foldhash 0.2.0",
  "hashbrown 0.16.1",

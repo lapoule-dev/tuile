@@ -214,7 +214,7 @@ pub struct Budget {
     /// Every tile the budget knows the place of: what the need told it, as
     /// long as the tile or a descendant is referenced. A sorted vector: it
     /// changes only by what the need changes.
-    tiles: sorted::SortedCols<TileId, TileInfo>,
+    tiles: sorted::SortedMap<TileId, TileInfo>,
     /// The need last read, each wanted tile's best entry: a step changes
     /// it by what changed.
     need: need_state::NeedState,
@@ -309,8 +309,10 @@ impl Budget {
     /// same `now` — decides exactly as if it had applied them itself, and
     /// reports them in its statistics.
     pub fn apply_arrivals(&mut self, now: Micros) {
+        let upkeep = sorted::upkeep();
         let mut st = std::mem::take(&mut self.pending);
         self.apply_events(now, &mut st);
+        self.walk_upkeep(upkeep);
         self.pending = st;
     }
 
