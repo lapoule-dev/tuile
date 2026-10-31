@@ -224,10 +224,9 @@ impl TileRenderer {
                     wgpu::StencilOperation::Replace,
                 ),
                 // Borrows it: draw only where nobody stamped anything.
-                Pass::Fallback => face(
-                    wgpu::CompareFunction::Greater,
-                    wgpu::StencilOperation::Keep,
-                ),
+                Pass::Fallback => {
+                    face(wgpu::CompareFunction::Greater, wgpu::StencilOperation::Keep)
+                }
                 // Replaces it: stamp both marks, unconditionally.
                 Pass::Replacing => face(
                     wgpu::CompareFunction::Always,
@@ -275,10 +274,7 @@ impl TileRenderer {
                         // at once.
                         depth_write_enabled: Some(matches!(
                             kind,
-                            Pass::Solid
-                                | Pass::Layers
-                                | Pass::Replacing
-                                | Pass::ReplacingFallback
+                            Pass::Solid | Pass::Layers | Pass::Replacing | Pass::ReplacingFallback
                         )),
                         depth_compare: Some(match kind {
                             Pass::Backdrop => wgpu::CompareFunction::Always,

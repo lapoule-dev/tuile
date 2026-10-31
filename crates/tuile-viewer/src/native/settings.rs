@@ -60,6 +60,32 @@ pub(crate) fn imagery_compression(
     }
 }
 
+/// The key the phone's settings page keeps the 3D Tiles tilesets under, and
+/// the environment variable that says the same where there is none: asset
+/// numbers, comma-separated.
+pub(crate) const TILESETS_KEY: &str = "tilesets";
+pub(crate) const TILESETS_VARIABLE: &str = "TUILE_TILESETS";
+
+/// The 3D Tiles tilesets drawn over the globe: what `--tileset` said, else
+/// the settings page, else [`TILESETS_VARIABLE`], else none. A value that is
+/// not a list of asset numbers is an error naming where it was read.
+pub(crate) fn tilesets(
+    flag: Option<Vec<i64>>,
+    host: &dyn crate::host::Host,
+) -> Result<Vec<i64>, String> {
+    if let Some(flag) = flag {
+        return Ok(flag);
+    }
+    let said = |value: Option<String>| value.filter(|v| !v.trim().is_empty());
+    if let Some(page) = said(host.setting(TILESETS_KEY)) {
+        return crate::start::asset_list(&format!("the setting {TILESETS_KEY:?}"), &page);
+    }
+    match said(host.var(TILESETS_VARIABLE)) {
+        Some(env) => crate::start::asset_list(TILESETS_VARIABLE, &env),
+        None => Ok(Vec::new()),
+    }
+}
+
 /// The scene's clock: what the command line said (`--time`, `--time-offset`,
 /// `--time-rate`), or — where it named no instant — `TUILE_LIT_AT`, UTC
 /// seconds since the Unix epoch, a session pinned to a stated moment for
@@ -151,6 +177,68 @@ mod tests {
                 .flatten()
                 .map(str::to_owned)
         }
+    }
+
+    /// A machine whose settings page and environment hold what they are given.
+    struct Said {
+        page: Option<&'static str>,
+        env: Option<&'static str>,
+    }
+
+    impl crate::host::Host for Said {
+        fn var(&self, name: &str) -> Option<String> {
+            (name == TILESETS_VARIABLE)
+                .then_some(self.env)
+                .flatten()
+                .map(str::to_owned)
+        }
+        fn read(&self, path: &std::path::Path) -> std::io::Result<String> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                path.display().to_string(),
+            ))
+        }
+        fn is_macos(&self) -> bool {
+            true
+        }
+        fn setting(&self, key: &str) -> Option<String> {
+            (key == TILESETS_KEY)
+                .then_some(self.page)
+                .flatten()
+                .map(str::to_owned)
+        }
+    }
+
+    /// **The flag, then the settings page, then the environment, then
+    /// none**; a value that is not asset numbers is said with where it was
+    /// read, not guessed at.
+    #[test]
+    fn tilesets_are_the_flag_then_the_page_then_the_environment() {
+        let none = Said {
+            page: None,
+            env: None,
+        };
+        assert_eq!(tilesets(None, &none), Ok(Vec::new()));
+        let both = Said {
+            page: Some("2275207"),
+            env: Some("96188"),
+        };
+        assert_eq!(tilesets(Some(vec![7]), &both), Ok(vec![7]), "the flag wins");
+        assert_eq!(tilesets(None, &both), Ok(vec![2_275_207]), "then the page");
+        let env = Said {
+            page: Some("  "),
+            env: Some("96188,2275207"),
+        };
+        assert_eq!(tilesets(None, &env), Ok(vec![96_188, 2_275_207]));
+        let bad = Said {
+            page: None,
+            env: Some("photoreal"),
+        };
+        let why = tilesets(None, &bad).expect_err("not a number");
+        assert!(
+            why.contains(TILESETS_VARIABLE) && why.contains("photoreal"),
+            "{why}"
+        );
     }
 
     /// **Off unless the person chose**: the flag first, then the settings

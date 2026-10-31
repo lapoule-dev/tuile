@@ -10,6 +10,12 @@
 //! backdrop is drawn before the selection so that ground is never bare.
 
 use super::{App, AMBIENT, ATMOSPHERE_STRENGTH, DIAGNOSTICS};
+
+/// How tall a provider's logo is drawn, in the controls' units (points on a
+/// desktop): the height of a line of a map's credits.
+const LOGO_HEIGHT: f64 = 18.0;
+/// The space around and between the logos, in the same units.
+const LOGO_MARGIN: f64 = 10.0;
 use std::fmt;
 use tuile_wgpu::OverlayVertex;
 
@@ -259,6 +265,22 @@ impl App {
         if self.views.freeze {
             active.pump.rebase(&active.gpu.queue, origin);
         }
+        // The 3D Tiles over the globe, each from its own server, the same
+        // way and on the same frame's deadline.
+        for layer in &mut self.surfaces {
+            let stream = &mut layer.surface.stream;
+            let uploaded = if self.views.freeze {
+                let n = layer.pump.pump(stream, &active.gpu, deadline);
+                layer.pump.rebase(&active.gpu.queue, origin);
+                n
+            } else {
+                layer
+                    .pump
+                    .advance(stream, &active.gpu, &views, origin, deadline)
+            };
+            self.uploaded += uploaded;
+            self.stats.uploads += uploaded as u64;
+        }
     }
 
     /// Uploads the view matrix, the sun and the air — the first eye's, which
@@ -371,6 +393,21 @@ impl App {
                 color: v.color,
             })
             .collect();
+        // The logos the 3D Tiles' providers require, for as long as their
+        // tilesets are in the session — over the picture, bottom left, where
+        // a map's credits are looked for. Drawn whether or not the controls
+        // are: they are not ours to hide.
+        let logos: Vec<&crate::surface::Logo> = self
+            .surfaces
+            .iter()
+            .flat_map(|layer| layer.surface.logos.iter())
+            .collect();
+        nav_mesh.extend(crate::surface::logos_mesh(
+            &logos,
+            active.safe,
+            (LOGO_HEIGHT * ui.scale) as f32,
+            (LOGO_MARGIN * ui.scale) as f32,
+        ));
         // The loading indicator over everything, already in device pixels.
         if let Some(spinner) = indicator {
             nav_mesh.extend(spinner.mesh().into_iter().map(|v| OverlayVertex {
@@ -413,6 +450,28 @@ impl App {
         // the black square. The tree is the only thing that can answer, so the
         // server sends it and the pump reads it. Nothing here to get wrong.
         let (drawn, resolution) = active.pump.resolve(&active.gpu);
+        // The 3D Tiles over the globe, resolved the same way, and what the
+        // tiles drawn credit, for the caption.
+        let mut replacing: Vec<&tuile_wgpu::PreparedTile> = Vec::new();
+        let mut replacing_fallback: Vec<&tuile_wgpu::PreparedTile> = Vec::new();
+        for layer in &mut self.surfaces {
+            let crate::surface::Layer {
+                pump,
+                drawn: credited,
+                showing,
+                ..
+            } = layer;
+            let (mine, _) = pump.resolve(&active.gpu);
+            *credited = mine
+                .exact
+                .iter()
+                .chain(mine.fallback.iter())
+                .filter_map(|tile| tile.copyright.clone())
+                .collect();
+            *showing = !(mine.exact.is_empty() && mine.fallback.is_empty());
+            replacing.extend(mine.exact);
+            replacing_fallback.extend(mine.fallback);
+        }
         let rendered = drawn.exact.len() + drawn.fallback.len();
         let old_imagery = drawn
             .exact
@@ -469,7 +528,7 @@ impl App {
                 );
                 pass.set_scissor_rect(box_.x, box_.y, box_.width, box_.height);
             }
-            renderer.paint(
+            renderer.paint_replacing(
                 pass,
                 // The shell first — the only thing that can cover ground
                 // before any tile has arrived at all — then the complete
@@ -481,6 +540,11 @@ impl App {
                     .then_some(shell)
                     .into_iter()
                     .chain(coarse.iter().copied()),
+                // The 3D Tiles over the globe, before the globe's own
+                // tiles: where they are drawn they replace the ground, which
+                // keeps out of every pixel they took and covers the rest.
+                replacing.iter().copied(),
+                replacing_fallback.iter().copied(),
                 drawn.exact.iter().copied(),
                 // Last, testing depth and never writing it: an ancestor
                 // borrowing ground it does not own must be occluded by the
@@ -690,6 +754,21 @@ impl App {
             self.stats.errors += errors.len() as u64;
             for err in errors {
                 tracing::warn!("server: {err}");
+            }
+            // Each tileset over the globe, on a line of its own.
+            for layer in &mut self.surfaces {
+                tracing::info!(
+                    "3D Tiles {} | {} drawn | {} loading | {:.0} MiB",
+                    layer.surface.asset,
+                    layer.drawn.len(),
+                    layer.pump.stats.requested,
+                    layer.pump.gpu_bytes as f32 / (1024.0 * 1024.0),
+                );
+                let errors = std::mem::take(&mut layer.pump.errors);
+                self.stats.errors += errors.len() as u64;
+                for err in errors {
+                    tracing::warn!("3D Tiles {}: {err}", layer.surface.asset);
+                }
             }
         }
     }

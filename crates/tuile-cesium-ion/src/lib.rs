@@ -27,9 +27,9 @@ pub const ION_API_BASE: &str = "https://api.cesium.com/";
 
 #[derive(Debug, thiserror::Error)]
 pub enum IonError {
-    #[error("http transport: {0}")]
+    #[error("http transport: {}", tuile_core::fetch::redact(.0))]
     Transport(String),
-    #[error("ion api status {status} for {url}")]
+    #[error("ion api status {status} for {}", tuile_core::fetch::redact(.url.as_str()))]
     Status { status: u16, url: Url },
     #[error("invalid endpoint response: {0}")]
     InvalidEndpoint(#[from] serde_json::Error),
@@ -622,8 +622,10 @@ mod tests {
         let http = Arc::new(MockHttp::default());
         http.push(EXTERNAL_ENDPOINT_URL, 200, EXTERNAL_ENDPOINT);
         http.push(EXTERNAL_ROOT_URL, 200, EXTERNAL_ROOT);
-        let fetcher =
-            IonTileFetcher::new(IonClient::new(Arc::clone(&http), "account-token"), 2_275_207);
+        let fetcher = IonTileFetcher::new(
+            IonClient::new(Arc::clone(&http), "account-token"),
+            2_275_207,
+        );
         let (url, root, credits) = futures_executor::block_on(async {
             let url = fetcher.tileset_url().await.expect("resolve");
             let root = fetcher.fetch(&url).await.expect("root");
@@ -652,8 +654,10 @@ mod tests {
         use tuile_core::tileset::Tileset;
         let http = Arc::new(MockHttp::default());
         http.push(EXTERNAL_ENDPOINT_URL, 200, EXTERNAL_ENDPOINT);
-        let fetcher =
-            IonTileFetcher::new(IonClient::new(Arc::clone(&http), "account-token"), 2_275_207);
+        let fetcher = IonTileFetcher::new(
+            IonClient::new(Arc::clone(&http), "account-token"),
+            2_275_207,
+        );
         let url = futures_executor::block_on(fetcher.tileset_url()).expect("resolve");
         let tileset = Tileset::from_json_bytes(EXTERNAL_ROOT.as_bytes(), &url).expect("parse");
         let mut urls = Vec::new();
@@ -665,11 +669,18 @@ mod tests {
         }
         assert_eq!(urls.len(), 2);
         for u in &urls {
-            let q: Vec<(String, String)> = u.query_pairs().map(|(k, v)| (k.into(), v.into())).collect();
-            assert!(q.contains(&("session".into(), "FAKE_SESSION".into())), "{u}");
+            let q: Vec<(String, String)> =
+                u.query_pairs().map(|(k, v)| (k.into(), v.into())).collect();
+            assert!(
+                q.contains(&("session".into(), "FAKE_SESSION".into())),
+                "{u}"
+            );
             assert!(q.contains(&("key".into(), "FAKE_KEY".into())), "{u}");
         }
-        let glb = urls.iter().find(|u| u.path().ends_with(".glb")).expect("a glb");
+        let glb = urls
+            .iter()
+            .find(|u| u.path().ends_with(".glb"))
+            .expect("a glb");
         http.push(glb.as_str(), 200, "glTF");
         let body = futures_executor::block_on(fetcher.fetch(glb)).expect("content");
         assert_eq!(&body[..], b"glTF");
@@ -684,7 +695,11 @@ mod tests {
     #[test]
     fn an_attribution_reads_as_words_a_logo_and_a_link() {
         let endpoint: EndpointJson = serde_json::from_str(EXTERNAL_ENDPOINT).expect("fixture");
-        let credits: Vec<_> = endpoint.attributions.iter().map(Attribution::credit).collect();
+        let credits: Vec<_> = endpoint
+            .attributions
+            .iter()
+            .map(Attribution::credit)
+            .collect();
         assert_eq!(credits[0].text, "Cesium ion");
         assert_eq!(
             credits[0].logo.as_ref().map(Url::as_str),

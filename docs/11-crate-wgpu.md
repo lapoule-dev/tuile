@@ -32,7 +32,7 @@ None. Native and wasm builds use the same public API; transports live in `tuile-
 cargo run -p tuile-wgpu --example snapshot -- <tileset.json> <out.png> [size]
 ```
 
-Loads a tileset, runs the geometry server in-process until the tiles settle, renders one frame and writes a PNG. It is the shipped way to *see* a 3D Tiles tileset; the interactive viewer below draws the terrain-and-imagery globe and does not load a `tileset.json`.
+Loads a tileset, runs the geometry server in-process until the tiles settle, renders one frame and writes a PNG. It is the way to *see* a local 3D Tiles tileset alone; the interactive viewer below draws a host's tilesets over its terrain-and-imagery globe (`--tileset`).
 
 ## The viewer: `tuile-viewer` + `examples/wgpu-viewer`
 
@@ -45,6 +45,8 @@ One application, four shells:
 - **Web**: `packages/tuile-viewer`, an ES module — WebGPU, or WebGL2 where there is none — with its geometry server in a Web Worker; `scripts/try-viewer.sh web`.
 
 CLI (desktop): `--lon --lat --altitude --heading --pitch`, `--here`, `--imagery <layer>`, `--imagery-compression off|auto|bc7|astc` (off by default), and sources by address with no catalog and no token: `--terrain-url <layer.json URL>`, `--imagery-template <{z}/{x}/{y} URL>`, `--imagery-scheme webmercator|geographic`, `--imagery-max-level <n>` (`examples/heightfield-serve` prints a working set). `--help` lists them all.
+
+3D Tiles over the globe: `--tileset <asset>[,<asset>…]` (else the `tilesets` setting, else `TUILE_TILESETS`) opens the host's tilesets by asset number (`Sources::tileset`; the public binary asks ion, whose endpoint may point at another service's tileset, the key and session it hands out then carried to every request). Each runs a geometry server and a pump of its own, and is drawn as a surface that **replaces** the ground where it is drawn (`TileRenderer::paint_replacing`): drawn after the backdrop and before the globe's own tiles, it stamps a second stencil bit that the ground's passes keep out of, so the two are never decided by depth — no z-fighting — and wherever it has nothing yet the globe is drawn as without it, so no ground is ever bare. Its credits stay on screen while it is in the session: the host's logos over the picture, bottom left, and in the title bar the names each drawn tile's glTF `asset.copyright` gives, most frequent first, then the host's own. A tileset that cannot be opened is said in a window and the globe stands without it. Not in the browser yet: the page's worker serves the globe alone.
 
 Keys: drag moves the globe, right-drag tilts and turns, wheel zooms; `N` north up, `L` current location, `C`/`V` copy/go to a view link, `I` next imagery layer, `W` wireframe, `D` diagnostic views, `F` freeze the traversal (the camera moves, the selection does not — essential for debugging the LOD). Touch gestures on phones. `O` (or `--record <file.mcap>`) records the session — camera, clocks, atmosphere, input and the pictures drawn — and `TUILE_REPLAY` flies a recorded camera path again exactly; `tuile-record` exports and diagnoses a recording.
 

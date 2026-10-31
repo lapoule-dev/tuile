@@ -34,7 +34,9 @@ use tuile_core::source::TileId;
 use tuile_terrain::{
     skirt_height, to_decoded, GeoRect, GeographicTilingScheme, Header, QuantizedMesh, TileCoord,
 };
-use tuile_wgpu::{ContentPump, GpuContext, TileRenderer, ViewUniform, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT};
+use tuile_wgpu::{
+    ContentPump, GpuContext, TileRenderer, ViewUniform, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT,
+};
 
 const SIZE: u32 = 512;
 
@@ -362,17 +364,18 @@ fn a_replacing_surface_takes_every_pixel_it_draws_and_no_other() {
         }
     }
     replacing.pump(
-        &mut Scripted::new([
-            mesh(shared, 1, lowered),
-            select(vec![exact(shared)], 1),
-        ]),
+        &mut Scripted::new([mesh(shared, 1, lowered), select(vec![exact(shared)], 1)]),
         &gpu,
         FrameDeadline::UNBOUNDED,
     );
 
     let rect = rect_of(shared);
     let (lon, lat) = rect.center();
-    let look_at = geodetic_to_ecef(Geodetic { lon, lat, height: 0.0 });
+    let look_at = geodetic_to_ecef(Geodetic {
+        lon,
+        lat,
+        height: 0.0,
+    });
     let eye = look_at + look_at.normalize() * 30_000.0;
     ground.rebase(&gpu.queue, eye);
     replacing.rebase(&gpu.queue, eye);

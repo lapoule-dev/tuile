@@ -736,7 +736,12 @@ mod tests {
         .expect("external json");
         let grafted = ts.graft(root_id, external, &sub.url).expect("graft");
         assert_eq!(
-            ts.tile(grafted).content.as_ref().expect("content").url.as_str(),
+            ts.tile(grafted)
+                .content
+                .as_ref()
+                .expect("content")
+                .url
+                .as_str(),
             "https://tiles.test/v1/files/leaf.glb?session=S1&key=K",
             "the session and the key reach the grafted subtree"
         );

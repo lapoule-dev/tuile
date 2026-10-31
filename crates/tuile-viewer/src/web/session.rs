@@ -95,6 +95,12 @@ impl Started {
         None
     }
 
+    /// The 3D Tiles drawn over the globe: none in a page yet — its geometry
+    /// server is a worker that serves the globe alone.
+    pub(crate) fn take_surfaces(&mut self) -> (Vec<crate::surface::Surface>, Vec<String>) {
+        (Vec::new(), Vec::new())
+    }
+
     /// Closes the session down. A page has no store to flush and no thread to
     /// join: the worker is terminated, and that is all of it.
     pub(crate) fn close(self, _patience: std::time::Duration, _join_the_server: bool) {

@@ -35,6 +35,7 @@ mod signals;
 mod snapshot;
 mod start;
 mod steer;
+mod surface;
 
 #[cfg(feature = "control")]
 pub mod control;
