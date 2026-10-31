@@ -53,7 +53,9 @@ pub trait Sources: Send + Sync {
     /// Provided, refusing: a host that serves terrain and imagery only need
     /// not say anything about tilesets.
     async fn tileset(&self, asset: i64) -> Result<TilesetSource, String> {
-        Err(format!("asset {asset}: this host serves no 3D Tiles tilesets"))
+        Err(format!(
+            "asset {asset}: this host serves no 3D Tiles tilesets"
+        ))
     }
 }
 

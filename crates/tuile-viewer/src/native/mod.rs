@@ -166,7 +166,8 @@ fn session(
 ) -> anyhow::Result<()> {
     // The command line, read by `main`. Exit code 2 is the usual one for a
     // command that was not understood.
-    let (view, here, imagery, compression, clock, max_altitude, record) = match invocation {
+    let (view, here, imagery, compression, clock, max_altitude, record, tilesets) = match invocation
+    {
         Ok(start::Invocation::Run {
             view,
             here,
@@ -175,6 +176,7 @@ fn session(
             clock,
             max_altitude,
             record,
+            tilesets,
             ..
         }) => (
             view,
@@ -184,6 +186,7 @@ fn session(
             clock,
             max_altitude,
             record,
+            tilesets,
         ),
         Ok(start::Invocation::Help) => {
             println!("{}", start::usage());
@@ -231,6 +234,15 @@ fn session(
     // else the phone's settings page — and off when they made none.
     let compression = match settings::imagery_compression(compression, &host::Machine) {
         Ok(choice) => choice,
+        Err(why) => {
+            eprintln!("{}: {why}", embed::identity().executable);
+            std::process::exit(2);
+        }
+    };
+    // The 3D Tiles drawn over the globe: the flag, else the settings page,
+    // else TUILE_TILESETS; none when nothing says.
+    let tilesets = match settings::tilesets(tilesets, &host::Machine) {
+        Ok(tilesets) => tilesets,
         Err(why) => {
             eprintln!("{}: {why}", embed::identity().executable);
             std::process::exit(2);
@@ -308,6 +320,7 @@ fn session(
         timeout: crate::launch::START_TIMEOUT,
         imagery_plan,
         stored_imagery,
+        tilesets,
     };
     let launch = launch::start(&handle, plan.clone());
     // A phone tries again by itself; a desktop says why and stops, as it

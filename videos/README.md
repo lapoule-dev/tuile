@@ -636,3 +636,36 @@ viewer's sunset disc, 8× (before | after).
 TUILE_ENV_FILE=~/Projects/tuile/.env scripts/discs-scenes.sh videos/discs-s1-2026-10-25
 scripts/discs-sheet.py videos/discs-s0-2026-10-25 videos/discs-s1-2026-10-25 videos/discs-s1-2026-10-25/sheets
 ```
+
+## ion-photoreal-2026-10-31/ — 3D Tiles over the globe, through ion (2026-10-31)
+
+Branch `feat/viewer-ion-photorealistic`. The viewer's own frame, headless on
+Metal (M2), with ion asset 2275207 — a 3D Tiles tileset ion points at on
+another service, opened through its endpoint — drawn over the globe as a
+surface that replaces the ground. Each directory holds the same view twice:
+`globe.png` without the tileset, `tileset.png` with it; each `.log` the scan
+of both frames (0 black pixels in all six).
+
+- `eiffel/`: eye 2.3040 E 48.8535 N, 350 m, heading 310, pitch 12.
+- `pic-du-midi/`: eye 0.1520 E 42.9300 N, 3150 m, heading 315, pitch 6.
+- `paris-overview/`: eye 2.3065 E 48.8505 N, 5000 m, heading 315, pitch 20.
+- Lit for 2026-10-31T12:00:00Z, 1280×800 at scale 1, the tileset given 60 s
+  after the globe settled. The providers' logos are bottom left, over a
+  dark band; `window-title.txt` is the native window's title during a run,
+  with the credits the drawn tiles name.
+- Looked at: the tower, La Défense and the Trocadéro stand in 3D where the
+  globe alone has them flat; no seam or black between the mesh and the
+  globe; the mesh is lit by the scene's sun over textures that already carry
+  their own light, so it reads brighter and flatter than the imagery beside
+  it (not changed here).
+
+```bash
+# CESIUM_ION_TOKEN in the environment (never printed)
+for shot in "eiffel 2.3040 48.8535 350 310 12" "pic-du-midi 0.1520 42.9300 3150 315 6" \
+            "paris-overview 2.3065 48.8505 5000 315 20"; do
+  set -- $shot
+  cargo run --release -p tuile-wgpu-viewer --example tileset_shot -- --tileset 2275207 \
+    --lon $2 --lat $3 --altitude $4 --heading $5 --pitch $6 \
+    --at 2026-10-31T12:00:00Z --seconds 60 --out videos/ion-photoreal-2026-10-31/$1
+done
+```

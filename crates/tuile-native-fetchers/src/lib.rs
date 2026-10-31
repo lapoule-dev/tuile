@@ -465,6 +465,7 @@ impl NativeHttp {
                     if !is_retryable_status(status) {
                         return outcome;
                     }
+                    let url = tuile_core::fetch::redact(url.as_str());
                     tracing::warn!(%url, status, attempt, "retryable status");
                     // The origin's own pacing wins over ours when it states one.
                     retry_after(response.headers())
@@ -474,6 +475,10 @@ impl NativeHttp {
                     if !is_retryable_transport(error) {
                         return outcome;
                     }
+                    let (url, error) = (
+                        tuile_core::fetch::redact(url.as_str()),
+                        tuile_core::fetch::redact(&error.to_string()),
+                    );
                     tracing::warn!(%url, attempt, %error, "retryable transport failure");
                     self.retry.backoff(attempt, spread)
                 }
