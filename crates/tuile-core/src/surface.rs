@@ -572,6 +572,7 @@ mod tests {
             textures: Vec::new(),
             imagery: Vec::new(),
             withheld_drape: None,
+            copyright: None,
             local_origin_ecef: origin,
             transform_local: glam::Mat4::IDENTITY,
         })

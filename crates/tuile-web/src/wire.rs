@@ -675,6 +675,8 @@ impl Writer {
             textures,
             imagery,
             withheld_drape,
+            // Not carried yet: see `Reader::decoded`.
+            copyright: _,
             local_origin_ecef,
             transform_local,
         } = c;
@@ -1050,6 +1052,9 @@ impl<'a> Reader<'a> {
             textures,
             imagery,
             withheld_drape: self.option_u64()?,
+            // Not carried by the wire yet: the browser draws no 3D Tiles
+            // content whose credits it would show.
+            copyright: None,
             local_origin_ecef: self.dvec3()?,
             transform_local: Mat4::from_cols_array(&self.f32s()?),
         })
@@ -1092,6 +1097,7 @@ mod tests {
                 scale: [2.0, 4.0],
             }],
             withheld_drape: Some(u64::MAX - 1),
+            copyright: None,
             // The anti-jitter origin: every bit of the f64 must survive.
             local_origin_ecef: DVec3::new(4_201_234.123_456_789, 172_001.000_000_1, -4_779_000.5),
             transform_local: Mat4::from_translation(glam::Vec3::new(1.0, 2.0, 3.0)),

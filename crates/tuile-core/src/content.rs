@@ -101,6 +101,10 @@ pub struct DecodedTileContent {
     /// over real terrain and report success, which is bare ground nobody is
     /// told about.
     pub withheld_drape: Option<u64>,
+    /// Who the content belongs to, as its glTF payload says (`asset.copyright`):
+    /// the credit a consumer must show while it draws this tile. `None` for
+    /// content that names nobody, and for every mesh built rather than read.
+    pub copyright: Option<std::sync::Arc<str>>,
     /// The rebasing origin, f64 ECEF.
     pub local_origin_ecef: DVec3,
     /// Residual transform to apply at render time (identity: everything is
@@ -469,8 +473,18 @@ fn decode_glb(
         )?;
     }
 
+    let copyright: Option<std::sync::Arc<str>> = doc
+        .as_json()
+        .asset
+        .copyright
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(std::sync::Arc::from);
+
     Ok(DecodedTileContent {
         withheld_drape: None,
+        copyright,
         meshes,
         textures,
         // glTF content carries its own texturing; draping happens above.
@@ -666,6 +680,11 @@ pub(crate) mod tests {
     /// Builds a minimal valid glb: one triangle with asymmetric vertices
     /// (1,0,0), (0,2,0), (0,0,3) so up-axis mistakes are visible.
     pub(crate) fn test_glb() -> Vec<u8> {
+        glb_with_asset(serde_json::json!({ "version": "2.0" }))
+    }
+
+    /// [`test_glb`], with `asset` as its glTF `asset` object.
+    fn glb_with_asset(asset: serde_json::Value) -> Vec<u8> {
         let positions: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]];
         let indices: [u16; 3] = [0, 1, 2];
 
@@ -684,7 +703,7 @@ pub(crate) mod tests {
         }
 
         let json = serde_json::json!({
-            "asset": { "version": "2.0" },
+            "asset": asset,
             "scene": 0,
             "scenes": [{ "nodes": [0] }],
             "nodes": [{ "mesh": 0 }],
@@ -764,6 +783,27 @@ pub(crate) mod tests {
             d.meshes[0].material.base_color_factor,
             [1.0, 0.5, 0.25, 1.0]
         );
+    }
+
+    /// The credit a glTF payload names in `asset.copyright` comes out with
+    /// the content, trimmed; a payload that names nobody gives `None`, and so
+    /// does an empty one.
+    #[test]
+    fn the_copyright_a_glb_states_is_kept() {
+        let named = glb_with_asset(serde_json::json!({
+            "version": "2.0",
+            "copyright": " Data SIO, NOAA; Landsat / Copernicus "
+        }));
+        let d = decode(&named, &hints(DVec3::ZERO)).expect("decode");
+        assert_eq!(
+            d.copyright.as_deref(),
+            Some("Data SIO, NOAA; Landsat / Copernicus")
+        );
+        let silent = decode(&test_glb(), &hints(DVec3::ZERO)).expect("decode");
+        assert_eq!(silent.copyright, None);
+        let empty = glb_with_asset(serde_json::json!({ "version": "2.0", "copyright": "  " }));
+        let d = decode(&empty, &hints(DVec3::ZERO)).expect("decode");
+        assert_eq!(d.copyright, None);
     }
 
     #[test]
@@ -879,6 +919,7 @@ pub(crate) mod tests {
             textures,
             imagery: Vec::new(),
             withheld_drape: None,
+            copyright: None,
             local_origin_ecef: DVec3::ZERO,
             transform_local: Mat4::IDENTITY,
         }

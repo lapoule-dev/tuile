@@ -57,6 +57,7 @@ const SIZE: u32 = 256;
 fn quad() -> DecodedTileContent {
     DecodedTileContent {
         withheld_drape: None,
+        copyright: None,
         meshes: vec![DecodedMesh {
             positions: vec![
                 [-1.0, -1.0, 0.0],

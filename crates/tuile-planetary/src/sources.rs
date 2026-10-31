@@ -17,6 +17,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use tuile_core::fetch::{FetchError, Fetched, TileFetcher};
 use tuile_core::raster::ImageryProvider;
 use tuile_terrain::{LayerJson, TerrainSource};
 
@@ -43,6 +45,43 @@ pub trait Sources: Send + Sync {
     /// The imagery of `asset`. The provider says which grid it is cut on
     /// ([`ImageryProvider::tiling_scheme`]); the crossing drapes either.
     async fn imagery(&self, asset: i64) -> Result<Arc<dyn ImageryProvider>, String>;
+
+    /// The 3D Tiles tileset of `asset`: where its root document is, how it
+    /// and everything beneath it are fetched, and who must be credited while
+    /// it is drawn.
+    ///
+    /// Provided, refusing: a host that serves terrain and imagery only need
+    /// not say anything about tilesets.
+    async fn tileset(&self, asset: i64) -> Result<TilesetSource, String> {
+        Err(format!("asset {asset}: this host serves no 3D Tiles tilesets"))
+    }
+}
+
+/// A 3D Tiles tileset as a host serves it: see [`Sources::tileset`].
+#[derive(Clone)]
+pub struct TilesetSource {
+    /// The root document. Its query, if it has one, is carried to every
+    /// request beneath (`tuile_core::tileset`).
+    pub url: url::Url,
+    /// What fetches the root, the external tilesets and the contents, with
+    /// whatever credential the service wants.
+    pub fetcher: Arc<dyn TileFetcher>,
+    /// Who must be credited, on screen, while any of it is drawn — besides
+    /// what each content names itself
+    /// (`tuile_core::content::DecodedTileContent::copyright`).
+    pub credits: Vec<Credit>,
+}
+
+/// One credit a source requires on screen: words, and the logo that stands
+/// for them where the provider asks for one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Credit {
+    /// What a person reads; the logo's own words when it is a logo alone.
+    pub text: String,
+    /// The image the provider requires be shown, if any.
+    pub logo: Option<url::Url>,
+    /// Where the credit leads, if anywhere.
+    pub link: Option<url::Url>,
 }
 
 /// A source held by pointer, as the source it points to.
@@ -51,6 +90,18 @@ pub trait Sources: Send + Sync {
 /// *value* implementing the trait; this is the adapter between the two, so no
 /// host has to write it.
 pub struct Held<T: ?Sized>(pub Arc<T>);
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+impl TileFetcher for Held<dyn TileFetcher> {
+    async fn fetch(&self, url: &url::Url) -> Result<Bytes, FetchError> {
+        self.0.fetch(url).await
+    }
+
+    async fn fetch_cacheable(&self, url: &url::Url) -> Result<Fetched<Bytes>, FetchError> {
+        self.0.fetch_cacheable(url).await
+    }
+}
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
