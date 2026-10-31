@@ -2348,6 +2348,19 @@ mod batch {
         assert_eq!(d.fatal, Some(SessionError::LoadFailed(mesh(a))));
         assert!(!d.frame_ready);
     }
+
+    /// The end of a session names the resource that ended it, so the
+    /// runtime can report it to the client.
+    #[test]
+    fn an_end_of_session_names_its_resource() {
+        let mut r = Rig::batch();
+        let a = t(3, 2, 2);
+        let s = *r.step(&drawn(&[a])).start.first().expect(RED);
+        r.b.on_failed(mesh(a), s.gen, Failure::Transient);
+        let d = r.step(&drawn(&[a]));
+        let fatal = d.fatal.expect(RED);
+        assert_eq!(fatal.resource(), Some(mesh(a)), "{RED}");
+    }
 }
 
 mod failures {
