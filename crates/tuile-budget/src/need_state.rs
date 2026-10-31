@@ -57,7 +57,10 @@ impl WantedImagery {
 }
 
 /// A list of layers: up to two in place — a tile wears one or two — more
-/// on the heap. A kept need holds no allocation of its own for them.
+/// on the heap. A kept need holds no allocation of its own for them: a
+/// boxed list for every tile costs a block each time a tile enters or its
+/// layers change (measured on the tour: internal allocations per step p99
+/// 38 -> 49).
 #[derive(Clone, Debug, PartialEq)]
 enum Layers {
     Inline(u8, [LayerReach; 2]),
