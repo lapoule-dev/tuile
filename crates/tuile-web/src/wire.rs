@@ -675,8 +675,7 @@ impl Writer {
             textures,
             imagery,
             withheld_drape,
-            // Not carried yet: see `Reader::decoded`.
-            copyright: _,
+            copyright,
             local_origin_ecef,
             transform_local,
         } = c;
@@ -723,6 +722,14 @@ impl Writer {
             self.layer(layer);
         }
         self.option_u64(*withheld_drape);
+        // Who the tile credits: shown below the picture while it is drawn.
+        match copyright {
+            Some(text) => {
+                self.u8(1);
+                self.bytes(text.as_bytes());
+            }
+            None => self.u8(0),
+        }
         self.dvec3(*local_origin_ecef);
         for f in transform_local.to_cols_array() {
             self.f32(f);
@@ -1052,9 +1059,12 @@ impl<'a> Reader<'a> {
             textures,
             imagery,
             withheld_drape: self.option_u64()?,
-            // Not carried by the wire yet: the browser draws no 3D Tiles
-            // content whose credits it would show.
-            copyright: None,
+            copyright: match self.u8()? {
+                0 => None,
+                _ => Some(Arc::from(
+                    std::str::from_utf8(self.bytes()?).map_err(|_| WireError::Utf8)?,
+                )),
+            },
             local_origin_ecef: self.dvec3()?,
             transform_local: Mat4::from_cols_array(&self.f32s()?),
         })
@@ -1097,7 +1107,7 @@ mod tests {
                 scale: [2.0, 4.0],
             }],
             withheld_drape: Some(u64::MAX - 1),
-            copyright: None,
+            copyright: Some(Arc::from("Data © someone; Imagery © someone else")),
             // The anti-jitter origin: every bit of the f64 must survive.
             local_origin_ecef: DVec3::new(4_201_234.123_456_789, 172_001.000_000_1, -4_779_000.5),
             transform_local: Mat4::from_translation(glam::Vec3::new(1.0, 2.0, 3.0)),
@@ -1131,6 +1141,7 @@ mod tests {
             );
         }
         assert_eq!(a.withheld_drape, b.withheld_drape);
+        assert_eq!(a.copyright, b.copyright, "the credits cross");
         assert_eq!(
             a.local_origin_ecef.to_array().map(f64::to_bits),
             b.local_origin_ecef.to_array().map(f64::to_bits)

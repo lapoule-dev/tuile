@@ -74,6 +74,8 @@ public class TuileActivity extends NativeActivity {
     /** The last caption asked for: shown once the window can carry it. UI thread only. */
     private String captionWanted = "";
     private boolean captionRetrying = false;
+    /** How far the caption stands off the bottom, pixels: the credits bar's height. UI thread only. */
+    private int captionLift = 0;
 
     /** The largest configuration file read: a configuration is a few hundred bytes. */
     private static final int LONGEST_FILE = 64 * 1024;
@@ -356,6 +358,19 @@ public class TuileActivity extends NativeActivity {
         });
     }
 
+    /** Lifts the caption off the bottom by the credits bar's height, in pixels. */
+    public void captionLift(final int pixels) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                captionLift = pixels;
+                if (caption != null && caption.isShowing()) {
+                    caption.update(0, captionLift, -1, -1);
+                }
+            }
+        });
+    }
+
     private void showCaption(String text) {
         captionWanted = text;
         final View anchor = getWindow().getDecorView();
@@ -397,7 +412,7 @@ public class TuileActivity extends NativeActivity {
         if (text.isEmpty()) {
             caption.dismiss();
         } else if (!caption.isShowing()) {
-            caption.showAtLocation(anchor, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL, 0, 0);
+            caption.showAtLocation(anchor, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL, 0, captionLift);
         }
     }
 

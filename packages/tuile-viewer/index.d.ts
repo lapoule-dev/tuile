@@ -120,6 +120,24 @@ export interface ViewerOptions {
    * minute), 0 (frozen), negative to run backwards.
    */
   timeRate?: number;
+  /**
+   * 3D Tiles tilesets of the catalog offered over the globe, each a switch in
+   * the menu: off until the person turns it on (the choice is kept for the
+   * next visit), or on from the start with `on: true`. Drawn where they have
+   * content, replacing the ground there; their credits are shown in a bar
+   * below the picture while they are drawn. None by default.
+   */
+  tilesets?: TilesetOffer[];
+}
+
+/** A 3D Tiles tileset of the catalog, offered over the globe. */
+export interface TilesetOffer {
+  /** Its asset number in the catalog. */
+  asset: number;
+  /** What the menu calls it; `3D Tiles <asset>` when left out. */
+  name?: string;
+  /** On from the start, whatever the last visit left. */
+  on?: boolean;
 }
 
 export interface ViewerEvents {

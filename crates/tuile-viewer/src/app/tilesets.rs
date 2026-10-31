@@ -136,17 +136,11 @@ impl App {
         self.draw_soon();
     }
 
-    /// Marks the tilesets the session came up without — on, and yet not
-    /// among its surfaces — as failed, so that they are not opened again
-    /// behind the message that said so.
-    pub(super) fn note_the_tilesets_up(&mut self) {
+    /// Marks the tilesets the session's launch could not open as failed, so
+    /// that they are not opened again behind the message that said so.
+    pub(super) fn note_the_tilesets_up(&mut self, failures: &[(i64, String)]) {
         for slot in &mut self.tilesets.slots {
-            if slot.on
-                && !self
-                    .surfaces
-                    .iter()
-                    .any(|layer| layer.surface.asset == slot.asset)
-            {
+            if failures.iter().any(|(asset, _)| *asset == slot.asset) {
                 slot.failed = true;
             }
         }

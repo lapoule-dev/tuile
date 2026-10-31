@@ -96,7 +96,12 @@ impl App {
             return;
         };
         let (size, safe, scale) = (active.size, active.safe, active.scale.max(1.0));
+        let before = self.credits.height();
         self.credits.lay_out(&text, size, safe, scale);
+        // A phone's and a page's caption stand above the bar.
+        if self.credits.height() != before {
+            crate::desktop::caption_lift(self.credits.height());
+        }
     }
 }
 

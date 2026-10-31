@@ -53,8 +53,8 @@ pub(crate) struct Started {
     pub runtime: tokio::runtime::Handle,
     /// The 3D Tiles drawn over the globe, until the window takes them.
     pub surfaces: Vec<crate::surface::Surface>,
-    /// Why a tileset asked for is not among them, a sentence each.
-    pub surface_failures: Vec<String>,
+    /// Why a tileset asked for is not among them: its asset, and a sentence.
+    pub surface_failures: Vec<(i64, String)>,
     /// Their servers' threads, joined on the way out — those opened later
     /// too ([`Started::open_tileset`]).
     pub surface_servers: Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
@@ -67,7 +67,7 @@ pub(crate) struct Started {
 impl Started {
     /// The 3D Tiles drawn over the globe, and why any asked for is not, for
     /// the window to take once.
-    pub(crate) fn take_surfaces(&mut self) -> (Vec<crate::surface::Surface>, Vec<String>) {
+    pub(crate) fn take_surfaces(&mut self) -> (Vec<crate::surface::Surface>, Vec<(i64, String)>) {
         (
             std::mem::take(&mut self.surfaces),
             std::mem::take(&mut self.surface_failures),
@@ -330,7 +330,7 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
             }
             Err(why) => {
                 tracing::error!(asset, "3D Tiles tileset not opened: {why}");
-                surface_failures.push(format!("3D Tiles asset {asset}: {why}"));
+                surface_failures.push((asset, format!("3D Tiles asset {asset}: {why}")));
             }
         }
     }
@@ -393,7 +393,7 @@ async fn open_surface(
         crate::surface::Surface {
             asset,
             stream,
-            meter,
+            meter: Some(meter),
             credits: source.credits,
         },
         server,

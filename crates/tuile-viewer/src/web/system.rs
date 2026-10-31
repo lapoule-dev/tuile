@@ -131,6 +131,11 @@ pub(crate) fn caption(text: &str) {
     super::screen::caption(text);
 }
 
+/// The caption lifted off the bottom by the credits bar's height.
+pub(crate) fn caption_lift(pixels: u32) {
+    super::screen::caption_lift(pixels);
+}
+
 /// Puts `text` on the browser's clipboard. A key press or a menu click is
 /// the person's own gesture, which is what the browser asks before it lets a
 /// page write there.

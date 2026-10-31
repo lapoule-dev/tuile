@@ -111,6 +111,7 @@ export async function createViewer(container, options) {
     time: o.time,
     timeOffset: o.timeOffset,
     timeRate: o.timeRate,
+    tilesets: o.tilesets ?? [],
   };
 
   const listeners = new Map(EVENTS.map((kind) => [kind, new Set()]));
