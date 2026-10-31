@@ -345,6 +345,11 @@ impl NeedState {
         &self.tiles
     }
 
+    /// What its map spent keeping its order since the last call.
+    pub fn take_upkeep(&mut self) -> u64 {
+        self.tiles.take_upkeep()
+    }
+
     /// Its entries with a float that was not finite.
     pub fn rejected(&self) -> usize {
         self.rejected

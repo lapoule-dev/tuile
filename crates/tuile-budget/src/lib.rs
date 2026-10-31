@@ -309,10 +309,8 @@ impl Budget {
     /// same `now` — decides exactly as if it had applied them itself, and
     /// reports them in its statistics.
     pub fn apply_arrivals(&mut self, now: Micros) {
-        let upkeep = sorted::upkeep();
         let mut st = std::mem::take(&mut self.pending);
         self.apply_events(now, &mut st);
-        self.walk_upkeep(upkeep);
         self.pending = st;
     }
 

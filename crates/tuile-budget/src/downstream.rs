@@ -620,6 +620,39 @@ impl Downstream {
         self.again = true;
     }
 
+    /// What its maps spent keeping their order since the last call.
+    pub fn take_upkeep(&mut self) -> u64 {
+        let mut n = self.sums.depths.take_upkeep();
+        if let Some(c) = self.capped_sel.as_mut() {
+            n = n.saturating_add(c.depths.take_upkeep());
+        }
+        for m in [
+            &mut self.levels_far,
+            &mut self.levels_moved,
+            &mut self.coarsening,
+            &mut self.capped_coarsening,
+        ] {
+            n = n.saturating_add(m.take_upkeep());
+        }
+        for m in [&mut self.jobs, &mut self.inflight] {
+            n = n.saturating_add(m.take_upkeep());
+        }
+        n.saturating_add(self.entries.take_upkeep())
+            .saturating_add(self.contrib.take_upkeep())
+            .saturating_add(self.floor.take_upkeep())
+            .saturating_add(self.sel.take_upkeep())
+            .saturating_add(self.reach.take_upkeep())
+            .saturating_add(self.readers.take_upkeep())
+            .saturating_add(self.items.take_upkeep())
+            .saturating_add(self.worn.take_upkeep())
+            .saturating_add(self.wants.take_upkeep())
+            .saturating_add(self.refresh.take_upkeep())
+            .saturating_add(self.waiting.take_upkeep())
+            .saturating_add(self.ancestry.take_upkeep())
+            .saturating_add(self.kept_empty.take_upkeep())
+            .saturating_add(self.support.kids.take_upkeep())
+    }
+
     /// Drops the step's lists and batches and the indexes the next step
     /// rebuilds — who reads what, the work, the deadlines — keeping the
     /// units' results; every unit is read again at the next step.

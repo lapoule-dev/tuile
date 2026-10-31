@@ -389,10 +389,16 @@ fn latency_bucket(d: Micros) -> usize {
 }
 
 impl Budget {
-    /// Counts what the sorted maps spent keeping their order since
-    /// [`sorted::upkeep`](super::sorted::upkeep) read `since`.
-    pub(super) fn walk_upkeep(&self, since: u64) {
-        let n = super::sorted::upkeep().saturating_sub(since);
+    /// Counts what the kept maps spent keeping their order since the last
+    /// step took it.
+    pub(super) fn walk_upkeep(&mut self) {
+        let n = self
+            .tiles
+            .take_upkeep()
+            .saturating_add(self.held_last.take_upkeep())
+            .saturating_add(self.arena.take_upkeep())
+            .saturating_add(self.need.take_upkeep())
+            .saturating_add(self.down.take_upkeep());
         self.walk(usize::try_from(n).unwrap_or(usize::MAX));
     }
 
@@ -1401,7 +1407,6 @@ impl Budget {
 
     /// The step.
     pub(super) fn step(&mut self, input: FrameInput<'_>) -> Decisions {
-        let upkeep = super::sorted::upkeep();
         let now = input.now;
         let mut st = std::mem::take(&mut self.pending);
         let mut d = Decisions::default();
@@ -1617,8 +1622,9 @@ impl Budget {
             }
         }
         st.protected = protected;
-        // What keeping the maps in order cost.
-        self.walk_upkeep(upkeep);
+        // What keeping the kept maps in order cost, this step and the
+        // events applied since the last.
+        self.walk_upkeep();
         st.work = st.work.saturating_add(self.scratch.walked.swap(0, Relaxed));
         d.stats = st;
         d

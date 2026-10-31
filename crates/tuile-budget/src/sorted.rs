@@ -27,28 +27,18 @@
 //! The map is checked against the standard library's by random sequences
 //! (the tests below), the fork's own tests likewise.
 //!
-//! Every map counts what keeping its order cost ([`upkeep`]), for the
-//! step's `work`.
+//! Every map counts what keeping its order costs, in a counter of its own
+//! that its owner takes ([`SortedMap::take_upkeep`]) into the step's
+//! `work`. What a tree walks for one change is not measured: it is taken
+//! from the B-tree's bound, its path, ⌈log2(n + 2)⌉ for n entries. So the
+//! decision bound P6.4 holds over (`decide_work_grows_with_changes_not_
+//! with_the_view`) bounds the *number* of structural changes — a key added
+//! or removed — at the B-tree's cost each; what can be O(view), a pass over
+//! a whole map (`retain`, `rebuild`, the keys between two bounds), counts
+//! the entries it passes, one by one.
 
-thread_local! {
-    /// The entries this thread's maps passed over to keep their order
-    /// ([`upkeep`]).
-    static UPKEEP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// Counts `n` entries passed over to keep a map in order.
-fn kept(n: usize) {
-    let _ = UPKEEP.try_with(|c| c.set(c.get().saturating_add(n as u64)));
-}
-
-/// What this thread's maps have passed over to keep their order so far: a
-/// change's path in a tree, a batch's pass, a merge's rotations. A step
-/// adds what it spent to its `work`.
-pub(super) fn upkeep() -> u64 {
-    UPKEEP.try_with(std::cell::Cell::get).unwrap_or(0)
-}
-
-/// A change's path in a tree of `n` entries: ⌈log2(n + 2)⌉.
+/// A change's path in a tree of `n` entries, the B-tree's bound:
+/// ⌈log2(n + 2)⌉.
 fn path(n: usize) -> usize {
     (usize::BITS - (n + 1).leading_zeros()) as usize
 }
@@ -58,121 +48,142 @@ type Nodes<K, V> = btree_slab::SlabByEighths<btree_slab::generic::Node<K, V>>;
 
 /// An ordered map kept from one step to the next. Its accessors mirror
 /// `BTreeMap`'s: entries come as `(&K, &V)`, in key order.
-pub(super) struct SortedMap<K, V>(btree_slab::BTreeMapByEighths<K, V>);
+pub(super) struct SortedMap<K, V> {
+    map: btree_slab::BTreeMapByEighths<K, V>,
+    /// What keeping the order cost since the owner last took it.
+    upkeep: u64,
+}
 
 impl<K, V> Default for SortedMap<K, V> {
     fn default() -> Self {
-        SortedMap(btree_slab::BTreeMapByEighths::default())
+        SortedMap {
+            map: btree_slab::BTreeMapByEighths::default(),
+            upkeep: 0,
+        }
     }
 }
 
 impl<K: Ord + Copy + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for SortedMap<K, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_map().entries(self.0.iter()).finish()
+        f.debug_map().entries(self.map.iter()).finish()
     }
 }
 
 impl<K: Ord + Copy, V: Clone> Clone for SortedMap<K, V> {
     fn clone(&self) -> Self {
-        SortedMap(self.0.iter().map(|(k, v)| (*k, v.clone())).collect())
+        SortedMap {
+            map: self.map.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            upkeep: 0,
+        }
     }
 }
 
 impl<K: Ord + Copy, V: PartialEq> PartialEq for SortedMap<K, V> {
     fn eq(&self, other: &Self) -> bool {
-        self.0.len() == other.0.len() && self.0.iter().eq(other.0.iter())
+        self.map.len() == other.map.len() && self.map.iter().eq(other.map.iter())
     }
 }
 
 impl<K: Ord + Copy, V> SortedMap<K, V> {
+    /// Counts `n` entries passed over to keep the order.
+    fn kept(&mut self, n: usize) {
+        self.upkeep = self.upkeep.saturating_add(n as u64);
+    }
+
+    /// What keeping the order cost since the last call: for the step's
+    /// `work`.
+    pub fn take_upkeep(&mut self) -> u64 {
+        std::mem::take(&mut self.upkeep)
+    }
+
     /// The value at `k`.
     pub fn get(&self, k: &K) -> Option<&V> {
-        self.0.get(k)
+        self.map.get(k)
     }
 
     /// Whether `k` has a value.
     pub fn contains_key(&self, k: &K) -> bool {
-        self.0.contains_key(k)
+        self.map.contains_key(k)
     }
 
     /// The entries, in key order.
     pub fn iter(&self) -> btree_slab::generic::map::Iter<'_, K, V, Nodes<K, V>> {
-        self.0.iter()
+        self.map.iter()
     }
 
     /// The keys, in order.
     pub fn keys(&self) -> impl Iterator<Item = &K> + '_ {
-        self.0.keys()
+        self.map.keys()
     }
 
     /// How many entries.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.map.len()
     }
 
     /// The entries with keys in `r`, in order.
     pub fn range(&self, r: std::ops::RangeInclusive<K>) -> impl Iterator<Item = (&K, &V)> + '_ {
-        self.0.range(r)
+        self.map.range(r)
     }
 
     /// Whether the map is empty.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.map.is_empty()
     }
 
     /// The value at `k`, to change in place.
     pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
-        self.0.get_mut(k)
+        self.map.get_mut(k)
     }
 
     /// Sets `k` to `v`; returns the value it replaces. A new key costs its
     /// path in the tree; a value replaced, none beyond finding it.
     pub fn insert(&mut self, k: K, v: V) -> Option<V> {
-        if let Some(x) = self.0.get_mut(&k) {
+        if let Some(x) = self.map.get_mut(&k) {
             return Some(std::mem::replace(x, v));
         }
-        kept(path(self.0.len()));
-        self.0.insert(k, v)
+        self.kept(path(self.map.len()));
+        self.map.insert(k, v)
     }
 
     /// Removes `k`; returns its value.
     pub fn remove(&mut self, k: &K) -> Option<V> {
-        let v = self.0.remove(k);
+        let v = self.map.remove(k);
         if v.is_some() {
-            kept(path(self.0.len()));
+            self.kept(path(self.map.len()));
         }
         v
     }
 
     /// Empties the map, keeping its nodes' room.
     pub fn clear(&mut self) {
-        self.0.clear();
+        self.map.clear();
     }
 
     /// The map made of `entries`, in place of its own: what a step that
     /// rebuilds it whole passes over.
     pub fn rebuild(&mut self, entries: impl IntoIterator<Item = (K, V)>) {
-        self.0.clear();
+        self.map.clear();
         for (k, v) in entries {
-            kept(path(self.0.len()));
-            self.0.insert(k, v);
+            self.kept(path(self.map.len()));
+            self.map.insert(k, v);
         }
     }
 
     /// The values, in key order, to change in place (their keys stay).
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut V> + '_ {
-        self.0.values_mut()
+        self.map.values_mut()
     }
 
     /// Keeps the entries `f` keeps: a pass over every entry.
     pub fn retain(&mut self, mut f: impl FnMut(&K, &mut V) -> bool) {
-        kept(self.0.len());
-        self.0.retain(|k, v| f(k, v));
+        self.kept(self.map.len());
+        self.map.retain(|k, v| f(k, v));
     }
 
     /// The keys strictly between `after` and `before` (`None`: unbounded),
     /// in order, into `out`.
-    pub fn keys_between(&self, after: Option<K>, before: Option<K>, out: &mut Vec<K>) {
+    pub fn keys_between(&mut self, after: Option<K>, before: Option<K>, out: &mut Vec<K>) {
         use std::ops::Bound::{Excluded, Unbounded};
         out.clear();
         let lo = after.map_or(Unbounded, Excluded);
@@ -182,7 +193,8 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
                 return;
             }
         }
-        out.extend(self.0.range((lo, hi)).map(|(k, _)| *k));
+        out.extend(self.map.range((lo, hi)).map(|(k, _)| *k));
+        self.kept(out.len());
     }
 
     /// Applies `changes` — a value to set at a key, or `None` to remove the
@@ -211,7 +223,7 @@ impl<'a, K: Ord + Copy, V> IntoIterator for &'a SortedMap<K, V> {
     type IntoIter = btree_slab::generic::map::Iter<'a, K, V, Nodes<K, V>>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
+        self.map.iter()
     }
 }
 

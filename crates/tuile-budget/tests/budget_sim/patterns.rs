@@ -752,12 +752,20 @@ fn need_delta(before: &NeedSet, after: &NeedSet) -> u64 {
 /// W_k ≤ a · (#ΔN_k + #E_k) · log2(tracked + 2) + b, on every step of a
 /// converged still view (nothing changes: W_k ≤ b) and of the soak's tour.
 /// #E_k counts the events the step applies and the decisions the step
-/// before took — loads started, cancelled, deliveries, evictions: each
-/// changes a resource's state, which this step reads back as an event's
-/// change is read.
+/// before took — loads started, cancelled, deliveries, evictions. A
+/// decision changes a resource's state (a load in flight, a copy in
+/// transit, a copy gone) after the passes of its step have read the arena,
+/// so its effect on the jobs, the marks and the work is read by the next
+/// step, from the arena's changes, exactly as an event's is: it is a change
+/// of that step's input, one step late. Counting only the events left those
+/// steps' work unexplained (2 still steps over the bound once the maps'
+/// upkeep was counted).
 ///
-/// `work` includes what keeping the kept maps in order costs (a change's
-/// path in a tree, a whole pass): no upkeep is left outside it.
+/// `work` includes what keeping the kept maps in order costs: each
+/// structural change (a key added or removed) at the B-tree's bound, its
+/// path, and every pass over a whole map entry by entry (`sorted.rs`). So
+/// for single changes the bound checks how many there are; what could grow
+/// with the view — whole passes — is counted as it is walked.
 ///
 /// `work` counts every element a step walks, the passes after the need
 /// included (drape levels, selection, draw set, wants, ranking, marks,
