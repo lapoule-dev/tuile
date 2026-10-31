@@ -62,6 +62,28 @@ fn script() -> impl Strategy<Value = Vec<Op>> {
     prop::collection::vec(op(), 1..80)
 }
 
+/// The fixed corpus's scripts: drawn like [`script`]'s (the same ops, the
+/// same weights, 1 to 79 of them), by a seeded generator of this file's
+/// own, so the corpus never moves with a dependency's version.
+const CORPUS: u64 = 128;
+
+fn corpus_script(i: u64) -> Vec<Op> {
+    let mut m = Mix(0x7475_696c_6520_0000 ^ i);
+    let len = 1 + m.next() % 79;
+    (0..len)
+        .map(|_| match m.next() % 20 {
+            0..=5 => Op::Step(m.next()),
+            6..=9 => Op::Load(m.next()),
+            10..=13 => Op::Upload(m.next()),
+            14 => Op::Fail(m.next()),
+            15 => Op::Miss(m.next()),
+            16 => Op::Pressure((m.next() % 4) as u8),
+            17 => Op::Thermal((m.next() % 4) as u8),
+            _ => Op::Wait((m.next() % 3_000) as u16),
+        })
+        .collect()
+}
+
 /// SplitMix64: seeded choices inside an op.
 struct Mix(u64);
 impl Mix {
@@ -161,6 +183,17 @@ struct Harness {
 
 impl Harness {
     fn new(cfg: BudgetConfig, store_seed: u64) -> Self {
+        let b = Lockstep::new(cfg.clone()).unwrap();
+        Harness::with(cfg, store_seed, b)
+    }
+
+    /// A run of the fixed corpus, recorded under `key`.
+    fn keyed(cfg: BudgetConfig, store_seed: u64, key: String) -> Self {
+        let b = Lockstep::keyed(cfg.clone(), key).unwrap();
+        Harness::with(cfg, store_seed, b)
+    }
+
+    fn with(cfg: BudgetConfig, store_seed: u64, b: Lockstep) -> Self {
         let mut m = Mix(store_seed);
         let mut store = Store::default();
         for l in 0..=DEPTH {
@@ -174,7 +207,7 @@ impl Harness {
             }
         }
         Harness {
-            b: Lockstep::new(cfg.clone()).unwrap(),
+            b,
             cfg,
             now: Micros::ZERO,
             frame: 0,
@@ -399,6 +432,27 @@ fn guard_config() -> ProptestConfig {
     ProptestConfig {
         cases: base.cases.max(1_024),
         ..base
+    }
+}
+
+/// O1's guard on a fixed corpus: [`CORPUS`] seeded scripts, each on both
+/// policies and a squeezed memory, the need in its order and permuted, every
+/// step checked against the reference (`tests/reference/`).
+#[test]
+fn decide_agrees_with_the_reference_on_a_fixed_corpus() {
+    for i in 0..CORPUS {
+        let ops = corpus_script(i);
+        for (name, cfg) in [
+            ("interactive", interactive()),
+            ("squeezed", squeezed()),
+            ("batch", batch()),
+        ] {
+            for permute in [false, true] {
+                let key = format!("corpus/{i:03}/{name}/{permute}");
+                let tr = Harness::keyed(cfg.clone(), 7, key).run(&ops, permute);
+                assert!(tr.len() <= ops.len());
+            }
+        }
     }
 }
 
