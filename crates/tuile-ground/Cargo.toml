@@ -1,0 +1,28 @@
+[package]
+name = "tuile-ground"
+description = "The authoritative ground: a deterministic terrain contract (pluggable frame, tiles, edits, water, batched queries) for simulations and renderers alike"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+# At the bottom of the graph: no other tuile crate, no GPU API, no async
+# runtime, no I/O. It builds for `wasm32-unknown-unknown`.
+[dependencies]
+thiserror = { workspace = true }
+glam = { workspace = true }
+# A geodetic frame's metric needs a cosine that is the same on every target.
+libm = { workspace = true }
+
+[dev-dependencies]
+# Determinism, edit ordering and batch equivalence over random edits and
+# queries.
+proptest = { workspace = true }

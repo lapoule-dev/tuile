@@ -14,6 +14,7 @@ tuile/
 │   │   — the standard and the globe (render-agnostic)
 │   ├── tuile-core/            # 3D Tiles parsing, SSE traversal, decoding, the geometry server, the protocol; re-exports the budget
 │   ├── tuile-budget/          # the graphics budget: pure, deterministic decide(); at the bottom of the graph
+│   ├── tuile-ground/          # the authoritative ground: pluggable frame, tiles, edits, water, batched queries
 │   ├── tuile-b3dm/            # the b3dm container: parse + encode, zero I/O
 │   ├── tuile-terrain/         # quantized-mesh decode/encode, geographic tiling, heightfield source, terrain over HTTP
 │   ├── tuile-planetary/       # terrain × imagery as one TileTree + TileLoader
@@ -74,6 +75,8 @@ Not built, and not scheduled today: `tuile-server`, the network middleware (`12-
 ```
 tuile-budget     → thiserror (pure, deterministic: no clock, no GPU, no runtime, no I/O, no other
                    tuile crate; owns TileId)
+tuile-ground     → thiserror, glam (f64), libm (pure, deterministic: no other tuile crate, no GPU,
+                   no runtime, no I/O; see docs/explorations/ground-contract.md)
 tuile-b3dm       → serde_json, thiserror (pure codec, zero I/O)
 tuile-core       → tuile-budget (re-exported as `budget`), tuile-b3dm, serde, glam (f64), gltf, image, texcomp (no GPU feature), bytes,
                    async-trait + futures (async traits), thiserror, tracing — NO runtime;

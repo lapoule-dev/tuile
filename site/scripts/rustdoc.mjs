@@ -47,6 +47,7 @@ const libraries = [
   // core and formats
   'tuile-core',
   'tuile-budget',
+  'tuile-ground',
   'tuile-b3dm',
   'tuile-terrain',
   'tuile-pack',

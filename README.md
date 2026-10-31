@@ -243,6 +243,7 @@ Routing, authentication and limits belong to whoever deploys it.
 |---|---|---|
 | Core | `tuile-core` | 3D Tiles parsing, SSE traversal, content decoding, geometry streaming |
 | | `tuile-budget` | The graphics budget: what is loaded, uploaded, drawn and evicted, pure and deterministic |
+| | `tuile-ground` | The authoritative ground: a deterministic terrain contract (frames, tiles, ordered edits, water, batched queries) for simulations and renderers |
 | | `tuile-b3dm` | The legacy Batched 3D Model container, parsed and encoded |
 | | `tuile-terrain` | Quantized-mesh decoding and geographic tiling |
 | | `tuile-planetary` | Terrain × imagery, assembled as a tile tree and a loader |

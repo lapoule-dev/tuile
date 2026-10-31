@@ -117,6 +117,7 @@ jobs:
         run: >-
           cargo check --target wasm32-unknown-unknown
           -p tuile-budget
+          -p tuile-ground
           -p tuile-core
           -p tuile-web
           -p tuile-wgpu

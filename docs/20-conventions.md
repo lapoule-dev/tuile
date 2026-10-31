@@ -54,7 +54,7 @@ Jobs:
 2. `msrv`: check + clippy on Rust 1.97.1, the pinned `rust-version`.
 3. `test`: `cargo test --workspace` on `ubuntu-24.04` and `macos-latest`, `fail-fast: false`. The Linux image is pinned because it is also the Vulkan driver (lavapipe) the headless GPU tests render through; moving it is a deliberate change.
 4. `budget-sim`: the graphics budget's simulation and property tests in release (10,000 property cases), golden decision digests checked on Linux as on the Mac that recorded them.
-5. `wasm-guard`: `cargo check --target wasm32-unknown-unknown` with `-D warnings` for every crate that claims wasm (core, web, wgpu, planetary, terrain, camera, atmosphere, film, film-gpu, ui), and clippy for the viewer's web shell.
+5. `wasm-guard`: `cargo check --target wasm32-unknown-unknown` with `-D warnings` for every crate that claims wasm (budget, ground, core, web, wgpu, planetary, terrain, camera, atmosphere, film, film-gpu, ui), and clippy for the viewer's web shell.
 6. `web-package`: the wasm build and bindings of `packages/tuile-viewer` (wasm-bindgen at the locked version), its typings, and a bundler build of `examples/web-viewer-vite`.
 7. `android`: clippy for `aarch64-linux-android` and the APK through `crates/tuile-viewer/android/build.sh`.
 8. `docs`: `cargo doc --workspace --no-deps` with `-D warnings`.
