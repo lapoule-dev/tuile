@@ -307,11 +307,8 @@ impl App {
         if let Some(layer) = snapshot.imagery {
             title = format!("{title} — {} · {}", layer.name, layer.attribution);
         }
-        // And whose 3D Tiles: see `surface`.
-        let surfaces = self.surface_credits();
-        if let Some(credits) = &surfaces {
-            title = format!("{title} — 3D Tiles · {credits}");
-        }
+        // Whose 3D Tiles is not said here: the credits bar below the
+        // picture says it, on every shell (see `credits`).
         // How the imagery is held, and what it holds: the one line that
         // tells a compressed session from an uncompressed one.
         let held = self.imagery_held();
@@ -335,9 +332,6 @@ impl App {
                 .imagery
                 .map(|layer| format!("{} · {}", layer.name, layer.attribution))
                 .unwrap_or_default();
-            if let Some(credits) = &surfaces {
-                caption = format!("{caption} — 3D Tiles · {credits}");
-            }
             if let Some(held) = &held {
                 caption = format!("{caption} — {held}");
             }

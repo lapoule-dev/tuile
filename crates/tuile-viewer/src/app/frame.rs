@@ -38,6 +38,9 @@ impl App {
             return;
         }
         let dt = self.start_the_frame();
+        // Before anything reads the viewport: the bar decides how much of
+        // the frame the view has.
+        self.lay_out_the_credits();
         self.ease_the_camera(dt);
         if self.active.is_none() {
             return;
@@ -381,13 +384,21 @@ impl App {
         } else {
             Vec::new()
         };
-        let mut nav_mesh: Vec<OverlayVertex> = controls
-            .into_iter()
+        // The credits bar's background first, already in device pixels.
+        let bar = self.credits.layout();
+        let mut nav_mesh: Vec<OverlayVertex> = bar
+            .map(|bar| bar.background.as_slice())
+            .unwrap_or_default()
+            .iter()
             .map(|v| OverlayVertex {
-                position: ui.from(v.position),
+                position: v.position,
                 color: v.color,
             })
             .collect();
+        nav_mesh.extend(controls.into_iter().map(|v| OverlayVertex {
+            position: ui.from(v.position),
+            color: v.color,
+        }));
         // The loading indicator over everything, already in device pixels.
         if let Some(spinner) = indicator {
             nav_mesh.extend(spinner.mesh().into_iter().map(|v| OverlayVertex {
@@ -398,6 +409,17 @@ impl App {
         active
             .overlay
             .set_geometry(&active.gpu, &nav_mesh, active.size);
+        // And its line, over its background.
+        let line = bar
+            .and_then(|bar| bar.label.as_ref())
+            .map(|label| tuile_wgpu::OverlayMask {
+                width: label.mask.width,
+                height: label.mask.height,
+                coverage: &label.mask.coverage,
+                position: label.position,
+                color: label.color,
+            });
+        active.overlay.set_mask(&active.gpu, line);
     }
 
     /// Resolves what to draw, draws it, and hands the frame to the compositor.
@@ -411,7 +433,9 @@ impl App {
         let serving = self.imagery.generation;
         let views = self.view_uniforms();
         let picture = self.picture();
-        let viewport = self.viewport();
+        // The whole frame, credits bar included: the overlay is laid out in
+        // it.
+        let viewport = self.frame_size();
         // The same clearance the tiles' view uniform is built with, so an
         // overlay and the ground share one clip space.
         let clearance = self.controller.height_above_ground();
@@ -632,9 +656,10 @@ impl App {
         #[cfg(feature = "control")]
         {
             let eyes = self.eyes();
+            let picture = self.picture();
             if let Some(active) = self.active.as_mut() {
                 if let super::screen::Screen::Offscreen(offscreen) = &mut active.screen {
-                    offscreen.read(&active.gpu, &eyes);
+                    offscreen.read(&active.gpu, &eyes, picture);
                 }
             }
         }
@@ -763,9 +788,10 @@ impl App {
         self.picture().aspect() as f32
     }
 
-    /// Where the picture sits in the frame: the whole frame unless a host
-    /// held the camera to an aspect, and then the largest rectangle of that
-    /// shape, centred.
+    /// Where the picture sits in the frame: the view (the frame above the
+    /// credits bar, the whole frame without one) unless a host held the
+    /// camera to an aspect, and then the largest rectangle of that shape,
+    /// centred in the view.
     fn picture(&self) -> crate::frame_host::Letterbox {
         let (w, h) = self.viewport();
         crate::frame_host::Letterbox::of((w as u32, h as u32), self.fixed_aspect)
