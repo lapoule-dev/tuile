@@ -8889,6 +8889,8 @@ name = "tuile-budget"
 version = "0.15.1"
 dependencies = [
  "criterion",
+ "foldhash 0.2.0",
+ "hashbrown 0.16.1",
  "proptest",
  "thiserror 2.0.18",
 ]
