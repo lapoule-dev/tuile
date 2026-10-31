@@ -7,6 +7,7 @@ members = [
     "crates/tuile-bevy",
     "crates/tuile-bing",
     "crates/tuile-budget",
+    "crates/tuile-ground",
     "crates/tuile-cesium-ion",
     "crates/tuile-farm",
     "crates/tuile-film",
@@ -92,6 +93,9 @@ serde_json = "1.0.150"
 parquet = { version = "58.4.0", default-features = false }
 roxmltree = "0.20"
 thiserror = "2.0.18"
+# Transcendentals in authoritative paths (`tuile-ground`): pure Rust, the same
+# bits on every target, where the platform's `sin`/`cos` are not.
+libm = "0.2.16"
 # The budget's resource index (`tuile-budget`'s arena): the hash table std's
 # own map is built on, keyed by an index into the arena's columns, hashed with
 # a fixed seed — probed, never iterated. no_std, wasm-clean.

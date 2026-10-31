@@ -9113,6 +9113,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuile-ground"
+version = "0.15.1"
+dependencies = [
+ "glam 0.33.2",
+ "libm",
+ "proptest",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "tuile-heightfield-serve"
 version = "0.15.1"
 dependencies = [
