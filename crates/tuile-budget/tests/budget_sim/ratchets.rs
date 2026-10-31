@@ -145,8 +145,8 @@ fn allocation_ratchets_hold() {
 /// O1.0's memory-pressure scenario (`soak::pressure_profile`), measured:
 /// the soak's tour for a simulated minute. Not a ratchet (its numbers are
 /// printed, `--nocapture`): the test holds the scenario to what it claims —
-/// over its target on at least 90 % of its steps (the eviction order built
-/// and sorted), evicting on at least 10 %, the view not relaxed — so that
+/// over its target on at least 90 % of its steps (the eviction order
+/// walked), evicting on at least 10 %, the view not relaxed — so that
 /// the bench's `decide/pressure` measures what it names.
 #[test]
 #[cfg_attr(

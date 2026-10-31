@@ -24,6 +24,10 @@
 //! sorted `Vec`, the arena's slots, whose finds are sorted by a total key
 //! before they decide anything): no decision depends on a hash order. The
 //! arena's hash index is only probed.
+//!
+//! Eviction walks an order the arena keeps up to date (`state`'s eviction
+//! index, merged with the recently needed resources sorted once a step), and
+//! knows whether room can be made from the bytes it counts, without a scan.
 
 // The decisions are integer arithmetic: floats stay in `imagery` and
 // `priority`, quantised once, where bit-exactness is controlled.
@@ -42,7 +46,7 @@ use super::imagery::{drape_rank, needed_level, DrapeCandidate, GeoRect, LevelCla
 use super::need::{ImageryNeed, LayerReach, Membership, Need};
 use super::priority::{score, PriorityKey, Quantised, Urgency};
 use super::sorted::{recycle, union4, SortedMap};
-use super::state::{Arena, CpuCopy, Gpu, Load, Rank, Slot, Transit};
+use super::state::{Arena, CpuCopy, EvictKey, Gpu, Held, Load, Rank, Slot, Transit};
 use super::stats::{BudgetStats, CancelReason, EvictReason, GAP_BUCKETS, LATENCY_BUCKETS};
 use super::tier::{Presence, PresenceOracle, Source, Tier};
 use super::types::{
@@ -157,14 +161,9 @@ pub(super) struct Scratch {
     keys: Vec<(ResourceId, PriorityKey)>,
     ancestry: Vec<(TileId, TileId, u32)>,
     jobs: Vec<(PriorityKey, ResourceId, Job, Want)>,
-    /// Per class, this step's eviction order of the GPU residents outside
-    /// the kept set, the floor and transit, built at its first use: their
-    /// keys do not move within a step after the mark, and the set only
-    /// shrinks, so every later use filters it instead of sorting again.
-    /// Dropped at the end of the step: only a step under pressure builds it.
-    /// Each key with its slot: no slot is freed within a step (`prune`
-    /// runs last).
-    evict_order: PerClass<Option<Vec<(EvictKey, Slot)>>>,
+    /// This step's room: built at its first use, dropped with the step's
+    /// evictions. Only a step under pressure builds it.
+    room: Option<Room>,
     /// The loads, then the deliveries, picked from `jobs`.
     picked: Vec<(PriorityKey, ResourceId, Job, Want)>,
 }
@@ -182,17 +181,82 @@ struct Selection {
     depth: u32,
 }
 
-/// The eviction order: least recently needed first, then finer, then
-/// farther; the resource last, so the order is total.
-type EvictKey = (Micros, Reverse<u32>, Reverse<u32>, ResourceId);
+/// What a step can evict beyond the arena's idle bytes: the grouped GPU
+/// residents (needed at one of the two most recent times) outside the kept
+/// set, the floor and transit, in eviction order, and their bytes by what
+/// the step wants of them. Built at its first use in a step, after the mark:
+/// the keys no longer move, and the set only shrinks (evictions, copies put
+/// in transit), so later uses skip what left it. Each key with its slot: no
+/// slot is freed within a step (`prune` runs last).
+#[derive(Debug)]
+pub(super) struct Room {
+    grouped: Vec<(EvictKey, Slot)>,
+    /// By class, the GPU bytes of `grouped` still evictable, by want:
+    /// [`want_bucket`].
+    bytes: PerClass<[Bytes; WANT_BUCKETS]>,
+}
 
-fn evict_key(a: &Arena, s: Slot) -> EvictKey {
-    (
-        a.last_needed(s),
-        Reverse(a.level(s)),
-        Reverse(a.distance(s)),
-        a.id(s),
-    )
+/// Not wanted, then one bucket per urgency.
+const WANT_BUCKETS: usize = 8;
+
+/// A resource's bucket in [`Room::bytes`]: 0 if the step does not want it,
+/// else [`urgency_bucket`].
+fn want_bucket(w: Option<&Want>) -> usize {
+    w.map_or(0, |w| urgency_bucket(w.urgency))
+}
+
+/// The bucket of a want of urgency `u`: one past it, in urgency order.
+fn urgency_bucket(u: Urgency) -> usize {
+    1 + u as usize
+}
+
+/// A walk of the eviction order: the arena's filed resources, by key,
+/// merged with a step's grouped ones, sorted. The two are disjoint (a
+/// resource is filed or grouped), and both stay ordered while the walk
+/// evicts what it visits.
+#[derive(Default)]
+struct Walk {
+    /// The last filed entry visited.
+    after: Option<(EvictKey, Slot)>,
+    /// The next grouped entry.
+    next: usize,
+}
+
+impl Walk {
+    /// The next entry of a class `class` takes, holding one of `held` if
+    /// filed: the grouped ones are taken as they are, their holdings left to
+    /// the caller.
+    fn next(
+        &mut self,
+        a: &Arena,
+        grouped: &[(EvictKey, Slot)],
+        class: impl Fn(Class) -> bool + Copy,
+        held: &[Held],
+    ) -> Option<(EvictKey, Slot)> {
+        while grouped
+            .get(self.next)
+            .is_some_and(|(_, s)| !class(a.class(*s)))
+        {
+            self.next += 1;
+        }
+        let g = grouped.get(self.next).copied();
+        let f = a.next_filed(self.after.as_ref(), class, held);
+        match (f, g) {
+            (Some(f), Some(g)) if g < f => {
+                self.next += 1;
+                Some(g)
+            }
+            (Some(f), _) => {
+                self.after = Some(f);
+                Some(f)
+            }
+            (None, Some(g)) => {
+                self.next += 1;
+                Some(g)
+            }
+            (None, None) => None,
+        }
+    }
 }
 
 /// Work on a wanted resource.
@@ -1195,7 +1259,7 @@ impl Budget {
         let mut st = std::mem::take(&mut self.pending);
         let mut d = Decisions::default();
         let eff = self.eff();
-        self.scratch.evict_order = PerClass::default();
+        self.scratch.room = None;
         let mut ranked = std::mem::take(&mut self.ranked_last);
         for r in &ranked {
             if let Some(s) = self.arena.find(*r) {
@@ -1313,7 +1377,7 @@ impl Budget {
                 continue;
             };
             if wants.contains_key(&r) {
-                arena.set_last_needed(s, now);
+                arena.touch(s, now);
                 let cold = arena.cold_mut(s);
                 cold.set_unneeded_since(None);
                 cold.first_wanted_or(now);
@@ -1321,7 +1385,7 @@ impl Budget {
                     arena.set_distance(s, tn.q.distance);
                 }
             } else if drawn_last.contains(&r) {
-                arena.set_last_needed(s, now);
+                arena.touch(s, now);
                 let cold = arena.cold_mut(s);
                 cold.set_unneeded_since(None);
                 cold.set_first_wanted(None);
@@ -1440,7 +1504,7 @@ impl Budget {
 
         // 9. Eviction and release.
         if !eff.batch {
-            self.evict(now, &eff, &mut d, &mut st);
+            self.evict(now, &eff, &wants, &mut d, &mut st);
         }
 
         // 10. Relaxation.
@@ -1738,7 +1802,7 @@ impl Budget {
             }
             cold.first_wanted_or(now);
             cold.set_unneeded_since(None);
-            self.arena.set_last_needed(s, now);
+            self.arena.touch(s, now);
             self.arena.set_rank(s, Some(w.urgency), Some(Rank::of(key)));
             self.arena.set_load(
                 s,
@@ -1806,7 +1870,10 @@ impl Budget {
         if self.ledger.gpu[class].plus(bytes) <= limit {
             return true;
         }
-        let order = self.evict_order(class, st);
+        let mut room = match self.scratch.room.take() {
+            Some(room) => room,
+            None => self.room(wants, st),
+        };
         // The victims now: still evictable, and worth less than the work.
         let victim = |b: &Budget, r: &ResourceId, s: Slot| -> Option<Bytes> {
             let a = &b.arena;
@@ -1815,27 +1882,50 @@ impl Budget {
                 .is_none_or(|w| urgency < Urgency::Ring && w.urgency > urgency);
             (!a.has_transit(s) && worth_less).then_some(a.gpu(s)?.bytes)
         };
-        st.work = st.work.saturating_add(sat_u32(order.len()));
-        let freeable = order
-            .iter()
-            .filter_map(|(k, s)| victim(self, &k.3, *s))
-            .fold(Bytes::ZERO, |a, b| a.plus(b));
+        let freeable = self.freeable(&room, class, urgency);
+        debug_assert_eq!(
+            freeable,
+            self.arena
+                .iter()
+                .filter(|&s| {
+                    let a = &self.arena;
+                    a.class(s) == class
+                        && a.has_gpu(s)
+                        && !self.kept(&a.id(s))
+                        && !self.is_floor(a.level(s))
+                })
+                .filter_map(|s| victim(self, &self.arena.id(s), s))
+                .fold(Bytes::ZERO, |a, b| a.plus(b)),
+            "the bytes counted evictable are those a scan finds"
+        );
         if self.ledger.gpu[class].minus(freeable).plus(bytes) > limit {
             *strained = true;
-            self.scratch.evict_order[class] = Some(order);
+            self.scratch.room = Some(room);
             return false;
         }
-        for &((.., r), s) in &order {
+        let mut walk = Walk::default();
+        while let Some(((.., r), s)) =
+            walk.next(&self.arena, &room.grouped, |c| c == class, &Held::GPU)
+        {
             if self.ledger.gpu[class].plus(bytes) <= limit {
                 break;
             }
-            if victim(self, &r, s).is_none() {
+            st.work = st.work.saturating_add(1);
+            // The order holds neither the kept set nor the floor.
+            if self.kept(&r) || self.is_floor(self.arena.level(s)) {
                 continue;
             }
+            let Some(b) = victim(self, &r, s) else {
+                continue;
+            };
             if wants.contains_key(&r) {
                 // Wanted work displaces wanted work: the view asks for more
                 // than the budget holds.
                 *strained = true;
+            }
+            if self.arena.grouped(s) {
+                let i = want_bucket(wants.get(&r));
+                room.bytes[class][i] = room.bytes[class][i].minus(b);
             }
             self.arena.take_gpu(s, &mut self.ledger);
             d.evict.push(r);
@@ -1843,33 +1933,52 @@ impl Budget {
             st.evictions[class][EvictReason::Admission as usize] += 1;
             self.recent.insert(r, now);
         }
-        self.scratch.evict_order[class] = Some(order);
+        self.scratch.room = Some(room);
         true
     }
 
-    /// This step's eviction order for `class`, built at its first use
-    /// (see `Scratch::evict_order`); the caller puts it back.
-    fn evict_order(&mut self, class: Class, st: &mut BudgetStats) -> Vec<(EvictKey, Slot)> {
-        if let Some(order) = self.scratch.evict_order[class].take() {
-            return order;
-        }
-        st.work = st.work.saturating_add(sat_u32(self.arena.len()));
+    /// This step's [`Room`], built at its first use, after the mark: the
+    /// grouped GPU residents outside the kept set, the floor and transit.
+    fn room(&self, wants: &SortedMap<ResourceId, Want>, st: &mut BudgetStats) -> Room {
         let a = &self.arena;
-        let mut order: Vec<(EvictKey, Slot)> = a
-            .iter()
+        let mut grouped: Vec<(EvictKey, Slot)> = a
+            .grouped_slots()
             .filter(|&s| {
-                a.class(s) == class
-                    && a.has_gpu(s)
+                a.has_gpu(s)
                     && !a.has_transit(s)
                     && !self.kept(&a.id(s))
                     && !self.is_floor(a.level(s))
             })
-            .map(|s| (evict_key(a, s), s))
+            .map(|s| (a.evict_key(s), s))
             .collect();
         // Keys end in the resource: total, so unstable is stable, and the
-        // slots' order — not the resources' — is forgotten.
-        order.sort_unstable();
-        order
+        // slots' order — not the resources' — is forgotten. A slot listed
+        // twice comes out once.
+        grouped.sort_unstable();
+        grouped.dedup();
+        st.work = st.work.saturating_add(sat_u32(grouped.len()));
+        let mut bytes = PerClass::splat([Bytes::ZERO; WANT_BUCKETS]);
+        for &((.., r), s) in &grouped {
+            let (c, i) = (a.class(s), want_bucket(wants.get(&r)));
+            bytes[c][i] = bytes[c][i].plus(a.gpu(s).map_or(Bytes::ZERO, |g| g.bytes));
+        }
+        Room { grouped, bytes }
+    }
+
+    /// What `make_room` can evict of `class` for work of `urgency`: every
+    /// idle byte (nothing filed is wanted this step), and of the grouped
+    /// ones those not wanted, or wanted less than the work when the work is
+    /// the view's.
+    fn freeable(&self, room: &Room, class: Class, urgency: Urgency) -> Bytes {
+        let b = &room.bytes[class];
+        let wanted_less = if urgency < Urgency::Ring {
+            b[urgency_bucket(urgency) + 1..]
+                .iter()
+                .fold(Bytes::ZERO, |a, x| a.plus(*x))
+        } else {
+            Bytes::ZERO
+        };
+        self.arena.idle(class).plus(b[0]).plus(wanted_less)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2002,6 +2111,17 @@ impl Budget {
             }
         }
         let reused = c.delivered_before;
+        // A stale GPU copy on its way again leaves the step's room.
+        let in_room = self.scratch.room.is_some() && {
+            let a = &self.arena;
+            a.grouped(s) && a.has_gpu(s) && !self.kept(&r) && !self.is_floor(a.level(s))
+        };
+        if let (true, Some(room), Some(g)) =
+            (in_room, self.scratch.room.as_mut(), self.arena.gpu(s))
+        {
+            let i = want_bucket(wants.get(&r));
+            room.bytes[class][i] = room.bytes[class][i].minus(g.bytes);
+        }
         // `make_room` frees no slot: `s` is still `r`'s.
         self.active.insert(r);
         self.arena.put_transit(
@@ -2094,10 +2214,17 @@ impl Budget {
         plan
     }
 
-    fn evict(&mut self, now: Micros, eff: &Eff, d: &mut Decisions, st: &mut BudgetStats) {
+    fn evict(
+        &mut self,
+        now: Micros,
+        eff: &Eff,
+        wants: &SortedMap<ResourceId, Want>,
+        d: &mut Decisions,
+        st: &mut BudgetStats,
+    ) {
         let w = self.cfg.watermarks;
         if let Some(p) = eff.pool {
-            self.evict_pooled(now, p, d, st);
+            self.evict_pooled(now, p, wants, d, st);
         }
         for class in Class::ALL {
             if eff.pool.is_some_and(|p| p.members[class]) {
@@ -2109,10 +2236,21 @@ impl Budget {
                 continue;
             }
             let low = eff.target[class].scaled(u64::from(w.low_percent), 100);
-            let order = self.evict_order(class, st);
-            for &(_, s) in &order {
+            let room = match self.scratch.room.take() {
+                Some(room) => room,
+                None => self.room(wants, st),
+            };
+            let mut walk = Walk::default();
+            while let Some(((.., r), s)) =
+                walk.next(&self.arena, &room.grouped, |c| c == class, &Held::GPU)
+            {
                 if self.ledger.gpu[class] <= low {
                     break;
+                }
+                st.work = st.work.saturating_add(1);
+                // The order holds neither the kept set nor the floor.
+                if self.kept(&r) || self.is_floor(self.arena.level(s)) {
+                    continue;
                 }
                 // Still on the GPU, and not on its way again.
                 let evictable = self.arena.has_gpu(s) && !self.arena.has_transit(s);
@@ -2121,58 +2259,89 @@ impl Budget {
                 }
                 self.evict_one(now, s, class, d, st);
             }
+            self.scratch.room = Some(room);
         }
         // Only a step under pressure built one: nothing kept across steps.
-        self.scratch.evict_order = PerClass::default();
+        self.scratch.room = None;
         if self.ledger.decoded > eff.decoded {
-            st.work = st.work.saturating_add(sat_u32(self.arena.len()));
-            let a = &self.arena;
-            let mut cands: Vec<_> = a
-                .iter()
-                .filter(|&s| a.has_cpu(s) && !a.has_transit(s))
-                // Release order: copies of protected GPU residents first
-                // (they will not be evicted soon), then of evictable GPU
-                // residents (their copy is what an eviction demotes to),
-                // then copies already demoted (they save a re-read when the
-                // view comes back).
-                .map(|s| {
-                    let r = a.id(s);
-                    let rank = match (a.has_gpu(s), self.kept(&r)) {
-                        (true, true) => 0u8,
-                        (true, false) => 1,
-                        (false, _) => 2,
-                    };
-                    (
-                        (
-                            rank,
-                            a.last_needed(s),
-                            Reverse(a.level(s)),
-                            Reverse(a.distance(s)),
-                            r,
-                        ),
-                        s,
-                    )
-                })
-                .collect();
-            // Keys end in the resource: total, so the slots' order is
-            // forgotten.
-            cands.sort_unstable();
-            for ((.., r), s) in cands {
-                if self.ledger.decoded <= eff.decoded {
-                    break;
+            self.release_decoded(eff.decoded, d, st);
+        }
+    }
+
+    /// Releases decoded copies outside transit, down to `target`. Release
+    /// order: copies of protected GPU residents first (they will not be
+    /// evicted soon), then of evictable GPU residents (their copy is what an
+    /// eviction demotes to), then copies already demoted (they save a
+    /// re-read when the view comes back); each in eviction order.
+    fn release_decoded(&mut self, target: Bytes, d: &mut Decisions, st: &mut BudgetStats) {
+        let a = &self.arena;
+        let held = |s: Slot| a.has_cpu(s) && !a.has_transit(s);
+        // The protected first: the kept set, sorted by key.
+        let mut kept: Vec<(EvictKey, Slot)> = union4(
+            self.drawn_last.iter().copied(),
+            self.swap_last.iter().copied(),
+            std::iter::empty(),
+            std::iter::empty(),
+        )
+        .filter_map(|r| a.find(r))
+        .filter(|&s| held(s) && a.has_gpu(s))
+        .map(|s| (a.evict_key(s), s))
+        .collect();
+        kept.sort_unstable();
+        // The grouped holders, sorted, merged with the filed ones below.
+        let mut grouped: Vec<(EvictKey, Slot)> = a
+            .grouped_slots()
+            .filter(|&s| held(s))
+            .map(|s| (a.evict_key(s), s))
+            .collect();
+        grouped.sort_unstable();
+        grouped.dedup();
+        st.work = st
+            .work
+            .saturating_add(sat_u32(kept.len()))
+            .saturating_add(sat_u32(grouped.len()));
+        for &(_, s) in &kept {
+            if self.ledger.decoded <= target {
+                return;
+            }
+            self.release_one(s, d, st);
+        }
+        // Then the evictable GPU residents' copies, then the demoted ones.
+        for (held, gpu) in [(&Held::GPU[..1], true), (&[Held::Cpu][..], false)] {
+            let mut walk = Walk::default();
+            while let Some(((.., r), s)) = walk.next(&self.arena, &grouped, |_| true, held) {
+                st.work = st.work.saturating_add(1);
+                let a = &self.arena;
+                if !a.has_cpu(s) || a.has_gpu(s) != gpu || (gpu && self.kept(&r)) {
+                    continue;
                 }
-                self.arena.take_cpu(s, &mut self.ledger);
-                d.release.push(r);
-                st.released += 1;
-                st.releases[self.arena.class(s)] += 1;
+                if self.ledger.decoded <= target {
+                    return;
+                }
+                self.release_one(s, d, st);
             }
         }
+    }
+
+    /// Releases the decoded copy of `s`, and counts it.
+    fn release_one(&mut self, s: Slot, d: &mut Decisions, st: &mut BudgetStats) {
+        self.arena.take_cpu(s, &mut self.ledger);
+        d.release.push(self.arena.id(s));
+        st.released += 1;
+        st.releases[self.arena.class(s)] += 1;
     }
 
     /// D-A3: one sweep over the pool's members, in the one eviction order,
     /// down to the low watermark of the pool's target, no member below its
     /// floor except to keep I2, none left above its ceiling.
-    fn evict_pooled(&mut self, now: Micros, p: PoolEff, d: &mut Decisions, st: &mut BudgetStats) {
+    fn evict_pooled(
+        &mut self,
+        now: Micros,
+        p: PoolEff,
+        wants: &SortedMap<ResourceId, Want>,
+        d: &mut Decisions,
+        st: &mut BudgetStats,
+    ) {
         let w = self.cfg.watermarks;
         let used = |l: &Ledger| {
             Class::ALL
@@ -2202,30 +2371,27 @@ impl Budget {
         let short = |l: &Ledger, c: Class| {
             p.members[c] && l.gpu[c].minus(protected[c]) > p.target(c, &l.gpu)
         };
-        st.work = st.work.saturating_add(sat_u32(self.arena.len()));
-        let a = &self.arena;
-        let mut cands: Vec<_> = a
-            .iter()
-            .filter(|&s| {
-                p.members[a.class(s)]
-                    && a.has_gpu(s)
-                    && !self.kept(&a.id(s))
-                    && !a.has_transit(s)
-                    && !self.is_floor(a.level(s))
-            })
-            .map(|s| {
-                (
-                    evict_key(a, s),
-                    s,
-                    a.class(s),
-                    a.gpu(s).map_or(Bytes::ZERO, |g| g.bytes),
-                )
-            })
-            .collect();
-        // Keys end in the resource: total, so the slots' order is
-        // forgotten.
-        cands.sort_unstable();
-        for &(_, s, class, bytes) in &cands {
+        let room = match self.scratch.room.take() {
+            Some(room) => room,
+            None => self.room(wants, st),
+        };
+        let member = |c: Class| p.members[c];
+        // A candidate: a member's GPU resident outside the kept set, the
+        // floor and transit.
+        let candidate = |b: &Budget, r: &ResourceId, s: Slot| {
+            let a = &b.arena;
+            a.has_gpu(s) && !a.has_transit(s) && !b.kept(r) && !b.is_floor(a.level(s))
+        };
+        let mut walk = Walk::default();
+        while let Some(((.., r), s)) = walk.next(&self.arena, &room.grouped, member, &Held::GPU) {
+            st.work = st.work.saturating_add(1);
+            if !candidate(self, &r, s) {
+                continue;
+            }
+            let (class, bytes) = (
+                self.arena.class(s),
+                self.arena.gpu(s).map_or(Bytes::ZERO, |g| g.bytes),
+            );
             for c in Class::ALL {
                 over[c] &= self.ledger.gpu[c] > ceiling_low(c);
             }
@@ -2245,15 +2411,18 @@ impl Budget {
         // I2 needs: a member whose unprotected bytes are still over its
         // target once the pool is trimmed goes below its floor, in the same
         // order, until they fit.
-        for &(_, s, class, _) in &cands {
+        let mut walk = Walk::default();
+        while let Some(((.., r), s)) = walk.next(&self.arena, &room.grouped, member, &Held::GPU) {
             if Class::ALL.iter().all(|c| !short(&self.ledger, *c)) {
                 break;
             }
-            let resident = self.arena.has_gpu(s);
-            if resident && short(&self.ledger, class) {
+            st.work = st.work.saturating_add(1);
+            let class = self.arena.class(s);
+            if candidate(self, &r, s) && short(&self.ledger, class) {
                 self.evict_one(now, s, class, d, st);
             }
         }
+        self.scratch.room = Some(room);
     }
 
     /// Evicts the resource of `s`, of `class`, from the GPU, and counts it.
@@ -2436,24 +2605,31 @@ impl Budget {
         };
         // Whatever holds a copy — on the GPU, or only decoded (a copy an
         // earlier release or sweep demoted) — and was not needed last.
+        let candidate = |b: &Budget, s: Slot| {
+            let a = &b.arena;
+            (a.has_gpu(s) || a.has_cpu(s))
+                && !a.has_transit(s)
+                && !b.wanted_last.contains(&a.id(s))
+                && !b.is_floor(a.level(s))
+        };
         let a = &self.arena;
-        let mut cands: Vec<_> = a
-            .iter()
-            .filter(|&s| {
-                (a.has_gpu(s) || a.has_cpu(s))
-                    && !a.has_transit(s)
-                    && !self.wanted_last.contains(&a.id(s))
-                    && !self.is_floor(a.level(s))
-            })
-            .map(|s| (evict_key(a, s), s))
+        let mut grouped: Vec<(EvictKey, Slot)> = a
+            .grouped_slots()
+            .filter(|&s| candidate(self, s))
+            .map(|s| (a.evict_key(s), s))
             .collect();
         // Keys end in the resource: total, so the slots' order is
-        // forgotten.
-        cands.sort_unstable();
+        // forgotten; a slot listed twice comes out once.
+        grouped.sort_unstable();
+        grouped.dedup();
         let mut out = super::Released::default();
-        for ((.., r), s) in cands {
+        let mut walk = Walk::default();
+        while let Some(((.., r), s)) = walk.next(&self.arena, &grouped, |_| true, &Held::ALL) {
             if total(&self.ledger) <= target && self.ledger.decoded <= target {
                 break;
+            }
+            if !candidate(self, s) {
+                continue;
             }
             // Whole: both copies, in one place in the one order.
             if self.arena.take_gpu(s, &mut self.ledger).is_some() {
@@ -2525,6 +2701,10 @@ impl Budget {
         debug_assert!(
             a.gpu_drapes_consistent(),
             "the ordered index of GPU drapes drifted from the slots"
+        );
+        debug_assert!(
+            a.evict_index_consistent(),
+            "the eviction index drifted from the slots"
         );
         for s in a.iter() {
             let class = a.class(s);
