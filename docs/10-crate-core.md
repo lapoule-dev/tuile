@@ -22,9 +22,10 @@ tuile_core
 ├── source       # TileTree / TileLoader: the abstraction the traversal and the server consume,
 │                #   so 3D Tiles, quantized-mesh terrain and compositions share one engine
 ├── traversal    # SSE selection, refinement, prioritization — PURE FUNCTIONS
-├── budget       # the graphics budget: one pure, deterministic decide() per step — what is
-│                #   loaded, delivered, uploaded, drawn and evicted, per memory class;
-│                #   Policy::Interactive (viewers) and Policy::Batch (films)
+├── budget       # re-export of the `tuile-budget` crate: the graphics budget, one pure,
+│                #   deterministic decide() per step — what is loaded, delivered, uploaded,
+│                #   drawn and evicted, per memory class; Policy::Interactive (viewers) and
+│                #   Policy::Batch (films)
 ├── protocol     # ClientMessage / ServerMessage, the GeometryStream trait + InProcessStream
 ├── runtime      # GeometryServer: the session loop around traverse() and Budget::decide();
 │                #   loads inline (default, wasm) or as tasks on a host tokio handle
@@ -101,7 +102,7 @@ pub struct ImageryPlan { pub target: ImageryFormat, pub encode: ImageryEncode } 
 
 - **Rebasing lives in the core**, not in the backends: `DecodedTileContent` comes out in local f32 coordinates + f64 origin. All backends benefit, none can get it wrong.
 - **The traversal is synchronous and pure — but the system IS NOT stateless.** State exists (residency, in-flight requests, selection history for hold-until-ready): it lives in the `GeometryServer` and its budget and ENTERS the traversal as explicit inputs (`Residency`, the previous selection, the frame), instead of being stored on the tiles. Reason: N sessions could share ONE immutable tile arena — any per-tile state would make the tree non-shareable without locks or copies. No per-frame allocations in the traversal: scratch buffers are reused.
-- **The graphics budget is one pure module** (`budget`): it reads no clock, spawns nothing, touches no GPU, iterates no hash map; the same inputs give the same `Decisions`, bit for bit (`Decisions::digest`). The consumer executes its decisions and reports the bytes it really holds (`Ack`). Its invariants (I1–I15) and simulation are in `docs/explorations/graphics-budget-*.md`; CI runs the simulation and the properties in release (`budget-sim`).
+- **The graphics budget is one pure crate** (`tuile-budget`, re-exported here as `budget`, with its `TileId` re-exported from `source`; it depends on nothing in the workspace): it reads no clock, spawns nothing, touches no GPU, iterates no hash map; the same inputs give the same `Decisions`, bit for bit (`Decisions::digest`). The consumer executes its decisions and reports the bytes it really holds (`Ack`). Its invariants (I1–I15) and simulation are in `docs/explorations/graphics-budget-*.md`; CI runs the simulation and the properties in release (`budget-sim`).
 - **Config**: names and defaults aligned with the reference implementations — `maximum_screen_space_error` (16.0), `forbid_holes` (our REPLACE hold-until-ready), `loading_descendant_limit`, `preload_ancestors`/`preload_siblings` — plus the globe's own (`horizon_culling`, `uniform_detail`, `refine_hysteresis`).
 - **Streaming mode is a core trait** (`protocol::GeometryStream`), not a network matter. `InProcessStream` lives here; the browser's worker binding lives in `tuile-web`; a WebSocket binding would live in `tuile-server` (planned). On the consumer side, `Content` always carries decoded content.
 - **Compression is the consumer's choice, off by default.** `ImageryCompression::Off` is byte-identical to the path without compression. `select(caps)` is a helper behind `Auto`, a pure function of `GpuTextureCaps`; nothing in tuile calls it on a consumer's behalf, and no licence or source policy is coded in tuile. A format the device cannot sample falls back to RGBA8.
@@ -123,7 +124,7 @@ pub struct ImageryPlan { pub target: ImageryFormat, pub encode: ImageryEncode } 
 - `geo`: WGS84↔ECEF round-trip < 1e-9 m on a set of known points (equator, poles, negative altitude).
 - `content`: b3dm → same vertices as the equivalent glb; RTC_CENTER composed; up-axis verified on a known asymmetric mesh.
 - `traversal`: on a hand-crafted mini-tileset — camera at infinity → root only; camera close → leaves, requests ordered by SSE; REPLACE: non-resident children → parent stays selected; all resident → parent deselected; a tile outside the frustum never selected nor requested.
-- `budget`: the scenario simulation with its golden decision digests, the property tests, the per-class hard limits, the "never black" invariants (`lost`, `bare` = 0) — `tests/budget_*.rs`.
+- `budget`: the scenario simulation with its golden decision digests, the property tests, the per-class hard limits, the "never black" invariants (`lost`, `bare` = 0) — in the `tuile-budget` crate (`crates/tuile-budget/tests/`, `benches/budget_decide.rs`); `tests/budget_imagery.rs` stays here, since it drives the budget from the traversal's views.
 - `protocol`/`runtime`: an end-to-end `InProcessStream` session (ViewerState → Select/Content/Evict consistent with the pure traversal on the same camera); determinism: the same `ViewerState` sequence gives the same `Select` sequence.
 - `texels`/`stored`: the capability matrix of `select`; `Off` byte-identical; KTX2 fixtures (`tests/fixtures/uastc`) transcoded bit-exact; any bytes give a texture or an error, never a panic.
 

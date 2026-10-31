@@ -13,7 +13,7 @@
 mod budget_common;
 
 use budget_common::*;
-use tuile_core::budget::{
+use tuile_budget::{
     check, BudgetConfig, BudgetMeter, BudgetObserver, BudgetSignals, Bytes, Class, Decisions,
     EyeCoverage, FrameDeadline, FrameRecord, LayerId, Micros, NeedSet, Pressure, ResourceId,
     StepRecord, Thermal, Violations,
@@ -135,10 +135,10 @@ fn the_lost_tiles_signal_counts_a_wanted_tile_with_no_cover() {
     let floor = drawn_draped(&[root], 0);
     m.settle(&floor, 20);
     // A 3D Tiles tile of another tree: no ancestor can stand for it.
-    let other = tuile_core::budget::TileId(u64::MAX - 7);
+    let other = tuile_budget::TileId(u64::MAX - 7);
     let mut need = floor.clone();
     need.drawn
-        .push((other, tuile_core::budget::Need::new(5, Class::Tiles3dMesh)));
+        .push((other, tuile_budget::Need::new(5, Class::Tiles3dMesh)));
     let d = m.step(&need);
     assert!(d.stats.floor_in, "the floor is in");
     assert_eq!(m.s().lost_tiles, 1, "{RED}");
@@ -437,9 +437,9 @@ fn the_swaps_signal_counts_refines_and_coarsenings_and_never_a_gap() {
     let need = drawn(&[a]);
     let mut d = Decisions::default();
     d.stats.floor_in = true;
-    d.draw.items.push(tuile_core::budget::DrawItem {
+    d.draw.items.push(tuile_budget::DrawItem {
         mesh: ResourceId::Mesh(a),
-        role: tuile_core::budget::Role::Exact,
+        role: tuile_budget::Role::Exact,
         drapes: Vec::new(),
         serves: vec![a],
     });
@@ -496,7 +496,7 @@ fn the_fallback_depth_holds_the_deepest_climb_until_published() {
     assert_eq!(m.s().fallback_depth_max, 0, "reset by the publish");
 }
 
-fn need_of(id: tuile_core::budget::TileId) -> tuile_core::budget::Need {
+fn need_of(id: tuile_budget::TileId) -> tuile_budget::Need {
     need(id)
 }
 
@@ -660,9 +660,9 @@ fn the_violations_signal_names_the_invariant_broken() {
         (11, |d| {
             let a = t(3, 2, 2);
             d.evict.push(ResourceId::Mesh(a));
-            d.draw.items.push(tuile_core::budget::DrawItem {
+            d.draw.items.push(tuile_budget::DrawItem {
                 mesh: ResourceId::Mesh(a),
-                role: tuile_core::budget::Role::Exact,
+                role: tuile_budget::Role::Exact,
                 drapes: Vec::new(),
                 serves: vec![a],
             });
@@ -693,7 +693,7 @@ fn the_violations_signal_names_the_invariant_broken() {
 /// every label of every series takes its value from its closed set.
 #[test]
 fn labels_stay_within_their_closed_sets() {
-    use tuile_core::budget::observe::labels;
+    use tuile_budget::observe::labels;
     let mut m = Metered::new(floored());
     let root = t(0, 0, 0);
     for k in 0..200u64 {

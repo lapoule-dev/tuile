@@ -6,6 +6,7 @@ members = [
     "crates/tuile-b3dm",
     "crates/tuile-bevy",
     "crates/tuile-bing",
+    "crates/tuile-budget",
     "crates/tuile-cesium-ion",
     "crates/tuile-farm",
     "crates/tuile-film",

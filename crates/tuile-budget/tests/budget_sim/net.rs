@@ -7,9 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use tuile_core::budget::{Generation, Micros, Presence, PresenceOracle, ResourceId, Source, Start};
+use tuile_budget::{Generation, Micros, Presence, PresenceOracle, ResourceId, Source, Start};
 
-use tuile_core::budget::cost::Cost;
+use tuile_budget::cost::Cost;
 
 use super::rng::Rng;
 use super::world::cost;

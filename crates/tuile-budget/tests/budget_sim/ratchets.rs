@@ -12,9 +12,7 @@
 //! depend on the allocator underneath, so they hold on the Linux CI as on
 //! the Mac that recorded them.
 
-use tuile_core::budget::{
-    Budget, BudgetMeter, BudgetObserver, Micros, Pressure, StepRecord, Thermal,
-};
+use tuile_budget::{Budget, BudgetMeter, BudgetObserver, Micros, Pressure, StepRecord, Thermal};
 
 use super::scenarios::{approach, home};
 use super::server::{DecideAllocs, Profile, Sim};
@@ -105,7 +103,7 @@ fn motion() -> (u64, i64, i64, usize) {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn allocation_ratchets_hold() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

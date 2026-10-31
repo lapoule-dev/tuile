@@ -12,7 +12,8 @@ tuile/
 ├── docs/                      # these documents; docs/explorations/ holds research notes and measurements
 ├── crates/
 │   │   — the standard and the globe (render-agnostic)
-│   ├── tuile-core/            # 3D Tiles parsing, SSE traversal, decoding, the graphics budget, the geometry server, the protocol
+│   ├── tuile-core/            # 3D Tiles parsing, SSE traversal, decoding, the geometry server, the protocol; re-exports the budget
+│   ├── tuile-budget/          # the graphics budget: pure, deterministic decide(); at the bottom of the graph
 │   ├── tuile-b3dm/            # the b3dm container: parse + encode, zero I/O
 │   ├── tuile-terrain/         # quantized-mesh decode/encode, geographic tiling, heightfield source, terrain over HTTP
 │   ├── tuile-planetary/       # terrain × imagery as one TileTree + TileLoader
@@ -71,8 +72,10 @@ Not built, and not scheduled today: `tuile-server`, the network middleware (`12-
 ## Dependency rules (strict)
 
 ```
+tuile-budget     → thiserror (pure, deterministic: no clock, no GPU, no runtime, no I/O, no other
+                   tuile crate; owns TileId)
 tuile-b3dm       → serde_json, thiserror (pure codec, zero I/O)
-tuile-core       → tuile-b3dm, serde, glam (f64), gltf, image, texcomp (no GPU feature), bytes,
+tuile-core       → tuile-budget (re-exported as `budget`), tuile-b3dm, serde, glam (f64), gltf, image, texcomp (no GPU feature), bytes,
                    async-trait + futures (async traits), thiserror, tracing — NO runtime;
                    reqwest only behind the optional "http" feature, tokio only behind the
                    optional native feature "rt-tokio"
@@ -89,7 +92,9 @@ tuile-bevy       → tuile-wgpu, tuile-planetary, bevy (render + core pipeline);
                    no executor of its own: tuile-wgpu's HostPass draws into the camera's targets
 ```
 
-Forbidden in the core: wgpu or any renderer, axum or any HTTP framework, reqwest outside its own optional `http` feature, `std::fs` in production paths (OK in tests), and tokio unconditionally. The core is async-runtime-agnostic: it exposes async traits and pure structures, and the caller supplies the execution. Under `rt-tokio` the caller supplies it as a runtime handle (`runtime::Spawn::Tokio`) on which the geometry server spawns its loads; the core never builds a runtime. On wasm the loads stay in the server's own `FuturesUnordered` (`Spawn::Inline`). CI checks the rule on every pull request: the `wasm-guard` job builds the core and every crate that claims wasm for `wasm32-unknown-unknown`, with `-D warnings`.
+The graphics budget is its own crate, `tuile-budget`, at the bottom of the graph (decided 2026-10-31): it depends on no other tuile crate and owns the tile handle `TileId`; `tuile-core` depends on it and re-exports it whole (`tuile_core::budget`, and `TileId` from `tuile_core::source`), so every path into the budget goes through the core unchanged. Everything forbidden in the core is forbidden there too, and its own lints hold crate-wide: no iteration over a hash container, no narrowing `as`, no float arithmetic in the decision engine and its state. Its simulation, property tests, goldens and the `decide` bench live in it.
+
+Forbidden in the core: wgpu or any renderer, axum or any HTTP framework, reqwest outside its own optional `http` feature, `std::fs` in production paths (OK in tests), and tokio unconditionally. The core is async-runtime-agnostic: it exposes async traits and pure structures, and the caller supplies the execution. Under `rt-tokio` the caller supplies it as a runtime handle (`runtime::Spawn::Tokio`) on which the geometry server spawns its loads; the core never builds a runtime. On wasm the loads stay in the server's own `FuturesUnordered` (`Spawn::Inline`). CI checks the rule on every pull request: the `wasm-guard` job builds the budget, the core and every crate that claims wasm for `wasm32-unknown-unknown`, with `-D warnings`.
 
 ## The foundational traits (shipped)
 
@@ -185,7 +190,7 @@ ViewerState (one ViewState per view: pose, projection, viewport)
 Traversal (tuile-core) ── SSE per tile, frustum culling, REPLACE/ADD, hold-until-ready,
    │                       the ancestor chain and the pinned coarse floor
    ▼
-Budget::decide (tuile-core::budget) ── pure and deterministic: what to load, cancel, deliver,
+Budget::decide (tuile-budget)     ── pure and deterministic: what to load, cancel, deliver,
    │                                   draw and evict, per memory class, under the hard limits
    ├──► TileLoader::load / load_drape ──► TileFetcher (+ ContentStore) ──► decode off the frame (Offload)
    ├──► Content { resource, … }  ──► the consumer uploads in plan order, within its frame deadline ──► Ack { bytes }

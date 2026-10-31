@@ -26,12 +26,13 @@ Module map (see `docs/10-crate-core.md`):
 - [`drive`] — render-agnostic consumer driving (progressive + bulk)
 - [`fetch`] — abstract byte source ([`fetch::FsFetcher`], `HttpFetcher`)
 - [`budget`] — the graphics budget: pure, deterministic GPU residency decisions
+  (the `tuile-budget` crate, re-exported)
 - [`texels`] — the imagery format seam: GPU capabilities → plan, texels
 
 ## Where it sits
 
-At the bottom of the workspace: its only workspace dependency is
-`tuile-b3dm`. Every other crate builds on it — the connectors
+Near the bottom of the workspace: its only workspace dependencies are
+`tuile-budget` (re-exported as [`budget`]) and `tuile-b3dm`. Every other crate builds on it — the connectors
 (`tuile-cesium-ion`, `tuile-bing`), the data crates (`tuile-terrain`,
 `tuile-planetary`, `tuile-pack`, `tuile-tile-server`), the renderers
 (`tuile-wgpu`, `tuile-film-gpu`) and the hosts (`tuile-viewer`, `tuile-web`).

@@ -12,9 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use tuile_core::budget::{
-    Bytes, Class, Decisions, FrameDeadline, Generation, PerClass, ResourceId,
-};
+use tuile_budget::{Bytes, Class, Decisions, FrameDeadline, Generation, PerClass, ResourceId};
 
 use super::world::cost;
 

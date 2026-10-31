@@ -8885,6 +8885,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuile-budget"
+version = "0.15.0"
+dependencies = [
+ "criterion",
+ "proptest",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "tuile-camera"
 version = "0.15.1"
 dependencies = [
@@ -8943,7 +8952,6 @@ version = "0.15.1"
 dependencies = [
  "async-trait",
  "bytes",
- "criterion",
  "futures-channel",
  "futures-core",
  "futures-executor",
@@ -8951,7 +8959,6 @@ dependencies = [
  "glam 0.33.2",
  "gltf",
  "image",
- "proptest",
  "reqwest",
  "serde",
  "serde_json",
@@ -8962,6 +8969,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tuile-b3dm",
+ "tuile-budget",
  "url",
 ]
 

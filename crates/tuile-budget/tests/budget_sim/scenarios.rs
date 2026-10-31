@@ -3,7 +3,7 @@
 
 //! The scenarios of spec §8.
 
-use tuile_core::budget::{Bytes, Class, Micros, Pressure, Thermal};
+use tuile_budget::{Bytes, Class, Micros, Pressure, Thermal};
 
 use super::detmath;
 use super::net::NetProfile;
@@ -62,7 +62,7 @@ pub fn converges(mut profile: Profile) {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_still_camera_converges_within_two_seconds_on_desktop() {
     converges(Profile::desktop());
@@ -73,7 +73,7 @@ fn a_still_camera_converges_within_two_seconds_on_desktop() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_still_camera_converges_within_four_seconds_on_a_phone() {
     converges(Profile::handheld());
@@ -83,7 +83,7 @@ fn a_still_camera_converges_within_four_seconds_on_a_phone() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_still_camera_converges_at_the_handheld_low_clamp() {
     converges(Profile::handheld_low());
@@ -94,7 +94,7 @@ fn a_still_camera_converges_at_the_handheld_low_clamp() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn ten_still_minutes_cancel_nothing_flap_nothing_and_hold_the_digest() {
     let mut sim = Sim::new(Profile::desktop(), 2);
@@ -133,7 +133,7 @@ pub fn turn(t: f64) -> Camera {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_half_turn_in_one_second_converges() {
     let mut p = Profile::desktop();
@@ -176,7 +176,7 @@ pub fn zoom(t: f64) -> Camera {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_zoom_out_to_200_km_and_back_never_shows_a_hole() {
     let mut sim = Sim::new(Profile::desktop(), 4);
@@ -192,7 +192,7 @@ fn a_zoom_out_to_200_km_and_back_never_shows_a_hole() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn after_a_zoom_out_and_back_the_drapes_are_sharp_again() {
     let mut sim = Sim::new(Profile::desktop(), 5);
@@ -210,7 +210,7 @@ fn after_a_zoom_out_and_back_the_drapes_are_sharp_again() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn over_the_plain_imagery_is_deeper_than_terrain() {
     let mut sim = Sim::new(Profile::desktop(), 6);
@@ -244,7 +244,7 @@ pub fn back_and_forth(t: f64) -> Camera {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn back_and_forth_reuses_what_is_held() {
     let mut sim = Sim::new(Profile::desktop(), 7);
@@ -266,7 +266,7 @@ fn back_and_forth_reuses_what_is_held() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_memory_warning_mid_flight_trims_without_a_hole() {
     let mut sim = Sim::new(Profile::handheld(), 8);
@@ -299,7 +299,7 @@ fn a_memory_warning_mid_flight_trims_without_a_hole() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn thermal_serious_halves_uploads_without_a_hole() {
     let mut sim = Sim::new(Profile::handheld(), 9);
@@ -324,7 +324,7 @@ fn thermal_serious_halves_uploads_without_a_hole() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn backgrounding_and_foregrounding_refill_without_a_hole() {
     let mut sim = Sim::new(Profile::handheld(), 10);
@@ -345,7 +345,7 @@ fn backgrounding_and_foregrounding_refill_without_a_hole() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_lossy_stalling_network_never_blocks_the_view() {
     let mut p = Profile::desktop();
@@ -364,7 +364,7 @@ fn a_lossy_stalling_network_never_blocks_the_view() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_relaunch_fills_the_view_from_the_store_without_network() {
     let mut first = Sim::new(Profile::handheld(), 12);
@@ -392,7 +392,7 @@ fn a_relaunch_fills_the_view_from_the_store_without_network() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_lying_store_index_costs_one_miss_per_lie() {
     let mut first = Sim::new(Profile::desktop().clone(), 14);
@@ -424,7 +424,7 @@ pub fn film_cam(frame: u64) -> Camera {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_300_frame_film_is_exact_every_frame() {
     let mut sim = Sim::new(Profile::film(), 16);
@@ -439,12 +439,7 @@ fn film(
     seed: u64,
     net: NetProfile,
     frames: std::ops::Range<u64>,
-) -> Vec<
-    Vec<(
-        tuile_core::budget::ResourceId,
-        Option<tuile_core::budget::ResourceId>,
-    )>,
-> {
+) -> Vec<Vec<(tuile_budget::ResourceId, Option<tuile_budget::ResourceId>)>> {
     let mut p = Profile::film();
     p.net = net;
     let mut sim = Sim::new(p, seed);
@@ -457,7 +452,7 @@ fn film(
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_film_does_not_depend_on_the_network() {
     let fast = film(17, NetProfile::desktop().clean(), 0..60);
@@ -469,7 +464,7 @@ fn a_film_does_not_depend_on_the_network() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_film_does_not_depend_on_how_frames_are_split() {
     let whole = film(19, NetProfile::desktop().clean(), 0..120);
@@ -483,7 +478,7 @@ fn a_film_does_not_depend_on_how_frames_are_split() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn golden_decision_digests_hold() {
     let path =
@@ -515,7 +510,7 @@ fn golden_decision_digests_hold() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_zoom_out_at_the_hard_ceiling_never_deadlocks() {
     let mut p = Profile::handheld_low();

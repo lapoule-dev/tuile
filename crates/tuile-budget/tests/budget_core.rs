@@ -13,8 +13,8 @@
 mod budget_common;
 
 use budget_common::*;
-use tuile_core::budget::cost::Cost;
-use tuile_core::budget::{
+use tuile_budget::cost::Cost;
+use tuile_budget::{
     Budget, BudgetConfig, Bytes, Class, ConfigError, Failure, FailurePolicy, LayerId, Micros,
     NeedSet, PerClass, Pressure, Protection, ResourceId, ResourceState, Role, SessionError, Source,
     Thermal, Tier, Urgency,
@@ -22,12 +22,12 @@ use tuile_core::budget::{
 
 const RED: &str = "the budget core regressed";
 
-fn mesh(id: tuile_core::budget::TileId) -> ResourceId {
+fn mesh(id: tuile_budget::TileId) -> ResourceId {
     ResourceId::Mesh(id)
 }
 
 /// Every step of `ds` asked to start `r`?
-fn started(ds: &[tuile_core::budget::Decisions], r: ResourceId) -> bool {
+fn started(ds: &[tuile_budget::Decisions], r: ResourceId) -> bool {
     ds.iter().any(|d| d.start.iter().any(|s| s.resource == r))
 }
 
@@ -213,7 +213,7 @@ mod pool {
 
 mod ledger {
     use super::*;
-    use tuile_core::budget::cost::{drape_cost, mesh_cost, within_drift, Cost, TextureFormat};
+    use tuile_budget::cost::{drape_cost, mesh_cost, within_drift, Cost, TextureFormat};
 
     /// C2: a drape costs its full mip chain, level by level; its staging
     /// copy aligns every row to 256 bytes.
@@ -382,7 +382,7 @@ mod requests {
         );
     }
 
-    fn need_of(id: tuile_core::budget::TileId) -> tuile_core::budget::Need {
+    fn need_of(id: tuile_budget::TileId) -> tuile_budget::Need {
         need(id)
     }
 
@@ -949,7 +949,7 @@ mod tiers {
         assert!(ds.iter().all(|d| d.deliver.is_empty()));
     }
 
-    fn evicted_but_decoded() -> (Rig, tuile_core::budget::TileId) {
+    fn evicted_but_decoded() -> (Rig, tuile_budget::TileId) {
         let mut c = small(1);
         c.decoded_target = Bytes::mib(64);
         let mut r = Rig::new(c);
@@ -1034,7 +1034,7 @@ mod tiers {
         assert_eq!(local, 3, "{RED}");
     }
 
-    fn need_ring(id: tuile_core::budget::TileId) -> tuile_core::budget::Need {
+    fn need_ring(id: tuile_budget::TileId) -> tuile_budget::Need {
         need(id)
     }
 
@@ -1457,7 +1457,7 @@ mod pressure {
 mod upload {
     use super::*;
 
-    fn loaded(c: BudgetConfig, need: &NeedSet) -> (Rig, tuile_core::budget::Decisions) {
+    fn loaded(c: BudgetConfig, need: &NeedSet) -> (Rig, tuile_budget::Decisions) {
         let mut r = Rig::new(c);
         let d = r.step(need);
         r.load(&d);
@@ -1602,7 +1602,7 @@ mod upload {
 mod draw {
     use super::*;
 
-    fn need_of_tile(id: tuile_core::budget::TileId) -> tuile_core::budget::Need {
+    fn need_of_tile(id: tuile_budget::TileId) -> tuile_budget::Need {
         need(id)
     }
 
@@ -1801,7 +1801,7 @@ mod draw {
             dl(root, 1, 0),
             "the overlay's own ancestor"
         );
-        assert_ne!(overlay.uv, tuile_core::budget::UvTransform::IDENTITY);
+        assert_ne!(overlay.uv, tuile_budget::UvTransform::IDENTITY);
         assert_eq!(item.drapes.len(), 2, "one drape per layer");
     }
 
@@ -2141,7 +2141,7 @@ mod batch {
     fn a_batch_frame_reads_the_same_drapes_whatever_order_its_loads_land_in() {
         use std::cmp::Reverse;
         use std::collections::{BTreeMap, BTreeSet};
-        use tuile_core::budget::{Generation, TileId};
+        use tuile_budget::{Generation, TileId};
 
         type Pick = fn(&BTreeMap<ResourceId, Generation>) -> ResourceId;
         let first: Pick = |p| *p.keys().next().expect("pending");
@@ -2536,7 +2536,7 @@ mod stats {
         r.load(&d);
         let d = r.step(&drawn(&[a]));
         assert_eq!(d.stats.completed, 1, "{RED}");
-        let mut want = [0; tuile_core::budget::stats::LATENCY_BUCKETS];
+        let mut want = [0; tuile_budget::stats::LATENCY_BUCKETS];
         want[7] = 1; // 100 ms ∈ [64, 128)
         assert_eq!(d.stats.latency_ms, want);
     }
@@ -2787,7 +2787,7 @@ mod refresh {
         assert!(!started(&ds, mesh(a)), "the ring holds the only slot");
     }
 
-    fn need_ring(id: tuile_core::budget::TileId) -> tuile_core::budget::Need {
+    fn need_ring(id: tuile_budget::TileId) -> tuile_budget::Need {
         need(id)
     }
     /// D-A4: a layer's epoch refreshes that layer's drapes only.
@@ -2943,7 +2943,7 @@ mod stats_digest {
 
 mod deadline {
     use super::*;
-    use tuile_core::budget::{FrameDeadline, SwapGroup};
+    use tuile_budget::{FrameDeadline, SwapGroup};
 
     /// I18 (D-A8): a frame deadline is its share of the display period, at
     /// the executor's throughput: a quarter of 13.9, 11.1 and 8.3 ms at 72,
