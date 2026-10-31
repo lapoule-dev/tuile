@@ -75,15 +75,20 @@ pub fn main(embedder: impl ViewerHost) -> ! {
     // else what a file opened in the application kept. Its terrain and
     // layers take the host's place, and its start view fills in what the
     // flags did not say — a flag wins over the file.
-    let section = embedder.identity().config_section;
+    let identity = embedder.identity();
     let flag = match &invocation {
         Ok(start::Invocation::Run { config, .. }) => config.clone(),
         _ => None,
     };
-    let configured = match crate::import::start(&section, flag.as_deref(), &host::Machine) {
+    let configured = match crate::import::start(
+        &identity.config_section,
+        flag.as_deref(),
+        &host::Machine,
+        &identity.name,
+    ) {
         Ok(settings) => settings,
         Err(error) => {
-            eprintln!("{}: {error}", embedder.identity().executable);
+            eprintln!("{}: {error}", identity.executable);
             if in_a_bundle() {
                 desktop::alert("The configuration file cannot be read", &error.to_string());
             }

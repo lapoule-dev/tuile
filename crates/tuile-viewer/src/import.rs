@@ -90,11 +90,6 @@ pub(crate) fn settings_file(host: &dyn crate::host::Host) -> Option<PathBuf> {
     Some(crate::host::support_dir(host)?.join(SETTINGS_FILE))
 }
 
-/// The default configuration file, in the support directory.
-pub(crate) fn default_config_file(host: &dyn crate::host::Host) -> Option<PathBuf> {
-    Some(crate::host::support_dir(host)?.join(DEFAULT_CONFIG_FILE))
-}
-
 /// The configuration file this session was started with: `--config`, or the
 /// default one. Read once, at start, and never kept.
 static SESSION: std::sync::OnceLock<config_file::ConfigFile> = std::sync::OnceLock::new();
@@ -118,15 +113,27 @@ pub(crate) fn running() -> Settings {
 /// desktop, `config.tuile` in the support directory if it is there, else
 /// the settings an earlier import kept. Returns the settings the process
 /// runs with.
+///
+/// `name` is the application's: its support directory is read before the
+/// process has adopted its identity.
 pub(crate) fn start(
     section: &str,
     flag: Option<&Path>,
     host: &dyn crate::host::Host,
+    name: &str,
 ) -> Result<Settings, ConfigError> {
-    let stored = || stored_settings(settings_file(host).as_deref(), section);
+    let dir = crate::host::support_dir_of(host, name);
+    let stored = || {
+        stored_settings(
+            dir.as_ref().map(|d| d.join(SETTINGS_FILE)).as_deref(),
+            section,
+        )
+    };
     let session = match flag {
         Some(path) => Some(read_session(path, section)?),
-        None => default_config_file(host)
+        None => dir
+            .as_ref()
+            .map(|d| d.join(DEFAULT_CONFIG_FILE))
             .filter(|path| !host.is_handheld() && path.is_file())
             .and_then(|path| match read_session(&path, section) {
                 Ok(read) => Some(read),
@@ -551,6 +558,42 @@ mod tests {
                 .expect("an import link")
                 .is_ok()
         );
+    }
+
+    /// A machine whose home is a temporary directory.
+    struct Home(std::path::PathBuf);
+
+    impl crate::host::Host for Home {
+        fn var(&self, name: &str) -> Option<String> {
+            (name == "HOME").then(|| self.0.display().to_string())
+        }
+        fn read(&self, path: &Path) -> std::io::Result<String> {
+            std::fs::read_to_string(path)
+        }
+        fn is_macos(&self) -> bool {
+            true
+        }
+    }
+
+    /// At start the settings are read from the support directory of the
+    /// application's own name — a renamed copy's, not the default one's —
+    /// and a file that `--config` names wins over them.
+    #[test]
+    fn the_settings_are_read_where_the_application_named_keeps_them() {
+        let home = tempfile::tempdir().expect("a home");
+        let dir = home.path().join("Library/Application Support/Tuile Other");
+        std::fs::create_dir_all(&dir).expect("a support directory");
+        std::fs::write(dir.join(SETTINGS_FILE), "[ion]\nterrain = 42\n").expect("settings");
+        let host = Home(home.path().to_owned());
+        let read = |flag: Option<&Path>| start("ion", flag, &host, "Tuile Other").expect("read");
+        assert_eq!(read(None).terrain, Some(42));
+        let given = home.path().join("given.tuile");
+        std::fs::write(&given, "[ion]\nterrain = 7\n").expect("a file");
+        assert_eq!(read(Some(&given)).terrain, Some(7));
+        let wrong = home.path().join("wrong.tuile");
+        std::fs::write(&wrong, "[ion]\nterrain = \"x\"\n").expect("a file");
+        let error = start("ion", Some(&wrong), &host, "Tuile Other").expect_err("refused");
+        assert_eq!(error.key, "ion.terrain");
     }
 
     #[test]
