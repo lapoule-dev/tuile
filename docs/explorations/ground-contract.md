@@ -42,10 +42,13 @@ is *derived* from it and invalidated by its edit events.
   - `GeodeticFrame`: a region of the globe, longitude and latitude in
     radians, heights above the ellipsoid, with a spherical metric. Its
     latitudes lie within ±90° (poles included) and its longitudes within ±2π,
-    spanning at most 2π (checked when a ground is built). A region spanning
-    exactly 2π is the whole globe and **wraps**: a brush across the
-    antimeridian edits both sides. A narrower region has edges, and a brush
-    is clipped to them as in a planar frame.
+    spanning at most 2π (checked when a ground is built). Longitudes are
+    **periodic**: a brush whole turns away is the same brush (to the rounding
+    of `lon ± k·2π`), a brush across the antimeridian edits both sides, and a
+    region narrower than a turn clips a brush to its edges. A region whose
+    `max.x − min.x` is exactly 2π is the whole globe: its first and last
+    sample meridians are one place (a region a rounding short of 2π has two,
+    a hair apart). A row of samples at ±90° is one place too.
 
   A frame also measures brushes: the offset of a column from another in
   metres, in the tangent plane at the first (`tangent_offset`), and the
@@ -57,7 +60,12 @@ is *derived* from it and invalidated by its edit events.
   widened by `asin(r/R)`, longitudes by `asin(sin θ / cos φ)` at the latitude
   `φ` closest to a pole, and every longitude when the cap contains a pole. So
   a ball at a pole carves a disc over every longitude, and a ball near it
-  reaches the far side. A position beyond ±90° of latitude names no place: a
+  reaches the far side. A capsule's axis is the chord between its ends, so it
+  follows their great circle: its reach is the great-circle arc the short way
+  (latitudes up to the arc's vertex closest to a pole, by Clairaut;
+  longitudes the short way, across the antimeridian if shorter), widened by
+  the cap of `r / cos(θ/2)`. No column outside a brush's footprint is reached
+  (a property test checks every sample). A position beyond ±90° of latitude names no place: a
   brush there is refused (`InvalidBrush`).
 
   A frame gives its bounds, its edit level, its metric (metres per unit at a
@@ -119,8 +127,9 @@ is *derived* from it and invalidated by its edit events.
   the idiom a height adapter uses), `spans` (the solid intervals of a
   column), `solid` (collision, volume tests), `raycast` (first entry into
   solid; clear line of sight is `None`; a ray starting in solid hits at 0, and
-  one entering the bounds below the surface hits on the entry face, max edges
-  included; water does not block; rays do not wrap), `water` (body, level, depth). Solid is closed: a
+  one entering the bounds below the surface hits on the entry face (max edges
+  included, for a ray moving inward only), exactly on it; water does not
+  block; rays do not wrap), `water` (body, level, depth). Solid is closed: a
   point exactly on a surface is solid and stands on it.
 - **Costs are bounded** per query by the ground's size, never by the query's
   values. The reference: `surface`, `solid`, `water`, `spans` O(1); `raycast`
@@ -136,6 +145,11 @@ is *derived* from it and invalidated by its edit events.
   (`WaterBodyId`) in the list, the one place it is defined. Coverage belongs
   to the source, not to edits: digging below a body's level beside it does
   not flood the hole.
+- **One place, one value**: the samples of one place (a pole row, the seam of
+  a whole-globe frame) must agree in the source (checked at build), and an
+  edit decides each place once, at its first sample, and copies the bits, so
+  they stay equal to the bit. A cell's slope is measured with the metric at
+  its centre, so normals near a pole stay upright.
 - **3D-ready**: a column is a list of spans; a heightfield is the one-span
   case. The reference `Heightfield` says what it cannot hold — an overhang or a
   tunnel leaves its columns unchanged — rather than faking it. Its raycast is
@@ -185,7 +199,8 @@ third read — which must also answer bit for bit like the heightfield it pages.
 **Golden digests** pin a fixed script's state and a fixed set of answers
 (surfaces, normals, solidity, water, raycasts) in a planar frame, a geodetic
 region and around a pole. They were recorded on macOS (aarch64) with rustc
-1.99.0; the CI `test` jobs run them on Linux (x86-64) and macOS (aarch64), so
+1.99.0 (last with the great-circle capsule footprint, one-place pole rows
+and seams, and normals at the cell's centre); the CI `test` jobs run them on Linux (x86-64) and macOS (aarch64), so
 a drift on one target fails there. Checking them on wasm32 is the next step
 for CI.
 
@@ -232,7 +247,8 @@ Questions for Laurent:
 7. Replica digest: part of EditGround or per implementation? — *implemented
    on `EditGround`.*
 8. Residency: on-demand tiles behind the trait, invisible to answers —
-   confirm.
+   confirm. — *default if unanswered: allowed, invisible to answers; a load
+   failure is fatal.*
 9. A client-side partial replica of the ground (tiles around the camera,
    synchronised by tile version and the server's edits) for prediction:
    later design. — *default if unanswered: none in this contract; clients
