@@ -37,6 +37,7 @@ fn surface() -> DecodedTileContent {
             material: MaterialDesc {
                 base_color_factor: [1.0, 1.0, 1.0, 1.0],
                 base_color_texture: None,
+                unlit: false,
             },
         }],
         textures: Vec::new(),

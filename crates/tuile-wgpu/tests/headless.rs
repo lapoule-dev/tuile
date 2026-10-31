@@ -46,6 +46,7 @@ fn quad_content(origin: DVec3) -> DecodedTileContent {
             material: MaterialDesc {
                 base_color_factor: [1.0; 4],
                 base_color_texture: Some(0),
+                unlit: false,
             },
         }],
         textures: vec![DecodedTexture::from_rgba8(
@@ -278,6 +279,39 @@ fn textured_quad_renders_with_correct_colors() {
     assert!(
         br[0] > 150 && br[1] > 150 && br[2] > 150,
         "bottom-right = {br:?} (want white)"
+    );
+}
+
+/// `KHR_materials_unlit`: a material whose colour carries its own light is
+/// not shaded by its facets. A quad whose normals face away from the sun is
+/// dark when lit by them, and as bright as ground facing up when unlit — it
+/// is lit by the local vertical, as the ground under it is.
+#[test]
+fn an_unlit_material_is_not_shaded_by_its_facets() {
+    let Some(gpu) = gpu() else { return };
+    let origin = DVec3::ZERO;
+    let renderer = TileRenderer::new(&gpu, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mut view = looking_down_z(2.5);
+    // The planet's centre far below the quad: the local vertical is +Z.
+    view.atmosphere.earth = [0.0, 0.0, -6_371_000.0, 6_371_000.0];
+    let shade = |normal: [f32; 3], unlit: bool| {
+        let mut content = quad_content(origin);
+        content.meshes[0].normals = Some(vec![normal; 4]);
+        content.meshes[0].material.base_color_texture = None;
+        content.meshes[0].material.unlit = unlit;
+        let tile = prepare(&gpu, &content, origin);
+        render_frame(&gpu, &renderer, &[&tile], &view).px(SIZE / 2, SIZE / 2)[0]
+    };
+    let facing_up = shade([0.0, 0.0, 1.0], false);
+    let facing_away = shade([1.0, 0.0, 0.0], false);
+    let unlit_away = shade([1.0, 0.0, 0.0], true);
+    assert!(
+        facing_away + 40 < facing_up,
+        "a facet turned from the sun is darker: {facing_away} against {facing_up}"
+    );
+    assert!(
+        unlit_away.abs_diff(facing_up) <= 2,
+        "unlit, its facets do not count: {unlit_away} against {facing_up}"
     );
 }
 
@@ -700,6 +734,7 @@ fn a_coarse_tableland_seen_from_orbit_through_the_air_shows_none_of_its_facets()
             material: MaterialDesc {
                 base_color_factor: [DARK_SURFACE, DARK_SURFACE, DARK_SURFACE, 1.0],
                 base_color_texture: None,
+                unlit: false,
             },
         }],
         textures: Vec::new(),

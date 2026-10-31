@@ -712,6 +712,7 @@ impl Writer {
                 self.f32(f);
             }
             self.option_u64(material.base_color_texture.map(|t| t as u64));
+            self.u8(u8::from(material.unlit));
         }
         self.len(textures.len());
         for t in textures {
@@ -1035,6 +1036,7 @@ impl<'a> Reader<'a> {
             let material = MaterialDesc {
                 base_color_factor: self.f32s()?,
                 base_color_texture: self.option_u64()?.map(|t| t as usize),
+                unlit: self.u8()? != 0,
             };
             meshes.push(DecodedMesh {
                 positions,
@@ -1091,6 +1093,7 @@ mod tests {
                 material: MaterialDesc {
                     base_color_factor: [0.1, 0.2, 0.3, 1.0],
                     base_color_texture: Some(0),
+                    unlit: true,
                 },
             }],
             textures: vec![DecodedTexture::from_rgba8(1, 1, vec![1, 2, 3, 4])],
@@ -1123,6 +1126,7 @@ mod tests {
             assert_eq!(m.indices, n.indices);
             assert_eq!(m.material.base_color_factor, n.material.base_color_factor);
             assert_eq!(m.material.base_color_texture, n.material.base_color_texture);
+            assert_eq!(m.material.unlit, n.material.unlit);
         }
         assert_eq!(a.textures.len(), b.textures.len());
         for (t, u) in a.textures.iter().zip(&b.textures) {
