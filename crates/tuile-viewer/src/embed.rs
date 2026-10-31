@@ -39,6 +39,8 @@
 //!             credentials: "The key is read from ATLAS_KEY, or from the file `token` \
 //!                           in the application's support directory."
 //!                 .into(),
+//!             credential_variable: "ATLAS_KEY".into(),
+//!             config_section: "atlas".into(),
 //!         }
 //!     }
 //!     fn terrain(&self) -> TerrainChoice {
