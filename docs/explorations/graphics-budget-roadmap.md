@@ -25,7 +25,7 @@ PRs — numbered B1–B8 in that plan, unrelated to section B below — fixes it
 signals, and a measured acceptance (imagery peak ≤ 15.5 MB, BC7 settle ≤ 6.0 s, Off goldens unchanged). It comes
 before A2 and A4.
 
-### O1 — the budget's algorithms, before CB (status: O1.3 need deltas and its debt pass, 2026-10-31)
+### O1 — the budget's algorithms, before CB (status: O1.4 dirty sets, 2026-10-31)
 
 The budget is its own crate, `tuile-budget` (#163). O1 optimises its `decide` before the compression budget,
 decisions bit-identical throughout. The guard comes first (O1.0): today's engine frozen at 3d1a028e in
@@ -259,6 +259,66 @@ average near 100, missed the same two bounds (yaw 39.5 s, tilt 22.2 s) and the r
 duplicate concurrent request appeared once on each build. Neither build left a hole or a black patch. Per-layer
 M-web was not run (a wasm build and a 25-minute run per layer, on a loaded machine).
 
+
+**O1.4 — dirty sets** (`perf/budget-o1-dirty-sets`). The passes after the need — drape levels, the floor,
+the selection, the draw set, the wants and refreshes, the marks, the work — keep their results from one step to
+the next (`downstream.rs`). A unit (a tile's levels, a drawn tile's selection, a mesh's draw item, a tile's wants,
+a wanted resource's work) is read again only when what it read may have changed: its tile was named by the need's
+change (for its shape or place: membership, level, class, layers, parent, footprint; a tile named for its floats
+alone has only its levels and wants read again); its tile's resources changed (an event, an eviction, a delivery,
+a prune: the arena notes every slot's changes); it read another tile and that changed — each unit's reach is kept
+and indexed by tile, which finds the descendants falling back on a tile and the parent a finer tile holds; a time
+it waits on fell due, through queues ordered by time instead of scans (a retry or a delivery's backoff, a load's
+timeout or an unneeded resource's grace, the 30 s an empty slot backing off is kept); or something every unit
+reads moved (the LOD scale, the pressure, an epoch, Batch). Kept outputs are patched — a unit's old contribution
+out, its new one in: statistics as sums, drapes worn as counts, the drawn, wanted, swap and chain sets as marks
+on the arena's slots. A whole need is read as a delta (it names the tiles it lists and those it dropped). The
+prune keeps its eighth-step cadence but walks only the slots emptied since or whose time fell due, the recent
+evictions in time order, and the tiles its counts of what keeps each let go (a cycle among the parents falls back
+on the whole walk). In a debug build every pass is recomputed from scratch each step and compared, as are the
+work sets and their waits, the marks, the held ancestry, the prune's counts and the slots it frees; a release
+build with debug assertions runs these checks on every `budget_sim` scenario. Decisions and the whole internal
+state unchanged: the recorded digests match on every `budget_sim` run and the corpus, goldens and pattern goldens
+untouched. P6.4 (`decide_work_grows_with_changes_not_with_the_view`) is no longer ignored: a 16, b 256 hold on all
+5 100 steps (red before on 1 499, worst W 19 329 against 256).
+
+Red seen, each propagation rule removed in turn: the parent's (held ancestry changed at a step's end), the
+descendants' (an ancestor's mesh), the drapes' (an ancestor's drape) and the place's (an ancestor's footprint)
+each fail a scenario of their own in `budget_core` (`dirty_sets::*`, on the decision in release, on the full
+recomputation's check in debug); the drapes' also diverges from the recorded digests on 34 of 60 `budget_sim`
+runs. Resource events: 20 `budget_core` tests and 54 of 60 runs. The deadline queues: a load's timeout (one
+`budget_core` test, 6 runs), the retry/backoff wake (3 tests, 42 runs), the prune's re-look when a kept slot's
+want goes (48 runs). One rule has no red: units that read their own tile's last item are read again when it
+changed; no input of the suites needs it (the item is a fixed point of the layer switch), and it stays.
+
+| Measure (Apple M2, shared; best of 5 interleaved rounds, mean / p99 µs) | main (#170) | O1.4 |
+|---|---|---|
+| `decide` still (484 drawn) | 911 / 1 002 | 45 / 47 |
+| `decide` still, told the whole need | 952 / 1 032 | 375 / 412 |
+| `decide` motion | 815 / 1 925 | 452 / 1 212 |
+| `decide` pressure | 539 / 828 | 402 / 941 |
+| `decide` + host diff, still | 974 / 1 051 | 71 / 72 |
+| `decide` + host diff, motion | 856 / 2 012 | 486 / 1 283 |
+| host diff alone, still / motion (mean) | 27 / 40 | 25 / 33 |
+| allocations per step, still (internal / output) | 13 / 649 | 0 / 649 |
+| allocations per step, motion p99 (internal) | 40 | 31 |
+| allocations per step, pressure p50 / p99 (internal) | 13 / 83 | 2 / 82 |
+| step buffers after the tour | 340 096 B | 244 216 B |
+| bytes per tracked resource | 470 | 467 |
+| P6.4 `work`, still view (mean / worst) | 16 524 / 19 329 | 9 / 5 409 |
+| P6.4 `work`, tour (mean / worst) | 18 453 / 25 194 | 5 297 / 12 990 |
+
+Load average 9–39 during the rounds; the pressure p99 moves within the rounds' spread. M-run (`p2-slow`, Off,
+three interleaved runs each, load about 12): imagery peak 172.7 → 172.3 MB, every upload landed 0.8 → 1.0 s,
+frame p50 40 → 39 ms, frame p99 67 → 78 ms (per run 62–113 for `main`, 66–90 for O1.4: the machine's noise, the
+budget's `decide` being under a millisecond of frames of tens), obligations kept ×3 on both, no black pixel and no
+hole in any run, the six settled pictures opened. M-web not run: a wasm build and a 25-minute run on a machine at
+load 40–90 from other jobs.
+
+Not in O1.4, listed for O1.5: the ranking re-keys every job each step (a job's score ages with time); the kept
+sorted vectors' upkeep (a batch merged into a vector of the view's size) is not counted in `work`; the host's diff
+clones every changed tile's `Need` (about 640 heap blocks a step on the tour); the runtime's presence index does not
+tell a generation (`PresenceOracle::generation`), so the levels that asked it are read again every step there.
 
 Order is strict: A before B, B before C. Every step of A, B and C goes through the same battery before
 the next starts — tests seen red, mutants killed, the reference model extended, Kani proofs of its
