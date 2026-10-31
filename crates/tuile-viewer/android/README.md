@@ -80,6 +80,17 @@ viewer needs none of Google's services, and the image is the smallest.
 
 ## The access token: none in the APK
 
+**A tester's own token, from a configuration file.** Tapping a `.tuile`
+file, sharing one to *Tuile*, or following a `tuile://import?src=https://…`
+link imports it (see [Try tuile](../../../docs/try-tuile.md)): the activity
+receives it (`onCreate`, `onNewIntent`) and the viewer takes it once a
+second. The token is sealed with AES-GCM under a key that lives in the
+Android Keystore and never leaves it (`sealSecret`, `openSecret`), and with
+it the application asks the service directly. Without one, it asks the
+catalog proxy as below. Not exercised on a device yet: the intent filters,
+the Keystore round trip and the share sheet are written and compiled, not
+run.
+
 The Android build holds **no secret**. The catalog is asked through the
 catalog proxy (`tuile-catalog-proxy`, `tuile_cesium_ion::proxy`), which holds
 the token on a server — the same proxy the web build uses, for the same reason:

@@ -33,6 +33,15 @@ instead of a committed `.pbxproj`.
 
 ## The access token
 
+**The one-step way: open a configuration file.** Tap a `.tuile` file in
+Files, Mail, Messages or a download, or AirDrop it, and pick *Tuile*; or
+follow a `tuile://import?src=https://…` link. The token goes to the
+Keychain, the rest to the application's settings, and a waiting start-up
+begins at once — see [Try tuile](../../../docs/try-tuile.md). The bundle
+declares the type and the scheme, and names the application class that
+receives them (`NSPrincipalClass`, `TuileApplication`). The Keychain comes
+second, after the environment and before everything below.
+
 The host says which credential its sources need — the public viewer's is in
 `examples/wgpu-viewer/phone.conf`: the variable's name, which is also the key
 of the field on the settings page, and that field's title. At run time the
