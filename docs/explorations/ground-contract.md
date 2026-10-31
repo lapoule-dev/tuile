@@ -40,27 +40,89 @@ is *derived* from it and invalidated by its edit events.
     it drifts from the sphere by `d²/2R`, ≈ 320 m at 64 km from the anchor —
     a planar world is drawn flat, the anchor only says where);
   - `GeodeticFrame`: a region of the globe, longitude and latitude in
-    radians, heights above the ellipsoid, with a spherical metric.
+    radians, heights above the ellipsoid, with a spherical metric. It does
+    not wrap the antimeridian and stays within ±90° of latitude (checked when
+    a ground is built); near a pole a brush's reach in longitude grows without
+    bound, and a brush whose reach cannot be measured is refused.
 
   A frame gives its bounds, its edit level, its metric (metres per unit at a
   column, which is all the authoritative paths need) and conversions to and
   from geodetic coordinates where it has a place on the globe. Nothing else
   in the contract assumes one frame or the other.
 - **Numbers are f64**, with a determinism discipline (§ 4).
-- **Tiles**: the quadtree of the frame's bounds. Edits bump a `Version` per
-  tile at the frame's edit level and append `TileChanged` events. Derived data
-  uses tiles of the same grid (or multiples of it) and invalidates by version.
-- **Edits** are volume operations (`Brush`: sphere, capsule, box; `Add` or
-  `Remove`) with a caller-given `EditSeq`. A ground applies them in strictly
-  increasing order and refuses the rest, unchanged: replicas that receive the
-  same edits hold the same bits however the network delivered them.
+- **Complete over its bounds, whatever is resident.** Every column inside the
+  bounds has its answer, always: an answer never depends on what is in memory
+  or on load order, and there is no "unknown yet" (unlike
+  `tuile_core::ground::GroundHeight`, advisory and streaming). An
+  implementation **may** load or generate its tiles on demand and evict them
+  invisibly: a procedural source computes a tile on first query, caches it,
+  evicts it and recomputes it bit for bit; a disk-backed source pages tiles;
+  edits are a per-tile, versioned, ordered layer re-applied when a tile comes
+  back. It will matter: a 128 km world at 8 m spacing is about 2.7·10⁸
+  samples, some 2 GB of `f64`. A memory budget for such a source is an
+  implementation setting, not part of the contract. Rendering keeps tuile's
+  own streaming, levels of detail and graphics budget; the later adapter
+  (§ 6) makes it draw the same surface.
+- **Tiles**: the quadtree of the frame's bounds, levels 0 to 30. Tile `x`
+  covers `[edge(x), edge(x+1))` with `edge(x) = min + (max − min)·(x/2^l)`,
+  computed one way everywhere, so `tile_of` and `tile_bounds` agree to the
+  bit on any bounds (a geodetic region's are not powers of two). Edits bump a
+  `Version` per tile at the frame's edit level and append `TileChanged`
+  events. **The report is complete and may be conservative**: a point query
+  on a column of an unreported tile answers bit for bit as before, a ray
+  changes only if it crosses a reported tile, and an edit that changes
+  nothing reports nothing. In the reference heightfield a changed sample
+  changes every cell it is a corner of, so the report covers the changed
+  samples' rectangle widened by one cell.
+- **Edits** are volume operations (`Brush`: sphere, capsule at any slope,
+  box; `Add` or `Remove`) with a caller-given `EditSeq`, applied in a
+  **contiguous** order. A fresh ground expects 1, then every next number:
+  - the expected number is **consumed** — the edit is applied, or refused for
+    its content (`OutOfBounds`; `InvalidBrush`: a non-finite coordinate, a
+    radius not positive, a box whose min is above its max, a reach the
+    frame's metric cannot measure). A refusal for content is the same on
+    every replica, so it consumes the number and changes nothing else;
+  - an edit from the past (`Stale`) or past a missing one (`Gap { expected,
+    got }`) is refused and changes nothing, not even the expected number:
+    the caller delivers the missing edits first.
+
+  So a lost or reordered edit stops a replica at a prefix of the script
+  instead of letting it diverge. A brush is measured in the metric of its
+  anchor (a sphere's centre, the middle of a capsule's segment): exact in a
+  planar frame, accurate in a geodetic one while the brush is small. A
+  heightfield resolves edits at its sample spacing.
 - **Queries are batched**: slices in, slices out, no allocation per query —
-  `surface` (where a walker lands), `spans` (the solid intervals of a column),
-  `solid` (collision, volume tests), `raycast` (first entry into solid; clear
-  line of sight is `None`), `water` (body, level, depth).
+  `surface` (where a walker lands; a probe at `+∞` gives the column's top,
+  the idiom a height adapter uses), `spans` (the solid intervals of a
+  column), `solid` (collision, volume tests), `raycast` (first entry into
+  solid; clear line of sight is `None`; a ray starting in solid hits at 0;
+  water does not block), `water` (body, level, depth). Solid is closed: a
+  point exactly on a surface is solid and stands on it.
+- **Costs are bounded** per query by the ground's size, never by the query's
+  values. The reference: `surface`, `solid`, `water`, `spans` O(1); `raycast`
+  O(cells crossed), at most `2(n−1)+1` cells, each an exact quadratic;
+  `apply` O(samples under the footprint + tiles reported), both at most `n²`
+  (an edit level finer than the cells is refused at build).
+- **Rays are straight in the frame's coordinates.** In a geodetic frame a ray
+  at constant height follows the curved surface; a true chord between the
+  same ends sags below it by about `d²/8R` at its middle (`d` its length,
+  `R` the earth's radius): ≈ 2 m at 10 km, ≈ 49 m at 50 km. A long geodetic
+  line of sight is optimistic by that much.
+- **Water**: bodies, each with its own level; a body is named by its index
+  (`WaterBodyId`) in the list, the one place it is defined. Coverage belongs
+  to the source, not to edits: digging below a body's level beside it does
+  not flood the hole.
 - **3D-ready**: a column is a list of spans; a heightfield is the one-span
   case. The reference `Heightfield` says what it cannot hold — an overhang or a
-  tunnel leaves its columns unchanged — rather than faking it.
+  tunnel leaves its columns unchanged — rather than faking it. Its raycast is
+  exact up to rounding: a 2D walk over the cells the segment's projection
+  crosses, and in each cell the first root of the segment against the
+  bilinear patch.
+- **Digest**: `EditGround::digest` covers everything that decides answers and
+  order (the frame's bounds, edit level and metric, the samples, the water
+  coverage and bodies, the versions, the last consumed edit). Replicas of one
+  implementation compare it; digests of different implementations are not
+  comparable.
 
 ## 4. Determinism discipline
 
@@ -75,11 +137,18 @@ rounds correctly on every target. So, in authoritative paths:
   some targets only;
 - no iteration over hash containers in anything that produces a result
   (versions live in a `BTreeMap`);
-- edits applied in the caller's total order.
+- edits applied in the caller's contiguous order;
+- an implementation that pages or regenerates tiles recomputes them bit for
+  bit: residency never shows in an answer.
 
-The tests check replicas agree bit for bit (a state digest) over random edit
-sequences; a cross-target check (the same digest on Linux, macOS and wasm) is
-the next step for CI.
+The tests check, on both frames, that replicas agree bit for bit over random
+edit scripts, that any delivery order leaves a replica at a prefix of the
+script, that change reports are complete (no point answer moves outside the
+reported tiles), that versions move by one on reported tiles only, and that
+raycasts agree with the surface. **Golden digests** pin a fixed script's state
+and a fixed set of answers (surfaces, normals, solidity, water, raycasts) on
+both frames; CI runs them on Linux and macOS, so a drift on one target fails
+there. Checking them on wasm32 is the next step for CI.
 
 ## 5. Decisions taken, and options left open
 
@@ -87,10 +156,45 @@ the next step for CI.
 |---|---|---|
 | Frame | pluggable: planar (with an optional anchor) and geodetic | whether a planar world may ever be wrapped on the ellipsoid for gameplay (today: no, drawn flat at its anchor) |
 | Numbers | f64 with the discipline above | a host may keep fixed point **inside** its implementation (exact edits, hashable state) and convert at the boundary; the contract stays f64 |
-| Water | bodies, each with its own level; per-column coverage | rivers with a sloping surface (a level per body cannot hold one) |
-| 2.5D or 3D | the contract is 3D (spans, volume edits); the reference is a heightfield | when a volumetric implementation lands (density terrain plan) |
-| Tile grid | the quadtree of the frame's bounds, versioned at one level | the edit level and tile size for a given world, and whether derived data must use exactly that level |
-| Raycast | a march at half a cell along the segment (reference) | an exact traversal for the volumetric implementation |
+| Edit order | contiguous from 1; content refusals consume their number | question 1 below |
+| Water | bodies, each with its own level, named by index; per-column coverage, not changed by edits | rivers with a sloping surface (a level per body cannot hold one); flooding on edits (question 6) |
+| 2.5D or 3D | the contract is 3D (spans, volume edits); the reference is a heightfield | when a volumetric implementation lands (see `procedural-unbounded-terrain.md`) |
+| Tile grid | the quadtree of the frame's bounds, levels ≤ 30, versioned at one level; reports complete, may be conservative | the edit level and tile size for a given world, whether derived data must use exactly that level; alignment with tuile's tiling (question 4) |
+| Raycast | exact for the reference heightfield, straight in frame coordinates | question 2 and 3 below |
+| Metric | spherical, radius = WGS84 semi-major axis | question 5 below |
+| Digest | on `EditGround`, comparable within one implementation | question 7 below |
+| Residency | complete over the bounds; on-demand tiles allowed behind the trait, invisible to answers | confirm (below) |
+
+Questions for Laurent:
+
+1. Edit seq: contiguous with caller buffering, or monotonic with gaps? Do
+   refused-but-deterministic edits consume their number? (most important)
+   — *implemented: contiguous, and they consume it.*
+2. Raycast exact now or approximate with documented error? Does water block
+   LOS? Should Hit carry a normal or the span? — *implemented: exact for the
+   heightfield; water does not block; `Hit` carries the point and fraction
+   only.*
+3. Geodetic rays: frame-straight or true chords? — *implemented:
+   frame-straight, with the `d²/8R` error documented.*
+4. Tile grid vs tuile's tiling: TileKey (u8 level, u32 x/y from the frame's
+   min corner) never shares edges with tuile_terrain's global TMS (2×1 roots)
+   or TileId's terrain layout (27-bit x/y, 4-bit source tag,
+   crates/tuile-budget/src/tile_id.rs) → the adapter would invalidate by
+   rectangle overlap. Should a GeodeticFrame be definable as a terrain
+   TileCoord (bounds = tile_rect(c); ground tile (l,x,y) = global (c.level+l,
+   (c.x<<l)+x, (c.y<<l)+y)), at the cost of arbitrary regions?
+5. Spherical metric: brush radii up to ~0.7 % off vs the renderer's ellipsoid
+   (~700 m on a 100 km brush) — OK, or ellipsoid radii of curvature (libm +
+   arithmetic)?
+6. Water and edits: does digging below a body's level beside it flood; is
+   coverage part of edits? — *today: no flooding, coverage is the source's.*
+7. Replica digest: part of EditGround or per implementation? — *implemented
+   on `EditGround`.*
+8. Residency: on-demand tiles behind the trait, invisible to answers —
+   confirm.
+9. A client-side partial replica of the ground (tiles around the camera,
+   synchronised by tile version and the server's edits) for prediction:
+   later design.
 
 ## 6. What comes after (not in this note's PR)
 
@@ -101,9 +205,14 @@ the next step for CI.
    authoritative and complete), so the renderer draws exactly the
    authoritative surface — proven on one map: the drawn heights equal the
    simulated ones at sampled points, before and after a sequence of edits.
+   `tuile_ground::Geodetic` mirrors `tuile_core::geo::Geodetic` (the ground
+   sits below the core and cannot use it): the adapter converts with a
+   `From`.
 3. Water drawn from the same bodies.
-4. A procedural source (the procedural terrain study) implementing the traits.
+4. A procedural source (`procedural-unbounded-terrain.md`) implementing the
+   traits, generating tiles on demand.
 5. A volumetric ground (overhangs, tunnels) behind the same traits.
 6. Budget accounting of edited tiles in the graphics budget.
+7. The golden digests checked on wasm32 in CI.
 
 Items 2 to 6 follow the graphics budget work.

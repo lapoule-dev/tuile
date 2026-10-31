@@ -52,6 +52,7 @@ Budget::decide ── pure and deterministic: what to load, deliver, draw and
    └──► Evict   ──► released after the draw that stops using it`;
 
 const rules = `tuile-budget    → thiserror                       (pure, deterministic, zero I/O)
+tuile-ground    → thiserror, glam (f64), libm     (pure, deterministic, zero I/O)
 tuile-b3dm      → serde_json, thiserror           (pure codec, zero I/O)
 tuile-core      → tuile-budget, tuile-b3dm, serde, glam (f64), gltf, image, texcomp,
                   async traits — and NO runtime (tokio only behind the
@@ -74,6 +75,7 @@ const crates: { group: string; items: Item[] }[] = [
     items: [
       ['tuile-core', 'Tileset parsing, screen-space-error traversal, content decoding, the graphics budget, the geometry server and the streaming protocol. Render-agnostic, wasm-clean.'],
       ['tuile-budget', 'The graphics budget: what is loaded, uploaded, drawn and evicted, decided by one pure, deterministic step. Re-exported by tuile-core, wasm-clean.'],
+      ['tuile-ground', 'The authoritative ground: one deterministic terrain contract — pluggable frames, versioned tiles, ordered edits, water, batched queries — that a simulation steps on and a renderer draws. wasm-clean.'],
       ['tuile-b3dm', 'The legacy 3D Tiles 1.0 batched-model container: parse and encode, zero I/O.'],
       ['tuile-terrain', 'Quantized-mesh decoding and encoding, geographic tiling, a heightfield source, terrain from any layer.json URL.'],
       ['tuile-planetary', 'Terrain × imagery assembled into one tile tree and one loader, backend-agnostic.'],
