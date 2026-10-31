@@ -204,7 +204,9 @@ impl<K: Ord + Copy, V> SortedCols<K, V> {
     }
 
     /// Keeps the entries `f` keeps, in order. A map left with more than an
-    /// eighth of its room unused gives back most of it.
+    /// eighth of its room unused gives back most of it: without that, a view
+    /// that shrinks keeps the room of the largest it ever was (measured on
+    /// the tour: 432 -> 436 bytes per tracked resource).
     pub fn retain(&mut self, mut f: impl FnMut(&K, &mut V) -> bool) {
         let mut w = 0;
         for i in 0..self.keys.len() {
@@ -278,6 +280,11 @@ impl<'a, K: Ord + Copy, V> IntoIterator for &'a SortedCols<K, V> {
 
 /// Makes room in `v` for `extra` more: by an eighth of its room at least,
 /// so it grows rarely and with little slack.
+///
+/// Why not `Vec`'s own doubling: the maps grown this way are kept for the
+/// session, and a doubling leaves up to half of them unused. Measured on the
+/// tour (`allocation_ratchets_hold`): with plain `push` in
+/// [`SortedCols::push`], the bytes per tracked resource go 432 -> 433.
 fn grow<T>(v: &mut Vec<T>, extra: usize) {
     if v.len() + extra > v.capacity() {
         v.reserve_exact(extra.max(v.capacity() / 8));
