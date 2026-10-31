@@ -11,7 +11,7 @@
 //! (`decide still: mean … p50 … p99 …`), from individually timed calls,
 //! since a p99 is what a frame budget feels.
 //!
-//! `cargo bench -p tuile-core --bench budget_decide`
+//! `cargo bench -p tuile-budget --bench budget_decide`
 
 #![allow(dead_code, unused_imports, clippy::unwrap_used, clippy::panic)]
 // The simulation's modules come in whole, its counting allocator with them
@@ -39,7 +39,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use tuile_core::budget::{FrameInput, Micros, NeedSet};
+use tuile_budget::{FrameInput, Micros, NeedSet};
 
 use server::{Profile, Sim};
 use world::{Camera, SIDE};

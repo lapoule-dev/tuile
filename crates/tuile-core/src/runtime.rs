@@ -1612,6 +1612,9 @@ impl State {
         if let Some(fatal) = &d.fatal {
             let resource = match fatal {
                 crate::budget::SessionError::LoadFailed(r) => Some(*r),
+                // `SessionError` is `#[non_exhaustive]`, and the budget is now
+                // another crate: a later end of session names no resource.
+                _ => None,
             };
             let message = fatal.to_string();
             tx.unbounded_send(ServerMessage::Error {

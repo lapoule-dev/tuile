@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use budget_common::*;
 use proptest::prelude::*;
-use tuile_core::budget::{
+use tuile_budget::{
     Budget, BudgetConfig, Bytes, Class, Decisions, Failure, FrameInput, Generation, Micros,
     NeedSet, Pressure, ResourceId, Role, Source, Thermal, TileId,
 };
@@ -112,7 +112,7 @@ fn view(seed: u64, permute: bool) -> NeedSet {
     need
 }
 
-fn need_of(tile: TileId, m: &mut Mix) -> tuile_core::budget::Need {
+fn need_of(tile: TileId, m: &mut Mix) -> tuile_budget::Need {
     let (l, ..) = tile.terrain_coord();
     draped(tile, l + (m.next() % 6) as u32)
         .with_sse_excess((m.next() % 40) as f32 / 10.0 - 1.0)
@@ -305,7 +305,7 @@ impl Harness {
 fn interactive() -> BudgetConfig {
     let mut c = BudgetConfig::interactive(Bytes(MESH.0 * 24 + drape().0 * 24));
     c.pinned_level = Some(0);
-    c.max_in_flight = tuile_core::budget::PerClass([4, 2, 4, 1]);
+    c.max_in_flight = tuile_budget::PerClass([4, 2, 4, 1]);
     c.max_local_reads = 2;
     c.request_heap = 32;
     c.upload_bytes_per_frame = Bytes(MESH.0 * 3);

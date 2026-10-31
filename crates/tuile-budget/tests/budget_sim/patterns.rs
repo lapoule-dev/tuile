@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use tuile_core::budget::{Class, Decisions, Micros, NeedSet, ResourceId, Source, TileId};
+use tuile_budget::{Class, Decisions, Micros, NeedSet, ResourceId, Source, TileId};
 
 use super::scenarios::{approach, home, settle};
 use super::server::{Profile, Sim};
@@ -114,7 +114,7 @@ fn rotation(profile: Profile, seed: u64) {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_portrait_landscape_rotation_never_shows_a_hole() {
     rotation(Profile::handheld(), 31);
@@ -124,7 +124,7 @@ fn a_portrait_landscape_rotation_never_shows_a_hole() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_portrait_landscape_rotation_never_shows_a_hole_at_the_low_clamp() {
     rotation(Profile::handheld_low(), 32);
@@ -168,7 +168,7 @@ fn ten_rotations(profile: Profile, seed: u64, store: bool) -> (Sim, BTreeSet<Res
 fn ten_rotations_starts(
     profile: Profile,
     seed: u64,
-) -> (Sim, BTreeSet<ResourceId>, Vec<tuile_core::budget::Start>) {
+) -> (Sim, BTreeSet<ResourceId>, Vec<tuile_budget::Start>) {
     let mut sim = Sim::new(quiet(profile), seed);
     settle(&mut sim, 8.0);
     let mut first = BTreeSet::new();
@@ -206,7 +206,7 @@ fn ten_rotations_starts(
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn ten_rotations_fetch_nothing_after_the_first() {
     for (profile, seed) in [(Profile::handheld(), 33), (Profile::handheld_low(), 34)] {
@@ -235,7 +235,7 @@ fn ten_rotations_fetch_nothing_after_the_first() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn ten_rotations_without_a_store_thrash_nothing() {
     let (sim, first, from) = ten_rotations(Profile::handheld(), 35, false);
@@ -258,7 +258,7 @@ fn ten_rotations_without_a_store_thrash_nothing() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_resize_decides_on_the_new_viewport_the_same_step() {
     let mut sim = Sim::new(quiet(Profile::desktop()), 36);
@@ -341,7 +341,7 @@ fn resize_starts(profile: Profile, seed: u64, lens: Lens) {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_resize_starts_nothing_outside_the_new_need() {
     resize_starts(
@@ -358,7 +358,7 @@ fn a_resize_starts_nothing_outside_the_new_need() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_split_screen_shrink_comes_back_under_target_without_a_hole() {
     let profile = quiet(Profile::handheld());
@@ -409,7 +409,7 @@ fn scale_digests(change: bool, seed: u64) -> Vec<u64> {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_scale_change_alone_decides_nothing_new() {
     let still = scale_digests(false, 40);
@@ -432,7 +432,7 @@ fn cold_start_bare(profile: Profile, seed: u64) -> u32 {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_cold_start_draws_no_bare_ground() {
     for (profile, seed) in [
@@ -519,7 +519,7 @@ fn head(profile: Profile, seed: u64) -> Sim {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_stereo_head_never_shows_a_hole_in_either_eye() {
     for (hz, seed) in [(72, 51), (90, 52), (120, 53)] {
@@ -549,7 +549,7 @@ fn session_bytes(profile: Profile, seed: u64, script: &dyn Fn(f64) -> Camera) ->
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_stereo_pair_costs_its_union() {
     use super::server::Eye;
@@ -591,7 +591,7 @@ fn a_stereo_pair_costs_its_union() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn hyperstereo_costs_its_union_and_covers_both_eyes() {
     use super::server::Eye;
@@ -622,7 +622,7 @@ fn hyperstereo_costs_its_union_and_covers_both_eyes() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn uploads_fit_the_refresh_deadline_at_72_90_and_120_hz() {
     for (hz, seed) in [(72, 58), (90, 59), (120, 60)] {
@@ -641,7 +641,7 @@ fn uploads_fit_the_refresh_deadline_at_72_90_and_120_hz() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_stereo_head_converges_after_it_stops() {
     let profile = quiet(Profile::headset(90));
@@ -664,7 +664,7 @@ fn a_stereo_head_converges_after_it_stops() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_stereo_film_is_exact_in_both_eyes() {
     use super::server::Eye;
@@ -686,7 +686,7 @@ fn a_stereo_film_is_exact_in_both_eyes() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_web_cold_start_converges_one_message_late() {
     super::scenarios::converges(Profile::web());
@@ -698,7 +698,7 @@ fn a_web_cold_start_converges_one_message_late() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_web_resize_and_a_device_pixel_ratio_change() {
     let mut sim = Sim::new(quiet(Profile::web()), 63);

@@ -10,8 +10,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use tuile_core::budget::imagery::{needed_level, LevelClamp};
-use tuile_core::budget::{Class, Micros, ResourceId, Role, TileId};
+use tuile_budget::imagery::{needed_level, LevelClamp};
+use tuile_budget::{Class, Micros, ResourceId, Role, TileId};
 
 use super::detmath;
 use super::patterns::{converged_within, listed, quiet, record};
@@ -89,7 +89,7 @@ fn floor_bound(p: &Profile) -> Micros {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn the_floor_is_in_within_its_bound() {
     for (profile, seed) in [
@@ -117,7 +117,7 @@ fn the_floor_is_in_within_its_bound() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_cold_start_covers_the_view_before_it_refines_any_of_it() {
     for (profile, seed) in [
@@ -152,7 +152,7 @@ fn a_cold_start_covers_the_view_before_it_refines_any_of_it() {
 type Levels = BTreeMap<TileId, (u32, u32)>;
 
 /// What each exactly drawn tile showed: its mesh level and drape level.
-fn exact_levels(d: &tuile_core::budget::Decisions) -> Levels {
+fn exact_levels(d: &tuile_budget::Decisions) -> Levels {
     d.draw
         .items
         .iter()
@@ -171,7 +171,7 @@ fn exact_levels(d: &tuile_core::budget::Decisions) -> Levels {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_still_camera_never_coarsens_what_it_drew() {
     for (profile, seed) in [
@@ -221,7 +221,7 @@ fn a_still_camera_never_coarsens_what_it_drew() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_warm_start_converges_no_later_than_a_cold_one() {
     for (profile, seed) in [(Profile::desktop(), 81), (Profile::handheld(), 82)] {
@@ -267,7 +267,7 @@ fn slow_dive(t: f64) -> Camera {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_cold_fast_zoom_in_to_the_deepest_level_never_shows_a_hole() {
     for (profile, seed) in [
@@ -304,7 +304,7 @@ fn slow_dive_converges(profile: Profile, seed: u64, bound: Micros) {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_slow_zoom_in_converges_at_the_deepest_level() {
     for (profile, seed) in [(Profile::desktop(), 87), (Profile::handheld_low(), 89)] {
@@ -328,7 +328,7 @@ fn a_slow_zoom_in_converges_at_the_deepest_level() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_slow_zoom_in_converges_at_the_deepest_level_on_a_phone() {
     slow_dive_converges(Profile::handheld(), 88, Micros::from_secs(11));
@@ -341,7 +341,7 @@ fn a_slow_zoom_in_converges_at_the_deepest_level_on_a_phone() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_fast_zoom_in_starts_nothing_the_view_has_left() {
     for (profile, seed) in [(Profile::desktop(), 90), (Profile::handheld(), 91)] {
@@ -391,7 +391,7 @@ fn a_fast_zoom_in_starts_nothing_the_view_has_left() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn over_the_plain_imagery_keeps_sharpening_after_terrain_stops() {
     for (profile, seed) in [(Profile::desktop(), 92), (Profile::handheld(), 93)] {
@@ -451,7 +451,7 @@ fn over_the_plain_imagery_keeps_sharpening_after_terrain_stops() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_film_dive_is_exact_every_frame() {
     let mut sim = Sim::new(Profile::film(), 94);
@@ -481,7 +481,7 @@ pub fn fast_climb(t: f64) -> Camera {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_fast_zoom_out_returns_under_target_within_the_bound() {
     for (profile, seed) in [(Profile::desktop(), 95), (Profile::handheld(), 96)] {
@@ -518,7 +518,7 @@ fn a_fast_zoom_out_returns_under_target_within_the_bound() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_cold_climb_never_shows_a_hole() {
     for (profile, seed) in [(Profile::desktop(), 97), (Profile::handheld(), 98)] {
@@ -530,7 +530,7 @@ fn a_cold_climb_never_shows_a_hole() {
         };
         let mut sim = Sim::new(quiet(profile), seed);
         let low = record(&mut sim, 3.0, climb(0.0));
-        let deepest = |d: &tuile_core::budget::Decisions| {
+        let deepest = |d: &tuile_budget::Decisions| {
             d.draw
                 .items
                 .iter()
@@ -555,7 +555,7 @@ fn a_cold_climb_never_shows_a_hole() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_zoom_out_on_a_headset_never_shows_a_hole_in_either_eye() {
     let mut sim = Sim::new(quiet(Profile::headset(90)), 99);
@@ -569,7 +569,7 @@ fn a_zoom_out_on_a_headset_never_shows_a_hole_in_either_eye() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn newly_visible_ground_is_covered_the_step_it_appears() {
     for (profile, seed) in [
@@ -635,7 +635,7 @@ fn newly_visible_ground_is_covered_the_step_it_appears() {
             if let Some(u) = urgency {
                 assert_eq!(
                     u,
-                    tuile_core::budget::Urgency::Hole,
+                    tuile_budget::Urgency::Hole,
                     "P4.1 (c), {name}: {tile:?} asked for below a hole"
                 );
             }
@@ -650,7 +650,7 @@ fn newly_visible_ground_is_covered_the_step_it_appears() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_head_rate_yaw_never_shows_a_hole() {
     for (profile, seed) in [
@@ -703,7 +703,7 @@ pub fn orbit(t: f64, period: f64) -> Camera {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn an_orbit_keeps_its_target_exact() {
     for (profile, seed) in [(Profile::desktop(), 107), (Profile::handheld(), 108)] {
@@ -750,7 +750,7 @@ fn an_orbit_keeps_its_target_exact() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_tilt_to_the_horizon_converges_without_a_hole() {
     for (profile, seed) in [(Profile::desktop(), 109), (Profile::handheld(), 110)] {
@@ -803,7 +803,7 @@ fn a_tilt_to_the_horizon_converges_without_a_hole() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_turn_and_back_flaps_nothing_and_refetches_nothing() {
     for (profile, seed) in [(Profile::desktop(), 111), (Profile::handheld(), 112)] {
@@ -867,7 +867,7 @@ fn a_turn_and_back_flaps_nothing_and_refetches_nothing() {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_rotation_never_evicts_what_is_still_in_view() {
     for (profile, seed) in [
@@ -901,7 +901,7 @@ fn golden(profile: Profile, seed: u64, run: impl FnOnce(&mut Sim)) -> u64 {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn pattern_goldens_hold() {
     use super::patterns::look_around;

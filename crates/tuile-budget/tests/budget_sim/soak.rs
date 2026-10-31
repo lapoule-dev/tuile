@@ -3,7 +3,7 @@
 
 //! The soak (I6, I7): a long scripted tour; the slopes must be flat.
 
-use tuile_core::budget::Micros;
+use tuile_budget::Micros;
 
 use super::detmath;
 use super::server::{Profile, Sim};
@@ -148,7 +148,7 @@ fn soak(minutes: u64) {
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn five_simulated_minutes_keep_flat_latency_and_bounded_state() {
     soak(5);
@@ -158,7 +158,7 @@ fn five_simulated_minutes_keep_flat_latency_and_bounded_state() {
 /// release job for its time: 12.6 min on an M-series Mac (passed
 /// 2026-10-21). No scheduled workflow runs it yet; it is run by hand.
 #[test]
-#[ignore = "13 min in release: by hand, cargo test --release -p tuile-core --test budget_sim -- --ignored one_simulated_hour (no nightly job yet)"]
+#[ignore = "13 min in release: by hand, cargo test --release -p tuile-budget --test budget_sim -- --ignored one_simulated_hour (no nightly job yet)"]
 fn one_simulated_hour_keeps_flat_latency_and_bounded_state() {
     soak(60);
 }

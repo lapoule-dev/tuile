@@ -10,7 +10,7 @@
 
 use std::ops::{Index, IndexMut};
 
-pub use crate::source::TileId;
+pub use crate::tile_id::TileId;
 
 /// A kind of GPU resource, each with its own target, overflow and request
 /// quota, so that one class cannot starve another (a 3D Tiles fly-over cannot
