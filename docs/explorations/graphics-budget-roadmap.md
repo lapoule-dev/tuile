@@ -25,7 +25,7 @@ PRs — numbered B1–B8 in that plan, unrelated to section B below — fixes it
 signals, and a measured acceptance (imagery peak ≤ 15.5 MB, BC7 settle ≤ 6.0 s, Off goldens unchanged). It comes
 before A2 and A4.
 
-### O1 — the budget's algorithms, before CB (status: O1.1 dense arena, 2026-10-31)
+### O1 — the budget's algorithms, before CB (status: O1.2 eviction index, 2026-10-31)
 
 The budget is its own crate, `tuile-budget` (#163). O1 optimises its `decide` before the compression budget,
 decisions bit-identical throughout. The guard comes first (O1.0): today's engine frozen at 3d1a028e in
@@ -80,6 +80,49 @@ cases), goldens untouched; a broken drape index is caught at step 8 by every loc
 The criterion means (`decide/still` −26.1 %, `motion` −23.1 %, `pressure` −29.4 %, p < 0.05) agree. The
 allocation counts barely move: the arena allocates only when its columns grow, and the per-step allocations
 left are the step's own buffers (O1.5).
+
+**O1.2 — persistent eviction index** (`perf/budget-o1-evict-index`). The eviction order is no longer rebuilt by a
+full scan and sort in `evict_order`, the pooled sweep, the decoded release and `release_beyond`, and `make_room`
+no longer folds the whole order on every delivery to learn whether room can be made. The arena keeps the order up
+to date. An eviction key moves whenever the view touches a resource — every step for everything drawn — so the
+arena files only what the view left alone: the resources needed at the two most recent times are *grouped*
+(listed by that time, outside the index); every other resource holding a copy outside transit is *filed* in a
+treap per class and per copies held (both, GPU only, decoded only), keyed by `(EvictKey, slot)`, its links a
+column of the arena (8 B a slot, nothing allocated as resources come and go), and its GPU bytes counted as its
+class's *idle bytes* unless it is of the floor. A third time files the older group's resources not needed since;
+a resource needed again leaves the index. A step that draws what it drew moves nothing; one that turns files what
+it left. Walks merge the index with the grouped resources, sorted once a step when a walk needs them; nothing
+filed is wanted or kept, so `make_room` knows what it can free from the idle bytes plus the step's grouped
+candidates by want urgency (`Room`), in O(1) per delivery, and evicts by walking the order (O(log N) per victim).
+Same victims in the same order: lockstep green in every `budget_sim` run and the properties (2 048 cases),
+goldens and pattern goldens untouched. `audit` checks the index (order, heap, membership, idle bytes, groups)
+against a recomputation in debug builds, and `make_room` checks its count against a scan. Red seen: a slot left
+out of the index when its transit ends diverges from the frozen reference in 13 of 61 `budget_sim` runs (first
+at step 140 of the back-and-forth, on the decoded releases).
+
+The index's links and the group lists cost about 17 B per tracked resource; the arena's columns now grow by an
+eighth instead of doubling (slots are never given back, so a doubling left up to half of every column unused for
+the session), which more than pays for them.
+
+| Measure | O1.1 | O1.2 |
+|---|---|---|
+| `decide` still (484 drawn) | mean 816 µs, p50 806, p99 905 | mean 813 µs, p50 802, p99 887 (no change) |
+| `decide` motion | mean 696 µs, p50 608, p99 1 726 | mean 680 µs, p50 606, p99 1 627 (−2 %, p99 −6 %) |
+| `decide` pressure | mean 652 µs, p50 637, p99 1 117 | mean 466 µs, p50 456, p99 720 (−29 %, p99 −36 %) |
+| allocations per step, still (internal / output) | 13 / 649 | 13 / 649 |
+| allocations per step, motion p99 (internal) | 42 | 38 |
+| allocations per step, pressure p50 / p99 (internal) | 21 / 73 | 12 / 74 |
+| step buffers after the tour | 381 056 B | 381 056 B |
+| bytes per tracked resource | 452 (2 927 tracked) | 445 (2 927 tracked) |
+
+The criterion means: `decide/pressure` −30.1 % (p < 0.05); `still` −0.2 % and `motion` −1.2 %, neither
+significant. The still view never evicts, so it gains nothing (and pays nothing measurable: the group lists turn
+over in place). The motion tour evicts on few steps. Under pressure, timed with temporary probes, `make_room`
+took about 180 µs a step (some 270 calls a step past its fast path, each folding the order, plus the order's
+build and sort) and the sweeps about 56 µs (the pooled one 44); after, about 22 µs (mostly the probes' own
+clocks) and 25 µs, of which the step's grouped candidates, sorted, about 16. What is left of the step is the
+need, the draw set and the ranking (O1.3–O1.5). Allocations under pressure: the median step halves; the p99 is
+one block higher (73 → 74), the decoded release now collecting the kept copies and the grouped holders apart.
 
 The pressure scenario's I7 break, explained (not fixed: behaviour is frozen through O1): at t ≈ 105 s of the
 unlooped tour under `pressure_profile`, 1 336 of the 1 929 tracked resources hold only a decoded copy (no GPU

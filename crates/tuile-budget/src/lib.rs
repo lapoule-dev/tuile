@@ -182,12 +182,12 @@ impl Budget {
     pub fn new(cfg: BudgetConfig) -> Result<Self, ConfigError> {
         cfg.validate()?;
         Ok(Budget {
+            arena: state::Arena::new(cfg.pinned_level),
             cfg,
             pressure: Pressure::Normal,
             thermal: Thermal::Nominal,
             factor: (1, 1),
             events: Vec::new(),
-            arena: Default::default(),
             tiles: Default::default(),
             imagery_prev: Default::default(),
             held_last: Default::default(),
