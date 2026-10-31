@@ -34,6 +34,7 @@ mod setup;
 pub(crate) use setup::backend_named;
 mod stall;
 mod tape;
+mod tilesets;
 mod touch;
 mod warmup;
 
@@ -126,6 +127,15 @@ pub struct ViewerConfig {
     /// frame, what the picture was drawn under — see `tuile_tape::session`.
     /// `TUILE_RECORD` says the same where there is no command line.
     pub(crate) record: crate::recording::RecordSettings,
+    /// The host's 3D Tiles tilesets on offer — each a switch in the menu,
+    /// off unless it is among `tilesets_on`.
+    pub(crate) tilesets: Vec<crate::embed::TilesetChoice>,
+    /// Those on at the start: what the session was started with, else the
+    /// last session's choice. The launch opens these.
+    pub(crate) tilesets_on: Vec<i64>,
+    /// Whether a switch is kept for the next session; not by a headless
+    /// run, which must leave the person's choice alone.
+    pub(crate) keeps_tilesets: bool,
 }
 
 /// Where the on-screen controls live: the part of the frame not under a
@@ -280,6 +290,8 @@ pub struct App {
     surfaces: Vec<crate::surface::Layer>,
     /// The bar their credits are shown in, below the picture.
     credits: credits::Credits,
+    /// Which of them are switched on: see `tilesets`.
+    tilesets: tilesets::Tilesets,
     /// The session on its way up; `None` once it has arrived or failed.
     launch: Option<crate::launch::Launch>,
     /// Why the session could not start, once that is known.
@@ -467,6 +479,11 @@ impl App {
             session: None,
             surfaces: Vec::new(),
             credits: credits::Credits::default(),
+            tilesets: tilesets::Tilesets::new(
+                &config.tilesets,
+                &config.tilesets_on,
+                config.keeps_tilesets,
+            ),
             launch: Some(launch),
             failed: None,
             messages: messages::Messages::default(),
@@ -628,6 +645,7 @@ impl App {
             .into_iter()
             .map(|surface| crate::surface::Layer::new(surface, origin))
             .collect();
+        self.note_the_tilesets_up();
         if !failures.is_empty() {
             self.messages.say(
                 format!("{}: a 3D Tiles tileset is not shown", self.title),
@@ -895,6 +913,7 @@ impl App {
         // location is taken on whatever turn of the loop it arrives, hidden
         // and warming included.
         self.take_the_session();
+        self.take_the_tilesets();
         self.take_the_gpu();
         self.messages.offer(
             self.active.is_some() || self.ended_by.is_some(),

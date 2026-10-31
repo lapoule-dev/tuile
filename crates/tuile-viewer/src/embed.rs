@@ -239,6 +239,26 @@ impl ImageryChoice {
     }
 }
 
+/// A 3D Tiles tileset a host offers to draw over the globe: a switch in the
+/// viewer's menu (off until the person turns it on), and on a phone's
+/// settings page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TilesetChoice {
+    /// What a person reads on the switch.
+    pub name: String,
+    /// The number [`Sources::tileset`] is asked for.
+    pub asset: i64,
+}
+
+impl TilesetChoice {
+    pub fn new(name: &str, asset: i64) -> Self {
+        Self {
+            name: name.to_owned(),
+            asset,
+        }
+    }
+}
+
 /// The three answers that make the application a host's own: see the module.
 #[async_trait::async_trait]
 pub trait ViewerHost: Send + Sync + 'static {
@@ -251,6 +271,12 @@ pub trait ViewerHost: Send + Sync + 'static {
     /// The imagery layers on offer, in the order a person should meet them.
     /// The first is what a session opens on. Must not be empty.
     fn imagery(&self) -> Vec<ImageryChoice>;
+
+    /// The 3D Tiles tilesets on offer over the globe, each a switch that is
+    /// off until the person turns it on. None by default.
+    fn tilesets(&self) -> Vec<TilesetChoice> {
+        Vec::new()
+    }
 
     /// Finds the host's credentials and answers with its sources.
     ///

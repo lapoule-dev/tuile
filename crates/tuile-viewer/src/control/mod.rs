@@ -604,6 +604,11 @@ impl Headless {
             imagery_compression: start.imagery_compression,
             // A headless run writes its own session log (`Start::log`).
             record: Default::default(),
+            // The run's, all on, and a switch never kept: a run leaves the
+            // person's choice alone.
+            tilesets: Vec::new(),
+            tilesets_on: start.tilesets.clone(),
+            keeps_tilesets: false,
         };
         let mut app = App::new(config, launch);
         app.speak_through(said);

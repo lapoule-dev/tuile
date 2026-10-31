@@ -271,7 +271,13 @@ impl App {
         // With the on-screen controls: a page that brings its own has its
         // own menu too.
         if self.controls {
-            self.menu = crate::menu::Installed::install(self.imagery.layers);
+            let tilesets: Vec<crate::embed::TilesetChoice> = self
+                .tilesets
+                .slots
+                .iter()
+                .map(|s| crate::embed::TilesetChoice::new(&s.name, s.asset))
+                .collect();
+            self.menu = crate::menu::Installed::install(self.imagery.layers, &tilesets);
         }
         if self.statusbar.is_none() {
             tracing::info!("no status-bar item on this platform; the readout is off");

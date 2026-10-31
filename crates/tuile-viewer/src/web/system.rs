@@ -256,6 +256,36 @@ pub(crate) fn remembered_view(name: &str) -> Option<String> {
     storage()?.get_item(&last_view_key(name)).ok().flatten()
 }
 
+/// Where the 3D Tiles tilesets a person switched on are kept for the next
+/// session of the viewer named `name`: their asset numbers, comma-separated.
+fn tilesets_on_key(name: &str) -> String {
+    format!("tuile-viewer/tilesets-on/{name}")
+}
+
+/// Keeps `on`, the tilesets a person switched on, for the next session;
+/// none on forgets the entry.
+pub(crate) fn keep_tilesets_on(on: &[i64]) {
+    let Some(storage) = storage() else {
+        return;
+    };
+    let key = tilesets_on_key(&name());
+    let _ = if on.is_empty() {
+        storage.remove_item(&key)
+    } else {
+        let line: Vec<String> = on.iter().map(i64::to_string).collect();
+        storage.set_item(&key, &line.join(","))
+    };
+}
+
+/// The tilesets the last session of the viewer named `name` left switched
+/// on.
+pub(crate) fn tilesets_kept_on(name: &str) -> Vec<i64> {
+    storage()
+        .and_then(|s| s.get_item(&tilesets_on_key(name)).ok().flatten())
+        .and_then(|text| crate::start::asset_list("tilesets-on", &text).ok())
+        .unwrap_or_default()
+}
+
 /// Keeps `link` as the view the next session of this viewer opens on, or —
 /// with `None` — forgets the last one.
 pub(crate) fn keep_the_view(link: Option<&str>) {

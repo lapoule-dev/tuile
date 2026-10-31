@@ -69,6 +69,9 @@ pub(crate) struct Snapshot {
     pub clock: crate::menu::Clock,
     /// Whether the session is being recorded.
     pub recording: bool,
+    /// Which of the session's 3D Tiles tilesets are drawn, a bit each by
+    /// their order (`crate::menu::State::tilesets`).
+    pub tilesets: u32,
 }
 
 impl Snapshot {
@@ -108,6 +111,7 @@ impl Snapshot {
             diagnostic: 0,
             clock: crate::menu::Clock::default(),
             recording: false,
+            tilesets: 0,
         }
     }
 }
