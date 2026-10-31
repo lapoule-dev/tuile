@@ -751,6 +751,21 @@ fn need_delta(before: &NeedSet, after: &NeedSet) -> u64 {
 /// since the last step, never with the size of the view:
 /// W_k ≤ a · (#ΔN_k + #E_k) · log2(tracked + 2) + b, on every step of a
 /// converged still view (nothing changes: W_k ≤ b) and of the soak's tour.
+/// #E_k counts the events the step applies and the decisions the step
+/// before took — loads started, cancelled, deliveries, evictions. A
+/// decision changes a resource's state (a load in flight, a copy in
+/// transit, a copy gone) after the passes of its step have read the arena,
+/// so its effect on the jobs, the marks and the work is read by the next
+/// step, from the arena's changes, exactly as an event's is: it is a change
+/// of that step's input, one step late. Counting only the events left those
+/// steps' work unexplained (2 still steps over the bound once the maps'
+/// upkeep was counted).
+///
+/// `work` includes what keeping the kept maps in order costs: each
+/// structural change (a key added or removed) at the B-tree's bound, its
+/// path, and every pass over a whole map entry by entry (`sorted.rs`). So
+/// for single changes the bound checks how many there are; what could grow
+/// with the view — whole passes — is counted as it is walked.
 ///
 /// `work` counts every element a step walks, the passes after the need
 /// included (drape levels, selection, draw set, wants, ranking, marks,
@@ -770,6 +785,7 @@ fn decide_work_grows_with_changes_not_with_the_view() {
     sim.run(5.0, &approach);
     let mut meter = BudgetMeter::new(sim.budget.config());
     let mut prev: Option<NeedSet> = None;
+    let mut decided = 0u64;
     // (phase, step, W, #ΔN, #E, tracked, bound)
     let mut over: Vec<(&str, u64, u64, u64, u64, u64, u64)> = Vec::new();
     let mut steps = 0u64;
@@ -803,7 +819,8 @@ fn decide_work_grows_with_changes_not_with_the_view() {
         let dn = prev
             .as_ref()
             .map_or_else(|| listed(&need).len() as u64, |p| need_delta(p, &need));
-        let e = sim.step_events;
+        let e = sim.step_events + decided;
+        decided = (d.start.len() + d.cancel.len() + d.deliver.len() + d.evict.len()) as u64;
         let tracked = u64::from(d.stats.tracked);
         let log = u64::from(64 - (tracked + 2).leading_zeros()); // ⌈log2⌉
         let bound = P64_A * (dn + e) * log + P64_B;

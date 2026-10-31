@@ -56,7 +56,7 @@ use super::engine::{ItemBufs, ItemStats, Reach, TileSelection, Want, DRAPES, MES
 use super::need::Membership;
 use super::need_state::{Named, TileNeed};
 use super::priority::Urgency;
-use super::sorted::{SortedCols, SortedMap};
+use super::sorted::SortedMap;
 use super::state::{Advance, Change, Mark, Slot};
 use super::stats::{BudgetStats, GAP_BUCKETS};
 use super::tier::PresenceOracle;
@@ -620,6 +620,39 @@ impl Downstream {
         self.again = true;
     }
 
+    /// What its maps spent keeping their order since the last call.
+    pub fn take_upkeep(&mut self) -> u64 {
+        let mut n = self.sums.depths.take_upkeep();
+        if let Some(c) = self.capped_sel.as_mut() {
+            n = n.saturating_add(c.depths.take_upkeep());
+        }
+        for m in [
+            &mut self.levels_far,
+            &mut self.levels_moved,
+            &mut self.coarsening,
+            &mut self.capped_coarsening,
+        ] {
+            n = n.saturating_add(m.take_upkeep());
+        }
+        for m in [&mut self.jobs, &mut self.inflight] {
+            n = n.saturating_add(m.take_upkeep());
+        }
+        n.saturating_add(self.entries.take_upkeep())
+            .saturating_add(self.contrib.take_upkeep())
+            .saturating_add(self.floor.take_upkeep())
+            .saturating_add(self.sel.take_upkeep())
+            .saturating_add(self.reach.take_upkeep())
+            .saturating_add(self.readers.take_upkeep())
+            .saturating_add(self.items.take_upkeep())
+            .saturating_add(self.worn.take_upkeep())
+            .saturating_add(self.wants.take_upkeep())
+            .saturating_add(self.refresh.take_upkeep())
+            .saturating_add(self.waiting.take_upkeep())
+            .saturating_add(self.ancestry.take_upkeep())
+            .saturating_add(self.kept_empty.take_upkeep())
+            .saturating_add(self.support.kids.take_upkeep())
+    }
+
     /// Drops the step's lists and batches and the indexes the next step
     /// rebuilds — who reads what, the work, the deadlines — keeping the
     /// units' results; every unit is read again at the next step.
@@ -804,7 +837,7 @@ impl Budget {
     /// positions before, whether they were wanted, and what changed.
     pub(super) fn downstream(
         &mut self,
-        tiles: &SortedCols<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed>,
         named: &[Named],
         presence: &dyn PresenceOracle,
         st: &mut BudgetStats,
@@ -1005,7 +1038,7 @@ impl Budget {
     /// `l.moved`.
     fn levels_pass(
         &mut self,
-        tiles: &SortedCols<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed>,
         presence: &dyn PresenceOracle,
         l: &mut StepLists,
     ) {
@@ -1045,7 +1078,7 @@ impl Budget {
     }
 
     /// Whether each dirty floor tile is in.
-    fn floor_pass(&mut self, tiles: &SortedCols<TileId, TileNeed>, l: &mut StepLists) {
+    fn floor_pass(&mut self, tiles: &SortedMap<TileId, TileNeed>, l: &mut StepLists) {
         self.walk(l.dirty.len());
         for i in 0..l.dirty.len() {
             let t = l.dirty[i];
@@ -1143,7 +1176,7 @@ impl Budget {
     /// runs changed, added to `l.items`. Every drawn tile when `full`.
     fn selection_pass(
         &mut self,
-        tiles: &SortedCols<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed>,
         full: bool,
         l: &mut StepLists,
     ) {
@@ -1244,7 +1277,7 @@ impl Budget {
     /// whole selection.
     fn items_pass(
         &mut self,
-        tiles: &SortedCols<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed>,
         full: bool,
         floor_in: bool,
         l: &mut StepLists,
@@ -1466,7 +1499,7 @@ impl Budget {
     /// The wants of the tiles whose need, levels, mesh or mesh's item
     /// changed (every tile's when `all`); the resources whose want changed,
     /// into `l.wants`.
-    fn wants_pass(&mut self, tiles: &SortedCols<TileId, TileNeed>, all: bool, l: &mut StepLists) {
+    fn wants_pass(&mut self, tiles: &SortedMap<TileId, TileNeed>, all: bool, l: &mut StepLists) {
         l.wants.clear();
         let meshes_in = self.meshes_in(tiles);
         let mut dirty = std::mem::take(&mut l.wants_dirty);
@@ -1562,9 +1595,7 @@ impl Budget {
                 l.wants.push(*r);
             }
         }
-        let refresh = self.down.refresh.values_mut();
-        refresh.clear();
-        refresh.extend_from_slice(&fresh);
+        self.down.refresh.rebuild(fresh.iter().copied());
         l.refresh = fresh;
     }
 
@@ -1575,14 +1606,14 @@ impl Budget {
     fn ancestry_follow(&mut self, named: &[Named], full: bool, l: &mut StepLists) {
         if full || !self.down.ancestry_ready {
             let mut a = std::mem::take(&mut self.down.ancestry);
-            let v = a.values_mut();
-            v.clear();
+            a.clear();
             for (h, _) in self.held_last.iter() {
                 Self::chain_of(*h, |t| self.tiles.get(&t).copied(), &mut l.chain);
                 self.walk(1 + l.chain.len());
-                v.extend(l.chain.iter().map(|&(p, passed)| ((p, *h), passed)));
+                for &(p, passed) in &l.chain {
+                    a.insert((p, *h), passed);
+                }
             }
-            v.sort_unstable_by_key(|e| e.0);
             self.down.ancestry = a;
             self.down.ancestry_ready = true;
             return;
@@ -1604,14 +1635,14 @@ impl Budget {
             // tile above a held one, before or after, read again.
             let mut a = std::mem::take(&mut self.down.ancestry);
             add(&mut l.pairs, a.keys().map(|k| k.0));
-            let v = a.values_mut();
-            v.clear();
+            a.clear();
             for (h, _) in self.held_last.iter() {
                 Self::chain_of(*h, |t| self.tiles.get(&t).copied(), &mut l.chain);
                 self.walk(1 + l.chain.len());
-                v.extend(l.chain.iter().map(|&(p, passed)| ((p, *h), passed)));
+                for &(p, passed) in &l.chain {
+                    a.insert((p, *h), passed);
+                }
             }
-            v.sort_unstable_by_key(|e| e.0);
             add(&mut l.pairs, a.keys().map(|k| k.0));
             self.down.ancestry = a;
             return;
@@ -1681,7 +1712,7 @@ impl Budget {
     /// Whether `t` is a seed: wanted, held, or holding a tracked resource.
     /// `overlay`: tiles whose change is not yet counted, with their tree
     /// position and membership before it.
-    fn seed(&self, t: TileId, tiles: &SortedCols<TileId, TileNeed>, overlay: &[Named]) -> bool {
+    fn seed(&self, t: TileId, tiles: &SortedMap<TileId, TileNeed>, overlay: &[Named]) -> bool {
         let wanted = match overlay.binary_search_by_key(&t, |x| x.tile) {
             Ok(i) => overlay[i].was_wanted(),
             Err(_) => tiles.get(&t).is_some(),
@@ -1694,7 +1725,7 @@ impl Budget {
     fn support_of(
         &self,
         t: TileId,
-        tiles: &SortedCols<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed>,
         overlay: &[Named],
     ) -> (Option<TileId>, bool) {
         let kept = self.seed(t, tiles, overlay) || self.down.support.kids.contains_key(&t);
@@ -1706,18 +1737,12 @@ impl Budget {
     }
 
     /// Whether `t`, known, is kept.
-    fn kept_tile(&self, t: TileId, tiles: &SortedCols<TileId, TileNeed>) -> bool {
+    fn kept_tile(&self, t: TileId, tiles: &SortedMap<TileId, TileNeed>) -> bool {
         self.seed(t, tiles, &[]) || self.down.support.kids.contains_key(&t)
     }
 
     /// `p` gains (`on`) or loses a kept child; what follows up the tree.
-    fn kid(
-        &mut self,
-        p: TileId,
-        on: bool,
-        tiles: &SortedCols<TileId, TileNeed>,
-        overlay: &[Named],
-    ) {
+    fn kid(&mut self, p: TileId, on: bool, tiles: &SortedMap<TileId, TileNeed>, overlay: &[Named]) {
         let (mut p, mut on) = (p, on);
         for _ in 0..=self.tiles.len() + 1 {
             let before = self.support_of(p, tiles, overlay);
@@ -1751,7 +1776,7 @@ impl Budget {
         &mut self,
         t: TileId,
         before: (Option<TileId>, bool),
-        tiles: &SortedCols<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed>,
         overlay: &[Named],
     ) {
         let after = self.support_of(t, tiles, overlay);
@@ -1771,7 +1796,7 @@ impl Budget {
     /// The support follows the named tiles' new places and memberships, one
     /// tile at a time, those not yet counted seen as they were. No support
     /// kept: rebuilt.
-    fn support_follow(&mut self, named: &[Named], tiles: &SortedCols<TileId, TileNeed>) {
+    fn support_follow(&mut self, named: &[Named], tiles: &SortedMap<TileId, TileNeed>) {
         if !self.down.support.ready {
             self.support_rebuild(tiles);
             return;
@@ -1803,7 +1828,7 @@ impl Budget {
     /// The support rebuilt: every tile's tracked resources counted, the kept
     /// tiles found from the seeds as the prune finds them, each kept known
     /// tile counted towards its parent.
-    fn support_rebuild(&mut self, tiles: &SortedCols<TileId, TileNeed>) {
+    fn support_rebuild(&mut self, tiles: &SortedMap<TileId, TileNeed>) {
         self.walk(self.tiles.len() + self.arena.len());
         let mut overflow = false;
         for i in self.tiles.values_mut() {
@@ -1831,7 +1856,7 @@ impl Budget {
             }
         }
         parents.sort_unstable();
-        kids.values_mut().extend(
+        kids.rebuild(
             parents
                 .chunk_by(|a, b| a == b)
                 .map(|run| (run[0], sat_u32(run.len()))),
@@ -1859,7 +1884,7 @@ impl Budget {
     /// The tiles still referenced — wanted, holding a tracked resource,
     /// held — and every ancestor of theirs, sorted: the prune's walk, as
     /// before O1.4.
-    fn keep_set(&self, tiles: &SortedCols<TileId, TileNeed>) -> Vec<TileId> {
+    fn keep_set(&self, tiles: &SortedMap<TileId, TileNeed>) -> Vec<TileId> {
         let mut keep: Vec<TileId> = tiles.keys().copied().collect();
         keep.reserve(self.arena.len());
         keep.extend(self.arena.iter().map(|s| self.arena.id(s).tile()));
@@ -1887,7 +1912,7 @@ impl Budget {
 
     /// A slot of tile `t` came (`on`) or went: its tile's count, and what
     /// follows for its keep.
-    pub(super) fn tile_slot(&mut self, t: TileId, on: bool, tiles: &SortedCols<TileId, TileNeed>) {
+    pub(super) fn tile_slot(&mut self, t: TileId, on: bool, tiles: &SortedMap<TileId, TileNeed>) {
         let before = self.support_of(t, tiles, &[]);
         let Some(i) = self.tiles.get_mut(&t) else {
             // A resource of a tile whose place is unknown: the counts no
@@ -1919,7 +1944,7 @@ impl Budget {
     pub(super) fn mark(
         &mut self,
         now: Micros,
-        tiles: &SortedCols<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed>,
         named: &[Named],
         wants: Wants<'_>,
     ) {
@@ -2223,7 +2248,7 @@ impl Budget {
     /// The step's end: the held set takes this step's draw set (its
     /// ancestry and the prune's support follow), a time gone back is
     /// settled.
-    pub(super) fn end_step(&mut self, tiles: &SortedCols<TileId, TileNeed>) {
+    pub(super) fn end_step(&mut self, tiles: &SortedMap<TileId, TileNeed>) {
         let changes = std::mem::take(&mut self.down.held_changes);
         let mut l = std::mem::take(&mut self.down.step);
         l.held.clear();
@@ -2259,14 +2284,14 @@ impl Budget {
         self.apply_ancestry(&mut l, false);
         if rebuild {
             let mut a = std::mem::take(&mut self.down.ancestry);
-            let v = a.values_mut();
-            v.clear();
+            a.clear();
             for (h, _) in self.held_last.iter() {
                 Self::chain_of(*h, |t| self.tiles.get(&t).copied(), &mut l.chain);
                 self.walk(1 + l.chain.len());
-                v.extend(l.chain.iter().map(|&(p, passed)| ((p, *h), passed)));
+                for &(p, passed) in &l.chain {
+                    a.insert((p, *h), passed);
+                }
             }
-            v.sort_unstable_by_key(|e| e.0);
             add(&mut self.down.next_sels, a.keys().map(|k| k.0));
             self.down.ancestry = a;
             self.down.ancestry_ready = true;
@@ -2309,7 +2334,7 @@ impl Budget {
     /// drape needs or the held set. Returns the keys looked at.
     pub(super) fn prune_levels(
         &mut self,
-        tiles: &SortedCols<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed>,
         named: &[Named],
     ) -> u32 {
         let keeps = |b: &Budget, t: TileId, l: LayerId| {
@@ -2368,7 +2393,7 @@ impl Budget {
     pub(super) fn prune_tracked(
         &mut self,
         now: Micros,
-        tiles: &SortedCols<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed>,
         wants: Wants<'_>,
     ) -> u32 {
         let mut visited = 0u32;
@@ -2516,7 +2541,7 @@ impl Budget {
 
     /// The tiles nothing references any more, nor any descendant, go.
     /// Returns the tiles looked at.
-    fn prune_tiles(&mut self, tiles: &SortedCols<TileId, TileNeed>) -> u32 {
+    fn prune_tiles(&mut self, tiles: &SortedMap<TileId, TileNeed>) -> u32 {
         if self.down.support.whole || !self.down.support.ready {
             // The counts do not tell: the whole walk, as before O1.4.
             let keep = self.keep_set(tiles);
@@ -2540,10 +2565,8 @@ impl Budget {
                 .collect();
             assert_eq!(gone, want, "the support frees what the prune's walk frees");
         }
-        if !gone.is_empty() {
-            self.tiles.retain(|t, _| gone.binary_search(t).is_err());
-        }
         for t in &gone {
+            self.tiles.remove(t);
             self.down.support.kids.remove(t);
         }
         gone.clear();
@@ -2582,7 +2605,7 @@ impl Budget {
     }
 
     /// The support's counts against the prune's walk.
-    fn check_support(&self, tiles: &SortedCols<TileId, TileNeed>) {
+    fn check_support(&self, tiles: &SortedMap<TileId, TileNeed>) {
         let sup = &self.down.support;
         if !sup.ready || sup.whole {
             return;
@@ -2621,7 +2644,7 @@ impl Budget {
     /// its answers may have changed.
     fn check_levels(
         &self,
-        tiles: &SortedCols<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed>,
         presence: &dyn PresenceOracle,
         last: &std::collections::BTreeMap<(TileId, LayerId), u32>,
     ) {
@@ -2661,7 +2684,7 @@ impl Budget {
     }
 
     /// The floor and the selection against a reading of every drawn tile.
-    fn check_selection(&self, tiles: &SortedCols<TileId, TileNeed>) {
+    fn check_selection(&self, tiles: &SortedMap<TileId, TileNeed>) {
         let floor: Vec<(TileId, bool)> = tiles
             .iter()
             .filter(|(_, tn)| self.is_floor(tn.need.level))
@@ -2732,7 +2755,7 @@ impl Budget {
     /// selection's) or kept, with what each read of other tiles.
     fn all_items(
         &self,
-        tiles: &SortedCols<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed>,
         capped: Option<&[(ResourceId, TileId, Role)]>,
     ) -> Expected {
         let runs: Vec<(ResourceId, TileId, Role)> = match capped {
@@ -2822,7 +2845,7 @@ impl Budget {
 
     /// The wants and refreshes kept against a reading of every tile and
     /// every drawn resource.
-    fn check_wants(&self, tiles: &SortedCols<TileId, TileNeed>) {
+    fn check_wants(&self, tiles: &SortedMap<TileId, TileNeed>) {
         let meshes_in = self.meshes_in(tiles);
         let mut want = Vec::new();
         let (mut drapes, mut put) = (Vec::new(), Vec::new());
