@@ -30,7 +30,11 @@
 //   test private helpers, not decisions);
 // - `ResourceView` is `#[non_exhaustive]`, so it cannot be built outside the
 //   crate: the `view` shim below declares a field-for-field twin of it (the
-//   copy's `Budget::resource` answers with the twin, compared field by field).
+//   copy's `Budget::resource` answers with the twin, compared field by field);
+// - `Budget::snapshot` (added with the debt pass after O1.3, PR on top of
+//   #169) reads the whole internal state into the real crate's test-only
+//   `snapshot::Snapshot`, for the lockstep to compare it step by step. It
+//   only reads; it is not in the decision path.
 //
 // Behaviour changes followed since the freeze: none.
 
@@ -365,6 +369,81 @@ impl Budget {
     /// How many resources the budget tracks.
     pub fn tracked(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Adaptation (debt pass after O1.3): the whole internal state in the
+    /// canonical form of `tuile_budget::snapshot`, the real budget's
+    /// test-only view, for the lockstep to compare. Reads only.
+    pub fn snapshot(&self) -> tuile_budget::snapshot::Snapshot {
+        use tuile_budget::snapshot::{rect_bits, ResourceSnapshot, Snapshot};
+        Snapshot {
+            resources: self
+                .entries
+                .iter()
+                .map(|(id, e)| ResourceSnapshot {
+                    id: *id,
+                    class: e.class,
+                    level: e.level,
+                    distance: e.distance,
+                    last_needed: e.last_needed,
+                    first_wanted: e.first_wanted,
+                    unneeded_since: e.unneeded_since,
+                    load: match e.load {
+                        state::Load::Idle => None,
+                        state::Load::Loading {
+                            gen,
+                            source,
+                            started,
+                            epoch,
+                        } => Some((gen, source, started, epoch)),
+                    },
+                    cpu: e.cpu.map(|c| (c.gen, c.cost, c.epoch, c.delivered_before)),
+                    transit: e.transit.map(|t| (t.gen, t.cost, t.epoch)),
+                    gpu: e.gpu.map(|g| (g.gen, g.bytes, g.epoch)),
+                    presence: e.presence,
+                    store_missed: e.store_missed,
+                    failures: e.failures,
+                    retry_at: e.retry_at,
+                    discards: e.discards,
+                    deliver_after: e.deliver_after,
+                    urgency: e.urgency,
+                    priority: e.priority.map(|p| p.key(*id)),
+                })
+                .collect(),
+            tiles: self
+                .tiles
+                .iter()
+                .map(|(t, i)| (*t, i.parent, i.level, i.rect.map(rect_bits)))
+                .collect(),
+            imagery_prev: self.imagery_prev.iter().map(|(k, v)| (*k, *v)).collect(),
+            held_last: self.held_last.iter().copied().collect(),
+            drawn_last: self.drawn_last.iter().copied().collect(),
+            worn_last: self.worn_last.clone(),
+            swap_last: self.swap_last.iter().copied().collect(),
+            chain_last: self.chain_last.iter().copied().collect(),
+            active: self.active.iter().copied().collect(),
+            floor_set: self.floor_set.iter().copied().collect(),
+            ranked_last: self.ranked_last.clone(),
+            wanted_last: self.wanted_last.iter().copied().collect(),
+            recent: self.recent.iter().map(|(k, v)| (*k, *v)).collect(),
+            epochs: self.epochs,
+            layer_epochs: self.layer_epochs.iter().map(|(k, v)| (*k, *v)).collect(),
+            next_gen: self.next_gen,
+            last_now: self.last_now,
+            scale: self.scale,
+            scale_fine: self.scale_fine,
+            ledger: self.ledger,
+            in_flight: self.in_flight,
+            local_reads: self.local_reads,
+            underflows: self.underflows,
+            fatal: self.fatal.clone(),
+            pending: self.pending.clone(),
+            pressure: self.pressure,
+            thermal: self.thermal,
+            factor: self.factor,
+            steps: self.steps,
+            events: self.events.len(),
+        }
     }
 
     /// Drops the buffers a step reuses from one step to the next, which

@@ -554,6 +554,12 @@ impl Arena {
         self.order[s.i()].last_needed
     }
 
+    /// Level, distance and last needed, for the test-only snapshot.
+    pub fn order_fields(&self, s: Slot) -> (u32, u32, Micros) {
+        let o = self.order[s.i()];
+        (o.level, o.distance, o.last_needed)
+    }
+
     pub fn set_distance(&mut self, s: Slot, d: u32) {
         if self.order[s.i()].distance == d {
             return;
