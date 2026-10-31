@@ -107,9 +107,9 @@ An `.ipa` cannot be handed out outside the App Store, so the public route is
    **Beta App Review**. The first build of each version needs that review
    (usually under a day); later builds of the same version usually do not —
    but here every release is a new version, so every release is reviewed
-   once. Export compliance: the app uses only the system's HTTPS; answer the
-   question in App Store Connect, or add `ITSAppUsesNonExemptEncryption =
-   NO` to the bundler's property list once that answer is settled.
+   once. Export compliance is answered by the bundle: the property list
+   already says `ITSAppUsesNonExemptEncryption = NO` (HTTPS only, which is
+   exempt), so no build waits on the question.
 4. The public link is the repository variable `TESTFLIGHT_PUBLIC_LINK`; the
    release notes print it.
 
