@@ -8,7 +8,7 @@
 //! - `decide/motion`: the soak's tour, the step's `decide` alone timed;
 //! - `decide/pressure`: the tour's orbit, looped, under memory pressure
 //!   (`soak::pressure_profile`: over target on nearly every step, so the
-//!   eviction order is built and sorted every step), `decide` alone timed.
+//!   eviction order is walked every step), `decide` alone timed.
 //!
 //! The simulation runs its budget alone here (`Sim::unchecked`): the frozen
 //! reference the tests run beside it (`tests/reference/`) is left out.
