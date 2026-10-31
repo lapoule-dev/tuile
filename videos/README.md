@@ -650,9 +650,10 @@ of both frames (0 black pixels in all six).
 - `pic-du-midi/`: eye 0.1520 E 42.9300 N, 3150 m, heading 315, pitch 6.
 - `paris-overview/`: eye 2.3065 E 48.8505 N, 5000 m, heading 315, pitch 20.
 - Lit for 2026-10-31T12:00:00Z, 1280×800 at scale 1, the tileset given 60 s
-  after the globe settled. The providers' logos are bottom left, over a
-  dark band; `window-title.txt` is the native window's title during a run,
-  with the credits the drawn tiles name.
+  after the globe settled (these frames still show the providers' logos
+  bottom left; they were removed from the viewer afterwards).
+  `window-title.txt` is the native window's title during a run, with the
+  credits the drawn tiles name.
 - Looked at: the tower, La Défense and the Trocadéro stand in 3D where the
   globe alone has them flat; no seam or black between the mesh and the
   globe; the mesh is lit by the scene's sun over textures that already carry
