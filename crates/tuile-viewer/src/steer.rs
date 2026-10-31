@@ -26,7 +26,8 @@
 //! | `tuile://goto?…&time=&timeOffset=&timeRate=` | also sets the scene's clock, as `--time`, `--time-offset` and `--time-rate` do: see below |
 //! | `tuile://north` | north up, about the point at the centre of the view |
 //! | `tuile://here` | centres on the current location (the system still asks the person) |
-//! | `tuile://view?freeze=on\|off&wireframe=on\|off` | the two display switches |
+//! | `tuile://view?freeze=on\|off&wireframe=on\|off&diagnostic=normal\|unlit\|coverage\|geometry` | the display switches, and the diagnostic view `D` cycles |
+//! | `tuile://tileset?asset=<n>&show=on\|off` | one of the host's 3D Tiles tilesets drawn over the globe, or not |
 //! | `tuile://imagery?name=<key>` | drapes another of the host's imagery layers; `name=next` takes the one after the present |
 //! | `tuile://import?src=https://…` | fetches a configuration file and imports it, as opening it would (`crate::import`) |
 //!
@@ -391,6 +392,18 @@ pub(crate) fn parse_url_among(
             pairs
                 .iter()
                 .map(|(key, text)| {
+                    if *key == "diagnostic" {
+                        return crate::menu::DIAGNOSTICS
+                            .iter()
+                            .position(|name| name.eq_ignore_ascii_case(text))
+                            .map(Command::Diagnostic)
+                            .ok_or_else(|| {
+                                format!(
+                                    "diagnostic is one of {}, not {text:?}",
+                                    crate::menu::DIAGNOSTICS.join(", ").to_lowercase()
+                                )
+                            });
+                    }
                     let on = match *text {
                         "on" => true,
                         "off" => false,
@@ -1227,6 +1240,11 @@ mod tests {
             parse_url(&url("tileset?show=on&asset=7")),
             Ok(vec![Command::Tileset { asset: 7, on: true }])
         );
+        assert_eq!(
+            parse_url(&url("view?diagnostic=unlit")),
+            Ok(vec![Command::Diagnostic(1)])
+        );
+        assert!(parse_url(&url("view?diagnostic=shiny")).is_err());
         for wrong in [
             "tileset",
             "tileset?asset=7",
