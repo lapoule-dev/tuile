@@ -6,6 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Test data stays in the repository: the tests that read it run there.
+exclude = ["tests/frozen/"]
 
 [dependencies]
 bytemuck = { workspace = true }

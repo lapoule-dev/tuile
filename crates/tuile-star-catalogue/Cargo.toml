@@ -24,4 +24,4 @@ glam = { workspace = true }
 # recorded SHA-256.
 flate2 = { workspace = true }
 sha2 = "0.11"
-tuile-atmosphere = { path = "../tuile-atmosphere" }
+tuile-atmosphere = { version = "0.15.1", path = "../tuile-atmosphere" }
