@@ -534,6 +534,18 @@ fn sel_entries(
 /// failure (until 30 s after its want went), or wanted — and if so, the time
 /// from which it may let it go, as far as time alone tells
 /// (`Micros(u64::MAX)`: only when its want goes).
+/// The swap and chain marks of a resource, drawable or not, wanted at
+/// urgency `u`: a drawable member of a swap the view waits on (a hole, a
+/// blocker, an ancestor), and of an ancestor's chain.
+fn swap_chain(drawable: bool, u: Option<Urgency>) -> (bool, bool) {
+    let swap = drawable
+        && matches!(
+            u,
+            Some(Urgency::Hole | Urgency::Blocker | Urgency::Ancestor)
+        );
+    (swap, drawable && u == Some(Urgency::Ancestor))
+}
+
 fn kept_until(a: &super::state::Arena, s: Slot, now: Micros, wants: Wants<'_>) -> Option<Micros> {
     let cold = a.cold(s);
     let unneeded = cold.unneeded_since();
@@ -1974,14 +1986,8 @@ impl Budget {
             let Some(s) = self.arena.find(r) else {
                 continue;
             };
-            let drawable = self.arena.has_gpu(s);
             let u = wants.get(&r).map(|w| w.urgency);
-            let swap = drawable
-                && matches!(
-                    u,
-                    Some(Urgency::Hole | Urgency::Blocker | Urgency::Ancestor)
-                );
-            let chain = drawable && u == Some(Urgency::Ancestor);
+            let (swap, chain) = swap_chain(self.arena.has_gpu(s), u);
             self.arena.mark(s, Mark::Swap, swap);
             self.arena.mark(s, Mark::Chain, chain);
         }
@@ -2859,22 +2865,11 @@ impl Budget {
                 w.is_some() || drawn,
                 "the wanted mark of {r:?}"
             );
-            let u = w.map(|w| w.urgency);
-            if a.marked(s, Mark::Swap) {
-                assert!(
-                    matches!(
-                        u,
-                        Some(Urgency::Hole | Urgency::Blocker | Urgency::Ancestor)
-                    ),
-                    "the swap mark of {r:?}"
-                );
-            }
-            if a.marked(s, Mark::Chain) {
-                assert!(
-                    a.marked(s, Mark::Swap) && u == Some(Urgency::Ancestor),
-                    "the chain mark of {r:?}"
-                );
-            }
+            assert_eq!(
+                (a.marked(s, Mark::Swap), a.marked(s, Mark::Chain)),
+                swap_chain(a.has_gpu(s), w.map(|w| w.urgency)),
+                "the swap and chain marks of {r:?}"
+            );
             // After a time gone back, the older group may hold what is
             // needed (the next step touches it all).
             if self.down.touch_all {
