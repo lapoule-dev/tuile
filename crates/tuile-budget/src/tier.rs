@@ -40,6 +40,14 @@ pub enum Presence {
 pub trait PresenceOracle {
     /// Where `r` is held locally, if anywhere.
     fn holds(&self, r: ResourceId) -> Presence;
+
+    /// A value that changes whenever an answer may: equal from one step to
+    /// the next, every answer is the same, and the budget need not ask
+    /// again what it asked already. `None` (the default) promises nothing:
+    /// the budget asks again every step.
+    fn generation(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// No local store: everything not decoded is remote.
@@ -49,6 +57,10 @@ pub struct NoStore;
 impl PresenceOracle for NoStore {
     fn holds(&self, _: ResourceId) -> Presence {
         Presence::Absent
+    }
+
+    fn generation(&self) -> Option<u64> {
+        Some(0)
     }
 }
 

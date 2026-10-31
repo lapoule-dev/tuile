@@ -137,6 +137,80 @@ impl Wanted {
     }
 }
 
+/// A tile a change named, with what the budget knew of it before: its
+/// parent and level (its footprint aside), and whether it was wanted; and
+/// what of it changed beyond its floats and footprint — its shape (entered,
+/// left, another membership, level, class or layers: what the selection,
+/// the floor and the draw items read of it) and its place in the tree
+/// (parent, level, footprint). Packed: a change names every tile of a
+/// moving view, most of them for their floats alone.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Named {
+    pub tile: TileId,
+    parent: u64,
+    level: u32,
+    flags: u8,
+}
+
+/// `Named::flags`: a position was known, with a parent; the tile was
+/// wanted.
+const KNOWN: u8 = 1;
+const PARENT: u8 = 1 << 1;
+const WANTED: u8 = 1 << 2;
+/// `Named::flags`: its shape changed; its place did.
+const SHAPED: u8 = 1 << 3;
+const MOVED: u8 = 1 << 4;
+
+impl Named {
+    fn new(
+        tile: TileId,
+        before: Option<TileInfo>,
+        wanted: bool,
+        shaped: bool,
+        moved: bool,
+    ) -> Self {
+        let parent = before.and_then(|i| i.parent());
+        let flag = |b: bool, f: u8| if b { f } else { 0 };
+        Named {
+            tile,
+            parent: parent.map_or(0, |p| p.0),
+            level: before.map_or(0, |i| i.level),
+            flags: flag(before.is_some(), KNOWN)
+                | flag(parent.is_some(), PARENT)
+                | flag(wanted, WANTED)
+                | flag(shaped, SHAPED)
+                | flag(moved, MOVED),
+        }
+    }
+
+    /// Whether its shape changed: it entered or left, or its membership,
+    /// level, class or layers changed.
+    pub fn shaped(&self) -> bool {
+        self.flags & SHAPED != 0
+    }
+
+    /// Whether its place in the tree changed: parent, level or footprint.
+    pub fn moved(&self) -> bool {
+        self.flags & MOVED != 0
+    }
+
+    /// Its tree position before the change (its footprint left out).
+    pub fn before(&self) -> Option<TileInfo> {
+        (self.flags & KNOWN != 0).then(|| {
+            TileInfo::new(
+                (self.flags & PARENT != 0).then_some(TileId(self.parent)),
+                self.level,
+                None,
+            )
+        })
+    }
+
+    /// Whether it was wanted before the change.
+    pub fn was_wanted(&self) -> bool {
+        self.flags & WANTED != 0
+    }
+}
+
 /// One wanted tile: its best entry, and what its entries count.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TileNeed {
@@ -254,6 +328,11 @@ pub(crate) struct NeedState {
 struct Scratch {
     /// A delta's words, sorted, when it does not come sorted.
     ops: Vec<(TileId, DeltaOp)>,
+    /// The last change's tiles, in order, each with the tree position it
+    /// had before (`None`: none known) and whether it was wanted before.
+    named: Vec<Named>,
+    /// A changed tile's layers before the change.
+    layers: Vec<super::types::LayerId>,
 }
 
 impl NeedState {
@@ -275,6 +354,14 @@ impl NeedState {
     /// Drops the buffers a change reuses.
     pub fn release_scratch(&mut self) {
         self.scratch = Scratch::default();
+    }
+
+    /// The tiles the last change named — entered, changed or left — in
+    /// tile order, each with the tree position it had before and whether
+    /// it was wanted before. A whole need names the tiles it lists and
+    /// those it no longer lists.
+    pub fn named(&self) -> &[Named] {
+        &self.scratch.named
     }
 
     /// Applies what changed; `positions` gets the tree position of every
@@ -340,6 +427,9 @@ impl NeedState {
         // The tiles that enter go to the end of the map, and their tree
         // positions to the end of theirs: `ops` come in tile order, so each
         // tail is sorted, and is merged in place once the change is done.
+        let mut named = std::mem::take(&mut self.scratch.named);
+        named.clear();
+        let mut old_layers = std::mem::take(&mut self.scratch.layers);
         let old = self.tiles.len();
         let old_positions = positions.len();
         let (mut cursor, mut at_position) = (0, 0);
@@ -350,6 +440,8 @@ impl NeedState {
                 for k in cursor..at {
                     self.uncount(k);
                     removed = true;
+                    let gone = self.tiles.key_column()[k];
+                    Self::name_left(gone, positions, old_positions, &mut at_position, &mut named);
                 }
             }
             let found = at < old && self.tiles.key_column()[at] == t;
@@ -371,9 +463,32 @@ impl NeedState {
                     }
                 }
             }
+            let mut shaped = true;
             let info = if found {
+                let old = self.tiles.value_at(at);
+                let (m, level, class) = (old.membership, old.need.level, old.need.class);
+                let had = old.need.imagery.is_some();
+                old_layers.clear();
+                old_layers.extend(
+                    old.need
+                        .imagery
+                        .iter()
+                        .flat_map(|i| i.layers().iter().map(|x| x.layer)),
+                );
                 self.uncount(at);
                 let info = r.finish(self.tiles.value_at_mut(at));
+                let new = self.tiles.value_at(at);
+                shaped = info.is_none()
+                    || new.membership != m
+                    || new.need.level != level
+                    || new.need.class != class
+                    || new.need.imagery.is_some() != had
+                    || !new
+                        .need
+                        .imagery
+                        .iter()
+                        .flat_map(|i| i.layers().iter().map(|x| x.layer))
+                        .eq(old_layers.iter().copied());
                 match info {
                     Some(_) => self.count(at),
                     None => removed = true,
@@ -391,15 +506,27 @@ impl NeedState {
                 }
                 info
             };
+            let keys = &positions.key_column()[at_position..old_positions];
+            let i = at_position + keys.partition_point(|k| *k < t);
+            let known = i < old_positions && positions.key_column()[i] == t;
+            let before = known.then(|| *positions.value_at(i));
+            let place = |x: &TileInfo| (x.parent(), x.level, x.rect());
+            let moved = match (&before, &info) {
+                (Some(b), Some(n)) => place(b) != place(n),
+                (None, Some(_)) => true,
+                (_, None) => false,
+            };
+            named.push(Named::new(t, before, found, shaped, moved));
+            at_position = if known { i + 1 } else { i };
             if let Some(info) = info {
-                let keys = &positions.key_column()[at_position..old_positions];
-                let i = at_position + keys.partition_point(|k| *k < t);
-                if i < old_positions && positions.key_column()[i] == t {
-                    *positions.value_at_mut(i) = info;
-                    at_position = i + 1;
+                if known {
+                    // What the prune counts of the tile is not the need's.
+                    let p = positions.value_at_mut(i);
+                    let slots = p.slots;
+                    *p = info;
+                    p.slots = slots;
                 } else {
                     positions.push(t, info);
-                    at_position = i;
                 }
             }
         }
@@ -407,6 +534,8 @@ impl NeedState {
             for k in cursor..old {
                 self.uncount(k);
                 removed = true;
+                let gone = self.tiles.key_column()[k];
+                Self::name_left(gone, positions, old_positions, &mut at_position, &mut named);
             }
         }
         let entered = self.tiles.len() - old;
@@ -415,6 +544,31 @@ impl NeedState {
         }
         self.tiles.merge_tail(self.tiles.len() - entered);
         positions.merge_tail(old_positions);
+        self.scratch.named = named;
+        self.scratch.layers = old_layers;
+    }
+
+    /// Names `t`, wanted, which a whole need no longer lists: it left. Its
+    /// tree position is looked up from `at`, past those of the tiles named
+    /// before it.
+    fn name_left(
+        t: TileId,
+        positions: &SortedCols<TileId, TileInfo>,
+        old_positions: usize,
+        at: &mut usize,
+        named: &mut Vec<Named>,
+    ) {
+        let keys = &positions.key_column()[*at..old_positions];
+        let i = *at + keys.partition_point(|k| *k < t);
+        let known = i < old_positions && positions.key_column()[i] == t;
+        named.push(Named::new(
+            t,
+            known.then(|| *positions.value_at(i)),
+            true,
+            true,
+            false,
+        ));
+        *at = if known { i + 1 } else { i };
     }
 
     /// Drops the records marked to go (no entry), in one pass.

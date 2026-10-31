@@ -403,6 +403,7 @@ fn a_lying_store_index_costs_one_miss_per_lie() {
         store.held.remove(r);
         store.lies.insert(*r);
     }
+    store.generation += 1;
     let mut again = Sim::new(Profile::desktop(), 15);
     again.net.store = store;
     again.run(6.0, &|_| home());

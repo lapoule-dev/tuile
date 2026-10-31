@@ -1,61 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! Sorted vectors standing in for per-step `BTreeSet`s: refilled in place
-//! each step, so they keep their capacity, and read by binary search.
-//! Ordered like the sets they replace: no decision depends on a hash order.
-
-/// A sorted set without duplicates, refilled in place.
-#[derive(Clone, Debug)]
-pub(super) struct SortedSet<T>(Vec<T>);
-
-impl<T> Default for SortedSet<T> {
-    fn default() -> Self {
-        SortedSet(Vec::new())
-    }
-}
-
-impl<T: Ord + Copy> SortedSet<T> {
-    /// Whether `x` is in the set.
-    pub fn contains(&self, x: &T) -> bool {
-        self.0.binary_search(x).is_ok()
-    }
-
-    /// How many members.
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// The members, in order.
-    pub fn iter(&self) -> std::slice::Iter<'_, T> {
-        self.0.iter()
-    }
-
-    /// The set becomes `items`, sorted and deduplicated, in the same
-    /// buffer.
-    pub fn refill(&mut self, items: impl IntoIterator<Item = T>) {
-        self.0.clear();
-        self.0.extend(items);
-        // Equal members are identical: an unstable sort orders them as a
-        // stable one would.
-        self.0.sort_unstable();
-        self.0.dedup();
-    }
-}
-
-impl<'a, T> IntoIterator for &'a SortedSet<T> {
-    type Item = &'a T;
-    type IntoIter = std::slice::Iter<'a, T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
+//! A sorted vector standing in for a `BTreeMap`: read by binary search,
+//! changed in place or by batches merged in one pass (`SortedMap::apply`),
+//! so it keeps its room and allocates nothing once grown. Ordered like the
+//! maps it replaces: no decision depends on a hash order.
 
 /// A map as a sorted vector of distinct keys, built once per step in a
 /// buffer kept across steps, read by binary search. Its accessors mirror
 /// `BTreeMap`'s: entries come as `(&K, &V)`, in key order.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct SortedMap<K, V>(Vec<(K, V)>);
 
 impl<K, V> Default for SortedMap<K, V> {
@@ -65,25 +19,14 @@ impl<K, V> Default for SortedMap<K, V> {
 }
 
 impl<K: Ord + Copy, V> SortedMap<K, V> {
-    /// A map whose entries are `v`'s, already sorted by key and distinct.
-    pub fn from_sorted(v: Vec<(K, V)>) -> Self {
-        debug_assert!(v.windows(2).all(|w| w[0].0 < w[1].0), "sorted, distinct");
-        SortedMap(v)
-    }
-
-    /// Its entries, as the vector they are kept in.
-    pub fn into_vec(self) -> Vec<(K, V)> {
-        self.0
-    }
-
-    /// Its buffer, emptied, for the next step to fill.
-    pub fn into_buffer(mut self) -> Vec<(K, V)> {
-        self.0.clear();
-        self.0
-    }
-
     fn find(&self, k: &K) -> Option<usize> {
         self.0.binary_search_by(|e| e.0.cmp(k)).ok()
+    }
+
+    /// The entries, to change in place: kept sorted by key and distinct
+    /// by whoever changes them.
+    pub fn values_mut(&mut self) -> &mut Vec<(K, V)> {
+        &mut self.0
     }
 
     /// The value at `k`.
@@ -119,6 +62,110 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
             .iter()
             .take_while(move |e| e.0 <= hi)
             .map(|(k, v)| (k, v))
+    }
+
+    /// Whether the map is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The value at `k`, to change in place.
+    pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
+        self.find(k).map(|i| &mut self.0[i].1)
+    }
+
+    /// Sets `k` to `v`, in place; returns the value it replaces. The
+    /// entries after it move up: for maps that change by a few entries.
+    pub fn insert(&mut self, k: K, v: V) -> Option<V> {
+        match self.0.binary_search_by(|e| e.0.cmp(&k)) {
+            Ok(i) => Some(std::mem::replace(&mut self.0[i].1, v)),
+            Err(i) => {
+                grow(&mut self.0, 1);
+                self.0.insert(i, (k, v));
+                None
+            }
+        }
+    }
+
+    /// Removes `k`; returns its value.
+    pub fn remove(&mut self, k: &K) -> Option<V> {
+        self.find(k).map(|i| self.0.remove(i).1)
+    }
+
+    /// Empties the map, keeping its room.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Applies `changes` — a value to set at a key, or `None` to remove the
+    /// key — the last change of a key winning; `changes` is left empty.
+    /// Values set in place, removed entries dropped in one pass, new keys
+    /// appended and the whole sorted once: nothing allocated once the map
+    /// has grown. `spent` receives each value replaced or removed.
+    pub fn apply(&mut self, changes: &mut Vec<(K, Option<V>)>, mut spent: impl FnMut(V))
+    where
+        V: Default,
+    {
+        if changes.is_empty() {
+            return;
+        }
+        let used = changes.len();
+        // A stable sort: of a key's changes, the last stays last.
+        changes.sort_by_key(|c| c.0);
+        let n0 = self.0.len();
+        let (mut removed, mut appended) = (false, false);
+        // The removals kept at the front of `changes`, in key order.
+        let mut gone = 0;
+        let len = changes.len();
+        for i in 0..len {
+            if i + 1 < len && changes[i + 1].0 == changes[i].0 {
+                continue;
+            }
+            let k = changes[i].0;
+            let v = changes[i].1.take();
+            match self.0[..n0].binary_search_by(|e| e.0.cmp(&k)) {
+                Ok(at) => match v {
+                    Some(v) => spent(std::mem::replace(&mut self.0[at].1, v)),
+                    None => {
+                        changes[gone].0 = k;
+                        gone += 1;
+                        removed = true;
+                    }
+                },
+                Err(_) => {
+                    if let Some(v) = v {
+                        grow(&mut self.0, 1);
+                        self.0.push((k, v));
+                        appended = true;
+                    }
+                }
+            }
+        }
+        if removed {
+            let (mut w, mut j) = (0, 0);
+            for r in 0..self.0.len() {
+                if r < n0 && j < gone && self.0[r].0 == changes[j].0 {
+                    j += 1;
+                    spent(std::mem::take(&mut self.0[r].1));
+                    continue;
+                }
+                self.0.swap(w, r);
+                w += 1;
+            }
+            self.0.truncate(w);
+        }
+        changes.clear();
+        trim(changes, used);
+        if appended {
+            // Distinct keys: unstable is stable.
+            self.0.sort_unstable_by_key(|e| e.0);
+        }
+        let len = self.0.len();
+        trim(&mut self.0, len);
+        debug_assert!(
+            self.0.windows(2).all(|w| w[0].0 < w[1].0),
+            "sorted, distinct"
+        );
     }
 }
 
@@ -183,6 +230,16 @@ impl<K: Ord + Copy, V> SortedCols<K, V> {
     /// How many entries.
     pub fn len(&self) -> usize {
         self.keys.len()
+    }
+
+    /// The value at `k`, to change in place (its key stays).
+    pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
+        self.find(k).map(|i| &mut self.vals[i])
+    }
+
+    /// The values, in key order, to change in place (their keys stay).
+    pub fn values_mut(&mut self) -> std::slice::IterMut<'_, V> {
+        self.vals.iter_mut()
     }
 
     /// The value at place `i`.
@@ -296,37 +353,19 @@ fn grow<T>(v: &mut Vec<T>, extra: usize) {
     }
 }
 
+/// Gives back most of `v`'s room when it is four times what was `used` of
+/// it: a buffer grown by one large step does not stay that large, and one
+/// used about as much each step is left alone.
+pub(super) fn trim<T>(v: &mut Vec<T>, used: usize) {
+    if v.capacity() > 4 * used + 256 {
+        v.shrink_to(2 * used + 64);
+    }
+}
+
 /// Pushes `x` on `v`, grown as [`grow`] does.
 pub(super) fn push_grown<T>(v: &mut Vec<T>, x: T) {
     grow(v, 1);
     v.push(x);
-}
-
-/// The distinct members of four sorted, deduplicated streams, in order:
-/// their union, without building it.
-pub(super) fn union4<T: Ord + Copy>(
-    a: impl Iterator<Item = T>,
-    b: impl Iterator<Item = T>,
-    c: impl Iterator<Item = T>,
-    d: impl Iterator<Item = T>,
-) -> impl Iterator<Item = T> {
-    let mut a = a.peekable();
-    let mut b = b.peekable();
-    let mut c = c.peekable();
-    let mut d = d.peekable();
-    std::iter::from_fn(move || {
-        let next = [a.peek(), b.peek(), c.peek(), d.peek()]
-            .into_iter()
-            .flatten()
-            .min()
-            .copied()?;
-        // Every stream at that member moves past it.
-        a.next_if_eq(&next);
-        b.next_if_eq(&next);
-        c.next_if_eq(&next);
-        d.next_if_eq(&next);
-        Some(next)
-    })
 }
 
 #[cfg(test)]
@@ -334,24 +373,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_refilled_set_is_sorted_and_distinct() {
-        let mut s = SortedSet::default();
-        s.refill([5, 1, 3, 1, 5]);
-        assert_eq!(s.iter().copied().collect::<Vec<_>>(), [1, 3, 5]);
-        assert!(s.contains(&3) && !s.contains(&2));
-        s.refill([2]);
-        assert_eq!(s.iter().copied().collect::<Vec<_>>(), [2]);
-    }
-
-    #[test]
     fn a_sorted_map_reads_like_a_btree_map() {
-        let m = SortedMap::from_sorted(vec![(1, 'a'), (3, 'b'), (7, 'c')]);
+        let mut m = SortedMap::default();
+        for (k, v) in [(7, 'c'), (1, 'a'), (3, 'b')] {
+            m.insert(k, v);
+        }
         assert_eq!(m.get(&3), Some(&'b'));
         assert!(m.get(&2).is_none() && m.contains_key(&7));
         assert_eq!(m.range(2..=7).map(|(k, _)| *k).collect::<Vec<_>>(), [3, 7]);
         assert_eq!(m.keys().copied().collect::<Vec<_>>(), [1, 3, 7]);
-        assert_eq!(m.len(), 3);
-        assert_eq!(m.into_buffer().capacity(), 3);
+        assert_eq!(m.remove(&3), Some('b'));
+        assert_eq!(m.len(), 2);
     }
 
     /// Two sorted runs of distinct keys merge in place into one, each
@@ -399,14 +431,40 @@ mod tests {
     }
 
     #[test]
-    fn the_union_of_four_streams_is_their_sorted_distinct_members() {
-        let u: Vec<_> = union4(
-            [1, 4, 9].into_iter(),
-            [1, 2].into_iter(),
-            std::iter::empty(),
-            [2, 9, 10].into_iter(),
-        )
-        .collect();
-        assert_eq!(u, [1, 2, 4, 9, 10]);
+    fn changes_apply_as_a_btree_map_takes_them_one_by_one() {
+        // Random changes against an ordered map of the same keys.
+        let mut m: SortedMap<u32, u32> = SortedMap::default();
+        let mut oracle = std::collections::BTreeMap::new();
+        let mut x = 12345u32;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let mut changes = Vec::new();
+        for _ in 0..200 {
+            for _ in 0..(next() % 20) {
+                let k = next() % 64;
+                let v = (next() % 3 != 0).then(&mut next);
+                changes.push((k, v));
+            }
+            for (k, v) in &changes {
+                match v {
+                    Some(v) => {
+                        oracle.insert(*k, *v);
+                    }
+                    None => {
+                        oracle.remove(k);
+                    }
+                }
+            }
+            m.apply(&mut changes, |_| {});
+            assert!(changes.is_empty());
+            assert_eq!(
+                m.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
+                oracle.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>()
+            );
+        }
     }
 }

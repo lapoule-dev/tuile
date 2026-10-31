@@ -754,10 +754,15 @@ fn need_delta(before: &NeedSet, after: &NeedSet) -> u64 {
 ///
 /// `work` counts every element a step walks, the passes after the need
 /// included (drape levels, selection, draw set, wants, ranking, marks,
-/// protection). Red before O1.4: every pass after the need walked all of
-/// it, so W_k was O(need + tracked) even when nothing changed.
+/// protection, prune). Red before O1.4's dirty sets: every pass after the
+/// need walked all of it, so W_k was O(need + tracked) even when nothing
+/// changed (about 15 700 a still step, over the bound on 1 499 of 5 100
+/// steps).
 #[test]
-#[ignore = "red until O1.4's dirty sets: W ≈ 15 700 a still step, 1 499 of 5 100 steps over"]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
 fn decide_work_grows_with_changes_not_with_the_view() {
     use tuile_budget::{BudgetMeter, BudgetObserver, Pressure, StepRecord, Thermal};
 

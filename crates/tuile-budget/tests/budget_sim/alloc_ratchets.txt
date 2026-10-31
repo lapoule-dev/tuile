@@ -1,5 +1,5 @@
-still-internal-allocs-per-step 13
+still-internal-allocs-per-step 0
 meter-allocs-per-still-step 0
-motion-internal-allocs-per-step-p99 40
-scratch-bytes-after-tour 340096
-bytes-per-tracked-resource 470
+motion-internal-allocs-per-step-p99 31
+scratch-bytes-after-tour 244216
+bytes-per-tracked-resource 467

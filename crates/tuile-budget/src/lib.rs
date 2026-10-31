@@ -13,6 +13,7 @@ pub mod config;
 pub mod cost;
 pub mod deadline;
 pub mod decisions;
+mod downstream;
 mod engine;
 pub mod error;
 pub mod imagery;
@@ -148,7 +149,8 @@ const THRASH_WINDOW: Micros = Micros::from_secs(10);
 
 /// What the budget knows of a tile's place in its tree: its parent, level
 /// and footprint, packed (48 bytes, not 64: the budget keeps one per tile
-/// it knows of).
+/// it knows of), and how many resources of the tile the arena tracks (for
+/// the prune: a tile with one is kept).
 #[derive(Clone, Copy, Debug, Default)]
 struct TileInfo {
     /// The parent's id, when `has_parent`.
@@ -158,6 +160,9 @@ struct TileInfo {
     level: u32,
     has_parent: bool,
     has_rect: bool,
+    /// The tile's tracked resources (saturating: the prune then falls back
+    /// on its full walk, `downstream::Support`).
+    slots: u16,
 }
 
 impl TileInfo {
@@ -168,6 +173,7 @@ impl TileInfo {
             level,
             has_parent: parent.is_some(),
             has_rect: rect.is_some(),
+            slots: 0,
         }
     }
 
@@ -212,24 +218,22 @@ pub struct Budget {
     /// The need last read, each wanted tile's best entry: a step changes
     /// it by what changed.
     need: need_state::NeedState,
+    /// Each drawn or blocking tile's imagery level per layer, as last
+    /// chosen (the hysteresis reads it), and those of the tiles held.
     imagery_prev: std::collections::BTreeMap<(TileId, LayerId), u32>,
-    held_last: sorted::SortedSet<TileId>,
-    drawn_last: sorted::SortedSet<ResourceId>,
-    /// The drapes each drawn mesh wore last step, by mesh, in its stacking
-    /// order: on a layer switch, the old layer stays worn until the new one
-    /// is drawable.
-    worn_last: Vec<(ResourceId, DrapeChoice)>,
-    swap_last: sorted::SortedSet<ResourceId>,
-    chain_last: sorted::SortedSet<ResourceId>,
-    /// Resources loading or in transit (an index, so a step need not scan).
+    /// The tiles whose meshes were drawn last step as themselves or held
+    /// (not as a fallback).
+    held_last: sorted::SortedMap<TileId, ()>,
+    /// Resources loading or in transit (an index, so a step need not scan),
+    /// each marked `Active` on its slot.
     active: std::collections::BTreeSet<ResourceId>,
-    /// Resources of the floor (an index).
-    floor_set: std::collections::BTreeSet<ResourceId>,
     /// Resources ranked last step (their urgency is cleared next step).
     ranked_last: Vec<ResourceId>,
     /// Steps taken, for the amortised prune.
     steps: u64,
-    wanted_last: sorted::SortedSet<ResourceId>,
+    /// What the passes after the need keep from one step to the next: the
+    /// draw set, the wants, the work, and what changed (O1.4).
+    down: downstream::Downstream,
     /// A step's buffers, kept across steps.
     scratch: engine::Scratch,
     recent: std::collections::BTreeMap<ResourceId, Micros>,
@@ -267,15 +271,10 @@ impl Budget {
             need: Default::default(),
             imagery_prev: Default::default(),
             held_last: Default::default(),
-            drawn_last: Default::default(),
-            worn_last: Vec::new(),
-            swap_last: Default::default(),
-            chain_last: Default::default(),
             active: Default::default(),
-            floor_set: Default::default(),
             ranked_last: Vec::new(),
             steps: 0,
-            wanted_last: Default::default(),
+            down: Default::default(),
             scratch: Default::default(),
             recent: Default::default(),
             epochs: PerClass::splat(0),
@@ -353,6 +352,8 @@ impl Budget {
             (Class::Drape, Some(l)) => *self.layer_epochs.entry(l).or_insert(0) += 1,
             _ => self.epochs[class] += 1,
         }
+        // Every copy's freshness moved: the next step reads it again.
+        self.down.everything_again();
     }
 
     /// The platform's memory signal; takes effect at the next step.
@@ -432,6 +433,16 @@ impl Budget {
     #[doc(hidden)]
     pub fn snapshot(&self) -> snapshot::Snapshot {
         let a = &self.arena;
+        // The sets a step keeps, as the marks on their members' slots.
+        let marked = |m: state::Mark| -> Vec<ResourceId> {
+            let mut v: Vec<ResourceId> = a
+                .iter()
+                .filter(|&s| a.marked(s, m))
+                .map(|s| a.id(s))
+                .collect();
+            v.sort_unstable();
+            v
+        };
         let mut resources: Vec<snapshot::ResourceSnapshot> = a
             .iter()
             .map(|s| {
@@ -480,15 +491,30 @@ impl Budget {
                 .map(|(t, i)| (*t, i.parent(), i.level, i.rect().map(snapshot::rect_bits)))
                 .collect(),
             imagery_prev: self.imagery_prev.iter().map(|(k, v)| (*k, *v)).collect(),
-            held_last: self.held_last.iter().copied().collect(),
-            drawn_last: self.drawn_last.iter().copied().collect(),
-            worn_last: self.worn_last.clone(),
-            swap_last: self.swap_last.iter().copied().collect(),
-            chain_last: self.chain_last.iter().copied().collect(),
+            held_last: self.held_last.keys().copied().collect(),
+            drawn_last: marked(state::Mark::Drawn),
+            worn_last: self
+                .down
+                .items()
+                .flat_map(|(m, i)| i.drapes().map(move |d| (*m, *d)))
+                .collect(),
+            swap_last: marked(state::Mark::Swap),
+            chain_last: marked(state::Mark::Chain),
             active: self.active.iter().copied().collect(),
-            floor_set: self.floor_set.iter().copied().collect(),
+            floor_set: marked(state::Mark::FloorSet),
             ranked_last: self.ranked_last.clone(),
-            wanted_last: self.wanted_last.iter().copied().collect(),
+            // Every resource wanted or drawn, tracked or not: the marks are
+            // on tracked slots only.
+            wanted_last: {
+                let mut w: Vec<ResourceId> = self
+                    .down
+                    .wanted()
+                    .chain(marked(state::Mark::Drawn))
+                    .collect();
+                w.sort_unstable();
+                w.dedup();
+                w
+            },
             recent: self.recent.iter().map(|(k, v)| (*k, *v)).collect(),
             epochs: self.epochs,
             layer_epochs: self.layer_epochs.iter().map(|(k, v)| (*k, *v)).collect(),
@@ -517,6 +543,7 @@ impl Budget {
     pub fn release_scratch(&mut self) {
         self.scratch = Default::default();
         self.need.release_scratch();
+        self.down.release_scratch();
     }
 }
 

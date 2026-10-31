@@ -36,13 +36,27 @@
 //! index for the newest group. So a step that draws what it drew moves
 //! nothing, and one that turns files only what it left. A walk of the order
 //! merges the index with the groups, sorted when a walk needs them.
+//!
+//! The newest group is not rewritten each step either (O1.4): its members
+//! carry a mark, "needed at the newest time", rather than the time itself,
+//! so a step that needs what it needed changes none of them. When the time
+//! moves on, the caller names the members that the new step no longer
+//! needs ([`Arena::advance`]): they alone take the old time and become the
+//! older group. A time that goes back is played as before, every member
+//! touched one by one ([`Arena::regress`]).
+//!
+//! Beyond the copies, a slot carries the marks of the sets a step keeps from
+//! one step to the next — drawn, swap, chain, in flight or in transit, of
+//! the floor's loads, wanted — so that the protected bytes are kept up to
+//! date as copies and marks change, and every change of a slot's copies or
+//! load is noted, for the step to know what changed since it last looked.
 
 // The decisions are integer arithmetic: floats stay in `imagery` and
 // `priority`, quantised once, where bit-exactness is controlled.
 #![deny(clippy::float_arithmetic)]
 
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::BuildHasher;
 
 use foldhash::fast::FixedState;
@@ -50,10 +64,11 @@ use hashbrown::HashTable;
 
 use super::cost::Cost;
 use super::priority::{PriorityKey, Urgency};
+use super::sorted::SortedMap;
 use super::tier::Tier;
 use super::tier::{Presence, Source};
 use super::types::ResourceId;
-use super::types::{Bytes, Class, Generation, Micros, PerClass};
+use super::types::{Bytes, Class, Generation, LayerId, Micros, PerClass};
 use super::Ledger;
 
 /// A load in flight, or none.
@@ -135,26 +150,95 @@ impl Slot {
     }
 }
 
-// Which copies a slot holds, and what its payload columns mean: one byte
-// per slot, read before any payload.
+// Which copies a slot holds, and what its payload columns mean, then the
+// sets the step keeps it in: two bytes per slot, read before any payload.
 /// The slot holds a tracked resource (a freed slot does not).
-const LIVE: u8 = 1;
+const LIVE: u16 = 1;
 /// A decoded copy: `cpu` holds it.
-const CPU: u8 = 1 << 1;
+const CPU: u16 = 1 << 1;
 /// The decoded copy reached the GPU once (`CpuCopy::delivered_before`).
-const DELIVERED: u8 = 1 << 2;
+const DELIVERED: u16 = 1 << 2;
 /// A copy in transit: `transit` holds it.
-const TRANSIT: u8 = 1 << 3;
+const TRANSIT: u16 = 1 << 3;
 /// A copy on the GPU: `gpu` holds it.
-const GPU: u8 = 1 << 4;
+const GPU: u16 = 1 << 4;
 /// A load in flight: `load` holds it.
-const LOADING: u8 = 1 << 5;
+const LOADING: u16 = 1 << 5;
 /// The load in flight reads a local store (`Source::Local`); else the
 /// network.
-const LOCAL: u8 = 1 << 6;
+const LOCAL: u16 = 1 << 6;
 /// Needed at one of the two most recent times: listed in that time's group,
 /// not filed in the eviction index.
-const GROUPED: u8 = 1 << 7;
+const GROUPED: u16 = 1 << 7;
+
+/// The sets a step keeps a resource in, as marks on its slot ([`Mark`]).
+const DRAWN: u16 = 1 << 8;
+const SWAP: u16 = 1 << 9;
+const CHAIN: u16 = 1 << 10;
+const ACTIVE: u16 = 1 << 11;
+const FLOOR_SET: u16 = 1 << 12;
+const WANTED: u16 = 1 << 13;
+
+/// The sets a step keeps from one step to the next, as marks on the slots
+/// of their members: what protects a resource, and what the view wanted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Mark {
+    /// Drawn: a mesh of the draw set, or a drape one wears.
+    Drawn,
+    /// The drawable half of a swap the view waits on.
+    Swap,
+    /// An ancestor of the drawn cut, drawable (a swap's member too).
+    Chain,
+    /// A load in flight or a copy in transit, until the prune notes it is
+    /// neither (`Budget::active`).
+    Active,
+    /// A load started at the floor's levels (`Budget::floor_set`).
+    FloorSet,
+    /// Wanted or drawn at the last step (`Budget::wanted_last`).
+    Wanted,
+}
+
+impl Mark {
+    fn bit(self) -> u16 {
+        match self {
+            Mark::Drawn => DRAWN,
+            Mark::Swap => SWAP,
+            Mark::Chain => CHAIN,
+            Mark::Active => ACTIVE,
+            Mark::FloorSet => FLOOR_SET,
+            Mark::Wanted => WANTED,
+        }
+    }
+}
+
+/// The time of the newest group, standing for it in a member's
+/// `last_needed`: the group's members do not move when the time does.
+const CUR: Micros = Micros(u64::MAX);
+
+/// What changed of a resource ([`Arena::changes`]), as bits.
+pub(super) struct Change;
+
+impl Change {
+    /// Its GPU copy: whether it is drawable, and its tier.
+    pub const GPU: u8 = 1;
+    /// Its decoded copy: its tier.
+    pub const CPU: u8 = 1 << 1;
+    /// Its load, its transit, its slot made: its work only.
+    pub const LOAD: u8 = 1 << 2;
+    /// Its tier otherwise: a store missed it, its slot went.
+    pub const TIER: u8 = 1 << 3;
+}
+
+/// What [`Arena::advance`] did with a new time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Advance {
+    /// The groups moved on: the leavers left.
+    Moved,
+    /// The newest group's own time: nothing moved, the leavers stay.
+    Same,
+    /// An earlier time: nothing moved; [`Arena::regress`] plays it.
+    Back,
+}
 
 /// The eviction order: least recently needed first, then finer, then
 /// farther; the resource last, so the order is total.
@@ -192,7 +276,8 @@ impl Held {
 struct Group {
     at: Option<Micros>,
     /// Each slot listed when it joined; a slot that left since (needed
-    /// again later, freed) stays listed and is told apart by its time.
+    /// again later, freed) stays listed and is told apart by its time —
+    /// [`CUR`] for the newest group's members.
     slots: Vec<Slot>,
 }
 
@@ -209,6 +294,11 @@ struct EvictIndex {
     /// The newest group, and the one before.
     cur: Group,
     prev: Group,
+    /// The newest group's members (live, marked [`CUR`]).
+    cur_len: usize,
+    /// While a time that went back is played: members carry their times,
+    /// the newest group's too, as before the mark (`regress`).
+    explicit: bool,
 }
 
 impl Default for EvictIndex {
@@ -218,6 +308,8 @@ impl Default for EvictIndex {
             idle: PerClass::splat(Bytes::ZERO),
             cur: Group::default(),
             prev: Group::default(),
+            cur_len: 0,
+            explicit: false,
         }
     }
 }
@@ -325,15 +417,17 @@ pub(super) struct Arena {
     live: usize,
     id: Vec<ResourceId>,
     class: Vec<Class>,
-    flags: Vec<u8>,
+    flags: Vec<u16>,
     order: Vec<Order>,
     gpu: Vec<Gpu>,
-    transit: Vec<Transit>,
+    /// The copies in transit, by slot: few at a time, so kept apart.
+    transit: SortedMap<u32, Transit>,
     cpu: Vec<CpuPayload>,
-    load: Vec<LoadPayload>,
-    /// This step's urgency and priority, if it has work.
-    urgency: Vec<Option<Urgency>>,
-    priority: Vec<Option<Rank>>,
+    /// The loads in flight, by slot: few at a time, so kept apart.
+    load: SortedMap<u32, LoadPayload>,
+    /// This step's urgency and priority of the slots with work, by slot:
+    /// few, so kept apart rather than in two columns.
+    ranks: SortedMap<u32, (Urgency, Rank)>,
     cold: Vec<Cold>,
     /// The drapes with a GPU copy, in resource order: a tile's drawable
     /// drapes of one layer are a range of it, by level.
@@ -341,6 +435,19 @@ pub(super) struct Arena {
     /// The floor's last level (`BudgetConfig::pinned_level`).
     pinned: Option<u32>,
     evict: EvictIndex,
+    /// Every resource whose copies, load or tier changed, in order, with
+    /// what changed ([`Change`]), since the step last took them
+    /// ([`Arena::changes`]); a resource may come twice.
+    changed: Vec<(ResourceId, u8)>,
+    /// By class, the bytes of the protected resources (`protection_of`):
+    /// kept up to date as copies and marks change.
+    protected: PerClass<Bytes>,
+    /// The GPU copies by class, layer and content epoch: whether any is of
+    /// an older epoch than its own, without a scan.
+    gpu_epochs: BTreeMap<(Class, Option<LayerId>, u64), u32>,
+    /// Slots that held nothing at some point since the prune last looked:
+    /// the only ones a prune can free.
+    emptied: Vec<Slot>,
 }
 
 /// The bytes one slot holds across the columns, its index and free-list
@@ -349,17 +456,13 @@ pub(super) struct Arena {
 /// tracked resource (240 B as one entry of an ordered map, its key apart).
 pub(super) const SLOT_BYTES: usize = std::mem::size_of::<ResourceId>()
     + std::mem::size_of::<Class>()
-    + std::mem::size_of::<u8>()
+    + std::mem::size_of::<u16>()
     + std::mem::size_of::<Order>()
     + std::mem::size_of::<Gpu>()
-    + std::mem::size_of::<Transit>()
     + std::mem::size_of::<CpuPayload>()
-    + std::mem::size_of::<LoadPayload>()
-    + std::mem::size_of::<Option<Urgency>>()
-    + std::mem::size_of::<Option<Rank>>()
     + std::mem::size_of::<Cold>();
 const _: () = assert!(SLOT_BYTES <= MAX_SLOT_BYTES);
-const MAX_SLOT_BYTES: usize = 211;
+const MAX_SLOT_BYTES: usize = 139;
 
 impl Default for Arena {
     fn default() -> Self {
@@ -373,15 +476,18 @@ impl Default for Arena {
             flags: Vec::new(),
             order: Vec::new(),
             gpu: Vec::new(),
-            transit: Vec::new(),
+            transit: SortedMap::default(),
             cpu: Vec::new(),
-            load: Vec::new(),
-            urgency: Vec::new(),
-            priority: Vec::new(),
+            load: SortedMap::default(),
+            ranks: SortedMap::default(),
             cold: Vec::new(),
             gpu_drapes: BTreeSet::new(),
             pinned: None,
             evict: EvictIndex::default(),
+            changed: Vec::new(),
+            protected: PerClass::splat(Bytes::ZERO),
+            gpu_epochs: BTreeMap::new(),
+            emptied: Vec::new(),
         }
     }
 }
@@ -407,19 +513,29 @@ impl Arena {
     }
 
     /// The slot of `r`, tracked from now on if it was not, as a resource of
-    /// `class` at `level`, first needed `now`, holding nothing.
+    /// `class` at `level`, first needed `now`, holding nothing. The newest
+    /// group is `now`'s ([`Arena::advance`]).
     pub fn find_or_insert(&mut self, r: ResourceId, class: Class, level: u32, now: Micros) -> Slot {
         if let Some(s) = self.find(r) {
             return s;
         }
+        let explicit = self.evict.explicit;
         let order = Order {
-            last_needed: now,
+            last_needed: if explicit { now } else { CUR },
             level,
             distance: 0,
         };
-        // The group of `now` first: making it may file an older group, which
-        // the new slot is not part of.
-        self.group_at(now);
+        if explicit {
+            // The group of `now` first: making it may file an older group,
+            // which the new slot is not part of.
+            self.group_at(now);
+        } else {
+            debug_assert_eq!(
+                self.evict.cur.at,
+                Some(now),
+                "a slot joins the newest group"
+            );
+        }
         let s = match self.free.pop() {
             Some(s) => {
                 let i = s.i();
@@ -428,11 +544,7 @@ impl Arena {
                 self.flags[i] = LIVE | GROUPED;
                 self.order[i] = order;
                 self.gpu[i] = Gpu::default();
-                self.transit[i] = Transit::default();
                 self.cpu[i] = CpuPayload::default();
-                self.load[i] = LoadPayload::default();
-                self.urgency[i] = None;
-                self.priority[i] = None;
                 self.cold[i] = Cold::default();
                 s
             }
@@ -446,11 +558,7 @@ impl Arena {
                 self.flags.push(LIVE | GROUPED);
                 self.order.push(order);
                 self.gpu.push(Gpu::default());
-                self.transit.push(Transit::default());
                 self.cpu.push(CpuPayload::default());
-                self.load.push(LoadPayload::default());
-                self.urgency.push(None);
-                self.priority.push(None);
                 self.cold.push(Cold::default());
                 s
             }
@@ -460,7 +568,14 @@ impl Arena {
         } = self;
         index.insert_unique(hasher.hash_one(r), s, |x| hasher.hash_one(id[x.i()]));
         self.live += 1;
-        self.join(s, now);
+        if explicit {
+            self.join(s, now);
+        } else {
+            self.evict.cur.slots.push(s);
+            self.evict.cur_len += 1;
+        }
+        self.changed.push((r, Change::LOAD));
+        self.emptied.push(s);
         s
     }
 
@@ -479,11 +594,7 @@ impl Arena {
         grow(&mut self.flags);
         grow(&mut self.order);
         grow(&mut self.gpu);
-        grow(&mut self.transit);
         grow(&mut self.cpu);
-        grow(&mut self.load);
-        grow(&mut self.urgency);
-        grow(&mut self.priority);
         grow(&mut self.cold);
     }
 
@@ -495,6 +606,12 @@ impl Arena {
         if let Ok(e) = self.index.find_entry(h, |x| *x == s) {
             e.remove();
         }
+        if self.is_cur(s) {
+            self.evict.cur_len -= 1;
+        }
+        self.ranks.remove(&s.0);
+        // Untracked, it is asked of the presence index again.
+        self.changed.push((self.id[s.i()], Change::TIER));
         self.flags[s.i()] = 0;
         self.free.push(s);
         self.live -= 1;
@@ -528,15 +645,45 @@ impl Arena {
         self.order[s.i()].level
     }
 
-    #[cfg(test)]
+    /// When the resource of `s` was last needed.
     pub fn last_needed(&self, s: Slot) -> Micros {
-        self.order[s.i()].last_needed
+        match self.order[s.i()].last_needed {
+            CUR => self.evict.cur.at.unwrap_or(Micros::ZERO),
+            t => t,
+        }
     }
 
-    /// Level, distance and last needed, for the test-only snapshot.
+    /// Whether `s` is a member of the newest group.
+    fn is_cur(&self, s: Slot) -> bool {
+        let f = self.flags[s.i()];
+        f & LIVE != 0 && f & GROUPED != 0 && self.order[s.i()].last_needed == CUR
+    }
+
+    /// The newest group's time, once a step made one.
+    pub fn newest(&self) -> Option<Micros> {
+        self.evict.cur.at
+    }
+
+    /// Whether `s` is a member of the newest group.
+    pub fn is_newest(&self, s: Slot) -> bool {
+        self.is_cur(s)
+    }
+
+    /// How many members the newest group has.
+    pub fn newest_len(&self) -> usize {
+        self.evict.cur_len
+    }
+
+    /// Whether `s` holds a tracked resource.
+    pub fn live_slot(&self, s: Slot) -> bool {
+        self.has(s, LIVE)
+    }
+
+    /// Level, distance and last needed (a newest group's member at the
+    /// group's time), for the test-only snapshot.
     pub fn order_fields(&self, s: Slot) -> (u32, u32, Micros) {
         let o = self.order[s.i()];
-        (o.level, o.distance, o.last_needed)
+        (o.level, o.distance, self.last_needed(s))
     }
 
     pub fn set_distance(&mut self, s: Slot, d: u32) {
@@ -548,9 +695,30 @@ impl Arena {
         self.file(s);
     }
 
-    /// The resource of `s` was needed at `t`: it joins the group of `t`,
-    /// leaving the index if it was filed.
+    /// The resource of `s` was needed at `t`, the newest group's time (once
+    /// [`Arena::advance`] made it so): it joins the newest group, leaving
+    /// the index if it was filed. A member stays as it is.
     pub fn touch(&mut self, s: Slot, t: Micros) {
+        if self.evict.explicit {
+            self.touch_explicit(s, t);
+            return;
+        }
+        debug_assert_eq!(self.evict.cur.at, Some(t), "touched at the newest time");
+        if self.is_cur(s) {
+            return;
+        }
+        if !self.grouped(s) {
+            self.unfile(s);
+            self.set(s, GROUPED, true);
+        }
+        self.order[s.i()].last_needed = CUR;
+        self.evict.cur.slots.push(s);
+        self.evict.cur_len += 1;
+    }
+
+    /// `touch` with the time written in the slot: the group of `t` made
+    /// first, the slot joining the group of its time.
+    fn touch_explicit(&mut self, s: Slot, t: Micros) {
         self.group_at(t);
         if self.grouped(s) {
             if self.order[s.i()].last_needed == t {
@@ -562,6 +730,103 @@ impl Arena {
         }
         self.order[s.i()].last_needed = t;
         self.join(s, t);
+    }
+
+    /// The newest time is `t`. Later than the newest group's: the older
+    /// group's resources not needed since are filed; `leavers` — the newest
+    /// group's members a step at `t` no longer needs, every one of them —
+    /// become the older group, at the newest group's time; the other
+    /// members stay, now members at `t`, without a write. The newest
+    /// group's time itself: nothing moves. Earlier: nothing moves either,
+    /// and [`Arena::regress`] must play the step.
+    pub fn advance(&mut self, t: Micros, leavers: &[Slot]) -> Advance {
+        debug_assert!(!self.evict.explicit, "a time gone back is settled first");
+        let at = self.evict.cur.at;
+        match at {
+            Some(a) if t == a => return Advance::Same,
+            Some(a) if t < a => return Advance::Back,
+            _ => {}
+        }
+        let old = std::mem::take(&mut self.evict.prev);
+        if let Some(pat) = old.at {
+            for &s in &old.slots {
+                if self.has(s, LIVE) && self.grouped(s) && self.order[s.i()].last_needed == pat {
+                    self.set(s, GROUPED, false);
+                    self.file(s);
+                }
+            }
+        }
+        let mut slots = old.slots;
+        slots.clear();
+        if let Some(a) = at {
+            for &s in leavers {
+                debug_assert!(self.is_cur(s), "a leaver is a member of the newest group");
+                self.order[s.i()].last_needed = a;
+                slots.push(s);
+            }
+            self.evict.cur_len -= leavers.len();
+        } else {
+            debug_assert!(leavers.is_empty(), "no group, no member");
+        }
+        self.evict.prev = Group { at, slots };
+        self.evict.cur.at = Some(t);
+        // The newest group's list keeps the members that left it: dropped
+        // once they outnumber the members.
+        if self.evict.cur.slots.len() > 2 * self.evict.cur_len + 64 {
+            self.compact_newest();
+        }
+        Advance::Moved
+    }
+
+    /// The newest group's list, its members only, each once.
+    fn compact_newest(&mut self) {
+        let mut slots = std::mem::take(&mut self.evict.cur.slots);
+        slots.retain(|&s| self.is_cur(s));
+        slots.sort_unstable();
+        slots.dedup();
+        self.evict.cur.slots = slots;
+    }
+
+    /// A step at a time earlier than the newest group's: every member of the
+    /// newest group takes its time, and until [`Arena::settle`] the groups
+    /// are kept as before the mark — the caller touches every resource the
+    /// step needs. Returns the work: the members written.
+    pub fn regress(&mut self) -> usize {
+        let at = self.evict.cur.at.unwrap_or(Micros::ZERO);
+        let slots = std::mem::take(&mut self.evict.cur.slots);
+        for &s in &slots {
+            if self.is_cur(s) {
+                self.order[s.i()].last_needed = at;
+            }
+        }
+        let n = slots.len();
+        self.evict.cur.slots = slots;
+        self.evict.cur_len = 0;
+        self.evict.explicit = true;
+        n
+    }
+
+    /// Ends a step [`Arena::regress`] began: the newest group's resources
+    /// marked members again. Returns them, for the caller to know whom the
+    /// next step may leave.
+    pub fn settle(&mut self, out: &mut Vec<Slot>) {
+        if !self.evict.explicit {
+            return;
+        }
+        let at = self.evict.cur.at;
+        let mut slots = std::mem::take(&mut self.evict.cur.slots);
+        slots.retain(|&s| {
+            self.has(s, LIVE) && self.grouped(s) && Some(self.order[s.i()].last_needed) == at
+        });
+        slots.sort_unstable();
+        slots.dedup();
+        for &s in &slots {
+            self.order[s.i()].last_needed = CUR;
+        }
+        self.evict.cur_len = slots.len();
+        out.extend_from_slice(&slots);
+        self.evict.cur.slots = slots;
+        self.evict.explicit = false;
     }
 
     /// Lists `s` in the group of `t`, which is one of the two.
@@ -601,7 +866,7 @@ impl Arena {
     pub fn evict_key(&self, s: Slot) -> EvictKey {
         let o = self.order[s.i()];
         (
-            o.last_needed,
+            self.last_needed(s),
             Reverse(o.level),
             Reverse(o.distance),
             self.id[s.i()],
@@ -621,15 +886,17 @@ impl Arena {
 
     /// The grouped slots, unordered, a slot possibly more than once.
     pub fn grouped_slots(&self) -> impl Iterator<Item = Slot> + '_ {
-        [&self.evict.cur, &self.evict.prev]
-            .into_iter()
-            .flat_map(move |g| {
-                g.slots.iter().copied().filter(move |&s| {
-                    self.has(s, LIVE)
-                        && self.grouped(s)
-                        && Some(self.order[s.i()].last_needed) == g.at
-                })
-            })
+        let e = &self.evict;
+        let newest = e.cur.slots.iter().copied().filter(move |&s| {
+            self.has(s, LIVE) && self.grouped(s) && {
+                let t = self.order[s.i()].last_needed;
+                t == CUR || (e.explicit && Some(t) == e.cur.at)
+            }
+        });
+        let older = e.prev.slots.iter().copied().filter(move |&s| {
+            self.has(s, LIVE) && self.grouped(s) && Some(self.order[s.i()].last_needed) == e.prev.at
+        });
+        newest.chain(older)
     }
 
     /// The copies `s` holds as the index files them; none in transit.
@@ -730,6 +997,15 @@ impl Arena {
         let mut listed: Vec<Slot> = self.grouped_slots().collect();
         listed.sort_unstable();
         listed.dedup();
+        // The newest group's members are counted, and listed.
+        let members = self.iter().filter(|&s| self.is_cur(s)).count();
+        if members != self.evict.cur_len
+            || self
+                .iter()
+                .any(|s| self.is_cur(s) && !self.evict.cur.slots.contains(&s))
+        {
+            return false;
+        }
         let mut idle = PerClass::splat(Bytes::ZERO);
         let mut want: PerClass<[Vec<(EvictKey, Slot)>; 3]> = PerClass::default();
         for s in self.iter() {
@@ -754,6 +1030,26 @@ impl Arena {
         idle == self.evict.idle
     }
 
+    /// The protected bytes and the GPU copies by epoch are those a scan
+    /// finds: checked by `audit` in debug builds.
+    pub fn sums_consistent(&self) -> bool {
+        let mut protected = PerClass::splat(Bytes::ZERO);
+        let mut epochs: BTreeMap<(Class, Option<LayerId>, u64), u32> = BTreeMap::new();
+        for s in self.iter() {
+            let c = self.class(s);
+            protected[c] = protected[c].plus(self.protection_bytes(s));
+            if let Some(g) = self.gpu(s) {
+                *epochs.entry(self.epoch_key(s, g.epoch)).or_insert(0) += 1;
+            }
+        }
+        let transits = self.iter().filter(|&s| self.has_transit(s)).map(|s| s.0);
+        let loads = self.iter().filter(|&s| self.loading(s)).map(|s| s.0);
+        protected == self.protected
+            && epochs == self.gpu_epochs
+            && transits.eq(self.transit.keys().copied())
+            && loads.eq(self.load.keys().copied())
+    }
+
     pub fn cold(&self, s: Slot) -> &Cold {
         &self.cold[s.i()]
     }
@@ -763,26 +1059,162 @@ impl Arena {
     }
 
     pub fn urgency(&self, s: Slot) -> Option<Urgency> {
-        self.urgency[s.i()]
+        self.ranks.get(&s.0).map(|r| r.0)
     }
 
     pub fn priority(&self, s: Slot) -> Option<Rank> {
-        self.priority[s.i()]
+        self.ranks.get(&s.0).map(|r| r.1)
     }
 
     /// This step's urgency and priority.
     pub fn set_rank(&mut self, s: Slot, urgency: Option<Urgency>, priority: Option<Rank>) {
-        self.urgency[s.i()] = urgency;
-        self.priority[s.i()] = priority;
+        match (urgency, priority) {
+            (Some(u), Some(p)) => {
+                self.ranks.insert(s.0, (u, p));
+            }
+            _ => {
+                self.ranks.remove(&s.0);
+            }
+        }
     }
 
-    fn has(&self, s: Slot, bit: u8) -> bool {
+    fn has(&self, s: Slot, bit: u16) -> bool {
         self.flags[s.i()] & bit != 0
     }
 
-    fn set(&mut self, s: Slot, bit: u8, on: bool) {
+    fn set(&mut self, s: Slot, bit: u16, on: bool) {
         let f = &mut self.flags[s.i()];
         *f = if on { *f | bit } else { *f & !bit };
+    }
+
+    /// Whether `s` carries `m`.
+    pub fn marked(&self, s: Slot, m: Mark) -> bool {
+        self.has(s, m.bit())
+    }
+
+    /// Puts `m` on `s`, or takes it off; the protected bytes follow.
+    pub fn mark(&mut self, s: Slot, m: Mark, on: bool) {
+        if self.has(s, m.bit()) == on {
+            return;
+        }
+        let before = self.protection_bytes(s);
+        self.set(s, m.bit(), on);
+        self.reprotect(s, before);
+    }
+
+    /// The bytes `s` adds to its class's protected bytes: its GPU and
+    /// in-transit bytes when it is protected — a member of the drawn, swap,
+    /// active or floor sets, and drawn, in a swap, in transit, or of the
+    /// floor with a copy on or bound for the GPU (`Budget::protection_of`).
+    fn protection_bytes(&self, s: Slot) -> Bytes {
+        let f = self.flags[s.i()];
+        if f & (DRAWN | SWAP | ACTIVE | FLOOR_SET) == 0 {
+            return Bytes::ZERO;
+        }
+        let floor = self.is_floor(s) && f & (GPU | TRANSIT) != 0;
+        if !floor && f & (DRAWN | SWAP | TRANSIT) == 0 {
+            return Bytes::ZERO;
+        }
+        let gpu = if f & GPU != 0 {
+            self.gpu[s.i()].bytes
+        } else {
+            Bytes::ZERO
+        };
+        let transit = if f & TRANSIT != 0 {
+            self.transit.get(&s.0).map_or(Bytes::ZERO, |t| t.cost.gpu)
+        } else {
+            Bytes::ZERO
+        };
+        gpu.plus(transit)
+    }
+
+    /// `s` changed: its protected bytes were `before`.
+    fn reprotect(&mut self, s: Slot, before: Bytes) {
+        let after = self.protection_bytes(s);
+        if after != before {
+            let c = self.class(s);
+            self.protected[c] = self.protected[c].minus(before).plus(after);
+        }
+    }
+
+    /// By class, the bytes of the protected resources.
+    pub fn protected(&self) -> PerClass<Bytes> {
+        self.protected
+    }
+
+    /// The resources with a copy in transit, in order.
+    pub fn transits(&self) -> impl Iterator<Item = ResourceId> + '_ {
+        self.transit.keys().map(|n| self.id[Slot(*n).i()])
+    }
+
+    /// How many resources have a copy in transit.
+    pub fn transits_len(&self) -> usize {
+        self.transit.len()
+    }
+
+    /// The resources whose copies, load or tier changed since the step
+    /// last took them, in order, with what changed (a resource may come
+    /// twice).
+    pub fn changes(&self) -> &[(ResourceId, u8)] {
+        &self.changed
+    }
+
+    /// The tier of the resource of `s` changed outside its copies: a store
+    /// missed it.
+    pub fn note_tier(&mut self, s: Slot) {
+        self.note(s, Change::TIER);
+    }
+
+    /// Forgets the changes up to `n`.
+    pub fn forget_changes(&mut self, n: usize) {
+        self.changed.drain(..n.min(self.changed.len()));
+    }
+
+    /// The slots emptied since the last call, sorted, each once, as many
+    /// as are still live and empty: the only ones a prune can free.
+    pub fn take_emptied(&mut self, out: &mut Vec<Slot>) {
+        out.clear();
+        out.extend(
+            self.emptied
+                .drain(..)
+                .filter(|&s| self.flags[s.i()] & LIVE != 0),
+        );
+        out.retain(|&s| self.is_empty(s));
+        out.sort_unstable();
+        out.dedup();
+    }
+
+    /// The GPU copies of a content key (class, and layer for drapes), by
+    /// epoch, with how many hold it.
+    pub fn gpu_epochs(&self) -> impl Iterator<Item = ((Class, Option<LayerId>, u64), u32)> + '_ {
+        self.gpu_epochs.iter().map(|(k, n)| (*k, *n))
+    }
+
+    /// The content key the GPU copy of `s` is counted under.
+    fn epoch_key(&self, s: Slot, epoch: u64) -> (Class, Option<LayerId>, u64) {
+        (self.class(s), self.id(s).layer(), epoch)
+    }
+
+    /// A GPU copy of epoch `epoch` came (`+1`) or went (`-1`).
+    fn count_epoch(&mut self, s: Slot, epoch: u64, came: bool) {
+        let k = self.epoch_key(s, epoch);
+        if came {
+            *self.gpu_epochs.entry(k).or_insert(0) += 1;
+        } else if let Some(n) = self.gpu_epochs.get_mut(&k) {
+            *n -= 1;
+            if *n == 0 {
+                self.gpu_epochs.remove(&k);
+            }
+        }
+    }
+
+    /// `what` changed of `s`: noted, and kept for the prune if it now holds
+    /// nothing.
+    fn note(&mut self, s: Slot, what: u8) {
+        self.changed.push((self.id[s.i()], what));
+        if self.is_empty(s) {
+            self.emptied.push(s);
+        }
     }
 
     pub fn has_gpu(&self, s: Slot) -> bool {
@@ -806,7 +1238,7 @@ impl Arena {
     }
 
     pub fn transit(&self, s: Slot) -> Option<Transit> {
-        self.has_transit(s).then(|| self.transit[s.i()])
+        self.transit.get(&s.0).copied()
     }
 
     pub fn cpu(&self, s: Slot) -> Option<CpuCopy> {
@@ -825,7 +1257,9 @@ impl Arena {
         if !self.loading(s) {
             return Load::Idle;
         }
-        let l = self.load[s.i()];
+        let Some(&l) = self.load.get(&s.0) else {
+            return Load::Idle;
+        };
         Load::Loading {
             gen: l.gen,
             source: if self.has(s, LOCAL) {
@@ -839,10 +1273,15 @@ impl Arena {
     }
 
     pub fn set_load(&mut self, s: Slot, load: Load) {
+        self.note(s, Change::LOAD);
         match load {
             Load::Idle => {
+                self.load.remove(&s.0);
                 self.set(s, LOADING, false);
                 self.set(s, LOCAL, false);
+                if self.is_empty(s) {
+                    self.emptied.push(s);
+                }
             }
             Load::Loading {
                 gen,
@@ -850,11 +1289,14 @@ impl Arena {
                 started,
                 epoch,
             } => {
-                self.load[s.i()] = LoadPayload {
-                    gen,
-                    started,
-                    epoch,
-                };
+                self.load.insert(
+                    s.0,
+                    LoadPayload {
+                        gen,
+                        started,
+                        epoch,
+                    },
+                );
                 self.set(s, LOADING, true);
                 self.set(s, LOCAL, source == Source::Local);
             }
@@ -874,6 +1316,7 @@ impl Arena {
     }
 
     pub fn put_cpu(&mut self, s: Slot, l: &mut Ledger, c: CpuCopy) {
+        self.note(s, Change::CPU);
         self.unfile(s);
         self.drop_cpu(s, l);
         l.decoded = l.decoded.plus(c.cost.gpu);
@@ -894,6 +1337,7 @@ impl Arena {
         self.unfile(s);
         let c = self.drop_cpu(s, l);
         self.file(s);
+        self.note(s, Change::CPU);
         c
     }
 
@@ -906,18 +1350,24 @@ impl Arena {
     }
 
     pub fn put_transit(&mut self, s: Slot, l: &mut Ledger, t: Transit) {
+        self.note(s, Change::LOAD);
+        let before = self.protection_bytes(s);
         self.unfile(s);
         self.drop_transit(s, l);
         let class = self.class(s);
         l.gpu[class] = l.gpu[class].plus(t.cost.gpu);
         l.in_transit = l.in_transit.plus(t.cost.staging);
-        self.transit[s.i()] = t;
+        self.transit.insert(s.0, t);
         self.set(s, TRANSIT, true);
+        self.reprotect(s, before);
     }
 
     pub fn take_transit(&mut self, s: Slot, l: &mut Ledger) -> Option<Transit> {
+        let before = self.protection_bytes(s);
         let t = self.drop_transit(s, l)?;
         self.file(s);
+        self.reprotect(s, before);
+        self.note(s, Change::LOAD);
         Some(t)
     }
 
@@ -927,14 +1377,20 @@ impl Arena {
         l.gpu[class] = l.gpu[class].minus(t.cost.gpu);
         l.in_transit = l.in_transit.minus(t.cost.staging);
         self.set(s, TRANSIT, false);
+        self.transit.remove(&s.0);
         Some(t)
     }
 
     pub fn put_gpu(&mut self, s: Slot, l: &mut Ledger, g: Gpu) {
+        self.note(s, Change::GPU);
+        let before = self.protection_bytes(s);
         self.unfile(s);
         let class = self.class(s);
         match self.gpu(s) {
-            Some(old) => l.gpu[class] = l.gpu[class].minus(old.bytes),
+            Some(old) => {
+                l.gpu[class] = l.gpu[class].minus(old.bytes);
+                self.count_epoch(s, old.epoch, false);
+            }
             None => {
                 if let r @ ResourceId::Drape { .. } = self.id(s) {
                     self.gpu_drapes.insert(r);
@@ -944,19 +1400,25 @@ impl Arena {
         l.gpu[class] = l.gpu[class].plus(g.bytes);
         self.gpu[s.i()] = g;
         self.set(s, GPU, true);
+        self.count_epoch(s, g.epoch, true);
         self.file(s);
+        self.reprotect(s, before);
     }
 
     pub fn take_gpu(&mut self, s: Slot, l: &mut Ledger) -> Option<Gpu> {
         let g = self.gpu(s)?;
+        let before = self.protection_bytes(s);
         self.unfile(s);
         let class = self.class(s);
         l.gpu[class] = l.gpu[class].minus(g.bytes);
         self.set(s, GPU, false);
+        self.count_epoch(s, g.epoch, false);
         if let r @ ResourceId::Drape { .. } = self.id(s) {
             self.gpu_drapes.remove(&r);
         }
         self.file(s);
+        self.reprotect(s, before);
+        self.note(s, Change::GPU);
         Some(g)
     }
 
@@ -1015,6 +1477,7 @@ mod tests {
     fn a_freed_slot_is_the_next_taken_and_starts_empty() {
         let mut a = Arena::default();
         let mut l = Ledger::default();
+        a.advance(Micros(5), &[]);
         let s0 = a.find_or_insert(mesh(1), Class::TerrainMesh, 3, Micros(5));
         let s1 = a.find_or_insert(mesh(2), Class::TerrainMesh, 4, Micros(5));
         assert_ne!(s0, s1);
@@ -1038,6 +1501,7 @@ mod tests {
         a.remove(s0);
         assert_eq!(a.find(mesh(1)), None);
         assert_eq!(a.len(), 1);
+        a.advance(Micros(8), &[s1]);
         let s2 = a.find_or_insert(mesh(3), Class::Drape, 7, Micros(8));
         assert_eq!(s2, s0, "the freed slot is reused");
         assert_eq!(a.id(s2), mesh(3));
@@ -1054,6 +1518,7 @@ mod tests {
     fn the_flags_carry_the_optional_fields() {
         let mut a = Arena::default();
         let mut l = Ledger::default();
+        a.advance(Micros(5), &[]);
         let s = a.find_or_insert(mesh(1), Class::TerrainMesh, 3, Micros(5));
         let load = Load::Loading {
             gen: Generation(4),
@@ -1107,6 +1572,7 @@ mod tests {
             epoch: 0,
         };
         let d = |lv| ResourceId::drape(TileId(1), crate::LayerId(0), lv);
+        a.advance(Micros(0), &[]);
         for lv in [5, 2, 9] {
             let s = a.find_or_insert(d(lv), Class::Drape, 1, Micros(0));
             a.put_gpu(s, &mut l, g);
@@ -1150,6 +1616,7 @@ mod tests {
             delivered_before: false,
         };
         // Four meshes needed at 10: one of the floor, one decoded too.
+        a.advance(Micros(10), &[]);
         let s: Vec<Slot> = (1..=4)
             .map(|n| {
                 a.find_or_insert(
@@ -1168,9 +1635,14 @@ mod tests {
         assert_eq!(a.idle(Class::TerrainMesh), Bytes::ZERO);
         // At 20 the view keeps mesh 4; at 30, nothing: the group of 10 is
         // filed then, mesh 4 still grouped (20 is one of the two times).
+        assert_eq!(a.advance(Micros(20), &s[..3]), Advance::Moved);
         a.touch(s[3], Micros(20));
         a.touch(s[3], Micros(20));
+        assert_eq!(a.advance(Micros(20), &[]), Advance::Same);
         assert!(filed(&a, Class::TerrainMesh, &Held::ALL).is_empty());
+        assert_eq!(a.last_needed(s[0]), Micros(10));
+        assert_eq!(a.last_needed(s[3]), Micros(20));
+        a.advance(Micros(30), &[s[3]]);
         let x = a.find_or_insert(mesh(9), Class::TerrainMesh, 5, Micros(30));
         assert!(a.grouped(x));
         assert_eq!(
@@ -1215,9 +1687,10 @@ mod tests {
     #[test]
     fn the_eviction_index_keeps_its_order_through_any_churn() {
         // Slots filed and unfiled in a scrambled order, against an ordered
-        // set of the same keys.
+        // set of the same keys: times that go back, played one by one.
         let mut a = Arena::new(None);
         let mut l = Ledger::default();
+        a.regress();
         let mut oracle = BTreeSet::new();
         let n = 300u64;
         let slots: Vec<Slot> = (0..n)

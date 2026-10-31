@@ -130,6 +130,8 @@ pub struct SimStore {
     pub held: BTreeSet<ResourceId>,
     /// Claimed but not held.
     pub lies: BTreeSet<ResourceId>,
+    /// Bumped by every change to `held` or `lies`: the index's generation.
+    pub generation: u64,
 }
 
 impl PresenceOracle for SimStore {
@@ -139,6 +141,10 @@ impl PresenceOracle for SimStore {
         } else {
             Presence::Absent
         }
+    }
+
+    fn generation(&self) -> Option<u64> {
+        Some(self.generation)
     }
 }
 
@@ -193,8 +199,8 @@ impl SimNet {
         let (done_at, outcome) = match s.source {
             Source::Local => {
                 let lie = !self.store.held.contains(&s.resource);
-                if lie {
-                    self.store.lies.remove(&s.resource);
+                if lie && self.store.lies.remove(&s.resource) {
+                    self.store.generation += 1;
                 }
                 let at = now.plus(Micros((self.profile.local_ms * 1_000.0) as u64));
                 (Some(at), if lie { Outcome::Miss } else { Outcome::Ok })
@@ -259,8 +265,8 @@ impl SimNet {
                         self.latencies
                             .push((at, at.since(f.started).0 as f64 / 1_000.0));
                     }
-                    if self.store_fills {
-                        self.store.held.insert(r);
+                    if self.store_fills && self.store.held.insert(r) {
+                        self.store.generation += 1;
                     }
                     out.push(Arrival::Loaded(r, f.gen, cost(r)));
                 }
