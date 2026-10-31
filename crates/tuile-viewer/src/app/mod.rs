@@ -645,11 +645,15 @@ impl App {
             .into_iter()
             .map(|surface| crate::surface::Layer::new(surface, origin))
             .collect();
-        self.note_the_tilesets_up();
+        self.note_the_tilesets_up(&failures);
         if !failures.is_empty() {
             self.messages.say(
                 format!("{}: a 3D Tiles tileset is not shown", self.title),
-                failures.join("\n"),
+                failures
+                    .iter()
+                    .map(|(_, why)| why.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
             );
         }
         if let (Some(active), Some(meter)) = (self.active.as_mut(), started.meter()) {

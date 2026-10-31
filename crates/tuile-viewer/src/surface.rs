@@ -20,17 +20,25 @@
 
 use std::sync::Arc;
 
-use tuile_core::protocol::InProcessStream;
 use tuile_planetary::Credit;
 use tuile_wgpu::ContentPump;
+
+/// The stream to a tileset's geometry server: in this process on a desktop
+/// and a phone; in the page's worker, over a channel of its own, in a
+/// browser.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type SurfaceStream = tuile_core::protocol::InProcessStream;
+#[cfg(target_arch = "wasm32")]
+pub(crate) type SurfaceStream = crate::web::TilesetStream;
 
 /// A tileset that is up: its stream and what must be shown with it.
 pub(crate) struct Surface {
     /// The asset number it was asked for by.
     pub asset: i64,
-    pub stream: InProcessStream,
-    /// Its server's budget signals, which its pump records frames into.
-    pub meter: tuile_core::runtime::SharedMeter,
+    pub stream: SurfaceStream,
+    /// Its server's budget signals, which its pump records frames into:
+    /// none in a page, whose server's meter is in the worker.
+    pub meter: Option<tuile_core::runtime::SharedMeter>,
     /// What the host says must be credited while it is drawn.
     pub credits: Vec<Credit>,
 }
@@ -53,7 +61,9 @@ pub(crate) struct Layer {
 impl Layer {
     pub(crate) fn new(surface: Surface, render_origin: glam::DVec3) -> Self {
         let mut pump = ContentPump::new(render_origin);
-        pump.observe(Arc::clone(&surface.meter));
+        if let Some(meter) = &surface.meter {
+            pump.observe(Arc::clone(meter));
+        }
         Self {
             surface,
             pump,
@@ -73,8 +83,6 @@ impl Layer {
 /// first's single pixel loads many times the tiles the screen can show,
 /// fills the class's share of the budget well before the view is complete,
 /// and leaves the rest of the view coarse.
-// The native session's: a page opens no tileset yet.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn traversal(globe: &tuile_core::traversal::Config) -> tuile_core::traversal::Config {
     tuile_core::traversal::Config {
         cull: globe.cull,
@@ -91,8 +99,6 @@ pub(crate) fn traversal(globe: &tuile_core::traversal::Config) -> tuile_core::tr
 /// device): a photographic mesh of a city fills that before the view is
 /// complete. It is the ground here, so it gets the ground mesh's limits and
 /// its loads in flight.
-// The native session's: a page opens no tileset yet.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn budget(globe: &tuile_core::budget::BudgetConfig) -> tuile_core::budget::BudgetConfig {
     use tuile_core::budget::Class;
     let mut b = globe.clone();

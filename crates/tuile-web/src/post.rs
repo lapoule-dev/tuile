@@ -16,6 +16,11 @@
 //! handler, so a host can speak to its worker beside the stream without a
 //! second channel.
 //!
+//! A second stream between the same page and worker — a 3D Tiles tileset's
+//! geometry server beside the globe's — goes over a `MessageChannel` port
+//! of its own ([`WorkerStream::over`], [`serve_over`]): one port, one
+//! stream, nothing to tell apart.
+//!
 //! The page drains the stream with a poll from its frame loop, exactly as a
 //! desktop drains the in-process binding: a worker mid-decode cannot stall a
 //! frame, and a frame that skips cannot lose a message.
@@ -25,7 +30,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use futures_channel::mpsc;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use tuile_core::protocol::{
     ClientMessage, GeometryStream, InProcessStream, ServerMessage, StreamError,
 };
@@ -34,12 +39,13 @@ use wasm_bindgen::{JsCast, JsValue};
 
 use crate::wire;
 
-/// One end of a worker's message channel: the page's handle on the worker, or
-/// the worker's own global scope.
+/// One end of a worker's message channel: the page's handle on the worker,
+/// the worker's own global scope, or a port of a channel of their own.
 #[derive(Clone)]
 enum Port {
     Worker(web_sys::Worker),
     Scope(web_sys::DedicatedWorkerGlobalScope),
+    Channel(web_sys::MessagePort),
 }
 
 impl Port {
@@ -50,6 +56,7 @@ impl Port {
         let posted = match self {
             Port::Worker(w) => w.post_message_with_transfer(&buffer, &transfer),
             Port::Scope(s) => s.post_message_with_transfer(&buffer, &transfer),
+            Port::Channel(p) => p.post_message_with_transferable(&buffer, &transfer),
         };
         if let Err(e) = posted {
             tracing::error!("a protocol message could not be posted: {e:?}");
@@ -60,6 +67,8 @@ impl Port {
         match self {
             Port::Worker(w) => w.set_onmessage(handler),
             Port::Scope(s) => s.set_onmessage(handler),
+            // Setting the handler starts the port's queue, too.
+            Port::Channel(p) => p.set_onmessage(handler),
         }
     }
 }
@@ -72,11 +81,17 @@ impl Port {
 pub struct Connection {
     port: Port,
     _handler: Closure<dyn FnMut(web_sys::MessageEvent)>,
+    /// Dropped with the connection: a served stream's task hears it and
+    /// lets go of the stream, which ends its server.
+    _stop: Option<futures_channel::oneshot::Sender<()>>,
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
         self.port.listen(None);
+        if let Port::Channel(port) = &self.port {
+            port.close();
+        }
     }
 }
 
@@ -98,6 +113,7 @@ fn connect(
     Connection {
         port,
         _handler: handler,
+        _stop: None,
     }
 }
 
@@ -120,7 +136,18 @@ impl WorkerStream {
         worker: &web_sys::Worker,
         host: impl FnMut(JsValue) + 'static,
     ) -> (Self, Connection) {
-        let port = Port::Worker(worker.clone());
+        Self::on(Port::Worker(worker.clone()), host)
+    }
+
+    /// Connects over `port`, one end of a channel whose other end the
+    /// worker serves a stream on ([`serve_over`]).
+    pub fn over(port: web_sys::MessagePort) -> (Self, Connection) {
+        Self::on(Port::Channel(port), |_| {
+            tracing::warn!("a stream's own port carried something not the protocol's")
+        })
+    }
+
+    fn on(port: Port, host: impl FnMut(JsValue) + 'static) -> (Self, Connection) {
         let (to_page, inbox) = mpsc::unbounded();
         let connection = connect(
             port.clone(),
@@ -182,7 +209,30 @@ impl GeometryStream for WorkerStream {
 /// `host`. Runs until the server closes the stream.
 pub fn serve(stream: InProcessStream, host: impl FnMut(JsValue) + 'static) -> Connection {
     let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
-    let port = Port::Scope(scope);
+    serve_on(stream, Port::Scope(scope), host, None)
+}
+
+/// Serves `stream` over `port`, one end of a channel whose other end the page
+/// holds ([`WorkerStream::over`]). Dropping the returned [`Connection`]
+/// closes the port and lets go of the stream, which ends its server.
+pub fn serve_over(stream: InProcessStream, port: web_sys::MessagePort) -> Connection {
+    let (stop, stopped) = futures_channel::oneshot::channel();
+    let mut connection = serve_on(
+        stream,
+        Port::Channel(port),
+        |_| tracing::warn!("a stream's own port carried something not the protocol's"),
+        Some(stopped),
+    );
+    connection._stop = Some(stop);
+    connection
+}
+
+fn serve_on(
+    stream: InProcessStream,
+    port: Port,
+    host: impl FnMut(JsValue) + 'static,
+    mut stopped: Option<futures_channel::oneshot::Receiver<()>>,
+) -> Connection {
     // Shared between the handler that sends and the task that receives. Each
     // borrow lasts one call: the task borrows only inside a poll, never across
     // an await, so the handler always finds the stream free.
@@ -212,8 +262,17 @@ pub fn serve(stream: InProcessStream, host: impl FnMut(JsValue) + 'static) -> Co
         host,
     );
     wasm_bindgen_futures::spawn_local(async move {
-        while let Some(message) =
-            futures_util::future::poll_fn(|cx| stream.borrow_mut().poll_message(cx)).await
+        while let Some(message) = futures_util::future::poll_fn(|cx| {
+            // Its connection dropped: the stream is let go of here, and its
+            // server ends.
+            if let Some(stop) = stopped.as_mut() {
+                if stop.poll_unpin(cx).is_ready() {
+                    return Poll::Ready(None);
+                }
+            }
+            stream.borrow_mut().poll_message(cx)
+        })
+        .await
         {
             // What the server has sent by now goes in one post.
             let mut batch = vec![wire::encode_server(&message)];

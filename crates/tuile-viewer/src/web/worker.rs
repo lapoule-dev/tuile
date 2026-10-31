@@ -15,6 +15,11 @@
 //! bytes, the memory and thermal signals; what the page asks beside it
 //! arrives as [`ToWorker`] and is done to the loader's own handles, and the
 //! budget's signals go back as [`ToPage::Signals`] for the page's overlay.
+//!
+//! A host's 3D Tiles tileset, switched on, is a geometry server of its own
+//! here too, beside the globe's, as a desktop runs one beside its own: the
+//! page asks for it with a `MessageChannel` port ([`ToWorker::OpenTileset`]),
+//! and its stream is served on that port ([`tuile_web::post::serve_over`]).
 
 use std::sync::Arc;
 
@@ -22,7 +27,11 @@ use tuile_core::source::TileLoader;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use super::control::{Glance, ToPage, ToWorker};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use super::control::{CreditWire, Glance, ToPage, ToWorker};
 use super::options::{ProfileChoice, SourcesSpec};
 use super::sources::PageSources;
 use crate::gate::{Gate, Gated};
@@ -89,7 +98,7 @@ async fn start(
     let (terrain, layers) = spec.choices()?;
     let sources = Arc::new(PageSources::new(spec)?);
     let globe = crate::globe::assemble(
-        sources,
+        Arc::clone(&sources) as Arc<dyn tuile_planetary::Sources>,
         None,
         &terrain,
         &layers,
@@ -138,6 +147,11 @@ async fn start(
         layers: globe.layers,
         choices: layers,
         gate,
+        sources,
+        traversal: crate::surface::traversal(&profile.traversal()),
+        tileset_budget: crate::surface::budget(&profile.budget()),
+        tilesets: Rc::default(),
+        asked: Rc::default(),
     };
     let connection = tuile_web::post::serve(stream, move |value| handles.heard(value));
     // The worker is the session: the connection lasts as long as it does.
@@ -246,11 +260,39 @@ struct Handles {
     layers: Layers,
     choices: Vec<crate::embed::ImageryChoice>,
     gate: Gate,
+    /// What a tileset is opened with: the page's sources, and how it is
+    /// traversed and budgeted (`crate::surface`).
+    sources: Arc<PageSources>,
+    traversal: tuile_core::traversal::Config,
+    tileset_budget: tuile_core::budget::BudgetConfig,
+    /// The tilesets served, by asset: dropping one's connection lets go of
+    /// its stream, and its server ends.
+    tilesets: Rc<RefCell<HashMap<i64, tuile_web::post::Connection>>>,
+    /// Each tileset's latest request, counted: an opening that a close or a
+    /// later opening has overtaken is let go of when it lands.
+    asked: Rc<RefCell<HashMap<i64, u64>>>,
 }
 
 impl Handles {
     fn heard(&self, value: JsValue) {
+        // The port a tileset is to be served on travels beside the message.
+        let port = js_sys::Reflect::get(&value, &JsValue::from_str("port"))
+            .ok()
+            .and_then(|p| p.dyn_into::<web_sys::MessagePort>().ok());
         match serde_wasm_bindgen::from_value::<ToWorker>(value) {
+            Ok(ToWorker::OpenTileset { asset }) => match port {
+                Some(port) => self.open_tileset(asset, port),
+                None => post(&ToPage::TilesetFailed {
+                    asset,
+                    reason: "no port to serve it on".to_owned(),
+                }),
+            },
+            Ok(ToWorker::CloseTileset { asset }) => {
+                *self.asked.borrow_mut().entry(asset).or_default() += 1;
+                if self.tilesets.borrow_mut().remove(&asset).is_some() {
+                    tracing::info!(asset, "3D Tiles tileset closed");
+                }
+            }
             Ok(ToWorker::Slots { reported }) => self.budget.set_from_device(reported),
             Ok(ToWorker::Pause { paused: true }) => self.gate.shut(),
             Ok(ToWorker::Pause { paused: false }) => self.gate.open(),
@@ -271,6 +313,68 @@ impl Handles {
             Ok(ToWorker::Start { .. }) => tracing::warn!("a second start was ignored"),
             Err(e) => tracing::error!("the page said something unreadable: {e}"),
         }
+    }
+}
+
+impl Handles {
+    /// Opens the tileset `asset` as a desktop does — its root, then a server
+    /// of its own on this worker's loop — and serves it on `port`.
+    fn open_tileset(&self, asset: i64, port: web_sys::MessagePort) {
+        let sources = Arc::clone(&self.sources);
+        let (traversal, budget) = (self.traversal.clone(), self.tileset_budget.clone());
+        let tilesets = Rc::clone(&self.tilesets);
+        let asked = Rc::clone(&self.asked);
+        let request = {
+            let mut asked = asked.borrow_mut();
+            let n = asked.entry(asset).or_default();
+            *n += 1;
+            *n
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            let opened = async {
+                use tuile_planetary::Sources as _;
+                let source = sources.tileset(asset).await?;
+                let root = source
+                    .fetcher
+                    .fetch(&source.url)
+                    .await
+                    .map_err(|e| format!("its root: {e}"))?;
+                let tileset = tuile_core::tileset::Tileset::from_json_bytes(&root, &source.url)
+                    .map_err(|e| format!("its root: {e}"))?;
+                let fetcher = Arc::new(tuile_planetary::Held(Arc::clone(&source.fetcher)));
+                let (stream, server) =
+                    tuile_core::runtime::in_process(tileset, fetcher, traversal, budget)
+                        .map_err(|e| format!("the graphics budget cannot run: {e}"))?;
+                let server = server
+                    .with_breather(BURST, Arc::new(breathe))
+                    .with_clock(clock());
+                wasm_bindgen_futures::spawn_local(async move {
+                    server.run().await;
+                    tracing::info!(asset, "a tileset's geometry server has stopped");
+                });
+                Ok::<_, String>((stream, source.credits))
+            }
+            .await;
+            if asked.borrow().get(&asset) != Some(&request) {
+                tracing::info!(asset, "a tileset opened after it was closed; let go");
+                return;
+            }
+            match opened {
+                Ok((stream, credits)) => {
+                    let connection = tuile_web::post::serve_over(stream, port);
+                    tilesets.borrow_mut().insert(asset, connection);
+                    tracing::info!(asset, "3D Tiles tileset up");
+                    post(&ToPage::TilesetOpened {
+                        asset,
+                        credits: credits.iter().map(CreditWire::of).collect(),
+                    });
+                }
+                Err(reason) => {
+                    tracing::error!(asset, "3D Tiles tileset not opened: {reason}");
+                    post(&ToPage::TilesetFailed { asset, reason });
+                }
+            }
+        });
     }
 }
 
