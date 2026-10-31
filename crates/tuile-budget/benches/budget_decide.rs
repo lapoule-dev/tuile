@@ -16,7 +16,9 @@
 //! - `diff/still`, `diff/motion`: the host's side of a delta step, the
 //!   `NeedDelta::diff` the runtime (`tuile-core`'s `runtime.rs`) computes
 //!   from the need it kept and the new one before each `decide`: on the
-//!   still view, the same need again; on the tour, consecutive needs. The
+//!   still view, the same need again; on the tour, consecutive needs (for
+//!   criterion, a fixed stretch of the tour, 10–70 s, recorded once, so
+//!   that every build diffs the same pairs). The
 //!   percentiles also report `decide + diff` per step, what a delta step
 //!   costs the host in all, to compare with `decide` told the whole need.
 //!
@@ -223,6 +225,24 @@ fn tour_sim(pressed: bool) -> Sim {
     sim
 }
 
+/// The tour's consecutive needs from `from` to `to`, in pairs.
+fn tour_needs(from: Micros, to: Micros) -> Vec<(NeedSet, NeedSet)> {
+    let mut sim = tour_sim(false);
+    let mut last: Option<NeedSet> = None;
+    let mut pairs = Vec::new();
+    while sim.now < to {
+        let t = sim.now.0 as f64 / 1e6;
+        let need = sim.step(camera(false, t)).0;
+        if sim.now > from {
+            if let Some(l) = last.take() {
+                pairs.push((l, need.clone()));
+            }
+        }
+        last = Some(need);
+    }
+    pairs
+}
+
 fn bench(c: &mut Criterion) {
     report();
     let mut g = c.benchmark_group("decide");
@@ -258,17 +278,19 @@ fn bench(c: &mut Criterion) {
         });
     }
     {
-        let mut sim = tour_sim(false);
+        // A fixed stretch of the tour, its consecutive needs recorded once:
+        // every build diffs the same pairs, however many iterations its
+        // own speed lets criterion run (stepping one simulation on, a
+        // faster build reached later, costlier parts of the tour).
+        let pairs = tour_needs(Micros::from_secs(10), Micros::from_secs(70));
+        let mut delta = NeedDelta::new();
+        let mut i = 0usize;
         g.bench_function("motion", |b| {
-            b.iter_custom(|iters| {
-                let mut total = Duration::ZERO;
-                for _ in 0..iters {
-                    let t = sim.now.0 as f64 / 1e6;
-                    sim.step(camera(false, t));
-                    let us = sim.diff_us.last().map_or(0.0, |(_, d, _)| *d);
-                    total += Duration::from_secs_f64(us / 1e6);
-                }
-                total
+            b.iter(|| {
+                let (last, need) = &pairs[i % pairs.len()];
+                i += 1;
+                delta.diff(last, need);
+                black_box(&delta);
             })
         });
     }
