@@ -756,36 +756,47 @@ struct Flight {
 /// The loader's presence index, as the budget's oracle, with every answer
 /// noted for the step's record.
 ///
-/// Answers are kept for [`PRESENCE_FOR`]: the budget asks of every drape it
-/// weighs, at every level it weighs it, at every step, and a loader answers
+/// Answers are kept for a window of [`PRESENCE_FOR`]: the budget asks of
+/// every drape it weighs, at every level it weighs it, and a loader answers
 /// a drape by working out every imagery tile it would stack — in a browser's
 /// worker, two thirds of the thread near the ground, the loads' own replies
 /// waiting seconds behind it. A store's index changes by what is fetched
 /// into it, which a load answers anyway; an answer a second old misplaces a
 /// read between the store and the network at worst, never a tile.
+///
+/// The answers change only when the window does: the clock enters the next
+/// [`PRESENCE_FOR`], or the loader's epoch moves on (its content, and so
+/// what its stores hold, changed). Then every answer is dropped and the
+/// oracle's [`generation`](PresenceOracle::generation) moves on with them;
+/// within a window it is the same, and the budget does not read again the
+/// levels it chose by asking (O1.4).
 struct Presences<'a> {
     loader: &'a dyn TileLoader,
     asked: std::cell::RefCell<Vec<(ResourceId, Presence)>>,
-    kept: &'a std::cell::RefCell<HashMap<ResourceId, (Presence, Micros)>>,
-    now: Micros,
+    kept: &'a std::cell::RefCell<HashMap<ResourceId, Presence>>,
+    generation: u64,
 }
 
-/// How long the loader's answer about one resource is kept.
+/// The window the loader's answers are kept for.
 const PRESENCE_FOR: Micros = Micros::from_millis(1_000);
 
 impl PresenceOracle for Presences<'_> {
     fn holds(&self, r: ResourceId) -> Presence {
         let kept = self.kept.borrow().get(&r).copied();
         let p = match kept {
-            Some((p, at)) if self.now.since(at) < PRESENCE_FOR => p,
-            _ => {
+            Some(p) => p,
+            None => {
                 let p = self.loader.holds(r);
-                self.kept.borrow_mut().insert(r, (p, self.now));
+                self.kept.borrow_mut().insert(r, p);
                 p
             }
         };
         self.asked.borrow_mut().push((r, p));
         p
+    }
+
+    fn generation(&self) -> Option<u64> {
+        Some(self.generation)
     }
 }
 
@@ -799,8 +810,12 @@ struct State {
     /// Where each of them stands in the budget's order, as of the last step:
     /// for a pool that orders the work they wait on.
     ranks: crate::offload::LoadRanks,
-    /// The loader's recent answers about presence (see [`Presences`]).
-    presence: std::cell::RefCell<HashMap<ResourceId, (Presence, Micros)>>,
+    /// The loader's answers about presence in the current window, the
+    /// window (its number and the loader's epoch), and the answers'
+    /// generation (see [`Presences`]).
+    presence: std::cell::RefCell<HashMap<ResourceId, Presence>>,
+    presence_window: Option<(u64, u64)>,
+    presence_generation: u64,
     /// The decoded copies the budget counts (its decoded tier): delivered
     /// from here, again after an eviction, until the budget releases them.
     decoded: BTreeMap<ResourceId, (Generation, ResourceContent)>,
@@ -869,6 +884,8 @@ impl State {
             in_flight: BTreeMap::new(),
             ranks: crate::offload::LoadRanks::default(),
             presence: std::cell::RefCell::default(),
+            presence_window: None,
+            presence_generation: 0,
             decoded: BTreeMap::new(),
             steepest: HashMap::new(),
             events: Vec::new(),
@@ -1407,18 +1424,20 @@ impl State {
             camera_moved = camera_moved,
         );
         let need = self.need(host);
-        // Taken for the decision and put back after it. Bounded: what has
-        // gone stale goes once the map has grown.
-        let kept = std::cell::RefCell::new(std::mem::take(self.presence.get_mut()));
-        if kept.borrow().len() > 16_384 {
-            kept.borrow_mut()
-                .retain(|_, (_, at)| now.since(*at) < PRESENCE_FOR);
+        // A new window drops every answer, and their generation moves on.
+        let window = (now.0 / PRESENCE_FOR.0, host.loader.epoch());
+        if self.presence_window != Some(window) {
+            self.presence_window = Some(window);
+            self.presence_generation = self.presence_generation.wrapping_add(1);
+            self.presence.get_mut().clear();
         }
+        // Taken for the decision and put back after it.
+        let kept = std::cell::RefCell::new(std::mem::take(self.presence.get_mut()));
         let presence = Presences {
             loader: host.loader.as_ref(),
             asked: std::cell::RefCell::new(Vec::new()),
             kept: &kept,
-            now,
+            generation: self.presence_generation,
         };
         // The first step reads the whole need; every later one what changed
         // since the one before, which the budget kept.
@@ -2717,6 +2736,151 @@ mod tests {
                 item.mesh
             );
         }
+    }
+
+    /// **A still view reads its drape levels again only when the store's
+    /// answers may have changed** (O1.4, `PresenceOracle::generation`). The
+    /// drapes never arrive, so every drawn tile's level is chosen by asking
+    /// the loader's presence index, every step. Within one window of
+    /// [`PRESENCE_FOR`] the answers cannot change: a still step reads no
+    /// level. The clock enters the next window, the store now holding a
+    /// drape: the levels are read again, the loader asked again, and the
+    /// new answer used.
+    #[test]
+    fn a_still_view_reads_its_levels_again_only_when_the_store_may_have_changed() {
+        struct Stalled {
+            draped: Draped,
+            stored: Arc<Mutex<HashSet<ResourceId>>>,
+            asked: Arc<Mutex<HashMap<ResourceId, u32>>>,
+        }
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        impl TileLoader for Stalled {
+            async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
+                self.draped.load(id).await
+            }
+            fn drapes(&self, id: TileId) -> Option<DrapeReach> {
+                self.draped.drapes(id)
+            }
+            async fn load_drape(
+                &self,
+                _id: TileId,
+                _layer: LayerId,
+                _level: u32,
+            ) -> Result<DrapeContent, LoadError> {
+                futures_util::future::pending().await
+            }
+            fn holds(&self, r: ResourceId) -> crate::budget::Presence {
+                *self.asked.lock().expect("asked").entry(r).or_default() += 1;
+                if self.stored.lock().expect("stored").contains(&r) {
+                    crate::budget::Presence::Stored
+                } else {
+                    crate::budget::Presence::Absent
+                }
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tileset = deep_tileset(dir.path());
+        let arena = Arc::new(RwLock::new(tileset));
+        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
+        let stored = Arc::new(Mutex::new(HashSet::new()));
+        let asked = Arc::new(Mutex::new(HashMap::new()));
+        let loader = Stalled {
+            draped: Draped {
+                inner: TilesetLoader::new(Arc::clone(&arena), Arc::new(FsFetcher)),
+                arena,
+                epoch: Arc::new(AtomicU64::new(1)),
+                meshes: Arc::new(AtomicUsize::new(0)),
+                drapes: Arc::new(Mutex::new(Vec::new())),
+            },
+            stored: Arc::clone(&stored),
+            asked: Arc::clone(&asked),
+        };
+        let (mut stream, server) =
+            in_process_with(tree, Arc::new(loader), Config::default(), roomy()).expect("budget");
+        let clock = Arc::new(AtomicU64::new(1));
+        let at = Arc::clone(&clock);
+        let server = server.with_clock(Arc::new(move || Micros(at.load(Ordering::SeqCst))));
+        let meter = server.meter();
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        let mut generation = 1;
+        // One still step, prompted by the same view told again; its work.
+        let mut still = |stream: &mut InProcessStream, server: &mut Pin<Box<_>>| {
+            generation += 1;
+            look(stream, near_view(), generation);
+            assert!(settle(server, stream, &mut consumer));
+            meter.lock().expect("meter").signals().decide_work
+        };
+        // Still steps at 60 a second, three windows: each step's work, and
+        // whether it is the first of a window.
+        const DT: u64 = 16_667;
+        let mut steps = Vec::new();
+        let mut asked_by_window = Vec::new();
+        for i in 0..190u64 {
+            let t = 1 + PRESENCE_FOR.0 / 2 + i * DT;
+            let before = clock.swap(t, Ordering::SeqCst);
+            let first = t / PRESENCE_FOR.0 != before / PRESENCE_FOR.0;
+            if first {
+                asked_by_window.push(asked.lock().expect("asked").clone());
+            }
+            if i == 100 {
+                // The store fills mid-window: every drape asked of it so far.
+                let all: Vec<ResourceId> = asked.lock().expect("asked").keys().copied().collect();
+                stored.lock().expect("stored").extend(all);
+            }
+            steps.push((still(&mut stream, &mut server), first));
+        }
+        assert!(asked_by_window.len() >= 3, "three windows");
+        assert!(!asked_by_window[1].is_empty(), "no level asked the store");
+        // By window, from the first whole one (the steps before it settle
+        // what was in flight): the still steps' work is the least, but for
+        // the prune's (every eighth, with work of its own); the window's
+        // first step reads the levels again, and does more.
+        let starts: Vec<usize> = (0..steps.len()).filter(|&i| steps[i].1).collect();
+        let mut pruned = None;
+        for w in starts
+            .windows(2)
+            .map(|w| (w[0], w[1]))
+            .chain([(starts[starts.len() - 1], steps.len())])
+        {
+            let (from, to) = w;
+            let steady = steps[from + 1..to].iter().map(|s| s.0).min().unwrap_or(0);
+            let p = *pruned.get_or_insert_with(|| {
+                (from + 1..to).find(|&i| steps[i].0 > steady).unwrap_or(0) % 8
+            });
+            for (i, &(work, _)) in steps.iter().enumerate().take(to).skip(from + 1) {
+                if i % 8 != p {
+                    assert_eq!(work, steady, "step {i}: a still step read its levels again");
+                }
+            }
+            if from % 8 != p {
+                assert!(
+                    steps[from].0 > steady,
+                    "step {from}: the levels were not read again in a new window ({} against {steady})",
+                    steps[from].0
+                );
+            }
+        }
+        // The loader is asked once a window at most, and again in the
+        // window after the store filled.
+        asked_by_window.push(asked.lock().expect("asked").clone());
+        for w in asked_by_window.windows(2) {
+            for (r, n) in &w[1] {
+                let m = w[0].get(r).copied().unwrap_or(0);
+                assert!(*n <= m + 1, "{r:?} asked {} times within a window", n - m);
+            }
+        }
+        let (filled, after) = (
+            &asked_by_window[asked_by_window.len() - 2],
+            &asked_by_window[asked_by_window.len() - 1],
+        );
+        assert!(
+            filled.iter().any(|(r, n)| after.get(r) > Some(n)),
+            "the loader was not asked again in a new window"
+        );
     }
 
     /// **A change of imagery redrapes without reloading a mesh, and without
