@@ -25,6 +25,157 @@ PRs — numbered B1–B8 in that plan, unrelated to section B below — fixes it
 signals, and a measured acceptance (imagery peak ≤ 15.5 MB, BC7 settle ≤ 6.0 s, Off goldens unchanged). It comes
 before A2 and A4.
 
+### O1 — the budget's algorithms, before CB (status: O1.3 need deltas, 2026-10-31)
+
+The budget is its own crate, `tuile-budget` (#163). O1 optimises its `decide` before the compression budget,
+decisions bit-identical throughout. The guard comes first (O1.0): today's engine frozen at 3d1a028e in
+`crates/tuile-budget/tests/reference/` (engine, state, sorted and the `Budget` methods, a mechanical copy) and
+driven step by step beside the real one (`Lockstep`) in every `budget_sim` run and in the properties' random
+scripts — `Decisions` (digest and content; statistics but the `work` counter), ledger, audit, residency and
+resource views compared every step. O1.1–O1.5 change the real engine and keep the lockstep green.
+
+The baseline on an Apple M2 (16 GB), `cargo bench -p tuile-budget --bench budget_decide` and the release
+`budget_sim` ratchets:
+
+| Measure | Value |
+|---|---|
+| `decide` still view (484 drawn) | mean 1 098 µs, p50 1 086 µs, p99 1 188 µs |
+| `decide` motion (soak tour, ≤ 1 022 drawn) | mean 902 µs, p50 797 µs, p99 2 174 µs |
+| `decide` pressure (desktop on 384 MiB, LOD relaxation capped, the tour's orbit looped; ≤ 293 drawn) | mean 911 µs, p50 879 µs, p99 1 650 µs |
+| allocations per step, still (internal / output) | 13 / 649 |
+| allocations per step, motion p99 (internal) | 43 |
+| allocations per step, pressure p50 / p99 (internal) | 21 / 76 |
+| step buffers after the tour | 381 056 B |
+| bytes per tracked resource | 534 (2 927 tracked) |
+
+The pressure scenario (`soak::pressure_profile`) is over its target on 2 879 of 3 000 steps and evicts on 551:
+the eviction order is built and sorted nearly every step, for a view a third the size of the motion one at the
+same cost. P6.4 (`decide_work_grows_with_changes_not_with_the_view`) is written and ignored: on a converged
+still view, with nothing changing, W_k is about 3 550 (up to 4 646) against a bound of 256 — `work` is
+O(need + tracked) until the incremental decide (O1.4).
+
+**O1.1 — dense arena** (`perf/budget-o1-arena`). `entries: BTreeMap<ResourceId, Entry>` is gone: each tracked
+resource has a `u32` slot in `state::Arena`, found through a fixed-seed hash index (hashbrown's `HashTable` of
+slots, foldhash's `FixedState`) that is only probed, never iterated; freed slots are reused last-freed-first. The
+state is columns by slot: id, class, a flags byte (live, decoded, delivered, in transit, on the GPU, loading,
+local), the eviction key (last needed, level, distance), each copy's payload without its `Option`, the step's
+rank, and the cold rest. 211 B a slot (`SLOT_BYTES`, was `ENTRY_BYTES` 240 plus a 16 B key in a map node). The
+full scans (eviction order, decoded release, pooled sweep, `release_beyond`, prune, audit) walk the slots and
+sort by their total keys as before; the one range query (a tile's drawable drapes of a layer, by level) reads an
+ordered index of the GPU drapes kept by `put_gpu`/`take_gpu`. The eviction orders carry their slots, so a step's
+evictions look nothing up. Lockstep with the frozen reference green (budget_sim release, properties at 2 048
+cases), goldens untouched; a broken drape index is caught at step 8 by every lockstep run.
+
+| Measure | O1.0 | O1.1 |
+|---|---|---|
+| `decide` still (484 drawn) | mean 1 098 µs, p50 1 086, p99 1 199 | mean 818 µs, p50 808, p99 889 (−26 %) |
+| `decide` motion | mean 900 µs, p50 796, p99 2 176 | mean 696 µs, p50 609, p99 1 729 (−23 %) |
+| `decide` pressure | mean 908 µs, p50 877, p99 1 637 | mean 652 µs, p50 637, p99 1 124 (−29 %) |
+| allocations per step, still (internal / output) | 13 / 649 | 13 / 649 |
+| allocations per step, motion p99 (internal) | 43 | 42 |
+| allocations per step, pressure p50 / p99 (internal) | 21 / 76 | 21 / 73 |
+| step buffers after the tour | 381 056 B | 381 056 B |
+| bytes per tracked resource | 534 (2 927 tracked) | 452 (2 927 tracked) |
+
+The criterion means (`decide/still` −26.1 %, `motion` −23.1 %, `pressure` −29.4 %, p < 0.05) agree. The
+allocation counts barely move: the arena allocates only when its columns grow, and the per-step allocations
+left are the step's own buffers (O1.5).
+
+**O1.2 — persistent eviction index** (`perf/budget-o1-evict-index`). The eviction order is no longer rebuilt by a
+full scan and sort in `evict_order`, the pooled sweep, the decoded release and `release_beyond`, and `make_room`
+no longer folds the whole order on every delivery to learn whether room can be made. The arena keeps the order up
+to date. An eviction key moves whenever the view touches a resource — every step for everything drawn — so the
+arena files only what the view left alone: the resources needed at the two most recent times are *grouped*
+(listed by that time, outside the index); every other resource holding a copy outside transit is *filed* in a
+treap per class and per copies held (both, GPU only, decoded only), keyed by `(EvictKey, slot)`, its links a
+column of the arena (8 B a slot, nothing allocated as resources come and go), and its GPU bytes counted as its
+class's *idle bytes* unless it is of the floor. A third time files the older group's resources not needed since;
+a resource needed again leaves the index. A step that draws what it drew moves nothing; one that turns files what
+it left. Walks merge the index with the grouped resources, sorted once a step when a walk needs them; nothing
+filed is wanted or kept, so `make_room` knows what it can free from the idle bytes plus the step's grouped
+candidates by want urgency (`Room`), in O(1) per delivery, and evicts by walking the order (O(log N) per victim).
+Same victims in the same order: lockstep green in every `budget_sim` run and the properties (2 048 cases),
+goldens and pattern goldens untouched. `audit` checks the index (order, heap, membership, idle bytes, groups)
+against a recomputation in debug builds, and `make_room` checks its count against a scan. Red seen: a slot left
+out of the index when its transit ends diverges from the frozen reference in 13 of 61 `budget_sim` runs (first
+at step 140 of the back-and-forth, on the decoded releases).
+
+The index's links and the group lists cost about 17 B per tracked resource; the arena's columns now grow by an
+eighth instead of doubling (slots are never given back, so a doubling left up to half of every column unused for
+the session), which more than pays for them.
+
+| Measure | O1.1 | O1.2 |
+|---|---|---|
+| `decide` still (484 drawn) | mean 816 µs, p50 806, p99 905 | mean 813 µs, p50 802, p99 887 (no change) |
+| `decide` motion | mean 696 µs, p50 608, p99 1 726 | mean 680 µs, p50 606, p99 1 627 (−2 %, p99 −6 %) |
+| `decide` pressure | mean 652 µs, p50 637, p99 1 117 | mean 466 µs, p50 456, p99 720 (−29 %, p99 −36 %) |
+| allocations per step, still (internal / output) | 13 / 649 | 13 / 649 |
+| allocations per step, motion p99 (internal) | 42 | 38 |
+| allocations per step, pressure p50 / p99 (internal) | 21 / 73 | 12 / 74 |
+| step buffers after the tour | 381 056 B | 381 056 B |
+| bytes per tracked resource | 452 (2 927 tracked) | 445 (2 927 tracked) |
+
+The criterion means: `decide/pressure` −30.1 % (p < 0.05); `still` −0.2 % and `motion` −1.2 %, neither
+significant. The still view never evicts, so it gains nothing (and pays nothing measurable: the group lists turn
+over in place). The motion tour evicts on few steps. Under pressure, timed with temporary probes, `make_room`
+took about 180 µs a step (some 270 calls a step past its fast path, each folding the order, plus the order's
+build and sort) and the sweeps about 56 µs (the pooled one 44); after, about 22 µs (mostly the probes' own
+clocks) and 25 µs, of which the step's grouped candidates, sorted, about 16. What is left of the step is the
+need, the draw set and the ranking (O1.3–O1.5). Allocations under pressure: the median step halves; the p99 is
+one block higher (73 → 74), the decoded release now collecting the kept copies and the grouped holders apart.
+
+The pressure scenario's I7 break, explained (not fixed: behaviour is frozen through O1): at t ≈ 105 s of the
+unlooped tour under `pressure_profile`, 1 336 of the 1 929 tracked resources hold only a decoded copy (no GPU
+copy, nothing in transit or loading; 984 of them not wanted), and the decoded tier sits at 534 MB, just under its
+512 MiB target. That target is `BudgetConfig::interactive`'s quarter of the configured GPU total (2 GiB), and
+`retarget` does not scale it: `eff()` scales the decoded target by pressure only, not by the retarget factor.
+So on a 384 MiB budget the decoded tier still keeps 512 MiB of copies demoted by evictions, and every one of
+them is a tracked resource that the simulation's I7 bound (GPU-drawable + pending + need) does not count.
+
+**O1.3 — need deltas** (`perf/budget-o1-need-deltas`). The need no longer arrives whole each step to be sorted,
+deduplicated and reinserted (O(N log N) for a still view). `NeedDelta` (in `tuile-budget`) says what changed
+since the step before, tile by tile: the tiles that entered and those whose entries changed, each with all its
+entries now (membership and need, in the need's order), and the tiles that left; a change is any entry more or
+less, another membership, or any field of a need, floats compared bit for bit. `NeedDelta::diff(before, after)`
+builds one from two whole needs, and `apply_to` gives the whole need back. `FrameInput::from_delta` passes one
+(`FrameInput::new` still passes a whole need: the first step, a resynchronisation, a caller with whole needs
+only), and the geometry server (`runtime.rs`) sends the whole need on its first step and deltas after, diffed
+against the need it kept. The budget keeps the need it last read (`need_state::NeedState`): each wanted tile's
+best entry in a sorted vector, which the step reads as it is — no per-step copy. A delta resolves only the tiles
+it names (best entry first, the first of equals; tree position from the last entry, as before), merged in one
+pass; a whole need is applied the same way, every tile named. The tree positions (`tiles`) become a sorted vector
+of packed 48-byte entries, updated only for the tiles named. Same decisions: lockstep green in every `budget_sim`
+run (the simulation sends deltas, the frozen engine the whole need) and the properties (2 048 cases, one step in
+four a whole need, the rest deltas), goldens and pattern goldens untouched. In debug builds the kept need is
+checked every step against a recomputation from the whole need (kept beside, rebuilt by `apply_to`), and every
+wanted tile's tree position too. Red seen: a delta whose changed tiles are not applied diverges at step 3 in 60 of
+61 `budget_sim` runs, fails the property, and fails `the_need_kept_through_deltas_is_the_whole_needs` at its
+first step.
+
+| Measure | O1.2 | O1.3 |
+|---|---|---|
+| `decide` still (484 drawn), told what changed (nothing) | mean 809 µs, p50 798, p99 884 | mean 771 µs, p50 761, p99 851 (−5 %) |
+| `decide` still, told the whole need (`still-full`) | (the only path) | mean 807 µs, p50 797, p99 889 (no change) |
+| `decide` motion | mean 680 µs, p50 605, p99 1 618 | mean 698 µs, p50 626, p99 1 618 (+3 %) |
+| `decide` pressure | mean 464 µs, p50 454, p99 716 | mean 467 µs, p50 458, p99 709 (no change) |
+| allocations per step, still (internal / output) | 13 / 649 | 13 / 649 |
+| allocations per step, motion p99 (internal) | 38 | 38 |
+| allocations per step, pressure p50 / p99 (internal) | 12 / 74 | 12 / 74 |
+| step buffers after the tour | 381 056 B | 349 824 B |
+| bytes per tracked resource | 445 (2 927 tracked) | 432 (2 927 tracked) |
+| P6.4 `work`, still view (nothing changing) | ≈ 1 470 a step, worst 4 646 | ≈ 910 a step, worst 4 080 |
+
+Criterion: `decide/still` −5.1 % (p < 0.05). The gain is small, as expected: everything after `read_need`
+(imagery levels, draw set, wants, ranking, prune) still walks the whole need every step until O1.4's dirty sets.
+In motion every wanted tile's SSE and distance change every step, so a delta names nearly the whole need and the
+budget resolves it all as before; the step is about 3 % slower there (the larger kept record, 96 bytes against
+the 40 of the old borrowed one, and the sorted vectors' merges when tiles enter), and the diff the host now
+computes (outside `decide`) is not in these numbers. `work` counts what the delta names instead of every entry:
+on the still view, about 560 less a step. P6.4 stays ignored (red on 1 488 of 5 100 steps, all still, against
+1 492 before) until O1.4. Memory: the kept need adds about 65 KB on the tour (607 tiles), paid for by the tree
+positions' sorted vector of packed entries (1 841 tiles, 214 KB as a `BTreeMap` → about 103 KB) and the step's
+borrowed copy of the need gone.
+
 
 Order is strict: A before B, B before C. Every step of A, B and C goes through the same battery before
 the next starts — tests seen red, mutants killed, the reference model extended, Kani proofs of its

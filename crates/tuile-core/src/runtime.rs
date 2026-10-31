@@ -32,8 +32,8 @@
 
 use crate::budget::{
     Budget, BudgetConfig, BudgetEvent, BudgetMeter, BudgetObserver, Bytes, Class, ConfigError,
-    Decisions, Failure, FrameInput, Generation, ImageryNeed, Micros, Need, NeedSet, Presence,
-    PresenceOracle, ResourceId, StepRecord, TexelFootprint,
+    Decisions, Failure, FrameInput, Generation, ImageryNeed, Micros, Need, NeedDelta, NeedSet,
+    Presence, PresenceOracle, ResourceId, StepRecord, TexelFootprint,
 };
 use crate::content::{DecodedTileContent, DrapeContent};
 use crate::fetch::TileFetcher;
@@ -852,6 +852,12 @@ struct State {
     /// The platform's signals as last handed to the budget, for its record.
     pressure: crate::budget::Pressure,
     thermal: crate::budget::Thermal,
+    /// The need the budget last read, `None` before the first step: a step
+    /// tells the budget what changed since it ([`NeedDelta`]), not the
+    /// whole need again.
+    need_last: Option<NeedSet>,
+    /// What changed, in a buffer kept across steps.
+    need_delta: NeedDelta,
 }
 
 impl State {
@@ -887,6 +893,8 @@ impl State {
             published_at: None,
             pressure: crate::budget::Pressure::Normal,
             thermal: crate::budget::Thermal::Nominal,
+            need_last: None,
+            need_delta: NeedDelta::new(),
         }
     }
 
@@ -1412,10 +1420,17 @@ impl State {
             kept: &kept,
             now,
         };
+        // The first step reads the whole need; every later one what changed
+        // since the one before, which the budget kept.
+        let input = match &self.need_last {
+            Some(last) => {
+                self.need_delta.diff(last, &need);
+                FrameInput::from_delta(self.frame, now, &self.need_delta)
+            }
+            None => FrameInput::new(self.frame, now, &need),
+        };
         let deciding = crate::metrics::stamp();
-        let d = self
-            .budget
-            .decide(FrameInput::new(self.frame, now, &need).with_presence(&presence));
+        let d = self.budget.decide(input.with_presence(&presence));
         let decide_wall = Micros(deciding.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
         self.sse_scale_milli = d.sse_scale_milli;
 
@@ -1493,6 +1508,7 @@ impl State {
         });
         self.ranks.publish(ranked.into_iter().map(|(_, r)| r));
         let priming = self.priming(&need);
+        self.need_last = Some(need);
         let mm = crate::metrics::metrics();
         mm.priming_total.set(u64::from(priming.total));
         mm.priming_pending.set(u64::from(priming.outstanding));
@@ -1612,6 +1628,9 @@ impl State {
         if let Some(fatal) = &d.fatal {
             let resource = match fatal {
                 crate::budget::SessionError::LoadFailed(r) => Some(*r),
+                // `SessionError` is `#[non_exhaustive]`, and the budget is now
+                // another crate: a later end of session names no resource.
+                _ => None,
             };
             let message = fatal.to_string();
             tx.unbounded_send(ServerMessage::Error {

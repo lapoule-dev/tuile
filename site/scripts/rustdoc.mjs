@@ -46,6 +46,7 @@ const stageDir = join(siteDir, 'public', 'docs', 'api');
 const libraries = [
   // core and formats
   'tuile-core',
+  'tuile-budget',
   'tuile-b3dm',
   'tuile-terrain',
   'tuile-pack',

@@ -34,6 +34,9 @@ thiserror = { workspace = true }
 # it was declared and never used.
 tracing = { workspace = true }
 tuile-b3dm = { version = "0.15.1", path = "../tuile-b3dm" }
+# The graphics budget, re-exported whole as `budget` (and its `TileId` from
+# `source`): pure, wasm-clean, at the bottom of the graph.
+tuile-budget = { version = "0.15.1", path = "../tuile-budget" }
 url = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -49,15 +52,6 @@ futures-executor = { workspace = true }
 # subscriber is installed in a test and its output parsed back.
 tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
-# The budget's properties (protection, total order, ledger, determinism,
-# cancellation) over random need and arrival sequences.
-proptest = { workspace = true }
-# What one budget `decide` costs, mean and percentiles (`benches/budget_decide.rs`).
-criterion = { workspace = true }
-
-[[bench]]
-name = "budget_decide"
-harness = false
 
 [features]
 default = []
