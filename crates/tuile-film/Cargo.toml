@@ -10,11 +10,11 @@ authors.workspace = true
 [dependencies]
 glam = { workspace = true }
 thiserror = { workspace = true }
-tuile-atmosphere = { version = "0.15.0", path = "../tuile-atmosphere" }
-tuile-core = { version = "0.15.0", path = "../tuile-core" }
-tuile-overlay = { version = "0.15.0", path = "../tuile-overlay" }
-tuile-pack = { version = "0.15.0", path = "../tuile-pack" }
-tuile-terrain = { version = "0.15.0", path = "../tuile-terrain" }
+tuile-atmosphere = { version = "0.15.1", path = "../tuile-atmosphere" }
+tuile-core = { version = "0.15.1", path = "../tuile-core" }
+tuile-overlay = { version = "0.15.1", path = "../tuile-overlay" }
+tuile-pack = { version = "0.15.1", path = "../tuile-pack" }
+tuile-terrain = { version = "0.15.1", path = "../tuile-terrain" }
 
 [dev-dependencies]
 image = { workspace = true }

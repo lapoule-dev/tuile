@@ -25,7 +25,7 @@ tokio-rustls = { version = "0.26", default-features = false }
 rustls-pki-types = { version = "1", features = ["std"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tuile-terrain = { version = "0.15.0", path = "../../crates/tuile-terrain" }
+tuile-terrain = { version = "0.15.1", path = "../../crates/tuile-terrain" }
 
 [dev-dependencies]
 tower = "0.5"

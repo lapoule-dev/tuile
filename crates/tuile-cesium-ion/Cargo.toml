@@ -20,11 +20,11 @@ roxmltree = { workspace = true }
 tracing = { workspace = true }
 flate2 = { workspace = true }
 thiserror = { workspace = true }
-tuile-bing = { version = "0.15.0", path = "../tuile-bing" }
-tuile-core = { version = "0.15.0", path = "../tuile-core" }
+tuile-bing = { version = "0.15.1", path = "../tuile-bing" }
+tuile-core = { version = "0.15.1", path = "../tuile-core" }
 # `Sources`, which `IonSources` implements: the seam a globe is assembled on.
-tuile-planetary = { version = "0.15.0", path = "../tuile-planetary" }
-tuile-terrain = { version = "0.15.0", path = "../tuile-terrain" }
+tuile-planetary = { version = "0.15.1", path = "../tuile-planetary" }
+tuile-terrain = { version = "0.15.1", path = "../tuile-terrain" }
 url = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
