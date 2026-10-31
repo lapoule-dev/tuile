@@ -39,6 +39,8 @@
 //!             credentials: "The key is read from ATLAS_KEY, or from the file `token` \
 //!                           in the application's support directory."
 //!                 .into(),
+//!             credential_variable: "ATLAS_KEY".into(),
+//!             config_section: "atlas".into(),
 //!         }
 //!     }
 //!     fn terrain(&self) -> TerrainChoice {
@@ -93,6 +95,16 @@ pub struct Identity {
     /// One sentence for `--help`: where this host's credentials are read
     /// from. Empty when it needs none.
     pub credentials: String,
+    /// The environment variable this host's credential is read from
+    /// (`CESIUM_ION_TOKEN`, say), which is also the key a token from a
+    /// configuration file is kept under in the system's secure storage.
+    /// Empty when the host takes no credential: a file's token is then
+    /// refused rather than kept for nothing.
+    pub credential_variable: String,
+    /// The table of a configuration file this host reads — `ion` for
+    /// `[ion]`. See `crate::config_file`: the token, the API address, the
+    /// terrain and the imagery layers are under it.
+    pub config_section: String,
 }
 
 impl Default for Identity {
@@ -105,6 +117,8 @@ impl Default for Identity {
             executable: "tuile-wgpu-viewer".into(),
             store: "tiles".into(),
             credentials: String::new(),
+            credential_variable: String::new(),
+            config_section: "source".into(),
         }
     }
 }
@@ -262,8 +276,9 @@ impl std::fmt::Display for MissingCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "There is no access token for terrain and imagery. Export {} before \
-             starting from a terminal",
+            "There is no access token for terrain and imagery. Open your \
+             configuration file (a .tuile file) in the application, or export {} \
+             before starting from a terminal",
             self.variable
         )?;
         match &self.file {
@@ -288,6 +303,15 @@ impl std::error::Error for MissingCredential {}
 /// found.
 pub fn credential(variable: &str) -> Result<String, MissingCredential> {
     credential_from(&host::Machine, variable)
+}
+
+/// The API address a configuration file set for the host's service, if
+/// one did — the session's `--config`, else what the last file opened in
+/// the application kept. Read afresh at each call, so a host that asks at
+/// each connection takes an import at once.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn configured_api() -> Option<url::Url> {
+    crate::import::current_api(&identity().config_section, &host::Machine)
 }
 
 /// [`credential`], on a given machine — the one the tests are.

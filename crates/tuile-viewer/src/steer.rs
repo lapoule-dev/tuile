@@ -28,6 +28,7 @@
 //! | `tuile://here` | centres on the current location (the system still asks the person) |
 //! | `tuile://view?freeze=on\|off&wireframe=on\|off` | the two display switches |
 //! | `tuile://imagery?name=<key>` | drapes another of the host's imagery layers; `name=next` takes the one after the present |
+//! | `tuile://import?src=https://…` | fetches a configuration file and imports it, as opening it would (`crate::import`) |
 //!
 //! ## The scene's clock in a link
 //!
@@ -61,8 +62,10 @@
 //!
 //! **What a URL can do is all in that table.** It moves the camera, sets the
 //! scene's clock, flips two display switches and picks among the layers the
-//! host listed. It reads no file, runs nothing, and carries no
-//! credential; anything else — an unknown command, an unknown parameter, a
+//! host listed — or, `import`, fetches a configuration file from an `https`
+//! address and imports it with the same checks as a file opened by hand. It
+//! reads no local file, runs nothing, and carries no credential (an `import`
+//! whose address names a token is refused); anything else — an unknown command, an unknown parameter, a
 //! value out of the flags' bounds, a URL longer than [`LONGEST_URL`] — is
 //! dropped whole with one line in the log, and the view does not move.
 //!
@@ -147,6 +150,13 @@ pub(crate) enum Command {
         allow(dead_code)
     )]
     ShowKeys,
+    /// Ask for a configuration file to import, in the system's open panel:
+    /// *File › Open Configuration…*.
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "application")),
+        allow(dead_code)
+    )]
+    OpenConfiguration,
     /// The scene's clock at this instant (Unix seconds UTC), running at this
     /// rate from now on.
     Clock {
@@ -195,6 +205,21 @@ pub(crate) enum Request {
     /// whose clipboard answers later: see `crate::desktop::Pasted`.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     Pasted(Option<String>),
+    /// A configuration file's name and text, to import (`crate::import`):
+    /// shared with or opened in the application, or fetched for a link.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Import {
+        file: String,
+        text: String,
+    },
+    /// A configuration file on disk, to read and import: opened from the
+    /// Finder, *File › Open…*, or handed over by the system.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    ImportFile(std::path::PathBuf),
+    /// An import that failed on its way to the loop — a link's file that
+    /// could not be fetched — and why.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    ImportFailed(String),
 }
 
 impl Goto {

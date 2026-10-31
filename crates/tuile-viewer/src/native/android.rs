@@ -287,6 +287,49 @@ pub(crate) fn paste() -> Option<String> {
     call_string("paste")
 }
 
+/// What a view or a share brought since the last call — a configuration
+/// file or an import link — as the request the loop carries out.
+pub(crate) fn take_import() -> Option<crate::steer::Request> {
+    crate::native::android_signals::import_request(&call_string("takeImport")?)
+}
+
+/// Seals `value` under `name` in the activity's Keystore-backed store.
+pub(crate) fn seal_secret(name: &str, value: &str) -> bool {
+    with_activity(|env, activity| {
+        let name = env.new_string(name)?;
+        let value = env.new_string(value)?;
+        env.call_method(
+            activity,
+            jni_str!("sealSecret"),
+            jni_sig!("(Ljava/lang/String;Ljava/lang/String;)Z"),
+            &[JValue::Object(&name), JValue::Object(&value)],
+        )?
+        .z()
+    })
+    .unwrap_or(false)
+}
+
+/// The value sealed under `name`, if there is one.
+pub(crate) fn open_secret(name: &str) -> Option<String> {
+    with_activity(|env, activity| {
+        let name = env.new_string(name)?;
+        let value = env
+            .call_method(
+                activity,
+                jni_str!("openSecret"),
+                jni_sig!("(Ljava/lang/String;)Ljava/lang/String;"),
+                &[JValue::Object(&name)],
+            )?
+            .l()?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        let value = env.cast_local::<JString>(value)?;
+        value.try_to_string(env).map(Some)
+    })
+    .flatten()
+}
+
 /// Logcat's priorities, as `<android/log.h>` numbers them.
 #[derive(Clone, Copy)]
 pub(crate) enum LogPriority {

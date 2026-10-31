@@ -106,13 +106,61 @@ pub(crate) fn view(snapshot: &Snapshot) {
 }
 
 /// Puts a request on the queue the render loop drains: the one way anything
-/// outside the loop — the system's event dispatch, a menu — acts on the view.
-#[cfg_attr(
-    not(all(target_os = "macos", feature = "application")),
-    allow(dead_code)
-)]
+/// outside the loop — the system's event dispatch, a menu, a fetch on
+/// another thread — acts on the view.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn queue(request: Request) {
     system::send(request);
+}
+
+/// Called once the event loop exists and before it runs: what the platform
+/// can only set up on the windowing layer's own objects — on macOS, the
+/// delegate method that receives opened files.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn adopt_the_loop() {
+    #[cfg(all(target_os = "macos", feature = "application"))]
+    system::adopt_the_loop();
+}
+
+/// Asks the person for a configuration file, with the system's open panel,
+/// and queues it for import. Only a Mac has the panel; elsewhere the file
+/// arrives from the system (a share, *Open in…*).
+pub(crate) fn choose_configuration() {
+    #[cfg(all(target_os = "macos", feature = "application"))]
+    system::choose_configuration();
+}
+
+/// The queue, for the platforms whose handlers do not keep their own: one
+/// sender, filled from any thread, drained by the loop.
+#[cfg(not(any(
+    target_arch = "wasm32",
+    all(target_os = "macos", feature = "application")
+)))]
+mod outbox {
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::Mutex;
+
+    use crate::steer::Request;
+
+    static OUTBOX: Mutex<Option<Sender<Request>>> = Mutex::new(None);
+
+    pub(super) fn open() -> Receiver<Request> {
+        let (sender, receiver) = channel();
+        if let Ok(mut outbox) = OUTBOX.lock() {
+            *outbox = Some(sender);
+        }
+        receiver
+    }
+
+    pub(super) fn send(request: Request) {
+        if let Ok(outbox) = OUTBOX.lock() {
+            if let Some(sender) = outbox.as_ref() {
+                // A closed channel means the loop is gone, and so is the
+                // point of the request.
+                let _ = sender.send(request);
+            }
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "application"))]
@@ -372,6 +420,109 @@ mod system {
         receiver
     }
 
+    /// What the system hands the application to open: a configuration file
+    /// (a double-click in the Finder, `open file.tuile`, a drop on the
+    /// Dock icon) or, should one come this way, a URL.
+    ///
+    /// AppKit gives every open request to the application's delegate as
+    /// `application:openURLs:` — at launch too, once it finishes launching.
+    /// The windowing layer owns that delegate, so the method is added to its
+    /// class at run time, as the scripting properties are added to the
+    /// application's. Called once the event loop exists (the class with it),
+    /// before the loop runs.
+    pub(super) fn adopt_the_loop() {
+        let Some(class) = AnyClass::get(c"WinitApplicationDelegate") else {
+            tracing::error!("no application delegate to receive opened files");
+            return;
+        };
+        let class = (class as *const AnyClass).cast_mut();
+        // SAFETY: `open_urls` has the signature the type string states —
+        // nothing returned, from `self`, `_cmd` and two objects — which is
+        // `application:openURLs:`'s; the class is the live delegate class.
+        unsafe {
+            let imp: Imp = std::mem::transmute::<
+                extern "C-unwind" fn(&AnyObject, Sel, *mut AnyObject, *mut AnyObject),
+                Imp,
+            >(open_urls);
+            class_addMethod(class, sel!(application:openURLs:), imp, c"v@:@@".as_ptr());
+        }
+    }
+
+    /// `application:openURLs:`: each file is queued for import, any other
+    /// URL as a steering URL.
+    extern "C-unwind" fn open_urls(
+        _this: &AnyObject,
+        _cmd: Sel,
+        _app: *mut AnyObject,
+        urls: *mut AnyObject,
+    ) {
+        if urls.is_null() {
+            return;
+        }
+        // SAFETY: AppKit passes an `NSArray` of `NSURL`; `count` and
+        // `objectAtIndex:` are plain reads of it.
+        let count: usize = unsafe { msg_send![urls, count] };
+        for i in 0..count {
+            let url: *mut AnyObject = unsafe { msg_send![urls, objectAtIndex: i] };
+            if let Some(request) = request_for(url) {
+                send(request);
+            }
+        }
+    }
+
+    /// An `NSURL` as a request: a file to import, or a URL to steer by.
+    fn request_for(url: *mut AnyObject) -> Option<Request> {
+        if url.is_null() {
+            return None;
+        }
+        // SAFETY: `url` is an `NSURL`; the three are plain reads that return
+        // a flag and two strings (or nil).
+        let file: bool = unsafe { msg_send![url, isFileURL] };
+        if file {
+            let path: Option<Retained<NSString>> = unsafe { msg_send![url, path] };
+            return path.map(|p| Request::ImportFile(std::path::PathBuf::from(p.to_string())));
+        }
+        let text: Option<Retained<NSString>> = unsafe { msg_send![url, absoluteString] };
+        text.map(|t| Request::Url(t.to_string()))
+    }
+
+    /// *File › Open Configuration…*: the system's open panel, for one file;
+    /// what is chosen is queued for import.
+    pub(super) fn choose_configuration() {
+        let Some(class) = AnyClass::get(c"NSOpenPanel") else {
+            return;
+        };
+        // SAFETY: `openPanel` is NSOpenPanel's constructor; the setters take
+        // a flag or a string; `runModal` runs the panel on this, the main
+        // thread, and returns NSModalResponseOK (1) when a file was chosen;
+        // `URLs` is then an array of one `NSURL`.
+        unsafe {
+            let panel: Retained<AnyObject> = msg_send![class, openPanel];
+            let _: () = msg_send![&panel, setCanChooseFiles: true];
+            let _: () = msg_send![&panel, setCanChooseDirectories: false];
+            let _: () = msg_send![&panel, setAllowsMultipleSelection: false];
+            let _: () = msg_send![&panel, setMessage: &*NSString::from_str(
+                "Choose your configuration file — the .tuile file with your access token."
+            )];
+            let _: () = msg_send![&panel, setPrompt: &*NSString::from_str("Open")];
+            let answer: isize = msg_send![&panel, runModal];
+            if answer != 1 {
+                return;
+            }
+            let urls: *mut AnyObject = msg_send![&panel, URLs];
+            if urls.is_null() {
+                return;
+            }
+            let count: usize = msg_send![urls, count];
+            if count > 0 {
+                let url: *mut AnyObject = msg_send![urls, objectAtIndex: 0usize];
+                if let Some(request) = request_for(url) {
+                    send(request);
+                }
+            }
+        }
+    }
+
     pub(super) fn alert(title: &str, text: &str) {
         let Some(mtm) = MainThreadMarker::new() else {
             eprintln!("{title}\n\n{text}");
@@ -424,7 +575,7 @@ mod system {
     #![allow(unsafe_code)]
 
     use std::cell::RefCell;
-    use std::sync::mpsc::{channel, Receiver};
+    use std::sync::mpsc::Receiver;
 
     use objc2::rc::Retained;
     use objc2::{ClassType, MainThreadMarker};
@@ -443,9 +594,121 @@ mod system {
     }
 
     pub(super) fn listen() -> Receiver<Request> {
-        // Nothing steers a phone's viewer from outside yet: the queue is
-        // always empty.
-        channel().1
+        // What reaches a phone's viewer from outside: a configuration file
+        // or an import link the system hands the application (`open`).
+        let receiver = super::outbox::open();
+        open::listen();
+        receiver
+    }
+
+    /// What the system hands a phone's application to open: a configuration
+    /// file (Files, AirDrop, Mail, a download — *Open in Tuile*) or an
+    /// import link (`tuile://import?src=…`).
+    ///
+    /// UIKit gives both to the application's delegate as
+    /// `application:openURL:options:`, the one at launch included. The
+    /// windowing layer runs `UIApplicationMain` with no delegate of its own
+    /// and leaves the application's class to `NSPrincipalClass`; the bundle
+    /// names [`open::APPLICATION`] there, a `UIApplication` that gives itself
+    /// a delegate when it is made, before anything is opened.
+    pub(super) mod open {
+        use objc2::rc::{Allocated, Retained};
+        use objc2::runtime::NSObject;
+        use objc2::{define_class, msg_send, AllocAnyThread, ClassType, MainThreadOnly};
+        use objc2_foundation::{NSDictionary, NSURL};
+        use objc2_ui_kit::{UIApplication, UIResponder};
+
+        use crate::steer::Request;
+
+        /// The class name the bundle's `NSPrincipalClass` says.
+        pub(crate) const APPLICATION: &str = "TuileApplication";
+
+        define_class!(
+            // SAFETY: `NSObject` has no subclassing requirements, and the
+            // class does not implement `Drop`.
+            #[unsafe(super(NSObject))]
+            #[name = "TuileApplicationDelegate"]
+            struct Delegate;
+
+            impl Delegate {
+                /// `application:openURL:options:`: a file is read now — it may
+                /// be outside the container, readable only while its
+                /// security scope is open — and queued for import; any other
+                /// URL is queued as a URL.
+                #[unsafe(method(application:openURL:options:))]
+                fn open(&self, _app: &UIApplication, url: &NSURL, _options: &NSDictionary) -> bool {
+                    super::send(request_for(url));
+                    true
+                }
+            }
+        );
+
+        define_class!(
+            // SAFETY: `UIApplication` is meant to be subclassed and named as
+            // the principal class; `init` is overridden only to give the
+            // application its delegate, and the class does not implement
+            // `Drop`.
+            #[unsafe(super(UIApplication, UIResponder, NSObject))]
+            #[thread_kind = MainThreadOnly]
+            #[name = "TuileApplication"]
+            struct Application;
+
+            impl Application {
+                #[unsafe(method_id(init))]
+                fn init(this: Allocated<Self>) -> Option<Retained<Self>> {
+                    // SAFETY: the superclass's designated initialiser.
+                    let this: Option<Retained<Self>> =
+                        unsafe { msg_send![super(this.set_ivars(())), init] };
+                    this.inspect(|this| {
+                        // SAFETY: `NSObject`'s `init` is the designated
+                        // initialiser.
+                        let delegate: Retained<Delegate> =
+                            unsafe { msg_send![Delegate::alloc(), init] };
+                        // SAFETY: the delegate property takes an object; it
+                        // is not retained by the application, so the
+                        // delegate is kept for the life of the process.
+                        let _: () = unsafe { msg_send![&**this, setDelegate: &*delegate] };
+                        std::mem::forget(delegate);
+                    })
+                }
+            }
+        );
+
+        /// Registers both classes, so `UIApplicationMain` finds the
+        /// principal class by its name. Before the loop runs.
+        pub(crate) fn listen() {
+            let _ = Delegate::class();
+            let class = Application::class();
+            debug_assert_eq!(class.name().to_str().ok(), Some(APPLICATION));
+        }
+
+        fn request_for(url: &NSURL) -> Request {
+            if !url.isFileURL() {
+                let text = url
+                    .absoluteString()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                return Request::Url(text);
+            }
+            let path = url.path().map(|p| p.to_string()).unwrap_or_default();
+            let file = crate::import::file_name(&path);
+            // SAFETY: a plain call on the URL, balanced below.
+            let scoped: bool = unsafe { msg_send![url, startAccessingSecurityScopedResource] };
+            let read = crate::import::read_file(std::path::Path::new(&path));
+            if scoped {
+                // SAFETY: as above.
+                let _: () = unsafe { msg_send![url, stopAccessingSecurityScopedResource] };
+            }
+            // A copy the system made into Documents/Inbox is the
+            // application's to remove once read.
+            if path.contains("/Documents/Inbox/") {
+                let _ = std::fs::remove_file(&path);
+            }
+            match read {
+                Ok(text) => Request::Import { file, text },
+                Err(error) => Request::ImportFailed(error.to_string()),
+            }
+        }
     }
 
     /// The window's root view controller: what an alert is presented on, and
@@ -574,7 +837,9 @@ mod system {
         )
     }
 
-    pub(super) fn send(_request: Request) {}
+    pub(super) fn send(request: Request) {
+        super::outbox::send(request);
+    }
 
     pub(super) fn drawing(_outcome: Result<&str, &str>) {}
 
@@ -588,13 +853,16 @@ mod system {
 /// embedder is the application itself.
 #[cfg(target_os = "android")]
 mod system {
-    use std::sync::mpsc::{channel, Receiver};
+    use std::sync::mpsc::Receiver;
 
     use crate::native::android;
     use crate::steer::Request;
 
+    /// What a view or a share brings — a configuration file, an import
+    /// link — is held by the activity and taken by the loop
+    /// (`android::take_import`), which queues it here.
     pub(super) fn listen() -> Receiver<Request> {
-        channel().1
+        super::outbox::open()
     }
 
     pub(super) fn alert(title: &str, text: &str) {
@@ -619,7 +887,9 @@ mod system {
         super::Pasted::Now(android::paste())
     }
 
-    pub(super) fn send(_request: Request) {}
+    pub(super) fn send(request: Request) {
+        super::outbox::send(request);
+    }
 
     pub(super) fn drawing(_outcome: Result<&str, &str>) {}
 
@@ -643,13 +913,14 @@ mod system {
     target_arch = "wasm32"
 )))]
 mod system {
-    use std::sync::mpsc::{channel, Receiver};
+    use std::sync::mpsc::Receiver;
 
     use crate::steer::Request;
 
+    /// Nothing outside steers this viewer; an import link's fetch reports
+    /// back here.
     pub(super) fn listen() -> Receiver<Request> {
-        // The sender is dropped here: the queue is simply always empty.
-        channel().1
+        super::outbox::open()
     }
 
     pub(super) fn alert(title: &str, text: &str) {
@@ -671,7 +942,9 @@ mod system {
         super::Pasted::Now(None)
     }
 
-    pub(super) fn send(_request: Request) {}
+    pub(super) fn send(request: Request) {
+        super::outbox::send(request);
+    }
 
     pub(super) fn drawing(_outcome: Result<&str, &str>) {}
 

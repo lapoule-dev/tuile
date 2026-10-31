@@ -56,6 +56,12 @@ FLAGS (each takes one number; `--flag value` or `--flag=value`):
     --record-scale <s> a picture's size over the frame's: 0.5 (the default),
                        1 for the frame as drawn, 0.25
     --record-codec <c> jpeg (the default) or png (every bit kept)
+    --config <file>    a configuration file (a .tuile file: the access token,
+                       the API address, the terrain, the layers, the start
+                       view), read for this session and not kept. Without it,
+                       config.tuile in the support directory is read if it
+                       exists; a flag wins over what the file says. Opening a
+                       file in the application (File > Open) keeps it instead
 IMAGERY_LAYERS
     --imagery-compression <off|auto|bc7|astc>
                        how imagery is held on the GPU: off (RGBA8, the
@@ -222,6 +228,24 @@ pub(crate) fn remembered(host: &dyn crate::host::Host) -> Option<StartView> {
     view_in_link(&host.read(&file).ok()?)
 }
 
+/// Fills in `view` from a configuration file's start view, for each number
+/// the command line `arguments` did not give: a flag wins over the file.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn fill_in(view: &mut StartView, arguments: &[String], start: &[(String, f64)]) {
+    for (key, value) in start {
+        let flag = format!("--{key}");
+        let given = arguments
+            .iter()
+            .any(|a| a == &flag || a.starts_with(&format!("{flag}=")));
+        if given {
+            continue;
+        }
+        if let Some(f) = FLAGS.iter().find(|f| f.name == flag) {
+            *(f.field)(view) = *value;
+        }
+    }
+}
+
 /// The view a remembered link describes — the whole of one, and nothing
 /// else: a link that is not a single complete `goto` is no view.
 pub(crate) fn view_in_link(text: &str) -> Option<StartView> {
@@ -267,6 +291,9 @@ pub(crate) enum Invocation {
         /// `--record` and its pictures' `--record-fps`, `--record-scale`
         /// and `--record-codec`.
         record: crate::recording::RecordSettings,
+        /// `--config`: a configuration file read for this session — its
+        /// token used, nothing kept (see `crate::import`).
+        config: Option<std::path::PathBuf>,
     },
     /// Print [`usage`] and leave.
     Help,
@@ -453,7 +480,7 @@ where
     let mut here = false;
     let mut imagery: Option<String> = None;
     // The flags that take text: each at most once.
-    let mut texts: [(&str, Option<String>); 12] = [
+    let mut texts: [(&str, Option<String>); 13] = [
         ("--terrain-url", None),
         ("--imagery-template", None),
         ("--imagery-scheme", None),
@@ -466,6 +493,7 @@ where
         ("--record-fps", None),
         ("--record-scale", None),
         ("--record-codec", None),
+        ("--config", None),
     ];
     let mut compression: Option<tuile_wgpu::ImageryCompression> = None;
     let mut seen = [false; FLAGS.len()];
@@ -552,7 +580,7 @@ where
     if here && (seen[0] || seen[1]) {
         return Err("--here and --lon/--lat both say where to start; give one".to_owned());
     }
-    let [(_, terrain), (_, template), (_, scheme), (_, max_level), (_, time), (_, offset), (_, rate), (_, ceiling), (_, record), (_, record_fps), (_, record_scale), (_, record_codec)] =
+    let [(_, terrain), (_, template), (_, scheme), (_, max_level), (_, time), (_, offset), (_, rate), (_, ceiling), (_, record), (_, record_fps), (_, record_scale), (_, record_codec), (_, config)] =
         texts;
     // Read as an altitude is, with the same bounds: it is one.
     let max_altitude = ceiling
@@ -591,6 +619,7 @@ where
                 record_codec.as_deref(),
             )?,
         },
+        config: config.map(std::path::PathBuf::from),
     })
 }
 
@@ -661,6 +690,7 @@ mod tests {
             clock: _,
             max_altitude: None,
             record: _,
+            config: None,
         }) = parsed
         else {
             unreachable!("{args:?} should start a session, got {parsed:?}");
@@ -1006,6 +1036,35 @@ mod tests {
     }
 
     #[test]
+    fn a_files_start_view_fills_in_what_the_flags_did_not_say() {
+        let arguments: Vec<String> = ["--lon", "3", "--altitude=900"].map(str::to_owned).into();
+        let mut view = run(&["--lon", "3", "--altitude=900"]);
+        fill_in(
+            &mut view,
+            &arguments,
+            &[
+                ("lon".into(), 10.0),
+                ("lat".into(), 45.0),
+                ("altitude".into(), 5000.0),
+            ],
+        );
+        assert_eq!((view.lon, view.lat, view.altitude), (3.0, 45.0, 900.0));
+    }
+
+    #[test]
+    fn config_names_a_file_once() {
+        match parse(["--config", "mine.tuile", "--lon", "3"]) {
+            Ok(Invocation::Run { config, view, .. }) => {
+                assert_eq!(config.as_deref(), Some(std::path::Path::new("mine.tuile")));
+                assert_eq!(view.lon, 3.0);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(parse(["--config=a.tuile", "--config", "b.tuile"]).is_err());
+        assert!(parse(["--config"]).is_err());
+    }
+
+    #[test]
     fn here_replaces_the_position_and_refuses_to_share_it() {
         assert_eq!(
             parse(["--here", "--altitude", "3000", "--pitch", "40"]),
@@ -1022,6 +1081,7 @@ mod tests {
                 clock: Default::default(),
                 max_altitude: None,
                 record: Default::default(),
+                config: None,
             })
         );
         // Either order, either coordinate.

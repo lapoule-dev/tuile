@@ -53,7 +53,10 @@ const APP_ICON: &str = "AppIcon";
 ///   system's URL loading — it is the viewer's own TLS client — but the
 ///   declaration is what the system holds the application to, and it is the
 ///   truth;
-/// - `ITSAppUsesNonExemptEncryption`: HTTPS only, which is exempt.
+/// - `ITSAppUsesNonExemptEncryption`: HTTPS only, which is exempt;
+/// - the configuration file's type and the URL scheme, with
+///   `NSPrincipalClass` naming the application class that receives them
+///   (see `documents`).
 pub(crate) fn info_plist(bundle: &Bundle, version: &str) -> plist::Value {
     use plist::Value::{Array, Boolean, Dictionary, String as Text};
     let Bundle {
@@ -120,8 +123,24 @@ pub(crate) fn info_plist(bundle: &Bundle, version: &str) -> plist::Value {
     ] {
         info.insert(key.into(), value);
     }
+    // A configuration file opens here (Files, AirDrop, Mail, a download),
+    // and so does an import link; both arrive at the delegate the viewer's
+    // principal class gives itself (`tuile_viewer` `desktop`).
+    for (key, value) in crate::documents::declarations(bundle) {
+        info.insert(key.into(), value);
+    }
+    info.insert(
+        "CFBundleURLTypes".into(),
+        crate::documents::url_types(bundle),
+    );
+    info.insert("NSPrincipalClass".into(), text(PRINCIPAL_CLASS));
     Dictionary(info)
 }
+
+/// The application class the viewer defines and names here, the one that
+/// receives opened files and links. The same string as `tuile_viewer`'s
+/// `desktop::system::open::APPLICATION`.
+pub(crate) const PRINCIPAL_CLASS: &str = "TuileApplication";
 
 /// The asset catalogue: the icon, one 1024-pixel image that the platform's
 /// compiler cuts into every size, and the launch colour.
@@ -348,6 +367,33 @@ mod tests {
         info.get(key)
             .and_then(plist::Value::as_string)
             .map(str::to_owned)
+    }
+
+    #[test]
+    fn the_phone_opens_configuration_files_and_import_links() {
+        let info = info();
+        assert!(info.get("CFBundleDocumentTypes").is_some());
+        assert!(info.get("UTExportedTypeDeclarations").is_some());
+        let schemes: Vec<String> = info
+            .get("CFBundleURLTypes")
+            .and_then(plist::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(plist::Value::as_dictionary)
+            .filter_map(|t| t.get("CFBundleURLSchemes")?.as_array())
+            .flatten()
+            .filter_map(|s| s.as_string().map(str::to_owned))
+            .collect();
+        assert_eq!(schemes, ["tuile"]);
+        assert_eq!(
+            string(&info, "NSPrincipalClass").as_deref(),
+            Some(PRINCIPAL_CLASS)
+        );
+        // The class the viewer defines is the one named here.
+        assert!(include_str!("../../tuile-viewer/src/desktop.rs")
+            .contains(&format!("APPLICATION: &str = \"{PRINCIPAL_CLASS}\"")));
+        assert!(include_str!("../../tuile-viewer/src/desktop.rs")
+            .contains(&format!("#[name = \"{PRINCIPAL_CLASS}\"]")));
     }
 
     #[test]

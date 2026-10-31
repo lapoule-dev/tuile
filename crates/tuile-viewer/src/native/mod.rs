@@ -11,6 +11,7 @@ pub mod android;
 // the host.
 #[cfg(any(target_os = "android", test))]
 pub(crate) mod android_signals;
+mod configured;
 pub(crate) mod launch;
 mod open;
 pub(crate) mod settings;
@@ -69,14 +70,42 @@ pub fn main(embedder: impl ViewerHost) -> ! {
     } else {
         std::env::args().skip(1).collect()
     };
-    let invocation = start::parse(arguments);
+    let mut invocation = start::parse(&arguments);
+    // The configuration: `--config`'s file, else the desktop's default one,
+    // else what a file opened in the application kept. Its terrain and
+    // layers take the host's place, and its start view fills in what the
+    // flags did not say — a flag wins over the file.
+    let identity = embedder.identity();
+    let flag = match &invocation {
+        Ok(start::Invocation::Run { config, .. }) => config.clone(),
+        _ => None,
+    };
+    let configured = match crate::import::start(
+        &identity.config_section,
+        flag.as_deref(),
+        &host::Machine,
+        &identity.name,
+    ) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("{}: {error}", identity.executable);
+            if in_a_bundle() {
+                desktop::alert("The configuration file cannot be read", &error.to_string());
+            }
+            std::process::exit(2);
+        }
+    };
+    if let Ok(start::Invocation::Run { view, .. }) = &mut invocation {
+        start::fill_in(view, &arguments, &configured.start);
+    }
     // Sources the command line named by address take the host's place —
     // before the layers are adopted, since a template is then the only one.
     let addresses = match &invocation {
         Ok(start::Invocation::Run { addresses, .. }) => addresses.clone(),
         _ => start::Addresses::default(),
     };
-    let embedder = open::Addressed::wrap(Arc::new(embedder), addresses);
+    let embedder = configured::Configured::wrap(Arc::new(embedder), configured);
+    let embedder = open::Addressed::wrap(embedder, addresses);
     embed::adopt(embedder.identity(), embedder.imagery());
     journal::open();
     if let Err(error) = session(embedder, invocation) {
@@ -222,7 +251,7 @@ fn session(
     );
     // How hard this machine may be pushed: the desktop's numbers, or a
     // phone's, sized from its memory. See `profile`.
-    let profile = profile::Profile::current();
+    let mut profile = profile::Profile::current();
     tracing::info!(
         gpu_mib = profile.gpu_bytes >> 20,
         local_reads = profile.max_local_reads,
@@ -283,25 +312,33 @@ fn session(
     let launch = launch::start(&handle, plan.clone());
     // A phone tries again by itself; a desktop says why and stops, as it
     // always has — its command line is how it is tried again.
-    let retries = (!profile.hold_window_until_warm).then(|| {
+    let retry = {
         let handle = handle.clone();
-        crate::launch::Retries::new(move || launch::start(&handle, plan.clone()))
-    });
+        move || crate::launch::Retries::new(move || launch::start(&handle, plan.clone()))
+    };
+    let mut retries = None;
     // A desktop waits for it here, with no window yet: its window is held
     // shut until the globe has a floor anyway, and a refusal is a sentence
     // for the person — shown in a window when there is no terminal. A phone
     // opens its window now and collects the launch from its loop, drawing the
     // loading indicator meanwhile.
+    //
+    // Started from an icon, a desktop that cannot start — no token yet, most
+    // often — does not quit: it opens its window as a phone does, says why,
+    // and tries again by itself and as soon as a configuration file is
+    // opened (File > Open, a double-click, a link).
     let launch = if profile.hold_window_until_warm {
         match launch.wait() {
             Ok(started) => crate::launch::Launch::finished(Ok(started)),
             Err(why) if bundled => {
-                desktop::alert(&format!("{} cannot start yet", host::app_name()), &why);
-                std::process::exit(1);
+                profile.hold_window_until_warm = false;
+                retries = Some(retry());
+                crate::launch::Launch::finished(Err(why))
             }
             Err(why) => anyhow::bail!("{why}"),
         }
     } else {
+        retries = Some(retry());
         launch
     };
 
@@ -376,6 +413,7 @@ fn session(
         signals::catch_interruptions();
     }
     let event_loop = event_loop()?;
+    desktop::adopt_the_loop();
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(app_config, launch);
     // On a phone this never returns: the system owns the loop, and the

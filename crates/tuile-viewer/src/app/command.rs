@@ -19,7 +19,14 @@ impl App {
     /// it comes from outside the process, and must not be able to do more than
     /// fail.
     pub(super) fn take_the_commands(&mut self) {
+        #[cfg(target_os = "android")]
+        super::importing::take_from_the_activity();
         while let Ok(request) = self.requests.try_recv() {
+            // A configuration file, or an import link: see `importing`.
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.take_an_import(&request) {
+                continue;
+            }
             match request {
                 // A script's command arrives already read and already checked.
                 Request::Do(command) => self.apply(command),
@@ -33,6 +40,8 @@ impl App {
                     Err(why) => tracing::error!("steering URL ignored: {why}"),
                 },
                 Request::Pasted(text) => self.go_to_the_link(text),
+                // Taken above; a page has no files to import.
+                Request::Import { .. } | Request::ImportFile(_) | Request::ImportFailed(_) => {}
             }
         }
     }
@@ -109,6 +118,7 @@ impl App {
                 &format!("{} — keys and gestures", self.title),
                 &crate::start::keys(),
             ),
+            Command::OpenConfiguration => crate::desktop::choose_configuration(),
             Command::Imagery(layer) => self.drape(layer),
             Command::Clock { instant, rate } => {
                 let wall = super::wall_seconds();

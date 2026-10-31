@@ -4,6 +4,7 @@
 #![doc = include_str!("../README.md")]
 
 mod android;
+mod documents;
 mod handheld;
 mod icon;
 
@@ -123,6 +124,10 @@ fn info_plist(bundle: &Bundle, version: &str) -> plist::Value {
             text("Copyright © lapoule.dev. MIT OR Apache-2.0."),
         ),
     ] {
+        info.insert(key.into(), value);
+    }
+    // The configuration file's type, which a double-click opens here.
+    for (key, value) in documents::declarations(bundle) {
         info.insert(key.into(), value);
     }
     // A bundle that is not the project's own tells the program inside it who
@@ -398,6 +403,25 @@ mod tests {
             .and_then(plist::Value::as_string)
             .unwrap_or_else(|| unreachable!("{key} is missing or not a string"))
             .to_owned()
+    }
+
+    #[test]
+    fn a_double_click_on_a_configuration_file_opens_the_application() {
+        let info = info_plist(&Bundle::default(), "1.2.3");
+        let info = info.as_dictionary().expect("a dictionary");
+        let documents = info
+            .get("CFBundleDocumentTypes")
+            .and_then(plist::Value::as_array)
+            .expect("document types");
+        let types: Vec<&str> = documents
+            .iter()
+            .filter_map(plist::Value::as_dictionary)
+            .filter_map(|d| d.get("LSItemContentTypes")?.as_array())
+            .flatten()
+            .filter_map(plist::Value::as_string)
+            .collect();
+        assert_eq!(types, ["dev.lapoule.tuile.viewer.config"]);
+        assert!(info.get("UTExportedTypeDeclarations").is_some());
     }
 
     #[test]

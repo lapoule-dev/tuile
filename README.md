@@ -280,7 +280,11 @@ under `examples/` (`tuile-wgpu-viewer`, `tuile-orbit-probe`,
 
 ## Getting started
 
-You need a recent stable Rust (see `rust-version` in `Cargo.toml`).
+**Just want to fly the globe?** Download the viewer for your Mac, iPhone or
+Android phone and set it up with your own free Cesium ion token in one file:
+[Try tuile](docs/try-tuile.md).
+
+To build it yourself, you need a recent stable Rust (see `rust-version` in `Cargo.toml`).
 
 ```bash
 cargo check --workspace
@@ -370,6 +374,7 @@ The design documents live in [`docs/`](docs/):
 | [`02-3d-tiles-primer.md`](docs/02-3d-tiles-primer.md) | The standard: what is implemented and how |
 | [`03-roadmap.md`](docs/03-roadmap.md) | Milestones and acceptance criteria |
 | [`20-conventions.md`](docs/20-conventions.md) | Style, tests, CI, licences, commits |
+| [`try-tuile.md`](docs/try-tuile.md) | Download the viewer, configure it with your own token, fly |
 
 Each crate has its own specification beside them (`10-crate-core.md`,
 `11-crate-wgpu.md`, …), and `cargo doc --no-deps --workspace` builds the API

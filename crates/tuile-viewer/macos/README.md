@@ -23,10 +23,23 @@ run from a terminal.
 
 ## The access token
 
+**The one-step way: open a configuration file.** Double-click a `.tuile`
+file, or use **File › Open Configuration…** (⌘O), or
+`open my-tuile.tuile`. The token goes to the Keychain, the rest to the
+application's settings, and a short message names what the file set up —
+see [Try tuile](../../../docs/try-tuile.md) and the example,
+`examples/wgpu-viewer/config.example.tuile`. A first launch with no token
+opens its window, says so, and starts as soon as a file is opened. A link,
+`tuile://import?src=https://…/file.tuile`, fetches and imports one the same
+way; the token is never in the link.
+
 An application started from an icon has no shell environment. The token is read
 
 1. from `CESIUM_ION_TOKEN` in the environment, if it is set — always first;
-2. otherwise from `~/Library/Application Support/Tuile/token`.
+2. from the file `--config` named, or `config.tuile` in the support
+   directory, read for the session and not kept;
+3. from the Keychain, where an opened configuration file kept it;
+4. otherwise from `~/Library/Application Support/Tuile/token`.
 
 The file holds the token on a line of its own (a `NAME=value` line also reads).
 Create it yourself and keep it to yourself:
@@ -103,6 +116,7 @@ osascript -e 'tell application "Tuile" to go to longitude -4.02 latitude 5.34 al
 | `tuile://here` | centres on the current location |
 | `tuile://view?freeze=on\|off&wireframe=on\|off` | the two display switches |
 | `tuile://imagery?name=<layer>` | drapes another imagery layer; `name=next` takes the one after the present |
+| `tuile://import?src=https://…` | fetches a configuration file and imports it, as opening it would |
 
 The parameters are the command-line flags' — same names, same units, same
 bounds, one table in the source; `time`, `timeOffset` and `timeRate` are read

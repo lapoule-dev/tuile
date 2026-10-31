@@ -175,8 +175,47 @@ pub(crate) fn launch_settings(lines: &str) -> LaunchSettings {
     settings
 }
 
+/// What the activity holds for import (`TuileActivity.takeImport`), as a
+/// request: `link\n<url>`, or `file\n<name>\n<text>`. Anything else is
+/// nothing.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn import_request(held: &str) -> Option<crate::steer::Request> {
+    let (kind, rest) = held.split_once('\n')?;
+    match kind {
+        "link" => Some(crate::steer::Request::Url(rest.trim().to_owned())),
+        "file" => {
+            let (file, text) = rest.split_once('\n').unwrap_or((rest, ""));
+            Some(crate::steer::Request::Import {
+                file: file.trim().to_owned(),
+                text: text.to_owned(),
+            })
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn what_the_activity_holds_becomes_a_request() {
+        use super::import_request;
+        use crate::steer::Request;
+        assert_eq!(
+            import_request("link\ntuile://import?src=https://x.test/c.tuile"),
+            Some(Request::Url(
+                "tuile://import?src=https://x.test/c.tuile".into()
+            ))
+        );
+        assert_eq!(
+            import_request("file\nmine.tuile\n[ion]\ntoken = \"t\"\n"),
+            Some(Request::Import {
+                file: "mine.tuile".into(),
+                text: "[ion]\ntoken = \"t\"\n".into()
+            })
+        );
+        assert_eq!(import_request("other\nx"), None);
+        assert_eq!(import_request(""), None);
+    }
     use super::*;
 
     /// Every level the platform defines, read as the viewer's three grades —
