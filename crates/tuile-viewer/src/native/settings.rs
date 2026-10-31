@@ -86,6 +86,34 @@ pub(crate) fn tilesets(
     }
 }
 
+/// The key of the phone's settings switch that turns the host's offered
+/// 3D Tiles on: a boolean, off by default.
+pub(crate) const SHOW_TILESETS_KEY: &str = "show_tilesets";
+
+/// The tilesets on at the start: those asked for (`asked`, from
+/// [`tilesets`]), else every one `offered` when the settings page's switch
+/// is on, else what the person left on last time (`kept`). None by default.
+pub(crate) fn tilesets_on(
+    asked: Vec<i64>,
+    offered: &[crate::embed::TilesetChoice],
+    host: &dyn crate::host::Host,
+    kept: impl FnOnce() -> Vec<i64>,
+) -> Vec<i64> {
+    if !asked.is_empty() {
+        return asked;
+    }
+    let switched = host.setting(SHOW_TILESETS_KEY).is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+    if switched {
+        return offered.iter().map(|c| c.asset).collect();
+    }
+    kept()
+}
+
 /// The scene's clock: what the command line said (`--time`, `--time-offset`,
 /// `--time-rate`), or — where it named no instant — `TUILE_LIT_AT`, UTC
 /// seconds since the Unix epoch, a session pinned to a stated moment for
@@ -238,6 +266,56 @@ mod tests {
         assert!(
             why.contains(TILESETS_VARIABLE) && why.contains("photoreal"),
             "{why}"
+        );
+    }
+
+    /// A machine whose settings page holds the 3D Tiles switch.
+    struct Switch(Option<&'static str>);
+
+    impl crate::host::Host for Switch {
+        fn var(&self, _name: &str) -> Option<String> {
+            None
+        }
+        fn read(&self, path: &std::path::Path) -> std::io::Result<String> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                path.display().to_string(),
+            ))
+        }
+        fn is_macos(&self) -> bool {
+            true
+        }
+        fn setting(&self, key: &str) -> Option<String> {
+            (key == SHOW_TILESETS_KEY)
+                .then_some(self.0)
+                .flatten()
+                .map(str::to_owned)
+        }
+    }
+
+    /// **Off unless the person chose**: what was asked for, else the
+    /// settings switch, else the last session's choice, else none — the
+    /// viewer as it was before tilesets existed.
+    #[test]
+    fn offered_tilesets_are_off_unless_chosen() {
+        let offered = [crate::embed::TilesetChoice::new("Mesh", 2275207)];
+        let nothing = Vec::new;
+        assert!(tilesets_on(Vec::new(), &offered, &Switch(None), nothing).is_empty());
+        assert!(tilesets_on(Vec::new(), &offered, &Switch(Some("0")), nothing).is_empty());
+        assert_eq!(
+            tilesets_on(Vec::new(), &offered, &Switch(Some("1")), nothing),
+            vec![2275207],
+            "the settings switch"
+        );
+        assert_eq!(
+            tilesets_on(vec![7], &offered, &Switch(Some("1")), nothing),
+            vec![7],
+            "what was asked for wins"
+        );
+        assert_eq!(
+            tilesets_on(Vec::new(), &offered, &Switch(None), || vec![2275207]),
+            vec![2275207],
+            "the last session's choice"
         );
     }
 

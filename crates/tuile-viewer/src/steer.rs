@@ -167,6 +167,12 @@ pub(crate) enum Command {
     ClockNow,
     /// The session recorded, or the recording closed.
     Record(bool),
+    /// The host's 3D Tiles tileset of this asset number drawn over the
+    /// globe, or not: see `crate::surface`.
+    Tileset {
+        asset: i64,
+        on: bool,
+    },
 }
 
 /// Which of `layers` a person, a flag, a URL or a script means by `text`: a
@@ -354,6 +360,30 @@ pub(crate) fn parse_url_among(
             [("name", name)] => Ok(vec![Command::Imagery(layer_named(layers, name)?)]),
             _ => Err("imagery takes exactly one parameter, name=".to_owned()),
         },
+        "tileset" => {
+            let (mut asset, mut on) = (None, None);
+            for (key, text) in &pairs {
+                match *key {
+                    "asset" => {
+                        asset = Some(text.parse::<i64>().map_err(|_| {
+                            format!("asset is a tileset's asset number, not {text:?}")
+                        })?)
+                    }
+                    "show" => {
+                        on = Some(match *text {
+                            "on" => true,
+                            "off" => false,
+                            _ => return Err(format!("show is on or off, not {text:?}")),
+                        })
+                    }
+                    _ => return Err(format!("tileset takes asset= and show=, not {key:?}")),
+                }
+            }
+            match (asset, on) {
+                (Some(asset), Some(on)) => Ok(vec![Command::Tileset { asset, on }]),
+                _ => Err("tileset takes asset= and show=on|off".to_owned()),
+            }
+        }
         "view" => {
             if pairs.is_empty() {
                 return Err("view changes nothing: give freeze= or wireframe=".to_owned());
@@ -1178,6 +1208,34 @@ mod tests {
             &[],
         ] {
             assert!(Goto::from_numbers(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A tileset is shown or hidden by its asset number, and nothing else
+    /// reads as either.
+    #[test]
+    fn a_tileset_is_shown_or_hidden_by_url() {
+        let url = |rest: &str| format!("{}://{rest}", scheme());
+        assert_eq!(
+            parse_url(&url("tileset?asset=2275207&show=off")),
+            Ok(vec![Command::Tileset {
+                asset: 2275207,
+                on: false
+            }])
+        );
+        assert_eq!(
+            parse_url(&url("tileset?show=on&asset=7")),
+            Ok(vec![Command::Tileset { asset: 7, on: true }])
+        );
+        for wrong in [
+            "tileset",
+            "tileset?asset=7",
+            "tileset?show=on",
+            "tileset?asset=x&show=on",
+            "tileset?asset=7&show=maybe",
+            "tileset?asset=7&show=on&layer=2",
+        ] {
+            assert!(parse_url(&url(wrong)).is_err(), "{wrong}");
         }
     }
 }

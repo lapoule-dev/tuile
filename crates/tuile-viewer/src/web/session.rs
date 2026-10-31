@@ -101,6 +101,13 @@ impl Started {
         (Vec::new(), Vec::new())
     }
 
+    /// Opens the host's tileset `asset` again: the worker serves none yet.
+    pub(crate) fn open_tileset(&self, asset: i64) -> crate::surface::Opening {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(Err(format!("3D Tiles {asset}: not in a page yet")));
+        rx
+    }
+
     /// Closes the session down. A page has no store to flush and no thread to
     /// join: the worker is terminated, and that is all of it.
     pub(crate) fn close(self, _patience: std::time::Duration, _join_the_server: bool) {

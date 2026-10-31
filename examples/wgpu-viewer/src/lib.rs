@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tuile_cesium_ion::IonSources;
 use tuile_native_fetchers::{default_cache_dir, CacheConfig, NativeHttp};
-use tuile_viewer::{Identity, ImageryChoice, Sources, TerrainChoice, ViewerHost};
+use tuile_viewer::{Identity, ImageryChoice, Sources, TerrainChoice, TilesetChoice, ViewerHost};
 
 /// The environment variable the access token is read from — on every
 /// platform but Android, which holds none.
@@ -20,6 +20,10 @@ const WORLD_TERRAIN: i64 = 1;
 const AERIAL: i64 = 2;
 const AERIAL_WITH_LABELS: i64 = 3;
 const SATELLITE_MOSAIC: i64 = 3954;
+
+/// The ion asset of the photorealistic 3D Tiles: a mesh of the whole
+/// surface, buildings and trees included, ion points at on another service.
+const PHOTOREALISTIC: i64 = 2275207;
 
 /// Whose pictures the layers are: shown beside the layer's name for as long
 /// as it is on screen.
@@ -90,6 +94,16 @@ impl ViewerHost for Public {
             // the geographic grid, where the two above are web-mercator.
             ImageryChoice::new("satellite", "Satellite", SATELLITE_MOSAIC, MOSAIC),
         ]
+    }
+
+    fn tilesets(&self) -> Vec<TilesetChoice> {
+        // Off until the person turns it on in the menu (on a phone, its
+        // settings page). Named for what it shows; whose it is, the credits
+        // bar says while it is drawn.
+        vec![TilesetChoice::new(
+            "Photorealistic 3D Tiles",
+            PHOTOREALISTIC,
+        )]
     }
 
     async fn connect(&self) -> Result<Arc<dyn Sources>, String> {

@@ -641,7 +641,6 @@ where
 
 /// Asset numbers, comma-separated: `2275207` or `2275207,96188`. `what` is
 /// where they were read, for the message when one is not a number.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn asset_list(what: &str, text: &str) -> Result<Vec<i64>, String> {
     text.split(',')
         .map(|one| {

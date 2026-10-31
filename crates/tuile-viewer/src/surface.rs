@@ -35,6 +35,10 @@ pub(crate) struct Surface {
     pub credits: Vec<Credit>,
 }
 
+/// A tileset on its way up, after a person switched it on: the surface, or
+/// why it could not be opened.
+pub(crate) type Opening = tokio::sync::oneshot::Receiver<Result<Surface, String>>;
+
 /// A tileset in the window: its session and its pump, and what its last
 /// frame's tiles credited.
 pub(crate) struct Layer {

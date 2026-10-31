@@ -55,8 +55,13 @@ pub(crate) struct Started {
     pub surfaces: Vec<crate::surface::Surface>,
     /// Why a tileset asked for is not among them, a sentence each.
     pub surface_failures: Vec<String>,
-    /// Their servers' threads, joined on the way out.
-    pub surface_servers: Vec<std::thread::JoinHandle<()>>,
+    /// Their servers' threads, joined on the way out — those opened later
+    /// too ([`Started::open_tileset`]).
+    pub surface_servers: Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    /// What a tileset switched on later is opened with: the host's sources,
+    /// and the launch's plan for its traversal and budget.
+    pub sources: Arc<dyn crate::embed::Sources>,
+    pub plan: Plan,
 }
 
 impl Started {
@@ -67,6 +72,29 @@ impl Started {
             std::mem::take(&mut self.surfaces),
             std::mem::take(&mut self.surface_failures),
         )
+    }
+
+    /// Opens the host's tileset `asset` again, after the session is up — a
+    /// person switched it back on. Its server runs as the launch's do; the
+    /// answer arrives on the receiver.
+    pub(crate) fn open_tileset(&self, asset: i64) -> crate::surface::Opening {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sources = Arc::clone(&self.sources);
+        let plan = self.plan.clone();
+        let runtime = self.runtime.clone();
+        let servers = Arc::clone(&self.surface_servers);
+        self.runtime.spawn(async move {
+            let opened = open_surface(sources.as_ref(), asset, &plan, &runtime)
+                .await
+                .map(|(surface, server)| {
+                    if let Ok(mut servers) = servers.lock() {
+                        servers.push(server);
+                    }
+                    surface
+                });
+            let _ = tx.send(opened);
+        });
+        rx
     }
 
     /// How the loader holds imagery, for the window to tell it the device's
@@ -109,7 +137,11 @@ impl Started {
                     tracing::error!("the geometry server panicked; its last work is lost");
                 }
             }
-            for server in surface_servers {
+            let servers = surface_servers
+                .lock()
+                .map(|mut servers| std::mem::take(&mut *servers))
+                .unwrap_or_default();
+            for server in servers {
                 if server.join().is_err() {
                     tracing::error!("a tileset's geometry server panicked");
                 }
@@ -319,7 +351,9 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         runtime,
         surfaces,
         surface_failures,
-        surface_servers,
+        surface_servers: Arc::new(std::sync::Mutex::new(surface_servers)),
+        sources,
+        plan,
     })
 }
 

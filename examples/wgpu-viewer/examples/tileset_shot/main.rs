@@ -11,7 +11,10 @@
 //! ```
 //!
 //! Writes `<out>/globe.png` (no tileset), `<out>/tileset.png` (with it) and
-//! prints what each frame's scan found. The host is the application's own
+//! prints what each frame's scan found. Then, in the same session, switches
+//! the tilesets off as the menu does (`tileset?asset=…&show=off`) and writes
+//! `<out>/off.png` a moment later, and on again, `<out>/on.png` once they
+//! have had `--seconds` to come back. The host is the application's own
 //! (`tuile_wgpu_viewer::Public`): the token is read from `CESIUM_ION_TOKEN`
 //! and never printed. `--seconds` is how long the tileset is given to load
 //! after the globe has settled (the settling watches the globe's own pump).
@@ -92,6 +95,32 @@ fn main() {
     }
 }
 
+/// Saves the eye's picture as `<out>/<name>.png` and says what its scan
+/// found.
+fn save(run: &Headless, asked: &Asked, name: &str, note: &str) -> Result<(), String> {
+    let (pixels, (w, h)) = run.picture(0).ok_or("the eye drew nothing")?;
+    let path = asked.out.join(format!("{name}.png"));
+    image::save_buffer(&path, pixels, w, h, image::ExtendedColorType::Rgba8)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    println!(
+        "{}: {note}, {} black pixels, eye {}",
+        path.display(),
+        run.state().black(),
+        run.state().to_json()["view"]
+    );
+    Ok(())
+}
+
+/// Every tileset of the run switched on or off, as the menu switches one.
+fn switch(run: &mut Headless, tilesets: &[i64], on: bool) {
+    for asset in tilesets {
+        run.act(&Action::Url(format!(
+            "tuile://tileset?asset={asset}&show={}",
+            if on { "on" } else { "off" }
+        )));
+    }
+}
+
 fn shoot(asked: &Asked, tilesets: Vec<i64>, name: &str) -> Result<(), String> {
     let dir = tempfile::Builder::new()
         .prefix("tuile-tileset-shot-")
@@ -103,7 +132,7 @@ fn shoot(asked: &Asked, tilesets: Vec<i64>, name: &str) -> Result<(), String> {
         size: asked.size,
         scale: 1.0,
         lit_at: asked.at,
-        tilesets,
+        tilesets: tilesets.clone(),
         ..Start::new(
             Arc::new(tuile_wgpu_viewer::Public),
             dir.path().join("tiles"),
@@ -120,18 +149,20 @@ fn shoot(asked: &Asked, tilesets: Vec<i64>, name: &str) -> Result<(), String> {
     if with {
         run.run_for(asked.seconds);
     }
-    let (pixels, (w, h)) = run.picture(0).ok_or("the eye drew nothing")?;
-    let path = asked.out.join(format!("{name}.png"));
-    image::save_buffer(&path, pixels, w, h, image::ExtendedColorType::Rgba8)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    println!(
-        "{}: settled {} in {:.1} s, {} black pixels, eye {}",
-        path.display(),
-        settled.settled,
-        settled.seconds,
-        run.state().black(),
-        run.state().to_json()["view"]
-    );
+    let settled = format!("settled {} in {:.1} s", settled.settled, settled.seconds);
+    save(&run, asked, name, &settled)?;
+    if with {
+        // Off: the very next frame, then once the globe has settled.
+        switch(&mut run, &tilesets, false);
+        run.run_for(0.1);
+        save(&run, asked, "off-at-once", "switched off, the next frames")?;
+        run.settle(60.0);
+        save(&run, asked, "off", "switched off, settled")?;
+        // On again: opened afresh, given the same time to come back.
+        switch(&mut run, &tilesets, true);
+        run.run_for(asked.seconds);
+        save(&run, asked, "on", "switched on again")?;
+    }
     run.finish().map(|_| ())
 }
 
