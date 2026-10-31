@@ -4,8 +4,10 @@
 //! One decision step, in order:
 //!
 //! 1. apply the recorded arrivals, in a canonical order;
-//! 2. read the need: quantise, merge duplicates, choose each tile's imagery
-//!    level (with hysteresis, Interactive only);
+//! 2. read the need: the need kept from the last step, changed by what
+//!    changed (or replaced by a whole need) — each tile that entered or
+//!    changed quantised and merged again (`need_state`); then choose each
+//!    tile's imagery level (with hysteresis, Interactive only);
 //! 3. build the draw set from acknowledged resources only: exact, held finer
 //!    descendants on a zoom-out, the nearest drawable ancestor otherwise, and
 //!    each mesh's best drawable drape;
@@ -43,9 +45,10 @@ use super::decisions::{
 };
 use super::error::{AuditError, SessionError};
 use super::imagery::{drape_rank, needed_level, DrapeCandidate, GeoRect, LevelClamp, UvTransform};
-use super::need::{ImageryNeed, LayerReach, Membership, Need};
+use super::need::{LayerReach, Membership};
+use super::need_state::{NeedState, TileNeed, WantedImagery};
 use super::priority::{score, PriorityKey, Quantised, Urgency};
-use super::sorted::{recycle, union4, SortedMap};
+use super::sorted::{union4, SortedMap};
 use super::state::{Arena, CpuCopy, EvictKey, Gpu, Held, Load, Rank, Slot, Transit};
 use super::stats::{BudgetStats, CancelReason, EvictReason, GAP_BUCKETS, LATENCY_BUCKETS};
 use super::tier::{Presence, PresenceOracle, Source, Tier};
@@ -54,7 +57,7 @@ use super::types::{
     ResourceId, Thermal, TileId,
 };
 use super::view::{Protection, ResourceState, ResourceView};
-use super::{Budget, Event, FrameInput, Ledger, TileInfo, RECENT_CAP, THRASH_WINDOW};
+use super::{Budget, Event, FrameInput, Ledger, NeedInput, RECENT_CAP, THRASH_WINDOW};
 
 /// The step's effective numbers, after pressure, thermal and retarget.
 struct Eff {
@@ -139,21 +142,10 @@ struct Want {
     level: u32,
 }
 
-/// One wanted tile's need, merged: borrowed from the step's input.
-#[derive(Clone, Copy, Debug)]
-struct TileNeed<'a> {
-    membership: Membership,
-    need: &'a Need,
-    q: Quantised,
-    /// Its place in the need's entries: of equal entries, the first wins.
-    seq: u32,
-}
-
 /// A step's buffers, kept across steps so that a step allocates nothing
 /// once they have grown to the view.
 #[derive(Debug, Default)]
 pub(super) struct Scratch {
-    tiles: Vec<(TileId, TileNeed<'static>)>,
     drapes: Vec<((TileId, LayerId), u32)>,
     /// Wants before their merge: (resource, order put, want).
     wants_raw: Vec<(ResourceId, u32, Want)>,
@@ -266,25 +258,9 @@ enum Job {
     Deliver,
 }
 
-fn sort_key<'n>(n: &'n TileNeed<'_>) -> impl Ord + 'n {
-    let img = n
-        .need
-        .imagery
-        .as_ref()
-        .map(|i| (i.footprint.ratio().to_bits(), &i.layers));
-    (
-        Reverse(n.membership),
-        n.q,
-        img,
-        n.need.level,
-        n.need.parent,
-        n.need.class,
-    )
-}
-
 /// The layers a need asks for, in stacking order.
-fn layers(img: &ImageryNeed) -> &[LayerReach] {
-    &img.layers
+fn layers(img: &WantedImagery) -> &[LayerReach] {
+    img.layers()
 }
 
 /// Every layer of `tile`, as a range of a map keyed by `(tile, layer)`.
@@ -295,7 +271,7 @@ fn tile_layers(tile: TileId) -> std::ops::RangeInclusive<(TileId, LayerId)> {
 /// The floor swap group `r` belongs to (D-A1), if any: a floor tile's mesh
 /// and its floor drape of every layer it wears, in stacking order.
 fn floor_group<'t>(
-    tiles: &'t SortedMap<TileId, TileNeed<'_>>,
+    tiles: &'t SortedMap<TileId, TileNeed>,
     r: ResourceId,
     is_floor: impl Fn(u32) -> bool,
 ) -> Option<impl Iterator<Item = ResourceId> + Clone + 't> {
@@ -602,45 +578,26 @@ impl Budget {
         self.events = events;
     }
 
-    // 2. The need.
-    fn read_need<'a>(
-        &mut self,
-        input: &FrameInput<'a>,
-        st: &mut BudgetStats,
-    ) -> SortedMap<TileId, TileNeed<'a>> {
-        let mut tiles: Vec<(TileId, TileNeed<'a>)> =
-            recycle(std::mem::take(&mut self.scratch.tiles));
-        for (seq, (m, t, n)) in input.need.entries().enumerate() {
-            let q = Quantised::of(n);
-            if q.rejected {
-                st.rejected_inputs += 1;
-            }
-            tiles.push((
-                t,
-                TileNeed {
-                    membership: m,
-                    need: n,
-                    q,
-                    seq: u32::try_from(seq).unwrap_or(u32::MAX),
-                },
-            ));
-            self.tiles.insert(
-                t,
-                TileInfo {
-                    parent: n.parent,
-                    level: n.level,
-                    rect: n.rect,
-                },
+    // 2. The need: the one kept, changed by what the step is told.
+    fn read_need(&mut self, need: &mut NeedState, input: &FrameInput<'_>, st: &mut BudgetStats) {
+        // The tree positions of the tiles that entered or changed; what a
+        // tile that did not change told the budget is already known.
+        let named = match input.need {
+            NeedInput::Full(n) => need.apply_full(n, &mut self.tiles),
+            NeedInput::Delta(d) => need.apply_delta(d, &mut self.tiles),
+        };
+        #[cfg(debug_assertions)]
+        for (t, info) in need.positions() {
+            assert_eq!(
+                self.tiles.get(&t),
+                Some(&info),
+                "the tree position of {t:?} is the whole need's"
             );
         }
-        // Per tile, the best entry first; of equals, the first listed.
-        tiles.sort_unstable_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then_with(|| sort_key(&b.1).cmp(&sort_key(&a.1)))
-                .then(a.1.seq.cmp(&b.1.seq))
-        });
-        tiles.dedup_by_key(|e| e.0);
-        SortedMap::from_sorted(tiles)
+        st.rejected_inputs = st.rejected_inputs.saturating_add(sat_u32(need.rejected()));
+        // The whole need is still walked downstream (O1.4): only what
+        // changed is counted here.
+        st.work = st.work.saturating_add(named);
     }
 
     /// How cheaply a drape could be drawn: on the GPU, decoded, in a local
@@ -659,7 +616,7 @@ impl Budget {
     /// (I14, I15). Batch takes the exact level, a function of the frame.
     fn drape_needs(
         &mut self,
-        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        tiles: &SortedMap<TileId, TileNeed>,
         presence: &dyn PresenceOracle,
     ) -> SortedMap<(TileId, LayerId), u32> {
         let mut out = std::mem::take(&mut self.scratch.drapes);
@@ -728,7 +685,7 @@ impl Budget {
 
     /// Every floor tile the need lists is drawable with its floor drape
     /// of every layer it wears (P1.1), and the need lists one at least.
-    fn floor_in(&self, tiles: &SortedMap<TileId, TileNeed<'_>>) -> bool {
+    fn floor_in(&self, tiles: &SortedMap<TileId, TileNeed>) -> bool {
         let mut any = false;
         let all = tiles
             .iter()
@@ -780,7 +737,7 @@ impl Budget {
                 let Some(info) = self.tiles.get(&t) else {
                     break;
                 };
-                let Some(p) = info.parent else {
+                let Some(p) = info.parent() else {
                     break;
                 };
                 out.push((p, h, passed));
@@ -813,8 +770,8 @@ impl Budget {
     /// at most 64, lazily, so a caller that stops at the first hit walks no
     /// further.
     fn ancestors(&self, t: TileId) -> impl Iterator<Item = TileId> + '_ {
-        std::iter::successors(self.tiles.get(&t).and_then(|i| i.parent), move |p| {
-            self.tiles.get(p).and_then(|i| i.parent)
+        std::iter::successors(self.tiles.get(&t).and_then(|i| i.parent()), move |p| {
+            self.tiles.get(p).and_then(|i| i.parent())
         })
         .take(64)
     }
@@ -826,7 +783,7 @@ impl Budget {
         if up == 0 {
             return Some(UvTransform::IDENTITY);
         }
-        match (rect, self.tiles.get(&x).and_then(|i| i.rect)) {
+        match (rect, self.tiles.get(&x).and_then(|i| i.rect())) {
             (Some(a), Some(b)) => UvTransform::between(a, b),
             _ => None,
         }
@@ -860,7 +817,7 @@ impl Budget {
                 uv: UvTransform::IDENTITY,
             });
         }
-        let rect = self.tiles.get(&tile).and_then(|i| i.rect);
+        let rect = self.tiles.get(&tile).and_then(|i| i.rect());
         // `best_drape`'s fold, walked lazily: the first of equal ranks wins.
         let mut best: Option<(DrapeCandidate, ResourceId, UvTransform)> = None;
         for (up, x) in std::iter::once(tile)
@@ -892,7 +849,7 @@ impl Budget {
     /// ancestor it maps into: `best_drape_for(tile, layer, _).is_some()`,
     /// stopping at the first found.
     fn has_drape(&self, tile: TileId, layer: LayerId) -> bool {
-        let rect = self.tiles.get(&tile).and_then(|i| i.rect);
+        let rect = self.tiles.get(&tile).and_then(|i| i.rect());
         std::iter::once(tile)
             .chain(self.ancestors(tile))
             .enumerate()
@@ -921,7 +878,7 @@ impl Budget {
     /// ancestor.
     fn select(
         &self,
-        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        tiles: &SortedMap<TileId, TileNeed>,
         drapes: &SortedMap<(TileId, LayerId), u32>,
         ancestry: &[(TileId, TileId, u32)],
         cap: Option<u32>,
@@ -974,7 +931,7 @@ impl Budget {
     // 3. The draw set.
     fn build_draw(
         &self,
-        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        tiles: &SortedMap<TileId, TileNeed>,
         drapes: &SortedMap<(TileId, LayerId), u32>,
         ancestry: &[(TileId, TileId, u32)],
         floor_in: bool,
@@ -1091,7 +1048,7 @@ impl Budget {
     /// What the step wants loaded or delivered.
     fn wants(
         &self,
-        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        tiles: &SortedMap<TileId, TileNeed>,
         drapes: &SortedMap<(TileId, LayerId), u32>,
         draw: &DrawSet,
         raw: &mut Vec<(ResourceId, u32, Want)>,
@@ -1271,21 +1228,18 @@ impl Budget {
         self.steps += 1;
 
         self.apply_events(now, &mut st);
-        let tiles = self.read_need(&input, &mut st);
-        let listed = input.need.drawn.len()
-            + input.need.blockers.len()
-            + input.need.ancestors.len()
-            + input.need.ring.len();
-        st.work = st.work.saturating_add(sat_u32(listed));
-        let drapes = self.drape_needs(&tiles, input.presence);
-        st.floor_in = self.floor_in(&tiles);
+        let mut need = std::mem::take(&mut self.need);
+        self.read_need(&mut need, &input, &mut st);
+        let tiles = need.tiles();
+        let drapes = self.drape_needs(tiles, input.presence);
+        st.floor_in = self.floor_in(tiles);
         let mut ancestry = std::mem::take(&mut self.scratch.ancestry);
         self.held_ancestry(&mut ancestry);
-        let (draw, coarsening) = self.build_draw(&tiles, &drapes, &ancestry, st.floor_in, &mut st);
+        let (draw, coarsening) = self.build_draw(tiles, &drapes, &ancestry, st.floor_in, &mut st);
         self.scratch.ancestry = ancestry;
         let mut raw = std::mem::take(&mut self.scratch.wants_raw);
         let merged = std::mem::take(&mut self.scratch.wants);
-        let wants = self.wants(&tiles, &drapes, &draw, &mut raw, merged);
+        let wants = self.wants(tiles, &drapes, &draw, &mut raw, merged);
         // Drawn content of an older epoch is refreshed, new before old.
         raw.clear();
         for i in &draw.items {
@@ -1490,7 +1444,7 @@ impl Budget {
             now,
             &eff,
             &picked,
-            &tiles,
+            tiles,
             &coarsening,
             &wants,
             &mut d,
@@ -1498,7 +1452,7 @@ impl Budget {
         );
 
         // 8. The upload plan.
-        d.upload_plan = self.plan(&eff, &keys, &tiles);
+        d.upload_plan = self.plan(&eff, &keys, tiles);
         // The plan scans the loads and transits for those in transit.
         st.work = st.work.saturating_add(sat_u32(self.active.len()));
 
@@ -1529,7 +1483,7 @@ impl Budget {
                         .is_some_and(|s| self.arena.has_transit(s) || self.arena.loading(s))
             });
         if eff.batch {
-            let complete = input.need.blockers.is_empty()
+            let complete = need.blockers() == 0
                 && tiles
                     .iter()
                     .filter(|(_, n)| n.membership == Membership::Drawn)
@@ -1561,9 +1515,9 @@ impl Budget {
         let mut wanted = std::mem::take(&mut self.wanted_last);
         wanted.refill(wants.keys().chain(self.drawn_last.iter()).copied());
         self.wanted_last = wanted;
-        let pruned = self.prune(now, &tiles, &wants, &drapes);
+        let pruned = self.prune(now, tiles, &wants, &drapes);
         st.work = st.work.saturating_add(pruned);
-        self.scratch.tiles = recycle(tiles.into_buffer());
+        self.need = need;
         self.scratch.drapes = drapes.into_buffer();
         self.scratch.wants = wants.into_buffer();
         self.scratch.keys = keys.into_buffer();
@@ -1987,7 +1941,7 @@ impl Budget {
         now: Micros,
         eff: &Eff,
         jobs: &[(PriorityKey, ResourceId, Job, Want)],
-        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        tiles: &SortedMap<TileId, TileNeed>,
         coarsening: &BTreeSet<TileId>,
         wants: &SortedMap<ResourceId, Want>,
         d: &mut Decisions,
@@ -2144,7 +2098,7 @@ impl Budget {
         &self,
         eff: &Eff,
         keys: &SortedMap<ResourceId, PriorityKey>,
-        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        tiles: &SortedMap<TileId, TileNeed>,
     ) -> UploadPlan {
         // Group: the blockers of one parent (meshes and drapes), else a
         // tile's mesh and its drape.
@@ -2533,7 +2487,7 @@ impl Budget {
     fn prune(
         &mut self,
         now: Micros,
-        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        tiles: &SortedMap<TileId, TileNeed>,
         wants: &SortedMap<ResourceId, Want>,
         drapes: &SortedMap<(TileId, LayerId), u32>,
     ) -> u32 {
@@ -2602,7 +2556,7 @@ impl Budget {
         for i in 0..seeds {
             let mut cur = keep[i];
             let walk = keep.len();
-            while let Some(p) = self.tiles.get(&cur).and_then(|i| i.parent) {
+            while let Some(p) = self.tiles.get(&cur).and_then(|i| i.parent()) {
                 // A seed's ancestors are walked from the seed itself; a
                 // tile met twice in one walk is a cycle.
                 if keep[..seeds].binary_search(&p).is_ok() || keep[walk..].contains(&p) {
@@ -2781,7 +2735,7 @@ impl Budget {
 mod tests {
     use super::*;
     use crate::cost::Cost;
-    use crate::{BudgetConfig, NeedSet};
+    use crate::{BudgetConfig, Need, NeedSet};
 
     #[test]
     fn a_slot_freed_twice_saturates_and_is_recorded() {

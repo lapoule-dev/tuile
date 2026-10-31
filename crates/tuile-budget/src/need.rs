@@ -7,11 +7,16 @@
 use super::imagery::{GeoRect, TexelFootprint};
 use super::types::{Class, LayerId, TileId};
 
-/// What the traversal wants, built afresh each decision step.
+/// What the traversal wants: the whole need of one decision step.
 ///
 /// A tile may appear in several lists; the most urgent membership wins. The
 /// order of the entries does not matter: the budget's decisions are stable
-/// under any permutation of them.
+/// under any permutation of them, but for a tile listed twice in one list
+/// with needs that tie, where the first listed wins.
+///
+/// A step gives the budget either the whole need or what changed in it
+/// since the step before ([`NeedDelta`]); a delta built from two needs
+/// ([`NeedDelta::diff`]) decides exactly as the second need would.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NeedSet {
     /// The tiles the traversal wants drawn this step.
@@ -30,6 +35,62 @@ impl NeedSet {
     /// An empty need.
     pub fn new() -> Self {
         NeedSet::default()
+    }
+
+    /// How many entries it lists, every list counted.
+    pub fn len(&self) -> usize {
+        self.drawn.len() + self.blockers.len() + self.ancestors.len() + self.ring.len()
+    }
+
+    /// Whether it lists nothing.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The list of `m`.
+    pub fn list(&self, m: Membership) -> &Vec<(TileId, Need)> {
+        match m {
+            Membership::Drawn => &self.drawn,
+            Membership::Blocker => &self.blockers,
+            Membership::Ancestor => &self.ancestors,
+            Membership::Ring => &self.ring,
+        }
+    }
+
+    /// The list of `m`, to change.
+    pub fn list_mut(&mut self, m: Membership) -> &mut Vec<(TileId, Need)> {
+        match m {
+            Membership::Drawn => &mut self.drawn,
+            Membership::Blocker => &mut self.blockers,
+            Membership::Ancestor => &mut self.ancestors,
+            Membership::Ring => &mut self.ring,
+        }
+    }
+
+    /// The entry at `seq` in [`NeedSet::entries`]' order.
+    pub(crate) fn entry(&self, seq: usize) -> Option<(Membership, TileId, &Need)> {
+        let mut i = seq;
+        for m in Membership::ALL {
+            let l = self.list(m);
+            if let Some((t, n)) = l.get(i) {
+                return Some((m, *t, n));
+            }
+            i -= l.len();
+        }
+        None
+    }
+
+    /// Every entry's tile and its place in [`NeedSet::entries`], by tile,
+    /// then in that order: each tile's entries side by side, as listed.
+    pub(crate) fn grouped_into(&self, out: &mut Vec<(TileId, u32)>) {
+        out.clear();
+        out.extend(
+            self.entries()
+                .enumerate()
+                .map(|(seq, (_, t, _))| (t, u32::try_from(seq).unwrap_or(u32::MAX))),
+        );
+        // Each place once: unstable is stable here.
+        out.sort_unstable();
     }
 
     /// Every entry with its membership, most urgent list first.
@@ -59,11 +120,337 @@ pub enum Membership {
     Ring,
 }
 
+impl Membership {
+    /// Every membership, most urgent first: the order of the lists.
+    pub const ALL: [Membership; 4] = [
+        Membership::Drawn,
+        Membership::Blocker,
+        Membership::Ancestor,
+        Membership::Ring,
+    ];
+}
+
+/// What changed in the need since the step before, tile by tile: the tiles
+/// that entered it, those whose entries changed, those that left.
+///
+/// The budget keeps the need it last read; a step given a delta
+/// ([`FrameInput::from_delta`](crate::FrameInput::from_delta)) applies it to
+/// that need instead of reading a whole one, and decides exactly as it
+/// would on the whole need the delta leads to.
+///
+/// The unit of change is the tile. A tile that entered or changed is listed
+/// with every entry it now has — each `(tile, membership, need)` of it, side
+/// by side, in the need's order (a list's entries as listed); a tile that
+/// left is named. A tile changed when any of its entries did: one more or
+/// one less, another membership, any field of a need (a float compared bit
+/// for bit, [`Need::same_as`]): its SSE, distance or centrality, its
+/// parent, its imagery or footprint.
+///
+/// [`NeedDelta::diff`] builds one from two whole needs. Applied to the
+/// first ([`NeedDelta::apply_to`]), it gives the second, entry for entry; only
+/// the order of the tiles within a list may differ, on which nothing
+/// depends.
+///
+/// Built by hand ([`NeedDelta::enter`], [`NeedDelta::change`],
+/// [`NeedDelta::leave`]), a tile is meant to appear once. If it appears more
+/// than once, its last word counts, in the order: left, entered, changed —
+/// within one list, the later. Entering or changing a tile with no entry
+/// records nothing (a tile goes by [`NeedDelta::leave`]); a tile that left
+/// and was not there stays away, one that "changed" and was not there
+/// enters.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NeedDelta {
+    entered: Vec<(TileId, Membership, Need)>,
+    changed: Vec<(TileId, Membership, Need)>,
+    left: Vec<TileId>,
+}
+
+/// One tile's last word in a [`NeedDelta`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeltaOp {
+    /// It left.
+    Leave,
+    /// Its entries now: `entered` (`list` 0) or `changed` (1), `start..end`;
+    /// for a whole need's run (2), `start..end` of its grouped entries.
+    Set { list: u8, start: u32, end: u32 },
+}
+
+impl NeedDelta {
+    /// No change.
+    pub fn new() -> Self {
+        NeedDelta::default()
+    }
+
+    /// What changed from `before` to `after`.
+    pub fn between(before: &NeedSet, after: &NeedSet) -> Self {
+        let mut d = NeedDelta::new();
+        d.diff(before, after);
+        d
+    }
+
+    /// Becomes what changed from `before` to `after`, in its own buffers.
+    /// The tiles come in order, each tile's entries in the need's order.
+    pub fn diff(&mut self, before: &NeedSet, after: &NeedSet) {
+        self.clear();
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        before.grouped_into(&mut a);
+        after.grouped_into(&mut b);
+        let run = |g: &[(TileId, u32)], i: usize| {
+            let t = g[i].0;
+            i + g[i..].iter().take_while(|e| e.0 == t).count()
+        };
+        fn entry(n: &NeedSet, seq: u32) -> (Membership, TileId, &Need) {
+            usize::try_from(seq)
+                .ok()
+                .and_then(|s| n.entry(s))
+                .expect("a place listed")
+        }
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() || j < b.len() {
+            let ta = a.get(i).map(|e| e.0);
+            let tb = b.get(j).map(|e| e.0);
+            match (ta, tb) {
+                (Some(x), Some(y)) if x == y => {
+                    let (ia, jb) = (run(&a, i), run(&b, j));
+                    let same = ia - i == jb - j
+                        && a[i..ia].iter().zip(&b[j..jb]).all(|(p, q)| {
+                            let (pm, _, pn) = entry(before, p.1);
+                            let (qm, _, qn) = entry(after, q.1);
+                            pm == qm && pn.same_as(qn)
+                        });
+                    if !same {
+                        for e in &b[j..jb] {
+                            let (m, t, n) = entry(after, e.1);
+                            self.changed.push((t, m, n.clone()));
+                        }
+                    }
+                    (i, j) = (ia, jb);
+                }
+                (Some(x), y) if y.is_none_or(|y| x < y) => {
+                    self.left.push(x);
+                    i = run(&a, i);
+                }
+                _ => {
+                    let jb = run(&b, j);
+                    for e in &b[j..jb] {
+                        let (m, t, n) = entry(after, e.1);
+                        self.entered.push((t, m, n.clone()));
+                    }
+                    j = jb;
+                }
+            }
+        }
+    }
+
+    /// `tile` entered the need, with these entries.
+    pub fn enter(&mut self, tile: TileId, entries: impl IntoIterator<Item = (Membership, Need)>) {
+        self.entered
+            .extend(entries.into_iter().map(|(m, n)| (tile, m, n)));
+    }
+
+    /// `tile`'s entries changed: these are all of them now.
+    pub fn change(&mut self, tile: TileId, entries: impl IntoIterator<Item = (Membership, Need)>) {
+        self.changed
+            .extend(entries.into_iter().map(|(m, n)| (tile, m, n)));
+    }
+
+    /// `tile` left the need.
+    pub fn leave(&mut self, tile: TileId) {
+        self.left.push(tile);
+    }
+
+    /// No change, its buffers kept.
+    pub fn clear(&mut self) {
+        self.entered.clear();
+        self.changed.clear();
+        self.left.clear();
+    }
+
+    /// Whether nothing changed.
+    pub fn is_empty(&self) -> bool {
+        self.entered.is_empty() && self.changed.is_empty() && self.left.is_empty()
+    }
+
+    /// The entries of the tiles that entered.
+    pub fn entered(&self) -> &[(TileId, Membership, Need)] {
+        &self.entered
+    }
+
+    /// The entries, all of them now, of the tiles that changed.
+    pub fn changed(&self) -> &[(TileId, Membership, Need)] {
+        &self.changed
+    }
+
+    /// The tiles that left.
+    pub fn left(&self) -> &[TileId] {
+        &self.left
+    }
+
+    /// The tiles it names: entered, changed or left.
+    pub fn tiles(&self) -> usize {
+        let runs = |l: &[(TileId, Membership, Need)]| {
+            l.iter()
+                .enumerate()
+                .filter(|(i, e)| *i == 0 || l[i - 1].0 != e.0)
+                .count()
+        };
+        runs(&self.entered) + runs(&self.changed) + self.left.len()
+    }
+
+    /// Applies it to `need`: the whole need it leads to. Each tile it names
+    /// loses every entry it had, then gets its entries now, at the end of
+    /// their lists.
+    pub fn apply_to(&self, need: &mut NeedSet) {
+        let mut ops = Vec::new();
+        self.ops_into(&mut ops);
+        let named: Vec<TileId> = ops.iter().map(|o| o.0).collect();
+        for m in Membership::ALL {
+            need.list_mut(m)
+                .retain(|(t, _)| named.binary_search(t).is_err());
+        }
+        for (_, op) in &ops {
+            for (t, m, n) in self.group(*op) {
+                need.list_mut(*m).push((*t, n.clone()));
+            }
+        }
+    }
+
+    /// Each tile's word in tile order, read off the lists as they are: when
+    /// each list comes sorted by tile and no tile is in two of them (as
+    /// [`NeedDelta::diff`] makes them). `None` otherwise
+    /// ([`NeedDelta::ops_into`] sorts them).
+    pub(crate) fn sorted_ops(&self) -> Option<impl Iterator<Item = (TileId, DeltaOp)> + '_> {
+        let sorted = |l: &[(TileId, Membership, Need)]| l.windows(2).all(|w| w[0].0 <= w[1].0);
+        let ok = self.left.windows(2).all(|w| w[0] < w[1])
+            && sorted(&self.entered)
+            && sorted(&self.changed);
+        if !ok {
+            return None;
+        }
+        let mut check = Words::new(self);
+        check.by_ref().for_each(drop);
+        (!check.clash).then(|| Words::new(self))
+    }
+
+    /// Each tile's last word, in tile order, into `out` (its buffer kept).
+    pub(crate) fn ops_into(&self, out: &mut Vec<(TileId, DeltaOp)>) {
+        out.clear();
+        out.extend(self.left.iter().map(|t| (*t, DeltaOp::Leave)));
+        for (list, l) in [(0u8, &self.entered), (1, &self.changed)] {
+            let mut i = 0;
+            while i < l.len() {
+                let t = l[i].0;
+                let end = i + l[i..].iter().take_while(|e| e.0 == t).count();
+                let (start, end) = (sat(i), sat(end));
+                out.push((t, DeltaOp::Set { list, start, end }));
+                i = usize::try_from(end).unwrap_or(usize::MAX).max(i + 1);
+            }
+        }
+        // By tile, then in the order the words count: left, entered,
+        // changed, each list as written. Only the last word of a tile stays.
+        // Keys distinct but for a tile left twice, two equal words.
+        out.sort_unstable_by_key(|(t, op)| {
+            (
+                *t,
+                match *op {
+                    DeltaOp::Leave => (0u8, 0u32),
+                    DeltaOp::Set { list, start, .. } => (1 + list, start),
+                },
+            )
+        });
+        out.reverse();
+        out.dedup_by_key(|(t, _)| *t);
+        out.reverse();
+    }
+
+    /// The entries of a tile's word.
+    pub(crate) fn group(&self, op: DeltaOp) -> &[(TileId, Membership, Need)] {
+        match op {
+            DeltaOp::Leave => &[],
+            DeltaOp::Set { list, start, end } => {
+                let l = if list == 0 {
+                    &self.entered
+                } else {
+                    &self.changed
+                };
+                let at = |x: u32| usize::try_from(x).unwrap_or(usize::MAX).min(l.len());
+                &l[at(start)..at(end)]
+            }
+        }
+    }
+}
+
+/// A sorted delta's words, by tile: its three lists merged.
+struct Words<'d> {
+    d: &'d NeedDelta,
+    l: usize,
+    e: usize,
+    c: usize,
+    /// Whether two lists named one tile.
+    clash: bool,
+}
+
+impl<'d> Words<'d> {
+    fn new(d: &'d NeedDelta) -> Self {
+        Words {
+            d,
+            l: 0,
+            e: 0,
+            c: 0,
+            clash: false,
+        }
+    }
+}
+
+impl Iterator for Words<'_> {
+    type Item = (TileId, DeltaOp);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let heads = [
+            self.d.left.get(self.l).copied(),
+            self.d.entered.get(self.e).map(|x| x.0),
+            self.d.changed.get(self.c).map(|x| x.0),
+        ];
+        let t = heads.iter().flatten().min().copied()?;
+        self.clash |= heads.iter().filter(|h| **h == Some(t)).count() > 1;
+        let run = |l: &[(TileId, Membership, Need)], i: usize| {
+            i + l[i..].iter().take_while(|x| x.0 == t).count()
+        };
+        Some(if heads[0] == Some(t) {
+            self.l += 1;
+            (t, DeltaOp::Leave)
+        } else if heads[1] == Some(t) {
+            let end = run(&self.d.entered, self.e);
+            let op = DeltaOp::Set {
+                list: 0,
+                start: sat(self.e),
+                end: sat(end),
+            };
+            self.e = end;
+            (t, op)
+        } else {
+            let end = run(&self.d.changed, self.c);
+            let op = DeltaOp::Set {
+                list: 1,
+                start: sat(self.c),
+                end: sat(end),
+            };
+            self.c = end;
+            (t, op)
+        })
+    }
+}
+
+/// A position as a `u32`, saturating.
+fn sat(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 /// One tile's need, from the traversal.
 ///
 /// Floats are quantised once when the budget reads them; a non-finite value
 /// counts as zero and is reported in the step's statistics.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 #[non_exhaustive]
 pub struct Need {
     /// The tile's level in its tree.
@@ -85,7 +472,58 @@ pub struct Need {
     pub rect: Option<GeoRect>,
 }
 
+// By hand for `clone_from`, which keeps the layers' buffer: the budget
+// copies the needs it is told about into the ones it keeps.
+impl Clone for Need {
+    fn clone(&self) -> Self {
+        Need {
+            level: self.level,
+            parent: self.parent,
+            class: self.class,
+            sse_excess: self.sse_excess,
+            centrality: self.centrality,
+            distance: self.distance,
+            imagery: self.imagery.clone(),
+            rect: self.rect,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.level = source.level;
+        self.parent = source.parent;
+        self.class = source.class;
+        self.sse_excess = source.sse_excess;
+        self.centrality = source.centrality;
+        self.distance = source.distance;
+        self.imagery.clone_from(&source.imagery);
+        self.rect = source.rect;
+    }
+}
+
 impl Need {
+    /// Whether `self` and `other` are the same need, their floats compared
+    /// bit for bit: `-0.0` is not `0.0`, and a NaN is itself. What a
+    /// [`NeedDelta`] calls a change.
+    pub fn same_as(&self, other: &Need) -> bool {
+        let rect_bits = |r: &GeoRect| [r.west, r.south, r.east, r.north].map(f64::to_bits);
+        let imagery_same = match (&self.imagery, &other.imagery) {
+            (Some(a), Some(b)) => {
+                a.footprint.ratio().to_bits() == b.footprint.ratio().to_bits()
+                    && a.layers == b.layers
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        self.level == other.level
+            && self.parent == other.parent
+            && self.class == other.class
+            && self.sse_excess.to_bits() == other.sse_excess.to_bits()
+            && self.centrality.to_bits() == other.centrality.to_bits()
+            && self.distance.to_bits() == other.distance.to_bits()
+            && imagery_same
+            && self.rect.as_ref().map(rect_bits) == other.rect.as_ref().map(rect_bits)
+    }
+
     /// A need for a tile at `level`, of mesh class `class`, with neutral
     /// scores.
     pub fn new(level: u32, class: Class) -> Self {
@@ -146,13 +584,28 @@ pub struct LayerReach {
 /// geometric and common to every layer, and how deep each layer it wears
 /// reaches. Each layer picks its level, falls back and refreshes on its
 /// own.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct ImageryNeed {
     /// How large one level-0 texel looks on screen, at the tile's closest
     /// visible point.
     pub footprint: TexelFootprint,
     /// The layers the tile wears, in stacking order.
     pub layers: Vec<LayerReach>,
+}
+
+// By hand for `clone_from`, which keeps the layers' buffer.
+impl Clone for ImageryNeed {
+    fn clone(&self) -> Self {
+        ImageryNeed {
+            footprint: self.footprint,
+            layers: self.layers.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.footprint = source.footprint;
+        self.layers.clone_from(&source.layers);
+    }
 }
 
 impl ImageryNeed {
@@ -165,5 +618,149 @@ impl ImageryNeed {
                 max_level,
             }],
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn tile(i: u64) -> TileId {
+        TileId::from_terrain(2, i % 4, i / 4)
+    }
+
+    fn need() -> NeedSet {
+        let n = |l| Need::new(l, Class::TerrainMesh).with_sse_excess(0.5);
+        NeedSet {
+            drawn: vec![(tile(0), n(2)), (tile(1), n(2))],
+            blockers: vec![(tile(2), n(3))],
+            ancestors: vec![(tile(3), n(1))],
+            ring: vec![(tile(4), n(2)), (tile(0), n(2))],
+        }
+    }
+
+    /// Each list's entries in a canonical order: what a need is, up to the
+    /// order of its tiles.
+    fn canon(n: &NeedSet) -> Vec<(Membership, TileId, Vec<String>)> {
+        let mut out: Vec<(Membership, TileId, Vec<String>)> = Vec::new();
+        for (m, t, e) in n.entries() {
+            match out.iter_mut().find(|x| x.0 == m && x.1 == t) {
+                Some(x) => x.2.push(format!("{e:?}")),
+                None => out.push((m, t, vec![format!("{e:?}")])),
+            }
+        }
+        out.sort_by_key(|a| (a.0, a.1));
+        out
+    }
+
+    /// Every kind of change is one: a float (bit for bit, `-0.0` against
+    /// `0.0`), the parent, the level, the imagery, a move between lists,
+    /// an entry more, a tile gone, a tile new.
+    #[test]
+    fn every_kind_of_change_is_seen_and_applied() {
+        let base = need();
+        type Edit = Box<dyn Fn(&mut NeedSet)>;
+        let edits: Vec<(&str, Edit)> = vec![
+            ("sse", Box::new(|n| n.drawn[0].1.sse_excess = 0.75)),
+            ("distance", Box::new(|n| n.drawn[0].1.distance = 3.0)),
+            ("centrality", Box::new(|n| n.drawn[0].1.centrality = 0.5)),
+            ("signed zero", Box::new(|n| n.drawn[1].1.distance = -0.0)),
+            (
+                "parent",
+                Box::new(|n| n.blockers[0].1.parent = Some(tile(9))),
+            ),
+            ("level", Box::new(|n| n.ancestors[0].1.level = 7)),
+            (
+                "imagery",
+                Box::new(|n| {
+                    let fp = crate::TexelFootprint::new(2.0, 1.0, 1.0, 1.0, 1.0).unwrap();
+                    n.ring[0].1.imagery = Some(ImageryNeed::base(fp, 4));
+                }),
+            ),
+            (
+                "membership",
+                Box::new(|n| {
+                    let e = n.drawn.remove(1);
+                    n.ancestors.push(e);
+                }),
+            ),
+            (
+                "an entry more",
+                Box::new(|n| {
+                    let e = n.drawn[1].clone();
+                    n.drawn.push(e);
+                }),
+            ),
+            ("gone", Box::new(|n| n.blockers.clear())),
+            (
+                "new",
+                Box::new(|n| n.ring.push((tile(12), Need::new(2, Class::TerrainMesh)))),
+            ),
+        ];
+        for (what, edit) in edits {
+            let mut after = base.clone();
+            edit(&mut after);
+            let d = NeedDelta::between(&base, &after);
+            assert_eq!(d.tiles(), 1, "{what}: one tile changed");
+            let mut applied = base.clone();
+            d.apply_to(&mut applied);
+            assert_eq!(canon(&applied), canon(&after), "{what}");
+        }
+        assert!(
+            NeedDelta::between(&base, &base).is_empty(),
+            "no change, no delta"
+        );
+    }
+
+    /// A delta between two needs leads from one to the other, whatever
+    /// they are; a tile's entries come side by side, in the need's order.
+    #[test]
+    fn a_delta_leads_from_one_need_to_the_other() {
+        let a = need();
+        let mut b = need();
+        b.drawn.reverse();
+        b.drawn[0].1.sse_excess = 2.0;
+        b.ring.push((tile(4), Need::new(9, Class::TerrainMesh)));
+        b.ancestors.clear();
+        b.blockers
+            .push((tile(13), Need::new(3, Class::TerrainMesh)));
+        let d = NeedDelta::between(&a, &b);
+        assert_eq!(d.left(), &[tile(3)]);
+        assert_eq!(
+            d.entered().iter().map(|e| e.0).collect::<Vec<_>>(),
+            [tile(13)]
+        );
+        // `tile(1)`'s need changed; `tile(4)` has an entry more.
+        let mut changed: Vec<_> = d.changed().iter().map(|e| (e.0, e.1)).collect();
+        changed.dedup();
+        changed.sort();
+        let mut want = vec![(tile(1), Membership::Drawn), (tile(4), Membership::Ring)];
+        want.sort();
+        assert_eq!(changed, want);
+        assert_eq!(d.tiles(), 4);
+        let mut x = a.clone();
+        d.apply_to(&mut x);
+        assert_eq!(canon(&x), canon(&b));
+    }
+
+    /// By hand, a tile's last word counts: left, then entered, then
+    /// changed; a word with no entry is none.
+    #[test]
+    fn a_tiles_last_word_counts() {
+        let n = || Need::new(1, Class::TerrainMesh);
+        let mut d = NeedDelta::new();
+        d.leave(tile(0));
+        d.enter(tile(0), [(Membership::Drawn, n())]);
+        d.change(tile(1), [(Membership::Ring, n())]);
+        d.enter(tile(1), [(Membership::Drawn, n())]);
+        d.change(tile(2), []);
+        let mut x = NeedSet::new();
+        x.ancestors.push((tile(2), n()));
+        d.apply_to(&mut x);
+        assert_eq!(x.drawn.iter().map(|e| e.0).collect::<Vec<_>>(), [tile(0)]);
+        assert_eq!(x.ring.iter().map(|e| e.0).collect::<Vec<_>>(), [tile(1)]);
+        assert_eq!(x.ancestors.len(), 1, "an empty word changes nothing");
+        assert_eq!(d.tiles(), 4);
     }
 }

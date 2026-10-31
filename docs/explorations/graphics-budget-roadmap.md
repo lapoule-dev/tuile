@@ -25,7 +25,7 @@ PRs — numbered B1–B8 in that plan, unrelated to section B below — fixes it
 signals, and a measured acceptance (imagery peak ≤ 15.5 MB, BC7 settle ≤ 6.0 s, Off goldens unchanged). It comes
 before A2 and A4.
 
-### O1 — the budget's algorithms, before CB (status: O1.2 eviction index, 2026-10-31)
+### O1 — the budget's algorithms, before CB (status: O1.3 need deltas, 2026-10-31)
 
 The budget is its own crate, `tuile-budget` (#163). O1 optimises its `decide` before the compression budget,
 decisions bit-identical throughout. The guard comes first (O1.0): today's engine frozen at 3d1a028e in
@@ -131,6 +131,50 @@ copy, nothing in transit or loading; 984 of them not wanted), and the decoded ti
 `retarget` does not scale it: `eff()` scales the decoded target by pressure only, not by the retarget factor.
 So on a 384 MiB budget the decoded tier still keeps 512 MiB of copies demoted by evictions, and every one of
 them is a tracked resource that the simulation's I7 bound (GPU-drawable + pending + need) does not count.
+
+**O1.3 — need deltas** (`perf/budget-o1-need-deltas`). The need no longer arrives whole each step to be sorted,
+deduplicated and reinserted (O(N log N) for a still view). `NeedDelta` (in `tuile-budget`) says what changed
+since the step before, tile by tile: the tiles that entered and those whose entries changed, each with all its
+entries now (membership and need, in the need's order), and the tiles that left; a change is any entry more or
+less, another membership, or any field of a need, floats compared bit for bit. `NeedDelta::diff(before, after)`
+builds one from two whole needs, and `apply_to` gives the whole need back. `FrameInput::from_delta` passes one
+(`FrameInput::new` still passes a whole need: the first step, a resynchronisation, a caller with whole needs
+only), and the geometry server (`runtime.rs`) sends the whole need on its first step and deltas after, diffed
+against the need it kept. The budget keeps the need it last read (`need_state::NeedState`): each wanted tile's
+best entry in a sorted vector, which the step reads as it is — no per-step copy. A delta resolves only the tiles
+it names (best entry first, the first of equals; tree position from the last entry, as before), merged in one
+pass; a whole need is applied the same way, every tile named. The tree positions (`tiles`) become a sorted vector
+of packed 48-byte entries, updated only for the tiles named. Same decisions: lockstep green in every `budget_sim`
+run (the simulation sends deltas, the frozen engine the whole need) and the properties (2 048 cases, one step in
+four a whole need, the rest deltas), goldens and pattern goldens untouched. In debug builds the kept need is
+checked every step against a recomputation from the whole need (kept beside, rebuilt by `apply_to`), and every
+wanted tile's tree position too. Red seen: a delta whose changed tiles are not applied diverges at step 3 in 60 of
+61 `budget_sim` runs, fails the property, and fails `the_need_kept_through_deltas_is_the_whole_needs` at its
+first step.
+
+| Measure | O1.2 | O1.3 |
+|---|---|---|
+| `decide` still (484 drawn), told what changed (nothing) | mean 809 µs, p50 798, p99 884 | mean 771 µs, p50 761, p99 851 (−5 %) |
+| `decide` still, told the whole need (`still-full`) | (the only path) | mean 807 µs, p50 797, p99 889 (no change) |
+| `decide` motion | mean 680 µs, p50 605, p99 1 618 | mean 698 µs, p50 626, p99 1 618 (+3 %) |
+| `decide` pressure | mean 464 µs, p50 454, p99 716 | mean 467 µs, p50 458, p99 709 (no change) |
+| allocations per step, still (internal / output) | 13 / 649 | 13 / 649 |
+| allocations per step, motion p99 (internal) | 38 | 38 |
+| allocations per step, pressure p50 / p99 (internal) | 12 / 74 | 12 / 74 |
+| step buffers after the tour | 381 056 B | 349 824 B |
+| bytes per tracked resource | 445 (2 927 tracked) | 432 (2 927 tracked) |
+| P6.4 `work`, still view (nothing changing) | ≈ 1 470 a step, worst 4 646 | ≈ 910 a step, worst 4 080 |
+
+Criterion: `decide/still` −5.1 % (p < 0.05). The gain is small, as expected: everything after `read_need`
+(imagery levels, draw set, wants, ranking, prune) still walks the whole need every step until O1.4's dirty sets.
+In motion every wanted tile's SSE and distance change every step, so a delta names nearly the whole need and the
+budget resolves it all as before; the step is about 3 % slower there (the larger kept record, 96 bytes against
+the 40 of the old borrowed one, and the sorted vectors' merges when tiles enter), and the diff the host now
+computes (outside `decide`) is not in these numbers. `work` counts what the delta names instead of every entry:
+on the still view, about 560 less a step. P6.4 stays ignored (red on 1 488 of 5 100 steps, all still, against
+1 492 before) until O1.4. Memory: the kept need adds about 65 KB on the tour (607 tiles), paid for by the tree
+positions' sorted vector of packed entries (1 841 tiles, 214 KB as a `BTreeMap` → about 103 KB) and the step's
+borrowed copy of the need gone.
 
 
 Order is strict: A before B, B before C. Every step of A, B and C goes through the same battery before

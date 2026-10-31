@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use tuile_budget::{
     Budget, BudgetConfig, BudgetStats, Bytes, Class, Decisions, FrameDeadline, FrameInput,
-    Generation, LayerId, Micros, NeedSet, Policy, Pressure, ResourceId, Role, Source, Thermal,
-    TileId,
+    Generation, LayerId, Micros, NeedDelta, NeedSet, Policy, Pressure, ResourceId, Role, Source,
+    Thermal, TileId,
 };
 
 use super::gpu::SimGpu;
@@ -288,6 +288,11 @@ pub struct Sim {
     /// The events the last `decide` applied: those fed since the one
     /// before (P6.4's #E_k).
     pub step_events: u64,
+    /// The need of the last step, `None` before the first: a step tells
+    /// the budget what changed since it, as the geometry server does.
+    need_last: Option<NeedSet>,
+    /// What changed, in a buffer kept across steps.
+    delta: NeedDelta,
 }
 
 impl Sim {
@@ -337,6 +342,8 @@ impl Sim {
             fed: 0,
             fed_at_decide: 0,
             step_events: 0,
+            need_last: None,
+            delta: NeedDelta::new(),
             profile,
         }
     }
@@ -407,12 +414,22 @@ impl Sim {
             drawn_last,
             self.pinned(),
         );
-        let input = FrameInput::new(self.frame, self.now, &need).with_presence(&self.net.store);
+        // The first step reads the whole need; every later one what changed
+        // since the step before (built outside what is timed and counted).
+        let input = match &self.need_last {
+            Some(last) => {
+                self.delta.diff(last, &need);
+                FrameInput::from_delta(self.frame, self.now, &self.delta)
+            }
+            None => FrameInput::new(self.frame, self.now, &need),
+        }
+        .with_presence(&self.net.store);
         self.step_events = self.fed - self.fed_at_decide;
         self.fed_at_decide = self.fed;
         // The real budget's call alone is timed and counted; the frozen
-        // reference decides after it, and the two are compared.
-        let (d, (heap, us)) = self.budget.decide_with(input, |b, i| {
+        // reference decides after it, on the whole need, and the two are
+        // compared.
+        let (d, (heap, us)) = self.budget.decide_with(input, &need, |b, i| {
             let clock = std::time::Instant::now();
             let (d, heap) = super::alloc::counted(|| b.decide(i));
             (d, (heap, clock.elapsed().as_secs_f64() * 1e6))
@@ -519,6 +536,10 @@ impl Sim {
         }
         self.now = self.now.plus(self.profile.dt);
         self.frame += 1;
+        match &mut self.need_last {
+            Some(last) => last.clone_from(&need),
+            None => self.need_last = Some(need.clone()),
+        }
         (need, d)
     }
 
