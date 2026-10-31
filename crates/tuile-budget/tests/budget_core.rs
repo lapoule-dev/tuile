@@ -3165,4 +3165,47 @@ mod dirty_sets {
             "{RED}: the drape mapped into the footprint the need tells"
         );
     }
+
+    /// The worn rule: a tile reads the drapes an ancestor's mesh wore last
+    /// step (a layer switch: an old layer stands in while the new one is
+    /// drawable nowhere), so it is read again when that mesh's item
+    /// changes. Here the ancestor starts wearing a layer the tile does not
+    /// ask for; the tile, lost so far (its own layer is drawable nowhere),
+    /// then stands on it. The ancestor's own need changed, not its place,
+    /// and no resource changed: nothing else reads the tile again.
+    #[test]
+    fn a_tile_stands_on_an_ancestor_wearing_a_layer_since() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        // The root's mesh and its layer-1 drape drawable; then the root
+        // drawn wearing nothing, the drape kept resident.
+        r.settle(&drawn_layered(&[root], 0, &[1]), 10);
+        r.settle(&drawn(&[root]), 10);
+        let k = children(root)[0];
+        let mut ask = drawn(&[root]);
+        ask.drawn.push((k, layered(k, 1, &[0])));
+        let d = r.step(&ask);
+        assert!(!r.b.residency().drawable(k));
+        assert_eq!(
+            d.draw.get(mesh(root)).map(|i| i.serves.clone()),
+            Some(vec![root]),
+            "the root wears nothing: the tile has nothing to stand on"
+        );
+        // The root asks for layer 1 again: its item wears it from now on.
+        ask.drawn[0].1 = layered(root, 0, &[1]);
+        let d = r.step(&ask);
+        assert_eq!(
+            d.draw
+                .get(mesh(root))
+                .and_then(|i| i.drape(LayerId(1)))
+                .map(|c| c.resource),
+            Some(dl(root, 1, 0))
+        );
+        let d = r.step(&ask);
+        assert_eq!(
+            d.draw.get(mesh(root)).map(|i| i.serves.clone()),
+            Some(vec![root, k]),
+            "{RED}: the tile stands on the ancestor wearing a layer since"
+        );
+    }
 }
