@@ -12,14 +12,16 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 mod budget_common;
+mod reference;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use budget_common::*;
 use proptest::prelude::*;
+use reference::Lockstep;
 use tuile_budget::{
-    Budget, BudgetConfig, Bytes, Class, Decisions, Failure, FrameInput, Generation, Micros,
-    NeedSet, Pressure, ResourceId, Role, Source, Thermal, TileId,
+    BudgetConfig, Bytes, Class, Decisions, Failure, FrameInput, Generation, Micros, NeedSet,
+    Pressure, ResourceId, Role, Source, Thermal, TileId,
 };
 
 /// One scripted event.
@@ -142,7 +144,9 @@ struct Record {
 }
 
 struct Harness {
-    b: Budget,
+    /// The budget under test, in lockstep with today's engine frozen
+    /// (`tests/reference/`): every step of every script is compared to it.
+    b: Lockstep,
     cfg: BudgetConfig,
     now: Micros,
     frame: u64,
@@ -168,7 +172,7 @@ impl Harness {
             }
         }
         Harness {
-            b: Budget::new(cfg.clone()).unwrap(),
+            b: Lockstep::new(cfg.clone()).unwrap(),
             cfg,
             now: Micros::ZERO,
             frame: 0,
@@ -303,7 +307,11 @@ impl Harness {
 }
 
 fn interactive() -> BudgetConfig {
-    let mut c = BudgetConfig::interactive(Bytes(MESH.0 * 24 + drape().0 * 24));
+    interactive_on(Bytes(MESH.0 * 24 + drape().0 * 24))
+}
+
+fn interactive_on(total: Bytes) -> BudgetConfig {
+    let mut c = BudgetConfig::interactive(total);
     c.pinned_level = Some(0);
     c.max_in_flight = tuile_budget::PerClass([4, 2, 4, 1]);
     c.max_local_reads = 2;
@@ -311,6 +319,12 @@ fn interactive() -> BudgetConfig {
     c.upload_bytes_per_frame = Bytes(MESH.0 * 3);
     c.delivery_credit = Bytes(MESH.0 * 6);
     c
+}
+
+/// [`interactive`] on a third of its memory: eviction and `make_room` run
+/// on most steps, so ties in the eviction order are decided often.
+fn squeezed() -> BudgetConfig {
+    interactive_on(Bytes(MESH.0 * 8 + drape().0 * 8))
 }
 
 fn batch() -> BudgetConfig {
@@ -361,6 +375,39 @@ fn config() -> ProptestConfig {
         // 10 000 cases abort on rejects rather than on a counterexample.
         max_global_rejects: base.cases.saturating_mul(4).max(1_024),
         ..base
+    }
+}
+
+/// The guard's own configuration: at least 1 024 cases, since a random
+/// script only now and then reaches a tie the engine must break as today
+/// (an eviction order of equally recent residents, measured: half the runs
+/// at 256 cases, every run at 1 024).
+fn guard_config() -> ProptestConfig {
+    let base = config();
+    ProptestConfig {
+        cases: base.cases.max(1_024),
+        ..base
+    }
+}
+
+proptest! {
+    #![proptest_config(guard_config())]
+
+    /// O1's guard: the budget decides, step by step, exactly as today's
+    /// engine frozen in `tests/reference/` — decisions (digest and content,
+    /// statistics but the `work` counter), ledger, audit, residency and
+    /// resource views — on random scripts, both policies and a squeezed
+    /// memory, the need in its order and permuted. (Every other property's
+    /// harness runs in lockstep too; this one names the guard and covers
+    /// Batch.)
+    #[test]
+    fn decide_agrees_with_the_frozen_reference(ops in script()) {
+        for cfg in [interactive(), squeezed(), batch()] {
+            for permute in [false, true] {
+                let tr = Harness::new(cfg.clone(), 7).run(&ops, permute);
+                prop_assert!(tr.len() <= ops.len());
+            }
+        }
     }
 }
 

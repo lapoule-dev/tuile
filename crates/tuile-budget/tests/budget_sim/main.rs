@@ -22,6 +22,8 @@ mod motion;
 mod net;
 mod patterns;
 mod ratchets;
+#[path = "../reference/mod.rs"]
+mod reference;
 mod rng;
 mod scenarios;
 mod server;

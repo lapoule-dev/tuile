@@ -86,13 +86,14 @@ fn motion() -> (u64, i64, i64, usize) {
         .copied()
         .unwrap_or(0);
     let tracked = sim.budget.tracked();
-    let ((), t) = super::alloc::counted(|| sim.budget.release_scratch());
+    // The real budget alone: the frozen reference beside it is not measured.
+    let ((), t) = super::alloc::counted(|| sim.budget.real.release_scratch());
     let scratch = -t.live;
     let cfg = sim.budget.config().clone();
     let fresh = Budget::new(cfg).unwrap();
     // `Budget::new` holds nothing on the heap (empty maps and vectors), so
     // what the swap and drop give back is the old budget's whole heap.
-    let ((), t) = super::alloc::counted(|| drop(std::mem::replace(&mut sim.budget, fresh)));
+    let ((), t) = super::alloc::counted(|| drop(std::mem::replace(&mut sim.budget.real, fresh)));
     let per = -t.live / (tracked.max(1) as i64);
     (p99, scratch, per, tracked)
 }
@@ -139,4 +140,69 @@ fn allocation_ratchets_hold() {
         );
     }
     assert_eq!(got.lines().count(), want.lines().count(), "ratchet count");
+}
+
+/// O1.0's memory-pressure scenario (`soak::pressure_profile`), measured:
+/// the soak's tour for a simulated minute. Not a ratchet (its numbers are
+/// printed, `--nocapture`): the test holds the scenario to what it claims —
+/// over its target on at least 90 % of its steps (the eviction order built
+/// and sorted), evicting on at least 10 %, the view not relaxed — so that
+/// the bench's `decide/pressure` measures what it names.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
+fn the_pressure_scenario_stays_over_target() {
+    let mut sim = Sim::new(super::soak::pressure_profile(), 11);
+    super::soak::under_pressure(&mut sim);
+    sim.count_output = true;
+    let end = Micros::from_secs(60);
+    let (mut steps, mut evicting, mut over, mut drawn) = (0u32, 0u32, 0u32, 0usize);
+    while sim.now < end {
+        let t = sim.now.0 as f64 / 1e6;
+        let measured = sim.now >= Micros::from_secs(10);
+        let (_, d) = sim.step(super::soak::pressure_tour(t));
+        if measured {
+            steps += 1;
+            evicting += u32::from(!d.evict.is_empty());
+            over += u32::from(
+                tuile_budget::Class::ALL
+                    .iter()
+                    .any(|c| d.stats.gpu[*c] > d.stats.target[*c]),
+            );
+            drawn += d.draw.items.len();
+            assert_eq!(
+                d.sse_scale_milli, 1_000,
+                "the pressure scenario relaxed its view"
+            );
+        }
+    }
+    let mut internal: Vec<u64> = sim
+        .decide_allocs
+        .iter()
+        .filter(|a| a.now >= Micros::from_secs(10))
+        .map(DecideAllocs::internal)
+        .collect();
+    internal.sort_unstable();
+    let p50 = internal.get(internal.len() / 2).copied().unwrap_or(0);
+    let p99 = internal
+        .get(internal.len() * 99 / 100)
+        .copied()
+        .unwrap_or(0);
+    eprintln!(
+        "pressure ({} MiB): over target on {over}/{steps} steps, evicting on {evicting}, \
+         {} drawn on average; internal blocks per step p50 {p50}, p99 {p99}; {} tracked",
+        super::soak::PRESSURE_MIB,
+        drawn / steps.max(1) as usize,
+        sim.budget.tracked()
+    );
+    assert!(
+        over * 10 >= steps * 9,
+        "the pressure scenario fell under its target"
+    );
+    assert!(
+        evicting * 10 >= steps,
+        "the pressure scenario evicts too seldom"
+    );
 }
