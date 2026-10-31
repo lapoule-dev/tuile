@@ -85,6 +85,19 @@ fn motion() -> (u64, i64, i64, usize) {
         .get(internal.len() * 99 / 100)
         .copied()
         .unwrap_or(0);
+    // The host's diff (not a ratchet): the blocks it allocates per step.
+    let mut diff: Vec<u64> = sim
+        .diff_us
+        .iter()
+        .filter(|(t, _, _)| *t >= Micros::from_secs(10))
+        .map(|(_, _, a)| *a)
+        .collect();
+    diff.sort_unstable();
+    eprintln!(
+        "tour: the host's diff allocates p50 {}, p99 {} blocks per step",
+        diff.get(diff.len() / 2).copied().unwrap_or(0),
+        diff.get(diff.len() * 99 / 100).copied().unwrap_or(0)
+    );
     let tracked = sim.budget.tracked();
     // The real budget alone: the frozen reference beside it is not measured.
     let ((), t) = super::alloc::counted(|| sim.budget.real.release_scratch());
