@@ -14,6 +14,10 @@ workspace = true
 # runtime, no I/O. It builds for `wasm32-unknown-unknown`.
 [dependencies]
 thiserror = { workspace = true }
+# The arena's index: resource → slot, a fixed-seed hash table never iterated
+# (`state::Arena`).
+hashbrown = { workspace = true }
+foldhash = { workspace = true }
 
 [dev-dependencies]
 # The budget's properties (protection, total order, ledger, determinism,
