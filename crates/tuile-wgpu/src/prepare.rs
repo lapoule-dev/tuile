@@ -141,6 +141,10 @@ pub struct PreparedTile {
     /// among its layers. What a host reads to know how far a switch of
     /// imagery has crossed the screen.
     pub imagery_source: Option<u32>,
+    /// Who the content credits, as it named itself
+    /// ([`tuile_core::content::DecodedTileContent::copyright`]): what a host
+    /// puts on screen while it draws this tile.
+    pub copyright: Option<Arc<str>>,
 }
 
 /// A tile's stitching: what it was last told, and its slide towards it.
@@ -439,6 +443,7 @@ pub fn prepare(
     PreparedTile {
         sharpest_imagery_level,
         imagery_source,
+        copyright: content.copyright.clone(),
         meshes,
         tile_bg,
         tile_buf,
