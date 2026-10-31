@@ -11,13 +11,18 @@
 //! ```
 //!
 //! Writes `<out>/globe.png` (no tileset), `<out>/tileset.png` (with it) and
-//! prints what each frame's scan found. Then, in the same session, switches
-//! the tilesets off as the menu does (`tileset?asset=…&show=off`) and writes
-//! `<out>/off.png` a moment later, and on again, `<out>/on.png` once they
-//! have had `--seconds` to come back. The host is the application's own
-//! (`tuile_wgpu_viewer::Public`): the token is read from `CESIUM_ION_TOKEN`
-//! and never printed. `--seconds` is how long the tileset is given to load
-//! after the globe has settled (the settling watches the globe's own pump).
+//! prints what each frame's scan found; `--globe off` skips the globe alone.
+//! `--diagnostic normal|unlit|coverage|geometry` draws in a diagnostic view,
+//! as the window's `D` does. With `--switch on`, then, in the same session,
+//! it switches the tilesets off as the menu does
+//! (`tileset?asset=…&show=off`) and writes `<out>/off-at-once.png` and
+//! `<out>/off.png`, and on again, `<out>/on.png` once they have had
+//! `--seconds` to come back.
+//!
+//! The host is the application's own (`tuile_wgpu_viewer::Public`): the
+//! token is read from `CESIUM_ION_TOKEN`, or the `token` file, and never
+//! printed. `--seconds` is how long the tileset is given to load after the
+//! globe has settled (the settling watches the globe's own pump).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,6 +37,12 @@ struct Asked {
     out: PathBuf,
     size: (u32, u32),
     seconds: f64,
+    /// Whether to switch the tilesets off and on again after the shot.
+    switch: bool,
+    /// The diagnostic view to draw (`--diagnostic unlit`), as `D` cycles.
+    diagnostic: Option<String>,
+    /// Whether to shoot the globe alone first (`--globe off` skips it).
+    globe: bool,
 }
 
 fn read(args: &[String]) -> Result<Asked, String> {
@@ -73,6 +84,9 @@ fn read(args: &[String]) -> Result<Asked, String> {
             number("--height", 800.0)? as u32,
         ),
         seconds: number("--seconds", 40.0)?,
+        switch: flags.get("--switch").is_some_and(|v| *v == "on"),
+        diagnostic: flags.get("--diagnostic").map(|v| (*v).to_owned()),
+        globe: flags.get("--globe").is_none_or(|v| *v != "off"),
     })
 }
 
@@ -142,6 +156,9 @@ fn shoot(asked: &Asked, tilesets: Vec<i64>, name: &str) -> Result<(), String> {
     // Placed again once the ground under it is known: at the start the
     // floor is the coarsest relief's, which can stand kilometres above the
     // real ground and lifts a low eye with it.
+    if let Some(view) = &asked.diagnostic {
+        run.act(&Action::Url(format!("tuile://view?diagnostic={view}")));
+    }
     run.settle(120.0);
     run.act(&Action::Go(asked.view));
     let settled = run.settle(120.0);
@@ -151,7 +168,7 @@ fn shoot(asked: &Asked, tilesets: Vec<i64>, name: &str) -> Result<(), String> {
     }
     let settled = format!("settled {} in {:.1} s", settled.settled, settled.seconds);
     save(&run, asked, name, &settled)?;
-    if with {
+    if with && asked.switch {
         // Off: the very next frame, then once the globe has settled.
         switch(&mut run, &tilesets, false);
         run.run_for(0.1);
@@ -168,6 +185,8 @@ fn shoot(asked: &Asked, tilesets: Vec<i64>, name: &str) -> Result<(), String> {
 
 fn run(asked: &Asked) -> Result<(), String> {
     std::fs::create_dir_all(&asked.out).map_err(|e| e.to_string())?;
-    shoot(asked, Vec::new(), "globe")?;
+    if asked.globe {
+        shoot(asked, Vec::new(), "globe")?;
+    }
     shoot(asked, asked.tilesets.clone(), "tileset")
 }
