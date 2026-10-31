@@ -25,7 +25,7 @@ PRs — numbered B1–B8 in that plan, unrelated to section B below — fixes it
 signals, and a measured acceptance (imagery peak ≤ 15.5 MB, BC7 settle ≤ 6.0 s, Off goldens unchanged). It comes
 before A2 and A4.
 
-### O1 — the budget's algorithms, before CB (status: O1.3 need deltas, 2026-10-31)
+### O1 — the budget's algorithms, before CB (status: O1.3 need deltas and its debt pass, 2026-10-31)
 
 The budget is its own crate, `tuile-budget` (#163). O1 optimises its `decide` before the compression budget,
 decisions bit-identical throughout. The guard comes first (O1.0): today's engine frozen at 3d1a028e in
@@ -175,6 +175,78 @@ on the still view, about 560 less a step. P6.4 stays ignored (red on 1 488 of 5 
 1 492 before) until O1.4. Memory: the kept need adds about 65 KB on the tour (607 tiles), paid for by the tree
 positions' sorted vector of packed entries (1 841 tiles, 214 KB as a `BTreeMap` → about 103 KB) and the step's
 borrowed copy of the need gone.
+
+**The debt pass after O1.3** (`perf/budget-o1-debt`, on top of the stack). One commit per debt, decisions
+bit-identical (lockstep green, goldens and pattern goldens untouched, ratchets only down):
+
+- `SessionError::resource()` matched exhaustively in the crate (#163's wildcard in the runtime gone);
+- the lockstep compares the whole internal state each step (`tuile_budget::snapshot`), not only outputs (#165):
+  seen red with a failure count not reset on success, which the old lockstep passed on all 61 `budget_sim` runs and
+  the new one fails on 54;
+- the eviction index on `std::collections::BTreeSet` instead of the hand-written treap (#168) was tried and
+  reverted: decisions identical, but bytes per tracked resource 432 → 470 and motion allocations p99 38 → 39; the
+  treap stays until Laurent decides;
+- the host's diff (`NeedDelta::diff`, what the runtime computes before `decide`) measured (#169): about 22 µs
+  still, 33 µs in motion, and about 640 heap blocks a step on the tour (each changed tile's `Need` cloned);
+- motion back under O1.2 (#169): the kept tiles and the tree positions as key/value columns (`SortedCols`, lookups
+  in a dense key column), entering tiles merged in place (no buffer), the kept record 88 → 80 bytes;
+- the need state's memory rules each kept with the number that justifies it (#169).
+
+`budget_decide` per layer, the same binaries run back to back five times on the same (shared, loaded) Apple M2,
+best of five (noise only adds time); `decide+diff` is a delta step's whole cost to the host:
+
+| Layer | still | still, whole need | motion | pressure | decide + diff, still | decide + diff, motion |
+|---|---|---|---|---|---|---|
+| O1.0 | 1 097 / 1 195 | (the only path) | 904 / 2 174 | 913 / 1 654 | — | — |
+| O1.1 | 814 / 893 | (the only path) | 695 / 1 730 | 652 / 1 125 | — | — |
+| O1.2 | 812 / 902 | (the only path) | 680 / 1 619 | 466 / 723 | — | — |
+| O1.3 | 774 / 867 | 809 / 892 | 699 / 1 620 | 471 / 720 | not measured then | not measured then |
+| debt pass | 721 / 789 | 749 / 815 | 654 / 1 518 | 429 / 658 | 742 / 822 | 686 / 1 584 |
+
+(mean / p99, µs.) Allocations (release `budget_sim`, counting allocator):
+
+| Layer | still internal / output | motion p99 | pressure p50 / p99 | step buffers | bytes / tracked resource |
+|---|---|---|---|---|---|
+| O1.0 | 13 / 649 | 43 | 21 / 76 | 381 056 B | 534 |
+| O1.1 | 13 / 649 | 42 | 21 / 73 | 381 056 B | 452 |
+| O1.2 | 13 / 649 | 38 | 12 / 74 | 381 056 B | 445 |
+| O1.3 | 13 / 649 | 38 | 12 / 73 | 349 824 B | 432 |
+| debt pass | 13 / 649 | 38 | 12 / 74 | 340 096 B | 432 |
+
+**M-run** (native headless runner, `p2-slow`, Paris 160 km → 5 km, desktop 1280×800 @2, imagery `Off`, Metal,
+`TUILE_REQUIRE_GPU=1`; the six builds interleaved, three runs each, median). Measured on a machine shared with
+another heavy job (load average 15–50 during the runs: frame times are inflated for every build alike), so the
+rows compare builds, not absolute frame budgets. "Every upload landed" is the runner's settle time plus its idle
+wait. `main` is 0.15.1; the stack is based on 0.15.0 (`#163`'s base), so `main` differs from the stack by more
+than the budget.
+
+| Build | imagery on the GPU at its peak | every upload landed | frame p99 | frame p50 | obligations |
+|---|---|---|---|---|---|
+| `main` (2f9d240b) | 161.1 MB | 1.2 s | 78 ms | 39 ms | kept ×3 |
+| #163 (crate move; O1.0 is the same binary) | 171.3 MB | 1.4 s | 73 ms | 32 ms | kept ×3 |
+| O1.1 | 172.0 MB | 0.7 s | 72 ms | 32 ms | kept ×3 |
+| O1.2 | 172.3 MB | 0.8 s | 70 ms | 39 ms | kept ×3 |
+| O1.3 | 173.0 MB | 1.0 s | 67 ms | 40 ms | kept ×3 |
+| debt pass | 173.0 MB | 1.3 s | 62 ms | 33 ms | kept ×3 |
+
+No black pixel in any of the 18 settled pictures. Within the noise, the layers do not move the runner's numbers:
+the budget's `decide` is a fraction of a millisecond in frames of tens.
+
+**M-web** (`scripts/web-bench.py`, headless Chrome, 1280×800 @2, the ten patterns), `main` and the debt pass:
+
+| Build | Configuration | Patterns kept | Convergence median / max | Holes (moving frames, black pixels) | Violations |
+|---|---|---|---|---|---|
+| `main` | WebGPU auto | 10/10 | 8.0 / 15.0 s | 0, 0 | none |
+| `main` | WebGL2 auto | 9/10 | 10.5 / 15.0 s | 0, 0 | hand: one duplicate concurrent request |
+| `main` | off | 10/10 | 6.0 / 15.0 s | 0, 0 | none |
+| debt pass | WebGPU auto | 8/10 | 10.1 / 28.1 s | 0, 0 | yaw, tilt: convergence over bound |
+| debt pass | WebGL2 auto | 10/10 | 9.5 / 17.0 s | 0, 0 | none |
+| debt pass | off | 10/10 | 7.5 / 16.0 s | 0, 0 | none |
+
+The convergence violations follow the machine's load, not the build: `main`'s first WebGPU auto run, under a load
+average near 100, missed the same two bounds (yaw 39.5 s, tilt 22.2 s) and the run here was taken at load 13; a
+duplicate concurrent request appeared once on each build. Neither build left a hole or a black patch. Per-layer
+M-web was not run (a wasm build and a 25-minute run per layer, on a loaded machine).
 
 
 Order is strict: A before B, B before C. Every step of A, B and C goes through the same battery before
