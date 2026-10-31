@@ -25,7 +25,7 @@ PRs — numbered B1–B8 in that plan, unrelated to section B below — fixes it
 signals, and a measured acceptance (imagery peak ≤ 15.5 MB, BC7 settle ≤ 6.0 s, Off goldens unchanged). It comes
 before A2 and A4.
 
-### O1 — the budget's algorithms, before CB (status: O1 baseline, 2026-10-31)
+### O1 — the budget's algorithms, before CB (status: O1.1 dense arena, 2026-10-31)
 
 The budget is its own crate, `tuile-budget` (#163). O1 optimises its `decide` before the compression budget,
 decisions bit-identical throughout. The guard comes first (O1.0): today's engine frozen at 3d1a028e in
@@ -53,6 +53,41 @@ the eviction order is built and sorted nearly every step, for a view a third the
 same cost. P6.4 (`decide_work_grows_with_changes_not_with_the_view`) is written and ignored: on a converged
 still view, with nothing changing, W_k is about 3 550 (up to 4 646) against a bound of 256 — `work` is
 O(need + tracked) until the incremental decide (O1.4).
+
+**O1.1 — dense arena** (`perf/budget-o1-arena`). `entries: BTreeMap<ResourceId, Entry>` is gone: each tracked
+resource has a `u32` slot in `state::Arena`, found through a fixed-seed hash index (hashbrown's `HashTable` of
+slots, foldhash's `FixedState`) that is only probed, never iterated; freed slots are reused last-freed-first. The
+state is columns by slot: id, class, a flags byte (live, decoded, delivered, in transit, on the GPU, loading,
+local), the eviction key (last needed, level, distance), each copy's payload without its `Option`, the step's
+rank, and the cold rest. 211 B a slot (`SLOT_BYTES`, was `ENTRY_BYTES` 240 plus a 16 B key in a map node). The
+full scans (eviction order, decoded release, pooled sweep, `release_beyond`, prune, audit) walk the slots and
+sort by their total keys as before; the one range query (a tile's drawable drapes of a layer, by level) reads an
+ordered index of the GPU drapes kept by `put_gpu`/`take_gpu`. The eviction orders carry their slots, so a step's
+evictions look nothing up. Lockstep with the frozen reference green (budget_sim release, properties at 2 048
+cases), goldens untouched; a broken drape index is caught at step 8 by every lockstep run.
+
+| Measure | O1.0 | O1.1 |
+|---|---|---|
+| `decide` still (484 drawn) | mean 1 098 µs, p50 1 086, p99 1 199 | mean 818 µs, p50 808, p99 889 (−26 %) |
+| `decide` motion | mean 900 µs, p50 796, p99 2 176 | mean 696 µs, p50 609, p99 1 729 (−23 %) |
+| `decide` pressure | mean 908 µs, p50 877, p99 1 637 | mean 652 µs, p50 637, p99 1 124 (−29 %) |
+| allocations per step, still (internal / output) | 13 / 649 | 13 / 649 |
+| allocations per step, motion p99 (internal) | 43 | 42 |
+| allocations per step, pressure p50 / p99 (internal) | 21 / 76 | 21 / 73 |
+| step buffers after the tour | 381 056 B | 381 056 B |
+| bytes per tracked resource | 534 (2 927 tracked) | 452 (2 927 tracked) |
+
+The criterion means (`decide/still` −26.1 %, `motion` −23.1 %, `pressure` −29.4 %, p < 0.05) agree. The
+allocation counts barely move: the arena allocates only when its columns grow, and the per-step allocations
+left are the step's own buffers (O1.5).
+
+The pressure scenario's I7 break, explained (not fixed: behaviour is frozen through O1): at t ≈ 105 s of the
+unlooped tour under `pressure_profile`, 1 336 of the 1 929 tracked resources hold only a decoded copy (no GPU
+copy, nothing in transit or loading; 984 of them not wanted), and the decoded tier sits at 534 MB, just under its
+512 MiB target. That target is `BudgetConfig::interactive`'s quarter of the configured GPU total (2 GiB), and
+`retarget` does not scale it: `eff()` scales the decoded target by pressure only, not by the retarget factor.
+So on a 384 MiB budget the decoded tier still keeps 512 MiB of copies demoted by evictions, and every one of
+them is a tracked resource that the simulation's I7 bound (GPU-drawable + pending + need) does not count.
 
 
 Order is strict: A before B, B before C. Every step of A, B and C goes through the same battery before

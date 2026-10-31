@@ -20,8 +20,10 @@
 //!    decoded copies over their budget;
 //! 10. relax the LOD with time, never with frames.
 //!
-//! Every container is ordered (`BTreeMap`, `BTreeSet`, sorted `Vec`): no
-//! decision depends on a hash order.
+//! Every container that is iterated is ordered (`BTreeMap`, `BTreeSet`,
+//! sorted `Vec`, the arena's slots, whose finds are sorted by a total key
+//! before they decide anything): no decision depends on a hash order. The
+//! arena's hash index is only probed.
 
 // The decisions are integer arithmetic: floats stay in `imagery` and
 // `priority`, quantised once, where bit-exactness is controlled.
@@ -40,7 +42,7 @@ use super::imagery::{drape_rank, needed_level, DrapeCandidate, GeoRect, LevelCla
 use super::need::{ImageryNeed, LayerReach, Membership, Need};
 use super::priority::{score, PriorityKey, Quantised, Urgency};
 use super::sorted::{recycle, union4, SortedMap};
-use super::state::{CpuCopy, Entry, Gpu, Load, Rank, Transit};
+use super::state::{Arena, CpuCopy, Gpu, Load, Rank, Slot, Transit};
 use super::stats::{BudgetStats, CancelReason, EvictReason, GAP_BUCKETS, LATENCY_BUCKETS};
 use super::tier::{Presence, PresenceOracle, Source, Tier};
 use super::types::{
@@ -160,7 +162,9 @@ pub(super) struct Scratch {
     /// keys do not move within a step after the mark, and the set only
     /// shrinks, so every later use filters it instead of sorting again.
     /// Dropped at the end of the step: only a step under pressure builds it.
-    evict_order: PerClass<Option<Vec<EvictKey>>>,
+    /// Each key with its slot: no slot is freed within a step (`prune`
+    /// runs last).
+    evict_order: PerClass<Option<Vec<(EvictKey, Slot)>>>,
     /// The loads, then the deliveries, picked from `jobs`.
     picked: Vec<(PriorityKey, ResourceId, Job, Want)>,
 }
@@ -182,8 +186,13 @@ struct Selection {
 /// farther; the resource last, so the order is total.
 type EvictKey = (Micros, Reverse<u32>, Reverse<u32>, ResourceId);
 
-fn evict_key(r: ResourceId, e: &Entry) -> EvictKey {
-    (e.last_needed, Reverse(e.level), Reverse(e.distance), r)
+fn evict_key(a: &Arena, s: Slot) -> EvictKey {
+    (
+        a.last_needed(s),
+        Reverse(a.level(s)),
+        Reverse(a.distance(s)),
+        a.id(s),
+    )
 }
 
 /// Work on a wanted resource.
@@ -378,29 +387,31 @@ impl Budget {
         for &ev in &events {
             match ev {
                 Event::Loaded(r, g, cost) => {
-                    let Some(e) = self.entries.get_mut(&r) else {
+                    let Some(s) = self.arena.find(r) else {
                         st.stale += 1;
                         continue;
                     };
-                    match e.load {
+                    match self.arena.load(s) {
                         Load::Loading {
                             gen,
                             source,
                             started,
                             epoch,
                         } if gen == g => {
-                            e.load = Load::Idle;
+                            self.arena.set_load(s, Load::Idle);
                             match source {
-                                Source::Network => {
-                                    release(&mut self.in_flight[e.class], &mut self.underflows)
-                                }
+                                Source::Network => release(
+                                    &mut self.in_flight[self.arena.class(s)],
+                                    &mut self.underflows,
+                                ),
                                 Source::Local => {
                                     release(&mut self.local_reads, &mut self.underflows);
                                     st.network_bytes_avoided =
                                         st.network_bytes_avoided.plus(cost.gpu);
                                 }
                             }
-                            e.put_cpu(
+                            self.arena.put_cpu(
+                                s,
                                 &mut self.ledger,
                                 CpuCopy {
                                     gen,
@@ -409,8 +420,9 @@ impl Budget {
                                     delivered_before: false,
                                 },
                             );
-                            e.failures = 0;
-                            e.store_missed = false;
+                            let cold = self.arena.cold_mut(s);
+                            cold.failures = 0;
+                            cold.store_missed = false;
                             st.completed += 1;
                             st.latency_ms[latency_bucket(now.since(started))] += 1;
                         }
@@ -418,61 +430,67 @@ impl Budget {
                     }
                 }
                 Event::Failed(r, g, why) => {
-                    let Some(e) = self.entries.get_mut(&r) else {
+                    let Some(s) = self.arena.find(r) else {
                         continue;
                     };
-                    if let Load::Loading { gen, source, .. } = e.load {
+                    if let Load::Loading { gen, source, .. } = self.arena.load(s) {
                         if gen == g {
-                            e.load = Load::Idle;
+                            self.arena.set_load(s, Load::Idle);
+                            let class = self.arena.class(s);
                             match source {
                                 Source::Network => {
-                                    release(&mut self.in_flight[e.class], &mut self.underflows)
+                                    release(&mut self.in_flight[class], &mut self.underflows)
                                 }
                                 Source::Local => {
                                     release(&mut self.local_reads, &mut self.underflows)
                                 }
                             }
                             st.failed += 1;
-                            st.failures[e.class][usize::from(why == Failure::Permanent)] += 1;
+                            st.failures[class][usize::from(why == Failure::Permanent)] += 1;
                             if self.cfg.policy == Policy::Batch {
                                 self.fatal.get_or_insert(SessionError::LoadFailed(r));
                             } else {
-                                e.failures += 1;
-                                e.retry_at = now.plus(backoff(self.cfg.failure, e.failures, why));
+                                let cold = self.arena.cold_mut(s);
+                                cold.failures += 1;
+                                cold.retry_at =
+                                    now.plus(backoff(self.cfg.failure, cold.failures, why));
                             }
                         }
                     }
                 }
                 Event::StoreMiss(r, g) => {
-                    let Some(e) = self.entries.get_mut(&r) else {
+                    let Some(s) = self.arena.find(r) else {
                         continue;
                     };
                     if let Load::Loading {
                         gen,
                         source: Source::Local,
                         ..
-                    } = e.load
+                    } = self.arena.load(s)
                     {
                         if gen == g {
-                            e.load = Load::Idle;
+                            self.arena.set_load(s, Load::Idle);
                             release(&mut self.local_reads, &mut self.underflows);
-                            e.store_missed = true;
-                            e.presence = Some(Presence::Absent);
+                            let cold = self.arena.cold_mut(s);
+                            cold.store_missed = true;
+                            cold.presence = Some(Presence::Absent);
                             st.store_misses += 1;
                         }
                     }
                 }
                 Event::Drawable(r, g, actual) => {
-                    let Some(e) = self.entries.get_mut(&r) else {
+                    let Some(s) = self.arena.find(r) else {
                         st.stale += 1;
                         continue;
                     };
-                    if e.transit.is_some_and(|t| t.gen == g) {
-                        if let Some(t) = e.take_transit(&mut self.ledger) {
+                    let a = &mut self.arena;
+                    if a.transit(s).is_some_and(|t| t.gen == g) {
+                        if let Some(t) = a.take_transit(s, &mut self.ledger) {
                             if !within_drift(t.cost.gpu, actual) {
-                                st.drift_exceeded[e.class] += 1;
+                                st.drift_exceeded[a.class(s)] += 1;
                             }
-                            e.put_gpu(
+                            a.put_gpu(
+                                s,
                                 &mut self.ledger,
                                 Gpu {
                                     gen: g,
@@ -481,19 +499,16 @@ impl Budget {
                                 },
                             );
                         }
-                        if let Some(c) = e.cpu.as_mut() {
-                            if c.gen == g {
-                                c.delivered_before = true;
-                            }
-                        }
-                    } else if e.transit.is_none()
-                        && e.gpu.is_none()
-                        && e.cpu.is_some_and(|c| c.gen == g)
+                        a.mark_delivered(s, g);
+                    } else if !a.has_transit(s)
+                        && !a.has_gpu(s)
+                        && a.cpu(s).is_some_and(|c| c.gen == g)
                     {
                         // Uploaded although its delivery was withdrawn: the
                         // GPU holds it, so the ledger does.
-                        let epoch = e.cpu.map(|c| c.epoch).unwrap_or(0);
-                        e.put_gpu(
+                        let epoch = a.cpu(s).map(|c| c.epoch).unwrap_or(0);
+                        a.put_gpu(
+                            s,
                             &mut self.ledger,
                             Gpu {
                                 gen: g,
@@ -506,14 +521,15 @@ impl Budget {
                     }
                 }
                 Event::Discarded(r, g) => {
-                    let Some(e) = self.entries.get_mut(&r) else {
+                    let Some(s) = self.arena.find(r) else {
                         continue;
                     };
-                    if e.transit.is_some_and(|t| t.gen == g) {
-                        e.take_transit(&mut self.ledger);
-                        e.discards += 1;
-                        e.deliver_after =
-                            now.plus(backoff(self.cfg.failure, e.discards, Failure::Transient));
+                    if self.arena.transit(s).is_some_and(|t| t.gen == g) {
+                        self.arena.take_transit(s, &mut self.ledger);
+                        let cold = self.arena.cold_mut(s);
+                        cold.discards += 1;
+                        cold.deliver_after =
+                            now.plus(backoff(self.cfg.failure, cold.discards, Failure::Transient));
                     }
                 }
             }
@@ -566,17 +582,7 @@ impl Budget {
     /// How cheaply a drape could be drawn: on the GPU, decoded, in a local
     /// store, or only remotely.
     fn drape_tier(&self, r: ResourceId, presence: &dyn PresenceOracle) -> Tier {
-        let e = self.entries.get(&r);
-        let epoch = self.epoch(r, Class::Drape);
-        match e {
-            Some(e) if e.gpu.is_some_and(|g| g.epoch == epoch) => Tier::Gpu,
-            Some(e) if e.fresh_cpu(epoch).is_some() => Tier::Decoded,
-            Some(e) if e.store_missed => Tier::Remote,
-            _ => match presence.holds(r) {
-                Presence::Stored => Tier::Stored,
-                Presence::Absent => Tier::Remote,
-            },
-        }
+        self.tier(r, self.arena.find(r), Class::Drape, presence)
     }
 
     /// Each wanted tile's imagery level this step.
@@ -692,7 +698,7 @@ impl Budget {
     }
 
     fn drawable(&self, r: ResourceId) -> bool {
-        self.entries.get(&r).is_some_and(|e| e.gpu.is_some())
+        self.arena.find(r).is_some_and(|s| self.arena.has_gpu(s))
     }
 
     /// Every (ancestor, held tile) pair of last step's held tiles, sorted,
@@ -769,14 +775,13 @@ impl Budget {
         layer: LayerId,
     ) -> impl Iterator<Item = (ResourceId, u32)> + '_ {
         // Only this layer's drapes: a layer never falls back on another's.
+        // Those on the GPU, by level: a range of the arena's ordered index.
         let lo = ResourceId::drape(x, layer, 0);
         let hi = ResourceId::drape(x, layer, u32::MAX);
-        self.entries
-            .range(lo..=hi)
-            .filter_map(|(r, e)| match (r, e.gpu) {
-                (ResourceId::Drape { level, .. }, Some(_)) => Some((*r, *level)),
-                _ => None,
-            })
+        self.arena.gpu_drapes(lo..=hi).filter_map(|r| match r {
+            ResourceId::Drape { level, .. } => Some((r, level)),
+            ResourceId::Mesh(_) => None,
+        })
     }
 
     fn best_drape_for(&self, tile: TileId, layer: LayerId, need: u32) -> Option<DrapeChoice> {
@@ -1051,9 +1056,9 @@ impl Budget {
                 .iter()
                 .filter(|(_, tn)| matches!(tn.membership, Membership::Drawn | Membership::Blocker))
                 .all(|(t, _)| {
-                    self.entries
-                        .get(&ResourceId::Mesh(*t))
-                        .is_some_and(|e| e.gpu.is_some() || e.cpu.is_some())
+                    let a = &self.arena;
+                    a.find(ResourceId::Mesh(*t))
+                        .is_some_and(|s| a.has_gpu(s) || a.has_cpu(s))
                 });
         for (t, tn) in tiles {
             let floor = self.is_floor(tn.need.level);
@@ -1141,19 +1146,16 @@ impl Budget {
         SortedMap::from_sorted(merged)
     }
 
-    fn protection(&self, r: ResourceId) -> Option<Protection> {
-        self.protection_of(r, self.entries.get(&r)?)
-    }
-
-    /// What protects `r`, whose entry is `e`.
-    fn protection_of(&self, r: ResourceId, e: &Entry) -> Option<Protection> {
-        if self.is_floor(e.level) && (e.gpu.is_some() || e.transit.is_some()) {
+    /// What protects `r`, whose slot is `s`.
+    fn protection_of(&self, r: ResourceId, s: Slot) -> Option<Protection> {
+        let a = &self.arena;
+        if self.is_floor(a.level(s)) && (a.has_gpu(s) || a.has_transit(s)) {
             return Some(Protection::Floor);
         }
         if self.drawn_last.contains(&r) {
             return Some(Protection::Drawn);
         }
-        if e.transit.is_some() {
+        if a.has_transit(s) {
             return Some(Protection::InTransit);
         }
         if self.swap_last.contains(&r) {
@@ -1168,17 +1170,18 @@ impl Budget {
     fn tier(
         &self,
         r: ResourceId,
-        e: Option<&Entry>,
+        e: Option<Slot>,
         class: Class,
         presence: &dyn PresenceOracle,
     ) -> Tier {
+        let a = &self.arena;
         let epoch = self.epoch(r, class);
         match e {
-            Some(e) if e.gpu.is_some_and(|g| g.epoch == epoch) => Tier::Gpu,
-            Some(e) if e.fresh_cpu(epoch).is_some() => Tier::Decoded,
+            Some(s) if a.gpu(s).is_some_and(|g| g.epoch == epoch) => Tier::Gpu,
+            Some(s) if a.fresh_cpu(s, epoch).is_some() => Tier::Decoded,
             // A wrong hint is believed once; otherwise the index is asked
             // afresh, since a store fills as the session runs.
-            Some(e) if e.store_missed => Tier::Remote,
+            Some(s) if a.cold(s).store_missed => Tier::Remote,
             _ => match presence.holds(r) {
                 Presence::Stored => Tier::Stored,
                 Presence::Absent => Tier::Remote,
@@ -1195,9 +1198,8 @@ impl Budget {
         self.scratch.evict_order = PerClass::default();
         let mut ranked = std::mem::take(&mut self.ranked_last);
         for r in &ranked {
-            if let Some(e) = self.entries.get_mut(r) {
-                e.urgency = None;
-                e.priority = None;
+            if let Some(s) = self.arena.find(*r) {
+                self.arena.set_rank(s, None, None);
             }
         }
         ranked.clear();
@@ -1224,8 +1226,9 @@ impl Budget {
         raw.clear();
         for i in &draw.items {
             for r in std::iter::once(i.mesh).chain(i.drapes.iter().map(|x| x.resource)) {
-                if let Some(e) = self.entries.get(&r) {
-                    if e.stale_gpu(self.epoch(r, e.class)) && !wants.contains_key(&r) {
+                if let Some(s) = self.arena.find(r) {
+                    let class = self.arena.class(s);
+                    if self.arena.stale_gpu(s, self.epoch(r, class)) && !wants.contains_key(&r) {
                         let seq = u32::try_from(raw.len()).unwrap_or(u32::MAX);
                         raw.push((
                             r,
@@ -1233,8 +1236,8 @@ impl Budget {
                             Want {
                                 urgency: Urgency::Refresh,
                                 q: Quantised::default(),
-                                class: e.class,
-                                level: e.level,
+                                class,
+                                level: self.arena.level(s),
                             },
                         ));
                     }
@@ -1294,7 +1297,7 @@ impl Budget {
         // was already marked unneeded.
         // A merge of the three sorted sources, not a set built of them.
         let Budget {
-            entries,
+            arena,
             drawn_last,
             wanted_last,
             ..
@@ -1306,23 +1309,26 @@ impl Budget {
             std::iter::empty(),
         );
         for r in touched {
-            let Some(e) = entries.get_mut(&r) else {
+            let Some(s) = arena.find(r) else {
                 continue;
             };
             if wants.contains_key(&r) {
-                e.last_needed = now;
-                e.unneeded_since = None;
-                e.first_wanted.get_or_insert(now);
+                arena.set_last_needed(s, now);
+                let cold = arena.cold_mut(s);
+                cold.set_unneeded_since(None);
+                cold.first_wanted_or(now);
                 if let Some(tn) = tiles.get(&r.tile()) {
-                    e.distance = tn.q.distance;
+                    arena.set_distance(s, tn.q.distance);
                 }
             } else if drawn_last.contains(&r) {
-                e.last_needed = now;
-                e.unneeded_since = None;
-                e.first_wanted = None;
+                arena.set_last_needed(s, now);
+                let cold = arena.cold_mut(s);
+                cold.set_unneeded_since(None);
+                cold.set_first_wanted(None);
             } else {
-                e.unneeded_since.get_or_insert(now);
-                e.first_wanted = None;
+                let cold = arena.cold_mut(s);
+                cold.unneeded_since_or(now);
+                cold.set_first_wanted(None);
             }
         }
 
@@ -1338,23 +1344,24 @@ impl Budget {
         for (r, w) in &wants {
             let class = self.class_of(*r, w.class);
             let epoch = self.epoch(*r, class);
-            let e = self.entries.get(r);
+            let a = &self.arena;
+            let e = a.find(*r);
             let mut urgency = w.urgency;
             let job = match e {
-                Some(e) if e.gpu.is_some_and(|g| g.epoch == epoch) => None,
-                Some(e) if e.transit.is_some() => None,
-                Some(e) if e.fresh_cpu(epoch).is_some() => {
-                    (e.deliver_after <= now).then_some(Job::Deliver)
+                Some(s) if a.gpu(s).is_some_and(|g| g.epoch == epoch) => None,
+                Some(s) if a.has_transit(s) => None,
+                Some(s) if a.fresh_cpu(s, epoch).is_some() => {
+                    (a.cold(s).deliver_after <= now).then_some(Job::Deliver)
                 }
-                Some(e) if matches!(e.load, Load::Loading { .. }) => None,
-                Some(e) if e.backing_off(now) => None,
+                Some(s) if a.loading(s) => None,
+                Some(s) if a.backing_off(s, now) => None,
                 _ => Some(Job::Load),
             };
-            if e.is_some_and(|e| e.stale_gpu(epoch)) {
+            if e.is_some_and(|s| a.stale_gpu(s, epoch)) {
                 urgency = Urgency::Refresh;
             }
             let waited = e
-                .and_then(|e| e.first_wanted)
+                .and_then(|s| a.cold(s).first_wanted())
                 .map(|f| now.since(f))
                 .unwrap_or(Micros::ZERO);
             // How many wanted tiles it stands in for, as a fallback.
@@ -1387,9 +1394,8 @@ impl Budget {
             .saturating_add(sat_u32(jobs.len()));
         self.ranked_last.extend(jobs.iter().map(|j| j.1));
         for (k, r, _, w) in &jobs {
-            if let Some(e) = self.entries.get_mut(r) {
-                e.urgency = Some(w.urgency);
-                e.priority = Some(Rank::of(k));
+            if let Some(s) = self.arena.find(*r) {
+                self.arena.set_rank(s, Some(w.urgency), Some(Rank::of(k)));
             }
         }
 
@@ -1453,9 +1459,10 @@ impl Budget {
         let pending_view = jobs.iter().any(|j| j.3.urgency <= Urgency::Drape)
             || wants.iter().any(|(r, w)| {
                 w.urgency <= Urgency::Drape
-                    && self.entries.get(r).is_some_and(|e| {
-                        e.transit.is_some() || matches!(e.load, Load::Loading { .. })
-                    })
+                    && self
+                        .arena
+                        .find(*r)
+                        .is_some_and(|s| self.arena.has_transit(s) || self.arena.loading(s))
             });
         if eff.batch {
             let complete = input.need.blockers.is_empty()
@@ -1519,11 +1526,12 @@ impl Budget {
         st.sse_scale_milli = d.sse_scale_milli;
         st.in_flight = self.in_flight;
         st.local_reads = self.local_reads;
-        st.tracked = sat_u32(self.entries.len());
+        st.tracked = sat_u32(self.arena.len());
         for r in &self.active {
-            if let Some(e) = self.entries.get(r) {
-                if let Some(t) = e.transit {
-                    st.transit[e.class] = st.transit[e.class].plus(t.cost.gpu);
+            if let Some(s) = self.arena.find(*r) {
+                if let Some(t) = self.arena.transit(s) {
+                    let c = self.arena.class(s);
+                    st.transit[c] = st.transit[c].plus(t.cost.gpu);
                 }
             }
         }
@@ -1542,16 +1550,17 @@ impl Budget {
             self.floor_set.iter().copied(),
         );
         for r in candidates {
-            let Some(e) = self.entries.get(&r) else {
+            let Some(s) = self.arena.find(r) else {
                 continue;
             };
-            if self.protection_of(r, e).is_some() {
-                let b = e
-                    .gpu
+            if self.protection_of(r, s).is_some() {
+                let a = &self.arena;
+                let b = a
+                    .gpu(s)
                     .map(|g| g.bytes)
                     .unwrap_or(Bytes::ZERO)
-                    .plus(e.transit.map(|t| t.cost.gpu).unwrap_or(Bytes::ZERO));
-                p[e.class] = p[e.class].plus(b);
+                    .plus(a.transit(s).map(|t| t.cost.gpu).unwrap_or(Bytes::ZERO));
+                p[a.class(s)] = p[a.class(s)].plus(b);
             }
         }
         p
@@ -1565,23 +1574,28 @@ impl Budget {
         let mut fatal = None;
         let active: Vec<ResourceId> = self.active.iter().copied().collect();
         for r in &active {
-            let Some(e) = self.entries.get_mut(r) else {
+            let Some(s) = self.arena.find(*r) else {
                 continue;
             };
+            let class = self.arena.class(s);
             if let Load::Loading {
                 gen,
                 source,
                 started,
                 ..
-            } = e.load
+            } = self.arena.load(s)
             {
-                let unneeded = e.unneeded_since.is_some_and(|u| now.since(u) >= grace);
+                let unneeded = self
+                    .arena
+                    .cold(s)
+                    .unneeded_since()
+                    .is_some_and(|u| now.since(u) >= grace);
                 let timed_out = now.since(started) >= timeout;
                 if (unneeded && !batch) || timed_out {
-                    e.load = Load::Idle;
+                    self.arena.set_load(s, Load::Idle);
                     match source {
                         Source::Network => {
-                            release(&mut self.in_flight[e.class], &mut self.underflows)
+                            release(&mut self.in_flight[class], &mut self.underflows)
                         }
                         Source::Local => release(&mut self.local_reads, &mut self.underflows),
                     }
@@ -1589,7 +1603,7 @@ impl Budget {
                     st.cancelled += 1;
                     if unneeded && !batch {
                         st.cancels[CancelReason::Grace as usize] += 1;
-                        st.wasted_starts[e.class] += 1;
+                        st.wasted_starts[class] += 1;
                     } else {
                         st.cancels[CancelReason::Timeout as usize] += 1;
                     }
@@ -1597,18 +1611,24 @@ impl Budget {
                         if batch {
                             fatal.get_or_insert(SessionError::LoadFailed(*r));
                         } else {
-                            e.failures += 1;
-                            e.retry_at = now.plus(backoff(failure, e.failures, Failure::Transient));
+                            let cold = self.arena.cold_mut(s);
+                            cold.failures += 1;
+                            cold.retry_at =
+                                now.plus(backoff(failure, cold.failures, Failure::Transient));
                         }
                     }
                 }
             }
             if !batch {
-                if let Some(t) = e.transit {
-                    if e.unneeded_since.is_some_and(|u| now.since(u) >= grace)
+                if let Some(t) = self.arena.transit(s) {
+                    if self
+                        .arena
+                        .cold(s)
+                        .unneeded_since()
+                        .is_some_and(|u| now.since(u) >= grace)
                         && !self.drawn_last.contains(r)
                     {
-                        e.take_transit(&mut self.ledger);
+                        self.arena.take_transit(s, &mut self.ledger);
                         d.cancel.push((*r, t.gen));
                         st.cancelled += 1;
                         st.cancels[CancelReason::Grace as usize] += 1;
@@ -1674,10 +1694,11 @@ impl Budget {
                             .active
                             .iter()
                             .filter(|vr| {
-                                self.entries.get(vr).is_some_and(|ve| {
-                                    ve.class == class
+                                let a = &self.arena;
+                                a.find(**vr).is_some_and(|vs| {
+                                    a.class(vs) == class
                                         && matches!(
-                                            ve.load,
+                                            a.load(vs),
                                             Load::Loading {
                                                 source: Source::Network,
                                                 ..
@@ -1685,15 +1706,15 @@ impl Budget {
                                         )
                                         && (wants.get(vr).is_some_and(|vw| {
                                             matches!(vw.urgency, Urgency::Ring | Urgency::Ancestor)
-                                        }) || ve.urgency == Some(Urgency::Refresh))
+                                        }) || a.urgency(vs) == Some(Urgency::Refresh))
                                 })
                             })
                             .filter_map(|vr| keys.get(vr).map(|k| (*k, *vr)))
                             .max();
                         let Some((_, vr)) = victim else { continue };
-                        if let Some(ve) = self.entries.get_mut(&vr) {
-                            if let Load::Loading { gen, .. } = ve.load {
-                                ve.load = Load::Idle;
+                        if let Some(vs) = self.arena.find(vr) {
+                            if let Load::Loading { gen, .. } = self.arena.load(vs) {
+                                self.arena.set_load(vs, Load::Idle);
                                 release(&mut self.in_flight[class], &mut self.underflows);
                                 d.cancel.push((vr, gen));
                                 st.cancelled += 1;
@@ -1706,28 +1727,28 @@ impl Budget {
             let gen = Generation(self.next_gen);
             self.next_gen += 1;
             let epoch = self.epoch(*r, class);
-            let e = self
-                .entries
-                .entry(*r)
-                .or_insert_with(|| Entry::new(class, w.level, now));
-            if matches!(e.load, Load::Loading { .. }) {
+            let s = self.arena.find_or_insert(*r, class, w.level, now);
+            if self.arena.loading(s) {
                 st.duplicates_in_flight += 1;
                 continue;
             }
-            if e.presence.is_none() && !e.store_missed {
-                e.presence = Some(presence.holds(*r));
+            let cold = self.arena.cold_mut(s);
+            if cold.presence.is_none() && !cold.store_missed {
+                cold.presence = Some(presence.holds(*r));
             }
-            e.first_wanted.get_or_insert(now);
-            e.last_needed = now;
-            e.unneeded_since = None;
-            e.urgency = Some(w.urgency);
-            e.priority = Some(Rank::of(key));
-            e.load = Load::Loading {
-                gen,
-                source,
-                started: now,
-                epoch,
-            };
+            cold.first_wanted_or(now);
+            cold.set_unneeded_since(None);
+            self.arena.set_last_needed(s, now);
+            self.arena.set_rank(s, Some(w.urgency), Some(Rank::of(key)));
+            self.arena.set_load(
+                s,
+                Load::Loading {
+                    gen,
+                    source,
+                    started: now,
+                    epoch,
+                },
+            );
             if self.cfg.pinned_level.is_some_and(|p| w.level <= p) {
                 self.floor_set.insert(*r);
             }
@@ -1787,28 +1808,28 @@ impl Budget {
         }
         let order = self.evict_order(class, st);
         // The victims now: still evictable, and worth less than the work.
-        let victim = |b: &Budget, r: &ResourceId| -> Option<Bytes> {
-            let e = b.entries.get(r)?;
+        let victim = |b: &Budget, r: &ResourceId, s: Slot| -> Option<Bytes> {
+            let a = &b.arena;
             let worth_less = wants
                 .get(r)
                 .is_none_or(|w| urgency < Urgency::Ring && w.urgency > urgency);
-            (e.transit.is_none() && worth_less).then_some(e.gpu?.bytes)
+            (!a.has_transit(s) && worth_less).then_some(a.gpu(s)?.bytes)
         };
         st.work = st.work.saturating_add(sat_u32(order.len()));
         let freeable = order
             .iter()
-            .filter_map(|k| victim(self, &k.3))
+            .filter_map(|(k, s)| victim(self, &k.3, *s))
             .fold(Bytes::ZERO, |a, b| a.plus(b));
         if self.ledger.gpu[class].minus(freeable).plus(bytes) > limit {
             *strained = true;
             self.scratch.evict_order[class] = Some(order);
             return false;
         }
-        for &(.., r) in &order {
+        for &((.., r), s) in &order {
             if self.ledger.gpu[class].plus(bytes) <= limit {
                 break;
             }
-            if victim(self, &r).is_none() {
+            if victim(self, &r, s).is_none() {
                 continue;
             }
             if wants.contains_key(&r) {
@@ -1816,13 +1837,11 @@ impl Budget {
                 // than the budget holds.
                 *strained = true;
             }
-            if let Some(e) = self.entries.get_mut(&r) {
-                e.take_gpu(&mut self.ledger);
-                d.evict.push(r);
-                st.evicted += 1;
-                st.evictions[class][EvictReason::Admission as usize] += 1;
-                self.recent.insert(r, now);
-            }
+            self.arena.take_gpu(s, &mut self.ledger);
+            d.evict.push(r);
+            st.evicted += 1;
+            st.evictions[class][EvictReason::Admission as usize] += 1;
+            self.recent.insert(r, now);
         }
         self.scratch.evict_order[class] = Some(order);
         true
@@ -1830,24 +1849,25 @@ impl Budget {
 
     /// This step's eviction order for `class`, built at its first use
     /// (see `Scratch::evict_order`); the caller puts it back.
-    fn evict_order(&mut self, class: Class, st: &mut BudgetStats) -> Vec<EvictKey> {
+    fn evict_order(&mut self, class: Class, st: &mut BudgetStats) -> Vec<(EvictKey, Slot)> {
         if let Some(order) = self.scratch.evict_order[class].take() {
             return order;
         }
-        st.work = st.work.saturating_add(sat_u32(self.entries.len()));
-        let mut order: Vec<EvictKey> = self
-            .entries
+        st.work = st.work.saturating_add(sat_u32(self.arena.len()));
+        let a = &self.arena;
+        let mut order: Vec<(EvictKey, Slot)> = a
             .iter()
-            .filter(|(r, e)| {
-                e.class == class
-                    && e.gpu.is_some()
-                    && e.transit.is_none()
-                    && !self.kept(r)
-                    && !self.is_floor(e.level)
+            .filter(|&s| {
+                a.class(s) == class
+                    && a.has_gpu(s)
+                    && !a.has_transit(s)
+                    && !self.kept(&a.id(s))
+                    && !self.is_floor(a.level(s))
             })
-            .map(|(r, e)| evict_key(*r, e))
+            .map(|s| (evict_key(a, s), s))
             .collect();
-        // Keys end in the resource: total, so unstable is stable.
+        // Keys end in the resource: total, so unstable is stable, and the
+        // slots' order — not the resources' — is forgotten.
         order.sort_unstable();
         order
     }
@@ -1872,11 +1892,12 @@ impl Budget {
             };
             // A floor mesh and its drapes are one swap group (D-A1): none
             // goes until every one is loaded, then they go together.
+            let a = &self.arena;
             let ready = group.clone().all(|m| {
-                self.entries.get(&m).is_some_and(|e| {
-                    e.gpu.is_some()
-                        || e.transit.is_some()
-                        || e.fresh_cpu(self.epoch(m, e.class)).is_some()
+                a.find(m).is_some_and(|s| {
+                    a.has_gpu(s)
+                        || a.has_transit(s)
+                        || a.fresh_cpu(s, self.epoch(m, a.class(s))).is_some()
                 })
             });
             if !ready {
@@ -1906,17 +1927,17 @@ impl Budget {
         flags: &mut (bool, bool),
     ) {
         let (blocked, strained) = (&mut flags.0, &mut flags.1);
-        let Some(e) = self.entries.get(&r) else {
+        let Some(s) = self.arena.find(r) else {
             return;
         };
-        let class = e.class;
+        let class = self.arena.class(s);
         let epoch = self.epoch(r, class);
         // Already on its way, or on the GPU at the current epoch (a stale
         // GPU copy is redelivered: new before old).
-        if e.transit.is_some() || e.gpu.is_some_and(|g| g.epoch == epoch) {
+        if self.arena.has_transit(s) || self.arena.gpu(s).is_some_and(|g| g.epoch == epoch) {
             return;
         }
-        let Some(c) = e.fresh_cpu(epoch) else {
+        let Some(c) = self.arena.fresh_cpu(s, epoch) else {
             return;
         };
         let credit_ok = self.ledger.in_transit == Bytes::ZERO
@@ -1981,11 +2002,10 @@ impl Budget {
             }
         }
         let reused = c.delivered_before;
-        let Some(e) = self.entries.get_mut(&r) else {
-            return;
-        };
+        // `make_room` frees no slot: `s` is still `r`'s.
         self.active.insert(r);
-        e.put_transit(
+        self.arena.put_transit(
+            s,
             &mut self.ledger,
             Transit {
                 gen: c.gen,
@@ -2023,7 +2043,7 @@ impl Budget {
             .active
             .iter()
             .filter_map(|r| {
-                let t = self.entries.get(r)?.transit?;
+                let t = self.arena.transit(self.arena.find(*r)?)?;
                 Some((*r, t.cost.gpu))
             })
             .map(|(r, b)| {
@@ -2090,47 +2110,34 @@ impl Budget {
             }
             let low = eff.target[class].scaled(u64::from(w.low_percent), 100);
             let order = self.evict_order(class, st);
-            for &(.., r) in &order {
+            for &(_, s) in &order {
                 if self.ledger.gpu[class] <= low {
                     break;
                 }
                 // Still on the GPU, and not on its way again.
-                let evictable = self
-                    .entries
-                    .get(&r)
-                    .is_some_and(|e| e.gpu.is_some() && e.transit.is_none());
+                let evictable = self.arena.has_gpu(s) && !self.arena.has_transit(s);
                 if !evictable {
                     continue;
                 }
-                if let Some(e) = self.entries.get_mut(&r) {
-                    e.take_gpu(&mut self.ledger);
-                    d.evict.push(r);
-                    st.evicted += 1;
-                    let why = if self.pressure == Pressure::Normal {
-                        EvictReason::Sweep
-                    } else {
-                        EvictReason::Pressure
-                    };
-                    st.evictions[class][why as usize] += 1;
-                    self.recent.insert(r, now);
-                }
+                self.evict_one(now, s, class, d, st);
             }
         }
         // Only a step under pressure built one: nothing kept across steps.
         self.scratch.evict_order = PerClass::default();
         if self.ledger.decoded > eff.decoded {
-            st.work = st.work.saturating_add(sat_u32(self.entries.len()));
-            let mut cands: Vec<_> = self
-                .entries
+            st.work = st.work.saturating_add(sat_u32(self.arena.len()));
+            let a = &self.arena;
+            let mut cands: Vec<_> = a
                 .iter()
-                .filter(|(_, e)| e.cpu.is_some() && e.transit.is_none())
+                .filter(|&s| a.has_cpu(s) && !a.has_transit(s))
                 // Release order: copies of protected GPU residents first
                 // (they will not be evicted soon), then of evictable GPU
                 // residents (their copy is what an eviction demotes to),
                 // then copies already demoted (they save a re-read when the
                 // view comes back).
-                .map(|(r, e)| {
-                    let rank = match (e.gpu.is_some(), self.kept(r)) {
+                .map(|s| {
+                    let r = a.id(s);
+                    let rank = match (a.has_gpu(s), self.kept(&r)) {
                         (true, true) => 0u8,
                         (true, false) => 1,
                         (false, _) => 2,
@@ -2138,26 +2145,26 @@ impl Budget {
                     (
                         (
                             rank,
-                            e.last_needed,
-                            Reverse(e.level),
-                            Reverse(e.distance),
-                            *r,
+                            a.last_needed(s),
+                            Reverse(a.level(s)),
+                            Reverse(a.distance(s)),
+                            r,
                         ),
-                        *r,
+                        s,
                     )
                 })
                 .collect();
+            // Keys end in the resource: total, so the slots' order is
+            // forgotten.
             cands.sort_unstable();
-            for (_, r) in cands {
+            for ((.., r), s) in cands {
                 if self.ledger.decoded <= eff.decoded {
                     break;
                 }
-                if let Some(e) = self.entries.get_mut(&r) {
-                    e.take_cpu(&mut self.ledger);
-                    d.release.push(r);
-                    st.released += 1;
-                    st.releases[e.class] += 1;
-                }
+                self.arena.take_cpu(s, &mut self.ledger);
+                d.release.push(r);
+                st.released += 1;
+                st.releases[self.arena.class(s)] += 1;
             }
         }
     }
@@ -2195,28 +2202,30 @@ impl Budget {
         let short = |l: &Ledger, c: Class| {
             p.members[c] && l.gpu[c].minus(protected[c]) > p.target(c, &l.gpu)
         };
-        st.work = st.work.saturating_add(sat_u32(self.entries.len()));
-        let mut cands: Vec<_> = self
-            .entries
+        st.work = st.work.saturating_add(sat_u32(self.arena.len()));
+        let a = &self.arena;
+        let mut cands: Vec<_> = a
             .iter()
-            .filter(|(r, e)| {
-                p.members[e.class]
-                    && e.gpu.is_some()
-                    && !self.kept(r)
-                    && e.transit.is_none()
-                    && !self.is_floor(e.level)
+            .filter(|&s| {
+                p.members[a.class(s)]
+                    && a.has_gpu(s)
+                    && !self.kept(&a.id(s))
+                    && !a.has_transit(s)
+                    && !self.is_floor(a.level(s))
             })
-            .map(|(r, e)| {
+            .map(|s| {
                 (
-                    (e.last_needed, Reverse(e.level), Reverse(e.distance), *r),
-                    *r,
-                    e.class,
-                    e.gpu.map_or(Bytes::ZERO, |g| g.bytes),
+                    evict_key(a, s),
+                    s,
+                    a.class(s),
+                    a.gpu(s).map_or(Bytes::ZERO, |g| g.bytes),
                 )
             })
             .collect();
+        // Keys end in the resource: total, so the slots' order is
+        // forgotten.
         cands.sort_unstable();
-        for &(_, r, class, bytes) in &cands {
+        for &(_, s, class, bytes) in &cands {
             for c in Class::ALL {
                 over[c] &= self.ledger.gpu[c] > ceiling_low(c);
             }
@@ -2229,45 +2238,44 @@ impl Budget {
             let goes =
                 over[class] || (pool_trim && self.ledger.gpu[class].minus(bytes) >= floor(class));
             if goes {
-                self.evict_one(now, r, class, d, st);
+                self.evict_one(now, s, class, d, st);
             }
         }
         // The floor yields to I2 (Laurent, 2026-10-21), and only as far as
         // I2 needs: a member whose unprotected bytes are still over its
         // target once the pool is trimmed goes below its floor, in the same
         // order, until they fit.
-        for &(_, r, class, _) in &cands {
+        for &(_, s, class, _) in &cands {
             if Class::ALL.iter().all(|c| !short(&self.ledger, *c)) {
                 break;
             }
-            let resident = self.entries.get(&r).is_some_and(|e| e.gpu.is_some());
+            let resident = self.arena.has_gpu(s);
             if resident && short(&self.ledger, class) {
-                self.evict_one(now, r, class, d, st);
+                self.evict_one(now, s, class, d, st);
             }
         }
     }
 
-    /// Evicts `r`, of `class`, from the GPU, and counts it.
+    /// Evicts the resource of `s`, of `class`, from the GPU, and counts it.
     fn evict_one(
         &mut self,
         now: Micros,
-        r: ResourceId,
+        s: Slot,
         class: Class,
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) {
-        if let Some(e) = self.entries.get_mut(&r) {
-            e.take_gpu(&mut self.ledger);
-            d.evict.push(r);
-            st.evicted += 1;
-            let why = if self.pressure == Pressure::Normal {
-                EvictReason::Sweep
-            } else {
-                EvictReason::Pressure
-            };
-            st.evictions[class][why as usize] += 1;
-            self.recent.insert(r, now);
-        }
+        let r = self.arena.id(s);
+        self.arena.take_gpu(s, &mut self.ledger);
+        d.evict.push(r);
+        st.evicted += 1;
+        let why = if self.pressure == Pressure::Normal {
+            EvictReason::Sweep
+        } else {
+            EvictReason::Pressure
+        };
+        st.evictions[class][why as usize] += 1;
+        self.recent.insert(r, now);
     }
 
     fn relax(
@@ -2347,28 +2355,34 @@ impl Budget {
             return visited;
         }
         let visited = visited
-            .saturating_add(sat_u32(self.entries.len()))
+            .saturating_add(sat_u32(self.arena.len()))
             .saturating_add(sat_u32(self.tiles.len()));
-        let entries = &self.entries;
-        self.active.retain(|r| {
-            entries
-                .get(r)
-                .is_some_and(|e| e.transit.is_some() || matches!(e.load, Load::Loading { .. }))
-        });
-        self.entries.retain(|r, e| {
-            if !e.is_empty() {
+        let a = &self.arena;
+        self.active
+            .retain(|r| a.find(*r).is_some_and(|s| a.has_transit(s) || a.loading(s)));
+        let kept = |a: &Arena, s: Slot| {
+            if !a.is_empty(s) {
                 return true;
             }
-            if e.backing_off(now)
-                && e.unneeded_since
+            let cold = a.cold(s);
+            if cold.backing_off(now)
+                && cold
+                    .unneeded_since()
                     .is_none_or(|u| now.since(u) < Micros::from_secs(30))
             {
                 return true;
             }
-            wants.contains_key(r) && e.unneeded_since.is_none()
-        });
-        let entries = &self.entries;
-        self.floor_set.retain(|r| entries.contains_key(r));
+            wants.contains_key(&a.id(s)) && cold.unneeded_since().is_none()
+        };
+        for n in 0..self.arena.slots() {
+            if let Some(s) = self.arena.live(n) {
+                if !kept(&self.arena, s) {
+                    self.arena.remove(s);
+                }
+            }
+        }
+        let a = &self.arena;
+        self.floor_set.retain(|r| a.find(*r).is_some());
         // Keep only what is wanted this step among idle, never-started entries.
         self.recent.retain(|_, t| now.since(*t) <= THRASH_WINDOW);
         if self.recent.len() > RECENT_CAP {
@@ -2384,7 +2398,10 @@ impl Budget {
         // The tiles still referenced and every ancestor of theirs, as one
         // sorted vector rather than a set grown node by node.
         let mut keep: Vec<TileId> = tiles.keys().copied().collect();
-        keep.extend(self.entries.keys().map(|r| r.tile()));
+        // As many as are tracked: one growth, as the ordered map's exact
+        // length gave before.
+        keep.reserve(self.arena.len());
+        keep.extend(self.arena.iter().map(|s| self.arena.id(s).tile()));
         keep.extend(self.held_last.iter().copied());
         keep.sort_unstable();
         keep.dedup();
@@ -2419,69 +2436,67 @@ impl Budget {
         };
         // Whatever holds a copy — on the GPU, or only decoded (a copy an
         // earlier release or sweep demoted) — and was not needed last.
-        let mut cands: Vec<_> = self
-            .entries
+        let a = &self.arena;
+        let mut cands: Vec<_> = a
             .iter()
-            .filter(|(r, e)| {
-                (e.gpu.is_some() || e.cpu.is_some())
-                    && e.transit.is_none()
-                    && !self.wanted_last.contains(r)
-                    && !self.is_floor(e.level)
+            .filter(|&s| {
+                (a.has_gpu(s) || a.has_cpu(s))
+                    && !a.has_transit(s)
+                    && !self.wanted_last.contains(&a.id(s))
+                    && !self.is_floor(a.level(s))
             })
-            .map(|(r, e)| {
-                (
-                    (e.last_needed, Reverse(e.level), Reverse(e.distance), *r),
-                    *r,
-                )
-            })
+            .map(|s| (evict_key(a, s), s))
             .collect();
+        // Keys end in the resource: total, so the slots' order is
+        // forgotten.
         cands.sort_unstable();
         let mut out = super::Released::default();
-        for (_, r) in cands {
+        for ((.., r), s) in cands {
             if total(&self.ledger) <= target && self.ledger.decoded <= target {
                 break;
             }
-            if let Some(e) = self.entries.get_mut(&r) {
-                // Whole: both copies, in one place in the one order.
-                if e.take_gpu(&mut self.ledger).is_some() {
-                    out.gpu.push(r);
-                }
-                if e.take_cpu(&mut self.ledger).is_some() {
-                    out.decoded.push(r);
-                }
+            // Whole: both copies, in one place in the one order.
+            if self.arena.take_gpu(s, &mut self.ledger).is_some() {
+                out.gpu.push(r);
+            }
+            if self.arena.take_cpu(s, &mut self.ledger).is_some() {
+                out.decoded.push(r);
             }
         }
         out
     }
 
     pub(super) fn view(&self, r: ResourceId) -> Option<ResourceView> {
-        let e = self.entries.get(&r)?;
+        let a = &self.arena;
+        let s = a.find(r)?;
+        let cold = a.cold(s);
         let now = self.last_now.unwrap_or(Micros::ZERO);
-        let state = match e.load {
+        let load = a.load(s);
+        let state = match load {
             Load::Loading { source, .. } => ResourceState::Loading { source },
-            Load::Idle if e.transit.is_some() => ResourceState::InTransit,
-            Load::Idle if e.gpu.is_some() => ResourceState::Drawable,
-            Load::Idle if e.cpu.is_some() => ResourceState::Loaded,
-            Load::Idle if e.backing_off(now) => ResourceState::Failed {
-                retries: e.failures,
-                next_at: e.retry_at,
+            Load::Idle if a.has_transit(s) => ResourceState::InTransit,
+            Load::Idle if a.has_gpu(s) => ResourceState::Drawable,
+            Load::Idle if a.has_cpu(s) => ResourceState::Loaded,
+            Load::Idle if cold.backing_off(now) => ResourceState::Failed {
+                retries: cold.failures,
+                next_at: cold.retry_at,
             },
             Load::Idle => ResourceState::Wanted,
         };
-        let gen = match e.load {
+        let gen = match load {
             Load::Loading { gen, .. } => Some(gen),
-            Load::Idle => e
-                .transit
+            Load::Idle => a
+                .transit(s)
                 .map(|t| t.gen)
-                .or(e.gpu.map(|g| g.gen))
-                .or(e.cpu.map(|c| c.gen)),
+                .or(a.gpu(s).map(|g| g.gen))
+                .or(a.cpu(s).map(|c| c.gen)),
         };
-        let epoch = self.epoch(r, e.class);
-        let tier = if e.gpu.is_some() {
+        let epoch = self.epoch(r, a.class(s));
+        let tier = if a.has_gpu(s) {
             Tier::Gpu
-        } else if e.fresh_cpu(epoch).is_some() {
+        } else if a.fresh_cpu(s, epoch).is_some() {
             Tier::Decoded
-        } else if e.presence == Some(Presence::Stored) && !e.store_missed {
+        } else if cold.presence == Some(Presence::Stored) && !cold.store_missed {
             Tier::Stored
         } else {
             Tier::Remote
@@ -2490,11 +2505,11 @@ impl Budget {
             state,
             tier,
             gen,
-            gpu: e.gpu.map(|g| g.bytes).unwrap_or(Bytes::ZERO),
-            decoded: e.cpu.map(|c| c.cost.gpu).unwrap_or(Bytes::ZERO),
-            protected: self.protection(r),
-            urgency: e.urgency,
-            priority: e.priority.map(|p| p.key(r)),
+            gpu: a.gpu(s).map(|g| g.bytes).unwrap_or(Bytes::ZERO),
+            decoded: a.cpu(s).map(|c| c.cost.gpu).unwrap_or(Bytes::ZERO),
+            protected: self.protection_of(r, s),
+            urgency: a.urgency(s),
+            priority: a.priority(s).map(|p| p.key(r)),
         })
     }
 
@@ -2506,23 +2521,29 @@ impl Budget {
         }
         let mut l = Ledger::default();
         let mut flight = PerClass::splat(0u32);
-        for e in self.entries.values() {
-            if let Some(g) = e.gpu {
-                l.gpu[e.class] = l.gpu[e.class].plus(g.bytes);
+        let a = &self.arena;
+        debug_assert!(
+            a.gpu_drapes_consistent(),
+            "the ordered index of GPU drapes drifted from the slots"
+        );
+        for s in a.iter() {
+            let class = a.class(s);
+            if let Some(g) = a.gpu(s) {
+                l.gpu[class] = l.gpu[class].plus(g.bytes);
             }
-            if let Some(t) = e.transit {
-                l.gpu[e.class] = l.gpu[e.class].plus(t.cost.gpu);
+            if let Some(t) = a.transit(s) {
+                l.gpu[class] = l.gpu[class].plus(t.cost.gpu);
                 l.in_transit = l.in_transit.plus(t.cost.staging);
             }
-            if let Some(c) = e.cpu {
+            if let Some(c) = a.cpu(s) {
                 l.decoded = l.decoded.plus(c.cost.gpu);
             }
             if let Load::Loading {
                 source: Source::Network,
                 ..
-            } = e.load
+            } = a.load(s)
             {
-                flight[e.class] += 1;
+                flight[class] += 1;
             }
         }
         for c in Class::ALL {

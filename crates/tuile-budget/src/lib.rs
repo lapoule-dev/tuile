@@ -134,7 +134,8 @@ pub struct Budget {
     /// `retarget`: a factor `num / den` on targets, overflows, hard limits.
     factor: (u64, u64),
     events: Vec<Event>,
-    entries: std::collections::BTreeMap<ResourceId, state::Entry>,
+    /// Every tracked resource's state, by slot.
+    arena: state::Arena,
     tiles: std::collections::BTreeMap<TileId, TileInfo>,
     imagery_prev: std::collections::BTreeMap<(TileId, LayerId), u32>,
     held_last: sorted::SortedSet<TileId>,
@@ -186,7 +187,7 @@ impl Budget {
             thermal: Thermal::Nominal,
             factor: (1, 1),
             events: Vec::new(),
-            entries: Default::default(),
+            arena: Default::default(),
             tiles: Default::default(),
             imagery_prev: Default::default(),
             held_last: Default::default(),
@@ -347,7 +348,7 @@ impl Budget {
 
     /// How many resources the budget tracks.
     pub fn tracked(&self) -> usize {
-        self.entries.len()
+        self.arena.len()
     }
 
     /// Drops the buffers a step reuses from one step to the next, which
@@ -377,17 +378,14 @@ impl ResidencyView<'_> {
 
     /// Whether `tile`'s mesh is on the GPU, acknowledged.
     pub fn drawable(&self, tile: TileId) -> bool {
-        self.budget
-            .entries
-            .get(&ResourceId::Mesh(tile))
-            .is_some_and(|e| e.gpu.is_some())
+        let a = &self.budget.arena;
+        a.find(ResourceId::Mesh(tile)).is_some_and(|s| a.has_gpu(s))
     }
 
     /// Whether `tile`'s mesh is decoded or on the GPU.
     pub fn loaded(&self, tile: TileId) -> bool {
-        self.budget
-            .entries
-            .get(&ResourceId::Mesh(tile))
-            .is_some_and(|e| e.gpu.is_some() || e.cpu.is_some())
+        let a = &self.budget.arena;
+        a.find(ResourceId::Mesh(tile))
+            .is_some_and(|s| a.has_gpu(s) || a.has_cpu(s))
     }
 }
