@@ -2017,8 +2017,11 @@ fn one_place_stays_one<F: Frame>(
     let n = g.samples_per_side();
     let (lo, hi) = g.frame().bounds();
     let seam = hi.x - lo.x == core::f64::consts::TAU;
+    let mut applied = 0usize;
     for e in edits {
-        let _ = g.apply(e, &mut Vec::new());
+        if g.apply(e, &mut Vec::new()).is_ok() {
+            applied += 1;
+        }
         for j in [0, n - 1] {
             if g.sample_column(0, j).y.abs() == FRAC_PI_2 {
                 let first = g.sample_height(0, j).unwrap().to_bits();
@@ -2044,6 +2047,8 @@ fn one_place_stays_one<F: Frame>(
             }
         }
     }
+    // A script none of whose edits applied proves nothing: drawn again.
+    prop_assume!(applied > 0, "no edit of the script applied");
     Ok(())
 }
 
@@ -2098,16 +2103,7 @@ fn normals_near_a_pole_stay_upright() {
         edit_level: 2,
     };
     // The pole row is flat; the next rows rise gently eastwards.
-    let g = Heightfield::new(f, 257, |i, j| 0.1 * i as f64 * j as f64).unwrap_or_else(|_| {
-        Heightfield::new(f, 257, |i, j| {
-            if j == 0 {
-                0.0
-            } else {
-                0.1 * i as f64 * j as f64
-            }
-        })
-        .unwrap()
-    });
+    let g = Heightfield::new(f, 257, |i, j| 0.1 * i as f64 * j as f64).unwrap();
     let s = surface(&g, DVec3::new(0.25, -FRAC_PI_2 + 1e-9, 1e6)).unwrap();
     assert!(s.normal.z > 0.5, "{:?}", s.normal);
 }
