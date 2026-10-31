@@ -81,76 +81,6 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
         self.0.binary_search_by(|e| e.0.cmp(k)).ok()
     }
 
-    /// The entries, to change in place: kept sorted by key and distinct
-    /// by whoever changes them.
-    pub fn values_mut(&mut self) -> &mut Vec<(K, V)> {
-        &mut self.0
-    }
-
-    /// Keeps the entries `f` keeps, in order. A map left with more than an
-    /// eighth of its room unused gives back most of it.
-    pub fn retain(&mut self, mut f: impl FnMut(&K, &mut V) -> bool) {
-        self.0.retain_mut(|(k, v)| f(k, v));
-        let len = self.0.len();
-        if self.0.capacity() > 64 && self.0.capacity() > len + len / 8 {
-            self.0.shrink_to(len + len / 16);
-        }
-    }
-
-    /// Adds `new`'s entries — sorted, distinct, of keys not in the map —
-    /// `new` left empty. When `spilled`, entries of new keys were also
-    /// pushed at the map's end: it is sorted once, whole; otherwise `new`
-    /// is merged in from the back.
-    pub fn add_new(&mut self, new: &mut Vec<(K, V)>, spilled: bool)
-    where
-        V: Default,
-    {
-        if spilled {
-            for e in new.drain(..) {
-                push_grown(&mut self.0, e);
-            }
-            // Distinct keys: unstable is stable.
-            self.0.sort_unstable_by_key(|a| a.0);
-        } else {
-            self.merge_new(new);
-        }
-        debug_assert!(
-            self.0.windows(2).all(|w| w[0].0 < w[1].0),
-            "sorted, distinct"
-        );
-    }
-
-    /// Adds `new`'s entries — sorted, distinct, of keys not in the map —
-    /// in one pass from the back, `new` left empty: each takes a
-    /// placeholder's place as the old entries move up past it.
-    fn merge_new(&mut self, new: &mut Vec<(K, V)>)
-    where
-        V: Default,
-    {
-        let Some(&(k0, _)) = new.first() else {
-            return;
-        };
-        let (mut i, mut j) = (self.0.len(), new.len());
-        grow(&mut self.0, j);
-        self.0.resize_with(i + j, || (k0, V::default()));
-        let mut w = self.0.len();
-        while j > 0 {
-            w -= 1;
-            if i > 0 && self.0[i - 1].0 > new[j - 1].0 {
-                i -= 1;
-                self.0.swap(w, i);
-            } else {
-                j -= 1;
-                std::mem::swap(&mut self.0[w], &mut new[j]);
-            }
-        }
-        new.clear();
-        debug_assert!(
-            self.0.windows(2).all(|w| w[0].0 < w[1].0),
-            "sorted, distinct"
-        );
-    }
-
     /// The value at `k`.
     pub fn get(&self, k: &K) -> Option<&V> {
         self.find(k).map(|i| &self.0[i].1)
@@ -193,6 +123,156 @@ impl<'a, K: Ord + Copy, V> IntoIterator for &'a SortedMap<K, V> {
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter().map(|(k, v)| (k, v))
+    }
+}
+
+/// A map kept from one step to the next, as two columns: its keys, sorted
+/// and distinct, and their values at the same places. A lookup searches the
+/// keys alone, a dense column (eight bytes a tile for a `TileId`), rather
+/// than strides of whole entries: the budget looks tiles up by the thousand
+/// each step, and the values are large (a kept need's record, a tree
+/// position). Its read accessors mirror [`SortedMap`]'s.
+///
+/// Entries are added at its end, then merged in place
+/// ([`SortedCols::merge_tail`]): no buffer to keep for them.
+#[derive(Clone, Debug)]
+pub(super) struct SortedCols<K, V> {
+    keys: Vec<K>,
+    vals: Vec<V>,
+}
+
+impl<K, V> Default for SortedCols<K, V> {
+    fn default() -> Self {
+        SortedCols {
+            keys: Vec::new(),
+            vals: Vec::new(),
+        }
+    }
+}
+
+impl<K: Ord + Copy, V> SortedCols<K, V> {
+    fn find(&self, k: &K) -> Option<usize> {
+        self.keys.binary_search(k).ok()
+    }
+
+    /// The value at `k`.
+    pub fn get(&self, k: &K) -> Option<&V> {
+        self.find(k).map(|i| &self.vals[i])
+    }
+
+    /// The entries, in key order.
+    pub fn iter(&self) -> std::iter::Zip<std::slice::Iter<'_, K>, std::slice::Iter<'_, V>> {
+        self.keys.iter().zip(self.vals.iter())
+    }
+
+    /// The keys, in order.
+    pub fn keys(&self) -> std::slice::Iter<'_, K> {
+        self.keys.iter()
+    }
+
+    /// The keys, as the column they are kept in.
+    pub fn key_column(&self) -> &[K] {
+        &self.keys
+    }
+
+    /// How many entries.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// The value at place `i`.
+    pub fn value_at(&self, i: usize) -> &V {
+        &self.vals[i]
+    }
+
+    /// The value at place `i`, to change in place (its key stays).
+    pub fn value_at_mut(&mut self, i: usize) -> &mut V {
+        &mut self.vals[i]
+    }
+
+    /// Room for exactly `n` more entries.
+    pub fn reserve_exact(&mut self, n: usize) {
+        self.keys.reserve_exact(n);
+        self.vals.reserve_exact(n);
+    }
+
+    /// Adds an entry at the end, out of order until
+    /// [`SortedCols::merge_tail`]; each column grown as [`push_grown`] does.
+    pub fn push(&mut self, k: K, v: V) {
+        push_grown(&mut self.keys, k);
+        push_grown(&mut self.vals, v);
+    }
+
+    /// Keeps the entries `f` keeps, in order. A map left with more than an
+    /// eighth of its room unused gives back most of it.
+    pub fn retain(&mut self, mut f: impl FnMut(&K, &mut V) -> bool) {
+        let mut w = 0;
+        for i in 0..self.keys.len() {
+            if f(&self.keys[i], &mut self.vals[i]) {
+                self.keys.swap(w, i);
+                self.vals.swap(w, i);
+                w += 1;
+            }
+        }
+        self.keys.truncate(w);
+        self.vals.truncate(w);
+        let shrink = |cap: usize| cap > 64 && cap > w + w / 8;
+        if shrink(self.keys.capacity()) {
+            self.keys.shrink_to(w + w / 16);
+        }
+        if shrink(self.vals.capacity()) {
+            self.vals.shrink_to(w + w / 16);
+        }
+    }
+
+    /// Merges the entries from place `mid` on — sorted, distinct, of keys
+    /// not before `mid` — into the sorted entries before it, in place: no
+    /// buffer, the two columns moved together.
+    pub fn merge_tail(&mut self, mid: usize) {
+        merge_in_place(&mut self.keys, &mut self.vals, mid);
+        debug_assert!(
+            self.keys.windows(2).all(|w| w[0] < w[1]),
+            "sorted, distinct"
+        );
+    }
+}
+
+/// Merges the sorted runs `keys[..mid]` and `keys[mid..]` (distinct keys)
+/// in place, `vals` moved alike: the symmetric merge by rotations
+/// (Kim and Kutzner's SymMerge, in its simplest form), O(n log n) moves at
+/// worst, no allocation; a short run merged into a long one costs about
+/// one pass over the long one per level.
+fn merge_in_place<K: Ord + Copy, V>(keys: &mut [K], vals: &mut [V], mid: usize) {
+    let n = keys.len();
+    if mid == 0 || mid >= n || keys[mid - 1] < keys[mid] {
+        return;
+    }
+    // Split the longer run at its middle, the shorter where that key
+    // falls; rotate the two inner parts past each other.
+    let (cut_a, cut_b) = if mid >= n - mid {
+        let a = mid / 2;
+        let b = mid + keys[mid..].partition_point(|k| *k < keys[a]);
+        (a, b)
+    } else {
+        let b = mid + (n - mid) / 2;
+        let a = keys[..mid].partition_point(|k| *k < keys[b]);
+        (a, b)
+    };
+    keys[cut_a..cut_b].rotate_left(mid - cut_a);
+    vals[cut_a..cut_b].rotate_left(mid - cut_a);
+    let new_mid = cut_a + (cut_b - mid);
+    let (kl, kr) = keys.split_at_mut(new_mid);
+    let (vl, vr) = vals.split_at_mut(new_mid);
+    merge_in_place(kl, vl, cut_a);
+    merge_in_place(kr, vr, cut_b - new_mid);
+}
+
+impl<'a, K: Ord + Copy, V> IntoIterator for &'a SortedCols<K, V> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = std::iter::Zip<std::slice::Iter<'a, K>, std::slice::Iter<'a, V>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -260,6 +340,50 @@ mod tests {
         assert_eq!(m.keys().copied().collect::<Vec<_>>(), [1, 3, 7]);
         assert_eq!(m.len(), 3);
         assert_eq!(m.into_buffer().capacity(), 3);
+    }
+
+    /// Two sorted runs of distinct keys merge in place into one, each
+    /// value still at its key, whatever the runs' lengths and interleaving.
+    #[test]
+    fn sorted_columns_merge_their_tail_in_place() {
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..2_000u64 {
+            let len = usize::try_from(next() % 40).unwrap();
+            let mut all: Vec<u64> = (0..len).map(|_| next() % 100).collect();
+            all.sort_unstable();
+            all.dedup();
+            let mut head = Vec::new();
+            let mut tail = Vec::new();
+            for k in &all {
+                if next() % 3 == 0 {
+                    tail.push(*k);
+                } else {
+                    head.push(*k);
+                }
+            }
+            let mut m: SortedCols<u64, u64> = SortedCols::default();
+            for k in head.iter().chain(&tail) {
+                m.push(*k, k * 10 + 1);
+            }
+            m.merge_tail(head.len());
+            assert_eq!(m.keys().copied().collect::<Vec<_>>(), all, "round {round}");
+            for (k, v) in &m {
+                assert_eq!(*v, k * 10 + 1, "round {round}");
+            }
+            m.retain(|k, _| k.is_multiple_of(2));
+            assert!(m
+                .iter()
+                .all(|(k, v)| k.is_multiple_of(2) && *v == k * 10 + 1));
+            for k in &all {
+                assert_eq!(m.get(k).is_some(), k.is_multiple_of(2), "round {round}");
+            }
+        }
     }
 
     #[test]
