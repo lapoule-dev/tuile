@@ -127,11 +127,19 @@ impl Offscreen {
         }
     }
 
-    /// Reads every eye back and scans it against the camera that drew it.
+    /// Reads every eye back and scans it against the camera that drew it —
+    /// the picture's rectangle of it, whose shape the camera was drawn for:
+    /// the bars around it (a held aspect, the credits bar) are not the
+    /// camera's.
     ///
     /// **Blocks on the GPU**, every frame: a headless run is there to look
     /// at its pictures, and a picture not read back is not looked at.
-    pub(crate) fn read(&mut self, gpu: &GpuContext, cameras: &[GlobeCamera]) {
+    pub(crate) fn read(
+        &mut self,
+        gpu: &GpuContext,
+        cameras: &[GlobeCamera],
+        picture: crate::frame_host::Letterbox,
+    ) {
         let m = tuile_core::metrics::metrics();
         let size = self.size;
         // About a quarter of a million rays an eye, whatever the frame: every
@@ -144,7 +152,8 @@ impl Offscreen {
         for (index, (eye, camera)) in self.eyes.iter_mut().zip(cameras).enumerate() {
             eye.pixels = eye.readback.take(gpu, size);
             eye.bare = eye.pixels.as_ref().map_or(Bare::default(), |pixels| {
-                tuile_tape::scan::bare_ground(pixels, size.0, size.1, &frame_of(camera), step)
+                let (cropped, w, h) = crop(pixels, size, picture);
+                tuile_tape::scan::bare_ground(&cropped, w, h, &frame_of(camera), step)
             });
             m.eye_ground_pixels.set(index, eye.bare.ground);
             m.eye_black_pixels.set(index, eye.bare.black);
@@ -154,6 +163,29 @@ impl Offscreen {
     pub(crate) fn size(&self) -> (u32, u32) {
         self.size
     }
+}
+
+/// The picture's rectangle of a frame of `size`, tightly packed RGBA8, and
+/// its size. The whole frame when the picture is the frame.
+fn crop(
+    pixels: &[u8],
+    size: (u32, u32),
+    picture: crate::frame_host::Letterbox,
+) -> (std::borrow::Cow<'_, [u8]>, u32, u32) {
+    let x = picture.x.min(size.0);
+    let y = picture.y.min(size.1);
+    let w = picture.width.min(size.0 - x);
+    let h = picture.height.min(size.1 - y);
+    if (x, y, w, h) == (0, 0, size.0, size.1) || w == 0 || h == 0 {
+        return (std::borrow::Cow::Borrowed(pixels), size.0, size.1);
+    }
+    let stride = size.0 as usize * 4;
+    let mut out = Vec::with_capacity(w as usize * h as usize * 4);
+    for row in y..y + h {
+        let start = row as usize * stride + x as usize * 4;
+        out.extend_from_slice(&pixels[start..start + w as usize * 4]);
+    }
+    (std::borrow::Cow::Owned(out), w, h)
 }
 
 /// A camera, as a tape and a scan speak of one.

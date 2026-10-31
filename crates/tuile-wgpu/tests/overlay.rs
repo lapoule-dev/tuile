@@ -4,7 +4,7 @@
 //! The overlay pipeline on a real device: pixel coordinates must land where
 //! they claim, and translucency must composite rather than replace.
 
-use tuile_wgpu::{GpuContext, OverlayRenderer, OverlayVertex, DEPTH_FORMAT, SAMPLES};
+use tuile_wgpu::{GpuContext, OverlayMask, OverlayRenderer, OverlayVertex, DEPTH_FORMAT, SAMPLES};
 
 const SIZE: u32 = 64;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -39,7 +39,12 @@ fn quad(x0: f32, y0: f32, x1: f32, y1: f32, color: [f32; 4]) -> Vec<OverlayVerte
 fn render(gpu: &GpuContext, vertices: &[OverlayVertex]) -> Vec<u8> {
     let mut overlay = OverlayRenderer::new(gpu, FORMAT, None);
     overlay.set_geometry(gpu, vertices, (SIZE, SIZE));
+    draw(gpu, &overlay)
+}
 
+/// Renders what `overlay` holds over an opaque red background and reads the
+/// pixels back.
+fn draw(gpu: &GpuContext, overlay: &OverlayRenderer) -> Vec<u8> {
     let color = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("overlay test"),
         size: wgpu::Extent3d {
@@ -264,4 +269,61 @@ fn the_overlay_draws_into_a_pass_that_carries_depth() {
     gpu.device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("a validation error would surface here");
+}
+
+/// A 16 × 8 mask, its left half inked and its right half bare.
+fn half_inked() -> Vec<u8> {
+    (0..8)
+        .flat_map(|_| (0..16).map(|x| if x < 8 { 255 } else { 0 }))
+        .collect()
+}
+
+/// A mask lands a texel to a pixel where it says, inked where its coverage
+/// is and clear where it is not.
+#[test]
+fn a_mask_is_inked_where_it_covers() {
+    let Some(gpu) = gpu() else { return };
+    let mut overlay = OverlayRenderer::new(&gpu, FORMAT, None);
+    overlay.set_geometry(&gpu, &[], (SIZE, SIZE));
+    let coverage = half_inked();
+    overlay.set_mask(
+        &gpu,
+        Some(OverlayMask {
+            width: 16,
+            height: 8,
+            coverage: &coverage,
+            position: [10.0, 20.0],
+            color: [0.0, 0.0, 1.0, 1.0],
+        }),
+    );
+    let pixels = draw(&gpu, &overlay);
+    assert_eq!(pixel(&pixels, 12, 23), [0, 0, 255, 255], "inked texel");
+    assert_eq!(pixel(&pixels, 22, 23), [255, 0, 0, 255], "bare texel");
+    assert_eq!(pixel(&pixels, 12, 30), [255, 0, 0, 255], "below the mask");
+    assert_eq!(pixel(&pixels, 8, 23), [255, 0, 0, 255], "left of the mask");
+}
+
+/// A mask taken away leaves the frame exactly as if there had never been
+/// one: a viewer with nothing to credit draws what it drew before.
+#[test]
+fn no_mask_is_the_frame_without_one() {
+    let Some(gpu) = gpu() else { return };
+    let triangles = quad(0.0, 0.0, 32.0, 32.0, [0.0, 1.0, 0.0, 0.5]);
+    let before = render(&gpu, &triangles);
+    let mut overlay = OverlayRenderer::new(&gpu, FORMAT, None);
+    overlay.set_geometry(&gpu, &triangles, (SIZE, SIZE));
+    let coverage = half_inked();
+    overlay.set_mask(
+        &gpu,
+        Some(OverlayMask {
+            width: 16,
+            height: 8,
+            coverage: &coverage,
+            position: [10.0, 20.0],
+            color: [0.0, 0.0, 1.0, 1.0],
+        }),
+    );
+    assert_ne!(draw(&gpu, &overlay), before, "the mask is drawn");
+    overlay.set_mask(&gpu, None);
+    assert!(draw(&gpu, &overlay) == before, "not a pixel changed");
 }

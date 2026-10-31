@@ -12,10 +12,11 @@
 //! the globe's own tiles, and where it has nothing yet the globe is there as
 //! it would be without it.
 //!
-//! Its credits are the provider's terms, not decoration. The ones the host
-//! names are kept in the window's title for as long as the tileset is in the
-//! session; the ones each tile names in its own payload are gathered from the
-//! tiles drawn, most frequent first, and shown with them.
+//! Its credits are the provider's terms, not decoration. What each tile
+//! names in its own payload is gathered from the tiles drawn, most frequent
+//! first, followed by what the host names, and shown in one line in the
+//! credits bar below the picture for as long as the tileset is in the
+//! session (`app::credits`).
 
 use std::sync::Arc;
 

@@ -6,6 +6,7 @@
 //! drives the geometry stream through the [`ContentPump`].
 
 mod command;
+mod credits;
 mod demand;
 #[cfg(feature = "control")]
 mod driven;
@@ -277,6 +278,8 @@ pub struct App {
     /// The host's 3D Tiles drawn over the globe, taken from the session:
     /// see [`crate::surface`].
     surfaces: Vec<crate::surface::Layer>,
+    /// The bar their credits are shown in, below the picture.
+    credits: credits::Credits,
     /// The session on its way up; `None` once it has arrived or failed.
     launch: Option<crate::launch::Launch>,
     /// Why the session could not start, once that is known.
@@ -463,6 +466,7 @@ impl App {
             active: None,
             session: None,
             surfaces: Vec::new(),
+            credits: credits::Credits::default(),
             launch: Some(launch),
             failed: None,
             messages: messages::Messages::default(),
@@ -946,7 +950,15 @@ impl App {
         })
     }
 
+    /// The 3D view, in device pixels: the frame above the credits bar, from
+    /// the frame's top-left — the whole frame when there is no bar. What the
+    /// camera, the traversal, picking and the gestures all measure against.
     fn viewport(&self) -> (f64, f64) {
+        credits::view_of(self.frame_size(), self.credits.height())
+    }
+
+    /// The whole frame, in device pixels, credits bar included.
+    fn frame_size(&self) -> (f64, f64) {
         self.active
             .as_ref()
             .map_or((1920.0, 1080.0), |a| (a.size.0 as f64, a.size.1 as f64))
@@ -971,6 +983,9 @@ impl App {
             };
         }
         let (x, y, sw, sh) = active.safe;
+        // The safe area above the credits bar, when there is one: the bar
+        // already keeps its own line clear of the bottom inset.
+        let sh = sh.min((h - y).max(0.0));
         let scale = active.scale.max(1.0);
         UiFrame {
             origin: (x, y),
