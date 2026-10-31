@@ -40,10 +40,25 @@ is *derived* from it and invalidated by its edit events.
     it drifts from the sphere by `d²/2R`, ≈ 320 m at 64 km from the anchor —
     a planar world is drawn flat, the anchor only says where);
   - `GeodeticFrame`: a region of the globe, longitude and latitude in
-    radians, heights above the ellipsoid, with a spherical metric. It does
-    not wrap the antimeridian and stays within ±90° of latitude (checked when
-    a ground is built); near a pole a brush's reach in longitude grows without
-    bound, and a brush whose reach cannot be measured is refused.
+    radians, heights above the ellipsoid, with a spherical metric. Its
+    latitudes lie within ±90° (poles included) and its longitudes within ±2π,
+    spanning at most 2π (checked when a ground is built). A region spanning
+    exactly 2π is the whole globe and **wraps**: a brush across the
+    antimeridian edits both sides. A narrower region has edges, and a brush
+    is clipped to them as in a planar frame.
+
+  A frame also measures brushes: the offset of a column from another in
+  metres, in the tangent plane at the first (`tangent_offset`), and the
+  rectangle of columns within reach of a brush (`reach`). In a geodetic frame
+  the offset is the orthographic projection on the sphere's tangent plane
+  (a distance `R·sin θ` for an arc `R·θ`, short by `θ²/6` of it, 4·10⁻⁵ at
+  100 km; heights stay along each column, the curvature `d²/2R` under a
+  brush is not folded in), and the reach is a spherical cap: latitudes
+  widened by `asin(r/R)`, longitudes by `asin(sin θ / cos φ)` at the latitude
+  `φ` closest to a pole, and every longitude when the cap contains a pole. So
+  a ball at a pole carves a disc over every longitude, and a ball near it
+  reaches the far side. A position beyond ±90° of latitude names no place: a
+  brush there is refused (`InvalidBrush`).
 
   A frame gives its bounds, its edit level, its metric (metres per unit at a
   column, which is all the authoritative paths need) and conversions to and
@@ -62,11 +77,19 @@ is *derived* from it and invalidated by its edit events.
   samples, some 2 GB of `f64`. A memory budget for such a source is an
   implementation setting, not part of the contract. Rendering keeps tuile's
   own streaming, levels of detail and graphics budget; the later adapter
-  (§ 6) makes it draw the same surface.
+  (§ 6) makes it draw the same surface. Reads are infallible: a source that
+  cannot load or regenerate a tile has no answer, must not give a wrong one,
+  and fails fatally — outside the contract, as running out of memory is. Its
+  digest covers the non-resident state too: it may be computed from the
+  source's identity (what regenerates the tiles bit for bit) and its edit
+  layer, without loading anything.
 - **Tiles**: the quadtree of the frame's bounds, levels 0 to 30. Tile `x`
   covers `[edge(x), edge(x+1))` with `edge(x) = min + (max − min)·(x/2^l)`,
-  computed one way everywhere, so `tile_of` and `tile_bounds` agree to the
-  bit on any bounds (a geodetic region's are not powers of two). Edits bump a
+  computed one way everywhere and the last edge being `max` itself, so
+  `tile_of` and `tile_bounds` agree to the bit on any bounds (a geodetic
+  region's are not powers of two) whose edges are strictly increasing — tiles
+  wider than the rounding of the bounds; a heightfield checks it for its cells
+  and its edit-level tiles when built (`DegenerateCells`). Edits bump a
   `Version` per tile at the frame's edit level and append `TileChanged`
   events. **The report is complete and may be conservative**: a point query
   on a column of an unreported tile answers bit for bit as before, a ray
@@ -79,24 +102,25 @@ is *derived* from it and invalidated by its edit events.
   **contiguous** order. A fresh ground expects 1, then every next number:
   - the expected number is **consumed** — the edit is applied, or refused for
     its content (`OutOfBounds`; `InvalidBrush`: a non-finite coordinate, a
-    radius not positive, a box whose min is above its max, a reach the
-    frame's metric cannot measure). A refusal for content is the same on
+    radius not positive, a box whose min is above its max, a latitude beyond
+    ±90°). A refusal for content is the same on
     every replica, so it consumes the number and changes nothing else;
   - an edit from the past (`Stale`) or past a missing one (`Gap { expected,
     got }`) is refused and changes nothing, not even the expected number:
     the caller delivers the missing edits first.
 
   So a lost or reordered edit stops a replica at a prefix of the script
-  instead of letting it diverge. A brush is measured in the metric of its
-  anchor (a sphere's centre, the middle of a capsule's segment): exact in a
-  planar frame, accurate in a geodetic one while the brush is small. A
-  heightfield resolves edits at its sample spacing.
+  instead of letting it diverge. A brush is measured in each column's
+  tangent plane (above). A box is taken as given and does not wrap. A
+  heightfield resolves edits at its sample spacing. A brush's fields are
+  public: it is validated when the edit is applied.
 - **Queries are batched**: slices in, slices out, no allocation per query —
   `surface` (where a walker lands; a probe at `+∞` gives the column's top,
   the idiom a height adapter uses), `spans` (the solid intervals of a
   column), `solid` (collision, volume tests), `raycast` (first entry into
-  solid; clear line of sight is `None`; a ray starting in solid hits at 0;
-  water does not block), `water` (body, level, depth). Solid is closed: a
+  solid; clear line of sight is `None`; a ray starting in solid hits at 0, and
+  one entering the bounds below the surface hits on the entry face, max edges
+  included; water does not block; rays do not wrap), `water` (body, level, depth). Solid is closed: a
   point exactly on a surface is solid and stands on it.
 - **Costs are bounded** per query by the ground's size, never by the query's
   values. The reference: `surface`, `solid`, `water`, `spans` O(1); `raycast`
@@ -116,12 +140,15 @@ is *derived* from it and invalidated by its edit events.
   case. The reference `Heightfield` says what it cannot hold — an overhang or a
   tunnel leaves its columns unchanged — rather than faking it. Its raycast is
   exact up to rounding: a 2D walk over the cells the segment's projection
-  crosses, and in each cell the first root of the segment against the
-  bilinear patch.
+  crosses, and in each cell the entry root of the segment against the
+  bilinear patch, chosen by the sign of the quadratic term and computed around
+  the segment's point at the cell's entry (a long segment does not
+  extrapolate the patch across the map).
 - **Digest**: `EditGround::digest` covers everything that decides answers and
   order (the frame's bounds, edit level and metric, the samples, the water
-  coverage and bodies, the versions, the last consumed edit). Replicas of one
-  implementation compare it; digests of different implementations are not
+  coverage and bodies, the versions, the last consumed edit; not a planar
+  frame's anchor, which only places the world for a renderer). Replicas of
+  one implementation compare it; digests of different implementations are not
   comparable.
 
 ## 4. Determinism discipline
@@ -141,20 +168,32 @@ rounds correctly on every target. So, in authoritative paths:
 - an implementation that pages or regenerates tiles recomputes them bit for
   bit: residency never shows in an answer.
 
-The tests check, on both frames, that replicas agree bit for bit over random
-edit scripts, that any delivery order leaves a replica at a prefix of the
-script, that change reports are complete (no point answer moves outside the
-reported tiles), that versions move by one on reported tiles only, and that
-raycasts agree with the surface. **Golden digests** pin a fixed script's state
-and a fixed set of answers (surfaces, normals, solidity, water, raycasts) on
-both frames; CI runs them on Linux and macOS, so a drift on one target fails
-there. Checking them on wasm32 is the next step for CI.
+The properties are written once, generic over any `EditGround` built by a
+factory — a **conformance suite** a new implementation runs as is: replicas
+agree bit for bit over random edit scripts; any delivery order leaves a
+replica at a prefix of the script; a replica buffering early edits reaches
+the script's end; change reports are complete (no point answer moves outside
+the reported tiles, no ray whose rectangle misses them changes); versions move
+by one on reported tiles only; raycasts agree with the surface, rays starting
+and ending outside the bounds included. They run on the heightfield in a
+planar frame, a geodetic region, a polar cap over every longitude, a polar
+window with edges and an equatorial band over every longitude (edits biased
+toward tile edges, the pole and the antimeridian), and on an **evicting test
+double** — a ground that rebuilds itself from its source and edit log every
+third read — which must also answer bit for bit like the heightfield it pages.
+
+**Golden digests** pin a fixed script's state and a fixed set of answers
+(surfaces, normals, solidity, water, raycasts) in a planar frame, a geodetic
+region and around a pole. They were recorded on macOS (aarch64) with rustc
+1.99.0; the CI `test` jobs run them on Linux (x86-64) and macOS (aarch64), so
+a drift on one target fails there. Checking them on wasm32 is the next step
+for CI.
 
 ## 5. Decisions taken, and options left open
 
 | Point | Taken here | Open for a decision |
 |---|---|---|
-| Frame | pluggable: planar (with an optional anchor) and geodetic | whether a planar world may ever be wrapped on the ellipsoid for gameplay (today: no, drawn flat at its anchor) |
+| Frame | pluggable: planar (with an optional anchor) and geodetic (poles included; wraps over the whole globe) | whether a planar world may ever be wrapped on the ellipsoid for gameplay (today: no, drawn flat at its anchor) |
 | Numbers | f64 with the discipline above | a host may keep fixed point **inside** its implementation (exact edits, hashable state) and convert at the boundary; the contract stays f64 |
 | Edit order | contiguous from 1; content refusals consume their number | question 1 below |
 | Water | bodies, each with its own level, named by index; per-column coverage, not changed by edits | rivers with a sloping surface (a level per body cannot hold one); flooding on edits (question 6) |
@@ -182,10 +221,12 @@ Questions for Laurent:
    crates/tuile-budget/src/tile_id.rs) → the adapter would invalidate by
    rectangle overlap. Should a GeodeticFrame be definable as a terrain
    TileCoord (bounds = tile_rect(c); ground tile (l,x,y) = global (c.level+l,
-   (c.x<<l)+x, (c.y<<l)+y)), at the cost of arbitrary regions?
+   (c.x<<l)+x, (c.y<<l)+y)), at the cost of arbitrary regions? — *default if
+   unanswered: the frame's own grid; the adapter invalidates by rectangle
+   overlap.*
 5. Spherical metric: brush radii up to ~0.7 % off vs the renderer's ellipsoid
    (~700 m on a 100 km brush) — OK, or ellipsoid radii of curvature (libm +
-   arithmetic)?
+   arithmetic)? — *default if unanswered: spherical.*
 6. Water and edits: does digging below a body's level beside it flood; is
    coverage part of edits? — *today: no flooding, coverage is the source's.*
 7. Replica digest: part of EditGround or per implementation? — *implemented
@@ -194,7 +235,8 @@ Questions for Laurent:
    confirm.
 9. A client-side partial replica of the ground (tiles around the camera,
    synchronised by tile version and the server's edits) for prediction:
-   later design.
+   later design. — *default if unanswered: none in this contract; clients
+   draw through tuile's streaming and read the server's answers.*
 
 ## 6. What comes after (not in this note's PR)
 
