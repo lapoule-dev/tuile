@@ -3,7 +3,7 @@
 
 #![doc = include_str!("../README.md")]
 
-pub mod budget;
+pub use tuile_budget as budget;
 pub mod content;
 pub mod determinism;
 pub mod drive;

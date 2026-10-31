@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use tuile_core::budget::{
+use tuile_budget::{
     Budget, BudgetConfig, BudgetStats, Bytes, Class, Decisions, FrameDeadline, FrameInput,
     Generation, LayerId, Micros, NeedSet, Policy, Pressure, ResourceId, Role, Source, Thermal,
     TileId,
@@ -79,7 +79,7 @@ impl Profile {
     pub fn desktop() -> Self {
         let mut b = BudgetConfig::interactive(Bytes::gib(2));
         // Today's desktop viewer runs 64 fetches; the same, split by class.
-        b.max_in_flight = tuile_core::budget::PerClass([32, 16, 32, 4]);
+        b.max_in_flight = tuile_budget::PerClass([32, 16, 32, 4]);
         // And reads its local store as widely: at the default 8, a warm
         // start reads at most 8 resources a step and converges later than a
         // cold one on a good network (P1.3).
@@ -102,7 +102,7 @@ impl Profile {
     /// A phone: 512 MiB, cellular, 60 fps, 4 s to converge.
     pub fn handheld() -> Self {
         let mut b = BudgetConfig::interactive(Bytes::mib(512));
-        b.max_in_flight = tuile_core::budget::PerClass([8, 4, 8, 2]);
+        b.max_in_flight = tuile_budget::PerClass([8, 4, 8, 2]);
         b.upload_bytes_per_frame = Bytes::mib(4);
         b.delivery_credit = Bytes::mib(16);
         b.imagery_over_terrain_cap = 2;
@@ -356,7 +356,7 @@ impl Sim {
                 }
                 Arrival::Failed(r, g) => {
                     self.budget
-                        .on_failed(r, g, tuile_core::budget::Failure::Transient)
+                        .on_failed(r, g, tuile_budget::Failure::Transient)
                 }
                 Arrival::StoreMiss(r, g) => self.budget.on_store_miss(r, g),
             }

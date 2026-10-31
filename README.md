@@ -242,6 +242,7 @@ Routing, authentication and limits belong to whoever deploys it.
 | Area | Crate | What it is |
 |---|---|---|
 | Core | `tuile-core` | 3D Tiles parsing, SSE traversal, content decoding, geometry streaming |
+| | `tuile-budget` | The graphics budget: what is loaded, uploaded, drawn and evicted, pure and deterministic |
 | | `tuile-b3dm` | The legacy Batched 3D Model container, parsed and encoded |
 | | `tuile-terrain` | Quantized-mesh decoding and geographic tiling |
 | | `tuile-planetary` | Terrain × imagery, assembled as a tile tree and a loader |

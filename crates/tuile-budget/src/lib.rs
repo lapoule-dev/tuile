@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! The graphics budget: one pure, deterministic module that decides what is
-//! loaded, delivered, uploaded, drawn and evicted, for viewers
-//! ([`Policy::Interactive`]) and films ([`Policy::Batch`]) alike.
-//!
-//! It reads no clock, spawns nothing, touches no GPU and iterates no hash
-//! map: time, the view, arrivals and platform signals are inputs, and the
-//! same inputs give the same [`Decisions`], bit for bit
-//! ([`Decisions::digest`]). It builds for `wasm32-unknown-unknown`.
-//!
-//! See `docs/explorations/graphics-budget-to-be-and-spec.md` for the
-//! invariants I1–I15 it upholds.
-//!
-//! # The step
-//!
-//! Between two calls to [`Budget::decide`], arrivals are recorded
-//! ([`Budget::on_loaded`], [`Budget::on_drawable`], …) but not applied; the
-//! next `decide` applies them in a canonical order, whatever order they came
-//! in, then decides.
-
+#![doc = include_str!("../README.md")]
 // Determinism guards (A3.f): a hash container's order is seeded per process
 // and differs between targets, so nothing here may iterate one; and a
 // `usize` is 32 bits on wasm32, so no length is narrowed by `as` (see
@@ -41,6 +23,7 @@ mod sorted;
 mod state;
 pub mod stats;
 pub mod tier;
+pub mod tile_id;
 pub mod types;
 pub mod view;
 

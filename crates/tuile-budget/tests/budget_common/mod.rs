@@ -9,8 +9,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use tuile_core::budget::cost::{drape_cost, Cost, TextureFormat};
-use tuile_core::budget::{
+use tuile_budget::cost::{drape_cost, Cost, TextureFormat};
+use tuile_budget::{
     Budget, BudgetConfig, Bytes, Class, Decisions, FrameInput, GeoRect, ImageryNeed, LayerId,
     LayerReach, Micros, Need, NeedSet, Presence, PresenceOracle, ResourceId, TexelFootprint,
     TileId,
@@ -97,7 +97,7 @@ pub fn dr(id: TileId, level: u32) -> ResourceId {
 }
 
 /// The drape a draw item wears for the base layer, if any.
-pub fn base_drape(item: &tuile_core::budget::DrawItem) -> Option<tuile_core::budget::DrapeChoice> {
+pub fn base_drape(item: &tuile_budget::DrawItem) -> Option<tuile_budget::DrapeChoice> {
     item.drape(LayerId(0)).copied()
 }
 
@@ -175,9 +175,9 @@ pub struct Rig {
     /// The local store.
     pub store: Store,
     /// Generations of the last delivery of each resource.
-    pub delivered: BTreeMap<ResourceId, tuile_core::budget::Generation>,
+    pub delivered: BTreeMap<ResourceId, tuile_budget::Generation>,
     /// Loads started and not yet completed by the rig.
-    pub pending: BTreeMap<ResourceId, tuile_core::budget::Generation>,
+    pub pending: BTreeMap<ResourceId, tuile_budget::Generation>,
 }
 
 impl Rig {

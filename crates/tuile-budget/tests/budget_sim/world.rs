@@ -19,8 +19,8 @@ use std::collections::BTreeSet;
 
 use super::detmath;
 
-use tuile_core::budget::cost::{drape_cost, Cost, TextureFormat};
-use tuile_core::budget::{
+use tuile_budget::cost::{drape_cost, Cost, TextureFormat};
+use tuile_budget::{
     Bytes, Class, GeoRect, ImageryNeed, Need, NeedSet, ResourceId, TexelFootprint, TileId,
 };
 

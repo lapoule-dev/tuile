@@ -1,0 +1,27 @@
+[package]
+name = "tuile-budget"
+description = "The graphics budget: pure, deterministic decisions of what is loaded, uploaded, drawn and evicted"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# At the bottom of the graph: no other tuile crate, no GPU API, no async
+# runtime, no I/O. It builds for `wasm32-unknown-unknown`.
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The budget's properties (protection, total order, ledger, determinism,
+# cancellation) over random need and arrival sequences.
+proptest = { workspace = true }
+# What one budget `decide` costs, mean and percentiles (`benches/budget_decide.rs`).
+criterion = { workspace = true }
+
+[[bench]]
+name = "budget_decide"
+harness = false

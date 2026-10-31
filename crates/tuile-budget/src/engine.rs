@@ -2555,7 +2555,7 @@ impl Budget {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::budget::BudgetConfig;
+    use crate::BudgetConfig;
 
     #[test]
     fn a_slot_freed_twice_saturates_and_is_recorded() {
