@@ -274,6 +274,11 @@ pub struct Sim {
     pub decide_us: Vec<(Micros, f64)>,
     /// What the heap saw during each `decide` call, with the step's time.
     pub decide_allocs: Vec<DecideAllocs>,
+    /// The host's side of a delta step (O1.3): wall time of building the
+    /// delta from the last need and this one (`NeedDelta::diff`, what the
+    /// runtime computes before `decide`), µs, and the blocks it allocated,
+    /// with the step's time. Absent on a whole-need step.
+    pub diff_us: Vec<(Micros, f64, u64)>,
     /// Also count the allocations of the step's output alone (a clone of
     /// its `Decisions`), for [`DecideAllocs::output`]: off by default, it
     /// costs a clone per step.
@@ -336,6 +341,7 @@ impl Sim {
             wanted_at: BTreeMap::new(),
             waits: Vec::new(),
             decide_us: Vec::new(),
+            diff_us: Vec::new(),
             decide_allocs: Vec::new(),
             count_output: false,
             levels: BTreeMap::new(),
@@ -418,7 +424,10 @@ impl Sim {
         // since the step before (built outside what is timed and counted).
         let input = match &self.need_last {
             Some(last) => {
-                self.delta.diff(last, &need);
+                let clock = std::time::Instant::now();
+                let ((), heap) = super::alloc::counted(|| self.delta.diff(last, &need));
+                let us = clock.elapsed().as_secs_f64() * 1e6;
+                self.diff_us.push((self.now, us, heap.allocs));
                 FrameInput::from_delta(self.frame, self.now, &self.delta)
             }
             None => FrameInput::new(self.frame, self.now, &need),

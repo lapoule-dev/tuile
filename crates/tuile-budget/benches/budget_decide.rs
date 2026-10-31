@@ -13,6 +13,13 @@
 //!   (`soak::pressure_profile`: over target on nearly every step, so the
 //!   eviction order is walked every step), `decide` alone timed.
 //!
+//! - `diff/still`, `diff/motion`: the host's side of a delta step, the
+//!   `NeedDelta::diff` the runtime (`tuile-core`'s `runtime.rs`) computes
+//!   from the need it kept and the new one before each `decide`: on the
+//!   still view, the same need again; on the tour, consecutive needs. The
+//!   percentiles also report `decide + diff` per step, what a delta step
+//!   costs the host in all, to compare with `decide` told the whole need.
+//!
 //! The simulation runs its budget alone here (`Sim::unchecked`): the frozen
 //! reference the tests run beside it (`tests/reference/`) is left out.
 //!
@@ -109,6 +116,13 @@ fn percentiles(name: &str, mut us: Vec<f64>, drawn: usize) {
     );
 }
 
+/// The host's diff on the still view: the need it kept, and the same need
+/// traversed again (an equal set, not the same one).
+fn diff_still(delta: &mut NeedDelta, last: &NeedSet, need: &NeedSet) -> usize {
+    delta.diff(last, need);
+    delta.tiles()
+}
+
 /// The percentiles, from individually timed calls.
 fn report() {
     for (name, whole) in [("still", false), ("still-full", true)] {
@@ -121,6 +135,24 @@ fn report() {
             us.push(t.elapsed().as_secs_f64() * 1e6);
         }
         percentiles(name, us, drawn);
+    }
+    {
+        let (mut sim, need) = converged();
+        let again = need.clone();
+        let mut delta = NeedDelta::new();
+        let (mut diff, mut both) = (Vec::with_capacity(2_000), Vec::with_capacity(2_000));
+        let mut drawn = 0;
+        for _ in 0..2_000 {
+            let t = Instant::now();
+            black_box(diff_still(&mut delta, &need, &again));
+            let d = t.elapsed().as_secs_f64() * 1e6;
+            let t = Instant::now();
+            drawn = black_box(decide_still(&mut sim, &need, false));
+            diff.push(d);
+            both.push(d + t.elapsed().as_secs_f64() * 1e6);
+        }
+        percentiles_named("diff", "still", diff, drawn);
+        percentiles_named("decide+diff", "still", both, drawn);
     }
 
     for (name, pressed) in [("motion", false), ("pressure", true)] {
@@ -137,7 +169,37 @@ fn report() {
             .collect();
         let drawn = sim.decide_allocs.iter().map(|a| a.drawn).max().unwrap_or(0);
         percentiles(name, us, drawn as usize);
+        if !pressed {
+            // The diff of each delta step, and its step's decide beside it.
+            let decide: std::collections::BTreeMap<u64, f64> =
+                sim.decide_us.iter().map(|(t, d)| (t.0, *d)).collect();
+            let measured = sim
+                .diff_us
+                .iter()
+                .filter(|(t, _, _)| *t >= Micros::from_secs(10));
+            let diff: Vec<f64> = measured.clone().map(|(_, d, _)| *d).collect();
+
+            let both: Vec<f64> = measured
+                .map(|(t, d, _)| d + decide.get(&t.0).copied().unwrap_or(0.0))
+                .collect();
+            percentiles_named("diff", name, diff, drawn as usize);
+            percentiles_named("decide+diff", name, both, drawn as usize);
+        }
     }
+}
+
+fn percentiles_named(what: &str, name: &str, mut us: Vec<f64>, drawn: usize) {
+    us.sort_by(f64::total_cmp);
+    let at = |p: usize| us.get(us.len() * p / 100).copied().unwrap_or(0.0);
+    let mean = us.iter().sum::<f64>() / us.len().max(1) as f64;
+    eprintln!(
+        "{what} {name}: mean {mean:.1} µs, p50 {:.1} µs, p99 {:.1} µs, max {:.1} µs \
+         ({} calls, {drawn} drawn)",
+        at(50),
+        at(99),
+        us.last().copied().unwrap_or(0.0),
+        us.len()
+    );
 }
 
 /// The tour's camera at `t`; under pressure, its orbit, looped
@@ -178,6 +240,31 @@ fn bench(c: &mut Criterion) {
                     let t = sim.now.0 as f64 / 1e6;
                     sim.step(camera(pressed, t));
                     let us = sim.decide_us.last().map_or(0.0, |(_, d)| *d);
+                    total += Duration::from_secs_f64(us / 1e6);
+                }
+                total
+            })
+        });
+    }
+    g.finish();
+    let mut g = c.benchmark_group("diff");
+    {
+        let (_, need) = converged();
+        let again = need.clone();
+        let mut delta = NeedDelta::new();
+        g.bench_function("still", |b| {
+            b.iter(|| black_box(diff_still(&mut delta, &need, &again)))
+        });
+    }
+    {
+        let mut sim = tour_sim(false);
+        g.bench_function("motion", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let t = sim.now.0 as f64 / 1e6;
+                    sim.step(camera(false, t));
+                    let us = sim.diff_us.last().map_or(0.0, |(_, d, _)| *d);
                     total += Duration::from_secs_f64(us / 1e6);
                 }
                 total
