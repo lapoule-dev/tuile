@@ -155,10 +155,12 @@ impl Host for Machine {
         system::bundled(key)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn configured(&self) -> Option<String> {
         crate::import::session_token().map(|t| t.expose().to_owned())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn secret(&self, key: &str) -> Option<String> {
         use crate::secrets::Secrets;
         crate::secrets::System

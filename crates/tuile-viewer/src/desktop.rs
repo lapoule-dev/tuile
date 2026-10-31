@@ -116,6 +116,7 @@ pub(crate) fn queue(request: Request) {
 /// Called once the event loop exists and before it runs: what the platform
 /// can only set up on the windowing layer's own objects — on macOS, the
 /// delegate method that receives opened files.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn adopt_the_loop() {
     #[cfg(all(target_os = "macos", feature = "application"))]
     system::adopt_the_loop();
