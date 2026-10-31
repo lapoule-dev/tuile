@@ -9,8 +9,12 @@
 //! same order; every step, the two `Decisions` must be equal — digest and
 //! content, the statistics included except `work`, the cost counter the
 //! optimisations exist to lower — and so must the ledgers, the audits, and
-//! the residency and resource views of every tile the need names. The first
-//! divergence panics with the step and the fields that differ.
+//! the residency and resource views of every tile the need names, and the
+//! whole internal state (`tuile_budget::snapshot`: every tracked resource's
+//! load, copies, generations, epochs, costs and eviction key, the tree
+//! positions, the step-to-step sets, the epochs, the ledger, the in-flight
+//! counts). The first divergence panics with the step and the fields that
+//! differ.
 //!
 //! Wired into every `budget_sim` run (the `Sim` holds a [`Lockstep`]) and
 //! into a proptest over random scripts (`budget_properties.rs`).
@@ -159,6 +163,14 @@ impl Lockstep {
             frozen.tracked(),
             "lockstep: step {step}: the tracked counts diverge (left real, right frozen)"
         );
+        let (rs, fs) = (real.snapshot(), frozen.snapshot());
+        if rs != fs {
+            panic!(
+                "lockstep: step {step}: the internal state diverges from the frozen reference; \
+                 differing (left real, right frozen): {}",
+                rs.diff(&fs).join("; ")
+            );
+        }
         let (rr, fr) = (real.residency(), frozen.residency());
         for (_, t, _) in need.entries() {
             assert_eq!(
@@ -289,6 +301,14 @@ impl Lockstep {
                 self.steps
             );
             assert_eq!(self.real.ledger(), f.ledger());
+            let (rs, fs) = (self.real.snapshot(), f.snapshot());
+            assert!(
+                rs == fs,
+                "lockstep: after step {}: release_beyond: the internal state diverges; \
+                 differing (left real, right frozen): {}",
+                self.steps,
+                rs.diff(&fs).join("; ")
+            );
         }
         a
     }
