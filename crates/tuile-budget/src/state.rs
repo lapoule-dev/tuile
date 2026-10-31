@@ -501,6 +501,14 @@ impl Arena {
         }
     }
 
+    /// What its maps spent keeping their order since the last call.
+    pub fn take_upkeep(&mut self) -> u64 {
+        self.transit
+            .take_upkeep()
+            .saturating_add(self.load.take_upkeep())
+            .saturating_add(self.ranks.take_upkeep())
+    }
+
     /// How many resources are tracked.
     pub fn len(&self) -> usize {
         self.live

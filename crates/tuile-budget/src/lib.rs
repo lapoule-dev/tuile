@@ -213,9 +213,9 @@ pub struct Budget {
     /// Every tracked resource's state, by slot.
     arena: state::Arena,
     /// Every tile the budget knows the place of: what the need told it, as
-    /// long as the tile or a descendant is referenced. A sorted vector: it
-    /// changes only by what the need changes.
-    tiles: sorted::SortedCols<TileId, TileInfo>,
+    /// long as the tile or a descendant is referenced. Changed only by what
+    /// the need changes.
+    tiles: sorted::SortedMap<TileId, TileInfo>,
     /// The need last read, each wanted tile's best entry: a step changes
     /// it by what changed.
     need: need_state::NeedState,

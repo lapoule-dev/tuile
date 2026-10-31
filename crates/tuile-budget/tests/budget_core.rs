@@ -3196,6 +3196,70 @@ mod dirty_sets {
         );
     }
 
+    /// P6.4 where the ancestry is deep (O1.4, `held`): four tiles drawn at
+    /// level 19 give way to their sixteen children, which land together.
+    /// Each held tile that comes or goes is one change of the held set and
+    /// a walk up its twenty ancestors — not a pair rewritten per ancestor in
+    /// an ordered map — so every step's work stays within P6.4's bound on
+    /// what changed: the need's tiles, the events applied and the decisions
+    /// of the step before.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release only: the debug build's checks walk too (cargo test --release -p tuile-budget --test budget_core)"
+    )]
+    fn a_deep_region_refining_at_once_costs_what_changed() {
+        let mut r = Rig::interactive();
+        let coarse: Vec<tuile_budget::TileId> = (0..2)
+            .flat_map(|x| (0..2).map(move |y| t(19, x, y)))
+            .collect();
+        let fine: Vec<tuile_budget::TileId> = coarse.iter().flat_map(|c| children(*c)).collect();
+        // Every ancestor told, so that each walk climbs the whole tree.
+        let with_ancestors = |drawn_tiles: &[tuile_budget::TileId]| {
+            let mut n = drawn(drawn_tiles);
+            let mut up = std::collections::BTreeSet::new();
+            for d in drawn_tiles {
+                let mut p = parent(*d);
+                while let Some(x) = p {
+                    up.insert(x);
+                    p = parent(x);
+                }
+            }
+            n.ancestors = up.into_iter().map(|x| (x, need(x))).collect();
+            n
+        };
+        r.settle(&with_ancestors(&coarse), 50);
+        let ask = with_ancestors(&fine);
+        let (mut decided, mut fed) = (0u64, 0u64);
+        let mut over = Vec::new();
+        for step in 0..12 {
+            let d = r.step(&ask);
+            let named = if step == 0 {
+                (coarse.len() + fine.len()) as u64
+            } else {
+                0
+            };
+            let e = decided + fed;
+            let tracked = u64::from(d.stats.tracked);
+            let log = u64::from(64 - (tracked + 2).leading_zeros());
+            let bound = 16 * (named + e) * log + 256;
+            if u64::from(d.stats.work) > bound {
+                over.push((step, d.stats.work, bound, named, e));
+            }
+            decided = (d.start.len() + d.cancel.len() + d.deliver.len() + d.evict.len()) as u64;
+            fed = (d.start.len() + d.upload_plan.items.len()) as u64;
+            r.complete(&d);
+        }
+        assert!(
+            fine.iter().all(|x| r.b.residency().drawable(*x)),
+            "the region refined"
+        );
+        assert!(
+            over.is_empty(),
+            "{RED}: work over the bound (step, W, bound, #ΔN, #E): {over:?}"
+        );
+    }
+
     /// The worn rule: a tile reads the drapes an ancestor's mesh wore last
     /// step (a layer switch: an old layer stands in while the new one is
     /// drawable nowhere), so it is read again when that mesh's item

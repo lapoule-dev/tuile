@@ -66,6 +66,18 @@ fn still() -> (u64, u64, u32, u64) {
 /// per step past the first ten seconds, the step buffers the budget holds
 /// then (`release_scratch`), and the heap the budget frees when dropped
 /// without them, per tracked resource.
+///
+/// `bytes-per-tracked-resource` and `scratch-bytes-after-tour` went up
+/// once, by a decision (PR #175): 429 -> 455 and 234 360 -> 236 688 B. The
+/// kept maps became sorted blocks (`sorted.rs`), whose change shifts its
+/// block only where one sorted vector shifted the whole map. Their room is
+/// about 80 % used against about 94 % for a vector grown by an eighth;
+/// each map keeps one spare block, so that a split after a merge allocates
+/// nothing; and each block keeps its keys and its values in two columns,
+/// so that a search reads the keys alone (a second vector header, ~24 B,
+/// for each of ~300 blocks). Over the change that made the ancestry the
+/// held set (467 -> 429, 244 216 -> 234 360), the net over #175 is
+/// 467 -> 455 and 244 216 -> 236 688.
 fn motion() -> (u64, i64, i64, usize) {
     let mut sim = Sim::new(Profile::desktop(), 11);
     sim.count_output = true;

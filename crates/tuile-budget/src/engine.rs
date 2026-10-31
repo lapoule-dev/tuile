@@ -48,7 +48,7 @@ use super::imagery::{drape_rank, needed_level, DrapeCandidate, GeoRect, LevelCla
 use super::need::{LayerReach, Membership};
 use super::need_state::{NeedState, TileNeed, WantedImagery};
 use super::priority::{score, PriorityKey, Quantised, Urgency};
-use super::sorted::{SortedCols, SortedMap};
+use super::sorted::SortedMap;
 use super::state::{Arena, CpuCopy, EvictKey, Gpu, Held, Load, Mark, Rank, Slot, Transit};
 use super::stats::{BudgetStats, CancelReason, EvictReason, LATENCY_BUCKETS};
 use super::tier::{Presence, PresenceOracle, Source, Tier};
@@ -341,7 +341,7 @@ fn layers(img: &WantedImagery) -> &[LayerReach] {
 /// The floor swap group `r` belongs to (D-A1), if any: a floor tile's mesh
 /// and its floor drape of every layer it wears, in stacking order.
 fn floor_group<'t>(
-    tiles: &'t SortedCols<TileId, TileNeed>,
+    tiles: &'t SortedMap<TileId, TileNeed>,
     r: ResourceId,
     is_floor: impl Fn(u32) -> bool,
 ) -> Option<impl Iterator<Item = ResourceId> + Clone + 't> {
@@ -389,6 +389,19 @@ fn latency_bucket(d: Micros) -> usize {
 }
 
 impl Budget {
+    /// Counts what the kept maps spent keeping their order since the last
+    /// step took it.
+    pub(super) fn walk_upkeep(&mut self) {
+        let n = self
+            .tiles
+            .take_upkeep()
+            .saturating_add(self.held_last.take_upkeep())
+            .saturating_add(self.arena.take_upkeep())
+            .saturating_add(self.need.take_upkeep())
+            .saturating_add(self.down.take_upkeep());
+        self.walk(usize::try_from(n).unwrap_or(usize::MAX));
+    }
+
     /// Counts `n` more elements walked by the step.
     pub(super) fn walk(&self, n: usize) {
         // Relaxed: a counter the step alone reads, through `&self` (a
@@ -1225,7 +1238,7 @@ impl Budget {
 
     /// Whether Batch may want drapes this step: every mesh the frame draws
     /// and waits on is loaded. Under Interactive, always.
-    pub(super) fn meshes_in(&self, tiles: &SortedCols<TileId, TileNeed>) -> bool {
+    pub(super) fn meshes_in(&self, tiles: &SortedMap<TileId, TileNeed>) -> bool {
         if self.cfg.policy != Policy::Batch {
             return true;
         }
@@ -1607,6 +1620,9 @@ impl Budget {
             }
         }
         st.protected = protected;
+        // What keeping the kept maps in order cost, this step and the
+        // events applied since the last.
+        self.walk_upkeep();
         st.work = st.work.saturating_add(self.scratch.walked.swap(0, Relaxed));
         d.stats = st;
         d
@@ -1747,7 +1763,7 @@ impl Budget {
         key_now: &dyn Fn(&Budget, ResourceId) -> Option<PriorityKey>,
         wants: Wants<'_>,
         presence: &dyn PresenceOracle,
-        tiles: &SortedCols<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed>,
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) {
@@ -2032,7 +2048,7 @@ impl Budget {
         eff: &Eff,
         jobs: &[(PriorityKey, ResourceId, Job, Want)],
         picked: &[u32],
-        tiles: &SortedCols<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed>,
         coarsening: &SortedMap<TileId, ()>,
         wants: Wants<'_>,
         d: &mut Decisions,
@@ -2190,7 +2206,7 @@ impl Budget {
         &self,
         eff: &Eff,
         key: &dyn Fn(&Budget, ResourceId) -> Option<PriorityKey>,
-        tiles: &SortedCols<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed>,
     ) -> UploadPlan {
         // Group: the blockers of one parent (meshes and drapes), else a
         // tile's mesh and its drape.
@@ -2579,7 +2595,7 @@ impl Budget {
     fn prune(
         &mut self,
         now: Micros,
-        tiles: &SortedCols<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed>,
         named: &[super::need_state::Named],
         wants: Wants<'_>,
     ) -> u32 {
