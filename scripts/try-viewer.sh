@@ -135,7 +135,7 @@ web() {
   fi
   exec "$root/target/release/tuile-catalog-proxy" \
     --env-file "$env" \
-    --assets 1,2,3,3954 \
+    --assets 1,2,3,3954,2275207 \
     --listen "$listen" \
     --serve /examples/web-viewer="$root/examples/web-viewer" \
     --serve /packages/tuile-viewer="$root/packages/tuile-viewer" \
