@@ -85,12 +85,17 @@ fn escape(text: &str) -> String {
 /// - the activity handles its own configuration changes — a turn of the
 ///   screen is a resize, not the activity destroyed and the session with it;
 /// - `lib_name` names the native library the activity loads;
+/// - the import link (`<scheme>://import?src=…`) and the configuration file
+///   (`.tuile`, viewed or shared) open the activity, which hands them to the
+///   viewer;
 /// - no backup: the tile store is a cache, and there is nothing else.
 pub(crate) fn manifest(bundle: &Bundle, version: &str) -> anyhow::Result<String> {
     let code = version_code(version)?;
     let package = escape(&bundle.identifier);
     let label = escape(&bundle.name);
     let library = escape(&library_name(&bundle.executable));
+    let scheme = escape(&bundle.scheme);
+    let extension = crate::documents::EXTENSION;
     let version = escape(version);
     Ok(format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
@@ -120,6 +125,36 @@ pub(crate) fn manifest(bundle: &Bundle, version: &str) -> anyhow::Result<String>
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- An import link, tapped in a browser or a message. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="{scheme}" android:host="import" />
+            </intent-filter>
+            <!-- A configuration file opened from a file manager or a
+                 download, by its extension where the address has one. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:host="*" />
+                <data android:mimeType="*/*" />
+                <data android:pathPattern=".*\\.{extension}" />
+                <data android:pathPattern=".*\\..*\\.{extension}" />
+                <data android:pathPattern=".*\\..*\\..*\\.{extension}" />
+            </intent-filter>
+            <!-- A configuration file shared from another application, whose
+                 address seldom says its name: the activity reads it, and the
+                 viewer refuses what is not a configuration. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/toml" />
+                <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="text/plain" />
             </intent-filter>
         </activity>
     </application>
@@ -192,6 +227,14 @@ mod tests {
 
     /// The manifest names the host's library, the activity that loads it, the
     /// one permission and the version — and escapes what it is given.
+    #[test]
+    fn the_manifest_opens_links_and_configuration_files() {
+        let xml = manifest(&Bundle::default(), "0.8.0").expect("a manifest");
+        assert!(xml.contains(r#"<data android:scheme="tuile" android:host="import" />"#));
+        assert!(xml.contains(r#"android:pathPattern=".*\\.tuile""#), "{xml}");
+        assert!(xml.contains("android.intent.action.SEND"));
+    }
+
     #[test]
     fn the_manifest_carries_the_identity_the_library_and_the_version() {
         let bundle = Bundle::default();
