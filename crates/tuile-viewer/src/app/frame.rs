@@ -11,11 +11,6 @@
 
 use super::{App, AMBIENT, ATMOSPHERE_STRENGTH, DIAGNOSTICS};
 
-/// How tall a provider's logo is drawn, in the controls' units (points on a
-/// desktop): the height of a line of a map's credits.
-const LOGO_HEIGHT: f64 = 18.0;
-/// The space around and between the logos, in the same units.
-const LOGO_MARGIN: f64 = 10.0;
 use std::fmt;
 use tuile_wgpu::OverlayVertex;
 
@@ -393,21 +388,6 @@ impl App {
                 color: v.color,
             })
             .collect();
-        // The logos the 3D Tiles' providers require, for as long as their
-        // tilesets are in the session — over the picture, bottom left, where
-        // a map's credits are looked for. Drawn whether or not the controls
-        // are: they are not ours to hide.
-        let logos: Vec<&crate::surface::Logo> = self
-            .surfaces
-            .iter()
-            .flat_map(|layer| layer.surface.logos.iter())
-            .collect();
-        nav_mesh.extend(crate::surface::logos_mesh(
-            &logos,
-            active.safe,
-            (LOGO_HEIGHT * ui.scale) as f32,
-            (LOGO_MARGIN * ui.scale) as f32,
-        ));
         // The loading indicator over everything, already in device pixels.
         if let Some(spinner) = indicator {
             nav_mesh.extend(spinner.mesh().into_iter().map(|v| OverlayVertex {

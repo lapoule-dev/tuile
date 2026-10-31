@@ -323,9 +323,9 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
     })
 }
 
-/// Opens one of the host's 3D Tiles tilesets: its root, its credits' logos,
-/// and a geometry server of its own on a thread of its own, its loads tasks
-/// on the runtime as the globe's are.
+/// Opens one of the host's 3D Tiles tilesets: its root and a geometry server
+/// of its own on a thread of its own, its loads tasks on the runtime as the
+/// globe's are.
 async fn open_surface(
     sources: &dyn crate::embed::Sources,
     asset: i64,
@@ -340,21 +340,6 @@ async fn open_surface(
         .map_err(|e| format!("its root: {e}"))?;
     let tileset = tuile_core::tileset::Tileset::from_json_bytes(&root, &source.url)
         .map_err(|e| format!("its root: {e}"))?;
-    // The logos the provider requires on screen. One that cannot be had is
-    // credited by its words alone, which are on screen anyway.
-    let mut logos = Vec::new();
-    for credit in &source.credits {
-        let Some(url) = &credit.logo else { continue };
-        match source.fetcher.fetch(url).await {
-            Ok(bytes) => match crate::surface::decode_logo(&bytes) {
-                Ok(logo) => logos.push(logo),
-                Err(e) => tracing::warn!(credit = %credit.text, "a logo that does not decode: {e}"),
-            },
-            Err(e) => {
-                tracing::warn!(credit = %credit.text, "a logo that could not be fetched: {e}")
-            }
-        }
-    }
     let fetcher = Arc::new(tuile_planetary::Held(Arc::clone(&source.fetcher)));
     let (stream, server) = tuile_core::runtime::in_process(
         tileset,
@@ -376,7 +361,6 @@ async fn open_surface(
             stream,
             meter,
             credits: source.credits,
-            logos,
         },
         server,
     ))
