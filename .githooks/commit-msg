@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# No assistant attribution in this repository's history: a commit whose
+# message carries one is refused, not silently cleaned, so its author sees it.
+# Enable once per clone: `git config core.hooksPath .githooks`. CI runs the same
+# check on every commit of a pull request (`.github/workflows/ci.yml`).
+if grep -n -i -E '^(Co-Authored-By:.*(Claude|anthropic)|Claude-Session:|Generated with .*Claude)|claude\.ai/code/session_' "$1" >&2; then
+  echo >&2
+  echo "commit-msg: refused, the message carries an assistant attribution (lines above)." >&2
+  echo "Remove them and commit again." >&2
+  exit 1
+fi

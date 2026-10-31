@@ -27,6 +27,7 @@
 ## Git and PRs
 
 - Conventional commits: `feat(core): ...`, `fix(viewer): ...`, `docs:`, `test:`, `chore:`, `ci:`.
+- No assistant attribution in commit messages (no `Co-Authored-By` naming an assistant, no session links). A commit carrying one is refused by `.githooks/commit-msg` — enable it once per clone with `git config core.hooksPath .githooks` — and by the `commit-messages` CI job on every pull request.
 - One PR = one topic. Milestones are split into reviewable PRs (< ~800 lines of diff excluding fixtures/snapshots).
 - Each PR: description of the what/why; when it meets a roadmap criterion, tick it in `docs/03-roadmap.md` in the same PR.
 - **Work in a git worktree**, one per topic, branched from `origin/main` — never in the main checkout.
