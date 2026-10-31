@@ -2214,6 +2214,25 @@ impl Budget {
         plan
     }
 
+    /// The step's room against a recount, before the sweeps (which walk it
+    /// without its bytes): per class, the GPU bytes of its grouped
+    /// residents still on the GPU and not in transit. `None` when they
+    /// agree, or when the step built no room.
+    fn room_drift(&self) -> Option<(Class, Bytes, Bytes)> {
+        let room = self.scratch.room.as_ref()?;
+        let a = &self.arena;
+        Class::ALL.into_iter().find_map(|c| {
+            let counted = room.bytes[c].iter().fold(Bytes::ZERO, |x, y| x.plus(*y));
+            let found = room
+                .grouped
+                .iter()
+                .filter(|&&(_, s)| a.class(s) == c && !a.has_transit(s))
+                .filter_map(|&(_, s)| a.gpu(s))
+                .fold(Bytes::ZERO, |x, g| x.plus(g.bytes));
+            (counted != found).then_some((c, counted, found))
+        })
+    }
+
     fn evict(
         &mut self,
         now: Micros,
@@ -2222,6 +2241,11 @@ impl Budget {
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) {
+        debug_assert_eq!(
+            self.room_drift(),
+            None,
+            "the room counts the bytes of its residents still evictable"
+        );
         let w = self.cfg.watermarks;
         if let Some(p) = eff.pool {
             self.evict_pooled(now, p, wants, d, st);
@@ -2756,7 +2780,8 @@ impl Budget {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::BudgetConfig;
+    use crate::cost::Cost;
+    use crate::{BudgetConfig, NeedSet};
 
     #[test]
     fn a_slot_freed_twice_saturates_and_is_recorded() {
@@ -2775,5 +2800,79 @@ mod tests {
         release(&mut b.local_reads, &mut b.underflows);
         assert_eq!(b.local_reads, 0);
         assert_eq!(b.audit(), Err(AuditError::SlotUnderflow { count: 1 }));
+    }
+
+    /// O1.2's debt: a stale GPU copy redelivered in a step whose room is
+    /// built leaves the room, its bytes taken off its bucket. Here a ring
+    /// resident `r`, stale after an epoch, is redelivered after a fresher
+    /// ring tile's delivery built the room (evicting an idle resident):
+    /// without the bucket's update, the room counts `r`'s bytes as
+    /// evictable while they are on their way, and a later `make_room` of
+    /// the step would free bytes that are not there. The check is
+    /// `evict`'s debug assertion of the room against a recount.
+    #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "the room is checked by a debug assertion"
+    )]
+    fn a_stale_copy_redelivered_leaves_the_steps_room() {
+        let t3d = Class::Tiles3dMesh;
+        let mut cfg = BudgetConfig::interactive(Bytes::mib(64));
+        cfg.pinned_level = None;
+        cfg.target[t3d] = Bytes::mib(4);
+        cfg.hard_limit[t3d] = Bytes::mib(6);
+        let mut b = Budget::new(cfg).unwrap();
+        let tile = |x| TileId::from_terrain(1, x, 0);
+        let (v, r, r1) = (tile(0), tile(1), tile(2));
+        let want = |t: TileId, sse: f32| (t, Need::new(1, t3d).with_sse_excess(sse));
+        let need = |drawn: &[TileId], ring: &[(TileId, f32)]| NeedSet {
+            drawn: drawn.iter().map(|t| want(*t, 1.0)).collect(),
+            ring: ring.iter().map(|(t, s)| want(*t, *s)).collect(),
+            ..NeedSet::default()
+        };
+        let mut now = Micros::ZERO;
+        let mut step = |b: &mut Budget, n: &NeedSet| {
+            now = now.plus(Micros(16_667));
+            b.decide(crate::FrameInput::new(0, now, n))
+        };
+        let load = |b: &mut Budget, d: &Decisions, t: TileId, mib: u64| {
+            let s = d.start.iter().find(|s| s.resource == ResourceId::Mesh(t));
+            let s = s.unwrap_or_else(|| panic!("{t:?} not started: {d:?}"));
+            b.on_loaded(s.resource, s.gen, Cost::flat(Bytes::mib(mib)));
+        };
+        let ack = |b: &mut Budget, d: &Decisions, t: TileId, mib: u64| {
+            let (res, g) = d
+                .deliver
+                .iter()
+                .find(|x| x.0 == ResourceId::Mesh(t))
+                .unwrap();
+            b.on_drawable(*res, *g, Bytes::mib(mib));
+        };
+        // `r` resident from the ring, then `v` drawn beside it, then left.
+        let ring = need(&[], &[(r, 0.0)]);
+        let d = step(&mut b, &ring);
+        load(&mut b, &d, r, 1);
+        let d = step(&mut b, &ring);
+        ack(&mut b, &d, r, 1);
+        let with_v = need(&[v], &[(r, 0.0)]);
+        let d = step(&mut b, &with_v);
+        load(&mut b, &d, v, 3);
+        let d = step(&mut b, &with_v);
+        ack(&mut b, &d, v, 3);
+        step(&mut b, &ring);
+        step(&mut b, &ring);
+        // A new epoch: `r`'s copy is stale; `r` and a fresher `r1` load.
+        b.new_epoch(t3d, None);
+        let both = need(&[], &[(r, 0.0), (r1, 3.0)]);
+        let d = step(&mut b, &both);
+        load(&mut b, &d, r, 1);
+        load(&mut b, &d, r1, 1);
+        let d = step(&mut b, &both);
+        // `r1` first: room built, `v` evicted; then `r`, redelivered.
+        assert!(d.evict.contains(&ResourceId::Mesh(v)), "{d:?}");
+        let order: Vec<_> = d.deliver.iter().map(|x| x.0).collect();
+        assert_eq!(order, [ResourceId::Mesh(r1), ResourceId::Mesh(r)]);
+        // `evict` asserts the room against a recount, which counted `r`'s
+        // stale copy, on its way again, without the update.
     }
 }
