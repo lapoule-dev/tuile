@@ -22,9 +22,12 @@
 //! rectangle, level `l` splits it into `2^l × 2^l` tiles, up to
 //! [`MAX_LEVEL`]. Tile `x` along `u` covers `[edge(x), edge(x + 1))`, with
 //! `edge(x) = min + (max − min) × (x / 2^l)` computed in `f64` exactly that
-//! way, so [`Frame::tile_of`] and [`Frame::tile_bounds`] agree to the bit on
-//! any bounds: `tile_of(tile_bounds(k).0) == k`, and a tile's max corner
-//! belongs to the next tile. Edits are versioned per tile at one level
+//! way (and the last edge is `max` itself), so [`Frame::tile_of`] and
+//! [`Frame::tile_bounds`] agree to the bit on any bounds whose edges at that
+//! level are strictly increasing — tiles wider than the rounding of the
+//! bounds, which a ground checks at its edit level when it is built:
+//! `tile_of(tile_bounds(k).0) == k`, and a tile's max corner belongs to the
+//! next tile. Edits are versioned per tile at one level
 //! ([`Frame::edit_level`]); data derived from the ground uses tiles of the
 //! same grid.
 
@@ -56,8 +59,8 @@ pub enum InvalidFrame {
     Bounds,
     #[error("edit level {0} is above the deepest level, {MAX_LEVEL}")]
     Level(u8),
-    /// Beyond ±90° of latitude, or more than 360° of longitude.
-    #[error("a geodetic region lies within ±90° of latitude and 360° of longitude")]
+    /// Latitudes beyond ±90°, or longitudes beyond ±2π or spanning more.
+    #[error("a geodetic region lies within ±90° of latitude, ±2π and 2π of longitude")]
     Geodetic,
     #[error("the anchor is not finite")]
     Anchor,
@@ -84,6 +87,39 @@ pub trait Frame: Send + Sync + std::fmt::Debug {
     /// The frame position of a geodetic one, where the frame has a place on
     /// the globe.
     fn geodetic_to_position(&self, g: Geodetic) -> Option<Position>;
+
+    /// The horizontal offset of column `p` from column `at`, in metres, in
+    /// the local east-north tangent plane at `at`; `None` where `p` is too
+    /// far to be seen from that plane (beyond the horizon of a globe).
+    /// Brushes are measured with it, column by column. The default scales
+    /// the difference by the metric at `at`, exact for a constant metric;
+    /// a frame whose metric varies overrides it.
+    fn tangent_offset(&self, at: Column, p: Column) -> Option<DVec2> {
+        Some((p - at) * self.metres_per_unit(at))
+    }
+
+    /// The rectangle of columns within `r` metres (by
+    /// [`Self::tangent_offset`]) of some column of `[lo, hi]`. It may extend
+    /// beyond the bounds, and spans a whole period of `u` when it reaches
+    /// every `u` (a cap around a pole). The default is exact for a constant
+    /// metric; a frame whose metric varies overrides it.
+    fn reach(&self, lo: Column, hi: Column, r: f64) -> (Column, Column) {
+        let m = self.metres_per_unit((lo + hi) / 2.0);
+        let d = DVec2::new(r / m.x, r / m.y);
+        (lo - d, hi + d)
+    }
+
+    /// The period of `u` when the frame wraps around it (a geodetic frame
+    /// spanning the whole globe: 2π); `None` for a frame with edges.
+    fn u_period(&self) -> Option<f64> {
+        None
+    }
+
+    /// Whether a column names a place in the frame, inside its bounds or
+    /// not (a latitude beyond ±90° names none). Brushes are checked with it.
+    fn is_place(&self, c: Column) -> bool {
+        c.is_finite()
+    }
 
     /// Whether the frame can hold a ground: finite bounds with min below
     /// max, and an edit level at most [`MAX_LEVEL`]. A ground checks its
@@ -146,6 +182,10 @@ pub trait Frame: Send + Sync + std::fmt::Debug {
 /// Edge `i` of a grid of `count` equal divisions of `[lo, hi]`, computed one
 /// way everywhere so that [`grid_index`] agrees with it to the bit.
 pub(crate) fn grid_edge(lo: f64, hi: f64, i: u64, count: u64) -> f64 {
+    if i >= count {
+        // `lo + (hi − lo)` may round away from `hi`.
+        return hi;
+    }
     lo + (hi - lo) * (to_f64(i) / to_f64(count))
 }
 
@@ -299,10 +339,14 @@ impl Frame for PlanarFrame {
 /// A region of the globe: `u` longitude and `v` latitude in radians,
 /// heights above the ellipsoid.
 ///
-/// The region does not wrap the antimeridian (`min.x < max.x`) and stays
-/// within ±90° of latitude. Near a pole a degree of longitude shrinks to
-/// nothing: a brush there reaches across a huge range of longitudes, and one
-/// at the pole itself is refused as invalid.
+/// Its longitudes lie within ±2π with `min.x < max.x` and span at most 2π,
+/// and its latitudes within ±90° (poles included). A region spanning exactly
+/// 2π of longitude is the whole globe: brushes wrap around it
+/// ([`Frame::u_period`]); a narrower region has edges, and a brush is
+/// clipped to them. Brushes are measured in each column's tangent plane, so
+/// a ball at a pole carves a disc, not a longitude-latitude rectangle;
+/// segments (rays, a capsule's axis) are straight in longitude and latitude
+/// and do not wrap.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GeodeticFrame {
     /// West-south corner (radians).
@@ -328,6 +372,55 @@ impl Frame for GeodeticFrame {
         DVec2::new(EARTH_RADIUS * libm::cos(column.y), EARTH_RADIUS)
     }
 
+    /// The orthographic projection of `p` on the tangent plane at `at`, on
+    /// the sphere of radius [`EARTH_RADIUS`]: a distance `R·sin θ` for an
+    /// arc `R·θ`, short by `θ²/6` of it (4·10⁻⁵ at 100 km). Longitudes
+    /// wrap by construction. `None` beyond 90° of arc.
+    fn tangent_offset(&self, at: Column, p: Column) -> Option<DVec2> {
+        let (sa, ca) = (libm::sin(at.y), libm::cos(at.y));
+        let (sp, cp) = (libm::sin(p.y), libm::cos(p.y));
+        let dl = p.x - at.x;
+        let (sdl, cdl) = (libm::sin(dl), libm::cos(dl));
+        let east = cp * sdl;
+        let north = sp * ca - cp * sa * cdl;
+        let up = sp * sa + cp * ca * cdl;
+        (up > 0.0).then(|| DVec2::new(east, north) * EARTH_RADIUS)
+    }
+
+    /// A spherical cap of angular radius `asin(r/R)` around the rectangle:
+    /// latitudes widened by it, longitudes by `asin(sin θ / cos φ)` with `φ`
+    /// the rectangle's latitude closest to a pole, and every longitude when
+    /// the cap contains a pole.
+    fn reach(&self, lo: Column, hi: Column, r: f64) -> (Column, Column) {
+        use core::f64::consts::{FRAC_PI_2, PI};
+        let s = r / EARTH_RADIUS;
+        let every =
+            |south: f64, north: f64| (DVec2::new(lo.x - PI, south), DVec2::new(hi.x + PI, north));
+        if s >= 1.0 {
+            return every(-FRAC_PI_2, FRAC_PI_2);
+        }
+        let dlat = libm::asin(s);
+        let (south, north) = (lo.y - dlat, hi.y + dlat);
+        let c = libm::cos(lo.y.abs().max(hi.y.abs()));
+        if south <= -FRAC_PI_2 || north >= FRAC_PI_2 || s >= c {
+            return every(south, north);
+        }
+        let dlon = libm::asin(s / c);
+        (
+            DVec2::new(lo.x - dlon, south),
+            DVec2::new(hi.x + dlon, north),
+        )
+    }
+
+    fn u_period(&self) -> Option<f64> {
+        let tau = core::f64::consts::TAU;
+        (self.max.x - self.min.x == tau).then_some(tau)
+    }
+
+    fn is_place(&self, c: Column) -> bool {
+        c.is_finite() && c.y.abs() <= core::f64::consts::FRAC_PI_2
+    }
+
     fn to_geodetic(&self, p: Position) -> Option<Geodetic> {
         Some(Geodetic {
             lon: p.x,
@@ -348,8 +441,8 @@ impl Frame for GeodeticFrame {
         if self.edit_level > MAX_LEVEL {
             return Err(InvalidFrame::Level(self.edit_level));
         }
-        let half_pi = core::f64::consts::FRAC_PI_2;
-        if lo.y < -half_pi || hi.y > half_pi || hi.x - lo.x > core::f64::consts::TAU {
+        let (lat, tau) = (core::f64::consts::FRAC_PI_2, core::f64::consts::TAU);
+        if lo.y < -lat || hi.y > lat || lo.x < -tau || hi.x > tau || hi.x - lo.x > tau {
             return Err(InvalidFrame::Geodetic);
         }
         Ok(())
@@ -471,6 +564,16 @@ mod tests {
             edit_level: 2,
         };
         assert_eq!(polar.validate(), Err(InvalidFrame::Geodetic));
+        let far = GeodeticFrame {
+            min: DVec2::new(100.0, 0.0),
+            max: DVec2::new(100.1, 0.1),
+            edit_level: 2,
+        };
+        assert_eq!(
+            far.validate(),
+            Err(InvalidFrame::Geodetic),
+            "longitudes within ±2π"
+        );
     }
 
     #[test]

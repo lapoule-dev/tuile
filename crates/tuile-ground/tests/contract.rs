@@ -10,6 +10,9 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 use std::collections::BTreeMap;
+use std::f64::consts::{FRAC_PI_2, PI};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use glam::{DVec2, DVec3};
 use proptest::prelude::*;
@@ -27,9 +30,11 @@ fn planar() -> PlanarFrame {
 
 /// About 4 km × 4 km of globe around 45° N.
 fn geodetic() -> GeodeticFrame {
+    // `libm`'s cosine, not the platform's: the golden digests depend on
+    // these bounds to the bit.
     let lat = 45f64.to_radians();
     let dlat = 4096.0 / EARTH_RADIUS;
-    let dlon = dlat / lat.cos();
+    let dlon = dlat / libm::cos(lat);
     GeodeticFrame {
         min: DVec2::new(0.0, lat),
         max: DVec2::new(dlon, lat + dlat),
@@ -710,7 +715,309 @@ fn the_digest_covers_the_frame_and_the_water() {
 }
 
 // ---------------------------------------------------------------------------
-// Properties, on both frames.
+// Poles and the antimeridian.
+
+/// Every longitude, from 8 km south of the north pole up to it: 257
+/// samples, 32 m apart in latitude.
+fn polar() -> GeodeticFrame {
+    GeodeticFrame {
+        min: DVec2::new(-PI, FRAC_PI_2 - 8192.0 / EARTH_RADIUS),
+        max: DVec2::new(PI, FRAC_PI_2),
+        edit_level: 4,
+    }
+}
+
+/// The same cap, but a window of one radian of longitude: it has edges.
+fn polar_window() -> GeodeticFrame {
+    GeodeticFrame {
+        min: DVec2::new(-0.5, FRAC_PI_2 - 8192.0 / EARTH_RADIUS),
+        max: DVec2::new(0.5, FRAC_PI_2),
+        edit_level: 4,
+    }
+}
+
+/// A band around the equator over every longitude: 637 km north to south,
+/// samples 156 km apart in longitude.
+fn global() -> GeodeticFrame {
+    GeodeticFrame {
+        min: DVec2::new(-PI, -0.05),
+        max: DVec2::new(PI, 0.05),
+        edit_level: 4,
+    }
+}
+
+#[test]
+fn a_ball_at_the_pole_carves_a_disc_over_every_longitude() {
+    let f = polar();
+    let mut g = flat(f, 0.0);
+    let r = 2000.0;
+    let mut changed = Vec::new();
+    g.apply(
+        &sphere(1, EditOp::Remove, DVec3::new(0.3, FRAC_PI_2, 0.0), r),
+        &mut changed,
+    )
+    .unwrap();
+    // The disc's angular radius: tangent-plane distance R·sin θ ≤ r.
+    let theta = (r / EARTH_RADIUS).asin();
+    let (mut inside, mut outside) = (0, 0);
+    for j in 0..257 {
+        for i in (0..257).step_by(4) {
+            let c = g.sample_column(i, j);
+            if !f.contains(c) {
+                continue;
+            }
+            let h = top(&g, c).unwrap();
+            let from_pole = FRAC_PI_2 - c.y;
+            if from_pole < theta * 0.999 {
+                assert!(h < 0.0, "carved at every longitude: {c:?} {h}");
+                inside += 1;
+            } else if from_pole > theta * 1.001 {
+                assert_eq!(h, 0.0, "nothing beyond the disc: {c:?}");
+                outside += 1;
+            }
+        }
+    }
+    assert!(inside > 1000 && outside > 1000, "{inside} {outside}");
+    for x in 0..16 {
+        assert!(
+            changed
+                .iter()
+                .any(|c| c.tile == TileKey { level: 4, x, y: 15 }),
+            "every tile around the pole is reported: {changed:?}"
+        );
+    }
+}
+
+/// A ball a kilometre from the pole reaches across it to the far side.
+#[test]
+fn a_ball_near_the_pole_covers_its_far_side() {
+    let mut g = flat(polar(), 0.0);
+    let centre = DVec3::new(0.0, FRAC_PI_2 - 1000.0 / EARTH_RADIUS, 0.0);
+    g.apply(&sphere(1, EditOp::Remove, centre, 2000.0), &mut Vec::new())
+        .unwrap();
+    // Sample meridian 255 is at longitude π − 0.0245, across the pole.
+    // Row 240 is 512 m from the pole (about 1.5 km from the centre), row
+    // 219 1184 m (about 2.2 km).
+    assert!(top(&g, g.sample_column(255, 240)).unwrap() < 0.0);
+    assert_eq!(top(&g, g.sample_column(255, 219)), Some(0.0));
+    // A quarter turn away, about 1.1 km from the centre.
+    assert!(top(&g, g.sample_column(192, 240)).unwrap() < 0.0);
+}
+
+#[test]
+fn a_ball_across_the_antimeridian_wraps() {
+    let mut g = flat(global(), 0.0);
+    let mut changed = Vec::new();
+    // 64 km east of 180°, on the equator, 400 km wide.
+    g.apply(
+        &sphere(
+            1,
+            EditOp::Remove,
+            DVec3::new(-PI + 0.01, 0.0, 0.0),
+            400_000.0,
+        ),
+        &mut changed,
+    )
+    .unwrap();
+    let j = 128; // the equator
+    assert!(
+        top(&g, g.sample_column(1, j)).unwrap() < 0.0,
+        "east of 180°"
+    );
+    assert!(
+        top(&g, g.sample_column(255, j)).unwrap() < 0.0,
+        "west of 180°, 220 km from the centre"
+    );
+    assert_eq!(top(&g, g.sample_column(128, j)), Some(0.0), "the far side");
+    let xs: Vec<u32> = changed.iter().map(|c| c.tile.x).collect();
+    assert!(
+        xs.contains(&0) && xs.contains(&15),
+        "both ends reported: {xs:?}"
+    );
+    // A window with edges clips instead.
+    let mut window = flat(
+        GeodeticFrame {
+            min: DVec2::new(-PI, -0.05),
+            max: DVec2::new(0.0, 0.05),
+            edit_level: 4,
+        },
+        0.0,
+    );
+    window
+        .apply(
+            &sphere(
+                1,
+                EditOp::Remove,
+                DVec3::new(-PI + 0.01, 0.0, 0.0),
+                400_000.0,
+            ),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    assert!(top(&window, window.sample_column(1, 128)).unwrap() < 0.0);
+}
+
+#[test]
+fn latitudes_beyond_the_poles_are_no_place() {
+    let mut g = flat(polar(), 0.0);
+    let mut changed = Vec::new();
+    assert_eq!(
+        g.apply(
+            &sphere(1, EditOp::Remove, DVec3::new(0.0, 1.6, 0.0), 500.0),
+            &mut changed
+        ),
+        Err(GroundError::InvalidBrush)
+    );
+    assert_eq!(g.last_seq(), EditSeq(1), "consumed");
+    assert!(changed.is_empty());
+    let capsule = Edit {
+        seq: EditSeq(2),
+        op: EditOp::Add,
+        brush: Brush::Capsule {
+            a: DVec3::new(0.0, 1.5, 0.0),
+            b: DVec3::new(0.0, -1.7, 0.0),
+            radius: 5.0,
+        },
+    };
+    assert_eq!(
+        g.apply(&capsule, &mut changed),
+        Err(GroundError::InvalidBrush)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A ground that keeps nothing resident.
+
+/// A test double for a paged or procedural source: it holds its source and
+/// its edit log and rebuilds the heightfield from them every third read,
+/// dropping whatever it held. The contract says no answer can tell.
+#[derive(Debug)]
+struct Evicting<F: Frame + Clone> {
+    source: Heightfield<F>,
+    log: Vec<Edit>,
+    last: EditSeq,
+    resident: Mutex<Option<Heightfield<F>>>,
+    reads: AtomicU64,
+}
+
+impl<F: Frame + Clone> Evicting<F> {
+    fn new(source: Heightfield<F>) -> Self {
+        Evicting {
+            source,
+            log: Vec::new(),
+            last: EditSeq(0),
+            resident: Mutex::new(None),
+            reads: AtomicU64::new(0),
+        }
+    }
+
+    fn rebuild(&self) -> Heightfield<F> {
+        let mut g = self.source.clone();
+        for e in &self.log {
+            let _ = g.apply(e, &mut Vec::new());
+        }
+        g
+    }
+
+    fn with<R>(&self, read: impl FnOnce(&Heightfield<F>) -> R) -> R {
+        let mut slot = self.resident.lock().unwrap();
+        if self.reads.fetch_add(1, Ordering::Relaxed).is_multiple_of(3) {
+            *slot = None;
+        }
+        read(slot.get_or_insert_with(|| self.rebuild()))
+    }
+}
+
+impl<F: Frame + Clone> Ground for Evicting<F> {
+    fn frame(&self) -> &dyn Frame {
+        self.source.frame()
+    }
+    fn version(&self, tile: TileKey) -> Version {
+        self.with(|g| g.version(tile))
+    }
+    fn water_bodies(&self) -> &[WaterBody] {
+        self.source.water_bodies()
+    }
+    fn surface(&self, p: &[DVec3], out: &mut [Option<Surface>]) -> Result<(), BatchMismatch> {
+        self.with(|g| g.surface(p, out))
+    }
+    fn spans(&self, c: &[DVec2], out: &mut SpanBuffer) {
+        self.with(|g| g.spans(c, out));
+    }
+    fn solid(&self, p: &[DVec3], out: &mut [bool]) -> Result<(), BatchMismatch> {
+        self.with(|g| g.solid(p, out))
+    }
+    fn raycast(&self, r: &[Ray], out: &mut [Option<Hit>]) -> Result<(), BatchMismatch> {
+        self.with(|g| g.raycast(r, out))
+    }
+    fn water(&self, c: &[DVec2], out: &mut [Option<WaterAt>]) -> Result<(), BatchMismatch> {
+        self.with(|g| g.water(c, out))
+    }
+}
+
+impl<F: Frame + Clone> EditGround for Evicting<F> {
+    fn last_seq(&self) -> EditSeq {
+        self.last
+    }
+
+    fn apply(&mut self, edit: &Edit, changed: &mut Vec<TileChanged>) -> Result<(), GroundError> {
+        let mut g = self.rebuild();
+        let result = g.apply(edit, changed);
+        if result
+            .as_ref()
+            .map_or_else(GroundError::consumes_seq, |()| true)
+        {
+            self.log.push(*edit);
+            self.last = edit.seq;
+        }
+        *self.resident.get_mut().unwrap() = Some(g);
+        result
+    }
+
+    /// From the source's identity (its digest) and the edit layer, without
+    /// loading anything.
+    fn digest(&self) -> u64 {
+        let mut h = Fnv::default();
+        h.u64(self.source.digest());
+        for e in &self.log {
+            h.u64(e.seq.0);
+            h.u64(u64::from(e.op == EditOp::Add));
+            let (kind, points, radius) = match e.brush {
+                Brush::Sphere { centre, radius } => (0, [centre, centre], radius),
+                Brush::Capsule { a, b, radius } => (1, [a, b], radius),
+                Brush::Box { min, max } => (2, [min, max], 0.0),
+            };
+            h.u64(kind);
+            for p in points {
+                p.to_array().into_iter().for_each(|v| h.u64(v.to_bits()));
+            }
+            h.u64(radius.to_bits());
+        }
+        h.0
+    }
+}
+
+#[derive(Debug)]
+struct Fnv(u64);
+
+impl Default for Fnv {
+    fn default() -> Self {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Fnv {
+    fn u64(&mut self, v: u64) {
+        for b in v.to_le_bytes() {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Properties, generic over any `EditGround` built by a factory: a conformance
+// suite a new implementation can run.
 
 /// An edit in metres around the frame's centre, realised in a frame on the
 /// ramp: the brush sits on the ramp's surface, give or take `dz`, so most
@@ -801,21 +1108,82 @@ fn script<F: Frame>(frame: &F, specs: &[Spec]) -> Vec<Edit> {
         .collect()
 }
 
-/// Columns over the whole frame: an irregular grid, and every tile corner
-/// with the column just before it (where off-by-ones live).
-fn probe_columns<F: Frame>(frame: &F) -> Vec<DVec2> {
+fn arb_script<F: Frame + Copy + 'static>(frame: F) -> impl Strategy<Value = Vec<Edit>> {
+    proptest::collection::vec(arb_spec(), 1..10).prop_map(move |v| script(&frame, &v))
+}
+
+/// Edits on a frame over every longitude, in its own coordinates: longitudes
+/// often within 0.2 rad of the antimeridian; on a polar frame, distances
+/// from the pole often under 400 m or nil; radii scaled to the frame's
+/// cells (`scale`, metres).
+fn arb_globe_script(frame: GeodeticFrame, near_pole: bool) -> impl Strategy<Value = Vec<Edit>> {
+    let lon = prop_oneof![-PI..PI, (PI - 0.2)..PI, -PI..(-PI + 0.2)];
+    let place = if near_pole {
+        prop_oneof![0.0f64..9000.0, 0.0f64..400.0, Just(0.0)]
+            .prop_map(|d| FRAC_PI_2 - d / EARTH_RADIUS)
+            .boxed()
+    } else {
+        (-0.045f64..0.045).boxed()
+    };
+    let scale = if near_pole { 1.0 } else { 100.0 };
+    let one = (
+        lon,
+        place,
+        -30.0f64..30.0,
+        40.0f64..2500.0,
+        -1.0f64..1.0,
+        any::<bool>(),
+        0u8..13,
+    );
+    proptest::collection::vec(one, 1..8).prop_map(move |v| {
+        v.into_iter()
+            .enumerate()
+            .map(|(k, (lon, lat, dz, r, slope, add, kind))| {
+                let r = r * scale;
+                let dlat = r / EARTH_RADIUS;
+                let p = DVec3::new(lon, lat, dz);
+                let brush = match kind {
+                    0..=3 => Brush::Sphere {
+                        centre: p,
+                        radius: r,
+                    },
+                    4..=7 => Brush::Capsule {
+                        a: p,
+                        b: DVec3::new(lon + 0.3 * slope / scale, lat - dlat, dz + slope * r),
+                        radius: r / 3.0 + 1.0,
+                    },
+                    8..=10 => Brush::Box {
+                        min: DVec3::new(lon - 0.2 / scale, lat - dlat, dz - r),
+                        max: DVec3::new(lon + 0.2 / scale, lat, dz),
+                    },
+                    11 => Brush::Sphere {
+                        centre: DVec3::new(lon, 1.6, dz),
+                        radius: r,
+                    },
+                    _ => Brush::Sphere {
+                        centre: DVec3::new(lon, frame.min.y - 10.0 * dlat - 0.01, dz),
+                        radius: r,
+                    },
+                };
+                Edit {
+                    seq: EditSeq(k as u64 + 1),
+                    op: if add { EditOp::Add } else { EditOp::Remove },
+                    brush,
+                }
+            })
+            .collect()
+    })
+}
+
+/// Columns over the whole frame: an irregular grid, and every edit-level
+/// tile corner with the columns just before it (where off-by-ones live).
+fn probe_columns(frame: &dyn Frame) -> Vec<DVec2> {
+    let (lo, hi) = frame.bounds();
     let mut out = Vec::new();
     for i in 0..48 {
         for j in 0..48 {
-            out.push(
-                at(
-                    frame,
-                    -2040.0 + 85.1 * f64::from(i),
-                    -2040.0 + 84.7 * f64::from(j),
-                    0.0,
-                )
-                .truncate(),
-            );
+            let f = DVec2::new((f64::from(i) + 0.37) / 48.0, (f64::from(j) + 0.71) / 48.0);
+            out.push(lo + (hi - lo) * f);
         }
     }
     let level = frame.edit_level();
@@ -828,6 +1196,45 @@ fn probe_columns<F: Frame>(frame: &F) -> Vec<DVec2> {
         }
     }
     out
+}
+
+/// Rays over the whole frame, many starting or ending outside its bounds,
+/// some underground: fractions of the bounds and heights relative to the
+/// surface at (the clamp of) each end.
+fn rays_over(g: &impl Ground, ends: &[(f64, f64, f64, f64, f64, f64)]) -> Vec<Ray> {
+    let (lo, hi) = g.frame().bounds();
+    let height = |c: DVec2| {
+        let inside = c.clamp(lo, DVec2::new(hi.x.next_down(), hi.y.next_down()));
+        top(g, inside).unwrap_or(0.0)
+    };
+    ends.iter()
+        .map(|&(u1, v1, z1, u2, v2, z2)| {
+            let (a, b) = (
+                lo + (hi - lo) * DVec2::new(u1, v1),
+                lo + (hi - lo) * DVec2::new(u2, v2),
+            );
+            Ray {
+                from: a.extend(height(a) + z1),
+                to: b.extend(height(b) + z2),
+            }
+        })
+        .collect()
+}
+
+fn fixed_ray_ends() -> Vec<(f64, f64, f64, f64, f64, f64)> {
+    (0..40)
+        .map(|k| {
+            let t = f64::from(k) / 40.0;
+            (
+                -0.2 + 1.4 * t,
+                1.2 - 1.3 * t,
+                30.0 - 50.0 * t,
+                1.2 - 1.4 * ((t * 7.0) % 1.0),
+                -0.2 + 1.4 * ((t * 3.0) % 1.0),
+                -20.0 + 60.0 * ((t * 5.0) % 1.0),
+            )
+        })
+        .collect()
 }
 
 /// Every answer a column gives to point queries, as bits.
@@ -862,24 +1269,39 @@ fn answers(g: &impl Ground, columns: &[DVec2]) -> Vec<[u64; 6]> {
         .collect()
 }
 
-/// The ramp with a sea over its low half, so water answers move too.
-fn wet_ramp<F: Frame>(frame: F) -> Heightfield<F> {
-    ramp(frame)
-        .with_water(
-            vec![WaterBody {
-                kind: WaterKind::Sea,
-                level: 100.0,
-            }],
-            |i, _| (i < 100).then_some(WaterBodyId(0)),
-        )
-        .unwrap()
+fn hits(g: &impl Ground, rays: &[Ray]) -> Vec<Option<Hit>> {
+    let mut out = vec![None; rays.len()];
+    g.raycast(rays, &mut out).unwrap();
+    out
 }
 
-fn replicas_agree<F: Frame + Copy>(frame: F, specs: &[Spec]) -> Result<(), TestCaseError> {
-    let edits = script(&frame, specs);
-    let (mut a, mut b) = (ramp(frame), ramp(frame));
+/// A sea over the low samples, so water answers move too.
+fn wet<F: Frame>(g: Heightfield<F>, level: f64) -> Heightfield<F> {
+    g.with_water(
+        vec![WaterBody {
+            kind: WaterKind::Sea,
+            level,
+        }],
+        |i, _| (i < 100).then_some(WaterBodyId(0)),
+    )
+    .unwrap()
+}
+
+fn wet_ramp<F: Frame>(frame: F) -> Heightfield<F> {
+    wet(ramp(frame), 100.0)
+}
+
+fn wet_flat<F: Frame>(frame: F) -> Heightfield<F> {
+    wet(flat(frame, 0.0), 1.0)
+}
+
+fn replicas_agree<G: EditGround>(
+    make: impl Fn() -> G,
+    edits: &[Edit],
+) -> Result<(), TestCaseError> {
+    let (mut a, mut b) = (make(), make());
     let (mut ca, mut cb) = (Vec::new(), Vec::new());
-    for e in &edits {
+    for e in edits {
         prop_assert_eq!(a.apply(e, &mut ca), b.apply(e, &mut cb));
     }
     prop_assert_eq!(a.last_seq(), EditSeq(edits.len() as u64));
@@ -890,13 +1312,16 @@ fn replicas_agree<F: Frame + Copy>(frame: F, specs: &[Spec]) -> Result<(), TestC
 
 /// Versions grow by exactly one on every reported tile, are reported once
 /// and in order, and never move on any other tile.
-fn versions_bump_by_one<F: Frame + Copy>(frame: F, specs: &[Spec]) -> Result<(), TestCaseError> {
-    let mut g = ramp(frame);
-    let level = frame.edit_level();
+fn versions_bump_by_one<G: EditGround>(
+    make: impl Fn() -> G,
+    edits: &[Edit],
+) -> Result<(), TestCaseError> {
+    let mut g = make();
+    let level = g.frame().edit_level();
     let all: Vec<TileKey> = (0..1u32 << level)
         .flat_map(|y| (0..1u32 << level).map(move |x| TileKey { level, x, y }))
         .collect();
-    for e in &script(&frame, specs) {
+    for e in edits {
         let before: BTreeMap<TileKey, Version> = all.iter().map(|k| (*k, g.version(*k))).collect();
         let mut changed = Vec::new();
         let _ = g.apply(e, &mut changed);
@@ -904,8 +1329,7 @@ fn versions_bump_by_one<F: Frame + Copy>(frame: F, specs: &[Spec]) -> Result<(),
             .windows(2)
             .all(|w| (w[0].tile.y, w[0].tile.x) < (w[1].tile.y, w[1].tile.x)));
         for k in &all {
-            let reported = changed.iter().find(|c| c.tile == *k);
-            match reported {
+            match changed.iter().find(|c| c.tile == *k) {
                 Some(c) => {
                     prop_assert_eq!(c.version.0, before[k].0 + 1);
                     prop_assert_eq!(g.version(*k), c.version);
@@ -918,22 +1342,35 @@ fn versions_bump_by_one<F: Frame + Copy>(frame: F, specs: &[Spec]) -> Result<(),
 }
 
 /// The change report is complete: a column in an unreported tile answers
-/// every point query bit for bit as before the edit.
-fn changes_are_local<F: Frame + Copy>(frame: F, specs: &[Spec]) -> Result<(), TestCaseError> {
-    let mut g = wet_ramp(frame);
-    let columns = probe_columns(&frame);
+/// every point query bit for bit as before the edit, and a ray whose
+/// segment's rectangle meets no reported tile hits where it did.
+fn changes_are_local<G: EditGround>(
+    make: impl Fn() -> G,
+    edits: &[Edit],
+) -> Result<(), TestCaseError> {
+    let mut g = make();
+    let level = g.frame().edit_level();
+    let columns = probe_columns(g.frame());
     let tiles: Vec<Option<TileKey>> = columns
         .iter()
-        .map(|c| frame.tile_of(*c, frame.edit_level()))
+        .map(|c| g.frame().tile_of(*c, level))
         .collect();
-    let mut before = answers(&g, &columns);
-    for e in &script(&frame, specs) {
+    let rays = rays_over(&g, &fixed_ray_ends());
+    let ray_tiles: Vec<Vec<TileKey>> = rays
+        .iter()
+        .map(|r| {
+            let (a, b) = (r.from.truncate(), r.to.truncate());
+            tiles_over(g.frame(), a.min(b), a.max(b), level).collect()
+        })
+        .collect();
+    let (mut before, mut before_hits) = (answers(&g, &columns), hits(&g, &rays));
+    for e in edits {
         let mut changed = Vec::new();
         let _ = g.apply(e, &mut changed);
-        let after = answers(&g, &columns);
+        let reported = |t: &TileKey| changed.iter().any(|c| c.tile == *t);
+        let (after, after_hits) = (answers(&g, &columns), hits(&g, &rays));
         for k in 0..columns.len() {
-            let reported = tiles[k].is_some_and(|t| changed.iter().any(|c| c.tile == t));
-            if !reported {
+            if !tiles[k].is_some_and(|t| reported(&t)) {
                 prop_assert_eq!(
                     before[k],
                     after[k],
@@ -944,7 +1381,18 @@ fn changes_are_local<F: Frame + Copy>(frame: F, specs: &[Spec]) -> Result<(), Te
                 );
             }
         }
-        before = after;
+        for k in 0..rays.len() {
+            if !ray_tiles[k].iter().any(reported) {
+                prop_assert_eq!(
+                    before_hits[k].map(|h| (h.fraction.to_bits(), h.at.z.to_bits())),
+                    after_hits[k].map(|h| (h.fraction.to_bits(), h.at.z.to_bits())),
+                    "ray {:?} crossing no reported tile changed under {:?}",
+                    rays[k],
+                    e
+                );
+            }
+        }
+        (before, before_hits) = (after, after_hits);
     }
     Ok(())
 }
@@ -952,13 +1400,12 @@ fn changes_are_local<F: Frame + Copy>(frame: F, specs: &[Spec]) -> Result<(), Te
 /// Whatever order and duplication the edits arrive in, each delivered once
 /// in that order, a replica's state is the state after a prefix of the
 /// script: it never applies an edit past a missing one.
-fn deliveries_leave_a_prefix<F: Frame + Copy>(
-    frame: F,
-    specs: &[Spec],
+fn deliveries_leave_a_prefix<G: EditGround>(
+    make: impl Fn() -> G,
+    edits: &[Edit],
     delivery: &[usize],
 ) -> Result<(), TestCaseError> {
-    let edits = script(&frame, specs);
-    let mut g = ramp(frame);
+    let mut g = make();
     for &k in delivery {
         let e = &edits[k % edits.len()];
         let (last, digest) = (g.last_seq(), g.digest());
@@ -970,7 +1417,7 @@ fn deliveries_leave_a_prefix<F: Frame + Copy>(
         }
     }
     let applied = usize::try_from(g.last_seq().0).unwrap();
-    let mut reference = ramp(frame);
+    let mut reference = make();
     for e in &edits[..applied] {
         let _ = reference.apply(e, &mut Vec::new());
     }
@@ -978,31 +1425,67 @@ fn deliveries_leave_a_prefix<F: Frame + Copy>(
     Ok(())
 }
 
-/// The raycast agrees with the surface: no point of the segment before the
-/// hit is under the ground, the hit is on it, and a clear segment stays
-/// above it all the way.
-fn rays_agree_with_the_surface<F: Frame + Copy>(
-    frame: F,
-    specs: &[Spec],
-    rays: &[(f64, f64, f64, f64, f64, f64)],
+/// A replica that buffers what arrives early and retries it once the gap
+/// is filled reaches the script's final state, whatever the delivery order
+/// and duplication, once every edit has arrived.
+fn a_buffering_replica_reaches_the_script<G: EditGround>(
+    make: impl Fn() -> G,
+    edits: &[Edit],
+    delivery: &[usize],
 ) -> Result<(), TestCaseError> {
-    let mut g = ramp(frame);
-    for e in &script(&frame, specs) {
+    let mut g = make();
+    let mut early: BTreeMap<EditSeq, Edit> = BTreeMap::new();
+    // The delivery, then every edit once more, last first, so nothing is
+    // lost and the gaps are at their widest.
+    let rest = (0..edits.len()).rev();
+    for k in delivery.iter().copied().chain(rest) {
+        let e = edits[k % edits.len()];
+        match g.apply(&e, &mut Vec::new()) {
+            Err(GroundError::Gap { .. }) => {
+                early.insert(e.seq, e);
+            }
+            Err(GroundError::Stale { .. }) => {}
+            _ => {
+                // Drain what has become next.
+                while let Some(next) = early.remove(&EditSeq(g.last_seq().0 + 1)) {
+                    let _ = g.apply(&next, &mut Vec::new());
+                }
+            }
+        }
+    }
+    let mut reference = make();
+    for e in edits {
+        let _ = reference.apply(e, &mut Vec::new());
+    }
+    prop_assert_eq!(g.last_seq(), EditSeq(edits.len() as u64));
+    prop_assert_eq!(g.digest(), reference.digest());
+    Ok(())
+}
+
+/// The raycast agrees with the surface: no point of the segment before the
+/// hit is under the ground (a segment running underground from where it
+/// enters the bounds hits there), and the hit is on the surface or, where
+/// the segment enters the ground's domain, below it.
+fn rays_agree_with_the_surface<G: EditGround>(
+    make: impl Fn() -> G,
+    edits: &[Edit],
+    ends: &[(f64, f64, f64, f64, f64, f64)],
+) -> Result<(), TestCaseError> {
+    let mut g = make();
+    for e in edits {
         let _ = g.apply(e, &mut Vec::new());
     }
+    let (lo, hi) = g.frame().bounds();
     let tolerance = 1e-6;
-    for &(e1, n1, z1, e2, n2, z2) in rays {
-        let from = at(&frame, e1, n1, ramp_height(e1) + z1);
-        let to = at(&frame, e2, n2, ramp_height(e2) + z2);
-        let hit = cast(&g, from, to);
+    for ray in rays_over(&g, ends) {
+        let hit = cast(&g, ray.from, ray.to);
         let end = hit.map_or(1.0, |h| h.fraction);
-        // Strictly before the hit (a segment starting in solid hits at 0).
         for s in 0..400 {
             let t = end * f64::from(s) / 400.0;
             if t >= end {
                 break;
             }
-            let p = from + (to - from) * t;
+            let p = ray.from + (ray.to - ray.from) * t;
             if let Some(h) = top(&g, p.truncate()) {
                 prop_assert!(
                     p.z > h - tolerance,
@@ -1012,71 +1495,123 @@ fn rays_agree_with_the_surface<F: Frame + Copy>(
             }
         }
         if let Some(hit) = hit {
-            if hit.fraction > 0.0 {
-                let h = top(&g, hit.at.truncate()).unwrap();
-                prop_assert!(
-                    (hit.at.z - h).abs() < tolerance,
-                    "the hit is on the surface: {hit:?} vs {h}"
-                );
-            }
+            let c = hit.at.truncate();
+            let on_edge = c.x == lo.x || c.y == lo.y || c.x == hi.x || c.y == hi.y;
+            let inside = c.clamp(lo, DVec2::new(hi.x.next_down(), hi.y.next_down()));
+            let h = top(&g, inside).unwrap();
+            // Where the segment enters the ground's domain (its start, or the
+            // bounds' entry face) it may already be below the surface.
+            let entry = hit.fraction == 0.0 || on_edge;
+            prop_assert!(
+                (hit.at.z - h).abs() < tolerance || (entry && hit.at.z < h + tolerance),
+                "the hit is on the surface: {hit:?} vs {h}"
+            );
         }
     }
     Ok(())
 }
 
-fn arb_specs() -> impl Strategy<Value = Vec<Spec>> {
-    proptest::collection::vec(arb_spec(), 1..10)
+/// The evicting double answers every query, reports and digests like
+/// replicas of itself, and answers bit for bit like the heightfield it pages.
+fn the_double_answers_like_the_heightfield<F: Frame + Copy>(
+    make: impl Fn() -> Heightfield<F>,
+    edits: &[Edit],
+) -> Result<(), TestCaseError> {
+    let (mut plain, mut paged) = (make(), Evicting::new(make()));
+    let columns = probe_columns(plain.frame());
+    let rays = rays_over(&plain, &fixed_ray_ends());
+    for e in edits {
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        prop_assert_eq!(plain.apply(e, &mut a), paged.apply(e, &mut b));
+        prop_assert_eq!(a, b);
+        prop_assert_eq!(answers(&plain, &columns), answers(&paged, &columns));
+        prop_assert_eq!(hits(&plain, &rays), hits(&paged, &rays));
+        let (mut sa, mut sb) = (SpanBuffer::default(), SpanBuffer::default());
+        plain.spans(&columns, &mut sa);
+        paged.spans(&columns, &mut sb);
+        prop_assert_eq!(sa, sb);
+    }
+    Ok(())
 }
 
-fn arb_rays() -> impl Strategy<Value = Vec<(f64, f64, f64, f64, f64, f64)>> {
+fn arb_ray_ends() -> impl Strategy<Value = Vec<(f64, f64, f64, f64, f64, f64)>> {
     proptest::collection::vec(
         (
-            -2000.0f64..2000.0,
-            -2000.0f64..2000.0,
-            -5.0f64..60.0,
-            -2000.0f64..2000.0,
-            -2000.0f64..2000.0,
+            -0.3f64..1.3,
+            -0.3f64..1.3,
+            -40.0f64..60.0,
+            -0.3f64..1.3,
+            -0.3f64..1.3,
             -40.0f64..60.0,
         ),
         1..8,
     )
 }
 
+/// Every property on one ground and one script.
+fn all_properties<G: EditGround>(
+    make: impl Fn() -> G,
+    edits: &[Edit],
+    delivery: &[usize],
+    ends: &[(f64, f64, f64, f64, f64, f64)],
+) -> Result<(), TestCaseError> {
+    replicas_agree(&make, edits)?;
+    versions_bump_by_one(&make, edits)?;
+    changes_are_local(&make, edits)?;
+    deliveries_leave_a_prefix(&make, edits, delivery)?;
+    a_buffering_replica_reaches_the_script(&make, edits, delivery)?;
+    rays_agree_with_the_surface(&make, edits, ends)
+}
+
+fn arb_delivery() -> impl Strategy<Value = Vec<usize>> {
+    proptest::collection::vec(0usize..64, 0..24)
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(48))]
-
-    /// Two replicas applying the same edits end with the same bits.
-    #[test]
-    fn replicas_agree_in_both_frames(specs in arb_specs()) {
-        replicas_agree(planar(), &specs)?;
-        replicas_agree(geodetic(), &specs)?;
-    }
+    #![proptest_config(ProptestConfig::with_cases(32))]
 
     #[test]
-    fn versions_bump_by_one_in_both_frames(specs in arb_specs()) {
-        versions_bump_by_one(planar(), &specs)?;
-        versions_bump_by_one(geodetic(), &specs)?;
-    }
-
-    #[test]
-    fn changes_are_local_in_both_frames(specs in arb_specs()) {
-        changes_are_local(planar(), &specs)?;
-        changes_are_local(geodetic(), &specs)?;
-    }
-
-    #[test]
-    fn deliveries_leave_a_prefix_in_both_frames(
-        specs in arb_specs(),
-        delivery in proptest::collection::vec(0usize..64, 0..24),
+    fn the_heightfield_on_a_planar_frame(
+        edits in arb_script(planar()), delivery in arb_delivery(), ends in arb_ray_ends(),
     ) {
-        deliveries_leave_a_prefix(planar(), &specs, &delivery)?;
-        deliveries_leave_a_prefix(geodetic(), &specs, &delivery)?;
+        all_properties(|| wet_ramp(planar()), &edits, &delivery, &ends)?;
     }
 
     #[test]
-    fn rays_agree_with_the_surface_in_both_frames(specs in arb_specs(), rays in arb_rays()) {
-        rays_agree_with_the_surface(planar(), &specs, &rays)?;
-        rays_agree_with_the_surface(geodetic(), &specs, &rays)?;
+    fn the_heightfield_on_a_geodetic_frame(
+        edits in arb_script(geodetic()), delivery in arb_delivery(), ends in arb_ray_ends(),
+    ) {
+        all_properties(|| wet_ramp(geodetic()), &edits, &delivery, &ends)?;
+    }
+
+    #[test]
+    fn the_heightfield_around_a_pole(
+        edits in arb_globe_script(polar(), true), delivery in arb_delivery(), ends in arb_ray_ends(),
+    ) {
+        all_properties(|| wet_flat(polar()), &edits, &delivery, &ends)?;
+        all_properties(|| wet_flat(polar_window()), &edits, &delivery, &ends)?;
+    }
+
+    #[test]
+    fn the_heightfield_across_the_antimeridian(
+        edits in arb_globe_script(global(), false), delivery in arb_delivery(), ends in arb_ray_ends(),
+    ) {
+        all_properties(|| wet_flat(global()), &edits, &delivery, &ends)?;
+    }
+
+    #[test]
+    fn a_ground_that_keeps_nothing_resident(
+        edits in arb_script(geodetic()), delivery in arb_delivery(), ends in arb_ray_ends(),
+    ) {
+        all_properties(|| Evicting::new(wet_ramp(geodetic())), &edits, &delivery, &ends)?;
+        the_double_answers_like_the_heightfield(|| wet_ramp(geodetic()), &edits)?;
+    }
+
+    #[test]
+    fn a_ground_that_keeps_nothing_resident_around_a_pole(
+        edits in arb_globe_script(polar(), true),
+    ) {
+        the_double_answers_like_the_heightfield(|| wet_flat(polar()), &edits)?;
     }
 
     /// Edits on columns far apart commute: their order only shows in the
@@ -1102,9 +1637,15 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Golden digests: a fixed script's state and answers, recorded. The same
-// test runs on every CI target (Linux and macOS today); a drift in any
-// arithmetic path on one of them fails here.
+// Golden digests: a fixed script's state and answers, recorded.
+//
+// Recorded on macOS (aarch64, Apple silicon) with rustc 1.99.0, by
+// running this test with the expected values zeroed and copying what it
+// prints. The `test` CI jobs run it on Linux (x86-64) and macOS (aarch64):
+// a drift in any arithmetic path on one of them fails here. wasm32 is not
+// run yet. Every input is built with `+ − × ÷ sqrt` and `libm`, never the
+// platform's transcendentals; a deliberate change of arithmetic re-records
+// them in the same commit, saying why.
 
 /// A deterministic script of edits from a fixed linear congruential
 /// sequence.
@@ -1129,38 +1670,57 @@ fn golden_specs() -> Vec<Spec> {
         .collect()
 }
 
-fn golden<F: Frame + Copy>(frame: F) -> (u64, u64) {
-    let mut g = wet_ramp(frame);
+/// A fixed script around the pole: balls and capsules at and near it, and
+/// across the antimeridian.
+fn golden_polar_script() -> Vec<Edit> {
+    (0..12u32)
+        .map(|k| {
+            let kf = f64::from(k);
+            let lon = -PI + 0.5 * kf;
+            let lat = FRAC_PI_2 - 300.0 * kf / EARTH_RADIUS;
+            let p = DVec3::new(lon, lat, 10.0 - 3.0 * kf);
+            let brush = if k % 3 == 2 {
+                Brush::Capsule {
+                    a: p,
+                    b: DVec3::new(PI - 0.05, lat - 0.0002, -20.0),
+                    radius: 150.0,
+                }
+            } else {
+                Brush::Sphere {
+                    centre: p,
+                    radius: 200.0 + 90.0 * kf,
+                }
+            };
+            Edit {
+                seq: EditSeq(u64::from(k) + 1),
+                op: if k % 2 == 0 {
+                    EditOp::Remove
+                } else {
+                    EditOp::Add
+                },
+                brush,
+            }
+        })
+        .collect()
+}
+
+fn golden(mut g: impl EditGround, script: &[Edit]) -> (u64, u64) {
     let (mut changed, mut refused) = (Vec::new(), 0);
-    for e in &script(&frame, &golden_specs()) {
+    for e in script {
         refused += usize::from(g.apply(e, &mut changed).is_err());
     }
-    // The script exercises edits that change the ground and refusals.
-    assert!(
-        changed.len() > 10 && refused >= 2,
-        "{} {refused}",
-        changed.len()
-    );
-    let columns = probe_columns(&frame);
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut write = |v: u64| {
-        for b in v.to_le_bytes() {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x0100_0000_01b3);
-        }
-    };
+    // The script exercises edits that change the ground.
+    assert!(changed.len() > 10, "{} {refused}", changed.len());
+    let columns = probe_columns(g.frame());
+    let mut h = Fnv::default();
     for a in answers(&g, &columns) {
-        a.into_iter().for_each(&mut write);
+        a.into_iter().for_each(|v| h.u64(v));
     }
-    for k in 0..64 {
-        let e = -2000.0 + 62.5 * f64::from(k);
-        let from = at(&frame, e, -1500.0, ramp_height(e) + 30.0);
-        let to = at(&frame, -e, 1500.0, ramp_height(-e) - 10.0);
-        let hit = cast(&g, from, to);
-        write(hit.map_or(u64::MAX, |h| h.fraction.to_bits()));
-        write(hit.map_or(u64::MAX, |h| h.at.z.to_bits()));
+    for hit in hits(&g, &rays_over(&g, &fixed_ray_ends())) {
+        h.u64(hit.map_or(u64::MAX, |h| h.fraction.to_bits()));
+        h.u64(hit.map_or(u64::MAX, |h| h.at.z.to_bits()));
     }
-    (g.digest(), h)
+    (g.digest(), h.0)
 }
 
 #[test]
@@ -1168,16 +1728,116 @@ fn golden_digests_are_recorded() {
     let recorded = [
         (
             "planar",
-            golden(planar()),
-            (0xbcf0_845d_1feb_cb69, 0xc09e_1967_da7d_c764),
+            golden(wet_ramp(planar()), &script(&planar(), &golden_specs())),
+            (0x1736_893e_df47_5f1e, 0x2eb5_d769_c49b_c4ab),
         ),
         (
             "geodetic",
-            golden(geodetic()),
-            (0xf82b_4095_c2e2_abf8, 0x0929_7c73_20d1_59a4),
+            golden(wet_ramp(geodetic()), &script(&geodetic(), &golden_specs())),
+            (0x6f92_c77b_6f59_c82e, 0x1713_dab3_be21_28cb),
+        ),
+        (
+            "polar",
+            golden(wet_flat(polar()), &golden_polar_script()),
+            (0xbc83_dd69_a56e_7c64, 0x53c0_3bb6_ac0f_5895),
         ),
     ];
-    for (name, got, want) in recorded {
-        assert_eq!(got, want, "{name}: state and answer digests ({got:#018x?})");
+    let wrong: Vec<String> = recorded
+        .iter()
+        .filter(|(_, got, want)| got != want)
+        .map(|(name, got, _)| format!("{name}: ({:#018x}, {:#018x})", got.0, got.1))
+        .collect();
+    assert!(wrong.is_empty(), "state and answer digests: {wrong:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Raycast edges and precision, degenerate grids.
+
+#[test]
+fn a_ray_entering_through_a_max_edge_below_the_surface_hits_there() {
+    let g = flat(planar(), 0.0);
+    for (from, to, x, y) in [
+        (
+            DVec3::new(2100.0, 0.0, -1000.0),
+            DVec3::new(-2100.0, 0.0, -1000.0),
+            2048.0,
+            0.0,
+        ),
+        (
+            DVec3::new(-2100.0, 0.0, -1000.0),
+            DVec3::new(2100.0, 0.0, -1000.0),
+            -2048.0,
+            0.0,
+        ),
+        (
+            DVec3::new(3.0, 2100.0, -1000.0),
+            DVec3::new(3.0, -2100.0, -1000.0),
+            3.0,
+            2048.0,
+        ),
+    ] {
+        let hit = cast(&g, from, to).expect("the segment runs underground from its entry");
+        assert_eq!((hit.at.x, hit.at.y), (x, y), "{hit:?}");
     }
+}
+
+/// A concave patch (one raised corner) grazed by long rays: the entry is a
+/// hair after the cell's corner, where a root computed from the far start
+/// of the ray loses its precision or rounds to before the corner.
+#[test]
+fn a_grazing_entry_into_a_concave_patch_is_found_at_once() {
+    let g = Heightfield::new(
+        planar(),
+        257,
+        |i, j| {
+            if (i, j) == (129, 128) {
+                64.0
+            } else {
+                0.0
+            }
+        },
+    )
+    .unwrap();
+    let mut misses = Vec::new();
+    for e in 0..60 {
+        let eps = 1e-4 * 0.6f64.powi(e);
+        for k in 0..60 {
+            let start = -2000.0 + 33.7 * f64::from(k);
+            for slope in [0.1, 0.5, 2.0, 7.0] {
+                // z = eps − slope·x: above the flat ground west of the
+                // cell, at the cell's corner a hair above its surface.
+                let from = DVec3::new(start, start, eps - slope * start);
+                let to = DVec3::new(16.0, 16.0, eps - slope * 16.0);
+                let hit = cast(&g, from, to).expect("the ray enters the patch");
+                // Along the diagonal, s = x/16: the patch is 64·s·(1 − s)
+                // and the gap −64s² + b·s − eps, whose first root is
+                // 2·eps / (b + √(b² − 256·eps)).
+                let b = 64.0 + 16.0 * slope;
+                let x = 16.0 * (2.0 * eps / (b + (b * b - 256.0 * eps).sqrt()));
+                if (hit.at.x - x).abs() > 1e-9 {
+                    misses.push((eps, start, slope, x, hit.at.x));
+                }
+            }
+        }
+    }
+    assert!(
+        misses.is_empty(),
+        "{} late entries, e.g. {:?}",
+        misses.len(),
+        &misses[..misses.len().min(3)]
+    );
+}
+
+#[test]
+fn cells_too_narrow_to_tell_apart_are_refused() {
+    // 2^-1074-wide bounds: every edge rounds onto the next.
+    let f = GeodeticFrame {
+        min: DVec2::new(0.5, 0.5),
+        max: DVec2::new(0.5f64.next_up(), 0.5f64.next_up().next_up()),
+        edit_level: 0,
+    };
+    assert_eq!(
+        Heightfield::new(f, 17, |_, _| 0.0).err(),
+        Some(InvalidGround::DegenerateCells)
+    );
 }

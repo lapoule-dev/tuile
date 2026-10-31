@@ -10,7 +10,9 @@ and a renderer draws, so the two never disagree about where the surface is.
   world ([`PlanarFrame`], metres, optionally anchored on the globe) or a
   region of the globe ([`GeodeticFrame`], longitude and latitude in radians).
   Queries and edits are expressed in that frame; nothing assumes one or the
-  other. Rays are straight in the frame's coordinates ([`Ray`]).
+  other. Brushes are measured in each column's tangent plane, so a geodetic
+  ground can be edited at its poles and across the antimeridian; rays are
+  straight in the frame's coordinates ([`Ray`]).
 - **f64, deterministic.** Every number is an `f64`. Authoritative paths use
   only `+ − × ÷ sqrt` and `libm` for anything transcendental, never fused
   multiply-add or fast-math: the same edits in the same order give the same
@@ -19,7 +21,8 @@ and a renderer draws, so the two never disagree about where the surface is.
 - **Complete over its bounds.** Every column inside the bounds has its
   answer, always: no "unknown yet", and no answer depends on what is in
   memory or on load order. An implementation may still generate or load its
-  tiles on demand and evict them, as long as no answer can tell.
+  tiles on demand and evict them, as long as no answer can tell; a load
+  failure is fatal, never an answer.
 - **Tiled and versioned.** A quadtree over the frame's bounds; an edit bumps
   the [`Version`] of every tile whose answers may have changed and reports
   them ([`TileChanged`]), so derived data (navigation meshes, clearance maps,

@@ -30,6 +30,11 @@
 //! for such a source is an implementation setting, not part of this
 //! contract.
 //!
+//! Reads are infallible: a source that cannot load or regenerate a tile has
+//! no answer to give, and must not give a wrong one. Such a failure is
+//! outside the contract and fatal to the ground — the host handles it as it
+//! handles running out of memory, not as a query result.
+//!
 //! # Boundaries
 //!
 //! Solid is closed: a point exactly at a span's top (or bottom) is solid, a
@@ -223,6 +228,11 @@ pub trait EditGround: Ground {
     /// one implementation agree on it iff their states agree (for practical
     /// purposes), on every target. Digests of different implementations are
     /// not comparable.
+    ///
+    /// It covers the whole state, resident or not. An implementation that
+    /// pages or regenerates its tiles may compute it from the identity of
+    /// its source (what regenerates the tiles bit for bit) and its edit
+    /// layer (the consumed edits, in order), without loading anything.
     fn digest(&self) -> u64;
 }
 

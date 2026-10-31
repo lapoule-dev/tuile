@@ -17,6 +17,11 @@
 //! volumetric implementation of the same contract. Authoritative arithmetic
 //! uses only `+ − × ÷ sqrt` and the frame's metric.
 //!
+//! On a frame that wraps around `u` (a geodetic frame over the whole globe),
+//! the first and last sample meridians are the same place, held as two
+//! samples: edits measure both the same way and keep them equal up to
+//! rounding. Rays do not wrap.
+//!
 //! # Costs
 //!
 //! - `surface`, `solid`, `water`: O(1) per query; `spans`: O(1) per column.
@@ -26,7 +31,7 @@
 //!   at most `n²` — the edit level is checked at build to give tiles of at
 //!   least one cell.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use glam::{DVec2, DVec3};
 use thiserror::Error;
@@ -45,6 +50,8 @@ const DRY: u32 = u32::MAX;
 /// Why a heightfield could not be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum InvalidGround {
+    #[error("cells or edit-level tiles too narrow for their edges to be told apart")]
+    DegenerateCells,
     #[error(transparent)]
     Frame(#[from] InvalidFrame),
     #[error("{0} samples per side: at least 2, and n² must fit in memory")]
@@ -96,6 +103,21 @@ impl<F: Frame> Heightfield<F> {
                 level,
                 cells: n - 1,
             });
+        }
+        // Every edge strictly after the one before, for the cells and the
+        // edit-level tiles, so cells and tiles have widths and tile_of
+        // agrees with tile_bounds. O(n).
+        let (lo, hi) = frame.bounds();
+        for axis in 0..2 {
+            for count in [as_u64(n - 1), 1u64 << level] {
+                for i in 0..count {
+                    if grid_edge(lo[axis], hi[axis], i, count)
+                        >= grid_edge(lo[axis], hi[axis], i + 1, count)
+                    {
+                        return Err(InvalidGround::DegenerateCells);
+                    }
+                }
+            }
         }
         let mut heights = Vec::with_capacity(len);
         for j in 0..n {
@@ -206,8 +228,17 @@ impl<F: Frame> Heightfield<F> {
             self.edge(i + 1, 0) - self.edge(i, 0),
             self.edge(j + 1, 1) - self.edge(j, 1),
         ) * self.frame.metres_per_unit(c);
-        let gx = (h(i + 1, j) - h(i, j) + h(i + 1, j + 1) - h(i, j + 1)) / (2.0 * step.x);
-        let gy = (h(i, j + 1) - h(i, j) + h(i + 1, j + 1) - h(i + 1, j)) / (2.0 * step.y);
+        // A cell with no width in metres (a row of samples at a pole, where
+        // every longitude is one place) has no slope across it.
+        let slope = |dh: f64, w: f64| if w > 0.0 { dh / (2.0 * w) } else { 0.0 };
+        let gx = slope(
+            h(i + 1, j) - h(i, j) + h(i + 1, j + 1) - h(i, j + 1),
+            step.x,
+        );
+        let gy = slope(
+            h(i, j + 1) - h(i, j) + h(i + 1, j + 1) - h(i + 1, j),
+            step.y,
+        );
         let v = DVec3::new(-gx, -gy, 1.0);
         v / (v.x * v.x + v.y * v.y + v.z * v.z).sqrt()
     }
@@ -227,7 +258,14 @@ impl<F: Frame> Heightfield<F> {
     /// The first entry of a segment into solid: the part of the segment
     /// inside the bounds, walked cell by cell, each cell's bilinear patch
     /// met exactly.
+    ///
+    /// The entry face is closed: a segment entering through a max edge
+    /// below the surface hits there (on the edge, which is otherwise outside
+    /// the ground), as it does through a min edge.
     fn cast(&self, r: &Ray) -> Option<Hit> {
+        if !(r.from.is_finite() && r.to.is_finite()) {
+            return None;
+        }
         let (lo, hi) = self.frame.bounds();
         let d = r.to - r.from;
         // The parameters inside the bounds.
@@ -244,11 +282,11 @@ impl<F: Frame> Heightfield<F> {
                 t1 = t1.min(a.max(b));
             }
         }
-        // A NaN segment meets nothing.
-        if t0.is_nan() || t1.is_nan() || t0 > t1 {
+        if t0 > t1 {
             return None;
         }
         let start = r.from + d * t0;
+        // Solid at the start agrees with `solid` wherever that answers.
         if self.is_solid(start) {
             return Some(Hit {
                 at: start,
@@ -274,10 +312,8 @@ impl<F: Frame> Heightfield<F> {
             let end = tx.min(ty).min(t1).max(t);
             if let Some(th) = self.enter_patch(r, d, i, j, t, end) {
                 let at = r.from + d * th;
-                // The max edges belong to no cell.
-                return self
-                    .frame
-                    .contains(at.truncate())
+                // The max edges belong to no cell, except as the entry face.
+                return (th == t0 || self.frame.contains(at.truncate()))
                     .then_some(Hit { at, fraction: th });
             }
             if end >= t1 {
@@ -302,7 +338,9 @@ impl<F: Frame> Heightfield<F> {
     }
 
     /// The smallest `t` in `[ta, tb]` where the segment is at or below the
-    /// bilinear patch of cell `(i, j)`: the first root of a quadratic.
+    /// bilinear patch of cell `(i, j)`: the entry root of a quadratic in
+    /// `s = t − ta`, expressed around the segment's point at `ta` so a long
+    /// segment does not extrapolate the patch across the map.
     fn enter_patch(&self, r: &Ray, d: DVec3, i: usize, j: usize, ta: f64, tb: f64) -> Option<f64> {
         let (x0, x1) = (self.edge(i, 0), self.edge(i + 1, 0));
         let (y0, y1) = (self.edge(j, 1), self.edge(j + 1, 1));
@@ -310,40 +348,49 @@ impl<F: Frame> Heightfield<F> {
         let h00 = h(i, j);
         let (e, f) = (h(i + 1, j) - h00, h(i, j + 1) - h00);
         let k = h00 - h(i + 1, j) - h(i, j + 1) + h(i + 1, j + 1);
-        // fx = ax + bx·t, fy = ay + by·t.
-        let (ax, bx) = ((r.from.x - x0) / (x1 - x0), d.x / (x1 - x0));
-        let (ay, by) = ((r.from.y - y0) / (y1 - y0), d.y / (y1 - y0));
-        // patch − z = c0 + c1·t + c2·t².
-        let c0 = h00 + e * ax + f * ay + k * ax * ay - r.from.z;
-        let c1 = e * bx + f * by + k * (ax * by + ay * bx) - d.z;
-        let c2 = k * bx * by;
-        let q = |t: f64| c0 + t * (c1 + t * c2);
-        if q(ta) >= 0.0 {
+        let p = r.from + d * ta;
+        // fx = ax + bx·s, fy = ay + by·s.
+        let (ax, bx) = ((p.x - x0) / (x1 - x0), d.x / (x1 - x0));
+        let (ay, by) = ((p.y - y0) / (y1 - y0), d.y / (y1 - y0));
+        // patch − z = c0 + c1·s + c2·s².
+        let c0 = h00 + e * ax + f * ay + k * ax * ay - p.z;
+        if c0 >= 0.0 {
             return Some(ta);
         }
-        let mut first: Option<f64> = None;
-        let mut take = |root: f64| {
-            if root >= ta && root <= tb && first.is_none_or(|f| root < f) {
-                first = Some(root);
-            }
-        };
-        if c2 == 0.0 {
-            if c1 > 0.0 {
-                take(-c0 / c1);
-            }
+        let c1 = e * bx + f * by + k * (ax * by + ay * bx) - d.z;
+        let c2 = k * bx * by;
+        let sb = tb - ta;
+        // Below the patch at s = 0: the entry is where the gap first comes
+        // back to 0 — the upper root of a convex gap (the lower one is
+        // negative), the lower root of a concave one.
+        let root = if c2 == 0.0 {
+            (c1 > 0.0).then(|| -c0 / c1)
         } else {
             let disc = c1 * c1 - 4.0 * c2 * c0;
-            if disc >= 0.0 {
-                // The two roots without cancellation.
-                let s = disc.sqrt();
-                let m = -0.5 * (c1 + if c1 >= 0.0 { s } else { -s });
-                let r1 = m / c2;
-                take(r1);
-                take(if m == 0.0 { r1 } else { c0 / m });
-            }
+            (disc >= 0.0)
+                .then(|| {
+                    // The two roots without cancellation.
+                    let sq = disc.sqrt();
+                    let m = -0.5 * (c1 + if c1 >= 0.0 { sq } else { -sq });
+                    let r1 = m / c2;
+                    let r2 = if m == 0.0 { r1 } else { c0 / m };
+                    (r1.min(r2), r1.max(r2))
+                })
+                .and_then(|(low, high)| {
+                    if c2 > 0.0 {
+                        Some(high)
+                    } else {
+                        // Both roots on one side of 0: none ahead, or the
+                        // lower one is the entry.
+                        (high >= 0.0).then_some(low)
+                    }
+                })
+        };
+        match root.map(|s| s.max(0.0)) {
+            Some(s) if s <= sb => Some((ta + s).min(tb)),
+            // Rounding may hide a root the end of the interval shows.
+            _ => (c0 + sb * (c1 + sb * c2) >= 0.0).then_some(tb),
         }
-        // Rounding may hide a root the end of the interval shows.
-        first.or_else(|| (q(tb) >= 0.0).then_some(tb))
     }
 
     /// The samples an edit changes, and the rectangle of columns whose
@@ -502,21 +549,47 @@ impl<F: Frame> EditGround for Heightfield<F> {
         }
         // From here the number is consumed, whatever the content.
         self.last = edit.seq;
-        if !edit.brush.is_valid() {
+        if !edit.brush.is_valid_in(&self.frame) {
             return Err(GroundError::InvalidBrush);
         }
         let (lo, hi) = edit.brush.footprint(&self.frame);
         if !(lo.is_finite() && hi.is_finite()) {
             return Err(GroundError::InvalidBrush);
         }
+        // The footprint's parts inside the bounds: itself, clipped, and on a
+        // frame that wraps around `u`, its copies a period away; all of `u`
+        // when it spans a period (a cap around a pole).
         let (blo, bhi) = self.frame.bounds();
-        if hi.x < blo.x || hi.y < blo.y || lo.x >= bhi.x || lo.y >= bhi.y {
+        let mut parts: Vec<(Column, Column)> = Vec::with_capacity(3);
+        let mut take = |l: Column, h: Column| {
+            if !(h.x < blo.x || h.y < blo.y || l.x >= bhi.x || l.y >= bhi.y) {
+                parts.push((l.max(blo), h.min(bhi)));
+            }
+        };
+        match self.frame.u_period() {
+            Some(p) if hi.x - lo.x >= p => {
+                take(DVec2::new(blo.x, lo.y), DVec2::new(bhi.x, hi.y));
+            }
+            Some(p) => {
+                for shift in [0.0, -p, p] {
+                    let s = DVec2::new(shift, 0.0);
+                    take(lo + s, hi + s);
+                }
+            }
+            None => take(lo, hi),
+        }
+        if parts.is_empty() {
             return Err(GroundError::OutOfBounds);
         }
-        let Some((lo, hi)) = self.carve(edit, lo.max(blo), hi.min(bhi)) else {
-            return Ok(());
-        };
-        for tile in tiles_over(&self.frame, lo, hi, self.frame.edit_level()) {
+        let level = self.frame.edit_level();
+        let mut tiles = BTreeSet::new();
+        for (l, h) in parts {
+            if let Some((a, b)) = self.carve(edit, l, h) {
+                tiles.extend(tiles_over(&self.frame, a, b, level).map(|k| (k.y, k.x)));
+            }
+        }
+        for (y, x) in tiles {
+            let tile = TileKey { level, x, y };
             let v = self.versions.entry(tile).or_default();
             // 2^64 edits of one tile cannot happen; saturating rather than
             // wrapping keeps versions from going back.
@@ -527,7 +600,8 @@ impl<F: Frame> EditGround for Heightfield<F> {
     }
 
     /// FNV-1a over the frame (bounds, edit level, the metric at both
-    /// corners), the samples, the water (coverage, each body's kind and
+    /// corners; not a planar frame's anchor, which only places the world for
+    /// a renderer and decides no answer), the samples, the water (coverage, each body's kind and
     /// level), the versions and the last consumed edit.
     fn digest(&self) -> u64 {
         let mut h = Fnv::default();

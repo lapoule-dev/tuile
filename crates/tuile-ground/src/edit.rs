@@ -30,7 +30,7 @@
 //! [`GroundError::Gap`]: crate::GroundError::Gap
 //! [`Version`]: crate::Version
 
-use glam::{DVec2, DVec3};
+use glam::DVec3;
 
 use crate::frame::{Column, Frame, Position, TileKey, Version};
 
@@ -48,11 +48,16 @@ pub enum EditOp {
 
 /// The volume an edit acts on, in the frame's coordinates; radii in metres.
 ///
-/// A brush is a shape in the local metric of its anchor (a sphere's centre,
-/// the middle of a capsule's segment): horizontal offsets are converted to
-/// metres with [`Frame::metres_per_unit`] there. That is exact in a planar
-/// frame, and in a geodetic one exact at the anchor and accurate while the
-/// brush is small against the change of the metric across it.
+/// A brush is measured column by column in that column's tangent plane
+/// ([`Frame::tangent_offset`]): exact in a planar frame; in a geodetic frame
+/// horizontal distances are those of the sphere (short by `θ²/6` of the
+/// arc, 4·10⁻⁵ at 100 km), and heights stay along each column (the earth's
+/// curvature under a brush, `d²/2R`, is not folded in). A ball at a pole
+/// carves a disc around it. A capsule's axis is taken in each column's
+/// tangent plane, so it runs the short way across the antimeridian.
+///
+/// The fields are public: a brush is validated when an edit is applied
+/// ([`Brush::is_valid_in`]), and an invalid one is refused there.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Brush {
     /// A ball; `radius` finite and positive.
@@ -65,7 +70,8 @@ pub enum Brush {
         radius: f64,
     },
     /// A box aligned with the frame's axes, corners included; `min <= max`
-    /// on every axis.
+    /// on every axis. Its coordinates are taken as given: on a frame that
+    /// wraps, a box does not wrap (split one across the antimeridian in two).
     Box { min: Position, max: Position },
 }
 
@@ -90,58 +96,60 @@ impl Brush {
         }
     }
 
-    /// The column whose metric measures the brush.
-    fn anchor(&self) -> Column {
-        match *self {
-            Brush::Sphere { centre, .. } => centre.truncate(),
-            Brush::Capsule { a, b, .. } => (a.truncate() + b.truncate()) / 2.0,
-            Brush::Box { min, .. } => min.truncate(),
-        }
+    /// Whether the brush is a volume ([`Self::is_valid`]) at places of the
+    /// frame ([`Frame::is_place`]: a latitude beyond ±90° is none).
+    pub fn is_valid_in<F: Frame + ?Sized>(&self, frame: &F) -> bool {
+        let places = match *self {
+            Brush::Sphere { centre, .. } => [centre, centre],
+            Brush::Capsule { a, b, .. } => [a, b],
+            Brush::Box { min, max } => [min, max],
+        };
+        self.is_valid() && places.iter().all(|p| frame.is_place(p.truncate()))
     }
 
     /// The rectangle of columns the brush can reach (both corners
-    /// included). Not finite for a brush whose reach the frame's metric
-    /// cannot measure (at a pole).
+    /// included), from [`Frame::reach`]: it may extend beyond the bounds,
+    /// and spans a whole period of `u` when the brush covers a pole.
     pub fn footprint<F: Frame + ?Sized>(&self, frame: &F) -> (Column, Column) {
-        let m = frame.metres_per_unit(self.anchor());
-        let reach = |r: f64| DVec2::new(r / m.x, r / m.y);
         match *self {
             Brush::Sphere { centre, radius } => {
-                let d = reach(radius);
-                (centre.truncate() - d, centre.truncate() + d)
+                frame.reach(centre.truncate(), centre.truncate(), radius)
             }
-            Brush::Capsule { a, b, radius } => {
-                let d = reach(radius);
-                (
-                    a.truncate().min(b.truncate()) - d,
-                    a.truncate().max(b.truncate()) + d,
-                )
-            }
+            Brush::Capsule { a, b, radius } => frame.reach(
+                a.truncate().min(b.truncate()),
+                a.truncate().max(b.truncate()),
+                radius,
+            ),
             Brush::Box { min, max } => (min.truncate(), max.truncate()),
         }
     }
 
     /// The vertical extent `[bottom, top]` of the brush on a column's
-    /// vertical line, `None` where it misses it. Exact (up to rounding) for
-    /// every brush and slope; uses only `+ − × ÷ sqrt`.
+    /// vertical line, `None` where it misses it. Exact (up to rounding) in
+    /// the column's tangent plane, for every brush and slope; `+ − × ÷ sqrt`
+    /// and the frame's [`Frame::tangent_offset`].
     pub fn column_extent<F: Frame + ?Sized>(
         &self,
         frame: &F,
         column: Column,
     ) -> Option<(f64, f64)> {
-        let m = frame.metres_per_unit(self.anchor());
         // A point relative to the column's vertical line, in metres.
-        let local = |p: Position| DVec3::new((p.x - column.x) * m.x, (p.y - column.y) * m.y, p.z);
+        let local = |p: Position| {
+            frame
+                .tangent_offset(column, p.truncate())
+                .map(|o| DVec3::new(o.x, o.y, p.z))
+        };
         match *self {
-            Brush::Sphere { centre, radius } => ball_chord(local(centre), radius),
+            Brush::Sphere { centre, radius } => ball_chord(local(centre)?, radius),
             Brush::Capsule { a, b, radius } => {
                 let (a, b) = (local(a), local(b));
+                let axis = a.zip(b).and_then(|(a, b)| cylinder_chord(a, b, radius));
                 // A capsule is the two end balls and the cylinder between
                 // them; its chord is the hull of theirs (a capsule is convex).
                 [
-                    ball_chord(a, radius),
-                    ball_chord(b, radius),
-                    cylinder_chord(a, b, radius),
+                    a.and_then(|a| ball_chord(a, radius)),
+                    b.and_then(|b| ball_chord(b, radius)),
+                    axis,
                 ]
                 .into_iter()
                 .flatten()
@@ -210,8 +218,13 @@ fn cylinder_chord(a: DVec3, b: DVec3, r: f64) -> Option<(f64, f64)> {
     if disc < 0.0 {
         return None;
     }
+    // The two roots without cancellation (an axis close to vertical makes
+    // `half_b` large against `horizontal`).
     let s = disc.sqrt();
-    let (mut z0, mut z1) = ((-half_b - s) / horizontal, (-half_b + s) / horizontal);
+    let m = -(half_b + if half_b >= 0.0 { s } else { -s });
+    let r0 = m / horizontal;
+    let r1 = if m == 0.0 { r0 } else { c / m };
+    let (mut z0, mut z1) = (r0.min(r1), r0.max(r1));
     // The projection's parameter, (wd + z·d.z) / len2, must lie in [0, 1].
     if d.z == 0.0 {
         if wd < 0.0 || wd > len2 {
@@ -227,6 +240,8 @@ fn cylinder_chord(a: DVec3, b: DVec3, r: f64) -> Option<(f64, f64)> {
 
 #[cfg(test)]
 mod tests {
+    use glam::DVec2;
+
     use super::*;
     use crate::frame::PlanarFrame;
 
