@@ -15,14 +15,18 @@
 //! | `v1/assets/{id}/endpoint` | asks ion with the account token, and answers the endpoint with its URLs pointing back here and **no token in it**: no account token, no asset token, no imagery key |
 //! | `assets/{id}/{path}` | fetches `{path}` under the asset's own URL with the asset's short-lived token, which it refreshes itself |
 //! | `bing/{id}/REST/v1/Imagery/Metadata/{style}` | asks the imagery service for its metadata with the key ion gave for the asset |
+//! | `tiles3d/{id}/{path}?session=…` | for a 3D Tiles asset ion points at on another service: fetches `{path}` from that service with the key ion gave, and answers tileset documents with their references pointing back here |
 //!
 //! The imagery service's tiles themselves are **not** proxied: the metadata
 //! names public tile URLs that carry no key, and the client fetches them from
 //! the service's own CDN as it always has — fewer bytes through the proxy,
 //! nothing secret on the way.
 //!
+//! A 3D Tiles service's tiles **are** proxied, unlike the imagery's: every
+//! request it answers needs the key, which must not reach the client.
+//!
 //! **Not an open proxy.** It answers for the assets it was configured with,
-//! for these three routes, for relative paths of a narrow alphabet and the
+//! for these four routes, for relative paths of a narrow alphabet and the
 //! two query parameters a terrain request carries; everything else is a 404
 //! or a 400 before anything goes upstream. And a reply is never sent if it
 //! would carry the account token, an asset token or an imagery key, whatever
@@ -57,6 +61,14 @@ const ENDPOINT_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
 /// The longest relative path an asset request may name.
 const LONGEST_PATH: usize = 160;
+
+/// The longest path a 3D Tiles service's request may name: its files are
+/// named by long encoded identifiers.
+const LONGEST_TILES3D_PATH: usize = 512;
+
+/// The query parameter a 3D Tiles service's references carry, and the only
+/// one passed on: the session its root hands out.
+const TILES3D_QUERY: &str = "session";
 
 /// What the proxy serves, and with which credential.
 #[derive(Clone)]
@@ -105,6 +117,13 @@ pub enum Route {
     },
     /// `bing/{id}/REST/v1/Imagery/Metadata/{style}`.
     ImageryMetadata { id: u64, style: String },
+    /// `tiles3d/{id}/{path}?session={session}`: a file of a 3D Tiles
+    /// service ion points the asset at.
+    Tiles3d {
+        id: u64,
+        path: String,
+        session: Option<String>,
+    },
 }
 
 /// Why a request is refused before anything goes upstream.
@@ -149,6 +168,28 @@ impl Route {
                     style: (*style).to_owned(),
                 })
             }
+            ["tiles3d", id, rest @ ..] if !rest.is_empty() => {
+                let id = asset(id)?;
+                let path = rest.join("/");
+                if path.len() > LONGEST_TILES3D_PATH || !rest.iter().all(|s| is_plain(s)) {
+                    return Err(Refusal::BadRequest("not a path the proxy passes on"));
+                }
+                let mut session = None;
+                for (key, value) in url::form_urlencoded::parse(query.unwrap_or("").as_bytes()) {
+                    let allowed = key == TILES3D_QUERY
+                        && session.is_none()
+                        && !value.is_empty()
+                        && value.len() <= 512
+                        && value
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+                    if !allowed {
+                        return Err(Refusal::BadRequest("not a query the proxy passes on"));
+                    }
+                    session = Some(value.into_owned());
+                }
+                Ok(Self::Tiles3d { id, path, session })
+            }
             ["assets", id, rest @ ..] if !rest.is_empty() => {
                 let id = asset(id)?;
                 let path = rest.join("/");
@@ -179,7 +220,10 @@ impl Route {
 
     fn asset(&self) -> u64 {
         match self {
-            Self::Endpoint(id) | Self::Asset { id, .. } | Self::ImageryMetadata { id, .. } => *id,
+            Self::Endpoint(id)
+            | Self::Asset { id, .. }
+            | Self::ImageryMetadata { id, .. }
+            | Self::Tiles3d { id, .. } => *id,
         }
     }
 }
@@ -216,6 +260,9 @@ struct Upstream {
     token: String,
     /// The imagery service's API and key, for imagery ion serves through it.
     imagery: Option<(String, String)>,
+    /// The 3D Tiles service's root, key included, for a tileset ion points
+    /// at on another service.
+    tiles3d: Option<Url>,
     fetched: Instant,
 }
 
@@ -250,6 +297,10 @@ impl<H: IonHttp> Catalog<H> {
             Route::Endpoint(id) => self.endpoint(*id, public).await,
             Route::Asset { id, path, query } => self.file(*id, path, query).await,
             Route::ImageryMetadata { id, style } => self.imagery_metadata(*id, style).await,
+            Route::Tiles3d { id, path, session } => {
+                self.tiles3d_file(*id, path, session.as_deref(), public)
+                    .await
+            }
         };
         self.withheld(reply)
     }
@@ -264,6 +315,9 @@ impl<H: IonHttp> Catalog<H> {
                 secrets.push(upstream.token.clone());
                 if let Some((_, key)) = &upstream.imagery {
                     secrets.push(key.clone());
+                }
+                if let Some(root) = &upstream.tiles3d {
+                    secrets.extend(root.query_pairs().map(|(_, v)| v.into_owned()));
                 }
             }
             secrets
@@ -318,18 +372,31 @@ impl<H: IonHttp> Catalog<H> {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         };
-        let imagery = match text("externalType").as_deref() {
-            None => None,
-            Some("BING") => Some((
-                option("url").ok_or_else(|| Reply::refused(502, "no imagery service named"))?,
-                option("key").unwrap_or_default(),
-            )),
+        let (imagery, tiles3d) = match text("externalType").as_deref() {
+            None => (None, None),
+            Some("BING") => (
+                Some((
+                    option("url").ok_or_else(|| Reply::refused(502, "no imagery service named"))?,
+                    option("key").unwrap_or_default(),
+                )),
+                None,
+            ),
+            Some("3DTILES") => (
+                None,
+                Some(
+                    option("url")
+                        .and_then(|u| Url::parse(&u).ok())
+                        .filter(|u| u.scheme() == "https" && !u.path().is_empty())
+                        .ok_or_else(|| Reply::refused(502, "no 3D Tiles service named"))?,
+                ),
+            ),
             Some(_) => return Err(Reply::refused(404, "not an asset the proxy serves")),
         };
         let upstream = Upstream {
             url: text("url").and_then(|u| Url::parse(&u).ok()),
             token: text("accessToken").unwrap_or_default(),
             imagery,
+            tiles3d,
             json,
             fetched: Instant::now(),
         };
@@ -351,7 +418,15 @@ impl<H: IonHttp> Catalog<H> {
             return Reply::refused(502, "the catalog answered something unreadable");
         };
         object.insert("accessToken".to_owned(), Value::String(String::new()));
-        if upstream.imagery.is_some() {
+        if let Some(root) = &upstream.tiles3d {
+            // The service's root, here, with no key.
+            let Ok(here) = public.join(&format!("tiles3d/{id}{}", root.path())) else {
+                return Reply::refused(500, "no public address");
+            };
+            if let Some(options) = object.get_mut("options").and_then(Value::as_object_mut) {
+                options.insert("url".to_owned(), Value::String(here.to_string()));
+            }
+        } else if upstream.imagery.is_some() {
             let Ok(service) = public.join(&format!("bing/{id}")) else {
                 return Reply::refused(500, "no public address");
             };
@@ -421,6 +496,82 @@ impl<H: IonHttp> Catalog<H> {
         Reply::refused(502, "the tile service refused the asset's token")
     }
 
+    /// A file of the 3D Tiles service the asset points at, asked with the
+    /// key ion gave and the session the client carries. The service's root
+    /// is asked fresh — it hands out the session, and one kept would hand
+    /// out an expired one — and a tileset document is answered with its
+    /// references pointing back here.
+    async fn tiles3d_file(
+        &self,
+        id: u64,
+        path: &str,
+        session: Option<&str>,
+        public: &Url,
+    ) -> Reply {
+        let upstream = match self.upstream(id, false).await {
+            Ok(upstream) => upstream,
+            Err(reply) => return reply,
+        };
+        let Some(root) = upstream.tiles3d.as_ref() else {
+            return Reply::refused(404, "the asset is not a 3D Tiles service's");
+        };
+        let mut url = root.clone();
+        url.set_path(&format!("/{path}"));
+        url.set_query(None);
+        {
+            let mut query = url.query_pairs_mut();
+            for (key, value) in root.query_pairs() {
+                query.append_pair(&key, &value);
+            }
+            if let Some(session) = session {
+                query.append_pair(TILES3D_QUERY, session);
+            }
+        }
+        let is_root = url.path() == root.path();
+        // Never logged with its URL: the key is in it.
+        let response = if is_root {
+            self.http.get_fresh(&url, None).await
+        } else {
+            self.http.get(&url, None).await
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => return Reply::refused(502, "the 3D Tiles service could not be reached"),
+        };
+        match response.status {
+            200 => {}
+            404 => return Reply::refused(404, "no such tile"),
+            status => {
+                tracing::warn!(asset = id, status, "the 3D Tiles service refused a file");
+                return Reply::refused(502, "the 3D Tiles service refused the file");
+            }
+        }
+        let body = if path.ends_with(".json") {
+            let Ok(here) = public.join(&format!("tiles3d/{id}/")) else {
+                return Reply::refused(500, "no public address");
+            };
+            match rewritten(&response.body, root, &here) {
+                Some(body) => Bytes::from(body),
+                None => {
+                    return Reply::refused(
+                        502,
+                        "the 3D Tiles service answered something unreadable",
+                    )
+                }
+            }
+        } else {
+            response.body
+        };
+        Reply {
+            status: 200,
+            content_type: content_type(path),
+            // As the service says, and not kept at all when it says nothing:
+            // the root must never be.
+            max_age: if is_root { None } else { response.max_age },
+            body,
+        }
+    }
+
     /// The imagery service's metadata, asked with the key.
     async fn imagery_metadata(&self, id: u64, style: &str) -> Reply {
         let upstream = match self.upstream(id, false).await {
@@ -460,6 +611,58 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// A 3D Tiles document of the service at `root`, its references pointing at
+/// `here` (`…/tiles3d/{id}/`) instead: a reference by absolute path, or by
+/// URL on the service's own origin. Relative references already resolve
+/// here. `None` for a document that is not JSON.
+fn rewritten(body: &[u8], root: &Url, here: &Url) -> Option<Vec<u8>> {
+    fn walk(value: &mut Value, root: &Url, here: &Url) {
+        match value {
+            Value::Object(map) => {
+                for (key, v) in map.iter_mut() {
+                    if matches!(key.as_str(), "uri" | "url") {
+                        if let Value::String(reference) = v {
+                            if let Some(local) = local(reference, root, here) {
+                                *reference = local;
+                            }
+                            continue;
+                        }
+                    }
+                    walk(v, root, here);
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|v| walk(v, root, here)),
+            _ => {}
+        }
+    }
+    fn local(reference: &str, root: &Url, here: &Url) -> Option<String> {
+        let resolved = root.join(reference).ok()?;
+        let absolute_path = reference.starts_with('/') && !reference.starts_with("//");
+        if !absolute_path && Url::parse(reference).is_err() {
+            return None;
+        }
+        if resolved.origin() != root.origin() {
+            return None;
+        }
+        let mut url = here.join(resolved.path().trim_start_matches('/')).ok()?;
+        // The service's key never goes back: only what the reference itself
+        // carried besides it.
+        let keep: Vec<(String, String)> = resolved
+            .query_pairs()
+            .filter(|(k, v)| !root.query_pairs().any(|(rk, rv)| rk == *k && rv == *v))
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        url.set_query(None);
+        if !keep.is_empty() {
+            url.query_pairs_mut().extend_pairs(keep);
+        }
+        Some(url.to_string())
+    }
+    let mut json: Value = serde_json::from_slice(body).ok()?;
+    walk(&mut json, root, here);
+    serde_json::to_vec(&json).ok()
+}
+
 /// The type of a file, by its name.
 fn content_type(path: &str) -> &'static str {
     let extension = path.rsplit_once('.').map_or("", |(_, e)| e);
@@ -470,6 +673,7 @@ fn content_type(path: &str) -> &'static str {
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
         "xml" => "application/xml",
+        "glb" => "model/gltf-binary",
         _ => "application/octet-stream",
     }
 }
@@ -696,6 +900,102 @@ mod tests {
         let again = block(catalog.answer(&route, &public()));
         assert_eq!(again.status, 200);
         assert_eq!(http.calls().len(), 3);
+    }
+
+    /// A 3D Tiles service's key, in its root's URL as ion gives it.
+    const SERVICE_KEY: &str = "service-key-secret-123";
+
+    fn tiles3d_endpoint() -> String {
+        format!(
+            r#"{{"type":"3DTILES","externalType":"3DTILES",
+                "options":{{"url":"https://tiles3d.test/v1/3dtiles/root.json?key={SERVICE_KEY}"}},
+                "attributions":[{{"html":"Cesium ion","collapsible":false}}]}}"#
+        )
+    }
+
+    fn tiles3d_catalog(http: Arc<MockHttp>) -> Catalog<MockHttp> {
+        let mut config = ProxyConfig::new(TOKEN, [2275207]);
+        config.api_base = Url::parse(API).expect("a url");
+        Catalog::new(http, config)
+    }
+
+    /// A 3D Tiles asset on another service: its endpoint points here with
+    /// no key; its root is asked fresh with the key and never kept; its
+    /// references by absolute path point back here, the session kept and
+    /// the key gone; its tiles go through with the key and the session.
+    #[test]
+    fn a_3d_tiles_service_is_proxied_and_its_key_never_leaves() {
+        let http = Arc::new(MockHttp::default());
+        http.push(
+            &format!("{API}v1/assets/2275207/endpoint"),
+            200,
+            &tiles3d_endpoint(),
+        );
+        let root = format!("https://tiles3d.test/v1/3dtiles/root.json?key={SERVICE_KEY}");
+        http.push(
+            &root,
+            200,
+            r#"{"asset":{"version":"1.0"},"geometricError":1e7,
+                "root":{"geometricError":1e6,"boundingVolume":{"box":[0,0,0,1,0,0,0,1,0,0,0,1]},
+                  "children":[{"geometricError":1,"boundingVolume":{"box":[0,0,0,1,0,0,0,1,0,0,0,1]},
+                    "content":{"uri":"/v1/3dtiles/datasets/CgA/files/A1.json?session=S-1_x"}},
+                    {"geometricError":1,"boundingVolume":{"box":[0,0,0,1,0,0,0,1,0,0,0,1]},
+                    "content":{"uri":"https://elsewhere.test/b.glb"}}]}}"#,
+        );
+        let tile =
+            format!("https://tiles3d.test/v1/3dtiles/datasets/CgA/files/B2.glb?key={SERVICE_KEY}&session=S-1_x");
+        http.push(&tile, 200, "glTF");
+        let catalog = tiles3d_catalog(Arc::clone(&http));
+
+        let reply = block(catalog.answer(&Route::Endpoint(2275207), &public()));
+        assert_eq!(reply.status, 200);
+        let json: Value = serde_json::from_slice(&reply.body).expect("json");
+        assert_eq!(
+            json["options"]["url"],
+            "http://192.168.1.20:8091/catalog/tiles3d/2275207/v1/3dtiles/root.json"
+        );
+        assert!(!text(&reply).contains(SERVICE_KEY));
+
+        let route = Route::read("tiles3d/2275207/v1/3dtiles/root.json", None).expect("a route");
+        let reply = block(catalog.answer(&route, &public()));
+        assert_eq!(reply.status, 200, "{}", text(&reply));
+        assert_eq!(reply.max_age, None, "the root is never kept");
+        assert_eq!(http.fresh(), vec![root.clone()], "and asked fresh");
+        let body = text(&reply);
+        assert!(!body.contains(SERVICE_KEY), "{body}");
+        let json: Value = serde_json::from_slice(&reply.body).expect("json");
+        assert_eq!(
+            json["root"]["children"][0]["content"]["uri"],
+            "http://192.168.1.20:8091/catalog/tiles3d/2275207/v1/3dtiles/datasets/CgA/files/A1.json?session=S-1_x"
+        );
+        assert_eq!(
+            json["root"]["children"][1]["content"]["uri"], "https://elsewhere.test/b.glb",
+            "another origin is not the service's"
+        );
+
+        let route = Route::read(
+            "tiles3d/2275207/v1/3dtiles/datasets/CgA/files/B2.glb",
+            Some("session=S-1_x"),
+        )
+        .expect("a route");
+        let reply = block(catalog.answer(&route, &public()));
+        assert_eq!((reply.status, text(&reply).as_str()), (200, "glTF"));
+        assert_eq!(reply.content_type, "model/gltf-binary");
+        let calls = http.calls();
+        assert!(calls.contains(&(tile, None)), "{calls:?}");
+        assert!(
+            calls.iter().skip(1).all(|(_, bearer)| bearer.is_none()),
+            "no ion credential goes to the service"
+        );
+
+        // Nothing but the session is passed on.
+        for query in ["key=x", "session=a&session=b", "session=a b", "other=1"] {
+            assert!(
+                Route::read("tiles3d/2275207/v1/x.glb", Some(query)).is_err(),
+                "{query}"
+            );
+        }
+        assert!(Route::read("tiles3d/2275207/../x.glb", None).is_err());
     }
 
     /// An asset token refused is replaced, and the tile asked for again.
