@@ -20,8 +20,9 @@
 //!   percentiles also report `decide + diff` per step, what a delta step
 //!   costs the host in all, to compare with `decide` told the whole need.
 //!
-//! The simulation runs its budget alone here (`Sim::unchecked`): the frozen
-//! reference the tests run beside it (`tests/reference/`) is left out.
+//! The simulation runs its budget alone here (`Sim::unchecked`): the check
+//! against the recorded reference the tests run (`tests/reference/`) is
+//! left out.
 //!
 //! Criterion gives the means; the percentiles are printed first
 //! (`decide still: mean … p50 … p99 …`), from individually timed calls,
