@@ -56,6 +56,21 @@ pub enum SessionError {
     LoadFailed(ResourceId),
 }
 
+impl SessionError {
+    /// The resource this end of session names, if any.
+    ///
+    /// The match is exhaustive here, where the enum lives: a new variant
+    /// does not compile until it says which resource it names, so a caller
+    /// in another crate (where `#[non_exhaustive]` forces a wildcard arm)
+    /// never silently reports `None` for it.
+    #[must_use]
+    pub fn resource(&self) -> Option<ResourceId> {
+        match self {
+            Self::LoadFailed(r) => Some(*r),
+        }
+    }
+}
+
 /// A disagreement between the ledger and the resource states, found by
 /// [`Budget::audit`](super::Budget::audit).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
