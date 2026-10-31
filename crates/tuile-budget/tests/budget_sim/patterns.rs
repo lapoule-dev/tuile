@@ -724,3 +724,110 @@ fn a_web_resize_and_a_device_pixel_ratio_change() {
     };
     assert_eq!(digests(false), digests(true), "P5.5 on the web");
 }
+
+/// P6.4's constants (spec §12, "a and b are set in Phase 3 and kept"):
+/// provisional until O1.4 lands the incremental `decide` they bound.
+const P64_A: u64 = 16;
+const P64_B: u64 = 256;
+
+/// The tiles whose need entry changed between two steps (P6.4's #ΔN_k):
+/// entered, left, or listed with another membership or need.
+fn need_delta(before: &NeedSet, after: &NeedSet) -> u64 {
+    type Entries = BTreeMap<TileId, Vec<(tuile_budget::Membership, tuile_budget::Need)>>;
+    let entries = |n: &NeedSet| -> Entries {
+        let mut m = Entries::new();
+        for (ms, t, need) in n.entries() {
+            m.entry(t).or_default().push((ms, need.clone()));
+        }
+        m
+    };
+    let (a, b) = (entries(before), entries(after));
+    let tiles: BTreeSet<TileId> = a.keys().chain(b.keys()).copied().collect();
+    tiles.iter().filter(|t| a.get(t) != b.get(t)).count() as u64
+}
+
+/// P6.4, decisions stay fresh (D-A7): `decide`'s work counter — the
+/// `decide_work` signal a `BudgetMeter` publishes — grows with what changed
+/// since the last step, never with the size of the view:
+/// W_k ≤ a · (#ΔN_k + #E_k) · log2(tracked + 2) + b, on every step of a
+/// converged still view (nothing changes: W_k ≤ b) and of the soak's tour.
+///
+/// Red today: `decide` reads the whole need, ranks every want and scans the
+/// tracked entries each step, so W_k is O(need + tracked) even when nothing
+/// changed. O1.4 (dirty sets) turns it green.
+#[test]
+#[ignore = "red until O1.4 (incremental decide): work is O(need) today"]
+fn decide_work_grows_with_changes_not_with_the_view() {
+    use tuile_budget::{BudgetMeter, BudgetObserver, Pressure, StepRecord, Thermal};
+
+    let mut sim = Sim::new(Profile::desktop(), 7);
+    sim.run(5.0, &approach);
+    let mut meter = BudgetMeter::new(sim.budget.config());
+    let mut prev: Option<NeedSet> = None;
+    // (phase, step, W, #ΔN, #E, tracked, bound)
+    let mut over: Vec<(&str, u64, u64, u64, u64, u64, u64)> = Vec::new();
+    let mut steps = 0u64;
+    let mut worst = (0.0f64, 0u64, 0u64);
+    let tour_from = sim.now.plus(Micros::from_secs(25));
+    let end = tour_from.plus(Micros::from_secs(60));
+    while sim.now < end {
+        let (phase, cam) = if sim.now < tour_from {
+            ("still", home())
+        } else {
+            let t = sim.now.since(tour_from).0 as f64 / 1e6;
+            ("tour", super::soak::tour(t))
+        };
+        let (need, d) = sim.step(cam);
+        meter.step(&StepRecord {
+            step: steps,
+            frame: sim.frame,
+            now: sim.now,
+            views_changed: false,
+            eyes: 1,
+            need: &need,
+            events: &[],
+            presence: &[],
+            decisions: &d,
+            ledger: sim.budget.ledger(),
+            pressure: Pressure::Normal,
+            thermal: Thermal::Nominal,
+            decide_wall: None,
+        });
+        let w = u64::from(meter.signals().decide_work);
+        let dn = prev
+            .as_ref()
+            .map_or_else(|| listed(&need).len() as u64, |p| need_delta(p, &need));
+        let e = sim.step_events;
+        let tracked = u64::from(d.stats.tracked);
+        let log = u64::from(64 - (tracked + 2).leading_zeros()); // ⌈log2⌉
+        let bound = P64_A * (dn + e) * log + P64_B;
+        if w > bound {
+            over.push((phase, steps, w, dn, e, tracked, bound));
+        }
+        let ratio = w as f64 / bound as f64;
+        if ratio > worst.0 {
+            worst = (ratio, w, bound);
+        }
+        prev = Some(need);
+        steps += 1;
+    }
+    let still = over.iter().filter(|o| o.0 == "still").count();
+    let first: Vec<String> = over
+        .iter()
+        .take(5)
+        .map(|(ph, k, w, dn, e, tr, b)| {
+            format!("{ph} step {k}: W {w} > {b} (#ΔN {dn}, #E {e}, tracked {tr})")
+        })
+        .collect();
+    assert!(
+        over.is_empty(),
+        "{RED}: W_k over a·(#ΔN+#E)·log2(tracked+2)+b (a {P64_A}, b {P64_B}) on {} of {steps} \
+         steps ({still} of them still, nothing changing); worst W {} against {} ({:.1}×); \
+         first: {}",
+        over.len(),
+        worst.1,
+        worst.2,
+        worst.0,
+        first.join("; ")
+    );
+}
