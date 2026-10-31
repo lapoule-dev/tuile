@@ -805,3 +805,103 @@ fn only_the_protected_set_overflows_under_critical_pressure() {
         }
     }
 }
+
+/// The tiles of the held-ancestry property: every tile of levels 0 to 2,
+/// and eight of level 3.
+fn tree_tiles() -> Vec<TileId> {
+    let mut v = vec![t(0, 0, 0)];
+    for l in 1..=2u32 {
+        let n = 1u64 << l;
+        v.extend((0..n).flat_map(|x| (0..n).map(move |y| t(l, x, y))));
+    }
+    v.extend((0..4u64).flat_map(|x| (0..2u64).map(move |y| t(3, x, y))));
+    v
+}
+
+/// One action on the tree: a step (completing what it asked or not), a
+/// tile's parent link told otherwise, a tile drawn or not.
+#[derive(Clone, Debug)]
+enum TreeOp {
+    Step { complete: bool },
+    Link { tile: u8, kind: u8, other: u8 },
+    Toggle { tile: u8 },
+}
+
+fn tree_op() -> impl Strategy<Value = TreeOp> {
+    prop_oneof![
+        4 => any::<bool>().prop_map(|complete| TreeOp::Step { complete }),
+        2 => (any::<u8>(), 0u8..3, any::<u8>())
+            .prop_map(|(tile, kind, other)| TreeOp::Link { tile, kind, other }),
+        2 => any::<u8>().prop_map(|tile| TreeOp::Toggle { tile }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// O1.4 (`held`): the held set answers which held tiles lie below a
+    /// tile — and the levels each walk passes — as the closure of the
+    /// parent links does, on any tree the need tells: the quadtree's own
+    /// links, links that are not (another tile's, any), none, cycles; while
+    /// tiles land, are drawn and held, and their links change. A debug
+    /// build compares every step with the closure built from scratch, and
+    /// every selection with one read again.
+    #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "the comparison is the debug build's: cargo test -p tuile-budget --test budget_properties"
+    )]
+    fn the_held_set_answers_as_the_closure_of_the_parent_links(
+        start in prop::collection::vec((0u8..3, any::<u8>(), any::<bool>()), 29),
+        ops in prop::collection::vec(tree_op(), 1..60),
+    ) {
+        let tiles = tree_tiles();
+        let n = tiles.len();
+        // Per tile: its link (0 the quadtree's, 1 another tile's, 2 none)
+        // and whether it is drawn (else an ancestor of the view).
+        let mut links: Vec<(u8, u8)> = start.iter().map(|(k, o, _)| (*k, *o)).collect();
+        let mut drawn_now: Vec<bool> = start.iter().map(|(_, _, d)| *d).collect();
+        let need_of = |links: &[(u8, u8)], drawn_now: &[bool]| {
+            let mut ns = NeedSet::default();
+            for (i, &id) in tiles.iter().enumerate() {
+                let (l, ..) = id.terrain_coord();
+                let mut nd = tuile_budget::Need::new(l, Class::TerrainMesh)
+                    .with_rect(rect(id))
+                    .with_sse_excess(1.0)
+                    .with_distance(1_000.0);
+                let p = match links[i].0 {
+                    0 => parent(id),
+                    1 => Some(tiles[usize::from(links[i].1) % n]),
+                    _ => None,
+                };
+                if let Some(p) = p {
+                    nd = nd.with_parent(p);
+                }
+                if drawn_now[i] {
+                    ns.drawn.push((id, nd));
+                } else {
+                    ns.ancestors.push((id, nd));
+                }
+            }
+            ns
+        };
+        let mut r = Rig::interactive();
+        for op in ops {
+            match op {
+                TreeOp::Step { complete } => {
+                    let d = r.step(&need_of(&links, &drawn_now));
+                    if complete {
+                        r.complete(&d);
+                    }
+                }
+                TreeOp::Link { tile, kind, other } => {
+                    links[usize::from(tile) % n] = (kind, other);
+                }
+                TreeOp::Toggle { tile } => {
+                    let i = usize::from(tile) % n;
+                    drawn_now[i] = !drawn_now[i];
+                }
+            }
+        }
+    }
+}

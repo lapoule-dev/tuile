@@ -53,6 +53,7 @@ use std::collections::{BinaryHeap, VecDeque};
 
 use super::decisions::{DrapeChoice, DrawItem, DrawSet, Role};
 use super::engine::{ItemBufs, ItemStats, Reach, TileSelection, Want, DRAPES, MESH, PLACE, WORN};
+use super::held::{morton, Morton};
 use super::need::Membership;
 use super::need_state::{Named, TileNeed};
 use super::priority::Urgency;
@@ -61,7 +62,7 @@ use super::state::{Advance, Change, Mark, Slot};
 use super::stats::{BudgetStats, GAP_BUCKETS};
 use super::tier::PresenceOracle;
 use super::types::{sat_u32, LayerId, Micros, Pressure, ResourceId, TileId};
-use super::{Budget, Policy, RECENT_CAP, THRASH_WINDOW};
+use super::{Budget, Policy, TileInfo, RECENT_CAP, THRASH_WINDOW};
 
 /// A sorted set.
 type Set<K> = SortedMap<K, ()>;
@@ -284,8 +285,11 @@ pub(super) struct Downstream {
     wakes: BinaryHeap<Reverse<(Micros, ResourceId)>>,
     inflight: Set<ResourceId>,
     sums: Sums,
-    /// (ancestor, held tile) → the lowest level passed on the way.
-    ancestry: SortedMap<(TileId, TileId), u32>,
+    /// The held set, as the held ancestry reads it (`held`): the held tiles
+    /// whose walk is geometric, in Morton order, with the level each walk
+    /// reaches; the others.
+    held_regular: SortedMap<Morton, (TileId, u8)>,
+    held_irregular: Set<TileId>,
     ancestry_ready: bool,
     /// How far the arena's changes were read.
     seen: usize,
@@ -375,6 +379,7 @@ struct StepLists {
     old_wants: Vec<(ResourceId, Want)>,
     drapes: Vec<(LayerId, u32)>,
     chain: Vec<(TileId, u32)>,
+    chain_now: Vec<(TileId, u32)>,
     worn: Vec<(ResourceId, i32)>,
     tiles: Vec<TileId>,
     capped: Vec<(ResourceId, TileId, Role)>,
@@ -397,7 +402,6 @@ struct StepLists {
     c_wait: Changes<ResourceId, Micros>,
     c_kept: Changes<Slot, Micros>,
     c_set3: Changes<ResourceId, ()>,
-    c_ancestry: Changes<(TileId, TileId), u32>,
     refresh: Vec<(ResourceId, Want)>,
     gone: Vec<(TileId, LayerId)>,
     done: Vec<ResourceId>,
@@ -701,12 +705,14 @@ impl Downstream {
         }
     }
 
-    /// The held tiles a walk from which reaches `of`, with the lowest level
-    /// each passed before it, in tile order.
-    pub fn held_pairs(&self, of: TileId) -> impl Iterator<Item = (TileId, u32)> + '_ {
-        self.ancestry
-            .range((of, TileId(0))..=(of, TileId(u64::MAX)))
-            .map(|((_, h), p)| (*h, *p))
+    /// The geometric held tiles, by Morton key (`held`).
+    pub fn held_regular(&self) -> &SortedMap<Morton, (TileId, u8)> {
+        &self.held_regular
+    }
+
+    /// The other held tiles (`held`).
+    pub fn held_irregular(&self) -> &Set<TileId> {
+        &self.held_irregular
     }
 
     /// The work the step ranks.
@@ -1569,111 +1575,94 @@ impl Budget {
     }
 
     /// The held ancestry follows the tree positions the need changed: the
-    /// held tiles whose walk passed a named tile, or are named, walk again;
-    /// the tiles whose pairs changed, into `l.pairs`. Rebuilt whole from the
-    /// held set when it is not kept.
+    /// held tiles whose walk passed a named tile, or are named, walk again
+    /// (as the positions were, as they are); the tiles their walks reach
+    /// differently, into `l.pairs`. Read whole from the held set when it is
+    /// not kept.
     fn ancestry_follow(&mut self, named: &[Named], full: bool, l: &mut StepLists) {
         if full || !self.down.ancestry_ready {
-            let mut a = std::mem::take(&mut self.down.ancestry);
-            let v = a.values_mut();
-            v.clear();
-            for (h, _) in self.held_last.iter() {
-                Self::chain_of(*h, |t| self.tiles.get(&t).copied(), &mut l.chain);
-                self.walk(1 + l.chain.len());
-                v.extend(l.chain.iter().map(|&(p, passed)| ((p, *h), passed)));
-            }
-            v.sort_unstable_by_key(|e| e.0);
-            self.down.ancestry = a;
-            self.down.ancestry_ready = true;
+            self.held_rebuild();
             return;
         }
         if named.is_empty() {
-            return;
-        }
-        l.held.clear();
-        for &Named { tile: x, .. } in named {
-            if self.held_last.contains_key(&x) {
-                add(&mut l.held, [x]);
-            }
-            add(&mut l.held, self.down.held_pairs(x).map(|(h, _)| h));
-        }
-        l.held.sort_unstable();
-        l.held.dedup();
-        if 4 * l.held.len() > self.held_last.len() {
-            // Most held tiles walk again: the ancestry rebuilt whole, every
-            // tile above a held one, before or after, read again.
-            let mut a = std::mem::take(&mut self.down.ancestry);
-            add(&mut l.pairs, a.keys().map(|k| k.0));
-            let v = a.values_mut();
-            v.clear();
-            for (h, _) in self.held_last.iter() {
-                Self::chain_of(*h, |t| self.tiles.get(&t).copied(), &mut l.chain);
-                self.walk(1 + l.chain.len());
-                v.extend(l.chain.iter().map(|&(p, passed)| ((p, *h), passed)));
-            }
-            v.sort_unstable_by_key(|e| e.0);
-            add(&mut l.pairs, a.keys().map(|k| k.0));
-            self.down.ancestry = a;
             return;
         }
         let before = |t: TileId| match named.binary_search_by_key(&t, |x| x.tile) {
             Ok(i) => named[i].before(),
             Err(_) => self.tiles.get(&t).copied(),
         };
-        for &h in &l.held {
-            Self::chain_of(h, before, &mut l.chain);
-            self.walk(1 + l.chain.len());
-            l.c_ancestry
-                .extend(l.chain.iter().map(|&(p, _)| ((p, h), None)));
+        l.held.clear();
+        for &Named { tile: x, .. } in named {
+            if self.held_last.contains_key(&x) {
+                l.held.push(x);
+            }
+            l.held.extend(self.held_under(x, before).map(|(h, _)| h));
         }
+        l.held.sort_unstable();
+        l.held.dedup();
         for i in 0..l.held.len() {
             let h = l.held[i];
-            Self::chain_of(h, |t| self.tiles.get(&t).copied(), &mut l.chain);
-            self.walk(1 + l.chain.len());
-            l.c_ancestry
-                .extend(l.chain.iter().map(|&(p, passed)| ((p, h), Some(passed))));
-        }
-        self.apply_ancestry(l, true);
-    }
-
-    /// The ancestry's batch applied; the tiles whose pairs it changes, into
-    /// `l.pairs` (`now`) or read again next step.
-    fn apply_ancestry(&mut self, l: &mut StepLists, now: bool) {
-        let c = &mut l.c_ancestry;
-        if c.is_empty() {
-            return;
-        }
-        // The last change of each key, against the kept value.
-        c.sort_by_key(|e| e.0);
-        let d = &mut self.down;
-        for i in 0..c.len() {
-            if i + 1 < c.len() && c[i + 1].0 == c[i].0 {
-                continue;
-            }
-            let (k, v) = (c[i].0, c[i].1);
-            if d.ancestry.get(&k).copied() != v {
-                if now {
-                    l.pairs.push(k.0);
-                } else {
-                    d.next_pairs(k.0);
+            Self::chain_of(h, before, &mut l.chain);
+            Self::chain_of(h, |t| self.tiles.get(&t).copied(), &mut l.chain_now);
+            self.walk(2 + l.chain.len() + l.chain_now.len());
+            // A tile whose pair with `h` came, went or changed.
+            for &(p, passed) in &l.chain {
+                if !l.chain_now.contains(&(p, passed)) {
+                    l.pairs.push(p);
                 }
             }
+            for &(p, passed) in &l.chain_now {
+                if !l.chain.contains(&(p, passed)) {
+                    l.pairs.push(p);
+                }
+            }
+            let was = self.held_key(h, before);
+            let now = self.held_key(h, |t| self.tiles.get(&t).copied());
+            self.down.held_put(h, was, false);
+            self.down.held_put(h, now, true);
         }
-        d.ancestry.apply(c, |_| {});
     }
 
-    /// A held tile `h` joins (`on`) or leaves the ancestry, in the batch.
+    /// The held set read whole: each held tile filed by its walk.
+    fn held_rebuild(&mut self) {
+        let d = &mut self.down;
+        d.held_regular.clear();
+        d.held_irregular.clear();
+        self.walk(self.held_last.len());
+        let held = std::mem::take(&mut self.held_last);
+        for (h, _) in held.iter() {
+            let k = self.held_key(*h, |t| self.tiles.get(&t).copied());
+            self.down.held_put(*h, k, true);
+        }
+        self.held_last = held;
+        self.down.ancestry_ready = true;
+    }
+
+    /// Where `h` is filed in the held set, by its walk as `info` tells it:
+    /// geometric, by its Morton key with the level its walk reaches; else
+    /// (`None`) with the others.
+    fn held_key(
+        &self,
+        h: TileId,
+        info: impl Fn(TileId) -> Option<TileInfo>,
+    ) -> Option<(Morton, u8)> {
+        let k = morton(h)?;
+        self.geometric_walk(h, info).map(|top| (k, top))
+    }
+
+    /// A held tile `h` joins (`on`) or leaves the held set: the tiles its
+    /// walk reaches read the held tiles below them again next step.
     fn ancestry_held(&mut self, h: TileId, on: bool, l: &mut StepLists) {
         if !self.down.ancestry_ready {
             return;
         }
         Self::chain_of(h, |t| self.tiles.get(&t).copied(), &mut l.chain);
         self.walk(1 + l.chain.len());
-        l.c_ancestry.extend(
-            l.chain
-                .iter()
-                .map(|&(p, passed)| ((p, h), on.then_some(passed))),
-        );
+        for &(p, _) in &l.chain {
+            self.down.next_pairs(p);
+        }
+        let k = self.held_key(h, |t| self.tiles.get(&t).copied());
+        self.down.held_put(h, k, on);
     }
 
     // The prune's support (see `Support`).
@@ -2227,16 +2216,6 @@ impl Budget {
         let changes = std::mem::take(&mut self.down.held_changes);
         let mut l = std::mem::take(&mut self.down.step);
         l.held.clear();
-        // Many held tiles come or go: the ancestry is rebuilt at its end,
-        // rather than changed tile by tile.
-        let rebuild = self.down.ancestry_ready && 4 * changes.len() > self.held_last.len();
-        if rebuild {
-            add(
-                &mut self.down.next_sels,
-                self.down.ancestry.keys().map(|k| k.0),
-            );
-            self.down.ancestry_ready = false;
-        }
         for &(t, on) in &changes {
             let before = self.support_of(t, tiles, &[]);
             let changed = if on {
@@ -2255,21 +2234,6 @@ impl Budget {
             if self.down.support.ready {
                 self.support_moved(t, before, tiles, &[]);
             }
-        }
-        self.apply_ancestry(&mut l, false);
-        if rebuild {
-            let mut a = std::mem::take(&mut self.down.ancestry);
-            let v = a.values_mut();
-            v.clear();
-            for (h, _) in self.held_last.iter() {
-                Self::chain_of(*h, |t| self.tiles.get(&t).copied(), &mut l.chain);
-                self.walk(1 + l.chain.len());
-                v.extend(l.chain.iter().map(|&(p, passed)| ((p, *h), passed)));
-            }
-            v.sort_unstable_by_key(|e| e.0);
-            add(&mut self.down.next_sels, a.keys().map(|k| k.0));
-            self.down.ancestry = a;
-            self.down.ancestry_ready = true;
         }
         self.down.held_changes = changes;
         self.down.held_changes.clear();
@@ -2553,6 +2517,25 @@ impl Budget {
 }
 
 impl Downstream {
+    /// `h` filed at `key` (`on`), or taken out of it.
+    fn held_put(&mut self, h: TileId, key: Option<(Morton, u8)>, on: bool) {
+        let d = self;
+        match (key.map(|k| (k.0, (h, k.1))), on) {
+            (Some((k, v)), true) => {
+                d.held_regular.insert(k, v);
+            }
+            (Some((k, _)), false) => {
+                d.held_regular.remove(&k);
+            }
+            (None, true) => {
+                d.held_irregular.insert(h, ());
+            }
+            (None, false) => {
+                d.held_irregular.remove(&h);
+            }
+        }
+    }
+
     /// The tiles above held tiles whose pairs changed at the step's end:
     /// their selections read the held tiles below them again next step.
     fn next_pairs(&mut self, p: TileId) {
@@ -2564,21 +2547,44 @@ impl Downstream {
 // what the step kept. A dependant the rules leave out shows here.
 #[cfg(debug_assertions)]
 impl Budget {
-    /// The held ancestry against a rebuild from the held set.
+    /// The held ancestry against the closure built from the held set: the
+    /// held set filed by each walk, and for every tile a walk reaches, the
+    /// held tiles below it and the levels passed, as the closure has them.
     fn check_ancestry(&self) {
         if !self.down.ancestry_ready {
             return;
         }
-        let mut want = Vec::new();
+        let info = |t: TileId| self.tiles.get(&t).copied();
+        let mut closure = Vec::new();
         let mut chain = Vec::new();
         for (h, _) in self.held_last.iter() {
-            Self::chain_of(*h, |t| self.tiles.get(&t).copied(), &mut chain);
-            want.extend(chain.iter().map(|&(p, passed)| ((p, *h), passed)));
+            Self::chain_of(*h, info, &mut chain);
+            closure.extend(chain.iter().map(|&(p, passed)| (p, *h, passed)));
+            match self.held_key(*h, info) {
+                Some((k, top)) => assert_eq!(
+                    self.down.held_regular.get(&k),
+                    Some(&(*h, top)),
+                    "{h:?} filed geometric"
+                ),
+                None => assert!(
+                    self.down.held_irregular.contains_key(h),
+                    "{h:?} filed apart"
+                ),
+            }
         }
-        want.sort_unstable_by_key(|e| e.0);
-        let kept: Vec<((TileId, TileId), u32)> =
-            self.down.ancestry.iter().map(|(k, v)| (*k, *v)).collect();
-        assert_eq!(kept, want, "the held ancestry is the held set's");
+        assert_eq!(
+            self.down.held_regular.len() + self.down.held_irregular.len(),
+            self.held_last.len(),
+            "the held set filed, each once"
+        );
+        closure.sort_unstable();
+        for run in closure.chunk_by(|a, b| a.0 == b.0) {
+            let of = run[0].0;
+            let mut found: Vec<(TileId, TileId, u32)> =
+                self.held_under(of, info).map(|(h, p)| (of, h, p)).collect();
+            found.sort_unstable();
+            assert_eq!(found, run, "the held tiles below {of:?}");
+        }
     }
 
     /// The support's counts against the prune's walk.

@@ -843,13 +843,11 @@ impl Budget {
         }
     }
 
-    /// The held tiles below `of`, in tile order.
+    /// The held tiles below `of`, in no particular order (`held`).
     fn held_below(&self, of: TileId) -> impl Iterator<Item = TileId> + '_ {
         let target = self.tiles.get(&of).map(|i| i.level);
-        self.down
-            .held_pairs(of)
+        self.held_under(of, |t| self.tiles.get(&t).copied())
             .filter(move |(_, passed)| target.is_none_or(|l| *passed > l))
-            .inspect(|_| self.walk(1))
             .map(|(h, _)| h)
     }
 
