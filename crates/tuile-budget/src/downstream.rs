@@ -3198,6 +3198,78 @@ mod tests {
         assert_eq!(b.audit(), Ok(()));
     }
 
+    /// A kept slot loading again when the cap looks — its want came back
+    /// (a load started), then went (`unneeded_since` set) before the prune
+    /// — holds something: the cap skips it, the cancel's grace is what ends
+    /// it. The cap of unneeded slots kept by one prune, a third of them
+    /// loading again since; then as many more unneeded slots and a prune
+    /// over the cap: the cap lets go only the oldest empty ones, every
+    /// loading one stays tracked with its load. Red before the skip: the cap
+    /// freed a loading slot (the arena's "a slot is freed holding nothing"
+    /// assertion).
+    #[test]
+    fn the_cap_skips_a_kept_slot_loading_again() {
+        use crate::state::Load;
+        use crate::tier::Source;
+        let mut b = Budget::new(BudgetConfig::interactive(Bytes::mib(64))).unwrap();
+        let now = Micros::from_secs(100);
+        b.arena.advance(now, &[]);
+        let n = BACKOFF_KEEP_MAX;
+        let tiles = SortedMap::default();
+        let (t, r) = (SortedMap::default(), SortedMap::default());
+        let wants = Wants {
+            tiles: &t,
+            refresh: &r,
+        };
+        // Unneeded since one millisecond per slot ago: the lowest ids
+        // longest.
+        let mut make = |b: &mut Budget, i: usize| {
+            let r = ResourceId::Mesh(TileId(i as u64));
+            let s = b.arena.find_or_insert(r, Class::TerrainMesh, 3, now);
+            let cold = b.arena.cold_mut(s);
+            cold.failures = 1;
+            cold.retry_at = now.plus(Micros::from_secs(60));
+            cold.set_unneeded_since(Some(Micros(now.0 - 1_000 * (2 * n - i) as u64)));
+            (r, s)
+        };
+        let first: Vec<(ResourceId, Slot)> = (0..n).map(|i| make(&mut b, i)).collect();
+        b.steps = 8;
+        b.prune_tracked(now, &tiles, wants);
+        assert_eq!(b.arena.len(), n, "within the cap: every slot kept");
+        // Every third kept slot loads again; as many new unneeded slots.
+        let mut loading = Vec::new();
+        for (i, &(r, s)) in first.iter().enumerate() {
+            if i % 3 == 0 {
+                b.arena.set_load(
+                    s,
+                    Load::Loading {
+                        gen: crate::Generation(1 + i as u64),
+                        source: Source::Network,
+                        started: now,
+                        epoch: 0,
+                    },
+                );
+                b.in_flight[Class::TerrainMesh] += 1;
+                loading.push(r);
+            }
+        }
+        for i in n..2 * n {
+            make(&mut b, i);
+        }
+        let later = now.plus(Micros::from_millis(100));
+        b.prune_tracked(later, &tiles, wants);
+        for r in &loading {
+            let s = b.arena.find(*r).expect("a loading slot is never let go");
+            assert!(b.arena.loading(s));
+        }
+        // The empty unneeded ones are within the cap (the oldest went); the
+        // loading ones stay beyond it.
+        let empty = b.arena.iter().filter(|&s| b.arena.is_empty(s)).count();
+        assert_eq!(empty, n, "the cap holds over the empty slots");
+        assert_eq!(b.arena.len(), n + loading.len());
+        assert_eq!(b.audit(), Ok(()));
+    }
+
     /// The cap's choice does not read a slot's number. A whole place
     /// leaves on one step, so the slots it kept tie on the time their want
     /// went; the tie is broken by the resource, the crate's final tie-break.
