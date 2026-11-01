@@ -525,14 +525,23 @@ fn a_network_outage_leaves_the_tracked_state_bounded_and_recovers() {
     let mut sim = Sim::new(Profile::desktop(), 21);
     let (from, to) = (Micros::from_secs(5), Micros::from_secs(35));
     sim.net.outage = Some((from, to));
+    let end = Micros::from_secs(80);
     let mut report = Micros::from_secs(5);
     let (mut tracked_max, mut kept_max, mut failed) = (0usize, 0usize, 0u64);
-    while sim.now < to {
+    let mut back = None;
+    while sim.now < end {
         let t = sim.now.0 as f64 / 1e6;
-        let (_, d) = sim.step(jumps(t));
+        if sim.now >= to && back.is_none() {
+            back = Some(sim.now);
+        }
+        let (need, d) = sim.step(jumps(t));
         failed += u64::from(d.stats.failed);
         tracked_max = tracked_max.max(sim.budget.tracked());
-        // The prune runs every eighth step: its cap holds right after one.
+        // The prune runs every eighth step: right after one, the cap holds
+        // and every tracked resource is accounted for — wanted (a tile's
+        // mesh and its drape at most), holding a copy, loading or in
+        // transit, or kept for its failures within the cap — through the
+        // outage and the recovery alike.
         if sim.budget.steps.is_multiple_of(8) {
             let kept = kept_for_their_failures(&sim);
             kept_max = kept_max.max(kept);
@@ -540,6 +549,22 @@ fn a_network_outage_leaves_the_tracked_state_bounded_and_recovers() {
                 kept <= BACKOFF_KEEP_MAX,
                 "{RED}: {kept} slots kept for their failures alone at t = {t:.1} s, \
                  the cap {BACKOFF_KEEP_MAX}"
+            );
+            let wanted = 2 * super::patterns::listed(&need).len();
+            let held = sim.gpu.drawable.len() + sim.gpu.pending.len();
+            let loading = d
+                .stats
+                .in_flight
+                .iter()
+                .map(|(_, n)| n as usize)
+                .sum::<usize>()
+                + d.stats.local_reads as usize;
+            let bound = wanted + held + loading + BACKOFF_KEEP_MAX;
+            assert!(
+                sim.budget.tracked() <= bound,
+                "{RED}: I7: {} tracked at t = {t:.1} s, bound {bound} ({wanted} wanted, {held} \
+                 held, {loading} loading, {BACKOFF_KEEP_MAX} kept at most)",
+                sim.budget.tracked()
             );
         }
         if sim.now >= report {
@@ -553,8 +578,7 @@ fn a_network_outage_leaves_the_tracked_state_bounded_and_recovers() {
             report = report.plus(Micros::from_secs(5));
         }
     }
-    let back = sim.now;
-    sim.run(45.0, &|_| jumps(45.0));
+    let back = back.expect("the network came back");
     let took = sim.converged_after(back).expect(RED);
     eprintln!(
         "outage: tracked at most {tracked_max}, kept for their failures at most {kept_max} \

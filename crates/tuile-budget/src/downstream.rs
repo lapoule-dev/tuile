@@ -406,9 +406,9 @@ struct StepLists {
     c_set: Changes<ResourceId, ()>,
     c_wait: Changes<ResourceId, Micros>,
     c_kept: Changes<Slot, Micros>,
-    /// The kept slots whose want went, with the time it went, while the
-    /// kept slots are over their cap.
-    unneeded_kept: Vec<(Micros, Slot)>,
+    /// The kept slots whose want went, with the time it went and their
+    /// resource, while the kept slots are over their cap.
+    unneeded_kept: Vec<(Micros, ResourceId, Slot)>,
     c_set3: Changes<ResourceId, ()>,
     refresh: Vec<(ResourceId, Want)>,
     gone: Vec<(TileId, LayerId)>,
@@ -2437,26 +2437,31 @@ impl Budget {
         // their failure history with them. The wanted ones are the view's,
         // counted with the need, never let go for the cap. The kept slots
         // are walked only when they outnumber the cap together, wanted ones
-        // included (a step buffer, nothing kept across steps for it): what
-        // the cap is for happens rarely, and the walk is bounded by the
-        // need, the cap and what a prune adds.
+        // included, into a step buffer (its room persists across steps, as
+        // every step list's does; no index is kept for it): what the cap is
+        // for happens rarely, and the walk is bounded by the need, the cap
+        // and what a prune adds.
         if self.down.kept_empty.len() > BACKOFF_KEEP_MAX {
             let mut unneeded = std::mem::take(&mut self.down.step.unneeded_kept);
             unneeded.clear();
+            unneeded.reserve(self.down.kept_empty.len());
             let a = &self.arena;
-            unneeded.extend(
-                self.down
-                    .kept_empty
-                    .iter()
-                    .filter_map(|(s, _)| a.cold(*s).unneeded_since().map(|u| (u, *s))),
-            );
+            // Keyed by the time the want went, then the resource — the
+            // crate's final tie-break — never the slot: a whole place leaves
+            // on one step, so ties are the normal case, and slot numbers
+            // follow the free list and the compactions, which no decision
+            // may read.
+            unneeded.extend(self.down.kept_empty.iter().filter_map(|(s, _)| {
+                debug_assert!(a.is_empty(*s), "a kept slot holds nothing");
+                a.cold(*s).unneeded_since().map(|u| (u, a.id(*s), *s))
+            }));
             visited = visited.saturating_add(sat_u32(self.down.kept_empty.len()));
             let n = unneeded.len().saturating_sub(BACKOFF_KEEP_MAX);
             if n > 0 {
-                // The `n` oldest, in any order: (time, slot) pairs are
+                // The `n` oldest, in any order: (time, resource) pairs are
                 // distinct, so the set chosen is the same whatever the order.
-                unneeded.select_nth_unstable(n - 1);
-                for &(_, s) in &unneeded[..n] {
+                unneeded.select_nth_unstable_by_key(n - 1, |x| (x.0, x.1));
+                for &(_, _, s) in &unneeded[..n] {
                     let t = self.arena.id(s).tile();
                     self.arena.remove(s);
                     self.tile_slot(t, false, tiles);
@@ -3187,5 +3192,88 @@ mod tests {
         b.prune_tracked(now.plus(Micros::from_millis(100)), &tiles, wants);
         assert_eq!(b.arena.len(), BACKOFF_KEEP_MAX);
         assert_eq!(b.audit(), Ok(()));
+    }
+
+    /// The cap's choice does not read a slot's number. A whole place
+    /// leaves on one step, so the slots it kept tie on the time their want
+    /// went; the tie is broken by the resource, the crate's final tie-break.
+    /// The same failures, unneeded since the same time, go through one
+    /// prune in three arenas whose slot numbers differ — a fresh one (slots
+    /// in insertion order), one that churned first (a freed slot is the
+    /// next taken, last freed first: the numbers come out reversed), one
+    /// compacted first (renumbered) — and the resources kept are the same
+    /// set. Keyed by slot, the churned arena kept the other half.
+    #[test]
+    fn the_cap_keeps_the_same_resources_whatever_the_slot_numbers() {
+        let now = Micros::from_secs(100);
+        let n = 2 * BACKOFF_KEEP_MAX;
+        let kept_after = |prepare: &dyn Fn(&mut Budget)| -> Vec<ResourceId> {
+            let mut b = Budget::new(BudgetConfig::interactive(Bytes::mib(64))).unwrap();
+            b.arena.advance(now, &[]);
+            prepare(&mut b);
+            // Three places of a third of the resources each, left at three
+            // times: within a place every slot ties, and the cap falls
+            // inside the second place, so the tie decides.
+            for i in 0..n {
+                let r = ResourceId::Mesh(TileId(i as u64));
+                let s = b.arena.find_or_insert(r, Class::TerrainMesh, 3, now);
+                let cold = b.arena.cold_mut(s);
+                cold.failures = 1;
+                cold.retry_at = now.plus(Micros::from_secs(60));
+                let place = (3 * i / n) as u64;
+                cold.set_unneeded_since(Some(Micros(now.0 - 1_000 * (3 - place))));
+            }
+            let tiles = SortedMap::default();
+            let (t, r) = (SortedMap::default(), SortedMap::default());
+            let wants = Wants {
+                tiles: &t,
+                refresh: &r,
+            };
+            b.steps = 8;
+            b.prune_tracked(now, &tiles, wants);
+            assert_eq!(b.arena.len(), BACKOFF_KEEP_MAX, "the cap holds");
+            assert_eq!(b.audit(), Ok(()));
+            let mut kept: Vec<ResourceId> = b.arena.iter().map(|s| b.arena.id(s)).collect();
+            kept.sort_unstable();
+            kept
+        };
+        let fresh = kept_after(&|_| {});
+        let churned = kept_after(&|b: &mut Budget| {
+            // `n` slots taken and freed: the free list hands them out last
+            // freed first, so the resources' slots come out reversed.
+            let dummies: Vec<Slot> = (0..n)
+                .map(|i| {
+                    let r = ResourceId::Mesh(TileId(1 << 40 | i as u64));
+                    b.arena.find_or_insert(r, Class::TerrainMesh, 3, now)
+                })
+                .collect();
+            for s in dummies {
+                b.arena.remove(s);
+            }
+        });
+        let compacted = kept_after(&|b: &mut Budget| {
+            let dummies: Vec<Slot> = (0..n)
+                .map(|i| {
+                    let r = ResourceId::Mesh(TileId(1 << 40 | i as u64));
+                    b.arena.find_or_insert(r, Class::TerrainMesh, 3, now)
+                })
+                .collect();
+            for s in dummies.iter().skip(1) {
+                b.arena.remove(*s);
+            }
+            let mut map = Vec::new();
+            b.arena.compact(&mut map);
+        });
+        // The place left longest went whole, the second one up to the cap —
+        // its lowest resources first — the most recent stays whole.
+        let want: Vec<ResourceId> = (n / 2..n)
+            .map(|i| ResourceId::Mesh(TileId(i as u64)))
+            .collect();
+        assert_eq!(fresh, want, "a fresh arena keeps the places left last");
+        assert_eq!(churned, fresh, "a churned arena keeps the same resources");
+        assert_eq!(
+            compacted, fresh,
+            "a compacted arena keeps the same resources"
+        );
     }
 }

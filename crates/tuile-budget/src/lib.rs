@@ -154,17 +154,28 @@ const THRASH_WINDOW: Micros = Micros::from_secs(10);
 /// it, the ones the view left longest are forgotten first: a want that
 /// comes back retries at once. What one costs the budget is its metadata
 /// alone — its slot in the arena's columns, its entry in the arena's index,
-/// in the prune's kept map and in its queue, [`BACKOFF_KEPT_BYTES`] —
-/// and the cap holds the lot under 128 KiB, whatever the network does. The
-/// resources the view still wants are its own: counted with the need, not
-/// here.
+/// in the prune's kept map and in its queue, and the entry of its tile's
+/// place, which it keeps alive, [`BACKOFF_KEPT_BYTES`] — and the cap holds
+/// those under 128 KiB, whatever the network does. Left out, bounded
+/// multiples of the same count: the index's spare room (hashbrown keeps its
+/// table under 7/8 full, at a power of two: up to twice its entries'
+/// bytes) and the queue's stale entries (at most twice the live ones, plus
+/// 64). The resources the view still wants are its own: counted with the
+/// need, not here.
 pub const BACKOFF_KEEP_MAX: usize = (128 << 10) / BACKOFF_KEPT_BYTES;
 
 /// What one resource kept backing off costs: its slot across the arena's
 /// columns, its index entry (a slot and a control byte, hashbrown's), the
-/// kept map's entry (slot and time) and its entry in the queue by due time
-/// (time and slot).
-pub const BACKOFF_KEPT_BYTES: usize = state::SLOT_BYTES + 5 + 12 + 16;
+/// kept map's entry (slot and time), its entry in the queue by due time
+/// (time and slot), and its tile's place ([`TileInfo`] and its key in the
+/// tiles' map), kept as long as a resource of the tile is tracked — at
+/// worst one tile per kept resource.
+pub const BACKOFF_KEPT_BYTES: usize = state::SLOT_BYTES
+    + 5
+    + 12
+    + 16
+    + std::mem::size_of::<TileInfo>()
+    + std::mem::size_of::<TileId>();
 
 /// What the budget knows of a tile's place in its tree: its parent, level
 /// and footprint, packed (48 bytes, not 64: the budget keeps one per tile
