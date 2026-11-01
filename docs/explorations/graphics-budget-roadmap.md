@@ -332,6 +332,14 @@ held-set and block commits, whose decisions are digest-identical — convergence
 the page's timings are not re-measured): patterns kept 6/8/10 on `main` against 10/9/10, no hole or black patch
 on either; the one O1.4 violation is WebGL2 yaw converging in 22.1 s against 20 s.
 
+**Arena capacity returned** (stacked on #175). The arena's columns and index grew to the session's high-water
+mark. Now, when the tracked resources stay under a quarter of the room for eight prunes (64 steps), the arena
+renumbers its live slots in order and cuts its columns to twice what they use; every set keyed by slot follows.
+Decisions and the whole state are unchanged (digests, goldens; on a flight that compacts, 4 800 steps of
+decisions and snapshots identical). After a flight that grows the tracked set to 4 889 and falls back to 995, the
+budget holds 870 B per tracked resource instead of 1 664 (new ratchet). The soak, the tour, the pressure scenario
+and P6.4's run never compact.
+
 Not in O1.4, listed for O1.5: the ranking re-keys every job each step (a job's score ages with time); the host's
 diff clones every changed tile's `Need` (about 640 heap blocks a step on the tour); the whole-need resync pays a
 lookup per tile in the blocks (still-full +21 % on x86, a cursor merge would bring it back).
