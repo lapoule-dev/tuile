@@ -3,7 +3,7 @@
 
 //! The scenarios of spec §8.
 
-use tuile_budget::{Bytes, Class, Micros, Pressure, Thermal};
+use tuile_budget::{Bytes, Class, Micros, Pressure, Thermal, BACKOFF_KEEP_MAX};
 
 use super::detmath;
 use super::net::NetProfile;
@@ -467,6 +467,106 @@ fn a_lossy_stalling_network_never_blocks_the_view() {
     let stop = settle(&mut sim, 30.0);
     let took = sim.converged_after(stop).expect(RED);
     assert!(took <= Micros::from_secs(20), "{took:?}");
+}
+
+/// The tracked resources holding nothing — no copy, nothing in transit, no
+/// load — whose want went: the slots the prune keeps for their failure
+/// history alone.
+fn kept_for_their_failures(sim: &Sim) -> usize {
+    sim.budget
+        .snapshot()
+        .resources
+        .iter()
+        .filter(|r| {
+            r.gpu.is_none()
+                && r.cpu.is_none()
+                && r.transit.is_none()
+                && r.load.is_none()
+                && r.unneeded_since.is_some()
+        })
+        .count()
+}
+
+/// The camera of the outage scenario: the approach, then a jump to a new
+/// place every two seconds, 94 km away, at the home view's height (a search
+/// box's "go to": each one reveals ground the last place did not share, and
+/// the loads of the place left have failed three or four times by then);
+/// from 35 s the camera stays at the fifteenth place.
+fn jumps(t: f64) -> Camera {
+    if t < 5.0 {
+        approach(t)
+    } else {
+        let k = ((t - 5.0) / 2.0).floor().min(14.0);
+        Camera {
+            x: (0.15 + 0.045 * k) * SIDE,
+            ..home()
+        }
+    }
+}
+
+/// I7, D1: a network outage. Every network load fails at once for half a
+/// minute (a refused connection) while the view jumps from place to place
+/// (nothing arriving, so each place wants its coarse tiles and fails them
+/// over and over), then the network is back and the camera stays at the
+/// last place, whose tiles then load through their backoffs. Every wanted resource fails and backs off,
+/// and the view leaves them behind: the budget keeps their failure history
+/// for a while (so a server that is down is not hammered the moment a tile
+/// comes back into view), but not without bound — the slots kept for
+/// resources the view left are capped by count, and so by the bytes of
+/// their metadata (`BACKOFF_KEEP_MAX`), the ones left longest let go first;
+/// the wanted ones are the view's own. Once the network is back the view
+/// converges, the backoffs of the wanted resources (30 s at most) included.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
+fn a_network_outage_leaves_the_tracked_state_bounded_and_recovers() {
+    let mut sim = Sim::new(Profile::desktop(), 21);
+    let (from, to) = (Micros::from_secs(5), Micros::from_secs(35));
+    sim.net.outage = Some((from, to));
+    let mut report = Micros::from_secs(5);
+    let (mut tracked_max, mut kept_max, mut failed) = (0usize, 0usize, 0u64);
+    while sim.now < to {
+        let t = sim.now.0 as f64 / 1e6;
+        let (_, d) = sim.step(jumps(t));
+        failed += u64::from(d.stats.failed);
+        tracked_max = tracked_max.max(sim.budget.tracked());
+        // The prune runs every eighth step: its cap holds right after one.
+        if sim.budget.steps.is_multiple_of(8) {
+            let kept = kept_for_their_failures(&sim);
+            kept_max = kept_max.max(kept);
+            assert!(
+                kept <= BACKOFF_KEEP_MAX,
+                "{RED}: {kept} slots kept for their failures alone at t = {t:.1} s, \
+                 the cap {BACKOFF_KEEP_MAX}"
+            );
+        }
+        if sim.now >= report {
+            eprintln!(
+                "outage t = {t:.0} s: tracked {}, drawable {}, kept for their failures {}, \
+                 failed so far {failed}",
+                sim.budget.tracked(),
+                sim.gpu.drawable.len(),
+                kept_for_their_failures(&sim)
+            );
+            report = report.plus(Micros::from_secs(5));
+        }
+    }
+    let back = sim.now;
+    sim.run(45.0, &|_| jumps(45.0));
+    let took = sim.converged_after(back).expect(RED);
+    eprintln!(
+        "outage: tracked at most {tracked_max}, kept for their failures at most {kept_max} \
+         (cap {BACKOFF_KEEP_MAX}, {} B each), {failed} loads failed; converged {took:?} after \
+         the network came back, {} tracked at the end",
+        tuile_budget::BACKOFF_KEPT_BYTES,
+        sim.budget.tracked()
+    );
+    assert!(
+        took <= Micros::from_secs(35),
+        "{RED}: converged {took:?} after the network came back"
+    );
 }
 
 /// I14, I15: a relaunch fills the view from the store, without network for

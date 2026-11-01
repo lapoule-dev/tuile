@@ -372,6 +372,26 @@ on 2 883 of 3 000 steps (2 879), evicting on 688 (551), 537 tracked (1 178). Rec
 one run that retargets (`the_pressure_scenario_stays_over_target`) and the new run added; every other run, the
 goldens and the pattern goldens byte-identical; ratchets untouched.
 
+**Failures bounded** (stacked on the decoded tier; decisions byte-identical). After a failed load a resource backs
+off (500 ms doubling to 30 s) and the prune keeps its empty slot while it backs off, for 30 s at most once its
+want went, so that a server that is down is not asked again the moment a tile comes back into view; only that
+window bounded those slots. They are now capped by count, and so by the bytes of their metadata:
+`BACKOFF_KEEP_MAX` = 128 KiB / `BACKOFF_KEPT_BYTES` (a slot across the arena's columns, its index entry, the kept
+map's entry, its queue entry: 172 B) = 762 slots, under a fifth of a steady desktop view's tracked state. Past
+the cap the prune lets go the slots whose want went longest ago (a walk of the kept slots into a step buffer, made only when the kept slots together, wanted
+ones included, outnumber the cap: nothing kept across steps for it), their failure
+history with them — a want that comes back retries at once; the wanted ones are the view's and never let go for
+the cap. Red first: `the_slots_kept_for_their_failures_are_capped_the_longest_left_first` (twice the cap of
+failed, backing-off, unneeded slots through one prune: 1 524 kept without the cap, the debug assertion; 762 with
+it, the most recently left). The simulated network has an outage (every load fails at once for a window) and a
+recorded scenario, `a_network_outage_leaves_the_tracked_state_bounded_and_recovers`: half a minute of outage
+while the camera jumps to a new place every two seconds, the kept slots checked against the cap after every
+prune, the view converging once the network is back. No simulated outage reaches the cap — while nothing
+arrives the traversal wants a place's coarse tiles and fails them over and over, so the kept slots follow the
+places visited within their backoff: 384 at most on the two-second jumps (3 949 failures; cap 762), 200 on the
+grow-then-shrink flight, 26 on eight-second jumps — so the scenario holds the cap without a red of its own; the
+cap's red is the unit test's, and the number is not lowered to make a scenario trip it.
+
 Not in O1.4, listed for O1.5: the ranking re-keys every job each step (a job's score ages with time); the host's
 diff clones every changed tile's `Need` (about 640 heap blocks a step on the tour); the whole-need resync pays a
 lookup per tile in the blocks (still-full +21 % on x86, a cursor merge would bring it back).

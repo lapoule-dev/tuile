@@ -63,7 +63,7 @@ use super::stats::{BudgetStats, GAP_BUCKETS};
 use super::tier::PresenceOracle;
 use super::types::{sat_u32, LayerId, Micros, Pressure, ResourceId, TileId};
 use super::TileInfo;
-use super::{Budget, Policy, RECENT_CAP, THRASH_WINDOW};
+use super::{Budget, Policy, BACKOFF_KEEP_MAX, RECENT_CAP, THRASH_WINDOW};
 
 /// A sorted set.
 type Set<K> = SortedMap<K, ()>;
@@ -406,6 +406,9 @@ struct StepLists {
     c_set: Changes<ResourceId, ()>,
     c_wait: Changes<ResourceId, Micros>,
     c_kept: Changes<Slot, Micros>,
+    /// The kept slots whose want went, with the time it went, while the
+    /// kept slots are over their cap.
+    unneeded_kept: Vec<(Micros, Slot)>,
     c_set3: Changes<ResourceId, ()>,
     refresh: Vec<(ResourceId, Want)>,
     gone: Vec<(TileId, LayerId)>,
@@ -2429,6 +2432,40 @@ impl Budget {
             }
         }
         self.down.kept_empty.apply(&mut c_kept, |_| {});
+        // The kept slots whose want went are bounded (`BACKOFF_KEEP_MAX`):
+        // past the cap, the ones whose want went longest ago are let go,
+        // their failure history with them. The wanted ones are the view's,
+        // counted with the need, never let go for the cap. The kept slots
+        // are walked only when they outnumber the cap together, wanted ones
+        // included (a step buffer, nothing kept across steps for it): what
+        // the cap is for happens rarely, and the walk is bounded by the
+        // need, the cap and what a prune adds.
+        if self.down.kept_empty.len() > BACKOFF_KEEP_MAX {
+            let mut unneeded = std::mem::take(&mut self.down.step.unneeded_kept);
+            unneeded.clear();
+            let a = &self.arena;
+            unneeded.extend(
+                self.down
+                    .kept_empty
+                    .iter()
+                    .filter_map(|(s, _)| a.cold(*s).unneeded_since().map(|u| (u, *s))),
+            );
+            visited = visited.saturating_add(sat_u32(self.down.kept_empty.len()));
+            let n = unneeded.len().saturating_sub(BACKOFF_KEEP_MAX);
+            if n > 0 {
+                // The `n` oldest, in any order: (time, slot) pairs are
+                // distinct, so the set chosen is the same whatever the order.
+                unneeded.select_nth_unstable(n - 1);
+                for &(_, s) in &unneeded[..n] {
+                    let t = self.arena.id(s).tile();
+                    self.arena.remove(s);
+                    self.tile_slot(t, false, tiles);
+                    c_kept.push((s, None));
+                }
+            }
+            self.down.step.unneeded_kept = unneeded;
+            self.down.kept_empty.apply(&mut c_kept, |_| {});
+        }
         self.down.step.c_kept = c_kept;
         let d = &mut self.down;
         if d.kept_due.len() > 2 * d.kept_empty.len() + 64 {
@@ -2438,14 +2475,24 @@ impl Budget {
                 .extend(d.kept_empty.iter().map(|(s, t)| Reverse((*t, *s))));
         }
         #[cfg(debug_assertions)]
-        for s in self.arena.iter() {
-            if self.arena.is_empty(s) {
-                assert!(
-                    kept_until(&self.arena, s, now, wants).is_some(),
-                    "the prune frees every empty slot nothing keeps ({:?})",
-                    self.arena.id(s)
-                );
+        {
+            let mut unneeded_kept = 0usize;
+            for s in self.arena.iter() {
+                if self.arena.is_empty(s) {
+                    assert!(
+                        kept_until(&self.arena, s, now, wants).is_some(),
+                        "the prune frees every empty slot nothing keeps ({:?})",
+                        self.arena.id(s)
+                    );
+                    unneeded_kept += usize::from(self.arena.cold(s).unneeded_since().is_some());
+                }
             }
+            assert!(
+                unneeded_kept <= BACKOFF_KEEP_MAX,
+                "{unneeded_kept} kept slots whose want went, over the cap of {BACKOFF_KEEP_MAX} \
+                 ({} kept in all)",
+                self.down.kept_empty.len()
+            );
         }
         self.down.step.slots = slots;
         visited = visited.saturating_add(self.arena_shrink());
@@ -3100,5 +3147,45 @@ mod tests {
         }
         assert_eq!(rig.b.arena.len(), live);
         assert_eq!(rig.b.audit(), Ok(()));
+    }
+
+    /// The slots kept for their failure history alone are capped
+    /// (`BACKOFF_KEEP_MAX`): twice the cap of empty slots, each failed and
+    /// backing off for a minute, each unneeded since its own time, go
+    /// through a prune; the cap remains, the ones unneeded longest gone,
+    /// the most recent kept; a wanted one is never let go for the cap.
+    #[test]
+    fn the_slots_kept_for_their_failures_are_capped_the_longest_left_first() {
+        let mut b = Budget::new(BudgetConfig::interactive(Bytes::mib(64))).unwrap();
+        let now = Micros::from_secs(100);
+        b.arena.advance(now, &[]);
+        let n = 2 * BACKOFF_KEEP_MAX;
+        for i in 0..n {
+            let r = ResourceId::Mesh(TileId(i as u64));
+            let s = b.arena.find_or_insert(r, Class::TerrainMesh, 3, now);
+            let cold = b.arena.cold_mut(s);
+            cold.failures = 1;
+            cold.retry_at = now.plus(Micros::from_secs(60));
+            // Unneeded since `i` milliseconds ago: the lowest ids longest.
+            cold.set_unneeded_since(Some(Micros(now.0 - 1_000 * (n - i) as u64)));
+        }
+        let tiles = SortedMap::default();
+        let (t, r) = (SortedMap::default(), SortedMap::default());
+        let wants = Wants {
+            tiles: &t,
+            refresh: &r,
+        };
+        b.steps = 8;
+        b.prune_tracked(now, &tiles, wants);
+        assert_eq!(b.arena.len(), BACKOFF_KEEP_MAX, "the cap holds");
+        assert_eq!(b.down.kept_empty.len(), BACKOFF_KEEP_MAX);
+        for i in 0..n {
+            let kept = b.arena.find(ResourceId::Mesh(TileId(i as u64))).is_some();
+            assert_eq!(kept, i >= n / 2, "slot {i}: the ones left longest go first");
+        }
+        // Another prune, nothing new: nothing more goes.
+        b.prune_tracked(now.plus(Micros::from_millis(100)), &tiles, wants);
+        assert_eq!(b.arena.len(), BACKOFF_KEEP_MAX);
+        assert_eq!(b.audit(), Ok(()));
     }
 }

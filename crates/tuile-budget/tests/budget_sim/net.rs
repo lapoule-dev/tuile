@@ -165,6 +165,10 @@ pub struct SimNet {
     /// Whether what arrives fills the local store (a disk cache); off for
     /// a device that keeps nothing between evictions.
     pub store_fills: bool,
+    /// A network outage: every network load started in `[from, to)` fails
+    /// at once (a refused connection, a resolver with no answer: back within
+    /// a millisecond, not after a round trip).
+    pub outage: Option<(Micros, Micros)>,
 }
 
 impl SimNet {
@@ -179,7 +183,14 @@ impl SimNet {
             network_starts: 0,
             network_bytes: 0,
             store_fills: true,
+            outage: None,
         }
+    }
+
+    /// Whether the network is out at `now`.
+    pub fn out(&self, now: Micros) -> bool {
+        self.outage
+            .is_some_and(|(from, to)| from <= now && now < to)
     }
 
     /// Whether `r` is in flight.
@@ -211,7 +222,9 @@ impl SimNet {
                     ResourceId::Mesh(_) => self.profile.meshes,
                     ResourceId::Drape { .. } => self.profile.imagery,
                 };
-                if self.rng.permille(server.stall_permille) {
+                if self.out(now) {
+                    (Some(now.plus(Micros::from_millis(1))), Outcome::Fail)
+                } else if self.rng.permille(server.stall_permille) {
                     (None, Outcome::Ok)
                 } else {
                     let ms = server.base_ms

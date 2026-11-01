@@ -148,6 +148,24 @@ const RECENT_CAP: usize = 4_096;
 /// The thrash window.
 const THRASH_WINDOW: Micros = Micros::from_secs(10);
 
+/// The most resources the budget keeps backing off after a failed load once
+/// the view has left them (for 30 s at most each), so that a server that is
+/// down is not asked again the moment a tile comes back into view. Past
+/// it, the ones the view left longest are forgotten first: a want that
+/// comes back retries at once. What one costs the budget is its metadata
+/// alone — its slot in the arena's columns, its entry in the arena's index,
+/// in the prune's kept map and in its queue, [`BACKOFF_KEPT_BYTES`] —
+/// and the cap holds the lot under 128 KiB, whatever the network does. The
+/// resources the view still wants are its own: counted with the need, not
+/// here.
+pub const BACKOFF_KEEP_MAX: usize = (128 << 10) / BACKOFF_KEPT_BYTES;
+
+/// What one resource kept backing off costs: its slot across the arena's
+/// columns, its index entry (a slot and a control byte, hashbrown's), the
+/// kept map's entry (slot and time) and its entry in the queue by due time
+/// (time and slot).
+pub const BACKOFF_KEPT_BYTES: usize = state::SLOT_BYTES + 5 + 12 + 16;
+
 /// What the budget knows of a tile's place in its tree: its parent, level
 /// and footprint, packed (48 bytes, not 64: the budget keeps one per tile
 /// it knows of), and how many resources of the tile the arena tracks (for
