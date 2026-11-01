@@ -1654,15 +1654,17 @@ impl Budget {
         if !back && self.down.due(now, &mut due) {
             due.sort_unstable();
             due.dedup();
-            due.retain(|r| self.active.contains(r));
+            due.retain(|r| {
+                self.arena
+                    .find(*r)
+                    .is_some_and(|s| self.arena.marked(s, Mark::Active))
+            });
             if self.down.deadlines_len() > 2 * self.active.len() + 64 {
                 // Mostly deadlines of loads gone: those of the loads still
                 // going, again.
                 self.down.clear_deadlines();
-                for &r in &self.active {
-                    let Some(s) = self.arena.find(r) else {
-                        continue;
-                    };
+                for &s in &self.active {
+                    let r = self.arena.id(s);
                     if let Load::Loading { started, .. } = self.arena.load(s) {
                         self.down.deadline(started.plus(timeout), r);
                     }
@@ -1673,8 +1675,11 @@ impl Budget {
                 self.down.trim_deadlines();
             }
         } else {
+            // Every load and transit, in resource order (the index is by
+            // slot).
             due.clear();
-            due.extend(self.active.iter().copied());
+            due.extend(self.active.iter().map(|s| self.arena.id(*s)));
+            due.sort_unstable();
             if !back {
                 // The deadlines were dropped: every load's, again.
                 for r in &due {
@@ -1815,23 +1820,23 @@ impl Budget {
                         let victim = self
                             .active
                             .iter()
-                            .filter(|vr| {
+                            .filter_map(|&vs| {
                                 let a = &self.arena;
-                                a.find(**vr).is_some_and(|vs| {
-                                    a.class(vs) == class
-                                        && matches!(
-                                            a.load(vs),
-                                            Load::Loading {
-                                                source: Source::Network,
-                                                ..
-                                            }
-                                        )
-                                        && (wants.get(vr).is_some_and(|vw| {
-                                            matches!(vw.urgency, Urgency::Ring | Urgency::Ancestor)
-                                        }) || a.urgency(vs) == Some(Urgency::Refresh))
-                                })
+                                let vr = a.id(vs);
+                                (a.class(vs) == class
+                                    && matches!(
+                                        a.load(vs),
+                                        Load::Loading {
+                                            source: Source::Network,
+                                            ..
+                                        }
+                                    )
+                                    && (wants.get(&vr).is_some_and(|vw| {
+                                        matches!(vw.urgency, Urgency::Ring | Urgency::Ancestor)
+                                    }) || a.urgency(vs) == Some(Urgency::Refresh)))
+                                .then_some(vr)
                             })
-                            .filter_map(|vr| key_now(self, *vr).map(|k| (k, *vr)))
+                            .filter_map(|vr| key_now(self, vr).map(|k| (k, vr)))
                             .max();
                         let Some((_, vr)) = victim else { continue };
                         if let Some(vs) = self.arena.find(vr) {
@@ -1885,7 +1890,9 @@ impl Budget {
             if self.cfg.pinned_level.is_some_and(|p| w.level <= p) {
                 self.arena.mark(s, Mark::FloorSet, true);
             }
-            self.active.insert(*r);
+            if !self.arena.marked(s, Mark::Active) {
+                self.active.push(s);
+            }
             self.arena.mark(s, Mark::Active, true);
             self.deadline(now.plus(self.cfg.load_timeout), *r);
             match source {
@@ -2193,7 +2200,9 @@ impl Budget {
             room.bytes[class][i] = room.bytes[class][i].minus(g.bytes);
         }
         // `make_room` frees no slot: `s` is still `r`'s.
-        self.active.insert(r);
+        if !self.arena.marked(s, Mark::Active) {
+            self.active.push(s);
+        }
         self.arena.mark(s, Mark::Active, true);
         self.arena.put_transit(
             s,

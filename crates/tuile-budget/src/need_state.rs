@@ -21,7 +21,7 @@ use std::cmp::Reverse;
 use super::imagery::TexelFootprint;
 use super::need::{DeltaOp, ImageryNeed, LayerReach, Membership, Need, NeedDelta, NeedSet};
 use super::priority::Quantised;
-use super::sorted::SortedMap;
+use super::sorted::{Cursor, SortedMap};
 use super::types::{sat_u32, Class, TileId};
 use super::TileInfo;
 
@@ -420,8 +420,11 @@ impl NeedState {
     }
 
     /// Applies `ops`, one per tile, in tile order. With `whole`, the tiles
-    /// `ops` does not name leave. Each tile is found, changed, added or
-    /// removed by its key: what a change costs is its own place.
+    /// `ops` does not name leave, and the kept need and the positions are
+    /// read with a cursor each — one pass over the map, as the tiles come in
+    /// order — rather than looked up tile by tile. Each tile is found,
+    /// changed, added or removed by its key: what a change costs is its own
+    /// place.
     fn apply(
         &mut self,
         ops: impl Iterator<Item = (TileId, DeltaOp)>,
@@ -435,19 +438,22 @@ impl NeedState {
         let mut gone = std::mem::take(&mut self.scratch.gone);
         gone.clear();
         let mut left = std::mem::take(&mut self.scratch.left);
-        let mut after: Option<TileId> = None;
+        // The whole need's cursors over the kept need and the positions.
+        let (mut cur, mut pos) = (Cursor::default(), Cursor::default());
         for (t, op) in ops {
-            if whole {
+            let place = if whole {
                 // The tiles between the last named and this one leave.
-                self.tiles.keys_between(after, Some(t), &mut left);
+                left.clear();
+                let place = self.tiles.advance(&mut cur, &t, |g| left.push(*g));
                 for &g in &left {
                     self.uncount_tile(g);
                     gone.push(g);
                     Self::name_left(g, positions, &mut named);
                 }
-            }
-            after = Some(t);
-            let place = self.tiles.locate(&t);
+                place.ok()
+            } else {
+                self.tiles.locate(&t)
+            };
             let found = place.is_some();
             let mut r = Resolve::default();
             match (op, src) {
@@ -511,11 +517,19 @@ impl NeedState {
                     self.rejected += n(rec.rejected);
                     self.blockers += n(rec.blockers);
                     self.tiles.insert(t, rec);
+                    if whole {
+                        // The map changed under the cursor: placed again.
+                        self.tiles.resume_after(&mut cur, &t);
+                    }
                 }
                 info
             };
-            let pos = positions.locate(&t);
-            let before = pos.map(|p| *positions.at(p));
+            let at = if whole {
+                positions.advance(&mut pos, &t, |_| {}).ok()
+            } else {
+                positions.locate(&t)
+            };
+            let before = at.map(|p| *positions.at(p));
             let place = |x: &TileInfo| (x.parent(), x.level, x.rect());
             let moved = match (&before, &info) {
                 (Some(b), Some(n)) => place(b) != place(n),
@@ -524,7 +538,7 @@ impl NeedState {
             };
             named.push(Named::new(t, before, found, shaped, moved));
             if let Some(info) = info {
-                match pos {
+                match at {
                     // What the prune counts of the tile is not the need's.
                     Some(at) => {
                         let p = positions.at_mut(at);
@@ -534,12 +548,16 @@ impl NeedState {
                     }
                     None => {
                         positions.insert(t, info);
+                        if whole {
+                            positions.resume_after(&mut pos, &t);
+                        }
                     }
                 }
             }
         }
         if whole {
-            self.tiles.keys_between(after, None, &mut left);
+            left.clear();
+            self.tiles.finish(&mut cur, |g| left.push(*g));
             for &g in &left {
                 self.uncount_tile(g);
                 gone.push(g);

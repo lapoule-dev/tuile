@@ -80,6 +80,13 @@ fn still() -> (u64, u64, u32, u64) {
 /// held set (467 -> 429, 244 216 -> 234 360), the net over #175 is
 /// 467 -> 455 and 244 216 -> 236 688; against `main` before O1.4 (#170),
 /// 470 -> 455 and 340 096 -> 236 688.
+///
+/// `bytes-per-tracked-resource-after-shrinking` went up once, by a
+/// decision (O1.5 part 2, Laurent's): 870 -> 872. The wants map keyed
+/// tile-first ends the shrink flight with the one emptied block its pool
+/// keeps for the next split (1 280 B; the design above) where the resource
+/// order's history left none — a block of room any history may leave in any
+/// kept map, bounded, not growth with the set.
 fn motion() -> (u64, u64, i64, i64, usize) {
     let mut sim = Sim::new(Profile::desktop(), 11);
     sim.count_output = true;

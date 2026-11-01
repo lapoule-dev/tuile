@@ -68,6 +68,29 @@ use super::{Budget, Policy, BACKOFF_KEEP_MAX, RECENT_CAP, THRASH_WINDOW};
 /// A sorted set.
 type Set<K> = SortedMap<K, ()>;
 
+/// A resource keyed tile-first: in a map so keyed a tile's mesh and its
+/// drapes are one range, read in one pass, where a map ordered by
+/// [`ResourceId`] holds every mesh before every drape (two regions, and two
+/// lookups per tile that defeat the sorted blocks' hint). The order within
+/// a tile is the resource's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ByTile(pub ResourceId);
+
+impl Ord for ByTile {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        self.0
+            .tile()
+            .cmp(&o.0.tile())
+            .then_with(|| self.0.cmp(&o.0))
+    }
+}
+
+impl PartialOrd for ByTile {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
 /// A batch of changes to a sorted map: a value to set, or `None` to remove.
 type Changes<K, V> = Vec<(K, Option<V>)>;
 
@@ -274,9 +297,10 @@ pub(super) struct Downstream {
     capped_sel: Option<Sums>,
     /// The drapes worn, with how many meshes wear each.
     worn: SortedMap<ResourceId, u32>,
-    /// The wants the tiles put, and the refreshes of drawn content.
-    wants: SortedMap<ResourceId, Want>,
-    refresh: SortedMap<ResourceId, Want>,
+    /// The wants the tiles put, and the refreshes of drawn content, by
+    /// tile ([`ByTile`]).
+    wants: SortedMap<ByTile, Want>,
+    refresh: SortedMap<ByTile, Want>,
     /// The wanted resources with work, those waiting on a time, and those
     /// the view waits on in flight or in transit.
     jobs: Set<ResourceId>,
@@ -402,7 +426,7 @@ struct StepLists {
     c_coarsening: Changes<TileId, ()>,
     c_items: Changes<ResourceId, Item>,
     c_worn: Changes<ResourceId, u32>,
-    c_wants: Changes<ResourceId, Want>,
+    c_wants: Changes<ByTile, Want>,
     c_set: Changes<ResourceId, ()>,
     c_wait: Changes<ResourceId, Micros>,
     c_kept: Changes<Slot, Micros>,
@@ -465,22 +489,26 @@ impl StepLists {
 /// The wants of a step: the tiles' and the refreshes, disjoint.
 #[derive(Clone, Copy)]
 pub(super) struct Wants<'a> {
-    tiles: &'a SortedMap<ResourceId, Want>,
-    refresh: &'a SortedMap<ResourceId, Want>,
+    tiles: &'a SortedMap<ByTile, Want>,
+    refresh: &'a SortedMap<ByTile, Want>,
 }
 
 impl<'a> Wants<'a> {
     pub fn get(&self, r: &ResourceId) -> Option<&'a Want> {
-        self.tiles.get(r).or_else(|| self.refresh.get(r))
+        let k = ByTile(*r);
+        self.tiles.get(&k).or_else(|| self.refresh.get(&k))
     }
 
     pub fn contains_key(&self, r: &ResourceId) -> bool {
         self.get(r).is_some()
     }
 
-    /// Every want, the tiles' then the refreshes'.
-    pub fn iter(&self) -> impl Iterator<Item = (&'a ResourceId, &'a Want)> + 'a {
-        self.tiles.iter().chain(self.refresh.iter())
+    /// Every want, the tiles' then the refreshes', each by tile.
+    pub fn iter(&self) -> impl Iterator<Item = (ResourceId, &'a Want)> + 'a {
+        self.tiles
+            .iter()
+            .chain(self.refresh.iter())
+            .map(|(k, w)| (k.0, w))
     }
 }
 
@@ -490,8 +518,8 @@ impl<'a> Wants<'a> {
 pub(super) struct Taken {
     /// Every unit of the passes was read: so is every want's work.
     pub full: bool,
-    wants: SortedMap<ResourceId, Want>,
-    refresh: SortedMap<ResourceId, Want>,
+    wants: SortedMap<ByTile, Want>,
+    refresh: SortedMap<ByTile, Want>,
     coarsening: Set<TileId>,
 }
 
@@ -508,13 +536,12 @@ impl Taken {
     }
 }
 
-/// The resources of `t` in a map keyed by resource: its mesh, then its
-/// drapes.
-fn of_tile<V>(m: &SortedMap<ResourceId, V>, t: TileId) -> impl Iterator<Item = (&ResourceId, &V)> {
-    let lo = ResourceId::drape(t, LayerId(0), 0);
-    let hi = ResourceId::drape(t, LayerId(u16::MAX), u32::MAX);
-    m.range(ResourceId::Mesh(t)..=ResourceId::Mesh(t))
-        .chain(m.range(lo..=hi))
+/// The resources of `t` in a map keyed by tile: its mesh, then its drapes,
+/// one range.
+fn of_tile<V>(m: &SortedMap<ByTile, V>, t: TileId) -> impl Iterator<Item = (ResourceId, &V)> {
+    let lo = ByTile(ResourceId::Mesh(t));
+    let hi = ByTile(ResourceId::drape(t, LayerId(u16::MAX), u32::MAX));
+    m.range(lo..=hi).map(|(k, v)| (k.0, v))
 }
 
 /// The entries of `t`'s selection: implied when it is drawn as itself.
@@ -770,7 +797,7 @@ impl Downstream {
     /// The resources the tiles want, in order (the refreshes left out:
     /// they are drawn).
     pub fn wanted(&self) -> impl Iterator<Item = ResourceId> + '_ {
-        self.wants.keys().copied()
+        self.wants.keys().map(|k| k.0)
     }
 
     /// Whether the view waits on something in flight or in transit.
@@ -918,7 +945,7 @@ impl Budget {
             add(&mut l.dirty, tiles.keys().copied());
             add(&mut l.dirty, self.down.sel.keys().copied());
             add(&mut l.dirty, self.down.floor.keys().copied());
-            add(&mut l.dirty, self.down.wants.keys().map(|r| r.tile()));
+            add(&mut l.dirty, self.down.wants.keys().map(|r| r.0.tile()));
         } else {
             add(
                 &mut l.dirty,
@@ -1523,7 +1550,7 @@ impl Budget {
         add(&mut dirty, l.moved.iter().copied());
         if all {
             add(&mut dirty, tiles.keys().copied());
-            add(&mut dirty, self.down.wants.keys().map(|r| r.tile()));
+            add(&mut dirty, self.down.wants.keys().map(|r| r.0.tile()));
         }
         dirty.sort_unstable();
         dirty.dedup();
@@ -1538,7 +1565,7 @@ impl Budget {
             }
             l.old_wants.clear();
             l.old_wants
-                .extend(of_tile(&self.down.wants, t).map(|(r, w)| (*r, *w)));
+                .extend(of_tile(&self.down.wants, t).map(|(r, w)| (r, *w)));
             self.walk(l.old_wants.len());
             // Both lists by resource: a merge.
             let (old, new) = (&l.old_wants, &l.tile_wants);
@@ -1568,7 +1595,7 @@ impl Budget {
                     }
                     (None, None) => break,
                 };
-                put(wants, &mut l.c_wants, r, w);
+                put(wants, &mut l.c_wants, ByTile(r), w);
                 l.wants.push(r);
             }
         }
@@ -1587,7 +1614,7 @@ impl Budget {
         for (m, i) in self.down.items.iter() {
             self.walk(1 + i.drapes().count());
             for r in std::iter::once(*m).chain(i.drapes().map(|x| x.resource)) {
-                if self.down.wants.contains_key(&r) {
+                if self.down.wants.contains_key(&ByTile(r)) {
                     continue;
                 }
                 if let Some(w) = self.refresh_of(r) {
@@ -1595,22 +1622,29 @@ impl Budget {
                 }
             }
         }
-        // The first refresh of a resource listed twice (a stable sort).
-        fresh.sort_by_key(|e| e.0);
+        // The first refresh of a resource listed twice (a stable sort), by
+        // tile, as the map keeps them.
+        fresh.sort_by_key(|e| ByTile(e.0));
         fresh.dedup_by_key(|e| e.0);
         // The refreshes that came, went or changed.
         let old = &self.down.refresh;
         for (r, w) in old.iter() {
-            if fresh.binary_search_by_key(r, |e| e.0).map(|i| fresh[i].1) != Ok(*w) {
-                l.wants.push(*r);
+            if fresh
+                .binary_search_by_key(r, |e| ByTile(e.0))
+                .map(|i| fresh[i].1)
+                != Ok(*w)
+            {
+                l.wants.push(r.0);
             }
         }
         for (r, w) in &fresh {
-            if old.get(r) != Some(w) {
+            if old.get(&ByTile(*r)) != Some(w) {
                 l.wants.push(*r);
             }
         }
-        self.down.refresh.rebuild(fresh.iter().copied());
+        self.down
+            .refresh
+            .rebuild(fresh.iter().map(|(r, w)| (ByTile(*r), *w)));
         l.refresh = fresh;
     }
 
@@ -1953,8 +1987,8 @@ impl Budget {
         add(&mut l.marks, self.down.fresh.drain(..));
         for &Named { tile: t, .. } in named {
             if tiles.get(&t).is_some() {
-                add(&mut l.marks, of_tile(wants.tiles, t).map(|(r, _)| *r));
-                add(&mut l.marks, of_tile(wants.refresh, t).map(|(r, _)| *r));
+                add(&mut l.marks, of_tile(wants.tiles, t).map(|(r, _)| r));
+                add(&mut l.marks, of_tile(wants.refresh, t).map(|(r, _)| r));
             }
         }
         l.marks.sort_unstable();
@@ -2037,7 +2071,7 @@ impl Budget {
             self.down.explicit = true;
             let mut all = std::mem::take(&mut l.done);
             all.clear();
-            all.extend(wants.iter().map(|(r, _)| *r));
+            all.extend(wants.iter().map(|(r, _)| r));
             all.extend(self.down.items.keys().copied());
             all.extend(self.down.worn.keys().copied());
             all.sort_unstable();
@@ -2054,7 +2088,7 @@ impl Budget {
             // After a time gone back: every resource the view needs.
             let mut all = std::mem::take(&mut l.done);
             all.clear();
-            all.extend(wants.iter().map(|(r, _)| *r));
+            all.extend(wants.iter().map(|(r, _)| r));
             all.extend(self.down.items.keys().copied());
             all.extend(self.down.worn.keys().copied());
             all.sort_unstable();
@@ -2139,7 +2173,7 @@ impl Budget {
             }
         }
         if full {
-            add(&mut l.marks, wants.iter().map(|(r, _)| *r));
+            add(&mut l.marks, wants.iter().map(|(r, _)| r));
             add(&mut l.marks, self.down.jobs.keys().copied());
             add(&mut l.marks, self.down.inflight.keys().copied());
         }
@@ -2190,20 +2224,20 @@ impl Budget {
             let mut waiting = Vec::new();
             let mut inflight = Vec::new();
             for (r, w) in wants.iter() {
-                let (job, wait) = self.job_of(*r, w, now);
+                let (job, wait) = self.job_of(r, w, now);
                 if job.is_some() {
-                    jobs.push(*r);
+                    jobs.push(r);
                 }
                 if let Some(t) = wait {
-                    waiting.push((*r, t));
+                    waiting.push((r, t));
                 }
                 if w.urgency <= Urgency::Drape
                     && self
                         .arena
-                        .find(*r)
+                        .find(r)
                         .is_some_and(|s| self.arena.has_transit(s) || self.arena.loading(s))
                 {
-                    inflight.push(*r);
+                    inflight.push(r);
                 }
             }
             for v in [&mut jobs, &mut inflight] {
@@ -2371,29 +2405,34 @@ impl Budget {
     ) -> u32 {
         let mut visited = 0u32;
         // Loads and transits: the index keeps only those still going.
-        let mut done = std::mem::take(&mut self.down.step.done);
+        let mut done = std::mem::take(&mut self.down.step.slots);
         done.clear();
         let a = &self.arena;
         done.extend(
             self.active
                 .iter()
-                .filter(|r| {
-                    !a.find(**r)
-                        .is_some_and(|s| a.has_transit(s) || a.loading(s))
-                })
+                .filter(|s| !(a.has_transit(**s) || a.loading(**s)))
                 .copied(),
         );
         visited = visited.saturating_add(sat_u32(self.active.len()));
-        for r in &done {
-            self.active.remove(r);
-            if let Some(s) = self.arena.find(*r) {
+        if !done.is_empty() {
+            let a = &self.arena;
+            self.active.retain(|s| a.has_transit(*s) || a.loading(*s));
+            for &s in &done {
                 self.arena.mark(s, Mark::Active, false);
             }
+            // A burst of loads does not keep its room once it is done; a
+            // list emptied holds none.
+            if self.active.is_empty() {
+                self.active = Vec::new();
+            } else {
+                let n = self.active.len();
+                super::sorted::trim(&mut self.active, n);
+            }
         }
-        self.down.step.done = done;
         // Empty slots: those emptied since, and those kept whose time fell
         // due.
-        let mut slots = std::mem::take(&mut self.down.step.slots);
+        let mut slots = done;
         self.arena.take_emptied(&mut slots);
         while let Some(&Reverse((t, s))) = self.down.kept_due.peek() {
             if t > now {
@@ -2539,6 +2578,8 @@ impl Budget {
         debug_assert_eq!(kept, d.kept_empty.len(), "a kept slot is a live slot");
         d.kept_empty
             .rekey(|s| Arena::moved_slot(&map, *s).unwrap_or(*s));
+        // The loads and transits in flight: live slots, every one.
+        moved += Arena::moved(&map, &mut self.active);
         // The queue, in its own vector: stale and dead entries dropped.
         let mut due = std::mem::take(&mut d.kept_due).into_vec();
         moved += due.len() as u64;
@@ -2966,13 +3007,17 @@ impl Budget {
             self.tile_wants(*t, tn, item, meshes_in, &mut drapes, &mut put);
             want.extend(put.iter().map(|(r, _, w)| (*r, *w)));
         }
-        want.sort_unstable_by_key(|e| e.0);
-        let kept: Vec<(ResourceId, Want)> = self.down.wants.iter().map(|(k, v)| (*k, *v)).collect();
+        want.sort_unstable_by_key(|e| ByTile(e.0));
+        let kept: Vec<(ResourceId, Want)> =
+            self.down.wants.iter().map(|(k, v)| (k.0, *v)).collect();
         assert_eq!(kept, want, "the wants kept are the wants put");
         let mut refresh: Vec<(ResourceId, Want)> = Vec::new();
         for (m, i) in self.down.items.iter() {
             for r in std::iter::once(*m).chain(i.drapes().map(|x| x.resource)) {
-                if want.binary_search_by_key(&r, |e| e.0).is_ok() {
+                if want
+                    .binary_search_by_key(&ByTile(r), |e| ByTile(e.0))
+                    .is_ok()
+                {
                     continue;
                 }
                 if let Some(w) = self.refresh_of(r) {
@@ -2980,10 +3025,10 @@ impl Budget {
                 }
             }
         }
-        refresh.sort_by_key(|e| e.0);
+        refresh.sort_by_key(|e| ByTile(e.0));
         refresh.dedup_by_key(|e| e.0);
         let kept: Vec<(ResourceId, Want)> =
-            self.down.refresh.iter().map(|(k, v)| (*k, *v)).collect();
+            self.down.refresh.iter().map(|(k, v)| (k.0, *v)).collect();
         assert_eq!(kept, refresh, "the refreshes kept are those found");
     }
 
@@ -3016,7 +3061,7 @@ impl Budget {
                     "{r:?}, of the newest group but not needed, is to leave it"
                 );
             }
-            let active = self.active.contains(&r);
+            let active = self.active.contains(&s);
             assert_eq!(
                 a.marked(s, Mark::Active),
                 active,
@@ -3150,6 +3195,40 @@ mod tests {
         }
         assert_eq!(rig.b.arena.len(), live);
         assert_eq!(rig.b.audit(), Ok(()));
+    }
+
+    /// Keyed tile-first, a tile's mesh and its drapes are one range of the
+    /// wants map, however many tiles come between them in the resources'
+    /// own order (every mesh before every drape): the wants of `t` are read
+    /// in one pass, and consecutive tiles read consecutive ranges, so the
+    /// sorted blocks' hint holds through a pass. Red with the resources'
+    /// order.
+    #[test]
+    fn a_tiles_resources_are_one_range_of_the_wants_map() {
+        let (a, b) = (TileId::from_terrain(3, 1, 1), TileId::from_terrain(3, 1, 2));
+        let keys = [
+            ByTile(ResourceId::Mesh(a)),
+            ByTile(ResourceId::drape(a, LayerId(0), 3)),
+            ByTile(ResourceId::drape(a, LayerId(1), 4)),
+            ByTile(ResourceId::Mesh(b)),
+            ByTile(ResourceId::drape(b, LayerId(0), 3)),
+        ];
+        assert!(
+            keys.windows(2).all(|w| w[0] < w[1]),
+            "a tile's resources come together"
+        );
+        let mut m: SortedMap<ByTile, u32> = SortedMap::default();
+        for (i, k) in (0u32..).zip(keys.iter().rev()) {
+            m.insert(*k, i);
+        }
+        let of_a: Vec<ResourceId> = of_tile(&m, a).map(|(r, _)| r).collect();
+        assert_eq!(of_a, keys[..3].iter().map(|k| k.0).collect::<Vec<_>>());
+        let of_b: Vec<ResourceId> = of_tile(&m, b).map(|(r, _)| r).collect();
+        assert_eq!(of_b, keys[3..].iter().map(|k| k.0).collect::<Vec<_>>());
+        assert!(
+            ResourceId::Mesh(b) < ResourceId::drape(a, LayerId(0), 3),
+            "in the resources' order another tile's mesh comes between"
+        );
     }
 
     /// The slots kept for their failure history alone are capped

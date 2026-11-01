@@ -207,6 +207,17 @@ pub(super) struct Place {
     i: usize,
 }
 
+/// A place a pass reads a map from, moving forward in key order
+/// ([`SortedMap::advance`]): a pass whose keys come sorted — a whole need's
+/// tiles — finds each next key by walking on from the last, one comparison
+/// an entry passed, instead of two binary searches a key. Starts before the
+/// first entry.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Cursor {
+    b: usize,
+    i: usize,
+}
+
 /// A map's entries, in key order, with their count: what is collected
 /// from it is allocated once.
 pub(super) struct Iter<'a, K, V> {
@@ -375,26 +386,79 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
         }
     }
 
-    /// The keys strictly between `after` and `before` (`None`: unbounded),
-    /// in order, into `out`: an entry passed for each.
-    #[inline]
-    pub fn keys_between(&mut self, after: Option<K>, before: Option<K>, out: &mut Vec<K>) {
-        out.clear();
-        let (b, i) = match after.and_then(|a| self.find(&a)) {
-            Some((b, Ok(i))) => (b, i + 1),
-            Some((b, Err(i))) => (b, i),
-            None => (0, 0),
+    /// Moves `c` on to the first entry whose key is not before `k`, giving
+    /// `skip` every key `c` passes on the way (strictly before `k`):
+    /// `Ok(place)` when that key is `k` (and `c` moves past it), `Err`
+    /// where `k` would go (`c` stays on the next key). The keys
+    /// sought must come in increasing order, and the map must not have
+    /// changed since `c` was placed — after an insertion or a removal,
+    /// [`SortedMap::resume_after`] places it again. Costs the entries
+    /// passed.
+    pub fn advance(
+        &mut self,
+        c: &mut Cursor,
+        k: &K,
+        mut skip: impl FnMut(&K),
+    ) -> Result<Place, Place> {
+        let mut passed = 0;
+        let found = loop {
+            let Some(blk) = self.blocks.get(c.b) else {
+                break Err(Place { b: c.b, i: 0 });
+            };
+            let mut hit = None;
+            while let Some(key) = blk.keys.get(c.i) {
+                match key.cmp(k) {
+                    std::cmp::Ordering::Less => {
+                        skip(key);
+                        c.i += 1;
+                        passed += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        // Found: the cursor moves past it, the place stays
+                        // readable until the map changes.
+                        hit = Some(Ok(Place { b: c.b, i: c.i }));
+                        c.i += 1;
+                        break;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        hit = Some(Err(Place { b: c.b, i: c.i }));
+                        break;
+                    }
+                }
+            }
+            if let Some(h) = hit {
+                break h;
+            }
+            c.b += 1;
+            c.i = 0;
         };
-        let blocks = self.blocks.get(b..).unwrap_or(&[]);
-        out.extend(
-            blocks
-                .iter()
-                .enumerate()
-                .flat_map(|(j, blk)| blk.keys[if j == 0 { i.min(blk.len()) } else { 0 }..].iter())
-                .copied()
-                .take_while(|k| before.is_none_or(|x| *k < x)),
-        );
-        self.kept(out.len());
+        self.kept(passed);
+        found
+    }
+
+    /// Moves `c` past every entry left, giving `skip` each key. Costs the
+    /// entries passed.
+    pub fn finish(&mut self, c: &mut Cursor, mut skip: impl FnMut(&K)) {
+        let mut passed = 0;
+        while let Some(blk) = self.blocks.get(c.b) {
+            for key in &blk.keys[c.i.min(blk.len())..] {
+                skip(key);
+                passed += 1;
+            }
+            c.b += 1;
+            c.i = 0;
+        }
+        self.kept(passed);
+    }
+
+    /// Places `c` just after `k` (after where `k` would be, when the map
+    /// does not hold it): for a pass to go on after it changed the map.
+    pub fn resume_after(&self, c: &mut Cursor, k: &K) {
+        *c = match self.find(k) {
+            Some((b, Ok(i))) => Cursor { b, i: i + 1 },
+            Some((b, Err(i))) => Cursor { b, i },
+            None => Cursor::default(),
+        };
     }
 
     /// A block from the pool, or a new one.
@@ -782,26 +846,69 @@ mod tests {
                 prop_assert!(m.iter().eq(o.iter()));
                 prop_assert!(m.consistent());
             }
-            let mut between = Vec::new();
             for (lo, span) in probes {
                 let hi = lo + span;
                 prop_assert_eq!(m.get(&lo), o.get(&lo));
                 prop_assert_eq!(m.contains_key(&hi), o.contains_key(&hi));
                 prop_assert!(m.range(lo..=hi).eq(o.range(lo..=hi)));
-                m.keys_between(Some(lo), Some(hi), &mut between);
-                let want: Vec<u16> = if lo < hi {
-                    o.range((std::ops::Bound::Excluded(lo), std::ops::Bound::Excluded(hi)))
-                        .map(|(k, _)| *k)
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                prop_assert_eq!(&between, &want);
-                m.keys_between(None, Some(hi), &mut between);
-                prop_assert!(between.iter().eq(o.range(..hi).map(|(k, _)| k)));
-                m.keys_between(Some(lo), None, &mut between);
-                prop_assert!(between.iter().eq(o.range((std::ops::Bound::Excluded(lo), std::ops::Bound::Unbounded)).map(|(k, _)| k)));
             }
+        }
+
+        /// A cursor advanced through sorted keys walks the map as the
+        /// standard ordered map ranges it: each key sought is found exactly
+        /// when the map holds it (its value readable at the place given),
+        /// the keys passed on the way are exactly those strictly between the
+        /// last key sought and this one, and `finish` gives the rest; placed
+        /// again after an insertion, it goes on from the key inserted.
+        #[test]
+        fn a_cursor_walks_the_map_as_the_standard_map_ranges_it(
+            keys in prop::collection::btree_set(0u16..600, 0..300),
+            sought in prop::collection::btree_set(0u16..620, 1..200),
+            inserted in prop::collection::btree_set(0u16..620, 0..8),
+        ) {
+            let mut m: SortedMap<u16, u32> = SortedMap::default();
+            let mut o: BTreeMap<u16, u32> = BTreeMap::new();
+            for k in &keys {
+                m.insert(*k, u32::from(*k));
+                o.insert(*k, u32::from(*k));
+            }
+            let mut c = Cursor::default();
+            let mut last: Option<u16> = None;
+            let mut passed = Vec::new();
+            for k in &sought {
+                passed.clear();
+                let r = m.advance(&mut c, k, |x| passed.push(*x));
+                let want: Vec<u16> = o
+                    .range((
+                        last.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+                        std::ops::Bound::Excluded(*k),
+                    ))
+                    .map(|(x, _)| *x)
+                    .collect();
+                prop_assert_eq!(&passed, &want, "passed on the way to {}", k);
+                match r {
+                    Ok(p) => prop_assert_eq!(Some(m.at(p)), o.get(k)),
+                    Err(_) => prop_assert!(!o.contains_key(k)),
+                }
+                if inserted.contains(k) && !o.contains_key(k) {
+                    // The map changes under the cursor: placed again after
+                    // the key, the walk goes on as if the key had been there.
+                    m.insert(*k, 7);
+                    o.insert(*k, 7);
+                    m.resume_after(&mut c, k);
+                }
+                last = Some(*k);
+            }
+            passed.clear();
+            m.finish(&mut c, |x| passed.push(*x));
+            let rest: Vec<u16> = o
+                .range((
+                    last.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+                    std::ops::Bound::Unbounded,
+                ))
+                .map(|(x, _)| *x)
+                .collect();
+            prop_assert_eq!(passed, rest);
         }
     }
 }

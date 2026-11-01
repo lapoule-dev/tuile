@@ -25,7 +25,7 @@ PRs — numbered B1–B8 in that plan, unrelated to section B below — fixes it
 signals, and a measured acceptance (imagery peak ≤ 15.5 MB, BC7 settle ≤ 6.0 s, Off goldens unchanged). It comes
 before A2 and A4.
 
-### O1 — the budget's algorithms, before CB (status: O1.5 part 1, 2026-11-01)
+### O1 — the budget's algorithms, before CB (status: O1.5 part 2, 2026-11-01)
 
 The budget is its own crate, `tuile-budget` (#163). O1 optimises its `decide` before the compression budget,
 decisions bit-identical throughout. The guard comes first (O1.0): today's engine frozen at 3d1a028e in
@@ -440,10 +440,33 @@ M-web (the ten patterns, headless Chrome, the display held awake — asleep, it 
 its loads): patterns kept 6/9/10 on the stack's tip (WebGPU auto / WebGL2 auto / off) against 9/10/10, no hole or
 black patch on either; the one violation left is WebGPU's warm relaunch converging in 21 s against 20.
 
-Left for the next parts of O1.5 (above): the ranking re-keys every job each step (a job's score ages with time);
-the whole-need resync pays a lookup per tile in the blocks (still-full +21 % on x86, a cursor merge would bring it
-back); the whole-need path groups the need into a fresh buffer each time (one block: keeping it would add the first
-step's grouping to every delta host's step buffers).
+Part 2 (`perf/budget-o1-wants-by-tile`): the maps a step reads for every tile, read in one pass. The wants and
+the refreshes are keyed tile-first (`ByTile`: the tile, then the resource): a tile's mesh and drapes are one range
+of the map, read in one pass, and consecutive tiles read consecutive ranges, so the sorted blocks' hint holds
+through the wants pass and the mark (keyed by resource, every mesh came before every drape: two regions, two
+lookups per tile, the hint defeated at each). The loads and transits in flight are a list of slots (pushed when a
+load or a delivery starts, the slot's `Active` mark saying whether it is listed; retained at the prune; renumbered
+with the compaction; its room given back when it empties), where a `BTreeSet` of resources was looked up and
+allocated nodes. The whole-need resync walks the kept need and the tree positions with a cursor each
+(`sorted::Cursor`): the tiles come in order, so one comparison an entry passed finds each, the tiles passed between
+two named ones being exactly those that left — the +21 % the sorted blocks had cost the resync (#175) given back
+and more. Tried and not kept, numbers at the declarations: `imagery_prev` on the blocks (its upkeep, counted, put
+P6.4 over on the big zoom, 115 978 against 113 728, and on a still step by one unit) and `recent` on the blocks
+(one block less at motion's p99, 19 B more per tracked resource after the shrink flight: entries expiring scattered
+by key leave the blocks half full). The ranking's bucket queue is not taken: every job's exact key is needed each
+step (the ranks map, the views digest, the preemption's victim), so a bucket queue would replace only the final
+sort, under 1 % of a motion step. Red first: `a_tiles_resources_are_one_range_of_the_wants_map`; the cursor's
+property against the standard map (which, with the resync test, caught the cursor left on a found key while it was
+written). M-bench on x86 (5 interleaved rounds, against #183): decide/still 45.0 → 38.6 µs (−14 %), still-full
+413 → 324 (−21 %), motion 710 → 642 (−10 %), pressure 515 → 477 (−7 %), motion p99 1 211 → 1 120, pressure p99
+946 → 887. Ratchets: step buffers after the tour 231 696 → 229 648 B, the rest equal, but the bytes per tracked
+resource after the shrink flight 870 → 872: one emptied block the wants map keeps for its next split (the pool,
+one per map by design) that the flight's history under the tile-first key leaves behind where the resource order
+did not — raised deliberately, Laurent's decision.
+
+Left for the next parts of O1.5: the whole-need path groups the need into a fresh buffer each time (one block:
+keeping it would add the first step's grouping to every delta host's step buffers); presence by store events; P6.4
+on the flight and the prune's scan of the loads in flight.
 
 Order is strict: A before B, B before C. Every step of A, B and C goes through the same battery before
 the next starts — tests seen red, mutants killed, the reference model extended, Kani proofs of its

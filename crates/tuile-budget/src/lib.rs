@@ -249,14 +249,21 @@ pub struct Budget {
     /// it by what changed.
     need: need_state::NeedState,
     /// Each drawn or blocking tile's imagery level per layer, as last
-    /// chosen (the hysteresis reads it), and those of the tiles held.
+    /// chosen (the hysteresis reads it), and those of the tiles held. An
+    /// ordered map of the standard library: on the sorted blocks its upkeep,
+    /// counted into `work`, put P6.4 over its bound on the tour's big zoom
+    /// (115 978 against 113 728) and on a still step by one unit (O1.5).
     imagery_prev: std::collections::BTreeMap<(TileId, LayerId), u32>,
     /// The tiles whose meshes were drawn last step as themselves or held
     /// (not as a fallback).
     held_last: sorted::SortedMap<TileId, ()>,
     /// Resources loading or in transit (an index, so a step need not scan),
-    /// each marked `Active` on its slot.
-    active: std::collections::BTreeSet<ResourceId>,
+    /// by slot, in the order they joined, each marked `Active` on its slot
+    /// (the mark says whether a slot is listed, so none is listed twice);
+    /// the prune drops those that are neither and trims the room a burst
+    /// left, and the slots follow the arena's renumbering. No decision reads
+    /// its order.
+    active: Vec<state::Slot>,
     /// Resources ranked last step (their urgency is cleared next step).
     ranked_last: Vec<ResourceId>,
     /// Steps taken, for the amortised prune.
@@ -266,6 +273,11 @@ pub struct Budget {
     down: downstream::Downstream,
     /// A step's buffers, kept across steps.
     scratch: engine::Scratch,
+    /// Recently evicted resources and when (the thrash count). An ordered
+    /// map of the standard library: on the sorted blocks (tried in O1.5)
+    /// the entries that expire scattered by key leave the blocks half full,
+    /// 19 B more per tracked resource after the shrink flight, for one
+    /// block less at motion's p99.
     recent: std::collections::BTreeMap<ResourceId, Micros>,
     epochs: PerClass<u64>,
     /// Per imagery layer, added to the drape class's epoch.
@@ -553,7 +565,11 @@ impl Budget {
                 .collect(),
             swap_last: marked(state::Mark::Swap),
             chain_last: marked(state::Mark::Chain),
-            active: self.active.iter().copied().collect(),
+            active: {
+                let mut v: Vec<ResourceId> = self.active.iter().map(|s| a.id(*s)).collect();
+                v.sort_unstable();
+                v
+            },
             floor_set: marked(state::Mark::FloorSet),
             ranked_last: self.ranked_last.clone(),
             // Every resource wanted or drawn, tracked or not: the marks are
