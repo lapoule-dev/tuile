@@ -6,6 +6,7 @@
 pub mod jobs;
 mod provenance;
 mod sources;
+mod store_log;
 mod switch;
 
 pub use provenance::{digest, Provenance, TerrainOrigin};
@@ -319,12 +320,21 @@ impl MeshCache {
         self.map.get(&c).map(Arc::clone)
     }
 
-    fn put(&mut self, c: TileCoord, mesh: Arc<tuile_terrain::QuantizedMesh>) {
+    /// Keeps `mesh` for `c`; `changed` hears of `c` when it is new here,
+    /// and of each tile let go to make room.
+    fn put(
+        &mut self,
+        c: TileCoord,
+        mesh: Arc<tuile_terrain::QuantizedMesh>,
+        changed: &mut dyn FnMut(TileCoord),
+    ) {
         if self.map.insert(c, mesh).is_none() {
+            changed(c);
             self.order.push_back(c);
             while self.order.len() > self.cap {
                 if let Some(old) = self.order.pop_front() {
                     self.map.remove(&old);
+                    changed(old);
                 }
             }
         }
@@ -360,19 +370,21 @@ impl ImageryCache {
     }
 
     /// Makes this the cache of `generation`, forgetting every tile of any
-    /// other.
+    /// other: whether it did.
     ///
     /// Forgetting is safe and it is not what takes the old picture off the
     /// screen: the cache hands out `Arc`s, so every drape already built keeps
     /// the textures it names for as long as its tile is resident. What is
     /// forgotten is only the *lookup*, which from here on would answer the
     /// new imagery's question with the old imagery's tile.
-    fn turn_to(&mut self, generation: u64) {
-        if self.generation != generation {
-            self.map.clear();
-            self.order.clear();
-            self.generation = generation;
+    fn turn_to(&mut self, generation: u64) -> bool {
+        if self.generation == generation {
+            return false;
         }
+        self.map.clear();
+        self.order.clear();
+        self.generation = generation;
+        true
     }
 
     /// Whether this tile is already decoded, without taking a reference.
@@ -384,12 +396,21 @@ impl ImageryCache {
         self.map.get(c).map(Arc::clone)
     }
 
-    fn put(&mut self, c: ImageryCoord, tex: Arc<DecodedTexture>) {
+    /// Keeps `tex` for `c`; `changed` hears of `c` when it is new here,
+    /// and of each tile let go to make room.
+    fn put(
+        &mut self,
+        c: ImageryCoord,
+        tex: Arc<DecodedTexture>,
+        changed: &mut dyn FnMut(ImageryCoord),
+    ) {
         if self.map.insert(c, tex).is_none() {
+            changed(c);
             self.order.push_back(c);
             while self.order.len() > self.cap {
                 if let Some(old) = self.order.pop_front() {
                     self.map.remove(&old);
+                    changed(old);
                 }
             }
         }
@@ -691,6 +712,9 @@ pub struct PlanetaryLoader<T: TerrainSource, I: ImageryProvider> {
     fetching: ImageryInFlight,
     /// The terrain tiles being fetched or built, likewise.
     building: TerrainInFlight,
+    /// What changed in what [`TileLoader::holds`] reads, as it changed: the
+    /// store events the session keeps its presence answers by.
+    changes: store_log::StoreLog,
     /// Where decoding and resampling run.
     ///
     /// Not a detail of taste: the server is one future, so any CPU work left in
@@ -707,8 +731,57 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
     /// a tile fetched before a switch.
     fn decoded(&self) -> std::sync::MutexGuard<'_, ImageryCache> {
         let mut cache = self.cache.lock().expect("imagery cache");
-        cache.turn_to(self.imagery.generation());
+        if cache.turn_to(self.imagery.generation()) {
+            self.changes.note(store_log::Change::All);
+        }
         cache
+    }
+
+    /// Notes a change to what a drape's presence reads over imagery tile
+    /// `c`.
+    fn imagery_changed(&self, scheme: &raster::TilingScheme, c: ImageryCoord) {
+        self.changes
+            .note(store_log::Change::Imagery(scheme.tile_rect(c)));
+    }
+
+    /// Keeps a decoded imagery tile, noting the tiles it adds and lets go.
+    fn keep_imagery(
+        &self,
+        cache: &mut ImageryCache,
+        scheme: &raster::TilingScheme,
+        c: ImageryCoord,
+        tex: Arc<DecodedTexture>,
+    ) {
+        cache.put(c, tex, &mut |at| self.imagery_changed(scheme, at));
+    }
+
+    /// Fetches imagery tile `c`'s bytes, noting a change when the imagery
+    /// store's index says otherwise of it after than before.
+    async fn imagery_bytes(
+        &self,
+        scheme: &raster::TilingScheme,
+        c: ImageryCoord,
+    ) -> Result<tuile_core::fetch::Fetched<bytes::Bytes>, RasterError> {
+        let before = self.imagery.holds(c);
+        let fetched = self.imagery.fetch_tile_bytes(c).await;
+        if self.imagery.holds(c) != before {
+            self.imagery_changed(scheme, c);
+        }
+        fetched
+    }
+
+    /// Fetches terrain tile `c`'s bytes, noting a change when the terrain
+    /// store's index says otherwise of it after than before.
+    async fn terrain_bytes(
+        &self,
+        c: TileCoord,
+    ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError> {
+        let before = self.terrain.holds(c);
+        let fetched = self.terrain.fetch_tile(c).await;
+        if self.terrain.holds(c) != before {
+            self.changes.note(store_log::Change::Mesh(c));
+        }
+        fetched
     }
 
     /// Folds a tile's `metadata` ranges into the shared availability, so the
@@ -804,7 +877,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                     ));
                     let mut cache = self.decoded();
                     if cache.generation == generation {
-                        cache.put(c, Arc::clone(&tex));
+                        self.keep_imagery(&mut cache, &scheme, c, Arc::clone(&tex));
                     }
                     return Ok((c, tex));
                 }
@@ -831,7 +904,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // Bytes, not the decoded texture: decoding is CPU work, and taking it
         // here rather than inside the provider is what lets it leave this
         // thread together with the resampling below, in one hop.
-        let fetched = self.imagery.fetch_tile_bytes(c).await;
+        let fetched = self.imagery_bytes(&scheme, c).await;
         drop(outstanding);
         match fetched {
             Ok(fetched) => {
@@ -872,7 +945,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                 {
                     let mut cache = self.decoded();
                     if cache.generation == generation {
-                        cache.put(c, Arc::clone(&tex));
+                        self.keep_imagery(&mut cache, &scheme, c, Arc::clone(&tex));
                     }
                 }
                 Ok((c, tex))
@@ -973,7 +1046,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                 m.mesh_fetches.inc();
                 let outstanding =
                     tuile_core::metrics::InFlight::new(&m.meshes_in_flight, &m.mesh_fetch_seconds);
-                let fetched = self.terrain.fetch_tile(coord).await;
+                let fetched = self.terrain_bytes(coord).await;
                 drop(outstanding);
                 match fetched {
                     Ok(fetched) => {
@@ -1061,7 +1134,9 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
             self.meshes
                 .lock()
                 .expect("mesh cache")
-                .put(coord, Arc::clone(&mesh));
+                .put(coord, Arc::clone(&mesh), &mut |at| {
+                    self.changes.note(store_log::Change::Mesh(at));
+                });
             Ok(mesh)
         })
     }
@@ -1534,7 +1609,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
             terrain_tiles += coords.len() as u64;
             futures_util::stream::iter(coords)
                 .for_each_concurrent(AT_ONCE, |c| async move {
-                    let _ = self.terrain.fetch_tile(c).await;
+                    let _ = self.terrain_bytes(c).await;
                 })
                 .await;
 
@@ -1549,7 +1624,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
             imagery_tiles += coords.len() as u64;
             futures_util::stream::iter(coords)
                 .for_each_concurrent(AT_ONCE, |c| async move {
-                    let _ = self.imagery.fetch_tile_bytes(c).await;
+                    let _ = self.imagery_bytes(&scheme, c).await;
                 })
                 .await;
         }
@@ -1660,6 +1735,32 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
             Presence::Absent
         }
     }
+
+    /// Noted as the loader changes what [`holds`](TileLoader::holds) reads
+    /// — a decoded mesh or imagery tile kept or let go, a store's index
+    /// changed by a fetch through this loader — and polled for what changes
+    /// without it: the imagery switched, the availability grown.
+    ///
+    /// Not seen: an entry a store drops on its own (a disk tier's eviction,
+    /// a store suspended, another writer's put). An answer it makes wrong is
+    /// a hint the budget believes until the resource is loaded — its read
+    /// then goes to the network under the local quota, once, and the load
+    /// puts it back — or until a change near it is noted.
+    fn store_events(&self) -> u64 {
+        self.changes
+            .count(self.imagery.generation(), self.availability.range_count())
+    }
+
+    fn store_changes(
+        &self,
+        since: u64,
+        asked: &[ResourceId],
+        touched: &mut Vec<ResourceId>,
+    ) -> u64 {
+        self.store_events();
+        self.changes
+            .touched(since, asked, |c| self.georect(c), touched)
+    }
 }
 
 /// The terrain quadtree of a parsed `layer.json`, as a boxed [`TileTree`].
@@ -1769,6 +1870,7 @@ where
         meshes: Mutex::new(MeshCache::new(512)),
         fetching: ImageryInFlight::default(),
         building: TerrainInFlight::default(),
+        changes: store_log::StoreLog::default(),
         availability,
         provenance: Arc::clone(&provenance),
         heights: Arc::clone(&heights),
@@ -1890,6 +1992,7 @@ mod tests {
             meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
             building: TerrainInFlight::default(),
+            changes: store_log::StoreLog::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
             provenance: Arc::default(),
             heights: Arc::new(TerrainHeights::new(scheme)),
@@ -1937,6 +2040,7 @@ mod tests {
             meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
             building: TerrainInFlight::default(),
+            changes: store_log::StoreLog::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
             provenance: Arc::default(),
             heights: Arc::new(TerrainHeights::new(scheme)),
@@ -2024,6 +2128,7 @@ mod tests {
             meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
             building: TerrainInFlight::default(),
+            changes: store_log::StoreLog::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
             provenance: Arc::default(),
             heights: Arc::new(TerrainHeights::new(scheme)),
@@ -2176,6 +2281,7 @@ mod tests {
             meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
             building: TerrainInFlight::default(),
+            changes: store_log::StoreLog::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
             provenance: Arc::default(),
             heights: Arc::new(TerrainHeights::new(scheme)),
@@ -2329,6 +2435,7 @@ mod tests {
         cache.lock().expect("cache").put(
             deeper,
             Arc::new(DecodedTexture::from_rgba8(1, 1, vec![255, 255, 255, 255])),
+            &mut |_| {},
         );
         assert_eq!(
             coarse_floor(&scheme, &rect, &cache),
@@ -2431,5 +2538,125 @@ mod tests {
                 "budget {slots} spends more fetches per fragment than coarsening costs"
             );
         }
+    }
+
+    /// A loader over flat imagery and a terrain store, holding `cap`
+    /// decoded imagery tiles.
+    fn store_loader(cap: usize) -> PlanetaryLoader<StoredTerrain, Painted> {
+        let scheme = GeographicTilingScheme::default();
+        PlanetaryLoader {
+            terrain: StoredTerrain::default(),
+            imagery: Painted(40),
+            scheme,
+            opts: GlobeOptions::default(),
+            cache: Mutex::new(ImageryCache::new(cap)),
+            meshes: Mutex::new(MeshCache::new(8)),
+            fetching: ImageryInFlight::default(),
+            building: TerrainInFlight::default(),
+            changes: store_log::StoreLog::default(),
+            availability: Arc::new(tuile_terrain::Availability::default()),
+            provenance: Arc::default(),
+            heights: Arc::new(TerrainHeights::new(scheme)),
+            offload: offload::inline(),
+        }
+    }
+
+    /// A terrain store with nothing behind it: a fetch answers that the
+    /// tile does not exist, and the store remembers the absence, as
+    /// `CachedTerrain` does.
+    #[derive(Default)]
+    struct StoredTerrain(Mutex<std::collections::HashSet<TileCoord>>);
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl tuile_terrain::TerrainSource for StoredTerrain {
+        async fn fetch_tile(
+            &self,
+            coord: TileCoord,
+        ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError>
+        {
+            self.0.lock().expect("store").insert(coord);
+            Err(tuile_terrain::TerrainSourceError::no_such_tile(format!(
+                "{coord:?}"
+            )))
+        }
+
+        fn holds(&self, coord: TileCoord) -> bool {
+            self.0.lock().expect("store").contains(&coord)
+        }
+    }
+
+    /// The store events' answer about `asked` since `since`.
+    fn touched<T: tuile_terrain::TerrainSource + 'static, I: ImageryProvider + 'static>(
+        loader: &PlanetaryLoader<T, I>,
+        since: u64,
+        asked: &[ResourceId],
+    ) -> Vec<ResourceId> {
+        let mut out = Vec::new();
+        loader.store_changes(since, asked, &mut out);
+        out
+    }
+
+    /// **A drape's imagery decoded, then let go, is a store event each time,
+    /// naming that drape and not one elsewhere; and the answer follows.**
+    /// The cache holds one drape's tiles: composing a drape on the other
+    /// side of the globe lets the first one's go.
+    #[test]
+    fn a_drapes_imagery_kept_and_let_go_are_store_events() {
+        let here = ResourceId::drape(ground_id(), LayerId(0), 9);
+        let far = TileId::from_terrain(GROUND.level, 3 * GROUND.x, GROUND.y);
+        let there = ResourceId::drape(far, LayerId(0), 9);
+        let cap = store_loader(1).drape_coords(ground_id(), 9).len();
+        let loader = store_loader(cap);
+        let start = loader.store_events();
+        assert_eq!(loader.holds(here), Presence::Absent);
+        assert_eq!(loader.store_events(), start, "asking is no event");
+        futures_executor::block_on(loader.compose(ground_id(), LayerId(0), 9)).expect("drape");
+        let kept = loader.store_events();
+        assert!(
+            kept > start,
+            "keeping the drape's imagery is no store event"
+        );
+        assert_eq!(touched(&loader, start, &[here, there]), vec![here]);
+        assert_eq!(loader.holds(here), Presence::Stored);
+        futures_executor::block_on(loader.compose(far, LayerId(0), 9)).expect("drape");
+        assert!(loader.store_events() > kept);
+        assert!(
+            touched(&loader, kept, &[here, there]).contains(&here),
+            "letting the drape's imagery go is no event about it"
+        );
+        assert_eq!(loader.holds(here), Presence::Absent);
+        assert_eq!(
+            touched(&loader, loader.store_events(), &[here, there]),
+            vec![]
+        );
+    }
+
+    /// **A terrain tile the store comes to hold is a store event about its
+    /// mesh and those built from it, not about a tile elsewhere.** The
+    /// source has nothing, so the tile and every ancestor up to its root are
+    /// fetched (each stored as absent): a tile under the other root reads
+    /// none of them.
+    #[test]
+    fn a_terrain_tile_stored_is_a_store_event_about_the_meshes_under_it() {
+        let loader = store_loader(8);
+        let at = TileCoord::new(3, 4, 2);
+        let mesh = |c: TileCoord| ResourceId::Mesh(TileId::from_terrain(c.level, c.x, c.y));
+        let asked = [
+            mesh(at),
+            mesh(TileCoord::new(5, 17, 9)),
+            mesh(TileCoord::new(3, 12, 2)),
+        ];
+        let start = loader.store_events();
+        assert_eq!(loader.holds(asked[0]), Presence::Absent);
+        let _ = futures_executor::block_on(loader.terrain_mesh(at));
+        // The tile and its ancestors were fetched, and stored as absent.
+        assert!(loader.store_events() > start);
+        let named = touched(&loader, start, &asked);
+        assert!(named.contains(&asked[0]) && named.contains(&asked[1]));
+        assert!(
+            !named.contains(&asked[2]),
+            "a tile elsewhere named: {named:?}"
+        );
+        assert_eq!(loader.holds(asked[0]), Presence::Stored);
     }
 }
