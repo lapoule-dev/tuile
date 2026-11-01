@@ -58,7 +58,7 @@ use super::need::Membership;
 use super::need_state::{Named, TileNeed};
 use super::priority::Urgency;
 use super::sorted::SortedMap;
-use super::state::{Advance, Change, Mark, Slot};
+use super::state::{Advance, Arena, Change, Mark, Slot, SHRINK_AFTER};
 use super::stats::{BudgetStats, GAP_BUCKETS};
 use super::tier::PresenceOracle;
 use super::types::{sat_u32, LayerId, Micros, Pressure, ResourceId, TileId};
@@ -325,6 +325,9 @@ pub(super) struct Downstream {
     deadlines: BinaryHeap<Reverse<(Micros, ResourceId)>>,
     /// The deadlines are not kept: the next cancel looks at every load.
     deadlines_lost: bool,
+    /// Prunes in a row that found the arena's room far more than its
+    /// tracked resources use (`state::SHRINK_AFTER`).
+    sparse_prunes: u32,
     /// This step's lists and batches.
     step: StepLists,
 }
@@ -2442,11 +2445,42 @@ impl Budget {
             }
         }
         self.down.step.slots = slots;
+        visited = visited.saturating_add(self.arena_shrink());
         // Recent evictions past the thrash window.
         visited = visited.saturating_add(self.expire_recent(now));
         // The tiles nothing references, nor any descendant.
         visited = visited.saturating_add(self.prune_tiles(tiles));
         visited
+    }
+
+    /// The arena's room given back once it stayed far more than the tracked
+    /// resources use for [`SHRINK_AFTER`] prunes in a row (`state`): its
+    /// slots renumbered, and every slot kept here with them. Returns the
+    /// slots walked.
+    fn arena_shrink(&mut self) -> u32 {
+        if !self.arena.sparse() {
+            self.down.sparse_prunes = 0;
+            return 0;
+        }
+        self.down.sparse_prunes += 1;
+        if self.down.sparse_prunes < SHRINK_AFTER {
+            return 0;
+        }
+        self.down.sparse_prunes = 0;
+        let mut map = Vec::new();
+        self.arena.compact(&mut map);
+        let to = |s: &Slot| Arena::moved_slot(&map, *s).unwrap_or(*s);
+        let d = &mut self.down;
+        d.kept_empty.rekey(to);
+        let due = std::mem::take(&mut d.kept_due).into_vec();
+        d.kept_due = due
+            .into_iter()
+            .filter_map(|Reverse((t, s))| Arena::moved_slot(&map, s).map(|s| Reverse((t, s))))
+            .collect();
+        Arena::moved(&map, &mut d.leavers);
+        // The step's room (`engine::Room`) names slots too, but a step
+        // drops it as it starts: none is read after the prune.
+        sat_u32(map.len())
     }
 
     /// An eviction of `r` at `now`, for the thrash count.

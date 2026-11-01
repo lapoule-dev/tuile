@@ -1472,6 +1472,9 @@ impl Budget {
         jobs.sort_unstable_by_key(|j| j.0);
         self.walk(jobs.len());
         self.ranked_last.extend(jobs.iter().map(|j| j.1));
+        // A burst of work does not keep its room once it is done.
+        let used = self.ranked_last.len();
+        super::sorted::trim(&mut self.ranked_last, used);
         for (k, r, _, w) in &jobs {
             if let Some(s) = self.arena.find(*r) {
                 self.arena.set_rank(s, Some(w.urgency), Some(Rank::of(k)));

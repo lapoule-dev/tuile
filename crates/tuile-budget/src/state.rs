@@ -20,7 +20,11 @@
 //! resources walks the slots and orders what it finds by a total key, or —
 //! a drape's drawable levels — reads an ordered index kept with the GPU
 //! copies. Slots are assigned and reused deterministically (a freed slot is
-//! the next one taken), though no decision depends on a slot's number.
+//! the next one taken), though no decision depends on a slot's number:
+//! when the tracked resources fall far under the columns' room, the arena
+//! renumbers its live slots in order and gives the room back
+//! ([`Arena::compact`]), every decision and the whole internal state
+//! unchanged.
 //!
 //! The arena also keeps the eviction order up to date, rather than have a
 //! step rebuild it (O1.2). A resource's eviction key — last needed, then
@@ -464,6 +468,26 @@ pub(super) const SLOT_BYTES: usize = std::mem::size_of::<ResourceId>()
 const _: () = assert!(SLOT_BYTES <= MAX_SLOT_BYTES);
 const MAX_SLOT_BYTES: usize = 139;
 
+/// [`Arena::compact`]'s number for a slot that held nothing.
+pub(super) const DEAD: u32 = u32::MAX;
+
+/// The arena gives its columns' room back ([`Arena::compact`]) when the
+/// tracked resources used less than a quarter of it ...
+pub(super) const SHRINK_BELOW: usize = 4;
+/// ... at this many prunes in a row (one every eighth step: 64 steps,
+/// about a second at 60 Hz, so that a view passing through does not
+/// compact). Measured: the five-minute soak, the tour, the pressure
+/// scenario and P6.4's run never compact; the flight that grows the
+/// tracked set to 4 889 and falls back to 995 compacts once ...
+pub(super) const SHRINK_AFTER: u32 = 8;
+/// ... down to twice the tracked resources: the columns grow by an eighth
+/// when full, so the room given back is taken again only once the tracked
+/// set has doubled, and a set that shrank by four is not compacted again
+/// before it shrinks by two more.
+pub(super) const SHRINK_TO: usize = 2;
+/// Never below this many slots: a small arena is not worth compacting.
+pub(super) const SHRINK_FLOOR: usize = 256;
+
 impl Default for Arena {
     fn default() -> Self {
         Arena {
@@ -588,9 +612,10 @@ impl Arena {
     }
 
     /// Makes room for one more slot in every column. A column grows by an
-    /// eighth when full, not twice: slots are never given back, so a
-    /// doubling would leave up to half of every column unused for the rest
-    /// of the session.
+    /// eighth when full, not twice: the room is given back only once the
+    /// tracked resources fell under a quarter of it ([`Arena::compact`]),
+    /// so a doubling would leave up to half of every column unused until
+    /// then.
     fn grow(&mut self) {
         fn grow<T>(v: &mut Vec<T>) {
             if v.len() == v.capacity() {
@@ -604,6 +629,109 @@ impl Arena {
         grow(&mut self.gpu);
         grow(&mut self.cpu);
         grow(&mut self.cold);
+    }
+
+    /// Whether the columns' room is far more than the tracked resources
+    /// use: over [`SHRINK_FLOOR`] slots, and more than [`SHRINK_BELOW`]
+    /// times the live ones.
+    pub fn sparse(&self) -> bool {
+        let room = self.id.capacity();
+        room > SHRINK_FLOOR && room > SHRINK_BELOW.saturating_mul(self.live)
+    }
+
+    /// Gives the columns' room back: the live slots moved down, in order,
+    /// to `0..len()`, every column cut to [`SHRINK_TO`] times as many
+    /// slots ([`SHRINK_FLOOR`] at least), the hash index rebuilt at that
+    /// size, the free list emptied. `map` gets each old slot's new number,
+    /// [`DEAD`] for a slot that held nothing, for the holders of slots
+    /// outside the arena to follow ([`Arena::moved`]).
+    ///
+    /// The live slots keep their order, so every walk in slot order — the
+    /// columns, the sets keyed by slot, the eviction index's ties (none:
+    /// its keys end with the resource) — finds them in the same order.
+    /// The slots taken next differ (the end of the columns, not the last
+    /// freed): no decision reads a slot's number.
+    pub fn compact(&mut self, map: &mut Vec<u32>) {
+        let n = self.id.len();
+        map.clear();
+        map.reserve_exact(n);
+        let mut w = 0usize;
+        for i in 0..n {
+            if self.flags[i] & LIVE == 0 {
+                map.push(DEAD);
+                continue;
+            }
+            map.push(u32::try_from(w).unwrap_or(DEAD));
+            if w != i {
+                self.id.swap(w, i);
+                self.class.swap(w, i);
+                self.flags.swap(w, i);
+                self.order.swap(w, i);
+                self.gpu.swap(w, i);
+                self.cpu.swap(w, i);
+                self.cold.swap(w, i);
+            }
+            w += 1;
+        }
+        debug_assert_eq!(w, self.live, "every live slot moved");
+        let room = SHRINK_TO.saturating_mul(w).max(SHRINK_FLOOR);
+        fn cut<T>(v: &mut Vec<T>, len: usize, room: usize) {
+            v.truncate(len);
+            v.shrink_to(room);
+        }
+        cut(&mut self.id, w, room);
+        cut(&mut self.class, w, room);
+        cut(&mut self.flags, w, room);
+        cut(&mut self.order, w, room);
+        cut(&mut self.gpu, w, room);
+        cut(&mut self.cpu, w, room);
+        cut(&mut self.cold, w, room);
+        self.free = Vec::new();
+        let Arena { hasher, id, .. } = &*self;
+        let mut index = HashTable::with_capacity(room);
+        for (i, r) in id.iter().enumerate() {
+            let s = Slot(u32::try_from(i).unwrap_or(DEAD));
+            index.insert_unique(hasher.hash_one(*r), s, |x| hasher.hash_one(id[x.i()]));
+        }
+        self.index = index;
+        // The sets keyed by slot: renumbered in place, their order kept.
+        let to = |n: &u32| map.get(*n as usize).copied().unwrap_or(DEAD);
+        self.transit.rekey(to);
+        self.load.rekey(to);
+        self.ranks.rekey(to);
+        for c in Class::ALL {
+            for set in &mut self.evict.filed[c] {
+                *set = std::mem::take(set)
+                    .into_iter()
+                    .map(|(k, s)| (k, Slot(map[s.i()])))
+                    .collect();
+            }
+        }
+        // The lists: the slots that held nothing dropped (they name no
+        // resource; a list's filter would skip them).
+        Self::moved(map, &mut self.evict.cur.slots);
+        Self::moved(map, &mut self.evict.prev.slots);
+        Self::moved(map, &mut self.emptied);
+    }
+
+    /// `slots` renumbered by a [`Arena::compact`]'s `map`, in order, the
+    /// slots that held nothing dropped; its room cut to twice what it
+    /// holds.
+    pub fn moved(map: &[u32], slots: &mut Vec<Slot>) {
+        slots.retain_mut(|s| match map.get(s.i()) {
+            Some(&n) if n != DEAD => {
+                *s = Slot(n);
+                true
+            }
+            _ => false,
+        });
+        slots.shrink_to(2 * slots.len());
+    }
+
+    /// The new number of `s` after a [`Arena::compact`]'s `map`, if it
+    /// held a resource.
+    pub fn moved_slot(map: &[u32], s: Slot) -> Option<Slot> {
+        map.get(s.i()).filter(|n| **n != DEAD).map(|n| Slot(*n))
     }
 
     /// Stops tracking the resource of `s`, which holds nothing; its slot
@@ -1690,6 +1818,84 @@ mod tests {
         assert_eq!(filed(&a, Class::TerrainMesh, &Held::GPU), vec![mesh(1)]);
         assert_eq!(a.idle(Class::TerrainMesh), Bytes::ZERO);
         assert!(a.evict_index_consistent());
+    }
+
+    #[test]
+    fn a_compacted_arena_keeps_every_resource_and_its_order() {
+        let mut a = Arena::new(Some(1));
+        let mut l = Ledger::default();
+        let g = |b| Gpu {
+            gen: Generation(1),
+            bytes: Bytes(b),
+            epoch: 0,
+        };
+        a.advance(Micros(1), &[]);
+        let n = 2_000u64;
+        let slots: Vec<Slot> = (0..n)
+            .map(|i| {
+                let s = a.find_or_insert(
+                    mesh(i),
+                    Class::TerrainMesh,
+                    u32::try_from(i % 7).unwrap(),
+                    Micros(1),
+                );
+                if i % 2 == 0 {
+                    a.put_gpu(s, &mut l, g(i + 1));
+                }
+                s
+            })
+            .collect();
+        // Time moves on twice: every slot filed in the eviction index.
+        a.advance(Micros(2), &slots);
+        a.advance(Micros(3), &[]);
+        let filed_before: Vec<ResourceId> = {
+            let mut out = Vec::new();
+            let mut after = None;
+            while let Some(e) = a.next_filed(after.as_ref(), |_| true, &Held::ALL) {
+                out.push(e.0 .3);
+                after = Some(e);
+            }
+            out
+        };
+        // Most go: a sparse arena.
+        for (i, &s) in slots.iter().enumerate() {
+            if i % 10 != 0 {
+                a.take_gpu(s, &mut l);
+                a.remove(s);
+            }
+        }
+        assert!(a.sparse(), "200 of 2 000 slots live");
+        let mut map = Vec::new();
+        a.compact(&mut map);
+        assert!(!a.sparse(), "the room given back");
+        assert_eq!(a.len(), 200);
+        // Every resource found again, in slot order as before.
+        let ids: Vec<ResourceId> = a.iter().map(|s| a.id(s)).collect();
+        let want: Vec<ResourceId> = (0..n).filter(|i| i % 10 == 0).map(mesh).collect();
+        assert_eq!(ids, want);
+        for r in &want {
+            let s = a.find(*r).unwrap();
+            assert_eq!(a.id(s), *r);
+        }
+        let filed_after: Vec<ResourceId> = {
+            let mut out = Vec::new();
+            let mut after = None;
+            while let Some(e) = a.next_filed(after.as_ref(), |_| true, &Held::ALL) {
+                out.push(e.0 .3);
+                after = Some(e);
+            }
+            out
+        };
+        let kept: Vec<ResourceId> = filed_before
+            .into_iter()
+            .filter(|r| want.contains(r) && a.gpu(a.find(*r).unwrap()).is_some())
+            .collect();
+        assert_eq!(filed_after, kept, "the eviction order kept");
+        assert!(a.evict_index_consistent() && a.sums_consistent() && a.gpu_drapes_consistent());
+        // A new resource takes the next slot at the end.
+        let s = a.find_or_insert(mesh(n), Class::TerrainMesh, 0, Micros(3));
+        assert_eq!(a.id(s), mesh(n));
+        assert_eq!(a.len(), 201);
     }
 
     #[test]

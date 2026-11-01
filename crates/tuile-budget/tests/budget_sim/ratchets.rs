@@ -137,6 +137,8 @@ fn allocation_ratchets_hold() {
         .join("tests/budget_sim/alloc_ratchets.txt");
     let (still_worst, still_output, still_drawn, meter_worst) = still();
     let (motion_p99, scratch, per_tracked, tracked) = motion();
+    let (_, shrunk_to, shrunk_held) = grown_then_shrunk();
+    let per_shrunk = shrunk_held / shrunk_to.max(1) as i64;
     eprintln!(
         "still: {still_worst} internal blocks per step at worst ({still_output} for the output, \
          {still_drawn} drawn), a meter watching it {meter_worst}; tour: p99 {motion_p99} internal blocks per step, then \
@@ -147,7 +149,8 @@ fn allocation_ratchets_hold() {
          meter-allocs-per-still-step {meter_worst}\n\
          motion-internal-allocs-per-step-p99 {motion_p99}\n\
          scratch-bytes-after-tour {scratch}\n\
-         bytes-per-tracked-resource {per_tracked}\n"
+         bytes-per-tracked-resource {per_tracked}\n\
+         bytes-per-tracked-resource-after-shrinking {per_shrunk}\n"
     );
     if std::env::var_os("TUILE_BLESS_BUDGET").is_some() {
         std::fs::write(&path, &got).unwrap();
@@ -230,5 +233,85 @@ fn the_pressure_scenario_stays_over_target() {
     assert!(
         evicting * 10 >= steps,
         "the pressure scenario evicts too seldom"
+    );
+}
+
+/// A flight that grows the tracked set, then shrinks it: up to 60 km and a
+/// turn over the plain (thousands of tiles tracked), back down to the
+/// still view, the app sent to the background and back (only the floor
+/// and what is drawn kept). Returns the tracked peak, the tracked at the
+/// end, and the heap the budget frees when dropped without its step
+/// buffers.
+fn grown_then_shrunk() -> (usize, usize, i64) {
+    use super::world::Camera;
+    let flight = |t: f64| -> Camera {
+        let h0 = home();
+        let lg = |a: f64, b: f64, k: f64| a * super::detmath::exp2(super::detmath::log2(b / a) * k);
+        if t < 5.0 {
+            approach(t)
+        } else if t < 10.0 {
+            Camera {
+                h: lg(2_000.0, 60_000.0, (t - 5.0) / 5.0),
+                ..h0
+            }
+        } else if t < 25.0 {
+            Camera {
+                h: 60_000.0,
+                heading: (t - 10.0) / 15.0 * std::f64::consts::TAU,
+                ..h0
+            }
+        } else if t < 30.0 {
+            Camera {
+                h: lg(60_000.0, 2_000.0, (t - 25.0) / 5.0),
+                ..h0
+            }
+        } else {
+            h0
+        }
+    };
+    let mut sim = Sim::new(Profile::desktop(), 7);
+    let mut peak = 0;
+    while sim.now < Micros::from_secs(60) {
+        let t = sim.now.0 as f64 / 1e6;
+        if (40.0..42.0).contains(&t) {
+            sim.pressure(Pressure::Background);
+        } else if (42.0..42.1).contains(&t) {
+            sim.pressure(Pressure::Normal);
+        }
+        sim.step(flight(t));
+        peak = peak.max(sim.budget.tracked());
+    }
+    let tracked = sim.budget.tracked();
+    let ((), _) = super::alloc::counted(|| sim.budget.real.release_scratch());
+    let cfg = sim.budget.config().clone();
+    let fresh = Budget::new(cfg).unwrap();
+    let ((), t) = super::alloc::counted(|| drop(std::mem::replace(&mut sim.budget.real, fresh)));
+    (peak, tracked, -t.live)
+}
+
+/// The arena gives its room back: after the tracked set grew five times
+/// over and fell back, the budget holds at most twice what the ratchet
+/// allows a steady view per tracked resource (`bytes-per-tracked-resource`):
+/// the arena keeps twice its tracked resources' room once it shrank
+/// (`state::SHRINK_TO`), and a kept map's blocks stay at least near half
+/// full. Before the arena shrank, 1 664 B.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
+fn a_tracked_set_that_shrinks_gives_its_room_back() {
+    let (peak, tracked, held) = grown_then_shrunk();
+    let per = held / tracked.max(1) as i64;
+    eprintln!(
+        "grown to {peak}, shrunk to {tracked} tracked: {held} B held, {per} B per tracked resource"
+    );
+    assert!(
+        peak >= 3 * tracked,
+        "the scenario shrinks the tracked set ({peak} -> {tracked})"
+    );
+    assert!(
+        per <= 2 * 455,
+        "{per} B per tracked resource after the set shrank from {peak} to {tracked}: the room is kept"
     );
 }

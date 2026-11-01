@@ -565,6 +565,22 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
         self.pool.truncate(room);
     }
 
+    /// Every key replaced by `f`'s, which keeps their order (a key's
+    /// renumbering): in place, a pass over every entry.
+    pub fn rekey(&mut self, mut f: impl FnMut(&K) -> K) {
+        self.kept(self.len);
+        for (blk, head) in self.blocks.iter_mut().zip(self.heads.iter_mut()) {
+            for k in &mut blk.keys {
+                *k = f(k);
+            }
+            *head = blk.keys[0];
+        }
+        debug_assert!(
+            self.keys().zip(self.keys().skip(1)).all(|(a, b)| a < b),
+            "a renumbering keeps the order"
+        );
+    }
+
     /// Keeps the entries `f` keeps: a pass over every entry, the blocks
     /// left empty dropped.
     pub fn retain(&mut self, mut f: impl FnMut(&K, &mut V) -> bool) {
