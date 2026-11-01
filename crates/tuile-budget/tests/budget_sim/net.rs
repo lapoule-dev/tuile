@@ -130,6 +130,8 @@ pub struct SimStore {
     pub held: BTreeSet<ResourceId>,
     /// Claimed but not held.
     pub lies: BTreeSet<ResourceId>,
+    /// Bumped by every change to `held` or `lies`: the index's generation.
+    pub generation: u64,
 }
 
 impl PresenceOracle for SimStore {
@@ -139,6 +141,10 @@ impl PresenceOracle for SimStore {
         } else {
             Presence::Absent
         }
+    }
+
+    fn generation(&self) -> Option<u64> {
+        Some(self.generation)
     }
 }
 
@@ -159,6 +165,10 @@ pub struct SimNet {
     /// Whether what arrives fills the local store (a disk cache); off for
     /// a device that keeps nothing between evictions.
     pub store_fills: bool,
+    /// A network outage: every network load started in `[from, to)` fails
+    /// at once (a refused connection, a resolver with no answer: back within
+    /// a millisecond, not after a round trip).
+    pub outage: Option<(Micros, Micros)>,
 }
 
 impl SimNet {
@@ -173,7 +183,14 @@ impl SimNet {
             network_starts: 0,
             network_bytes: 0,
             store_fills: true,
+            outage: None,
         }
+    }
+
+    /// Whether the network is out at `now`.
+    pub fn out(&self, now: Micros) -> bool {
+        self.outage
+            .is_some_and(|(from, to)| from <= now && now < to)
     }
 
     /// Whether `r` is in flight.
@@ -193,8 +210,8 @@ impl SimNet {
         let (done_at, outcome) = match s.source {
             Source::Local => {
                 let lie = !self.store.held.contains(&s.resource);
-                if lie {
-                    self.store.lies.remove(&s.resource);
+                if lie && self.store.lies.remove(&s.resource) {
+                    self.store.generation += 1;
                 }
                 let at = now.plus(Micros((self.profile.local_ms * 1_000.0) as u64));
                 (Some(at), if lie { Outcome::Miss } else { Outcome::Ok })
@@ -205,7 +222,9 @@ impl SimNet {
                     ResourceId::Mesh(_) => self.profile.meshes,
                     ResourceId::Drape { .. } => self.profile.imagery,
                 };
-                if self.rng.permille(server.stall_permille) {
+                if self.out(now) {
+                    (Some(now.plus(Micros::from_millis(1))), Outcome::Fail)
+                } else if self.rng.permille(server.stall_permille) {
                     (None, Outcome::Ok)
                 } else {
                     let ms = server.base_ms
@@ -259,8 +278,8 @@ impl SimNet {
                         self.latencies
                             .push((at, at.since(f.started).0 as f64 / 1_000.0));
                     }
-                    if self.store_fills {
-                        self.store.held.insert(r);
+                    if self.store_fills && self.store.held.insert(r) {
+                        self.store.generation += 1;
                     }
                     out.push(Arrival::Loaded(r, f.gen, cost(r)));
                 }

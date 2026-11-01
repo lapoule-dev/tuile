@@ -15,12 +15,13 @@
 use tuile_budget::{Budget, BudgetMeter, BudgetObserver, Micros, Pressure, StepRecord, Thermal};
 
 use super::scenarios::{approach, home};
-use super::server::{DecideAllocs, Profile, Sim};
+use super::server::{Profile, Sim};
 
 /// The still view: the approach, then still until nothing churns, then 120
-/// steps measured. The worst step's internal blocks (beyond its output),
-/// its output's, what it drew, and the worst step of a `BudgetMeter`
-/// watching it (past its first two, which fill its maps).
+/// steps measured. The worst step's blocks (`decide_into`, its output's
+/// buffers the host's: everything the step asked the heap for), what a
+/// fresh copy of its output would take, what it drew, and the worst step of
+/// a `BudgetMeter` watching it (past its first two, which fill its maps).
 fn still() -> (u64, u64, u32, u64) {
     let mut sim = Sim::new(Profile::desktop(), 7);
     sim.run(5.0, &approach);
@@ -56,17 +57,37 @@ fn still() -> (u64, u64, u32, u64) {
     }
     let meter_worst = metered.iter().skip(2).copied().max().unwrap_or(0);
     let w = &sim.decide_allocs[from..];
-    let worst = w.iter().map(DecideAllocs::internal).max().unwrap_or(0);
+    let worst = w.iter().map(|a| a.heap.allocs).max().unwrap_or(0);
     let output = w.iter().map(|a| a.output).max().unwrap_or(0);
     let drawn = w.iter().map(|a| a.drawn).max().unwrap_or(0);
     (worst, output, drawn, meter_worst)
 }
 
-/// The soak's tour for a simulated minute: the p99 of the internal blocks
-/// per step past the first ten seconds, the step buffers the budget holds
-/// then (`release_scratch`), and the heap the budget frees when dropped
-/// without them, per tracked resource.
-fn motion() -> (u64, i64, i64, usize) {
+/// The soak's tour for a simulated minute: the p99 of the blocks per step
+/// (`decide_into`) and of the host's diff's past the first ten seconds, the
+/// step buffers the budget holds then (`release_scratch`), and the heap the
+/// budget frees when dropped without them, per tracked resource.
+///
+/// `bytes-per-tracked-resource` and `scratch-bytes-after-tour` went up
+/// once, by a decision (PR #175): 429 -> 455 and 234 360 -> 236 688 B. The
+/// kept maps became sorted blocks (`sorted.rs`), whose change shifts its
+/// block only where one sorted vector shifted the whole map. Their room is
+/// about 80 % used against about 94 % for a vector grown by an eighth;
+/// each map keeps one spare block, so that a split after a merge allocates
+/// nothing; and each block keeps its keys and its values in two columns,
+/// so that a search reads the keys alone (a second vector header, ~24 B,
+/// for each of ~300 blocks). Over the change that made the ancestry the
+/// held set (467 -> 429, 244 216 -> 234 360), the net over #175 is
+/// 467 -> 455 and 244 216 -> 236 688; against `main` before O1.4 (#170),
+/// 470 -> 455 and 340 096 -> 236 688.
+///
+/// `bytes-per-tracked-resource-after-shrinking` went up once, by a
+/// decision (O1.5 part 2, Laurent's): 870 -> 872. The wants map keyed
+/// tile-first ends the shrink flight with the one emptied block its pool
+/// keeps for the next split (1 280 B; the design above) where the resource
+/// order's history left none — a block of room any history may leave in any
+/// kept map, bounded, not growth with the set.
+fn motion() -> (u64, u64, i64, i64, usize) {
     let mut sim = Sim::new(Profile::desktop(), 11);
     sim.count_output = true;
     let end = Micros::from_secs(60);
@@ -74,30 +95,31 @@ fn motion() -> (u64, i64, i64, usize) {
         let t = sim.now.0 as f64 / 1e6;
         sim.step(super::soak::tour(t));
     }
-    let mut internal: Vec<u64> = sim
-        .decide_allocs
-        .iter()
-        .filter(|a| a.now >= Micros::from_secs(10))
-        .map(DecideAllocs::internal)
-        .collect();
-    internal.sort_unstable();
-    let p99 = internal
-        .get(internal.len() * 99 / 100)
-        .copied()
-        .unwrap_or(0);
-    // The host's diff (not a ratchet): the blocks it allocates per step.
-    let mut diff: Vec<u64> = sim
+    let p99_of = |mut v: Vec<u64>| {
+        v.sort_unstable();
+        v.get(v.len() * 99 / 100).copied().unwrap_or(0)
+    };
+    let p99 = p99_of(
+        sim.decide_allocs
+            .iter()
+            .filter(|a| a.now >= Micros::from_secs(10))
+            .map(|a| a.heap.allocs)
+            .collect(),
+    );
+    // The host's diff: the blocks it allocates per step.
+    let diff: Vec<u64> = sim
         .diff_us
         .iter()
         .filter(|(t, _, _)| *t >= Micros::from_secs(10))
         .map(|(_, _, a)| *a)
         .collect();
-    diff.sort_unstable();
+    let mut sorted = diff.clone();
+    sorted.sort_unstable();
     eprintln!(
-        "tour: the host's diff allocates p50 {}, p99 {} blocks per step",
-        diff.get(diff.len() / 2).copied().unwrap_or(0),
-        diff.get(diff.len() * 99 / 100).copied().unwrap_or(0)
+        "tour: the host's diff allocates p50 {} blocks per step",
+        sorted.get(sorted.len() / 2).copied().unwrap_or(0)
     );
+    let diff_p99 = p99_of(diff);
     let tracked = sim.budget.tracked();
     // The budget alone: the reference's digests are not measured.
     let ((), t) = super::alloc::counted(|| sim.budget.real.release_scratch());
@@ -108,7 +130,7 @@ fn motion() -> (u64, i64, i64, usize) {
     // what the swap and drop give back is the old budget's whole heap.
     let ((), t) = super::alloc::counted(|| drop(std::mem::replace(&mut sim.budget.real, fresh)));
     let per = -t.live / (tracked.max(1) as i64);
-    (p99, scratch, per, tracked)
+    (p99, diff_p99, scratch, per, tracked)
 }
 
 /// A3.g: the converged still view, the tour's p99 and the bytes per tracked
@@ -123,18 +145,23 @@ fn allocation_ratchets_hold() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/budget_sim/alloc_ratchets.txt");
     let (still_worst, still_output, still_drawn, meter_worst) = still();
-    let (motion_p99, scratch, per_tracked, tracked) = motion();
+    let (motion_p99, diff_p99, scratch, per_tracked, tracked) = motion();
+    let (_, shrunk_to, shrunk_held) = grown_then_shrunk();
+    let per_shrunk = shrunk_held / shrunk_to.max(1) as i64;
     eprintln!(
-        "still: {still_worst} internal blocks per step at worst ({still_output} for the output, \
-         {still_drawn} drawn), a meter watching it {meter_worst}; tour: p99 {motion_p99} internal blocks per step, then \
-         {scratch} B of step buffers and {per_tracked} B per tracked resource ({tracked} tracked)"
+        "still: {still_worst} blocks per step at worst (a fresh copy of the output would take \
+         {still_output}, {still_drawn} drawn), a meter watching it {meter_worst}; tour: p99 \
+         {motion_p99} blocks per step, the host's diff p99 {diff_p99}, then {scratch} B of step \
+         buffers and {per_tracked} B per tracked resource ({tracked} tracked)"
     );
     let got = format!(
-        "still-internal-allocs-per-step {still_worst}\n\
+        "still-allocs-per-step {still_worst}\n\
          meter-allocs-per-still-step {meter_worst}\n\
-         motion-internal-allocs-per-step-p99 {motion_p99}\n\
+         motion-allocs-per-step-p99 {motion_p99}\n\
+         diff-allocs-per-step-p99 {diff_p99}\n\
          scratch-bytes-after-tour {scratch}\n\
-         bytes-per-tracked-resource {per_tracked}\n"
+         bytes-per-tracked-resource {per_tracked}\n\
+         bytes-per-tracked-resource-after-shrinking {per_shrunk}\n"
     );
     if std::env::var_os("TUILE_BLESS_BUDGET").is_some() {
         std::fs::write(&path, &got).unwrap();
@@ -191,21 +218,18 @@ fn the_pressure_scenario_stays_over_target() {
             );
         }
     }
-    let mut internal: Vec<u64> = sim
+    let mut blocks: Vec<u64> = sim
         .decide_allocs
         .iter()
         .filter(|a| a.now >= Micros::from_secs(10))
-        .map(DecideAllocs::internal)
+        .map(|a| a.heap.allocs)
         .collect();
-    internal.sort_unstable();
-    let p50 = internal.get(internal.len() / 2).copied().unwrap_or(0);
-    let p99 = internal
-        .get(internal.len() * 99 / 100)
-        .copied()
-        .unwrap_or(0);
+    blocks.sort_unstable();
+    let p50 = blocks.get(blocks.len() / 2).copied().unwrap_or(0);
+    let p99 = blocks.get(blocks.len() * 99 / 100).copied().unwrap_or(0);
     eprintln!(
         "pressure ({} MiB): over target on {over}/{steps} steps, evicting on {evicting}, \
-         {} drawn on average; internal blocks per step p50 {p50}, p99 {p99}; {} tracked",
+         {} drawn on average; blocks per step p50 {p50}, p99 {p99}; {} tracked",
         super::soak::PRESSURE_MIB,
         drawn / steps.max(1) as usize,
         sim.budget.tracked()
@@ -217,5 +241,59 @@ fn the_pressure_scenario_stays_over_target() {
     assert!(
         evicting * 10 >= steps,
         "the pressure scenario evicts too seldom"
+    );
+}
+
+/// The flight that grows the tracked set, then shrinks it
+/// (`scenarios::fly_grow_then_shrink`): the tracked peak, the tracked at
+/// the end, and the heap the budget frees when dropped without its step
+/// buffers.
+fn grown_then_shrunk() -> (usize, usize, i64) {
+    let mut sim = Sim::new(Profile::desktop(), 7);
+    let peak = super::scenarios::fly_grow_then_shrink(&mut sim, |_| {});
+    let tracked = sim.budget.tracked();
+    let ((), _) = super::alloc::counted(|| sim.budget.real.release_scratch());
+    let cfg = sim.budget.config().clone();
+    let fresh = Budget::new(cfg).unwrap();
+    let ((), t) = super::alloc::counted(|| drop(std::mem::replace(&mut sim.budget.real, fresh)));
+    (peak, tracked, -t.live)
+}
+
+/// A ratchet's recorded value (`alloc_ratchets.txt`).
+fn ratchet(name: &str) -> i64 {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/budget_sim/alloc_ratchets.txt");
+    let text = std::fs::read_to_string(path).expect("ratchets recorded");
+    text.lines()
+        .find_map(|l| l.strip_prefix(name).and_then(|v| v.trim().parse().ok()))
+        .unwrap_or_else(|| panic!("no ratchet {name}"))
+}
+
+/// The arena gives its room back: after the tracked set grew five times
+/// over and fell back, the budget holds at most twice what the ratchet
+/// allows a steady view per tracked resource (`bytes-per-tracked-resource`):
+/// the arena keeps twice its tracked resources' room once it shrank
+/// (`state::SHRINK_TO`), and a kept map's blocks stay at least near half
+/// full. Before the arena shrank, 1 664 B.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
+fn a_tracked_set_that_shrinks_gives_its_room_back() {
+    let (peak, tracked, held) = grown_then_shrunk();
+    let per = held / tracked.max(1) as i64;
+    let steady = ratchet("bytes-per-tracked-resource");
+    eprintln!(
+        "grown to {peak}, shrunk to {tracked} tracked: {held} B held, {per} B per tracked resource \
+         ({steady} for a steady view)"
+    );
+    assert!(
+        peak >= 3 * tracked,
+        "the scenario shrinks the tracked set ({peak} -> {tracked})"
+    );
+    assert!(
+        per <= 2 * steady,
+        "{per} B per tracked resource after the set shrank from {peak} to {tracked}: the room is kept"
     );
 }

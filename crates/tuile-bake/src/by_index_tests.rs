@@ -236,13 +236,15 @@ fn dressed(
     let item = DrawItem {
         mesh: ResourceId::Mesh(tile),
         role: Role::Exact,
-        drapes: vec![DrapeChoice {
+        drapes: [DrapeChoice {
             resource,
             layer: drape.layer,
             level: drape.level,
             uv: UvTransform::IDENTITY,
-        }],
-        serves: vec![tile],
+        }]
+        .into_iter()
+        .collect(),
+        serves: [tile].into_iter().collect(),
     };
     let drapes = std::collections::HashMap::from([(resource, Arc::new(drape))]);
     tuile_core::drive::dress(mesh, &item, &drapes)

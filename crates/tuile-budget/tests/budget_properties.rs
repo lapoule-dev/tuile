@@ -43,6 +43,9 @@ enum Op {
     Thermal(u8),
     /// Time passes.
     Wait(u16),
+    /// The clock goes back (a host whose clock does): the incremental
+    /// passes, the deadline queues and the prune must hold then too.
+    Back(u16),
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -55,6 +58,7 @@ fn op() -> impl Strategy<Value = Op> {
         1 => (0u8..4).prop_map(Op::Pressure),
         1 => (0u8..4).prop_map(Op::Thermal),
         2 => (0u16..3_000).prop_map(Op::Wait),
+        1 => (0u16..100).prop_map(Op::Back),
     ]
 }
 
@@ -63,8 +67,9 @@ fn script() -> impl Strategy<Value = Vec<Op>> {
 }
 
 /// The fixed corpus's scripts: drawn like [`script`]'s (the same ops, the
-/// same weights, 1 to 79 of them), by a seeded generator of this file's
-/// own, so the corpus never moves with a dependency's version.
+/// same weights, 1 to 79 of them — all but the clock going back, added by
+/// O1.4 after the corpus was recorded), by a seeded generator of this
+/// file's own, so the corpus never moves with a dependency's version.
 const CORPUS: u64 = 128;
 
 fn corpus_script(i: u64) -> Vec<Op> {
@@ -346,6 +351,9 @@ impl Harness {
                     ][usize::from(th % 4)],
                 ),
                 Op::Wait(ms) => self.now = self.now.plus(Micros::from_millis(u64::from(ms))),
+                Op::Back(ms) => {
+                    self.now = Micros(self.now.0.saturating_sub(u64::from(ms) * 1_000));
+                }
             }
         }
         let _ = &self.cfg;
@@ -671,6 +679,45 @@ proptest! {
     }
 }
 
+/// O1.4: the parents a need tells may form a cycle. The prune's counts of
+/// what keeps each tile cannot see one (a cycle holds itself up): a cycle
+/// sends the prune back to its whole walk. The need without the cycle, with
+/// it (formed by a change), without it again, every load completing, past
+/// several prunes (one every eighth step): in a debug build every step's
+/// checks hold — the prune frees what its whole walk frees, the support
+/// counts what the walk keeps, every pass equals its full recomputation.
+#[test]
+fn a_cycle_of_parents_prunes_as_the_walk_does() {
+    let cycled = |with: bool| {
+        let mut need = view(3, false);
+        if with {
+            // Two tiles, each the other's parent, both drawn.
+            let (a, b) = (t(9, 1, 1), t(9, 2, 2));
+            need.drawn.push((a, draped(a, 9).with_parent(b)));
+            need.drawn.push((b, draped(b, 9).with_parent(a)));
+        }
+        need
+    };
+    let mut lock = Lockstep::new(interactive()).unwrap();
+    let mut now = Micros::ZERO;
+    let mut last = NeedSet::new();
+    for k in 0..72u64 {
+        let need = cycled((12..44).contains(&k));
+        let delta = NeedDelta::between(&last, &need);
+        let d = lock.decide_delta(FrameInput::from_delta(k, now, &delta), &need);
+        for s in &d.start {
+            lock.on_loaded(s.resource, s.gen, est(s.resource));
+        }
+        for r in &d.upload_plan.items {
+            if let Some((_, g)) = d.deliver.iter().find(|(x, _)| x == r) {
+                lock.on_drawable(*r, *g, est(*r).gpu);
+            }
+        }
+        last = need;
+        now = now.plus(Micros(16_667));
+    }
+}
+
 /// The trace is not vacuous: over a long completing script the budget does
 /// decide, and the floor comes in.
 #[test]
@@ -755,6 +802,106 @@ fn only_the_protected_set_overflows_under_critical_pressure() {
                 s.protected[class].0,
                 s.target[class].0
             );
+        }
+    }
+}
+
+/// The tiles of the held-ancestry property: every tile of levels 0 to 2,
+/// and eight of level 3.
+fn tree_tiles() -> Vec<TileId> {
+    let mut v = vec![t(0, 0, 0)];
+    for l in 1..=2u32 {
+        let n = 1u64 << l;
+        v.extend((0..n).flat_map(|x| (0..n).map(move |y| t(l, x, y))));
+    }
+    v.extend((0..4u64).flat_map(|x| (0..2u64).map(move |y| t(3, x, y))));
+    v
+}
+
+/// One action on the tree: a step (completing what it asked or not), a
+/// tile's parent link told otherwise, a tile drawn or not.
+#[derive(Clone, Debug)]
+enum TreeOp {
+    Step { complete: bool },
+    Link { tile: u8, kind: u8, other: u8 },
+    Toggle { tile: u8 },
+}
+
+fn tree_op() -> impl Strategy<Value = TreeOp> {
+    prop_oneof![
+        4 => any::<bool>().prop_map(|complete| TreeOp::Step { complete }),
+        2 => (any::<u8>(), 0u8..3, any::<u8>())
+            .prop_map(|(tile, kind, other)| TreeOp::Link { tile, kind, other }),
+        2 => any::<u8>().prop_map(|tile| TreeOp::Toggle { tile }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// O1.4 (`held`): the held set answers which held tiles lie below a
+    /// tile — and the levels each walk passes — as the closure of the
+    /// parent links does, on any tree the need tells: the quadtree's own
+    /// links, links that are not (another tile's, any), none, cycles; while
+    /// tiles land, are drawn and held, and their links change. A debug
+    /// build compares every step with the closure built from scratch, and
+    /// every selection with one read again.
+    #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "the comparison is the debug build's: cargo test -p tuile-budget --test budget_properties"
+    )]
+    fn the_held_set_answers_as_the_closure_of_the_parent_links(
+        start in prop::collection::vec((0u8..3, any::<u8>(), any::<bool>()), 29),
+        ops in prop::collection::vec(tree_op(), 1..60),
+    ) {
+        let tiles = tree_tiles();
+        let n = tiles.len();
+        // Per tile: its link (0 the quadtree's, 1 another tile's, 2 none)
+        // and whether it is drawn (else an ancestor of the view).
+        let mut links: Vec<(u8, u8)> = start.iter().map(|(k, o, _)| (*k, *o)).collect();
+        let mut drawn_now: Vec<bool> = start.iter().map(|(_, _, d)| *d).collect();
+        let need_of = |links: &[(u8, u8)], drawn_now: &[bool]| {
+            let mut ns = NeedSet::default();
+            for (i, &id) in tiles.iter().enumerate() {
+                let (l, ..) = id.terrain_coord();
+                let mut nd = tuile_budget::Need::new(l, Class::TerrainMesh)
+                    .with_rect(rect(id))
+                    .with_sse_excess(1.0)
+                    .with_distance(1_000.0);
+                let p = match links[i].0 {
+                    0 => parent(id),
+                    1 => Some(tiles[usize::from(links[i].1) % n]),
+                    _ => None,
+                };
+                if let Some(p) = p {
+                    nd = nd.with_parent(p);
+                }
+                if drawn_now[i] {
+                    ns.drawn.push((id, nd));
+                } else {
+                    ns.ancestors.push((id, nd));
+                }
+            }
+            ns
+        };
+        let mut r = Rig::interactive();
+        for op in ops {
+            match op {
+                TreeOp::Step { complete } => {
+                    let d = r.step(&need_of(&links, &drawn_now));
+                    if complete {
+                        r.complete(&d);
+                    }
+                }
+                TreeOp::Link { tile, kind, other } => {
+                    links[usize::from(tile) % n] = (kind, other);
+                }
+                TreeOp::Toggle { tile } => {
+                    let i = usize::from(tile) % n;
+                    drawn_now[i] = !drawn_now[i];
+                }
+            }
         }
     }
 }

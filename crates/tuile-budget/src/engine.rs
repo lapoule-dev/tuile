@@ -36,28 +36,28 @@
 #![deny(clippy::float_arithmetic)]
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::sync::atomic::Ordering::Relaxed;
 
 use super::config::FailurePolicy;
 use super::cost::within_drift;
-use super::decisions::{
-    Decisions, DrapeChoice, DrawItem, DrawSet, Role, Start, SwapGroup, UploadPlan,
-};
+use super::decisions::{Decisions, DrapeChoice, DrawItem, Role, Start, UploadPlan};
+use super::downstream::{Item, Wants};
 use super::error::{AuditError, SessionError};
 use super::imagery::{drape_rank, needed_level, DrapeCandidate, GeoRect, LevelClamp, UvTransform};
 use super::need::{LayerReach, Membership};
 use super::need_state::{NeedState, TileNeed, WantedImagery};
 use super::priority::{score, PriorityKey, Quantised, Urgency};
-use super::sorted::{union4, SortedCols, SortedMap};
-use super::state::{Arena, CpuCopy, EvictKey, Gpu, Held, Load, Rank, Slot, Transit};
-use super::stats::{BudgetStats, CancelReason, EvictReason, GAP_BUCKETS, LATENCY_BUCKETS};
+use super::sorted::SortedMap;
+use super::state::{Arena, CpuCopy, EvictKey, Gpu, Held, Load, Mark, Rank, Slot, Transit};
+use super::stats::{BudgetStats, CancelReason, EvictReason, LATENCY_BUCKETS};
 use super::tier::{Presence, PresenceOracle, Source, Tier};
 use super::types::{
     sat_u32, Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure,
     ResourceId, Thermal, TileId,
 };
 use super::view::{Protection, ResourceState, ResourceView};
-use super::{Budget, Event, FrameInput, Ledger, NeedInput, RECENT_CAP, THRASH_WINDOW};
+use super::{Budget, Event, FrameInput, Ledger, NeedInput, TileInfo, THRASH_WINDOW};
 
 /// The step's effective numbers, after pressure, thermal and retarget.
 struct Eff {
@@ -134,43 +134,124 @@ impl PoolEff {
 }
 
 /// One wanted resource this step.
-#[derive(Clone, Copy, Debug)]
-struct Want {
-    urgency: Urgency,
-    q: Quantised,
-    class: Class,
-    level: u32,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Want {
+    pub urgency: Urgency,
+    pub q: Quantised,
+    pub class: Class,
+    pub level: u32,
+}
+
+/// A placeholder, for the sorted maps that keep wants.
+impl Default for Want {
+    fn default() -> Self {
+        Want {
+            urgency: Urgency::Refresh,
+            q: Quantised::default(),
+            class: Class::Drape,
+            level: 0,
+        }
+    }
+}
+
+/// What a drawn tile's selection adds to the step's counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct TileSelection {
+    /// Drawn as itself.
+    pub exact: bool,
+    /// Drawn by an ancestor alone.
+    pub fallback: bool,
+    /// Drawn by nothing.
+    pub lost: bool,
+    /// Drawn by the finer tiles it held last step: coarsening.
+    pub held: bool,
+    /// How far up its ancestor is, when one stands in.
+    pub depth: u32,
+}
+
+/// What a unit of the passes read beyond its own tile's mesh and drapes:
+/// the tiles whose place, mesh, drapes or last item it read. A change to
+/// any of them reads the unit again (`downstream`).
+#[derive(Debug, Default)]
+pub(super) struct Reach {
+    pub tiles: Vec<(TileId, u8)>,
+}
+
+/// What a unit read of a tile ([`Reach`]): its place in the tree (parent,
+/// level, footprint), whether its mesh is drawable, which of its drapes
+/// are, the drapes its mesh wore last step.
+pub(super) const PLACE: u8 = 1;
+pub(super) const MESH: u8 = 1 << 1;
+pub(super) const DRAPES: u8 = 1 << 2;
+pub(super) const WORN: u8 = 1 << 3;
+
+impl Reach {
+    /// It read `what` of `t`.
+    pub fn saw(&mut self, t: TileId, what: u8) {
+        self.tiles.push((t, what));
+    }
+
+    /// Starts over.
+    pub fn clear(&mut self) {
+        self.tiles.clear();
+    }
+
+    /// What it read beyond what every unit of `own` reads — `own`'s place,
+    /// mesh and drapes — by tile, sorted, each tile once, into `out`.
+    pub fn beyond(&mut self, own: TileId, out: &mut Vec<(TileId, u8)>) {
+        self.tiles.sort_unstable();
+        out.clear();
+        for &(t, w) in &self.tiles {
+            let w = if t == own { w & WORN } else { w };
+            if w == 0 {
+                continue;
+            }
+            match out.last_mut() {
+                Some(last) if last.0 == t => last.1 |= w,
+                _ => out.push((t, w)),
+            }
+        }
+    }
+}
+
+/// A draw item's buffers while it is built.
+#[derive(Debug, Default)]
+pub(super) struct ItemBufs {
+    needs: Vec<(LayerId, u32)>,
+    own: Vec<(LayerId, u32)>,
+}
+
+/// What a draw item adds to the step's statistics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ItemStats {
+    /// A layer it needs is worn by no drape.
+    pub bare: bool,
+    /// Exact, but some layer worn more than a level off its need.
+    pub underdraped: bool,
+    /// Its tile's level, for the imagery-over-terrain histogram.
+    pub tile_level: u32,
 }
 
 /// A step's buffers, kept across steps so that a step allocates nothing
 /// once they have grown to the view.
 #[derive(Debug, Default)]
 pub(super) struct Scratch {
-    drapes: Vec<((TileId, LayerId), u32)>,
-    /// Wants before their merge: (resource, order put, want).
-    wants_raw: Vec<(ResourceId, u32, Want)>,
-    wants: Vec<(ResourceId, Want)>,
-    keys: Vec<(ResourceId, PriorityKey)>,
-    ancestry: Vec<(TileId, TileId, u32)>,
-    jobs: Vec<(PriorityKey, ResourceId, Job, Want)>,
+    /// The work ranked: each job's key (its resource in it), what it is,
+    /// its want.
+    jobs: Vec<(PriorityKey, Job, Want)>,
+    /// The loads and transits whose deadline passed.
+    due: Vec<ResourceId>,
     /// This step's room: built at its first use, dropped with the step's
     /// evictions. Only a step under pressure builds it.
     room: Option<Room>,
-    /// The loads, then the deliveries, picked from `jobs`.
-    picked: Vec<(PriorityKey, ResourceId, Job, Want)>,
-}
-
-/// The meshes standing for the wanted tiles, before their drapes.
-#[derive(Default)]
-struct Selection {
-    /// (mesh, a tile it serves, the role it serves it in), unsorted: a mesh
-    /// is drawn in the least of its roles, for every tile it serves.
-    items: Vec<(ResourceId, TileId, Role)>,
-    coarsening: BTreeSet<TileId>,
-    exact: u32,
-    fallback: u32,
-    lost: u32,
-    depth: u32,
+    /// The loads, then the deliveries, picked from `jobs`: their places;
+    /// then the plan's transits by group.
+    picked: Vec<u32>,
+    /// The plan's: the copies in transit with their key (their resource in
+    /// it), bytes and group, and whether the plan took them.
+    transit: Vec<(PriorityKey, Bytes, (u8, TileId), bool)>,
+    /// What the step's read-only passes walk, added to its `work`.
+    walked: std::sync::atomic::AtomicU32,
 }
 
 /// What a step can evict beyond the arena's idle bytes: the grouped GPU
@@ -253,7 +334,7 @@ impl Walk {
 
 /// Work on a wanted resource.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Job {
+pub(super) enum Job {
     Load,
     Deliver,
 }
@@ -263,15 +344,10 @@ fn layers(img: &WantedImagery) -> &[LayerReach] {
     img.layers()
 }
 
-/// Every layer of `tile`, as a range of a map keyed by `(tile, layer)`.
-fn tile_layers(tile: TileId) -> std::ops::RangeInclusive<(TileId, LayerId)> {
-    (tile, LayerId(0))..=(tile, LayerId(u16::MAX))
-}
-
 /// The floor swap group `r` belongs to (D-A1), if any: a floor tile's mesh
 /// and its floor drape of every layer it wears, in stacking order.
 fn floor_group<'t>(
-    tiles: &'t SortedCols<TileId, TileNeed>,
+    tiles: &'t SortedMap<TileId, TileNeed>,
     r: ResourceId,
     is_floor: impl Fn(u32) -> bool,
 ) -> Option<impl Iterator<Item = ResourceId> + Clone + 't> {
@@ -319,6 +395,28 @@ fn latency_bucket(d: Micros) -> usize {
 }
 
 impl Budget {
+    /// Counts what the kept maps spent keeping their order since the last
+    /// step took it.
+    pub(super) fn walk_upkeep(&mut self) {
+        let n = self
+            .tiles
+            .take_upkeep()
+            .saturating_add(self.held_last.take_upkeep())
+            .saturating_add(self.arena.take_upkeep())
+            .saturating_add(self.need.take_upkeep())
+            .saturating_add(self.down.take_upkeep());
+        self.walk(usize::try_from(n).unwrap_or(usize::MAX));
+    }
+
+    /// Counts `n` more elements walked by the step.
+    pub(super) fn walk(&self, n: usize) {
+        // Relaxed: a counter the step alone reads, through `&self` (a
+        // `Budget` stays `Sync`).
+        let w = &self.scratch.walked;
+        let n = sat_u32(n);
+        w.store(w.load(Relaxed).saturating_add(n), Relaxed);
+    }
+
     fn class_of(&self, r: ResourceId, mesh_class: Class) -> Class {
         match r {
             ResourceId::Mesh(_) => mesh_class,
@@ -334,7 +432,7 @@ impl Budget {
                 .map_or(0, |l| self.layer_epochs.get(&l).copied().unwrap_or(0))
     }
 
-    fn is_floor(&self, level: u32) -> bool {
+    pub(super) fn is_floor(&self, level: u32) -> bool {
         self.cfg.pinned_level.is_some_and(|p| level <= p)
     }
 
@@ -402,11 +500,10 @@ impl Budget {
                 }
             }),
             hard,
-            decoded: if self.cfg.decoded_target == Bytes::MAX {
-                Bytes::MAX
-            } else {
-                self.cfg.decoded_target.scaled(pct, 100)
-            },
+            // The decoded tier is a target like the GPU's: retargeted with
+            // them and scaled by pressure. The copies an eviction demotes
+            // to are tracked state, bounded by this.
+            decoded: scale(self.cfg.decoded_target, pct),
             quota: PerClass::from_fn(|c| (self.cfg.max_in_flight[c] / thermal_div).max(1)),
             local: self.cfg.max_local_reads,
             upload: if self.cfg.upload_bytes_per_frame == Bytes::MAX {
@@ -514,6 +611,7 @@ impl Budget {
                             let cold = self.arena.cold_mut(s);
                             cold.store_missed = true;
                             cold.presence = Some(Presence::Absent);
+                            self.arena.note_tier(s);
                             st.store_misses += 1;
                         }
                     }
@@ -595,18 +693,20 @@ impl Budget {
             );
         }
         st.rejected_inputs = st.rejected_inputs.saturating_add(sat_u32(need.rejected()));
-        // The whole need is still walked downstream (O1.4): only what
-        // changed is counted here.
         st.work = st.work.saturating_add(named);
     }
 
-    /// How cheaply a drape could be drawn: on the GPU, decoded, in a local
-    /// store, or only remotely.
-    fn drape_tier(&self, r: ResourceId, presence: &dyn PresenceOracle) -> Tier {
-        self.tier(r, self.arena.find(r), Class::Drape, presence)
+    /// Whether `tn` asks for drapes this step: drawn or blocking, with
+    /// imagery.
+    pub(super) fn draped(tn: &TileNeed) -> bool {
+        matches!(tn.membership, Membership::Drawn | Membership::Blocker)
+            && tn.need.imagery.is_some()
     }
 
-    /// Each wanted tile's imagery level this step.
+    /// The imagery level of each layer tile `t` asks for this step, into
+    /// `out` in layer order, a layer listed twice at its last listing's
+    /// level. `asked` is set when the presence index was asked: the levels
+    /// then hold for this step only.
     ///
     /// The level follows the texel footprint (relaxed with the LOD, with
     /// hysteresis). When that level is held nowhere locally, a level already
@@ -614,62 +714,65 @@ impl Budget {
     /// level of the window between the relaxed and the unrelaxed need: a
     /// relaxation never sends to the network what a local tier can show
     /// (I14, I15). Batch takes the exact level, a function of the frame.
-    fn drape_needs(
-        &mut self,
-        tiles: &SortedCols<TileId, TileNeed>,
+    pub(super) fn drape_levels(
+        &self,
+        t: TileId,
+        tn: &TileNeed,
         presence: &dyn PresenceOracle,
-    ) -> SortedMap<(TileId, LayerId), u32> {
-        let mut out = std::mem::take(&mut self.scratch.drapes);
+        last: &BTreeMap<(TileId, LayerId), u32>,
+        out: &mut Vec<(LayerId, u32)>,
+        asked: &mut bool,
+    ) {
         out.clear();
+        let Some(img) = tn.need.imagery.as_ref() else {
+            return;
+        };
         let floor = self.cfg.pinned_level.unwrap_or(0);
         let batch = self.cfg.policy == Policy::Batch;
         let cap = self.cfg.imagery_cap();
-        for (t, tn) in tiles {
-            let draped = matches!(tn.membership, Membership::Drawn | Membership::Blocker);
-            let Some(img) = tn.need.imagery.as_ref().filter(|_| draped) else {
-                continue;
+        for reach in layers(img) {
+            self.walk(1);
+            let key = (t, reach.layer);
+            let drape = |l| ResourceId::drape(t, reach.layer, l);
+            let clamp = LevelClamp {
+                floor,
+                terrain_level: tn.need.level,
+                over_terrain_cap: cap,
+                source_max: reach.max_level,
             };
-            for reach in layers(img) {
-                let key = (*t, reach.layer);
-                let drape = |l| ResourceId::drape(*t, reach.layer, l);
-                let clamp = LevelClamp {
-                    floor,
-                    terrain_level: tn.need.level,
-                    over_terrain_cap: cap,
-                    source_max: reach.max_level,
-                };
-                if batch {
-                    out.push((key, needed_level(None, img.footprint, clamp)));
-                    continue;
-                }
-                let prev = self.imagery_prev.get(&key).copied();
-                let relaxed = needed_level(prev, img.footprint.relaxed(self.scale), clamp);
-                let mut level = relaxed;
-                if self.drape_tier(drape(relaxed), presence) == Tier::Remote {
-                    let full = needed_level(prev, img.footprint, clamp);
-                    let ceiling = tn.need.level.saturating_add(cap).min(reach.max_level);
-                    let lo = relaxed.min(full).saturating_sub(1).max(floor);
-                    let hi = relaxed.max(full).saturating_add(1).min(ceiling);
-                    let best = (lo..=hi)
-                        .map(|l| {
-                            let tier = self.drape_tier(drape(l), presence);
-                            ((tier, l.abs_diff(relaxed), Reverse(l)), l)
-                        })
-                        .min();
-                    if let Some(((tier, ..), l)) = best {
-                        if tier != Tier::Remote {
-                            level = l;
-                        }
+            if batch {
+                out.push((reach.layer, needed_level(None, img.footprint, clamp)));
+                continue;
+            }
+            let prev = last.get(&key).copied();
+            let relaxed = needed_level(prev, img.footprint.relaxed(self.scale), clamp);
+            let mut level = relaxed;
+            let tier = |r: ResourceId, asked: &mut bool| {
+                self.tier_asked(r, self.arena.find(r), Class::Drape, presence, asked)
+            };
+            if tier(drape(relaxed), asked) == Tier::Remote {
+                let full = needed_level(prev, img.footprint, clamp);
+                let ceiling = tn.need.level.saturating_add(cap).min(reach.max_level);
+                let lo = relaxed.min(full).saturating_sub(1).max(floor);
+                let hi = relaxed.max(full).saturating_add(1).min(ceiling);
+                let best = (lo..=hi)
+                    .map(|l| {
+                        self.walk(1);
+                        let tier = tier(drape(l), asked);
+                        ((tier, l.abs_diff(relaxed), Reverse(l)), l)
+                    })
+                    .min();
+                if let Some(((tier, ..), l)) = best {
+                    if tier != Tier::Remote {
+                        level = l;
                     }
                 }
-                out.push((key, level));
             }
-            // This tile's layers in order, a layer listed twice in the order
-            // listed; the tiles come in order.
-            let from = out.partition_point(|e| e.0 .0 < *t);
-            out[from..].sort_by_key(|e| e.0);
+            out.push((reach.layer, level));
         }
-        // A layer listed twice: the last listing's level.
+        // The layers in order, a layer listed twice in the order listed
+        // (a stable sort); then the last listing's level.
+        out.sort_by_key(|e| e.0);
         out.dedup_by(|later, earlier| {
             let same = later.0 == earlier.0;
             if same {
@@ -677,103 +780,104 @@ impl Budget {
             }
             same
         });
-        for (k, l) in &out {
-            self.imagery_prev.insert(*k, *l);
-        }
-        SortedMap::from_sorted(out)
     }
 
-    /// Every floor tile the need lists is drawable with its floor drape
-    /// of every layer it wears (P1.1), and the need lists one at least.
-    fn floor_in(&self, tiles: &SortedCols<TileId, TileNeed>) -> bool {
-        let mut any = false;
-        let all = tiles
-            .iter()
-            .filter(|(_, n)| self.is_floor(n.need.level))
-            .all(|(t, n)| {
-                any = true;
-                self.drawable(ResourceId::Mesh(*t))
-                    && n.need
-                        .imagery
-                        .as_ref()
-                        .map(layers)
-                        .unwrap_or(&[])
-                        .iter()
-                        .all(|r| self.drawable(ResourceId::drape(*t, r.layer, n.need.level)))
-            });
-        any && all
+    /// Tile `t`'s drape needs this step — each layer it asks for, in layer
+    /// order, at the level chosen — when it asks for drapes; into `out`.
+    pub(super) fn drapes_of(&self, t: TileId, tn: &TileNeed, out: &mut Vec<(LayerId, u32)>) {
+        out.clear();
+        if !Self::draped(tn) {
+            return;
+        }
+        let Some(img) = tn.need.imagery.as_ref() else {
+            return;
+        };
+        out.extend(layers(img).iter().map(|x| (x.layer, 0)));
+        out.sort_unstable_by_key(|e| e.0);
+        out.dedup_by_key(|e| e.0);
+        for (layer, level) in out.iter_mut() {
+            debug_assert!(
+                self.imagery_prev.contains_key(&(t, *layer)),
+                "a drape need's level is chosen before it is read"
+            );
+            *level = self.imagery_prev.get(&(t, *layer)).copied().unwrap_or(0);
+        }
+    }
+
+    /// Whether floor tile `t` is drawable with its floor drape of every
+    /// layer it wears (P1.1).
+    pub(super) fn floor_ready(&self, t: TileId, tn: &TileNeed) -> bool {
+        self.drawable(ResourceId::Mesh(t))
+            && tn
+                .need
+                .imagery
+                .as_ref()
+                .map(layers)
+                .unwrap_or(&[])
+                .iter()
+                .all(|r| self.drawable(ResourceId::drape(t, r.layer, tn.need.level)))
     }
 
     /// Kept from eviction this step: drawn, or in a swap the view waits on.
-    fn kept(&self, r: &ResourceId) -> bool {
-        self.drawn_last.contains(r) || self.swap_last.contains(r)
+    fn kept(&self, s: Slot) -> bool {
+        self.arena.marked(s, Mark::Drawn) || self.arena.marked(s, Mark::Swap)
     }
 
     /// The drapes `mesh` wore last step.
     fn worn_last_of(&self, mesh: ResourceId) -> impl Iterator<Item = &DrapeChoice> + '_ {
-        let from = self.worn_last.partition_point(|w| w.0 < mesh);
-        self.worn_last[from..]
-            .iter()
-            .take_while(move |w| w.0 == mesh)
-            .map(|w| &w.1)
+        self.down.worn(mesh)
     }
 
     fn drawable(&self, r: ResourceId) -> bool {
         self.arena.find(r).is_some_and(|s| self.arena.has_gpu(s))
     }
 
-    /// Every (ancestor, held tile) pair of last step's held tiles, sorted,
-    /// with the lowest level the walk from the held tile passed before
-    /// reaching that ancestor: `held` is a descendant of `of` exactly when
-    /// that level is above `of`'s own (or `of`'s is unknown). One walk per
-    /// held tile, once per step, instead of one per held tile and missing
-    /// tile.
-    fn held_ancestry(&self, out: &mut Vec<(TileId, TileId, u32)>) {
+    /// The pairs (ancestor, held tile) a held tile adds to the ancestry: for
+    /// each ancestor its walk from the held tile reaches, the lowest level
+    /// it passed before reaching it — `held` is a descendant of `of` exactly
+    /// when that level is above `of`'s own (or `of`'s is unknown). At most
+    /// 64 ancestors, the first visit of each (a cycle visits one twice).
+    /// `info` gives each tile's tree position.
+    pub(super) fn chain_of(
+        h: TileId,
+        info: impl Fn(TileId) -> Option<TileInfo>,
+        out: &mut Vec<(TileId, u32)>,
+    ) {
         out.clear();
-        for &h in &self.held_last {
-            let mut t = h;
-            let mut passed = u32::MAX;
-            for _ in 0..64 {
-                let Some(info) = self.tiles.get(&t) else {
-                    break;
-                };
-                let Some(p) = info.parent() else {
-                    break;
-                };
-                out.push((p, h, passed));
-                passed = passed.min(info.level);
-                t = p;
+        let mut t = h;
+        let mut passed = u32::MAX;
+        for _ in 0..64 {
+            let Some(i) = info(t) else {
+                break;
+            };
+            let Some(p) = i.parent() else {
+                break;
+            };
+            if !out.iter().any(|x| x.0 == p) {
+                out.push((p, passed));
             }
+            passed = passed.min(i.level);
+            t = p;
         }
-        // A cycle visits an ancestor twice: its first visit, the highest
-        // level passed, is the one that counts.
-        out.sort_unstable_by_key(|a| (a.0, a.1, Reverse(a.2)));
-        out.dedup_by(|b, a| (a.0, a.1) == (b.0, b.1));
     }
 
-    /// The held tiles below `of`, in tile order.
-    fn held_below<'h>(
-        &self,
-        ancestry: &'h [(TileId, TileId, u32)],
-        of: TileId,
-    ) -> impl Iterator<Item = TileId> + 'h {
+    /// The held tiles below `of`, in no particular order (`held`).
+    fn held_below(&self, of: TileId) -> impl Iterator<Item = TileId> + '_ {
         let target = self.tiles.get(&of).map(|i| i.level);
-        let from = ancestry.partition_point(|a| a.0 < of);
-        ancestry[from..]
-            .iter()
-            .take_while(move |a| a.0 == of)
-            .filter(move |a| target.is_none_or(|l| a.2 > l))
-            .map(|a| a.1)
+        self.held_under(of, |t| self.tiles.get(&t).copied())
+            .filter(move |(_, passed)| target.is_none_or(|l| *passed > l))
+            .map(|(h, _)| h)
     }
 
     /// The tile's ancestors, nearest first, as far as the budget knows them:
     /// at most 64, lazily, so a caller that stops at the first hit walks no
     /// further.
-    fn ancestors(&self, t: TileId) -> impl Iterator<Item = TileId> + '_ {
+    pub(super) fn ancestors(&self, t: TileId) -> impl Iterator<Item = TileId> + '_ {
         std::iter::successors(self.tiles.get(&t).and_then(|i| i.parent()), move |p| {
             self.tiles.get(p).and_then(|i| i.parent())
         })
         .take(64)
+        .inspect(|_| self.walk(1))
     }
 
     /// The UV mapping of `tile`'s mesh into the drapes of `x`, the tile
@@ -799,13 +903,24 @@ impl Budget {
         // Those on the GPU, by level: a range of the arena's ordered index.
         let lo = ResourceId::drape(x, layer, 0);
         let hi = ResourceId::drape(x, layer, u32::MAX);
-        self.arena.gpu_drapes(lo..=hi).filter_map(|r| match r {
-            ResourceId::Drape { level, .. } => Some((r, level)),
-            ResourceId::Mesh(_) => None,
-        })
+        self.arena
+            .gpu_drapes(lo..=hi)
+            .inspect(|_| self.walk(1))
+            .filter_map(|r| match r {
+                ResourceId::Drape { level, .. } => Some((r, level)),
+                ResourceId::Mesh(_) => None,
+            })
     }
 
-    fn best_drape_for(&self, tile: TileId, layer: LayerId, need: u32) -> Option<DrapeChoice> {
+    /// The drape `tile`'s mesh wears for `layer`, needed at `need`; `reach`
+    /// gets the tiles read beyond the tile's own drape at `need`.
+    fn best_drape_for(
+        &self,
+        tile: TileId,
+        layer: LayerId,
+        need: u32,
+        reach: &mut Reach,
+    ) -> Option<DrapeChoice> {
         // The tile's own drape at exactly its need is the best there is:
         // the coarsest at or above the need, and the closest owner.
         let own = ResourceId::drape(tile, layer, need);
@@ -824,6 +939,7 @@ impl Budget {
             .chain(self.ancestors(tile))
             .enumerate()
         {
+            reach.saw(x, PLACE | DRAPES);
             let Some(uv) = self.uv_into(rect, up, x) else {
                 continue;
             };
@@ -836,6 +952,12 @@ impl Budget {
                     best = Some((c, r, uv));
                 }
             }
+            // A drape at exactly the need: nothing farther up ranks before
+            // it (the closer owner wins a tie), so the walk ends — the same
+            // answer, fewer ancestors read.
+            if best.is_some_and(|(b, ..)| b.level == need) {
+                break;
+            }
         }
         best.map(|(c, resource, uv)| DrapeChoice {
             resource,
@@ -847,16 +969,19 @@ impl Budget {
 
     /// Whether `tile` has any drawable drape of `layer`, on itself or an
     /// ancestor it maps into: `best_drape_for(tile, layer, _).is_some()`,
-    /// stopping at the first found.
-    fn has_drape(&self, tile: TileId, layer: LayerId) -> bool {
+    /// stopping at the first found. `reach` gets the tile and the ancestors
+    /// read when the tile's own drapes did not answer.
+    fn has_drape(&self, tile: TileId, layer: LayerId, reach: &mut Reach) -> bool {
+        // Its own first: they need no mapping.
+        if self.drawable_drapes(tile, layer).next().is_some() {
+            return true;
+        }
         let rect = self.tiles.get(&tile).and_then(|i| i.rect());
-        std::iter::once(tile)
-            .chain(self.ancestors(tile))
-            .enumerate()
-            .any(|(up, x)| {
-                self.drawable_drapes(x, layer).next().is_some()
-                    && self.uv_into(rect, up, x).is_some()
-            })
+        self.ancestors(tile).enumerate().any(|(up, x)| {
+            reach.saw(x, PLACE | DRAPES);
+            self.drawable_drapes(x, layer).next().is_some()
+                && self.uv_into(rect, up + 1, x).is_some()
+        })
     }
 
     /// Whether `tile`'s mesh can be drawn dressed for `layers`: each layer
@@ -864,272 +989,223 @@ impl Budget {
     /// layer switch in progress — the mesh still wears a layer it no longer
     /// needs. A mesh that cannot is not drawn: bare ground is black ground
     /// (I1, D-A1).
-    fn dressable(&self, tile: TileId, layers: &[LayerId]) -> bool {
-        let missing = layers.iter().any(|l| !self.has_drape(tile, *l));
-        !missing
-            || self
-                .worn_last_of(ResourceId::Mesh(tile))
-                .any(|d| !layers.contains(&d.layer) && self.drawable(d.resource))
+    fn dressable(&self, tile: TileId, layers: &[LayerId], reach: &mut Reach) -> bool {
+        let missing = layers.iter().any(|l| !self.has_drape(tile, *l, reach));
+        if !missing {
+            return true;
+        }
+        // Last step's item of the tile's mesh, and the drapes it wore.
+        reach.saw(tile, WORN);
+        self.worn_last_of(ResourceId::Mesh(tile)).any(|d| {
+            reach.saw(d.resource.tile(), DRAPES);
+            !layers.contains(&d.layer) && self.drawable(d.resource)
+        })
     }
 
-    /// The meshes that stand for the wanted tiles, at levels up to `cap`:
-    /// each tile itself when drawable and dressed; else the finer tiles it
-    /// held last step (zoom-out); else its nearest drawable, dressed
-    /// ancestor.
-    fn select(
+    /// The meshes that stand for drawn tile `t`, at levels up to `cap`, into
+    /// `out` as (mesh, role): the tile itself when drawable and dressed for
+    /// `layers`; else the finer tiles it held last step (zoom-out); else its
+    /// nearest drawable, dressed ancestor. `reach` gets the tiles read
+    /// beyond the tile's own mesh and drapes (the held tiles below it, read
+    /// from the ancestry, are its own: a change to them reads it again).
+    pub(super) fn select_tile(
         &self,
-        tiles: &SortedCols<TileId, TileNeed>,
-        drapes: &SortedMap<(TileId, LayerId), u32>,
-        ancestry: &[(TileId, TileId, u32)],
+        t: TileId,
+        layers: &[LayerId],
         cap: Option<u32>,
-    ) -> Selection {
-        let mut sel = Selection::default();
-        // The layers each wanted tile's drape need asks for, in layer order.
-        let mut layers: Vec<LayerId> = Vec::new();
-        let shown = |t: TileId, layers: &[LayerId]| {
-            let level = self.tiles.get(&t).map_or(0, |i| i.level);
+        out: &mut Vec<(ResourceId, Role)>,
+        reach: &mut Reach,
+    ) -> TileSelection {
+        out.clear();
+        let mut sel = TileSelection::default();
+        let shown = |x: TileId, reach: &mut Reach| {
+            reach.saw(x, PLACE | MESH | DRAPES);
+            let level = self.tiles.get(&x).map_or(0, |i| i.level);
             cap.is_none_or(|c| level <= c)
-                && self.drawable(ResourceId::Mesh(t))
-                && self.dressable(t, layers)
+                && self.drawable(ResourceId::Mesh(x))
+                && self.dressable(x, layers, reach)
         };
-        for (t, _) in tiles
-            .iter()
-            .filter(|(_, n)| n.membership == Membership::Drawn)
-        {
-            layers.clear();
-            layers.extend(drapes.range(tile_layers(*t)).map(|((_, l), _)| *l));
-            if shown(*t, &layers) {
-                sel.items.push((ResourceId::Mesh(*t), *t, Role::Exact));
-                sel.exact += 1;
-                continue;
-            }
-            let mut held = false;
-            for h in self.held_below(ancestry, *t) {
-                if shown(h, &layers) {
-                    sel.items.push((ResourceId::Mesh(h), *t, Role::Held));
-                    held = true;
-                }
-            }
-            if held {
-                sel.coarsening.insert(*t);
-            }
-            let anc = self.ancestors(*t).find(|a| shown(*a, &layers));
-            if let Some(a) = anc {
-                sel.items.push((ResourceId::Mesh(a), *t, Role::Fallback));
-                let level = |x: TileId| self.tiles.get(&x).map_or(0, |i| i.level);
-                sel.depth = sel.depth.max(level(*t).saturating_sub(level(a)));
-                if !held {
-                    sel.fallback += 1;
-                }
-            } else if !held {
-                sel.lost += 1;
+        if shown(t, reach) {
+            out.push((ResourceId::Mesh(t), Role::Exact));
+            sel.exact = true;
+            return sel;
+        }
+        let mut held = false;
+        for h in self.held_below(t) {
+            if shown(h, reach) {
+                out.push((ResourceId::Mesh(h), Role::Held));
+                held = true;
             }
         }
+        sel.held = held;
+        let anc = self.ancestors(t).find(|a| shown(*a, reach));
+        if let Some(a) = anc {
+            out.push((ResourceId::Mesh(a), Role::Fallback));
+            let level = |x: TileId| self.tiles.get(&x).map_or(0, |i| i.level);
+            sel.depth = level(t).saturating_sub(level(a));
+            sel.fallback = !held;
+        } else {
+            sel.lost = !held;
+        }
+        // By mesh: an entry once (a cycle could name a tile twice).
+        out.sort_unstable();
+        out.dedup();
         sel
     }
 
-    // 3. The draw set.
-    fn build_draw(
+    /// The draw item of `mesh`, drawn for `run` — (tile served, role) by
+    /// tile, at least one — into `out` (its buffers reused), with what it
+    /// adds to the step's statistics. `drapes` gives a served tile's drape
+    /// needs. `reach` gets what it read beyond its own tile's drapes at the
+    /// levels needed (an ancestor's drapes; its own last item, in a layer
+    /// switch).
+    pub(super) fn build_item(
         &self,
-        tiles: &SortedCols<TileId, TileNeed>,
-        drapes: &SortedMap<(TileId, LayerId), u32>,
-        ancestry: &[(TileId, TileId, u32)],
-        floor_in: bool,
-        st: &mut BudgetStats,
-    ) -> (DrawSet, BTreeSet<TileId>) {
-        let mut sel = self.select(tiles, drapes, ancestry, None);
-        if sel.lost > 0 && !floor_in {
-            // P1.1 (b): coarse ground before any refinement. While wanted
-            // ground is lost and the floor not in, nothing finer than the
-            // floor is drawn.
-            if let Some(p) = self.cfg.pinned_level {
-                sel = self.select(tiles, drapes, ancestry, Some(p));
+        mesh: ResourceId,
+        run: &[(TileId, Role)],
+        drapes: impl Fn(TileId, &mut Vec<(LayerId, u32)>),
+        reach: &mut Reach,
+        bufs: &mut ItemBufs,
+        out: &mut DrawItem,
+    ) -> ItemStats {
+        self.walk(run.len());
+        let role = run.iter().map(|x| x.1).min().unwrap_or(Role::Exact);
+        out.mesh = mesh;
+        out.role = role;
+        out.serves.clear();
+        out.serves.extend(run.iter().map(|x| x.0));
+        out.serves.dedup();
+        let tile = mesh.tile();
+        // The level each layer is needed at: the tile's own need when
+        // exact; a held tile keeps its own last level; a fallback dresses
+        // for the finest of the tiles it serves.
+        let ItemBufs { needs, own } = bufs;
+        needs.clear();
+        for s in &out.serves {
+            drapes(*s, own);
+            for (layer, n) in own.iter() {
+                match needs.binary_search_by_key(layer, |x| x.0) {
+                    Ok(i) => needs[i].1 = needs[i].1.max(*n),
+                    Err(i) => needs.insert(i, (*layer, *n)),
+                }
             }
         }
-        st.exact += sel.exact;
-        st.fallback += sel.fallback;
-        st.lost += sel.lost;
-        st.fallback_depth_max = st.fallback_depth_max.max(sel.depth);
-        let Selection {
-            mut items,
-            coarsening,
-            ..
-        } = sel;
-        // By mesh, then by tile served: each mesh's run is one draw item.
-        items.sort_unstable();
-        let meshes = items.chunk_by(|a, b| a.0 == b.0).count();
-        let mut out = Vec::with_capacity(meshes);
-        // The level each layer is needed at, by layer.
-        let mut needs: Vec<(LayerId, u32)> = Vec::new();
-        for run in items.chunk_by(|a, b| a.0 == b.0) {
-            let mesh = run[0].0;
-            let role = run.iter().map(|x| x.2).min().unwrap_or(Role::Exact);
-            let mut serves: Vec<TileId> = Vec::with_capacity(run.len());
-            serves.extend(run.iter().map(|x| x.1));
-            serves.dedup();
-            let tile = mesh.tile();
-            // The level each layer is needed at: the tile's own need when
-            // exact; a held tile keeps its own last level; a fallback
-            // dresses for the finest of the tiles it serves.
-            needs.clear();
-            for s in &serves {
-                for ((_, layer), n) in drapes.range(tile_layers(*s)) {
-                    match needs.binary_search_by_key(layer, |x| x.0) {
-                        Ok(i) => needs[i].1 = needs[i].1.max(*n),
-                        Err(i) => needs.insert(i, (*layer, *n)),
-                    }
+        if role == Role::Held {
+            for (layer, n) in needs.iter_mut() {
+                if let Some(p) = self.imagery_prev.get(&(tile, *layer)) {
+                    *n = *p;
                 }
             }
-            if role == Role::Held {
-                for (layer, n) in needs.iter_mut() {
-                    if let Some(p) = self.imagery_prev.get(&(tile, *layer)) {
-                        *n = *p;
-                    }
-                }
-            }
-            let needed = |l: LayerId| needs.iter().any(|x| x.0 == l);
-            let mut chosen: Vec<DrapeChoice> = Vec::with_capacity(needs.len());
-            chosen.extend(
-                needs
-                    .iter()
-                    .filter_map(|(layer, n)| self.best_drape_for(tile, *layer, *n)),
-            );
-            if chosen.len() < needs.len() {
-                // A layer switch in progress: a layer the tiles now ask for
-                // is drawable nowhere yet, so the layers this mesh wore last
-                // step and no longer needs stay worn until it is.
-                for old in self.worn_last_of(mesh) {
-                    if !needed(old.layer) && self.drawable(old.resource) {
-                        chosen.push(*old);
-                    }
-                }
-                // One drape per layer: an unstable sort is the stable one.
-                chosen.sort_unstable_by_key(|d| d.layer);
-            }
-            // Bare: a layer the tiles need is worn by no drape, and no old
-            // layer stands in for it during a switch.
-            let missing = needs
+        }
+        let needed = |l: LayerId| needs.iter().any(|x| x.0 == l);
+        let chosen = &mut out.drapes;
+        chosen.clear();
+        chosen.extend(
+            needs
                 .iter()
-                .any(|(l, _)| !chosen.iter().any(|d| d.layer == *l));
-            let switching = chosen.iter().any(|d| !needed(d.layer));
-            if missing && !switching {
-                st.bare += 1;
-            }
-            if role == Role::Exact {
-                let off = needs.iter().any(|(layer, n)| {
-                    !chosen
-                        .iter()
-                        .any(|d| d.layer == *layer && d.level.abs_diff(*n) <= 1)
-                });
-                if off {
-                    st.underdraped += 1;
-                }
-                for d in &chosen {
-                    let gap = i64::from(d.level)
-                        - i64::from(self.tiles.get(&tile).map(|i| i.level).unwrap_or(0));
-                    let i =
-                        usize::try_from((gap + 8).clamp(0, GAP_BUCKETS as i64 - 1)).unwrap_or(0);
-                    st.imagery_over_terrain[i] += 1;
+                .filter_map(|(layer, n)| self.best_drape_for(tile, *layer, *n, reach)),
+        );
+        if chosen.len() < needs.len() {
+            // A layer switch in progress: a layer the tiles now ask for
+            // is drawable nowhere yet, so the layers this mesh wore last
+            // step and no longer needs stay worn until it is.
+            reach.saw(tile, WORN);
+            for old in self.worn_last_of(mesh) {
+                reach.saw(old.resource.tile(), DRAPES);
+                if !needed(old.layer) && self.drawable(old.resource) {
+                    chosen.push(*old);
                 }
             }
-            if role == Role::Held {
-                st.held += 1;
-            }
-            out.push(DrawItem {
-                mesh,
-                role,
-                drapes: chosen,
-                serves,
+            // One drape per layer: an unstable sort is the stable one.
+            chosen.sort_unstable_by_key(|d| d.layer);
+        }
+        // Bare: a layer the tiles need is worn by no drape, and no old
+        // layer stands in for it during a switch.
+        let missing = needs
+            .iter()
+            .any(|(l, _)| !chosen.iter().any(|d| d.layer == *l));
+        let switching = chosen.iter().any(|d| !needed(d.layer));
+        let mut stats = ItemStats {
+            bare: missing && !switching,
+            underdraped: false,
+            tile_level: self.tiles.get(&tile).map(|i| i.level).unwrap_or(0),
+        };
+        if role == Role::Exact {
+            stats.underdraped = needs.iter().any(|(layer, n)| {
+                !chosen
+                    .iter()
+                    .any(|d| d.layer == *layer && d.level.abs_diff(*n) <= 1)
             });
         }
-        (DrawSet { items: out }, coarsening)
+        stats
     }
 
-    /// What the step wants loaded or delivered.
-    fn wants(
+    /// What tile `t` puts in the wants, into `out` merged — per resource the
+    /// most urgent, then the best scored; of equals, the first put — in
+    /// resource order. `item` is the draw item of its mesh, `meshes_in`
+    /// whether Batch may want its drapes (always under Interactive).
+    pub(super) fn tile_wants(
         &self,
-        tiles: &SortedCols<TileId, TileNeed>,
-        drapes: &SortedMap<(TileId, LayerId), u32>,
-        draw: &DrawSet,
-        raw: &mut Vec<(ResourceId, u32, Want)>,
-        mut merged: Vec<(ResourceId, Want)>,
-    ) -> SortedMap<ResourceId, Want> {
-        raw.clear();
-        merged.clear();
+        t: TileId,
+        tn: &TileNeed,
+        item: Option<&Item>,
+        meshes_in: bool,
+        drapes: &mut Vec<(LayerId, u32)>,
+        out: &mut Vec<(ResourceId, u32, Want)>,
+    ) {
+        out.clear();
         let batch = self.cfg.policy == Policy::Batch;
         // Every want put, in order; merged below.
         let put = |out: &mut Vec<(ResourceId, u32, Want)>, r: ResourceId, w: Want| {
             let seq = u32::try_from(out.len()).unwrap_or(u32::MAX);
             out.push((r, seq, w));
         };
-        // Batch: a frame's drapes are those of what it draws. Batch never
-        // cancels a load it started (I13), so a drape started for a tile the
-        // selection is still settling past — its mesh not in, the tile then
-        // replaced by its children — would be read whatever the frame draws,
-        // and what a bake reads would follow the order its meshes came in.
-        // So no drape but the floor's own is wanted until every mesh the
-        // frame draws and waits on is loaded: the selection it then wears
-        // drapes for is the one the frame draws. A floor tile is no
-        // exception past its own drape: drawn while the selection settles,
-        // the finer drape it asks for is as much a pass's as any other's.
-        let meshes_in = !batch
-            || tiles
-                .iter()
-                .filter(|(_, tn)| matches!(tn.membership, Membership::Drawn | Membership::Blocker))
-                .all(|(t, _)| {
-                    let a = &self.arena;
-                    a.find(ResourceId::Mesh(*t))
-                        .is_some_and(|s| a.has_gpu(s) || a.has_cpu(s))
-                });
-        for (t, tn) in tiles {
-            let floor = self.is_floor(tn.need.level);
-            let mesh_drawable = self.drawable(ResourceId::Mesh(*t));
-            let urgency = if floor {
-                Urgency::Floor
-            } else {
-                match tn.membership {
-                    Membership::Drawn => Urgency::Hole,
-                    Membership::Blocker => Urgency::Blocker,
-                    Membership::Ring => Urgency::Ring,
-                    Membership::Ancestor => Urgency::Ancestor,
-                }
-            };
-            put(
-                raw,
-                ResourceId::Mesh(*t),
-                Want {
-                    urgency,
-                    q: tn.q,
-                    class: tn.need.class,
-                    level: tn.need.level,
-                },
-            );
-            if floor {
-                for reach in tn.need.imagery.as_ref().map(layers).unwrap_or(&[]) {
-                    put(
-                        raw,
-                        ResourceId::drape(*t, reach.layer, tn.need.level),
-                        Want {
-                            urgency: Urgency::Floor,
-                            q: tn.q,
-                            class: Class::Drape,
-                            level: tn.need.level,
-                        },
-                    );
-                }
+        let floor = self.is_floor(tn.need.level);
+        let mesh_drawable = self.drawable(ResourceId::Mesh(t));
+        let urgency = if floor {
+            Urgency::Floor
+        } else {
+            match tn.membership {
+                Membership::Drawn => Urgency::Hole,
+                Membership::Blocker => Urgency::Blocker,
+                Membership::Ring => Urgency::Ring,
+                Membership::Ancestor => Urgency::Ancestor,
             }
-            if !meshes_in {
-                continue;
+        };
+        put(
+            out,
+            ResourceId::Mesh(t),
+            Want {
+                urgency,
+                q: tn.q,
+                class: tn.need.class,
+                level: tn.need.level,
+            },
+        );
+        if floor {
+            for reach in tn.need.imagery.as_ref().map(layers).unwrap_or(&[]) {
+                put(
+                    out,
+                    ResourceId::drape(t, reach.layer, tn.need.level),
+                    Want {
+                        urgency: Urgency::Floor,
+                        q: tn.q,
+                        class: Class::Drape,
+                        level: tn.need.level,
+                    },
+                );
             }
-            for ((_, layer), &n) in drapes.range(tile_layers(*t)) {
-                let drape = ResourceId::drape(*t, *layer, n);
+        }
+        if meshes_in {
+            self.drapes_of(t, tn, drapes);
+            for &(layer, n) in drapes.iter() {
+                self.walk(1);
+                let drape = ResourceId::drape(t, layer, n);
                 let du = match tn.membership {
                     Membership::Blocker => Some(Urgency::Blocker),
                     _ if !mesh_drawable => Some(urgency),
                     _ => {
-                        let worn = draw
-                            .get(ResourceId::Mesh(*t))
-                            .and_then(|i| i.drape(*layer).copied());
+                        let worn = item.and_then(|i| i.drape(layer).copied());
                         let off = match worn {
                             None => true,
                             Some(w) if batch => w.resource != drape,
@@ -1147,7 +1223,7 @@ impl Budget {
                 };
                 if let Some(du) = du {
                     put(
-                        raw,
+                        out,
                         drape,
                         Want {
                             urgency: du,
@@ -1161,10 +1237,48 @@ impl Budget {
         }
         // Per resource the most urgent, then the best scored; of equals,
         // the first put.
-        raw.sort_unstable_by_key(|(r, seq, w)| (*r, w.urgency, Reverse(w.q), *seq));
-        raw.dedup_by_key(|e| e.0);
-        merged.extend(raw.iter().map(|(r, _, w)| (*r, *w)));
-        SortedMap::from_sorted(merged)
+        out.sort_unstable_by_key(|(r, seq, w)| (*r, w.urgency, Reverse(w.q), *seq));
+        out.dedup_by_key(|e| e.0);
+    }
+
+    /// Whether Batch may want drapes this step: every mesh the frame draws
+    /// and waits on is loaded. Under Interactive, always.
+    pub(super) fn meshes_in(&self, tiles: &SortedMap<TileId, TileNeed>) -> bool {
+        if self.cfg.policy != Policy::Batch {
+            return true;
+        }
+        tiles
+            .iter()
+            .filter(|(_, tn)| matches!(tn.membership, Membership::Drawn | Membership::Blocker))
+            .inspect(|_| self.walk(1))
+            .all(|(t, _)| {
+                let a = &self.arena;
+                a.find(ResourceId::Mesh(*t))
+                    .is_some_and(|s| a.has_gpu(s) || a.has_cpu(s))
+            })
+    }
+
+    /// The refresh `r`, drawn, asks for, if its GPU copy is of an older
+    /// epoch.
+    pub(super) fn refresh_of(&self, r: ResourceId) -> Option<Want> {
+        let s = self.arena.find(r)?;
+        let class = self.arena.class(s);
+        self.arena.stale_gpu(s, self.epoch(r, class)).then(|| Want {
+            urgency: Urgency::Refresh,
+            q: Quantised::default(),
+            class,
+            level: self.arena.level(s),
+        })
+    }
+
+    /// Whether some GPU copy is of an older epoch than its class's (and
+    /// layer's): only then can a refresh be wanted.
+    pub(super) fn any_stale(&self) -> bool {
+        self.arena.gpu_epochs().any(|((class, layer, epoch), _)| {
+            let now = self.epochs[class]
+                + layer.map_or(0, |l| self.layer_epochs.get(&l).copied().unwrap_or(0));
+            epoch < now
+        })
     }
 
     /// What protects `r`, whose slot is `s`.
@@ -1173,15 +1287,15 @@ impl Budget {
         if self.is_floor(a.level(s)) && (a.has_gpu(s) || a.has_transit(s)) {
             return Some(Protection::Floor);
         }
-        if self.drawn_last.contains(&r) {
+        if a.marked(s, Mark::Drawn) {
             return Some(Protection::Drawn);
         }
         if a.has_transit(s) {
             return Some(Protection::InTransit);
         }
-        if self.swap_last.contains(&r) {
+        if a.marked(s, Mark::Swap) {
             return Some(match r {
-                ResourceId::Mesh(_) if self.chain_last.contains(&r) => Protection::Chain,
+                ResourceId::Mesh(_) if a.marked(s, Mark::Chain) => Protection::Chain,
                 _ => Protection::Swap,
             });
         }
@@ -1195,6 +1309,18 @@ impl Budget {
         class: Class,
         presence: &dyn PresenceOracle,
     ) -> Tier {
+        self.tier_asked(r, e, class, presence, &mut false)
+    }
+
+    /// `tier`, `asked` set when the presence index answered.
+    fn tier_asked(
+        &self,
+        r: ResourceId,
+        e: Option<Slot>,
+        class: Class,
+        presence: &dyn PresenceOracle,
+        asked: &mut bool,
+    ) -> Tier {
         let a = &self.arena;
         let epoch = self.epoch(r, class);
         match e {
@@ -1203,21 +1329,93 @@ impl Budget {
             // A wrong hint is believed once; otherwise the index is asked
             // afresh, since a store fills as the session runs.
             Some(s) if a.cold(s).store_missed => Tier::Remote,
-            _ => match presence.holds(r) {
-                Presence::Stored => Tier::Stored,
-                Presence::Absent => Tier::Remote,
-            },
+            _ => {
+                *asked = true;
+                match presence.holds(r) {
+                    Presence::Stored => Tier::Stored,
+                    Presence::Absent => Tier::Remote,
+                }
+            }
         }
     }
 
-    /// The step.
-    pub(super) fn step(&mut self, input: FrameInput<'_>) -> Decisions {
+    /// The work `r`, wanted as `w`, asks for now — a load or a delivery —
+    /// and, asking for none, the time it waits on (a delivery's backoff or a
+    /// retry's) that will change that.
+    pub(super) fn job_of(
+        &self,
+        r: ResourceId,
+        w: &Want,
+        now: Micros,
+    ) -> (Option<Job>, Option<Micros>) {
+        let class = self.class_of(r, w.class);
+        let epoch = self.epoch(r, class);
+        let a = &self.arena;
+        match a.find(r) {
+            Some(s) if a.gpu(s).is_some_and(|g| g.epoch == epoch) => (None, None),
+            Some(s) if a.has_transit(s) => (None, None),
+            Some(s) if a.fresh_cpu(s, epoch).is_some() => {
+                let after = a.cold(s).deliver_after;
+                if after <= now {
+                    (Some(Job::Deliver), None)
+                } else {
+                    (None, Some(after))
+                }
+            }
+            Some(s) if a.loading(s) => (None, None),
+            Some(s) if a.backing_off(s, now) => (None, Some(a.cold(s).retry_at)),
+            _ => (Some(Job::Load), None),
+        }
+    }
+
+    /// The priority key of `r`, wanted as `w`, now: its urgency (a stale
+    /// GPU copy's refresh), score and tier.
+    fn key_of(
+        &self,
+        r: ResourceId,
+        w: &Want,
+        now: Micros,
+        coarsening: &dyn Fn(TileId) -> bool,
+        presence: &dyn PresenceOracle,
+    ) -> PriorityKey {
+        let class = self.class_of(r, w.class);
+        let epoch = self.epoch(r, class);
+        let a = &self.arena;
+        let e = a.find(r);
+        let mut urgency = w.urgency;
+        if e.is_some_and(|s| a.stale_gpu(s, epoch)) {
+            urgency = Urgency::Refresh;
+        }
+        let waited = e
+            .and_then(|s| a.cold(s).first_wanted())
+            .map(|f| now.since(f))
+            .unwrap_or(Micros::ZERO);
+        // How many wanted tiles it stands in for, as a fallback.
+        let cover = match self.down.drawn(r) {
+            Some(i) if i.role == Role::Fallback => sat_u32(self.down.serves(r)),
+            _ => 0,
+        };
+        let mut sc = score(w.q, waited, self.cfg.age_full, cover);
+        if urgency == Urgency::Hole && coarsening(r.tile()) {
+            // At the ceiling a coarser covering tile frees bytes: first.
+            sc += 1_000_000;
+        }
+        PriorityKey {
+            urgency,
+            score: Reverse(sc),
+            tier: self.tier(r, e, class, presence),
+            resource: r,
+        }
+    }
+
+    /// The step, into `d` (emptied by the caller, its buffers kept).
+    pub(super) fn step(&mut self, input: FrameInput<'_>, d: &mut Decisions) {
         let now = input.now;
         let mut st = std::mem::take(&mut self.pending);
-        let mut d = Decisions::default();
         let eff = self.eff();
         self.scratch.room = None;
         let mut ranked = std::mem::take(&mut self.ranked_last);
+        self.walk(ranked.len());
         for r in &ranked {
             if let Some(s) = self.arena.find(*r) {
                 self.arena.set_rank(s, None, None);
@@ -1231,234 +1429,115 @@ impl Budget {
         let mut need = std::mem::take(&mut self.need);
         self.read_need(&mut need, &input, &mut st);
         let tiles = need.tiles();
-        let drapes = self.drape_needs(tiles, input.presence);
-        st.floor_in = self.floor_in(tiles);
-        let mut ancestry = std::mem::take(&mut self.scratch.ancestry);
-        self.held_ancestry(&mut ancestry);
-        let (draw, coarsening) = self.build_draw(tiles, &drapes, &ancestry, st.floor_in, &mut st);
-        self.scratch.ancestry = ancestry;
-        let mut raw = std::mem::take(&mut self.scratch.wants_raw);
-        let merged = std::mem::take(&mut self.scratch.wants);
-        let wants = self.wants(tiles, &drapes, &draw, &mut raw, merged);
-        // Drawn content of an older epoch is refreshed, new before old.
-        raw.clear();
-        for i in &draw.items {
-            for r in std::iter::once(i.mesh).chain(i.drapes.iter().map(|x| x.resource)) {
-                if let Some(s) = self.arena.find(r) {
-                    let class = self.arena.class(s);
-                    if self.arena.stale_gpu(s, self.epoch(r, class)) && !wants.contains_key(&r) {
-                        let seq = u32::try_from(raw.len()).unwrap_or(u32::MAX);
-                        raw.push((
-                            r,
-                            seq,
-                            Want {
-                                urgency: Urgency::Refresh,
-                                q: Quantised::default(),
-                                class,
-                                level: self.arena.level(s),
-                            },
-                        ));
-                    }
-                }
-            }
-        }
-        let wants = if raw.is_empty() {
-            wants
-        } else {
-            // The first refresh of a resource listed twice.
-            raw.sort_unstable_by_key(|(r, seq, _)| (*r, *seq));
-            raw.dedup_by_key(|e| e.0);
-            let mut all = wants.into_vec();
-            all.extend(raw.iter().map(|(r, _, w)| (*r, *w)));
-            all.sort_unstable_by_key(|e| e.0);
-            SortedMap::from_sorted(all)
-        };
-        self.scratch.wants_raw = raw;
+        let named = need.named();
+        let full = self.cfg.policy == Policy::Batch;
 
-        // 4. Mark: needed now, or unneeded since when. What is drawn, the
-        // drapes each mesh wears, and the swap and chain sets are kept for
-        // the rest of the step and the next, in buffers refilled in place.
-        self.drawn_last.refill(
-            draw.items
-                .iter()
-                .flat_map(|i| std::iter::once(i.mesh).chain(i.drapes.iter().map(|x| x.resource))),
-        );
-        // Items are sorted by mesh: so is this.
-        self.worn_last.clear();
-        self.worn_last.extend(
-            draw.items
-                .iter()
-                .flat_map(|i| i.drapes.iter().map(move |x| (i.mesh, *x))),
-        );
-        let mut chain = std::mem::take(&mut self.chain_last);
-        chain.refill(
-            wants
-                .iter()
-                .filter(|(r, w)| w.urgency == Urgency::Ancestor && self.drawable(**r))
-                .map(|(r, _)| *r),
-        );
-        self.chain_last = chain;
-        let mut swap = std::mem::take(&mut self.swap_last);
-        swap.refill(
-            wants
-                .iter()
-                .filter(|(r, w)| {
-                    matches!(
-                        w.urgency,
-                        Urgency::Hole | Urgency::Blocker | Urgency::Ancestor
-                    ) && self.drawable(**r)
-                })
-                .map(|(r, _)| *r),
-        );
-        self.swap_last = swap;
-        // Only what the view touched this step or the last: everything else
-        // was already marked unneeded.
-        // A merge of the three sorted sources, not a set built of them.
-        let Budget {
-            arena,
-            drawn_last,
-            wanted_last,
-            ..
-        } = self;
-        let touched = union4(
-            wants.keys().copied(),
-            drawn_last.iter().copied(),
-            wanted_last.iter().copied(),
-            std::iter::empty(),
-        );
-        for r in touched {
-            let Some(s) = arena.find(r) else {
-                continue;
-            };
-            if wants.contains_key(&r) {
-                arena.touch(s, now);
-                let cold = arena.cold_mut(s);
-                cold.set_unneeded_since(None);
-                cold.first_wanted_or(now);
-                if let Some(tn) = tiles.get(&r.tile()) {
-                    arena.set_distance(s, tn.q.distance);
-                }
-            } else if drawn_last.contains(&r) {
-                arena.touch(s, now);
-                let cold = arena.cold_mut(s);
-                cold.set_unneeded_since(None);
-                cold.set_first_wanted(None);
-            } else {
-                let cold = arena.cold_mut(s);
-                cold.unneeded_since_or(now);
-                cold.set_first_wanted(None);
-            }
-        }
+        // 2–3. Drape levels, the floor, the selection, the draw set, the
+        // wants: what may have changed read again (`downstream`).
+        let taken = self.downstream(tiles, named, input.presence, &mut st);
+        let wants = taken.wants();
+        let coarsening = taken.coarsening();
+
+        // 4. Mark: needed now, or unneeded since when; the swap and chain
+        // sets; the eviction order's newest group.
+        self.mark(now, tiles, named, wants);
 
         // 5. Cancellations: grace and timeouts.
-        self.cancel(now, &eff, &mut d, &mut st);
+        self.cancel(now, &eff, d, &mut st);
 
-        // 6. Rank the work.
-        // Wants come in order: so do their keys.
-        let mut keys = std::mem::take(&mut self.scratch.keys);
-        keys.clear();
+        // 6. Rank the work: the wanted resources with a load or a delivery
+        // to start, kept up to date.
+        // A time gone back reads every want's work again: a wait that ended
+        // may have begun again.
+        let back = self.last_now.is_some_and(|l| now < l);
+        self.update_jobs(now, wants, full || taken.full || back);
         let mut jobs = std::mem::take(&mut self.scratch.jobs);
         jobs.clear();
-        for (r, w) in &wants {
-            let class = self.class_of(*r, w.class);
-            let epoch = self.epoch(*r, class);
-            let a = &self.arena;
-            let e = a.find(*r);
-            let mut urgency = w.urgency;
-            let job = match e {
-                Some(s) if a.gpu(s).is_some_and(|g| g.epoch == epoch) => None,
-                Some(s) if a.has_transit(s) => None,
-                Some(s) if a.fresh_cpu(s, epoch).is_some() => {
-                    (a.cold(s).deliver_after <= now).then_some(Job::Deliver)
-                }
-                Some(s) if a.loading(s) => None,
-                Some(s) if a.backing_off(s, now) => None,
-                _ => Some(Job::Load),
+        let is_coarsening = |t: TileId| coarsening.contains_key(&t);
+        for r in self.down.jobs() {
+            let Some(w) = wants.get(&r) else {
+                continue;
             };
-            if e.is_some_and(|s| a.stale_gpu(s, epoch)) {
-                urgency = Urgency::Refresh;
-            }
-            let waited = e
-                .and_then(|s| a.cold(s).first_wanted())
-                .map(|f| now.since(f))
-                .unwrap_or(Micros::ZERO);
-            // How many wanted tiles it stands in for, as a fallback.
-            let cover = draw
-                .get(*r)
-                .filter(|i| i.role == Role::Fallback)
-                .map_or(0, |i| sat_u32(i.serves.len()));
-            let mut sc = score(w.q, waited, self.cfg.age_full, cover);
-            if urgency == Urgency::Hole && coarsening.contains(&r.tile()) {
-                // At the ceiling a coarser covering tile frees bytes: first.
-                sc += 1_000_000;
-            }
-            let key = PriorityKey {
-                urgency,
-                score: Reverse(sc),
-                tier: self.tier(*r, e, class, input.presence),
-                resource: *r,
+            let (Some(job), _) = self.job_of(r, w, now) else {
+                continue;
             };
-            keys.push((*r, key));
-            if let Some(job) = job {
-                jobs.push((key, *r, job, Want { urgency, ..*w }));
-            }
+            let key = self.key_of(r, w, now, &is_coarsening, input.presence);
+            jobs.push((
+                key,
+                job,
+                Want {
+                    urgency: key.urgency,
+                    ..*w
+                },
+            ));
         }
-        let keys = SortedMap::from_sorted(keys);
         // Keys end in the resource: total, so unstable is stable.
         jobs.sort_unstable_by_key(|j| j.0);
-        st.work = st
-            .work
-            .saturating_add(sat_u32(wants.len()))
-            .saturating_add(sat_u32(jobs.len()));
-        self.ranked_last.extend(jobs.iter().map(|j| j.1));
-        for (k, r, _, w) in &jobs {
-            if let Some(s) = self.arena.find(*r) {
+        self.walk(jobs.len());
+        self.ranked_last.extend(jobs.iter().map(|j| j.0.resource));
+        // A burst of work does not keep its room once it is done.
+        let used = self.ranked_last.len();
+        super::sorted::trim(&mut self.ranked_last, used);
+        for (k, _, w) in &jobs {
+            if let Some(s) = self.arena.find(k.resource) {
                 self.arena.set_rank(s, Some(w.urgency), Some(Rank::of(k)));
             }
         }
+        // The key of a wanted resource, for those in flight or in transit.
+        let key = |b: &Budget, r: ResourceId| {
+            wants
+                .get(&r)
+                .map(|w| b.key_of(r, w, now, &is_coarsening, input.presence))
+        };
 
         let mut picked = std::mem::take(&mut self.scratch.picked);
         picked.clear();
+        // Places: a `u32` each, as many as the jobs.
+        let place = |i: usize| u32::try_from(i).unwrap_or(u32::MAX);
         picked.extend(
             jobs.iter()
-                .filter(|j| j.2 == Job::Load)
+                .enumerate()
+                .filter(|(_, j)| j.1 == Job::Load)
                 .take(self.cfg.request_heap as usize)
-                .copied(),
+                .map(|(i, _)| place(i)),
         );
         st.heap_len = sat_u32(picked.len());
+        self.walk(picked.len());
         self.start(
             now,
             &eff,
+            &jobs,
             &picked,
-            &keys,
-            &wants,
+            &key,
+            wants,
             input.presence,
-            &mut d,
+            tiles,
+            d,
             &mut st,
         );
 
         // 7. Deliveries.
         picked.clear();
-        picked.extend(jobs.iter().filter(|j| j.2 == Job::Deliver).copied());
+        picked.extend(
+            jobs.iter()
+                .enumerate()
+                .filter(|(_, j)| j.1 == Job::Deliver)
+                .map(|(i, _)| place(i)),
+        );
+        self.walk(jobs.len() + picked.len());
         let (blocked, strained) = self.deliver(
-            now,
-            &eff,
-            &picked,
-            tiles,
-            &coarsening,
-            &wants,
-            &mut d,
-            &mut st,
+            now, &eff, &jobs, &picked, tiles, coarsening, wants, d, &mut st,
         );
 
-        // 8. The upload plan.
-        d.upload_plan = self.plan(&eff, &keys, tiles);
-        // The plan scans the loads and transits for those in transit.
-        st.work = st.work.saturating_add(sat_u32(self.active.len()));
+        // 8. The upload plan (`picked` lent for its order by group).
+        self.scratch.picked = picked;
+        self.plan(&eff, &key, tiles, &mut d.upload_plan);
+        picked = std::mem::take(&mut self.scratch.picked);
+        st.work = st.work.saturating_add(sat_u32(self.arena.transits_len()));
 
         // 9. Eviction and release.
         if !eff.batch {
-            self.evict(now, &eff, &wants, &mut d, &mut st);
+            self.evict(now, &eff, wants, d, &mut st);
         }
 
         // 10. Relaxation.
@@ -1473,26 +1552,27 @@ impl Budget {
         d.sse_scale_milli = self.scale.max(thermal_floor);
         self.last_now = Some(now);
 
-        // Batch completeness.
-        let pending_view = jobs.iter().any(|j| j.3.urgency <= Urgency::Drape)
-            || wants.iter().any(|(r, w)| {
-                w.urgency <= Urgency::Drape
-                    && self
-                        .arena
-                        .find(*r)
-                        .is_some_and(|s| self.arena.has_transit(s) || self.arena.loading(s))
-            });
+        // Batch completeness. What the view waits on: work ranked, or in
+        // flight or in transit — since the ranking, as nothing in flight
+        // for the view lands or is cancelled in between, and what the step
+        // started or delivered was ranked.
+        self.walk(jobs.len());
+        let pending_view =
+            jobs.iter().any(|j| j.2.urgency <= Urgency::Drape) || self.down.view_waits();
         if eff.batch {
+            self.walk(tiles.len());
             let complete = need.blockers() == 0
                 && tiles
                     .iter()
                     .filter(|(_, n)| n.membership == Membership::Drawn)
-                    .all(|(t, _)| {
-                        let item = draw.get(ResourceId::Mesh(*t));
+                    .all(|(t, tn)| {
+                        let item = self.down.drawn(ResourceId::Mesh(*t));
                         let exact = item.is_some_and(|i| i.role == Role::Exact);
-                        let drape_ok = drapes.range(tile_layers(*t)).all(|((_, l), &n)| {
-                            item.and_then(|i| i.drape(*l))
-                                .is_some_and(|x| x.resource == ResourceId::drape(*t, *l, n))
+                        let mut drapes = Vec::new();
+                        self.drapes_of(*t, tn, &mut drapes);
+                        let drape_ok = drapes.iter().all(|&(l, n)| {
+                            item.and_then(|i| i.drape(l))
+                                .is_some_and(|x| x.resource == ResourceId::drape(*t, l, n))
                         });
                         exact && drape_ok
                     });
@@ -1505,26 +1585,19 @@ impl Budget {
             st.lost == 0 && st.fallback == 0 && st.held == 0 && st.underdraped == 0 && !pending_view
         };
 
-        // Bookkeeping for the next step.
-        self.held_last.refill(
-            draw.items
-                .iter()
-                .filter(|i| i.role != Role::Fallback)
-                .map(|i| i.mesh.tile()),
-        );
-        let mut wanted = std::mem::take(&mut self.wanted_last);
-        wanted.refill(wants.keys().chain(self.drawn_last.iter()).copied());
-        self.wanted_last = wanted;
-        let pruned = self.prune(now, tiles, &wants, &drapes);
+        // Bookkeeping for the next step: the held set, then the prune.
+        self.end_step(tiles);
+        let pruned = self.prune(now, tiles, named, wants);
         st.work = st.work.saturating_add(pruned);
-        self.need = need;
-        self.scratch.drapes = drapes.into_buffer();
-        self.scratch.wants = wants.into_buffer();
-        self.scratch.keys = keys.into_buffer();
+        #[cfg(debug_assertions)]
+        self.check_marks(wants);
         jobs.clear();
         self.scratch.jobs = jobs;
         picked.clear();
         self.scratch.picked = picked;
+        self.down.draw_set_into(&mut d.draw);
+        self.put_back(taken);
+        self.need = need;
 
         // Statistics.
         st.gpu = self.ledger.gpu;
@@ -1545,8 +1618,9 @@ impl Budget {
         st.in_flight = self.in_flight;
         st.local_reads = self.local_reads;
         st.tracked = sat_u32(self.arena.len());
-        for r in &self.active {
-            if let Some(s) = self.arena.find(*r) {
+        self.walk(self.arena.transits_len());
+        for r in self.arena.transits() {
+            if let Some(s) = self.arena.find(r) {
                 if let Some(t) = self.arena.transit(s) {
                     let c = self.arena.class(s);
                     st.transit[c] = st.transit[c].plus(t.cost.gpu);
@@ -1554,34 +1628,15 @@ impl Budget {
             }
         }
         st.protected = protected;
-        d.draw = draw;
+        // What keeping the kept maps in order cost, this step and the
+        // events applied since the last.
+        self.walk_upkeep();
+        st.work = st.work.saturating_add(self.scratch.walked.swap(0, Relaxed));
         d.stats = st;
-        d
     }
 
     fn protected_bytes(&self) -> PerClass<Bytes> {
-        let mut p = PerClass::splat(Bytes::ZERO);
-        let candidates = union4(
-            self.drawn_last.iter().copied(),
-            self.swap_last.iter().copied(),
-            self.active.iter().copied(),
-            self.floor_set.iter().copied(),
-        );
-        for r in candidates {
-            let Some(s) = self.arena.find(r) else {
-                continue;
-            };
-            if self.protection_of(r, s).is_some() {
-                let a = &self.arena;
-                let b = a
-                    .gpu(s)
-                    .map(|g| g.bytes)
-                    .unwrap_or(Bytes::ZERO)
-                    .plus(a.transit(s).map(|t| t.cost.gpu).unwrap_or(Bytes::ZERO));
-                p[a.class(s)] = p[a.class(s)].plus(b);
-            }
-        }
-        p
+        self.arena.protected()
     }
 
     fn cancel(&mut self, now: Micros, eff: &Eff, d: &mut Decisions, st: &mut BudgetStats) {
@@ -1590,8 +1645,58 @@ impl Budget {
         let batch = eff.batch;
         let failure = self.cfg.failure;
         let mut fatal = None;
-        let active: Vec<ResourceId> = self.active.iter().copied().collect();
-        for r in &active {
+        // Only a load or transit whose grace or timeout ran out since the
+        // last step can be cancelled: those whose deadline passed. A time
+        // gone back looks at every one, as before O1.4.
+        let mut due = std::mem::take(&mut self.scratch.due);
+        due.clear();
+        let back = self.last_now.is_some_and(|l| now < l);
+        if !back && self.down.due(now, &mut due) {
+            due.sort_unstable();
+            due.dedup();
+            due.retain(|r| {
+                self.arena
+                    .find(*r)
+                    .is_some_and(|s| self.arena.marked(s, Mark::Active))
+            });
+            if self.down.deadlines_len() > 2 * self.active.len() + 64 {
+                // Mostly deadlines of loads gone: those of the loads still
+                // going, again.
+                self.down.clear_deadlines();
+                for &s in &self.active {
+                    let r = self.arena.id(s);
+                    if let Load::Loading { started, .. } = self.arena.load(s) {
+                        self.down.deadline(started.plus(timeout), r);
+                    }
+                    if let Some(u) = self.arena.cold(s).unneeded_since() {
+                        self.down.deadline(u.plus(grace), r);
+                    }
+                }
+                self.down.trim_deadlines();
+            }
+        } else {
+            // Every load and transit, in resource order (the index is by
+            // slot).
+            due.clear();
+            due.extend(self.active.iter().map(|s| self.arena.id(*s)));
+            due.sort_unstable();
+            if !back {
+                // The deadlines were dropped: every load's, again.
+                for r in &due {
+                    let Some(s) = self.arena.find(*r) else {
+                        continue;
+                    };
+                    if let Load::Loading { started, .. } = self.arena.load(s) {
+                        self.down.deadline(started.plus(timeout), *r);
+                    }
+                    if let Some(u) = self.arena.cold(s).unneeded_since() {
+                        self.down.deadline(u.plus(grace), *r);
+                    }
+                }
+            }
+        }
+        self.walk(due.len());
+        for r in &due {
             let Some(s) = self.arena.find(*r) else {
                 continue;
             };
@@ -1644,7 +1749,7 @@ impl Budget {
                         .cold(s)
                         .unneeded_since()
                         .is_some_and(|u| now.since(u) >= grace)
-                        && !self.drawn_last.contains(r)
+                        && !self.arena.marked(s, Mark::Drawn)
                     {
                         self.arena.take_transit(s, &mut self.ledger);
                         d.cancel.push((*r, t.gen));
@@ -1657,6 +1762,7 @@ impl Budget {
         if let Some(f) = fatal {
             self.fatal.get_or_insert(f);
         }
+        self.scratch.due = due;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1664,10 +1770,12 @@ impl Budget {
         &mut self,
         now: Micros,
         eff: &Eff,
-        loads: &[(PriorityKey, ResourceId, Job, Want)],
-        keys: &SortedMap<ResourceId, PriorityKey>,
-        wants: &SortedMap<ResourceId, Want>,
+        jobs: &[(PriorityKey, Job, Want)],
+        loads: &[u32],
+        key_now: &dyn Fn(&Budget, ResourceId) -> Option<PriorityKey>,
+        wants: Wants<'_>,
         presence: &dyn PresenceOracle,
+        tiles: &SortedMap<TileId, TileNeed>,
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) {
@@ -1676,7 +1784,8 @@ impl Budget {
         // quota: a network load of lower priority starting after them is a
         // local wait (I15).
         let mut skipped_stored = 0u32;
-        for (key, r, _, w) in loads {
+        for (key, _, w) in loads.iter().filter_map(|i| jobs.get(*i as usize)) {
+            let r = &key.resource;
             let class = self.class_of(*r, w.class);
             if decoded_full && w.urgency >= Urgency::Ring {
                 // Backpressure: preload that could neither be delivered nor
@@ -1711,23 +1820,23 @@ impl Budget {
                         let victim = self
                             .active
                             .iter()
-                            .filter(|vr| {
+                            .filter_map(|&vs| {
                                 let a = &self.arena;
-                                a.find(**vr).is_some_and(|vs| {
-                                    a.class(vs) == class
-                                        && matches!(
-                                            a.load(vs),
-                                            Load::Loading {
-                                                source: Source::Network,
-                                                ..
-                                            }
-                                        )
-                                        && (wants.get(vr).is_some_and(|vw| {
-                                            matches!(vw.urgency, Urgency::Ring | Urgency::Ancestor)
-                                        }) || a.urgency(vs) == Some(Urgency::Refresh))
-                                })
+                                let vr = a.id(vs);
+                                (a.class(vs) == class
+                                    && matches!(
+                                        a.load(vs),
+                                        Load::Loading {
+                                            source: Source::Network,
+                                            ..
+                                        }
+                                    )
+                                    && (wants.get(&vr).is_some_and(|vw| {
+                                        matches!(vw.urgency, Urgency::Ring | Urgency::Ancestor)
+                                    }) || a.urgency(vs) == Some(Urgency::Refresh)))
+                                .then_some(vr)
                             })
-                            .filter_map(|vr| keys.get(vr).map(|k| (*k, *vr)))
+                            .filter_map(|vr| key_now(self, vr).map(|k| (k, vr)))
                             .max();
                         let Some((_, vr)) = victim else { continue };
                         if let Some(vs) = self.arena.find(vr) {
@@ -1745,7 +1854,18 @@ impl Budget {
             let gen = Generation(self.next_gen);
             self.next_gen += 1;
             let epoch = self.epoch(*r, class);
-            let s = self.arena.find_or_insert(*r, class, w.level, now);
+            let s = match self.arena.find(*r) {
+                Some(s) => s,
+                None => {
+                    // A new slot joins the newest group, `now`'s.
+                    self.newest_at(now);
+                    let s = self.arena.find_or_insert(*r, class, w.level, now);
+                    self.arena.mark(s, Mark::Wanted, true);
+                    self.made(*r);
+                    self.tile_slot(r.tile(), true, tiles);
+                    s
+                }
+            };
             if self.arena.loading(s) {
                 st.duplicates_in_flight += 1;
                 continue;
@@ -1768,9 +1888,13 @@ impl Budget {
                 },
             );
             if self.cfg.pinned_level.is_some_and(|p| w.level <= p) {
-                self.floor_set.insert(*r);
+                self.arena.mark(s, Mark::FloorSet, true);
             }
-            self.active.insert(*r);
+            if !self.arena.marked(s, Mark::Active) {
+                self.active.push(s);
+            }
+            self.arena.mark(s, Mark::Active, true);
+            self.deadline(now.plus(self.cfg.load_timeout), *r);
             match source {
                 Source::Network => {
                     self.in_flight[class] += 1;
@@ -1816,7 +1940,7 @@ impl Budget {
         bytes: Bytes,
         limit: Bytes,
         urgency: Urgency,
-        wants: &SortedMap<ResourceId, Want>,
+        wants: Wants<'_>,
         d: &mut Decisions,
         st: &mut BudgetStats,
         strained: &mut bool,
@@ -1845,7 +1969,7 @@ impl Budget {
                     let a = &self.arena;
                     a.class(s) == class
                         && a.has_gpu(s)
-                        && !self.kept(&a.id(s))
+                        && !self.kept(s)
                         && !self.is_floor(a.level(s))
                 })
                 .filter_map(|s| victim(self, &self.arena.id(s), s))
@@ -1866,7 +1990,7 @@ impl Budget {
             }
             st.work = st.work.saturating_add(1);
             // The order holds neither the kept set nor the floor.
-            if self.kept(&r) || self.is_floor(self.arena.level(s)) {
+            if self.kept(s) || self.is_floor(self.arena.level(s)) {
                 continue;
             }
             let Some(b) = victim(self, &r, s) else {
@@ -1885,7 +2009,7 @@ impl Budget {
             d.evict.push(r);
             st.evicted += 1;
             st.evictions[class][EvictReason::Admission as usize] += 1;
-            self.recent.insert(r, now);
+            self.evicted(r, now);
         }
         self.scratch.room = Some(room);
         true
@@ -1893,15 +2017,12 @@ impl Budget {
 
     /// This step's [`Room`], built at its first use, after the mark: the
     /// grouped GPU residents outside the kept set, the floor and transit.
-    fn room(&self, wants: &SortedMap<ResourceId, Want>, st: &mut BudgetStats) -> Room {
+    fn room(&self, wants: Wants<'_>, st: &mut BudgetStats) -> Room {
         let a = &self.arena;
         let mut grouped: Vec<(EvictKey, Slot)> = a
             .grouped_slots()
             .filter(|&s| {
-                a.has_gpu(s)
-                    && !a.has_transit(s)
-                    && !self.kept(&a.id(s))
-                    && !self.is_floor(a.level(s))
+                a.has_gpu(s) && !a.has_transit(s) && !self.kept(s) && !self.is_floor(a.level(s))
             })
             .map(|s| (a.evict_key(s), s))
             .collect();
@@ -1940,15 +2061,17 @@ impl Budget {
         &mut self,
         now: Micros,
         eff: &Eff,
-        jobs: &[(PriorityKey, ResourceId, Job, Want)],
-        tiles: &SortedCols<TileId, TileNeed>,
-        coarsening: &BTreeSet<TileId>,
-        wants: &SortedMap<ResourceId, Want>,
+        jobs: &[(PriorityKey, Job, Want)],
+        picked: &[u32],
+        tiles: &SortedMap<TileId, TileNeed>,
+        coarsening: &SortedMap<TileId, ()>,
+        wants: Wants<'_>,
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) -> (bool, bool) {
         let mut flags = (false, false);
-        for (_, r, _, w) in jobs {
+        for (key, _, w) in picked.iter().filter_map(|i| jobs.get(*i as usize)) {
+            let r = &key.resource;
             let Some(group) = floor_group(tiles, *r, |l| self.is_floor(l)) else {
                 self.deliver_one(now, eff, *r, w, coarsening, wants, d, st, &mut flags);
                 continue;
@@ -1983,8 +2106,8 @@ impl Budget {
         eff: &Eff,
         r: ResourceId,
         w: &Want,
-        coarsening: &BTreeSet<TileId>,
-        wants: &SortedMap<ResourceId, Want>,
+        coarsening: &SortedMap<TileId, ()>,
+        wants: Wants<'_>,
         d: &mut Decisions,
         st: &mut BudgetStats,
         flags: &mut (bool, bool),
@@ -2009,7 +2132,7 @@ impl Budget {
             return;
         }
         if !eff.batch {
-            let shrinking = matches!(r, ResourceId::Mesh(t) if coarsening.contains(&t));
+            let shrinking = matches!(r, ResourceId::Mesh(t) if coarsening.contains_key(&t));
             let urgent = matches!(w.urgency, Urgency::Floor | Urgency::Hole | Urgency::Drape);
             let preload = w.urgency >= Urgency::Ring;
             let mut limit = if shrinking {
@@ -2068,7 +2191,7 @@ impl Budget {
         // A stale GPU copy on its way again leaves the step's room.
         let in_room = self.scratch.room.is_some() && {
             let a = &self.arena;
-            a.grouped(s) && a.has_gpu(s) && !self.kept(&r) && !self.is_floor(a.level(s))
+            a.grouped(s) && a.has_gpu(s) && !self.kept(s) && !self.is_floor(a.level(s))
         };
         if let (true, Some(room), Some(g)) =
             (in_room, self.scratch.room.as_mut(), self.arena.gpu(s))
@@ -2077,7 +2200,10 @@ impl Budget {
             room.bytes[class][i] = room.bytes[class][i].minus(g.bytes);
         }
         // `make_room` frees no slot: `s` is still `r`'s.
-        self.active.insert(r);
+        if !self.arena.marked(s, Mark::Active) {
+            self.active.push(s);
+        }
+        self.arena.mark(s, Mark::Active, true);
         self.arena.put_transit(
             s,
             &mut self.ledger,
@@ -2094,14 +2220,21 @@ impl Budget {
         d.deliver.push((r, c.gen));
     }
 
+    /// The consumer's uploads this frame, into `plan`: the copies in
+    /// transit in priority order, grouped — the blockers of one parent
+    /// (meshes and drapes), else a tile's mesh and its drape — each group
+    /// going whole at its first member, byte-capped (the first item always
+    /// goes). Nothing allocated once the step's buffers have grown: the
+    /// transits and their order by group are step buffers, the plan's
+    /// groups overwritten in place.
     fn plan(
-        &self,
+        &mut self,
         eff: &Eff,
-        keys: &SortedMap<ResourceId, PriorityKey>,
-        tiles: &SortedCols<TileId, TileNeed>,
-    ) -> UploadPlan {
-        // Group: the blockers of one parent (meshes and drapes), else a
-        // tile's mesh and its drape.
+        key: &dyn Fn(&Budget, ResourceId) -> Option<PriorityKey>,
+        tiles: &SortedMap<TileId, TileNeed>,
+        plan: &mut UploadPlan,
+    ) {
+        plan.clear();
         let group_of = |r: ResourceId| -> (u8, TileId) {
             let t = r.tile();
             match tiles.get(&t) {
@@ -2112,60 +2245,73 @@ impl Budget {
                 _ => (1, t),
             }
         };
-        // Every copy in transit is indexed in `active` (`deliver_one`).
-        let mut transit: Vec<(PriorityKey, ResourceId, Bytes)> = self
-            .active
-            .iter()
-            .filter_map(|r| {
-                let t = self.arena.transit(self.arena.find(*r)?)?;
-                Some((*r, t.cost.gpu))
-            })
-            .map(|(r, b)| {
-                let k = keys.get(&r).copied().unwrap_or(PriorityKey {
-                    urgency: Urgency::Refresh,
-                    score: Reverse(i64::MIN),
-                    tier: Tier::Remote,
-                    resource: r,
-                });
-                (k, r, b)
-            })
-            .collect();
-        transit.sort_unstable();
-        let mut plan = UploadPlan::default();
-        // Each group's members with their bytes, in transit order.
-        let mut groups: BTreeMap<(u8, TileId), Vec<(ResourceId, Bytes)>> = BTreeMap::new();
-        for (_, r, b) in &transit {
-            groups.entry(group_of(*r)).or_default().push((*r, *b));
-        }
-        for (_, r, _) in &transit {
-            // A group goes whole, at its first member in transit order: a
-            // later member finds it gone.
-            let Some(mut members) = groups.remove(&group_of(*r)) else {
+        let mut transit = std::mem::take(&mut self.scratch.transit);
+        let mut by_group = std::mem::take(&mut self.scratch.picked);
+        transit.clear();
+        for r in self.arena.transits() {
+            let Some(t) = self.arena.find(r).and_then(|s| self.arena.transit(s)) else {
                 continue;
             };
-            let bytes = members.iter().fold(Bytes::ZERO, |a, m| a.plus(m.1));
+            let k = key(self, r).unwrap_or(PriorityKey {
+                urgency: Urgency::Refresh,
+                score: Reverse(i64::MIN),
+                tier: Tier::Remote,
+                resource: r,
+            });
+            transit.push((k, t.cost.gpu, group_of(r), false));
+        }
+        // Keys end in the resource: total, so unstable is stable.
+        transit.sort_unstable_by_key(|a| a.0);
+        // Each group's members as a run, in transit order within the group:
+        // the places of `transit`, by (group, place).
+        by_group.clear();
+        by_group.extend((0..transit.len()).map(|i| u32::try_from(i).unwrap_or(u32::MAX)));
+        by_group.sort_unstable_by_key(|&i| (transit[i as usize].2, i));
+        let mut groups = 0;
+        for i in 0..transit.len() {
+            // A group goes whole, at its first member in transit order: a
+            // later member finds it gone.
+            if transit[i].3 {
+                continue;
+            }
+            let (k, b, g, _) = transit[i];
+            let from = by_group.partition_point(|&j| transit[j as usize].2 < g);
+            let to = from + by_group[from..].partition_point(|&j| transit[j as usize].2 == g);
+            let members = &by_group[from..to];
+            let bytes = members
+                .iter()
+                .fold(Bytes::ZERO, |a, &j| a.plus(transit[j as usize].1));
             if plan.items.is_empty() && plan.bytes.plus(bytes) > eff.upload {
                 // The first item always goes, alone if its group is too big.
-                plan.items.push(*r);
-                plan.bytes = members
-                    .iter()
-                    .find(|m| m.0 == *r)
-                    .map_or(Bytes::ZERO, |m| m.1);
+                plan.items.push(k.resource);
+                plan.bytes = b;
                 break;
             }
             if plan.bytes.plus(bytes) > eff.upload {
                 break;
             }
-            plan.items.extend(members.iter().map(|m| m.0));
+            plan.items
+                .extend(members.iter().map(|&j| transit[j as usize].0.resource));
             plan.bytes = plan.bytes.plus(bytes);
+            for &j in members {
+                transit[j as usize].3 = true;
+            }
             if members.len() > 1 {
-                members.sort_unstable_by_key(|m| m.0);
-                plan.groups.push(SwapGroup {
-                    members: members.into_iter().map(|m| m.0).collect(),
-                });
+                let out = plan.group(groups);
+                out.extend(members.iter().map(|&j| transit[j as usize].0.resource));
+                out.sort_unstable();
+                groups += 1;
             }
         }
-        plan
+        plan.groups.truncate(groups);
+        debug_assert!(
+            plan.groups
+                .iter()
+                .all(|g| g.members.len() > 1 && g.members.iter().all(|m| plan.items.contains(m))),
+            "every group kept is a group of the plan's items"
+        );
+        self.scratch.transit = transit;
+        self.scratch.picked = by_group;
     }
 
     /// The step's room against a recount, before the sweeps (which walk it
@@ -2191,7 +2337,7 @@ impl Budget {
         &mut self,
         now: Micros,
         eff: &Eff,
-        wants: &SortedMap<ResourceId, Want>,
+        wants: Wants<'_>,
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) {
@@ -2219,7 +2365,7 @@ impl Budget {
                 None => self.room(wants, st),
             };
             let mut walk = Walk::default();
-            while let Some(((.., r), s)) =
+            while let Some((_, s)) =
                 walk.next(&self.arena, &room.grouped, |c| c == class, &Held::GPU)
             {
                 if self.ledger.gpu[class] <= low {
@@ -2227,7 +2373,7 @@ impl Budget {
                 }
                 st.work = st.work.saturating_add(1);
                 // The order holds neither the kept set nor the floor.
-                if self.kept(&r) || self.is_floor(self.arena.level(s)) {
+                if self.kept(s) || self.is_floor(self.arena.level(s)) {
                     continue;
                 }
                 // Still on the GPU, and not on its way again.
@@ -2254,18 +2400,15 @@ impl Budget {
     fn release_decoded(&mut self, target: Bytes, d: &mut Decisions, st: &mut BudgetStats) {
         let a = &self.arena;
         let held = |s: Slot| a.has_cpu(s) && !a.has_transit(s);
-        // The protected first: the kept set, sorted by key.
-        let mut kept: Vec<(EvictKey, Slot)> = union4(
-            self.drawn_last.iter().copied(),
-            self.swap_last.iter().copied(),
-            std::iter::empty(),
-            std::iter::empty(),
-        )
-        .filter_map(|r| a.find(r))
-        .filter(|&s| held(s) && a.has_gpu(s))
-        .map(|s| (a.evict_key(s), s))
-        .collect();
+        // The protected first: the kept set, sorted by key. Drawn or in a
+        // swap, it was needed this step: grouped.
+        let mut kept: Vec<(EvictKey, Slot)> = a
+            .grouped_slots()
+            .filter(|&s| self.kept(s) && held(s) && a.has_gpu(s))
+            .map(|s| (a.evict_key(s), s))
+            .collect();
         kept.sort_unstable();
+        kept.dedup();
         // The grouped holders, sorted, merged with the filed ones below.
         let mut grouped: Vec<(EvictKey, Slot)> = a
             .grouped_slots()
@@ -2287,10 +2430,10 @@ impl Budget {
         // Then the evictable GPU residents' copies, then the demoted ones.
         for (held, gpu) in [(&Held::GPU[..1], true), (&[Held::Cpu][..], false)] {
             let mut walk = Walk::default();
-            while let Some(((.., r), s)) = walk.next(&self.arena, &grouped, |_| true, held) {
+            while let Some((_, s)) = walk.next(&self.arena, &grouped, |_| true, held) {
                 st.work = st.work.saturating_add(1);
                 let a = &self.arena;
-                if !a.has_cpu(s) || a.has_gpu(s) != gpu || (gpu && self.kept(&r)) {
+                if !a.has_cpu(s) || a.has_gpu(s) != gpu || (gpu && self.kept(s)) {
                     continue;
                 }
                 if self.ledger.decoded <= target {
@@ -2316,7 +2459,7 @@ impl Budget {
         &mut self,
         now: Micros,
         p: PoolEff,
-        wants: &SortedMap<ResourceId, Want>,
+        wants: Wants<'_>,
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) {
@@ -2356,14 +2499,14 @@ impl Budget {
         let member = |c: Class| p.members[c];
         // A candidate: a member's GPU resident outside the kept set, the
         // floor and transit.
-        let candidate = |b: &Budget, r: &ResourceId, s: Slot| {
+        let candidate = |b: &Budget, s: Slot| {
             let a = &b.arena;
-            a.has_gpu(s) && !a.has_transit(s) && !b.kept(r) && !b.is_floor(a.level(s))
+            a.has_gpu(s) && !a.has_transit(s) && !b.kept(s) && !b.is_floor(a.level(s))
         };
         let mut walk = Walk::default();
-        while let Some(((.., r), s)) = walk.next(&self.arena, &room.grouped, member, &Held::GPU) {
+        while let Some((_, s)) = walk.next(&self.arena, &room.grouped, member, &Held::GPU) {
             st.work = st.work.saturating_add(1);
-            if !candidate(self, &r, s) {
+            if !candidate(self, s) {
                 continue;
             }
             let (class, bytes) = (
@@ -2390,13 +2533,13 @@ impl Budget {
         // target once the pool is trimmed goes below its floor, in the same
         // order, until they fit.
         let mut walk = Walk::default();
-        while let Some(((.., r), s)) = walk.next(&self.arena, &room.grouped, member, &Held::GPU) {
+        while let Some((_, s)) = walk.next(&self.arena, &room.grouped, member, &Held::GPU) {
             if Class::ALL.iter().all(|c| !short(&self.ledger, *c)) {
                 break;
             }
             st.work = st.work.saturating_add(1);
             let class = self.arena.class(s);
-            if candidate(self, &r, s) && short(&self.ledger, class) {
+            if candidate(self, s) && short(&self.ledger, class) {
                 self.evict_one(now, s, class, d, st);
             }
         }
@@ -2422,7 +2565,7 @@ impl Budget {
             EvictReason::Pressure
         };
         st.evictions[class][why as usize] += 1;
-        self.recent.insert(r, now);
+        self.evicted(r, now);
     }
 
     fn relax(
@@ -2484,94 +2627,21 @@ impl Budget {
         self.scale = u32::try_from(self.scale_fine / 1_000_000).unwrap_or(u32::MAX);
     }
 
+    /// The prune: every step the kept levels of the tiles that left the
+    /// drape needs or the held set; every eighth step, amortised, the empty
+    /// slots, the expired evictions and the unreferenced tiles. Returns the
+    /// entries looked at.
     fn prune(
         &mut self,
         now: Micros,
-        tiles: &SortedCols<TileId, TileNeed>,
-        wants: &SortedMap<ResourceId, Want>,
-        drapes: &SortedMap<(TileId, LayerId), u32>,
+        tiles: &SortedMap<TileId, TileNeed>,
+        named: &[super::need_state::Named],
+        wants: Wants<'_>,
     ) -> u32 {
-        // Amortised: emptied entries and unreferenced tiles go every eighth
-        // step, so a step does not scan all it tracks. Returns the entries
-        // visited.
-        let visited = sat_u32(self.imagery_prev.len());
-        if !self.steps.is_multiple_of(8) {
-            let held = &self.held_last;
-            self.imagery_prev
-                .retain(|k, _| drapes.contains_key(k) || held.contains(&k.0));
-            return visited;
+        let mut visited = self.prune_levels(tiles, named);
+        if self.steps.is_multiple_of(8) {
+            visited = visited.saturating_add(self.prune_tracked(now, tiles, wants));
         }
-        let visited = visited
-            .saturating_add(sat_u32(self.arena.len()))
-            .saturating_add(sat_u32(self.tiles.len()));
-        let a = &self.arena;
-        self.active
-            .retain(|r| a.find(*r).is_some_and(|s| a.has_transit(s) || a.loading(s)));
-        let kept = |a: &Arena, s: Slot| {
-            if !a.is_empty(s) {
-                return true;
-            }
-            let cold = a.cold(s);
-            if cold.backing_off(now)
-                && cold
-                    .unneeded_since()
-                    .is_none_or(|u| now.since(u) < Micros::from_secs(30))
-            {
-                return true;
-            }
-            wants.contains_key(&a.id(s)) && cold.unneeded_since().is_none()
-        };
-        for n in 0..self.arena.slots() {
-            if let Some(s) = self.arena.live(n) {
-                if !kept(&self.arena, s) {
-                    self.arena.remove(s);
-                }
-            }
-        }
-        let a = &self.arena;
-        self.floor_set.retain(|r| a.find(*r).is_some());
-        // Keep only what is wanted this step among idle, never-started entries.
-        self.recent.retain(|_, t| now.since(*t) <= THRASH_WINDOW);
-        if self.recent.len() > RECENT_CAP {
-            // The oldest go, by (time, resource): one sort, not one scan
-            // per removal.
-            let mut by_age: Vec<(Micros, ResourceId)> =
-                self.recent.iter().map(|(r, t)| (*t, *r)).collect();
-            by_age.sort_unstable();
-            for (_, r) in &by_age[..by_age.len() - RECENT_CAP] {
-                self.recent.remove(r);
-            }
-        }
-        // The tiles still referenced and every ancestor of theirs, as one
-        // sorted vector rather than a set grown node by node.
-        let mut keep: Vec<TileId> = tiles.keys().copied().collect();
-        // As many as are tracked: one growth, as the ordered map's exact
-        // length gave before.
-        keep.reserve(self.arena.len());
-        keep.extend(self.arena.iter().map(|s| self.arena.id(s).tile()));
-        keep.extend(self.held_last.iter().copied());
-        keep.sort_unstable();
-        keep.dedup();
-        let seeds = keep.len();
-        for i in 0..seeds {
-            let mut cur = keep[i];
-            let walk = keep.len();
-            while let Some(p) = self.tiles.get(&cur).and_then(|i| i.parent()) {
-                // A seed's ancestors are walked from the seed itself; a
-                // tile met twice in one walk is a cycle.
-                if keep[..seeds].binary_search(&p).is_ok() || keep[walk..].contains(&p) {
-                    break;
-                }
-                keep.push(p);
-                cur = p;
-            }
-        }
-        keep.sort_unstable();
-        keep.dedup();
-        self.tiles.retain(|t, _| keep.binary_search(t).is_ok());
-        let held = &self.held_last;
-        self.imagery_prev
-            .retain(|k, _| drapes.contains_key(k) || held.contains(&k.0));
         visited
     }
 
@@ -2587,7 +2657,7 @@ impl Budget {
             let a = &b.arena;
             (a.has_gpu(s) || a.has_cpu(s))
                 && !a.has_transit(s)
-                && !b.wanted_last.contains(&a.id(s))
+                && !a.marked(s, Mark::Wanted)
                 && !b.is_floor(a.level(s))
         };
         let a = &self.arena;
@@ -2683,6 +2753,10 @@ impl Budget {
         debug_assert!(
             a.evict_index_consistent(),
             "the eviction index drifted from the slots"
+        );
+        debug_assert!(
+            a.sums_consistent(),
+            "the protected bytes or the GPU copies by epoch drifted from the slots"
         );
         for s in a.iter() {
             let class = a.class(s);

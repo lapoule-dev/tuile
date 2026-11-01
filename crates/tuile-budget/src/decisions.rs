@@ -3,11 +3,21 @@
 
 //! [`Decisions`]: what one step tells the loaders and the consumer to do.
 
+use smallvec::SmallVec;
+
 use super::error::SessionError;
 use super::imagery::UvTransform;
 use super::stats::BudgetStats;
 use super::tier::Source;
 use super::types::{Bytes, Class, Generation, LayerId, ResourceId, TileId};
+
+/// The drapes a drawn mesh wears: one or two in place (a tile wears one or
+/// two layers), more on the heap.
+pub type Drapes = SmallVec<[DrapeChoice; 2]>;
+
+/// The tiles a drawn mesh stands for: up to four in place (an exact or held
+/// mesh serves one; a fallback a few), more on the heap.
+pub type Serves = SmallVec<[TileId; 4]>;
 
 /// A load to start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -60,12 +70,22 @@ pub struct DrawItem {
     /// The drapes it wears: one per layer the tiles it serves ask for, in
     /// stacking order (D-A4). A mesh whose need asks for imagery is drawn
     /// only dressed, every layer it needs worn (I1, D-A1).
-    pub drapes: Vec<DrapeChoice>,
+    pub drapes: Drapes,
     /// The wanted tiles it stands for (itself when `Exact`), sorted.
-    pub serves: Vec<TileId>,
+    pub serves: Serves,
 }
 
 impl DrawItem {
+    /// `mesh` drawn as `role`, wearing nothing, serving nothing yet.
+    pub fn new(mesh: ResourceId, role: Role) -> Self {
+        DrawItem {
+            mesh,
+            role,
+            drapes: Drapes::new(),
+            serves: Serves::new(),
+        }
+    }
+
     /// The drape it wears for `layer`, if any.
     pub fn drape(&self, layer: LayerId) -> Option<&DrapeChoice> {
         self.drapes.iter().find(|d| d.layer == layer)
@@ -115,6 +135,27 @@ pub struct UploadPlan {
     pub groups: Vec<SwapGroup>,
 }
 
+impl UploadPlan {
+    /// Empties the plan, its buffers kept: the items' and each group's
+    /// members' room stays for the next plan (the groups are overwritten in
+    /// place by [`UploadPlan::group`], then cut to those used).
+    pub(crate) fn clear(&mut self) {
+        self.items.clear();
+        self.bytes = Bytes::ZERO;
+    }
+
+    /// The `n`th group of the plan being built, emptied, to fill: an old
+    /// group's buffer when there is one at `n`, else a new one.
+    pub(crate) fn group(&mut self, n: usize) -> &mut Vec<ResourceId> {
+        if n == self.groups.len() {
+            self.groups.push(SwapGroup::default());
+        }
+        let g = &mut self.groups[n].members;
+        g.clear();
+        g
+    }
+}
+
 /// One step's decisions.
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
@@ -145,6 +186,24 @@ pub struct Decisions {
 }
 
 impl Decisions {
+    /// Empties the decisions for a step to fill, every buffer's room kept:
+    /// the lists, the plan's items and groups, the draw set's items (each
+    /// overwritten in place by the step). A host that hands the same
+    /// `Decisions` to every step gives the step nothing to allocate for its
+    /// output once they have grown to the view.
+    pub(crate) fn clear(&mut self) {
+        self.start.clear();
+        self.cancel.clear();
+        self.deliver.clear();
+        self.evict.clear();
+        self.release.clear();
+        self.upload_plan.clear();
+        self.sse_scale_milli = 0;
+        self.frame_ready = false;
+        self.fatal = None;
+        self.stats = BudgetStats::default();
+    }
+
     /// The relaxation as a factor on the SSE threshold.
     pub fn sse_scale(&self) -> f32 {
         self.sse_scale_milli as f32 / 1000.0

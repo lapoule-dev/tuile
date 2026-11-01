@@ -30,6 +30,13 @@ step reads only the tiles that entered, changed or left. Both decide alike:
 a delta built from two needs ([`NeedDelta::diff`]) gives the decisions of
 the second.
 
+The decisions go out by value ([`Budget::decide`]) or into the step
+before's ([`Budget::decide_into`]): emptied and refilled, their buffers kept
+— a host that hands the same [`Decisions`] to every step gives the step
+nothing to allocate for its output once they have grown to the view. A
+[`NeedDelta`] built every step ([`NeedDelta::diff`]) keeps its buffers the
+same way.
+
 ## Where it sits
 
 At the bottom of the workspace: it depends on no other tuile crate, and on

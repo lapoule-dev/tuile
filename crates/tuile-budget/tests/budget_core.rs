@@ -15,9 +15,9 @@ mod budget_common;
 use budget_common::*;
 use tuile_budget::cost::Cost;
 use tuile_budget::{
-    Budget, BudgetConfig, Bytes, Class, ConfigError, Failure, FailurePolicy, LayerId, Micros,
-    NeedSet, PerClass, Pressure, Protection, ResourceId, ResourceState, Role, SessionError, Source,
-    Thermal, Tier, Urgency,
+    Budget, BudgetConfig, Bytes, Class, ConfigError, Decisions, Failure, FailurePolicy, LayerId,
+    Micros, NeedSet, PerClass, Pressure, Protection, ResourceId, ResourceState, Role, SessionError,
+    Source, Thermal, Tier, Urgency,
 };
 
 const RED: &str = "the budget core regressed";
@@ -999,6 +999,42 @@ mod tiers {
         );
     }
 
+    /// C10, C4: the decoded tier's target follows `retarget` like the GPU
+    /// limits do. A device whose available memory halves keeps half the
+    /// decoded copies, not the configured quarter of a GPU it no longer
+    /// has: the copies demoted by evictions are tracked state, and a
+    /// budget retargeted to a fraction of its device would otherwise hold
+    /// the whole configured tier of them.
+    #[test]
+    fn the_decoded_tier_is_retargeted_with_the_gpu_limits() {
+        let mut c = small(1);
+        c.decoded_target = Bytes(MESH.0 * 8);
+        let mut r = Rig::new(c);
+        for x in 0..6 {
+            r.settle(&drawn(&[t(3, x, 0)]), 10);
+        }
+        let full = r.b.ledger().decoded;
+        assert!(full > Bytes(MESH.0 * 4), "{RED}: {full:?} decoded");
+        // Half the device (the configuration is 512 MiB in all).
+        r.b.retarget(Bytes::mib(256));
+        let d = r.step(&drawn(&[t(3, 5, 0)]));
+        let half = r.b.ledger().decoded;
+        assert!(
+            half <= Bytes(MESH.0 * 4),
+            "{RED}: {half:?} decoded after retargeting to half, target {:?}",
+            Bytes(MESH.0 * 4)
+        );
+        assert_eq!(d.stats.decoded, half);
+        assert!(d.release.len() >= 2, "{RED}: {} released", d.release.len());
+        // Retargeted back, the tier grows again to what it is configured.
+        r.b.retarget(Bytes::mib(512));
+        for x in 6..9 {
+            r.settle(&drawn(&[t(3, x, 0)]), 10);
+        }
+        assert!(r.b.ledger().decoded > Bytes(MESH.0 * 4), "{RED}");
+        assert!(r.b.ledger().decoded <= Bytes(MESH.0 * 8), "{RED}");
+    }
+
     /// I15: a stored tile is read locally, without a network slot.
     #[test]
     fn a_stored_tile_is_read_locally_without_a_network_slot() {
@@ -1614,7 +1650,7 @@ mod draw {
         let d = r.settle(&drawn(&[a]), 10);
         let item = d.draw.get(mesh(a)).expect(RED);
         assert_eq!(item.role, Role::Exact);
-        assert_eq!(item.serves, vec![a]);
+        assert_eq!(item.serves.to_vec(), vec![a]);
         assert_eq!(d.stats.exact, 1);
     }
 
@@ -1633,7 +1669,7 @@ mod draw {
         let d = r.step(&need);
         let item = d.draw.get(mesh(root)).expect(RED);
         assert_eq!(item.role, Role::Fallback);
-        assert_eq!(item.serves, vec![grandchild]);
+        assert_eq!(item.serves.to_vec(), vec![grandchild]);
         assert_eq!((d.stats.fallback, d.stats.lost), (1, 0));
     }
 
@@ -1671,7 +1707,7 @@ mod draw {
         let d = r.step(&drawn(&kids));
         let item = d.draw.get(mesh(p)).expect(RED);
         assert_eq!(item.role, Role::Fallback);
-        assert_eq!(item.serves, vec![kids[3]]);
+        assert_eq!(item.serves.to_vec(), vec![kids[3]]);
         let d = r.settle(&drawn(&kids), 10);
         assert!(!d.draw.draws(p));
     }
@@ -1769,7 +1805,7 @@ mod draw {
         assert_eq!(cover.role, Role::Fallback);
         let mut new_tiles = kids[1..].to_vec();
         new_tiles.sort();
-        assert_eq!(cover.serves, new_tiles);
+        assert_eq!(cover.serves.to_vec(), new_tiles);
         assert_eq!((d.stats.lost, d.stats.fallback), (0, 3));
     }
     /// D-A4, M36: each layer falls back on its own: a tile whose base
@@ -2474,6 +2510,35 @@ mod determinism {
         assert_eq!(a, script(false));
     }
 
+    /// A step written into the step before's decisions (`decide_into`, the
+    /// buffers kept and overwritten in place: lists, the plan's groups, the
+    /// draw set's items with their drapes and tiles served) decides exactly
+    /// what a step into fresh decisions does — statistics included — over a
+    /// script whose view, and so the number of items and groups, grows and
+    /// shrinks. Red with the buffers not emptied first, or the draw set's
+    /// items beyond this step's kept.
+    #[test]
+    fn a_step_into_the_last_decisions_is_the_step_into_fresh_ones() {
+        let (mut fresh, mut reused) = (Rig::interactive(), Rig::interactive());
+        reused.reuse = Some(Decisions::default());
+        let mut differed = 0;
+        for step in 0u64..160 {
+            // Four tiles, then eight, then two, drifting east.
+            let x = step / 20;
+            let n = [4usize, 8, 2, 6][(step / 40) as usize % 4];
+            let tiles: Vec<_> = (0..n as u64).map(|k| t(4, x + k, 1 + k % 3)).collect();
+            let need = drawn_draped(&tiles, 6);
+            let (a, b) = (fresh.step(&need), reused.step(&need));
+            assert_eq!(a, b, "{RED}: step {step}");
+            differed += usize::from(step > 0 && a.draw.items.len() != n);
+            if step % 3 != 0 {
+                fresh.complete(&a);
+                reused.complete(&b);
+            }
+        }
+        assert!(differed > 0, "the draw set never changed size");
+    }
+
     /// I12, C11: the decisions do not depend on the order of the need.
     #[test]
     fn the_decisions_do_not_depend_on_the_order_of_the_need() {
@@ -3017,5 +3082,289 @@ mod deadline {
         // Not first in the frame: nothing over the deadline goes.
         assert_eq!(cap(50).take(&[e], &[], Bytes(10), cost), none);
         assert_eq!(cap(250).take(&queue, &[], Bytes(100), cost), &[a]);
+    }
+}
+
+/// O1.4: a step reads again only what may have changed (`downstream`). Each
+/// test pins one propagation rule with a tile that nothing else would read
+/// again: left out, the tile keeps last step's answer (red in a release
+/// build; a debug build's full recomputation fails first).
+mod dirty_sets {
+    use super::*;
+
+    /// The parent's rule: a tile standing on an ancestor is read again when
+    /// a finer tile below it starts being drawn — the held set changes at
+    /// the step's end — though nothing of its own changed; it is then held
+    /// by that tile, no longer falling back.
+    #[test]
+    fn a_tile_is_held_by_a_finer_tile_drawn_since() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        r.settle(&drawn(&[root]), 10);
+        let p = children(root)[0];
+        let k = children(p)[0];
+        let ask = drawn(&[p, k]);
+        let d = r.step(&ask);
+        assert_eq!(d.stats.fallback, 2, "both stand on the root first");
+        r.load_where(|x| x == mesh(k));
+        for _ in 0..4 {
+            let d = r.step(&ask);
+            r.upload(&d);
+        }
+        let d = r.step(&ask);
+        assert!(r.b.residency().drawable(k));
+        assert!(!r.b.residency().drawable(p));
+        assert_eq!(
+            d.draw.get(mesh(k)).map(|i| i.serves.to_vec()),
+            Some(vec![p, k]),
+            "{RED}: the finer tile drawn since holds its ancestor"
+        );
+        assert_eq!(d.stats.fallback, 0, "{RED}");
+    }
+
+    /// The descendants' rule: a tile falling back is read again when a
+    /// nearer ancestor becomes drawable, and stands on it.
+    #[test]
+    fn a_tile_falling_back_moves_to_a_nearer_ancestor_drawn_since() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        r.settle(&drawn(&[root]), 10);
+        let p = children(root)[0];
+        let k = children(p)[0];
+        let mut ask = drawn(&[k]);
+        ask.ancestors.push((p, need(p)));
+        let d = r.step(&ask);
+        assert_eq!(
+            d.draw.get(mesh(root)).map(|i| i.serves.to_vec()),
+            Some(vec![k])
+        );
+        r.load_where(|x| x == mesh(p));
+        for _ in 0..4 {
+            let d = r.step(&ask);
+            r.upload(&d);
+        }
+        let d = r.step(&ask);
+        assert!(r.b.residency().drawable(p));
+        assert!(!r.b.residency().drawable(k));
+        assert_eq!(
+            d.draw.get(mesh(p)).map(|i| (i.role, i.serves.to_vec())),
+            Some((Role::Fallback, vec![k])),
+            "{RED}: the tile stands on its nearest drawable ancestor"
+        );
+        assert!(!d.draw.draws(root), "{RED}");
+    }
+
+    /// The drapes' rule: a drawn mesh wearing an ancestor's drape is read
+    /// again when a nearer ancestor's drape becomes drawable, and wears it.
+    /// The nearer ancestor is a blocker: its drape is wanted, it is not
+    /// drawn, so nothing else reads the mesh again.
+    #[test]
+    fn a_mesh_wears_a_nearer_ancestors_drape_drawn_since() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        r.settle(&drawn_draped(&[root], 0), 10);
+        let p = children(root)[0];
+        let k = children(p)[0];
+        let mut ask = drawn_draped(&[k], 2);
+        ask.blockers.push((p, draped(p, 1)));
+        r.step(&ask);
+        r.load_where(|x| x == mesh(k));
+        for _ in 0..4 {
+            let d = r.step(&ask);
+            r.upload(&d);
+        }
+        let worn = |d: &tuile_budget::Decisions| {
+            d.draw.get(mesh(k)).and_then(base_drape).map(|c| c.resource)
+        };
+        let d = r.step(&ask);
+        assert_eq!(worn(&d), Some(dr(root, 0)), "the root's drape first");
+        r.load_where(|x| x == dr(p, 1));
+        for _ in 0..4 {
+            let d = r.step(&ask);
+            r.upload(&d);
+        }
+        let d = r.step(&ask);
+        assert!(r.b.residency().drawable(k));
+        assert_eq!(
+            worn(&d),
+            Some(dr(p, 1)),
+            "{RED}: the mesh wears the nearer drape"
+        );
+    }
+
+    /// The place's rule: a mesh wearing an ancestor's drape is read again
+    /// when that ancestor's place in the tree changes (here its footprint),
+    /// and maps the drape into the new footprint. The ancestor is a
+    /// blocker, not drawn: nothing else reads the mesh again.
+    #[test]
+    fn a_mesh_maps_an_ancestors_drape_into_its_new_footprint() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        r.settle(&drawn(&[root]), 10);
+        let p = children(root)[0];
+        let k = children(p)[0];
+        let mut ask = drawn_draped(&[k], 2);
+        ask.blockers.push((p, draped(p, 1)));
+        r.step(&ask);
+        r.load_where(|x| x == mesh(k) || x == dr(p, 1));
+        for _ in 0..4 {
+            let d = r.step(&ask);
+            r.upload(&d);
+        }
+        let uv = |d: &tuile_budget::Decisions| {
+            d.draw
+                .get(mesh(k))
+                .and_then(base_drape)
+                .map(|c| (c.resource, c.uv))
+        };
+        let d = r.step(&ask);
+        let between = tuile_budget::UvTransform::between;
+        assert_eq!(uv(&d), Some((dr(p, 1), between(rect(k), rect(p)).unwrap())));
+        // The ancestor's footprint, told differently: its root's.
+        ask.blockers[0].1 = draped(p, 1).with_rect(rect(root));
+        r.step(&ask);
+        let d = r.step(&ask);
+        assert_eq!(
+            uv(&d),
+            Some((dr(p, 1), between(rect(k), rect(root)).unwrap())),
+            "{RED}: the drape mapped into the footprint the need tells"
+        );
+    }
+
+    /// The prune's whole walk: two tiles told as each other's parent close a
+    /// cycle, which counts of what keeps each tile cannot see through (each
+    /// would keep the other). The cycle sends the prune back to the whole
+    /// walk, and once nothing references them the two tiles are let go.
+    #[test]
+    fn tiles_whose_parents_close_a_cycle_are_let_go_once_unreferenced() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        r.settle(&drawn(&[root]), 10);
+        let [a, b, ..] = children(root);
+        let mut ask = drawn(&[root]);
+        ask.drawn.push((a, need(a).with_parent(b)));
+        ask.drawn.push((b, need(b).with_parent(a)));
+        r.step(&ask);
+        r.step(&ask);
+        let known = |r: &Rig| -> Vec<tuile_budget::TileId> {
+            r.b.snapshot().tiles.iter().map(|x| x.0).collect()
+        };
+        assert!(known(&r).contains(&a) && known(&r).contains(&b));
+        // Unreferenced: their loads cancelled past the grace, their slots
+        // freed, then the tiles.
+        r.idle_for(&drawn(&[root]), Micros::from_secs(2));
+        assert_eq!(r.b.tracked(), 1, "only the root's mesh is tracked");
+        let left = known(&r);
+        assert!(
+            !left.contains(&a) && !left.contains(&b),
+            "{RED}: the tiles of a cycle are kept: {left:?}"
+        );
+    }
+
+    /// P6.4 where the ancestry is deep (O1.4, `held`): four tiles drawn at
+    /// level 19 give way to their sixteen children, which land together.
+    /// Each held tile that comes or goes is one change of the held set and
+    /// a walk up its twenty ancestors — not a pair rewritten per ancestor in
+    /// an ordered map — so every step's work stays within P6.4's bound on
+    /// what changed: the need's tiles, the events applied and the decisions
+    /// of the step before.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release only: the debug build's checks walk too (cargo test --release -p tuile-budget --test budget_core)"
+    )]
+    fn a_deep_region_refining_at_once_costs_what_changed() {
+        let mut r = Rig::interactive();
+        let coarse: Vec<tuile_budget::TileId> = (0..2)
+            .flat_map(|x| (0..2).map(move |y| t(19, x, y)))
+            .collect();
+        let fine: Vec<tuile_budget::TileId> = coarse.iter().flat_map(|c| children(*c)).collect();
+        // Every ancestor told, so that each walk climbs the whole tree.
+        let with_ancestors = |drawn_tiles: &[tuile_budget::TileId]| {
+            let mut n = drawn(drawn_tiles);
+            let mut up = std::collections::BTreeSet::new();
+            for d in drawn_tiles {
+                let mut p = parent(*d);
+                while let Some(x) = p {
+                    up.insert(x);
+                    p = parent(x);
+                }
+            }
+            n.ancestors = up.into_iter().map(|x| (x, need(x))).collect();
+            n
+        };
+        r.settle(&with_ancestors(&coarse), 50);
+        let ask = with_ancestors(&fine);
+        let (mut decided, mut fed) = (0u64, 0u64);
+        let mut over = Vec::new();
+        for step in 0..12 {
+            let d = r.step(&ask);
+            let named = if step == 0 {
+                (coarse.len() + fine.len()) as u64
+            } else {
+                0
+            };
+            let e = decided + fed;
+            let tracked = u64::from(d.stats.tracked);
+            let log = u64::from(64 - (tracked + 2).leading_zeros());
+            let bound = 16 * (named + e) * log + 256;
+            if u64::from(d.stats.work) > bound {
+                over.push((step, d.stats.work, bound, named, e));
+            }
+            decided = (d.start.len() + d.cancel.len() + d.deliver.len() + d.evict.len()) as u64;
+            fed = (d.start.len() + d.upload_plan.items.len()) as u64;
+            r.complete(&d);
+        }
+        assert!(
+            fine.iter().all(|x| r.b.residency().drawable(*x)),
+            "the region refined"
+        );
+        assert!(
+            over.is_empty(),
+            "{RED}: work over the bound (step, W, bound, #ΔN, #E): {over:?}"
+        );
+    }
+
+    /// The worn rule: a tile reads the drapes an ancestor's mesh wore last
+    /// step (a layer switch: an old layer stands in while the new one is
+    /// drawable nowhere), so it is read again when that mesh's item
+    /// changes. Here the ancestor starts wearing a layer the tile does not
+    /// ask for; the tile, lost so far (its own layer is drawable nowhere),
+    /// then stands on it. The ancestor's own need changed, not its place,
+    /// and no resource changed: nothing else reads the tile again.
+    #[test]
+    fn a_tile_stands_on_an_ancestor_wearing_a_layer_since() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        // The root's mesh and its layer-1 drape drawable; then the root
+        // drawn wearing nothing, the drape kept resident.
+        r.settle(&drawn_layered(&[root], 0, &[1]), 10);
+        r.settle(&drawn(&[root]), 10);
+        let k = children(root)[0];
+        let mut ask = drawn(&[root]);
+        ask.drawn.push((k, layered(k, 1, &[0])));
+        let d = r.step(&ask);
+        assert!(!r.b.residency().drawable(k));
+        assert_eq!(
+            d.draw.get(mesh(root)).map(|i| i.serves.to_vec()),
+            Some(vec![root]),
+            "the root wears nothing: the tile has nothing to stand on"
+        );
+        // The root asks for layer 1 again: its item wears it from now on.
+        ask.drawn[0].1 = layered(root, 0, &[1]);
+        let d = r.step(&ask);
+        assert_eq!(
+            d.draw
+                .get(mesh(root))
+                .and_then(|i| i.drape(LayerId(1)))
+                .map(|c| c.resource),
+            Some(dl(root, 1, 0))
+        );
+        let d = r.step(&ask);
+        assert_eq!(
+            d.draw.get(mesh(root)).map(|i| i.serves.to_vec()),
+            Some(vec![root, k]),
+            "{RED}: the tile stands on the ancestor wearing a layer since"
+        );
     }
 }

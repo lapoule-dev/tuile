@@ -725,8 +725,8 @@ fn a_web_resize_and_a_device_pixel_ratio_change() {
     assert_eq!(digests(false), digests(true), "P5.5 on the web");
 }
 
-/// P6.4's constants (spec §12, "a and b are set in Phase 3 and kept"):
-/// provisional until O1.4 lands the incremental `decide` they bound.
+/// P6.4's constants (spec §12, "a and b are set in Phase 3 and kept"),
+/// held by O1.4's incremental `decide`.
 const P64_A: u64 = 16;
 const P64_B: u64 = 256;
 
@@ -751,12 +751,33 @@ fn need_delta(before: &NeedSet, after: &NeedSet) -> u64 {
 /// since the last step, never with the size of the view:
 /// W_k ≤ a · (#ΔN_k + #E_k) · log2(tracked + 2) + b, on every step of a
 /// converged still view (nothing changes: W_k ≤ b) and of the soak's tour.
+/// #E_k counts the events the step applies and the decisions the step
+/// before took — loads started, cancelled, deliveries, evictions. A
+/// decision changes a resource's state (a load in flight, a copy in
+/// transit, a copy gone) after the passes of its step have read the arena,
+/// so its effect on the jobs, the marks and the work is read by the next
+/// step, from the arena's changes, exactly as an event's is: it is a change
+/// of that step's input, one step late. Counting only the events left those
+/// steps' work unexplained (2 still steps over the bound once the maps'
+/// upkeep was counted).
 ///
-/// Red today: `decide` reads the whole need, ranks every want and scans the
-/// tracked entries each step, so W_k is O(need + tracked) even when nothing
-/// changed. O1.4 (dirty sets) turns it green.
+/// `work` includes what keeping the kept maps in order costs, as the
+/// sorted blocks count it (`sorted.rs`): the entries a change shifts in its
+/// block, those a split, a redistribution or a merge moves, the index's
+/// entries shifted when a block comes or goes, and every entry of a pass
+/// over a whole map. Nothing an ordered map does is left out of it.
+///
+/// `work` counts every element a step walks, the passes after the need
+/// included (drape levels, selection, draw set, wants, ranking, marks,
+/// protection, prune). Red before O1.4's dirty sets: every pass after the
+/// need walked all of it, so W_k was O(need + tracked) even when nothing
+/// changed (about 15 700 a still step, over the bound on 1 499 of 5 100
+/// steps).
 #[test]
-#[ignore = "red until O1.4 (incremental decide): work is O(need) today"]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
 fn decide_work_grows_with_changes_not_with_the_view() {
     use tuile_budget::{BudgetMeter, BudgetObserver, Pressure, StepRecord, Thermal};
 
@@ -764,6 +785,7 @@ fn decide_work_grows_with_changes_not_with_the_view() {
     sim.run(5.0, &approach);
     let mut meter = BudgetMeter::new(sim.budget.config());
     let mut prev: Option<NeedSet> = None;
+    let mut decided = 0u64;
     // (phase, step, W, #ΔN, #E, tracked, bound)
     let mut over: Vec<(&str, u64, u64, u64, u64, u64, u64)> = Vec::new();
     let mut steps = 0u64;
@@ -797,7 +819,8 @@ fn decide_work_grows_with_changes_not_with_the_view() {
         let dn = prev
             .as_ref()
             .map_or_else(|| listed(&need).len() as u64, |p| need_delta(p, &need));
-        let e = sim.step_events;
+        let e = sim.step_events + decided;
+        decided = (d.start.len() + d.cancel.len() + d.deliver.len() + d.evict.len()) as u64;
         let tracked = u64::from(d.stats.tracked);
         let log = u64::from(64 - (tracked + 2).leading_zeros()); // ⌈log2⌉
         let bound = P64_A * (dn + e) * log + P64_B;

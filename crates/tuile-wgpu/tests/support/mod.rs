@@ -225,12 +225,9 @@ pub fn drape(tile: TileId, gen: u64, content: DrapeContent) -> ServerMessage {
 
 /// A mesh drawn as itself.
 pub fn exact(tile: TileId) -> DrawItem {
-    DrawItem {
-        mesh: ResourceId::Mesh(tile),
-        role: Role::Exact,
-        drapes: Vec::new(),
-        serves: vec![tile],
-    }
+    let mut item = DrawItem::new(ResourceId::Mesh(tile), Role::Exact);
+    item.serves.push(tile);
+    item
 }
 
 /// Each of `tiles` drawn as itself.
@@ -240,14 +237,10 @@ pub fn exacts(tiles: &[TileId]) -> Vec<DrawItem> {
 
 /// An ancestor standing in for `serves`, under the fallback pass.
 pub fn fallback(tile: TileId, serves: &[TileId]) -> DrawItem {
-    let mut serves = serves.to_vec();
-    serves.sort();
-    DrawItem {
-        mesh: ResourceId::Mesh(tile),
-        role: Role::Fallback,
-        drapes: Vec::new(),
-        serves,
-    }
+    let mut item = DrawItem::new(ResourceId::Mesh(tile), Role::Fallback);
+    item.serves.extend_from_slice(serves);
+    item.serves.sort();
+    item
 }
 
 /// `item` wearing `drape` (a resource of `owner`'s) through `uv`.

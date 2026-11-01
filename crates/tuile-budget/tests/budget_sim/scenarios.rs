@@ -3,7 +3,7 @@
 
 //! The scenarios of spec §8.
 
-use tuile_budget::{Bytes, Class, Micros, Pressure, Thermal};
+use tuile_budget::{Bytes, Class, Micros, Pressure, Thermal, BACKOFF_KEEP_MAX};
 
 use super::detmath;
 use super::net::NetProfile;
@@ -37,6 +37,116 @@ pub fn settle(sim: &mut Sim, secs: f64) -> Micros {
     let stop = sim.now;
     sim.run(secs, &|_| home());
     stop
+}
+
+/// A flight that grows the tracked set, then shrinks it: the approach, up
+/// to 60 km and a turn over the plain (thousands of tiles tracked), back
+/// down to the still view, then still.
+pub fn grow_then_shrink(t: f64) -> Camera {
+    let h0 = home();
+    let lg = |a: f64, b: f64, k: f64| a * detmath::exp2(detmath::log2(b / a) * k);
+    if t < 5.0 {
+        approach(t)
+    } else if t < 10.0 {
+        Camera {
+            h: lg(2_000.0, 60_000.0, (t - 5.0) / 5.0),
+            ..h0
+        }
+    } else if t < 25.0 {
+        Camera {
+            h: 60_000.0,
+            heading: (t - 10.0) / 15.0 * std::f64::consts::TAU,
+            ..h0
+        }
+    } else if t < 30.0 {
+        Camera {
+            h: lg(60_000.0, 2_000.0, (t - 25.0) / 5.0),
+            ..h0
+        }
+    } else {
+        h0
+    }
+}
+
+/// Flies `sim` through [`grow_then_shrink`] for a minute, the app sent to
+/// the background at 40 s (only the floor and what is drawn kept) and back
+/// at 42 s; `each` sees the simulation after every step. Returns the
+/// tracked peak.
+pub fn fly_grow_then_shrink(sim: &mut Sim, mut each: impl FnMut(&Sim)) -> usize {
+    let mut peak = 0;
+    while sim.now < Micros::from_secs(60) {
+        let t = sim.now.0 as f64 / 1e6;
+        if (40.0..42.0).contains(&t) {
+            sim.pressure(Pressure::Background);
+        } else if (42.0..42.1).contains(&t) {
+            sim.pressure(Pressure::Normal);
+        }
+        sim.step(grow_then_shrink(t));
+        peak = peak.max(sim.budget.tracked());
+        each(sim);
+    }
+    peak
+}
+
+/// The arena gives its room back, in the budget, checked: on the flight
+/// that grows the tracked set to thousands and falls back to the still
+/// view, the room the budget has for tracked resources follows — it
+/// stays far over the set (sparse) for a while, then is cut to twice the
+/// set — and every decision and the whole state are the recorded ones
+/// (the reference, recorded with this scenario). The checked simulation
+/// (release with debug assertions) runs the arena's and the kept sets'
+/// renumbering checks here, every step.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
+fn the_arena_gives_its_room_back_on_the_flight_that_shrinks_the_tracked_set() {
+    let mut sim = Sim::new(Profile::desktop(), 7);
+    // (t, tracked, room) after every step.
+    let mut trace: Vec<(Micros, usize, usize)> = Vec::new();
+    let peak = fly_grow_then_shrink(&mut sim, |s| {
+        trace.push((s.now, s.budget.tracked(), s.budget.tracked_room()));
+    });
+    let room_max = trace.iter().map(|x| x.2).max().unwrap_or(0);
+    let sparse = trace
+        .iter()
+        .filter(|(_, tracked, room)| *room > 256 && *room > 4 * tracked)
+        .count();
+    // A compaction: the room falls from one step to the next, to twice the
+    // tracked set (256 at least), which the budget then grows from.
+    let compactions: Vec<&(Micros, usize, usize)> = trace
+        .windows(2)
+        .filter(|w| w[1].2 < w[0].2)
+        .map(|w| &w[1])
+        .collect();
+    let (_, tracked, room) = *trace.last().expect("steps");
+    eprintln!(
+        "grow then shrink: tracked peak {peak}, room at most {room_max}, sparse on {sparse} \
+         steps, compacted {} time(s) ({}), ending at {tracked} tracked in a room of {room}",
+        compactions.len(),
+        compactions
+            .iter()
+            .map(|(t, n, r)| format!("t = {:.2} s: {n} tracked, room {r}", t.0 as f64 / 1e6))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    assert!(peak >= 3 * tracked, "{RED}: the flight shrinks the set");
+    // Hysteresis: the eighth prune in a row (one every eighth step) that
+    // finds the set sparse compacts, so at least seven whole prune
+    // intervals pass sparse first.
+    assert!(
+        sparse >= 7 * 8,
+        "{RED}: the set under a quarter of the room on {sparse} steps"
+    );
+    assert!(
+        !compactions.is_empty(),
+        "{RED}: the room was never given back"
+    );
+    for (_, n, r) in &compactions {
+        assert_eq!(*r, (2 * n).max(256), "{RED}: the room after a compaction");
+    }
+    assert!(room < room_max / 2, "{RED}: room {room} of {room_max} kept");
 }
 
 pub fn converges(mut profile: Profile) {
@@ -359,6 +469,130 @@ fn a_lossy_stalling_network_never_blocks_the_view() {
     assert!(took <= Micros::from_secs(20), "{took:?}");
 }
 
+/// The tracked resources holding nothing — no copy, nothing in transit, no
+/// load — whose want went: the slots the prune keeps for their failure
+/// history alone.
+fn kept_for_their_failures(sim: &Sim) -> usize {
+    sim.budget
+        .snapshot()
+        .resources
+        .iter()
+        .filter(|r| {
+            r.gpu.is_none()
+                && r.cpu.is_none()
+                && r.transit.is_none()
+                && r.load.is_none()
+                && r.unneeded_since.is_some()
+        })
+        .count()
+}
+
+/// The camera of the outage scenario: the approach, then a jump to a new
+/// place every two seconds, 94 km away, at the home view's height (a search
+/// box's "go to": each one reveals ground the last place did not share, and
+/// the loads of the place left have failed three or four times by then);
+/// from 35 s the camera stays at the fifteenth place.
+fn jumps(t: f64) -> Camera {
+    if t < 5.0 {
+        approach(t)
+    } else {
+        let k = ((t - 5.0) / 2.0).floor().min(14.0);
+        Camera {
+            x: (0.15 + 0.045 * k) * SIDE,
+            ..home()
+        }
+    }
+}
+
+/// I7, D1: a network outage. Every network load fails at once for half a
+/// minute (a refused connection) while the view jumps from place to place
+/// (nothing arriving, so each place wants its coarse tiles and fails them
+/// over and over), then the network is back and the camera stays at the
+/// last place, whose tiles then load through their backoffs. Every wanted resource fails and backs off,
+/// and the view leaves them behind: the budget keeps their failure history
+/// for a while (so a server that is down is not hammered the moment a tile
+/// comes back into view), but not without bound — the slots kept for
+/// resources the view left are capped by count, and so by the bytes of
+/// their metadata (`BACKOFF_KEEP_MAX`), the ones left longest let go first;
+/// the wanted ones are the view's own. Once the network is back the view
+/// converges, the backoffs of the wanted resources (30 s at most) included.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
+fn a_network_outage_leaves_the_tracked_state_bounded_and_recovers() {
+    let mut sim = Sim::new(Profile::desktop(), 21);
+    let (from, to) = (Micros::from_secs(5), Micros::from_secs(35));
+    sim.net.outage = Some((from, to));
+    let end = Micros::from_secs(80);
+    let mut report = Micros::from_secs(5);
+    let (mut tracked_max, mut kept_max, mut failed) = (0usize, 0usize, 0u64);
+    let mut back = None;
+    while sim.now < end {
+        let t = sim.now.0 as f64 / 1e6;
+        if sim.now >= to && back.is_none() {
+            back = Some(sim.now);
+        }
+        let (need, d) = sim.step(jumps(t));
+        failed += u64::from(d.stats.failed);
+        tracked_max = tracked_max.max(sim.budget.tracked());
+        // The prune runs every eighth step: right after one, the cap holds
+        // and every tracked resource is accounted for — wanted (a tile's
+        // mesh and its drape at most), holding a copy, loading or in
+        // transit, or kept for its failures within the cap — through the
+        // outage and the recovery alike.
+        if sim.budget.steps.is_multiple_of(8) {
+            let kept = kept_for_their_failures(&sim);
+            kept_max = kept_max.max(kept);
+            assert!(
+                kept <= BACKOFF_KEEP_MAX,
+                "{RED}: {kept} slots kept for their failures alone at t = {t:.1} s, \
+                 the cap {BACKOFF_KEEP_MAX}"
+            );
+            let wanted = 2 * super::patterns::listed(&need).len();
+            let held = sim.gpu.drawable.len() + sim.gpu.pending.len();
+            let loading = d
+                .stats
+                .in_flight
+                .iter()
+                .map(|(_, n)| n as usize)
+                .sum::<usize>()
+                + d.stats.local_reads as usize;
+            let bound = wanted + held + loading + BACKOFF_KEEP_MAX;
+            assert!(
+                sim.budget.tracked() <= bound,
+                "{RED}: I7: {} tracked at t = {t:.1} s, bound {bound} ({wanted} wanted, {held} \
+                 held, {loading} loading, {BACKOFF_KEEP_MAX} kept at most)",
+                sim.budget.tracked()
+            );
+        }
+        if sim.now >= report {
+            eprintln!(
+                "outage t = {t:.0} s: tracked {}, drawable {}, kept for their failures {}, \
+                 failed so far {failed}",
+                sim.budget.tracked(),
+                sim.gpu.drawable.len(),
+                kept_for_their_failures(&sim)
+            );
+            report = report.plus(Micros::from_secs(5));
+        }
+    }
+    let back = back.expect("the network came back");
+    let took = sim.converged_after(back).expect(RED);
+    eprintln!(
+        "outage: tracked at most {tracked_max}, kept for their failures at most {kept_max} \
+         (cap {BACKOFF_KEEP_MAX}, {} B each), {failed} loads failed; converged {took:?} after \
+         the network came back, {} tracked at the end",
+        tuile_budget::BACKOFF_KEPT_BYTES,
+        sim.budget.tracked()
+    );
+    assert!(
+        took <= Micros::from_secs(35),
+        "{RED}: converged {took:?} after the network came back"
+    );
+}
+
 /// I14, I15: a relaunch fills the view from the store, without network for
 /// what the store holds.
 #[test]
@@ -403,6 +637,7 @@ fn a_lying_store_index_costs_one_miss_per_lie() {
         store.held.remove(r);
         store.lies.insert(*r);
     }
+    store.generation += 1;
     let mut again = Sim::new(Profile::desktop(), 15);
     again.net.store = store;
     again.run(6.0, &|_| home());

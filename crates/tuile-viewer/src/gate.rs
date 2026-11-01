@@ -95,6 +95,21 @@ impl TileLoader for Gated {
         self.inner.holds(r)
     }
 
+    /// An index, never a read, so never held.
+    fn store_events(&self) -> u64 {
+        self.inner.store_events()
+    }
+
+    /// An index, never a read, so never held.
+    fn store_changes(
+        &self,
+        since: u64,
+        asked: &[(tuile_core::budget::ResourceId, tuile_core::budget::Presence)],
+        touched: &mut Vec<tuile_core::budget::ResourceId>,
+    ) -> u64 {
+        self.inner.store_changes(since, asked, touched)
+    }
+
     async fn warm_up(&self, through_level: u32) {
         self.gate.passed().await;
         self.inner.warm_up(through_level).await;

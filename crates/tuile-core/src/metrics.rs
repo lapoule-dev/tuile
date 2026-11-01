@@ -459,6 +459,10 @@ pub struct Metrics {
     pub store_bytes_served: Counter,
     /// Bytes fetched from the origin and written to the store.
     pub store_bytes_fetched: Counter,
+    /// The loader's presence index asked (`TileLoader::holds`), by the
+    /// session for the budget: each one costs a loader its index lookups
+    /// and, for a drape, the imagery mosaic it would stack.
+    pub presence_answers: Counter,
 
     // --- Residency ---
     pub tiles_evicted: Counter,
@@ -790,6 +794,7 @@ snapshot! {
         store_misses,
         store_bytes_served,
         store_bytes_fetched,
+        presence_answers,
         tiles_evicted,
         frames,
         uploads,

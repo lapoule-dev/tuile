@@ -119,6 +119,9 @@ pub struct BudgetConfig {
     /// below it, so a zoom-out at the ceiling can always complete.
     pub hard_reserve_percent: u8,
     /// Decoded CPU bytes kept off the GPU (the second tier), all classes.
+    /// A target like the GPU's: retargeted with them
+    /// ([`Budget::retarget`](super::Budget::retarget)) and scaled by
+    /// pressure. Batch: [`Bytes::MAX`].
     pub decoded_target: Bytes,
     /// Network loads in flight per class.
     pub max_in_flight: PerClass<u32>,

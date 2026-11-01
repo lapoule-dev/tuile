@@ -180,6 +180,10 @@ pub struct Rig {
     pub pending: BTreeMap<ResourceId, tuile_budget::Generation>,
     /// The need of the last step, `None` before the first.
     pub need_last: Option<NeedSet>,
+    /// When set, every step is written into these decisions
+    /// (`Budget::decide_into`, the step before's buffers kept), as the
+    /// geometry server does, and a copy is returned.
+    pub reuse: Option<Decisions>,
 }
 
 impl Rig {
@@ -194,6 +198,7 @@ impl Rig {
             delivered: BTreeMap::new(),
             pending: BTreeMap::new(),
             need_last: None,
+            reuse: None,
         }
     }
 
@@ -229,7 +234,13 @@ impl Rig {
             None => FrameInput::new(self.frame, self.now, need),
         }
         .with_presence(&self.store);
-        let d = self.b.decide(input);
+        let d = match &mut self.reuse {
+            Some(out) => {
+                self.b.decide_into(input, out);
+                out.clone()
+            }
+            None => self.b.decide(input),
+        };
         self.need_last = Some(need.clone());
         for (r, g) in &d.deliver {
             self.delivered.insert(*r, *g);

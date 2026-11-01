@@ -13,8 +13,10 @@ pub mod config;
 pub mod cost;
 pub mod deadline;
 pub mod decisions;
+mod downstream;
 mod engine;
 pub mod error;
+mod held;
 pub mod imagery;
 pub mod need;
 mod need_state;
@@ -33,7 +35,7 @@ pub mod view;
 pub use config::{BudgetConfig, FailurePolicy, Pool, PressureFractions, Relaxation, Watermarks};
 pub use deadline::FrameDeadline;
 pub use decisions::{
-    Decisions, DrapeChoice, DrawItem, DrawSet, Role, Start, SwapGroup, UploadPlan,
+    Decisions, DrapeChoice, Drapes, DrawItem, DrawSet, Role, Serves, Start, SwapGroup, UploadPlan,
 };
 pub use error::{AuditError, ConfigError, SessionError};
 pub use imagery::{DrapeCandidate, GeoRect, LevelClamp, TexelFootprint, UvTransform};
@@ -146,9 +148,39 @@ const RECENT_CAP: usize = 4_096;
 /// The thrash window.
 const THRASH_WINDOW: Micros = Micros::from_secs(10);
 
+/// The most resources the budget keeps backing off after a failed load once
+/// the view has left them (for 30 s at most each), so that a server that is
+/// down is not asked again the moment a tile comes back into view. Past
+/// it, the ones the view left longest are forgotten first: a want that
+/// comes back retries at once. What one costs the budget is its metadata
+/// alone — its slot in the arena's columns, its entry in the arena's index,
+/// in the prune's kept map and in its queue, and the entry of its tile's
+/// place, which it keeps alive, [`BACKOFF_KEPT_BYTES`] — and the cap holds
+/// those under 128 KiB, whatever the network does. Left out, bounded
+/// multiples of the same count: the index's spare room (hashbrown keeps its
+/// table under 7/8 full, at a power of two: up to twice its entries'
+/// bytes) and the queue's stale entries (at most twice the live ones, plus
+/// 64). The resources the view still wants are its own: counted with the
+/// need, not here.
+pub const BACKOFF_KEEP_MAX: usize = (128 << 10) / BACKOFF_KEPT_BYTES;
+
+/// What one resource kept backing off costs: its slot across the arena's
+/// columns, its index entry (a slot and a control byte, hashbrown's), the
+/// kept map's entry (slot and time), its entry in the queue by due time
+/// (time and slot), and its tile's place (its `TileInfo` and its key in the
+/// tiles' map), kept as long as a resource of the tile is tracked — at
+/// worst one tile per kept resource.
+pub const BACKOFF_KEPT_BYTES: usize = state::SLOT_BYTES
+    + 5
+    + 12
+    + 16
+    + std::mem::size_of::<TileInfo>()
+    + std::mem::size_of::<TileId>();
+
 /// What the budget knows of a tile's place in its tree: its parent, level
 /// and footprint, packed (48 bytes, not 64: the budget keeps one per tile
-/// it knows of).
+/// it knows of), and how many resources of the tile the arena tracks (for
+/// the prune: a tile with one is kept).
 #[derive(Clone, Copy, Debug, Default)]
 struct TileInfo {
     /// The parent's id, when `has_parent`.
@@ -158,6 +190,9 @@ struct TileInfo {
     level: u32,
     has_parent: bool,
     has_rect: bool,
+    /// The tile's tracked resources (saturating: the prune then falls back
+    /// on its full walk, `downstream::Support`).
+    slots: u16,
 }
 
 impl TileInfo {
@@ -168,6 +203,7 @@ impl TileInfo {
             level,
             has_parent: parent.is_some(),
             has_rect: rect.is_some(),
+            slots: 0,
         }
     }
 
@@ -206,32 +242,42 @@ pub struct Budget {
     /// Every tracked resource's state, by slot.
     arena: state::Arena,
     /// Every tile the budget knows the place of: what the need told it, as
-    /// long as the tile or a descendant is referenced. A sorted vector: it
-    /// changes only by what the need changes.
-    tiles: sorted::SortedCols<TileId, TileInfo>,
+    /// long as the tile or a descendant is referenced. Changed only by what
+    /// the need changes.
+    tiles: sorted::SortedMap<TileId, TileInfo>,
     /// The need last read, each wanted tile's best entry: a step changes
     /// it by what changed.
     need: need_state::NeedState,
+    /// Each drawn or blocking tile's imagery level per layer, as last
+    /// chosen (the hysteresis reads it), and those of the tiles held. An
+    /// ordered map of the standard library: on the sorted blocks its upkeep,
+    /// counted into `work`, put P6.4 over its bound on the tour's big zoom
+    /// (115 978 against 113 728) and on a still step by one unit (O1.5).
     imagery_prev: std::collections::BTreeMap<(TileId, LayerId), u32>,
-    held_last: sorted::SortedSet<TileId>,
-    drawn_last: sorted::SortedSet<ResourceId>,
-    /// The drapes each drawn mesh wore last step, by mesh, in its stacking
-    /// order: on a layer switch, the old layer stays worn until the new one
-    /// is drawable.
-    worn_last: Vec<(ResourceId, DrapeChoice)>,
-    swap_last: sorted::SortedSet<ResourceId>,
-    chain_last: sorted::SortedSet<ResourceId>,
-    /// Resources loading or in transit (an index, so a step need not scan).
-    active: std::collections::BTreeSet<ResourceId>,
-    /// Resources of the floor (an index).
-    floor_set: std::collections::BTreeSet<ResourceId>,
+    /// The tiles whose meshes were drawn last step as themselves or held
+    /// (not as a fallback).
+    held_last: sorted::SortedMap<TileId, ()>,
+    /// Resources loading or in transit (an index, so a step need not scan),
+    /// by slot, in the order they joined, each marked `Active` on its slot
+    /// (the mark says whether a slot is listed, so none is listed twice);
+    /// the prune drops those that are neither and trims the room a burst
+    /// left, and the slots follow the arena's renumbering. No decision reads
+    /// its order.
+    active: Vec<state::Slot>,
     /// Resources ranked last step (their urgency is cleared next step).
     ranked_last: Vec<ResourceId>,
     /// Steps taken, for the amortised prune.
     steps: u64,
-    wanted_last: sorted::SortedSet<ResourceId>,
+    /// What the passes after the need keep from one step to the next: the
+    /// draw set, the wants, the work, and what changed (O1.4).
+    down: downstream::Downstream,
     /// A step's buffers, kept across steps.
     scratch: engine::Scratch,
+    /// Recently evicted resources and when (the thrash count). An ordered
+    /// map of the standard library: on the sorted blocks (tried in O1.5)
+    /// the entries that expire scattered by key leave the blocks half full,
+    /// 19 B more per tracked resource after the shrink flight, for one
+    /// block less at motion's p99.
     recent: std::collections::BTreeMap<ResourceId, Micros>,
     epochs: PerClass<u64>,
     /// Per imagery layer, added to the drape class's epoch.
@@ -267,15 +313,10 @@ impl Budget {
             need: Default::default(),
             imagery_prev: Default::default(),
             held_last: Default::default(),
-            drawn_last: Default::default(),
-            worn_last: Vec::new(),
-            swap_last: Default::default(),
-            chain_last: Default::default(),
             active: Default::default(),
-            floor_set: Default::default(),
             ranked_last: Vec::new(),
             steps: 0,
-            wanted_last: Default::default(),
+            down: Default::default(),
             scratch: Default::default(),
             recent: Default::default(),
             epochs: PerClass::splat(0),
@@ -299,8 +340,22 @@ impl Budget {
     }
 
     /// One decision step: applies the recorded arrivals, then decides.
+    /// [`Budget::decide_into`] with a fresh `Decisions`.
     pub fn decide(&mut self, input: FrameInput<'_>) -> Decisions {
-        self.step(input)
+        let mut d = Decisions::default();
+        self.decide_into(input, &mut d);
+        d
+    }
+
+    /// One decision step, its decisions written into `out`: emptied first,
+    /// its buffers kept — the lists, the plan's items and groups, the draw
+    /// set's items, each overwritten in place. A host that hands the same
+    /// `Decisions` to every step gives the step nothing to allocate for its
+    /// output once they have grown to the view. The same decisions as
+    /// [`Budget::decide`], bit for bit.
+    pub fn decide_into(&mut self, input: FrameInput<'_>, out: &mut Decisions) {
+        out.clear();
+        self.step(input, out);
     }
 
     /// Applies the arrivals recorded since the last step now, at `now`, so
@@ -353,6 +408,8 @@ impl Budget {
             (Class::Drape, Some(l)) => *self.layer_epochs.entry(l).or_insert(0) += 1,
             _ => self.epochs[class] += 1,
         }
+        // Every copy's freshness moved: the next step reads it again.
+        self.down.everything_again();
     }
 
     /// The platform's memory signal; takes effect at the next step.
@@ -360,8 +417,9 @@ impl Budget {
         self.pressure = p;
     }
 
-    /// Re-derives every class's target, overflow and hard limit from a new
-    /// total, keeping the configured split: the host calls it when the
+    /// Re-derives every class's target, overflow and hard limit, and the
+    /// decoded tier's target, from a new total, keeping the configured
+    /// split: the host calls it when the
     /// platform's available memory changes (`os_proc_available_memory`,
     /// `VK_EXT_memory_budget`, an Android `onTrimMemory` level, a browser's
     /// device-memory hint). The budget itself knows no platform. Takes effect
@@ -427,11 +485,29 @@ impl Budget {
         self.arena.len()
     }
 
+    /// How many resources the budget has room to track before its state
+    /// grows. The room follows the tracked set: it grows with it, and is
+    /// given back once the set stayed under a quarter of it for about a
+    /// second (then twice the set).
+    pub fn tracked_room(&self) -> usize {
+        self.arena.room()
+    }
+
     /// The whole internal state, in a canonical form: for the tests that
     /// compare it against a reference step by step. Not part of the API.
     #[doc(hidden)]
     pub fn snapshot(&self) -> snapshot::Snapshot {
         let a = &self.arena;
+        // The sets a step keeps, as the marks on their members' slots.
+        let marked = |m: state::Mark| -> Vec<ResourceId> {
+            let mut v: Vec<ResourceId> = a
+                .iter()
+                .filter(|&s| a.marked(s, m))
+                .map(|s| a.id(s))
+                .collect();
+            v.sort_unstable();
+            v
+        };
         let mut resources: Vec<snapshot::ResourceSnapshot> = a
             .iter()
             .map(|s| {
@@ -480,15 +556,34 @@ impl Budget {
                 .map(|(t, i)| (*t, i.parent(), i.level, i.rect().map(snapshot::rect_bits)))
                 .collect(),
             imagery_prev: self.imagery_prev.iter().map(|(k, v)| (*k, *v)).collect(),
-            held_last: self.held_last.iter().copied().collect(),
-            drawn_last: self.drawn_last.iter().copied().collect(),
-            worn_last: self.worn_last.clone(),
-            swap_last: self.swap_last.iter().copied().collect(),
-            chain_last: self.chain_last.iter().copied().collect(),
-            active: self.active.iter().copied().collect(),
-            floor_set: self.floor_set.iter().copied().collect(),
+            held_last: self.held_last.keys().copied().collect(),
+            drawn_last: marked(state::Mark::Drawn),
+            worn_last: self
+                .down
+                .items()
+                .flat_map(|(m, i)| i.drapes().map(move |d| (*m, *d)))
+                .collect(),
+            swap_last: marked(state::Mark::Swap),
+            chain_last: marked(state::Mark::Chain),
+            active: {
+                let mut v: Vec<ResourceId> = self.active.iter().map(|s| a.id(*s)).collect();
+                v.sort_unstable();
+                v
+            },
+            floor_set: marked(state::Mark::FloorSet),
             ranked_last: self.ranked_last.clone(),
-            wanted_last: self.wanted_last.iter().copied().collect(),
+            // Every resource wanted or drawn, tracked or not: the marks are
+            // on tracked slots only.
+            wanted_last: {
+                let mut w: Vec<ResourceId> = self
+                    .down
+                    .wanted()
+                    .chain(marked(state::Mark::Drawn))
+                    .collect();
+                w.sort_unstable();
+                w.dedup();
+                w
+            },
             recent: self.recent.iter().map(|(k, v)| (*k, *v)).collect(),
             epochs: self.epochs,
             layer_epochs: self.layer_epochs.iter().map(|(k, v)| (*k, *v)).collect(),
@@ -517,6 +612,7 @@ impl Budget {
     pub fn release_scratch(&mut self) {
         self.scratch = Default::default();
         self.need.release_scratch();
+        self.down.release_scratch();
     }
 }
 

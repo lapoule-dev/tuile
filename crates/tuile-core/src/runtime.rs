@@ -32,8 +32,8 @@
 
 use crate::budget::{
     Budget, BudgetConfig, BudgetEvent, BudgetMeter, BudgetObserver, Bytes, Class, ConfigError,
-    Decisions, Failure, FrameInput, Generation, ImageryNeed, Micros, Need, NeedDelta, NeedSet,
-    Presence, PresenceOracle, ResourceId, StepRecord, TexelFootprint,
+    Decisions, Failure, FrameInput, Generation, ImageryNeed, Membership, Micros, Need, NeedDelta,
+    NeedSet, Presence, PresenceOracle, ResourceId, StepRecord, TexelFootprint,
 };
 use crate::content::{DecodedTileContent, DrapeContent};
 use crate::fetch::TileFetcher;
@@ -754,39 +754,133 @@ struct Flight {
 }
 
 /// The loader's presence index, as the budget's oracle, with every answer
-/// noted for the step's record.
-///
-/// Answers are kept for [`PRESENCE_FOR`]: the budget asks of every drape it
-/// weighs, at every level it weighs it, at every step, and a loader answers
-/// a drape by working out every imagery tile it would stack — in a browser's
-/// worker, two thirds of the thread near the ground, the loads' own replies
-/// waiting seconds behind it. A store's index changes by what is fetched
-/// into it, which a load answers anyway; an answer a second old misplaces a
-/// read between the store and the network at worst, never a tile.
+/// noted for the step's record: the [`PresenceCache`]'s answers, the loader
+/// asked only for one it does not hold.
 struct Presences<'a> {
     loader: &'a dyn TileLoader,
     asked: std::cell::RefCell<Vec<(ResourceId, Presence)>>,
-    kept: &'a std::cell::RefCell<HashMap<ResourceId, (Presence, Micros)>>,
-    now: Micros,
+    kept: &'a std::cell::RefCell<PresenceCache>,
+    generation: u64,
 }
-
-/// How long the loader's answer about one resource is kept.
-const PRESENCE_FOR: Micros = Micros::from_millis(1_000);
 
 impl PresenceOracle for Presences<'_> {
     fn holds(&self, r: ResourceId) -> Presence {
-        let kept = self.kept.borrow().get(&r).copied();
-        let p = match kept {
-            Some((p, at)) if self.now.since(at) < PRESENCE_FOR => p,
-            _ => {
-                let p = self.loader.holds(r);
-                self.kept.borrow_mut().insert(r, (p, self.now));
-                p
-            }
-        };
+        let p = self.kept.borrow_mut().holds(self.loader, r);
         self.asked.borrow_mut().push((r, p));
         p
     }
+
+    fn generation(&self) -> Option<u64> {
+        Some(self.generation)
+    }
+}
+
+/// The loader's presence answers, kept until a store event says one may
+/// have changed.
+///
+/// The budget asks of every drape it weighs, at every level it weighs it,
+/// and a loader answers a drape by working out every imagery tile it would
+/// stack — in a browser's worker, two thirds of the thread near the ground,
+/// the loads' own replies waiting seconds behind it. So an answer is asked
+/// of the loader once and kept. It is asked again when the loader's store
+/// events ([`TileLoader::store_events`]) name it — a tile fetched into a
+/// store or dropped from it, a decoded copy kept or let go, where its answer
+/// reads — at the first step after the event, before the budget asks
+/// anything; and every answer is dropped when the loader's epoch moves on
+/// (its content, and so what its stores hold, changed).
+///
+/// The oracle's [`generation`](PresenceOracle::generation) moves on exactly
+/// when an answer the budget was given changed, or every one was dropped:
+/// while it stands, the budget does not read again the levels it chose by
+/// asking (O1.4), and a still view asks the loader nothing.
+#[derive(Default)]
+struct PresenceCache {
+    answers: HashMap<ResourceId, Presence>,
+    generation: u64,
+    /// The loader's epoch the answers are of.
+    epoch: Option<u64>,
+    /// The loader's store-event count every answer is up to date with.
+    seen: u64,
+    /// Past this many answers, those of tiles no longer in the need are let
+    /// go (see [`PresenceCache::prune`]).
+    prune_at: usize,
+    /// Step buffers: the answers' resources, those the events touched, the
+    /// need's tiles.
+    keys: Vec<(ResourceId, Presence)>,
+    touched: Vec<ResourceId>,
+    tiles: Vec<TileId>,
+}
+
+/// The fewest answers kept before the first prune.
+const PRESENCE_KEPT_AT_LEAST: usize = 1_024;
+
+impl PresenceCache {
+    /// Follows the loader, before a step: every answer dropped when its
+    /// epoch moved on, those its store events since the last step name
+    /// asked again; the generation moved on when one changed.
+    fn follow(&mut self, loader: &dyn TileLoader) {
+        let epoch = loader.epoch();
+        if self.epoch != Some(epoch) {
+            // Read before anything is asked: an event after it is told at
+            // the next step.
+            self.seen = loader.store_events();
+            self.epoch = Some(epoch);
+            self.answers.clear();
+            self.generation = self.generation.wrapping_add(1);
+            return;
+        }
+        if loader.store_events() == self.seen {
+            return;
+        }
+        self.keys.clear();
+        self.keys.extend(self.answers.iter().map(|(r, p)| (*r, *p)));
+        self.touched.clear();
+        self.seen = loader.store_changes(self.seen, &self.keys, &mut self.touched);
+        let mut moved = false;
+        for &r in &self.touched {
+            let now = ask(loader, r);
+            if let Some(p) = self.answers.get_mut(&r) {
+                if *p != now {
+                    *p = now;
+                    moved = true;
+                }
+            }
+        }
+        if moved {
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+
+    /// The answer about `r`: the one kept, or the loader's, then kept.
+    fn holds(&mut self, loader: &dyn TileLoader, r: ResourceId) -> Presence {
+        *self.answers.entry(r).or_insert_with(|| ask(loader, r))
+    }
+
+    /// Lets go of the answers about tiles no longer in the need, once the
+    /// answers have doubled since the last time: the budget reads its
+    /// answers for the tiles it needs, and asks again of a tile that comes
+    /// back. Letting one go changes no answer, so the generation stays.
+    fn prune(&mut self, need: &NeedSet) {
+        if self.answers.len() <= self.prune_at.max(PRESENCE_KEPT_AT_LEAST) {
+            return;
+        }
+        self.tiles.clear();
+        for m in Membership::ALL {
+            self.tiles.extend(need.list(m).iter().map(|(t, _)| *t));
+        }
+        self.tiles.sort_unstable();
+        self.tiles.dedup();
+        let tiles = &self.tiles;
+        self.answers
+            .retain(|r, _| tiles.binary_search(&r.tile()).is_ok());
+        self.prune_at = (2 * self.answers.len()).max(PRESENCE_KEPT_AT_LEAST);
+    }
+}
+
+/// The loader's answer about `r`, counted.
+fn ask(loader: &dyn TileLoader, r: ResourceId) -> Presence {
+    crate::metrics::metrics().presence_answers.inc();
+    loader.holds(r)
 }
 
 /// The session's state, owned: everything a step reads and changes.
@@ -799,8 +893,13 @@ struct State {
     /// Where each of them stands in the budget's order, as of the last step:
     /// for a pool that orders the work they wait on.
     ranks: crate::offload::LoadRanks,
-    /// The loader's recent answers about presence (see [`Presences`]).
-    presence: std::cell::RefCell<HashMap<ResourceId, (Presence, Micros)>>,
+    /// The loader's answers about presence, kept until a store event says
+    /// one may have changed (see [`PresenceCache`]).
+    presence: PresenceCache,
+    /// The last step's decisions, handed to the budget again to write the
+    /// next into: their buffers are kept, so a step allocates nothing for
+    /// its output once they have grown to the view.
+    decisions: Decisions,
     /// The decoded copies the budget counts (its decoded tier): delivered
     /// from here, again after an eviction, until the budget releases them.
     decoded: BTreeMap<ResourceId, (Generation, ResourceContent)>,
@@ -868,7 +967,8 @@ impl State {
             meter,
             in_flight: BTreeMap::new(),
             ranks: crate::offload::LoadRanks::default(),
-            presence: std::cell::RefCell::default(),
+            presence: PresenceCache::default(),
+            decisions: Decisions::default(),
             decoded: BTreeMap::new(),
             steepest: HashMap::new(),
             events: Vec::new(),
@@ -1407,18 +1507,17 @@ impl State {
             camera_moved = camera_moved,
         );
         let need = self.need(host);
-        // Taken for the decision and put back after it. Bounded: what has
-        // gone stale goes once the map has grown.
-        let kept = std::cell::RefCell::new(std::mem::take(self.presence.get_mut()));
-        if kept.borrow().len() > 16_384 {
-            kept.borrow_mut()
-                .retain(|_, (_, at)| now.since(*at) < PRESENCE_FOR);
-        }
+        // The answers the store's events since the last step may have
+        // changed are asked again, before the budget asks anything.
+        self.presence.follow(host.loader.as_ref());
+        // Taken for the decision and put back after it.
+        let generation = self.presence.generation;
+        let kept = std::cell::RefCell::new(std::mem::take(&mut self.presence));
         let presence = Presences {
             loader: host.loader.as_ref(),
             asked: std::cell::RefCell::new(Vec::new()),
             kept: &kept,
-            now,
+            generation,
         };
         // The first step reads the whole need; every later one what changed
         // since the one before, which the budget kept.
@@ -1430,7 +1529,9 @@ impl State {
             None => FrameInput::new(self.frame, now, &need),
         };
         let deciding = crate::metrics::stamp();
-        let d = self.budget.decide(input.with_presence(&presence));
+        let mut d = std::mem::take(&mut self.decisions);
+        self.budget
+            .decide_into(input.with_presence(&presence), &mut d);
         let decide_wall = Micros(deciding.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
         self.sse_scale_milli = d.sse_scale_milli;
 
@@ -1468,7 +1569,8 @@ impl State {
         // The record, for every sink at once.
         let events = std::mem::take(&mut self.events);
         let asked = presence.asked.into_inner();
-        *self.presence.get_mut() = kept.into_inner();
+        self.presence = kept.into_inner();
+        self.presence.prune(&need);
         if let Ok(mut meter) = self.meter.lock() {
             meter.step(&StepRecord {
                 step: self.steps - 1,
@@ -1509,6 +1611,7 @@ impl State {
         self.ranks.publish(ranked.into_iter().map(|(_, r)| r));
         let priming = self.priming(&need);
         self.need_last = Some(need);
+        self.decisions = d;
         let mm = crate::metrics::metrics();
         mm.priming_total.set(u64::from(priming.total));
         mm.priming_pending.set(u64::from(priming.outstanding));
@@ -2400,13 +2503,14 @@ mod tests {
         );
     }
 
-    /// **The loader is asked about a resource's presence once a second at
-    /// most**, however many steps weigh it: answering a drape costs the
-    /// loader its imagery mosaic, and asking it at every step of a settling
-    /// view took two thirds of a browser worker's thread. A clock that never
-    /// moves keeps every answer.
+    /// **The loader is asked about a resource's presence once while its
+    /// store stands still**, however many steps weigh it and however long
+    /// they run: answering a drape costs the loader its imagery mosaic, and
+    /// asking it at every step of a settling view took two thirds of a
+    /// browser worker's thread. The clock moves on seconds between the
+    /// views; the loader has no store events, so no answer is asked twice.
     #[test]
-    fn presence_is_asked_once_within_its_window() {
+    fn presence_is_asked_once_while_the_store_stands_still() {
         struct Counting(
             TilesetLoader<FsFetcher>,
             Arc<std::sync::Mutex<HashMap<ResourceId, u32>>>,
@@ -2432,17 +2536,26 @@ mod tests {
         );
         let (mut stream, server) =
             in_process_with(tree, Arc::new(loader), Config::default(), roomy()).expect("budget");
-        let server = server.with_clock(Arc::new(|| Micros(1)));
+        let clock = Arc::new(AtomicU64::new(1));
+        let at = Arc::clone(&clock);
+        let server = server.with_clock(Arc::new(move || Micros(at.load(Ordering::SeqCst))));
         let mut server = Box::pin(server.run());
         let mut consumer = Consumer::default();
         look(&stream, near_view(), 1);
         settle(&mut server, &mut stream, &mut consumer);
+        clock.store(2_500_001, Ordering::SeqCst);
         look(&stream, far_view(), 2);
+        settle(&mut server, &mut stream, &mut consumer);
+        clock.store(5_000_001, Ordering::SeqCst);
+        look(&stream, near_view(), 3);
         settle(&mut server, &mut stream, &mut consumer);
         let asked = asked.lock().expect("asked");
         assert!(!asked.is_empty(), "nothing was asked");
         let most = asked.values().copied().max().unwrap_or(0);
-        assert_eq!(most, 1, "a resource asked {most} times within one window");
+        assert_eq!(
+            most, 1,
+            "a resource asked {most} times with its store still"
+        );
     }
 
     /// **The loads in flight are ranked in the budget's order, and each
@@ -2717,6 +2830,360 @@ mod tests {
                 item.mesh
             );
         }
+    }
+
+    /// **A still view asks the loader nothing while its store stands still,
+    /// and the first step after a store event reads the new answer** (O1.5
+    /// part 3, `TileLoader::store_events`). The drapes never arrive, so every
+    /// drawn tile's level is chosen by asking the loader's presence index.
+    /// Five seconds of still steps at 60 a second: between events the loader
+    /// is asked nothing and no level is read again. The store fills (an
+    /// event per drape it now holds): the very next step asks the loader
+    /// about each once, and reads the levels again with the answers. The
+    /// store drops them again (an eviction, an event each): the same.
+    #[test]
+    fn a_still_view_asks_the_store_again_only_after_its_events() {
+        struct Stalled {
+            draped: Draped,
+            stored: Arc<Mutex<HashSet<ResourceId>>>,
+            asked: Arc<Mutex<HashMap<ResourceId, u32>>>,
+            /// The store's events: the resource each one changed.
+            events: Arc<Mutex<Vec<ResourceId>>>,
+        }
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        impl TileLoader for Stalled {
+            async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
+                self.draped.load(id).await
+            }
+            fn drapes(&self, id: TileId) -> Option<DrapeReach> {
+                self.draped.drapes(id)
+            }
+            async fn load_drape(
+                &self,
+                _id: TileId,
+                _layer: LayerId,
+                _level: u32,
+            ) -> Result<DrapeContent, LoadError> {
+                futures_util::future::pending().await
+            }
+            fn holds(&self, r: ResourceId) -> crate::budget::Presence {
+                *self.asked.lock().expect("asked").entry(r).or_default() += 1;
+                if self.stored.lock().expect("stored").contains(&r) {
+                    crate::budget::Presence::Stored
+                } else {
+                    crate::budget::Presence::Absent
+                }
+            }
+            fn store_events(&self) -> u64 {
+                self.events.lock().expect("events").len() as u64
+            }
+            fn store_changes(
+                &self,
+                since: u64,
+                asked: &[(ResourceId, Presence)],
+                touched: &mut Vec<ResourceId>,
+            ) -> u64 {
+                let events = self.events.lock().expect("events");
+                let new = &events[(since as usize).min(events.len())..];
+                touched.extend(asked.iter().map(|(r, _)| *r).filter(|r| new.contains(r)));
+                events.len() as u64
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tileset = deep_tileset(dir.path());
+        let arena = Arc::new(RwLock::new(tileset));
+        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
+        let stored = Arc::new(Mutex::new(HashSet::new()));
+        let asked = Arc::new(Mutex::new(HashMap::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let loader = Stalled {
+            draped: Draped {
+                inner: TilesetLoader::new(Arc::clone(&arena), Arc::new(FsFetcher)),
+                arena,
+                epoch: Arc::new(AtomicU64::new(1)),
+                meshes: Arc::new(AtomicUsize::new(0)),
+                drapes: Arc::new(Mutex::new(Vec::new())),
+            },
+            stored: Arc::clone(&stored),
+            asked: Arc::clone(&asked),
+            events: Arc::clone(&events),
+        };
+        let (mut stream, server) =
+            in_process_with(tree, Arc::new(loader), Config::default(), roomy()).expect("budget");
+        let clock = Arc::new(AtomicU64::new(1));
+        let at = Arc::clone(&clock);
+        let server = server.with_clock(Arc::new(move || Micros(at.load(Ordering::SeqCst))));
+        let meter = server.meter();
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        let mut generation = 1;
+        // One still step, prompted by the same view told again; the work of
+        // the steps it took (more than one when a new answer starts loads).
+        let work = || meter.lock().expect("meter").signals().decide_work_total;
+        let mut still = |stream: &mut InProcessStream, server: &mut Pin<Box<_>>| {
+            generation += 1;
+            let before = work();
+            look(stream, near_view(), generation);
+            assert!(settle(server, stream, &mut consumer));
+            work() - before
+        };
+        // Still steps at 60 a second for five seconds, from half a second
+        // in: each step's work, and what it asked the loader.
+        const DT: u64 = 16_667;
+        const FILL: usize = 100;
+        const EVICT: usize = 200;
+        let (mut steps, mut asks) = (Vec::new(), Vec::new());
+        let mut filled = Vec::new();
+        for i in 0..300usize {
+            clock.store(500_001 + i as u64 * DT, Ordering::SeqCst);
+            if i == FILL {
+                // The store fills: every drape asked of it so far, an event
+                // each.
+                filled = asked.lock().expect("asked").keys().copied().collect();
+                stored
+                    .lock()
+                    .expect("stored")
+                    .extend(filled.iter().copied());
+                events
+                    .lock()
+                    .expect("events")
+                    .extend(filled.iter().copied());
+            }
+            if i == EVICT {
+                // The store drops them all: an event each.
+                stored.lock().expect("stored").clear();
+                events
+                    .lock()
+                    .expect("events")
+                    .extend(filled.iter().copied());
+            }
+            let before = asked.lock().expect("asked").clone();
+            steps.push(still(&mut stream, &mut server));
+            let after = asked.lock().expect("asked").clone();
+            let step: HashMap<ResourceId, u32> = after
+                .iter()
+                .map(|(r, n)| (*r, n - before.get(r).copied().unwrap_or(0)))
+                .filter(|(_, n)| *n > 0)
+                .collect();
+            asks.push(step);
+        }
+        assert!(!filled.is_empty(), "no level asked the store");
+        // No resource is asked twice in one step.
+        for (i, step) in asks.iter().enumerate() {
+            for (r, n) in step {
+                assert_eq!(*n, 1, "step {i}: {r:?} asked {n} times");
+            }
+        }
+        // Between the events, once what each settled is asked, the loader
+        // is asked nothing — across the seconds the clock runs.
+        for (from, to) in [(20, FILL), (FILL + 50, EVICT), (EVICT + 50, 300)] {
+            for (i, step) in asks.iter().enumerate().take(to).skip(from) {
+                assert!(
+                    step.is_empty(),
+                    "step {i}, at {} ms: the loader was asked {} answers with its store still",
+                    (500_001 + i as u64 * DT) / 1_000,
+                    step.len()
+                );
+            }
+        }
+        // The first step after each event asks the loader about every
+        // resource the event changed, at once.
+        for at in [FILL, EVICT] {
+            for r in &filled {
+                assert_eq!(
+                    asks[at].get(r),
+                    Some(&1),
+                    "step {at}: {r:?} not asked again after its store event"
+                );
+            }
+        }
+        // The still steps' work is the least, but for the prune's (every
+        // eighth, with work of its own); the first step after each event
+        // reads the levels again, and does more than the still steps after
+        // it (the answers it reads may make the levels cheaper to read: a
+        // level held is taken without weighing its neighbours).
+        let steady = |from: usize, to: usize| steps[from..to].iter().copied().min().unwrap_or(0);
+        let before = steady(20, FILL);
+        let p = (21..FILL).find(|&i| steps[i] > before).unwrap_or(0) % 8;
+        for (i, &work) in steps.iter().enumerate().take(FILL).skip(20) {
+            if i % 8 != p {
+                assert_eq!(work, before, "step {i}: a still step read its levels again");
+            }
+        }
+        for (at, after) in [
+            (FILL, steady(FILL + 1, EVICT)),
+            (EVICT, steady(EVICT + 1, 300)),
+        ] {
+            assert!(
+                steps[at] > after,
+                "step {at}: the levels were not read again after a store event ({} against {after})",
+                steps[at]
+            );
+        }
+    }
+
+    /// A loader's presence index over a set of stored resources, with its
+    /// store events (the resource each one changed) and the answers it was
+    /// asked.
+    #[derive(Default)]
+    struct Indexed {
+        stored: Mutex<HashSet<ResourceId>>,
+        events: Mutex<Vec<ResourceId>>,
+        asked: AtomicUsize,
+        epoch: AtomicU64,
+    }
+
+    impl Indexed {
+        /// The store comes to hold `r` (`true`) or drops it, an event.
+        fn change(&self, r: ResourceId, held: bool) {
+            let mut stored = self.stored.lock().expect("stored");
+            if held {
+                stored.insert(r);
+            } else {
+                stored.remove(&r);
+            }
+            self.events.lock().expect("events").push(r);
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(Ordering::SeqCst)
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    impl TileLoader for Indexed {
+        async fn load(&self, _id: TileId) -> Result<Loaded, LoadError> {
+            Err(LoadError::Failed("nothing to load".into()))
+        }
+        fn holds(&self, r: ResourceId) -> Presence {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            if self.stored.lock().expect("stored").contains(&r) {
+                Presence::Stored
+            } else {
+                Presence::Absent
+            }
+        }
+        fn epoch(&self) -> u64 {
+            self.epoch.load(Ordering::SeqCst)
+        }
+        fn store_events(&self) -> u64 {
+            self.events.lock().expect("events").len() as u64
+        }
+        fn store_changes(
+            &self,
+            since: u64,
+            asked: &[(ResourceId, Presence)],
+            touched: &mut Vec<ResourceId>,
+        ) -> u64 {
+            let events = self.events.lock().expect("events");
+            let new = &events[(since as usize).min(events.len())..];
+            touched.extend(asked.iter().map(|(r, _)| *r).filter(|r| new.contains(r)));
+            events.len() as u64
+        }
+    }
+
+    /// **Presence answers follow the store's events, and their generation
+    /// moves exactly when one changes.** Asked once, an answer is kept: a
+    /// step with no event asks nothing. An event about a resource never
+    /// asked asks nothing; one about an answer kept asks it again at once
+    /// — the generation moving when the answer changed (a fill, an
+    /// eviction), not when it did not. The epoch moving drops every answer.
+    #[test]
+    fn presence_answers_follow_the_store_events() {
+        let loader = Indexed::default();
+        let (r, other) = (
+            ResourceId::drape(TileId(7), LayerId(0), 3),
+            ResourceId::Mesh(TileId(8)),
+        );
+        let mut cache = PresenceCache::default();
+        cache.follow(&loader);
+        let g = cache.generation;
+        assert_eq!(cache.holds(&loader, r), Presence::Absent);
+        assert_eq!(cache.holds(&loader, r), Presence::Absent);
+        assert_eq!(loader.asked(), 1, "an answer is asked once");
+        // Steps with no event ask nothing.
+        for _ in 0..100 {
+            cache.follow(&loader);
+        }
+        assert_eq!((loader.asked(), cache.generation), (1, g));
+        // An event about what was never asked asks nothing.
+        loader.change(other, true);
+        cache.follow(&loader);
+        assert_eq!((loader.asked(), cache.generation), (1, g));
+        // The store fills: asked again at once, the generation moves, and
+        // the budget's next question is answered without the loader.
+        loader.change(r, true);
+        cache.follow(&loader);
+        assert_eq!(loader.asked(), 2);
+        assert_ne!(cache.generation, g, "a changed answer keeps its generation");
+        let g = cache.generation;
+        assert_eq!(cache.holds(&loader, r), Presence::Stored);
+        assert_eq!(loader.asked(), 2);
+        // An event that changes no answer: asked, and the generation stays.
+        loader.change(r, true);
+        cache.follow(&loader);
+        assert_eq!((loader.asked(), cache.generation), (3, g));
+        // The store drops it: the same as a fill.
+        loader.change(r, false);
+        cache.follow(&loader);
+        assert_eq!(loader.asked(), 4);
+        assert_ne!(cache.generation, g, "an eviction keeps the generation");
+        let g = cache.generation;
+        assert_eq!(cache.holds(&loader, r), Presence::Absent);
+        assert_eq!(loader.asked(), 4);
+        // The epoch moves: every answer dropped, asked again.
+        loader.epoch.store(1, Ordering::SeqCst);
+        cache.follow(&loader);
+        assert_ne!(cache.generation, g);
+        assert_eq!(cache.holds(&loader, r), Presence::Absent);
+        assert_eq!(loader.asked(), 5);
+    }
+
+    /// **The answers about tiles no longer needed are let go once they
+    /// have doubled, and the generation stays.**
+    #[test]
+    fn presence_answers_of_tiles_gone_are_let_go() {
+        let loader = Indexed::default();
+        let mut cache = PresenceCache::default();
+        cache.follow(&loader);
+        let g = cache.generation;
+        let mesh = |i: u64| ResourceId::Mesh(TileId(i));
+        let need = |tiles: std::ops::Range<u64>| NeedSet {
+            drawn: tiles
+                .map(|i| (TileId(i), Need::new(0, Class::TerrainMesh)))
+                .collect(),
+            ..NeedSet::default()
+        };
+        for i in 0..PRESENCE_KEPT_AT_LEAST as u64 {
+            cache.holds(&loader, mesh(i));
+        }
+        cache.prune(&need(0..10));
+        assert_eq!(
+            cache.answers.len(),
+            PRESENCE_KEPT_AT_LEAST,
+            "not past the floor"
+        );
+        cache.holds(&loader, mesh(5_000));
+        cache.prune(&need(0..10));
+        assert_eq!(cache.answers.len(), 10, "the tiles needed kept");
+        assert_eq!(cache.generation, g);
+        let asked = loader.asked();
+        cache.holds(&loader, mesh(3));
+        assert_eq!(
+            loader.asked(),
+            asked,
+            "a tile still needed is not asked again"
+        );
+        cache.holds(&loader, mesh(500));
+        assert_eq!(
+            loader.asked(),
+            asked + 1,
+            "a tile that comes back is asked again"
+        );
     }
 
     /// **A change of imagery redrapes without reloading a mesh, and without

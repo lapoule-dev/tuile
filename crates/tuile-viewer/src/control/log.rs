@@ -183,6 +183,9 @@ impl Observer for BudgetTopics {
             "rereads_total": s.rereads_total,
             "swap_gaps_total": s.swap_gaps_total,
             "converged": s.converged,
+            "decide_steps": s.decide_micros.count,
+            "decide_micros_sum": s.decide_micros.sum,
+            "decide_peak_micros": s.decide_peak_micros,
         })
     }
 }
