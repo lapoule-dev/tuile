@@ -2295,6 +2295,12 @@ impl Budget {
             }
         }
         plan.groups.truncate(groups);
+        debug_assert!(
+            plan.groups
+                .iter()
+                .all(|g| g.members.len() > 1 && g.members.iter().all(|m| plan.items.contains(m))),
+            "every group kept is a group of the plan's items"
+        );
         self.scratch.transit = transit;
         self.scratch.picked = by_group;
     }

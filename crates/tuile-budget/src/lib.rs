@@ -35,8 +35,7 @@ pub mod view;
 pub use config::{BudgetConfig, FailurePolicy, Pool, PressureFractions, Relaxation, Watermarks};
 pub use deadline::FrameDeadline;
 pub use decisions::{
-    Decisions, DrapeChoice, Drapes, DrawItem, DrawSet, Role, Serves, Start, SwapGroup,
-    UploadPlan,
+    Decisions, DrapeChoice, Drapes, DrawItem, DrawSet, Role, Serves, Start, SwapGroup, UploadPlan,
 };
 pub use error::{AuditError, ConfigError, SessionError};
 pub use imagery::{DrapeCandidate, GeoRect, LevelClamp, TexelFootprint, UvTransform};

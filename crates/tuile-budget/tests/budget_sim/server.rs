@@ -450,6 +450,10 @@ impl Sim {
                 (heap, clock.elapsed().as_secs_f64() * 1e6)
             });
         self.decide_us.push((self.now, us));
+        // Outside the counted region, deliberately: what a fresh copy of
+        // the output takes (`count_output`), and the copy the simulation
+        // keeps for its log and its callers — the host's buffer goes back
+        // for the next step.
         let output = if self.count_output {
             super::alloc::counted(|| out.clone()).1.allocs
         } else {
