@@ -35,7 +35,8 @@ pub mod view;
 pub use config::{BudgetConfig, FailurePolicy, Pool, PressureFractions, Relaxation, Watermarks};
 pub use deadline::FrameDeadline;
 pub use decisions::{
-    Decisions, DrapeChoice, DrawItem, DrawSet, Role, Start, SwapGroup, UploadPlan,
+    Decisions, DrapeChoice, Drapes, DrawItem, DrawSet, Role, Serves, Start, SwapGroup,
+    UploadPlan,
 };
 pub use error::{AuditError, ConfigError, SessionError};
 pub use imagery::{DrapeCandidate, GeoRect, LevelClamp, TexelFootprint, UvTransform};
@@ -328,8 +329,22 @@ impl Budget {
     }
 
     /// One decision step: applies the recorded arrivals, then decides.
+    /// [`Budget::decide_into`] with a fresh `Decisions`.
     pub fn decide(&mut self, input: FrameInput<'_>) -> Decisions {
-        self.step(input)
+        let mut d = Decisions::default();
+        self.decide_into(input, &mut d);
+        d
+    }
+
+    /// One decision step, its decisions written into `out`: emptied first,
+    /// its buffers kept — the lists, the plan's items and groups, the draw
+    /// set's items, each overwritten in place. A host that hands the same
+    /// `Decisions` to every step gives the step nothing to allocate for its
+    /// output once they have grown to the view. The same decisions as
+    /// [`Budget::decide`], bit for bit.
+    pub fn decide_into(&mut self, input: FrameInput<'_>, out: &mut Decisions) {
+        out.clear();
+        self.step(input, out);
     }
 
     /// Applies the arrivals recorded since the last step now, at `now`, so

@@ -289,14 +289,36 @@ impl Lockstep {
         run: impl FnOnce(&mut Budget, FrameInput<'_>) -> (Decisions, R),
     ) -> (Decisions, R) {
         let (d, r) = run(&mut self.real, input);
+        self.folded(need, &d);
+        (d, r)
+    }
+
+    /// One step, checked, written into `out` as the host does
+    /// (`Budget::decide_into`: `out` emptied, its buffers kept); `run` makes
+    /// the budget's call, so a caller can measure it without counting the
+    /// check's.
+    pub fn decide_into_with<R>(
+        &mut self,
+        input: FrameInput<'_>,
+        need: &NeedSet,
+        out: &mut Decisions,
+        run: impl FnOnce(&mut Budget, FrameInput<'_>, &mut Decisions) -> R,
+    ) -> R {
+        let r = run(&mut self.real, input, out);
+        self.folded(need, out);
+        r
+    }
+
+    /// A step was taken, deciding `d`: its digests folded, the checkpoint
+    /// compared when due.
+    fn folded(&mut self, need: &NeedSet, d: &Decisions) {
         self.steps += 1;
         if let Some(rn) = &mut self.run {
-            rn.chains.fold(parts(&self.real, need, &d));
+            rn.chains.fold(parts(&self.real, need, d));
             if self.steps.is_multiple_of(digest::CHECKPOINT) {
                 rn.checkpoint(&format!("{:08}", self.steps), self.steps);
             }
         }
-        (d, r)
     }
 
     /// A load finished decoding.

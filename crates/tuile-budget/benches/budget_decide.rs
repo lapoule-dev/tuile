@@ -60,7 +60,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use tuile_budget::{FrameInput, Micros, NeedDelta, NeedSet};
+use tuile_budget::{Decisions, FrameInput, Micros, NeedDelta, NeedSet};
 
 use server::{Profile, Sim};
 use world::{Camera, SIDE};
@@ -88,9 +88,10 @@ fn converged() -> (Sim, NeedSet) {
     (sim, need)
 }
 
-/// One more step of the same need, `decide` alone: told whole, or as what
-/// changed (nothing).
-fn decide_still(sim: &mut Sim, need: &NeedSet, whole: bool) -> usize {
+/// One more step of the same need, `decide_into` alone (its decisions
+/// written into `out`, the step before's, as the geometry server does):
+/// told whole, or as what changed (nothing).
+fn decide_still(sim: &mut Sim, need: &NeedSet, whole: bool, out: &mut Decisions) -> usize {
     static NOTHING: std::sync::OnceLock<NeedDelta> = std::sync::OnceLock::new();
     let nothing = NOTHING.get_or_init(NeedDelta::new);
     let input = if whole {
@@ -99,10 +100,11 @@ fn decide_still(sim: &mut Sim, need: &NeedSet, whole: bool) -> usize {
         FrameInput::from_delta(sim.frame, sim.now, nothing)
     }
     .with_presence(&sim.net.store);
-    let d = sim.budget.decide_delta(input, need);
+    sim.budget
+        .decide_into_with(input, need, out, |b, i, o| b.decide_into(i, o));
     sim.frame += 1;
     sim.now = sim.now.plus(sim.profile.dt);
-    d.draw.items.len()
+    out.draw.items.len()
 }
 
 fn percentiles(name: &str, mut us: Vec<f64>, drawn: usize) {
@@ -130,11 +132,12 @@ fn diff_still(delta: &mut NeedDelta, last: &NeedSet, need: &NeedSet) -> usize {
 fn report() {
     for (name, whole) in [("still", false), ("still-full", true)] {
         let (mut sim, need) = converged();
+        let mut out = Decisions::default();
         let mut drawn = 0;
         let mut us = Vec::with_capacity(2_000);
         for _ in 0..2_000 {
             let t = Instant::now();
-            drawn = black_box(decide_still(&mut sim, &need, whole));
+            drawn = black_box(decide_still(&mut sim, &need, whole, &mut out));
             us.push(t.elapsed().as_secs_f64() * 1e6);
         }
         percentiles(name, us, drawn);
@@ -143,6 +146,7 @@ fn report() {
         let (mut sim, need) = converged();
         let again = need.clone();
         let mut delta = NeedDelta::new();
+        let mut out = Decisions::default();
         let (mut diff, mut both) = (Vec::with_capacity(2_000), Vec::with_capacity(2_000));
         let mut drawn = 0;
         for _ in 0..2_000 {
@@ -150,7 +154,7 @@ fn report() {
             black_box(diff_still(&mut delta, &need, &again));
             let d = t.elapsed().as_secs_f64() * 1e6;
             let t = Instant::now();
-            drawn = black_box(decide_still(&mut sim, &need, false));
+            drawn = black_box(decide_still(&mut sim, &need, false, &mut out));
             diff.push(d);
             both.push(d + t.elapsed().as_secs_f64() * 1e6);
         }
@@ -248,8 +252,9 @@ fn bench(c: &mut Criterion) {
     let mut g = c.benchmark_group("decide");
     for (name, whole) in [("still", false), ("still-full", true)] {
         let (mut sim, need) = converged();
+        let mut out = Decisions::default();
         g.bench_function(name, |b| {
-            b.iter(|| black_box(decide_still(&mut sim, &need, whole)))
+            b.iter(|| black_box(decide_still(&mut sim, &need, whole, &mut out)))
         });
     }
     for (name, pressed) in [("motion", false), ("pressure", true)] {

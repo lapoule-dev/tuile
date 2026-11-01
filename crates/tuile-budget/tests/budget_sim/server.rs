@@ -203,25 +203,23 @@ pub struct StepLog {
     pub idle: bool,
 }
 
-/// What the heap saw during one `decide` call.
+/// What the heap saw during one `decide_into` call: the step written into
+/// the decisions of the step before, as the geometry server does, so the
+/// output's buffers are the host's and the call allocates only for what
+/// outgrew them.
 #[derive(Clone, Copy, Debug)]
 pub struct DecideAllocs {
     /// The step's time.
     pub now: Micros,
     /// The call's own tally.
     pub heap: super::alloc::Tally,
-    /// The blocks its output alone takes (a clone of the `Decisions`, with
-    /// exact capacities), when [`Sim::count_output`] is set; else 0.
+    /// The blocks a fresh copy of its output takes (a clone of the
+    /// `Decisions`, with exact capacities), when [`Sim::count_output`] is
+    /// set; else 0. What a host that took a new `Decisions` every step
+    /// would allocate for the output.
     pub output: u64,
     /// Items drawn.
     pub drawn: u32,
-}
-
-impl DecideAllocs {
-    /// The blocks `decide` asked for beyond its output: its own scratch.
-    pub fn internal(&self) -> u64 {
-        self.heap.allocs.saturating_sub(self.output)
-    }
 }
 
 struct BudgetResidency<'a>(&'a Budget);
@@ -298,6 +296,9 @@ pub struct Sim {
     need_last: Option<NeedSet>,
     /// What changed, in a buffer kept across steps.
     delta: NeedDelta,
+    /// The decisions, written into the same buffers every step, as the
+    /// geometry server does.
+    out: Decisions,
 }
 
 impl Sim {
@@ -350,6 +351,7 @@ impl Sim {
             step_events: 0,
             need_last: None,
             delta: NeedDelta::new(),
+            out: Decisions::default(),
             profile,
         }
     }
@@ -435,19 +437,26 @@ impl Sim {
         .with_presence(&self.net.store);
         self.step_events = self.fed - self.fed_at_decide;
         self.fed_at_decide = self.fed;
-        // The budget's call alone is timed and counted; its digests are
-        // folded after it, and compared with the recorded reference.
-        let (d, (heap, us)) = self.budget.decide_with(input, &need, |b, i| {
-            let clock = std::time::Instant::now();
-            let (d, heap) = super::alloc::counted(|| b.decide(i));
-            (d, (heap, clock.elapsed().as_secs_f64() * 1e6))
-        });
+        // The budget's call alone is timed and counted, into the last
+        // step's decisions (their buffers kept, as the geometry server
+        // keeps them); its digests are folded after it, and compared with
+        // the recorded reference.
+        let mut out = std::mem::take(&mut self.out);
+        let (heap, us) = self
+            .budget
+            .decide_into_with(input, &need, &mut out, |b, i, o| {
+                let clock = std::time::Instant::now();
+                let ((), heap) = super::alloc::counted(|| b.decide_into(i, o));
+                (heap, clock.elapsed().as_secs_f64() * 1e6)
+            });
         self.decide_us.push((self.now, us));
         let output = if self.count_output {
-            super::alloc::counted(|| d.clone()).1.allocs
+            super::alloc::counted(|| out.clone()).1.allocs
         } else {
             0
         };
+        let d = out.clone();
+        self.out = out;
         self.decide_allocs.push(DecideAllocs {
             now: self.now,
             heap,

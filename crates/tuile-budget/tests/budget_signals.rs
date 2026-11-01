@@ -437,12 +437,9 @@ fn the_swaps_signal_counts_refines_and_coarsenings_and_never_a_gap() {
     let need = drawn(&[a]);
     let mut d = Decisions::default();
     d.stats.floor_in = true;
-    d.draw.items.push(tuile_budget::DrawItem {
-        mesh: ResourceId::Mesh(a),
-        role: tuile_budget::Role::Exact,
-        drapes: Vec::new(),
-        serves: vec![a],
-    });
+    let mut item = tuile_budget::DrawItem::new(ResourceId::Mesh(a), tuile_budget::Role::Exact);
+    item.serves.push(a);
+    d.draw.items.push(item);
     fabricated(&mut meter, &need, &d, 0);
     d.draw.items.clear();
     fabricated(&mut meter, &need, &d, 1);
@@ -660,12 +657,10 @@ fn the_violations_signal_names_the_invariant_broken() {
         (11, |d| {
             let a = t(3, 2, 2);
             d.evict.push(ResourceId::Mesh(a));
-            d.draw.items.push(tuile_budget::DrawItem {
-                mesh: ResourceId::Mesh(a),
-                role: tuile_budget::Role::Exact,
-                drapes: Vec::new(),
-                serves: vec![a],
-            });
+            let mut item =
+                tuile_budget::DrawItem::new(ResourceId::Mesh(a), tuile_budget::Role::Exact);
+            item.serves.push(a);
+            d.draw.items.push(item);
         }),
         (1, |d| {
             d.stats.floor_in = true;

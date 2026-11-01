@@ -41,7 +41,7 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use super::config::FailurePolicy;
 use super::cost::within_drift;
-use super::decisions::{Decisions, DrapeChoice, DrawItem, Role, Start, SwapGroup, UploadPlan};
+use super::decisions::{Decisions, DrapeChoice, DrawItem, Role, Start, UploadPlan};
 use super::downstream::{Item, Wants};
 use super::error::{AuditError, SessionError};
 use super::imagery::{drape_rank, needed_level, DrapeCandidate, GeoRect, LevelClamp, UvTransform};
@@ -236,14 +236,20 @@ pub(super) struct ItemStats {
 /// once they have grown to the view.
 #[derive(Debug, Default)]
 pub(super) struct Scratch {
-    jobs: Vec<(PriorityKey, ResourceId, Job, Want)>,
+    /// The work ranked: each job's key (its resource in it), what it is,
+    /// its want.
+    jobs: Vec<(PriorityKey, Job, Want)>,
     /// The loads and transits whose deadline passed.
     due: Vec<ResourceId>,
     /// This step's room: built at its first use, dropped with the step's
     /// evictions. Only a step under pressure builds it.
     room: Option<Room>,
-    /// The loads, then the deliveries, picked from `jobs`: their places.
+    /// The loads, then the deliveries, picked from `jobs`: their places;
+    /// then the plan's transits by group.
     picked: Vec<u32>,
+    /// The plan's: the copies in transit with their key (their resource in
+    /// it), bytes and group, and whether the plan took them.
+    transit: Vec<(PriorityKey, Bytes, (u8, TileId), bool)>,
     /// What the step's read-only passes walk, added to its `work`.
     walked: std::sync::atomic::AtomicU32,
 }
@@ -1402,11 +1408,10 @@ impl Budget {
         }
     }
 
-    /// The step.
-    pub(super) fn step(&mut self, input: FrameInput<'_>) -> Decisions {
+    /// The step, into `d` (emptied by the caller, its buffers kept).
+    pub(super) fn step(&mut self, input: FrameInput<'_>, d: &mut Decisions) {
         let now = input.now;
         let mut st = std::mem::take(&mut self.pending);
-        let mut d = Decisions::default();
         let eff = self.eff();
         self.scratch.room = None;
         let mut ranked = std::mem::take(&mut self.ranked_last);
@@ -1438,7 +1443,7 @@ impl Budget {
         self.mark(now, tiles, named, wants);
 
         // 5. Cancellations: grace and timeouts.
-        self.cancel(now, &eff, &mut d, &mut st);
+        self.cancel(now, &eff, d, &mut st);
 
         // 6. Rank the work: the wanted resources with a load or a delivery
         // to start, kept up to date.
@@ -1459,7 +1464,6 @@ impl Budget {
             let key = self.key_of(r, w, now, &is_coarsening, input.presence);
             jobs.push((
                 key,
-                r,
                 job,
                 Want {
                     urgency: key.urgency,
@@ -1470,12 +1474,12 @@ impl Budget {
         // Keys end in the resource: total, so unstable is stable.
         jobs.sort_unstable_by_key(|j| j.0);
         self.walk(jobs.len());
-        self.ranked_last.extend(jobs.iter().map(|j| j.1));
+        self.ranked_last.extend(jobs.iter().map(|j| j.0.resource));
         // A burst of work does not keep its room once it is done.
         let used = self.ranked_last.len();
         super::sorted::trim(&mut self.ranked_last, used);
-        for (k, r, _, w) in &jobs {
-            if let Some(s) = self.arena.find(*r) {
+        for (k, _, w) in &jobs {
+            if let Some(s) = self.arena.find(k.resource) {
                 self.arena.set_rank(s, Some(w.urgency), Some(Rank::of(k)));
             }
         }
@@ -1493,7 +1497,7 @@ impl Budget {
         picked.extend(
             jobs.iter()
                 .enumerate()
-                .filter(|(_, j)| j.2 == Job::Load)
+                .filter(|(_, j)| j.1 == Job::Load)
                 .take(self.cfg.request_heap as usize)
                 .map(|(i, _)| place(i)),
         );
@@ -1508,7 +1512,7 @@ impl Budget {
             wants,
             input.presence,
             tiles,
-            &mut d,
+            d,
             &mut st,
         );
 
@@ -1517,21 +1521,23 @@ impl Budget {
         picked.extend(
             jobs.iter()
                 .enumerate()
-                .filter(|(_, j)| j.2 == Job::Deliver)
+                .filter(|(_, j)| j.1 == Job::Deliver)
                 .map(|(i, _)| place(i)),
         );
         self.walk(jobs.len() + picked.len());
         let (blocked, strained) = self.deliver(
-            now, &eff, &jobs, &picked, tiles, coarsening, wants, &mut d, &mut st,
+            now, &eff, &jobs, &picked, tiles, coarsening, wants, d, &mut st,
         );
 
-        // 8. The upload plan.
-        d.upload_plan = self.plan(&eff, &key, tiles);
+        // 8. The upload plan (`picked` lent for its order by group).
+        self.scratch.picked = picked;
+        self.plan(&eff, &key, tiles, &mut d.upload_plan);
+        picked = std::mem::take(&mut self.scratch.picked);
         st.work = st.work.saturating_add(sat_u32(self.arena.transits_len()));
 
         // 9. Eviction and release.
         if !eff.batch {
-            self.evict(now, &eff, wants, &mut d, &mut st);
+            self.evict(now, &eff, wants, d, &mut st);
         }
 
         // 10. Relaxation.
@@ -1552,7 +1558,7 @@ impl Budget {
         // started or delivered was ranked.
         self.walk(jobs.len());
         let pending_view =
-            jobs.iter().any(|j| j.3.urgency <= Urgency::Drape) || self.down.view_waits();
+            jobs.iter().any(|j| j.2.urgency <= Urgency::Drape) || self.down.view_waits();
         if eff.batch {
             self.walk(tiles.len());
             let complete = need.blockers() == 0
@@ -1589,7 +1595,7 @@ impl Budget {
         self.scratch.jobs = jobs;
         picked.clear();
         self.scratch.picked = picked;
-        d.draw = self.down.draw_set();
+        self.down.draw_set_into(&mut d.draw);
         self.put_back(taken);
         self.need = need;
 
@@ -1627,7 +1633,6 @@ impl Budget {
         self.walk_upkeep();
         st.work = st.work.saturating_add(self.scratch.walked.swap(0, Relaxed));
         d.stats = st;
-        d
     }
 
     fn protected_bytes(&self) -> PerClass<Bytes> {
@@ -1760,7 +1765,7 @@ impl Budget {
         &mut self,
         now: Micros,
         eff: &Eff,
-        jobs: &[(PriorityKey, ResourceId, Job, Want)],
+        jobs: &[(PriorityKey, Job, Want)],
         loads: &[u32],
         key_now: &dyn Fn(&Budget, ResourceId) -> Option<PriorityKey>,
         wants: Wants<'_>,
@@ -1774,7 +1779,8 @@ impl Budget {
         // quota: a network load of lower priority starting after them is a
         // local wait (I15).
         let mut skipped_stored = 0u32;
-        for (key, r, _, w) in loads.iter().filter_map(|i| jobs.get(*i as usize)) {
+        for (key, _, w) in loads.iter().filter_map(|i| jobs.get(*i as usize)) {
+            let r = &key.resource;
             let class = self.class_of(*r, w.class);
             if decoded_full && w.urgency >= Urgency::Ring {
                 // Backpressure: preload that could neither be delivered nor
@@ -2048,7 +2054,7 @@ impl Budget {
         &mut self,
         now: Micros,
         eff: &Eff,
-        jobs: &[(PriorityKey, ResourceId, Job, Want)],
+        jobs: &[(PriorityKey, Job, Want)],
         picked: &[u32],
         tiles: &SortedMap<TileId, TileNeed>,
         coarsening: &SortedMap<TileId, ()>,
@@ -2057,7 +2063,8 @@ impl Budget {
         st: &mut BudgetStats,
     ) -> (bool, bool) {
         let mut flags = (false, false);
-        for (_, r, _, w) in picked.iter().filter_map(|i| jobs.get(*i as usize)) {
+        for (key, _, w) in picked.iter().filter_map(|i| jobs.get(*i as usize)) {
+            let r = &key.resource;
             let Some(group) = floor_group(tiles, *r, |l| self.is_floor(l)) else {
                 self.deliver_one(now, eff, *r, w, coarsening, wants, d, st, &mut flags);
                 continue;
@@ -2204,14 +2211,21 @@ impl Budget {
         d.deliver.push((r, c.gen));
     }
 
+    /// The consumer's uploads this frame, into `plan`: the copies in
+    /// transit in priority order, grouped — the blockers of one parent
+    /// (meshes and drapes), else a tile's mesh and its drape — each group
+    /// going whole at its first member, byte-capped (the first item always
+    /// goes). Nothing allocated once the step's buffers have grown: the
+    /// transits and their order by group are step buffers, the plan's
+    /// groups overwritten in place.
     fn plan(
-        &self,
+        &mut self,
         eff: &Eff,
         key: &dyn Fn(&Budget, ResourceId) -> Option<PriorityKey>,
         tiles: &SortedMap<TileId, TileNeed>,
-    ) -> UploadPlan {
-        // Group: the blockers of one parent (meshes and drapes), else a
-        // tile's mesh and its drape.
+        plan: &mut UploadPlan,
+    ) {
+        plan.clear();
         let group_of = |r: ResourceId| -> (u8, TileId) {
             let t = r.tile();
             match tiles.get(&t) {
@@ -2222,59 +2236,67 @@ impl Budget {
                 _ => (1, t),
             }
         };
-        let mut transit: Vec<(PriorityKey, ResourceId, Bytes)> = self
-            .arena
-            .transits()
-            .filter_map(|r| {
-                let t = self.arena.transit(self.arena.find(r)?)?;
-                Some((r, t.cost.gpu))
-            })
-            .map(|(r, b)| {
-                let k = key(self, r).unwrap_or(PriorityKey {
-                    urgency: Urgency::Refresh,
-                    score: Reverse(i64::MIN),
-                    tier: Tier::Remote,
-                    resource: r,
-                });
-                (k, r, b)
-            })
-            .collect();
-        transit.sort_unstable();
-        let mut plan = UploadPlan::default();
-        // Each group's members with their bytes, in transit order.
-        let mut groups: BTreeMap<(u8, TileId), Vec<(ResourceId, Bytes)>> = BTreeMap::new();
-        for (_, r, b) in &transit {
-            groups.entry(group_of(*r)).or_default().push((*r, *b));
-        }
-        for (_, r, _) in &transit {
-            // A group goes whole, at its first member in transit order: a
-            // later member finds it gone.
-            let Some(mut members) = groups.remove(&group_of(*r)) else {
+        let mut transit = std::mem::take(&mut self.scratch.transit);
+        let mut by_group = std::mem::take(&mut self.scratch.picked);
+        transit.clear();
+        for r in self.arena.transits() {
+            let Some(t) = self.arena.find(r).and_then(|s| self.arena.transit(s)) else {
                 continue;
             };
-            let bytes = members.iter().fold(Bytes::ZERO, |a, m| a.plus(m.1));
+            let k = key(self, r).unwrap_or(PriorityKey {
+                urgency: Urgency::Refresh,
+                score: Reverse(i64::MIN),
+                tier: Tier::Remote,
+                resource: r,
+            });
+            transit.push((k, t.cost.gpu, group_of(r), false));
+        }
+        // Keys end in the resource: total, so unstable is stable.
+        transit.sort_unstable_by_key(|a| a.0);
+        // Each group's members as a run, in transit order within the group:
+        // the places of `transit`, by (group, place).
+        by_group.clear();
+        by_group.extend((0..transit.len()).map(|i| u32::try_from(i).unwrap_or(u32::MAX)));
+        by_group.sort_unstable_by_key(|&i| (transit[i as usize].2, i));
+        let mut groups = 0;
+        for i in 0..transit.len() {
+            // A group goes whole, at its first member in transit order: a
+            // later member finds it gone.
+            if transit[i].3 {
+                continue;
+            }
+            let (k, b, g, _) = transit[i];
+            let from = by_group.partition_point(|&j| transit[j as usize].2 < g);
+            let to = from + by_group[from..].partition_point(|&j| transit[j as usize].2 == g);
+            let members = &by_group[from..to];
+            let bytes = members
+                .iter()
+                .fold(Bytes::ZERO, |a, &j| a.plus(transit[j as usize].1));
             if plan.items.is_empty() && plan.bytes.plus(bytes) > eff.upload {
                 // The first item always goes, alone if its group is too big.
-                plan.items.push(*r);
-                plan.bytes = members
-                    .iter()
-                    .find(|m| m.0 == *r)
-                    .map_or(Bytes::ZERO, |m| m.1);
+                plan.items.push(k.resource);
+                plan.bytes = b;
                 break;
             }
             if plan.bytes.plus(bytes) > eff.upload {
                 break;
             }
-            plan.items.extend(members.iter().map(|m| m.0));
+            plan.items
+                .extend(members.iter().map(|&j| transit[j as usize].0.resource));
             plan.bytes = plan.bytes.plus(bytes);
+            for &j in members {
+                transit[j as usize].3 = true;
+            }
             if members.len() > 1 {
-                members.sort_unstable_by_key(|m| m.0);
-                plan.groups.push(SwapGroup {
-                    members: members.into_iter().map(|m| m.0).collect(),
-                });
+                let out = plan.group(groups);
+                out.extend(members.iter().map(|&j| transit[j as usize].0.resource));
+                out.sort_unstable();
+                groups += 1;
             }
         }
-        plan
+        plan.groups.truncate(groups);
+        self.scratch.transit = transit;
+        self.scratch.picked = by_group;
     }
 
     /// The step's room against a recount, before the sweeps (which walk it

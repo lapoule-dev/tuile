@@ -728,23 +728,27 @@ impl Downstream {
         n
     }
 
-    /// The draw set, for the step's decisions.
-    pub fn draw_set(&self) -> DrawSet {
-        DrawSet {
-            items: self
-                .items
-                .iter()
-                .map(|(m, i)| {
-                    let mut serves: Vec<TileId> = self.run(*m).map(|x| x.0).collect();
-                    serves.dedup();
-                    DrawItem {
-                        mesh: *m,
-                        role: i.role,
-                        drapes: i.drapes().copied().collect(),
-                        serves,
-                    }
-                })
-                .collect(),
+    /// The draw set, for the step's decisions, into `out`: its items
+    /// overwritten in place (their drapes and tiles served in their own
+    /// room), those beyond this step's dropped.
+    pub fn draw_set_into(&self, out: &mut DrawSet) {
+        let n = self.items.len();
+        out.items.truncate(n);
+        for (i, (m, it)) in self.items.iter().enumerate() {
+            let item = match out.items.get_mut(i) {
+                Some(item) => item,
+                None => {
+                    out.items.push(DrawItem::new(*m, it.role));
+                    &mut out.items[i]
+                }
+            };
+            item.mesh = *m;
+            item.role = it.role;
+            item.drapes.clear();
+            item.drapes.extend(it.drapes().copied());
+            item.serves.clear();
+            item.serves.extend(self.run(*m).map(|x| x.0));
+            item.serves.dedup();
         }
     }
 
@@ -1383,12 +1387,7 @@ impl Budget {
             let new = if l.run.is_empty() {
                 None
             } else {
-                let built = l.built.get_or_insert_with(|| DrawItem {
-                    mesh: m,
-                    role: Role::Exact,
-                    drapes: Vec::new(),
-                    serves: Vec::new(),
-                });
+                let built = l.built.get_or_insert_with(|| DrawItem::new(m, Role::Exact));
                 let drapes = |s: TileId, out: &mut Vec<(LayerId, u32)>| match tiles.get(&s) {
                     Some(tn) => self.drapes_of(s, tn, out),
                     None => out.clear(),
@@ -2890,12 +2889,7 @@ impl Budget {
                 Some(tn) => self.drapes_of(s, tn, out),
                 None => out.clear(),
             };
-            let mut built = DrawItem {
-                mesh: m,
-                role: Role::Exact,
-                drapes: Vec::new(),
-                serves: Vec::new(),
-            };
+            let mut built = DrawItem::new(m, Role::Exact);
             let stats = self.build_item(m, &run, drapes, &mut reach, &mut bufs, &mut built);
             let mut beyond = Vec::new();
             reach.beyond(m.tile(), &mut beyond);

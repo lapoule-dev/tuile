@@ -15,9 +15,9 @@ mod budget_common;
 use budget_common::*;
 use tuile_budget::cost::Cost;
 use tuile_budget::{
-    Budget, BudgetConfig, Bytes, Class, ConfigError, Failure, FailurePolicy, LayerId, Micros,
-    NeedSet, PerClass, Pressure, Protection, ResourceId, ResourceState, Role, SessionError, Source,
-    Thermal, Tier, Urgency,
+    Budget, BudgetConfig, Bytes, Class, ConfigError, Decisions, Failure, FailurePolicy, LayerId,
+    Micros, NeedSet, PerClass, Pressure, Protection, ResourceId, ResourceState, Role, SessionError,
+    Source, Thermal, Tier, Urgency,
 };
 
 const RED: &str = "the budget core regressed";
@@ -1650,7 +1650,7 @@ mod draw {
         let d = r.settle(&drawn(&[a]), 10);
         let item = d.draw.get(mesh(a)).expect(RED);
         assert_eq!(item.role, Role::Exact);
-        assert_eq!(item.serves, vec![a]);
+        assert_eq!(item.serves.to_vec(), vec![a]);
         assert_eq!(d.stats.exact, 1);
     }
 
@@ -1669,7 +1669,7 @@ mod draw {
         let d = r.step(&need);
         let item = d.draw.get(mesh(root)).expect(RED);
         assert_eq!(item.role, Role::Fallback);
-        assert_eq!(item.serves, vec![grandchild]);
+        assert_eq!(item.serves.to_vec(), vec![grandchild]);
         assert_eq!((d.stats.fallback, d.stats.lost), (1, 0));
     }
 
@@ -1707,7 +1707,7 @@ mod draw {
         let d = r.step(&drawn(&kids));
         let item = d.draw.get(mesh(p)).expect(RED);
         assert_eq!(item.role, Role::Fallback);
-        assert_eq!(item.serves, vec![kids[3]]);
+        assert_eq!(item.serves.to_vec(), vec![kids[3]]);
         let d = r.settle(&drawn(&kids), 10);
         assert!(!d.draw.draws(p));
     }
@@ -1805,7 +1805,7 @@ mod draw {
         assert_eq!(cover.role, Role::Fallback);
         let mut new_tiles = kids[1..].to_vec();
         new_tiles.sort();
-        assert_eq!(cover.serves, new_tiles);
+        assert_eq!(cover.serves.to_vec(), new_tiles);
         assert_eq!((d.stats.lost, d.stats.fallback), (0, 3));
     }
     /// D-A4, M36: each layer falls back on its own: a tile whose base
@@ -2510,6 +2510,35 @@ mod determinism {
         assert_eq!(a, script(false));
     }
 
+    /// A step written into the step before's decisions (`decide_into`, the
+    /// buffers kept and overwritten in place: lists, the plan's groups, the
+    /// draw set's items with their drapes and tiles served) decides exactly
+    /// what a step into fresh decisions does — statistics included — over a
+    /// script whose view, and so the number of items and groups, grows and
+    /// shrinks. Red with the buffers not emptied first, or the draw set's
+    /// items beyond this step's kept.
+    #[test]
+    fn a_step_into_the_last_decisions_is_the_step_into_fresh_ones() {
+        let (mut fresh, mut reused) = (Rig::interactive(), Rig::interactive());
+        reused.reuse = Some(Decisions::default());
+        let mut differed = 0;
+        for step in 0u64..160 {
+            // Four tiles, then eight, then two, drifting east.
+            let x = step / 20;
+            let n = [4usize, 8, 2, 6][(step / 40) as usize % 4];
+            let tiles: Vec<_> = (0..n as u64).map(|k| t(4, x + k, 1 + k % 3)).collect();
+            let need = drawn_draped(&tiles, 6);
+            let (a, b) = (fresh.step(&need), reused.step(&need));
+            assert_eq!(a, b, "{RED}: step {step}");
+            differed += usize::from(step > 0 && a.draw.items.len() != n);
+            if step % 3 != 0 {
+                fresh.complete(&a);
+                reused.complete(&b);
+            }
+        }
+        assert!(differed > 0, "the draw set never changed size");
+    }
+
     /// I12, C11: the decisions do not depend on the order of the need.
     #[test]
     fn the_decisions_do_not_depend_on_the_order_of_the_need() {
@@ -3086,7 +3115,7 @@ mod dirty_sets {
         assert!(r.b.residency().drawable(k));
         assert!(!r.b.residency().drawable(p));
         assert_eq!(
-            d.draw.get(mesh(k)).map(|i| i.serves.clone()),
+            d.draw.get(mesh(k)).map(|i| i.serves.to_vec()),
             Some(vec![p, k]),
             "{RED}: the finer tile drawn since holds its ancestor"
         );
@@ -3106,7 +3135,7 @@ mod dirty_sets {
         ask.ancestors.push((p, need(p)));
         let d = r.step(&ask);
         assert_eq!(
-            d.draw.get(mesh(root)).map(|i| i.serves.clone()),
+            d.draw.get(mesh(root)).map(|i| i.serves.to_vec()),
             Some(vec![k])
         );
         r.load_where(|x| x == mesh(p));
@@ -3118,7 +3147,7 @@ mod dirty_sets {
         assert!(r.b.residency().drawable(p));
         assert!(!r.b.residency().drawable(k));
         assert_eq!(
-            d.draw.get(mesh(p)).map(|i| (i.role, i.serves.clone())),
+            d.draw.get(mesh(p)).map(|i| (i.role, i.serves.to_vec())),
             Some((Role::Fallback, vec![k])),
             "{RED}: the tile stands on its nearest drawable ancestor"
         );
@@ -3317,7 +3346,7 @@ mod dirty_sets {
         let d = r.step(&ask);
         assert!(!r.b.residency().drawable(k));
         assert_eq!(
-            d.draw.get(mesh(root)).map(|i| i.serves.clone()),
+            d.draw.get(mesh(root)).map(|i| i.serves.to_vec()),
             Some(vec![root]),
             "the root wears nothing: the tile has nothing to stand on"
         );
@@ -3333,7 +3362,7 @@ mod dirty_sets {
         );
         let d = r.step(&ask);
         assert_eq!(
-            d.draw.get(mesh(root)).map(|i| i.serves.clone()),
+            d.draw.get(mesh(root)).map(|i| i.serves.to_vec()),
             Some(vec![root, k]),
             "{RED}: the tile stands on the ancestor wearing a layer since"
         );

@@ -25,7 +25,7 @@ PRs — numbered B1–B8 in that plan, unrelated to section B below — fixes it
 signals, and a measured acceptance (imagery peak ≤ 15.5 MB, BC7 settle ≤ 6.0 s, Off goldens unchanged). It comes
 before A2 and A4.
 
-### O1 — the budget's algorithms, before CB (status: O1.4 dirty sets, 2026-10-31)
+### O1 — the budget's algorithms, before CB (status: O1.5 part 1, 2026-11-01)
 
 The budget is its own crate, `tuile-budget` (#163). O1 optimises its `decide` before the compression budget,
 decisions bit-identical throughout. The guard comes first (O1.0): today's engine frozen at 3d1a028e in
@@ -400,9 +400,50 @@ place's coarse tiles and fails them over and over, so the kept slots follow the 
 backoff: 384 at most on the two-second jumps (3 949 failures; cap 574), 200 on the grow-then-shrink flight, 26 on
 eight-second jumps — so the scenario holds the cap without a red of its own; the cap's red is the unit test's, and the number is not lowered to make a scenario trip it.
 
-Not in O1.4, listed for O1.5: the ranking re-keys every job each step (a job's score ages with time); the host's
-diff clones every changed tile's `Need` (about 640 heap blocks a step on the tour); the whole-need resync pays a
-lookup per tile in the blocks (still-full +21 % on x86, a cursor merge would bring it back).
+**O1.5 — the step's outputs allocate nothing once grown** (`perf/budget-o1-outputs`, part 1 of O1.5; decisions and
+the whole state byte-identical). Profiled first (samply on the bench, `Budget::step` in motion): the passes after
+the need 42 % of the step, the wants map's lookups 27 % (`of_tile` twice per named tile, a tile's mesh and drapes in
+two regions of a map ordered by resource, which defeats the block hint), `apply_delta` 8.5 %, the draw set's
+construction 6.6 %, malloc 1.2 %; the host's diff ~640 blocks a step. O1.5 is split by that weight, one stacked PR
+each: (1) the outputs, this part; (2) the wants and refreshes keyed tile-first, `imagery_prev`, `active` and
+`recent` on the sorted blocks, the whole-need resync by a cursor merge over the blocks, the ranking's bucket queue
+decided on the measurement (the ranking is under 2 % of the step); (3) the runtime's presence answers kept until a
+store event — a network load completed, a store miss, the loader's epoch — instead of the 1 s window; (4) P6.4 on
+the flight: the pressure switches (only the wants that read the pressure read again) and the five still steps after
+the descent, and the prune's scan of the loads in flight replaced by the arena's notes.
+
+Part 1: `Budget::decide_into(input, &mut Decisions)` writes a step into the step before's decisions — emptied
+first, every list refilled in place, the draw set's items overwritten one by one (their drapes and tiles served in
+their own room), the plan's groups overwritten and cut to those used — and `decide` is `decide_into` on a fresh
+`Decisions`; the geometry server keeps one `Decisions` and hands it to every step, the simulation and the bench
+too. `DrawItem` holds its drapes (one or two) and the tiles it serves (up to four) in place (`smallvec`, a public
+type change followed in tuile-core, tuile-wgpu, tuile-web and tuile-bake): a fresh copy of a still step's decisions
+takes 1 block instead of 649. The plan no longer builds a map of groups and a vector per group: the transits with
+their key, bytes and group in a step buffer sorted by key, their places by group in a buffer lent for the step's
+end, a group taken whole at its first member and its members flagged. The jobs buffer loses the resource its key
+already holds (80 → 64 B an entry). `NeedDelta::diff` writes over its earlier entries (`Need::clone_from` keeps
+the layers' buffer; the lists keep their length apart), so the host's diff allocates nothing. Red first:
+`a_step_into_the_last_decisions_is_the_step_into_fresh_ones` (two rigs, fresh against reused decisions, every
+`Decisions` compared whole over a view that grows and shrinks; red with the buffers not emptied),
+`a_delta_built_again_says_only_what_changed_since` (red with the earlier entries still listed), and the still
+ratchet at 0 (red with `decide_into` deciding into a fresh buffer and moving it). The ratchets are renamed for what
+they count — every block of the call, its output written into the host's buffers — and every one is down or equal:
+still 0 (the output's 649 gone), motion p99 30 → 23, the host's diff p99 (new) 0, step buffers after the tour
+236 688 → 231 696 B, bytes per tracked resource 451, after shrinking 870; the pressure scenario's blocks per step
+p50 33 → 28, p99 115 → 81. M-bench on x86 (16 reserved EPYC-Milan CPUs, 5 interleaved rounds, medians, against the stack's tip):
+decide/still 65.0 → 41.5 µs (−36 %: the output's 649 allocations and the draw set's rebuild), still-full 441 → 413
+(−6 %), motion 711 → 705 and pressure 511 → 519 (within the builder's band: a motion step's cost is the passes,
+part 2), decide + the host's diff in motion 589 / 1 341 → 562 / 1 287 (mean / p99), the diff alone 60.3 → 36.4 µs
+(−40 %). M-run (`p2-slow`, Off, Mac at load 3, five interleaved runs): imagery peak 172.3 → 172.0 MB, every upload
+landed 0.8 → 0.7 s, slowest frame 64 → 64 ms, median 36 → 35, no black pixel and no hole in any run.
+M-web (the ten patterns, headless Chrome, the display held awake — asleep, it hides the page and the viewer holds
+its loads): patterns kept 6/9/10 on the stack's tip (WebGPU auto / WebGL2 auto / off) against 9/10/10, no hole or
+black patch on either; the one violation left is WebGPU's warm relaunch converging in 21 s against 20.
+
+Left for the next parts of O1.5 (above): the ranking re-keys every job each step (a job's score ages with time);
+the whole-need resync pays a lookup per tile in the blocks (still-full +21 % on x86, a cursor merge would bring it
+back); the whole-need path groups the need into a fresh buffer each time (one block: keeping it would add the first
+step's grouping to every delta host's step buffers).
 
 Order is strict: A before B, B before C. Every step of A, B and C goes through the same battery before
 the next starts — tests seen red, mutants killed, the reference model extended, Kani proofs of its

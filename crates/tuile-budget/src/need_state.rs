@@ -337,6 +337,8 @@ struct Scratch {
     gone: Vec<TileId>,
     /// The tiles a whole need no longer lists, between two it lists.
     left: Vec<TileId>,
+    /// A whole need's entries grouped by tile.
+    grouped: Vec<(TileId, u32)>,
 }
 
 impl NeedState {
@@ -403,11 +405,12 @@ impl NeedState {
     /// Returns its entries.
     pub fn apply_full(&mut self, n: &NeedSet, positions: &mut SortedMap<TileId, TileInfo>) -> u32 {
         // A whole need is the first step's, or a resynchronisation's: its
-        // grouping is not kept.
-        let mut grouped = Vec::new();
+        // grouping is read once, into a buffer kept for the next.
+        let mut grouped = std::mem::take(&mut self.scratch.grouped);
         n.grouped_into(&mut grouped);
         let runs = Runs { g: &grouped, i: 0 };
         self.apply(runs, Source::Full(n, &grouped), true, positions);
+        self.scratch.grouped = grouped;
         #[cfg(debug_assertions)]
         {
             self.shadow.clone_from(n);

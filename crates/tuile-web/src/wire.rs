@@ -881,7 +881,7 @@ impl<'a> Reader<'a> {
             }
         };
         let n = self.len()?;
-        let mut drapes = Vec::with_capacity(n.min(16));
+        let mut drapes = tuile_core::budget::Drapes::with_capacity(n.min(16));
         for _ in 0..n {
             drapes.push(DrapeChoice {
                 resource: self.resource()?,
@@ -897,7 +897,7 @@ impl<'a> Reader<'a> {
             mesh,
             role,
             drapes,
-            serves: self.tiles()?,
+            serves: self.tiles()?.into(),
         })
     }
     fn layer(&mut self) -> Result<ImageryLayer, WireError> {
@@ -1299,7 +1299,7 @@ mod tests {
                 DrawItem {
                     mesh: ResourceId::Mesh(TileId(1)),
                     role: Role::Fallback,
-                    drapes: vec![DrapeChoice {
+                    drapes: [DrapeChoice {
                         resource: drape,
                         layer: LayerId(0),
                         level: 6,
@@ -1307,20 +1307,22 @@ mod tests {
                             scale: [0.5, 0.25],
                             offset: [0.5, 1.0 / 3.0],
                         },
-                    }],
-                    serves: vec![TileId(5), TileId(6)],
+                    }]
+                    .into_iter()
+                    .collect(),
+                    serves: [TileId(5), TileId(6)].into_iter().collect(),
                 },
                 DrawItem {
                     mesh: ResourceId::Mesh(TileId(5)),
                     role: Role::Exact,
-                    drapes: Vec::new(),
-                    serves: vec![TileId(5)],
+                    drapes: Default::default(),
+                    serves: [TileId(5)].into_iter().collect(),
                 },
                 DrawItem {
                     mesh: ResourceId::Mesh(TileId(9)),
                     role: Role::Held,
-                    drapes: Vec::new(),
-                    serves: vec![TileId(2)],
+                    drapes: Default::default(),
+                    serves: [TileId(2)].into_iter().collect(),
                 },
             ],
         };

@@ -18,6 +18,8 @@ thiserror = { workspace = true }
 # (`state::Arena`).
 hashbrown = { workspace = true }
 foldhash = { workspace = true }
+# A draw item's drapes and the tiles it serves, in place (`decisions`).
+smallvec = { workspace = true }
 
 [dev-dependencies]
 # The budget's properties (protection, total order, ledger, determinism,

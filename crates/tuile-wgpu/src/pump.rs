@@ -1403,8 +1403,8 @@ mod tests {
             DrawItem {
                 mesh: ResourceId::Mesh(TileId(2)),
                 role: Role::Exact,
-                drapes: Vec::new(),
-                serves: vec![TileId(2)],
+                drapes: Default::default(),
+                serves: [TileId(2)].into_iter().collect(),
             },
         );
     }

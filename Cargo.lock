@@ -8892,6 +8892,7 @@ dependencies = [
  "foldhash 0.2.0",
  "hashbrown 0.16.1",
  "proptest",
+ "smallvec",
  "thiserror 2.0.18",
 ]
 

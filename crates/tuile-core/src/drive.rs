@@ -371,13 +371,15 @@ mod tests {
         let item = crate::budget::DrawItem {
             mesh: ResourceId::Mesh(tile),
             role: Role::Exact,
-            drapes: vec![crate::budget::DrapeChoice {
+            drapes: [crate::budget::DrapeChoice {
                 resource,
                 layer: drape.layer,
                 level: drape.level,
                 uv: crate::budget::UvTransform::IDENTITY,
-            }],
-            serves: vec![tile],
+            }]
+            .into_iter()
+            .collect(),
+            serves: [tile].into_iter().collect(),
         };
         (item, HashMap::from([(resource, Arc::new(drape.clone()))]))
     }

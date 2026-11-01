@@ -816,6 +816,10 @@ struct State {
     presence: std::cell::RefCell<HashMap<ResourceId, Presence>>,
     presence_window: Option<(u64, u64)>,
     presence_generation: u64,
+    /// The last step's decisions, handed to the budget again to write the
+    /// next into: their buffers are kept, so a step allocates nothing for
+    /// its output once they have grown to the view.
+    decisions: Decisions,
     /// The decoded copies the budget counts (its decoded tier): delivered
     /// from here, again after an eviction, until the budget releases them.
     decoded: BTreeMap<ResourceId, (Generation, ResourceContent)>,
@@ -886,6 +890,7 @@ impl State {
             presence: std::cell::RefCell::default(),
             presence_window: None,
             presence_generation: 0,
+            decisions: Decisions::default(),
             decoded: BTreeMap::new(),
             steepest: HashMap::new(),
             events: Vec::new(),
@@ -1449,7 +1454,9 @@ impl State {
             None => FrameInput::new(self.frame, now, &need),
         };
         let deciding = crate::metrics::stamp();
-        let d = self.budget.decide(input.with_presence(&presence));
+        let mut d = std::mem::take(&mut self.decisions);
+        self.budget
+            .decide_into(input.with_presence(&presence), &mut d);
         let decide_wall = Micros(deciding.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
         self.sse_scale_milli = d.sse_scale_milli;
 
@@ -1528,6 +1535,7 @@ impl State {
         self.ranks.publish(ranked.into_iter().map(|(_, r)| r));
         let priming = self.priming(&need);
         self.need_last = Some(need);
+        self.decisions = d;
         let mm = crate::metrics::metrics();
         mm.priming_total.set(u64::from(priming.total));
         mm.priming_pending.set(u64::from(priming.outstanding));

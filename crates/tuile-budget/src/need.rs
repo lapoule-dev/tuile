@@ -158,11 +158,73 @@ impl Membership {
 /// records nothing (a tile goes by [`NeedDelta::leave`]); a tile that left
 /// and was not there stays away, one that "changed" and was not there
 /// enters.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Default)]
 pub struct NeedDelta {
+    /// The entries of the tiles that entered: the first `entered_len` of
+    /// `entered`. The rest are entries of earlier deltas, kept for their
+    /// buffers (a need's layers): `diff` writes into them in place, so a
+    /// delta built every step allocates nothing once its lists have grown.
     entered: Vec<(TileId, Membership, Need)>,
+    entered_len: usize,
     changed: Vec<(TileId, Membership, Need)>,
+    changed_len: usize,
     left: Vec<TileId>,
+    /// `diff`'s buffers: each need's entries grouped by tile.
+    grouped: (Grouped, Grouped),
+}
+
+/// A need's entries grouped by tile: each entry's tile and its place
+/// ([`NeedSet::grouped_into`]).
+type Grouped = Vec<(TileId, u32)>;
+
+impl Clone for NeedDelta {
+    fn clone(&self) -> Self {
+        NeedDelta {
+            entered: self.entered().to_vec(),
+            entered_len: self.entered_len,
+            changed: self.changed().to_vec(),
+            changed_len: self.changed_len,
+            left: self.left.clone(),
+            grouped: Default::default(),
+        }
+    }
+}
+
+impl std::fmt::Debug for NeedDelta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NeedDelta")
+            .field("entered", &self.entered())
+            .field("changed", &self.changed())
+            .field("left", &self.left)
+            .finish()
+    }
+}
+
+/// What a delta says: its three lists.
+impl PartialEq for NeedDelta {
+    fn eq(&self, o: &Self) -> bool {
+        self.entered() == o.entered() && self.changed() == o.changed() && self.left == o.left
+    }
+}
+
+/// Writes `(t, m, n)` as the `len`th entry of `list`, over an old entry when
+/// there is one (its need's buffers reused), else at the end.
+fn put(
+    list: &mut Vec<(TileId, Membership, Need)>,
+    len: &mut usize,
+    t: TileId,
+    m: Membership,
+    n: &Need,
+) {
+    match list.get_mut(*len) {
+        Some(e) => {
+            e.0 = t;
+            e.1 = m;
+            e.2.clone_from(n);
+        }
+        None => list.push((t, m, n.clone())),
+    }
+    *len += 1;
 }
 
 /// One tile's last word in a [`NeedDelta`].
@@ -188,11 +250,13 @@ impl NeedDelta {
         d
     }
 
-    /// Becomes what changed from `before` to `after`, in its own buffers.
-    /// The tiles come in order, each tile's entries in the need's order.
+    /// Becomes what changed from `before` to `after`, in its own buffers:
+    /// nothing allocated once they have grown to the view (an entry's need
+    /// is copied over an earlier delta's, its layers' buffer reused). The
+    /// tiles come in order, each tile's entries in the need's order.
     pub fn diff(&mut self, before: &NeedSet, after: &NeedSet) {
         self.clear();
-        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let (mut a, mut b) = std::mem::take(&mut self.grouped);
         before.grouped_into(&mut a);
         after.grouped_into(&mut b);
         let run = |g: &[(TileId, u32)], i: usize| {
@@ -221,7 +285,7 @@ impl NeedDelta {
                     if !same {
                         for e in &b[j..jb] {
                             let (m, t, n) = entry(after, e.1);
-                            self.changed.push((t, m, n.clone()));
+                            put(&mut self.changed, &mut self.changed_len, t, m, n);
                         }
                     }
                     (i, j) = (ia, jb);
@@ -234,24 +298,27 @@ impl NeedDelta {
                     let jb = run(&b, j);
                     for e in &b[j..jb] {
                         let (m, t, n) = entry(after, e.1);
-                        self.entered.push((t, m, n.clone()));
+                        put(&mut self.entered, &mut self.entered_len, t, m, n);
                     }
                     j = jb;
                 }
             }
         }
+        self.grouped = (a, b);
     }
 
     /// `tile` entered the need, with these entries.
     pub fn enter(&mut self, tile: TileId, entries: impl IntoIterator<Item = (Membership, Need)>) {
-        self.entered
-            .extend(entries.into_iter().map(|(m, n)| (tile, m, n)));
+        for (m, n) in entries {
+            put(&mut self.entered, &mut self.entered_len, tile, m, &n);
+        }
     }
 
     /// `tile`'s entries changed: these are all of them now.
     pub fn change(&mut self, tile: TileId, entries: impl IntoIterator<Item = (Membership, Need)>) {
-        self.changed
-            .extend(entries.into_iter().map(|(m, n)| (tile, m, n)));
+        for (m, n) in entries {
+            put(&mut self.changed, &mut self.changed_len, tile, m, &n);
+        }
     }
 
     /// `tile` left the need.
@@ -259,26 +326,27 @@ impl NeedDelta {
         self.left.push(tile);
     }
 
-    /// No change, its buffers kept.
+    /// No change, its buffers kept (the entries' needs too, for their
+    /// layers' buffers: the next change writes over them).
     pub fn clear(&mut self) {
-        self.entered.clear();
-        self.changed.clear();
+        self.entered_len = 0;
+        self.changed_len = 0;
         self.left.clear();
     }
 
     /// Whether nothing changed.
     pub fn is_empty(&self) -> bool {
-        self.entered.is_empty() && self.changed.is_empty() && self.left.is_empty()
+        self.entered_len == 0 && self.changed_len == 0 && self.left.is_empty()
     }
 
     /// The entries of the tiles that entered.
     pub fn entered(&self) -> &[(TileId, Membership, Need)] {
-        &self.entered
+        &self.entered[..self.entered_len]
     }
 
     /// The entries, all of them now, of the tiles that changed.
     pub fn changed(&self) -> &[(TileId, Membership, Need)] {
-        &self.changed
+        &self.changed[..self.changed_len]
     }
 
     /// The tiles that left.
@@ -294,7 +362,7 @@ impl NeedDelta {
                 .filter(|(i, e)| *i == 0 || l[i - 1].0 != e.0)
                 .count()
         };
-        runs(&self.entered) + runs(&self.changed) + self.left.len()
+        runs(self.entered()) + runs(self.changed()) + self.left.len()
     }
 
     /// Applies it to `need`: the whole need it leads to. Each tile it names
@@ -322,8 +390,8 @@ impl NeedDelta {
     pub(crate) fn sorted_ops(&self) -> Option<impl Iterator<Item = (TileId, DeltaOp)> + '_> {
         let sorted = |l: &[(TileId, Membership, Need)]| l.windows(2).all(|w| w[0].0 <= w[1].0);
         let ok = self.left.windows(2).all(|w| w[0] < w[1])
-            && sorted(&self.entered)
-            && sorted(&self.changed);
+            && sorted(self.entered())
+            && sorted(self.changed());
         if !ok {
             return None;
         }
@@ -336,7 +404,7 @@ impl NeedDelta {
     pub(crate) fn ops_into(&self, out: &mut Vec<(TileId, DeltaOp)>) {
         out.clear();
         out.extend(self.left.iter().map(|t| (*t, DeltaOp::Leave)));
-        for (list, l) in [(0u8, &self.entered), (1, &self.changed)] {
+        for (list, l) in [(0u8, self.entered()), (1, self.changed())] {
             let mut i = 0;
             while i < l.len() {
                 let t = l[i].0;
@@ -369,9 +437,9 @@ impl NeedDelta {
             DeltaOp::Leave => &[],
             DeltaOp::Set { list, start, end } => {
                 let l = if list == 0 {
-                    &self.entered
+                    self.entered()
                 } else {
-                    &self.changed
+                    self.changed()
                 };
                 let at = |x: u32| usize::try_from(x).unwrap_or(usize::MAX).min(l.len());
                 &l[at(start)..at(end)]
@@ -406,10 +474,11 @@ impl Iterator for Words<'_> {
     type Item = (TileId, DeltaOp);
 
     fn next(&mut self) -> Option<Self::Item> {
+        let (entered, changed) = (self.d.entered(), self.d.changed());
         let heads = [
             self.d.left.get(self.l).copied(),
-            self.d.entered.get(self.e).map(|x| x.0),
-            self.d.changed.get(self.c).map(|x| x.0),
+            entered.get(self.e).map(|x| x.0),
+            changed.get(self.c).map(|x| x.0),
         ];
         let t = heads.iter().flatten().min().copied()?;
         self.clash |= heads.iter().filter(|h| **h == Some(t)).count() > 1;
@@ -420,7 +489,7 @@ impl Iterator for Words<'_> {
             self.l += 1;
             (t, DeltaOp::Leave)
         } else if heads[1] == Some(t) {
-            let end = run(&self.d.entered, self.e);
+            let end = run(entered, self.e);
             let op = DeltaOp::Set {
                 list: 0,
                 start: sat(self.e),
@@ -429,7 +498,7 @@ impl Iterator for Words<'_> {
             self.e = end;
             (t, op)
         } else {
-            let end = run(&self.d.changed, self.c);
+            let end = run(changed, self.c);
             let op = DeltaOp::Set {
                 list: 1,
                 start: sat(self.c),
@@ -742,6 +811,44 @@ mod tests {
         let mut x = a.clone();
         d.apply_to(&mut x);
         assert_eq!(canon(&x), canon(&b));
+    }
+
+    /// A delta built again says only what changed since: its entries are
+    /// written over the earlier delta's (their buffers kept), and those
+    /// beyond this change are not its. Red with the earlier entries still
+    /// listed.
+    #[test]
+    fn a_delta_built_again_says_only_what_changed_since() {
+        let a = need();
+        let mut b = need();
+        for (_, n) in b.drawn.iter_mut().chain(b.ring.iter_mut()) {
+            n.sse_excess = 3.0;
+        }
+        b.blockers
+            .push((tile(13), Need::new(3, Class::TerrainMesh)));
+        let mut d = NeedDelta::new();
+        d.diff(&a, &b);
+        let (entered, changed) = (d.entered().len(), d.changed().len());
+        assert!(
+            entered > 0 && changed > 1,
+            "{entered} entered, {changed} changed"
+        );
+        // Nothing changed: the delta says so, whatever it said before.
+        d.diff(&a, &a);
+        assert!(d.is_empty());
+        assert_eq!((d.tiles(), d.entered().len(), d.changed().len()), (0, 0, 0));
+        // One change: the delta is that change alone.
+        let mut c = need();
+        c.ancestors[0].1.level = 9;
+        d.diff(&a, &c);
+        assert_eq!(d.tiles(), 1);
+        assert_eq!(d.entered(), &[]);
+        assert_eq!(d.changed().len(), 1);
+        assert_eq!(d.changed()[0].0, tile(3));
+        assert_eq!(d, NeedDelta::between(&a, &c), "built again, the same delta");
+        let mut applied = a.clone();
+        d.apply_to(&mut applied);
+        assert_eq!(canon(&applied), canon(&c));
     }
 
     /// By hand, a tile's last word counts: left, then entered, then
