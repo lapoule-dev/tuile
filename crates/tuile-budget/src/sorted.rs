@@ -37,6 +37,11 @@ pub(super) const BLOCK: usize = 32;
 /// Two neighbours holding this many entries or fewer become one block.
 const MERGE: usize = BLOCK - BLOCK / 8;
 
+/// Emptied blocks a map keeps for its next split: one (none: a merge then
+/// a split allocate, motion's p99 36 against 30 blocks a step; more: room
+/// held for nothing).
+const POOL: usize = 1;
+
 /// A block: its keys and its values, as two columns at the same places —
 /// a search reads the keys alone, a dense column, however large the values.
 #[derive(Clone, Debug)]
@@ -481,8 +486,8 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
     }
 
     /// Removes `k`; returns its value. Costs the entries it shifts in its
-    /// block, and a merge's entries and the index's when its block falls
-    /// under half a block with a neighbour.
+    /// block, and a merge's entries and the index's when its block and a
+    /// neighbour fit in [`MERGE`] entries.
     pub fn remove(&mut self, k: &K) -> Option<V> {
         let (b, Ok(i)) = self.find(k)? else {
             return None;
@@ -495,7 +500,7 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
             return Some(v);
         }
         self.heads[b] = self.blocks[b].head();
-        // Two neighbours that fit in half a block become one.
+        // Two neighbours that fit in 7/8 of a block become one.
         let fits = MERGE;
         if b + 1 < self.blocks.len() && self.blocks[b].len() + self.blocks[b + 1].len() <= fits {
             self.merge(b);
@@ -520,16 +525,9 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
         let mut blk = self.blocks.remove(b);
         self.heads.remove(b);
         blk.clear();
-        if self.pool.len() < self.pool_room() {
+        if self.pool.len() < POOL {
             self.pool.push(blk);
         }
-    }
-
-    /// The pool's bound: one block (none: a merge then a split allocate,
-    /// motion's p99 36 against 30 blocks a step; more: room held for
-    /// nothing).
-    fn pool_room(&self) -> usize {
-        1
     }
 
     /// Empties the map, its blocks kept in the pool.
@@ -563,7 +561,7 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
             self.len += 1;
             self.kept(1);
         }
-        let room = self.pool_room();
+        let room = POOL;
         self.pool.truncate(room);
     }
 
@@ -615,9 +613,9 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
         trim(changes, used);
     }
 
-    /// The map's invariants: blocks sorted and chained, none empty or over
-    /// a block, the index their first keys, neighbours over half a block
-    /// between them, the length their sum.
+    /// The map's invariants: keys sorted across the blocks, no block empty
+    /// or over [`BLOCK`], each block's two columns of one length, the index
+    /// their first keys, the length their sum.
     #[cfg(test)]
     fn consistent(&self) -> bool {
         let sorted = self.keys().zip(self.keys().skip(1)).all(|(a, b)| a < b);

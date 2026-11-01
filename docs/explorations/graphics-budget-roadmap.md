@@ -288,8 +288,10 @@ each fail a scenario of their own in `budget_core` (`dirty_sets::*`, on the deci
 recomputation's check in debug); the drapes' also diverges from the recorded digests on 34 of 60 `budget_sim`
 runs. Resource events: 20 `budget_core` tests and 54 of 60 runs. The deadline queues: a load's timeout (one
 `budget_core` test, 6 runs), the retry/backoff wake (3 tests, 42 runs), the prune's re-look when a kept slot's
-want goes (48 runs). One rule has no red: units that read their own tile's last item are read again when it
-changed; no input of the suites needs it (the item is a fixed point of the layer switch), and it stays.
+want goes (48 runs). The worn rule (units that read a tile's last item are read again when it changed) has its
+own scenario since the debt pass: a tile's selection reads the drapes an ancestor's mesh wore last step.
+
+First measured at 1265049b, before the debt pass below:
 
 | Measure (Apple M2, shared; best of 5 interleaved rounds, mean / p99 µs) | main (#170) | O1.4 |
 |---|---|---|
@@ -308,17 +310,31 @@ changed; no input of the suites needs it (the item is a fixed point of the layer
 | P6.4 `work`, still view (mean / worst) | 16 524 / 19 329 | 9 / 5 409 |
 | P6.4 `work`, tour (mean / worst) | 18 453 / 25 194 | 5 297 / 12 990 |
 
-Load average 9–39 during the rounds; the pressure p99 moves within the rounds' spread. M-run (`p2-slow`, Off,
-three interleaved runs each, load about 12): imagery peak 172.7 → 172.3 MB, every upload landed 0.8 → 1.0 s,
-frame p50 40 → 39 ms, frame p99 67 → 78 ms (per run 62–113 for `main`, 66–90 for O1.4: the machine's noise, the
-budget's `decide` being under a millisecond of frames of tens), obligations kept ×3 on both, no black pixel and no
-hole in any run, the six settled pictures opened. M-web not run: a wasm build and a 25-minute run on a machine at
-load 40–90 from other jobs.
+Load average 9–39 during the rounds; the pressure p99 moves within the rounds' spread.
 
-Not in O1.4, listed for O1.5: the ranking re-keys every job each step (a job's score ages with time); the kept
-sorted vectors' upkeep (a batch merged into a vector of the view's size) is not counted in `work`; the host's diff
-clones every changed tile's `Need` (about 640 heap blocks a step on the tour); the runtime's presence index does not
-tell a generation (`PresenceOracle::generation`), so the levels that asked it are read again every step there.
+**O1.4's debt pass** (PR #175, 2026-11-01). The worn rule got its red scenario; the session's presence oracle
+tells a generation (answers kept per one-second window or loader epoch, so a still view reads no level again
+within a window); the prune's cycle path has a test; `check_marks` reads the pass's own swap and chain rule. The
+sorted vectors' upkeep is now counted in `work`, and two changes keep P6.4 green with it: the held ancestry is the
+held set itself — geometric walks filed by a Morton key whose quadtree descendants are one interval, the others
+apart and walked — instead of its closure (~3 000 pairs, ~18 rewritten per held change); and the kept maps are
+sorted blocks of 32 entries (keys and values as two columns, an index of first keys, a one-block fast path, a
+cached last block, one spare block), each counting what it shifts. P6.4's #E_k counts the decisions of the step
+before as well (their effect is read one step later, as an event's). Cost on x86 (16 reserved EPYC-Milan CPUs,
+against the held-set commit): decide means +3–5 %, +21 % on the whole-need resync (still-full 367 → 443 µs), p99s
+6–9 % lower; arm64 at parity but for the resync (+4–7 %). Ratchets once: bytes per tracked resource 467 → 455
+(470 on `main`), step buffers after the tour 244 216 → 236 688 B (340 096 on `main`), allocations p99 31 → 30.
+
+M-run (`p2-slow`, Off, Mac, load 4–8, five interleaved runs, at a920e258): imagery peak 170.2 MB (`main`) against
+171.3, converged 0.57 against 0.60 s, slowest frame 63 ms (59–65) against 63 (55–67), median frame 35 against
+35 ms, no black pixel and no hole. M-web (WebGPU auto, WebGL2 auto, off; load 5–8, at c9572f88, before the
+held-set and block commits, whose decisions are digest-identical — convergence and holes follow the decisions,
+the page's timings are not re-measured): patterns kept 6/8/10 on `main` against 10/9/10, no hole or black patch
+on either; the one O1.4 violation is WebGL2 yaw converging in 22.1 s against 20 s.
+
+Not in O1.4, listed for O1.5: the ranking re-keys every job each step (a job's score ages with time); the host's
+diff clones every changed tile's `Need` (about 640 heap blocks a step on the tour); the whole-need resync pays a
+lookup per tile in the blocks (still-full +21 % on x86, a cursor merge would bring it back).
 
 Order is strict: A before B, B before C. Every step of A, B and C goes through the same battery before
 the next starts — tests seen red, mutants killed, the reference model extended, Kani proofs of its

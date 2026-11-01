@@ -761,11 +761,11 @@ fn need_delta(before: &NeedSet, after: &NeedSet) -> u64 {
 /// steps' work unexplained (2 still steps over the bound once the maps'
 /// upkeep was counted).
 ///
-/// `work` includes what keeping the kept maps in order costs: each
-/// structural change (a key added or removed) at the B-tree's bound, its
-/// path, and every pass over a whole map entry by entry (`sorted.rs`). So
-/// for single changes the bound checks how many there are; what could grow
-/// with the view — whole passes — is counted as it is walked.
+/// `work` includes what keeping the kept maps in order costs, as the
+/// sorted blocks count it (`sorted.rs`): the entries a change shifts in its
+/// block, those a split, a redistribution or a merge moves, the index's
+/// entries shifted when a block comes or goes, and every entry of a pass
+/// over a whole map. Nothing an ordered map does is left out of it.
 ///
 /// `work` counts every element a step walks, the passes after the need
 /// included (drape levels, selection, draw set, wants, ranking, marks,

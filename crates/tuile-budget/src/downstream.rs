@@ -37,10 +37,10 @@
 //! cadence but walks only the slots emptied since or whose time fell due,
 //! the recent evictions in time order, and the tiles its counts of what keeps
 //! each (`Support`) let go. A step's `work` counts the units read and what
-//! each walked. The results live in sorted vectors changed by each
-//! pass's batch of changes in one merge — nothing allocated once they have
-//! grown, the draw items' buffers recycled — whose upkeep is not counted, as
-//! the need's (O1.3). In a debug build every pass is read again whole, from
+//! each walked. The results live in ordered maps of sorted blocks
+//! (`sorted`) changed by each pass's batch of changes — nothing allocated
+//! once they have grown, the draw items' buffers recycled — each counting
+//! what keeping its order costs into `work`. In a debug build every pass is read again whole, from
 //! scratch, and compared (the `check_*` functions): a dependant left out of
 //! the rules above shows there first.
 
@@ -2902,10 +2902,10 @@ impl Budget {
             );
             // After a time gone back, the older group may hold what is
             // needed (the next step touches it all).
-            if self.down.touch_all {
-            } else if w.is_some() || drawn {
+            let needed = w.is_some() || drawn;
+            if !self.down.touch_all && needed {
                 assert!(a.is_newest(s), "{r:?}, needed now, is of the newest group");
-            } else if a.is_newest(s) {
+            } else if !self.down.touch_all && a.is_newest(s) {
                 assert!(
                     self.down.departed.contains(&r),
                     "{r:?}, of the newest group but not needed, is to leave it"

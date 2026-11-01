@@ -77,7 +77,8 @@ fn still() -> (u64, u64, u32, u64) {
 /// so that a search reads the keys alone (a second vector header, ~24 B,
 /// for each of ~300 blocks). Over the change that made the ancestry the
 /// held set (467 -> 429, 244 216 -> 234 360), the net over #175 is
-/// 467 -> 455 and 244 216 -> 236 688.
+/// 467 -> 455 and 244 216 -> 236 688; against `main` before O1.4 (#170),
+/// 470 -> 455 and 340 096 -> 236 688.
 fn motion() -> (u64, i64, i64, usize) {
     let mut sim = Sim::new(Profile::desktop(), 11);
     sim.count_output = true;
