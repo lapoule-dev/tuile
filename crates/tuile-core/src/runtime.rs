@@ -787,6 +787,7 @@ impl PresenceOracle for Presences<'_> {
             Some(p) => p,
             None => {
                 let p = self.loader.holds(r);
+                crate::metrics::metrics().presence_answers.inc();
                 self.kept.borrow_mut().insert(r, p);
                 p
             }
