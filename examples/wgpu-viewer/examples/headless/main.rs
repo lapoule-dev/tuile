@@ -41,6 +41,7 @@
 //! | `--imagery-compression C` | `off` (the default), `auto`, `bc7` or `astc`: how imagery is held on the GPU |
 //! | `--pictures DIR` | where each run's last picture goes, once settled: `<pattern>.png`, eye 0 |
 //! | `--idle S` | after settling, wait up to `S` seconds for every load and upload to land (drapes included, which the settling does not see), and say how long it took |
+//! | `--hold S` | then keep the view still for `S` seconds more, logged: what a still view costs |
 //!
 //! A run's log flies again in the application: `TUILE_REPLAY=<log>.mcap`.
 
@@ -56,7 +57,7 @@ use tuile_viewer::control::{
 
 const USAGE: &str = "headless list
 headless run <pattern|all> [--device D] [--hz N] [--memory-gib N] [--watch S] [--logs DIR] [--json PATH]
-             [--imagery-compression off|auto|bc7|astc] [--pictures DIR] [--idle S]
+             [--imagery-compression off|auto|bc7|astc] [--pictures DIR] [--idle S] [--hold S]
 
 The patterns ask the real catalog: TUILE_ION_TOKEN must be set. See the source's documentation.";
 
@@ -68,6 +69,7 @@ struct Asked {
     compression: ImageryCompression,
     pictures: Option<PathBuf>,
     idle: Option<f64>,
+    hold: Option<f64>,
 }
 
 fn device(name: &str, memory_gib: Option<f64>) -> Result<Device, String> {
@@ -150,6 +152,7 @@ fn read(args: &[String]) -> Result<Option<Asked>, String> {
             "--imagery-compression",
             "--pictures",
             "--idle",
+            "--hold",
         ]
         .contains(key)
         {
@@ -167,6 +170,7 @@ fn read(args: &[String]) -> Result<Option<Asked>, String> {
             .map_or(Ok(ImageryCompression::Off), |name| compression_named(name))?,
         pictures: flags.get("--pictures").map(PathBuf::from),
         idle: number("--idle")?,
+        hold: number("--hold")?,
     }))
 }
 
@@ -210,6 +214,7 @@ fn play(
     compression: ImageryCompression,
     pictures: Option<&Path>,
     idle: Option<f64>,
+    hold: Option<f64>,
 ) -> Result<Outcome, String> {
     let dir = place()?;
     let log = logs.join(format!("{}.mcap", pattern.key));
@@ -253,6 +258,11 @@ fn play(
             Ok(seconds) => println!("  idle {seconds:.1} s after settling"),
             Err(seconds) => println!("  NOT idle {seconds:.1} s after settling"),
         }
+    }
+    // A still view, for as long as asked: nothing it holds ends the wait.
+    if let Some(bound) = hold {
+        let held = run.wait_until(bound, |_| false).unwrap_or_else(|s| s);
+        println!("  held still {held:.1} s");
     }
     // The settled picture, as the run's own offscreen eye drew it.
     if let Some(dir) = pictures {
@@ -347,6 +357,7 @@ fn main() {
             asked.compression,
             asked.pictures.as_deref(),
             asked.idle,
+            asked.hold,
         ) {
             Ok(outcome) => outcome,
             Err(why) => {
