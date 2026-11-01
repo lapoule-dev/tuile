@@ -999,6 +999,42 @@ mod tiers {
         );
     }
 
+    /// C10, C4: the decoded tier's target follows `retarget` like the GPU
+    /// limits do. A device whose available memory halves keeps half the
+    /// decoded copies, not the configured quarter of a GPU it no longer
+    /// has: the copies demoted by evictions are tracked state, and a
+    /// budget retargeted to a fraction of its device would otherwise hold
+    /// the whole configured tier of them.
+    #[test]
+    fn the_decoded_tier_is_retargeted_with_the_gpu_limits() {
+        let mut c = small(1);
+        c.decoded_target = Bytes(MESH.0 * 8);
+        let mut r = Rig::new(c);
+        for x in 0..6 {
+            r.settle(&drawn(&[t(3, x, 0)]), 10);
+        }
+        let full = r.b.ledger().decoded;
+        assert!(full > Bytes(MESH.0 * 4), "{RED}: {full:?} decoded");
+        // Half the device (the configuration is 512 MiB in all).
+        r.b.retarget(Bytes::mib(256));
+        let d = r.step(&drawn(&[t(3, 5, 0)]));
+        let half = r.b.ledger().decoded;
+        assert!(
+            half <= Bytes(MESH.0 * 4),
+            "{RED}: {half:?} decoded after retargeting to half, target {:?}",
+            Bytes(MESH.0 * 4)
+        );
+        assert_eq!(d.stats.decoded, half);
+        assert!(d.release.len() >= 2, "{RED}: {} released", d.release.len());
+        // Retargeted back, the tier grows again to what it is configured.
+        r.b.retarget(Bytes::mib(512));
+        for x in 6..9 {
+            r.settle(&drawn(&[t(3, x, 0)]), 10);
+        }
+        assert!(r.b.ledger().decoded > Bytes(MESH.0 * 4), "{RED}");
+        assert!(r.b.ledger().decoded <= Bytes(MESH.0 * 8), "{RED}");
+    }
+
     /// I15: a stored tile is read locally, without a network slot.
     #[test]
     fn a_stored_tile_is_read_locally_without_a_network_slot() {

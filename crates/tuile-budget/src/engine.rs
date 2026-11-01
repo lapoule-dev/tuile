@@ -494,11 +494,10 @@ impl Budget {
                 }
             }),
             hard,
-            decoded: if self.cfg.decoded_target == Bytes::MAX {
-                Bytes::MAX
-            } else {
-                self.cfg.decoded_target.scaled(pct, 100)
-            },
+            // The decoded tier is a target like the GPU's: retargeted with
+            // them and scaled by pressure. The copies an eviction demotes
+            // to are tracked state, bounded by this.
+            decoded: scale(self.cfg.decoded_target, pct),
             quota: PerClass::from_fn(|c| (self.cfg.max_in_flight[c] / thermal_div).max(1)),
             local: self.cfg.max_local_reads,
             upload: if self.cfg.upload_bytes_per_frame == Bytes::MAX {

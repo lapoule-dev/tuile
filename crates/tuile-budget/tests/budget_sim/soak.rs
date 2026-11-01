@@ -33,13 +33,71 @@ pub fn under_pressure(sim: &mut Sim) {
 }
 
 /// The pressure scenario's camera: the tour's orbit (its first minute, a
-/// full turn, so it loops without a jump), forever. The tour's zoom-out under
-/// [`pressure_profile`] breaks the simulation's I7 bound on tracked state
-/// (at t ≈ 105 s: 1 968 tracked, bound 1 284 — the bound does not count the
-/// decoded copies an eviction demotes to), a finding left to the eviction
-/// work (O1.2, B), not to the baseline.
+/// full turn, so it loops without a jump), forever. The whole tour under
+/// pressure is [`the_tour_under_pressure_keeps_its_tracked_state_bounded`].
 pub fn pressure_tour(t: f64) -> Camera {
     tour(t % 60.0)
+}
+
+/// I7 under memory pressure: the whole tour, not looped — its pan and its
+/// zoom-out shed what the orbit loaded — on [`pressure_profile`] retargeted
+/// to [`PRESSURE_MIB`], every invariant checked. The decoded tier follows the
+/// retarget as the GPU limits do: the copies an eviction demotes to are
+/// bounded by a tier sized to the device the budget runs on (a quarter of
+/// it, as `BudgetConfig::interactive` configures the tier), not to the one
+/// configured. Before that, a 384 MiB budget kept the configured 512 MiB of
+/// demoted copies, every one a tracked resource, and the tracked state broke
+/// I7 at t ≈ 105 s (1 968 tracked, bound 1 284).
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
+fn the_tour_under_pressure_keeps_its_tracked_state_bounded() {
+    let mut sim = Sim::new(pressure_profile(), 11);
+    under_pressure(&mut sim);
+    let decoded_target = Bytes::mib(PRESSURE_MIB / 4);
+    let end = Micros::from_secs(180);
+    let mut report = Micros::from_secs(15);
+    let (mut tracked_max, mut decoded_max) = (0u32, Bytes::ZERO);
+    // Evictions, decoded releases, local re-reads within 10 s of an
+    // eviction, network re-fetches within 10 s of one: what the tier costs.
+    let (mut evicted, mut released, mut rereads, mut thrash) = (0u64, 0u64, 0u64, 0u64);
+    while sim.now < end {
+        let t = sim.now.0 as f64 / 1e6;
+        let (_, d) = sim.step(tour(t));
+        let decoded = sim.budget.ledger().decoded;
+        // Copies in transit to the GPU are not released; everything else
+        // over the tier's target is, within the step.
+        assert!(
+            decoded <= decoded_target.plus(d.stats.in_transit),
+            "I7: {decoded:?} decoded at t = {t:.1} s, the tier's target {decoded_target:?} \
+             ({:?} in transit)",
+            d.stats.in_transit
+        );
+        tracked_max = tracked_max.max(d.stats.tracked);
+        decoded_max = decoded_max.max(decoded);
+        evicted += u64::from(d.stats.evicted);
+        released += u64::from(d.stats.released);
+        rereads += u64::from(d.stats.rereads);
+        thrash += u64::from(d.stats.thrash);
+        if sim.now >= report {
+            eprintln!(
+                "pressure tour ({PRESSURE_MIB} MiB) t = {t:.0} s: tracked {}, decoded {:.1} MB, \
+                 evicted {evicted}, released {released}, re-read {rereads}, thrash {thrash}",
+                d.stats.tracked,
+                decoded.0 as f64 / 1e6
+            );
+            report = report.plus(Micros::from_secs(15));
+        }
+    }
+    eprintln!(
+        "pressure tour ({PRESSURE_MIB} MiB): tracked at most {tracked_max}, decoded at most \
+         {:.1} MB, evicted {evicted}, released {released}, re-read {rereads}, thrash {thrash}, \
+         {} steps",
+        decoded_max.0 as f64 / 1e6,
+        sim.log.len()
+    );
 }
 
 /// A tour that orbits, pans, zooms and turns, looping every four minutes.

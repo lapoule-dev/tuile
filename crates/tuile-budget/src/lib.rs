@@ -362,8 +362,9 @@ impl Budget {
         self.pressure = p;
     }
 
-    /// Re-derives every class's target, overflow and hard limit from a new
-    /// total, keeping the configured split: the host calls it when the
+    /// Re-derives every class's target, overflow and hard limit, and the
+    /// decoded tier's target, from a new total, keeping the configured
+    /// split: the host calls it when the
     /// platform's available memory changes (`os_proc_available_memory`,
     /// `VK_EXT_memory_budget`, an Android `onTrimMemory` level, a browser's
     /// device-memory hint). The budget itself knows no platform. Takes effect

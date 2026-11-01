@@ -129,13 +129,14 @@ clocks) and 25 µs, of which the step's grouped candidates, sorted, about 16. Wh
 need, the draw set and the ranking (O1.3–O1.5). Allocations under pressure: the median step halves; the p99 is
 one block higher (73 → 74), the decoded release now collecting the kept copies and the grouped holders apart.
 
-The pressure scenario's I7 break, explained (not fixed: behaviour is frozen through O1): at t ≈ 105 s of the
-unlooped tour under `pressure_profile`, 1 336 of the 1 929 tracked resources hold only a decoded copy (no GPU
-copy, nothing in transit or loading; 984 of them not wanted), and the decoded tier sits at 534 MB, just under its
-512 MiB target. That target is `BudgetConfig::interactive`'s quarter of the configured GPU total (2 GiB), and
-`retarget` does not scale it: `eff()` scales the decoded target by pressure only, not by the retarget factor.
-So on a 384 MiB budget the decoded tier still keeps 512 MiB of copies demoted by evictions, and every one of
-them is a tracked resource that the simulation's I7 bound (GPU-drawable + pending + need) does not count.
+The pressure scenario's I7 break, explained (left as found through O1, where behaviour was frozen; fixed after
+O1.4 — see *The decoded tier retargeted* below): at t ≈ 105 s of the unlooped tour under `pressure_profile`,
+1 336 of the 1 929 tracked resources held only a decoded copy (no GPU copy, nothing in transit or loading; 984
+of them not wanted), and the decoded tier sat at 534 MB, just under its 512 MiB target. That target is
+`BudgetConfig::interactive`'s quarter of the configured GPU total (2 GiB), and `retarget` did not scale it:
+`eff()` scaled the decoded target by pressure only, not by the retarget factor. So on a 384 MiB budget the
+decoded tier still kept 512 MiB of copies demoted by evictions, and every one of them is a tracked resource that
+the simulation's I7 bound (GPU-drawable + pending + need) does not count.
 
 **O1.3 — need deltas** (`perf/budget-o1-need-deltas`). The need no longer arrives whole each step to be sorted,
 deduplicated and reinserted (O(N log N) for a still view). `NeedDelta` (in `tuile-budget`) says what changed
@@ -352,6 +353,24 @@ before); 7 of 3 600 steps are over it, none of them the compaction — five stil
 (W 308–414 against 256, nothing changing) and the two pressure switches (W 4 416 and 2 072: a pressure change
 reads every unit again, which P6.4's #E does not count) — a finding outside P6.4's two runs, left as is. The soak,
 the tour, the pressure scenario and P6.4's run never compact.
+
+**The decoded tier retargeted** (stacked on the arena's room; the stack's one deliberate behaviour change). `eff()`
+scaled the decoded tier's target by the pressure percentage only, not by the `retarget` factor applied to every
+GPU target, overflow and hard limit: a budget configured for a 2 GiB device and retargeted to 384 MiB kept the
+configured 512 MiB of decoded copies — the copies an eviction demotes to, every one a tracked resource — and the
+simulation's I7 bound on tracked state broke on the tour under `pressure_profile` (above). The tier is now a
+target like the GPU's, `scale(decoded_target, pct)`: retargeted and scaled by pressure, `Bytes::MAX` left alone.
+Red first: `the_decoded_tier_is_retargeted_with_the_gpu_limits` (six meshes decoded on a tier of eight, the
+device retargeted to half: 614 400 B kept against 409 600) and
+`the_tour_under_pressure_keeps_its_tracked_state_bounded` (the whole tour, 180 s, on 384 MiB of 2 GiB, every
+invariant checked, the tier bounded by its retargeted target plus the copies in transit every step: red on the
+tier at t = 0.3 s, and on the simulation's own I7 at t = 105.55 s with that assertion out). On the pressure tour:
+the decoded tier 534 MB → at most 100.7 MB (96 MiB plus copies in transit), tracked at most 1 339 (1 968 before,
+at t = 105 s), evictions over the first 105 s 5 078 → 5 997, decoded releases 8 129 → 83 091, 3 049 re-reads from
+the store within 10 s of an eviction over the run, no network re-fetch. The looped pressure scenario: over target
+on 2 883 of 3 000 steps (2 879), evicting on 688 (551), 537 tracked (1 178). Recorded digests re-blessed for the
+one run that retargets (`the_pressure_scenario_stays_over_target`) and the new run added; every other run, the
+goldens and the pattern goldens byte-identical; ratchets untouched.
 
 Not in O1.4, listed for O1.5: the ranking re-keys every job each step (a job's score ages with time); the host's
 diff clones every changed tile's `Need` (about 640 heap blocks a step on the tour); the whole-need resync pays a
