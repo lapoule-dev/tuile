@@ -104,7 +104,7 @@ impl TileLoader for Gated {
     fn store_changes(
         &self,
         since: u64,
-        asked: &[tuile_core::budget::ResourceId],
+        asked: &[(tuile_core::budget::ResourceId, tuile_core::budget::Presence)],
         touched: &mut Vec<tuile_core::budget::ResourceId>,
     ) -> u64 {
         self.inner.store_changes(since, asked, touched)

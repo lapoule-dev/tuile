@@ -320,21 +320,21 @@ impl MeshCache {
         self.map.get(&c).map(Arc::clone)
     }
 
-    /// Keeps `mesh` for `c`; `changed` hears of `c` when it is new here,
-    /// and of each tile let go to make room.
+    /// Keeps `mesh` for `c`; `changed` hears of `c` when it is new here
+    /// (kept), and of each tile let go to make room.
     fn put(
         &mut self,
         c: TileCoord,
         mesh: Arc<tuile_terrain::QuantizedMesh>,
-        changed: &mut dyn FnMut(TileCoord),
+        changed: &mut dyn FnMut(TileCoord, store_log::Way),
     ) {
         if self.map.insert(c, mesh).is_none() {
-            changed(c);
+            changed(c, store_log::Way::Kept);
             self.order.push_back(c);
             while self.order.len() > self.cap {
                 if let Some(old) = self.order.pop_front() {
                     self.map.remove(&old);
-                    changed(old);
+                    changed(old, store_log::Way::LetGo);
                 }
             }
         }
@@ -396,21 +396,21 @@ impl ImageryCache {
         self.map.get(c).map(Arc::clone)
     }
 
-    /// Keeps `tex` for `c`; `changed` hears of `c` when it is new here,
-    /// and of each tile let go to make room.
+    /// Keeps `tex` for `c`; `changed` hears of `c` when it is new here
+    /// (kept), and of each tile let go to make room.
     fn put(
         &mut self,
         c: ImageryCoord,
         tex: Arc<DecodedTexture>,
-        changed: &mut dyn FnMut(ImageryCoord),
+        changed: &mut dyn FnMut(ImageryCoord, store_log::Way),
     ) {
         if self.map.insert(c, tex).is_none() {
-            changed(c);
+            changed(c, store_log::Way::Kept);
             self.order.push_back(c);
             while self.order.len() > self.cap {
                 if let Some(old) = self.order.pop_front() {
                     self.map.remove(&old);
-                    changed(old);
+                    changed(old, store_log::Way::LetGo);
                 }
             }
         }
@@ -738,12 +738,19 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
     }
 
     /// Notes a change to what a drape's presence reads at imagery tile `c`:
-    /// decoded and kept or let go (`decoded`), or stored.
-    fn imagery_changed(&self, scheme: &raster::TilingScheme, c: ImageryCoord, decoded: bool) {
+    /// decoded (`decoded`) or stored, kept or let go.
+    fn imagery_changed(
+        &self,
+        scheme: &raster::TilingScheme,
+        c: ImageryCoord,
+        decoded: bool,
+        way: store_log::Way,
+    ) {
         self.changes.note(store_log::Change::Imagery {
             rect: scheme.tile_rect(c),
             level: c.level,
             decoded,
+            way,
         });
     }
 
@@ -763,11 +770,11 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         c: ImageryCoord,
         tex: Arc<DecodedTexture>,
     ) {
-        let mut changed: Vec<ImageryCoord> = Vec::new();
-        cache.put(c, tex, &mut |at| changed.push(at));
+        let mut changed = Vec::new();
+        cache.put(c, tex, &mut |at, way| changed.push((at, way)));
         let floor = FLOOR_LEVEL.max(scheme.minimum_level);
         let held = |t: ImageryCoord| cache.has(&t) || self.imagery.holds(t);
-        for at in changed {
+        for (at, way) in changed {
             let under = if at.level > floor {
                 let up = at.level - floor;
                 ImageryCoord {
@@ -779,7 +786,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                 at
             };
             if !(self.imagery.holds(at) && held(under)) {
-                self.imagery_changed(scheme, at, true);
+                self.imagery_changed(scheme, at, true, way);
             }
         }
     }
@@ -793,8 +800,9 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
     ) -> Result<tuile_core::fetch::Fetched<bytes::Bytes>, RasterError> {
         let before = self.imagery.holds(c);
         let fetched = self.imagery.fetch_tile_bytes(c).await;
-        if self.imagery.holds(c) != before {
-            self.imagery_changed(scheme, c, false);
+        let after = self.imagery.holds(c);
+        if after != before {
+            self.imagery_changed(scheme, c, false, store_log::Way::of(after));
         }
         fetched
     }
@@ -807,8 +815,10 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
     ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError> {
         let before = self.terrain.holds(c);
         let fetched = self.terrain.fetch_tile(c).await;
-        if self.terrain.holds(c) != before {
-            self.changes.note(store_log::Change::Mesh(c));
+        let after = self.terrain.holds(c);
+        if after != before {
+            self.changes
+                .note(store_log::Change::Mesh(c, store_log::Way::of(after)));
         }
         fetched
     }
@@ -1174,12 +1184,12 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         self.meshes
             .lock()
             .expect("mesh cache")
-            .put(coord, mesh, &mut |at| changed.push(at));
+            .put(coord, mesh, &mut |at, way| changed.push((at, way)));
         let known = self.availability.range_count() > 0;
-        for at in changed {
+        for (at, way) in changed {
             let available = !known || self.availability.is_available(at);
             if !(available && self.terrain.holds(at)) {
-                self.changes.note(store_log::Change::Mesh(at));
+                self.changes.note(store_log::Change::Mesh(at, way));
             }
         }
     }
@@ -1798,7 +1808,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
     fn store_changes(
         &self,
         since: u64,
-        asked: &[ResourceId],
+        asked: &[(ResourceId, Presence)],
         touched: &mut Vec<ResourceId>,
     ) -> u64 {
         self.store_events();
@@ -2513,7 +2523,7 @@ mod tests {
         cache.lock().expect("cache").put(
             deeper,
             Arc::new(DecodedTexture::from_rgba8(1, 1, vec![255, 255, 255, 255])),
-            &mut |_| {},
+            &mut |_, _| {},
         );
         assert_eq!(
             coarse_floor(&scheme, &rect, &cache),
@@ -2663,11 +2673,12 @@ mod tests {
         }
     }
 
-    /// The store events' answer about `asked` since `since`.
+    /// The store events' answer about `asked` (with the answers they were
+    /// given) since `since`.
     fn touched<T: tuile_terrain::TerrainSource + 'static, I: ImageryProvider + 'static>(
         loader: &PlanetaryLoader<T, I>,
         since: u64,
-        asked: &[ResourceId],
+        asked: &[(ResourceId, Presence)],
     ) -> Vec<ResourceId> {
         let mut out = Vec::new();
         loader.store_changes(since, asked, &mut out);
@@ -2694,17 +2705,29 @@ mod tests {
             kept > start,
             "keeping the drape's imagery is no store event"
         );
-        assert_eq!(touched(&loader, start, &[here, there]), vec![here]);
+        assert_eq!(
+            touched(
+                &loader,
+                start,
+                &[(here, Presence::Absent), (there, Presence::Absent)]
+            ),
+            vec![here]
+        );
         assert_eq!(loader.holds(here), Presence::Stored);
         futures_executor::block_on(loader.compose(far, LayerId(0), 9)).expect("drape");
         assert!(loader.store_events() > kept);
         assert!(
-            touched(&loader, kept, &[here, there]).contains(&here),
+            touched(
+                &loader,
+                kept,
+                &[(here, Presence::Stored), (there, Presence::Stored)]
+            )
+            .contains(&here),
             "letting the drape's imagery go is no event about it"
         );
         assert_eq!(loader.holds(here), Presence::Absent);
         assert_eq!(
-            touched(&loader, loader.store_events(), &[here, there]),
+            touched(&loader, loader.store_events(), &[(here, Presence::Stored)]),
             vec![]
         );
     }
@@ -2740,7 +2763,10 @@ mod tests {
         assert_eq!(loader.holds(asked[1]), Presence::Absent);
         let _ = futures_executor::block_on(loader.terrain_mesh(at));
         assert!(loader.store_events() > start);
-        assert_eq!(touched(&loader, start, &asked), asked[..2].to_vec());
+        assert_eq!(
+            touched(&loader, start, &asked.map(|r| (r, Presence::Absent))),
+            asked[..2].to_vec()
+        );
         assert_eq!(loader.holds(asked[0]), Presence::Stored);
         assert_eq!(loader.holds(asked[1]), Presence::Stored);
         // The source turns out to have level 4 too: the level-5 tile now
@@ -2753,7 +2779,12 @@ mod tests {
             loader.store_events() > seen,
             "availability revealed is no event"
         );
-        assert_eq!(touched(&loader, seen, &asked), vec![asked[1]]);
+        let answers = [
+            (asked[0], Presence::Stored),
+            (asked[1], Presence::Stored),
+            (asked[2], Presence::Absent),
+        ];
+        assert_eq!(touched(&loader, seen, &answers), vec![asked[1]]);
         assert_eq!(loader.holds(asked[1]), Presence::Absent);
         // A mesh decoded at a tile the store holds is no event; one decoded
         // where the store holds nothing touches what climbs to it.
@@ -2786,7 +2817,12 @@ mod tests {
         );
         loader.keep_mesh(TileCoord::new(4, 8, 4), quad());
         assert!(loader.store_events() > seen);
-        assert_eq!(touched(&loader, seen, &asked), vec![asked[1]]);
+        let answers = [
+            (asked[0], Presence::Stored),
+            (asked[1], Presence::Absent),
+            (asked[2], Presence::Absent),
+        ];
+        assert_eq!(touched(&loader, seen, &answers), vec![asked[1]]);
         assert_eq!(loader.holds(asked[1]), Presence::Stored);
     }
 

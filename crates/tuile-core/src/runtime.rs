@@ -806,7 +806,7 @@ struct PresenceCache {
     prune_at: usize,
     /// Step buffers: the answers' resources, those the events touched, the
     /// need's tiles.
-    keys: Vec<ResourceId>,
+    keys: Vec<(ResourceId, Presence)>,
     touched: Vec<ResourceId>,
     tiles: Vec<TileId>,
 }
@@ -833,7 +833,7 @@ impl PresenceCache {
             return;
         }
         self.keys.clear();
-        self.keys.extend(self.answers.keys().copied());
+        self.keys.extend(self.answers.iter().map(|(r, p)| (*r, *p)));
         self.touched.clear();
         self.seen = loader.store_changes(self.seen, &self.keys, &mut self.touched);
         let mut moved = false;
@@ -2881,12 +2881,12 @@ mod tests {
             fn store_changes(
                 &self,
                 since: u64,
-                asked: &[ResourceId],
+                asked: &[(ResourceId, Presence)],
                 touched: &mut Vec<ResourceId>,
             ) -> u64 {
                 let events = self.events.lock().expect("events");
                 let new = &events[(since as usize).min(events.len())..];
-                touched.extend(asked.iter().filter(|r| new.contains(r)));
+                touched.extend(asked.iter().map(|(r, _)| *r).filter(|r| new.contains(r)));
                 events.len() as u64
             }
         }
@@ -3076,12 +3076,12 @@ mod tests {
         fn store_changes(
             &self,
             since: u64,
-            asked: &[ResourceId],
+            asked: &[(ResourceId, Presence)],
             touched: &mut Vec<ResourceId>,
         ) -> u64 {
             let events = self.events.lock().expect("events");
             let new = &events[(since as usize).min(events.len())..];
-            touched.extend(asked.iter().filter(|r| new.contains(r)));
+            touched.extend(asked.iter().map(|(r, _)| *r).filter(|r| new.contains(r)));
             events.len() as u64
         }
     }

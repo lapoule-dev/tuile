@@ -236,8 +236,9 @@ pub trait TileLoader: Send + Sync {
         0
     }
 
-    /// Which of `asked` may answer [`holds`](TileLoader::holds) differently
-    /// since the store events numbered `since` (a count
+    /// Which of `asked` — resources, with the answer each was given — may
+    /// answer [`holds`](TileLoader::holds) differently since the store
+    /// events numbered `since` (a count
     /// [`store_events`](TileLoader::store_events) or this returned), pushed
     /// onto `touched`; returns the count up to which every event is
     /// accounted for, the `since` of the next call. **Synchronous, and
@@ -246,15 +247,16 @@ pub trait TileLoader: Send + Sync {
     /// Naming one that did not change costs one more `holds`; leaving out
     /// one that did leaves the budget a wrong hint. So a loader that cannot
     /// tell, or no longer remembers that far back, names every one (the
-    /// default).
+    /// default). The answers let a loader leave out what an event cannot
+    /// move: a store that only gained cannot make a held answer absent.
     fn store_changes(
         &self,
         since: u64,
-        asked: &[crate::budget::ResourceId],
+        asked: &[(crate::budget::ResourceId, crate::budget::Presence)],
         touched: &mut Vec<crate::budget::ResourceId>,
     ) -> u64 {
         let _ = since;
-        touched.extend_from_slice(asked);
+        touched.extend(asked.iter().map(|(r, _)| *r));
         self.store_events()
     }
 
@@ -524,7 +526,7 @@ impl TileLoader for CompositeLoader {
     fn store_changes(
         &self,
         since: u64,
-        asked: &[crate::budget::ResourceId],
+        asked: &[(crate::budget::ResourceId, crate::budget::Presence)],
         touched: &mut Vec<crate::budget::ResourceId>,
     ) -> u64 {
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -541,8 +543,8 @@ impl TileLoader for CompositeLoader {
                 mine.extend(
                     asked
                         .iter()
-                        .filter(|r| r.tile().tag() == tag)
-                        .map(|r| untagged(*r)),
+                        .filter(|(r, _)| r.tile().tag() == tag)
+                        .map(|(r, p)| (untagged(*r), *p)),
                 );
                 theirs.clear();
                 let at = l.store_changes(from, &mine, &mut theirs);
@@ -750,12 +752,12 @@ mod tests {
         fn store_changes(
             &self,
             since: u64,
-            asked: &[crate::budget::ResourceId],
+            asked: &[(crate::budget::ResourceId, crate::budget::Presence)],
             touched: &mut Vec<crate::budget::ResourceId>,
         ) -> u64 {
             let events = self.0.lock().expect("events");
             let new = &events[(since as usize).min(events.len())..];
-            touched.extend(asked.iter().filter(|r| new.contains(r)));
+            touched.extend(asked.iter().map(|(r, _)| *r).filter(|r| new.contains(r)));
             events.len() as u64
         }
     }
@@ -770,7 +772,8 @@ mod tests {
         let (a, b) = (Evented::default(), Evented::default());
         let loader = CompositeLoader::new(vec![Box::new(a.clone()), Box::new(b.clone())]);
         let mesh = |t: u64, tag: u8| ResourceId::Mesh(TileId(t).with_tag(tag));
-        let asked = [mesh(1, 0), mesh(2, 0), mesh(1, 1)];
+        let asked =
+            [mesh(1, 0), mesh(2, 0), mesh(1, 1)].map(|r| (r, crate::budget::Presence::Absent));
         let start = loader.store_events();
         a.0.lock()
             .expect("events")

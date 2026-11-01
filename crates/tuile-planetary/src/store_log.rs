@@ -21,16 +21,48 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
-use tuile_core::budget::ResourceId;
+use tuile_core::budget::{Presence, ResourceId};
 use tuile_core::raster::GeoRect;
 use tuile_terrain::{AvailabilityRange, TileCoord};
+
+/// Which way a change goes: a tile kept (decoded, or stored) or let go.
+///
+/// The answers are monotone in it: a tile kept can make an absent answer
+/// held and never the other way — a drape's floor only moves to a deeper
+/// decoded tile, a mesh's climb only stops sooner at a held one — and a
+/// tile let go the reverse. So a kept tile leaves the held answers alone,
+/// and a tile let go the absent ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Way {
+    Kept,
+    LetGo,
+}
+
+impl Way {
+    /// Kept when the tile is held after the change, let go when not.
+    pub(crate) fn of(held: bool) -> Self {
+        if held {
+            Way::Kept
+        } else {
+            Way::LetGo
+        }
+    }
+
+    /// Whether a change this way may move `answer`.
+    fn moves(self, answer: Presence) -> bool {
+        match self {
+            Way::Kept => answer == Presence::Absent,
+            Way::LetGo => answer == Presence::Stored,
+        }
+    }
+}
 
 /// One change to what the presence answers read.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Change {
     /// A decoded mesh kept or let go, or the terrain store's index changed,
     /// at this tile: a mesh whose climb reaches it may answer differently.
-    Mesh(TileCoord),
+    Mesh(TileCoord, Way),
     /// The availability grew by this range of tiles at this level: a mesh
     /// at or under one of them may now be read from a tile of its own climb
     /// rather than an ancestor's.
@@ -41,6 +73,7 @@ pub(crate) enum Change {
         rect: GeoRect,
         level: u32,
         decoded: bool,
+        way: Way,
     },
     /// Everything: the imagery served was switched.
     All,
@@ -137,13 +170,14 @@ impl StoreLog {
         log.count()
     }
 
-    /// Pushes onto `touched` those of `asked` the changes numbered `since`
-    /// and after may touch (every one when they are no longer all kept),
-    /// reading the loader as it is now through `reads`; returns the count.
+    /// Pushes onto `touched` those of `asked` (with the answer each was
+    /// given) the changes numbered `since` and after may move (every one
+    /// when they are no longer all kept), reading the loader as it is now
+    /// through `reads`; returns the count.
     pub(crate) fn touched(
         &self,
         since: u64,
-        asked: &[ResourceId],
+        asked: &[(ResourceId, Presence)],
         reads: &dyn Reads,
         touched: &mut Vec<ResourceId>,
     ) -> u64 {
@@ -152,48 +186,53 @@ impl StoreLog {
         if since >= count {
             return count;
         }
+        let every = |touched: &mut Vec<ResourceId>| touched.extend(asked.iter().map(|(r, _)| *r));
         if since < log.first {
-            touched.extend_from_slice(asked);
+            every(touched);
             return count;
         }
         let skip = usize::try_from(since - log.first).unwrap_or(usize::MAX);
         let mut all = false;
-        let mut at: HashSet<(u32, u64, u64)> = HashSet::new();
+        // Kept and let go, by tile.
+        let mut at: [HashSet<(u32, u64, u64)>; 2] = [HashSet::new(), HashSet::new()];
         let mut revealed: Vec<(u32, AvailabilityRange)> = Vec::new();
-        let mut over: Vec<(GeoRect, u32, bool)> = Vec::new();
+        let mut over: Vec<(GeoRect, u32, bool, Way)> = Vec::new();
         for c in log.changes.iter().skip(skip) {
             match *c {
                 Change::All => all = true,
-                Change::Mesh(t) => {
-                    at.insert((t.level, t.x, t.y));
+                Change::Mesh(t, way) => {
+                    at[usize::from(way == Way::LetGo)].insert((t.level, t.x, t.y));
                 }
                 Change::Revealed(level, range) => revealed.push((level, range)),
                 Change::Imagery {
                     rect,
                     level,
                     decoded,
-                } => over.push((rect, level, decoded)),
+                    way,
+                } => over.push((rect, level, decoded, way)),
             }
         }
         drop(log);
         if all {
-            touched.extend_from_slice(asked);
+            every(touched);
             return count;
         }
-        for &r in asked {
+        for &(r, answer) in asked {
             let (z, x, y) = r.tile().terrain_coord();
             let hit = match r {
                 ResourceId::Mesh(_) => {
+                    let at = &at[usize::from(answer == Presence::Stored)];
                     revealed.iter().any(|&(level, range)| {
                         level <= z && range.contains(x >> (z - level), y >> (z - level))
-                    }) || (!at.is_empty() && climb_meets(z, x, y, &at, reads))
+                    }) || (!at.is_empty() && climb_meets(z, x, y, at, reads))
                 }
                 ResourceId::Drape { level: asked, .. } => {
                     let t = TileCoord::new(z, x, y);
                     let tile = reads.rect(t);
                     let mut levels = None;
-                    over.iter().any(|(o, level, decoded)| {
-                        meet(o, &tile)
+                    over.iter().any(|(o, level, decoded, way)| {
+                        way.moves(answer)
+                            && meet(o, &tile)
                             && (*decoded || {
                                 let (floor, lo, hi) =
                                     *levels.get_or_insert_with(|| reads.levels(t, asked));
@@ -273,14 +312,17 @@ mod tests {
         }
     }
 
+    /// What the changes since `since` touch of `asked`, every answer
+    /// absent.
     fn touched(
         log: &StoreLog,
         since: u64,
         asked: &[ResourceId],
         reads: &Square,
     ) -> Vec<ResourceId> {
+        let asked: Vec<_> = asked.iter().map(|r| (*r, Presence::Absent)).collect();
         let mut out = Vec::new();
-        log.touched(since, asked, reads, &mut out);
+        log.touched(since, &asked, reads, &mut out);
         out
     }
 
@@ -310,15 +352,15 @@ mod tests {
         let start = count(&log, 0, &[]);
         let asked = [mesh(3, 5, 2), mesh(3, 4, 2)];
         assert_eq!(touched(&log, start, &asked, &reads), vec![]);
-        log.note(Change::Mesh(TileCoord::new(2, 2, 1)));
+        log.note(Change::Mesh(TileCoord::new(2, 2, 1), Way::Kept));
         assert_eq!(touched(&log, start, &asked, &reads), vec![mesh(3, 5, 2)]);
         // Past the tile that stops the climb: nothing.
         let n = count(&log, 0, &[]);
-        log.note(Change::Mesh(TileCoord::new(0, 0, 0)));
+        log.note(Change::Mesh(TileCoord::new(0, 0, 0), Way::Kept));
         assert_eq!(touched(&log, n, &asked, &reads), vec![]);
         // At the stop itself: the one that climbs there.
         let n = count(&log, 0, &[]);
-        log.note(Change::Mesh(TileCoord::new(1, 1, 0)));
+        log.note(Change::Mesh(TileCoord::new(1, 1, 0), Way::Kept));
         assert_eq!(touched(&log, n, &asked, &reads), vec![mesh(3, 5, 2)]);
     }
 
@@ -371,6 +413,7 @@ mod tests {
             },
             level,
             decoded,
+            way: Way::Kept,
         };
         log.note(over(2, true));
         assert_eq!(touched(&log, start, &asked, &reads), vec![drape(3, 1, 1)]);
@@ -397,9 +440,49 @@ mod tests {
         assert_eq!(switched, start + 1);
         assert_eq!(touched(&log, start, &asked, &reads), asked.to_vec());
         for i in 0..=KEPT as u64 {
-            log.note(Change::Mesh(TileCoord::new(20, i, 0)));
+            log.note(Change::Mesh(TileCoord::new(20, i, 0), Way::Kept));
         }
         assert_eq!(touched(&log, switched, &asked, &reads), asked.to_vec());
         assert_eq!(touched(&log, switched + 2, &asked, &reads), vec![]);
+    }
+
+    /// **A tile kept moves only absent answers, a tile let go only held
+    /// ones; availability revealed moves either.**
+    #[test]
+    fn a_change_moves_only_the_answers_its_way_can() {
+        let reads = Square(vec![]);
+        let log = StoreLog::default();
+        let mut ranges = vec![];
+        let start = count(&log, 0, &ranges);
+        let (m, d) = (mesh(3, 5, 2), drape(3, 1, 1));
+        let ask = |since: u64, answer: Presence| {
+            let mut out = Vec::new();
+            log.touched(since, &[(m, answer), (d, answer)], &reads, &mut out);
+            out
+        };
+        log.note(Change::Mesh(TileCoord::new(3, 5, 2), Way::Kept));
+        log.note(Change::Imagery {
+            rect: reads.rect(TileCoord::new(3, 1, 1)),
+            level: 3,
+            decoded: true,
+            way: Way::Kept,
+        });
+        assert_eq!(ask(start, Presence::Absent), vec![m, d]);
+        assert_eq!(ask(start, Presence::Stored), vec![]);
+        let n = count(&log, 0, &ranges);
+        log.note(Change::Mesh(TileCoord::new(3, 5, 2), Way::LetGo));
+        log.note(Change::Imagery {
+            rect: reads.rect(TileCoord::new(3, 1, 1)),
+            level: 3,
+            decoded: true,
+            way: Way::LetGo,
+        });
+        assert_eq!(ask(n, Presence::Absent), vec![]);
+        assert_eq!(ask(n, Presence::Stored), vec![m, d]);
+        let n = count(&log, 0, &ranges);
+        ranges.push((3, square(5, 2)));
+        count(&log, 0, &ranges);
+        assert_eq!(ask(n, Presence::Absent), vec![m]);
+        assert_eq!(ask(n, Presence::Stored), vec![m]);
     }
 }
