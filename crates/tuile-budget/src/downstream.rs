@@ -3223,7 +3223,7 @@ mod tests {
         };
         // Unneeded since one millisecond per slot ago: the lowest ids
         // longest.
-        let mut make = |b: &mut Budget, i: usize| {
+        let make = |b: &mut Budget, i: usize| {
             let r = ResourceId::Mesh(TileId(i as u64));
             let s = b.arena.find_or_insert(r, Class::TerrainMesh, 3, now);
             let cold = b.arena.cold_mut(s);
