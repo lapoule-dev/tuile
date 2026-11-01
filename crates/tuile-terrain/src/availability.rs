@@ -40,6 +40,9 @@ pub struct Availability {
     deferred: AtomicBool,
     /// Reveals waiting for the gap between two passes.
     held: Mutex<Vec<(u32, Vec<Vec<AvailabilityRange>>)>>,
+    /// Every range folded in since the layer, with its level, in the order
+    /// it was: what [`Availability::added_since`] reads.
+    added: Mutex<Vec<(u32, AvailabilityRange)>>,
 }
 
 impl Availability {
@@ -70,7 +73,18 @@ impl Availability {
             seen: RwLock::new(seen),
             deferred: AtomicBool::new(false),
             held: Mutex::new(Vec::new()),
+            added: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The ranges folded in since the first `from` (with their level), onto
+    /// `out`; returns how many have been, the `from` of the next call. What
+    /// a reader that keeps answers by tile (a loader's presence index) needs
+    /// to know which of them a reveal may have changed.
+    pub fn added_since(&self, from: usize, out: &mut Vec<(u32, AvailabilityRange)>) -> usize {
+        let added = self.added.lock().unwrap_or_else(|e| e.into_inner());
+        out.extend_from_slice(added.get(from..).unwrap_or(&[]));
+        added.len()
     }
 
     /// How many distinct ranges are held, all levels together. Diagnostics: a
@@ -143,6 +157,10 @@ impl Availability {
                     if seen.insert(key(level as u32, range)) {
                         levels[level].push(*range);
                         deepest = deepest.max(level as u32);
+                        self.added
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((level as u32, *range));
                     }
                 }
             }
@@ -188,6 +206,38 @@ mod tests {
                   "maxzoom":15 {extra}, "available":{available} }}"#
         );
         LayerJson::from_slice(json.as_bytes()).expect("layer")
+    }
+
+    /// **The ranges folded in are read in order from where a reader
+    /// stood**: the layer's own are not among them, a repeat is not added
+    /// twice, and a held reveal is read once it is folded in.
+    #[test]
+    fn the_ranges_folded_in_are_read_from_where_a_reader_stood() {
+        let layer = layer_with("[]", r#", "metadataAvailability": 10"#);
+        let a = Availability::from_layer(&layer, 2, 1);
+        let mut read = Vec::new();
+        assert_eq!(
+            a.added_since(0, &mut read),
+            0,
+            "the layer's own are not added"
+        );
+        let range = |x| AvailabilityRange {
+            start_x: x,
+            start_y: 0,
+            end_x: x,
+            end_y: 0,
+        };
+        a.add_descendant_ranges(0, &[vec![range(1)]]);
+        a.add_descendant_ranges(0, &[vec![range(1)]]);
+        let at = a.added_since(0, &mut read);
+        assert_eq!((at, read.clone()), (1, vec![(1, range(1))]));
+        a.defer();
+        a.add_descendant_ranges(1, &[vec![range(5)]]);
+        read.clear();
+        assert_eq!(a.added_since(at, &mut read), at, "held, not folded");
+        a.apply_held();
+        assert_eq!(a.added_since(at, &mut read), 2);
+        assert_eq!(read, vec![(2, range(5))]);
     }
 
     #[test]
