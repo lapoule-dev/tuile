@@ -167,7 +167,7 @@ pub const BACKOFF_KEEP_MAX: usize = (128 << 10) / BACKOFF_KEPT_BYTES;
 /// What one resource kept backing off costs: its slot across the arena's
 /// columns, its index entry (a slot and a control byte, hashbrown's), the
 /// kept map's entry (slot and time), its entry in the queue by due time
-/// (time and slot), and its tile's place ([`TileInfo`] and its key in the
+/// (time and slot), and its tile's place (its `TileInfo` and its key in the
 /// tiles' map), kept as long as a resource of the tile is tracked — at
 /// worst one tile per kept resource.
 pub const BACKOFF_KEPT_BYTES: usize = state::SLOT_BYTES

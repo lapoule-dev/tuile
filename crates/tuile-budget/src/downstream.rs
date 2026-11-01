@@ -2450,9 +2450,13 @@ impl Budget {
             // crate's final tie-break — never the slot: a whole place leaves
             // on one step, so ties are the normal case, and slot numbers
             // follow the free list and the compactions, which no decision
-            // may read.
+            // may read. A kept slot loading again since the prune kept it
+            // (its want came back, then went) holds something: it is the
+            // cancel's, not the cap's.
             unneeded.extend(self.down.kept_empty.iter().filter_map(|(s, _)| {
-                debug_assert!(a.is_empty(*s), "a kept slot holds nothing");
+                if !a.is_empty(*s) {
+                    return None;
+                }
                 a.cold(*s).unneeded_since().map(|u| (u, a.id(*s), *s))
             }));
             visited = visited.saturating_add(sat_u32(self.down.kept_empty.len()));
