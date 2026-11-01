@@ -236,57 +236,29 @@ fn the_pressure_scenario_stays_over_target() {
     );
 }
 
-/// A flight that grows the tracked set, then shrinks it: up to 60 km and a
-/// turn over the plain (thousands of tiles tracked), back down to the
-/// still view, the app sent to the background and back (only the floor
-/// and what is drawn kept). Returns the tracked peak, the tracked at the
-/// end, and the heap the budget frees when dropped without its step
+/// The flight that grows the tracked set, then shrinks it
+/// (`scenarios::fly_grow_then_shrink`): the tracked peak, the tracked at
+/// the end, and the heap the budget frees when dropped without its step
 /// buffers.
 fn grown_then_shrunk() -> (usize, usize, i64) {
-    use super::world::Camera;
-    let flight = |t: f64| -> Camera {
-        let h0 = home();
-        let lg = |a: f64, b: f64, k: f64| a * super::detmath::exp2(super::detmath::log2(b / a) * k);
-        if t < 5.0 {
-            approach(t)
-        } else if t < 10.0 {
-            Camera {
-                h: lg(2_000.0, 60_000.0, (t - 5.0) / 5.0),
-                ..h0
-            }
-        } else if t < 25.0 {
-            Camera {
-                h: 60_000.0,
-                heading: (t - 10.0) / 15.0 * std::f64::consts::TAU,
-                ..h0
-            }
-        } else if t < 30.0 {
-            Camera {
-                h: lg(60_000.0, 2_000.0, (t - 25.0) / 5.0),
-                ..h0
-            }
-        } else {
-            h0
-        }
-    };
     let mut sim = Sim::new(Profile::desktop(), 7);
-    let mut peak = 0;
-    while sim.now < Micros::from_secs(60) {
-        let t = sim.now.0 as f64 / 1e6;
-        if (40.0..42.0).contains(&t) {
-            sim.pressure(Pressure::Background);
-        } else if (42.0..42.1).contains(&t) {
-            sim.pressure(Pressure::Normal);
-        }
-        sim.step(flight(t));
-        peak = peak.max(sim.budget.tracked());
-    }
+    let peak = super::scenarios::fly_grow_then_shrink(&mut sim, |_| {});
     let tracked = sim.budget.tracked();
     let ((), _) = super::alloc::counted(|| sim.budget.real.release_scratch());
     let cfg = sim.budget.config().clone();
     let fresh = Budget::new(cfg).unwrap();
     let ((), t) = super::alloc::counted(|| drop(std::mem::replace(&mut sim.budget.real, fresh)));
     (peak, tracked, -t.live)
+}
+
+/// A ratchet's recorded value (`alloc_ratchets.txt`).
+fn ratchet(name: &str) -> i64 {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/budget_sim/alloc_ratchets.txt");
+    let text = std::fs::read_to_string(path).expect("ratchets recorded");
+    text.lines()
+        .find_map(|l| l.strip_prefix(name).and_then(|v| v.trim().parse().ok()))
+        .unwrap_or_else(|| panic!("no ratchet {name}"))
 }
 
 /// The arena gives its room back: after the tracked set grew five times
@@ -303,15 +275,17 @@ fn grown_then_shrunk() -> (usize, usize, i64) {
 fn a_tracked_set_that_shrinks_gives_its_room_back() {
     let (peak, tracked, held) = grown_then_shrunk();
     let per = held / tracked.max(1) as i64;
+    let steady = ratchet("bytes-per-tracked-resource");
     eprintln!(
-        "grown to {peak}, shrunk to {tracked} tracked: {held} B held, {per} B per tracked resource"
+        "grown to {peak}, shrunk to {tracked} tracked: {held} B held, {per} B per tracked resource \
+         ({steady} for a steady view)"
     );
     assert!(
         peak >= 3 * tracked,
         "the scenario shrinks the tracked set ({peak} -> {tracked})"
     );
     assert!(
-        per <= 2 * 455,
+        per <= 2 * steady,
         "{per} B per tracked resource after the set shrank from {peak} to {tracked}: the room is kept"
     );
 }

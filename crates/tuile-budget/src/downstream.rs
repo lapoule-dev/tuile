@@ -326,8 +326,10 @@ pub(super) struct Downstream {
     /// The deadlines are not kept: the next cancel looks at every load.
     deadlines_lost: bool,
     /// Prunes in a row that found the arena's room far more than its
-    /// tracked resources use (`state::SHRINK_AFTER`).
+    /// tracked resources use (`state::SHRINK_AFTER`); the slot map of the
+    /// last compaction, kept for the next.
     sparse_prunes: u32,
+    compact_map: Vec<u32>,
     /// This step's lists and batches.
     step: StepLists,
 }
@@ -676,6 +678,7 @@ impl Downstream {
         self.deadlines_lost = true;
         self.next = Vec::new();
         self.next_sels = Vec::new();
+        self.compact_map = Vec::new();
         self.again = true;
     }
 
@@ -2456,7 +2459,8 @@ impl Budget {
     /// The arena's room given back once it stayed far more than the tracked
     /// resources use for [`SHRINK_AFTER`] prunes in a row (`state`): its
     /// slots renumbered, and every slot kept here with them. Returns the
-    /// slots walked.
+    /// entries moved (the arena's, the kept slots', the queue's, the
+    /// leavers'; the kept map counts its own pass).
     fn arena_shrink(&mut self) -> u32 {
         if !self.arena.sparse() {
             self.down.sparse_prunes = 0;
@@ -2467,20 +2471,37 @@ impl Budget {
             return 0;
         }
         self.down.sparse_prunes = 0;
-        let mut map = Vec::new();
-        self.arena.compact(&mut map);
-        let to = |s: &Slot| Arena::moved_slot(&map, *s).unwrap_or(*s);
+        // The map is a kept buffer: a compaction allocates nothing later.
+        let mut map = std::mem::take(&mut self.down.compact_map);
+        let mut moved = self.arena.compact(&mut map);
         let d = &mut self.down;
-        d.kept_empty.rekey(to);
-        let due = std::mem::take(&mut d.kept_due).into_vec();
-        d.kept_due = due
-            .into_iter()
-            .filter_map(|Reverse((t, s))| Arena::moved_slot(&map, s).map(|s| Reverse((t, s))))
-            .collect();
-        Arena::moved(&map, &mut d.leavers);
+        // A kept slot is a live one: the one site that frees a slot
+        // (`prune`) takes it out of the kept map in the same step. Were a
+        // dead one left, its old number would alias a renumbered live slot.
+        let kept = d.kept_empty.len();
+        d.kept_empty
+            .retain(|s, _| Arena::moved_slot(&map, *s).is_some());
+        debug_assert_eq!(kept, d.kept_empty.len(), "a kept slot is a live slot");
+        d.kept_empty
+            .rekey(|s| Arena::moved_slot(&map, *s).unwrap_or(*s));
+        // The queue, in its own vector: stale and dead entries dropped.
+        let mut due = std::mem::take(&mut d.kept_due).into_vec();
+        moved += due.len() as u64;
+        due.retain_mut(|Reverse((_, s))| match Arena::moved_slot(&map, *s) {
+            Some(n) => {
+                *s = n;
+                true
+            }
+            None => false,
+        });
+        d.kept_due = BinaryHeap::from(due);
+        moved += Arena::moved(&map, &mut d.leavers);
+        // The map's room follows the arena's.
+        map.shrink_to(self.arena.room());
+        d.compact_map = map;
         // The step's room (`engine::Room`) names slots too, but a step
         // drops it as it starts: none is read after the prune.
-        sat_u32(map.len())
+        u32::try_from(moved).unwrap_or(u32::MAX)
     }
 
     /// An eviction of `r` at `now`, for the thrash count.
@@ -2952,5 +2973,132 @@ impl Budget {
                 "the active mark of {r:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::state::{SHRINK_BELOW, SHRINK_FLOOR, SHRINK_TO};
+    use crate::{Budget, BudgetConfig, Bytes, Class, ResourceId, TileId};
+
+    /// The budget's prune-side compaction, driven directly: `n` tracked
+    /// slots added or taken (empty ones, as a prune frees them).
+    struct Rig {
+        b: Budget,
+        next: u64,
+        live: Vec<Slot>,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let mut b = Budget::new(BudgetConfig::interactive(Bytes::mib(64))).unwrap();
+            b.arena.advance(Micros(1), &[]);
+            Rig {
+                b,
+                next: 0,
+                live: Vec::new(),
+            }
+        }
+
+        fn add(&mut self, n: usize) {
+            for _ in 0..n {
+                let r = ResourceId::Mesh(TileId(self.next));
+                self.next += 1;
+                let s = self
+                    .b
+                    .arena
+                    .find_or_insert(r, Class::TerrainMesh, 3, Micros(1));
+                self.live.push(s);
+            }
+        }
+
+        fn take(&mut self, n: usize) {
+            for _ in 0..n {
+                let s = self.live.pop().unwrap();
+                self.b.arena.remove(s);
+            }
+        }
+
+        fn room(&self) -> usize {
+            self.b.arena.room()
+        }
+
+        /// One prune's look at the arena's room: whether it compacted.
+        fn prune(&mut self) -> bool {
+            let before = self.room();
+            self.b.arena_shrink();
+            if self.room() < before {
+                // The slots renumbered: found again by their resources.
+                self.live = self.b.arena.iter().collect();
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    /// The compaction has hysteresis: the set must stay under a quarter of
+    /// the room for `SHRINK_AFTER` prunes in a row — a set hovering around
+    /// the quarter never compacts — and a compaction leaves twice the set's
+    /// room, so a set that grows back fills it without one, and the next
+    /// compaction takes another `SHRINK_AFTER` sparse prunes once the set
+    /// has shrunk again: no thrash.
+    #[test]
+    fn the_compaction_waits_for_a_set_that_stays_small_and_does_not_thrash() {
+        let mut rig = Rig::new();
+        rig.add(1_200);
+        let room = rig.room();
+        assert!(room >= 1_200, "over the floor of {SHRINK_FLOOR}");
+        // Hovering around the quarter: sparse for seven prunes, then not,
+        // then sparse again — the count starts over.
+        let quarter = room / SHRINK_BELOW;
+        rig.take(1_200 - (quarter - 1));
+        assert!(rig.b.arena.sparse());
+        for _ in 0..SHRINK_AFTER - 1 {
+            assert!(!rig.prune());
+        }
+        rig.add(2);
+        assert!(!rig.b.arena.sparse(), "at the quarter: not sparse");
+        assert!(!rig.prune());
+        assert_eq!(rig.b.down.sparse_prunes, 0, "the count started over");
+        rig.take(2);
+        for _ in 0..SHRINK_AFTER - 1 {
+            assert!(!rig.prune(), "a set back under the quarter waits again");
+        }
+        assert_eq!(rig.room(), room, "no compaction yet");
+        // The eighth sparse prune in a row compacts, to twice the set.
+        assert!(rig.prune());
+        let live = rig.b.arena.len();
+        assert_eq!(live, quarter - 1);
+        assert_eq!(rig.room(), (SHRINK_TO * live).max(SHRINK_FLOOR));
+        assert!(!rig.b.arena.sparse());
+        // Growing back fills the room without a compaction, then grows it.
+        let compact_room = rig.room();
+        rig.add(compact_room - live);
+        for _ in 0..2 * SHRINK_AFTER {
+            assert!(!rig.prune());
+        }
+        assert_eq!(rig.room(), compact_room, "filled, not grown");
+        rig.add(compact_room);
+        assert!(rig.room() >= 2 * compact_room, "grown by eighths");
+        for _ in 0..2 * SHRINK_AFTER {
+            assert!(!rig.prune(), "a full arena never compacts");
+        }
+        // Shrunk again: eight sparse prunes, then one compaction, no more.
+        let room = rig.room();
+        rig.take(rig.live.len() - room / SHRINK_BELOW / 2);
+        for _ in 0..SHRINK_AFTER - 1 {
+            assert!(!rig.prune());
+        }
+        assert!(rig.prune());
+        let live = rig.b.arena.len();
+        assert_eq!(rig.room(), (SHRINK_TO * live).max(SHRINK_FLOOR));
+        for _ in 0..4 * SHRINK_AFTER {
+            assert!(!rig.prune(), "nothing to give back: no thrash");
+        }
+        assert_eq!(rig.b.arena.len(), live);
+        assert_eq!(rig.b.audit(), Ok(()));
     }
 }

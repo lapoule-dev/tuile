@@ -635,8 +635,13 @@ impl Arena {
     /// use: over [`SHRINK_FLOOR`] slots, and more than [`SHRINK_BELOW`]
     /// times the live ones.
     pub fn sparse(&self) -> bool {
-        let room = self.id.capacity();
+        let room = self.room();
         room > SHRINK_FLOOR && room > SHRINK_BELOW.saturating_mul(self.live)
+    }
+
+    /// The slots the columns have room for before they grow.
+    pub fn room(&self) -> usize {
+        self.id.capacity()
     }
 
     /// Gives the columns' room back: the live slots moved down, in order,
@@ -644,17 +649,20 @@ impl Arena {
     /// slots ([`SHRINK_FLOOR`] at least), the hash index rebuilt at that
     /// size, the free list emptied. `map` gets each old slot's new number,
     /// [`DEAD`] for a slot that held nothing, for the holders of slots
-    /// outside the arena to follow ([`Arena::moved`]).
+    /// outside the arena to follow ([`Arena::moved`]). Returns the entries
+    /// moved: the slots walked, the index's entries, the filed sets' and
+    /// the lists' (the maps keyed by slot count their own upkeep).
     ///
     /// The live slots keep their order, so every walk in slot order — the
     /// columns, the sets keyed by slot, the eviction index's ties (none:
-    /// its keys end with the resource) — finds them in the same order.
-    /// The slots taken next differ (the end of the columns, not the last
-    /// freed): no decision reads a slot's number.
-    pub fn compact(&mut self, map: &mut Vec<u32>) {
+    /// an [`EvictKey`] ends with the resource) — finds them in the same
+    /// order. The slots taken next differ (the end of the columns, not the
+    /// last freed): no decision reads a slot's number.
+    pub fn compact(&mut self, map: &mut Vec<u32>) -> u64 {
         let n = self.id.len();
         map.clear();
         map.reserve_exact(n);
+        let mut moved = n as u64;
         let mut w = 0usize;
         for i in 0..n {
             if self.flags[i] & LIVE == 0 {
@@ -686,21 +694,30 @@ impl Arena {
         cut(&mut self.gpu, w, room);
         cut(&mut self.cpu, w, room);
         cut(&mut self.cold, w, room);
-        self.free = Vec::new();
+        // No slot is free: the list is emptied and its room given back
+        // with the columns' (keeping room for every live slot to be freed
+        // costs 4 B a slot, which the shrunk budget's ratchet counts; the
+        // list grows again by doubling, a handful of allocations over a
+        // session, none on a still step).
+        self.free.clear();
+        self.free.shrink_to_fit();
         let Arena { hasher, id, .. } = &*self;
         let mut index = HashTable::with_capacity(room);
         for (i, r) in id.iter().enumerate() {
             let s = Slot(u32::try_from(i).unwrap_or(DEAD));
             index.insert_unique(hasher.hash_one(*r), s, |x| hasher.hash_one(id[x.i()]));
         }
+        moved += w as u64;
         self.index = index;
-        // The sets keyed by slot: renumbered in place, their order kept.
+        // The sets keyed by slot: renumbered in place, their order kept
+        // (each map counts the pass in its upkeep).
         let to = |n: &u32| map.get(*n as usize).copied().unwrap_or(DEAD);
         self.transit.rekey(to);
         self.load.rekey(to);
         self.ranks.rekey(to);
         for c in Class::ALL {
             for set in &mut self.evict.filed[c] {
+                moved += set.len() as u64;
                 *set = std::mem::take(set)
                     .into_iter()
                     .map(|(k, s)| (k, Slot(map[s.i()])))
@@ -709,15 +726,17 @@ impl Arena {
         }
         // The lists: the slots that held nothing dropped (they name no
         // resource; a list's filter would skip them).
-        Self::moved(map, &mut self.evict.cur.slots);
-        Self::moved(map, &mut self.evict.prev.slots);
-        Self::moved(map, &mut self.emptied);
+        moved += Self::moved(map, &mut self.evict.cur.slots);
+        moved += Self::moved(map, &mut self.evict.prev.slots);
+        moved += Self::moved(map, &mut self.emptied);
+        moved
     }
 
     /// `slots` renumbered by a [`Arena::compact`]'s `map`, in order, the
-    /// slots that held nothing dropped; its room cut to twice what it
-    /// holds.
-    pub fn moved(map: &[u32], slots: &mut Vec<Slot>) {
+    /// slots that held nothing dropped; its room cut to [`SHRINK_TO`] times
+    /// what it holds. Returns the entries walked.
+    pub fn moved(map: &[u32], slots: &mut Vec<Slot>) -> u64 {
+        let walked = slots.len() as u64;
         slots.retain_mut(|s| match map.get(s.i()) {
             Some(&n) if n != DEAD => {
                 *s = Slot(n);
@@ -725,7 +744,8 @@ impl Arena {
             }
             _ => false,
         });
-        slots.shrink_to(2 * slots.len());
+        slots.shrink_to(SHRINK_TO.saturating_mul(slots.len()));
+        walked
     }
 
     /// The new number of `s` after a [`Arena::compact`]'s `map`, if it
@@ -1848,6 +1868,38 @@ mod tests {
         // Time moves on twice: every slot filed in the eviction index.
         a.advance(Micros(2), &slots);
         a.advance(Micros(3), &[]);
+        // The maps keyed by slot: a transit, a load, a rank on some of the
+        // slots that stay (and on some that go).
+        let transit = |i: u64| Transit {
+            gen: Generation(2),
+            cost: Cost::flat(Bytes(i + 7)),
+            epoch: 1,
+        };
+        let load = |i: u64| Load::Loading {
+            gen: Generation(3),
+            source: Source::Network,
+            started: Micros(i),
+            epoch: 2,
+        };
+        let rank = |i: u64| Rank {
+            urgency: Urgency::Hole,
+            score: Reverse(i64::try_from(i).unwrap()),
+            tier: Tier::Remote,
+        };
+        for (i, &s) in slots.iter().enumerate() {
+            let i = i as u64;
+            if i.is_multiple_of(30) {
+                a.put_transit(s, &mut l, transit(i));
+            }
+            if i % 20 == 10 {
+                a.set_load(s, load(i));
+            }
+            if i.is_multiple_of(5) {
+                a.set_rank(s, Some(Urgency::Hole), Some(rank(i)));
+            }
+        }
+        let gpu_before: Vec<Option<Gpu>> = slots.iter().map(|&s| a.gpu(s)).collect();
+        let ledger_before = l;
         let filed_before: Vec<ResourceId> = {
             let mut out = Vec::new();
             let mut after = None;
@@ -1861,22 +1913,46 @@ mod tests {
         for (i, &s) in slots.iter().enumerate() {
             if i % 10 != 0 {
                 a.take_gpu(s, &mut l);
+                a.take_transit(s, &mut l);
+                a.set_load(s, Load::Idle);
+                a.set_rank(s, None, None);
                 a.remove(s);
             }
         }
         assert!(a.sparse(), "200 of 2 000 slots live");
+        let room_before = a.room();
         let mut map = Vec::new();
-        a.compact(&mut map);
+        let moved = a.compact(&mut map);
         assert!(!a.sparse(), "the room given back");
         assert_eq!(a.len(), 200);
-        // Every resource found again, in slot order as before.
+        assert_eq!(a.room(), SHRINK_TO * 200);
+        let n_slots = usize::try_from(n).unwrap();
+        assert!(room_before >= n_slots && moved >= n + 200);
+        assert_eq!(map.len(), n_slots);
+        // Every resource found again, in slot order as before, with its
+        // copies, its transit, its load and its rank at its new slot.
         let ids: Vec<ResourceId> = a.iter().map(|s| a.id(s)).collect();
         let want: Vec<ResourceId> = (0..n).filter(|i| i % 10 == 0).map(mesh).collect();
         assert_eq!(ids, want);
-        for r in &want {
-            let s = a.find(*r).unwrap();
-            assert_eq!(a.id(s), *r);
+        for (at, &old) in slots.iter().enumerate() {
+            let i = at as u64;
+            let r = mesh(i);
+            if !i.is_multiple_of(10) {
+                assert_eq!(a.find(r), None);
+                assert_eq!(Arena::moved_slot(&map, old), None);
+                continue;
+            }
+            let s = a.find(r).unwrap();
+            assert_eq!(a.id(s), r);
+            assert_eq!(Arena::moved_slot(&map, old), Some(s));
+            assert_eq!(s, Slot(u32::try_from(i / 10).unwrap()), "in order, dense");
+            assert_eq!(a.gpu(s), gpu_before[at]);
+            assert_eq!(a.transit(s), i.is_multiple_of(30).then(|| transit(i)));
+            assert_eq!(a.load(s), if i % 20 == 10 { load(i) } else { Load::Idle });
+            assert_eq!(a.priority(s), i.is_multiple_of(5).then(|| rank(i)));
+            assert_eq!(a.urgency(s), i.is_multiple_of(5).then_some(Urgency::Hole));
         }
+        assert!(l.gpu[Class::TerrainMesh] < ledger_before.gpu[Class::TerrainMesh]);
         let filed_after: Vec<ResourceId> = {
             let mut out = Vec::new();
             let mut after = None;

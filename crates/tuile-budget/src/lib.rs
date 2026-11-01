@@ -429,6 +429,14 @@ impl Budget {
         self.arena.len()
     }
 
+    /// How many resources the budget has room to track before its state
+    /// grows. The room follows the tracked set: it grows with it, and is
+    /// given back once the set stayed under a quarter of it for about a
+    /// second (then twice the set).
+    pub fn tracked_room(&self) -> usize {
+        self.arena.room()
+    }
+
     /// The whole internal state, in a canonical form: for the tests that
     /// compare it against a reference step by step. Not part of the API.
     #[doc(hidden)]

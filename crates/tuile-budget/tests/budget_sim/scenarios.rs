@@ -39,6 +39,116 @@ pub fn settle(sim: &mut Sim, secs: f64) -> Micros {
     stop
 }
 
+/// A flight that grows the tracked set, then shrinks it: the approach, up
+/// to 60 km and a turn over the plain (thousands of tiles tracked), back
+/// down to the still view, then still.
+pub fn grow_then_shrink(t: f64) -> Camera {
+    let h0 = home();
+    let lg = |a: f64, b: f64, k: f64| a * detmath::exp2(detmath::log2(b / a) * k);
+    if t < 5.0 {
+        approach(t)
+    } else if t < 10.0 {
+        Camera {
+            h: lg(2_000.0, 60_000.0, (t - 5.0) / 5.0),
+            ..h0
+        }
+    } else if t < 25.0 {
+        Camera {
+            h: 60_000.0,
+            heading: (t - 10.0) / 15.0 * std::f64::consts::TAU,
+            ..h0
+        }
+    } else if t < 30.0 {
+        Camera {
+            h: lg(60_000.0, 2_000.0, (t - 25.0) / 5.0),
+            ..h0
+        }
+    } else {
+        h0
+    }
+}
+
+/// Flies `sim` through [`grow_then_shrink`] for a minute, the app sent to
+/// the background at 40 s (only the floor and what is drawn kept) and back
+/// at 42 s; `each` sees the simulation after every step. Returns the
+/// tracked peak.
+pub fn fly_grow_then_shrink(sim: &mut Sim, mut each: impl FnMut(&Sim)) -> usize {
+    let mut peak = 0;
+    while sim.now < Micros::from_secs(60) {
+        let t = sim.now.0 as f64 / 1e6;
+        if (40.0..42.0).contains(&t) {
+            sim.pressure(Pressure::Background);
+        } else if (42.0..42.1).contains(&t) {
+            sim.pressure(Pressure::Normal);
+        }
+        sim.step(grow_then_shrink(t));
+        peak = peak.max(sim.budget.tracked());
+        each(sim);
+    }
+    peak
+}
+
+/// The arena gives its room back, in the budget, checked: on the flight
+/// that grows the tracked set to thousands and falls back to the still
+/// view, the room the budget has for tracked resources follows — it
+/// stays far over the set (sparse) for a while, then is cut to twice the
+/// set — and every decision and the whole state are the recorded ones
+/// (the reference, recorded with this scenario). The checked simulation
+/// (release with debug assertions) runs the arena's and the kept sets'
+/// renumbering checks here, every step.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
+fn the_arena_gives_its_room_back_on_the_flight_that_shrinks_the_tracked_set() {
+    let mut sim = Sim::new(Profile::desktop(), 7);
+    // (t, tracked, room) after every step.
+    let mut trace: Vec<(Micros, usize, usize)> = Vec::new();
+    let peak = fly_grow_then_shrink(&mut sim, |s| {
+        trace.push((s.now, s.budget.tracked(), s.budget.tracked_room()));
+    });
+    let room_max = trace.iter().map(|x| x.2).max().unwrap_or(0);
+    let sparse = trace
+        .iter()
+        .filter(|(_, tracked, room)| *room > 256 && *room > 4 * tracked)
+        .count();
+    // A compaction: the room falls from one step to the next, to twice the
+    // tracked set (256 at least), which the budget then grows from.
+    let compactions: Vec<&(Micros, usize, usize)> = trace
+        .windows(2)
+        .filter(|w| w[1].2 < w[0].2)
+        .map(|w| &w[1])
+        .collect();
+    let (_, tracked, room) = *trace.last().expect("steps");
+    eprintln!(
+        "grow then shrink: tracked peak {peak}, room at most {room_max}, sparse on {sparse} \
+         steps, compacted {} time(s) ({}), ending at {tracked} tracked in a room of {room}",
+        compactions.len(),
+        compactions
+            .iter()
+            .map(|(t, n, r)| format!("t = {:.2} s: {n} tracked, room {r}", t.0 as f64 / 1e6))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    assert!(peak >= 3 * tracked, "{RED}: the flight shrinks the set");
+    // Hysteresis: the eighth prune in a row (one every eighth step) that
+    // finds the set sparse compacts, so at least seven whole prune
+    // intervals pass sparse first.
+    assert!(
+        sparse >= 7 * 8,
+        "{RED}: the set under a quarter of the room on {sparse} steps"
+    );
+    assert!(
+        !compactions.is_empty(),
+        "{RED}: the room was never given back"
+    );
+    for (_, n, r) in &compactions {
+        assert_eq!(*r, (2 * n).max(256), "{RED}: the room after a compaction");
+    }
+    assert!(room < room_max / 2, "{RED}: room {room} of {room_max} kept");
+}
+
 pub fn converges(mut profile: Profile) {
     // I3 holds at the p95 latency: no host stalls here (they are the lossy
     // scenario's), failures still retried.

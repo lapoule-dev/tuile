@@ -335,10 +335,23 @@ on either; the one O1.4 violation is WebGL2 yaw converging in 22.1 s against 20 
 **Arena capacity returned** (stacked on #175). The arena's columns and index grew to the session's high-water
 mark. Now, when the tracked resources stay under a quarter of the room for eight prunes (64 steps), the arena
 renumbers its live slots in order and cuts its columns to twice what they use; every set keyed by slot follows.
-Decisions and the whole state are unchanged (digests, goldens; on a flight that compacts, 4 800 steps of
-decisions and snapshots identical). After a flight that grows the tracked set to 4 889 and falls back to 995, the
-budget holds 870 B per tracked resource instead of 1 664 (new ratchet). The soak, the tour, the pressure scenario
-and P6.4's run never compact.
+Decisions and the whole state are unchanged (digests, goldens). The flight that grows the tracked set to 4 889
+and falls back to 995 is a recorded scenario of its own
+(`the_arena_gives_its_room_back_on_the_flight_that_shrinks_the_tracked_set`: the room, read through
+`Budget::tracked_room`, stays over four times the set for 56 steps, then falls once, at t = 41.05 s, from 5 378
+to 1 178 slots for 589 tracked — twice the set — and the budget ends at 995 tracked in that room; its decisions
+and whole-state digests are in the recorded reference, and the checked simulation runs the renumbering's
+assertions on it every step). After the flight the budget holds 870 B per tracked resource instead of 1 664 (new
+ratchet, bounded by twice the steady ratchet read from the ratchets file). The hysteresis has its own test: a
+set hovering around the quarter never compacts, a compacted arena is filled and grown without one, and the next
+compaction waits for eight sparse prunes again (`the_compaction_waits_for_a_set_that_stays_small_and_does_not_thrash`);
+the arena's compaction test carries transits, loads and ranks through the renumbering; `SortedMap::rekey` has a
+property against the standard map renumbered. A compaction's entries moved count in `work`. P6.4 run once on the
+flight: the compaction step is within its bound (W 13 370, carried by the background's evictions the step
+before); 7 of 3 600 steps are over it, none of them the compaction — five still steps after the descent
+(W 308–414 against 256, nothing changing) and the two pressure switches (W 4 416 and 2 072: a pressure change
+reads every unit again, which P6.4's #E does not count) — a finding outside P6.4's two runs, left as is. The soak,
+the tour, the pressure scenario and P6.4's run never compact.
 
 Not in O1.4, listed for O1.5: the ranking re-keys every job each step (a job's score ages with time); the host's
 diff clones every changed tile's `Need` (about 640 heap blocks a step on the tour); the whole-need resync pays a

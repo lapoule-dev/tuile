@@ -700,6 +700,43 @@ mod tests {
     }
 
     proptest! {
+        /// A renumbering of the keys that keeps their order (what the
+        /// arena's compaction does to the maps keyed by slot) leaves the
+        /// map as the standard ordered map renumbered the same way: every
+        /// entry under its new key, found again, in order, the blocks'
+        /// heads with them.
+        #[test]
+        fn a_rekeyed_map_is_the_standard_ordered_map_renumbered(
+            keys in prop::collection::btree_set(0u16..2_000, 0..700),
+            gaps in prop::collection::vec(0u16..3, 700),
+        ) {
+            let mut m: SortedMap<u16, u32> = SortedMap::default();
+            let mut o: BTreeMap<u16, u32> = BTreeMap::new();
+            for k in &keys {
+                m.insert(*k, u32::from(*k));
+                o.insert(*k, u32::from(*k));
+            }
+            // New numbers in the old order, each at least the one before
+            // plus one: strictly increasing, so the order is kept.
+            let mut to: BTreeMap<u16, u16> = BTreeMap::new();
+            let mut next = 0u16;
+            for (k, g) in keys.iter().zip(&gaps) {
+                to.insert(*k, next);
+                next = next.saturating_add(1 + g);
+            }
+            m.rekey(|k| to[k]);
+            let o: BTreeMap<u16, u32> = o.into_iter().map(|(k, v)| (to[&k], v)).collect();
+            prop_assert_eq!(m.len(), o.len());
+            prop_assert!(m.iter().eq(o.iter()));
+            prop_assert!(m.consistent());
+            for (k, v) in &o {
+                prop_assert_eq!(m.get(k), Some(v));
+            }
+            for k in keys.iter().filter(|k| !o.contains_key(k)) {
+                prop_assert_eq!(m.get(k), None);
+            }
+        }
+
         /// Any sequence of changes leaves the map as the standard library's
         /// ordered map: its entries, lookups, ranges and the keys between
         /// two bounds, and the values a change replaces or removes.
