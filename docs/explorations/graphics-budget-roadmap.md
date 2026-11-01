@@ -465,8 +465,28 @@ one per map by design) that the flight's history under the tile-first key leaves
 did not — raised deliberately, Laurent's decision.
 
 Left for the next parts of O1.5: the whole-need path groups the need into a fresh buffer each time (one block:
-keeping it would add the first step's grouping to every delta host's step buffers); presence by store events; P6.4
+keeping it would add the first step's grouping to every delta host's step buffers); P6.4
 on the flight and the prune's scan of the loads in flight.
+
+Part 3 (`perf/budget-o1-presence-events`): the presence answers kept until a store event, not for a 1 s window.
+The session dropped every answer once a second and asked every drape again — 156 asks a second on a still view,
+an answer up to a second stale. `TileLoader::store_events` (a count that moves with every change to what `holds`
+reads) and `store_changes` (which of the answers kept the events since a count may move, given each answer) let
+the session's `PresenceCache` ask again, at the first step after an event and before the budget asks anything,
+exactly the answers an event names; the oracle's generation moves when one changed (or the epoch dropped them
+all), so a still view asks the loader nothing and reads no level. The planetary loader notes its changes as it
+makes them — a decoded mesh or imagery tile kept or let go, a store's index changed by a fetch through it — with
+the way each went (a tile kept moves only absent answers, one let go only held ones), and polls what changes
+without it: the imagery switched, and the availability's ranges folded in (`Availability::added_since`, a log in
+tuile-terrain). A mesh is touched by a change on its climb (up to the first tile decoded or the source's), or by
+availability revealed at or above it; a drape by a decoded tile over it, or a stored one at its floor level or its
+mosaic's. Not seen, and so the bound that remains: an entry a store drops on its own (foyer's disk-tier eviction,
+a store suspended, another writer) — a held answer believed until the resource is loaded (its read then goes to
+the network under the local quota, once, and the load puts it back) or a change near it is noted. M-run
+(`p2-slow`, three interleaved runs per mode, 10 s held still after settling): still view 156 → 0 asks a second,
+decide in the still phase 94 → 81 µs (off); over the run, the loading burst asks more (off 6 818 → 10 460 asks
+in a run, 406 → 640 a second: every answer an event touches, the moment it is touched, where the window refreshed each once a
+second, late) for the same decide time, imagery peak, frames and convergence.
 
 Order is strict: A before B, B before C. Every step of A, B and C goes through the same battery before
 the next starts — tests seen red, mutants killed, the reference model extended, Kani proofs of its
