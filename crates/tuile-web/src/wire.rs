@@ -622,6 +622,7 @@ impl Writer {
     fn ancestry(&mut self, a: &Ancestry) {
         self.u32(a.level);
         self.option_u64(a.parent.map(|p| p.0));
+        self.u8(u8::from(a.covers));
     }
     fn stats(&mut self, s: &TraversalStats) {
         let TraversalStats {
@@ -675,6 +676,7 @@ impl Writer {
             textures,
             imagery,
             withheld_drape,
+            copyright,
             local_origin_ecef,
             transform_local,
         } = c;
@@ -711,6 +713,7 @@ impl Writer {
                 self.f32(f);
             }
             self.option_u64(material.base_color_texture.map(|t| t as u64));
+            self.u8(u8::from(material.unlit));
         }
         self.len(textures.len());
         for t in textures {
@@ -721,6 +724,14 @@ impl Writer {
             self.layer(layer);
         }
         self.option_u64(*withheld_drape);
+        // Who the tile credits: shown below the picture while it is drawn.
+        match copyright {
+            Some(text) => {
+                self.u8(1);
+                self.bytes(text.as_bytes());
+            }
+            None => self.u8(0),
+        }
         self.dvec3(*local_origin_ecef);
         for f in transform_local.to_cols_array() {
             self.f32(f);
@@ -946,6 +957,7 @@ impl<'a> Reader<'a> {
         Ok(Ancestry {
             level: self.u32()?,
             parent: self.option_u64()?.map(TileId),
+            covers: self.u8()? != 0,
         })
     }
     fn stats(&mut self) -> Result<TraversalStats, WireError> {
@@ -1026,6 +1038,7 @@ impl<'a> Reader<'a> {
             let material = MaterialDesc {
                 base_color_factor: self.f32s()?,
                 base_color_texture: self.option_u64()?.map(|t| t as usize),
+                unlit: self.u8()? != 0,
             };
             meshes.push(DecodedMesh {
                 positions,
@@ -1050,6 +1063,12 @@ impl<'a> Reader<'a> {
             textures,
             imagery,
             withheld_drape: self.option_u64()?,
+            copyright: match self.u8()? {
+                0 => None,
+                _ => Some(Arc::from(
+                    std::str::from_utf8(self.bytes()?).map_err(|_| WireError::Utf8)?,
+                )),
+            },
             local_origin_ecef: self.dvec3()?,
             transform_local: Mat4::from_cols_array(&self.f32s()?),
         })
@@ -1076,6 +1095,7 @@ mod tests {
                 material: MaterialDesc {
                     base_color_factor: [0.1, 0.2, 0.3, 1.0],
                     base_color_texture: Some(0),
+                    unlit: true,
                 },
             }],
             textures: vec![DecodedTexture::from_rgba8(1, 1, vec![1, 2, 3, 4])],
@@ -1092,6 +1112,7 @@ mod tests {
                 scale: [2.0, 4.0],
             }],
             withheld_drape: Some(u64::MAX - 1),
+            copyright: Some(Arc::from("Data © someone; Imagery © someone else")),
             // The anti-jitter origin: every bit of the f64 must survive.
             local_origin_ecef: DVec3::new(4_201_234.123_456_789, 172_001.000_000_1, -4_779_000.5),
             transform_local: Mat4::from_translation(glam::Vec3::new(1.0, 2.0, 3.0)),
@@ -1107,6 +1128,7 @@ mod tests {
             assert_eq!(m.indices, n.indices);
             assert_eq!(m.material.base_color_factor, n.material.base_color_factor);
             assert_eq!(m.material.base_color_texture, n.material.base_color_texture);
+            assert_eq!(m.material.unlit, n.material.unlit);
         }
         assert_eq!(a.textures.len(), b.textures.len());
         for (t, u) in a.textures.iter().zip(&b.textures) {
@@ -1125,6 +1147,7 @@ mod tests {
             );
         }
         assert_eq!(a.withheld_drape, b.withheld_drape);
+        assert_eq!(a.copyright, b.copyright, "the credits cross");
         assert_eq!(
             a.local_origin_ecef.to_array().map(f64::to_bits),
             b.local_origin_ecef.to_array().map(f64::to_bits)
@@ -1178,6 +1201,7 @@ mod tests {
             ancestry: Ancestry {
                 level: 7,
                 parent: None,
+                covers: false,
             },
             content: ResourceContent::Mesh(Arc::new(sent)),
         });
@@ -1201,6 +1225,7 @@ mod tests {
         let ancestry = Ancestry {
             level: 7,
             parent: Some(TileId(41)),
+            covers: true,
         };
         let back = round_trip(&ServerMessage::Content {
             resource: ResourceId::Mesh(TileId(42)),
@@ -1243,6 +1268,7 @@ mod tests {
             ancestry: Ancestry {
                 level: 7,
                 parent: None,
+                covers: false,
             },
             content: ResourceContent::Drape(Arc::new(drape_content())),
         });
@@ -1342,6 +1368,7 @@ mod tests {
                 Ancestry {
                     level: 3,
                     parent: Some(TileId(1)),
+                    covers: false,
                 },
             )],
             stats,
@@ -1556,6 +1583,7 @@ mod tests {
             ancestry: Ancestry {
                 level: 0,
                 parent: None,
+                covers: false,
             },
             content: ResourceContent::Drape(Arc::new(drape_content())),
         });

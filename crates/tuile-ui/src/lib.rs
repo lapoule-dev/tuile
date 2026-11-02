@@ -3,13 +3,17 @@
 
 #![doc = include_str!("../README.md")]
 
+mod credits;
 mod nav;
 mod spinner;
 #[cfg(feature = "statusbar")]
 mod statusbar;
+mod text;
 
+pub use credits::{BarLayout, CreditBar};
 pub use nav::{NavWidget, Part};
 pub use spinner::{Spinner, SPOKES};
+pub use text::{Fitted, Font, Label, Mask};
 
 /// A 2-D vertex in **pixel** coordinates, with a straight (non-premultiplied)
 /// RGBA colour.

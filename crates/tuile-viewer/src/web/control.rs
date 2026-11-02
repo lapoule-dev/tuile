@@ -47,6 +47,11 @@ pub(crate) enum ToWorker {
     Imagery { layer: usize },
     /// Hold the loads not yet started, or let them go.
     Pause { paused: bool },
+    /// Open the host's 3D Tiles tileset of this asset number: a source of the
+    /// session's scene, its tiles on the session's one stream.
+    OpenTileset { asset: i64 },
+    /// Take it out of the scene.
+    CloseTileset { asset: i64 },
 }
 
 /// From the worker to its page.
@@ -65,6 +70,41 @@ pub(crate) enum ToPage {
     /// The budget's signals as the worker's session last published them:
     /// what the page's overlay reads, as a desktop's reads its own.
     Signals { glance: Box<Glance> },
+    /// A tileset is in the scene, with what must be credited while it is
+    /// drawn.
+    TilesetOpened {
+        asset: i64,
+        /// The tag its tiles carry in the scene.
+        tag: u8,
+        credits: Vec<CreditWire>,
+    },
+    /// It could not be opened: why, for the person.
+    TilesetFailed { asset: i64, reason: String },
+}
+
+/// A credit as it crosses: its words and its link. Its logo is not drawn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CreditWire {
+    pub text: String,
+    #[serde(default)]
+    pub link: Option<String>,
+}
+
+impl CreditWire {
+    pub(crate) fn of(credit: &tuile_planetary::Credit) -> Self {
+        Self {
+            text: credit.text.clone(),
+            link: credit.link.as_ref().map(|l| l.to_string()),
+        }
+    }
+
+    pub(crate) fn credit(&self) -> tuile_planetary::Credit {
+        tuile_planetary::Credit {
+            text: self.text.clone(),
+            logo: None,
+            link: self.link.as_deref().and_then(|l| url::Url::parse(l).ok()),
+        }
+    }
 }
 
 /// The budget's signals the page shows, as they cross to it: what the

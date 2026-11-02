@@ -10,6 +10,7 @@
 //! backdrop is drawn before the selection so that ground is never bare.
 
 use super::{App, AMBIENT, ATMOSPHERE_STRENGTH, DIAGNOSTICS};
+
 use std::fmt;
 use tuile_wgpu::OverlayVertex;
 
@@ -37,6 +38,9 @@ impl App {
             return;
         }
         let dt = self.start_the_frame();
+        // Before anything reads the viewport: the bar decides how much of
+        // the frame the view has.
+        self.lay_out_the_credits();
         self.ease_the_camera(dt);
         if self.active.is_none() {
             return;
@@ -364,13 +368,21 @@ impl App {
         } else {
             Vec::new()
         };
-        let mut nav_mesh: Vec<OverlayVertex> = controls
-            .into_iter()
+        // The credits bar's background first, already in device pixels.
+        let bar = self.credits.layout();
+        let mut nav_mesh: Vec<OverlayVertex> = bar
+            .map(|bar| bar.background.as_slice())
+            .unwrap_or_default()
+            .iter()
             .map(|v| OverlayVertex {
-                position: ui.from(v.position),
+                position: v.position,
                 color: v.color,
             })
             .collect();
+        nav_mesh.extend(controls.into_iter().map(|v| OverlayVertex {
+            position: ui.from(v.position),
+            color: v.color,
+        }));
         // The loading indicator over everything, already in device pixels.
         if let Some(spinner) = indicator {
             nav_mesh.extend(spinner.mesh().into_iter().map(|v| OverlayVertex {
@@ -381,6 +393,17 @@ impl App {
         active
             .overlay
             .set_geometry(&active.gpu, &nav_mesh, active.size);
+        // And its line, over its background.
+        let line = bar
+            .and_then(|bar| bar.label.as_ref())
+            .map(|label| tuile_wgpu::OverlayMask {
+                width: label.mask.width,
+                height: label.mask.height,
+                coverage: &label.mask.coverage,
+                position: label.position,
+                color: label.color,
+            });
+        active.overlay.set_mask(&active.gpu, line);
     }
 
     /// Resolves what to draw, draws it, and hands the frame to the compositor.
@@ -394,7 +417,9 @@ impl App {
         let serving = self.imagery.generation;
         let views = self.view_uniforms();
         let picture = self.picture();
-        let viewport = self.viewport();
+        // The whole frame, credits bar included: the overlay is laid out in
+        // it.
+        let viewport = self.frame_size();
         // The same clearance the tiles' view uniform is built with, so an
         // overlay and the ground share one clip space.
         let clearance = self.controller.height_above_ground();
@@ -413,6 +438,17 @@ impl App {
         // the black square. The tree is the only thing that can answer, so the
         // server sends it and the pump reads it. Nothing here to get wrong.
         let (drawn, resolution) = active.pump.resolve(&active.gpu);
+        // The 3D Tiles over the globe, from the same pump, and what their
+        // tiles drawn credit, for the caption.
+        let replacing = &drawn.covering;
+        let replacing_fallback = &drawn.covering_fallback;
+        self.surfaces_drawn.clear();
+        self.surfaces_drawn.extend(
+            replacing
+                .iter()
+                .chain(replacing_fallback.iter())
+                .filter_map(|tile| tile.copyright.clone()),
+        );
         let rendered = drawn.exact.len() + drawn.fallback.len();
         let old_imagery = drawn
             .exact
@@ -469,7 +505,7 @@ impl App {
                 );
                 pass.set_scissor_rect(box_.x, box_.y, box_.width, box_.height);
             }
-            renderer.paint(
+            renderer.paint_replacing(
                 pass,
                 // The shell first — the only thing that can cover ground
                 // before any tile has arrived at all — then the complete
@@ -481,6 +517,11 @@ impl App {
                     .then_some(shell)
                     .into_iter()
                     .chain(coarse.iter().copied()),
+                // The 3D Tiles over the globe, before the globe's own
+                // tiles: where they are drawn they replace the ground, which
+                // keeps out of every pixel they took and covers the rest.
+                replacing.iter().copied(),
+                replacing_fallback.iter().copied(),
                 drawn.exact.iter().copied(),
                 // Last, testing depth and never writing it: an ancestor
                 // borrowing ground it does not own must be occluded by the
@@ -588,9 +629,10 @@ impl App {
         #[cfg(feature = "control")]
         {
             let eyes = self.eyes();
+            let picture = self.picture();
             if let Some(active) = self.active.as_mut() {
                 if let super::screen::Screen::Offscreen(offscreen) = &mut active.screen {
-                    offscreen.read(&active.gpu, &eyes);
+                    offscreen.read(&active.gpu, &eyes, picture);
                 }
             }
         }
@@ -691,6 +733,17 @@ impl App {
             for err in errors {
                 tracing::warn!("server: {err}");
             }
+            // The tilesets over the globe, of the same session: their share
+            // of what it draws and holds.
+            if !self.surfaces.is_empty() {
+                let m = tuile_core::metrics::metrics();
+                tracing::info!(
+                    "3D Tiles {:?} | {} drawn | {:.0} MiB",
+                    self.surfaces.iter().map(|s| s.asset).collect::<Vec<_>>(),
+                    m.tiles3d_selected.get(),
+                    m.tiles3d_bytes.get() as f32 / (1024.0 * 1024.0),
+                );
+            }
         }
     }
 
@@ -704,9 +757,10 @@ impl App {
         self.picture().aspect() as f32
     }
 
-    /// Where the picture sits in the frame: the whole frame unless a host
-    /// held the camera to an aspect, and then the largest rectangle of that
-    /// shape, centred.
+    /// Where the picture sits in the frame: the view (the frame above the
+    /// credits bar, the whole frame without one) unless a host held the
+    /// camera to an aspect, and then the largest rectangle of that shape,
+    /// centred in the view.
     fn picture(&self) -> crate::frame_host::Letterbox {
         let (w, h) = self.viewport();
         crate::frame_host::Letterbox::of((w as u32, h as u32), self.fixed_aspect)

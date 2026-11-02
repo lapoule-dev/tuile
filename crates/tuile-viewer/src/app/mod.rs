@@ -6,6 +6,7 @@
 //! drives the geometry stream through the [`ContentPump`].
 
 mod command;
+mod credits;
 mod demand;
 #[cfg(feature = "control")]
 mod driven;
@@ -33,6 +34,7 @@ mod setup;
 pub(crate) use setup::backend_named;
 mod stall;
 mod tape;
+mod tilesets;
 mod touch;
 mod warmup;
 
@@ -125,6 +127,15 @@ pub struct ViewerConfig {
     /// frame, what the picture was drawn under — see `tuile_tape::session`.
     /// `TUILE_RECORD` says the same where there is no command line.
     pub(crate) record: crate::recording::RecordSettings,
+    /// The host's 3D Tiles tilesets on offer — each a switch in the menu,
+    /// off unless it is among `tilesets_on`.
+    pub(crate) tilesets: Vec<crate::embed::TilesetChoice>,
+    /// Those on at the start: what the session was started with, else the
+    /// last session's choice. The launch opens these.
+    pub(crate) tilesets_on: Vec<i64>,
+    /// Whether a switch is kept for the next session; not by a headless
+    /// run, which must leave the person's choice alone.
+    pub(crate) keeps_tilesets: bool,
 }
 
 /// Where the on-screen controls live: the part of the frame not under a
@@ -274,6 +285,16 @@ pub struct App {
     active: Option<Active>,
     /// The session, once it is up: its stream and the globe's handles.
     session: Option<crate::shell::Started>,
+    /// The host's 3D Tiles drawn over the globe: sources of the session's
+    /// scene, each leaving it when dropped — see [`crate::surface`].
+    surfaces: Vec<crate::surface::Surface>,
+    /// The `copyright` of each tile of theirs drawn in the last frame: what
+    /// their credits line gathers.
+    surfaces_drawn: Vec<std::sync::Arc<str>>,
+    /// The bar their credits are shown in, below the picture.
+    credits: credits::Credits,
+    /// Which of them are switched on: see `tilesets`.
+    tilesets: tilesets::Tilesets,
     /// The session on its way up; `None` once it has arrived or failed.
     launch: Option<crate::launch::Launch>,
     /// Why the session could not start, once that is known.
@@ -459,6 +480,14 @@ impl App {
             air: config.air.viewer,
             active: None,
             session: None,
+            surfaces: Vec::new(),
+            surfaces_drawn: Vec::new(),
+            credits: credits::Credits::default(),
+            tilesets: tilesets::Tilesets::new(
+                &config.tilesets,
+                &config.tilesets_on,
+                config.keeps_tilesets,
+            ),
             launch: Some(launch),
             failed: None,
             messages: messages::Messages::default(),
@@ -612,8 +641,26 @@ impl App {
     /// Takes over a session that has come up: its stream, the relief the
     /// camera stands on, how many layers a drape may carry, and the budget's
     /// meter the pump records its frames into.
-    fn adopt(&mut self, started: crate::shell::Started) {
+    fn adopt(&mut self, mut started: crate::shell::Started) {
         self.controller = self.controller.clone().with_ground(started.heights.clone());
+        let (surfaces, failures) = started.take_surfaces();
+        if let Some(active) = self.active.as_mut() {
+            for surface in &surfaces {
+                active.pump.hide_source(surface.tag, false);
+            }
+        }
+        self.surfaces = surfaces;
+        self.note_the_tilesets_up(&failures);
+        if !failures.is_empty() {
+            self.messages.say(
+                format!("{}: a 3D Tiles tileset is not shown", self.title),
+                failures
+                    .iter()
+                    .map(|(_, why)| why.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
         if let (Some(active), Some(meter)) = (self.active.as_mut(), started.meter()) {
             active.pump.observe(meter);
         }
@@ -661,12 +708,28 @@ impl App {
     /// Closes the session down: the stream, the store, the server. A phone, on
     /// its way out, is given seconds for all of it.
     pub fn shut_down(&mut self) {
+        // The tilesets leave the scene first.
+        self.surfaces.clear();
         let Some(session) = self.session.take() else {
             return;
         };
         let desktop = self.profile.hold_window_until_warm;
         let patience = std::time::Duration::from_secs(if desktop { 60 } else { 3 });
         session.close(patience, desktop);
+    }
+
+    /// What the 3D Tiles over the globe credit — the tiles drawn, then the
+    /// host's own — or `None` with none in the session.
+    fn surface_credits(&self) -> Option<String> {
+        if self.surfaces.is_empty() {
+            return None;
+        }
+        let credits: Vec<tuile_planetary::Credit> = self
+            .surfaces
+            .iter()
+            .flat_map(|surface| surface.credits.iter().cloned())
+            .collect();
+        Some(crate::surface::credit_line(&credits, &self.surfaces_drawn))
     }
 
     /// A one-line summary of the session, for the exit log.
@@ -853,6 +916,7 @@ impl App {
         // location is taken on whatever turn of the loop it arrives, hidden
         // and warming included.
         self.take_the_session();
+        self.take_the_tilesets();
         self.take_the_gpu();
         self.messages.offer(
             self.active.is_some() || self.ended_by.is_some(),
@@ -908,7 +972,15 @@ impl App {
         })
     }
 
+    /// The 3D view, in device pixels: the frame above the credits bar, from
+    /// the frame's top-left — the whole frame when there is no bar. What the
+    /// camera, the traversal, picking and the gestures all measure against.
     fn viewport(&self) -> (f64, f64) {
+        credits::view_of(self.frame_size(), self.credits.height())
+    }
+
+    /// The whole frame, in device pixels, credits bar included.
+    fn frame_size(&self) -> (f64, f64) {
         self.active
             .as_ref()
             .map_or((1920.0, 1080.0), |a| (a.size.0 as f64, a.size.1 as f64))
@@ -933,6 +1005,9 @@ impl App {
             };
         }
         let (x, y, sw, sh) = active.safe;
+        // The safe area above the credits bar, when there is one: the bar
+        // already keeps its own line clear of the bottom inset.
+        let sh = sh.min((h - y).max(0.0));
         let scale = active.scale.max(1.0);
         UiFrame {
             origin: (x, y),

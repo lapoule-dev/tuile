@@ -13,6 +13,16 @@ crate is their *transport* (tile URLs + auth). Draping imagery onto
 geometry is the core's raster-overlay module (see roadmap) — not this
 crate's business.
 
+A 3D Tiles asset ion does not host itself — its endpoint has an
+`externalType` and names the tileset in `options.url`, with the other
+service's key on it — resolves the same way: no ion bearer is sent there,
+the root document is asked fresh every time ([`IonHttp::get_fresh`]) since
+it hands out the session the content is fetched under, and the core carries
+the key and the session to every request beneath. [`IonSources`] answers
+`Sources::tileset` with the root, the fetcher and the credits
+([`Attribution::credit`]: the words, the logo and the link out of each
+attribution's HTML).
+
 Tokens are never stored in any repository; pass them in (CLI flag, env
 var read by the caller). Attribution strings returned by ion must be
 displayed by consumers ([`Attribution`]).

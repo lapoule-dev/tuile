@@ -273,6 +273,7 @@ fn content_of(tile: &TileIn<'_>) -> DecodedTileContent {
     let f = |b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
     DecodedTileContent {
         withheld_drape: None,
+        copyright: None,
         meshes: vec![DecodedMesh {
             positions: tile
                 .mesh

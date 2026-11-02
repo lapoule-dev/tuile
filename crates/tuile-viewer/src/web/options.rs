@@ -67,6 +67,54 @@ pub(crate) struct Options {
     /// Scene seconds a second: 1 by default — as `--time-rate`.
     #[serde(default)]
     pub time_rate: Option<f64>,
+    /// The 3D Tiles tilesets on offer over the globe, by the catalog's asset
+    /// number: each a switch in the menu, off until the person turns it on —
+    /// or on from the start with `on: true`, as `--tileset` is.
+    #[serde(default)]
+    pub tilesets: Vec<TilesetSpec>,
+}
+
+/// A 3D Tiles tileset on offer: `{ asset: 2275207, name: "…", on: false }`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TilesetSpec {
+    pub asset: i64,
+    /// What the menu calls it; `3D Tiles <asset>` when left out.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// On from the start, whatever the last session left.
+    #[serde(default)]
+    pub on: bool,
+}
+
+impl TilesetSpec {
+    /// The choices on offer, and those on at the start: the ones the page
+    /// says are, else the ones `kept` (the last session's) that are on offer.
+    pub(crate) fn choose(
+        specs: &[TilesetSpec],
+        kept: &[i64],
+    ) -> (Vec<crate::embed::TilesetChoice>, Vec<i64>) {
+        let offered: Vec<crate::embed::TilesetChoice> = specs
+            .iter()
+            .map(|t| {
+                let name = t
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("3D Tiles {}", t.asset));
+                crate::embed::TilesetChoice::new(&name, t.asset)
+            })
+            .collect();
+        let asked: Vec<i64> = specs.iter().filter(|t| t.on).map(|t| t.asset).collect();
+        let on = if asked.is_empty() {
+            kept.iter()
+                .copied()
+                .filter(|a| specs.iter().any(|t| t.asset == *a))
+                .collect()
+        } else {
+            asked
+        };
+        (offered, on)
+    }
 }
 
 impl Options {
@@ -685,5 +733,45 @@ mod tests {
         assert!(BackendChoice::Auto
             .backends()
             .contains(wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL));
+    }
+
+    /// A page offers tilesets by asset number: off unless it says `on`, or
+    /// the last session left them on — and none by default, the viewer as
+    /// it was before tilesets existed.
+    #[test]
+    fn tilesets_are_offered_off_unless_on() {
+        let o = options(CATALOG).expect("valid");
+        assert!(o.tilesets.is_empty());
+        let (offered, on) = TilesetSpec::choose(&o.tilesets, &[2275207]);
+        assert!(
+            offered.is_empty() && on.is_empty(),
+            "nothing offered, nothing on"
+        );
+
+        let page = CATALOG.replacen(
+            "\"profile\"",
+            r#""tilesets": [{ "asset": 2275207, "name": "Photorealistic 3D Tiles" },
+                            { "asset": 96188 }],
+               "profile""#,
+            1,
+        );
+        let o = options(&page).expect("valid");
+        let (offered, on) = TilesetSpec::choose(&o.tilesets, &[]);
+        let names: Vec<&str> = offered.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Photorealistic 3D Tiles", "3D Tiles 96188"]);
+        assert!(on.is_empty(), "off by default");
+        let (_, on) = TilesetSpec::choose(&o.tilesets, &[96188, 5]);
+        assert_eq!(on, vec![96188], "the last session's, among those offered");
+
+        let asked = page.replacen(
+            "{ \"asset\": 96188 }",
+            "{ \"asset\": 96188, \"on\": true }",
+            1,
+        );
+        let o = options(&asked).expect("valid");
+        assert_eq!(TilesetSpec::choose(&o.tilesets, &[2275207]).1, vec![96188]);
+        assert!(
+            options(&page.replacen("\"asset\": 96188", "\"asset\": 96188, \"x\": 1", 1)).is_err()
+        );
     }
 }

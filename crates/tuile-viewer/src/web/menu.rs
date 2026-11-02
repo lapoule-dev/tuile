@@ -73,7 +73,10 @@ impl Parts {
 impl Installed {
     /// Puts the menu on the page, over the view. `None` where there is no
     /// page to put it on.
-    pub(crate) fn install(layers: &'static [ImageryChoice]) -> Option<Self> {
+    pub(crate) fn install(
+        layers: &'static [ImageryChoice],
+        tilesets: &[crate::embed::TilesetChoice],
+    ) -> Option<Self> {
         let host = super::screen::host()?;
         let button = element(
             "button",
@@ -106,7 +109,7 @@ impl Installed {
         let mut handlers = Vec::new();
         let mut marks = Vec::new();
 
-        let mut sections = layout(layers);
+        let mut sections = layout(layers, tilesets);
         // What the desktop's Help menu holds, and its application menu's
         // About, after the application's own.
         sections.push((

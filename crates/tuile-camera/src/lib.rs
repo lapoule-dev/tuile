@@ -408,6 +408,13 @@ pub struct CameraController {
     /// its pose by the very next frame, which is a bug a caller cannot see
     /// and cannot work around.
     driven: bool,
+    /// The height above the ellipsoid the target was put at before the
+    /// floor lifted it, while it is lifted: where it goes back down to as the
+    /// floor comes down. At the start the relief known is a coarse tile's
+    /// highest peak, kilometres over the plain the eye was put above.
+    /// Forgotten once the eye is back there, and by a gesture that asks for
+    /// another height (a zoom, a tilt).
+    lifted_from: Option<f64>,
 }
 
 /// The terrain where it has an opinion, sea level where it does not.
@@ -453,6 +460,7 @@ impl CameraController {
             target: camera,
             ground: None,
             driven: false,
+            lifted_from: None,
         }
     }
 
@@ -505,9 +513,27 @@ impl CameraController {
         })
     }
 
-    /// Both bounds, the floor last: where they cross, the ground wins.
-    fn bounded(&self, position: DVec3) -> DVec3 {
-        self.lifted(self.lowered(position))
+    /// The target held within both bounds — the floor last: where they
+    /// cross, the ground wins — and, while the floor holds it
+    /// above where it was put, brought back down toward there as the floor
+    /// comes down: see [`Self::lifted_from`].
+    fn bound_the_target(&mut self) {
+        let mut position = self.lowered(self.target.position);
+        let g = ecef_to_geodetic(position);
+        if let Some(asked) = self.lifted_from {
+            if g.height > asked {
+                position = geodetic_to_ecef(Geodetic { height: asked, ..g });
+            }
+        }
+        let asked = ecef_to_geodetic(position).height;
+        let held = self.lifted(position);
+        let lifted = ecef_to_geodetic(held).height - asked;
+        self.lifted_from = if lifted > 1e-3 {
+            Some(self.lifted_from.unwrap_or(asked))
+        } else {
+            None
+        };
+        self.target.position = held;
     }
 
     /// The surface point the orbiting gestures pivot about: what the screen
@@ -667,6 +693,9 @@ impl CameraController {
         // nothing is touched, which is the point: zoom-to-cursor keeps working
         // where it is useful and stops being a catapult where it is not.
         let candidate = self.bound_the_sideways_travel(candidate);
+        // A height the person asked for: whatever the floor held up before
+        // is theirs no longer.
+        self.lifted_from = None;
         self.target.position = if factor >= 1.0 {
             self.short_of_the_ceiling(candidate)
         } else {
@@ -743,6 +772,9 @@ impl CameraController {
         if after > 0.0 && after >= self.target.pitch_violation() {
             return;
         }
+        // A tilt orbits the eye up or down: the height it leads to is the
+        // person's.
+        self.lifted_from = None;
         self.target = tilted;
     }
 
@@ -770,6 +802,7 @@ impl CameraController {
         );
         self.target = cam;
         self.camera = cam;
+        self.lifted_from = None;
     }
 
     /// Eases the live camera toward the gesture target — call once per frame
@@ -809,6 +842,7 @@ impl CameraController {
         self.camera = camera;
         self.target = camera;
         self.driven = true;
+        self.lifted_from = None;
     }
 
     /// Stops driving: the controller eases and clamps again, from wherever
@@ -841,8 +875,9 @@ impl CameraController {
         self.driven = false;
         // The same clamps a gesture gets, applied once here so `place` and a
         // drag agree about where the floor and the ceiling are.
-        self.camera.position = self.bounded(self.camera.position);
-        self.target.position = self.camera.position;
+        self.lifted_from = None;
+        self.bound_the_target();
+        self.camera.position = self.target.position;
     }
 
     /// Eases the live camera toward the gesture target by a **duration**, not by
@@ -891,7 +926,7 @@ impl CameraController {
         // a ridge without any zoom at all; and the ground itself rises under a
         // stationary camera as finer tiles stream in.
         // And the ceiling: a tilt orbits the eye up as well as round.
-        self.target.position = self.bounded(self.target.position);
+        self.bound_the_target();
         let c = &mut self.camera;
         let t = &self.target;
         c.position = c.position.lerp(t.position, k);
@@ -1290,6 +1325,68 @@ mod tests {
         assert!(
             ctrl.camera.altitude() >= 4000.0 + 150.0 - 1.0,
             "zoomed through the mountain to {:.0} m",
+            ctrl.camera.altitude()
+        );
+    }
+
+    /// Ground whose height can change, as relief does when finer tiles
+    /// arrive.
+    struct Streaming(std::sync::Mutex<f64>);
+    impl GroundHeight for Streaming {
+        fn height_at(&self, _lon: f64, _lat: f64) -> Option<f64> {
+            Some(*self.0.lock().expect("height"))
+        }
+    }
+
+    /// The bug: an eye placed low over a plain, at the start, when the only
+    /// relief known is a coarse tile's maximum — the highest peak of a
+    /// continent — was lifted kilometres up, and stayed there once the plain
+    /// arrived. The floor lifts the eye; when the floor comes down, the eye
+    /// comes back down to where it was put, never under the floor.
+    #[test]
+    fn an_eye_lifted_by_a_coarse_floor_comes_back_down_when_the_floor_does() {
+        let ground = Arc::new(Streaming(std::sync::Mutex::new(4808.0)));
+        let cam =
+            GlobeCamera::from_geodetic(0.85, 0.04, 350.0, 0.0, 0.2, std::f64::consts::FRAC_PI_3);
+        let mut ctrl = CameraController::new(cam)
+            .with_min_altitude(1.0)
+            .with_ground(Arc::clone(&ground) as Arc<dyn GroundHeight>);
+        ctrl.jump_to(cam);
+        ctrl.update(1.0);
+        assert!(
+            ctrl.camera.altitude() > 4800.0,
+            "held above the coarse floor"
+        );
+        // The plain arrives: 120 m.
+        *ground.0.lock().expect("height") = 120.0;
+        for _ in 0..3 {
+            ctrl.update(1.0);
+        }
+        assert!(
+            (ctrl.camera.altitude() - 350.0).abs() < 1.0,
+            "back where it was put, at {:.0} m",
+            ctrl.camera.altitude()
+        );
+        // And a floor that comes down only part of the way holds it there.
+        *ground.0.lock().expect("height") = 1000.0;
+        ctrl.update(1.0);
+        assert!((ctrl.camera.altitude() - 1001.0).abs() < 1.0);
+        *ground.0.lock().expect("height") = 120.0;
+        ctrl.update(1.0);
+        assert!(
+            (ctrl.camera.altitude() - 350.0).abs() < 1.0,
+            "the asked height is kept through a second lift"
+        );
+        // A person who zooms has asked for a new height: the old one is gone.
+        *ground.0.lock().expect("height") = 4808.0;
+        ctrl.update(1.0);
+        ctrl.zoom(-1.0, (512.0, 384.0), (1024.0, 768.0));
+        let asked = ctrl.target().altitude();
+        *ground.0.lock().expect("height") = 120.0;
+        ctrl.update(1.0);
+        assert!(
+            ctrl.camera.altitude() >= asked - 1.0,
+            "a zoom's height is the person's: {:.0} under {asked:.0}",
             ctrl.camera.altitude()
         );
     }

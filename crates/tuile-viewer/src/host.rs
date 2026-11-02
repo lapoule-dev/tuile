@@ -253,6 +253,13 @@ pub(crate) fn last_view_file(host: &dyn Host) -> Option<PathBuf> {
     Some(support_dir(host)?.join("last-view"))
 }
 
+/// Where the 3D Tiles tilesets a person switched on are kept for the next
+/// session: one line, their asset numbers, comma-separated.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn tilesets_on_file(host: &dyn Host) -> Option<PathBuf> {
+    Some(support_dir(host)?.join("tilesets-on"))
+}
+
 /// The file a token is read from, and the one a person is told to create.
 ///
 /// On a phone that is `Documents/token`: the one directory of an application

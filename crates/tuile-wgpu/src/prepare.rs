@@ -83,9 +83,10 @@ struct ImageryPass {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct MaterialUniform {
     base_color: [f32; 4],
-    /// x = 1 on the first pass, 0 after — the rest is padding the uniform
-    /// alignment would cost anyway. Named `flags` rather than `pass` because
-    /// WGSL reserves that word, and the two declarations must match.
+    /// x = 1 on the first pass, 0 after; y = 1 for a material that declares
+    /// `KHR_materials_unlit` — the rest is padding the uniform alignment would
+    /// cost anyway. Named `flags` rather than `pass` because WGSL reserves
+    /// that word, and the two declarations must match.
     flags: [f32; 4],
 }
 
@@ -141,6 +142,10 @@ pub struct PreparedTile {
     /// among its layers. What a host reads to know how far a switch of
     /// imagery has crossed the screen.
     pub imagery_source: Option<u32>,
+    /// Who the content credits, as it named itself
+    /// ([`tuile_core::content::DecodedTileContent::copyright`]): what a host
+    /// puts on screen while it draws this tile.
+    pub copyright: Option<Arc<str>>,
 }
 
 /// A tile's stitching: what it was last told, and its slide towards it.
@@ -152,6 +157,19 @@ struct Stitching {
 }
 
 impl PreparedTile {
+    /// Lets go of the meshes as they came: a tile never stitched — a 3D
+    /// Tiles tile, which is not ground — has no use for them, and the copy
+    /// is not charged for it (`DecodedTileContent::cost_held`).
+    pub(crate) fn forget_source(&mut self) {
+        self.source = Vec::new();
+        self.cell = None;
+    }
+
+    /// Whether the tile keeps the meshes as they came, for its stitches.
+    pub(crate) fn keeps_source(&self) -> bool {
+        !self.source.is_empty()
+    }
+
     /// Stitches the tile to its neighbours as `tuile_core::stitch::plan`
     /// decided for the tiles drawn from `frame` on: the vertex stage moves
     /// its vertices by the plan's strips. `slide` is how many frames the
@@ -439,6 +457,7 @@ pub fn prepare(
     PreparedTile {
         sharpest_imagery_level,
         imagery_source,
+        copyright: content.copyright.clone(),
         meshes,
         tile_bg,
         tile_buf,
@@ -796,7 +815,7 @@ fn materials(
         let first = f32::from(index == 0);
         let uniform = MaterialUniform {
             base_color: mesh.material.base_color_factor,
-            flags: [first, 0.0, 0.0, 0.0],
+            flags: [first, f32::from(u8::from(mesh.material.unlit)), 0.0, 0.0],
         };
         let material_buf = gpu
             .device

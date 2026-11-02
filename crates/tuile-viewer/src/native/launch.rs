@@ -51,9 +51,43 @@ pub(crate) struct Started {
     pub gate: Gate,
     /// The runtime the store is flushed on.
     pub runtime: tokio::runtime::Handle,
+    /// The 3D Tiles drawn over the globe, until the window takes them.
+    pub surfaces: Vec<crate::surface::Surface>,
+    /// Why a tileset asked for is not among them: its asset, and a sentence.
+    pub surface_failures: Vec<(i64, String)>,
+    /// The session's scene: the globe, and each tileset switched on.
+    pub scene: tuile_core::Composite,
+    /// What a tileset switched on later is opened with: the host's sources,
+    /// and the launch's plan for its traversal.
+    pub sources: Arc<dyn crate::embed::Sources>,
+    pub plan: Plan,
 }
 
 impl Started {
+    /// The 3D Tiles drawn over the globe, and why any asked for is not, for
+    /// the window to take once.
+    pub(crate) fn take_surfaces(&mut self) -> (Vec<crate::surface::Surface>, Vec<(i64, String)>) {
+        (
+            std::mem::take(&mut self.surfaces),
+            std::mem::take(&mut self.surface_failures),
+        )
+    }
+
+    /// Opens the host's tileset `asset` again, after the session is up — a
+    /// person switched it back on: added to the scene once its root is in;
+    /// the answer arrives on the receiver.
+    pub(crate) fn open_tileset(&self, asset: i64) -> crate::surface::Opening {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sources = Arc::clone(&self.sources);
+        let config = self.plan.config.clone();
+        let (scene, gate) = (self.scene.clone(), self.gate.clone());
+        self.runtime.spawn(async move {
+            let opened = open_surface(sources.as_ref(), asset, &config, &scene, &gate).await;
+            let _ = tx.send(opened);
+        });
+        rx
+    }
+
     /// How the loader holds imagery, for the window to tell it the device's
     /// plan.
     pub(crate) fn imagery_plan(&self) -> Option<&tuile_planetary::ImageryPlanHandle> {
@@ -79,8 +113,12 @@ impl Started {
             server,
             store,
             runtime,
+            surfaces,
             ..
         } = self;
+        // The tilesets leave the scene, then the session ends with its
+        // stream.
+        drop(surfaces);
         drop(stream);
         crate::native::store::close(store, &runtime, patience);
         if join_the_server {
@@ -176,6 +214,9 @@ pub(crate) struct Plan {
     /// What the same choice does with imagery stored already compressed:
     /// fixed for the session, as the globe is built with it.
     pub stored_imagery: tuile_core::texels::StoredPlan,
+    /// The host's 3D Tiles tilesets drawn over the globe, by asset number:
+    /// see [`crate::surface`].
+    pub tilesets: Vec<i64>,
 }
 
 /// Starts the launch on `runtime` and returns at once.
@@ -220,7 +261,7 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         plan.profile.decode_threads,
     ));
     let globe = crate::globe::assemble(
-        sources,
+        Arc::clone(&sources),
         store.clone().map(|s| s as Arc<dyn ContentStore>),
         &plan.terrain,
         plan.layers,
@@ -238,9 +279,18 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         inner: globe.loader,
         gate: gate.clone(),
     });
-    let (stream, server) =
-        tuile_core::runtime::in_process_with(globe.tree, loader, plan.config, plan.budget)
-            .map_err(|e| format!("the graphics budget cannot run: {e}"))?;
+    // One scene: the globe under tag 0 (its tiles' ids those of a globe
+    // alone), the tilesets beside it as they are switched on.
+    let scene = tuile_core::Composite::new();
+    scene
+        .add_at(0, globe.tree, loader, tuile_core::SourceOptions::default())
+        .map_err(|e| format!("the globe could not join the scene: {e}"))?;
+    let (stream, server) = tuile_core::runtime::in_process_composite(
+        scene.clone(),
+        plan.config.clone(),
+        plan.budget.clone(),
+    )
+    .map_err(|e| format!("the graphics budget cannot run: {e}"))?;
     let meter = server.meter();
     // Every load a task on the runtime's workers, so tiles keep arriving
     // while the server traverses.
@@ -252,6 +302,22 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         .name("geometry-server".into())
         .spawn(move || server_runtime.block_on(server.run()))
         .map_err(|e| format!("the geometry server could not start: {e}"))?;
+    // The 3D Tiles over it. One that cannot be opened is said and left out:
+    // the globe stands without it.
+    let mut surfaces = Vec::new();
+    let mut surface_failures = Vec::new();
+    for &asset in &plan.tilesets {
+        match open_surface(sources.as_ref(), asset, &plan.config, &scene, &gate).await {
+            Ok(surface) => {
+                tracing::info!(asset, "3D Tiles tileset up");
+                surfaces.push(surface);
+            }
+            Err(why) => {
+                tracing::error!(asset, "3D Tiles tileset not opened: {why}");
+                surface_failures.push((asset, format!("3D Tiles asset {asset}: {why}")));
+            }
+        }
+    }
     Ok(Started {
         stream,
         server: Some(server),
@@ -267,7 +333,56 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         store,
         gate,
         runtime,
+        surfaces,
+        surface_failures,
+        scene,
+        sources,
+        plan,
     })
+}
+
+/// Opens one of the host's 3D Tiles tilesets — its root, then a source of
+/// the session's scene, its loads behind the session's gate as the globe's
+/// are — and gives the surface that takes it out of the scene when dropped.
+async fn open_surface(
+    sources: &dyn crate::embed::Sources,
+    asset: i64,
+    globe: &tuile_core::traversal::Config,
+    scene: &tuile_core::Composite,
+    gate: &Gate,
+) -> Result<crate::surface::Surface, String> {
+    let source = sources.tileset(asset).await?;
+    let root = source
+        .fetcher
+        .fetch(&source.url)
+        .await
+        .map_err(|e| format!("its root: {e}"))?;
+    let tileset = tuile_core::tileset::Tileset::from_json_bytes(&root, &source.url)
+        .map_err(|e| format!("its root: {e}"))?;
+    let arena = Arc::new(std::sync::RwLock::new(tileset));
+    let loader: Arc<dyn TileLoader> = Arc::new(Gated {
+        inner: Arc::new(tuile_core::TilesetLoader::new(
+            Arc::clone(&arena),
+            Arc::new(tuile_planetary::Held(Arc::clone(&source.fetcher))),
+        )),
+        gate: gate.clone(),
+    });
+    let tag = scene
+        .add(
+            Box::new(tuile_core::TilesetTree::new(arena)),
+            loader,
+            crate::surface::options(globe),
+        )
+        .map_err(|e| format!("the scene has no room for it: {e}"))?;
+    let scene = scene.clone();
+    Ok(crate::surface::Surface::new(
+        asset,
+        tag,
+        source.credits,
+        move || {
+            scene.remove(tag);
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -275,6 +390,77 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use web_time::Instant;
+
+    /// A host serving one tileset from a file, and nothing else.
+    struct OneTileset(url::Url);
+
+    #[async_trait::async_trait]
+    impl crate::embed::Sources for OneTileset {
+        async fn terrain(
+            &self,
+            _asset: i64,
+        ) -> Result<
+            (
+                tuile_terrain::LayerJson,
+                Arc<dyn tuile_terrain::TerrainSource>,
+            ),
+            String,
+        > {
+            Err("no terrain".into())
+        }
+        async fn imagery(
+            &self,
+            _asset: i64,
+        ) -> Result<Arc<dyn tuile_core::raster::ImageryProvider>, String> {
+            Err("no imagery".into())
+        }
+        async fn tileset(&self, _asset: i64) -> Result<tuile_planetary::TilesetSource, String> {
+            Ok(tuile_planetary::TilesetSource {
+                url: self.0.clone(),
+                fetcher: Arc::new(tuile_core::fetch::FsFetcher),
+                credits: vec![tuile_planetary::Credit {
+                    text: "Someone".into(),
+                    logo: None,
+                    link: None,
+                }],
+            })
+        }
+    }
+
+    /// **A tileset switched on is a source of the session's scene, and
+    /// switched off it leaves it**: no server, no stream, no budget of its
+    /// own — the scene's one; traversed at the 3D Tiles error and covering
+    /// the ground; its surface, dropped, takes it out. Red with the surface
+    /// not leaving: its tag still live after the drop.
+    #[test]
+    fn a_tileset_switched_on_is_a_source_of_the_scene_and_leaves_it_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tileset.json");
+        std::fs::write(
+            &path,
+            r#"{ "asset": { "version": "1.1" }, "geometricError": 10,
+                 "root": { "boundingVolume": { "sphere": [0, 0, 0, 10] },
+                           "geometricError": 0, "content": { "uri": "a.glb" } } }"#,
+        )
+        .expect("the root");
+        let sources = OneTileset(url::Url::from_file_path(&path).expect("a url"));
+        let scene = tuile_core::Composite::new();
+        let globe = tuile_core::traversal::Config::interactive_globe();
+        let surface =
+            futures_executor::block_on(open_surface(&sources, 7, &globe, &scene, &Gate::default()))
+                .expect("opened");
+        assert_eq!(surface.asset, 7);
+        assert_eq!(scene.tags(), vec![surface.tag]);
+        assert_eq!(surface.credits.len(), 1);
+        let tags = scene.tags();
+        assert_eq!(tags.len(), 1, "one source in the scene");
+        let options = scene.options(tags[0]).expect("its options");
+        assert!(options.covers_ground);
+        assert_eq!(options.sse_factor * globe.maximum_screen_space_error, 16.0);
+        drop(surface);
+        assert!(scene.tags().is_empty(), "the tileset still in the scene");
+        assert_eq!(scene.retired(), tags, "its tag waits for the session");
+    }
 
     /// A host whose service never answers — the network a phone has in a
     /// lift, or a captive portal.
@@ -332,6 +518,7 @@ mod tests {
             timeout: crate::launch::START_TIMEOUT,
             imagery_plan: tuile_core::texels::ImageryPlan::RGBA8,
             stored_imagery: tuile_core::texels::StoredPlan::OFF,
+            tilesets: Vec::new(),
         }
     }
 

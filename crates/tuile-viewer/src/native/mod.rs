@@ -45,6 +45,33 @@ pub(crate) fn keep_the_view(link: Option<&str>) {
     let _ = std::fs::write(&file, format!("{link}\n"));
 }
 
+/// Keeps `on`, the 3D Tiles tilesets a person switched on, for the next
+/// session — a file in the application's support directory, removed when
+/// none is on.
+pub(crate) fn keep_tilesets_on(on: &[i64]) {
+    let Some(file) = host::tilesets_on_file(&host::Machine) else {
+        return;
+    };
+    if on.is_empty() {
+        let _ = std::fs::remove_file(&file);
+        return;
+    }
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let line: Vec<String> = on.iter().map(i64::to_string).collect();
+    let _ = std::fs::write(&file, format!("{}\n", line.join(",")));
+}
+
+/// The 3D Tiles tilesets the last session left switched on. A file that
+/// does not read as asset numbers is no choice at all.
+pub(crate) fn tilesets_kept_on() -> Vec<i64> {
+    host::tilesets_on_file(&host::Machine)
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .and_then(|text| crate::start::asset_list("tilesets-on", text.trim()).ok())
+        .unwrap_or_default()
+}
+
 /// Whether this process was started from an application bundle — from an
 /// icon, most likely, with no terminal behind it.
 fn in_a_bundle() -> bool {
@@ -166,7 +193,8 @@ fn session(
 ) -> anyhow::Result<()> {
     // The command line, read by `main`. Exit code 2 is the usual one for a
     // command that was not understood.
-    let (view, here, imagery, compression, clock, max_altitude, record) = match invocation {
+    let (view, here, imagery, compression, clock, max_altitude, record, tilesets) = match invocation
+    {
         Ok(start::Invocation::Run {
             view,
             here,
@@ -175,6 +203,7 @@ fn session(
             clock,
             max_altitude,
             record,
+            tilesets,
             ..
         }) => (
             view,
@@ -184,6 +213,7 @@ fn session(
             clock,
             max_altitude,
             record,
+            tilesets,
         ),
         Ok(start::Invocation::Help) => {
             println!("{}", start::usage());
@@ -236,6 +266,20 @@ fn session(
             std::process::exit(2);
         }
     };
+    // The 3D Tiles drawn over the globe: the flag, else the settings page,
+    // else TUILE_TILESETS; none when nothing says.
+    let tilesets = match settings::tilesets(tilesets, &host::Machine) {
+        Ok(tilesets) => tilesets,
+        Err(why) => {
+            eprintln!("{}: {why}", embed::identity().executable);
+            std::process::exit(2);
+        }
+    };
+    // Those on offer, each a switch; and those on: what was asked for, else
+    // the phone's settings switch, else the person's choice last time —
+    // none, until they turn one on.
+    let offered = embedder.tilesets();
+    let on = settings::tilesets_on(tilesets, &offered, &host::Machine, tilesets_kept_on);
     // `TUILE_BACKEND=gl` forces one — a launch setting on Android.
     let backends = crate::app::backend_named(std::env::var("TUILE_BACKEND").ok().as_deref())
         .map_err(anyhow::Error::msg)?;
@@ -308,6 +352,9 @@ fn session(
         timeout: crate::launch::START_TIMEOUT,
         imagery_plan,
         stored_imagery,
+        // Only those on: one switched off costs nothing, its root not even
+        // asked for.
+        tilesets: on.clone(),
     };
     let launch = launch::start(&handle, plan.clone());
     // A phone tries again by itself; a desktop says why and stops, as it
@@ -397,6 +444,9 @@ fn session(
         backends,
         imagery_compression: compression,
         record,
+        tilesets: offered,
+        tilesets_on: on.clone(),
+        keeps_tilesets: true,
     };
 
     // Everything the engine counts, scrapeable, so the log can stop being a

@@ -1,0 +1,17 @@
+{
+  "externalType": "3DTILES",
+  "type": "3DTILES",
+  "attributions": [
+    {
+      "html": "<span><a href=\"https://cesium.com\" target=\"_blank\"><img src=\"https://assets.ion.cesium.com/ion-credit.png\" alt=\"Cesium ion\"></a></span>",
+      "collapsible": false
+    },
+    {
+      "html": "<img alt=\"Google\" src=\"https://assets.ion.cesium.com/google-credit.png\" style=\"vertical-align:-6px\">",
+      "collapsible": false
+    }
+  ],
+  "options": {
+    "url": "https://tile.googleapis.com/v1/3dtiles/root.json?key=FAKE_KEY"
+  }
+}

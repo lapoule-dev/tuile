@@ -2088,6 +2088,7 @@ pub(crate) mod tests {
                 origin_ecef: DVec3::ZERO,
                 content: DecodedTileContent {
                     withheld_drape: None,
+                    copyright: None,
                     meshes: Vec::new(),
                     textures: vec![DecodedTexture::from_rgba8(2, 2, vec![255u8; 2 * 2 * 4])],
                     imagery: Vec::new(),
@@ -2392,6 +2393,7 @@ pub(crate) mod tests {
         let uvs = uvs_geographic(&positions, origin, &rect);
         DecodedTileContent {
             withheld_drape: None,
+            copyright: None,
             meshes: vec![DecodedMesh {
                 positions,
                 normals: None,
@@ -2400,6 +2402,7 @@ pub(crate) mod tests {
                 material: MaterialDesc {
                     base_color_factor: [1.0; 4],
                     base_color_texture: None,
+                    unlit: false,
                 },
             }],
             textures: Vec::new(),
@@ -2441,6 +2444,7 @@ pub(crate) mod tests {
         let uvs = uvs_geographic(&positions, origin, &rect);
         let decoded = DecodedTileContent {
             withheld_drape: None,
+            copyright: None,
             meshes: vec![DecodedMesh {
                 positions,
                 normals: None,
@@ -2449,6 +2453,7 @@ pub(crate) mod tests {
                 material: MaterialDesc {
                     base_color_factor: [1.0; 4],
                     base_color_texture: None,
+                    unlit: false,
                 },
             }],
             textures: Vec::new(),

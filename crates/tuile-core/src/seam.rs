@@ -617,6 +617,7 @@ mod tests {
         }
         DecodedTileContent {
             withheld_drape: None,
+            copyright: None,
             meshes: vec![DecodedMesh {
                 positions,
                 normals: None,

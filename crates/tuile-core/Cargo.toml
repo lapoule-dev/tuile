@@ -23,7 +23,9 @@ futures-channel = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
 glam = { workspace = true }
-gltf = { workspace = true }
+# `KHR_materials_unlit`: content that carries its light in its texture
+# (photogrammetry) says so, and is drawn without shading by its facets.
+gltf = { workspace = true, features = ["KHR_materials_unlit"] }
 image = { workspace = true }
 serde = { workspace = true }
 # Imagery stored already compressed (KTX 2.0, UASTC): read, transcoded or

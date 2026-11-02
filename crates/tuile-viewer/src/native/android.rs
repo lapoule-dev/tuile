@@ -251,6 +251,20 @@ pub(crate) fn caption(text: &str) {
     });
 }
 
+/// The caption lifted `pixels` device pixels off the bottom: the credits
+/// bar's height.
+pub(crate) fn caption_lift(pixels: u32) {
+    with_activity(|env, activity| {
+        env.call_method(
+            activity,
+            jni_str!("captionLift"),
+            jni_sig!("(I)V"),
+            &[JValue::Int(i32::try_from(pixels).unwrap_or(i32::MAX))],
+        )?;
+        Ok(())
+    });
+}
+
 /// An alert over the view; whether it could be shown now.
 pub(crate) fn alert(title: &str, text: &str) -> bool {
     with_activity(|env, activity| {

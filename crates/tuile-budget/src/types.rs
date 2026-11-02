@@ -42,6 +42,16 @@ impl Class {
         Class::Overlay,
     ];
 
+    /// Whether it lies on the globe — a terrain mesh, a drape, an overlay —
+    /// rather than standing on it or over it as a 3D Tiles mesh does. The
+    /// floor ([`BudgetConfig::pinned_level`](super::BudgetConfig::pinned_level))
+    /// and the coarse ground drawn first while ground is lost (P1.1) are the
+    /// ground's: a tileset's coarsest tiles are no floor, and a tileset's
+    /// tile not yet drawn holds no ground back.
+    pub const fn is_ground(self) -> bool {
+        !matches!(self, Class::Tiles3dMesh)
+    }
+
     /// The class's slot in a [`PerClass`].
     pub const fn index(self) -> usize {
         match self {

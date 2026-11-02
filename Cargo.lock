@@ -9285,6 +9285,7 @@ dependencies = [
  "tracing",
  "tuile-core",
  "tuile-terrain",
+ "url",
  "web-time",
 ]
 
@@ -9432,6 +9433,7 @@ dependencies = [
 name = "tuile-ui"
 version = "0.15.1"
 dependencies = [
+ "ab_glyph",
  "muda",
  "tray-icon",
  "tuile-camera",

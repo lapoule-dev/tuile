@@ -213,14 +213,15 @@ pub async fn drive_until_complete<S: GeometryStream + Unpin>(
             ServerMessage::Content {
                 resource,
                 gen,
+                class,
                 content,
                 ..
             } => {
                 // Held as uploaded: acknowledged with the estimator's bytes,
                 // which is what a consumer that keeps the decoded content
-                // holds.
+                // holds (the ground's meshes with the copy a stitch reads).
                 let bytes = match &content {
-                    ResourceContent::Mesh(m) => m.cost().gpu,
+                    ResourceContent::Mesh(m) => m.cost_held(class.is_ground()).gpu,
                     ResourceContent::Drape(d) => d.cost().gpu,
                 };
                 match content {
@@ -255,7 +256,11 @@ pub async fn drive_until_complete<S: GeometryStream + Unpin>(
             ServerMessage::Error { resource, message } => errors.push((resource, message)),
             ServerMessage::Select { .. } | ServerMessage::Priming(_) => {}
         }
-        if state.is_complete() {
+        // Complete for the views sent (generation 1): the session's first
+        // step answers no view — it lists the floor before any camera —
+        // and a scene with no floor (a tileset alone) converges on it, on
+        // nothing.
+        if state.is_complete() && state.generation() >= 1 {
             return Ok(BulkFrame {
                 draw: state.draw().clone(),
                 meshes,
@@ -336,6 +341,7 @@ mod tests {
             textures: Vec::new(),
             imagery: Vec::new(),
             withheld_drape: None,
+            copyright: None,
             local_origin_ecef: glam::DVec3::ZERO,
             transform_local: glam::Mat4::IDENTITY,
         }

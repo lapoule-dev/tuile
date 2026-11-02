@@ -30,3 +30,19 @@ The CDS states that the copyright of a catalogue depends on its origin and is
 given in its ReadMe; the ReadMe of V/50 states no copyright. The catalogue is
 a work of NASA's National Space Science Data Center (Astronomical Data
 Center). Its authors and the CDS are acknowledged here as the CDS asks.
+
+Bundled font
+------------
+
+crates/tuile-ui/fonts/Inter-Regular.ttf is Inter 4.1, Regular, unmodified:
+
+  Copyright (c) 2016 The Inter Project Authors (https://github.com/rsms/inter)
+  Licensed under the SIL Open Font License, Version 1.1; the licence is in
+  crates/tuile-ui/fonts/Inter-OFL.txt.
+  Source: https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip
+  (extras/ttf/Inter-Regular.ttf)
+  SHA-256: 40d692fce188e4471e2b3cba937be967878f631ad3ebbbdcd587687c7ebe0c82
+  Fetched 2026-10-31.
+
+It is embedded in the binaries that draw text (the viewers' credits bar);
+the font is not sold by itself, as the licence requires.

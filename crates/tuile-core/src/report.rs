@@ -207,6 +207,7 @@ mod tests {
         };
         let content = DecodedTileContent {
             withheld_drape: None,
+            copyright: None,
             meshes: vec![mesh],
             textures: vec![DecodedTexture::from_rgba8(256, 256, vec![0; 256 * 256 * 4])],
             imagery: Vec::new(),

@@ -244,6 +244,10 @@ const BUNDLED_PREFIX: &str = include_str!("../../tuile-viewer/ios/bundled-creden
 /// as `tuile_viewer`'s `IMAGERY_COMPRESSION_KEY`.
 pub(crate) const IMAGERY_COMPRESSION_KEY: &str = "imagery_compression";
 
+/// The key the settings page keeps the 3D Tiles switch under: the same as
+/// `tuile_viewer`'s `SHOW_TILESETS_KEY`.
+pub(crate) const SHOW_TILESETS_KEY: &str = "show_tilesets";
+
 /// The settings page: one secure text field for the credential, under the
 /// key the application reads first, and the choice of how imagery is held on
 /// the GPU — off unless the person picks otherwise, read at launch.
@@ -309,6 +313,28 @@ fn settings_bundle(credential: &Credential, out: &Path) -> anyhow::Result<()> {
     ] {
         compression.insert(key.into(), value);
     }
+    // The host's 3D Tiles over the globe — on a desktop and a page a switch
+    // in the menu, here a switch on this page: off unless turned on.
+    let mut tiles_group = plist::Dictionary::new();
+    tiles_group.insert("Type".into(), text("PSGroupSpecifier"));
+    tiles_group.insert("Title".into(), text("3D Tiles"));
+    tiles_group.insert(
+        "FooterText".into(),
+        text(
+            "A photographic mesh of the surface — buildings, trees, relief — \
+             drawn over the globe where it exists, its credits below the \
+             picture. Applies at the next launch.",
+        ),
+    );
+    let mut tiles = plist::Dictionary::new();
+    for (key, value) in [
+        ("Type", text("PSToggleSwitchSpecifier")),
+        ("Title", text("Photorealistic 3D Tiles")),
+        ("Key", text(SHOW_TILESETS_KEY)),
+        ("DefaultValue", Boolean(false)),
+    ] {
+        tiles.insert(key.into(), value);
+    }
     let mut root = plist::Dictionary::new();
     root.insert(
         "PreferenceSpecifiers".into(),
@@ -317,6 +343,8 @@ fn settings_bundle(credential: &Credential, out: &Path) -> anyhow::Result<()> {
             Dictionary(field),
             Dictionary(rendering),
             Dictionary(compression),
+            Dictionary(tiles_group),
+            Dictionary(tiles),
         ]),
     );
     Dictionary(root).to_file_xml(settings.join("Root.plist"))?;
@@ -554,6 +582,24 @@ mod tests {
             .filter_map(plist::Value::as_string)
             .collect();
         assert_eq!(values, ["off", "auto", "bc7", "astc"]);
+        // The 3D Tiles: a switch, off by default.
+        let switch = fields
+            .iter()
+            .filter_map(plist::Value::as_dictionary)
+            .find(|f| {
+                f.get("Type").and_then(plist::Value::as_string) == Some("PSToggleSwitchSpecifier")
+            })
+            .expect("a 3D Tiles switch");
+        assert_eq!(
+            switch.get("Key").and_then(plist::Value::as_string),
+            Some(SHOW_TILESETS_KEY)
+        );
+        assert_eq!(
+            switch
+                .get("DefaultValue")
+                .and_then(plist::Value::as_boolean),
+            Some(false)
+        );
         let info = plist::Value::from_file(dir.path().join("Info.plist")).expect("a plist");
         let key = bundled_key("SOME_TOKEN");
         assert!(info.as_dictionary().is_some_and(|d| !d.contains_key(&key)));

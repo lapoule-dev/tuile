@@ -86,13 +86,40 @@ pub(crate) struct Started {
     pub layer_budget: Budget,
     pub switcher: Switcher,
     pub gate: Gate,
+    /// The worker, for the tilesets opened in it.
+    link: Rc<Link>,
+    /// The tilesets asked for and not yet up, by asset: where each one's
+    /// answer goes.
+    tilesets: Tilesets,
 }
+
+/// The tilesets asked of the worker and not yet up.
+type Tilesets = Rc<RefCell<HashMap<i64, TilesetAnswer>>>;
+
+type TilesetAnswer = tokio::sync::oneshot::Sender<Result<crate::surface::Surface, String>>;
 
 impl Started {
     /// A page's loader is in its worker, which was given the device's plan
     /// in its start message: there is no handle here to set.
     pub(crate) fn imagery_plan(&self) -> Option<&tuile_planetary::ImageryPlanHandle> {
         None
+    }
+
+    /// The 3D Tiles drawn over the globe, from the start: none — a page
+    /// opens each once the session is up ([`Started::open_tileset`]).
+    pub(crate) fn take_surfaces(&mut self) -> (Vec<crate::surface::Surface>, Vec<(i64, String)>) {
+        (Vec::new(), Vec::new())
+    }
+
+    /// Opens the host's tileset `asset` in the worker, a source of the
+    /// session's scene: the answer arrives with the worker's
+    /// `tilesetOpened`, or its `tilesetFailed`. A request already waiting
+    /// for the same tileset is overtaken: its opening ends.
+    pub(crate) fn open_tileset(&self, asset: i64) -> crate::surface::Opening {
+        let (answer, opening) = tokio::sync::oneshot::channel();
+        self.tilesets.borrow_mut().insert(asset, answer);
+        self.link.post(&ToWorker::OpenTileset { asset });
+        opening
     }
 
     /// Closes the session down. A page has no store to flush and no thread to
@@ -255,12 +282,51 @@ pub(crate) fn start(plan: &Plan) -> Launch {
     };
     let answers: Rc<RefCell<VecDeque<Answer>>> = Rc::default();
     let waiting: Rc<RefCell<Option<Waiting>>> = Rc::default();
+    let tilesets: Tilesets = Rc::default();
+    // The worker's link, once it exists, for a tileset's stream to tell the
+    // worker when it is dropped.
+    let weak_link: Rc<RefCell<std::rc::Weak<Link>>> = Rc::default();
     let heard = {
         let (waiting, answers) = (Rc::clone(&waiting), Rc::clone(&answers));
+        let tilesets: Tilesets = Rc::clone(&tilesets);
+        let link_for_tilesets: Rc<RefCell<std::rc::Weak<Link>>> = Rc::clone(&weak_link);
         move |value: JsValue| match serde_wasm_bindgen::from_value::<ToPage>(value) {
+            Ok(ToPage::TilesetOpened {
+                asset,
+                tag,
+                credits,
+            }) => {
+                let link = link_for_tilesets.borrow().clone();
+                let surface = crate::surface::Surface::new(
+                    asset,
+                    tag,
+                    credits
+                        .iter()
+                        .map(super::control::CreditWire::credit)
+                        .collect(),
+                    // Dropped — switched off — it leaves the worker's scene.
+                    move || {
+                        if let Some(link) = link.upgrade() {
+                            link.post(&ToWorker::CloseTileset { asset });
+                        }
+                    },
+                );
+                // No one waits for it any more (switched off meanwhile): the
+                // surface is dropped here, and leaves the scene.
+                if let Some(answer) = tilesets.borrow_mut().remove(&asset) {
+                    let _ = answer.send(Ok(surface));
+                }
+            }
+            Ok(ToPage::TilesetFailed { asset, reason }) => {
+                if let Some(answer) = tilesets.borrow_mut().remove(&asset) {
+                    let _ = answer.send(Err(reason));
+                }
+            }
             Ok(ToPage::Started) => {
                 if let Some(w) = waiting.borrow_mut().take() {
-                    let _ = w.answer.send(Ok(started(w.stream, w.link, &answers)));
+                    let _ = w
+                        .answer
+                        .send(Ok(started(w.stream, w.link, &answers, &tilesets)));
                 }
             }
             Ok(ToPage::Failed { reason }) => {
@@ -284,6 +350,7 @@ pub(crate) fn start(plan: &Plan) -> Launch {
         worker,
         _connection: connection,
     });
+    *weak_link.borrow_mut() = Rc::downgrade(&link);
     let start = {
         let link = Rc::downgrade(&link);
         let (sources, profile, device_memory, decode_workers) = (
@@ -335,6 +402,7 @@ fn started(
     stream: WorkerStream,
     link: Rc<Link>,
     answers: &Rc<RefCell<VecDeque<Answer>>>,
+    tilesets: &Tilesets,
 ) -> Started {
     let heights = Arc::new(TerrainHeights::new(GeographicTilingScheme::default()));
     Started {
@@ -352,7 +420,11 @@ fn started(
             asked: RefCell::default(),
             answers: Rc::clone(answers),
         },
-        gate: Gate { link },
+        gate: Gate {
+            link: Rc::clone(&link),
+        },
+        link,
+        tilesets: Rc::clone(tilesets),
     }
 }
 

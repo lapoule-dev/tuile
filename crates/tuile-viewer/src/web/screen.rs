@@ -131,6 +131,23 @@ pub(crate) fn caption(text: &str) {
     });
 }
 
+/// Lifts the caption `pixels` device pixels off the bottom: above the
+/// credits bar, which already keeps clear of the home indicator. 0 puts it
+/// back along the bottom of the safe area.
+pub(crate) fn caption_lift(pixels: u32) {
+    let ratio = web_sys::window().map_or(1.0, |w| w.device_pixel_ratio().max(0.1));
+    let bottom = if pixels == 0 {
+        "calc(4px + env(safe-area-inset-bottom,0px))".to_owned()
+    } else {
+        format!("{:.1}px", 4.0 + f64::from(pixels) / ratio)
+    };
+    SCREEN.with(|s| {
+        if let Some(screen) = s.borrow().as_ref() {
+            let _ = screen.caption.style().set_property("bottom", &bottom);
+        }
+    });
+}
+
 /// Presents `title` and `text` over the view, with a button that dismisses
 /// them; `false` while another message is still up, which the caller keeps
 /// for a later turn — as the phone does.

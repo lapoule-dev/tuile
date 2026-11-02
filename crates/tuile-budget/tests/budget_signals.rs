@@ -134,11 +134,12 @@ fn the_lost_tiles_signal_counts_a_wanted_tile_with_no_cover() {
     let root = t(0, 0, 0);
     let floor = drawn_draped(&[root], 0);
     m.settle(&floor, 20);
-    // A 3D Tiles tile of another tree: no ancestor can stand for it.
+    // Ground of another tree: no ancestor can stand for it. (Ground: a 3D
+    // Tiles tile not drawn is never lost — the ground under it is drawn.)
     let other = tuile_budget::TileId(u64::MAX - 7);
     let mut need = floor.clone();
     need.drawn
-        .push((other, tuile_budget::Need::new(5, Class::Tiles3dMesh)));
+        .push((other, tuile_budget::Need::new(5, Class::TerrainMesh)));
     let d = m.step(&need);
     assert!(d.stats.floor_in, "the floor is in");
     assert_eq!(m.s().lost_tiles, 1, "{RED}");

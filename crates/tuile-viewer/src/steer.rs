@@ -26,7 +26,8 @@
 //! | `tuile://goto?…&time=&timeOffset=&timeRate=` | also sets the scene's clock, as `--time`, `--time-offset` and `--time-rate` do: see below |
 //! | `tuile://north` | north up, about the point at the centre of the view |
 //! | `tuile://here` | centres on the current location (the system still asks the person) |
-//! | `tuile://view?freeze=on\|off&wireframe=on\|off` | the two display switches |
+//! | `tuile://view?freeze=on\|off&wireframe=on\|off&diagnostic=normal\|unlit\|coverage\|geometry` | the display switches, and the diagnostic view `D` cycles |
+//! | `tuile://tileset?asset=<n>&show=on\|off` | one of the host's 3D Tiles tilesets drawn over the globe, or not |
 //! | `tuile://imagery?name=<key>` | drapes another of the host's imagery layers; `name=next` takes the one after the present |
 //! | `tuile://import?src=https://…` | fetches a configuration file and imports it, as opening it would (`crate::import`) |
 //!
@@ -167,6 +168,12 @@ pub(crate) enum Command {
     ClockNow,
     /// The session recorded, or the recording closed.
     Record(bool),
+    /// The host's 3D Tiles tileset of this asset number drawn over the
+    /// globe, or not: see `crate::surface`.
+    Tileset {
+        asset: i64,
+        on: bool,
+    },
 }
 
 /// Which of `layers` a person, a flag, a URL or a script means by `text`: a
@@ -354,6 +361,30 @@ pub(crate) fn parse_url_among(
             [("name", name)] => Ok(vec![Command::Imagery(layer_named(layers, name)?)]),
             _ => Err("imagery takes exactly one parameter, name=".to_owned()),
         },
+        "tileset" => {
+            let (mut asset, mut on) = (None, None);
+            for (key, text) in &pairs {
+                match *key {
+                    "asset" => {
+                        asset = Some(text.parse::<i64>().map_err(|_| {
+                            format!("asset is a tileset's asset number, not {text:?}")
+                        })?)
+                    }
+                    "show" => {
+                        on = Some(match *text {
+                            "on" => true,
+                            "off" => false,
+                            _ => return Err(format!("show is on or off, not {text:?}")),
+                        })
+                    }
+                    _ => return Err(format!("tileset takes asset= and show=, not {key:?}")),
+                }
+            }
+            match (asset, on) {
+                (Some(asset), Some(on)) => Ok(vec![Command::Tileset { asset, on }]),
+                _ => Err("tileset takes asset= and show=on|off".to_owned()),
+            }
+        }
         "view" => {
             if pairs.is_empty() {
                 return Err("view changes nothing: give freeze= or wireframe=".to_owned());
@@ -361,6 +392,18 @@ pub(crate) fn parse_url_among(
             pairs
                 .iter()
                 .map(|(key, text)| {
+                    if *key == "diagnostic" {
+                        return crate::menu::DIAGNOSTICS
+                            .iter()
+                            .position(|name| name.eq_ignore_ascii_case(text))
+                            .map(Command::Diagnostic)
+                            .ok_or_else(|| {
+                                format!(
+                                    "diagnostic is one of {}, not {text:?}",
+                                    crate::menu::DIAGNOSTICS.join(", ").to_lowercase()
+                                )
+                            });
+                    }
                     let on = match *text {
                         "on" => true,
                         "off" => false,
@@ -1178,6 +1221,39 @@ mod tests {
             &[],
         ] {
             assert!(Goto::from_numbers(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A tileset is shown or hidden by its asset number, and nothing else
+    /// reads as either.
+    #[test]
+    fn a_tileset_is_shown_or_hidden_by_url() {
+        let url = |rest: &str| format!("{}://{rest}", scheme());
+        assert_eq!(
+            parse_url(&url("tileset?asset=2275207&show=off")),
+            Ok(vec![Command::Tileset {
+                asset: 2275207,
+                on: false
+            }])
+        );
+        assert_eq!(
+            parse_url(&url("tileset?show=on&asset=7")),
+            Ok(vec![Command::Tileset { asset: 7, on: true }])
+        );
+        assert_eq!(
+            parse_url(&url("view?diagnostic=unlit")),
+            Ok(vec![Command::Diagnostic(1)])
+        );
+        assert!(parse_url(&url("view?diagnostic=shiny")).is_err());
+        for wrong in [
+            "tileset",
+            "tileset?asset=7",
+            "tileset?show=on",
+            "tileset?asset=x&show=on",
+            "tileset?asset=7&show=maybe",
+            "tileset?asset=7&show=on&layer=2",
+        ] {
+            assert!(parse_url(&url(wrong)).is_err(), "{wrong}");
         }
     }
 }

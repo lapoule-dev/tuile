@@ -286,6 +286,9 @@ pub struct Start {
     /// How imagery is held on the GPU: off, as a window's session holds it
     /// unless the person asks.
     pub imagery_compression: tuile_wgpu::ImageryCompression,
+    /// The host's 3D Tiles tilesets drawn over the globe, by asset number:
+    /// none unless a run asks (`--tileset` in a window).
+    pub tilesets: Vec<i64>,
 }
 
 /// Midsummer noon over Greenwich, 2026: the sun high over Europe.
@@ -307,6 +310,7 @@ impl Start {
             log: None,
             pictures: Pictures::WhenWrong,
             imagery_compression: tuile_wgpu::ImageryCompression::Off,
+            tilesets: Vec::new(),
         }
     }
 }
@@ -557,6 +561,7 @@ impl Headless {
                 None,
             ))
             .1,
+            tilesets: start.tilesets.clone(),
         };
         let launch = crate::native::launch::start(&handle, plan.clone());
         let launch = if profile.hold_window_until_warm {
@@ -599,6 +604,11 @@ impl Headless {
             imagery_compression: start.imagery_compression,
             // A headless run writes its own session log (`Start::log`).
             record: Default::default(),
+            // The run's, all on, and a switch never kept: a run leaves the
+            // person's choice alone.
+            tilesets: Vec::new(),
+            tilesets_on: start.tilesets.clone(),
+            keeps_tilesets: false,
         };
         let mut app = App::new(config, launch);
         app.speak_through(said);
