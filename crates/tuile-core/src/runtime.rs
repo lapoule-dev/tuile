@@ -1233,6 +1233,8 @@ impl State {
         if views.is_empty() {
             distance = 0.0;
         }
+        // The tile's own threshold, as the traversal refines against it.
+        let tau = tau * tree.sse_factor(tile);
         let excess = if sse > 0.0 && tau > 0.0 {
             (sse / tau).log2().clamp(-16.0, 16.0)
         } else {
@@ -2805,6 +2807,73 @@ mod tests {
         let (stream, server) =
             in_process_with(tree, loader, Config::default(), roomy()).expect("budget");
         (stream, server, epoch, meshes, drapes)
+    }
+
+    /// **The need prices a tile against its source's threshold**, as the
+    /// traversal refines against it: the same tile under a source at four
+    /// times the error is wanted two binary orders less urgently. Red with
+    /// the factor left out of the need: the two excesses equal.
+    #[test]
+    fn the_need_prices_a_tile_against_its_sources_threshold() {
+        use crate::source::{Composite, SourceOptions};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = write_fixture(dir.path());
+        let tileset = || -> Box<dyn TileTree> {
+            let bytes = std::fs::read(url.to_file_path().expect("a path")).expect("the fixture");
+            let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
+            Box::new(TilesetTree::new(Arc::new(RwLock::new(tileset))))
+        };
+        let scene = Composite::new();
+        let loader: Arc<dyn TileLoader> = Arc::new(scene.loader());
+        let nothing = || -> Arc<dyn TileLoader> {
+            Arc::new(TilesetLoader::new(
+                Arc::new(RwLock::new(
+                    Tileset::from_json_bytes(
+                        &std::fs::read(url.to_file_path().expect("a path")).expect("the fixture"),
+                        &url,
+                    )
+                    .expect("tileset"),
+                )),
+                Arc::new(FsFetcher),
+            ))
+        };
+        let one = scene
+            .add(tileset(), nothing(), SourceOptions::default())
+            .expect("a tag");
+        let four = scene
+            .add(
+                tileset(),
+                nothing(),
+                SourceOptions {
+                    sse_factor: 4.0,
+                    ..SourceOptions::default()
+                },
+            )
+            .expect("a tag");
+        let tree = scene.tree();
+        let clock = default_clock();
+        let host = Host {
+            tree: &tree,
+            loader: &loader,
+            clock: &clock,
+        };
+        let views = [ViewState::perspective(
+            glam::dvec3(0.0, 0.0, 400.0),
+            glam::dvec3(0.0, 0.0, -1.0),
+            glam::dvec3(0.0, 1.0, 0.0),
+            glam::dvec2(1024.0, 1024.0),
+            60.0f64.to_radians(),
+        )];
+        let roots = tree.roots();
+        let root = |tag: u8| *roots.iter().find(|r| r.tag() == tag).expect("a root");
+        let excess =
+            |tag: u8| State::need_of(&host, &HashMap::new(), &views, 16.0, root(tag)).sse_excess;
+        assert!(
+            (excess(one) - excess(four) - 2.0).abs() < 1e-4,
+            "{} against {}",
+            excess(one),
+            excess(four)
+        );
     }
 
     /// **A drape is a load of its own, and every drawn item is dressed.**

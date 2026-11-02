@@ -37,8 +37,8 @@ pub use protocol::{
 pub use report::GeometryReport;
 pub use runtime::{in_process, in_process_with, Clock, GeometryServer, SharedMeter};
 pub use source::{
-    CompositeLoader, CompositeTileTree, DrapeReach, LoadError, Loaded, TileId, TileLoader,
-    TileProperties, TileTree,
+    Composite, CompositeError, CompositeLoader, CompositeTileTree, DrapeReach, LoadError, Loaded,
+    SourceOptions, TileId, TileLoader, TileProperties, TileTree,
 };
 pub use tiles3d::{SharedTileset, TilesetLoader, TilesetTree};
 pub use tileset::Tileset;
