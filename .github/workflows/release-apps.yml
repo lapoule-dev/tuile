@@ -120,6 +120,12 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: release-macos
+      # `.cargo/config.toml` pins SDKROOT to a developer Mac's Command Line
+      # Tools SDK, a path the runner does not have (aws-lc-sys's build script
+      # then fails to find clang). Its `force = false` lets the environment
+      # win: the runner's own macOS SDK.
+      - name: The runner's macOS SDK
+        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
       - name: Signing keychain
         id: keychain
         env:

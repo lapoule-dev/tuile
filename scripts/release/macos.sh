@@ -57,7 +57,7 @@ done
 lipo -create -output "$out/$package" \
   "$target_dir/aarch64-apple-darwin/release/$package" \
   "$target_dir/x86_64-apple-darwin/release/$package"
-lipo -verify_arch arm64 x86_64 "$out/$package"
+for arch in arm64 x86_64; do lipo "$out/$package" -verify_arch "$arch"; done
 
 # 2. The bundle, as a local build lays it out.
 mkdir -p "$out/stage"
