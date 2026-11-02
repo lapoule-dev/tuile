@@ -780,3 +780,168 @@ fn a_zoom_out_at_the_hard_ceiling_never_deadlocks() {
     let took = sim.settled_after(stop).expect("settled");
     assert!(took <= Micros::from_secs(10), "{took:?}");
 }
+
+/// The city's centre, metres.
+fn city_centre() -> (f64, f64) {
+    use super::world::{CITY_SIDE, CITY_X0, CITY_Y0};
+    (CITY_X0 + CITY_SIDE / 2.0, CITY_Y0 + CITY_SIDE / 2.0)
+}
+
+/// A visit to the city: from the west at 2 km, round it at 4 km for twenty
+/// seconds looking at its centre, held still, then away up to 40 km and a
+/// hundred kilometres west, held still there.
+pub fn city_visit(t: f64) -> Camera {
+    let (cx, cy) = city_centre();
+    let orbit = |a: f64, h: f64| {
+        let (s, c) = detmath::sin_cos(a);
+        Camera {
+            x: cx - 4_000.0 * c,
+            y: cy - 4_000.0 * s,
+            h,
+            heading: a,
+            pitch: 25f64.to_radians(),
+        }
+    };
+    if t < 5.0 {
+        let k = t / 5.0;
+        Camera {
+            x: cx - 20_000.0 + 16_000.0 * k,
+            y: cy,
+            h: 2_000.0,
+            heading: 0.0,
+            pitch: 30f64.to_radians(),
+        }
+    } else if t < 25.0 {
+        let k = (t - 5.0) / 20.0;
+        orbit(k * std::f64::consts::TAU, 2_000.0 - 500.0 * k)
+    } else if t < 35.0 {
+        orbit(std::f64::consts::TAU, 1_500.0)
+    } else if t < 40.0 {
+        let k = (t - 35.0) / 5.0;
+        Camera {
+            x: cx - 4_000.0 - 100_000.0 * k,
+            y: cy,
+            h: 1_500.0 + 38_500.0 * k,
+            heading: 0.0,
+            pitch: 30f64.to_radians(),
+        }
+    } else {
+        Camera {
+            x: cx - 104_000.0,
+            y: cy,
+            h: 40_000.0,
+            heading: 0.0,
+            pitch: 30f64.to_radians(),
+        }
+    }
+}
+
+/// What a run of [`city_visit`] measured.
+struct CityRun {
+    /// Peak bytes on the GPU per class, and of all classes together.
+    peak: tuile_budget::PerClass<Bytes>,
+    peak_total: Bytes,
+    /// The city's tiles drawn as themselves and the ground meshes drawn
+    /// inside the city's square, at the end of the still view over it.
+    city_drawn: usize,
+    ground_under: usize,
+    /// When the still view over the city first converged, seconds after
+    /// it began.
+    converged_after: Option<f64>,
+    /// The city's bytes when the view had been away for ten seconds.
+    city_away: Bytes,
+}
+
+fn visit_the_city(city: bool) -> CityRun {
+    use super::world::{is_city, square, CITY_SIDE, CITY_X0, CITY_Y0};
+    let mut sim = Sim::new(Profile::desktop(), 21);
+    sim.city = city;
+    let mut run = CityRun {
+        peak: tuile_budget::PerClass::splat(Bytes::ZERO),
+        peak_total: Bytes::ZERO,
+        city_drawn: 0,
+        ground_under: 0,
+        converged_after: None,
+        city_away: Bytes::ZERO,
+    };
+    let inside = |t: tuile_budget::TileId| {
+        let [x0, x1, y0, y1] = square(t);
+        x0 >= CITY_X0 && x1 <= CITY_X0 + CITY_SIDE && y0 >= CITY_Y0 && y1 <= CITY_Y0 + CITY_SIDE
+    };
+    while sim.now < Micros::from_secs(50) {
+        let t = sim.now.0 as f64 / 1e6;
+        let (_, d) = sim.step(city_visit(t));
+        let mut total = Bytes::ZERO;
+        for c in Class::ALL {
+            run.peak[c] = run.peak[c].max(d.stats.gpu[c]);
+            total = total.plus(d.stats.gpu[c]);
+        }
+        run.peak_total = run.peak_total.max(total);
+        if (25.0..35.0).contains(&t) && d.stats.converged && run.converged_after.is_none() {
+            run.converged_after = Some(t - 25.0);
+        }
+        if (34.9..35.0).contains(&t) {
+            let drawn = d
+                .draw
+                .items
+                .iter()
+                .filter(|i| i.role == tuile_budget::Role::Exact);
+            run.city_drawn = drawn.clone().filter(|i| is_city(i.mesh.tile())).count();
+            run.ground_under = drawn
+                .filter(|i| !is_city(i.mesh.tile()) && inside(i.mesh.tile()))
+                .count();
+        }
+        run.city_away = d.stats.gpu[Class::Tiles3dMesh];
+    }
+    run
+}
+
+/// **The globe and a city's 3D Tiles share one budget**: one need, one
+/// ledger, the city a source of its own (a tag, `Tiles3dMesh`, its own
+/// threshold). Every invariant holds at every step (`Sim::check`: no ground
+/// lost once the floor is in, no class over its limit, the pool within its
+/// own); the still view over the city converges, the city drawn; the ground
+/// under the drawn city is refined coarser than without it (the cover rule:
+/// it stays as the fallback, never black); the scene's GPU bytes stay within
+/// the device's; and once the view has left, the city's bytes are let go.
+/// Recorded in the reference.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
+fn the_globe_and_a_city_share_one_budget() {
+    let with = visit_the_city(true);
+    let without = visit_the_city(false);
+    let gib = |b: Bytes| b.0 as f64 / f64::from(1u32 << 30);
+    eprintln!(
+        "city: peak terrain {:.3} / city {:.3} / drapes {:.3} GiB, all {:.3} GiB of 2; \
+         {} city tiles and {} ground meshes under it drawn (without the city: {}); \
+         converged {:?} s into the still view (without: {:?}); the city's bytes away {:.3} GiB",
+        gib(with.peak[Class::TerrainMesh]),
+        gib(with.peak[Class::Tiles3dMesh]),
+        gib(with.peak[Class::Drape]),
+        gib(with.peak_total),
+        with.city_drawn,
+        with.ground_under,
+        without.ground_under,
+        with.converged_after,
+        without.converged_after,
+        gib(with.city_away),
+    );
+    assert!(with.city_drawn > 0, "{RED}: the city never drawn");
+    assert!(
+        with.converged_after.is_some(),
+        "{RED}: the still view over the city never converged"
+    );
+    assert!(
+        with.ground_under < without.ground_under,
+        "{RED}: the ground under the city refined as finely as without it ({} against {})",
+        with.ground_under,
+        without.ground_under
+    );
+    assert!(
+        with.peak_total <= Bytes::gib(2),
+        "{RED}: the scene over the device's budget"
+    );
+}

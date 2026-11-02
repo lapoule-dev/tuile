@@ -1131,7 +1131,7 @@ impl Budget {
             let t = l.dirty[i];
             let now = tiles
                 .get(&t)
-                .filter(|tn| self.is_floor(tn.need.level))
+                .filter(|tn| self.is_floor(tn.need.class, tn.need.level))
                 .map(|tn| self.floor_ready(t, tn));
             let d = &mut self.down;
             let before = d.floor.get(&t).copied();
@@ -1245,7 +1245,14 @@ impl Budget {
                 Some(tn) if tn.membership == Membership::Drawn => {
                     self.layers_of(t, tn, &mut l.drapes, &mut l.layers);
                     l.reach.clear();
-                    let c = self.select_tile(t, &l.layers, None, &mut l.entries, &mut l.reach);
+                    let c = self.select_tile(
+                        t,
+                        tn.need.class,
+                        &l.layers,
+                        None,
+                        &mut l.entries,
+                        &mut l.reach,
+                    );
                     l.reach.beyond(t, &mut l.beyond);
                     Some(c)
                 }
@@ -1330,8 +1337,9 @@ impl Budget {
         l: &mut StepLists,
     ) {
         // P1.1 (b): coarse ground before any refinement. While wanted
-        // ground is lost and the floor not in, nothing finer than the floor
-        // is drawn: the whole selection is read again, capped.
+        // ground is lost and the floor not in, no ground finer than the
+        // floor is drawn: the whole selection is read again, the ground's
+        // capped (only ground is ever lost, `select_tile`).
         let cap = self
             .cfg
             .pinned_level
@@ -1348,7 +1356,11 @@ impl Budget {
             {
                 self.layers_of(*t, tn, &mut l.drapes, &mut l.layers);
                 l.reach.clear();
-                let c = self.select_tile(*t, &l.layers, Some(p), &mut l.entries, &mut l.reach);
+                // The ground is capped; a 3D Tiles tile is drawn as it would
+                // be: it holds no ground back, and no ground holds it back.
+                let class = tn.need.class;
+                let cap = class.is_ground().then_some(p);
+                let c = self.select_tile(*t, class, &l.layers, cap, &mut l.entries, &mut l.reach);
                 sums.selection(&c, true);
                 if c.held {
                     coarsening.insert(*t, ());
@@ -2845,7 +2857,7 @@ impl Budget {
     fn check_selection(&self, tiles: &SortedMap<TileId, TileNeed>) {
         let floor: Vec<(TileId, bool)> = tiles
             .iter()
-            .filter(|(_, tn)| self.is_floor(tn.need.level))
+            .filter(|(_, tn)| self.is_floor(tn.need.class, tn.need.level))
             .map(|(t, tn)| (*t, self.floor_ready(*t, tn)))
             .collect();
         let kept: Vec<(TileId, bool)> = self.down.floor.iter().map(|(k, v)| (*k, *v)).collect();
@@ -2877,7 +2889,8 @@ impl Budget {
             let tn = tiles.get(&t).unwrap_or_else(|| unreachable!());
             self.layers_of(t, tn, &mut drapes, &mut layers);
             reach.clear();
-            let counts = self.select_tile(t, &layers, None, &mut entries, &mut reach);
+            let counts =
+                self.select_tile(t, tn.need.class, &layers, None, &mut entries, &mut reach);
             reach.beyond(t, &mut beyond);
             self.reach_of(Unit::sel(t), &mut kept_reach);
             assert_eq!(kept_reach, beyond, "what {t:?}'s selection reads");

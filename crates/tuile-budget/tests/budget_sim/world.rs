@@ -263,37 +263,74 @@ pub struct Camera {
     pub pitch: f64,
 }
 
-/// The tile `(level, x, y)`.
+/// The tile `(level, x, y)` of the globe.
 pub fn tile(level: u32, x: u64, y: u64) -> TileId {
     TileId::from_terrain(level, x, y)
+}
+
+/// The city: a 3D Tiles tileset over the plain, a quadtree of meshes of the
+/// whole surface under a source tag of its own, drawn in place of the ground
+/// it covers (`SourceOptions::covers_ground` in tuile-core). Its root covers
+/// a square of [`CITY_SIDE`] from (`CITY_X0`, `CITY_Y0`).
+pub const CITY: u8 = 1;
+/// The city's corner, metres.
+pub const CITY_X0: f64 = 0.55 * SIDE;
+/// The city's corner, metres.
+pub const CITY_Y0: f64 = 0.40 * SIDE;
+/// The city's side, metres (32 km).
+pub const CITY_SIDE: f64 = SIDE / 64.0;
+/// Its deepest level (128 m tiles).
+pub const CITY_DEPTH: u32 = 8;
+/// Its screen-space error as a multiple of the globe's: 16 px against 2.
+pub const CITY_FACTOR: f64 = 8.0;
+/// A city mesh's bytes: geometry and its photographs.
+pub const CITY_MESH: Bytes = Bytes::kib(400);
+/// How much coarser the ground under the drawn city is refined: by the
+/// city's own factor, so that it stays a fallback a few levels up.
+pub const COVER_RELAX: f64 = 8.0;
+
+/// Whether `id` is a tile of the city.
+pub fn is_city(id: TileId) -> bool {
+    id.tag() == CITY
+}
+
+/// The city's tile `(level, x, y)`.
+pub fn city_tile(level: u32, x: u64, y: u64) -> TileId {
+    tile(level, x, y).with_tag(CITY)
 }
 
 /// Its parent.
 pub fn parent(id: TileId) -> Option<TileId> {
     let (l, x, y) = id.terrain_coord();
-    (l > 0).then(|| tile(l - 1, x / 2, y / 2))
+    (l > 0).then(|| tile(l - 1, x / 2, y / 2).with_tag(id.tag()))
 }
 
 /// Its children.
 pub fn children(id: TileId) -> [TileId; 4] {
     let (l, x, y) = id.terrain_coord();
+    let tag = id.tag();
     [
-        tile(l + 1, 2 * x, 2 * y),
-        tile(l + 1, 2 * x + 1, 2 * y),
-        tile(l + 1, 2 * x, 2 * y + 1),
-        tile(l + 1, 2 * x + 1, 2 * y + 1),
+        tile(l + 1, 2 * x, 2 * y).with_tag(tag),
+        tile(l + 1, 2 * x + 1, 2 * y).with_tag(tag),
+        tile(l + 1, 2 * x, 2 * y + 1).with_tag(tag),
+        tile(l + 1, 2 * x + 1, 2 * y + 1).with_tag(tag),
     ]
 }
 
 /// Its ground square `[x0, x1] × [y0, y1]`, metres.
 pub fn square(id: TileId) -> [f64; 4] {
     let (l, x, y) = id.terrain_coord();
-    let s = SIDE / f64::from(1u32 << l);
+    let (x0, y0, side) = if is_city(id) {
+        (CITY_X0, CITY_Y0, CITY_SIDE)
+    } else {
+        (0.0, 0.0, SIDE)
+    };
+    let s = side / f64::from(1u32 << l);
     [
-        x as f64 * s,
-        (x + 1) as f64 * s,
-        y as f64 * s,
-        (y + 1) as f64 * s,
+        x0 + x as f64 * s,
+        x0 + (x + 1) as f64 * s,
+        y0 + y as f64 * s,
+        y0 + (y + 1) as f64 * s,
     ]
 }
 
@@ -316,13 +353,19 @@ pub fn region(id: TileId) -> Region {
 
 /// Whether it has children.
 pub fn has_children(id: TileId) -> bool {
-    id.terrain_coord().0 < region(id).terrain_max()
+    let max = if is_city(id) {
+        CITY_DEPTH
+    } else {
+        region(id).terrain_max()
+    };
+    id.terrain_coord().0 < max
 }
 
-/// What a resource costs: meshes by region, drapes by mosaic size (one
-/// 256² imagery tile per level of climb, squared).
+/// What a resource costs: meshes by region (the city's its own), drapes by
+/// mosaic size (one 256² imagery tile per level of climb, squared).
 pub fn cost(r: ResourceId) -> Cost {
     match r {
+        ResourceId::Mesh(t) if is_city(t) => Cost::flat(CITY_MESH),
         ResourceId::Mesh(t) => Cost::flat(region(t).mesh_bytes()),
         ResourceId::Drape { tile: t, level, .. } => {
             let up = level.saturating_sub(t.terrain_coord().0).min(4);
@@ -421,9 +464,13 @@ pub fn sight(view: &View, id: TileId, margin: f64) -> Sight {
     }
 }
 
-/// The geometric error of `id`, metres.
+/// The geometric error of `id`, metres: the city's, a sixteenth of its
+/// tile's side, priced at [`CITY_FACTOR`] times the globe's threshold.
 pub fn geometric_error(id: TileId) -> f64 {
     let l = id.terrain_coord().0;
+    if is_city(id) {
+        return CITY_SIDE / (16.0 * f64::from(1u32 << l));
+    }
     SIDE / (128.0 * f64::from(1u32 << l)) * region(id).roughness()
 }
 
@@ -453,13 +500,16 @@ pub trait Residency {
 }
 
 /// The traversal: builds this step's need from every view (one eye, or a
-/// stereo rig), as one union (spec §13.3).
+/// stereo rig), as one union (spec §13.3) — with the city beside the globe
+/// when `city`, at its own threshold, and the ground it covered last step
+/// refined [`COVER_RELAX`] times coarser (the runtime's cover rule).
 pub fn traverse(
     views: &[View],
     residency: &dyn Residency,
     sse_scale: f64,
     drawn_last: &BTreeSet<TileId>,
     pinned: u32,
+    city: bool,
 ) -> NeedSet {
     let mut need = NeedSet::new();
     let tau = TAU * sse_scale;
@@ -484,7 +534,63 @@ pub fn traverse(
         &mut seen_tiles,
     );
     ring(views, tau, tile(0, 0, 0), &mut need, &seen_tiles);
+    if city {
+        visit(
+            views,
+            residency,
+            tau,
+            drawn_last,
+            city_tile(0, 0, 0),
+            &mut need,
+            &mut seen_tiles,
+        );
+    }
     need
+}
+
+/// Whether the ground tile `id` lies under the city tiles drawn last step,
+/// as the runtime tells it: its four corners and its centre each under one
+/// of them (a city tile's footprint is its square here).
+fn covered(drawn_last: &BTreeSet<TileId>, id: TileId) -> bool {
+    let [x0, x1, y0, y1] = square(id);
+    let city = city_tile(0, 0, 0);
+    let mut drawn = drawn_last.range(city..).take_while(|t| is_city(**t));
+    let mut points = [
+        (x0, y0),
+        (x1, y0),
+        (x0, y1),
+        (x1, y1),
+        ((x0 + x1) / 2.0, (y0 + y1) / 2.0),
+    ];
+    let mut left = points.len();
+    if drawn.clone().next().is_none() {
+        return false;
+    }
+    for t in &mut drawn {
+        let [a0, a1, b0, b1] = square(*t);
+        for p in &mut points {
+            if p.0.is_finite() && a0 <= p.0 && p.0 <= a1 && b0 <= p.1 && p.1 <= b1 {
+                *p = (f64::NAN, f64::NAN);
+                left -= 1;
+            }
+        }
+        if left == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// The threshold `id` is refined against: the city's factor for its
+/// tiles, the cover's relaxation for ground under the city drawn last step.
+fn tau_of(tau: f64, drawn_last: &BTreeSet<TileId>, id: TileId) -> f64 {
+    if is_city(id) {
+        tau * CITY_FACTOR
+    } else if covered(drawn_last, id) {
+        tau * COVER_RELAX
+    } else {
+        tau
+    }
 }
 
 /// A tile's need over every view: the largest SSE excess and centrality,
@@ -509,7 +615,12 @@ fn need_of(views: &[View], id: TileId, tau: f64) -> Need {
         }
     }
     let excess = detmath::log2(sse_best.max(1e-12) / tau).clamp(-8.0, 8.0);
-    let mut n = Need::new(l, Class::TerrainMesh)
+    let class = if is_city(id) {
+        Class::Tiles3dMesh
+    } else {
+        Class::TerrainMesh
+    };
+    let mut n = Need::new(l, class)
         .with_rect(rect(id))
         .with_sse_excess(excess as f32)
         .with_centrality(centrality as f32)
@@ -517,7 +628,8 @@ fn need_of(views: &[View], id: TileId, tau: f64) -> Need {
     if let Some(p) = parent(id) {
         n = n.with_parent(p);
     }
-    if let Some(fp) = footprint {
+    // The city's meshes carry their own photographs.
+    if let (Some(fp), false) = (footprint, is_city(id)) {
         n = n.with_imagery(ImageryNeed::base(fp, region(id).imagery_max()));
     }
     n
@@ -536,11 +648,17 @@ fn visit(
         return;
     }
     seen_tiles.insert(id);
+    // The tile's own threshold: the globe's, the city's, or the cover's.
+    let tau_id = tau_of(tau, drawn_last, id);
     let kids_drawn_last = children(id).iter().any(|k| drawn_last.contains(k));
-    let threshold = if kids_drawn_last { tau / 1.25 } else { tau };
+    let threshold = if kids_drawn_last {
+        tau_id / 1.25
+    } else {
+        tau_id
+    };
     let refine = has_children(id) && sse_max(views, id) > threshold;
     if !refine {
-        need.drawn.push((id, need_of(views, id, tau)));
+        need.drawn.push((id, need_of(views, id, tau_id)));
         return;
     }
     let visible_kids: Vec<TileId> = children(id)
@@ -553,16 +671,17 @@ fn visit(
         .filter(|&k| !res.resident(k))
         .collect();
     if missing.is_empty() {
-        need.ancestors.push((id, need_of(views, id, tau)));
+        need.ancestors.push((id, need_of(views, id, tau_id)));
         for k in visible_kids {
             visit(views, res, tau, drawn_last, k, need, seen_tiles);
         }
     } else {
-        need.drawn.push((id, need_of(views, id, tau)));
+        need.drawn.push((id, need_of(views, id, tau_id)));
         // Every child the hold waits on, resident or not: a resident
         // sibling evicted while the others load restarts the swap.
         for k in visible_kids {
-            need.blockers.push((k, need_of(views, k, tau)));
+            need.blockers
+                .push((k, need_of(views, k, tau_of(tau, drawn_last, k))));
         }
     }
 }
