@@ -147,7 +147,9 @@ pub struct BudgetStats {
     pub held: u32,
     /// Wanted tiles standing on an ancestor.
     pub fallback: u32,
-    /// Wanted tiles with nothing to draw (must be 0 once the floor is in).
+    /// Wanted ground tiles with nothing to draw (must be 0 once the floor is
+    /// in). A 3D Tiles tile not drawn yet is not lost: the ground under it is
+    /// drawn.
     pub lost: u32,
     /// Drawn items whose tiles ask for imagery and that do not wear a
     /// drawable drape for every layer they need, own or ancestor's (must be

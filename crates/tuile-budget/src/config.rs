@@ -174,16 +174,26 @@ pub struct BudgetConfig {
 impl BudgetConfig {
     /// A viewer's budget for `gpu` bytes in total.
     ///
-    /// The ground — terrain and imagery — is one pool of 82 % of the device
-    /// (D-A3, decided 2026-10-20): terrain between 25 % and 60 % of it,
-    /// imagery between 40 % and 75 %, the split following the view. 3D Tiles
-    /// keep 15 % and overlays 3 % of their own. Every other number is a
-    /// first proposal (decision D5), tuned per profile from simulated curves.
+    /// The scene is one pool (D-A3, decided 2026-10-20; 3D Tiles joined it
+    /// 2026-11-02): terrain, imagery and 3D Tiles share it, the split
+    /// following the view, and no class has a share of the device of its
+    /// own. The pool is trimmed to 70 % of 82 % of the device, with 15 % of
+    /// that over it for what is on screen — the ground's numbers of before,
+    /// so a globe alone decides as it did — and never crosses 97 %: the
+    /// 15 % 3D Tiles kept apart is the scene's headroom, for whichever class
+    /// the view needs it. Within it terrain keeps between 25 % and 60 % (of
+    /// the 82 %), imagery between 40 % and 75 %, 3D Tiles from nothing to
+    /// what the ground's floors leave (35 %): the ground's floors hold only
+    /// when it is contested. Overlays keep 3 % of their own. Every other
+    /// number is a first proposal (decision D5), tuned per profile from
+    /// simulated curves.
     pub fn interactive(gpu: Bytes) -> Self {
         let share = |pct: u64| gpu.scaled(pct, 100);
+        // What the targets are measured on: the ground's pool of before.
         let ground = share(82);
         let mut members = PerClass::splat(false);
         members[Class::TerrainMesh] = true;
+        members[Class::Tiles3dMesh] = true;
         members[Class::Drape] = true;
         let mut floor_percent = PerClass::splat(0u8);
         floor_percent[Class::TerrainMesh] = 25;
@@ -192,13 +202,13 @@ impl BudgetConfig {
             members,
             target: ground.scaled(70, 100),
             overflow: ground.scaled(15, 100),
-            hard_limit: ground,
+            hard_limit: share(97),
             floor_percent,
         };
         // The members' own limits are their ceilings.
         let hard_limit = PerClass([
             ground.scaled(60, 100),
-            share(15),
+            ground.scaled(35, 100),
             ground.scaled(75, 100),
             share(3),
         ]);
@@ -209,7 +219,7 @@ impl BudgetConfig {
             hard_limit,
             hard_reserve_percent: 15,
             decoded_target: gpu.scaled(1, 4),
-            max_in_flight: PerClass([16, 8, 16, 4]),
+            max_in_flight: PerClass([16, 16, 16, 4]),
             max_local_reads: 8,
             request_heap: 256,
             upload_bytes_per_frame: Bytes::mib(8),

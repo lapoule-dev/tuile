@@ -1031,7 +1031,7 @@ impl Arena {
 
     /// Whether the resource of `s` is of the floor.
     pub fn is_floor(&self, s: Slot) -> bool {
-        self.pinned.is_some_and(|p| self.order[s.i()].level <= p)
+        self.class(s).is_ground() && self.pinned.is_some_and(|p| self.order[s.i()].level <= p)
     }
 
     /// Whether `s` is grouped (needed at one of the two most recent times)

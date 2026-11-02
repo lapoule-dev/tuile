@@ -161,7 +161,8 @@ pub(super) struct TileSelection {
     pub exact: bool,
     /// Drawn by an ancestor alone.
     pub fallback: bool,
-    /// Drawn by nothing.
+    /// Ground drawn by nothing (a 3D Tiles tile not drawn is never lost:
+    /// the ground under it is drawn).
     pub lost: bool,
     /// Drawn by the finer tiles it held last step: coarsening.
     pub held: bool,
@@ -349,13 +350,13 @@ fn layers(img: &WantedImagery) -> &[LayerReach] {
 fn floor_group<'t>(
     tiles: &'t SortedMap<TileId, TileNeed>,
     r: ResourceId,
-    is_floor: impl Fn(u32) -> bool,
+    is_floor: impl Fn(Class, u32) -> bool,
 ) -> Option<impl Iterator<Item = ResourceId> + Clone + 't> {
     let t = r.tile();
     let tn = tiles.get(&t)?;
     let img = tn.need.imagery.as_ref()?;
     let level = tn.need.level;
-    if !is_floor(level) {
+    if !is_floor(tn.need.class, level) {
         return None;
     }
     let drapes = layers(img)
@@ -432,8 +433,10 @@ impl Budget {
                 .map_or(0, |l| self.layer_epochs.get(&l).copied().unwrap_or(0))
     }
 
-    pub(super) fn is_floor(&self, level: u32) -> bool {
-        self.cfg.pinned_level.is_some_and(|p| level <= p)
+    /// Whether a resource of `class` at `level` is of the floor: the
+    /// ground's levels up to `pinned_level` ([`Class::is_ground`]).
+    pub(super) fn is_floor(&self, class: Class, level: u32) -> bool {
+        class.is_ground() && self.cfg.pinned_level.is_some_and(|p| level <= p)
     }
 
     fn eff(&self) -> Eff {
@@ -1008,9 +1011,12 @@ impl Budget {
     /// nearest drawable, dressed ancestor. `reach` gets the tiles read
     /// beyond the tile's own mesh and drapes (the held tiles below it, read
     /// from the ancestry, are its own: a change to them reads it again).
+    /// A tile drawn by nothing is lost only if it is ground (`class`, P1.1):
+    /// where a 3D Tiles tile is not drawn yet, the ground under it is.
     pub(super) fn select_tile(
         &self,
         t: TileId,
+        class: Class,
         layers: &[LayerId],
         cap: Option<u32>,
         out: &mut Vec<(ResourceId, Role)>,
@@ -1045,7 +1051,7 @@ impl Budget {
             sel.depth = level(t).saturating_sub(level(a));
             sel.fallback = !held;
         } else {
-            sel.lost = !held;
+            sel.lost = !held && class.is_ground();
         }
         // By mesh: an entry once (a cycle could name a tile twice).
         out.sort_unstable();
@@ -1160,7 +1166,7 @@ impl Budget {
             let seq = u32::try_from(out.len()).unwrap_or(u32::MAX);
             out.push((r, seq, w));
         };
-        let floor = self.is_floor(tn.need.level);
+        let floor = self.is_floor(tn.need.class, tn.need.level);
         let mesh_drawable = self.drawable(ResourceId::Mesh(t));
         let urgency = if floor {
             Urgency::Floor
@@ -1284,7 +1290,7 @@ impl Budget {
     /// What protects `r`, whose slot is `s`.
     fn protection_of(&self, r: ResourceId, s: Slot) -> Option<Protection> {
         let a = &self.arena;
-        if self.is_floor(a.level(s)) && (a.has_gpu(s) || a.has_transit(s)) {
+        if self.is_floor(a.class(s), a.level(s)) && (a.has_gpu(s) || a.has_transit(s)) {
             return Some(Protection::Floor);
         }
         if a.marked(s, Mark::Drawn) {
@@ -1887,7 +1893,7 @@ impl Budget {
                     epoch,
                 },
             );
-            if self.cfg.pinned_level.is_some_and(|p| w.level <= p) {
+            if self.is_floor(w.class, w.level) {
                 self.arena.mark(s, Mark::FloorSet, true);
             }
             if !self.arena.marked(s, Mark::Active) {
@@ -1970,7 +1976,7 @@ impl Budget {
                     a.class(s) == class
                         && a.has_gpu(s)
                         && !self.kept(s)
-                        && !self.is_floor(a.level(s))
+                        && !self.is_floor(a.class(s), a.level(s))
                 })
                 .filter_map(|s| victim(self, &self.arena.id(s), s))
                 .fold(Bytes::ZERO, |a, b| a.plus(b)),
@@ -1990,7 +1996,7 @@ impl Budget {
             }
             st.work = st.work.saturating_add(1);
             // The order holds neither the kept set nor the floor.
-            if self.kept(s) || self.is_floor(self.arena.level(s)) {
+            if self.kept(s) || self.is_floor(self.arena.class(s), self.arena.level(s)) {
                 continue;
             }
             let Some(b) = victim(self, &r, s) else {
@@ -2022,7 +2028,10 @@ impl Budget {
         let mut grouped: Vec<(EvictKey, Slot)> = a
             .grouped_slots()
             .filter(|&s| {
-                a.has_gpu(s) && !a.has_transit(s) && !self.kept(s) && !self.is_floor(a.level(s))
+                a.has_gpu(s)
+                    && !a.has_transit(s)
+                    && !self.kept(s)
+                    && !self.is_floor(a.class(s), a.level(s))
             })
             .map(|s| (a.evict_key(s), s))
             .collect();
@@ -2072,7 +2081,7 @@ impl Budget {
         let mut flags = (false, false);
         for (key, _, w) in picked.iter().filter_map(|i| jobs.get(*i as usize)) {
             let r = &key.resource;
-            let Some(group) = floor_group(tiles, *r, |l| self.is_floor(l)) else {
+            let Some(group) = floor_group(tiles, *r, |c, l| self.is_floor(c, l)) else {
                 self.deliver_one(now, eff, *r, w, coarsening, wants, d, st, &mut flags);
                 continue;
             };
@@ -2191,7 +2200,7 @@ impl Budget {
         // A stale GPU copy on its way again leaves the step's room.
         let in_room = self.scratch.room.is_some() && {
             let a = &self.arena;
-            a.grouped(s) && a.has_gpu(s) && !self.kept(s) && !self.is_floor(a.level(s))
+            a.grouped(s) && a.has_gpu(s) && !self.kept(s) && !self.is_floor(a.class(s), a.level(s))
         };
         if let (true, Some(room), Some(g)) =
             (in_room, self.scratch.room.as_mut(), self.arena.gpu(s))
@@ -2373,7 +2382,7 @@ impl Budget {
                 }
                 st.work = st.work.saturating_add(1);
                 // The order holds neither the kept set nor the floor.
-                if self.kept(s) || self.is_floor(self.arena.level(s)) {
+                if self.kept(s) || self.is_floor(self.arena.class(s), self.arena.level(s)) {
                     continue;
                 }
                 // Still on the GPU, and not on its way again.
@@ -2501,7 +2510,7 @@ impl Budget {
         // floor and transit.
         let candidate = |b: &Budget, s: Slot| {
             let a = &b.arena;
-            a.has_gpu(s) && !a.has_transit(s) && !b.kept(s) && !b.is_floor(a.level(s))
+            a.has_gpu(s) && !a.has_transit(s) && !b.kept(s) && !b.is_floor(a.class(s), a.level(s))
         };
         let mut walk = Walk::default();
         while let Some((_, s)) = walk.next(&self.arena, &room.grouped, member, &Held::GPU) {
@@ -2658,7 +2667,7 @@ impl Budget {
             (a.has_gpu(s) || a.has_cpu(s))
                 && !a.has_transit(s)
                 && !a.marked(s, Mark::Wanted)
-                && !b.is_floor(a.level(s))
+                && !b.is_floor(a.class(s), a.level(s))
         };
         let a = &self.arena;
         let mut grouped: Vec<(EvictKey, Slot)> = a
@@ -2680,6 +2689,33 @@ impl Budget {
                 continue;
             }
             // Whole: both copies, in one place in the one order.
+            if self.arena.take_gpu(s, &mut self.ledger).is_some() {
+                out.gpu.push(r);
+            }
+            if self.arena.take_cpu(s, &mut self.ledger).is_some() {
+                out.decoded.push(r);
+            }
+        }
+        out
+    }
+
+    pub(super) fn release_source_impl(&mut self, tag: u8) -> super::Released {
+        // Whatever holds a copy outside transit and was not wanted last.
+        let a = &self.arena;
+        let mut slots: Vec<(ResourceId, Slot)> = a
+            .iter()
+            .filter(|&s| {
+                a.id(s).tile().tag() == tag
+                    && (a.has_gpu(s) || a.has_cpu(s))
+                    && !a.has_transit(s)
+                    && !a.marked(s, Mark::Wanted)
+            })
+            .map(|s| (a.id(s), s))
+            .collect();
+        // By resource: the order the consumer is told in.
+        slots.sort_unstable();
+        let mut out = super::Released::default();
+        for (r, s) in slots {
             if self.arena.take_gpu(s, &mut self.ledger).is_some() {
                 out.gpu.push(r);
             }

@@ -82,22 +82,32 @@ mod config {
         );
     }
 
-    /// C1: the interactive split is per class and never exceeds the total.
+    /// C1: the interactive split never exceeds the total: the pool's
+    /// target and the targets of the classes outside it (a member's own
+    /// target is its ceiling within the pool, not a share of the device).
     #[test]
     fn the_interactive_split_never_exceeds_the_total() {
         let total = Bytes::mib(300);
         let c = BudgetConfig::interactive(total);
-        let sum = c.target.iter().fold(Bytes::ZERO, |a, (_, b)| a.plus(b));
+        let sum = c
+            .target
+            .iter()
+            .filter(|(k, _)| !c.pool.holds(*k))
+            .fold(c.pool.target, |a, (_, b)| a.plus(b));
         assert!(sum <= total);
         assert!(c.target.iter().all(|(_, b)| b > Bytes::ZERO));
     }
 
-    /// D-A3 (decided 2026-10-20) and D3, spec §15.1: the ground is one pool
-    /// of 82 % of the device — terrain between 25 % and 60 % of it, imagery
-    /// between 40 % and 75 % —, the stand-ins' class gone, its 2 % in the
-    /// pool.
+    /// D-A3 (decided 2026-10-20) and D3, spec §15.1, and 3D Tiles in the
+    /// ledger (2026-11-02): the scene is one pool, trimmed to 70 % of 82 % of
+    /// the device and never over 97 % — terrain between 25 % and 60 % of the
+    /// 82 %, imagery between 40 % and 75 %, 3D Tiles from nothing to what the
+    /// ground's floors leave (35 %) — and no class but the overlays has a
+    /// share of the device of its own: a tileset's room follows the view.
+    /// Red with 3D Tiles outside the pool, on 15 % of the device of their
+    /// own.
     #[test]
-    fn the_ground_is_one_pool_with_floors_and_ceilings() {
+    fn the_scene_is_one_pool_and_3d_tiles_have_no_fixed_share() {
         let total = Bytes::gib(1);
         let c = BudgetConfig::interactive(total);
         let ground = total.scaled(82, 100);
@@ -106,22 +116,29 @@ mod config {
             p.holds(Class::TerrainMesh) && p.holds(Class::Drape),
             "{RED}"
         );
-        assert!(!p.holds(Class::Tiles3dMesh) && !p.holds(Class::Overlay));
-        assert_eq!(p.hard_limit, ground);
+        assert!(
+            p.holds(Class::Tiles3dMesh),
+            "{RED}: 3D Tiles keep a fixed share of the device"
+        );
+        assert!(!p.holds(Class::Overlay));
+        assert_eq!(p.target, ground.scaled(70, 100));
+        assert_eq!(p.overflow, ground.scaled(15, 100));
+        assert_eq!(p.hard_limit, total.scaled(97, 100));
         assert_eq!(c.hard_limit[Class::TerrainMesh], ground.scaled(60, 100));
         assert_eq!(c.hard_limit[Class::Drape], ground.scaled(75, 100));
+        assert_eq!(c.hard_limit[Class::Tiles3dMesh], ground.scaled(35, 100));
         assert_eq!(
             (
                 p.floor_percent[Class::TerrainMesh],
-                p.floor_percent[Class::Drape]
+                p.floor_percent[Class::Drape],
+                p.floor_percent[Class::Tiles3dMesh],
             ),
-            (25, 40)
+            (25, 40, 0)
         );
-        let outside = c.hard_limit[Class::Tiles3dMesh].plus(c.hard_limit[Class::Overlay]);
-        let all = outside.plus(p.hard_limit);
+        let all = c.hard_limit[Class::Overlay].plus(p.hard_limit);
         assert!(
             all <= total && total.minus(all) < Bytes(4),
-            "the pool and the other classes share the whole device"
+            "the pool and the overlays share the whole device"
         );
         assert_eq!(Class::ALL.len(), 4, "no class for stand-ins");
     }
@@ -345,6 +362,189 @@ mod ledger {
         assert_eq!(
             r.b.ledger().gpu[Class::TerrainMesh],
             Bytes(MESH.0 * drawable)
+        );
+    }
+}
+
+/// A 3D Tiles tileset beside the globe in one budget: its tiles under a
+/// source tag of their own, class `Tiles3dMesh`, no imagery.
+mod three_d_tiles {
+    use super::*;
+
+    /// The tileset's tile `(level, x, y)`, under tag 1.
+    fn s(level: u32, x: u64, y: u64) -> tuile_budget::TileId {
+        t(level, x, y).with_tag(1)
+    }
+
+    /// Its need: a 3D Tiles mesh, no imagery.
+    fn mesh_need(id: tuile_budget::TileId) -> tuile_budget::Need {
+        let mut n = need(id);
+        n.class = Class::Tiles3dMesh;
+        n
+    }
+
+    /// **The floor is the ground's**: a tileset's coarsest tiles, at the
+    /// pinned levels, are neither wanted as the floor nor protected as it,
+    /// and are let go once the view has left them like any other tile. Red
+    /// with the floor read from the level alone: the tileset's root is
+    /// protected as the floor and never evicted.
+    #[test]
+    fn a_tilesets_coarse_tiles_are_no_floor() {
+        let mut c = small(1);
+        c.pinned_level = Some(1);
+        c.target[Class::Tiles3dMesh] = Bytes::ZERO;
+        c.overflow[Class::Tiles3dMesh] = Bytes::ZERO;
+        let mut r = Rig::new(c);
+        let ground = t(0, 0, 0);
+        let root = s(0, 0, 0);
+        let mut need = drawn(&[ground]);
+        need.drawn.push((root, mesh_need(root)));
+        r.settle(&need, 20);
+        assert!(
+            r.b.residency().drawable(root),
+            "the tileset's root is drawn"
+        );
+        assert_eq!(
+            r.b.resource(mesh(ground)).and_then(|v| v.protected),
+            Some(Protection::Floor),
+            "the ground's root is the floor"
+        );
+        // The view leaves the tileset: its root is let go.
+        let mut evicted = false;
+        for _ in 0..20 {
+            let d = r.settle(&drawn(&[ground]), 10);
+            evicted |= d.evict.contains(&mesh(root));
+        }
+        assert_ne!(
+            r.b.resource(mesh(root)).and_then(|v| v.protected),
+            Some(Protection::Floor),
+            "{RED}: a tileset's root protected as the floor"
+        );
+        assert!(evicted, "{RED}: the tileset's root never evicted");
+        assert!(r.b.residency().drawable(ground), "the floor stays");
+    }
+
+    /// **A source that left the scene is let go of at once**: once its
+    /// tiles have left the need, `release_source` drops both copies of what
+    /// the budget holds of it — the globe's untouched, a tile of it still
+    /// wanted kept — and the budget tracks none of it once the prune has
+    /// freed the empty slots, which is when its tag may name another
+    /// source's tiles. Red with nothing released (`Released` empty: the
+    /// tileset's bytes held until the pool needs their room).
+    #[test]
+    fn a_source_that_left_is_released_and_then_untracked() {
+        let mut r = Rig::interactive();
+        let ground = t(1, 0, 0);
+        let tiles = [s(1, 0, 0), s(1, 1, 0), s(2, 0, 0)];
+        let mut need = drawn(&[ground]);
+        need.drawn
+            .extend(tiles.iter().map(|&id| (id, mesh_need(id))));
+        r.settle(&need, 20);
+        assert!(tiles.iter().all(|t| r.b.residency().drawable(*t)));
+        assert!(r.b.tracks_source(1));
+        let before = r.b.ledger().gpu[Class::Tiles3dMesh];
+        assert!(before > Bytes::ZERO);
+        // The source goes: its tiles leave the need, but one of them,
+        // still wanted, stays.
+        let mut left = drawn(&[ground]);
+        left.drawn.push((tiles[2], mesh_need(tiles[2])));
+        r.step(&left);
+        let released = r.b.release_source(1);
+        assert_eq!(
+            released.gpu,
+            vec![mesh(tiles[0]), mesh(tiles[1])],
+            "{RED}: the source's GPU copies held"
+        );
+        assert!(!released.gpu.contains(&mesh(ground)));
+        assert!(r.b.residency().drawable(tiles[2]), "a wanted tile kept");
+        assert_eq!(
+            r.b.ledger().gpu[Class::Tiles3dMesh],
+            before.minus(Bytes(MESH.0 * 2)),
+            "the ledger gives the bytes back"
+        );
+        r.b.audit().expect("the ledger is the states'");
+        // Gone from the need too: released, then untracked after a prune.
+        r.step(&drawn(&[ground]));
+        r.b.release_source(1);
+        for _ in 0..16 {
+            r.step(&drawn(&[ground]));
+        }
+        assert!(!r.b.tracks_source(1), "{RED}: the source still tracked");
+        assert!(r.b.tracks_source(0), "the globe's tracked");
+        assert!(r.b.residency().drawable(ground));
+    }
+
+    /// **A tileset's tile not drawn yet loses no ground (P1.1)**: with the
+    /// floor not in, ground drawable as itself is drawn as itself while a
+    /// tileset's tile waits for its load — no ground is lost, so nothing is
+    /// capped to the floor. Red with every class lost alike: the tileset's
+    /// tile counted lost, and the ground capped to a floor that is not in,
+    /// so lost as well.
+    #[test]
+    fn a_tileset_tile_not_drawn_yet_loses_no_ground() {
+        let mut c = Rig::interactive_config();
+        c.pinned_level = Some(0);
+        let mut r = Rig::new(c);
+        let floor = t(0, 0, 0);
+        let ground = t(2, 1, 1);
+        let tile = s(2, 1, 1);
+        let mut view = drawn(&[ground]);
+        view.drawn.push((tile, mesh_need(tile)));
+        view.ancestors.push((floor, need(floor)));
+        let need = view;
+        // The ground's mesh arrives; the floor's and the tileset's never do.
+        let mut d = r.step(&need);
+        for _ in 0..10 {
+            r.load_where(|x| x == mesh(ground));
+            r.upload(&d);
+            d = r.step(&need);
+        }
+        assert!(r.b.residency().drawable(ground));
+        assert!(!r.b.residency().drawable(floor), "the floor is not in");
+        assert_eq!(
+            d.stats.lost, 0,
+            "{RED}: a tileset's tile not drawn counted lost ground"
+        );
+        assert!(
+            d.draw
+                .items
+                .iter()
+                .any(|i| i.mesh == mesh(ground) && i.role == Role::Exact),
+            "{RED}: the ground was capped while no ground was lost"
+        );
+    }
+
+    /// **While ground is lost, the ground alone is capped (P1.1)**: the
+    /// ground's draw holds to the floor until the floor is in, and a
+    /// tileset's tile that is drawable is drawn as itself meanwhile. Red with
+    /// every tile capped: the tileset's tile, finer than the floor, not
+    /// drawn.
+    #[test]
+    fn while_ground_is_lost_the_ground_alone_is_capped() {
+        let mut c = Rig::interactive_config();
+        c.pinned_level = Some(0);
+        let mut r = Rig::new(c);
+        let floor = t(0, 0, 0);
+        let lost = t(2, 2, 2);
+        let tile = s(2, 1, 1);
+        let mut view = drawn(&[lost]);
+        view.drawn.push((tile, mesh_need(tile)));
+        view.ancestors.push((floor, need(floor)));
+        let need = view;
+        let mut d = r.step(&need);
+        for _ in 0..10 {
+            r.load_where(|x| x == mesh(tile));
+            r.upload(&d);
+            d = r.step(&need);
+        }
+        assert!(r.b.residency().drawable(tile));
+        assert!(d.stats.lost > 0, "the fixture: ground is lost");
+        assert!(
+            d.draw
+                .items
+                .iter()
+                .any(|i| i.mesh == mesh(tile) && i.role == Role::Exact),
+            "{RED}: the tileset's tile was capped to the ground's floor"
         );
     }
 }
@@ -1459,12 +1659,26 @@ mod pressure {
         r.settle(&drawn(&tiles), 30);
         r.b.retarget(Bytes::mib(64));
         let d = r.step(&drawn(&tiles));
-        let sum = d
+        // The pool's members each within the pool's target, which with the
+        // classes outside it fits the new total (a member's target is what
+        // the others leave it: the members' targets are not a split).
+        let shrunk = BudgetConfig::interactive(Bytes::mib(64));
+        let pool = r.b.config().pool;
+        let outside = d
             .stats
             .target
             .iter()
+            .filter(|(c, _)| !pool.holds(*c))
             .fold(Bytes::ZERO, |a, (_, b)| a.plus(b));
-        assert!(sum <= Bytes::mib(64) && sum > Bytes::ZERO, "{RED}");
+        assert!(
+            d.stats
+                .target
+                .iter()
+                .filter(|(c, _)| pool.holds(*c))
+                .all(|(_, t)| t <= shrunk.pool.target && t > Bytes::ZERO),
+            "{RED}"
+        );
+        assert!(outside.plus(shrunk.pool.target) <= Bytes::mib(64), "{RED}");
         assert_eq!(d.stats.lost, 0);
         assert_eq!(d.stats.exact, 4);
     }
