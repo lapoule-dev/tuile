@@ -584,7 +584,11 @@ impl ContentPump {
         let (bytes, store): (u64, Keep) = match &q.content {
             ResourceContent::Mesh(content) => {
                 let tile = r.tile();
-                let prepared = prepare(gpu, content, self.render_origin);
+                let mut prepared = prepare(gpu, content, self.render_origin);
+                // Only the ground is stitched: a 3D Tiles mesh keeps no copy.
+                if !q.class.is_ground() {
+                    prepared.forget_source();
+                }
                 let bytes = mesh_bytes(&prepared, content);
                 let kept = self
                     .contents
@@ -820,9 +824,14 @@ impl ContentPump {
         };
         let mut exact: Vec<TileId> = Vec::new();
         let mut fallback: Vec<TileId> = Vec::new();
+        // The surfaces drawn in place of the ground (`Ancestry::covers`):
+        // apart, as the renderer draws them before it.
+        let mut covering: Vec<TileId> = Vec::new();
+        let mut covering_fallback: Vec<TileId> = Vec::new();
         let mut dressed: std::collections::HashSet<TileId> = std::collections::HashSet::new();
         for item in &self.draw.items {
             let tile = item.mesh.tile();
+            let covers = self.ancestry.get(&tile).is_some_and(|a| a.covers);
             let Some(mesh) = self.prepared.get_mut(&tile) else {
                 // The budget draws only what was acknowledged; a mesh missing
                 // here is a fault of this side, and the ground it was to cover
@@ -841,6 +850,11 @@ impl ContentPump {
             mesh.dress(gpu, &wear);
             dressed.insert(tile);
             let level = self.ancestry.get(&tile).map_or(0, |a| a.level);
+            let (exact, fallback) = if covers {
+                (&mut covering, &mut covering_fallback)
+            } else {
+                (&mut exact, &mut fallback)
+            };
             match item.role {
                 Role::Exact => {
                     counts.exact += item.serves.len().max(1);
@@ -868,14 +882,27 @@ impl ContentPump {
         // A tile both drawn as itself and standing in for another is real
         // geometry: it is not demoted to the backdrop pass.
         fallback.retain(|t| !exact.contains(t));
-        // The backdrop: every mesh of its level in its own drape, behind it all.
+        covering_fallback.retain(|t| !covering.contains(t));
+        // The backdrop: every mesh of the ground at its level in its own
+        // drape, behind it all — the ground's alone: a 3D Tiles mesh at that
+        // depth of its own tree is no ground.
         let mut backdrop: Vec<TileId> = Vec::new();
         if let Some(level) = self.backdrop_level {
+            let ground = |t: &TileId| {
+                self.held
+                    .get(&ResourceId::Mesh(*t))
+                    .is_some_and(|h| h.class.is_ground())
+            };
             let floor: Vec<TileId> = self
                 .prepared
                 .keys()
                 .copied()
-                .filter(|t| self.ancestry.get(t).is_some_and(|a| a.level == level))
+                .filter(|t| {
+                    self.ancestry
+                        .get(t)
+                        .is_some_and(|a| a.level == level && !a.covers)
+                })
+                .filter(ground)
                 .collect();
             for tile in floor {
                 if !dressed.contains(&tile) {
@@ -956,6 +983,8 @@ impl ContentPump {
             exact
                 .iter()
                 .chain(fallback.iter())
+                .chain(covering.iter())
+                .chain(covering_fallback.iter())
                 .filter(|t| self.prepared.contains_key(t)),
         );
         let surfaces = |ids: &[TileId]| -> Vec<&PreparedTile> {
@@ -965,6 +994,8 @@ impl ContentPump {
             exact: surfaces(&exact),
             fallback: surfaces(&fallback),
             backdrop: surfaces(&backdrop),
+            covering: surfaces(&covering),
+            covering_fallback: surfaces(&covering_fallback),
         };
         self.rebase_for_drawing(
             &gpu.queue,
@@ -973,6 +1004,8 @@ impl ContentPump {
                 .iter()
                 .chain(drawn.fallback.iter())
                 .chain(drawn.backdrop.iter())
+                .chain(drawn.covering.iter())
+                .chain(drawn.covering_fallback.iter())
                 .copied(),
         );
         (drawn, counts)
@@ -1099,14 +1132,19 @@ fn blocks_to_encode(gpu: &GpuContext, content: &ResourceContent) -> u64 {
 }
 
 fn mesh_bytes(prepared: &PreparedTile, content: &tuile_core::DecodedTileContent) -> u64 {
-    let copy: u64 = content
-        .meshes
-        .iter()
-        .map(|m| {
-            m.positions.len() as u64 * tuile_core::content::VERTEX_STRIDE
-                + m.indices.len() as u64 * 4
-        })
-        .sum();
+    // The copy kept to stitch the tile, if it keeps one.
+    let copy: u64 = if prepared.keeps_source() {
+        content
+            .meshes
+            .iter()
+            .map(|m| {
+                m.positions.len() as u64 * tuile_core::content::VERTEX_STRIDE
+                    + m.indices.len() as u64 * 4
+            })
+            .sum()
+    } else {
+        0
+    };
     // The tile's uniform, at the alignment a uniform offset needs.
     let uniform = tuile_core::budget::cost::TILE_UNIFORM_BYTES
         .div_ceil(tuile_core::budget::cost::UNIFORM_ALIGNMENT)
@@ -1158,9 +1196,16 @@ pub struct Drawn<'a> {
     pub exact: Vec<&'a PreparedTile>,
     /// Ancestors standing in for ground that is not their own.
     pub fallback: Vec<&'a PreparedTile>,
-    /// A complete coarse level behind it all (see
+    /// A complete coarse level of the ground behind it all (see
     /// [`ContentPump::set_backdrop_level`]).
     pub backdrop: Vec<&'a PreparedTile>,
+    /// The surfaces drawn in place of the ground (3D Tiles of a mesh of the
+    /// whole surface, [`Ancestry::covers`](tuile_core::protocol::Ancestry)):
+    /// drawn as themselves, and the ancestors standing in for theirs — what
+    /// `TileRenderer::paint_replacing` draws before the ground, which keeps
+    /// out of the pixels they take.
+    pub covering: Vec<&'a PreparedTile>,
+    pub covering_fallback: Vec<&'a PreparedTile>,
 }
 
 /// How the draw set resolved onto what the GPU actually holds.
@@ -1239,6 +1284,7 @@ mod tests {
             ancestry: Ancestry {
                 level: 0,
                 parent: None,
+                covers: false,
             },
             content: ResourceContent::Mesh(Arc::new(tuile_core::DecodedTileContent {
                 meshes: Vec::new(),

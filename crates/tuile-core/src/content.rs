@@ -166,10 +166,18 @@ impl DecodedTileContent {
     /// with their mip chains. Draped imagery is a resource of its own
     /// ([`DrapeContent`]) and is not counted here.
     pub fn cost(&self) -> crate::budget::cost::Cost {
+        self.cost_held(true)
+    }
+
+    /// [`Self::cost`], with the CPU copy of the meshes or without:
+    /// a consumer keeps one to stitch the ground's tiles to their
+    /// neighbours, and none of a mesh it never stitches — a 3D Tiles tile's
+    /// (`Class::is_ground`).
+    pub fn cost_held(&self, cpu_copy: bool) -> crate::budget::cost::Cost {
         use crate::budget::cost::mesh_cost;
         let vertices: u64 = self.meshes.iter().map(|m| m.positions.len() as u64).sum();
         let indices: u64 = self.meshes.iter().map(|m| m.indices.len() as u64).sum();
-        let mut cost = mesh_cost(vertices, VERTEX_STRIDE, indices, true);
+        let mut cost = mesh_cost(vertices, VERTEX_STRIDE, indices, cpu_copy);
         for t in &self.textures {
             let c = t.cost();
             cost.gpu = cost.gpu.plus(c.gpu);

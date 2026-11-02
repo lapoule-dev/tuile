@@ -1152,7 +1152,9 @@ impl State {
                                 self.steepest.insert(tile, cos);
                             }
                         }
-                        let cost = c.cost();
+                        // The ground's consumer keeps a copy of its mesh to
+                        // stitch it; a 3D Tiles mesh is never stitched.
+                        let cost = c.cost_held(ground);
                         (ResourceContent::Mesh(Arc::new(c)), cost)
                     }
                     // The load grew the tree (an external tileset grafted):
@@ -1203,6 +1205,7 @@ impl State {
         Ancestry {
             level: tree.level(tile),
             parent: tree.parent(tile),
+            covers: tree.covers_ground(tile),
         }
     }
 
@@ -2982,10 +2985,12 @@ mod tests {
         }
     }
 
-    /// **A 3D Tiles mesh's slopes are not measured**: they ease the ground's
-    /// imagery need, and a tileset's mesh carries its own photographs. A
-    /// ground mesh that lands has its steepest face kept; a 3D Tiles mesh
-    /// has none. Red with every mesh measured: the tileset's tile kept.
+    /// **A 3D Tiles mesh's slopes are not measured, nor a copy charged**:
+    /// slopes ease the ground's imagery need, and a tileset's mesh carries
+    /// its own photographs; the copy is what a consumer keeps to stitch the
+    /// ground, and a 3D Tiles mesh is never stitched. Red with every mesh
+    /// measured (the tileset's tile kept), and with every mesh charged its
+    /// copy.
     #[test]
     fn only_the_grounds_slopes_are_measured() {
         use crate::content::{DecodedMesh, DecodedTileContent};
@@ -3037,6 +3042,19 @@ mod tests {
         assert!(
             !state.steepest.contains_key(&surface),
             "a 3D Tiles mesh's slopes measured"
+        );
+        // And charged without the copy only a stitched ground mesh keeps.
+        let charged = |tile: TileId| {
+            state.events.iter().find_map(|e| match e {
+                BudgetEvent::Loaded(r, _, cost) if *r == ResourceId::Mesh(tile) => Some(*cost),
+                _ => None,
+            })
+        };
+        assert_eq!(charged(ground), Some(content().cost_held(true)));
+        assert_eq!(
+            charged(surface),
+            Some(content().cost_held(false)),
+            "a 3D Tiles mesh charged a CPU copy"
         );
     }
 

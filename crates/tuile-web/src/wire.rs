@@ -622,6 +622,7 @@ impl Writer {
     fn ancestry(&mut self, a: &Ancestry) {
         self.u32(a.level);
         self.option_u64(a.parent.map(|p| p.0));
+        self.u8(u8::from(a.covers));
     }
     fn stats(&mut self, s: &TraversalStats) {
         let TraversalStats {
@@ -956,6 +957,7 @@ impl<'a> Reader<'a> {
         Ok(Ancestry {
             level: self.u32()?,
             parent: self.option_u64()?.map(TileId),
+            covers: self.u8()? != 0,
         })
     }
     fn stats(&mut self) -> Result<TraversalStats, WireError> {
@@ -1199,6 +1201,7 @@ mod tests {
             ancestry: Ancestry {
                 level: 7,
                 parent: None,
+                covers: false,
             },
             content: ResourceContent::Mesh(Arc::new(sent)),
         });
@@ -1222,6 +1225,7 @@ mod tests {
         let ancestry = Ancestry {
             level: 7,
             parent: Some(TileId(41)),
+            covers: true,
         };
         let back = round_trip(&ServerMessage::Content {
             resource: ResourceId::Mesh(TileId(42)),
@@ -1264,6 +1268,7 @@ mod tests {
             ancestry: Ancestry {
                 level: 7,
                 parent: None,
+                covers: false,
             },
             content: ResourceContent::Drape(Arc::new(drape_content())),
         });
@@ -1363,6 +1368,7 @@ mod tests {
                 Ancestry {
                     level: 3,
                     parent: Some(TileId(1)),
+                    covers: false,
                 },
             )],
             stats,
@@ -1577,6 +1583,7 @@ mod tests {
             ancestry: Ancestry {
                 level: 0,
                 parent: None,
+                covers: false,
             },
             content: ResourceContent::Drape(Arc::new(drape_content())),
         });

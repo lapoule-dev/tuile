@@ -181,6 +181,7 @@ pub fn ancestry(tile: TileId) -> Ancestry {
     Ancestry {
         level: z,
         parent: (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2)),
+        covers: false,
     }
 }
 
