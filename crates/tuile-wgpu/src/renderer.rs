@@ -809,7 +809,7 @@ impl TileRenderer {
 
     /// Draws a surface that replaces the ground where it is drawn: its tiles,
     /// then its stand-ins where none of them reached. Before the ground, so
-    /// the ground keeps out of every pixel it took — see [`REPLACED`].
+    /// the ground keeps out of every pixel it took — see `REPLACED`.
     pub fn render_replacing<'t>(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
