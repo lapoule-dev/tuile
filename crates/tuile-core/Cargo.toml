@@ -41,10 +41,10 @@ thiserror = { workspace = true }
 # crate was built is worse than no log line, and the flag bought nothing —
 # it was declared and never used.
 tracing = { workspace = true }
-tuile-b3dm = { version = "0.16.0", path = "../tuile-b3dm" }
+tuile-b3dm = { version = "0.16.1", path = "../tuile-b3dm" }
 # The graphics budget, re-exported whole as `budget` (and its `TileId` from
 # `source`): pure, wasm-clean, at the bottom of the graph.
-tuile-budget = { version = "0.16.0", path = "../tuile-budget" }
+tuile-budget = { version = "0.16.1", path = "../tuile-budget" }
 url = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

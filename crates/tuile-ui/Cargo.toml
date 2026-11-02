@@ -25,8 +25,8 @@ statusbar = ["dep:tray-icon", "dep:muda"]
 # Rust, wasm-clean, no system font lookup; the version winit already locks.
 # No variable-font support: the bundled font is a static instance.
 ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
-tuile-camera = { version = "0.16.0", path = "../tuile-camera" }
-tuile-core = { version = "0.16.0", path = "../tuile-core" }
+tuile-camera = { version = "0.16.1", path = "../tuile-camera" }
+tuile-core = { version = "0.16.1", path = "../tuile-core" }
 # The menu bar's item on macOS, the notification area on Windows. No default
 # features: those are the GTK 3 backends on Linux (AppIndicator for the item,
 # GTK 3 for the menu), and GTK 3's bindings are unmaintained.
