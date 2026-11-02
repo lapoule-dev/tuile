@@ -193,3 +193,17 @@ opt-level = 3
 # minutes, optimised a few seconds. Its arithmetic is the same at any level.
 [profile.dev.package.tuile-film]
 opt-level = 3
+
+# The budget decides every frame of every test that draws the globe, and its
+# debug build checks each decision's ancestry against the whole tree
+# (`downstream::check_ancestry`): unoptimised, the fast-zoom scenario spends
+# its minutes in that bookkeeping. Optimised, the same checks still run —
+# `debug-assertions` and overflow checks are the dev profile's, at any level.
+[profile.dev.package.tuile-budget]
+opt-level = 3
+
+# The traversal, its tile sets and its hash maps are what every scene test
+# spends its time in: unoptimised, the planet's ground-coverage scenario
+# takes a quarter of an hour. Optimised, the same checks still run.
+[profile.dev.package.tuile-core]
+opt-level = 3
