@@ -82,22 +82,32 @@ mod config {
         );
     }
 
-    /// C1: the interactive split is per class and never exceeds the total.
+    /// C1: the interactive split never exceeds the total: the pool's
+    /// target and the targets of the classes outside it (a member's own
+    /// target is its ceiling within the pool, not a share of the device).
     #[test]
     fn the_interactive_split_never_exceeds_the_total() {
         let total = Bytes::mib(300);
         let c = BudgetConfig::interactive(total);
-        let sum = c.target.iter().fold(Bytes::ZERO, |a, (_, b)| a.plus(b));
+        let sum = c
+            .target
+            .iter()
+            .filter(|(k, _)| !c.pool.holds(*k))
+            .fold(c.pool.target, |a, (_, b)| a.plus(b));
         assert!(sum <= total);
         assert!(c.target.iter().all(|(_, b)| b > Bytes::ZERO));
     }
 
-    /// D-A3 (decided 2026-10-20) and D3, spec §15.1: the ground is one pool
-    /// of 82 % of the device — terrain between 25 % and 60 % of it, imagery
-    /// between 40 % and 75 % —, the stand-ins' class gone, its 2 % in the
-    /// pool.
+    /// D-A3 (decided 2026-10-20) and D3, spec §15.1, and 3D Tiles in the
+    /// ledger (2026-11-02): the scene is one pool, trimmed to 70 % of 82 % of
+    /// the device and never over 97 % — terrain between 25 % and 60 % of the
+    /// 82 %, imagery between 40 % and 75 %, 3D Tiles from nothing to what the
+    /// ground's floors leave (35 %) — and no class but the overlays has a
+    /// share of the device of its own: a tileset's room follows the view.
+    /// Red with 3D Tiles outside the pool, on 15 % of the device of their
+    /// own.
     #[test]
-    fn the_ground_is_one_pool_with_floors_and_ceilings() {
+    fn the_scene_is_one_pool_and_3d_tiles_have_no_fixed_share() {
         let total = Bytes::gib(1);
         let c = BudgetConfig::interactive(total);
         let ground = total.scaled(82, 100);
@@ -106,22 +116,29 @@ mod config {
             p.holds(Class::TerrainMesh) && p.holds(Class::Drape),
             "{RED}"
         );
-        assert!(!p.holds(Class::Tiles3dMesh) && !p.holds(Class::Overlay));
-        assert_eq!(p.hard_limit, ground);
+        assert!(
+            p.holds(Class::Tiles3dMesh),
+            "{RED}: 3D Tiles keep a fixed share of the device"
+        );
+        assert!(!p.holds(Class::Overlay));
+        assert_eq!(p.target, ground.scaled(70, 100));
+        assert_eq!(p.overflow, ground.scaled(15, 100));
+        assert_eq!(p.hard_limit, total.scaled(97, 100));
         assert_eq!(c.hard_limit[Class::TerrainMesh], ground.scaled(60, 100));
         assert_eq!(c.hard_limit[Class::Drape], ground.scaled(75, 100));
+        assert_eq!(c.hard_limit[Class::Tiles3dMesh], ground.scaled(35, 100));
         assert_eq!(
             (
                 p.floor_percent[Class::TerrainMesh],
-                p.floor_percent[Class::Drape]
+                p.floor_percent[Class::Drape],
+                p.floor_percent[Class::Tiles3dMesh],
             ),
-            (25, 40)
+            (25, 40, 0)
         );
-        let outside = c.hard_limit[Class::Tiles3dMesh].plus(c.hard_limit[Class::Overlay]);
-        let all = outside.plus(p.hard_limit);
+        let all = c.hard_limit[Class::Overlay].plus(p.hard_limit);
         assert!(
             all <= total && total.minus(all) < Bytes(4),
-            "the pool and the other classes share the whole device"
+            "the pool and the overlays share the whole device"
         );
         assert_eq!(Class::ALL.len(), 4, "no class for stand-ins");
     }
@@ -1592,12 +1609,26 @@ mod pressure {
         r.settle(&drawn(&tiles), 30);
         r.b.retarget(Bytes::mib(64));
         let d = r.step(&drawn(&tiles));
-        let sum = d
+        // The pool's members each within the pool's target, which with the
+        // classes outside it fits the new total (a member's target is what
+        // the others leave it: the members' targets are not a split).
+        let shrunk = BudgetConfig::interactive(Bytes::mib(64));
+        let pool = r.b.config().pool;
+        let outside = d
             .stats
             .target
             .iter()
+            .filter(|(c, _)| !pool.holds(*c))
             .fold(Bytes::ZERO, |a, (_, b)| a.plus(b));
-        assert!(sum <= Bytes::mib(64) && sum > Bytes::ZERO, "{RED}");
+        assert!(
+            d.stats
+                .target
+                .iter()
+                .filter(|(c, _)| pool.holds(*c))
+                .all(|(_, t)| t <= shrunk.pool.target && t > Bytes::ZERO),
+            "{RED}"
+        );
+        assert!(outside.plus(shrunk.pool.target) <= Bytes::mib(64), "{RED}");
         assert_eq!(d.stats.lost, 0);
         assert_eq!(d.stats.exact, 4);
     }
