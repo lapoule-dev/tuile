@@ -424,6 +424,56 @@ mod three_d_tiles {
         assert!(r.b.residency().drawable(ground), "the floor stays");
     }
 
+    /// **A source that left the scene is let go of at once**: once its
+    /// tiles have left the need, `release_source` drops both copies of what
+    /// the budget holds of it — the globe's untouched, a tile of it still
+    /// wanted kept — and the budget tracks none of it once the prune has
+    /// freed the empty slots, which is when its tag may name another
+    /// source's tiles. Red with nothing released (`Released` empty: the
+    /// tileset's bytes held until the pool needs their room).
+    #[test]
+    fn a_source_that_left_is_released_and_then_untracked() {
+        let mut r = Rig::interactive();
+        let ground = t(1, 0, 0);
+        let tiles = [s(1, 0, 0), s(1, 1, 0), s(2, 0, 0)];
+        let mut need = drawn(&[ground]);
+        need.drawn
+            .extend(tiles.iter().map(|&id| (id, mesh_need(id))));
+        r.settle(&need, 20);
+        assert!(tiles.iter().all(|t| r.b.residency().drawable(*t)));
+        assert!(r.b.tracks_source(1));
+        let before = r.b.ledger().gpu[Class::Tiles3dMesh];
+        assert!(before > Bytes::ZERO);
+        // The source goes: its tiles leave the need, but one of them,
+        // still wanted, stays.
+        let mut left = drawn(&[ground]);
+        left.drawn.push((tiles[2], mesh_need(tiles[2])));
+        r.step(&left);
+        let released = r.b.release_source(1);
+        assert_eq!(
+            released.gpu,
+            vec![mesh(tiles[0]), mesh(tiles[1])],
+            "{RED}: the source's GPU copies held"
+        );
+        assert!(!released.gpu.contains(&mesh(ground)));
+        assert!(r.b.residency().drawable(tiles[2]), "a wanted tile kept");
+        assert_eq!(
+            r.b.ledger().gpu[Class::Tiles3dMesh],
+            before.minus(Bytes(MESH.0 * 2)),
+            "the ledger gives the bytes back"
+        );
+        r.b.audit().expect("the ledger is the states'");
+        // Gone from the need too: released, then untracked after a prune.
+        r.step(&drawn(&[ground]));
+        r.b.release_source(1);
+        for _ in 0..16 {
+            r.step(&drawn(&[ground]));
+        }
+        assert!(!r.b.tracks_source(1), "{RED}: the source still tracked");
+        assert!(r.b.tracks_source(0), "the globe's tracked");
+        assert!(r.b.residency().drawable(ground));
+    }
+
     /// **A tileset's tile not drawn yet loses no ground (P1.1)**: with the
     /// floor not in, ground drawable as itself is drawn as itself while a
     /// tileset's tile waits for its load — no ground is lost, so nothing is
