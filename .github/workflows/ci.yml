@@ -117,23 +117,33 @@ jobs:
       - if: matrix.shard.doc
         run: cargo test --workspace --doc
 
-  # On macOS, what depends on the platform's GPU backend (Metal) and its
-  # system: every test of a crate that links wgpu or a GPU backend crate
-  # directly, the viewer and its macOS bundle, and the native stores whose
-  # disk and TLS paths differ by OS. Everything else is platform-independent
-  # and runs on Linux only. The whole workspace is still *built* here, every
-  # test target included, as `cargo test` built it, so code that only
-  # compiles on macOS is checked.
+  # On macOS, the tests whose outcome can depend on the platform, and only
+  # those; everything else runs on Linux only. Kept here:
+  #   - the GPU backends and what draws through them — every crate that links
+  #     wgpu or a GPU backend crate directly: tuile-wgpu, tuile-film-gpu,
+  #     tuile-film-native, tuile-atmosphere, tuile-bevy and its viewer,
+  #     tuile-viewer, tuile-record, globe-bulk, orbit-probe (Metal here,
+  #     lavapipe on Linux; naga writes MSL here, SPIR-V there);
+  #   - what has macOS code: tuile-viewer-bundle (the .app), tuile-record and
+  #     tuile-viewer (cfg(target_os = "macos") paths);
+  #   - what reads the OS underneath: tuile-storage-foyer (foyer's disk
+  #     engine), tuile-native-fetchers (disk cache, TLS through aws-lc),
+  #     tuile-farm (processes, unix permissions), tuile-bake (memory read
+  #     from cgroup and /proc on Linux, from neither here; thread counts),
+  #     tuile-hydra (the C ABI).
+  # The whole workspace is still *built* here, every test target included,
+  # as `cargo test` built it, so code that only compiles on macOS is checked.
   test-macos:
     runs-on: macos-latest
     env:
       TUILE_REQUIRE_GPU: 1
-      GPU_TESTS: >-
+      MACOS_TESTS: >-
         package(tuile-wgpu) | package(tuile-film-gpu) | package(tuile-film-native)
         | package(tuile-atmosphere) | package(tuile-bevy) | package(tuile-bevy-viewer)
         | package(tuile-viewer) | package(tuile-viewer-bundle) | package(tuile-record)
         | package(tuile-globe-bulk) | package(tuile-orbit-probe)
         | package(tuile-storage-foyer) | package(tuile-native-fetchers) | package(tuile-farm)
+        | package(tuile-bake) | package(tuile-hydra)
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -144,12 +154,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest@0.9.148
-      - run: cargo nextest run --profile ci --workspace -E "$GPU_TESTS"
+      - run: cargo nextest run --profile ci --workspace -E "$MACOS_TESTS"
       - run: >-
           cargo test --doc
           -p tuile-wgpu -p tuile-film-gpu -p tuile-film-native -p tuile-atmosphere
           -p tuile-bevy -p tuile-viewer -p tuile-record
           -p tuile-storage-foyer -p tuile-native-fetchers -p tuile-farm
+          -p tuile-bake -p tuile-hydra
 
   # The graphics budget's simulation and properties, in release: the
   # scenarios are too slow unoptimised (they are ignored in debug builds),
