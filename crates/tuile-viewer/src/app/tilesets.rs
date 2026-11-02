@@ -4,17 +4,16 @@
 //! The host's 3D Tiles tilesets switched on and off, from the menu, a
 //! steering URL or a script.
 //!
-//! Off, a tileset costs nothing: its layer is dropped — its pump and what
-//! it held on the GPU, its stream, and with the stream its geometry server,
-//! which ends when its client hangs up. The globe under it was never
-//! unloaded (its tiles are selected and loaded under the tileset, which
-//! only keeps them out of the pixels it draws), so the frame after is the
-//! frame of a session without the tileset, with no instant of bare ground.
-//! Its credits go with it, and the credits bar with them when it was the
-//! last.
+//! Off, a tileset leaves the session's scene: the server lets go of what it
+//! held of it at once (its GPU copies evicted, its decoded copies dropped)
+//! and refines the ground under it again. The ground there was never
+//! unloaded — kept a few levels coarser under the tileset, as its fallback
+//! — so the frame after is coarse ground sharpening, with no instant of
+//! bare ground. Its credits go with it, and the credits bar with them when
+//! it was the last.
 //!
-//! On, it is opened again as at the start — its root asked fresh, a server
-//! of its own — and drawn once its tiles arrive; until then the globe is
+//! On, it is opened again as at the start — its root asked fresh, a source
+//! of the scene — and drawn once its tiles arrive; until then the globe is
 //! there, as it was.
 //!
 //! Each is off until the person turns it on, unless the session was started
@@ -126,9 +125,17 @@ impl App {
         } else {
             tracing::info!(asset, "3D Tiles switched off");
             slot.opening = None;
-            // Its pump, its GPU copies, its stream; its server ends with the
-            // stream. The globe beneath was loaded all along.
-            self.surfaces.retain(|layer| layer.surface.asset != asset);
+            // Not drawn from the next frame, before the server's next
+            // selection; out of the scene: the server lets go of what it
+            // held of it, its GPU copies evicted. The ground beneath was kept
+            // all along, coarser under it, and is refined again.
+            if let (Some(surface), Some(active)) = (
+                self.surfaces.iter().find(|s| s.asset == asset),
+                self.active.as_mut(),
+            ) {
+                active.pump.hide_source(surface.tag, true);
+            }
+            self.surfaces.retain(|surface| surface.asset != asset);
         }
         if self.tilesets.keeps {
             crate::shell::keep_tilesets_on(&self.tilesets.on());
@@ -152,7 +159,6 @@ impl App {
         let Some(session) = self.session.as_ref() else {
             return;
         };
-        let origin = self.controller.camera.position;
         let mut failures = Vec::new();
         for slot in &mut self.tilesets.slots {
             if let Some(opening) = slot.opening.as_mut() {
@@ -161,8 +167,10 @@ impl App {
                         slot.opening = None;
                         if slot.on {
                             tracing::info!(asset = slot.asset, "3D Tiles tileset up again");
-                            self.surfaces
-                                .push(crate::surface::Layer::new(surface, origin));
+                            if let Some(active) = self.active.as_mut() {
+                                active.pump.hide_source(surface.tag, false);
+                            }
+                            self.surfaces.push(surface);
                         }
                     }
                     Ok(Err(why)) => {
@@ -182,7 +190,7 @@ impl App {
             let up = self
                 .surfaces
                 .iter()
-                .any(|layer| layer.surface.asset == slot.asset);
+                .any(|surface| surface.asset == slot.asset);
             if slot.on && !slot.failed && !up {
                 slot.opening = Some(session.open_tileset(slot.asset));
             }

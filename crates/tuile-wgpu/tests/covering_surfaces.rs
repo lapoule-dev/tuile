@@ -207,3 +207,33 @@ fn a_surface_is_acknowledged_without_a_copy_and_the_ground_with_one() {
         );
     }
 }
+
+/// A source hidden — a tileset switched off, before the server's next
+/// selection has arrived — is not drawn from the next frame; the ground is.
+/// Shown again, it is. Red with the hidden source drawn: the surface still
+/// in the covering pass the frame it was switched off.
+#[test]
+fn a_hidden_source_is_not_drawn_from_the_next_frame() {
+    let Some(gpu) = gpu() else { return };
+    let ground = TileId::from_terrain(2, 1, 1);
+    let tile = TileId(0).with_tag(1);
+    let mut stream = Scripted::new([
+        mesh(ground, 1, surface()),
+        covering(tile, 0, None, 2),
+        select(
+            vec![exact(ground), exact(tile)],
+            ground,
+            &[surface_ancestry(0, 0)],
+        ),
+    ]);
+    let mut pump = ContentPump::new(DVec3::ZERO);
+    pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+    assert_eq!(pump.resolve(&gpu).0.covering.len(), 1);
+    pump.hide_source(1, true);
+    let (drawn, counts) = pump.resolve(&gpu);
+    assert!(drawn.covering.is_empty(), "the hidden source drawn");
+    assert_eq!(drawn.exact.len(), 1, "the ground drawn");
+    assert_eq!(counts.lost, 0);
+    pump.hide_source(1, false);
+    assert_eq!(pump.resolve(&gpu).0.covering.len(), 1);
+}

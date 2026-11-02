@@ -5,12 +5,17 @@
 //! surface, buildings and trees and the ground under them — on top of the
 //! terrain and imagery.
 //!
-//! Each tileset is a geometry server of its own, fed by the host's fetcher
-//! ([`tuile_planetary::Sources::tileset`]) and drained by a pump of its own,
-//! and drawn as a surface that **replaces** the ground where it is drawn
-//! (`tuile_wgpu::TileRenderer::paint_replacing`): never fought for a pixel by
-//! the globe's own tiles, and where it has nothing yet the globe is there as
-//! it would be without it.
+//! Each tileset is a source of the session's one scene
+//! ([`tuile_core::Composite`]): one geometry server, one budget, one stream
+//! and one pump for the globe and every tileset over it. Switched on, it is
+//! added to the scene under a tag of its own, traversed at the error its
+//! author chose its geometric errors for ([`options`]); switched off, it is
+//! removed, and the server lets go of what it held of it. It is drawn as a
+//! surface that **replaces** the ground where it is drawn
+//! (`tuile_wgpu::TileRenderer::paint_replacing`, the pump's
+//! `Drawn::covering`): never fought for a pixel by the globe's own tiles,
+//! and where it has nothing the globe is there — the ground under it kept,
+//! a few levels coarser, as the fallback.
 //!
 //! Its credits are the provider's terms, not decoration. What each tile
 //! names in its own payload is gathered from the tiles drawn, most frequent
@@ -21,93 +26,91 @@
 use std::sync::Arc;
 
 use tuile_planetary::Credit;
-use tuile_wgpu::ContentPump;
 
-/// The stream to a tileset's geometry server: in this process on a desktop
-/// and a phone; in the page's worker, over a channel of its own, in a
-/// browser.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) type SurfaceStream = tuile_core::protocol::InProcessStream;
-#[cfg(target_arch = "wasm32")]
-pub(crate) type SurfaceStream = crate::web::TilesetStream;
-
-/// A tileset that is up: its stream and what must be shown with it.
+/// A tileset that is up: a source of the session's scene, and what must be
+/// shown with it. Dropped, it leaves the scene.
 pub(crate) struct Surface {
     /// The asset number it was asked for by.
     pub asset: i64,
-    pub stream: SurfaceStream,
-    /// Its server's budget signals, which its pump records frames into:
-    /// none in a page, whose server's meter is in the worker.
-    pub meter: Option<tuile_core::runtime::SharedMeter>,
+    /// The tag its tiles carry in the scene: what the window stops drawing
+    /// the frame it is switched off (`ContentPump::hide_source`).
+    pub tag: u8,
     /// What the host says must be credited while it is drawn.
     pub credits: Vec<Credit>,
+    /// What takes it out of the scene: the session's.
+    leave: Option<Leave>,
+}
+
+/// What takes a surface out of the scene: sent across threads on a desktop
+/// and a phone, where it is opened on the runtime; a page's stays on its own.
+#[cfg(not(target_arch = "wasm32"))]
+type Leave = Box<dyn FnOnce() + Send>;
+#[cfg(target_arch = "wasm32")]
+type Leave = Box<dyn FnOnce()>;
+
+impl Surface {
+    /// The tileset `asset` with its `credits`, taken out of the scene by
+    /// `leave` when it is dropped.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn new(
+        asset: i64,
+        tag: u8,
+        credits: Vec<Credit>,
+        leave: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        Self {
+            asset,
+            tag,
+            credits,
+            leave: Some(Box::new(leave)),
+        }
+    }
+
+    /// The tileset `asset` with its `credits`, taken out of the scene by
+    /// `leave` when it is dropped.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn new(
+        asset: i64,
+        tag: u8,
+        credits: Vec<Credit>,
+        leave: impl FnOnce() + 'static,
+    ) -> Self {
+        Self {
+            asset,
+            tag,
+            credits,
+            leave: Some(Box::new(leave)),
+        }
+    }
+}
+
+impl Drop for Surface {
+    fn drop(&mut self) {
+        if let Some(leave) = self.leave.take() {
+            leave();
+        }
+    }
 }
 
 /// A tileset on its way up, after a person switched it on: the surface, or
 /// why it could not be opened.
 pub(crate) type Opening = tokio::sync::oneshot::Receiver<Result<Surface, String>>;
 
-/// A tileset in the window: its session and its pump, and what its last
-/// frame's tiles credited.
-pub(crate) struct Layer {
-    pub surface: Surface,
-    pub pump: ContentPump,
-    /// The `copyright` of each tile drawn in the last frame.
-    pub drawn: Vec<Arc<str>>,
-    /// Whether anything of it was drawn in the last frame.
-    pub showing: bool,
-}
+/// The error 3D Tiles content is authored for: the specification's
+/// customary 16 pixels, against which a tileset's geometric errors are
+/// chosen.
+pub(crate) const TILESET_ERROR_PX: f64 = 16.0;
 
-impl Layer {
-    pub(crate) fn new(surface: Surface, render_origin: glam::DVec3) -> Self {
-        let mut pump = ContentPump::new(render_origin);
-        if let Some(meter) = &surface.meter {
-            pump.observe(Arc::clone(meter));
-        }
-        Self {
-            surface,
-            pump,
-            drawn: Vec::new(),
-            showing: false,
-        }
+/// How a tileset joins the scene: traversed at [`TILESET_ERROR_PX`] whatever
+/// the globe's threshold — a terrain's errors are the quantized mesh's, a
+/// tileset's are its author's, and asking the second for the first's pixel or
+/// two loads many times the tiles the screen can show — and standing for the
+/// ground under it, which is then refined coarser, kept as the fallback.
+pub(crate) fn options(globe: &tuile_core::traversal::Config) -> tuile_core::SourceOptions {
+    tuile_core::SourceOptions {
+        sse_factor: TILESET_ERROR_PX / globe.maximum_screen_space_error,
+        covers_ground: true,
     }
-}
-
-/// How a tileset is traversed: at the screen-space error 3D Tiles content
-/// is authored for — the specification's customary 16 pixels, against which
-/// a tileset's geometric errors are chosen — and otherwise as the globe is
-/// (its culling).
-///
-/// Not the globe's own threshold: a terrain's errors are the quantized
-/// mesh's, a tileset's are its author's, and asking the second for the
-/// first's single pixel loads many times the tiles the screen can show,
-/// fills the class's share of the budget well before the view is complete,
-/// and leaves the rest of the view coarse.
-pub(crate) fn traversal(globe: &tuile_core::traversal::Config) -> tuile_core::traversal::Config {
-    tuile_core::traversal::Config {
-        cull: globe.cull,
-        horizon_culling: globe.horizon_culling,
-        ..tuile_core::traversal::Config::default()
-    }
-}
-
-/// A tileset's budget: the globe's, with the 3D Tiles mesh class given the
-/// room the globe's own mesh class has.
-///
-/// A tileset's server holds that one class and nothing else, and the
-/// interactive budget sizes it as a guest beside a ground (a sixth of the
-/// device): a photographic mesh of a city fills that before the view is
-/// complete. It is the ground here, so it gets the ground mesh's limits and
-/// its loads in flight.
-pub(crate) fn budget(globe: &tuile_core::budget::BudgetConfig) -> tuile_core::budget::BudgetConfig {
-    use tuile_core::budget::Class;
-    let mut b = globe.clone();
-    let (from, to) = (Class::TerrainMesh, Class::Tiles3dMesh);
-    b.hard_limit[to] = globe.hard_limit[from];
-    b.target[to] = globe.target[from];
-    b.overflow[to] = globe.overflow[from];
-    b.max_in_flight[to] = globe.max_in_flight[from].max(globe.max_in_flight[to]);
-    b
 }
 
 /// The words a set of tilesets must show: what the tiles drawn credit, each
@@ -151,31 +154,34 @@ mod tests {
         }
     }
 
-    /// A tileset is traversed at the 3D Tiles convention's error, not the
-    /// globe's, and its mesh class is given the ground mesh's room.
+    /// A tileset is traversed at the 3D Tiles convention's error, whatever
+    /// the globe's, and stands for the ground under it. (Its budget is the
+    /// scene's: no clone of the globe's, no share of its own.)
     #[test]
-    fn a_tileset_is_traversed_and_budgeted_as_the_ground() {
-        use tuile_core::budget::{BudgetConfig, Bytes, Class};
-        let globe = tuile_core::traversal::Config {
-            maximum_screen_space_error: 1.0,
-            cull: false,
-            ..tuile_core::traversal::Config::interactive_globe()
-        };
-        let mine = traversal(&globe);
-        assert_eq!(mine.maximum_screen_space_error, 16.0);
-        assert!(!mine.cull, "the globe's culling is kept");
-        let ground = BudgetConfig::interactive(Bytes::mib(4096));
-        let b = budget(&ground);
-        assert_eq!(
-            b.hard_limit[Class::Tiles3dMesh],
-            ground.hard_limit[Class::TerrainMesh]
-        );
-        assert_eq!(
-            b.target[Class::Tiles3dMesh],
-            ground.target[Class::TerrainMesh]
-        );
-        assert!(b.max_in_flight[Class::Tiles3dMesh] >= ground.max_in_flight[Class::TerrainMesh]);
-        assert_eq!(b.hard_limit[Class::Drape], ground.hard_limit[Class::Drape]);
+    fn a_tileset_is_traversed_at_its_error_and_covers_the_ground() {
+        for globe in [1.0, 2.0, 4.0] {
+            let config = tuile_core::traversal::Config {
+                maximum_screen_space_error: globe,
+                ..tuile_core::traversal::Config::interactive_globe()
+            };
+            let o = options(&config);
+            assert_eq!(o.sse_factor * globe, 16.0);
+            assert!(o.covers_ground);
+        }
+    }
+
+    /// A surface leaves the scene when it is dropped, once.
+    #[test]
+    fn a_surface_leaves_the_scene_when_dropped() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let left = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&left);
+        let surface = Surface::new(7, 1, Vec::new(), move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(left.load(Ordering::SeqCst), 0);
+        drop(surface);
+        assert_eq!(left.load(Ordering::SeqCst), 1);
     }
 
     /// The names the tiles credit, each once, most frequent first; then the
