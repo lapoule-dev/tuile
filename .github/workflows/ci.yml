@@ -103,6 +103,9 @@ jobs:
     env:
       # A GPU test that finds no adapter fails instead of passing empty.
       TUILE_REQUIRE_GPU: 1
+      # File and line in every backtrace, without the variables' types no
+      # debugger reads here: smaller objects, faster links, a smaller cache.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -145,6 +148,7 @@ jobs:
     runs-on: macos-latest
     env:
       TUILE_REQUIRE_GPU: 1
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
       MACOS_TESTS: >-
         package(tuile-wgpu) | package(tuile-film-gpu) | package(tuile-film-native)
         | package(tuile-atmosphere) | package(tuile-bevy) | package(tuile-bevy-viewer)
