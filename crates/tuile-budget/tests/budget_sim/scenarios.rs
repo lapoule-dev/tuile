@@ -903,8 +903,9 @@ fn visit_the_city(city: bool) -> CityRun {
 /// own); the still view over the city converges, the city drawn; the ground
 /// under the drawn city is refined coarser than without it (the cover rule:
 /// it stays as the fallback, never black); the scene's GPU bytes stay within
-/// the device's; and once the view has left, the city's bytes are let go.
-/// Recorded in the reference.
+/// the device's; and the city takes what the view needs of the scene's pool,
+/// beyond the 15 % of the device 3D Tiles once kept apart (0.210 GiB, its
+/// target there, against 0.382). Recorded in the reference.
 #[test]
 #[cfg_attr(
     debug_assertions,
@@ -943,5 +944,12 @@ fn the_globe_and_a_city_share_one_budget() {
     assert!(
         with.peak_total <= Bytes::gib(2),
         "{RED}: the scene over the device's budget"
+    );
+    // No class has a share of its own: the city takes what the view needs
+    // of the pool, beyond the 15 % of the device 3D Tiles once kept apart.
+    assert!(
+        with.peak[Class::Tiles3dMesh] > Bytes::gib(2).scaled(15, 100),
+        "{RED}: the city held to a fixed share ({:.3} GiB)",
+        gib(with.peak[Class::Tiles3dMesh])
     );
 }
