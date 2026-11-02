@@ -470,6 +470,15 @@ pub struct Metrics {
     pub imagery_bytes: Gauge,
     pub imagery_textures: Gauge,
 
+    // --- 3D Tiles beside the globe (the `Tiles3dMesh` class) ---
+    /// Their meshes in the last draw set: of `tiles_selected`.
+    pub tiles3d_selected: Gauge,
+    /// Their bytes on the GPU, as the budget's ledger counts them: of
+    /// `resident_bytes`.
+    pub tiles3d_bytes: Gauge,
+    /// Their loads started: of `loads_started`.
+    pub tiles3d_loads_started: Counter,
+
     // --- Consumer ---
     pub frames: Counter,
     /// Wall time from the top of one frame to the top of the next.
@@ -796,6 +805,7 @@ snapshot! {
         store_bytes_fetched,
         presence_answers,
         tiles_evicted,
+        tiles3d_loads_started,
         frames,
         uploads,
     ],
@@ -814,6 +824,8 @@ snapshot! {
         resident_bytes,
         imagery_bytes,
         imagery_textures,
+        tiles3d_selected,
+        tiles3d_bytes,
         pending_uploads,
         prepared_tiles,
         frame_exact,
