@@ -100,7 +100,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test-linux
+          # The key the single `test` job had: main's cache keeps serving.
+          shared-key: test
           # The workspace runner builds a superset of the other two.
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard.name == 'workspace' }}
       - uses: taiki-e/install-action@v2
@@ -138,6 +139,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
