@@ -5,6 +5,7 @@
 
 pub use tuile_budget as budget;
 pub mod content;
+pub mod cover;
 pub mod determinism;
 pub mod drive;
 pub mod fetch;
@@ -35,7 +36,9 @@ pub use protocol::{
     ClientMessage, GeometryStream, InProcessStream, ResourceContent, ServerMessage,
 };
 pub use report::GeometryReport;
-pub use runtime::{in_process, in_process_with, Clock, GeometryServer, SharedMeter};
+pub use runtime::{
+    in_process, in_process_composite, in_process_with, Clock, GeometryServer, SharedMeter,
+};
 pub use source::{
     Composite, CompositeError, CompositeLoader, CompositeTileTree, DrapeReach, LoadError, Loaded,
     SourceOptions, TileId, TileLoader, TileProperties, TileTree,
