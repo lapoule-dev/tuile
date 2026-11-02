@@ -157,6 +157,19 @@ struct Stitching {
 }
 
 impl PreparedTile {
+    /// Lets go of the meshes as they came: a tile never stitched — a 3D
+    /// Tiles tile, which is not ground — has no use for them, and the copy
+    /// is not charged for it (`DecodedTileContent::cost_held`).
+    pub(crate) fn forget_source(&mut self) {
+        self.source = Vec::new();
+        self.cell = None;
+    }
+
+    /// Whether the tile keeps the meshes as they came, for its stitches.
+    pub(crate) fn keeps_source(&self) -> bool {
+        !self.source.is_empty()
+    }
+
     /// Stitches the tile to its neighbours as `tuile_core::stitch::plan`
     /// decided for the tiles drawn from `frame` on: the vertex stage moves
     /// its vertices by the plan's strips. `slide` is how many frames the
