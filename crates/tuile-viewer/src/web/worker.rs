@@ -16,10 +16,9 @@
 //! arrives as [`ToWorker`] and is done to the loader's own handles, and the
 //! budget's signals go back as [`ToPage::Signals`] for the page's overlay.
 //!
-//! A host's 3D Tiles tileset, switched on, is a geometry server of its own
-//! here too, beside the globe's, as a desktop runs one beside its own: the
-//! page asks for it with a `MessageChannel` port ([`ToWorker::OpenTileset`]),
-//! and its stream is served on that port ([`tuile_web::post::serve_over`]).
+//! A host's 3D Tiles tileset, switched on, is a source of the session's one
+//! scene here too, as on a desktop ([`ToWorker::OpenTileset`]): the globe
+//! and every tileset over it are one server, one budget and one stream.
 
 use std::sync::Arc;
 
@@ -119,9 +118,14 @@ async fn start(
         inner: globe.loader,
         gate: gate.clone(),
     });
-    let (stream, server) = tuile_core::runtime::in_process_with(
-        globe.tree,
-        loader,
+    // One scene: the globe under tag 0, the tilesets beside it as they are
+    // switched on.
+    let scene = tuile_core::Composite::new();
+    scene
+        .add_at(0, globe.tree, loader, tuile_core::SourceOptions::default())
+        .map_err(|e| format!("the globe could not join the scene: {e}"))?;
+    let (stream, server) = tuile_core::runtime::in_process_composite(
+        scene.clone(),
         profile.traversal(),
         profile.budget(),
     )
@@ -148,8 +152,8 @@ async fn start(
         choices: layers,
         gate,
         sources,
-        traversal: crate::surface::traversal(&profile.traversal()),
-        tileset_budget: crate::surface::budget(&profile.budget()),
+        traversal: profile.traversal(),
+        scene,
         tilesets: Rc::default(),
         asked: Rc::default(),
     };
@@ -260,14 +264,13 @@ struct Handles {
     layers: Layers,
     choices: Vec<crate::embed::ImageryChoice>,
     gate: Gate,
-    /// What a tileset is opened with: the page's sources, and how it is
-    /// traversed and budgeted (`crate::surface`).
+    /// What a tileset is opened with: the page's sources, and the globe's
+    /// traversal its own is measured against (`crate::surface::options`).
     sources: Arc<PageSources>,
     traversal: tuile_core::traversal::Config,
-    tileset_budget: tuile_core::budget::BudgetConfig,
-    /// The tilesets served, by asset: dropping one's connection lets go of
-    /// its stream, and its server ends.
-    tilesets: Rc<RefCell<HashMap<i64, tuile_web::post::Connection>>>,
+    /// The session's scene, and the tag each tileset in it is under.
+    scene: tuile_core::Composite,
+    tilesets: Rc<RefCell<HashMap<i64, u8>>>,
     /// Each tileset's latest request, counted: an opening that a close or a
     /// later opening has overtaken is let go of when it lands.
     asked: Rc<RefCell<HashMap<i64, u64>>>,
@@ -275,22 +278,13 @@ struct Handles {
 
 impl Handles {
     fn heard(&self, value: JsValue) {
-        // The port a tileset is to be served on travels beside the message.
-        let port = js_sys::Reflect::get(&value, &JsValue::from_str("port"))
-            .ok()
-            .and_then(|p| p.dyn_into::<web_sys::MessagePort>().ok());
         match serde_wasm_bindgen::from_value::<ToWorker>(value) {
-            Ok(ToWorker::OpenTileset { asset }) => match port {
-                Some(port) => self.open_tileset(asset, port),
-                None => post(&ToPage::TilesetFailed {
-                    asset,
-                    reason: "no port to serve it on".to_owned(),
-                }),
-            },
+            Ok(ToWorker::OpenTileset { asset }) => self.open_tileset(asset),
             Ok(ToWorker::CloseTileset { asset }) => {
                 *self.asked.borrow_mut().entry(asset).or_default() += 1;
-                if self.tilesets.borrow_mut().remove(&asset).is_some() {
-                    tracing::info!(asset, "3D Tiles tileset closed");
+                if let Some(tag) = self.tilesets.borrow_mut().remove(&asset) {
+                    self.scene.remove(tag);
+                    tracing::info!(asset, "3D Tiles tileset out of the scene");
                 }
             }
             Ok(ToWorker::Slots { reported }) => self.budget.set_from_device(reported),
@@ -317,11 +311,12 @@ impl Handles {
 }
 
 impl Handles {
-    /// Opens the tileset `asset` as a desktop does — its root, then a server
-    /// of its own on this worker's loop — and serves it on `port`.
-    fn open_tileset(&self, asset: i64, port: web_sys::MessagePort) {
+    /// Opens the tileset `asset` as a desktop does — its root, then a source
+    /// of the scene, its loads behind the session's gate.
+    fn open_tileset(&self, asset: i64) {
         let sources = Arc::clone(&self.sources);
-        let (traversal, budget) = (self.traversal.clone(), self.tileset_budget.clone());
+        let options = crate::surface::options(&self.traversal);
+        let (scene, gate) = (self.scene.clone(), self.gate.clone());
         let tilesets = Rc::clone(&self.tilesets);
         let asked = Rc::clone(&self.asked);
         let request = {
@@ -341,31 +336,41 @@ impl Handles {
                     .map_err(|e| format!("its root: {e}"))?;
                 let tileset = tuile_core::tileset::Tileset::from_json_bytes(&root, &source.url)
                     .map_err(|e| format!("its root: {e}"))?;
-                let fetcher = Arc::new(tuile_planetary::Held(Arc::clone(&source.fetcher)));
-                let (stream, server) =
-                    tuile_core::runtime::in_process(tileset, fetcher, traversal, budget)
-                        .map_err(|e| format!("the graphics budget cannot run: {e}"))?;
-                let server = server
-                    .with_breather(BURST, Arc::new(breathe))
-                    .with_clock(clock());
-                wasm_bindgen_futures::spawn_local(async move {
-                    server.run().await;
-                    tracing::info!(asset, "a tileset's geometry server has stopped");
-                });
-                Ok::<_, String>((stream, source.credits))
+                Ok::<_, String>((tileset, source))
             }
             .await;
             if asked.borrow().get(&asset) != Some(&request) {
                 tracing::info!(asset, "a tileset opened after it was closed; let go");
                 return;
             }
-            match opened {
-                Ok((stream, credits)) => {
-                    let connection = tuile_web::post::serve_over(stream, port);
-                    tilesets.borrow_mut().insert(asset, connection);
-                    tracing::info!(asset, "3D Tiles tileset up");
+            let joined = opened.and_then(|(tileset, source)| {
+                let arena = Arc::new(std::sync::RwLock::new(tileset));
+                let loader: Arc<dyn TileLoader> = Arc::new(Gated {
+                    inner: Arc::new(tuile_core::TilesetLoader::new(
+                        Arc::clone(&arena),
+                        Arc::new(tuile_planetary::Held(Arc::clone(&source.fetcher))),
+                    )),
+                    gate,
+                });
+                let tag = scene
+                    .add(
+                        Box::new(tuile_core::TilesetTree::new(arena)),
+                        loader,
+                        options,
+                    )
+                    .map_err(|e| format!("the scene has no room for it: {e}"))?;
+                Ok((tag, source.credits))
+            });
+            match joined {
+                Ok((tag, credits)) => {
+                    // One opened again while up replaces it.
+                    if let Some(old) = tilesets.borrow_mut().insert(asset, tag) {
+                        scene.remove(old);
+                    }
+                    tracing::info!(asset, tag, "3D Tiles tileset in the scene");
                     post(&ToPage::TilesetOpened {
                         asset,
+                        tag,
                         credits: credits.iter().map(CreditWire::of).collect(),
                     });
                 }

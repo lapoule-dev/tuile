@@ -496,6 +496,38 @@ headless runner on the real network, criterion benches, Pyroscope/Prometheus on 
 Each experiment is kept only if it wins (network, blur, thrash, decide cost, invariants); the loser
 is deleted (no switch).
 
+### 3D Tiles in the ledger (after O1.5, before O-CB; a stack on #173, 2026-11-02)
+
+The study (`docs/explorations/3d-tiles-in-the-budget.md`, #174) found #173 running a geometry server, a budget cloned
+from the globe's, a stream and a pump per tileset: with one tileset the scene's envelope was ≈ 1.31 G on the GPU
+(5.25 GiB on a 4 GiB desktop), the globe still loading its ground under the tileset, and the tileset's coarsest tiles
+pinned as a floor. One server, one ledger and one pump for the whole scene replace it, in five stacked PRs:
+
+- **The composite** (tuile-core): `Composite`, the sources of one scene — the globe under tag 0, each tileset under a
+  tag of its own (1..15) — added and removed while the session runs, a removed tag retired until the session holds
+  nothing of it; each root culled against its own source's occluder (`TileTree::occluder_of`); each source's
+  screen-space error a factor of the traversal's (`SourceOptions::sse_factor`: 16 px for a tileset over a globe at
+  2), read by the traversal and the need alike; `covers_ground` for a mesh of the whole surface.
+- **The budget** (tuile-budget): the floor and P1.1's lost-ground cap are the ground's (`Class::is_ground`) — terrain-
+  only inputs identical, the recorded reference unchanged; a city beside the globe in the simulation, with the cover
+  rule, recorded; **3D Tiles join the pool: no class keeps a share of the device of its own** — the pool's targets the
+  ground's of before (70 % and 15 % of 82 % of the device), its hard limit 97 %, the old 15 % the scene's headroom;
+  terrain-only decisions identical (goldens, pattern goldens), the recorded chains re-blessed for their statistics only,
+  the city's peak 0.210 → 0.382 GiB of 2; `release_source` / `tracks_source`.
+- **The runtime** (tuile-core): `in_process_composite`; the session steps when a source comes or goes, lets a removed one
+  go at once (released, evicted, its tag given back once nothing of it is left); the floor walk and the priming the
+  ground's; no slope measured for 3D content; per-class metrics; **the ground under a covering surface refined
+  coarser** (`crate::cover`: under the inner footprints of the covering tiles drawn last step, the ground is traversed
+  at 8× its error and kept as the fallback — coarse ground, never black).
+- **The pump** (tuile-wgpu): `Ancestry::covers`; `resolve` gives the covering surfaces apart for `paint_replacing`;
+  the backdrop the ground's; no CPU copy of 3D content, kept nor charged.
+- **The viewer and the page** (tuile-viewer, tuile-web): one server, one stream, one pump; a tileset switched on is a
+  source added to the scene, switched off it leaves it (and the window stops drawing it the next frame,
+  `hide_source`); #173's second server, `surface::budget`, its pump and stream per tileset, and the worker's second
+  server over a `MessageChannel` are gone.
+
+Measured (base #173's tip, tip the stack's top): M-run 18/18 both sides in off/auto/astc, 0 black, 0 holes, peak, landing and frame times within noise; M-web 10/10 at the tip in the three configurations (base 9/10 twice, one duplicate request), 0 holes; held at the page's patterns' end +2.5 to +4 % (the pool's targets over the whole scene); the tileset on over Paris at 700 m, 954 MiB of the scene on the GPU of G = 4 GiB (555 MiB of 3D Tiles), off 402 MiB with the ground drawn the next frame. M-sim: terrain-only decisions identical, the city recorded (peak 0.382 GiB of 2); M-bench parity; no ratchet up.
+
 ### A — Algorithmic corrections (first)
 A0. The cut-over, EFFECTIVE everywhere: native (Mac first, then iOS/Android), web (page + worker over
     postMessage, WebGPU and WebGL2, verified in a real browser) and bake (tuile-bake Session on

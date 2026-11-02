@@ -87,6 +87,8 @@ pub struct ContentPump {
     /// The level whose meshes are drawn as a backdrop behind the draw set,
     /// each in its own drape: see [`Self::set_backdrop_level`].
     backdrop_level: Option<u32>,
+    /// The sources not drawn, a bit per tag: see [`Self::hide_source`].
+    hidden_sources: u16,
     /// How many `Select` messages this pump has applied.
     selects_seen: u64,
     /// The generation this pump last sent with a `ViewerState` — monotone,
@@ -161,6 +163,7 @@ impl ContentPump {
             lost: 0,
             bare: 0,
             backdrop_level: None,
+            hidden_sources: 0,
             selects_seen: 0,
             generation_sent: 0,
             generation_selected: 0,
@@ -229,6 +232,21 @@ impl ContentPump {
     /// answered. `None`, the default, draws none.
     pub fn set_backdrop_level(&mut self, level: Option<u32>) {
         self.backdrop_level = level;
+    }
+
+    /// Stops drawing the tiles of source `tag` (a composite's,
+    /// [`TileId::tag`]), or draws them again: what a host does the frame a
+    /// person switches a tileset off, before the server's next selection —
+    /// which no longer lists them — has arrived. The ground under it is drawn
+    /// as it is (coarser, the cover's fallback). Shown again when a source
+    /// comes up under the tag.
+    pub fn hide_source(&mut self, tag: u8, hidden: bool) {
+        let bit = 1u16 << (tag & 15);
+        if hidden {
+            self.hidden_sources |= bit;
+        } else {
+            self.hidden_sources &= !bit;
+        }
     }
 
     /// How the tiles drawn are stitched to one another
@@ -831,6 +849,9 @@ impl ContentPump {
         let mut dressed: std::collections::HashSet<TileId> = std::collections::HashSet::new();
         for item in &self.draw.items {
             let tile = item.mesh.tile();
+            if self.hidden_sources & (1 << (tile.tag() & 15)) != 0 {
+                continue;
+            }
             let covers = self.ancestry.get(&tile).is_some_and(|a| a.covers);
             let Some(mesh) = self.prepared.get_mut(&tile) else {
                 // The budget draws only what was acknowledged; a mesh missing
