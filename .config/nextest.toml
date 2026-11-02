@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+
+# The test runner CI uses: every test in its own process, every binary's
+# tests in one pool, so one slow binary no longer holds all the others back
+# the way `cargo test` runs them, one binary after the other. Doc-tests are
+# not nextest's: CI runs them with `cargo test --doc`.
+
+[profile.default]
+# The longest tests start first: a run cannot end before they do, so starting
+# them last is what makes a run as long as their sum with everything else.
+slow-timeout = { period = "60s" }
+
+[[profile.default.overrides]]
+filter = '''
+    binary_id(tuile-wgpu::sky_flicker)
+    | binary_id(tuile-wgpu::fast_zoom_never_empties)
+    | binary_id(tuile-planetary::selection_covers_the_ground)
+    | binary_id(tuile-budget::budget_properties)
+    | binary_id(tuile-budget::budget_sim)
+    | binary_id(tuile-bake::ground_memory)
+    | binary_id(tuile-film-gpu::atmosphere)
+    | binary_id(tuile-film-gpu::headless)
+'''
+priority = 100
+
+[profile.ci]
+# Every failure of a run, not the first one only.
+fail-fast = false
+failure-output = "immediate-final"
+slow-timeout = { period = "60s" }
+
+[profile.ci.junit]
+path = "junit.xml"
