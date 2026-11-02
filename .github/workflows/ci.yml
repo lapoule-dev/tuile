@@ -5,6 +5,14 @@ on:
     branches: [main]
   pull_request:
 
+# A new push to a pull request supersedes the run of the previous one: that
+# run is cancelled rather than left holding runners (macOS runners are few,
+# and a stack of pull requests pushes them all at once). Runs on main are
+# never cancelled: each merge is tested.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
