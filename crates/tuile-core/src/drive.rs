@@ -255,7 +255,11 @@ pub async fn drive_until_complete<S: GeometryStream + Unpin>(
             ServerMessage::Error { resource, message } => errors.push((resource, message)),
             ServerMessage::Select { .. } | ServerMessage::Priming(_) => {}
         }
-        if state.is_complete() {
+        // Complete for the views sent (generation 1): the session's first
+        // step answers no view — it lists the floor before any camera —
+        // and a scene with no floor (a tileset alone) converges on it, on
+        // nothing.
+        if state.is_complete() && state.generation() >= 1 {
             return Ok(BulkFrame {
                 draw: state.draw().clone(),
                 meshes,
