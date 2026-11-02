@@ -207,3 +207,23 @@ opt-level = 3
 # takes a quarter of an hour. Optimised, the same checks still run.
 [profile.dev.package.tuile-core]
 opt-level = 3
+
+# The GPU stack the render tests drive, frame after frame. In a debug build
+# objc2 checks every Metal message's type encoding against its declaration
+# (two thirds of a macOS render test's CPU, sampled), wgpu-core validates
+# every command and naga translates every shader of every test process.
+# Optimised, they check and translate the same: debug assertions stay on.
+[profile.dev.package.objc2]
+opt-level = 3
+
+[profile.dev.package.objc2-encode]
+opt-level = 3
+
+[profile.dev.package.wgpu-core]
+opt-level = 3
+
+[profile.dev.package.wgpu-hal]
+opt-level = 3
+
+[profile.dev.package.naga]
+opt-level = 3
