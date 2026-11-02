@@ -110,6 +110,12 @@ pub struct Ancestry {
     pub level: u32,
     /// The tile one level up, or `None` at a root.
     pub parent: Option<TileId>,
+    /// Drawn, it stands for the ground under it — a mesh of the whole
+    /// surface drawn in place of the globe's
+    /// ([`TileTree::covers_ground`](crate::source::TileTree::covers_ground)):
+    /// a consumer draws it before the ground, which keeps out of the pixels
+    /// it takes.
+    pub covers: bool,
 }
 
 /// The content of one resource: a tile's mesh, or a tile's drape (D-A2).

@@ -213,14 +213,15 @@ pub async fn drive_until_complete<S: GeometryStream + Unpin>(
             ServerMessage::Content {
                 resource,
                 gen,
+                class,
                 content,
                 ..
             } => {
                 // Held as uploaded: acknowledged with the estimator's bytes,
                 // which is what a consumer that keeps the decoded content
-                // holds.
+                // holds (the ground's meshes with the copy a stitch reads).
                 let bytes = match &content {
-                    ResourceContent::Mesh(m) => m.cost().gpu,
+                    ResourceContent::Mesh(m) => m.cost_held(class.is_ground()).gpu,
                     ResourceContent::Drape(d) => d.cost().gpu,
                 };
                 match content {
