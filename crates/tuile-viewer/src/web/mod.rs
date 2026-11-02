@@ -51,6 +51,6 @@ pub(crate) mod system;
 pub mod worker;
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) use session::{Budget, Gate, Started, TilesetStream};
+pub(crate) use session::{Budget, Gate, Started};
 #[cfg(target_arch = "wasm32")]
 pub(crate) use system::{keep_the_view, keep_tilesets_on};

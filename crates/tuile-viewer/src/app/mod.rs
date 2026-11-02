@@ -285,9 +285,12 @@ pub struct App {
     active: Option<Active>,
     /// The session, once it is up: its stream and the globe's handles.
     session: Option<crate::shell::Started>,
-    /// The host's 3D Tiles drawn over the globe, taken from the session:
-    /// see [`crate::surface`].
-    surfaces: Vec<crate::surface::Layer>,
+    /// The host's 3D Tiles drawn over the globe: sources of the session's
+    /// scene, each leaving it when dropped — see [`crate::surface`].
+    surfaces: Vec<crate::surface::Surface>,
+    /// The `copyright` of each tile of theirs drawn in the last frame: what
+    /// their credits line gathers.
+    surfaces_drawn: Vec<std::sync::Arc<str>>,
     /// The bar their credits are shown in, below the picture.
     credits: credits::Credits,
     /// Which of them are switched on: see `tilesets`.
@@ -478,6 +481,7 @@ impl App {
             active: None,
             session: None,
             surfaces: Vec::new(),
+            surfaces_drawn: Vec::new(),
             credits: credits::Credits::default(),
             tilesets: tilesets::Tilesets::new(
                 &config.tilesets,
@@ -640,11 +644,12 @@ impl App {
     fn adopt(&mut self, mut started: crate::shell::Started) {
         self.controller = self.controller.clone().with_ground(started.heights.clone());
         let (surfaces, failures) = started.take_surfaces();
-        let origin = self.controller.camera.position;
-        self.surfaces = surfaces
-            .into_iter()
-            .map(|surface| crate::surface::Layer::new(surface, origin))
-            .collect();
+        if let Some(active) = self.active.as_mut() {
+            for surface in &surfaces {
+                active.pump.hide_source(surface.tag, false);
+            }
+        }
+        self.surfaces = surfaces;
         self.note_the_tilesets_up(&failures);
         if !failures.is_empty() {
             self.messages.say(
@@ -703,8 +708,7 @@ impl App {
     /// Closes the session down: the stream, the store, the server. A phone, on
     /// its way out, is given seconds for all of it.
     pub fn shut_down(&mut self) {
-        // Their streams first: a tileset's server ends with its stream, and
-        // the session joins it.
+        // The tilesets leave the scene first.
         self.surfaces.clear();
         let Some(session) = self.session.take() else {
             return;
@@ -723,14 +727,9 @@ impl App {
         let credits: Vec<tuile_planetary::Credit> = self
             .surfaces
             .iter()
-            .flat_map(|layer| layer.surface.credits.iter().cloned())
+            .flat_map(|surface| surface.credits.iter().cloned())
             .collect();
-        let drawn: Vec<std::sync::Arc<str>> = self
-            .surfaces
-            .iter()
-            .flat_map(|layer| layer.drawn.iter().cloned())
-            .collect();
-        Some(crate::surface::credit_line(&credits, &drawn))
+        Some(crate::surface::credit_line(&credits, &self.surfaces_drawn))
     }
 
     /// A one-line summary of the session, for the exit log.

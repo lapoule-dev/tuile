@@ -88,58 +88,15 @@ pub(crate) struct Started {
     pub gate: Gate,
     /// The worker, for the tilesets opened in it.
     link: Rc<Link>,
-    /// The tilesets asked for and not yet up, by asset.
+    /// The tilesets asked for and not yet up, by asset: where each one's
+    /// answer goes.
     tilesets: Tilesets,
 }
 
-/// The tilesets asked of the worker and not yet up: each one's stream, made
-/// when it was asked for, and where its answer goes.
-type Tilesets = Rc<RefCell<HashMap<i64, Asked>>>;
+/// The tilesets asked of the worker and not yet up.
+type Tilesets = Rc<RefCell<HashMap<i64, TilesetAnswer>>>;
 
-struct Asked {
-    stream: WorkerStream,
-    connection: Connection,
-    answer: tokio::sync::oneshot::Sender<Result<crate::surface::Surface, String>>,
-}
-
-/// A tileset's stream to its server in the worker, over a channel of its
-/// own. Dropping it closes the channel and tells the worker to let the
-/// server go — a person switched the tileset off.
-///
-/// `Send`, as a stream must be: what is not — the port's handler, the
-/// worker — waits in a task of the page's ([`watch_the_close`]) for this to
-/// be dropped.
-pub(crate) struct TilesetStream {
-    inner: WorkerStream,
-    _dropped: tokio::sync::oneshot::Sender<()>,
-}
-
-/// Closes a tileset's channel and tells the worker, once its stream has
-/// been dropped.
-fn watch_the_close(
-    dropped: tokio::sync::oneshot::Receiver<()>,
-    connection: Connection,
-    link: std::rc::Weak<Link>,
-    asset: i64,
-) {
-    wasm_bindgen_futures::spawn_local(async move {
-        let _ = dropped.await;
-        drop(connection);
-        if let Some(link) = link.upgrade() {
-            link.post(&ToWorker::CloseTileset { asset });
-        }
-    });
-}
-
-impl GeometryStream for TilesetStream {
-    fn send(&self, msg: ClientMessage) -> Result<(), StreamError> {
-        self.inner.send(msg)
-    }
-
-    fn poll_message(&mut self, cx: &mut Context<'_>) -> Poll<Option<ServerMessage>> {
-        self.inner.poll_message(cx)
-    }
-}
+type TilesetAnswer = tokio::sync::oneshot::Sender<Result<crate::surface::Surface, String>>;
 
 impl Started {
     /// A page's loader is in its worker, which was given the device's plan
@@ -154,47 +111,14 @@ impl Started {
         (Vec::new(), Vec::new())
     }
 
-    /// Opens the host's tileset `asset` in the worker, on a channel of its
-    /// own: the answer arrives with the worker's `tilesetOpened`, or its
-    /// `tilesetFailed`.
+    /// Opens the host's tileset `asset` in the worker, a source of the
+    /// session's scene: the answer arrives with the worker's
+    /// `tilesetOpened`, or its `tilesetFailed`. A request already waiting
+    /// for the same tileset is overtaken: its opening ends.
     pub(crate) fn open_tileset(&self, asset: i64) -> crate::surface::Opening {
         let (answer, opening) = tokio::sync::oneshot::channel();
-        let channel = match web_sys::MessageChannel::new() {
-            Ok(channel) => channel,
-            Err(e) => {
-                let _ = answer.send(Err(format!("no channel to the worker: {e:?}")));
-                return opening;
-            }
-        };
-        let (stream, connection) = WorkerStream::over(channel.port1());
-        let port = channel.port2();
-        let message = match serde_wasm_bindgen::to_value(&ToWorker::OpenTileset { asset }) {
-            Ok(message) => message,
-            Err(e) => {
-                let _ = answer.send(Err(format!("the request could not be written: {e}")));
-                return opening;
-            }
-        };
-        let _ = js_sys::Reflect::set(&message, &JsValue::from_str("port"), &port);
-        let transfer = js_sys::Array::of1(&port);
-        if let Err(e) = self
-            .link
-            .worker
-            .post_message_with_transfer(&message, &transfer)
-        {
-            let _ = answer.send(Err(format!("the worker could not be asked: {e:?}")));
-            return opening;
-        }
-        // A request already waiting for the same tileset is overtaken: its
-        // stream goes, and its opening ends.
-        self.tilesets.borrow_mut().insert(
-            asset,
-            Asked {
-                stream,
-                connection,
-                answer,
-            },
-        );
+        self.tilesets.borrow_mut().insert(asset, answer);
+        self.link.post(&ToWorker::OpenTileset { asset });
         opening
     }
 
@@ -367,36 +291,35 @@ pub(crate) fn start(plan: &Plan) -> Launch {
         let tilesets: Tilesets = Rc::clone(&tilesets);
         let link_for_tilesets: Rc<RefCell<std::rc::Weak<Link>>> = Rc::clone(&weak_link);
         move |value: JsValue| match serde_wasm_bindgen::from_value::<ToPage>(value) {
-            Ok(ToPage::TilesetOpened { asset, credits }) => {
-                let Some(asked) = tilesets.borrow_mut().remove(&asset) else {
-                    return;
-                };
-                let (dropped, watched) = tokio::sync::oneshot::channel();
-                watch_the_close(
-                    watched,
-                    asked.connection,
-                    link_for_tilesets.borrow().clone(),
+            Ok(ToPage::TilesetOpened {
+                asset,
+                tag,
+                credits,
+            }) => {
+                let link = link_for_tilesets.borrow().clone();
+                let surface = crate::surface::Surface::new(
                     asset,
-                );
-                let surface = crate::surface::Surface {
-                    asset,
-                    stream: TilesetStream {
-                        inner: asked.stream,
-                        _dropped: dropped,
-                    },
-                    meter: None,
-                    credits: credits
+                    tag,
+                    credits
                         .iter()
                         .map(super::control::CreditWire::credit)
                         .collect(),
-                };
-                // A switch turned off in the meantime: the surface is
-                // dropped here, and the worker told.
-                let _ = asked.answer.send(Ok(surface));
+                    // Dropped — switched off — it leaves the worker's scene.
+                    move || {
+                        if let Some(link) = link.upgrade() {
+                            link.post(&ToWorker::CloseTileset { asset });
+                        }
+                    },
+                );
+                // No one waits for it any more (switched off meanwhile): the
+                // surface is dropped here, and leaves the scene.
+                if let Some(answer) = tilesets.borrow_mut().remove(&asset) {
+                    let _ = answer.send(Ok(surface));
+                }
             }
             Ok(ToPage::TilesetFailed { asset, reason }) => {
-                if let Some(asked) = tilesets.borrow_mut().remove(&asset) {
-                    let _ = asked.answer.send(Err(reason));
+                if let Some(answer) = tilesets.borrow_mut().remove(&asset) {
+                    let _ = answer.send(Err(reason));
                 }
             }
             Ok(ToPage::Started) => {

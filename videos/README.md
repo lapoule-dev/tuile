@@ -760,3 +760,29 @@ cargo run --release -p tuile-wgpu-viewer --example tileset_shot -- --tileset 227
 … --globe off --diagnostic unlit|coverage|geometry --out …/diagnostic/<view>/<view-name>
 python3 videos/ion-seams-2026-10-31/seamline.py 170 690 725 750 <png>…
 ```
+
+## 3d-tiles-ledger-2026-11-02/ — the globe and a tileset as one scene, switched on, off at once, on again (2026-11-02)
+
+Pictures, not a film: the photorealistic tileset (asset 2275207) over Paris,
+700 m up, heading 315°, pitch 20°, with the globe, through the one server,
+budget, stream and pump of the "3D Tiles in the ledger" stack (top:
+`feat/3d-tiles-viewer`). Five pictures a run: `globe`, the tileset `on`,
+`off-at-once` (the frame after the switch: the ground drawn, never black),
+`off` (the ground refined again) and `on` again.
+
+- `tip/`: desktop (Metal), the stack's top. GPU bytes printed at each
+  picture: globe 368 MiB; tileset 954 MiB (555 MiB of 3D Tiles, 646 drawn)
+  of a 4 GiB budget; off 402 MiB (no 3D Tiles held); on again 1019 MiB.
+- `web-{base,tip}-{webgpu,webgl2}/`: the page, base = #173's tip (a second
+  server per tileset in the worker), tip = the stack; the same five pictures,
+  menu switch clicked through the DevTools protocol. Same picture both sides.
+
+```bash
+# Desktop
+cargo run --release -p tuile-wgpu-viewer --example tileset_shot -- --tileset 2275207 \
+  --lon 2.2945 --lat 48.8584 --altitude 700 --heading 315 --pitch 20 \
+  --switch on --seconds 40 --out videos/3d-tiles-ledger-2026-11-02/tip
+# Page: the web viewer behind the catalog proxy (assets 1,2,3,3954,2275207),
+# opened at ?lon=2.2945&lat=48.8584&altitude=700&heading=315&pitch=20[&backend=webgl2],
+# the "Photorealistic 3D Tiles" menu entry clicked on, off, on, 40 s between pictures.
+```

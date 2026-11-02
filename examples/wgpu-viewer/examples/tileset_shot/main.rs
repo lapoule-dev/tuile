@@ -116,11 +116,18 @@ fn save(run: &Headless, asked: &Asked, name: &str, note: &str) -> Result<(), Str
     let path = asked.out.join(format!("{name}.png"));
     image::save_buffer(&path, pixels, w, h, image::ExtendedColorType::Rgba8)
         .map_err(|e| format!("{}: {e}", path.display()))?;
+    // What the scene holds on the GPU at this picture, by the budget's
+    // ledger: the globe's and the tilesets', one session.
+    let m = tuile_core::metrics::metrics();
+    let mib = |b: u64| b as f64 / f64::from(1u32 << 20);
     println!(
-        "{}: {note}, {} black pixels, eye {}",
+        "{}: {note}, {} black pixels, eye {}, {:.0} MiB on the GPU ({:.0} MiB of 3D Tiles, {} drawn)",
         path.display(),
         run.state().black(),
-        run.state().to_json()["view"]
+        run.state().to_json()["view"],
+        mib(m.resident_bytes.get()),
+        mib(m.tiles3d_bytes.get()),
+        m.tiles3d_selected.get(),
     );
     Ok(())
 }
@@ -174,6 +181,9 @@ fn shoot(asked: &Asked, tilesets: Vec<i64>, name: &str) -> Result<(), String> {
         run.run_for(0.1);
         save(&run, asked, "off-at-once", "switched off, the next frames")?;
         run.settle(60.0);
+        // The ground under it refines again on the server's steps: given
+        // time to, as the tileset is given time to load.
+        run.run_for(asked.seconds.min(10.0));
         save(&run, asked, "off", "switched off, settled")?;
         // On again: opened afresh, given the same time to come back.
         switch(&mut run, &tilesets, true);

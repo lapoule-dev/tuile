@@ -47,11 +47,10 @@ pub(crate) enum ToWorker {
     Imagery { layer: usize },
     /// Hold the loads not yet started, or let them go.
     Pause { paused: bool },
-    /// Open the host's 3D Tiles tileset of this asset number and serve it
-    /// on the port posted with this message (its `port` field, transferred):
-    /// a stream of its own, beside the globe's.
+    /// Open the host's 3D Tiles tileset of this asset number: a source of the
+    /// session's scene, its tiles on the session's one stream.
     OpenTileset { asset: i64 },
-    /// Close it: its stream and its server.
+    /// Take it out of the scene.
     CloseTileset { asset: i64 },
 }
 
@@ -71,10 +70,12 @@ pub(crate) enum ToPage {
     /// The budget's signals as the worker's session last published them:
     /// what the page's overlay reads, as a desktop's reads its own.
     Signals { glance: Box<Glance> },
-    /// A tileset is up and served on its port, with what must be credited
-    /// while it is drawn.
+    /// A tileset is in the scene, with what must be credited while it is
+    /// drawn.
     TilesetOpened {
         asset: i64,
+        /// The tag its tiles carry in the scene.
+        tag: u8,
         credits: Vec<CreditWire>,
     },
     /// It could not be opened: why, for the person.

@@ -263,22 +263,6 @@ impl App {
         if self.views.freeze {
             active.pump.rebase(&active.gpu.queue, origin);
         }
-        // The 3D Tiles over the globe, each from its own server, the same
-        // way and on the same frame's deadline.
-        for layer in &mut self.surfaces {
-            let stream = &mut layer.surface.stream;
-            let uploaded = if self.views.freeze {
-                let n = layer.pump.pump(stream, &active.gpu, deadline);
-                layer.pump.rebase(&active.gpu.queue, origin);
-                n
-            } else {
-                layer
-                    .pump
-                    .advance(stream, &active.gpu, &views, origin, deadline)
-            };
-            self.uploaded += uploaded;
-            self.stats.uploads += uploaded as u64;
-        }
     }
 
     /// Uploads the view matrix, the sun and the air — the first eye's, which
@@ -454,28 +438,17 @@ impl App {
         // the black square. The tree is the only thing that can answer, so the
         // server sends it and the pump reads it. Nothing here to get wrong.
         let (drawn, resolution) = active.pump.resolve(&active.gpu);
-        // The 3D Tiles over the globe, resolved the same way, and what the
+        // The 3D Tiles over the globe, from the same pump, and what their
         // tiles drawn credit, for the caption.
-        let mut replacing: Vec<&tuile_wgpu::PreparedTile> = Vec::new();
-        let mut replacing_fallback: Vec<&tuile_wgpu::PreparedTile> = Vec::new();
-        for layer in &mut self.surfaces {
-            let crate::surface::Layer {
-                pump,
-                drawn: credited,
-                showing,
-                ..
-            } = layer;
-            let (mine, _) = pump.resolve(&active.gpu);
-            *credited = mine
-                .exact
+        let replacing = &drawn.covering;
+        let replacing_fallback = &drawn.covering_fallback;
+        self.surfaces_drawn.clear();
+        self.surfaces_drawn.extend(
+            replacing
                 .iter()
-                .chain(mine.fallback.iter())
-                .filter_map(|tile| tile.copyright.clone())
-                .collect();
-            *showing = !(mine.exact.is_empty() && mine.fallback.is_empty());
-            replacing.extend(mine.exact);
-            replacing_fallback.extend(mine.fallback);
-        }
+                .chain(replacing_fallback.iter())
+                .filter_map(|tile| tile.copyright.clone()),
+        );
         let rendered = drawn.exact.len() + drawn.fallback.len();
         let old_imagery = drawn
             .exact
@@ -760,20 +733,16 @@ impl App {
             for err in errors {
                 tracing::warn!("server: {err}");
             }
-            // Each tileset over the globe, on a line of its own.
-            for layer in &mut self.surfaces {
+            // The tilesets over the globe, of the same session: their share
+            // of what it draws and holds.
+            if !self.surfaces.is_empty() {
+                let m = tuile_core::metrics::metrics();
                 tracing::info!(
-                    "3D Tiles {} | {} drawn | {} loading | {:.0} MiB",
-                    layer.surface.asset,
-                    layer.drawn.len(),
-                    layer.pump.stats.requested,
-                    layer.pump.gpu_bytes as f32 / (1024.0 * 1024.0),
+                    "3D Tiles {:?} | {} drawn | {:.0} MiB",
+                    self.surfaces.iter().map(|s| s.asset).collect::<Vec<_>>(),
+                    m.tiles3d_selected.get(),
+                    m.tiles3d_bytes.get() as f32 / (1024.0 * 1024.0),
                 );
-                let errors = std::mem::take(&mut layer.pump.errors);
-                self.stats.errors += errors.len() as u64;
-                for err in errors {
-                    tracing::warn!("3D Tiles {}: {err}", layer.surface.asset);
-                }
             }
         }
     }
