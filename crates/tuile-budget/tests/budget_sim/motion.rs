@@ -599,6 +599,7 @@ fn newly_visible_ground_is_covered_the_step_it_appears() {
             1.0,
             &BTreeSet::new(),
             sim.profile.budget.pinned_level.unwrap_or(0),
+            sim.city,
         );
         let mut fresh = 0;
         for (tile, _) in &ideal.drawn {

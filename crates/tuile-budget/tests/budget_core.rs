@@ -349,6 +349,139 @@ mod ledger {
     }
 }
 
+/// A 3D Tiles tileset beside the globe in one budget: its tiles under a
+/// source tag of their own, class `Tiles3dMesh`, no imagery.
+mod three_d_tiles {
+    use super::*;
+
+    /// The tileset's tile `(level, x, y)`, under tag 1.
+    fn s(level: u32, x: u64, y: u64) -> tuile_budget::TileId {
+        t(level, x, y).with_tag(1)
+    }
+
+    /// Its need: a 3D Tiles mesh, no imagery.
+    fn mesh_need(id: tuile_budget::TileId) -> tuile_budget::Need {
+        let mut n = need(id);
+        n.class = Class::Tiles3dMesh;
+        n
+    }
+
+    /// **The floor is the ground's**: a tileset's coarsest tiles, at the
+    /// pinned levels, are neither wanted as the floor nor protected as it,
+    /// and are let go once the view has left them like any other tile. Red
+    /// with the floor read from the level alone: the tileset's root is
+    /// protected as the floor and never evicted.
+    #[test]
+    fn a_tilesets_coarse_tiles_are_no_floor() {
+        let mut c = small(1);
+        c.pinned_level = Some(1);
+        c.target[Class::Tiles3dMesh] = Bytes::ZERO;
+        c.overflow[Class::Tiles3dMesh] = Bytes::ZERO;
+        let mut r = Rig::new(c);
+        let ground = t(0, 0, 0);
+        let root = s(0, 0, 0);
+        let mut need = drawn(&[ground]);
+        need.drawn.push((root, mesh_need(root)));
+        r.settle(&need, 20);
+        assert!(
+            r.b.residency().drawable(root),
+            "the tileset's root is drawn"
+        );
+        assert_eq!(
+            r.b.resource(mesh(ground)).and_then(|v| v.protected),
+            Some(Protection::Floor),
+            "the ground's root is the floor"
+        );
+        // The view leaves the tileset: its root is let go.
+        let mut evicted = false;
+        for _ in 0..20 {
+            let d = r.settle(&drawn(&[ground]), 10);
+            evicted |= d.evict.contains(&mesh(root));
+        }
+        assert_ne!(
+            r.b.resource(mesh(root)).and_then(|v| v.protected),
+            Some(Protection::Floor),
+            "{RED}: a tileset's root protected as the floor"
+        );
+        assert!(evicted, "{RED}: the tileset's root never evicted");
+        assert!(r.b.residency().drawable(ground), "the floor stays");
+    }
+
+    /// **A tileset's tile not drawn yet loses no ground (P1.1)**: with the
+    /// floor not in, ground drawable as itself is drawn as itself while a
+    /// tileset's tile waits for its load — no ground is lost, so nothing is
+    /// capped to the floor. Red with every class lost alike: the tileset's
+    /// tile counted lost, and the ground capped to a floor that is not in,
+    /// so lost as well.
+    #[test]
+    fn a_tileset_tile_not_drawn_yet_loses_no_ground() {
+        let mut c = Rig::interactive_config();
+        c.pinned_level = Some(0);
+        let mut r = Rig::new(c);
+        let floor = t(0, 0, 0);
+        let ground = t(2, 1, 1);
+        let tile = s(2, 1, 1);
+        let mut view = drawn(&[ground]);
+        view.drawn.push((tile, mesh_need(tile)));
+        view.ancestors.push((floor, need(floor)));
+        let need = view;
+        // The ground's mesh arrives; the floor's and the tileset's never do.
+        let mut d = r.step(&need);
+        for _ in 0..10 {
+            r.load_where(|x| x == mesh(ground));
+            r.upload(&d);
+            d = r.step(&need);
+        }
+        assert!(r.b.residency().drawable(ground));
+        assert!(!r.b.residency().drawable(floor), "the floor is not in");
+        assert_eq!(
+            d.stats.lost, 0,
+            "{RED}: a tileset's tile not drawn counted lost ground"
+        );
+        assert!(
+            d.draw
+                .items
+                .iter()
+                .any(|i| i.mesh == mesh(ground) && i.role == Role::Exact),
+            "{RED}: the ground was capped while no ground was lost"
+        );
+    }
+
+    /// **While ground is lost, the ground alone is capped (P1.1)**: the
+    /// ground's draw holds to the floor until the floor is in, and a
+    /// tileset's tile that is drawable is drawn as itself meanwhile. Red with
+    /// every tile capped: the tileset's tile, finer than the floor, not
+    /// drawn.
+    #[test]
+    fn while_ground_is_lost_the_ground_alone_is_capped() {
+        let mut c = Rig::interactive_config();
+        c.pinned_level = Some(0);
+        let mut r = Rig::new(c);
+        let floor = t(0, 0, 0);
+        let lost = t(2, 2, 2);
+        let tile = s(2, 1, 1);
+        let mut view = drawn(&[lost]);
+        view.drawn.push((tile, mesh_need(tile)));
+        view.ancestors.push((floor, need(floor)));
+        let need = view;
+        let mut d = r.step(&need);
+        for _ in 0..10 {
+            r.load_where(|x| x == mesh(tile));
+            r.upload(&d);
+            d = r.step(&need);
+        }
+        assert!(r.b.residency().drawable(tile));
+        assert!(d.stats.lost > 0, "the fixture: ground is lost");
+        assert!(
+            d.draw
+                .items
+                .iter()
+                .any(|i| i.mesh == mesh(tile) && i.role == Role::Exact),
+            "{RED}: the tileset's tile was capped to the ground's floor"
+        );
+    }
+}
+
 mod requests {
     use super::*;
 

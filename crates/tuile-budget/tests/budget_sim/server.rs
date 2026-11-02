@@ -16,7 +16,7 @@ use tuile_budget::{
 use super::gpu::SimGpu;
 use super::net::{Arrival, NetProfile, SimNet};
 use super::reference::Lockstep;
-use super::world::{children, parent, sight, traverse, Camera, Lens, Residency, View};
+use super::world::{children, is_city, parent, sight, traverse, Camera, Lens, Residency, View};
 
 /// One eye of a profile's rig: where it sits along the camera's right
 /// vector, metres, and its lens.
@@ -301,6 +301,8 @@ pub struct Sim {
     out: Decisions,
     /// The pressure last set ([`Sim::pressure`]).
     pub pressure_set: Pressure,
+    /// The city's tileset is drawn beside the globe (`world::CITY`).
+    pub city: bool,
 }
 
 impl Sim {
@@ -355,6 +357,7 @@ impl Sim {
             delta: NeedDelta::new(),
             out: Decisions::default(),
             pressure_set: Pressure::Normal,
+            city: false,
             profile,
         }
     }
@@ -424,6 +427,7 @@ impl Sim {
             self.sse_scale,
             drawn_last,
             self.pinned(),
+            self.city,
         );
         // The first step reads the whole need; every later one what changed
         // since the step before (built outside what is timed and counted).
@@ -671,12 +675,13 @@ impl Sim {
                 self.fail(&format!("P4.2: {e:?}, wanted on screen, evicted"));
             }
         }
-        // I1: once the floor is in, nothing is lost and the ground is covered.
+        // I1: once the floor is in, nothing is lost and the ground is covered
+        // (where the city has nothing yet, the ground under it is drawn).
         if self.floor_in {
             if s.lost != 0 {
                 self.fail(&format!("I1: {} wanted tiles lost", s.lost));
             }
-            for (t, _) in &need.drawn {
+            for (t, _) in need.drawn.iter().filter(|(t, _)| !is_city(*t)) {
                 if !covered(d, *t) {
                     self.fail(&format!("I1: {t:?} uncovered"));
                 }
@@ -684,7 +689,7 @@ impl Sim {
             // I17: and in each eye, against that eye's own frustum.
             if views.len() > 1 {
                 for (e, v) in views.iter().enumerate() {
-                    for (t, _) in &need.drawn {
+                    for (t, _) in need.drawn.iter().filter(|(t, _)| !is_city(*t)) {
                         if sight(v, *t, 0.0).visible && !covered(d, *t) {
                             self.fail(&format!("I17: eye {e}: {t:?} uncovered"));
                         }
@@ -751,7 +756,9 @@ impl Sim {
                 .any(|i| i.mesh == *e || i.drapes.iter().any(|x| x.resource == *e));
             if drawn
                 || self.gpu.pending.contains_key(e)
-                || e.tile().terrain_coord().0 <= self.pinned() && cfg.pinned_level.is_some()
+                || e.tile().terrain_coord().0 <= self.pinned()
+                    && cfg.pinned_level.is_some()
+                    && !is_city(e.tile())
             {
                 self.fail(&format!("I11: protected {e:?} evicted"));
             }
@@ -911,10 +918,7 @@ impl Sim {
                 let release = self.budget.release_beyond(Bytes::mib(256));
                 for r in &release.gpu {
                     if let Some(b) = self.gpu.drawable.remove(r) {
-                        let c = match r {
-                            ResourceId::Mesh(_) => Class::TerrainMesh,
-                            ResourceId::Drape { .. } => Class::Drape,
-                        };
+                        let c = class_of(*r);
                         self.gpu.bytes[c] = self.gpu.bytes[c].minus(b);
                     }
                 }
@@ -947,6 +951,7 @@ fn down(d: &Decisions, t: TileId, depth: u32) -> bool {
 
 fn class_of(r: ResourceId) -> Class {
     match r {
+        ResourceId::Mesh(t) if super::world::is_city(t) => Class::Tiles3dMesh,
         ResourceId::Mesh(_) => Class::TerrainMesh,
         ResourceId::Drape { .. } => Class::Drape,
     }

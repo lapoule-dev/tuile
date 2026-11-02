@@ -261,7 +261,9 @@ pub fn check(s: &StepRecord<'_>, cfg: &BudgetConfig, out: &mut Violations) {
         let floor_tiles: BTreeSet<TileId> = s
             .need
             .entries()
-            .filter(|(_, _, n)| cfg.pinned_level.is_some_and(|p| n.level <= p))
+            .filter(|(_, _, n)| {
+                n.class.is_ground() && cfg.pinned_level.is_some_and(|p| n.level <= p)
+            })
             .map(|(_, t, _)| t)
             .collect();
         for e in &d.evict {

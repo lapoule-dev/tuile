@@ -61,6 +61,7 @@ impl SimGpu {
 
 fn class(r: ResourceId) -> Class {
     match r {
+        ResourceId::Mesh(t) if super::world::is_city(t) => Class::Tiles3dMesh,
         ResourceId::Mesh(_) => Class::TerrainMesh,
         ResourceId::Drape { .. } => Class::Drape,
     }
