@@ -93,6 +93,33 @@ pub trait TileTree: Send + Sync {
         None
     }
 
+    /// The occluder that hides what is behind it from the tile `id` and
+    /// everything under it: [`TileTree::occluder`], unless the tree combines
+    /// sources that do not share one — a composite answers each source's,
+    /// so a globe keeps its planet with a tileset beside it. The traversal
+    /// asks it of each root.
+    fn occluder_of(&self, _id: TileId) -> Option<crate::math::Occluder> {
+        self.occluder()
+    }
+
+    /// The tile's screen-space error threshold, as a multiple of the
+    /// traversal's ([`crate::traversal::Config::maximum_screen_space_error`]):
+    /// 1 unless the tree says otherwise. A composite answers its source's
+    /// ([`SourceOptions::sse_factor`]): a 3D Tiles tileset's errors are
+    /// chosen by its author for 16 px, a terrain's for the traversal's own.
+    /// The traversal refines against it, and the need's priority reads it.
+    fn sse_factor(&self, _id: TileId) -> f64 {
+        1.0
+    }
+
+    /// Whether the tile, drawn, stands for the ground under it — a mesh of
+    /// the whole surface drawn in place of the globe's — rather than
+    /// standing on it ([`SourceOptions::covers_ground`]). False unless the
+    /// tree says otherwise.
+    fn covers_ground(&self, _id: TileId) -> bool {
+        false
+    }
+
     /// From now on, hold every change a load makes to this tree's shape until
     /// [`apply_deferred_edits`](TileTree::apply_deferred_edits) is called.
     ///
@@ -321,10 +348,353 @@ pub enum LoadError {
     BadTag(u8),
 }
 
+/// How a source of a composition is traversed and drawn, beyond its tiles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceOptions {
+    /// Its screen-space error threshold, as a multiple of the traversal's
+    /// ([`crate::traversal::Config::maximum_screen_space_error`]): 1 for the
+    /// globe, whose terrain is priced at the traversal's error; the error a
+    /// tileset's author chose its geometric errors for (the specification's
+    /// customary 16 px) over the traversal's, for a 3D Tiles tileset. Read by
+    /// the traversal and by the need's priority alike
+    /// ([`TileTree::sse_factor`]).
+    pub sse_factor: f64,
+    /// Where it is drawn, it stands for the ground under it — a mesh of the
+    /// whole surface, buildings and trees and the ground beneath them, drawn
+    /// in place of the globe's — rather than standing on it
+    /// ([`TileTree::covers_ground`]).
+    pub covers_ground: bool,
+}
+
+impl Default for SourceOptions {
+    /// Traversed at the traversal's error, standing on the ground.
+    fn default() -> Self {
+        Self {
+            sse_factor: 1.0,
+            covers_ground: false,
+        }
+    }
+}
+
+/// Why a source could not join a composition.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CompositeError {
+    /// Every tag is taken: by a source, or by one removed whose resources a
+    /// session may still hold (see [`Composite::release`]).
+    #[error("no source tag is free (at most {MAX_SOURCES} sources, removed ones included until released)")]
+    Full,
+    /// The tag asked for is taken.
+    #[error("source tag {0} is taken")]
+    Taken(u8),
+}
+
+/// A tag of a composition, as it stands.
+enum Slot {
+    /// Free: never used, or removed and released.
+    Free,
+    /// A source.
+    Live(Entry),
+    /// A source removed whose resources a session may still hold: its tag is
+    /// not given to another source until the session says it holds none of
+    /// them ([`Composite::release`]), so that no id of the old source ever
+    /// names a tile of the new one.
+    Retired,
+}
+
+struct Entry {
+    tree: Option<std::sync::Arc<dyn TileTree>>,
+    loader: Option<std::sync::Arc<dyn TileLoader>>,
+    options: SourceOptions,
+}
+
+/// What a composition's tree, loader and handle share.
+struct Sources {
+    slots: Vec<Slot>,
+    /// Moves with every source added or removed: part of the tree's
+    /// [`revision`](TileTree::revision).
+    scene: u64,
+    /// Taken from the sum of the loaders' epochs so that a source coming or
+    /// going does not move it: the composite's epoch moves only when a
+    /// source's does ([`TileLoader::epoch`]).
+    epoch_base: u64,
+    /// The store events of the loaders removed, and one per removal: the
+    /// composite's count only ever moves forward ([`TileLoader::store_events`]).
+    events_base: u64,
+    /// The count [`TileLoader::store_changes`] returned last, and each tag's
+    /// count behind it.
+    seen: (u64, [u64; MAX_SOURCES]),
+}
+
+impl Sources {
+    fn new() -> Self {
+        Self {
+            slots: (0..MAX_SOURCES).map(|_| Slot::Free).collect(),
+            scene: 0,
+            epoch_base: 0,
+            events_base: 0,
+            seen: (0, [0; MAX_SOURCES]),
+        }
+    }
+
+    fn entry(&self, tag: u8) -> Option<&Entry> {
+        match self.slots.get(tag as usize) {
+            Some(Slot::Live(e)) => Some(e),
+            _ => None,
+        }
+    }
+
+    fn tree(&self, tag: u8) -> Option<&dyn TileTree> {
+        self.entry(tag).and_then(|e| e.tree.as_deref())
+    }
+
+    fn loader(&self, tag: u8) -> Option<std::sync::Arc<dyn TileLoader>> {
+        self.entry(tag).and_then(|e| e.loader.clone())
+    }
+
+    /// The live sources, by tag.
+    fn live(&self) -> impl Iterator<Item = (u8, &Entry)> {
+        self.slots.iter().enumerate().filter_map(|(i, s)| match s {
+            // MAX_SOURCES is 16: every index is a u8.
+            Slot::Live(e) => Some((i as u8, e)),
+            _ => None,
+        })
+    }
+
+    fn trees(&self) -> impl Iterator<Item = (u8, &dyn TileTree)> {
+        self.live()
+            .filter_map(|(tag, e)| e.tree.as_deref().map(|t| (tag, t)))
+    }
+
+    fn loaders(&self) -> impl Iterator<Item = (u8, &dyn TileLoader)> {
+        self.live()
+            .filter_map(|(tag, e)| e.loader.as_deref().map(|l| (tag, l)))
+    }
+}
+
+/// The state a [`Composite`], its [`CompositeTileTree`] and its
+/// [`CompositeLoader`] share: the sources by tag, and who to tell when they
+/// change.
+struct Shared {
+    sources: std::sync::RwLock<Sources>,
+    /// The sessions told when a source comes or goes.
+    listeners: std::sync::Mutex<Vec<futures_channel::mpsc::UnboundedSender<()>>>,
+}
+
+impl Shared {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            sources: std::sync::RwLock::new(Sources::new()),
+            listeners: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The sources, read. A writer never panics while holding the lock, so a
+    /// poisoned one is read as it stands.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Sources> {
+        self.sources.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Sources> {
+        self.sources.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Tells every session listening that the sources changed; forgets the
+    /// ones gone.
+    fn tell(&self) {
+        let mut listeners = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
+        listeners.retain(|l| l.unbounded_send(()).is_ok());
+    }
+}
+
+/// A scene of several sources, one geometry server for all of them: the
+/// globe and the 3D Tiles over it, each a source under a tag of its own
+/// ([`TileId`]'s top four bits), added and removed while the session runs.
+///
+/// The host keeps this handle; the session runs on its [`tree`](Self::tree)
+/// and its [`loader`](Self::loader) (see [`crate::runtime::in_process_with`]),
+/// which see the sources as they stand at each call. A source added is traversed from the next pass; a
+/// source removed is traversed no more, and its tiles leave the need — the
+/// budget lets go of them as of any tile the view left.
+///
+/// A removed source's tag is not given to another source until the session
+/// has let go of everything it held of it ([`Composite::release`]): until
+/// then an id under that tag could name the old source's tile.
+#[derive(Clone)]
+pub struct Composite {
+    shared: std::sync::Arc<Shared>,
+}
+
+impl Default for Composite {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for Composite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Composite")
+            .field("tags", &self.tags())
+            .finish()
+    }
+}
+
+impl Composite {
+    /// A scene with no source.
+    pub fn new() -> Self {
+        Self {
+            shared: Shared::new(),
+        }
+    }
+
+    /// Adds a source under the lowest free tag, which its tiles carry.
+    pub fn add(
+        &self,
+        tree: Box<dyn TileTree>,
+        loader: std::sync::Arc<dyn TileLoader>,
+        options: SourceOptions,
+    ) -> Result<u8, CompositeError> {
+        let tag = {
+            let sources = self.shared.read();
+            sources
+                .slots
+                .iter()
+                .position(|s| matches!(s, Slot::Free))
+                .ok_or(CompositeError::Full)?
+        };
+        // MAX_SOURCES is 16: every index is a u8.
+        self.add_at(tag as u8, tree, loader, options)?;
+        Ok(tag as u8)
+    }
+
+    /// Adds a source under `tag`, which must be free: the globe under 0, so
+    /// that its tiles keep the ids a standalone globe gives them.
+    pub fn add_at(
+        &self,
+        tag: u8,
+        tree: Box<dyn TileTree>,
+        loader: std::sync::Arc<dyn TileLoader>,
+        options: SourceOptions,
+    ) -> Result<(), CompositeError> {
+        {
+            let mut sources = self.shared.write();
+            match sources.slots.get(tag as usize) {
+                Some(Slot::Free) => {}
+                _ => return Err(CompositeError::Taken(tag)),
+            }
+            // Its store events are read from where it stands now: nothing it
+            // stored before it joined was asked of it.
+            let count = loader.store_events();
+            sources.seen.1[tag as usize] = count;
+            sources.events_base = sources.events_base.wrapping_add(count).wrapping_add(1);
+            sources.epoch_base = sources.epoch_base.wrapping_sub(loader.epoch());
+            sources.slots[tag as usize] = Slot::Live(Entry {
+                tree: Some(std::sync::Arc::from(tree)),
+                loader: Some(loader),
+                options,
+            });
+            sources.scene += 1;
+        }
+        self.shared.tell();
+        Ok(())
+    }
+
+    /// Removes the source under `tag`; whether there was one. Its tag stays
+    /// taken until [`Composite::release`].
+    pub fn remove(&self, tag: u8) -> bool {
+        {
+            let mut sources = self.shared.write();
+            let Some(Slot::Live(entry)) = sources.slots.get(tag as usize) else {
+                return false;
+            };
+            // Its events folded into the base, plus one: the composite's count
+            // moves on, and never comes back to a value it had.
+            let (count, epoch) = entry
+                .loader
+                .as_ref()
+                .map_or((0, 0), |l| (l.store_events(), l.epoch()));
+            sources.events_base = sources.events_base.wrapping_add(count).wrapping_add(1);
+            sources.epoch_base = sources.epoch_base.wrapping_add(epoch);
+            sources.slots[tag as usize] = Slot::Retired;
+            sources.scene += 1;
+        }
+        self.shared.tell();
+        true
+    }
+
+    /// The tags removed and not yet released: those a session must let go of.
+    pub fn retired(&self) -> Vec<u8> {
+        let sources = self.shared.read();
+        sources
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| matches!(s, Slot::Retired))
+            .map(|(i, _)| i as u8)
+            .collect()
+    }
+
+    /// Frees a removed source's tag for another source: called by the
+    /// session once it holds nothing of that source. Whether it was retired.
+    pub fn release(&self, tag: u8) -> bool {
+        let mut sources = self.shared.write();
+        match sources.slots.get_mut(tag as usize) {
+            Some(slot @ Slot::Retired) => {
+                *slot = Slot::Free;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The tags of the sources, in order.
+    pub fn tags(&self) -> Vec<u8> {
+        self.shared.read().live().map(|(tag, _)| tag).collect()
+    }
+
+    /// The options of the source under `tag`, if there is one.
+    pub fn options(&self, tag: u8) -> Option<SourceOptions> {
+        self.shared.read().entry(tag).map(|e| e.options)
+    }
+
+    /// The tree the traversal walks: every source's tiles, tagged.
+    pub fn tree(&self) -> CompositeTileTree {
+        CompositeTileTree {
+            shared: std::sync::Arc::clone(&self.shared),
+        }
+    }
+
+    /// The loader the session loads through, routing by tag.
+    pub fn loader(&self) -> CompositeLoader {
+        CompositeLoader {
+            shared: std::sync::Arc::clone(&self.shared),
+        }
+    }
+
+    /// A message each time a source comes or goes, for as long as the
+    /// receiver lives: what wakes a session to step again.
+    pub fn changes(&self) -> futures_channel::mpsc::UnboundedReceiver<()> {
+        let (tx, rx) = futures_channel::mpsc::unbounded();
+        self.shared
+            .listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(tx);
+        rx
+    }
+
+    /// A count that moves whenever a source comes or goes.
+    pub fn scene(&self) -> u64 {
+        self.shared.read().scene
+    }
+}
+
 /// Combines several [`TileTree`]s into one, tagging each sub-source's tiles.
 /// The traversal sees a single tree whose roots are the union of all sources.
+///
+/// Built whole from its trees ([`CompositeTileTree::new`]), or the tree of a
+/// [`Composite`], whose sources come and go while it is walked.
 pub struct CompositeTileTree {
-    sources: Vec<Box<dyn TileTree>>,
+    shared: std::sync::Arc<Shared>,
 }
 
 impl CompositeTileTree {
@@ -334,46 +704,96 @@ impl CompositeTileTree {
             sources.len() <= MAX_SOURCES,
             "at most {MAX_SOURCES} sources"
         );
-        Self { sources }
+        let shared = Shared::new();
+        {
+            let mut all = shared.write();
+            for (i, tree) in sources.into_iter().enumerate() {
+                all.slots[i] = Slot::Live(Entry {
+                    tree: Some(std::sync::Arc::from(tree)),
+                    loader: None,
+                    options: SourceOptions::default(),
+                });
+            }
+        }
+        Self { shared }
+    }
+
+    /// Calls `f` with the source of `id`'s tag, if there is one.
+    fn with<R>(&self, id: TileId, f: impl FnOnce(&dyn TileTree) -> R) -> Option<R> {
+        let sources = self.shared.read();
+        sources.tree(id.tag()).map(f)
     }
 }
 
 impl TileTree for CompositeTileTree {
     /// The occluder the sources agree on, or none.
     ///
-    /// Unanimity is the only safe rule: culling against a planet that only one
-    /// source lives on would hide the other's ground. Sources that agree —
-    /// terrain and imagery over the same globe, the usual case — keep it.
+    /// Unanimity is the only safe rule for one occluder over everything:
+    /// culling against a planet that only one source lives on would hide the
+    /// other's ground. The traversal asks each root's own
+    /// ([`TileTree::occluder_of`]), which a composite answers per source.
     fn occluder(&self) -> Option<crate::math::Occluder> {
-        let mut sources = self.sources.iter();
-        let first = sources.next()?.occluder()?;
-        sources
-            .all(|s| s.occluder() == Some(first))
+        let sources = self.shared.read();
+        let mut trees = sources.trees();
+        let first = trees.next()?.1.occluder()?;
+        trees
+            .all(|(_, s)| s.occluder() == Some(first))
             .then_some(first)
     }
 
+    /// The occluder of the source `id` belongs to: the globe's planet hides
+    /// the globe's far side even with a tileset beside it.
+    fn occluder_of(&self, id: TileId) -> Option<crate::math::Occluder> {
+        self.with(id, |s| s.occluder_of(id.payload())).flatten()
+    }
+
+    /// The source's factor (its [`SourceOptions::sse_factor`]) times the one
+    /// it gives the tile itself.
+    fn sse_factor(&self, id: TileId) -> f64 {
+        let sources = self.shared.read();
+        sources.entry(id.tag()).map_or(1.0, |e| {
+            e.options.sse_factor * e.tree.as_ref().map_or(1.0, |t| t.sse_factor(id.payload()))
+        })
+    }
+
+    fn covers_ground(&self, id: TileId) -> bool {
+        let sources = self.shared.read();
+        sources.entry(id.tag()).is_some_and(|e| {
+            e.options.covers_ground
+                || e.tree
+                    .as_ref()
+                    .is_some_and(|t| t.covers_ground(id.payload()))
+        })
+    }
+
     fn defer_edits(&self) {
-        for source in &self.sources {
+        let sources = self.shared.read();
+        for (_, source) in sources.trees() {
             source.defer_edits();
         }
     }
 
-    /// The sum of the sources' revisions, when every source has one.
+    /// The sum of the sources' revisions, plus the count of sources added
+    /// and removed in the top bits, when every source has one.
     ///
     /// A sum, because revisions only move forward: any source's moving moves
-    /// it. One source that cannot say makes the whole composite unable to.
+    /// it. A source coming or going moves the count, which outweighs any
+    /// source's own revision (under 2^40), so the sum never comes back to a
+    /// value it had. One source that cannot say makes the whole composite
+    /// unable to.
     fn revision(&self) -> Option<u64> {
-        self.sources
-            .iter()
-            .try_fold(0u64, |sum, s| Some(sum.wrapping_add(s.revision()?)))
+        let sources = self.shared.read();
+        let sum = sources
+            .trees()
+            .try_fold(0u64, |sum, (_, s)| Some(sum.wrapping_add(s.revision()?)))?;
+        Some(sum.wrapping_add(sources.scene << 40))
     }
 
     fn apply_deferred_edits(&self) -> Vec<(TileId, String)> {
-        self.sources
-            .iter()
-            .enumerate()
-            .flat_map(|(i, s)| {
-                let tag = i as u8;
+        let sources = self.shared.read();
+        sources
+            .trees()
+            .flat_map(|(tag, s)| {
                 s.apply_deferred_edits()
                     .into_iter()
                     .map(move |(id, why)| (id.with_tag(tag), why))
@@ -382,38 +802,44 @@ impl TileTree for CompositeTileTree {
     }
 
     fn roots(&self) -> Vec<TileId> {
-        self.sources
-            .iter()
-            .enumerate()
-            .flat_map(|(i, s)| {
-                let tag = i as u8;
-                s.roots().into_iter().map(move |id| id.with_tag(tag))
-            })
+        let sources = self.shared.read();
+        sources
+            .trees()
+            .flat_map(|(tag, s)| s.roots().into_iter().map(move |id| id.with_tag(tag)))
             .collect()
     }
 
     fn children(&self, id: TileId) -> Vec<TileId> {
         let tag = id.tag();
-        match self.sources.get(tag as usize) {
-            Some(s) => s
-                .children(id.payload())
+        self.with(id, |s| {
+            s.children(id.payload())
                 .into_iter()
                 .map(|c| c.with_tag(tag))
-                .collect(),
-            None => Vec::new(),
-        }
+                .collect()
+        })
+        .unwrap_or_default()
     }
 
     fn properties(&self, id: TileId) -> TileProperties {
-        // A missing tag should never reach here (handles come from roots()).
-        self.sources[id.tag() as usize].properties(id.payload())
+        // A missing tag should never reach here (handles come from roots()),
+        // but a source removed between a pass's roots and its descent can:
+        // an empty, contentless tile, which the traversal walks past.
+        self.with(id, |s| s.properties(id.payload()))
+            .unwrap_or(TileProperties {
+                bounding_volume: BoundingVolume::Sphere(crate::math::Sphere {
+                    center: glam::DVec3::ZERO,
+                    radius: 0.0,
+                }),
+                geometric_error: 0.0,
+                refine: Refine::Replace,
+                has_content: false,
+            })
     }
 
     fn parent(&self, id: TileId) -> Option<TileId> {
         let tag = id.tag();
-        self.sources
-            .get(tag as usize)
-            .and_then(|s| s.parent(id.payload()))
+        self.with(id, |s| s.parent(id.payload()))
+            .flatten()
             .map(|p| p.with_tag(tag))
     }
 
@@ -421,29 +847,21 @@ impl TileTree for CompositeTileTree {
     /// without a walk, and the default here would walk through `with_tag`
     /// round trips for nothing.
     fn level(&self, id: TileId) -> u32 {
-        self.sources
-            .get(id.tag() as usize)
-            .map_or(0, |s| s.level(id.payload()))
+        self.with(id, |s| s.level(id.payload())).unwrap_or(0)
     }
 
     fn mesh_class(&self, id: TileId) -> crate::budget::Class {
-        self.sources
-            .get(id.tag() as usize)
-            .map_or(crate::budget::Class::TerrainMesh, |s| {
-                s.mesh_class(id.payload())
-            })
+        self.with(id, |s| s.mesh_class(id.payload()))
+            .unwrap_or(crate::budget::Class::TerrainMesh)
     }
 }
 
 /// Routes [`TileLoader::load`] to the sub-loader matching the tile's tag, so
 /// each source textures its own tiles. Pair with a [`CompositeTileTree`]
-/// built from the same sources in the same order.
+/// built from the same sources in the same order — or take both from one
+/// [`Composite`].
 pub struct CompositeLoader {
-    loaders: Vec<Box<dyn TileLoader>>,
-    /// The store-event count this returned last, and each sub-loader's
-    /// behind it: what a `since` equal to it stands for (see
-    /// [`TileLoader::store_changes`]).
-    seen: std::sync::Mutex<(u64, Vec<u64>)>,
+    shared: std::sync::Arc<Shared>,
 }
 
 impl CompositeLoader {
@@ -452,8 +870,24 @@ impl CompositeLoader {
             loaders.len() <= MAX_SOURCES,
             "at most {MAX_SOURCES} loaders"
         );
-        let seen = std::sync::Mutex::new((0, vec![0; loaders.len()]));
-        Self { loaders, seen }
+        let shared = Shared::new();
+        {
+            let mut all = shared.write();
+            for (i, loader) in loaders.into_iter().enumerate() {
+                all.slots[i] = Slot::Live(Entry {
+                    tree: None,
+                    loader: Some(std::sync::Arc::from(loader)),
+                    options: SourceOptions::default(),
+                });
+            }
+        }
+        Self { shared }
+    }
+
+    /// The sub-loader of `tag`, held for as long as its call lasts: a source
+    /// removed meanwhile finishes the call it was asked.
+    fn of(&self, tag: u8) -> Result<std::sync::Arc<dyn TileLoader>, LoadError> {
+        self.shared.read().loader(tag).ok_or(LoadError::BadTag(tag))
     }
 }
 
@@ -481,15 +915,12 @@ fn tagged(r: crate::budget::ResourceId, tag: u8) -> crate::budget::ResourceId {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl TileLoader for CompositeLoader {
     async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
-        let tag = id.tag();
-        match self.loaders.get(tag as usize) {
-            Some(l) => l.load(id.payload()).await,
-            None => Err(LoadError::BadTag(tag)),
-        }
+        let loader = self.of(id.tag())?;
+        loader.load(id.payload()).await
     }
 
     fn drapes(&self, id: TileId) -> Option<DrapeReach> {
-        self.loaders.get(id.tag() as usize)?.drapes(id.payload())
+        self.shared.read().loader(id.tag())?.drapes(id.payload())
     }
 
     async fn load_drape(
@@ -498,44 +929,64 @@ impl TileLoader for CompositeLoader {
         layer: crate::budget::LayerId,
         level: u32,
     ) -> Result<crate::content::DrapeContent, LoadError> {
-        let tag = id.tag();
-        match self.loaders.get(tag as usize) {
-            Some(l) => l.load_drape(id.payload(), layer, level).await,
-            None => Err(LoadError::BadTag(tag)),
-        }
+        let loader = self.of(id.tag())?;
+        loader.load_drape(id.payload(), layer, level).await
     }
 
     fn holds(&self, r: crate::budget::ResourceId) -> crate::budget::Presence {
-        self.loaders
-            .get(r.tile().tag() as usize)
+        self.shared
+            .read()
+            .loader(r.tile().tag())
             .map_or(crate::budget::Presence::Absent, |l| l.holds(untagged(r)))
     }
 
-    /// The sub-loaders' counts, summed: it moves exactly when one of theirs
-    /// does.
+    /// The sub-loaders' counts, summed over a base that takes in those of
+    /// the sources removed, and one more per source added or removed: it
+    /// moves exactly when one of theirs does, or a source comes or goes, and
+    /// never comes back to a value it had.
     fn store_events(&self) -> u64 {
-        self.loaders
-            .iter()
-            .fold(0u64, |n, l| n.wrapping_add(l.store_events()))
+        let sources = self.shared.read();
+        sources.loaders().fold(sources.events_base, |n, (_, l)| {
+            n.wrapping_add(l.store_events())
+        })
     }
 
     /// Each sub-loader asked about its own resources, since the count it
     /// stood at when this returned `since`. A `since` this did not return
     /// (another asker's) is read from each one's first event: every
-    /// resource whose answer may have changed since then is named.
+    /// resource whose answer may have changed since then is named. The
+    /// resources of a source that came or went since are named too: their
+    /// answers were never its own, or are no longer anyone's.
     fn store_changes(
         &self,
         since: u64,
         asked: &[(crate::budget::ResourceId, crate::budget::Presence)],
         touched: &mut Vec<crate::budget::ResourceId>,
     ) -> u64 {
-        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        let known = seen.0 == since;
+        let mut guard = self.shared.write();
+        let sources = &mut *guard;
+        let known = sources.seen.0 == since;
         let (mut mine, mut theirs) = (Vec::new(), Vec::new());
-        let mut total = 0u64;
-        for (i, l) in self.loaders.iter().enumerate() {
-            let tag = i as u8;
-            let from = if known { seen.1[i] } else { 0 };
+        let mut total = sources.events_base;
+        for tag in 0..MAX_SOURCES {
+            // MAX_SOURCES is 16: every index is a u8.
+            let tag = tag as u8;
+            let Some(l) = sources.loader(tag) else {
+                // No source under this tag: an answer asked of one that has
+                // gone is no longer its.
+                touched.extend(
+                    asked
+                        .iter()
+                        .filter(|(r, _)| r.tile().tag() == tag)
+                        .map(|(r, _)| *r),
+                );
+                continue;
+            };
+            let from = if known {
+                sources.seen.1[tag as usize]
+            } else {
+                0
+            };
             let at = if l.store_events() == from {
                 from
             } else {
@@ -551,11 +1002,33 @@ impl TileLoader for CompositeLoader {
                 touched.extend(theirs.iter().map(|r| tagged(*r, tag)));
                 at
             };
-            seen.1[i] = at;
+            sources.seen.1[tag as usize] = at;
             total = total.wrapping_add(at);
         }
-        seen.0 = total;
+        sources.seen.0 = total;
         total
+    }
+
+    /// Every source's, together: the floor of each is fetched as one.
+    async fn warm_up(&self, through_level: u32) {
+        let loaders: Vec<std::sync::Arc<dyn TileLoader>> = {
+            let sources = self.shared.read();
+            sources
+                .live()
+                .filter_map(|(_, e)| e.loader.clone())
+                .collect()
+        };
+        futures_util::future::join_all(loaders.iter().map(|l| l.warm_up(through_level))).await;
+    }
+
+    /// The sub-loaders' epochs, summed: it moves whenever one of theirs
+    /// does, and only then — a source coming or going leaves it where it
+    /// was (the session refreshes every drape when it moves).
+    fn epoch(&self) -> u64 {
+        let sources = self.shared.read();
+        sources
+            .loaders()
+            .fold(sources.epoch_base, |n, (_, l)| n.wrapping_add(l.epoch()))
     }
 }
 
@@ -734,6 +1207,181 @@ mod tests {
         // Unknown tag → typed error, not a panic.
         let err = futures_executor::block_on(loader.load(TileId(0).with_tag(7)));
         assert!(matches!(err, Err(LoadError::BadTag(7))));
+    }
+
+    /// A loader with an epoch of its own, set by the test.
+    struct Epoched(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    impl TileLoader for Epoched {
+        async fn load(&self, _id: TileId) -> Result<Loaded, LoadError> {
+            Err(LoadError::Failed("nothing".into()))
+        }
+        fn epoch(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn store_events(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst) * 10
+        }
+    }
+
+    /// **Sources come and go while the composite is walked**: a source added
+    /// takes the lowest free tag and its tiles carry it; one removed is no
+    /// longer walked, and its tag is not given to another source until it is
+    /// released (an id under it could still name the old source's tile in a
+    /// session that has not let go of it); every change is told to whoever
+    /// listens, and moves the tree's revision. Red with a removed tag freed at
+    /// once: the third source took tag 0.
+    #[test]
+    fn sources_come_and_go_while_the_composite_is_walked() {
+        let scene = Composite::new();
+        let mut changes = scene.changes();
+        let stub = |ge: f64| -> Box<dyn TileTree> { Box::new(StubTree { ge }) };
+        let loader = |m: f32| -> std::sync::Arc<dyn TileLoader> {
+            std::sync::Arc::new(StubLoader { marker: m })
+        };
+        let tree = scene.tree();
+        assert_eq!(
+            scene.add(stub(10.0), loader(1.0), SourceOptions::default()),
+            Ok(0)
+        );
+        assert_eq!(
+            scene.add(stub(20.0), loader(2.0), SourceOptions::default()),
+            Ok(1)
+        );
+        assert_eq!(
+            tree.roots(),
+            vec![TileId(0).with_tag(0), TileId(0).with_tag(1)]
+        );
+        assert!(scene.remove(0));
+        assert!(!scene.remove(0), "removed once");
+        assert_eq!(tree.roots(), vec![TileId(0).with_tag(1)]);
+        assert!(tree.children(TileId(0).with_tag(0)).is_empty());
+        assert!(!tree.properties(TileId(0).with_tag(0)).has_content);
+        assert_eq!(scene.retired(), vec![0]);
+        let gone = futures_executor::block_on(scene.loader().load(TileId(0).with_tag(0)));
+        assert!(matches!(gone, Err(LoadError::BadTag(0))));
+        assert_eq!(
+            scene.add(stub(30.0), loader(3.0), SourceOptions::default()),
+            Ok(2),
+            "a retired tag is not reused"
+        );
+        assert!(scene.release(0));
+        assert!(scene.retired().is_empty());
+        assert_eq!(
+            scene.add(stub(40.0), loader(4.0), SourceOptions::default()),
+            Ok(0)
+        );
+        assert_eq!(tree.properties(TileId(0).with_tag(0)).geometric_error, 40.0);
+        assert_eq!(scene.tags(), vec![0, 1, 2]);
+        assert_eq!(
+            scene.add_at(1, stub(1.0), loader(1.0), SourceOptions::default()),
+            Err(CompositeError::Taken(1))
+        );
+        // Five changes, each told.
+        let mut told = 0;
+        while let Ok(()) = changes.try_recv() {
+            told += 1;
+        }
+        assert_eq!(told, 5);
+        for _ in 3..MAX_SOURCES {
+            scene
+                .add(stub(1.0), loader(1.0), SourceOptions::default())
+                .expect("a tag");
+        }
+        assert_eq!(
+            scene.add(stub(1.0), loader(1.0), SourceOptions::default()),
+            Err(CompositeError::Full)
+        );
+    }
+
+    /// A tree that says its revision.
+    struct Revised(u64);
+    impl TileTree for Revised {
+        fn roots(&self) -> Vec<TileId> {
+            vec![TileId(0)]
+        }
+        fn children(&self, _id: TileId) -> Vec<TileId> {
+            Vec::new()
+        }
+        fn properties(&self, id: TileId) -> TileProperties {
+            StubTree { ge: 1.0 }.properties(id)
+        }
+        fn revision(&self) -> Option<u64> {
+            Some(self.0)
+        }
+    }
+
+    /// **The composite's counts move on as its sources come and go, and its
+    /// epoch does not**: the revision and the store events never come back to
+    /// a value they had (a source removed takes its own out of the sum), and
+    /// the epoch — which refreshes every drape when it moves — moves only
+    /// when a source's own does. Red with a plain sum: the store events fall
+    /// back on a removal, the epoch moves on an addition.
+    #[test]
+    fn a_composites_counts_move_on_and_its_epoch_stays_as_sources_come_and_go() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let scene = Composite::new();
+        let (tree, loader) = (scene.tree(), scene.loader());
+        let a = std::sync::Arc::new(AtomicU64::new(3));
+        scene
+            .add(
+                Box::new(Revised(7)),
+                std::sync::Arc::new(Epoched(std::sync::Arc::clone(&a))),
+                SourceOptions::default(),
+            )
+            .expect("a");
+        let (rev, events, epoch) = (tree.revision(), loader.store_events(), loader.epoch());
+        let b = std::sync::Arc::new(AtomicU64::new(5));
+        let tag = scene
+            .add(
+                Box::new(Revised(9)),
+                std::sync::Arc::new(Epoched(std::sync::Arc::clone(&b))),
+                SourceOptions::default(),
+            )
+            .expect("b");
+        assert_eq!(loader.epoch(), epoch, "a source joining moves the epoch");
+        assert!(tree.revision() > rev && loader.store_events() > events);
+        let (rev, events) = (tree.revision(), loader.store_events());
+        scene.remove(tag);
+        assert_eq!(loader.epoch(), epoch, "a source leaving moves the epoch");
+        assert!(tree.revision() > rev, "the revision came back");
+        assert!(loader.store_events() > events, "the store events came back");
+        // A source's own epoch moving moves the composite's.
+        a.store(4, Ordering::SeqCst);
+        assert_ne!(loader.epoch(), epoch);
+    }
+
+    /// **A source's options reach the traversal through the tree**: its
+    /// screen-space error factor, and whether it stands for the ground it
+    /// covers. Red with the defaults answered.
+    #[test]
+    fn a_sources_options_are_its_tiles() {
+        let scene = Composite::new();
+        let globe = scene
+            .add(
+                Box::new(StubTree { ge: 1.0 }),
+                std::sync::Arc::new(StubLoader { marker: 0.0 }),
+                SourceOptions::default(),
+            )
+            .expect("globe");
+        let mesh = scene
+            .add(
+                Box::new(StubTree { ge: 1.0 }),
+                std::sync::Arc::new(StubLoader { marker: 0.0 }),
+                SourceOptions {
+                    sse_factor: 8.0,
+                    covers_ground: true,
+                },
+            )
+            .expect("mesh");
+        let tree = scene.tree();
+        assert_eq!(tree.sse_factor(TileId(1).with_tag(globe)), 1.0);
+        assert_eq!(tree.sse_factor(TileId(1).with_tag(mesh)), 8.0);
+        assert!(!tree.covers_ground(TileId(1).with_tag(globe)));
+        assert!(tree.covers_ground(TileId(1).with_tag(mesh)));
+        assert_eq!(scene.options(mesh).map(|o| o.sse_factor), Some(8.0));
     }
 
     /// A sub-loader's store events: the resource (as it names it) each one

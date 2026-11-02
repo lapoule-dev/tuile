@@ -682,6 +682,11 @@ pub fn traverse_with(
 
     let mut requested = HashMap::new();
     for root in roots {
+        // Each root's own: a composite's sources need not share one.
+        let occluder = config
+            .horizon_culling
+            .then(|| tree.occluder_of(root))
+            .flatten();
         visit(
             tree,
             residency,
@@ -1124,14 +1129,18 @@ fn visit(
     // (structural empty tiles always descend).
     // La bande morte : voir `Config::refine_hysteresis`. Sans mémoire de la
     // frame précédente il n'y a rien à stabiliser, et le seuil nu s'applique.
+    // The tile's own threshold: its source's (`TileTree::sse_factor`, 1 but
+    // in a composite of sources priced differently, where the product is
+    // then exact).
+    let tau = config.maximum_screen_space_error * tree.sse_factor(id);
     let threshold = if config.refine_hysteresis <= 0.0 || chosen_before.is_empty() {
-        config.maximum_screen_space_error
+        tau
     } else if chosen_before.contains(&id) {
         // Choisie ici la dernière fois : il faut nettement pire pour la couper.
-        config.maximum_screen_space_error * (1.0 + config.refine_hysteresis)
+        tau * (1.0 + config.refine_hysteresis)
     } else {
         // Déjà coupée : il faut nettement mieux pour la recoller.
-        config.maximum_screen_space_error / (1.0 + config.refine_hysteresis)
+        tau / (1.0 + config.refine_hysteresis)
     };
     let refines = has_children && (sse > threshold || !has_content);
 
@@ -1569,6 +1578,171 @@ mod tests {
             selected.contains(&TileId(1)),
             "with horizon culling off the far side must come back, or this \
              test is measuring something else"
+        );
+    }
+
+    /// A lone tile with nothing to hide it, beside the planet: a building set
+    /// floating in space as far as the traversal can tell.
+    struct Lone;
+
+    impl crate::source::TileTree for Lone {
+        fn roots(&self) -> Vec<TileId> {
+            vec![TileId(0)]
+        }
+        fn children(&self, _id: TileId) -> Vec<TileId> {
+            Vec::new()
+        }
+        fn properties(&self, _id: TileId) -> crate::source::TileProperties {
+            crate::source::TileProperties {
+                bounding_volume: crate::math::BoundingVolume::Sphere(crate::math::Sphere {
+                    center: dvec3(6_356_752.0 + 1_000.0, 0.0, 0.0),
+                    radius: 100.0,
+                }),
+                geometric_error: 0.0,
+                refine: crate::tileset::Refine::Replace,
+                has_content: true,
+            }
+        }
+    }
+
+    /// **Each source is culled against its own occluder.** A planet's far
+    /// side stays hidden with a source beside it that has no planet: one
+    /// occluder for the whole composite would have to be unanimous, and the
+    /// lone source would switch horizon culling off for the globe. Red with
+    /// the composite's one occluder: the far side selected.
+    #[test]
+    fn each_source_is_culled_against_its_own_occluder() {
+        const R: f64 = 6_356_752.0;
+        let composite = crate::source::CompositeTileTree::new(vec![
+            Box::new(PlanetTree { radius: R }),
+            Box::new(Lone),
+        ]);
+        assert!(
+            composite.occluder().is_none(),
+            "the fixture is wrong: the sources must disagree"
+        );
+        let mut residency = ResidentSet::default();
+        for t in [
+            TileId(0).with_tag(0),
+            TileId(1).with_tag(0),
+            TileId(0).with_tag(1),
+        ] {
+            residency.insert(t);
+        }
+        let views = vec![ViewState::perspective(
+            dvec3(R + 5_000.0, 0.0, 0.0),
+            dvec3(-1.0, 0.0, 0.0),
+            dvec3(0.0, 0.0, 1.0),
+            dvec2(1024.0, 1024.0),
+            60.0f64.to_radians(),
+        )];
+        let none = HashSet::new();
+        let mut out = TraversalOutput::default();
+        traverse(
+            &composite,
+            &residency,
+            &views,
+            &Config::default(),
+            0,
+            &none,
+            &none,
+            &mut out,
+        );
+        let selected: HashSet<TileId> = out.selected.iter().map(|(t, _)| *t).collect();
+        assert!(
+            selected.contains(&TileId(0).with_tag(0)),
+            "the ground below"
+        );
+        assert!(selected.contains(&TileId(0).with_tag(1)), "the lone source");
+        assert!(
+            !selected.contains(&TileId(1).with_tag(0)),
+            "the far side of the planet was selected beside a source with no planet"
+        );
+    }
+
+    /// **A source's screen-space error factor sets how finely it is
+    /// refined**, in the traversal as for a tree of its own: the same
+    /// tileset twice, at the traversal's error and at four times it, from
+    /// where the first refines and the second does not. Red with the factor
+    /// ignored: both refined.
+    #[test]
+    fn a_sources_sse_factor_sets_how_finely_it_is_refined() {
+        use crate::source::{SourceOptions, TileTree};
+        let tree = || -> Box<dyn TileTree> {
+            Box::new(crate::tiles3d::TilesetTree::new(std::sync::Arc::new(
+                std::sync::RwLock::new(mini_tileset()),
+            )))
+        };
+        struct Nothing;
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        impl crate::source::TileLoader for Nothing {
+            async fn load(
+                &self,
+                _id: TileId,
+            ) -> Result<crate::source::Loaded, crate::source::LoadError> {
+                Err(crate::source::LoadError::Failed("nothing".into()))
+            }
+        }
+        let scene = crate::source::Composite::new();
+        let fine = scene
+            .add(
+                tree(),
+                std::sync::Arc::new(Nothing),
+                SourceOptions::default(),
+            )
+            .expect("a tag");
+        let coarse = scene
+            .add(
+                tree(),
+                std::sync::Arc::new(Nothing),
+                SourceOptions {
+                    sse_factor: 4.0,
+                    ..SourceOptions::default()
+                },
+            )
+            .expect("a tag");
+        let composite = scene.tree();
+        assert_eq!(composite.sse_factor(TileId(0).with_tag(coarse)), 4.0);
+        let mut residency = ResidentSet::default();
+        for tag in [fine, coarse] {
+            for t in 0..5 {
+                residency.insert(TileId(t).with_tag(tag));
+            }
+        }
+        // The root (geometric error 50) seen from where its error is about
+        // twice the default 16 px: over 16, under 64.
+        let focal = 1024.0 / (2.0 * (30.0f64.to_radians()).tan());
+        let d = 50.0 * focal / 32.0;
+        let views = vec![ViewState::perspective(
+            dvec3(0.0, 0.0, d + 100.0),
+            dvec3(0.0, 0.0, -1.0),
+            dvec3(0.0, 1.0, 0.0),
+            dvec2(1024.0, 1024.0),
+            60.0f64.to_radians(),
+        )];
+        let none = HashSet::new();
+        let mut out = TraversalOutput::default();
+        traverse(
+            &composite,
+            &residency,
+            &views,
+            &Config::default(),
+            0,
+            &none,
+            &none,
+            &mut out,
+        );
+        let roots: Vec<TileId> = composite.roots();
+        let selected: HashSet<TileId> = out.selected.iter().map(|(t, _)| *t).collect();
+        let root_of = |tag: u8| *roots.iter().find(|r| r.tag() == tag).expect("a root");
+        assert!(
+            !selected.contains(&root_of(fine)),
+            "the source at the traversal's error is refined"
+        );
+        assert!(
+            selected.contains(&root_of(coarse)),
+            "the source at four times the error is not: {selected:?}"
         );
     }
 
