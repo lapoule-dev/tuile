@@ -752,14 +752,31 @@ fn need_delta(before: &NeedSet, after: &NeedSet) -> u64 {
 /// W_k ≤ a · (#ΔN_k + #E_k) · log2(tracked + 2) + b, on every step of a
 /// converged still view (nothing changes: W_k ≤ b) and of the soak's tour.
 /// #E_k counts the events the step applies and the decisions the step
-/// before took — loads started, cancelled, deliveries, evictions. A
+/// before took — loads started, cancelled, deliveries, evictions, releases
+/// of decoded copies. A
 /// decision changes a resource's state (a load in flight, a copy in
 /// transit, a copy gone) after the passes of its step have read the arena,
 /// so its effect on the jobs, the marks and the work is read by the next
 /// step, from the arena's changes, exactly as an event's is: it is a change
 /// of that step's input, one step late. Counting only the events left those
 /// steps' work unexplained (2 still steps over the bound once the maps'
-/// upkeep was counted).
+/// upkeep was counted). Three more inputs are counted, each deliberately
+/// (O1.5, part 4, on the flight below):
+///
+/// - a release changes the arena as an eviction does: it is a decision
+///   too (left out before; a change of pressure that released 600 decoded
+///   copies read 1 755 units again the step after, against 256);
+/// - a change of pressure is one input whose effect is a set: the copies
+///   its limits no longer hold are evicted and released on that step, each
+///   a decision of the step's output that no algorithm takes in less than
+///   a unit (the app sent to the background evicts 2 804 at once);
+/// - the prune runs every eighth step and frees the slots the steps since
+///   the last emptied: its step's #E is theirs (the events and decisions
+///   since the last prune), and the slots it frees are changes the next
+///   step reads, as a decision's (counted as the fall of the tracked set).
+///
+/// A time falling due is not an input: what waits on one is paced instead
+/// (the thrash window's expiries, `RECENT_DRAIN` a step).
 ///
 /// `work` includes what keeping the kept maps in order costs, as the
 /// sorted blocks count it (`sorted.rs`): the entries a change shifts in its
@@ -779,17 +796,9 @@ fn need_delta(before: &NeedSet, after: &NeedSet) -> u64 {
     ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn decide_work_grows_with_changes_not_with_the_view() {
-    use tuile_budget::{BudgetMeter, BudgetObserver, Pressure, StepRecord, Thermal};
-
     let mut sim = Sim::new(Profile::desktop(), 7);
     sim.run(5.0, &approach);
-    let mut meter = BudgetMeter::new(sim.budget.config());
-    let mut prev: Option<NeedSet> = None;
-    let mut decided = 0u64;
-    // (phase, step, W, #ΔN, #E, tracked, bound)
-    let mut over: Vec<(&str, u64, u64, u64, u64, u64, u64)> = Vec::new();
-    let mut steps = 0u64;
-    let mut worst = (0.0f64, 0u64, 0u64);
+    let mut p64 = P64::new(&sim);
     let tour_from = sim.now.plus(Micros::from_secs(25));
     let end = tour_from.plus(Micros::from_secs(60));
     while sim.now < end {
@@ -800,57 +809,187 @@ fn decide_work_grows_with_changes_not_with_the_view() {
             ("tour", super::soak::tour(t))
         };
         let (need, d) = sim.step(cam);
-        meter.step(&StepRecord {
-            step: steps,
+        p64.step(&sim, phase, &need, &d);
+    }
+    p64.assert_held();
+}
+
+/// P6.4 on the flight that grows the tracked set to thousands and falls
+/// back (`scenarios::fly_grow_then_shrink`): the descent to a still view,
+/// the app sent to the background and back (two pressure switches), the
+/// arena's compaction.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
+fn decide_work_grows_with_changes_not_with_the_view_on_the_flight() {
+    let mut sim = Sim::new(Profile::desktop(), 7);
+    let mut p64 = P64::new(&sim);
+    super::scenarios::fly_grow_then_shrink(&mut sim, |s, need, d| {
+        let phase = match s.now.0 / 1_000_000 {
+            0..=29 => "flight",
+            40..=42 => "background",
+            _ => "still",
+        };
+        p64.step(s, phase, need, d);
+    });
+    p64.assert_held();
+}
+
+/// P6.4 across changes of pressure on a converged still view: a change to
+/// or from `Normal` reads again only the wants that read the pressure (a
+/// drape worn one level finer than its need), and a change between two
+/// pressures under `Normal` none. The view sits well under its limits, so
+/// the changes evict nothing and every step is held to the bound of a step
+/// where nothing changes. Red with every want read again on a change of
+/// pressure: W 1 467 against 256 at each change.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
+fn a_change_of_pressure_reads_again_only_the_wants_that_read_it() {
+    use tuile_budget::Pressure;
+    let mut sim = Sim::new(Profile::desktop(), 7);
+    settle(&mut sim, 10.0);
+    let mut p64 = P64::new(&sim);
+    let schedule = [
+        Pressure::Warning,
+        Pressure::Critical,
+        Pressure::Normal,
+        Pressure::Critical,
+        Pressure::Warning,
+        Pressure::Normal,
+    ];
+    for p in schedule {
+        sim.pressure(p);
+        let end = sim.now.plus(Micros::from_secs(2));
+        while sim.now < end {
+            let (need, d) = sim.step(home());
+            p64.step(&sim, "still", &need, &d);
+        }
+    }
+    p64.assert_held();
+}
+
+/// P6.4's bound, checked step by step (see
+/// [`decide_work_grows_with_changes_not_with_the_view`]).
+struct P64 {
+    meter: tuile_budget::BudgetMeter,
+    prev: Option<NeedSet>,
+    pressure: tuile_budget::Pressure,
+    /// The decisions of the step before, counted in this step's #E.
+    decided: u64,
+    /// The events and decisions since the last prune, counted in the next
+    /// prune's #E.
+    since_prune: u64,
+    /// The resources tracked after the step before.
+    tracked: u64,
+    /// (phase, step, W, #ΔN, #E, tracked, bound)
+    over: Vec<(&'static str, u64, u64, u64, u64, u64, u64)>,
+    steps: u64,
+    worst: (f64, u64, u64),
+}
+
+impl P64 {
+    fn new(sim: &Sim) -> Self {
+        P64 {
+            meter: tuile_budget::BudgetMeter::new(sim.budget.config()),
+            prev: None,
+            pressure: tuile_budget::Pressure::Normal,
+            decided: 0,
+            since_prune: 0,
+            tracked: 0,
+            over: Vec::new(),
+            steps: 0,
+            worst: (0.0, 0, 0),
+        }
+    }
+
+    fn step(&mut self, sim: &Sim, phase: &'static str, need: &NeedSet, d: &Decisions) {
+        use tuile_budget::{BudgetObserver, StepRecord, Thermal};
+        self.meter.step(&StepRecord {
+            step: self.steps,
             frame: sim.frame,
             now: sim.now,
             views_changed: false,
             eyes: 1,
-            need: &need,
+            need,
             events: &[],
             presence: &[],
-            decisions: &d,
+            decisions: d,
             ledger: sim.budget.ledger(),
-            pressure: Pressure::Normal,
+            pressure: sim.pressure_set,
             thermal: Thermal::Nominal,
             decide_wall: None,
         });
-        let w = u64::from(meter.signals().decide_work);
-        let dn = prev
+        let w = u64::from(self.meter.signals().decide_work);
+        let dn = self
+            .prev
             .as_ref()
-            .map_or_else(|| listed(&need).len() as u64, |p| need_delta(p, &need));
-        let e = sim.step_events + decided;
-        decided = (d.start.len() + d.cancel.len() + d.deliver.len() + d.evict.len()) as u64;
+            .map_or_else(|| listed(need).len() as u64, |p| need_delta(p, need));
+        let mut e = sim.step_events + self.decided;
+        if sim.pressure_set != self.pressure {
+            // A change of pressure is one input whose effect is a set: the
+            // copies the new limits no longer hold are evicted and
+            // released on that step, each a decision of its output that no
+            // algorithm takes in less than a unit. They count with the
+            // events of their step.
+            e += (d.evict.len() + d.release.len()) as u64;
+            self.pressure = sim.pressure_set;
+        }
+        self.since_prune += e;
         let tracked = u64::from(d.stats.tracked);
+        self.decided =
+            (d.start.len() + d.cancel.len() + d.deliver.len() + d.evict.len() + d.release.len())
+                as u64;
+        if sim.budget.steps.is_multiple_of(8) {
+            // The prune runs every eighth step (`Budget::prune`): it frees
+            // the slots the events and decisions of the steps since the last
+            // emptied, and its work is theirs; the slots it frees are
+            // changes the next step reads, as a decision's (at least the
+            // fall of the tracked count).
+            e = self.since_prune;
+            self.since_prune = 0;
+            self.decided += self.tracked.saturating_sub(tracked);
+        }
+        self.tracked = tracked;
         let log = u64::from(64 - (tracked + 2).leading_zeros()); // ⌈log2⌉
         let bound = P64_A * (dn + e) * log + P64_B;
         if w > bound {
-            over.push((phase, steps, w, dn, e, tracked, bound));
+            self.over
+                .push((phase, self.steps, w, dn, e, tracked, bound));
         }
         let ratio = w as f64 / bound as f64;
-        if ratio > worst.0 {
-            worst = (ratio, w, bound);
+        if ratio > self.worst.0 {
+            self.worst = (ratio, w, bound);
         }
-        prev = Some(need);
-        steps += 1;
+        self.prev = Some(need.clone());
+        self.steps += 1;
     }
-    let still = over.iter().filter(|o| o.0 == "still").count();
-    let first: Vec<String> = over
-        .iter()
-        .take(5)
-        .map(|(ph, k, w, dn, e, tr, b)| {
-            format!("{ph} step {k}: W {w} > {b} (#ΔN {dn}, #E {e}, tracked {tr})")
-        })
-        .collect();
-    assert!(
-        over.is_empty(),
-        "{RED}: W_k over a·(#ΔN+#E)·log2(tracked+2)+b (a {P64_A}, b {P64_B}) on {} of {steps} \
-         steps ({still} of them still, nothing changing); worst W {} against {} ({:.1}×); \
-         first: {}",
-        over.len(),
-        worst.1,
-        worst.2,
-        worst.0,
-        first.join("; ")
-    );
+
+    fn assert_held(&self) {
+        let still = self.over.iter().filter(|o| o.0 == "still").count();
+        let first: Vec<String> = self
+            .over
+            .iter()
+            .take(8)
+            .map(|(ph, k, w, dn, e, tr, b)| {
+                format!("{ph} step {k}: W {w} > {b} (#ΔN {dn}, #E {e}, tracked {tr})")
+            })
+            .collect();
+        assert!(
+            self.over.is_empty(),
+            "{RED}: W_k over a·(#ΔN+#E)·log2(tracked+2)+b (a {P64_A}, b {P64_B}) on {} of {} \
+             steps ({still} of them still, nothing changing); worst W {} against {} ({:.1}×); \
+             first: {}",
+            self.over.len(),
+            self.steps,
+            self.worst.1,
+            self.worst.2,
+            self.worst.0,
+            first.join("; ")
+        );
+    }
 }

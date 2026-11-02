@@ -299,6 +299,8 @@ pub struct Sim {
     /// The decisions, written into the same buffers every step, as the
     /// geometry server does.
     out: Decisions,
+    /// The pressure last set ([`Sim::pressure`]).
+    pub pressure_set: Pressure,
 }
 
 impl Sim {
@@ -352,6 +354,7 @@ impl Sim {
             need_last: None,
             delta: NeedDelta::new(),
             out: Decisions::default(),
+            pressure_set: Pressure::Normal,
             profile,
         }
     }
@@ -840,6 +843,7 @@ impl Sim {
     /// Applies a memory signal.
     pub fn pressure(&mut self, p: Pressure) {
         self.budget.set_pressure(p);
+        self.pressure_set = p;
     }
 
     /// Applies a thermal state.

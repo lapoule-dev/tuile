@@ -3,7 +3,7 @@
 
 //! The scenarios of spec §8.
 
-use tuile_budget::{Bytes, Class, Micros, Pressure, Thermal, BACKOFF_KEEP_MAX};
+use tuile_budget::{Bytes, Class, Decisions, Micros, NeedSet, Pressure, Thermal, BACKOFF_KEEP_MAX};
 
 use super::detmath;
 use super::net::NetProfile;
@@ -70,9 +70,12 @@ pub fn grow_then_shrink(t: f64) -> Camera {
 
 /// Flies `sim` through [`grow_then_shrink`] for a minute, the app sent to
 /// the background at 40 s (only the floor and what is drawn kept) and back
-/// at 42 s; `each` sees the simulation after every step. Returns the
-/// tracked peak.
-pub fn fly_grow_then_shrink(sim: &mut Sim, mut each: impl FnMut(&Sim)) -> usize {
+/// at 42 s; `each` sees the simulation after every step, with the step's
+/// need and decisions. Returns the tracked peak.
+pub fn fly_grow_then_shrink(
+    sim: &mut Sim,
+    mut each: impl FnMut(&Sim, &NeedSet, &Decisions),
+) -> usize {
     let mut peak = 0;
     while sim.now < Micros::from_secs(60) {
         let t = sim.now.0 as f64 / 1e6;
@@ -81,9 +84,9 @@ pub fn fly_grow_then_shrink(sim: &mut Sim, mut each: impl FnMut(&Sim)) -> usize 
         } else if (42.0..42.1).contains(&t) {
             sim.pressure(Pressure::Normal);
         }
-        sim.step(grow_then_shrink(t));
+        let (need, d) = sim.step(grow_then_shrink(t));
         peak = peak.max(sim.budget.tracked());
-        each(sim);
+        each(sim, &need, &d);
     }
     peak
 }
@@ -105,7 +108,7 @@ fn the_arena_gives_its_room_back_on_the_flight_that_shrinks_the_tracked_set() {
     let mut sim = Sim::new(Profile::desktop(), 7);
     // (t, tracked, room) after every step.
     let mut trace: Vec<(Micros, usize, usize)> = Vec::new();
-    let peak = fly_grow_then_shrink(&mut sim, |s| {
+    let peak = fly_grow_then_shrink(&mut sim, |s, _, _| {
         trace.push((s.now, s.budget.tracked(), s.budget.tracked_room()));
     });
     let room_max = trace.iter().map(|x| x.2).max().unwrap_or(0);

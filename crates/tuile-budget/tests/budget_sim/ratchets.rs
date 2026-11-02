@@ -250,7 +250,7 @@ fn the_pressure_scenario_stays_over_target() {
 /// buffers.
 fn grown_then_shrunk() -> (usize, usize, i64) {
     let mut sim = Sim::new(Profile::desktop(), 7);
-    let peak = super::scenarios::fly_grow_then_shrink(&mut sim, |_| {});
+    let peak = super::scenarios::fly_grow_then_shrink(&mut sim, |_, _, _| {});
     let tracked = sim.budget.tracked();
     let ((), _) = super::alloc::counted(|| sim.budget.real.release_scratch());
     let cfg = sim.budget.config().clone();

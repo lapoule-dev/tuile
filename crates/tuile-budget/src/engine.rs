@@ -1144,6 +1144,9 @@ impl Budget {
     /// most urgent, then the best scored; of equals, the first put — in
     /// resource order. `item` is the draw item of its mesh, `meshes_in`
     /// whether Batch may want its drapes (always under Interactive).
+    /// Returns whether they read the pressure: a drape worn one level finer
+    /// than its need is wanted coarser under pressure only, and a change of
+    /// pressure to or from `Normal` moves no other want.
     pub(super) fn tile_wants(
         &self,
         t: TileId,
@@ -1152,8 +1155,9 @@ impl Budget {
         meshes_in: bool,
         drapes: &mut Vec<(LayerId, u32)>,
         out: &mut Vec<(ResourceId, u32, Want)>,
-    ) {
+    ) -> bool {
         out.clear();
+        let mut reads_pressure = false;
         let batch = self.cfg.policy == Policy::Batch;
         // Every want put, in order; merged below.
         let put = |out: &mut Vec<(ResourceId, u32, Want)>, r: ResourceId, w: Want| {
@@ -1209,9 +1213,10 @@ impl Budget {
                         let off = match worn {
                             None => true,
                             Some(w) if batch => w.resource != drape,
+                            Some(w) if w.level.abs_diff(n) > 1 => true,
                             Some(w) => {
-                                w.level.abs_diff(n) > 1
-                                    || (self.pressure != Pressure::Normal && w.level > n)
+                                reads_pressure |= w.level > n;
+                                self.pressure != Pressure::Normal && w.level > n
                             }
                         };
                         off.then_some(if floor {
@@ -1239,6 +1244,7 @@ impl Budget {
         // the first put.
         out.sort_unstable_by_key(|(r, seq, w)| (*r, w.urgency, Reverse(w.q), *seq));
         out.dedup_by_key(|e| e.0);
+        reads_pressure
     }
 
     /// Whether Batch may want drapes this step: every mesh the frame draws
@@ -1659,11 +1665,11 @@ impl Budget {
                     .find(*r)
                     .is_some_and(|s| self.arena.marked(s, Mark::Active))
             });
-            if self.down.deadlines_len() > 2 * self.active.len() + 64 {
+            if self.down.deadlines_len() > 2 * self.arena.active().len() + 64 {
                 // Mostly deadlines of loads gone: those of the loads still
                 // going, again.
                 self.down.clear_deadlines();
-                for &s in &self.active {
+                for &s in self.arena.active() {
                     let r = self.arena.id(s);
                     if let Load::Loading { started, .. } = self.arena.load(s) {
                         self.down.deadline(started.plus(timeout), r);
@@ -1678,7 +1684,7 @@ impl Budget {
             // Every load and transit, in resource order (the index is by
             // slot).
             due.clear();
-            due.extend(self.active.iter().map(|s| self.arena.id(*s)));
+            due.extend(self.arena.active().iter().map(|s| self.arena.id(*s)));
             due.sort_unstable();
             if !back {
                 // The deadlines were dropped: every load's, again.
@@ -1816,9 +1822,10 @@ impl Budget {
                         }
                         // Preempt the least urgent in-flight preload. Every
                         // load is indexed in `active` (`start`).
-                        st.work = st.work.saturating_add(sat_u32(self.active.len()));
+                        st.work = st.work.saturating_add(sat_u32(self.arena.active().len()));
                         let victim = self
-                            .active
+                            .arena
+                            .active()
                             .iter()
                             .filter_map(|&vs| {
                                 let a = &self.arena;
@@ -1890,10 +1897,7 @@ impl Budget {
             if self.cfg.pinned_level.is_some_and(|p| w.level <= p) {
                 self.arena.mark(s, Mark::FloorSet, true);
             }
-            if !self.arena.marked(s, Mark::Active) {
-                self.active.push(s);
-            }
-            self.arena.mark(s, Mark::Active, true);
+            self.arena.list_active(s);
             self.deadline(now.plus(self.cfg.load_timeout), *r);
             match source {
                 Source::Network => {
@@ -1910,7 +1914,8 @@ impl Budget {
                 }
             }
             if let Some(t) = self.recent.remove(r) {
-                if now.since(t) <= THRASH_WINDOW {
+                // An entry behind the horizon has left the window already.
+                if t >= self.recent_horizon && now.since(t) <= THRASH_WINDOW {
                     // Back from a local store is a demotion paying off; back
                     // from the network is thrash.
                     match source {
@@ -2200,10 +2205,7 @@ impl Budget {
             room.bytes[class][i] = room.bytes[class][i].minus(g.bytes);
         }
         // `make_room` frees no slot: `s` is still `r`'s.
-        if !self.arena.marked(s, Mark::Active) {
-            self.active.push(s);
-        }
-        self.arena.mark(s, Mark::Active, true);
+        self.arena.list_active(s);
         self.arena.put_transit(
             s,
             &mut self.ledger,
@@ -2642,7 +2644,7 @@ impl Budget {
         if self.steps.is_multiple_of(8) {
             visited = visited.saturating_add(self.prune_tracked(now, tiles, wants));
         }
-        visited
+        visited.saturating_add(self.drain_recent(super::RECENT_DRAIN))
     }
 
     pub(super) fn release_beyond_impl(&mut self, target: Bytes) -> super::Released {
@@ -2757,6 +2759,10 @@ impl Budget {
         debug_assert!(
             a.sums_consistent(),
             "the protected bytes or the GPU copies by epoch drifted from the slots"
+        );
+        debug_assert!(
+            a.active_consistent(),
+            "the active slots drifted from their places or their runs"
         );
         for s in a.iter() {
             let class = a.class(s);
