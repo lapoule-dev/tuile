@@ -72,7 +72,7 @@ use super::sorted::SortedMap;
 use super::tier::Tier;
 use super::tier::{Presence, Source};
 use super::types::ResourceId;
-use super::types::{Bytes, Class, Generation, LayerId, Micros, PerClass};
+use super::types::{sat_u32, Bytes, Class, Generation, LayerId, Micros, PerClass};
 use super::Ledger;
 
 /// A load in flight, or none.
@@ -194,7 +194,7 @@ pub(super) enum Mark {
     /// An ancestor of the drawn cut, drawable (a swap's member too).
     Chain,
     /// A load in flight or a copy in transit, until the prune notes it is
-    /// neither (`Budget::active`).
+    /// neither ([`Arena::active`]).
     Active,
     /// A load started at the floor's levels (`Budget::floor_set`).
     FloorSet,
@@ -357,7 +357,12 @@ pub(super) struct Cold {
     pub store_missed: bool,
     /// Which of `first_wanted`, `unneeded_since` hold a time.
     has: u8,
+    /// Its place in [`Arena::active`] while it is marked `Active`. In the
+    /// room the other fields leave (`Cold` stays 48 bytes).
+    active_at: u32,
 }
+
+const _: () = assert!(std::mem::size_of::<Cold>() == 48);
 
 const FIRST_WANTED: u8 = 1;
 const UNNEEDED: u8 = 1 << 1;
@@ -417,6 +422,14 @@ pub(super) struct Arena {
     index: HashTable<Slot>,
     /// Freed slots, the last freed taken first.
     free: Vec<Slot>,
+    /// The slots marked `Active` — a load in flight or a copy in transit,
+    /// until the prune notes they are neither — in two runs: those still
+    /// loading or in transit (`..active_busy`), then those that are
+    /// neither, moved there the moment their last load or transit ended
+    /// (each slot knows its place, `Cold::active_at`). The prune drops the
+    /// second run whole, without a scan; no decision reads the order.
+    active: Vec<Slot>,
+    active_busy: usize,
     /// Live slots.
     live: usize,
     id: Vec<ResourceId>,
@@ -494,6 +507,8 @@ impl Default for Arena {
             hasher: FixedState::with_seed(SEED),
             index: HashTable::new(),
             free: Vec::new(),
+            active: Vec::new(),
+            active_busy: 0,
             live: 0,
             id: Vec::new(),
             class: Vec::new(),
@@ -729,6 +744,13 @@ impl Arena {
         moved += Self::moved(map, &mut self.evict.cur.slots);
         moved += Self::moved(map, &mut self.evict.prev.slots);
         moved += Self::moved(map, &mut self.emptied);
+        // An active slot is live (only an empty slot is freed): none is
+        // dropped, so each keeps its place.
+        moved += Self::moved(map, &mut self.active);
+        debug_assert!(
+            self.active_consistent(),
+            "the active slots keep their places"
+        );
         moved
     }
 
@@ -1241,6 +1263,76 @@ impl Arena {
     fn set(&mut self, s: Slot, bit: u16, on: bool) {
         let f = &mut self.flags[s.i()];
         *f = if on { *f | bit } else { *f & !bit };
+        if bit & (LOADING | TRANSIT) != 0 && *f & ACTIVE != 0 {
+            self.place_active(s);
+        }
+    }
+
+    /// Lists `s` as active (marked `Active`), in the run its load and
+    /// transit put it in; a slot listed already stays where it is.
+    pub fn list_active(&mut self, s: Slot) {
+        if self.has(s, ACTIVE) {
+            return;
+        }
+        self.mark(s, Mark::Active, true);
+        self.cold[s.i()].active_at = sat_u32(self.active.len());
+        self.active.push(s);
+        self.place_active(s);
+    }
+
+    /// Moves the active slot `s` into the run its load and transit say.
+    fn place_active(&mut self, s: Slot) {
+        let busy = self.has(s, LOADING) || self.has(s, TRANSIT);
+        let at = self.cold[s.i()].active_at as usize;
+        if busy && at >= self.active_busy {
+            self.swap_active(at, self.active_busy);
+            self.active_busy += 1;
+        } else if !busy && at < self.active_busy {
+            self.active_busy -= 1;
+            self.swap_active(at, self.active_busy);
+        }
+    }
+
+    fn swap_active(&mut self, i: usize, j: usize) {
+        self.active.swap(i, j);
+        self.cold[self.active[i].i()].active_at = sat_u32(i);
+        self.cold[self.active[j].i()].active_at = sat_u32(j);
+    }
+
+    /// The slots marked `Active`, in no order a decision may read.
+    pub fn active(&self) -> &[Slot] {
+        &self.active
+    }
+
+    /// Drops from the active slots those neither loading nor in transit,
+    /// their marks taken off, into `out`; a list emptied gives its room
+    /// back, and one a burst left larger than twice its use, the excess.
+    pub fn drop_idle_active(&mut self, out: &mut Vec<Slot>) {
+        out.clear();
+        out.extend_from_slice(&self.active[self.active_busy..]);
+        self.active.truncate(self.active_busy);
+        for &s in out.iter() {
+            self.mark(s, Mark::Active, false);
+        }
+        if out.is_empty() {
+            return;
+        }
+        if self.active.is_empty() {
+            self.active = Vec::new();
+        } else {
+            let n = self.active.len();
+            super::sorted::trim(&mut self.active, n);
+        }
+    }
+
+    /// Whether every active slot is marked, knows its place, and sits in
+    /// the run its load and transit say.
+    pub fn active_consistent(&self) -> bool {
+        self.active.iter().enumerate().all(|(i, &s)| {
+            self.has(s, ACTIVE)
+                && self.cold[s.i()].active_at as usize == i
+                && (i < self.active_busy) == (self.has(s, LOADING) || self.has(s, TRANSIT))
+        }) && self.active_busy <= self.active.len()
     }
 
     /// Whether `s` carries `m`.
@@ -1838,6 +1930,75 @@ mod tests {
         assert_eq!(filed(&a, Class::TerrainMesh, &Held::GPU), vec![mesh(1)]);
         assert_eq!(a.idle(Class::TerrainMesh), Bytes::ZERO);
         assert!(a.evict_index_consistent());
+    }
+
+    /// The loads and transits that ended are apart when the prune comes, in
+    /// any order they ended or started again: the prune takes exactly the
+    /// slots neither loading nor in transit, their marks off, and walks
+    /// nothing else. Red with the slot not moved when its load ends (the
+    /// prune keeps an idle slot) and when its load starts again (it drops
+    /// a busy one).
+    #[test]
+    fn the_loads_that_ended_are_apart_for_the_prune() {
+        let mut a = Arena::new(None);
+        let mut l = Ledger::default();
+        a.advance(Micros(1), &[]);
+        let load = Load::Loading {
+            gen: Generation(1),
+            source: Source::Network,
+            started: Micros(1),
+            epoch: 0,
+        };
+        let transit = Transit {
+            gen: Generation(1),
+            cost: Cost::flat(Bytes(10)),
+            epoch: 0,
+        };
+        let slots: Vec<Slot> = (0..40u64)
+            .map(|i| {
+                let s = a.find_or_insert(mesh(i), Class::TerrainMesh, 3, Micros(1));
+                a.list_active(s);
+                if i % 3 == 0 {
+                    a.put_transit(s, &mut l, transit);
+                } else {
+                    a.set_load(s, load);
+                }
+                s
+            })
+            .collect();
+        assert!(a.active_consistent());
+        // Ended in a scattered order; one ends then starts again; one
+        // listed while idle.
+        let mut ended = Vec::new();
+        for i in [7usize, 0, 39, 12, 25, 1, 30] {
+            let s = slots[i];
+            if i % 3 == 0 {
+                a.take_transit(s, &mut l);
+            } else {
+                a.set_load(s, Load::Idle);
+            }
+            ended.push(s);
+            assert!(a.active_consistent());
+        }
+        let again = slots[25];
+        a.set_load(again, load);
+        ended.retain(|s| *s != again);
+        let idle = a.find_or_insert(mesh(99), Class::TerrainMesh, 3, Micros(1));
+        a.list_active(idle);
+        ended.push(idle);
+        assert!(a.active_consistent());
+        let mut out = Vec::new();
+        a.drop_idle_active(&mut out);
+        out.sort_unstable();
+        ended.sort_unstable();
+        assert_eq!(out, ended, "the prune takes exactly the slots that ended");
+        assert!(out.iter().all(|s| !a.marked(*s, Mark::Active)));
+        assert_eq!(a.active().len(), 41 - ended.len());
+        assert!(a
+            .active()
+            .iter()
+            .all(|s| a.marked(*s, Mark::Active) && (a.loading(*s) || a.has_transit(*s))));
+        assert!(a.active_consistent());
     }
 
     #[test]

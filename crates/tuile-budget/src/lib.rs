@@ -147,6 +147,12 @@ enum Event {
 const RECENT_CAP: usize = 4_096;
 /// The thrash window.
 const THRASH_WINDOW: Micros = Micros::from_secs(10);
+/// The most expired evictions a step takes out of `recent`. Whatever P6.4's
+/// bound allows a step that changes nothing (256) less what such a step
+/// walks besides; a burst of 2 800 evictions (the app sent to the
+/// background) is gone 44 steps after its window ends, where the prune
+/// took it out on one step (W 2 072 on a step where nothing changed).
+const RECENT_DRAIN: usize = 64;
 
 /// The most resources the budget keeps backing off after a failed load once
 /// the view has left them (for 30 s at most each), so that a server that is
@@ -257,13 +263,6 @@ pub struct Budget {
     /// The tiles whose meshes were drawn last step as themselves or held
     /// (not as a fallback).
     held_last: sorted::SortedMap<TileId, ()>,
-    /// Resources loading or in transit (an index, so a step need not scan),
-    /// by slot, in the order they joined, each marked `Active` on its slot
-    /// (the mark says whether a slot is listed, so none is listed twice);
-    /// the prune drops those that are neither and trims the room a burst
-    /// left, and the slots follow the arena's renumbering. No decision reads
-    /// its order.
-    active: Vec<state::Slot>,
     /// Resources ranked last step (their urgency is cleared next step).
     ranked_last: Vec<ResourceId>,
     /// Steps taken, for the amortised prune.
@@ -279,6 +278,12 @@ pub struct Budget {
     /// 19 B more per tracked resource after the shrink flight, for one
     /// block less at motion's p99.
     recent: std::collections::BTreeMap<ResourceId, Micros>,
+    /// The evictions before this time have left `recent`, whether or not
+    /// their entries are gone yet: the prune moves it, every eighth step,
+    /// to the thrash window's start, and the entries behind it are taken
+    /// out a few a step (`RECENT_DRAIN`), so that the evictions of a burst
+    /// do not all cost their removal on the one step their window ends.
+    recent_horizon: Micros,
     epochs: PerClass<u64>,
     /// Per imagery layer, added to the drape class's epoch.
     layer_epochs: std::collections::BTreeMap<LayerId, u64>,
@@ -313,12 +318,12 @@ impl Budget {
             need: Default::default(),
             imagery_prev: Default::default(),
             held_last: Default::default(),
-            active: Default::default(),
             ranked_last: Vec::new(),
             steps: 0,
             down: Default::default(),
             scratch: Default::default(),
             recent: Default::default(),
+            recent_horizon: Micros::ZERO,
             epochs: PerClass::splat(0),
             layer_epochs: Default::default(),
             next_gen: 1,
@@ -566,7 +571,7 @@ impl Budget {
             swap_last: marked(state::Mark::Swap),
             chain_last: marked(state::Mark::Chain),
             active: {
-                let mut v: Vec<ResourceId> = self.active.iter().map(|s| a.id(*s)).collect();
+                let mut v: Vec<ResourceId> = a.active().iter().map(|s| a.id(*s)).collect();
                 v.sort_unstable();
                 v
             },
@@ -584,7 +589,12 @@ impl Budget {
                 w.dedup();
                 w
             },
-            recent: self.recent.iter().map(|(k, v)| (*k, *v)).collect(),
+            recent: self
+                .recent
+                .iter()
+                .filter(|(_, t)| **t >= self.recent_horizon)
+                .map(|(k, v)| (*k, *v))
+                .collect(),
             epochs: self.epochs,
             layer_epochs: self.layer_epochs.iter().map(|(k, v)| (*k, *v)).collect(),
             next_gen: self.next_gen,

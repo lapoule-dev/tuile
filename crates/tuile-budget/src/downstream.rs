@@ -262,6 +262,16 @@ pub(super) struct Downstream {
     /// the presence index's generation when the levels asked it.
     scale: u32,
     pressure: Pressure,
+    /// Tiles whose wants read the pressure (`Budget::tile_wants`), sorted:
+    /// the only ones a change of pressure to or from `Normal` reads again.
+    /// A vector, not the sorted blocks, and its room given back when it is
+    /// four times what it holds: a few tiles at a time (a drape worn one
+    /// level finer than its need, a moment in a zoom out), where the
+    /// blocks' first block and spare one, or a burst's room kept, cost one
+    /// byte per tracked resource on the tour (one reader in a room of 64 at
+    /// its end, 512 B); the entries an insertion or a removal shifts are
+    /// counted in `work`.
+    pressure_readers: Vec<TileId>,
     oracle: Option<u64>,
     /// Tiles whose levels asked the presence index; whose levels moved.
     levels_far: Set<TileId>,
@@ -1044,8 +1054,9 @@ impl Budget {
         self.check_selection(tiles);
         let floor_in = self.down.floor_in();
         self.items_pass(tiles, full, floor_in, &mut l);
-        let pressure_moved = self.down.pressure != self.pressure;
-        self.wants_pass(tiles, full || pressure_moved, &mut l);
+        let pressure_moved =
+            (self.down.pressure == Pressure::Normal) != (self.pressure == Pressure::Normal);
+        self.wants_pass(tiles, full, pressure_moved, &mut l);
         self.refresh_pass(full, &mut l);
         #[cfg(debug_assertions)]
         self.check_wants(tiles);
@@ -1539,9 +1550,16 @@ impl Budget {
     }
 
     /// The wants of the tiles whose need, levels, mesh or mesh's item
-    /// changed (every tile's when `all`); the resources whose want changed,
-    /// into `l.wants`.
-    fn wants_pass(&mut self, tiles: &SortedMap<TileId, TileNeed>, all: bool, l: &mut StepLists) {
+    /// changed (every tile's when `all`, those that read the pressure when
+    /// `pressure` moved to or from `Normal`); the resources whose want
+    /// changed, into `l.wants`.
+    fn wants_pass(
+        &mut self,
+        tiles: &SortedMap<TileId, TileNeed>,
+        all: bool,
+        pressure: bool,
+        l: &mut StepLists,
+    ) {
         l.wants.clear();
         let meshes_in = self.meshes_in(tiles);
         let mut dirty = std::mem::take(&mut l.wants_dirty);
@@ -1551,18 +1569,36 @@ impl Budget {
         if all {
             add(&mut dirty, tiles.keys().copied());
             add(&mut dirty, self.down.wants.keys().map(|r| r.0.tile()));
+        } else if pressure {
+            add(&mut dirty, self.down.pressure_readers.iter().copied());
         }
         dirty.sort_unstable();
         dirty.dedup();
         self.walk(dirty.len());
         for &t in &dirty {
-            match tiles.get(&t) {
+            let reads = match tiles.get(&t) {
                 Some(tn) => {
                     let item = self.down.drawn(ResourceId::Mesh(t));
-                    self.tile_wants(t, tn, item, meshes_in, &mut l.drapes, &mut l.tile_wants);
+                    self.tile_wants(t, tn, item, meshes_in, &mut l.drapes, &mut l.tile_wants)
                 }
-                None => l.tile_wants.clear(),
-            }
+                None => {
+                    l.tile_wants.clear();
+                    false
+                }
+            };
+            let readers = &mut self.down.pressure_readers;
+            let shifted = match (readers.binary_search(&t), reads) {
+                (Err(i), true) => {
+                    readers.insert(i, t);
+                    readers.len() - i
+                }
+                (Ok(i), false) => {
+                    readers.remove(i);
+                    readers.len() - i + 1
+                }
+                _ => 0,
+            };
+            self.walk(shifted);
             l.old_wants.clear();
             l.old_wants
                 .extend(of_tile(&self.down.wants, t).map(|(r, w)| (r, *w)));
@@ -1600,6 +1636,11 @@ impl Budget {
             }
         }
         self.down.wants.apply(&mut l.c_wants, |_| {});
+        // A zoom out's burst of readers does not keep its room.
+        let readers = &mut self.down.pressure_readers;
+        if readers.capacity() > 4 * readers.len() + 4 {
+            readers.shrink_to(2 * readers.len());
+        }
         l.wants_dirty = dirty;
     }
 
@@ -2404,32 +2445,11 @@ impl Budget {
         wants: Wants<'_>,
     ) -> u32 {
         let mut visited = 0u32;
-        // Loads and transits: the index keeps only those still going.
+        // Loads and transits: the index keeps only those still going; those
+        // that ended since are already apart (`Arena::drop_idle_active`).
         let mut done = std::mem::take(&mut self.down.step.slots);
-        done.clear();
-        let a = &self.arena;
-        done.extend(
-            self.active
-                .iter()
-                .filter(|s| !(a.has_transit(**s) || a.loading(**s)))
-                .copied(),
-        );
-        visited = visited.saturating_add(sat_u32(self.active.len()));
-        if !done.is_empty() {
-            let a = &self.arena;
-            self.active.retain(|s| a.has_transit(*s) || a.loading(*s));
-            for &s in &done {
-                self.arena.mark(s, Mark::Active, false);
-            }
-            // A burst of loads does not keep its room once it is done; a
-            // list emptied holds none.
-            if self.active.is_empty() {
-                self.active = Vec::new();
-            } else {
-                let n = self.active.len();
-                super::sorted::trim(&mut self.active, n);
-            }
-        }
+        self.arena.drop_idle_active(&mut done);
+        visited = visited.saturating_add(sat_u32(done.len()));
         // Empty slots: those emptied since, and those kept whose time fell
         // due.
         let mut slots = done;
@@ -2579,7 +2599,6 @@ impl Budget {
         d.kept_empty
             .rekey(|s| Arena::moved_slot(&map, *s).unwrap_or(*s));
         // The loads and transits in flight: live slots, every one.
-        moved += Arena::moved(&map, &mut self.active);
         // The queue, in its own vector: stale and dead entries dropped.
         let mut due = std::mem::take(&mut d.kept_due).into_vec();
         moved += due.len() as u64;
@@ -2602,6 +2621,12 @@ impl Budget {
 
     /// An eviction of `r` at `now`, for the thrash count.
     pub(super) fn evicted(&mut self, r: ResourceId, now: Micros) {
+        if now < self.recent_horizon {
+            // A time gone back behind the horizon: the entries behind it
+            // are taken out now, so that this one is not taken for theirs.
+            self.drain_recent(usize::MAX);
+            self.recent_horizon = Micros::ZERO;
+        }
         self.recent.insert(r, now);
         let d = &mut self.down;
         if d.recent.back().is_some_and(|(t, _)| *t > now) {
@@ -2614,34 +2639,31 @@ impl Budget {
         }
     }
 
-    /// The recent evictions past the thrash window go; past the cap, the
-    /// oldest. Returns the entries looked at.
+    /// The recent evictions past the thrash window go — the horizon moves to
+    /// its start, and [`Self::drain_recent`] takes their entries out — and
+    /// past the cap, the oldest. Returns the entries looked at.
     fn expire_recent(&mut self, now: Micros) -> u32 {
         let mut visited = 0u32;
+        let horizon = Micros(now.0.saturating_sub(THRASH_WINDOW.0));
         if self.down.recent_disordered || self.down.recent.len() < self.recent.len() {
             // Times that went back, or the queue dropped: walked whole, as
             // before O1.4, and the queue rebuilt.
             visited = sat_u32(self.recent.len());
-            self.recent.retain(|_, t| now.since(*t) <= THRASH_WINDOW);
+            self.recent.retain(|_, t| *t >= horizon);
             let q = &mut self.down.recent;
             q.clear();
             q.extend(self.recent.iter().map(|(r, t)| (*t, *r)));
             q.make_contiguous().sort_unstable();
             self.down.recent_disordered = false;
         }
-        while let Some(&(t, r)) = self.down.recent.front() {
-            if now.since(t) <= THRASH_WINDOW {
-                break;
-            }
-            visited += 1;
-            self.down.recent.pop_front();
-            if self.recent.get(&r) == Some(&t) {
-                self.recent.remove(&r);
-            }
+        self.recent_horizon = self.recent_horizon.max(horizon);
+        if self.recent.len() > RECENT_CAP {
+            // Those behind the horizon first, then, if still over, the
+            // oldest by (time, resource): one sort, not one scan per
+            // removal.
+            visited = visited.saturating_add(self.drain_recent(usize::MAX));
         }
         if self.recent.len() > RECENT_CAP {
-            // The oldest go, by (time, resource): one sort, not one scan
-            // per removal.
             visited = visited.saturating_add(sat_u32(self.recent.len()));
             let q = &mut self.down.recent;
             q.clear();
@@ -2653,6 +2675,26 @@ impl Budget {
             }
         }
         visited
+    }
+
+    /// Takes out of `recent` up to `most` entries behind the horizon, oldest
+    /// first. Returns the entries looked at.
+    pub(super) fn drain_recent(&mut self, most: usize) -> u32 {
+        let mut visited = 0usize;
+        while visited < most {
+            let Some(&(t, r)) = self.down.recent.front() else {
+                break;
+            };
+            if t >= self.recent_horizon {
+                break;
+            }
+            visited += 1;
+            self.down.recent.pop_front();
+            if self.recent.get(&r) == Some(&t) {
+                self.recent.remove(&r);
+            }
+        }
+        sat_u32(visited)
     }
 
     /// The tiles nothing references any more, nor any descendant, go.
@@ -3001,12 +3043,19 @@ impl Budget {
     fn check_wants(&self, tiles: &SortedMap<TileId, TileNeed>) {
         let meshes_in = self.meshes_in(tiles);
         let mut want = Vec::new();
+        let mut readers = Vec::new();
         let (mut drapes, mut put) = (Vec::new(), Vec::new());
         for (t, tn) in tiles.iter() {
             let item = self.down.drawn(ResourceId::Mesh(*t));
-            self.tile_wants(*t, tn, item, meshes_in, &mut drapes, &mut put);
+            if self.tile_wants(*t, tn, item, meshes_in, &mut drapes, &mut put) {
+                readers.push(*t);
+            }
             want.extend(put.iter().map(|(r, _, w)| (*r, *w)));
         }
+        assert_eq!(
+            self.down.pressure_readers, readers,
+            "the tiles kept as reading the pressure are those that do"
+        );
         want.sort_unstable_by_key(|e| ByTile(e.0));
         let kept: Vec<(ResourceId, Want)> =
             self.down.wants.iter().map(|(k, v)| (k.0, *v)).collect();
@@ -3061,7 +3110,7 @@ impl Budget {
                     "{r:?}, of the newest group but not needed, is to leave it"
                 );
             }
-            let active = self.active.contains(&s);
+            let active = self.arena.active().contains(&s);
             assert_eq!(
                 a.marked(s, Mark::Active),
                 active,
