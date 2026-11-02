@@ -2699,6 +2699,33 @@ impl Budget {
         out
     }
 
+    pub(super) fn release_source_impl(&mut self, tag: u8) -> super::Released {
+        // Whatever holds a copy outside transit and was not wanted last.
+        let a = &self.arena;
+        let mut slots: Vec<(ResourceId, Slot)> = a
+            .iter()
+            .filter(|&s| {
+                a.id(s).tile().tag() == tag
+                    && (a.has_gpu(s) || a.has_cpu(s))
+                    && !a.has_transit(s)
+                    && !a.marked(s, Mark::Wanted)
+            })
+            .map(|s| (a.id(s), s))
+            .collect();
+        // By resource: the order the consumer is told in.
+        slots.sort_unstable();
+        let mut out = super::Released::default();
+        for (r, s) in slots {
+            if self.arena.take_gpu(s, &mut self.ledger).is_some() {
+                out.gpu.push(r);
+            }
+            if self.arena.take_cpu(s, &mut self.ledger).is_some() {
+                out.decoded.push(r);
+            }
+        }
+        out
+    }
+
     pub(super) fn view(&self, r: ResourceId) -> Option<ResourceView> {
         let a = &self.arena;
         let s = a.find(r)?;

@@ -460,6 +460,27 @@ impl Budget {
         self.release_beyond_impl(target)
     }
 
+    /// Lets go of what the budget holds of source `tag` (a composite's
+    /// sources tag their tiles, [`TileId::tag`]) that the last step did not
+    /// want: both copies of each resource, whole, as
+    /// [`release_beyond`](Self::release_beyond) does. For a source that left
+    /// the scene, once its tiles have left the need: its GPU copies are the
+    /// consumer's to drop (announced as `Evict`) at once, rather than
+    /// waiting for the pool to need their room. Deterministic.
+    pub fn release_source(&mut self, tag: u8) -> Released {
+        self.release_source_impl(tag)
+    }
+
+    /// Whether the budget tracks any resource of source `tag`: a load in
+    /// flight, a copy, or a slot kept for its failures. A source's tag is
+    /// given to another only once none is left, so that no id of the old
+    /// source ever names a tile of the new one.
+    pub fn tracks_source(&self, tag: u8) -> bool {
+        self.arena
+            .iter()
+            .any(|s| self.arena.id(s).tile().tag() == tag)
+    }
+
     /// The traversal's residency: drawable (Interactive) or loaded (Batch).
     pub fn residency(&self) -> ResidencyView<'_> {
         ResidencyView { budget: self }
