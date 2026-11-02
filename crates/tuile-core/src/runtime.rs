@@ -36,12 +36,13 @@ use crate::budget::{
     NeedSet, Presence, PresenceOracle, ResourceId, StepRecord, TexelFootprint,
 };
 use crate::content::{DecodedTileContent, DrapeContent};
+use crate::cover::{Cover, Covered};
 use crate::fetch::TileFetcher;
 use crate::protocol::{
     in_process_pair, Ancestry, ClientMessage, InProcessStream, Priming, ResourceContent,
     ServerEndpoint, ServerMessage,
 };
-use crate::source::{LoadError, Loaded, TileId, TileLoader, TileTree};
+use crate::source::{Composite, LoadError, Loaded, TileId, TileLoader, TileTree};
 use crate::tiles3d::{TilesetLoader, TilesetTree};
 use crate::tileset::Tileset;
 use crate::traversal::{
@@ -407,6 +408,7 @@ pub fn in_process_with(
         GeometryServer {
             tree,
             loader,
+            composite: None,
             endpoint,
             spawn: Spawn::Inline,
             breather: None,
@@ -416,12 +418,39 @@ pub fn in_process_with(
     ))
 }
 
+/// Creates a geometry server over a **scene of several sources** — the globe
+/// and the 3D Tiles over it — that a host adds to and removes from while it
+/// runs ([`Composite`]): one traversal, one need, one budget for all of them.
+/// The session steps again whenever a source comes or goes; a source removed
+/// is let go of at the step after (its tiles have left the need: what the
+/// budget held of it is released, its GPU copies announced as
+/// [`ServerMessage::Evict`]), and its tag released to the composite once the
+/// budget tracks nothing of it.
+pub fn in_process_composite(
+    composite: Composite,
+    config: Config,
+    budget: BudgetConfig,
+) -> Result<(InProcessStream, GeometryServer), ConfigError> {
+    let (stream, mut server) = in_process_with(
+        Box::new(composite.tree()),
+        Arc::new(composite.loader()),
+        config,
+        budget,
+    )?;
+    server.composite = Some(composite);
+    Ok((stream, server))
+}
+
 /// One streaming session: owns the tile tree, the loader, the budget and the
 /// in-flight state for one consumer. N sessions = N servers sharing nothing
 /// mutable.
 pub struct GeometryServer {
     tree: Box<dyn TileTree>,
     loader: Arc<dyn TileLoader>,
+    /// The scene, when the tree and the loader are a [`Composite`]'s: what
+    /// tells the session its sources changed, and takes back the tags of
+    /// those removed.
+    composite: Option<Composite>,
     endpoint: ServerEndpoint,
     /// Where the loads run. See [`Spawn`].
     spawn: Spawn,
@@ -453,6 +482,8 @@ impl Drop for Gone {
             &m.gaps,
             &m.resident_bytes,
             &m.imagery_bytes,
+            &m.tiles3d_selected,
+            &m.tiles3d_bytes,
             &m.loads_in_flight,
             &m.priming_total,
             &m.priming_pending,
@@ -523,6 +554,7 @@ impl GeometryServer {
         let GeometryServer {
             tree,
             loader,
+            composite,
             endpoint,
             spawn,
             breather,
@@ -543,11 +575,16 @@ impl GeometryServer {
             tree: tree.as_ref(),
             loader: &loader,
             clock: &clock,
+            composite: composite.as_ref(),
         };
+        // A source coming or going is a reason to step: what the views see
+        // changed.
+        let mut scene = composite.as_ref().map(Composite::changes);
 
         enum Event {
             Load(Result<Arrival, Aborted>),
             Client(ClientMessage),
+            Scene,
             Closed,
         }
 
@@ -579,6 +616,11 @@ impl GeometryServer {
             // host its turn already.
             let mut waited = false;
             let event = poll_fn(|cx| {
+                if let Some(changes) = scene.as_mut() {
+                    if let Poll::Ready(Some(())) = Pin::new(changes).poll_next(cx) {
+                        return Poll::Ready(Event::Scene);
+                    }
+                }
                 let mut poll_client =
                     |cx: &mut std::task::Context<'_>| match Pin::new(&mut rx).poll_next(cx) {
                         Poll::Ready(Some(msg)) => Poll::Ready(Some(Event::Client(msg))),
@@ -650,6 +692,16 @@ impl GeometryServer {
                 }
                 // Cancelled load: the budget cancelled it, and forgot it then.
                 Event::Load(Err(Aborted)) => None,
+                Event::Scene => {
+                    // Every change told meanwhile is answered by this step.
+                    if let Some(changes) = scene.as_mut() {
+                        while let Ok(()) = changes.try_recv() {}
+                    }
+                    state
+                        .step(&host, &tx, &mut loads)
+                        .err()
+                        .map(|stop| stop.why("answering a change of the scene"))
+                }
                 Event::Closed => Some("the client hung up".to_string()),
             };
             if let Some(why) = ended {
@@ -745,12 +797,17 @@ struct Host<'a> {
     tree: &'a dyn TileTree,
     loader: &'a Arc<dyn TileLoader>,
     clock: &'a Clock,
+    /// The scene the tree and the loader are of, if they are a composite's.
+    composite: Option<&'a Composite>,
 }
 
 /// A load in flight: its generation, and how to stop it.
 struct Flight {
     gen: Generation,
     handle: AbortHandle,
+    /// Its tile is ground (`Class::is_ground`): a 3D Tiles mesh drapes
+    /// nothing, so its slopes are not measured.
+    ground: bool,
 }
 
 /// The loader's presence index, as the budget's oracle, with every answer
@@ -930,6 +987,9 @@ struct State {
     ahead_moved: bool,
     /// What the last step drew, for the traversal's hold logic.
     rendered_last: HashSet<TileId>,
+    /// Where what the last step drew covers the ground (`crate::cover`):
+    /// the ground there is refined coarser this step.
+    cover: Cover,
     /// What the last pass under the previous views chose at its own level:
     /// the refine hysteresis's memory (`Config::refine_hysteresis`). Moved on
     /// only when the camera moves, so every pass of one frame refines against
@@ -982,6 +1042,7 @@ impl State {
             ahead_near: NearestContent::default(),
             ahead_moved: false,
             rendered_last: HashSet::new(),
+            cover: Cover::default(),
             chosen_before: HashSet::new(),
             near: NearestContent::default(),
             sse_scale_milli: 1_000,
@@ -1071,19 +1132,25 @@ impl State {
         let m = crate::metrics::metrics();
         // Only the load the budget is waiting for: a result that lands after
         // its load was cancelled is not this generation's any more.
-        match self.in_flight.get(&r) {
+        let ground = match self.in_flight.get(&r) {
             Some(f) if f.gen == gen => {
+                let ground = f.ground;
                 self.in_flight.remove(&r);
+                ground
             }
             _ => return,
-        }
+        };
         m.loads_in_flight.set(self.in_flight.len() as u64);
         match result {
             Ok(fetched) => {
                 let (content, cost) = match fetched {
                     Fetched::Mesh(Loaded::Content(c)) => {
-                        if let (ResourceId::Mesh(tile), Some(cos)) = (r, steepest_ground(&c)) {
-                            self.steepest.insert(tile, cos);
+                        // The ground's slopes ease its imagery's need; a 3D
+                        // Tiles mesh carries its own photographs.
+                        if let (ResourceId::Mesh(tile), true) = (r, ground) {
+                            if let Some(cos) = steepest_ground(&c) {
+                                self.steepest.insert(tile, cos);
+                            }
                         }
                         let cost = c.cost();
                         (ResourceContent::Mesh(Arc::new(c)), cost)
@@ -1148,7 +1215,13 @@ impl State {
             self.floor_revision = Some(revision);
             self.floor.clear();
             if let Some(pinned) = self.budget.config().pinned_level {
-                let mut frontier = tree.roots();
+                // The floor is the ground's: a tileset beside the globe has
+                // none (`Class::is_ground`).
+                let mut frontier: Vec<TileId> = tree
+                    .roots()
+                    .into_iter()
+                    .filter(|r| tree.mesh_class(*r).is_ground())
+                    .collect();
                 for _ in 0..=pinned {
                     let mut next = Vec::new();
                     for tile in frontier {
@@ -1352,7 +1425,19 @@ impl State {
             &crate::metrics::metrics().load_wake_wait_seconds,
         ));
         loads.push(Abortable::new(fut, registration), &handle);
-        self.in_flight.insert(r, Flight { gen, handle });
+        let class = host.tree.mesh_class(r.tile());
+        let ground = class.is_ground();
+        if class == Class::Tiles3dMesh && matches!(r, ResourceId::Mesh(_)) {
+            crate::metrics::metrics().tiles3d_loads_started.inc();
+        }
+        self.in_flight.insert(
+            r,
+            Flight {
+                gen,
+                handle,
+                ground,
+            },
+        );
         let m = crate::metrics::metrics();
         m.loads_started.inc();
         m.loads_by_level.inc(host.tree.level(r.tile()));
@@ -1367,7 +1452,7 @@ impl State {
         let mut total = 0u32;
         let mut outstanding = 0u32;
         for (_, t, n) in need.entries() {
-            if !pinned.is_some_and(|p| n.level <= p) {
+            if !n.class.is_ground() || !pinned.is_some_and(|p| n.level <= p) {
                 continue;
             }
             let mut resources = vec![ResourceId::Mesh(t)];
@@ -1417,6 +1502,27 @@ impl State {
                 message,
             });
         }
+        // The ground under what covered it at the last step is refined
+        // coarser this step (`crate::cover`): the traversal and the need
+        // read the tree through the cover.
+        let cover = std::mem::take(&mut self.cover);
+        let covered = Covered {
+            tree: host.tree,
+            loader: host.loader.as_ref(),
+            cover: &cover,
+        };
+        let view = Host {
+            tree: if cover.is_empty() {
+                host.tree
+            } else {
+                &covered
+            },
+            loader: host.loader,
+            clock: host.clock,
+            composite: host.composite,
+        };
+        let host = &view;
+        let tree = host.tree;
         self.frame += 1;
         self.steps += 1;
         // A change of what the loader drapes (a switch of imagery) refreshes
@@ -1561,13 +1667,25 @@ impl State {
                 .0,
         );
         m.imagery_bytes.set(ledger.gpu[Class::Drape].0);
+        m.tiles3d_bytes.set(ledger.gpu[Class::Tiles3dMesh].0);
+        m.tiles3d_selected.set(
+            d.draw
+                .items
+                .iter()
+                .filter(|i| tree.mesh_class(i.mesh.tile()) == Class::Tiles3dMesh)
+                .count() as u64,
+        );
 
         let result = self.execute(host, &d, tx, loads);
 
-        // What was drawn, for the next pass's hold logic.
+        // What was drawn, for the next pass's hold logic, and where it
+        // covers the ground.
         self.rendered_last.clear();
         self.rendered_last
             .extend(d.draw.items.iter().map(|i| i.mesh.tile()));
+        self.cover = Cover::of(tree, d.draw.items.iter().map(|i| i.mesh.tile()));
+        // The sources removed from the scene: let go of.
+        self.retire(host, tx)?;
 
         // The record, for every sink at once.
         let events = std::mem::take(&mut self.events);
@@ -1625,6 +1743,39 @@ impl State {
                 .map_err(|_| Stop::Gone)?;
         }
         result
+    }
+
+    /// Lets go of the sources removed from the scene, once their tiles have
+    /// left the need: what the budget holds of each is released (its GPU
+    /// copies announced as evictions, its decoded copies dropped), and its
+    /// tag is given back to the composite once nothing of it is tracked or
+    /// in flight — until then an id under it could name the old source's
+    /// tile.
+    fn retire(&mut self, host: &Host<'_>, tx: &UnboundedSender<ServerMessage>) -> Result<(), Stop> {
+        let Some(composite) = host.composite else {
+            return Ok(());
+        };
+        for tag in composite.retired() {
+            let released = self.budget.release_source(tag);
+            for r in &released.decoded {
+                self.decoded.remove(r);
+            }
+            self.steepest.retain(|t, _| t.tag() != tag);
+            if !released.gpu.is_empty() {
+                crate::metrics::metrics()
+                    .tiles_evicted
+                    .add(released.gpu.len() as u64);
+                tx.unbounded_send(ServerMessage::Evict {
+                    resources: released.gpu,
+                })
+                .map_err(|_| Stop::Gone)?;
+            }
+            let flying = self.in_flight.keys().any(|r| r.tile().tag() == tag);
+            if !flying && !self.budget.tracks_source(tag) {
+                composite.release(tag);
+            }
+        }
+        Ok(())
     }
 
     /// Executes one step's decisions, in their order: cancels, deliveries,
@@ -2809,6 +2960,349 @@ mod tests {
         (stream, server, epoch, meshes, drapes)
     }
 
+    /// A tileset's tree read as ground: its meshes of the terrain class, as
+    /// a globe's are (the test's ground).
+    struct AsGround(TilesetTree);
+
+    impl TileTree for AsGround {
+        fn roots(&self) -> Vec<TileId> {
+            self.0.roots()
+        }
+        fn children(&self, id: TileId) -> Vec<TileId> {
+            self.0.children(id)
+        }
+        fn properties(&self, id: TileId) -> crate::source::TileProperties {
+            self.0.properties(id)
+        }
+        fn parent(&self, id: TileId) -> Option<TileId> {
+            self.0.parent(id)
+        }
+        fn level(&self, id: TileId) -> u32 {
+            self.0.level(id)
+        }
+    }
+
+    /// **A 3D Tiles mesh's slopes are not measured**: they ease the ground's
+    /// imagery need, and a tileset's mesh carries its own photographs. A
+    /// ground mesh that lands has its steepest face kept; a 3D Tiles mesh
+    /// has none. Red with every mesh measured: the tileset's tile kept.
+    #[test]
+    fn only_the_grounds_slopes_are_measured() {
+        use crate::content::{DecodedMesh, DecodedTileContent};
+        let content = || DecodedTileContent {
+            meshes: vec![DecodedMesh {
+                positions: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
+                normals: None,
+                uvs: None,
+                indices: vec![0, 1, 2],
+                material: Default::default(),
+            }],
+            textures: Vec::new(),
+            imagery: Vec::new(),
+            withheld_drape: None,
+            copyright: None,
+            local_origin_ecef: glam::DVec3::new(0.0, 0.0, 6_371_000.0),
+            transform_local: glam::Mat4::IDENTITY,
+        };
+        let budget = roomy();
+        let meter: SharedMeter = Arc::new(Mutex::new(BudgetMeter::new(&budget)));
+        let mut state = State::new(
+            Config::default(),
+            Budget::new(budget).expect("budget"),
+            meter,
+        );
+        let (tx, _rx) = futures_channel::mpsc::unbounded();
+        let (ground, surface) = (TileId(3), TileId(4).with_tag(1));
+        for (tile, is_ground) in [(ground, true), (surface, false)] {
+            let r = ResourceId::Mesh(tile);
+            let (handle, _) = AbortHandle::new_pair();
+            state.in_flight.insert(
+                r,
+                Flight {
+                    gen: Generation(1),
+                    handle,
+                    ground: is_ground,
+                },
+            );
+            state.on_load_done(
+                (
+                    r,
+                    Generation(1),
+                    Ok(Fetched::Mesh(Loaded::Content(content()))),
+                ),
+                &tx,
+            );
+        }
+        assert!(state.steepest.contains_key(&ground), "the ground's slope");
+        assert!(
+            !state.steepest.contains_key(&surface),
+            "a 3D Tiles mesh's slopes measured"
+        );
+    }
+
+    /// The scene of the tests below: draped ground under tag 0, and the
+    /// handle to add a tileset beside it.
+    fn grounded_scene(dir: &std::path::Path) -> Composite {
+        let tileset = deep_tileset(dir);
+        let arena = Arc::new(RwLock::new(tileset));
+        let scene = Composite::new();
+        scene
+            .add_at(
+                0,
+                Box::new(AsGround(TilesetTree::new(Arc::clone(&arena)))),
+                Arc::new(Draped {
+                    inner: TilesetLoader::new(Arc::clone(&arena), Arc::new(FsFetcher)),
+                    arena,
+                    epoch: Arc::new(AtomicU64::new(1)),
+                    meshes: Arc::new(AtomicUsize::new(0)),
+                    drapes: Arc::new(Mutex::new(Vec::new())),
+                }),
+                crate::source::SourceOptions::default(),
+            )
+            .expect("the ground's tag");
+        scene
+    }
+
+    /// A tileset from the fixture in `dir`, as a source.
+    fn tileset_source(dir: &std::path::Path) -> (Box<dyn TileTree>, Arc<dyn TileLoader>) {
+        let url = write_fixture(dir);
+        let bytes = std::fs::read(url.to_file_path().expect("a path")).expect("the fixture");
+        let arena = Arc::new(RwLock::new(
+            Tileset::from_json_bytes(&bytes, &url).expect("tileset"),
+        ));
+        (
+            Box::new(TilesetTree::new(Arc::clone(&arena))),
+            Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher))),
+        )
+    }
+
+    /// **A scene takes a tileset while it runs, and lets it go again**: a
+    /// source added is loaded and drawn with no word from the consumer (the
+    /// session steps when the scene changes); removed, everything the
+    /// consumer held of it is evicted, nothing of it is drawn, and its tag is
+    /// given back once nothing of it is left. Red with the scene's changes
+    /// unheard: nothing of the tileset arrives; red with the removed source
+    /// not let go of: none of it evicted, its tag retired for ever.
+    #[test]
+    fn a_scene_takes_a_tileset_while_it_runs_and_lets_it_go_again() {
+        let (ground_dir, tileset_dir) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let scene = grounded_scene(ground_dir.path());
+        let (mut stream, server) =
+            in_process_composite(scene.clone(), Config::default(), roomy()).expect("budget");
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        let of = |tag: u8, rs: &[ResourceId]| rs.iter().filter(|r| r.tile().tag() == tag).count();
+        assert!(of(0, &consumer.contents) > 0, "the ground arrived");
+        // The tileset joins; the consumer says nothing.
+        let (tree, loader) = tileset_source(tileset_dir.path());
+        let tag = scene
+            .add(
+                tree,
+                loader,
+                crate::source::SourceOptions {
+                    covers_ground: true,
+                    ..crate::source::SourceOptions::default()
+                },
+            )
+            .expect("a tag");
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        assert!(
+            of(tag, &consumer.contents) > 0,
+            "nothing of the tileset arrived: the session did not hear the scene change"
+        );
+        assert!(
+            consumer
+                .draw
+                .items
+                .iter()
+                .any(|i| i.mesh.tile().tag() == tag),
+            "the tileset is drawn"
+        );
+        let held: Vec<ResourceId> = consumer
+            .held
+            .keys()
+            .filter(|r| r.tile().tag() == tag)
+            .copied()
+            .collect();
+        assert!(!held.is_empty());
+        // It goes.
+        assert!(scene.remove(tag));
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        assert!(
+            consumer
+                .draw
+                .items
+                .iter()
+                .all(|i| i.mesh.tile().tag() != tag),
+            "the tileset is still drawn"
+        );
+        for r in &held {
+            assert!(
+                consumer.evicted.contains(r),
+                "{r:?} of the removed tileset not evicted"
+            );
+        }
+        // Its tag comes back once the budget has pruned what is left of it
+        // (empty slots go at the eighth step): a few steps of a moving view.
+        for i in 0..12u64 {
+            look(
+                &stream,
+                if i % 2 == 0 { far_view() } else { near_view() },
+                2 + i,
+            );
+            assert!(settle(&mut server, &mut stream, &mut consumer));
+        }
+        assert!(
+            scene.retired().is_empty(),
+            "the removed tileset's tag is still retired: {:?}",
+            scene.retired()
+        );
+        assert!(
+            consumer.draw.items.iter().any(|i| i.mesh.tile().tag() == 0),
+            "the ground is drawn"
+        );
+        assert!(consumer.errors.is_empty(), "{:?}", consumer.errors);
+    }
+
+    /// **In a session, the ground under a covering source drawn is refined
+    /// coarser** (`crate::cover`): a surface a hundred kilometres wide over
+    /// the ground's footprint, drawn, and the ground under it stops at its
+    /// middle tiles where alone it draws its leaves — kept as the fallback,
+    /// not dropped. Red with the cover never read (the session's cover left
+    /// empty): the leaves drawn under the surface.
+    #[test]
+    fn the_ground_under_a_covering_source_is_refined_coarser() {
+        let drawn_ground = |covers_ground: bool| {
+            let (ground_dir, surface_dir) = (
+                tempfile::tempdir().expect("tempdir"),
+                tempfile::tempdir().expect("tempdir"),
+            );
+            let scene = grounded_scene(ground_dir.path());
+            let glb = crate::content::tests::test_glb();
+            std::fs::write(surface_dir.path().join("root.glb"), &glb).expect("glb");
+            // Over the equator at the prime meridian, where the ground's
+            // footprints are (`Draped::rect`), 200 km round.
+            let json = r#"{
+              "asset": { "version": "1.1" },
+              "geometricError": 0,
+              "root": {
+                "boundingVolume": { "sphere": [6378137, 0, 0, 200000] },
+                "geometricError": 0, "content": { "uri": "root.glb" }
+              }
+            }"#;
+            let path = surface_dir.path().join("tileset.json");
+            std::fs::write(&path, json).expect("tileset");
+            let url = Url::from_file_path(&path).expect("url");
+            let arena = Arc::new(RwLock::new(
+                Tileset::from_json_bytes(json.as_bytes(), &url).expect("tileset"),
+            ));
+            scene
+                .add(
+                    Box::new(TilesetTree::new(Arc::clone(&arena))),
+                    Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher))),
+                    crate::source::SourceOptions {
+                        covers_ground,
+                        ..crate::source::SourceOptions::default()
+                    },
+                )
+                .expect("a tag");
+            // Everything traversed: the surface is far from the ground's
+            // fixture in space, but drawn.
+            let config = Config {
+                cull: false,
+                ..Config::default()
+            };
+            let (mut stream, server) =
+                in_process_composite(scene, config, roomy()).expect("budget");
+            let mut server = Box::pin(server.run());
+            let mut consumer = Consumer::default();
+            // From where the ground's middle tiles are between the error and
+            // eight times it: refined alone, not under the cover.
+            let view = ViewState::perspective(
+                dvec3(0.0, 0.0, 450.0),
+                dvec3(0.0, 0.0, -1.0),
+                dvec3(0.0, 1.0, 0.0),
+                dvec2(1024.0, 768.0),
+                std::f64::consts::FRAC_PI_3,
+            );
+            for i in 0..4 {
+                look(&stream, view, 1 + i);
+                assert!(settle(&mut server, &mut stream, &mut consumer));
+            }
+            assert!(consumer.errors.is_empty(), "{:?}", consumer.errors);
+            assert!(
+                consumer.draw.items.iter().any(|i| i.mesh.tile().tag() == 1),
+                "the surface is drawn"
+            );
+            let mut ground: Vec<usize> = consumer
+                .draw
+                .items
+                .iter()
+                .filter(|i| i.mesh.tile().tag() == 0 && i.role == Role::Exact)
+                .map(|i| i.mesh.tile().index())
+                .collect();
+            ground.sort_unstable();
+            ground
+        };
+        let alone = drawn_ground(false);
+        let covered = drawn_ground(true);
+        assert!(
+            covered.len() < alone.len(),
+            "the ground under the surface refined as finely as alone: {covered:?} against {alone:?}"
+        );
+    }
+
+    /// **The floor is the ground's in the session too**: the floor walk
+    /// starts from the ground's roots alone, so a tileset beside the globe
+    /// lists no floor tile. Red with every root walked: the tileset's root
+    /// listed.
+    #[test]
+    fn the_floor_walk_starts_from_the_grounds_roots() {
+        let (ground_dir, tileset_dir) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let scene = grounded_scene(ground_dir.path());
+        let (tree, loader) = tileset_source(tileset_dir.path());
+        let tag = scene
+            .add(tree, loader, crate::source::SourceOptions::default())
+            .expect("a tag");
+        let mut budget = roomy();
+        budget.pinned_level = Some(1);
+        let meter: SharedMeter = Arc::new(Mutex::new(BudgetMeter::new(&budget)));
+        let mut state = State::new(
+            Config::default(),
+            Budget::new(budget).expect("budget"),
+            meter,
+        );
+        let composite = scene.tree();
+        let floor = state.floor(&composite).to_vec();
+        assert!(!floor.is_empty(), "the ground has a floor");
+        assert!(
+            floor.iter().all(|t| t.tag() != tag),
+            "the tileset's tiles listed in the floor: {floor:?}"
+        );
+        // Nor is it of the floor a host waits on before its first frame.
+        let surface = TileId(0).with_tag(tag);
+        let need = NeedSet {
+            drawn: vec![
+                (floor[0], Need::new(0, Class::TerrainMesh)),
+                (surface, Need::new(0, Class::Tiles3dMesh)),
+            ],
+            ..NeedSet::default()
+        };
+        assert_eq!(
+            state.priming(&need).total,
+            1,
+            "the tileset's tile counted in the floor's priming"
+        );
+    }
+
     /// **The need prices a tile against its source's threshold**, as the
     /// traversal refines against it: the same tile under a source at four
     /// times the error is wanted two binary orders less urgently. Red with
@@ -2856,6 +3350,7 @@ mod tests {
             tree: &tree,
             loader: &loader,
             clock: &clock,
+            composite: None,
         };
         let views = [ViewState::perspective(
             glam::dvec3(0.0, 0.0, 400.0),
