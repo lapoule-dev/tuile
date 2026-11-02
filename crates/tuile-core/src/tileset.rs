@@ -421,9 +421,8 @@ fn build_tile(
     let content = match &json.content {
         Some(c) => match c.uri() {
             Some(uri) => {
-                let url = base_url
-                    .join(uri)
-                    .map_err(|source| TilesetError::InvalidUri {
+                let url =
+                    resolve_uri(base_url, uri).map_err(|source| TilesetError::InvalidUri {
                         uri: uri.to_owned(),
                         source,
                     })?;
@@ -469,6 +468,33 @@ fn build_tile(
         tiles[id.0 as usize].children = ids;
     }
     Ok(id)
+}
+
+/// `uri` resolved against `base`, carrying the base's query parameters that
+/// `uri` does not set itself.
+///
+/// The specification is silent on query strings; the reference
+/// implementations both carry the parent's forward, and services rely on it:
+/// a key given once on the root URL, or a session given once on the root's
+/// content URIs, must reach every request beneath. A parameter the URI sets
+/// is its own and is kept. Its own come first, then the inherited ones, in
+/// the base's order.
+fn resolve_uri(base: &Url, uri: &str) -> Result<Url, url::ParseError> {
+    let mut url = base.join(uri)?;
+    if base.query().is_none_or(str::is_empty) {
+        return Ok(url);
+    }
+    let own: std::collections::HashSet<String> =
+        url.query_pairs().map(|(k, _)| k.into_owned()).collect();
+    let inherited: Vec<(String, String)> = base
+        .query_pairs()
+        .filter(|(k, _)| !own.contains(k.as_ref()))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    if !inherited.is_empty() {
+        url.query_pairs_mut().extend_pairs(inherited);
+    }
+    Ok(url)
 }
 
 /// Largest axis scale factor of an affine transform (1.0 for rigid motions).
@@ -662,6 +688,63 @@ mod tests {
         let forwards = grafted([0, 1]);
         assert_eq!(forwards.iter().map(Vec::len).sum::<usize>(), 2);
         assert_eq!(forwards, grafted([1, 0]), "the same ids either way");
+    }
+
+    /// A service that hands out its tileset under a key, and its subtrees
+    /// under a session, names each once: the key on the root's own URL, the
+    /// session on the root's content URIs. Every request below must carry
+    /// both, so a URI resolved against a base inherits the base's query
+    /// parameters it does not set itself — through an external tileset too.
+    /// The parameter a URI does set is its own.
+    #[test]
+    fn content_uris_inherit_the_query_of_the_url_they_resolve_against() {
+        let root = r#"{
+          "asset": { "version": "1.0" },
+          "geometricError": 100,
+          "root": {
+            "boundingVolume": { "sphere": [0,0,0, 10] },
+            "geometricError": 50,
+            "content": { "uri": "/v1/files/sub.json?session=S1" },
+            "children": [
+              { "boundingVolume": { "sphere": [0,0,0, 1] }, "geometricError": 0,
+                "content": { "uri": "near.glb?key=OWN" } }
+            ]
+          }
+        }"#;
+        let base = Url::parse("https://tiles.test/v1/root.json?key=K").expect("url");
+        let mut ts = Tileset::from_json_bytes(root.as_bytes(), &base).expect("parse");
+        let root_id = ts.root();
+        let sub = ts.tile(root_id).content.clone().expect("content");
+        assert_eq!(
+            sub.url.as_str(),
+            "https://tiles.test/v1/files/sub.json?session=S1&key=K"
+        );
+        assert_eq!(sub.kind, ContentKind::ExternalTileset);
+        let child = ts.tile(ts.tile(root_id).children[0]).content.clone();
+        assert_eq!(
+            child.expect("content").url.as_str(),
+            "https://tiles.test/v1/near.glb?key=OWN",
+            "a parameter the URI sets is not overridden"
+        );
+
+        let external: TilesetJson = serde_json::from_str(
+            r#"{ "asset": { "version": "1.0" }, "geometricError": 4,
+                 "root": { "boundingVolume": { "sphere": [0,0,0, 2] },
+                           "geometricError": 1,
+                           "content": { "uri": "/v1/files/leaf.glb" } } }"#,
+        )
+        .expect("external json");
+        let grafted = ts.graft(root_id, external, &sub.url).expect("graft");
+        assert_eq!(
+            ts.tile(grafted)
+                .content
+                .as_ref()
+                .expect("content")
+                .url
+                .as_str(),
+            "https://tiles.test/v1/files/leaf.glb?session=S1&key=K",
+            "the session and the key reach the grafted subtree"
+        );
     }
 
     #[test]

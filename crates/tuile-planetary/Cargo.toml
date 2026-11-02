@@ -25,6 +25,8 @@ tracing = { workspace = true }
 web-time = { workspace = true }
 tuile-core = { version = "0.15.1", path = "../tuile-core" }
 tuile-terrain = { version = "0.15.1", path = "../tuile-terrain" }
+# A tileset's root, in `TilesetSource`.
+url = { workspace = true }
 
 [dev-dependencies]
 image = { workspace = true }

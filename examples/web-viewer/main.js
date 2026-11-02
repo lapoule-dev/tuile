@@ -13,6 +13,10 @@
 //
 // `?compression=auto` (or `bc7`, `astc`; `off` by default) holds the imagery
 // block-compressed: see the package's `imageryCompression`.
+//
+// The photorealistic 3D Tiles (catalog asset 2275207) are offered in the
+// menu, off until turned on; `?tileset=on` turns them on from the start, as
+// the desktop's `--tileset 2275207` does.
 
 import { createViewer, UnsupportedError } from "../../packages/tuile-viewer/index.js";
 
@@ -73,6 +77,9 @@ try {
     timeOffset,
     timeRate,
     view: view(),
+    tilesets: addressed()
+      ? []
+      : [{ asset: 2275207, name: "Photorealistic 3D Tiles", on: params.get("tileset") === "on" }],
     sources: addressed() ?? {
       catalog: { url: "/catalog/" },
       terrain: { asset: 1 },

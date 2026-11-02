@@ -51,9 +51,52 @@ pub(crate) struct Started {
     pub gate: Gate,
     /// The runtime the store is flushed on.
     pub runtime: tokio::runtime::Handle,
+    /// The 3D Tiles drawn over the globe, until the window takes them.
+    pub surfaces: Vec<crate::surface::Surface>,
+    /// Why a tileset asked for is not among them: its asset, and a sentence.
+    pub surface_failures: Vec<(i64, String)>,
+    /// Their servers' threads, joined on the way out — those opened later
+    /// too ([`Started::open_tileset`]).
+    pub surface_servers: Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    /// What a tileset switched on later is opened with: the host's sources,
+    /// and the launch's plan for its traversal and budget.
+    pub sources: Arc<dyn crate::embed::Sources>,
+    pub plan: Plan,
 }
 
 impl Started {
+    /// The 3D Tiles drawn over the globe, and why any asked for is not, for
+    /// the window to take once.
+    pub(crate) fn take_surfaces(&mut self) -> (Vec<crate::surface::Surface>, Vec<(i64, String)>) {
+        (
+            std::mem::take(&mut self.surfaces),
+            std::mem::take(&mut self.surface_failures),
+        )
+    }
+
+    /// Opens the host's tileset `asset` again, after the session is up — a
+    /// person switched it back on. Its server runs as the launch's do; the
+    /// answer arrives on the receiver.
+    pub(crate) fn open_tileset(&self, asset: i64) -> crate::surface::Opening {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sources = Arc::clone(&self.sources);
+        let plan = self.plan.clone();
+        let runtime = self.runtime.clone();
+        let servers = Arc::clone(&self.surface_servers);
+        self.runtime.spawn(async move {
+            let opened = open_surface(sources.as_ref(), asset, &plan, &runtime)
+                .await
+                .map(|(surface, server)| {
+                    if let Ok(mut servers) = servers.lock() {
+                        servers.push(server);
+                    }
+                    surface
+                });
+            let _ = tx.send(opened);
+        });
+        rx
+    }
+
     /// How the loader holds imagery, for the window to tell it the device's
     /// plan.
     pub(crate) fn imagery_plan(&self) -> Option<&tuile_planetary::ImageryPlanHandle> {
@@ -79,14 +122,28 @@ impl Started {
             server,
             store,
             runtime,
+            surfaces,
+            surface_servers,
             ..
         } = self;
         drop(stream);
+        // A tileset's server ends when its stream does; the window has
+        // dropped the ones it took.
+        drop(surfaces);
         crate::native::store::close(store, &runtime, patience);
         if join_the_server {
             if let Some(server) = server {
                 if server.join().is_err() {
                     tracing::error!("the geometry server panicked; its last work is lost");
+                }
+            }
+            let servers = surface_servers
+                .lock()
+                .map(|mut servers| std::mem::take(&mut *servers))
+                .unwrap_or_default();
+            for server in servers {
+                if server.join().is_err() {
+                    tracing::error!("a tileset's geometry server panicked");
                 }
             }
         }
@@ -176,6 +233,9 @@ pub(crate) struct Plan {
     /// What the same choice does with imagery stored already compressed:
     /// fixed for the session, as the globe is built with it.
     pub stored_imagery: tuile_core::texels::StoredPlan,
+    /// The host's 3D Tiles tilesets drawn over the globe, by asset number:
+    /// see [`crate::surface`].
+    pub tilesets: Vec<i64>,
 }
 
 /// Starts the launch on `runtime` and returns at once.
@@ -220,7 +280,7 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         plan.profile.decode_threads,
     ));
     let globe = crate::globe::assemble(
-        sources,
+        Arc::clone(&sources),
         store.clone().map(|s| s as Arc<dyn ContentStore>),
         &plan.terrain,
         plan.layers,
@@ -238,9 +298,13 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         inner: globe.loader,
         gate: gate.clone(),
     });
-    let (stream, server) =
-        tuile_core::runtime::in_process_with(globe.tree, loader, plan.config, plan.budget)
-            .map_err(|e| format!("the graphics budget cannot run: {e}"))?;
+    let (stream, server) = tuile_core::runtime::in_process_with(
+        globe.tree,
+        loader,
+        plan.config.clone(),
+        plan.budget.clone(),
+    )
+    .map_err(|e| format!("the graphics budget cannot run: {e}"))?;
     let meter = server.meter();
     // Every load a task on the runtime's workers, so tiles keep arriving
     // while the server traverses.
@@ -252,6 +316,24 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         .name("geometry-server".into())
         .spawn(move || server_runtime.block_on(server.run()))
         .map_err(|e| format!("the geometry server could not start: {e}"))?;
+    // The 3D Tiles over it. One that cannot be opened is said and left out:
+    // the globe stands without it.
+    let mut surfaces = Vec::new();
+    let mut surface_failures = Vec::new();
+    let mut surface_servers = Vec::new();
+    for &asset in &plan.tilesets {
+        match open_surface(sources.as_ref(), asset, &plan, &runtime).await {
+            Ok((surface, server)) => {
+                tracing::info!(asset, "3D Tiles tileset up");
+                surfaces.push(surface);
+                surface_servers.push(server);
+            }
+            Err(why) => {
+                tracing::error!(asset, "3D Tiles tileset not opened: {why}");
+                surface_failures.push((asset, format!("3D Tiles asset {asset}: {why}")));
+            }
+        }
+    }
     Ok(Started {
         stream,
         server: Some(server),
@@ -267,7 +349,55 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         store,
         gate,
         runtime,
+        surfaces,
+        surface_failures,
+        surface_servers: Arc::new(std::sync::Mutex::new(surface_servers)),
+        sources,
+        plan,
     })
+}
+
+/// Opens one of the host's 3D Tiles tilesets: its root and a geometry server
+/// of its own on a thread of its own, its loads tasks on the runtime as the
+/// globe's are.
+async fn open_surface(
+    sources: &dyn crate::embed::Sources,
+    asset: i64,
+    plan: &Plan,
+    runtime: &tokio::runtime::Handle,
+) -> Result<(crate::surface::Surface, std::thread::JoinHandle<()>), String> {
+    let source = sources.tileset(asset).await?;
+    let root = source
+        .fetcher
+        .fetch(&source.url)
+        .await
+        .map_err(|e| format!("its root: {e}"))?;
+    let tileset = tuile_core::tileset::Tileset::from_json_bytes(&root, &source.url)
+        .map_err(|e| format!("its root: {e}"))?;
+    let fetcher = Arc::new(tuile_planetary::Held(Arc::clone(&source.fetcher)));
+    let (stream, server) = tuile_core::runtime::in_process(
+        tileset,
+        fetcher,
+        crate::surface::traversal(&plan.config),
+        crate::surface::budget(&plan.budget),
+    )
+    .map_err(|e| format!("the graphics budget cannot run: {e}"))?;
+    let meter = server.meter();
+    let server = server.with_spawn(tuile_core::runtime::Spawn::Tokio(runtime.clone()));
+    let server_runtime = runtime.clone();
+    let server = std::thread::Builder::new()
+        .name(format!("tileset-{asset}"))
+        .spawn(move || server_runtime.block_on(server.run()))
+        .map_err(|e| format!("its geometry server could not start: {e}"))?;
+    Ok((
+        crate::surface::Surface {
+            asset,
+            stream,
+            meter: Some(meter),
+            credits: source.credits,
+        },
+        server,
+    ))
 }
 
 #[cfg(test)]
@@ -332,6 +462,7 @@ mod tests {
             timeout: crate::launch::START_TIMEOUT,
             imagery_plan: tuile_core::texels::ImageryPlan::RGBA8,
             stored_imagery: tuile_core::texels::StoredPlan::OFF,
+            tilesets: Vec::new(),
         }
     }
 

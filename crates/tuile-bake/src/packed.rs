@@ -216,6 +216,7 @@ impl Packed {
                 // Index 0 of the tile's own textures, which is where the ABI
                 // looks and what makes a terrain tile report a texture at all.
                 base_color_texture: textured.then_some(0),
+                unlit: false,
             },
         };
         // What the bake counted, checked against what came back. A vertex
@@ -251,6 +252,7 @@ impl Packed {
             origin,
             DecodedTileContent {
                 withheld_drape: None,
+                copyright: None,
                 meshes: vec![mesh],
                 textures: Vec::new(),
                 imagery: Vec::new(),

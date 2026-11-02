@@ -19,6 +19,20 @@ graphics API, wasm-clean.
 [`Spinner`] is the loading indicator a viewer shows while the ground under
 its first view is still arriving.
 
+[`Font`] lays out and rasterises one line of text into a coverage mask
+([`Mask`], placed as a [`Label`]): one byte a pixel, which a backend uploads
+as a one-channel texture and draws as one quad (`tuile-wgpu`'s
+`OverlayMask`). The glyphs are rasterised by `ab_glyph` from one bundled
+font, Inter Regular (SIL Open Font License 1.1, `fonts/Inter-OFL.txt`) —
+a browser has no system font a wasm module can read, and the same font is
+the same line on every shell. A line too wide for its room is drawn smaller,
+down to a minimum, then cut with an ellipsis ([`Font::fit`]).
+
+[`CreditBar`] is the credits bar built on it: a strip along the bottom of
+the window, outside the picture, its line centred, inside a phone's safe
+area, scaled with the display's density. It says how tall it is, so the
+host gives the 3D view the rest of the frame.
+
 One thing here is not a widget and not pure: [`StatusBar`], behind the
 `statusbar` feature, which is a **native menu-bar item**. It lives here
 because it is a control a viewer offers a person, and it is optional
@@ -27,8 +41,9 @@ dependency to get the compass.
 
 ## Where it sits
 
-Depends on `tuile-camera` and `tuile-core`. Used by `tuile-viewer`, whose
-`tuile-wgpu` overlay renderer draws the triangles.
+Depends on `tuile-camera`, `tuile-core` and `ab_glyph`. Used by
+`tuile-viewer`, whose `tuile-wgpu` overlay renderer draws the triangles and
+the masks.
 
 ## Example
 

@@ -101,6 +101,10 @@ pub struct DecodedTileContent {
     /// over real terrain and report success, which is bare ground nobody is
     /// told about.
     pub withheld_drape: Option<u64>,
+    /// Who the content belongs to, as its glTF payload says (`asset.copyright`):
+    /// the credit a consumer must show while it draws this tile. `None` for
+    /// content that names nobody, and for every mesh built rather than read.
+    pub copyright: Option<std::sync::Arc<str>>,
     /// The rebasing origin, f64 ECEF.
     pub local_origin_ecef: DVec3,
     /// Residual transform to apply at render time (identity: everything is
@@ -395,6 +399,10 @@ pub struct MaterialDesc {
     pub base_color_factor: [f32; 4],
     /// Index into [`DecodedTileContent::textures`].
     pub base_color_texture: Option<usize>,
+    /// The material declares `KHR_materials_unlit`: its colour already
+    /// carries its light (photogrammetry), and it is not to be shaded by its
+    /// own facets.
+    pub unlit: bool,
 }
 
 impl Default for MaterialDesc {
@@ -402,6 +410,7 @@ impl Default for MaterialDesc {
         Self {
             base_color_factor: [1.0; 4],
             base_color_texture: None,
+            unlit: false,
         }
     }
 }
@@ -469,8 +478,18 @@ fn decode_glb(
         )?;
     }
 
+    let copyright: Option<std::sync::Arc<str>> = doc
+        .as_json()
+        .asset
+        .copyright
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(std::sync::Arc::from);
+
     Ok(DecodedTileContent {
         withheld_drape: None,
+        copyright,
         meshes,
         textures,
         // glTF content carries its own texturing; draping happens above.
@@ -539,6 +558,7 @@ fn walk_node(
                 base_color_texture: pbr
                     .base_color_texture()
                     .map(|info| info.texture().source().index()),
+                unlit: prim.material().unlit(),
             };
 
             out.push(DecodedMesh {
@@ -666,6 +686,20 @@ pub(crate) mod tests {
     /// Builds a minimal valid glb: one triangle with asymmetric vertices
     /// (1,0,0), (0,2,0), (0,0,3) so up-axis mistakes are visible.
     pub(crate) fn test_glb() -> Vec<u8> {
+        glb_with_asset(serde_json::json!({ "version": "2.0" }))
+    }
+
+    /// [`test_glb`], with `asset` as its glTF `asset` object.
+    fn glb_with_asset(asset: serde_json::Value) -> Vec<u8> {
+        glb_with(
+            asset,
+            serde_json::json!({ "pbrMetallicRoughness": { "baseColorFactor": [1.0, 0.5, 0.25, 1.0] } }),
+        )
+    }
+
+    /// [`test_glb`], with `asset` as its glTF `asset` object and `material`
+    /// as its one material.
+    fn glb_with(asset: serde_json::Value, material: serde_json::Value) -> Vec<u8> {
         let positions: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]];
         let indices: [u16; 3] = [0, 1, 2];
 
@@ -684,7 +718,7 @@ pub(crate) mod tests {
         }
 
         let json = serde_json::json!({
-            "asset": { "version": "2.0" },
+            "asset": asset,
             "scene": 0,
             "scenes": [{ "nodes": [0] }],
             "nodes": [{ "mesh": 0 }],
@@ -693,7 +727,7 @@ pub(crate) mod tests {
                 "indices": 1,
                 "material": 0
             }]}],
-            "materials": [{ "pbrMetallicRoughness": { "baseColorFactor": [1.0, 0.5, 0.25, 1.0] } }],
+            "materials": [material],
             "buffers": [{ "byteLength": bin.len() }],
             "bufferViews": [
                 { "buffer": 0, "byteOffset": 0, "byteLength": idx_offset, "target": 34962 },
@@ -764,6 +798,45 @@ pub(crate) mod tests {
             d.meshes[0].material.base_color_factor,
             [1.0, 0.5, 0.25, 1.0]
         );
+    }
+
+    /// The credit a glTF payload names in `asset.copyright` comes out with
+    /// the content, trimmed; a payload that names nobody gives `None`, and so
+    /// does an empty one.
+    #[test]
+    fn the_copyright_a_glb_states_is_kept() {
+        let named = glb_with_asset(serde_json::json!({
+            "version": "2.0",
+            "copyright": " Data SIO, NOAA; Landsat / Copernicus "
+        }));
+        let d = decode(&named, &hints(DVec3::ZERO)).expect("decode");
+        assert_eq!(
+            d.copyright.as_deref(),
+            Some("Data SIO, NOAA; Landsat / Copernicus")
+        );
+        let silent = decode(&test_glb(), &hints(DVec3::ZERO)).expect("decode");
+        assert_eq!(silent.copyright, None);
+        let empty = glb_with_asset(serde_json::json!({ "version": "2.0", "copyright": "  " }));
+        let d = decode(&empty, &hints(DVec3::ZERO)).expect("decode");
+        assert_eq!(d.copyright, None);
+    }
+
+    /// A material that declares `KHR_materials_unlit` is decoded as unlit —
+    /// what the photorealistic 3D Tiles declare, and require — and one that
+    /// does not, as lit.
+    #[test]
+    fn an_unlit_material_is_decoded_unlit() {
+        let unlit = glb_with(
+            serde_json::json!({ "version": "2.0" }),
+            serde_json::json!({
+                "pbrMetallicRoughness": { "baseColorFactor": [1.0, 1.0, 1.0, 1.0] },
+                "extensions": { "KHR_materials_unlit": {} }
+            }),
+        );
+        let d = decode(&unlit, &hints(DVec3::ZERO)).expect("decode");
+        assert!(d.meshes[0].material.unlit);
+        let lit = decode(&test_glb(), &hints(DVec3::ZERO)).expect("decode");
+        assert!(!lit.meshes[0].material.unlit);
     }
 
     #[test]
@@ -879,6 +952,7 @@ pub(crate) mod tests {
             textures,
             imagery: Vec::new(),
             withheld_drape: None,
+            copyright: None,
             local_origin_ecef: DVec3::ZERO,
             transform_local: Mat4::IDENTITY,
         }

@@ -61,6 +61,13 @@ pub(crate) fn caption(text: &str) {
     system::caption(text);
 }
 
+/// Lifts the caption `pixels` device pixels off the bottom of the window —
+/// the credits bar's height, which it must stay above — or puts it back
+/// with 0.
+pub(crate) fn caption_lift(pixels: u32) {
+    system::caption_lift(pixels);
+}
+
 /// Puts `text` on the clipboard; `false` when there is no clipboard to put it
 /// on.
 pub(crate) fn copy(text: &str) -> bool {
@@ -548,6 +555,8 @@ mod system {
     /// The title bar says it.
     pub(super) fn caption(_text: &str) {}
 
+    pub(super) fn caption_lift(_pixels: u32) {}
+
     pub(super) fn copy(text: &str) -> bool {
         let board = NSPasteboard::generalPasteboard();
         board.clearContents();
@@ -591,6 +600,24 @@ mod system {
     thread_local! {
         /// The caption's label, once made. Main thread only, as every view.
         static CAPTION: RefCell<Option<Retained<UILabel>>> = const { RefCell::new(None) };
+        /// How far the caption stands off the bottom, device pixels: the
+        /// credits bar's height.
+        static LIFT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn caption_lift(pixels: u32) {
+        LIFT.with(|lift| lift.set(pixels));
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let Some(view) = root(mtm).and_then(|root| root.view()) else {
+            return;
+        };
+        CAPTION.with(|cell| {
+            if let Some(label) = cell.borrow().as_ref() {
+                place(label, &view);
+            }
+        });
     }
 
     pub(super) fn listen() -> Receiver<Request> {
@@ -801,15 +828,19 @@ mod system {
         label
     }
 
-    /// Along the bottom of the safe area, clear of the home indicator.
+    /// Along the bottom of the safe area, clear of the home indicator — and
+    /// above the credits bar when there is one.
     fn place(label: &UILabel, view: &UIView) {
         let bounds = view.bounds();
         let insets = view.safeAreaInsets();
         let height = 16.0;
+        let scale = view.contentScaleFactor().max(1.0);
+        let bar = f64::from(LIFT.with(std::cell::Cell::get)) / scale;
+        let floor = insets.bottom.max(bar);
         let frame = objc2_core_foundation::CGRect::new(
             objc2_core_foundation::CGPoint::new(
                 insets.left + 12.0,
-                bounds.size.height - insets.bottom - height - 4.0,
+                bounds.size.height - floor - height - 4.0,
             ),
             objc2_core_foundation::CGSize::new(
                 (bounds.size.width - insets.left - insets.right - 24.0).max(0.0),
@@ -879,6 +910,10 @@ mod system {
         android::caption(text);
     }
 
+    pub(super) fn caption_lift(pixels: u32) {
+        android::caption_lift(pixels);
+    }
+
     pub(super) fn copy(text: &str) -> bool {
         android::copy(text)
     }
@@ -902,7 +937,7 @@ mod system {
 #[cfg(target_arch = "wasm32")]
 mod system {
     pub(super) use crate::web::system::{
-        alert, caption, copy, drawing, listen, loading, paste, send, try_alert, view,
+        alert, caption, caption_lift, copy, drawing, listen, loading, paste, send, try_alert, view,
     };
 }
 
@@ -933,6 +968,8 @@ mod system {
     }
 
     pub(super) fn caption(_text: &str) {}
+
+    pub(super) fn caption_lift(_pixels: u32) {}
 
     pub(super) fn copy(_text: &str) -> bool {
         false

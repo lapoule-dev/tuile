@@ -82,6 +82,14 @@ SOURCES BY ADDRESS (no catalog, no token; each replaces the host's own):
                                  the default) or geographic (2 tiles at level 0)
     --imagery-max-level <n>      the deepest level the template serves; deeper,
                                  its tiles are stretched
+
+3D TILES OVER THE GLOBE:
+    --tileset <asset>[,<asset>…] the host's 3D Tiles tilesets, by asset number,
+                                 drawn over the globe: where one is drawn it
+                                 replaces the ground, and where it has nothing
+                                 the globe shows. Without the flag, the
+                                 `tilesets` setting, else TUILE_TILESETS. Their
+                                 credits are kept on screen while they are drawn
     -h, --help         print this and exit
 ";
 
@@ -294,6 +302,9 @@ pub(crate) enum Invocation {
         /// `--config`: a configuration file read for this session — its
         /// token used, nothing kept (see `crate::import`).
         config: Option<std::path::PathBuf>,
+        /// `--tileset`: the host's 3D Tiles tilesets to draw over the globe,
+        /// by asset number, when the flag was given.
+        tilesets: Option<Vec<i64>>,
     },
     /// Print [`usage`] and leave.
     Help,
@@ -480,7 +491,7 @@ where
     let mut here = false;
     let mut imagery: Option<String> = None;
     // The flags that take text: each at most once.
-    let mut texts: [(&str, Option<String>); 13] = [
+    let mut texts: [(&str, Option<String>); 14] = [
         ("--terrain-url", None),
         ("--imagery-template", None),
         ("--imagery-scheme", None),
@@ -494,6 +505,7 @@ where
         ("--record-scale", None),
         ("--record-codec", None),
         ("--config", None),
+        ("--tileset", None),
     ];
     let mut compression: Option<tuile_wgpu::ImageryCompression> = None;
     let mut seen = [false; FLAGS.len()];
@@ -580,7 +592,7 @@ where
     if here && (seen[0] || seen[1]) {
         return Err("--here and --lon/--lat both say where to start; give one".to_owned());
     }
-    let [(_, terrain), (_, template), (_, scheme), (_, max_level), (_, time), (_, offset), (_, rate), (_, ceiling), (_, record), (_, record_fps), (_, record_scale), (_, record_codec), (_, config)] =
+    let [(_, terrain), (_, template), (_, scheme), (_, max_level), (_, time), (_, offset), (_, rate), (_, ceiling), (_, record), (_, record_fps), (_, record_scale), (_, record_codec), (_, config), (_, tileset)] =
         texts;
     // Read as an altitude is, with the same bounds: it is one.
     let max_altitude = ceiling
@@ -603,6 +615,9 @@ where
                 .to_owned(),
         );
     }
+    let tilesets = tileset
+        .map(|text| asset_list("--tileset", &text))
+        .transpose()?;
     Ok(Invocation::Run {
         view,
         here,
@@ -611,6 +626,7 @@ where
         compression,
         clock,
         max_altitude,
+        tilesets,
         record: crate::recording::RecordSettings {
             path: record.map(std::path::PathBuf::from),
             pictures: crate::recording::PictureSettings::parse(
@@ -621,6 +637,20 @@ where
         },
         config: config.map(std::path::PathBuf::from),
     })
+}
+
+/// Asset numbers, comma-separated: `2275207` or `2275207,96188`. `what` is
+/// where they were read, for the message when one is not a number.
+pub(crate) fn asset_list(what: &str, text: &str) -> Result<Vec<i64>, String> {
+    text.split(',')
+        .map(|one| {
+            one.trim()
+                .parse::<i64>()
+                .ok()
+                .filter(|asset| *asset >= 0)
+                .ok_or_else(|| format!("{what} wants asset numbers, comma-separated; got {text:?}"))
+        })
+        .collect()
 }
 
 /// The sources by address, from the text of their four flags.
@@ -691,6 +721,7 @@ mod tests {
             max_altitude: None,
             record: _,
             config: None,
+            tilesets: None,
         }) = parsed
         else {
             unreachable!("{args:?} should start a session, got {parsed:?}");
@@ -1035,6 +1066,32 @@ mod tests {
         assert!(FLAGS_TEXT.contains("--record <file>"));
     }
 
+    /// `--tileset` names asset numbers, one or several, and anything that is
+    /// not one is refused with the flag and the value named.
+    #[test]
+    fn tileset_names_asset_numbers() {
+        let named = |args: &[&str]| match parse(args) {
+            Ok(Invocation::Run { tilesets, .. }) => Ok(tilesets),
+            Ok(Invocation::Help) => Err("help".to_owned()),
+            Err(e) => Err(e),
+        };
+        assert_eq!(named(&[]), Ok(None));
+        assert_eq!(named(&["--tileset", "2275207"]), Ok(Some(vec![2_275_207])));
+        assert_eq!(
+            named(&["--tileset=2275207, 96188"]),
+            Ok(Some(vec![2_275_207, 96_188]))
+        );
+        for bad in ["photo", "-3", "12,", "1.5"] {
+            let error = named(&["--tileset", bad]).expect_err(bad);
+            assert!(
+                error.contains("--tileset") && error.contains(bad),
+                "{error}"
+            );
+        }
+        assert!(named(&["--tileset", "1", "--tileset", "2"]).is_err());
+        assert!(FLAGS_TEXT.contains("--tileset <asset>"));
+    }
+
     #[test]
     fn a_files_start_view_fills_in_what_the_flags_did_not_say() {
         let arguments: Vec<String> = ["--lon", "3", "--altitude=900"].map(str::to_owned).into();
@@ -1082,6 +1139,7 @@ mod tests {
                 max_altitude: None,
                 record: Default::default(),
                 config: None,
+                tilesets: None,
             })
         );
         // Either order, either coordinate.

@@ -30,16 +30,66 @@ pub fn is_retryable_status(status: u16) -> bool {
     )
 }
 
+/// What a fetch error says, with the values of every query parameter in it
+/// withheld: see [`redact`].
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
-    #[error("not found: {0}")]
+    #[error("not found: {}", redact(.0.as_str()))]
     NotFound(Url),
-    #[error("unsupported url scheme {scheme:?} for {url}")]
+    #[error("unsupported url scheme {scheme:?} for {}", redact(.url.as_str()))]
     UnsupportedScheme { scheme: String, url: Url },
-    #[error("i/o error fetching {url}: {message}")]
+    #[error("i/o error fetching {}: {}", redact(.url.as_str()), redact(.message))]
     Io { url: Url, message: String },
-    #[error("http status {status} for {url}")]
+    #[error("http status {status} for {}", redact(.url.as_str()))]
     Status { status: u16, url: Url },
+}
+
+/// `text` with the value of every query parameter of every URL in it
+/// replaced by `…`, the names kept.
+///
+/// A service may put its key on every URL it is fetched under, and a session
+/// beside it; a message that carries a URL — an error, a retry warning — must
+/// not carry them into a log, a window or a report. What is withheld is the
+/// value alone: which parameters a URL had is still said.
+pub fn redact(text: &str) -> String {
+    let delimiter = |c: char| c.is_whitespace() || "\"'()<>[]{}".contains(c);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(scheme) = rest.find("://") {
+        let start = rest[..scheme].rfind(delimiter).map_or(0, |i| i + 1);
+        let end = rest[scheme..]
+            .find(delimiter)
+            .map_or(rest.len(), |i| scheme + i);
+        out.push_str(&rest[..start]);
+        out.push_str(&redact_url(&rest[start..end]));
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One URL's query values withheld.
+fn redact_url(url: &str) -> String {
+    let Some((head, query)) = url.split_once('?') else {
+        return url.to_owned();
+    };
+    let (query, fragment) = match query.split_once('#') {
+        Some((q, f)) => (q, Some(f)),
+        None => (query, None),
+    };
+    let pairs: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, _)) => format!("{name}=…"),
+            None => pair.to_owned(),
+        })
+        .collect();
+    let mut out = format!("{head}?{}", pairs.join("&"));
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    out
 }
 
 /// Something fetched, with how long it may be reused.
@@ -176,6 +226,37 @@ impl TileFetcher for HttpFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No value of a query parameter survives in what an error says, and
+    /// everything else does.
+    #[test]
+    fn errors_withhold_query_values() {
+        let url = Url::parse("https://tiles.test/v1/a.glb?session=S3CR3T&key=K3Y").expect("url");
+        let said = FetchError::Status {
+            status: 403,
+            url: url.clone(),
+        }
+        .to_string();
+        assert_eq!(
+            said,
+            "http status 403 for https://tiles.test/v1/a.glb?session=…&key=…"
+        );
+        let said = FetchError::Io {
+            url,
+            message: "error sending request for url (https://tiles.test/b.json?key=K3Y)".into(),
+        }
+        .to_string();
+        assert!(!said.contains("K3Y") && !said.contains("S3CR3T"), "{said}");
+        assert!(
+            said.ends_with("(https://tiles.test/b.json?key=…)"),
+            "{said}"
+        );
+        assert_eq!(redact("no url at all"), "no url at all");
+        assert_eq!(
+            redact("file:///data/tileset.json and https://x.test/a?flag"),
+            "file:///data/tileset.json and https://x.test/a?flag"
+        );
+    }
     use futures_util::FutureExt;
 
     #[test]

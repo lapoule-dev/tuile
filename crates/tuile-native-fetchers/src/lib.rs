@@ -424,17 +424,18 @@ impl NativeHttp {
     }
 
     /// One GET through the middleware (pool + cache). Token-bearing endpoint
-    /// calls bypass the cache.
+    /// calls bypass the cache, and so does what the caller asked `fresh`.
     async fn get_once(
         &self,
         url: &Url,
         bearer: Option<&str>,
+        fresh: bool,
     ) -> Result<reqwest::Response, reqwest_middleware::Error> {
         let mut req = self.client.get(url.clone());
         if let Some(token) = bearer {
             req = req.bearer_auth(token);
         }
-        if url.host_str() == Some(ION_API_HOST) {
+        if fresh || url.host_str() == Some(ION_API_HOST) {
             req = req.with_extension(CacheMode::NoStore);
         }
         req.send().await
@@ -450,11 +451,12 @@ impl NativeHttp {
         &self,
         url: &Url,
         bearer: Option<&str>,
+        fresh: bool,
     ) -> Result<reqwest::Response, reqwest_middleware::Error> {
         let spread = spread_of(url);
         let mut attempt = 1;
         loop {
-            let outcome = self.get_once(url, bearer).await;
+            let outcome = self.get_once(url, bearer, fresh).await;
             let last = self.retry.attempts.is_some_and(|max| attempt >= max);
 
             let wait = match &outcome {
@@ -463,6 +465,7 @@ impl NativeHttp {
                     if !is_retryable_status(status) {
                         return outcome;
                     }
+                    let url = tuile_core::fetch::redact(url.as_str());
                     tracing::warn!(%url, status, attempt, "retryable status");
                     // The origin's own pacing wins over ours when it states one.
                     retry_after(response.headers())
@@ -472,6 +475,10 @@ impl NativeHttp {
                     if !is_retryable_transport(error) {
                         return outcome;
                     }
+                    let (url, error) = (
+                        tuile_core::fetch::redact(url.as_str()),
+                        tuile_core::fetch::redact(&error.to_string()),
+                    );
                     tracing::warn!(%url, attempt, %error, "retryable transport failure");
                     self.retry.backoff(attempt, spread)
                 }
@@ -492,8 +499,23 @@ impl NativeHttp {
 #[async_trait]
 impl IonHttp for NativeHttp {
     async fn get(&self, url: &Url, bearer: Option<&str>) -> Result<HttpResponse, IonError> {
+        self.ion_get(url, bearer, false).await
+    }
+
+    async fn get_fresh(&self, url: &Url, bearer: Option<&str>) -> Result<HttpResponse, IonError> {
+        self.ion_get(url, bearer, true).await
+    }
+}
+
+impl NativeHttp {
+    async fn ion_get(
+        &self,
+        url: &Url,
+        bearer: Option<&str>,
+        fresh: bool,
+    ) -> Result<HttpResponse, IonError> {
         let asked = Asked::now(url);
-        let response = match NativeHttp::get(self, url, bearer).await {
+        let response = match NativeHttp::get(self, url, bearer, fresh).await {
             Ok(response) => response,
             Err(e) => {
                 asked.failed();
@@ -527,7 +549,7 @@ impl TileFetcher for NativeHttp {
 
     async fn fetch_cacheable(&self, url: &Url) -> Result<Fetched<Bytes>, FetchError> {
         let asked = Asked::now(url);
-        let response = match NativeHttp::get(self, url, None).await {
+        let response = match NativeHttp::get(self, url, None, false).await {
             Ok(response) => response,
             Err(e) => {
                 asked.failed();
@@ -911,6 +933,33 @@ mod tests {
             .map(|(_, n)| n)
             .sum();
         assert_eq!(recorded, 9, "nothing else, and not the description");
+    }
+
+    /// What is asked fresh goes to the origin every time and leaves nothing
+    /// behind it, even with a lifetime stated; the same address asked the
+    /// ordinary way is then kept, and answered from the cache.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fresh_request_is_never_answered_from_the_cache() {
+        let dir = tempfile::tempdir().expect("dir");
+        let http = NativeHttp::with_transport(TransportConfig::over(CacheConfig {
+            dir: dir.path().to_path_buf(),
+            memory_bytes: 16 << 20,
+            disk_bytes: 64 << 20,
+        }))
+        .await
+        .expect("transport");
+        let (base, served) = origin().await;
+        let root = base.join("layer.json").expect("url");
+        let hits = || served.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..2 {
+            let r = IonHttp::get_fresh(&http, &root, None).await.expect("fresh");
+            assert_eq!(r.body.as_ref(), b"{}");
+        }
+        assert_eq!(hits(), 2, "both from the origin");
+        IonHttp::get(&http, &root, None).await.expect("ordinary");
+        assert_eq!(hits(), 3, "the fresh ones left nothing in the cache");
+        IonHttp::get(&http, &root, None).await.expect("cached");
+        assert_eq!(hits(), 3, "the ordinary one was kept");
     }
 
     #[test]

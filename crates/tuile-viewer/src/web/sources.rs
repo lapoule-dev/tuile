@@ -69,6 +69,13 @@ impl Sources for PageSources {
         Ok((source.layer().clone(), Arc::new(source)))
     }
 
+    /// A 3D Tiles asset of the catalog, through its proxy: one ion points
+    /// at on another service is answered by the proxy too, which holds that
+    /// service's key.
+    async fn tileset(&self, asset: i64) -> Result<tuile_planetary::TilesetSource, String> {
+        self.catalog()?.tileset(asset).await
+    }
+
     async fn imagery(&self, asset: i64) -> Result<Arc<dyn ImageryProvider>, String> {
         let Some(layer) = self.spec.template_of(asset) else {
             return self.catalog()?.imagery(asset).await;

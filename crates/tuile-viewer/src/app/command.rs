@@ -93,6 +93,7 @@ impl App {
                 web_time::Instant::now(),
                 crate::location::Placement::OVERHEAD,
             ),
+            Command::Tileset { asset, on } => self.switch_tileset(asset, on),
             Command::Freeze(on) => {
                 self.views.freeze = on;
                 tracing::info!("traversal freeze: {on}");
@@ -224,6 +225,7 @@ impl App {
                 layers,
                 clock: self.clock_state(),
                 recording: self.is_recording(),
+                tilesets: self.tilesets.bits(),
             },
             |snapshot| crate::menu::State::of(&snapshot, layers),
         )
@@ -238,7 +240,12 @@ impl App {
         if let Some(drawn) = drawn {
             self.drawn = drawn;
         }
-        let size = self.active.as_ref().map_or((0, 0), |a| a.size);
+        // The view's size, above the credits bar: what the centre is picked
+        // in. The whole frame when there is no bar.
+        let size = self.active.as_ref().map_or((0, 0), |_| {
+            let (w, h) = self.viewport();
+            (w as u32, h as u32)
+        });
         let snapshot = Snapshot {
             wireframe: self.views.wireframe,
             frozen: self.views.freeze,
@@ -250,6 +257,7 @@ impl App {
             diagnostic: self.views.diagnostic,
             clock: self.clock_state(),
             recording: self.is_recording(),
+            tilesets: self.tilesets.bits(),
             ..Snapshot::of(&self.controller, size)
         };
         crate::snapshot::publish(snapshot);
@@ -307,6 +315,8 @@ impl App {
         if let Some(layer) = snapshot.imagery {
             title = format!("{title} — {} · {}", layer.name, layer.attribution);
         }
+        // Whose 3D Tiles is not said here: the credits bar below the
+        // picture says it, on every shell (see `credits`).
         // How the imagery is held, and what it holds: the one line that
         // tells a compressed session from an uncompressed one.
         let held = self.imagery_held();

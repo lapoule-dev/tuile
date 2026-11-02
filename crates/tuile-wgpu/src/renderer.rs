@@ -55,6 +55,19 @@ pub struct LineVertex {
 /// nothing at all, which is a hole, which is black ground.
 const OWNED: u32 = 1;
 
+/// The mark a surface that **replaces** the ground stamps, besides
+/// [`OWNED`]: a 3D Tiles mesh of the whole surface — buildings, trees and
+/// the ground under them — drawn over a globe.
+///
+/// Two surfaces of the same ground from two sources never agree to the
+/// centimetre, so a depth test between them is a coin toss per pixel: the
+/// z-fighting this mark exists to make impossible. The replacing surface is
+/// drawn first and stamps it; the globe's own surfaces draw only where it is
+/// absent, whatever their depth. Where the replacing surface has nothing —
+/// not loaded yet, or not covering — the globe is drawn exactly as without
+/// it, so the ground is never bare.
+const REPLACED: u32 = 2;
+
 pub struct TileRenderer {
     pipeline: wgpu::RenderPipeline,
     /// Draws without touching depth — see [`TileRenderer::render_background`].
@@ -65,6 +78,10 @@ pub struct TileRenderer {
     /// Draws ancestors standing in for ground that is not theirs: tests depth,
     /// never writes it, drawn last. See `Pass::Fallback`.
     fallback: wgpu::RenderPipeline,
+    /// Draws a surface that replaces the ground where it is drawn, and its
+    /// stand-ins. See [`REPLACED`] and [`TileRenderer::paint_replacing`].
+    replacing: wgpu::RenderPipeline,
+    replacing_fallback: wgpu::RenderPipeline,
     wireframe: Option<wgpu::RenderPipeline>,
     lines: wgpu::RenderPipeline,
     /// The physical atmosphere: its tables, uniform and sky-view, and when
@@ -180,24 +197,47 @@ impl TileRenderer {
             /// which is what makes an uncovered fragment keep the pass beneath
             /// it rather than be painted with untextured ground.
             Layers,
+            /// A surface that replaces the ground where it is drawn: depth
+            /// as `Solid`, and the [`REPLACED`] mark, which the ground's own
+            /// passes then keep out of.
+            Replacing,
+            /// An ancestor standing in for the replacing surface where none
+            /// of its own tiles is ready: only where no replacing tile
+            /// drew, and then replacing as they do.
+            ReplacingFallback,
         }
         /// How a pass treats the ownership mark. See `stencil` below.
         fn stencil_face(kind: Pass) -> wgpu::StencilFaceState {
+            // The comparison is `reference OP (stored & read_mask)`.
+            let face = |compare, pass_op| wgpu::StencilFaceState {
+                compare,
+                fail_op: wgpu::StencilOperation::Keep,
+                depth_fail_op: wgpu::StencilOperation::Keep,
+                pass_op,
+            };
             match kind {
-                // Owns its ground: stamp the mark.
-                Pass::Solid | Pass::Layers => wgpu::StencilFaceState {
-                    compare: wgpu::CompareFunction::Always,
-                    fail_op: wgpu::StencilOperation::Keep,
-                    depth_fail_op: wgpu::StencilOperation::Keep,
-                    pass_op: wgpu::StencilOperation::Replace,
-                },
-                // Borrows it: draw only where nobody stamped.
-                Pass::Fallback => wgpu::StencilFaceState {
-                    compare: wgpu::CompareFunction::NotEqual,
-                    fail_op: wgpu::StencilOperation::Keep,
-                    depth_fail_op: wgpu::StencilOperation::Keep,
-                    pass_op: wgpu::StencilOperation::Keep,
-                },
+                // Owns its ground: stamp the mark — except where a replacing
+                // surface drew (read through the REPLACED bit alone, against
+                // a reference that does not carry it).
+                Pass::Solid | Pass::Layers => face(
+                    wgpu::CompareFunction::Equal,
+                    wgpu::StencilOperation::Replace,
+                ),
+                // Borrows it: draw only where nobody stamped anything.
+                Pass::Fallback => {
+                    face(wgpu::CompareFunction::Greater, wgpu::StencilOperation::Keep)
+                }
+                // Replaces it: stamp both marks, unconditionally.
+                Pass::Replacing => face(
+                    wgpu::CompareFunction::Always,
+                    wgpu::StencilOperation::Replace,
+                ),
+                // Stands in for it: only where the replacing surface has
+                // not stamped yet, and stamp as it does.
+                Pass::ReplacingFallback => face(
+                    wgpu::CompareFunction::Greater,
+                    wgpu::StencilOperation::Replace,
+                ),
                 Pass::Backdrop => wgpu::StencilFaceState::IGNORE,
             }
         }
@@ -232,10 +272,16 @@ impl TileRenderer {
                         // dip kilometres below it at coarse levels. There is no
                         // depth at which that stops being true for every level
                         // at once.
-                        depth_write_enabled: Some(matches!(kind, Pass::Solid | Pass::Layers)),
+                        depth_write_enabled: Some(matches!(
+                            kind,
+                            Pass::Solid | Pass::Layers | Pass::Replacing | Pass::ReplacingFallback
+                        )),
                         depth_compare: Some(match kind {
                             Pass::Backdrop => wgpu::CompareFunction::Always,
-                            Pass::Solid | Pass::Fallback => direction.nearer(),
+                            Pass::Solid
+                            | Pass::Fallback
+                            | Pass::Replacing
+                            | Pass::ReplacingFallback => direction.nearer(),
                             Pass::Layers => direction.nearer_or_level(),
                         }),
                         // **The mark that says who owns this ground.**
@@ -267,12 +313,20 @@ impl TileRenderer {
                         // `Backdrop` writes nothing and tests nothing: it is
                         // behind everything by construction and must not disturb
                         // the mark.
+                        //
+                        // A surface that replaces the ground adds a second
+                        // bit, [`REPLACED`]: see there.
                         stencil: wgpu::StencilState {
                             front: stencil_face(kind),
                             back: stencil_face(kind),
-                            read_mask: 0xff,
+                            read_mask: match kind {
+                                Pass::Solid | Pass::Layers => REPLACED,
+                                Pass::Fallback | Pass::ReplacingFallback => OWNED | REPLACED,
+                                Pass::Replacing | Pass::Backdrop => 0,
+                            },
                             write_mask: match kind {
-                                Pass::Solid | Pass::Layers => 0xff,
+                                Pass::Solid | Pass::Layers => OWNED,
+                                Pass::Replacing | Pass::ReplacingFallback => OWNED | REPLACED,
                                 Pass::Backdrop | Pass::Fallback => 0,
                             },
                         },
@@ -301,6 +355,8 @@ impl TileRenderer {
         let background = make_pipeline(wgpu::PolygonMode::Fill, Pass::Backdrop);
         let layers = make_pipeline(wgpu::PolygonMode::Fill, Pass::Layers);
         let fallback = make_pipeline(wgpu::PolygonMode::Fill, Pass::Fallback);
+        let replacing = make_pipeline(wgpu::PolygonMode::Fill, Pass::Replacing);
+        let replacing_fallback = make_pipeline(wgpu::PolygonMode::Fill, Pass::ReplacingFallback);
         let wireframe = gpu
             .device
             .features()
@@ -464,6 +520,8 @@ impl TileRenderer {
 
         Self {
             pipeline,
+            replacing,
+            replacing_fallback,
             background,
             layers,
             fallback,
@@ -749,6 +807,71 @@ impl TileRenderer {
         }
     }
 
+    /// Draws a surface that replaces the ground where it is drawn: its tiles,
+    /// then its stand-ins where none of them reached. Before the ground, so
+    /// the ground keeps out of every pixel it took — see `REPLACED`.
+    pub fn render_replacing<'t>(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        tiles: impl Iterator<Item = &'t PreparedTile>,
+        fallback: impl Iterator<Item = &'t PreparedTile>,
+    ) {
+        pass.set_stencil_reference(OWNED | REPLACED);
+        pass.set_bind_group(0, &self.view_bg, &[]);
+        pass.set_bind_group(3, &self.ground_air_bg, &[]);
+        for (pipeline, tiles) in [
+            (&self.replacing, tiles.collect::<Vec<_>>()),
+            (&self.replacing_fallback, fallback.collect::<Vec<_>>()),
+        ] {
+            pass.set_pipeline(pipeline);
+            for tile in tiles {
+                pass.set_bind_group(1, &tile.tile_bg, &[]);
+                for mesh in &tile.meshes {
+                    // A mesh of its own carries its own pictures: one pass.
+                    let Some(first) = mesh.material_bgs.first() else {
+                        continue;
+                    };
+                    pass.set_bind_group(2, first, &[]);
+                    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                }
+            }
+        }
+    }
+
+    /// [`TileRenderer::paint`], with a surface that replaces the ground
+    /// where it is drawn — a 3D Tiles mesh over a globe — between the
+    /// backdrop and the ground: `replacing` its tiles, `replacing_fallback`
+    /// the ancestors standing in for those not ready.
+    ///
+    /// The order is the guarantee once more. Drawn after the backdrop, the
+    /// replacing surface covers it; drawn before the ground, it is never
+    /// fought for a pixel — the ground keeps out of every pixel it took and
+    /// covers every pixel it left, so where it has nothing yet the globe is
+    /// there as it would be without it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_replacing<'t>(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        backdrop: impl Iterator<Item = &'t PreparedTile>,
+        replacing: impl Iterator<Item = &'t PreparedTile>,
+        replacing_fallback: impl Iterator<Item = &'t PreparedTile>,
+        tiles: impl Iterator<Item = &'t PreparedTile>,
+        fallback: impl Iterator<Item = &'t PreparedTile>,
+        overlay: Option<&crate::overlay::OverlayRenderer>,
+        wireframe: bool,
+    ) {
+        self.render_sky(pass);
+        self.render_background(pass, backdrop);
+        self.render_replacing(pass, replacing, replacing_fallback);
+        self.render(pass, tiles, wireframe);
+        self.render_fallback(pass, fallback);
+        if let Some(overlay) = overlay {
+            overlay.render(pass);
+        }
+    }
+
     /// The whole scene, in the order it has to go in.
     ///
     /// The order **is** the guarantee, and that is why it lives here instead of
@@ -776,15 +899,18 @@ impl TileRenderer {
         overlay: Option<&crate::overlay::OverlayRenderer>,
         wireframe: bool,
     ) {
-        self.render_sky(pass);
-        self.render_background(pass, backdrop);
-        self.render(pass, tiles, wireframe);
         // After the tiles that own their ground, so it is occluded by them —
         // see `render_fallback`.
-        self.render_fallback(pass, fallback);
-        if let Some(overlay) = overlay {
-            overlay.render(pass);
-        }
+        self.paint_replacing(
+            pass,
+            backdrop,
+            std::iter::empty(),
+            std::iter::empty(),
+            tiles,
+            fallback,
+            overlay,
+            wireframe,
+        );
     }
 }
 

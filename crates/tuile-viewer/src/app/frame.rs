@@ -10,6 +10,7 @@
 //! backdrop is drawn before the selection so that ground is never bare.
 
 use super::{App, AMBIENT, ATMOSPHERE_STRENGTH, DIAGNOSTICS};
+
 use std::fmt;
 use tuile_wgpu::OverlayVertex;
 
@@ -37,6 +38,9 @@ impl App {
             return;
         }
         let dt = self.start_the_frame();
+        // Before anything reads the viewport: the bar decides how much of
+        // the frame the view has.
+        self.lay_out_the_credits();
         self.ease_the_camera(dt);
         if self.active.is_none() {
             return;
@@ -259,6 +263,22 @@ impl App {
         if self.views.freeze {
             active.pump.rebase(&active.gpu.queue, origin);
         }
+        // The 3D Tiles over the globe, each from its own server, the same
+        // way and on the same frame's deadline.
+        for layer in &mut self.surfaces {
+            let stream = &mut layer.surface.stream;
+            let uploaded = if self.views.freeze {
+                let n = layer.pump.pump(stream, &active.gpu, deadline);
+                layer.pump.rebase(&active.gpu.queue, origin);
+                n
+            } else {
+                layer
+                    .pump
+                    .advance(stream, &active.gpu, &views, origin, deadline)
+            };
+            self.uploaded += uploaded;
+            self.stats.uploads += uploaded as u64;
+        }
     }
 
     /// Uploads the view matrix, the sun and the air — the first eye's, which
@@ -364,13 +384,21 @@ impl App {
         } else {
             Vec::new()
         };
-        let mut nav_mesh: Vec<OverlayVertex> = controls
-            .into_iter()
+        // The credits bar's background first, already in device pixels.
+        let bar = self.credits.layout();
+        let mut nav_mesh: Vec<OverlayVertex> = bar
+            .map(|bar| bar.background.as_slice())
+            .unwrap_or_default()
+            .iter()
             .map(|v| OverlayVertex {
-                position: ui.from(v.position),
+                position: v.position,
                 color: v.color,
             })
             .collect();
+        nav_mesh.extend(controls.into_iter().map(|v| OverlayVertex {
+            position: ui.from(v.position),
+            color: v.color,
+        }));
         // The loading indicator over everything, already in device pixels.
         if let Some(spinner) = indicator {
             nav_mesh.extend(spinner.mesh().into_iter().map(|v| OverlayVertex {
@@ -381,6 +409,17 @@ impl App {
         active
             .overlay
             .set_geometry(&active.gpu, &nav_mesh, active.size);
+        // And its line, over its background.
+        let line = bar
+            .and_then(|bar| bar.label.as_ref())
+            .map(|label| tuile_wgpu::OverlayMask {
+                width: label.mask.width,
+                height: label.mask.height,
+                coverage: &label.mask.coverage,
+                position: label.position,
+                color: label.color,
+            });
+        active.overlay.set_mask(&active.gpu, line);
     }
 
     /// Resolves what to draw, draws it, and hands the frame to the compositor.
@@ -394,7 +433,9 @@ impl App {
         let serving = self.imagery.generation;
         let views = self.view_uniforms();
         let picture = self.picture();
-        let viewport = self.viewport();
+        // The whole frame, credits bar included: the overlay is laid out in
+        // it.
+        let viewport = self.frame_size();
         // The same clearance the tiles' view uniform is built with, so an
         // overlay and the ground share one clip space.
         let clearance = self.controller.height_above_ground();
@@ -413,6 +454,28 @@ impl App {
         // the black square. The tree is the only thing that can answer, so the
         // server sends it and the pump reads it. Nothing here to get wrong.
         let (drawn, resolution) = active.pump.resolve(&active.gpu);
+        // The 3D Tiles over the globe, resolved the same way, and what the
+        // tiles drawn credit, for the caption.
+        let mut replacing: Vec<&tuile_wgpu::PreparedTile> = Vec::new();
+        let mut replacing_fallback: Vec<&tuile_wgpu::PreparedTile> = Vec::new();
+        for layer in &mut self.surfaces {
+            let crate::surface::Layer {
+                pump,
+                drawn: credited,
+                showing,
+                ..
+            } = layer;
+            let (mine, _) = pump.resolve(&active.gpu);
+            *credited = mine
+                .exact
+                .iter()
+                .chain(mine.fallback.iter())
+                .filter_map(|tile| tile.copyright.clone())
+                .collect();
+            *showing = !(mine.exact.is_empty() && mine.fallback.is_empty());
+            replacing.extend(mine.exact);
+            replacing_fallback.extend(mine.fallback);
+        }
         let rendered = drawn.exact.len() + drawn.fallback.len();
         let old_imagery = drawn
             .exact
@@ -469,7 +532,7 @@ impl App {
                 );
                 pass.set_scissor_rect(box_.x, box_.y, box_.width, box_.height);
             }
-            renderer.paint(
+            renderer.paint_replacing(
                 pass,
                 // The shell first — the only thing that can cover ground
                 // before any tile has arrived at all — then the complete
@@ -481,6 +544,11 @@ impl App {
                     .then_some(shell)
                     .into_iter()
                     .chain(coarse.iter().copied()),
+                // The 3D Tiles over the globe, before the globe's own
+                // tiles: where they are drawn they replace the ground, which
+                // keeps out of every pixel they took and covers the rest.
+                replacing.iter().copied(),
+                replacing_fallback.iter().copied(),
                 drawn.exact.iter().copied(),
                 // Last, testing depth and never writing it: an ancestor
                 // borrowing ground it does not own must be occluded by the
@@ -588,9 +656,10 @@ impl App {
         #[cfg(feature = "control")]
         {
             let eyes = self.eyes();
+            let picture = self.picture();
             if let Some(active) = self.active.as_mut() {
                 if let super::screen::Screen::Offscreen(offscreen) = &mut active.screen {
-                    offscreen.read(&active.gpu, &eyes);
+                    offscreen.read(&active.gpu, &eyes, picture);
                 }
             }
         }
@@ -691,6 +760,21 @@ impl App {
             for err in errors {
                 tracing::warn!("server: {err}");
             }
+            // Each tileset over the globe, on a line of its own.
+            for layer in &mut self.surfaces {
+                tracing::info!(
+                    "3D Tiles {} | {} drawn | {} loading | {:.0} MiB",
+                    layer.surface.asset,
+                    layer.drawn.len(),
+                    layer.pump.stats.requested,
+                    layer.pump.gpu_bytes as f32 / (1024.0 * 1024.0),
+                );
+                let errors = std::mem::take(&mut layer.pump.errors);
+                self.stats.errors += errors.len() as u64;
+                for err in errors {
+                    tracing::warn!("3D Tiles {}: {err}", layer.surface.asset);
+                }
+            }
         }
     }
 
@@ -704,9 +788,10 @@ impl App {
         self.picture().aspect() as f32
     }
 
-    /// Where the picture sits in the frame: the whole frame unless a host
-    /// held the camera to an aspect, and then the largest rectangle of that
-    /// shape, centred.
+    /// Where the picture sits in the frame: the view (the frame above the
+    /// credits bar, the whole frame without one) unless a host held the
+    /// camera to an aspect, and then the largest rectangle of that shape,
+    /// centred in the view.
     fn picture(&self) -> crate::frame_host::Letterbox {
         let (w, h) = self.viewport();
         crate::frame_host::Letterbox::of((w as u32, h as u32), self.fixed_aspect)

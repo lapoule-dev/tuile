@@ -20,12 +20,12 @@ use async_trait::async_trait;
 use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_core::fetch::TileFetcher;
 use tuile_core::raster::ImageryProvider;
-use tuile_planetary::Sources;
+use tuile_planetary::{Sources, TilesetSource};
 use tuile_terrain::{LayerJson, TerrainSource};
 use url::Url;
 
 use crate::tms::TmsImagery;
-use crate::{AssetEndpoint, IonClient, IonHttp, IonTerrainSource};
+use crate::{AssetEndpoint, IonClient, IonHttp, IonTerrainSource, IonTileFetcher};
 
 /// Terrain and imagery by ion asset number, resolved on demand.
 ///
@@ -117,6 +117,25 @@ where
             )),
         }
     }
+
+    /// A 3D Tiles asset: ion's own, or one ion points at elsewhere — the
+    /// endpoint says which, and the fetcher carries what each wants.
+    async fn tileset(&self, asset: i64) -> Result<TilesetSource, String> {
+        let fetcher = IonTileFetcher::new(self.client(), asset_number(asset)?);
+        let url = fetcher.tileset_url().await.map_err(|e| e.to_string())?;
+        let credits = fetcher
+            .attributions()
+            .await
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(crate::Attribution::credit)
+            .collect();
+        Ok(TilesetSource {
+            url,
+            fetcher: Arc::new(fetcher),
+            credits,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +215,27 @@ mod tests {
             .err()
             .expect("not handled");
         assert!(refused.contains("\"ELSEWHERE\""), "{refused}");
+    }
+
+    /// A 3D Tiles asset ion points elsewhere answers with that root, the
+    /// credits the endpoint lists, and a fetcher that sends no ion bearer
+    /// there; an asset that is not 3D Tiles is refused in words.
+    #[test]
+    fn a_3d_tiles_asset_is_a_tileset_with_its_credits() {
+        let (api, ion) = sources(include_str!("../fixtures/external-3dtiles-endpoint.json"));
+        let tileset = futures_executor::block_on(ion.tileset(2_275_207)).expect("a tileset");
+        assert_eq!(
+            tileset.url.as_str(),
+            "https://tile.googleapis.com/v1/3dtiles/root.json?key=FAKE_KEY"
+        );
+        let names: Vec<&str> = tileset.credits.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(names, ["Cesium ion", "Google"]);
+        futures_executor::block_on(tileset.fetcher.fetch(&tileset.url)).expect("the root");
+        let asked = api.asked.lock().expect("asked");
+        assert_eq!(asked.last().map(|a| a.1.clone()), Some(None), "no bearer");
+        drop(asked);
+        let (_, terrain) = sources(r#"{"type":"TERRAIN","url":"https://t.test/"}"#);
+        assert!(futures_executor::block_on(terrain.tileset(1)).is_err());
     }
 
     /// A negative number is not an asset, and nothing is asked.

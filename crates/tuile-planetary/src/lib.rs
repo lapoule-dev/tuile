@@ -10,7 +10,7 @@ mod store_log;
 mod switch;
 
 pub use provenance::{digest, Provenance, TerrainOrigin};
-pub use sources::{Held, Sources};
+pub use sources::{Credit, Held, Sources, TilesetSource};
 pub use switch::SwitchableImagery;
 
 use async_trait::async_trait;

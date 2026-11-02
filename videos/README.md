@@ -636,3 +636,127 @@ viewer's sunset disc, 8× (before | after).
 TUILE_ENV_FILE=~/Projects/tuile/.env scripts/discs-scenes.sh videos/discs-s1-2026-10-25
 scripts/discs-sheet.py videos/discs-s0-2026-10-25 videos/discs-s1-2026-10-25 videos/discs-s1-2026-10-25/sheets
 ```
+
+## ion-photoreal-2026-10-31/ — 3D Tiles over the globe, through ion (2026-10-31)
+
+Branch `feat/viewer-ion-photorealistic`. The viewer's own frame, headless on
+Metal (M2), with ion asset 2275207 — a 3D Tiles tileset ion points at on
+another service, opened through its endpoint — drawn over the globe as a
+surface that replaces the ground. Each directory holds the same view twice:
+`globe.png` without the tileset, `tileset.png` with it; each `.log` the scan
+of both frames (0 black pixels in all six).
+
+- `eiffel/`: eye 2.3040 E 48.8535 N, 350 m, heading 310, pitch 12.
+- `pic-du-midi/`: eye 0.1520 E 42.9300 N, 3150 m, heading 315, pitch 6.
+- `paris-overview/`: eye 2.3065 E 48.8505 N, 5000 m, heading 315, pitch 20.
+- Lit for 2026-10-31T12:00:00Z, 1280×800 at scale 1, the tileset given 60 s
+  after the globe settled (these frames still show the providers' logos
+  bottom left; they were removed from the viewer afterwards).
+  `window-title.txt` is the native window's title during a run, with the
+  credits the drawn tiles name.
+- Looked at: the tower, La Défense and the Trocadéro stand in 3D where the
+  globe alone has them flat; no seam or black between the mesh and the
+  globe; the mesh is lit by the scene's sun over textures that already carry
+  their own light, so it reads brighter and flatter than the imagery beside
+  it (since fixed: the tiles declare `KHR_materials_unlit`, now honoured —
+  see `ion-seams-2026-10-31/`).
+
+```bash
+# CESIUM_ION_TOKEN in the environment (never printed)
+for shot in "eiffel 2.3040 48.8535 350 310 12" "pic-du-midi 0.1520 42.9300 3150 315 6" \
+            "paris-overview 2.3065 48.8505 5000 315 20"; do
+  set -- $shot
+  cargo run --release -p tuile-wgpu-viewer --example tileset_shot -- --tileset 2275207 \
+    --lon $2 --lat $3 --altitude $4 --heading $5 --pitch $6 \
+    --at 2026-10-31T12:00:00Z --seconds 60 --out videos/ion-photoreal-2026-10-31/$1
+done
+```
+
+## ion-photoreal-credits-2026-10-31/ — credits bar, the switch, the web (2026-10-31)
+
+Branch `feat/viewer-ion-photorealistic`, after the providers' logos were
+removed, the credits bar (tuile-ui) added, the 3D Tiles made a switch (off by
+default), `KHR_materials_unlit` honoured and the camera floor fixed. Same
+three views as `ion-photoreal-2026-10-31/`, headless on Metal (M2), 1280×800
+at scale 1, lit for 2026-10-31T12:00:00Z, the tileset given 60 s:
+
+- `<view>/globe.png` (no tileset: no bar), `tileset.png` (the bar along the
+  bottom, outside the view, the credits centred), then in the same session
+  `off-at-once.png` (switched off as the menu does, 0.1 s later),
+  `off.png` (settled) and `on.png` (switched on again, 60 s later). Each
+  `shot.log` says what the scan found: **0 black pixels in all fifteen**.
+- `web-webgpu-eiffel/`, `web-webgl2-eiffel/`: the page in headless Chrome
+  through the catalog proxy, the switch clicked in the page's own menu:
+  `1-globe` (off by default, no bar), `2-tileset-on`, `3-off-at-once`,
+  `4-off`, `5-on-again`; the choice kept in local storage. The eye stays at
+  350 m with no second placement (before the camera fix it was lifted to
+  ~4.8 km). 0 black pixels in all ten; the page's caption stands above the
+  bar while it is shown.
+- Looked at: no logo; the bar bottom centre, outside the picture; the
+  tileset gone the next frame after the switch, the globe there, no black.
+
+```bash
+# The token is the one the viewer reads (CESIUM_ION_TOKEN, or the `token`
+# file in its support directory); never printed.
+for shot in "eiffel 2.3040 48.8535 350 310 12" "paris-overview 2.3065 48.8505 5000 315 20" \
+            "pic-du-midi 0.1520 42.9300 3150 315 6"; do
+  set -- $shot
+  cargo run --release -p tuile-wgpu-viewer --example tileset_shot -- --tileset 2275207 \
+    --lon $2 --lat $3 --altitude $4 --heading $5 --pitch $6 --at 2026-10-31T12:00:00Z \
+    --seconds 60 --switch on --out videos/ion-photoreal-credits-2026-10-31/$1
+done
+# The web: packages/tuile-viewer/build.sh, then the catalog proxy with the
+# asset (as scripts/try-viewer.sh web), then (pip: websockets):
+python3 videos/ion-photoreal-credits-2026-10-31/web-shoot.py \
+  "http://127.0.0.1:8091/examples/web-viewer/?lon=2.3040&lat=48.8535&altitude=350&heading=310&pitch=12&time=2026-10-31T12:00:00Z&timeRate=0" \
+  videos/ion-photoreal-credits-2026-10-31/web-webgpu-eiffel webgpu 60   # and ?backend=webgl2&…
+```
+
+## ion-seams-2026-10-31/ — seams in the photorealistic 3D Tiles, far over the countryside (2026-10-31)
+
+The diagnosis of the lines seen along tile borders from far away, one
+hypothesis at a time. Headless on Metal (M2), 1280×800 at scale 1, lit for
+2026-10-31T12:00:00Z, the tileset given 60 s. Views (lon lat altitude
+heading pitch): `beauce-5km` 1.49 48.45 5000 0 30, `beauce-15km` … 15000 0
+40, `beauce-40km` … 40000 0 60, `bourgogne-15km` 4.85 47.05 15000 0 30,
+`pyrenees-15km` 0.15 43.10 15000 180 25, `paris-15km` 2.35 48.85 15000 0 40.
+
+- `before/<view>/{globe,tileset}.png`: as the viewer drew them before the
+  fix (lit by per-tile computed normals).
+- `diagnostic/<view>/{unlit,coverage,geometry}/tileset.png`: the same code
+  in the diagnostic views (albedo only; magenta where no imagery layer —
+  the tileset — and green/blue where the globe shows through; flat lambert
+  only); `diagnostic/<view>/no-mips/`: lit as before, mipmaps off
+  (`TUILE_DIAG_NO_MIPS`, a temporary build, not committed).
+- `after/<view>/tileset.png`: with `KHR_materials_unlit` honoured.
+- `seamline.py`: the measure — the strongest luminance step between two
+  rows in a band, against the band's median. `glbscan.py` /
+  `glb-beauce.jsonl`: what the tiles declare, walked through the catalog
+  proxy towards the Beauce, levels 2 to 11.
+
+Measured (ratio of the border row's step to the band's median):
+
+| | before | unlit view | geometry view | no mipmaps | after |
+|---|---|---|---|---|---|
+| bourgogne-15km, rows 725–750 | 1.70 | 1.09 | 4.04 | 1.64 | 1.11 |
+| beauce-5km, rows 255–285 | 2.28 | 1.88 | 2.12 (steps of 0.3) | 2.21 | 2.50 |
+
+Over relief the lines were lighting (gone in the albedo, strongest in the
+geometry view, not the mipmaps) and went with the fix. Over the flat Beauce
+the remaining step is in the albedo itself: neighbouring tiles of different
+levels whose photographs differ in colour and sharpness — the data, which
+the fix does not change. The coverage view finds 124, 18 and 4 pixels of
+885 500 scanned (Bourgogne, Beauce, Pyrenees; the controls and the bar left out) where the globe shows through the
+tileset: sub-pixel cracks between tiles of different levels, drawn in the
+ground's colour, not visible as lines. No tile failed to decode (warnings
+logged: none from the tileset).
+
+```bash
+# Before / after: tileset_shot over the six views (globe and tileset)
+cargo run --release -p tuile-wgpu-viewer --example tileset_shot -- --tileset 2275207 \
+  --lon 4.85 --lat 47.05 --altitude 15000 --heading 0 --pitch 30 \
+  --at 2026-10-31T12:00:00Z --seconds 60 --out videos/ion-seams-2026-10-31/after/bourgogne-15km
+# A diagnostic view, the tileset alone
+… --globe off --diagnostic unlit|coverage|geometry --out …/diagnostic/<view>/<view-name>
+python3 videos/ion-seams-2026-10-31/seamline.py 170 690 725 750 <png>…
+```

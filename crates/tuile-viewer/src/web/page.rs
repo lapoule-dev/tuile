@@ -137,6 +137,12 @@ fn start_viewer_with(
                 .and_then(|link| crate::start::view_in_link(&link))
         })
         .unwrap_or_default();
+    // The 3D Tiles on offer, and those on: what the page says, else what
+    // the person left on last time — none until they turn one on.
+    let (offered, tilesets_on) = super::options::TilesetSpec::choose(
+        &options.tilesets,
+        &super::system::tilesets_kept_on(&options.name),
+    );
     let handheld = options.profile == ProfileChoice::Handheld;
     let profile = Profile::browser(handheld, options.device_memory);
     tracing::info!(
@@ -192,6 +198,9 @@ fn start_viewer_with(
         imagery_compression: options.imagery_compression,
         // A page has no file to record into.
         record: Default::default(),
+        tilesets: offered,
+        tilesets_on,
+        keeps_tilesets: true,
     };
     let app = App::new(config, launch);
     let id = CURRENT.with(|c| c.get()) + 1;

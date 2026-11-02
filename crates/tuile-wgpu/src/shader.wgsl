@@ -109,7 +109,8 @@ fn stitched(position: vec3f, uv: vec2f) -> vec3f {
 
 struct MaterialUniform {
     base_color: vec4f,
-    // x = 1 on the tile's first pass, 0 on every pass after it.
+    // x = 1 on the tile's first pass, 0 on every pass after it; y = 1 for a
+    // material that declares `KHR_materials_unlit` (see `fs_main`).
     //
     // A tile with more layers than one draw can bind is drawn again rather than
     // coarsened — see `tuile_core::raster::MAX_IMAGERY_PASSES`. The later passes
@@ -231,7 +232,22 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let opacity = max(first * albedo.a, saturate(layers));
     albedo = vec4f(ground.rgb, opacity);
 
-    let n = normalize(in.normal);
+    var n = normalize(in.normal);
+    // `KHR_materials_unlit`: the colour already carries its light — a
+    // photograph of the place, its slopes lit and shaded by the day it was
+    // taken — and the facets of the mesh are not to shade it again. It is lit
+    // as the ground is, by the sky over the place: the normal is the local
+    // vertical, so the day and the night, the sun's height and the air still
+    // reach it, and nothing of its own triangulation does — two tiles side by
+    // side, each with the normals its own triangles give, would otherwise be
+    // shaded apart along their common edge.
+    if (material.flags.y > 0.5) {
+        var centre = view.air.earth.xyz;
+        if (atmosphere.shape.w != 0.0) {
+            centre = atmosphere.centre.xyz + atmosphere.eye.xyz;
+        }
+        n = normalize(in.world - centre);
+    }
     let lambert = max(dot(n, -view.sun_dir.xyz), 0.0);
     let ambient = view.params.x;
     let lit = albedo.rgb * (ambient + (1.0 - ambient) * lambert);

@@ -18,6 +18,7 @@ use url::Url;
 pub struct MockHttp {
     responses: StdMutex<HashMap<String, Vec<HttpResponse>>>,
     log: StdMutex<Vec<(String, Option<String>)>>,
+    fresh: StdMutex<Vec<String>>,
 }
 
 impl MockHttp {
@@ -36,6 +37,11 @@ impl MockHttp {
 
     pub fn calls(&self) -> Vec<(String, Option<String>)> {
         self.log.lock().expect("lock").clone()
+    }
+
+    /// The URLs asked for past any cache ([`IonHttp::get_fresh`]).
+    pub fn fresh(&self) -> Vec<String> {
+        self.fresh.lock().expect("lock").clone()
     }
 }
 
@@ -56,5 +62,10 @@ impl IonHttp for MockHttp {
         } else {
             queue[0].clone()
         })
+    }
+
+    async fn get_fresh(&self, url: &Url, bearer: Option<&str>) -> Result<HttpResponse, IonError> {
+        self.fresh.lock().expect("lock").push(url.to_string());
+        self.get(url, bearer).await
     }
 }

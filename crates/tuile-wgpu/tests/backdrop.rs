@@ -28,6 +28,7 @@ use tuile_wgpu::ContentPump;
 fn surface() -> DecodedTileContent {
     DecodedTileContent {
         withheld_drape: None,
+        copyright: None,
         meshes: vec![DecodedMesh {
             positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
             normals: Some(vec![[0.0, 0.0, 1.0]; 3]),
@@ -36,6 +37,7 @@ fn surface() -> DecodedTileContent {
             material: MaterialDesc {
                 base_color_factor: [1.0, 1.0, 1.0, 1.0],
                 base_color_texture: None,
+                unlit: false,
             },
         }],
         textures: Vec::new(),

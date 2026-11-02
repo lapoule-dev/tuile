@@ -32,7 +32,7 @@
 //! (`crate::web::menu`). Elsewhere there is no menu and the keys are all
 //! there is, exactly as before.
 
-use crate::embed::ImageryChoice;
+use crate::embed::{ImageryChoice, TilesetChoice};
 use crate::snapshot::Snapshot;
 use crate::steer::Command;
 
@@ -69,6 +69,12 @@ pub(crate) enum Ask {
     /// The session recorded — camera, clocks, atmosphere and the pictures
     /// drawn — or the recording closed.
     ToggleRecording,
+    /// The host's tileset of this asset number, the `index`th of the
+    /// session's, drawn over the globe or not.
+    ToggleTileset {
+        index: usize,
+        asset: i64,
+    },
 }
 
 /// The rates the clock steps through, scene seconds a second: backwards an
@@ -102,6 +108,9 @@ pub(crate) struct State {
     pub clock: Clock,
     /// Whether the session is being recorded.
     pub recording: bool,
+    /// Which of the session's 3D Tiles tilesets are drawn, a bit each by
+    /// their order: bit 0 the first.
+    pub tilesets: u32,
 }
 
 impl State {
@@ -114,7 +123,13 @@ impl State {
             layers,
             clock: snapshot.clock,
             recording: snapshot.recording,
+            tilesets: snapshot.tilesets,
         }
+    }
+
+    /// Whether the `index`th tileset is drawn.
+    pub(crate) fn tileset_on(&self, index: usize) -> bool {
+        index < 32 && self.tilesets & (1 << index) != 0
     }
 
     /// What the check marks show: the state without its clock, which moves
@@ -139,6 +154,10 @@ impl Ask {
             Self::ToggleWireframe => Command::Wireframe(!now.wireframe),
             Self::ToggleFreeze => Command::Freeze(!now.frozen),
             Self::ToggleRecording => Command::Record(!now.recording),
+            Self::ToggleTileset { index, asset } => Command::Tileset {
+                asset,
+                on: !now.tileset_on(index),
+            },
             Self::Diagnostic(view) => Command::Diagnostic(view),
             Self::NextDiagnostic => Command::Diagnostic((now.diagnostic + 1) % DIAGNOSTICS.len()),
             Self::Imagery(layer) => Command::Imagery(layer),
@@ -191,6 +210,7 @@ impl Ask {
             Self::Imagery(layer) => Some(now.layer == layer),
             Self::Pause => Some(now.clock.rate == 0.0),
             Self::ToggleRecording => Some(now.recording),
+            Self::ToggleTileset { index, .. } => Some(now.tileset_on(index)),
             Self::Do(_)
             | Self::NextDiagnostic
             | Self::NextImagery
@@ -268,7 +288,10 @@ pub(crate) enum Entry {
     )),
     allow(dead_code)
 )]
-pub(crate) fn layout(layers: &[ImageryChoice]) -> Vec<(&'static str, Vec<Entry>)> {
+pub(crate) fn layout(
+    layers: &[ImageryChoice],
+    tilesets: &[TilesetChoice],
+) -> Vec<(&'static str, Vec<Entry>)> {
     let item = |title: &str, ask: Ask| Entry::Item {
         title: title.to_owned(),
         ask,
@@ -322,12 +345,29 @@ pub(crate) fn layout(layers: &[ImageryChoice]) -> Vec<(&'static str, Vec<Entry>)
         Entry::Separator,
         item("Now, in Real Time", Ask::Do(Command::ClockNow)),
     ];
-    vec![
+    let mut sections = vec![
         ("View", view),
         ("Go", go),
         ("Imagery", imagery),
         ("Time", time),
-    ]
+    ];
+    // The host's 3D Tiles, each a switch, when it offers any.
+    if !tilesets.is_empty() {
+        let items = tilesets
+            .iter()
+            .enumerate()
+            .map(|(index, choice)| Entry::Item {
+                title: choice.name.clone(),
+                ask: Ask::ToggleTileset {
+                    index,
+                    asset: choice.asset,
+                },
+                key: None,
+            })
+            .collect();
+        sections.push(("3D Tiles", items));
+    }
+    sections
 }
 
 pub(crate) use platform::Installed;
@@ -342,7 +382,7 @@ mod platform {
     };
 
     use super::{layout, Ask, Entry, State};
-    use crate::embed::ImageryChoice;
+    use crate::embed::{ImageryChoice, TilesetChoice};
     use crate::steer::{Command, Request};
 
     /// Set by a click: the platform has just flipped the clicked item's check
@@ -369,8 +409,11 @@ mod platform {
         /// main thread once the event loop is running. `None`, with a line in
         /// the log, when the platform refuses: a globe without a menu is
         /// still a globe.
-        pub(crate) fn install(layers: &'static [ImageryChoice]) -> Option<Self> {
-            match Self::build(layers) {
+        pub(crate) fn install(
+            layers: &'static [ImageryChoice],
+            tilesets: &[TilesetChoice],
+        ) -> Option<Self> {
+            match Self::build(layers, tilesets) {
                 Ok(installed) => Some(installed),
                 Err(why) => {
                     tracing::error!("no menu bar: {why}");
@@ -379,7 +422,10 @@ mod platform {
             }
         }
 
-        fn build(layers: &'static [ImageryChoice]) -> muda::Result<Self> {
+        fn build(
+            layers: &'static [ImageryChoice],
+            tilesets: &[TilesetChoice],
+        ) -> muda::Result<Self> {
             let identity = crate::embed::identity();
             let menu = Menu::new();
 
@@ -423,7 +469,7 @@ mod platform {
 
             // The application's own: every item is found again by its place
             // in the layout, which is its id.
-            let sections = layout(layers);
+            let sections = layout(layers, tilesets);
             let mut marks = Vec::new();
             for (title, entries) in &sections {
                 let submenu = Submenu::new(title, true);
@@ -517,7 +563,7 @@ mod platform {
             let layers: Vec<ImageryChoice> = (0..9)
                 .map(|n| ImageryChoice::new(&format!("l{n}"), &format!("L{n}"), n, ""))
                 .collect();
-            for (_, entries) in layout(&layers) {
+            for (_, entries) in layout(&layers, &[TilesetChoice::new("Mesh", 7)]) {
                 for entry in entries {
                     if let Entry::Item {
                         key: Some(key),
@@ -549,13 +595,16 @@ mod platform {
 )))]
 mod platform {
     use super::State;
-    use crate::embed::ImageryChoice;
+    use crate::embed::{ImageryChoice, TilesetChoice};
 
     /// No menu bar on this platform: the keys are all there is.
     pub(crate) struct Installed;
 
     impl Installed {
-        pub(crate) fn install(_layers: &'static [ImageryChoice]) -> Option<Self> {
+        pub(crate) fn install(
+            _layers: &'static [ImageryChoice],
+            _tilesets: &[TilesetChoice],
+        ) -> Option<Self> {
             None
         }
 
@@ -579,6 +628,7 @@ impl Default for State {
                 event: None,
             },
             recording: false,
+            tilesets: 0,
         }
     }
 }
@@ -597,14 +647,20 @@ mod tests {
     }
 
     fn items(layers: &[ImageryChoice]) -> Vec<(String, Ask, Option<char>)> {
-        layout(layers)
-            .into_iter()
-            .flat_map(|(_, entries)| entries)
-            .filter_map(|entry| match entry {
-                Entry::Item { title, ask, key } => Some((title, ask, key)),
-                Entry::Separator => None,
-            })
-            .collect()
+        layout(
+            layers,
+            &[
+                TilesetChoice::new("Photorealistic 3D Tiles", 2275207),
+                TilesetChoice::new("3D Tiles 96188", 96188),
+            ],
+        )
+        .into_iter()
+        .flat_map(|(_, entries)| entries)
+        .filter_map(|entry| match entry {
+            Entry::Item { title, ask, key } => Some((title, ask, key)),
+            Entry::Separator => None,
+        })
+        .collect()
     }
 
     /// The window's keys and the menu's key equivalents are one table: every
@@ -685,6 +741,15 @@ mod tests {
         ];
         wanted.extend((0..DIAGNOSTICS.len()).map(Command::Diagnostic));
         wanted.extend((0..layers.len()).map(Command::Imagery));
+        // Each tileset, switched from the state it is in.
+        wanted.push(Command::Tileset {
+            asset: 2275207,
+            on: true,
+        });
+        wanted.push(Command::Tileset {
+            asset: 96188,
+            on: true,
+        });
         for command in wanted {
             assert!(reachable.contains(&command), "{command:?} is on no menu");
         }
@@ -706,6 +771,7 @@ mod tests {
             layers: layers.len(),
             clock: State::default().clock,
             recording: false,
+            tilesets: 0b10,
         };
         let marked: Vec<String> = items(&layers)
             .into_iter()
@@ -717,7 +783,8 @@ mod tests {
             [
                 "Wireframe",
                 "Diagnostic View: Coverage",
-                "Aerial with labels"
+                "Aerial with labels",
+                "3D Tiles 96188"
             ]
         );
         // Actions carry no mark, whatever the state.
@@ -796,10 +863,22 @@ mod tests {
                 event: None,
             },
             recording: false,
+            tilesets: 0b1,
         };
         for (ask, command) in [
             (Ask::ToggleWireframe, Command::Wireframe(true)),
             (Ask::ToggleFreeze, Command::Freeze(false)),
+            (
+                Ask::ToggleTileset { index: 0, asset: 7 },
+                Command::Tileset {
+                    asset: 7,
+                    on: false,
+                },
+            ),
+            (
+                Ask::ToggleTileset { index: 1, asset: 8 },
+                Command::Tileset { asset: 8, on: true },
+            ),
             (Ask::NextDiagnostic, Command::Diagnostic(0)),
             (Ask::NextImagery, Command::Imagery(0)),
             (Ask::Imagery(1), Command::Imagery(1)),
