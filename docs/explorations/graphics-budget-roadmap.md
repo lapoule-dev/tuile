@@ -25,7 +25,7 @@ PRs — numbered B1–B8 in that plan, unrelated to section B below — fixes it
 signals, and a measured acceptance (imagery peak ≤ 15.5 MB, BC7 settle ≤ 6.0 s, Off goldens unchanged). It comes
 before A2 and A4.
 
-### O1 — the budget's algorithms, before CB (status: O1.5 part 2, 2026-11-01)
+### O1 — the budget's algorithms, before CB (status: O1.5 part 4, 2026-11-02)
 
 The budget is its own crate, `tuile-budget` (#163). O1 optimises its `decide` before the compression budget,
 decisions bit-identical throughout. The guard comes first (O1.0): today's engine frozen at 3d1a028e in
@@ -487,6 +487,29 @@ the network under the local quota, once, and the load puts it back) or a change 
 decide in the still phase 94 → 81 µs (off); over the run, the loading burst asks more (off 6 818 → 10 460 asks
 in a run, 406 → 640 a second: every answer an event touches, the moment it is touched, where the window refreshed each once a
 second, late) for the same decide time, imagery peak, frames and convergence.
+
+Part 4 (`perf/budget-o1-flight`): P6.4 on the flight. P6.4 run on the flight that grows the tracked set and falls
+back (`decide_work_grows_with_changes_not_with_the_view_on_the_flight`) was over its bound on 7 of 3 600 steps, and
+across changes of pressure on a still view (`a_change_of_pressure_reads_again_only_the_wants_that_read_it`) on 9
+of 720. Three causes, each fixed with decisions and the whole state byte-identical (two runs added to the recorded
+reference, every other line unchanged): (1) a change of pressure read every tile's wants again (W 1 467 to 4 454
+against 256 with nothing else changing); the wants keep the tiles that read the pressure — a drape worn one level
+finer than its need — and a change to or from `Normal` reads only those (a change between two pressures under
+`Normal`, none); (2) the thrash window's expiries all landed on the prune ten seconds after a burst of evictions
+(the five still steps after the descent, W 308–414, and 2 072 ten seconds after the background's 2 804
+evictions): the prune now moves a horizon and the entries behind it leave `recent` 64 a step (`RECENT_DRAIN`),
+the snapshot and the thrash count reading only what is past the horizon; (3) the prune scanned every load and
+transit in flight every eighth step: the arena keeps the active slots in two runs (busy, ended), each slot knowing
+its place in `Cold`'s spare room (still 48 B), moved the moment its last load or transit ends, and the prune drops
+the second run whole. P6.4's #E now counts, deliberately and each with its reason in the test, a release as a
+decision (as an eviction), the evictions and releases a change of pressure forces on its own step (one input,
+whose effect is a set: no algorithm takes them in less than a unit each), and on a prune step the events and
+decisions since the last prune plus the slots it frees, read the next step. M-bench (x86, 5 interleaved rounds,
+against `main`): at parity — still 39.1 → 39.0 µs, still-full 329 → 330, motion 642 → 648, pressure 478 → 479,
+motion p99 1 121 → 1 110, pressure p99 888 → 900: the work removed was the flight's spikes, which the bench's
+scenarios do not hold. Ratchets unchanged (the readers' vector gives back its room past four times its use: one
+reader in a room of 64 at the tour's end was the one byte per tracked resource over the ratchet). Not reached:
+motion's 23 blocks a step at p99, untouched by this part.
 
 Order is strict: A before B, B before C. Every step of A, B and C goes through the same battery before
 the next starts — tests seen red, mutants killed, the reference model extended, Kani proofs of its
