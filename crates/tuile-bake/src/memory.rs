@@ -183,6 +183,13 @@ pub fn watch(interval: Duration, watched: Vec<PathBuf>) {
                     selected = m.tiles_selected.get(),
                     in_flight = m.loads_in_flight.get(),
                     priming_pending = m.priming_pending.get(),
+                    // What the bakes' staged settling has in hand, all of them
+                    // together: grounds waiting for their read (each counted
+                    // whole, so a ceiling), and the selections settled so far.
+                    ground_reads = m.ground_reads_pending.get(),
+                    ground_reads_gib = format!("{:.2}", gib(m.ground_reads_pending_bytes.get())),
+                    settled_tiles = m.settled_tiles.get(),
+                    settled_gib = format!("{:.2}", gib(m.settled_bytes.get())),
                     // Whether the bandwidth is being spent twice. A store that
                     // is written and never read looks exactly like a store that
                     // is working, from anywhere but here.

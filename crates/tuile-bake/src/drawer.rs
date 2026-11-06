@@ -23,7 +23,7 @@
 //! and still place every camera where building them one after the other
 //! does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -63,6 +63,43 @@ impl Selected {
 
     pub fn is_empty(&self) -> bool {
         self.tiles.is_empty()
+    }
+}
+
+/// What frozen selections hold between them.
+///
+/// A selection holds its tiles' terrain by reference, and two selections of
+/// neighbouring frames share nearly all of it: summing each one's tiles would
+/// count a tile once per frame that selected it. So a tile's terrain counts
+/// once here, whichever selections hold it; each selection's own list counts
+/// for itself. What the session still keeps is counted too: this is what the
+/// selections hold, of which only what the session has let go is theirs alone.
+#[derive(Default)]
+pub struct Held {
+    seen: HashSet<usize>,
+    terrain: usize,
+    lists: usize,
+}
+
+impl Held {
+    /// Counts `selected`, to be given once.
+    pub fn add(&mut self, selected: &Selected) {
+        self.lists += selected.tiles.capacity() * std::mem::size_of::<SelectedTile>();
+        for t in &selected.tiles {
+            if self.seen.insert(Arc::as_ptr(&t.kept) as usize) {
+                self.terrain += t.kept.heap_bytes();
+            }
+        }
+    }
+
+    /// The distinct tiles held.
+    pub fn tiles(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// The bytes held: each tile's terrain once, and every selection's list.
+    pub fn bytes(&self) -> usize {
+        self.terrain + self.lists
     }
 }
 
@@ -230,12 +267,12 @@ impl GroundDrawer {
     }
 
     /// The tiles it holds prepared, and their bytes ([`crate::GroundMemory`]).
-    pub(crate) fn prepared(&self) -> (usize, usize) {
+    pub fn prepared(&self) -> (usize, usize) {
         (self.stitching.len(), self.stitching.heap_bytes())
     }
 
     /// The bytes of the ground last built.
-    pub(crate) fn built(&self) -> usize {
+    pub fn built(&self) -> usize {
         self.built
     }
 }

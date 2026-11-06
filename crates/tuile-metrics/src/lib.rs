@@ -188,6 +188,22 @@ fn describe() {
     );
     describe_gauge!("tuile_prepared_tiles", "Tiles resident on the GPU.");
     describe_gauge!(
+        "tuile_ground_reads_pending",
+        "Grounds built and not read yet, every bake of the process together."
+    );
+    describe_gauge!(
+        "tuile_ground_reads_pending_bytes",
+        "Their bytes, each ground counted whole: a ceiling, grounds share tiles."
+    );
+    describe_gauge!(
+        "tuile_settled_tiles",
+        "Distinct terrain tiles held by the selections settled so far."
+    );
+    describe_gauge!(
+        "tuile_settled_bytes",
+        "Their bytes, each tile once, with the selections' own lists."
+    );
+    describe_gauge!(
         "tuile_frame_exact",
         "Selected tiles the last frame drew with their own surface."
     );
@@ -379,6 +395,10 @@ fn publish(m: &Metrics) {
     gauge!("tuile_imagery_textures").set(m.imagery_textures.get() as f64);
     gauge!("tuile_pending_uploads").set(m.pending_uploads.get() as f64);
     gauge!("tuile_prepared_tiles").set(m.prepared_tiles.get() as f64);
+    gauge!("tuile_ground_reads_pending").set(m.ground_reads_pending.get() as f64);
+    gauge!("tuile_ground_reads_pending_bytes").set(m.ground_reads_pending_bytes.get() as f64);
+    gauge!("tuile_settled_tiles").set(m.settled_tiles.get() as f64);
+    gauge!("tuile_settled_bytes").set(m.settled_bytes.get() as f64);
     gauge!("tuile_frame_exact").set(m.frame_exact.get() as f64);
     gauge!("tuile_frame_coarser").set(m.frame_coarser.get() as f64);
     gauge!("tuile_frame_lost").set(m.frame_lost.get() as f64);
@@ -508,6 +528,10 @@ mod tests {
             "tuile_priming_pending",
             "tuile_priming_unavailable",
             "tuile_priming_done",
+            "tuile_ground_reads_pending",
+            "tuile_ground_reads_pending_bytes",
+            "tuile_settled_tiles",
+            "tuile_settled_bytes",
             "tuile_stitch_plans",
             "# HELP tuile_stitch_overflows",
             "# HELP tuile_pose_seconds_sum",

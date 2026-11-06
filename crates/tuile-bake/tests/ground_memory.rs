@@ -24,11 +24,14 @@
 #[path = "../../tuile-terrain/tests/support/mod.rs"]
 mod support;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use glam::DVec3;
 use support::{encoded, measured, LAT, LON};
-use tuile_bake::{Finish, GlobeConfig, Session, SourcesHandle};
+use tuile_bake::settle::{read_each, settle_each, Drawn};
+use tuile_bake::{pose_view, Finish, GlobeConfig, GroundDrawer, Held, Session, SourcesHandle};
 use tuile_core::fetch::Fetched;
 use tuile_core::raster::{ImageryCoord, ImageryProvider, RasterError, TilingScheme};
 use tuile_film::ground::Prepare;
@@ -208,4 +211,89 @@ fn the_ground_kept_small_answers_the_heights_of_the_meshes_as_they_came() {
         "{differing} heights differ from those of the meshes as they came ({read} read)"
     );
     eprintln!("{read} heights read, every one as from the meshes as they came");
+}
+
+/// The only test of this binary to settle: the numbers it reads are the
+/// process's, and a second settle beside it would move them.
+#[test]
+fn what_settling_holds_is_counted_while_held_and_let_go_after() {
+    let m = tuile_core::metrics::metrics();
+    let mut config = GlobeConfig::new("");
+    config.sources = Some(SourcesHandle(Arc::new(MadeUp)));
+    config.session.traversal.maximum_screen_space_error = SSE;
+    config.session.finish = Finish::Identity;
+    let mut session = Session::globe(config).expect("a globe");
+    session.keep_ground();
+    let mut drawer = GroundDrawer::new();
+    let drawn = Drawn {
+        how: DRAWN[0].0,
+        stitch: DRAWN[0].1,
+    };
+    let numbers: Vec<u32> = (0..FRAMES).collect();
+
+    let (reads, read_bytes, settled_bytes) =
+        (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+    let frames = settle_each(
+        &mut session,
+        &mut drawer,
+        drawn,
+        &numbers,
+        |i, _| vec![pose_view(&pose(i), VIEWPORT)],
+        |i, ground| {
+            reads.fetch_max(m.ground_reads_pending.get(), Ordering::SeqCst);
+            let bytes = m.ground_reads_pending_bytes.get();
+            assert!(bytes >= ground.heap_bytes() as u64, "frame {i}: {bytes}");
+            read_bytes.fetch_max(bytes, Ordering::SeqCst);
+            // The frames before the last are read by now or about to be.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while i == FRAMES - 1 && m.settled_bytes.get() == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            settled_bytes.fetch_max(m.settled_bytes.get(), Ordering::SeqCst);
+        },
+    )
+    .expect("settled");
+    assert!(reads.load(Ordering::SeqCst) >= 1, "a ground waited");
+    assert!(read_bytes.load(Ordering::SeqCst) > 0, "and weighed");
+    assert!(
+        settled_bytes.load(Ordering::SeqCst) > 0,
+        "the selections settled were counted"
+    );
+    assert_eq!(m.ground_reads_pending.get(), 0, "every ground read");
+    assert_eq!(m.ground_reads_pending_bytes.get(), 0, "every ground let go");
+    assert_eq!(m.settled_tiles.get(), 0, "the selections handed over");
+    assert_eq!(m.settled_bytes.get(), 0, "and their bytes");
+
+    // A tile shared by neighbouring frames is held, and counted, once.
+    let mut held = Held::default();
+    for s in &frames {
+        held.add(&s.selected);
+    }
+    let selected: usize = frames.iter().map(|s| s.selected.len()).sum();
+    let widest = frames.iter().map(|s| s.selected.len()).max().unwrap_or(0);
+    assert!(
+        (widest..selected).contains(&held.tiles()),
+        "{} tiles of {selected} selected, the widest frame {widest}",
+        held.tiles()
+    );
+    assert!(held.bytes() > 0);
+
+    // The staged path draws on its own drawer: the session's has nothing to
+    // say about it, and that drawer is where the figures are.
+    let memory = session.ground_memory().expect("kept");
+    assert!(memory.kept_bytes > 0);
+    assert_eq!(memory.prepared_bytes, 0, "the session drew nothing");
+    assert!(drawer.prepared().1 > 0, "the drawer prepared the tiles");
+    assert!(drawer.built() > 0, "and built the grounds");
+
+    // Grounds built again from their selections wait for their reads alike.
+    let frozen: Vec<(u32, &tuile_bake::Selected)> =
+        frames.iter().map(|s| (s.number, &s.selected)).collect();
+    let waited = AtomicU64::new(0);
+    read_each(&mut drawer, drawn, &frozen, |_, _| {
+        waited.fetch_max(m.ground_reads_pending.get(), Ordering::SeqCst);
+    });
+    assert!(waited.load(Ordering::SeqCst) >= 1, "a ground waited again");
+    assert_eq!(m.ground_reads_pending.get(), 0);
+    assert_eq!(m.ground_reads_pending_bytes.get(), 0);
 }
