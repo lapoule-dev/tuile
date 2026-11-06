@@ -26,12 +26,63 @@ use std::time::{Duration, Instant};
 use tuile_core::traversal::ViewStateParams;
 use tuile_film::ground::{Ground, Prepare};
 
-use crate::drawer::{GroundDrawer, Selected};
+use crate::drawer::{GroundDrawer, Held, Selected};
 use crate::session::{FrameError, Session};
 
 /// How many selections may wait for their ground: the most grounds' worth
 /// of tiles held frozen at once beyond the one being built.
 const LEAD: usize = 4;
+
+/// A ground built and not read yet, counted until its reading is over,
+/// whichever way that ends ([`tuile_core::metrics::Metrics::ground_reads_pending`]).
+struct Unread(u64);
+
+impl Unread {
+    fn new(bytes: usize) -> Self {
+        let m = tuile_core::metrics::metrics();
+        m.ground_reads_pending.inc();
+        m.ground_reads_pending_bytes.add(bytes as u64);
+        Self(bytes as u64)
+    }
+}
+
+impl Drop for Unread {
+    fn drop(&mut self) {
+        let m = tuile_core::metrics::metrics();
+        m.ground_reads_pending.dec();
+        m.ground_reads_pending_bytes.sub(self.0);
+    }
+}
+
+/// The selections a [`settle_each`] has settled and holds until it returns,
+/// published as they grow and taken off when it does: the caller then has
+/// them, and says for itself what it keeps
+/// ([`tuile_core::metrics::Metrics::settled_bytes`]).
+#[derive(Default)]
+struct Holding {
+    held: Held,
+    tiles: u64,
+    bytes: u64,
+}
+
+impl Holding {
+    fn add(&mut self, selected: &Selected) {
+        self.held.add(selected);
+        let (tiles, bytes) = (self.held.tiles() as u64, self.held.bytes() as u64);
+        let m = tuile_core::metrics::metrics();
+        m.settled_tiles.add(tiles - self.tiles);
+        m.settled_bytes.add(bytes - self.bytes);
+        (self.tiles, self.bytes) = (tiles, bytes);
+    }
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        let m = tuile_core::metrics::metrics();
+        m.settled_tiles.sub(self.tiles);
+        m.settled_bytes.sub(self.bytes);
+    }
+}
 
 /// One frame settled.
 pub struct Settled<T> {
@@ -98,6 +149,8 @@ where
     type Frozen = (usize, u32, u64, Selected, Duration);
     let read = &read;
     let settled: Mutex<Vec<(usize, Settled<T>)>> = Mutex::new(Vec::with_capacity(numbers.len()));
+    let holding = Mutex::new(Holding::default());
+    let holding_ref = &holding;
     let settled_ref = &settled;
     let failed = std::thread::scope(|scope| {
         let (frozen, thawed) = std::sync::mpsc::sync_channel::<Frozen>(LEAD);
@@ -107,10 +160,15 @@ where
                     let started = Instant::now();
                     let ground = Arc::new(drawer.ground(&selected, drawn.how, drawn.stitch));
                     let built_in = started.elapsed();
+                    let unread = Unread::new(drawer.built());
                     reads.spawn(move |_| {
+                        let _unread = unread;
                         let started = Instant::now();
                         let value = read(number, &ground);
                         let read_in = started.elapsed();
+                        if let Ok(mut holding) = holding_ref.lock() {
+                            holding.add(&selected);
+                        }
                         if let Ok(mut settled) = settled_ref.lock() {
                             settled.push((
                                 index,
@@ -211,7 +269,9 @@ where
             let ground = Arc::new(drawer.ground(selected, drawn.how, drawn.stitch));
             let built_in = started.elapsed();
             let number = *number;
+            let unread = Unread::new(drawer.built());
             reads.spawn(move |_| {
+                let _unread = unread;
                 let started = Instant::now();
                 let value = read(number, &ground);
                 let read_in = started.elapsed();

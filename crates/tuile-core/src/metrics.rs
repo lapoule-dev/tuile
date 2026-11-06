@@ -61,6 +61,9 @@ impl Gauge {
     pub fn inc(&self) {
         self.0.fetch_add(1, ORDER);
     }
+    pub fn add(&self, n: u64) {
+        self.0.fetch_add(n, ORDER);
+    }
     /// Saturating, because a gauge is an observation and no observation is
     /// worth a panic. An unbalanced decrement is a bug, but wrapping to
     /// eighteen quintillion turns that bug into a permanently unreadable
@@ -71,6 +74,13 @@ impl Gauge {
         let _ = self
             .0
             .fetch_update(ORDER, ORDER, |v| Some(v.saturating_sub(1)));
+    }
+    /// [`Self::dec`], `n` at a time.
+    #[allow(deprecated)]
+    pub fn sub(&self, n: u64) {
+        let _ = self
+            .0
+            .fetch_update(ORDER, ORDER, |v| Some(v.saturating_sub(n)));
     }
 }
 
@@ -525,6 +535,24 @@ pub struct Metrics {
     /// it looks from the outside exactly like a slow network.
     pub pending_uploads: Gauge,
     pub prepared_tiles: Gauge,
+
+    // --- What settling holds ---
+    //
+    // What a bake's staged settling has in hand at this instant, summed over
+    // every bake of the process: each adds what it takes and takes off what
+    // it lets go, so several at once read as their total. Left out of
+    // [`Snapshot`] on purpose: they follow the threads' timing, and a
+    // snapshot is made to be compared.
+    /// Grounds built and not read yet: the backlog between a bake's ground
+    /// stage and its reads, which nothing bounds.
+    pub ground_reads_pending: Gauge,
+    /// Their bytes, each ground counted whole. Grounds share tiles, so this
+    /// is a ceiling on what the backlog holds, not its exact size.
+    pub ground_reads_pending_bytes: Gauge,
+    /// Distinct terrain tiles the selections settled so far hold.
+    pub settled_tiles: Gauge,
+    /// Their bytes, each tile once, and the selections' own lists.
+    pub settled_bytes: Gauge,
 
     // --- The frame, as drawn ---
     //

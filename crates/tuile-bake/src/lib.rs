@@ -19,7 +19,7 @@ pub mod settle;
 pub mod tape;
 pub mod tiles;
 
-pub use drawer::{GroundDrawer, Selected};
+pub use drawer::{GroundDrawer, Held, Selected};
 pub use globe::{
     asset_of_namespace, duration_or, source_namespace, GlobeConfig, GlobeError, ReferenceFetched,
     ReferenceImagery, Sources, SourcesHandle, TileCache, BING_AERIAL, CESIUM_WORLD_TERRAIN,
