@@ -19,7 +19,7 @@ pub mod tone;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 
-pub use archives::{ArchivedTiles, Now, EXTRACT_BANDS};
+pub use archives::{ArchivedTiles, Now, PinReport, PinnedLayer, Pins, EXTRACT_BANDS, PINS_PREFIX};
 pub use bench::{
     block_segment, Asked, Bench, Later, LiveAnswer, LiveAnswers, LiveAsk, LiveAsked, Project,
     Reply, StoreAt, StoreObjects, BLOCK, LIVE_AT_ONCE, LIVE_MANY,

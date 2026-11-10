@@ -317,6 +317,20 @@ impl ObjectRunStore {
         }
     }
 
+    /// The same store, its objects read and written through what `wrap`
+    /// puts in front of them: tiers of copies, a counter.
+    pub fn wrapped(
+        self,
+        wrap: impl FnOnce(Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore>,
+        said: &str,
+    ) -> Self {
+        ObjectRunStore {
+            store: wrap(self.store),
+            tuning: self.tuning,
+            label: format!("{} {said}", self.label),
+        }
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }

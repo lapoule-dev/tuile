@@ -29,6 +29,31 @@ pub fn bucket(name: &str) -> Result<Arc<dyn Objects>, Error> {
     )?))
 }
 
+/// The tile store's bucket `name`, behind the global tier when the
+/// environment names one (`TUILE_TILES_GLOBAL`, as the bakes read it:
+/// [`tuile_bake::tiles::Tiers`]): its archives, immutable, are read from
+/// the region's copy, and what the bucket gives is copied there once for
+/// every other instance. The catalog and the manifests always come from
+/// the bucket.
+pub fn tile_bucket(name: &str) -> Result<Arc<dyn Objects>, Error> {
+    let config = BucketConfig {
+        bucket: name.to_string(),
+        ..BucketConfig::from_env()?
+    };
+    let store = ObjectRunStore::bucket(&config, Tuning::from_env())?;
+    let tiers = tuile_bake::tiles::Tiers::from_env()?;
+    Ok(Arc::new(match tiers.global {
+        Some(global) => {
+            println!("tile store: bucket {name}, its archives behind {}", global.name);
+            store.wrapped(
+                |origin| Arc::new(tuile_tile_server::Tiered::new(origin, vec![global])),
+                "behind its global tier",
+            )
+        }
+        None => store,
+    }))
+}
+
 /// The tile store a render reads, and what keeps its blocks.
 pub struct TileStore {
     pub objects: Arc<dyn Objects>,
@@ -43,7 +68,7 @@ pub struct TileStore {
 /// (`TUILE_TILES_LOCAL`), somebody else's server of
 /// the store routes (`TUILE_TILES_REMOTE`, see
 /// [`tuile_repository::HttpGet::from_env`]), its blocks kept under `cache`,
-/// or the bucket `TUILE_TILES_BUCKET`.
+/// or the bucket `TUILE_TILES_BUCKET` ([`tile_bucket`]).
 pub async fn tile_store(cache: &Path) -> Result<TileStore, Error> {
     // A store on this machine, for renders of packs that carry their tiles:
     // nothing is asked of a bucket.
@@ -86,7 +111,7 @@ pub async fn tile_store(cache: &Path) -> Result<TileStore, Error> {
             })
         }
         None => Ok(TileStore {
-            objects: bucket(&std::env::var("TUILE_TILES_BUCKET").map_err(|_| {
+            objects: tile_bucket(&std::env::var("TUILE_TILES_BUCKET").map_err(|_| {
                 "no tile store: neither TUILE_TILES_REMOTE nor TUILE_TILES_BUCKET is set"
             })?)?,
             remote_blocks: None,

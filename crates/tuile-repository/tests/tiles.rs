@@ -727,3 +727,94 @@ fn the_reader_s_bands_are_the_writer_s() {
         tuile_tile_server::extract::BANDS
     );
 }
+
+/// A zone pinned is read from the archives that held the tiles asked for
+/// when they were pinned, newest first, as its manifest was read then —
+/// whatever is written to the zone after — and an archive gone takes its
+/// tiles with it.
+#[tokio::test]
+async fn a_pinned_zone_is_read_as_it_was_when_pinned() {
+    let memory: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let written = Catalog {
+        layers: vec![layer("imagery", Grid::WebMercator, None)],
+    };
+    catalog::write(memory.as_ref(), &written)
+        .await
+        .expect("catalog");
+    let store = TileStore::open(memory.clone(), StoreConfig::default())
+        .await
+        .expect("open");
+    // One archive a flush: A, then B, then A again.
+    let put = |x: u32, said: &'static str| {
+        let store = &store;
+        async move {
+            store
+                .put("imagery", 7, x, 50, Bytes::from(said))
+                .await
+                .expect("put");
+            store.flush_all().await.expect("flush");
+        }
+    };
+    put(77, "A1").await;
+    put(78, "B1").await;
+    put(77, "A2").await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    copy_out(memory.as_ref(), dir.path()).await;
+    let objects: Arc<dyn Objects> =
+        Arc::new(ObjectRunStore::local(dir.path(), Tuning::default()).expect("store"));
+    let open = || {
+        let objects = objects.clone();
+        async move {
+            ArchivedTiles::open(objects.clone(), objects, Arc::new(|| 1_800_000_000))
+                .await
+                .expect("open")
+        }
+    };
+    let pinner = open().await;
+    let (pinned, report) = pinner
+        .pin("imagery", &[(7, 77, 50), (7, 78, 50), (7, 77, 50), (7, 76, 50)])
+        .await
+        .expect("pinned");
+    // A in the newest archive, B in the second: the first archive, whose A
+    // is older, holds nothing a reader would take from it.
+    assert_eq!(report.zones, 1);
+    assert_eq!((report.tiles, report.archives), (3, 2));
+    assert_eq!(report.absent, 1);
+    assert_eq!(report.absent_first, vec![("imagery".to_string(), 7, 76, 50)]);
+    assert!(report.incomplete().is_some());
+    let zone = pinner.zone_of("imagery", 7, 77, 50).expect("zone");
+    let archives = &pinned.zones[&zone];
+    assert_eq!(archives.len(), 2);
+    let pins = tuile_repository::Pins {
+        layers: vec![pinned.clone()],
+    };
+    assert!(pins.key().starts_with(tuile_repository::PINS_PREFIX));
+    assert_eq!(pins.key(), pins.clone().key(), "the same pins, the same key");
+    let back: tuile_repository::Pins = serde_json::from_slice(&pins.to_bytes()).expect("json");
+    assert_eq!(back, pins);
+
+    // A is written again after the pinning, and C for the first time: the
+    // zone's manifest gives the new A, the pinned reader the A it was
+    // pinned with, and no C.
+    store
+        .put("imagery", 7, 79, 50, Bytes::from("C1"))
+        .await
+        .expect("put");
+    put(77, "A3").await;
+    copy_out(memory.as_ref(), dir.path()).await;
+    let reader = open().await;
+    assert_eq!(answer(&reader, "imagery", 7, 77, 50).await, "image/png A3");
+    reader.read_pinned(&pins);
+    assert_eq!(answer(&reader, "imagery", 7, 77, 50).await, "image/png A2");
+    assert_eq!(answer(&reader, "imagery", 7, 78, 50).await, "image/png B1");
+    // C lies in the zone, in an archive written since: not there.
+    assert_eq!(answer(&reader, "imagery", 7, 79, 50).await, "absent");
+    reader.forget_extracts();
+    assert_eq!(answer(&reader, "imagery", 7, 79, 50).await, "image/png C1");
+
+    // The newest pinned archive removed: its tiles are absent, not an error.
+    std::fs::remove_file(dir.path().join(&archives[0])).expect("rm");
+    let reader = open().await;
+    reader.read_pinned(&pins);
+    assert_eq!(answer(&reader, "imagery", 7, 77, 50).await, "absent");
+}
