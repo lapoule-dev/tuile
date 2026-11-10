@@ -24,12 +24,20 @@
 //! the host's own type — fields it does not know refused — and the factory
 //! turns it into the segment's [`Overlays`]. The stock service has
 //! [`NoOverlays`], whose order says nothing.
+//!
+//! A segment and a final stage are `tracing` spans, their steps spans inside
+//! them — `segment` (`pack_wait`, `fetch_extracts`, `render`, `upload`) and
+//! `compress` (`gather`, `encode`, `upload`) — for whatever subscriber the
+//! host installs; the CPU-bound steps (`render`, `encode`) are entered on the
+//! blocking thread that does the work, for the whole of it.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
+use tracing::field::Empty;
+use tracing::Instrument;
 use tuile_farm::{ObjectRunStore, RunStore};
 use tuile_film::Overlays;
 
@@ -438,6 +446,19 @@ impl<F: OverlayFactory> Service<F> {
 
     /// Renders `order` to the store, once its pack is there.
     pub async fn segment(&self, order: &SegmentOrder<F::Order>) -> Result<SegmentDone, Error> {
+        let span = tracing::info_span!(
+            "segment",
+            out = %order.out,
+            pack = %order.pack,
+            first = order.frames.0,
+            last = order.frames.1,
+            frames = Empty,
+            bytes = Empty,
+        );
+        self.segment_in(order).instrument(span).await
+    }
+
+    async fn segment_in(&self, order: &SegmentOrder<F::Order>) -> Result<SegmentDone, Error> {
         let began = Instant::now();
         // Before anything is waited for: an order the host cannot draw
         // fails now, not an hour on.
@@ -445,17 +466,24 @@ impl<F: OverlayFactory> Service<F> {
         let within = Duration::from_secs(order.pack_within_seconds.unwrap_or(3600));
         let generation = self.generation().await?;
         let sources = &generation.sources;
-        loop {
-            if self.runs.exists(&order.pack).await? {
-                break;
+        async {
+            loop {
+                if self.runs.exists(&order.pack).await? {
+                    return Ok::<(), Error>(());
+                }
+                if began.elapsed() > within {
+                    return Err(format!(
+                        "{} did not come within {} s",
+                        order.pack,
+                        within.as_secs()
+                    )
+                    .into());
+                }
+                tokio::time::sleep(LOOK_EVERY).await;
             }
-            if began.elapsed() > within {
-                return Err(
-                    format!("{} did not come within {} s", order.pack, within.as_secs()).into(),
-                );
-            }
-            tokio::time::sleep(LOOK_EVERY).await;
         }
+        .instrument(tracing::info_span!("pack_wait"))
+        .await?;
         // The pack's tiles were published before it: zones read before they
         // were, by an earlier segment of this generation, are read again —
         // its clock stands still, and a manifest held is believed.
@@ -485,6 +513,10 @@ impl<F: OverlayFactory> Service<F> {
         let local = scratch.path().join("segment.mp4");
         let extract = self
             .fetch_extracts(sources, &film, order, &scratch.path().join("store"))
+            .instrument(tracing::info_span!(
+                "fetch_extracts",
+                extracts = order.extracts.len()
+            ))
             .await?;
         if let Some(fetched) = &extract {
             eprintln!(
@@ -505,7 +537,18 @@ impl<F: OverlayFactory> Service<F> {
         let rendered = Instant::now();
         let runtime = tokio::runtime::Handle::current();
         let (to, kept) = (local.clone(), generation.clone());
+        // Encoding is the sink's, frame by frame: inside the render, its
+        // seconds recorded on the span as `sink_seconds`.
+        let render_span = tracing::info_span!(
+            "render",
+            frames = Empty,
+            setup_seconds = Empty,
+            draw_seconds = Empty,
+            sink_seconds = Empty,
+        );
+        let on_its_thread = render_span.clone();
         let done = tokio::task::spawn_blocking(move || -> Result<crate::render::Done, Error> {
+            let _entered = on_its_thread.enter();
             let mut sink = film_sink(
                 to.to_string_lossy().into_owned(),
                 rendering.bitrate,
@@ -526,6 +569,10 @@ impl<F: OverlayFactory> Service<F> {
         .map_err(|e| e.to_string())??;
         let render_seconds = rendered.elapsed().as_secs_f64();
         drop(_card);
+        render_span.record("frames", done.frames);
+        render_span.record("setup_seconds", done.setup_seconds);
+        render_span.record("draw_seconds", done.opening.draw + done.timings.draw);
+        render_span.record("sink_seconds", done.opening.sink + done.timings.sink);
         let render = RenderTimes {
             setup_seconds: done.setup_seconds,
             opening: done.opening,
@@ -543,7 +590,14 @@ impl<F: OverlayFactory> Service<F> {
         let frames = done.frames;
 
         let store = self.store(order.store);
-        let bytes = store.put(&local, &order.out).await?;
+        let upload = tracing::info_span!("upload", bytes = Empty);
+        let bytes = store
+            .put(&local, &order.out)
+            .instrument(upload.clone())
+            .await?;
+        upload.record("bytes", bytes);
+        tracing::Span::current().record("frames", frames);
+        tracing::Span::current().record("bytes", bytes);
         let receipt = SegmentDone {
             out: order.out.clone(),
             frames: u64::from(frames),
@@ -560,6 +614,7 @@ impl<F: OverlayFactory> Service<F> {
                 &receipt_path,
                 &format!("{}.json", order.out.trim_end_matches(".mp4")),
             )
+            .instrument(upload)
             .await?;
         Ok(receipt)
     }
@@ -583,6 +638,20 @@ impl<F: OverlayFactory> Service<F> {
         &self,
         order: &tuile_farm::compress::CompressOrder,
     ) -> Result<tuile_farm::compress::CompressDone, Error> {
+        let span = tracing::info_span!(
+            "compress",
+            run = %order.run,
+            render_id = %order.render_id,
+            chunks = order.chunks,
+            delivery = %order.delivery.key(),
+        );
+        self.compress_in(order).instrument(span).await
+    }
+
+    async fn compress_in(
+        &self,
+        order: &tuile_farm::compress::CompressOrder,
+    ) -> Result<tuile_farm::compress::CompressDone, Error> {
         use tuile_farm::assemble::{gather, Gathered, RunKeys};
         std::fs::create_dir_all(&self.cache)?;
         let scratch = tempfile::tempdir_in(&self.cache)?;
@@ -595,6 +664,7 @@ impl<F: OverlayFactory> Service<F> {
             &scratch.path().join("join"),
             Some(order.fps),
         )
+        .instrument(tracing::info_span!("gather"))
         .await?;
         let Gathered::Joined {
             path: joined,
@@ -618,7 +688,9 @@ impl<F: OverlayFactory> Service<F> {
             .ok()
             .and_then(|d| d.parse().ok())
             .unwrap_or(0);
+        let encode = tracing::info_span!("encode", fps);
         let compressed = tokio::task::spawn_blocking(move || {
+            let _entered = encode.enter();
             crate::compress::compress(&joined, &to, &delivery, fps, device)
         })
         .await
@@ -637,7 +709,11 @@ impl<F: OverlayFactory> Service<F> {
             .out
             .clone()
             .unwrap_or_else(|| tuile_farm::compress::film_key(&order.run, &order.delivery));
-        let bytes = self.runs.put(&delivered, &key).await?;
+        let bytes = self
+            .runs
+            .put(&delivered, &key)
+            .instrument(tracing::info_span!("upload"))
+            .await?;
         let bitrate = (bytes as f64 * 8.0 / probe.seconds.max(1e-3)).round() as u64;
         eprintln!(
             "compress {key}: {frames} frames, {:.1} MB from {:.1} MB joined ({:.1} Mb/s), \
@@ -866,6 +942,93 @@ mod tests {
         );
     }
 
+    /// Every span opened on this thread while `f` runs: its name and its
+    /// fields, the ones recorded later included.
+    #[derive(Clone, Default)]
+    struct Spans(Arc<std::sync::Mutex<Vec<(String, Vec<(String, String)>)>>>);
+
+    struct Fields<'a>(&'a mut Vec<(String, String)>);
+
+    impl tracing::field::Visit for Fields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for Spans
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _: &tracing::span::Id,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = Vec::new();
+            attrs.record(&mut Fields(&mut fields));
+            self.0
+                .lock()
+                .expect("lock")
+                .push((attrs.metadata().name().to_string(), fields));
+        }
+    }
+
+    impl Spans {
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(self.clone())
+        }
+
+        fn names(&self) -> Vec<String> {
+            let spans = self.0.lock().expect("lock");
+            spans.iter().map(|(name, _)| name.clone()).collect()
+        }
+
+        fn field(&self, span: &str, field: &str) -> Option<String> {
+            let spans = self.0.lock().expect("lock");
+            spans
+                .iter()
+                .filter(|(name, _)| name == span)
+                .flat_map(|(_, fields)| fields.iter())
+                .find(|(name, _)| name == field)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    /// A segment is a span carrying what it renders, its wait for the pack
+    /// one inside it: what a host's subscriber traces.
+    #[tokio::test]
+    async fn a_segment_and_its_wait_for_the_pack_are_spans() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("catalog.json"), br#"{"layers": []}"#).expect("catalog");
+        let runs = Arc::new(
+            ObjectRunStore::local(dir.path(), tuile_farm::Tuning::default()).expect("store"),
+        );
+        let tiles: Arc<dyn tuile_repository::Objects> = runs.clone();
+        let service = Service::new(runs, tiles, dir.path().join("cache"), Limits::default());
+        let order: SegmentOrder = serde_json::from_value(serde_json::json!({
+            "pack": "packs/never.tuilepack",
+            "frames": [31, 60],
+            "out": "films/a/parts/31-60.mp4",
+            "pack_within_seconds": 0,
+        }))
+        .expect("order");
+        let spans = Spans::default();
+        let _default = tracing::subscriber::set_default(spans.subscriber());
+        service.segment(&order).await.expect_err("no pack");
+        let names = spans.names();
+        assert!(names.iter().any(|n| n == "segment"), "{names:?}");
+        assert!(names.iter().any(|n| n == "pack_wait"), "{names:?}");
+        assert_eq!(
+            spans.field("segment", "out").as_deref(),
+            Some("films/a/parts/31-60.mp4")
+        );
+        assert_eq!(spans.field("segment", "first").as_deref(), Some("31"));
+        assert_eq!(spans.field("segment", "last").as_deref(), Some("60"));
+    }
+
     #[tokio::test]
     async fn a_segment_whose_pack_never_comes_is_refused_once_its_time_is_over() {
         let dir = tempfile::tempdir().expect("dir");
@@ -1006,7 +1169,18 @@ mod tests {
         }))
         .expect("order");
         assert_eq!(order.segments, Store::Mezzanine);
+        let spans = Spans::default();
+        let traced = tracing::subscriber::set_default(spans.subscriber());
         let done = service.compress(&order).await.expect("compressed");
+        drop(traced);
+        let names = spans.names();
+        for step in ["compress", "gather", "encode", "upload"] {
+            assert!(names.iter().any(|n| n == step), "no {step} span: {names:?}");
+        }
+        assert_eq!(
+            spans.field("compress", "run").as_deref(),
+            Some("1557732/20261020T1000Z-ab12")
+        );
         assert_eq!(done.key, "1557732/20261020T1000Z-ab12/films/copy-v1.mp4");
         assert_eq!(done.frames, 5);
         assert!(runs.exists(&done.key).await.expect("exists"));
