@@ -709,6 +709,9 @@ impl Sink for NvencFilm {
     fn wants_i420(&self) -> bool {
         true
     }
+    fn wants_rgba(&self) -> bool {
+        false
+    }
 
     fn picture(&mut self, _index: u32, _frame: u32, _: &[u8], i420: &[u8]) -> Result<(), Error> {
         let (w, h) = self.size;

@@ -438,3 +438,94 @@ async fn a_frames_white_balance_and_exposure_are_the_grounds_not_the_overlays() 
     assert!(ratio(b) > ratio(a) * 1.1, "warmer: {a:?} then {b:?}");
     assert!(b[0] < a[0], "darker: {a:?} then {b:?}");
 }
+
+/// Every picture's RGBA and I420, kept; the RGBA asked for or not.
+struct Both {
+    rgba: bool,
+    pictures: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Sink for Both {
+    fn wants_i420(&self) -> bool {
+        true
+    }
+    fn wants_rgba(&self) -> bool {
+        self.rgba
+    }
+    fn picture(&mut self, _: u32, _: u32, rgba: &[u8], i420: &[u8]) -> Result<(), Error> {
+        self.pictures.push((rgba.to_vec(), i420.to_vec()));
+        Ok(())
+    }
+}
+
+/// The frame's picture, as an observer is handed it, and whether it was.
+#[derive(Default)]
+struct Looks(Vec<Option<Vec<u8>>>);
+
+impl tuile_film_native::Observer for Looks {
+    fn frame(&mut self, frame: &tuile_film_native::FrameOut<'_>) {
+        self.0.push(frame.rgba.map(<[u8]>::to_vec));
+    }
+    fn wants_picture(&self) -> bool {
+        true
+    }
+}
+
+/// A sink of I420 alone, under no observer that looks at the picture, is
+/// handed no RGBA — it is never read back — and the very same I420, byte
+/// for byte, mono and stereo; an observer that looks is handed the
+/// picture, the same as a sink that reads it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_picture_is_read_back_only_for_what_reads_it() {
+    if !has_adapter() {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("dir");
+    let (sources, film) = test_film(dir.path()).await;
+    let top_bottom = Stereo {
+        packing: tuile_film::Packing::TopBottom,
+        ..Stereo::default()
+    };
+    for stereo in [None, Some(top_bottom)] {
+        let order = Order {
+            supersample: 1,
+            tone: Tone::Off,
+            stereo,
+            ..Order::default()
+        };
+        let mut read = Both {
+            rgba: true,
+            pictures: Vec::new(),
+        };
+        render(&sources, &film, &order, &mut (), &mut read, &mut ())
+            .await
+            .expect("render");
+        let mut unread = Both {
+            rgba: false,
+            pictures: Vec::new(),
+        };
+        render(&sources, &film, &order, &mut (), &mut unread, &mut ())
+            .await
+            .expect("render");
+        assert_eq!(read.pictures.len(), FRAMES as usize, "{stereo:?}");
+        assert_eq!(unread.pictures.len(), FRAMES as usize, "{stereo:?}");
+        for ((rgba, i420), (none, same)) in read.pictures.iter().zip(&unread.pictures) {
+            assert!(!rgba.is_empty() && !i420.is_empty(), "{stereo:?}");
+            assert!(none.is_empty(), "{stereo:?}: RGBA read back for nothing");
+            assert!(i420 == same, "{stereo:?}: the I420 moved");
+        }
+        // An observer that looks: it, and only it, is handed the picture.
+        let mut looks = Looks::default();
+        let mut unread = Both {
+            rgba: false,
+            pictures: Vec::new(),
+        };
+        render(&sources, &film, &order, &mut (), &mut unread, &mut looks)
+            .await
+            .expect("render");
+        let seen: Vec<Vec<u8>> = looks.0.into_iter().map(|p| p.expect("a picture")).collect();
+        let sunk: Vec<&Vec<u8>> = read.pictures.iter().map(|p| &p.0).collect();
+        assert!(seen.iter().eq(sunk), "{stereo:?}: the observer's picture");
+    }
+}

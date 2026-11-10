@@ -154,7 +154,7 @@ fn the_meter_reads_a_picture_in_stops_and_by_thirds() {
         index: 0,
         width,
         height,
-        rgba: &rgba,
+        rgba: Some(&rgba),
         tiles: 3,
         entered: 3,
         layers: &[(12, 2), (13, 1)],
