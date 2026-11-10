@@ -244,6 +244,7 @@ fn settled_in_stages(session: &mut Session) -> Vec<(u64, Vec<Option<u64>>)> {
         &numbers,
         views,
         |i, ground: &Arc<Ground>| heights(i, ground),
+        |_| false,
     )
     .expect("settled")
     .into_iter()

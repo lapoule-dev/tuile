@@ -313,6 +313,7 @@ fn under_the_eyes(told: Told) -> Vec<(u32, Option<f64>)> {
             let at = ecef_to_geodetic(DVec3::from_array(eye));
             (frame, ground.height_at(at.lon, at.lat))
         },
+        |_| false,
     )
     .expect("settled")
     .into_iter()

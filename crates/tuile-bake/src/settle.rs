@@ -19,6 +19,19 @@
 //! what settling, building and reading each frame in turn hands back, bit
 //! for bit: the same views converged in the same order, each ground a
 //! function of its selection, each reading a function of its ground.
+//!
+//! # Bounded
+//!
+//! What it holds does not grow with the frames it settles. A ground
+//! weighs some fifteen times its selection, and a ground built is held
+//! until it is read: so at most [`READING`] grounds wait for or go through
+//! their reading at once, and the builder waits for a reading to end
+//! before it builds one more — whichever of converging, building and
+//! reading is the slowest sets the pace, and nothing piles up in front of
+//! it. A frozen selection pins its tiles' terrain after the session has
+//! let them go: so only the frames the caller says it keeps
+//! ([`settle_each`]'s `keep`) are handed back with theirs; the others' are
+//! let go as soon as their ground is read.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,6 +45,63 @@ use crate::session::{FrameError, Session};
 /// How many selections may wait for their ground: the most grounds' worth
 /// of tiles held frozen at once beyond the one being built.
 const LEAD: usize = 4;
+
+/// How many grounds may be built and not read yet, at most, at once: those
+/// read on the pool and those waiting for a thread of it. A builder that
+/// has this many out waits for one to be read before it builds the next.
+pub const READING: usize = 8;
+
+/// The grounds out for reading, counted, so a builder waits while there
+/// are [`READING`] of them.
+#[derive(Default)]
+struct Out {
+    count: std::sync::Mutex<usize>,
+    read: std::sync::Condvar,
+}
+
+impl Out {
+    /// Waits until fewer than [`READING`] grounds are out, then counts one
+    /// more. On a thread of the pool, it reads what is queued meanwhile
+    /// rather than block the readings it waits for.
+    fn take(&self) {
+        loop {
+            {
+                let mut count = self.count.lock().unwrap_or_else(|e| e.into_inner());
+                if *count < READING {
+                    *count += 1;
+                    return;
+                }
+                if rayon::current_thread_index().is_none() {
+                    let _ = self
+                        .read
+                        .wait_timeout(count, Duration::from_millis(50))
+                        .unwrap_or_else(|e| e.into_inner());
+                    continue;
+                }
+            }
+            if rayon::yield_now() != Some(rayon::Yield::Executed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// One ground read: a builder waiting may build the next.
+    fn give(&self) {
+        let mut count = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        *count -= 1;
+        self.read.notify_one();
+    }
+}
+
+/// A ground out for reading, given back to [`Out`] however its reading
+/// ends.
+struct Lent<'a>(&'a Out);
+
+impl Drop for Lent<'_> {
+    fn drop(&mut self) {
+        self.0.give();
+    }
+}
 
 /// A ground built and not read yet, counted until its reading is over,
 /// whichever way that ends ([`tuile_core::metrics::Metrics::ground_reads_pending`]).
@@ -89,11 +159,12 @@ pub struct Settled<T> {
     pub number: u32,
     /// What it converged on ([`Session::selection_digest`]).
     pub selection: u64,
-    /// Its selection, frozen: what its ground is built from — again, by
-    /// [`read_each`], for a caller that keeps this rather than the ground,
-    /// which weighs some fifteen times more. The ground itself is kept by
-    /// the reading, if it keeps it ([`settle_each`]).
-    pub selected: Selected,
+    /// Its selection, frozen, when the caller keeps it ([`settle_each`]'s
+    /// `keep`): what its ground is built from — again, by [`read_each`],
+    /// for a caller that keeps this rather than the ground, which weighs
+    /// some fifteen times more. The ground itself is kept by the reading,
+    /// if it keeps it.
+    pub selected: Option<Selected>,
     /// What was read of its ground.
     pub value: T,
     /// How long it took to converge, to build its ground, and to read it.
@@ -122,7 +193,9 @@ pub struct Drawn {
 /// Settles `numbers` in that order: each frame's views — asked of `views` —
 /// converged on `session`, its ground built by `drawer`, and `read` on that
 /// ground. The settled frames come back in the order of `numbers`; a ground
-/// lives as long as its reading keeps it, and no longer.
+/// lives as long as its reading keeps it, and no longer. A frame's frozen
+/// selection comes back with it when `keep` says so of its number, and is
+/// let go once its ground is read otherwise.
 ///
 /// While a frame converges, every second one of the next few
 /// ([`Session::ahead`], `TUILE_BAKE_AHEAD`, default 8) is announced, so their
@@ -133,21 +206,26 @@ pub struct Drawn {
 ///
 /// Stops at the first frame that does not converge; what was settled before
 /// it is then dropped.
-pub fn settle_each<T, V, R>(
+pub fn settle_each<T, V, R, K>(
     session: &mut Session,
     drawer: &mut GroundDrawer,
     drawn: Drawn,
     numbers: &[u32],
     mut views: V,
     read: R,
+    keep: K,
 ) -> Result<Vec<Settled<T>>, SettleError>
 where
     T: Send,
     V: FnMut(u32, &Session) -> Vec<ViewStateParams>,
     R: Fn(u32, &Arc<Ground>) -> T + Sync,
+    K: Fn(u32) -> bool + Sync,
 {
     type Frozen = (usize, u32, u64, Selected, Duration);
     let read = &read;
+    let keep = &keep;
+    let out = Out::default();
+    let out_ref = &out;
     let settled: Mutex<Vec<(usize, Settled<T>)>> = Mutex::new(Vec::with_capacity(numbers.len()));
     let holding = Mutex::new(Holding::default());
     let holding_ref = &holding;
@@ -157,17 +235,22 @@ where
         let builder = scope.spawn(move || {
             rayon::in_place_scope(|reads| {
                 for (index, number, selection, selected, converged_in) in thawed {
+                    out_ref.take();
+                    let lent = Lent(out_ref);
                     let started = Instant::now();
                     let ground = Arc::new(drawer.ground(&selected, drawn.how, drawn.stitch));
                     let built_in = started.elapsed();
                     let unread = Unread::new(drawer.built());
                     reads.spawn(move |_| {
+                        let _lent = lent;
                         let _unread = unread;
                         let started = Instant::now();
                         let value = read(number, &ground);
                         let read_in = started.elapsed();
-                        if let Ok(mut holding) = holding_ref.lock() {
-                            holding.add(&selected);
+                        drop(ground);
+                        let selected = keep(number).then_some(selected);
+                        if let (Some(selected), Ok(mut holding)) = (&selected, holding_ref.lock()) {
+                            holding.add(selected);
                         }
                         if let Ok(mut settled) = settled_ref.lock() {
                             settled.push((
@@ -249,7 +332,8 @@ type Timed<T> = (T, Duration, Duration);
 /// is built: what [`settle_each`] read them as, bit for bit, for a caller
 /// that kept the selections rather than the grounds. Back in the order
 /// given, with how long each took to build and to read; a ground lives as
-/// long as its reading keeps it.
+/// long as its reading keeps it, and at most [`READING`] are built and not
+/// read at once.
 pub fn read_each<T, R>(
     drawer: &mut GroundDrawer,
     drawn: Drawn,
@@ -263,14 +347,19 @@ where
     let read = &read;
     let out: Mutex<Vec<(usize, Timed<T>)>> = Mutex::new(Vec::with_capacity(frames.len()));
     let out_ref = &out;
+    let lending = Out::default();
+    let lending = &lending;
     rayon::in_place_scope(|reads| {
         for (index, (number, selected)) in frames.iter().enumerate() {
+            lending.take();
+            let lent = Lent(lending);
             let started = Instant::now();
             let ground = Arc::new(drawer.ground(selected, drawn.how, drawn.stitch));
             let built_in = started.elapsed();
             let number = *number;
             let unread = Unread::new(drawer.built());
             reads.spawn(move |_| {
+                let _lent = lent;
                 let _unread = unread;
                 let started = Instant::now();
                 let value = read(number, &ground);
