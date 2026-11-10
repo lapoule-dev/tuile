@@ -259,6 +259,16 @@ impl Tiered {
 
 impl Inner {
     async fn fetch_and_keep(&self, at: &Path) -> std::result::Result<(Bytes, ObjectMeta), Failed> {
+        // Kept by a download that ended since this reader missed the tiers.
+        for (i, tier) in self.tiers.iter().enumerate() {
+            if let Ok(got) = tier.objects.get(at).await {
+                let meta = got.meta.clone();
+                if let Ok(bytes) = got.bytes().await {
+                    self.hit(i, bytes.len() as u64);
+                    return Ok((bytes, meta));
+                }
+            }
+        }
         let got = self.origin.get(at).await.map_err(|e| Failed::of(at, e))?;
         let meta = got.meta.clone();
         let bytes = got.bytes().await.map_err(|e| Failed::of(at, e))?;

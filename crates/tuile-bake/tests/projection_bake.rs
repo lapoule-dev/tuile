@@ -106,7 +106,12 @@ impl tuile_bake::Sources for MadeUp {
 /// A camera flying north over the relief, a kilometre up, looking ahead
 /// and down.
 fn poses() -> Vec<tuile_tape::Frame> {
-    (0..FRAMES)
+    poses_from(0)
+}
+
+/// The same flight, `skip` frames on: the next chunk of the film.
+fn poses_from(skip: u32) -> Vec<tuile_tape::Frame> {
+    (skip..skip + FRAMES)
         .map(|i| {
             let lat = LAT + f64::from(i) * 0.002;
             let (p, l) = (lat.to_radians(), LON.to_radians());
@@ -224,6 +229,11 @@ fn neighbourhood(objects: Arc<dyn object_store::ObjectStore>) {
 
 /// Bakes the frames through `tiles` into a pack of references at `out`.
 fn bake(tiles: &Tiles, out: &std::path::Path) {
+    bake_poses(tiles, &poses(), out)
+}
+
+/// Bakes `poses` through `tiles` into a pack of references at `out`.
+fn bake_poses(tiles: &Tiles, poses: &[tuile_tape::Frame], out: &std::path::Path) {
     let mut config = GlobeConfig::new("");
     config.sources = Some(SourcesHandle(Arc::new(MadeUp)));
     config.session.traversal.maximum_screen_space_error = SSE;
@@ -238,7 +248,6 @@ fn bake(tiles: &Tiles, out: &std::path::Path) {
         imagery_layer,
         night_layer: String::new(),
     };
-    let poses = poses();
     let mut session = Session::globe(config).expect("a globe");
     bake_frames(
         &mut session,
@@ -252,13 +261,17 @@ fn bake(tiles: &Tiles, out: &std::path::Path) {
             content: &content,
             packed: &packed,
         },
-        &mut Poses(&poses),
+        &mut Poses(poses),
     )
     .expect("a bake");
 }
 
 fn eyes() -> Vec<Eye> {
-    poses()
+    eyes_of(&poses())
+}
+
+fn eyes_of(poses: &[tuile_tape::Frame]) -> Vec<Eye> {
+    poses
         .iter()
         .map(|p| {
             let g = tuile_core::geo::ecef_to_geodetic(DVec3::from_array(p.position));
@@ -372,6 +385,7 @@ fn a_terrain_projected_tile_by_tile_bakes_the_pack_a_whole_one_does() {
 struct Counted {
     inner: Arc<dyn object_store::ObjectStore>,
     gets: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    bytes: std::sync::atomic::AtomicU64,
 }
 
 impl Counted {
@@ -379,6 +393,7 @@ impl Counted {
         Arc::new(Self {
             inner,
             gets: Default::default(),
+            bytes: Default::default(),
         })
     }
 
@@ -439,7 +454,12 @@ impl object_store::ObjectStore for Counted {
                 .entry(l.to_string())
                 .or_default() += 1;
         }
-        self.inner.get_opts(l, o).await
+        let got = self.inner.get_opts(l, o).await?;
+        self.bytes.fetch_add(
+            got.range.end - got.range.start,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(got)
     }
     fn delete_stream(
         &self,
@@ -485,6 +505,10 @@ fn warm_bucket() -> Arc<Counted> {
 
 /// The terrain cut to what the bake reads, the imagery's zones whole.
 fn footprint() -> Footprint {
+    footprint_of(&poses())
+}
+
+fn footprint_of(poses: &[tuile_tape::Frame]) -> Footprint {
     let traversal = {
         let mut config = GlobeConfig::new("");
         config.session.traversal.maximum_screen_space_error = SSE;
@@ -492,7 +516,7 @@ fn footprint() -> Footprint {
     };
     let factor = terrain_tile_factor(&traversal, VIEWPORT.1, std::f64::consts::FRAC_PI_4);
     let (terrain, _) = layers();
-    Footprint::from_eyes(eyes(), factor).with_targeted_layer(&terrain)
+    Footprint::from_eyes(eyes_of(poses), factor).with_targeted_layer(&terrain)
 }
 
 /// **Two bakes of one process share one store, and nothing is downloaded
@@ -661,4 +685,96 @@ fn a_global_tier_spares_the_bucket_a_second_download() {
     let t = there.tiers().expect("tiers");
     assert_eq!((t.origin_requests, t.written), (0, 0), "{t:?}");
     assert!(std::fs::read(&a).expect("pack") == std::fs::read(&b).expect("pack"));
+}
+
+/// **Bench, before and after: two consecutive chunks of one film in one
+/// process.** Before, each chunk opens a store of its own and projects its
+/// zones anew (as each bake did); after, both read through one
+/// [`tuile_bake::tiles::SharedTiles`] and one projection directory. Counted
+/// at the bucket: requests and bytes, the catalog's reads, archives read
+/// more than once; timed: the projection and the bake. One JSON line per
+/// chunk to `TUILE_BENCH_OUT`. Run on demand:
+/// `TUILE_BENCH_OUT=… cargo test -p tuile-bake --test projection_bake -- --ignored bench`.
+#[test]
+#[ignore]
+fn bench_two_chunks_of_one_film() {
+    use std::io::Write as _;
+    use std::sync::atomic::Ordering;
+    std::env::set_var("TUILE_FETCHES", "1");
+    let out = std::env::var("TUILE_BENCH_OUT").expect("TUILE_BENCH_OUT");
+    let mut lines = std::fs::File::create(&out).expect("bench out");
+    for mode in ["before", "after"] {
+        let counted = warm_bucket();
+        let dir = tempfile::tempdir().expect("dir");
+        let objects: Arc<dyn object_store::ObjectStore> = counted.clone();
+        let shared =
+            tuile_bake::tiles::SharedTiles::new(move || Tiles::over(objects.clone()).map(Some));
+        let gets_before: std::collections::HashMap<String, u64> =
+            counted.gets.lock().expect("gets").clone();
+        let mut digests = Vec::new();
+        let mut archive_requests_so_far = 0u64;
+        for (chunk, skip) in [(0u32, 0u32), (1, 2)] {
+            let poses = poses_from(skip);
+            let requests: u64 = counted.gets.lock().expect("gets").values().sum();
+            let bytes = counted.bytes.load(Ordering::Relaxed);
+            let catalog = counted.gets("catalog.json");
+            let began = std::time::Instant::now();
+            let tiles = match mode {
+                "before" => Arc::new(Tiles::over(counted.clone()).expect("store")),
+                _ => shared.get().expect("store").expect("a store"),
+            };
+            let open_s = began.elapsed().as_secs_f64();
+            let began = std::time::Instant::now();
+            let report = tiles
+                .project_footprint(
+                    &footprint_of(&poses),
+                    // Before, every projection was downloaded again: as a
+                    // directory of its own.
+                    &dir.path().join(match mode {
+                        "before" => format!("projections-{chunk}"),
+                        _ => "projections".to_string(),
+                    }),
+                )
+                .expect("project");
+            let project_s = began.elapsed().as_secs_f64();
+            let pack = dir.path().join(format!("c{chunk}.tuilepack"));
+            let began = std::time::Instant::now();
+            bake_poses(&tiles, &poses, &pack);
+            let bake_s = began.elapsed().as_secs_f64();
+            let gets = counted.gets.lock().expect("gets").clone();
+            let archive_requests: u64 = gets
+                .iter()
+                .filter(|(k, _)| tuile_tile_server::tiered::is_archive_key(k))
+                .map(|(k, n)| n - gets_before.get(k).copied().unwrap_or(0))
+                .sum::<u64>()
+                - archive_requests_so_far;
+            archive_requests_so_far += archive_requests;
+            let bytes_now = std::fs::read(&pack).expect("pack");
+            digests.push(bytes_now);
+            writeln!(
+                lines,
+                "{{\"mode\":\"{mode}\",\"chunk\":{chunk},\"bucket_requests\":{},\"bucket_bytes\":{},\"catalog_reads\":{},\"archive_requests\":{archive_requests},\"zones_projected\":{},\"zones_reused\":{},\"projection_bytes\":{},\"projection_requests\":{},\"open_s\":{open_s},\"project_s\":{project_s},\"bake_s\":{bake_s},\"pack_bytes\":{}}}",
+                gets.values().sum::<u64>() - requests,
+                counted.bytes.load(Ordering::Relaxed) - bytes,
+                counted.gets("catalog.json") - catalog,
+                report.zones_projected,
+                report.zones_reused,
+                report.bytes,
+                report.requests,
+                digests.last().map_or(0, Vec::len),
+            )
+            .expect("write");
+        }
+        // Kept for comparison, chunk by chunk, whichever the store.
+        let _ = std::fs::create_dir_all(std::path::Path::new(&out).with_extension("packs"));
+        for (i, pack) in digests.iter().enumerate() {
+            std::fs::write(
+                std::path::Path::new(&out)
+                    .with_extension("packs")
+                    .join(format!("{mode}-c{i}.tuilepack")),
+                pack,
+            )
+            .expect("pack");
+        }
+    }
 }

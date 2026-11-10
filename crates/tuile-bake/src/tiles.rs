@@ -842,3 +842,44 @@ mod eviction_tests {
         assert_eq!(evict_oldest(&dir.path().join("none"), 0), (0, 0));
     }
 }
+
+#[cfg(test)]
+mod tier_tests {
+    use object_store::{ObjectStoreExt, PutMode, PutOptions};
+
+    /// A global tier on a disk keeps the first copy of an archive: a second
+    /// writer is told it is there, as a bucket's conditional write tells it.
+    #[test]
+    fn a_tier_on_a_disk_is_written_once() {
+        let dir = tempfile::tempdir().expect("dir");
+        let url = url::Url::from_directory_path(dir.path()).expect("url");
+        let tier = super::global_tier(url.as_str()).expect("tier");
+        let at = object_store::path::Path::from(
+            "layer/top/1-000000000000000000000001-0123456789abcdef.pmtiles",
+        );
+        let create = || PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                tier.put_opts(&at, "first".into(), create())
+                    .await
+                    .expect("first");
+                let second = tier.put_opts(&at, "second".into(), create()).await;
+                assert!(
+                    matches!(second, Err(object_store::Error::AlreadyExists { .. })),
+                    "{second:?}"
+                );
+                let kept = tier
+                    .get(&at)
+                    .await
+                    .expect("get")
+                    .bytes()
+                    .await
+                    .expect("bytes");
+                assert_eq!(&kept[..], b"first");
+            });
+    }
+}
