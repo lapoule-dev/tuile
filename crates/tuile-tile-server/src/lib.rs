@@ -45,7 +45,7 @@ pub use service::{
     TileService,
 };
 pub use store::{Census, Clock, Compaction, Fresh, Scrub, StatsSnapshot, StoreConfig, TileStore};
-pub use tiered::{Tier, Tiered, TieredStats};
+pub use tiered::{Tier, TierClock, Tiered, TieredStats, Touch, TOUCH_EVERY};
 pub use tiering::Tiering;
 pub use upstream::{TemplateUpstream, Upstream, UpstreamError};
 
