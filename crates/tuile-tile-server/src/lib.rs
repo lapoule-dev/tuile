@@ -23,6 +23,7 @@ pub mod projection;
 pub mod register;
 pub mod service;
 pub mod store;
+pub mod tiered;
 pub mod tiering;
 pub mod upstream;
 
@@ -44,6 +45,7 @@ pub use service::{
     TileService,
 };
 pub use store::{Census, Clock, Compaction, Fresh, Scrub, StatsSnapshot, StoreConfig, TileStore};
+pub use tiered::{Tier, Tiered, TieredStats};
 pub use tiering::Tiering;
 pub use upstream::{TemplateUpstream, Upstream, UpstreamError};
 

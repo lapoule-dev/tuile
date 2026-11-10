@@ -279,8 +279,7 @@ fn a_terrain_projected_tile_by_tile_bakes_the_pack_a_whole_one_does() {
     // (measured: three runs of four, a level-2 tile against four level-3
     // ones). That variation is the bake's own and the same whatever the
     // projection; one fetch at a time takes it away, so that a difference
-    // left is the projection's. The only test in this binary: nothing else
-    // reads the environment.
+    // left is the projection's. Every test of this binary sets it the same.
     std::env::set_var("TUILE_FETCHES", "1");
     let objects = bucket();
     let dir = tempfile::tempdir().expect("dir");
@@ -365,4 +364,301 @@ fn a_terrain_projected_tile_by_tile_bakes_the_pack_a_whole_one_does() {
         std::fs::read(&a).expect("pack") == std::fs::read(&b).expect("pack"),
         "the two packs differ"
     );
+}
+
+/// A bucket that counts what it is asked, by key: reads of whole objects
+/// and of ranges, heads left out.
+#[derive(Debug)]
+struct Counted {
+    inner: Arc<dyn object_store::ObjectStore>,
+    gets: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl Counted {
+    fn over(inner: Arc<dyn object_store::ObjectStore>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            gets: Default::default(),
+        })
+    }
+
+    fn gets(&self, key: &str) -> u64 {
+        self.gets
+            .lock()
+            .expect("gets")
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Reads of the store's archives, every key together.
+    fn archive_gets(&self) -> u64 {
+        self.gets
+            .lock()
+            .expect("gets")
+            .iter()
+            .filter(|(k, _)| tuile_tile_server::tiered::is_archive_key(k))
+            .map(|(_, n)| n)
+            .sum()
+    }
+}
+
+impl std::fmt::Display for Counted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Counted({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for Counted {
+    async fn put_opts(
+        &self,
+        l: &object_store::path::Path,
+        p: object_store::PutPayload,
+        o: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(l, p, o).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        l: &object_store::path::Path,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(l, o).await
+    }
+    async fn get_opts(
+        &self,
+        l: &object_store::path::Path,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if !o.head {
+            *self
+                .gets
+                .lock()
+                .expect("gets")
+                .entry(l.to_string())
+                .or_default() += 1;
+        }
+        self.inner.get_opts(l, o).await
+    }
+    fn delete_stream(
+        &self,
+        l: futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+    {
+        self.inner.delete_stream(l)
+    }
+    fn list(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.inner.list(p)
+    }
+    async fn list_with_delimiter(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(p).await
+    }
+    async fn copy_opts(
+        &self,
+        f: &object_store::path::Path,
+        t: &object_store::path::Path,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(f, t, o).await
+    }
+}
+
+/// The store filled by a first bake from the sources, and around it; then
+/// counted.
+fn warm_bucket() -> Arc<Counted> {
+    let objects = bucket();
+    neighbourhood(objects.clone());
+    let warm = Tiles::over(objects.clone()).expect("store");
+    let dir = tempfile::tempdir().expect("dir");
+    bake(&warm, &dir.path().join("warm.tuilepack"));
+    warm.flush().expect("flush");
+    Counted::over(objects)
+}
+
+/// The terrain cut to what the bake reads, the imagery's zones whole.
+fn footprint() -> Footprint {
+    let traversal = {
+        let mut config = GlobeConfig::new("");
+        config.session.traversal.maximum_screen_space_error = SSE;
+        exact_traversal(config.session.traversal)
+    };
+    let factor = terrain_tile_factor(&traversal, VIEWPORT.1, std::f64::consts::FRAC_PI_4);
+    let (terrain, _) = layers();
+    Footprint::from_eyes(eyes(), factor).with_targeted_layer(&terrain)
+}
+
+/// **Two bakes of one process share one store, and nothing is downloaded
+/// twice.** The catalog is read once; the second bake's projection reuses
+/// every zone the first made and reads no archive; a store opened later over
+/// the same projections (another process) reuses them too. The packs are
+/// the bytes a store opened for each bake gives.
+#[test]
+fn two_bakes_of_one_process_download_nothing_twice() {
+    std::env::set_var("TUILE_FETCHES", "1");
+    let counted = warm_bucket();
+    let dir = tempfile::tempdir().expect("dir");
+    let projections = dir.path().join("projections");
+
+    // As before: a store of its own for one bake, the reference.
+    let alone = Tiles::over(counted.clone()).expect("store");
+    alone
+        .project_footprint(&footprint(), &dir.path().join("alone"))
+        .expect("project");
+    let reference = dir.path().join("alone.tuilepack");
+    bake(&alone, &reference);
+    drop(alone);
+
+    let objects: Arc<dyn object_store::ObjectStore> = counted.clone();
+    let shared =
+        tuile_bake::tiles::SharedTiles::new(move || Tiles::over(objects.clone()).map(Some));
+    let catalog = counted.gets("catalog.json");
+
+    let first = shared.get().expect("store").expect("a store");
+    let report = first
+        .project_footprint(&footprint(), &projections)
+        .expect("project");
+    assert!(
+        report.zones_projected > 0 && report.zones_reused == 0,
+        "{report:?}"
+    );
+    let a = dir.path().join("a.tuilepack");
+    bake(&first, &a);
+    let archives = counted.archive_gets();
+    assert!(archives > 0);
+
+    let second = shared.get().expect("store").expect("a store");
+    assert!(Arc::ptr_eq(&first, &second), "one store for the process");
+    let again = second
+        .project_footprint(&footprint(), &projections)
+        .expect("project");
+    assert_eq!(again.zones_reused, report.zones_projected, "{again:?}");
+    assert_eq!((again.bytes, again.requests), (0, 0), "{again:?}");
+    let b = dir.path().join("b.tuilepack");
+    bake(&second, &b);
+    assert_eq!(counted.archive_gets(), archives, "no archive read twice");
+    assert_eq!(
+        counted.gets("catalog.json") - catalog,
+        1,
+        "the catalog read once"
+    );
+    assert_eq!(shared.opened(), 1);
+
+    // Another process over the same projections: made already.
+    let later = Tiles::over(counted.clone()).expect("store");
+    let reused = later
+        .project_footprint(&footprint(), &projections)
+        .expect("project");
+    assert_eq!(reused.zones_reused, report.zones_projected, "{reused:?}");
+    let c = dir.path().join("c.tuilepack");
+    bake(&later, &c);
+
+    let pack = std::fs::read(&reference).expect("pack");
+    for p in [&a, &b, &c] {
+        assert!(
+            std::fs::read(p).expect("pack") == pack,
+            "{} differs",
+            p.display()
+        );
+    }
+
+    // The catalog rewritten: the store is opened again.
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(async {
+            let catalog = tuile_tile_server::catalog::read(counted.as_ref()).await?;
+            tuile_tile_server::catalog::write(counted.as_ref(), &catalog).await
+        })
+        .expect("catalog");
+    let third = shared.get().expect("store").expect("a store");
+    assert!(!Arc::ptr_eq(&first, &third), "opened again");
+    assert_eq!(shared.opened(), 2);
+}
+
+/// **Two bakes that want the same zones at the same time download them
+/// once.** What two concurrent projections read of the bucket is what one
+/// alone reads.
+#[test]
+fn concurrent_bakes_wanting_one_zone_download_it_once() {
+    std::env::set_var("TUILE_FETCHES", "1");
+    let counted = warm_bucket();
+    let dir = tempfile::tempdir().expect("dir");
+
+    let alone = Tiles::over(counted.clone()).expect("store");
+    let before = counted.archive_gets();
+    alone
+        .project_footprint(&footprint(), &dir.path().join("alone"))
+        .expect("project");
+    let one = counted.archive_gets() - before;
+    assert!(one > 0);
+    drop(alone);
+
+    let shared = Arc::new(Tiles::over(counted.clone()).expect("store"));
+    let before = counted.archive_gets();
+    let projections = dir.path().join("together");
+    let reports: Vec<_> = (0..2)
+        .map(|_| {
+            let (tiles, at) = (shared.clone(), projections.clone());
+            std::thread::spawn(move || tiles.project_footprint(&footprint(), &at).expect("project"))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|t| t.join().expect("a bake"))
+        .collect();
+    assert_eq!(counted.archive_gets() - before, one, "{reports:?}");
+    assert_eq!(
+        reports.iter().map(|r| r.zones_reused).sum::<usize>(),
+        reports[0].zones_projected,
+        "{reports:?}"
+    );
+}
+
+/// **An archive read through a global tier is downloaded once for every
+/// store behind it.** A second store — another machine of the region —
+/// reads its archives from the tier, never from the bucket.
+#[test]
+fn a_global_tier_spares_the_bucket_a_second_download() {
+    std::env::set_var("TUILE_FETCHES", "1");
+    let counted = warm_bucket();
+    let global: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let dir = tempfile::tempdir().expect("dir");
+    let tiers = || tuile_bake::tiles::Tiers {
+        disk: None,
+        global: Some(tuile_tile_server::Tier::new("global", global.clone())),
+    };
+    let whole = Footprint::from_eyes(eyes(), 12.0);
+
+    let here = Tiles::open("bucket", counted.clone(), Vec::new(), tiers()).expect("store");
+    let before = counted.archive_gets();
+    here.project_footprint(&whole, &dir.path().join("here"))
+        .expect("project");
+    let a = dir.path().join("here.tuilepack");
+    bake(&here, &a);
+    assert!(counted.archive_gets() > before);
+    let written = here.tiers().expect("tiers").written;
+    assert!(written > 0);
+
+    let there = Tiles::open("bucket", counted.clone(), Vec::new(), tiers()).expect("store");
+    let before = counted.archive_gets();
+    there
+        .project_footprint(&whole, &dir.path().join("there"))
+        .expect("project");
+    let b = dir.path().join("there.tuilepack");
+    bake(&there, &b);
+    assert_eq!(
+        counted.archive_gets(),
+        before,
+        "every archive from the tier"
+    );
+    let t = there.tiers().expect("tiers");
+    assert_eq!((t.origin_requests, t.written), (0, 0), "{t:?}");
+    assert!(std::fs::read(&a).expect("pack") == std::fs::read(&b).expect("pack"));
 }
