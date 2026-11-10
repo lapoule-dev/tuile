@@ -78,7 +78,8 @@ tuile-tape = { version = "0.16.1", path = "../tuile-tape" }
 # engine's `ContentStore`.
 tuile-tile-server = { version = "0.16.1", path = "../tuile-tile-server" }
 tuile-terrain = { version = "0.16.1", path = "../tuile-terrain" }
-object_store = { version = "0.14.2", default-features = false, features = ["fs", "aws"] }
+# The bucket, a store on a disk, and the global tier (`TUILE_TILES_GLOBAL`).
+object_store = { version = "0.14.2", default-features = false, features = ["fs", "aws", "gcp"] }
 
 # --- profiling, behind the feature ------------------------------------------
 # Signal sampling across EVERY thread, without `perf` and without privileges.

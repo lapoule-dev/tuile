@@ -12,12 +12,32 @@
 //! or the server) fetched them, and each tile fetched now is offered to it.
 //! What is stored is what the source served, so the pack does not depend on
 //! whether the store was there.
+//!
+//! **Nothing downloaded twice.** A process opens the store once
+//! ([`SharedTiles`]) and every bake and converge of it reads through that one
+//! store: its catalog read once (and checked by its e-tag before each use),
+//! its archives' listings and its projections made once. The store's
+//! archives are immutable, so they are kept by key in tiers read before the
+//! bucket ([`tuile_tile_server::tiered`]):
+//!
+//! - a disk here, `TUILE_TILES_CACHE_DIR` (`TUILE_TILES_CACHE_GIB`, 8 by
+//!   default): whole archives, the least recently read evicted first. The
+//!   processes of one machine may share it;
+//! - a bucket shared by every machine, `TUILE_TILES_GLOBAL`: `gs://bucket/
+//!   prefix` (credentials as `object_store` reads them from the environment)
+//!   or `file:///dir`. What the bucket gives is written there once.
+//!
+//! The projections, under `TUILE_TILES_DIR`, are reused whenever the zone's
+//! archives are the ones they were made from.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use tuile_tile_server::projection::width_m;
-use tuile_tile_server::{Eye, Footprint, Grid, LayerDef, StoreConfig, StoreContent, TileStore};
+use tuile_tile_server::{
+    DiskCacheConfig, Eye, Footprint, Grid, LayerDef, StoreConfig, StoreContent, Tier, Tiered,
+    TileStore,
+};
 
 const DEFAULT_REGION: &str = "auto";
 /// Projections kept, in GiB, unless `TUILE_TILES_DIR_GIB` says.
@@ -131,10 +151,170 @@ pub fn terrain_tile_factor(
 /// from its projections, and its own tiles from memory.
 const BAKE_MANIFEST_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Archives kept on the disk tier, in GiB, unless `TUILE_TILES_CACHE_GIB` says.
+const DEFAULT_CACHE_GIB: u64 = 8;
+
+/// A store's own runtime. Dropped where a runtime may not block — the last
+/// handle on a shared store let go inside a task — it is shut down without
+/// waiting rather than panicking.
+struct OwnRuntime(Option<tokio::runtime::Runtime>);
+
+impl std::ops::Deref for OwnRuntime {
+    type Target = tokio::runtime::Runtime;
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_ref()
+            .expect("a store's runtime lives as long as the store")
+    }
+}
+
+impl Drop for OwnRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                runtime.shutdown_background();
+            }
+        }
+    }
+}
+
 /// The store, and the runtime its final flush runs on.
 pub struct Tiles {
-    runtime: tokio::runtime::Runtime,
+    runtime: OwnRuntime,
     store: Arc<TileStore>,
+    /// The catalog's e-tag when the store read it: see [`SharedTiles`].
+    catalog_tag: Option<String>,
+    /// The tiers before the bucket, when there are any.
+    tiered: Option<Tiered>,
+}
+
+/// The tiers the environment names, nearest first: the disk's, then the
+/// global one. See the [module](self).
+#[derive(Debug, Default)]
+pub struct Tiers {
+    pub disk: Option<DiskCacheConfig>,
+    pub global: Option<Tier>,
+}
+
+impl Tiers {
+    pub fn from_env() -> Result<Self, String> {
+        let disk = var("TUILE_TILES_CACHE_DIR").ok().map(|dir| {
+            let gib = std::env::var("TUILE_TILES_CACHE_GIB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(DEFAULT_CACHE_GIB);
+            DiskCacheConfig {
+                budget_bytes: gib << 30,
+                ..DiskCacheConfig::new(dir)
+            }
+        });
+        let global = match var("TUILE_TILES_GLOBAL") {
+            Ok(url) => Some(Tier::new("global", global_tier(&url)?)),
+            Err(_) => None,
+        };
+        Ok(Self { disk, global })
+    }
+}
+
+/// The global tier at `url`: `gs://bucket[/prefix]` or `file:///dir`.
+fn global_tier(url: &str) -> Result<Arc<dyn object_store::ObjectStore>, String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("TUILE_TILES_GLOBAL {url}: {e}"))?;
+    let prefix = parsed.path().trim_matches('/').to_string();
+    let objects: Arc<dyn object_store::ObjectStore> = match parsed.scheme() {
+        "gs" => {
+            let bucket = parsed
+                .host_str()
+                .ok_or_else(|| format!("TUILE_TILES_GLOBAL {url}: no bucket"))?;
+            Arc::new(
+                object_store::gcp::GoogleCloudStorageBuilder::from_env()
+                    .with_bucket_name(bucket)
+                    .build()
+                    .map_err(|e| format!("TUILE_TILES_GLOBAL {url}: {e}"))?,
+            )
+        }
+        "file" => {
+            let dir = parsed
+                .to_file_path()
+                .map_err(|()| format!("TUILE_TILES_GLOBAL {url}: not a path"))?;
+            std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            return Ok(Arc::new(
+                object_store::local::LocalFileSystem::new_with_prefix(&dir)
+                    .map_err(|e| format!("TUILE_TILES_GLOBAL {url}: {e}"))?,
+            ));
+        }
+        other => {
+            return Err(format!(
+                "TUILE_TILES_GLOBAL {url}: {other}:// is not a tier"
+            ))
+        }
+    };
+    Ok(if prefix.is_empty() {
+        objects
+    } else {
+        Arc::new(object_store::prefix::PrefixStore::new(objects, prefix))
+    })
+}
+
+/// One tile store for every bake and converge of a process: opened on first
+/// use, and opened again only when the bucket's catalog changed (its e-tag,
+/// checked by one small request before each use).
+///
+/// A store shared this way reads each archive's listing once, makes each
+/// projection once — two bakes that want the same zone at the same time
+/// download it once, the second waiting for the first — and keeps the
+/// archives it downloads in its tiers. What a host sets up beside the store
+/// (a ledger, an index reader, an absence store) is set up by `open`, before
+/// the store is shared.
+///
+/// [`Self::get`] is called off any async runtime: a store that is replaced
+/// is dropped with its own runtime when its last bake lets it go.
+pub struct SharedTiles {
+    open: Box<dyn Fn() -> Result<Option<Tiles>, String> + Send + Sync>,
+    current: Mutex<Option<Arc<Tiles>>>,
+    opened: std::sync::atomic::AtomicU64,
+}
+
+impl SharedTiles {
+    /// The store `open` opens, shared.
+    pub fn new(open: impl Fn() -> Result<Option<Tiles>, String> + Send + Sync + 'static) -> Self {
+        Self {
+            open: Box::new(open),
+            current: Mutex::new(None),
+            opened: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The store the environment names ([`Tiles::from_env`]), each opening
+    /// set up by `set_up`.
+    pub fn from_env(
+        set_up: impl Fn(Tiles) -> Result<Tiles, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self::new(move || Tiles::from_env()?.map(&set_up).transpose())
+    }
+
+    /// The store, `None` when the environment names none.
+    pub fn get(&self) -> Result<Option<Arc<Tiles>>, String> {
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| "the shared tile store's lock was poisoned".to_string())?;
+        if let Some(tiles) = current.as_ref() {
+            if tiles.catalog_unchanged() {
+                return Ok(Some(tiles.clone()));
+            }
+            tracing::info!("TILES-CATALOG-CHANGED: the store is opened again");
+        }
+        let fresh = (self.open)()?.map(Arc::new);
+        self.opened
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *current = fresh.clone();
+        Ok(fresh)
+    }
+
+    /// How many times the store was opened.
+    pub fn opened(&self) -> u64 {
+        self.opened.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 fn var(name: &str) -> Result<String, String> {
@@ -142,6 +322,13 @@ fn var(name: &str) -> Result<String, String> {
         .ok()
         .filter(|v| !v.is_empty())
         .ok_or_else(|| format!("{name} is not set"))
+}
+
+/// The catalog's e-tag, `None` when it cannot be read.
+async fn catalog_tag(objects: &dyn object_store::ObjectStore) -> Option<String> {
+    use object_store::ObjectStoreExt;
+    let at = object_store::path::Path::from(tuile_tile_server::catalog::CATALOG_KEY);
+    objects.head(&at).await.ok().and_then(|meta| meta.e_tag)
 }
 
 impl Tiles {
@@ -190,16 +377,35 @@ impl Tiles {
                     Err(_) => return Ok(None),
                 },
             };
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(runtime_threads())
-            .enable_all()
-            .build()
-            .map_err(|e| format!("tile store runtime: {e}"))?;
         // A store of its own inside a bucket that holds another: a trial that
         // shares a real bucket without touching what it serves.
         let s3: Arc<dyn object_store::ObjectStore> = match var("TUILE_TILES_PREFIX") {
             Ok(prefix) => Arc::new(object_store::prefix::PrefixStore::new(s3, prefix)),
             Err(_) => s3,
+        };
+        Self::open(&bucket, s3, layers, Tiers::from_env()?).map(Some)
+    }
+
+    /// The store on `origin` (named `name` in what is said of it), `layers`
+    /// declared that its catalog lacks, read through `tiers`.
+    pub fn open(
+        name: &str,
+        origin: Arc<dyn object_store::ObjectStore>,
+        layers: Vec<LayerDef>,
+        tiers: Tiers,
+    ) -> Result<Self, String> {
+        let bucket = name;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(runtime_threads())
+            .enable_all()
+            .build()
+            .map_err(|e| format!("tile store runtime: {e}"))?;
+        let tiered = tiers
+            .global
+            .map(|global| Tiered::new(origin.clone(), vec![global]));
+        let s3: Arc<dyn object_store::ObjectStore> = match &tiered {
+            Some(t) => Arc::new(t.clone()),
+            None => origin,
         };
         if !layers.is_empty() {
             runtime
@@ -225,43 +431,56 @@ impl Tiles {
                 })
                 .map_err(|e| format!("tile store {bucket}: its catalog: {e}"))?;
         }
+        let catalog_tag = runtime.block_on(catalog_tag(s3.as_ref()));
         let store = runtime
-            .block_on(TileStore::open(
-                s3,
-                StoreConfig {
-                    manifest_ttl: BAKE_MANIFEST_TTL,
-                    ..StoreConfig::default()
-                },
-            ))
+            .block_on(async {
+                let store = TileStore::open(
+                    s3,
+                    StoreConfig {
+                        manifest_ttl: BAKE_MANIFEST_TTL,
+                        ..StoreConfig::default()
+                    },
+                )
+                .await?;
+                match tiers.disk {
+                    Some(disk) => store.with_disk_cache(disk).await,
+                    None => Ok(store),
+                }
+            })
             .map_err(|e| format!("tile bucket {bucket}: {e}"))?;
-        tracing::info!(bucket, layers = store.layers().count(), "TILES-OPEN");
-        Ok(Some(Self {
-            runtime,
+        tracing::info!(
+            bucket,
+            layers = store.layers().count(),
+            tiers = tiered.as_ref().map(|t| t.to_string()),
+            disk_mb = store.disk_bytes() as f64 / 1e6,
+            "TILES-OPEN"
+        );
+        Ok(Self {
+            runtime: OwnRuntime(Some(runtime)),
             store: Arc::new(store),
-        }))
+            catalog_tag,
+            tiered,
+        })
+    }
+
+    /// Whether the catalog is still the one the store read: one small
+    /// request. A request that fails says yes — the store goes on as it is.
+    pub fn catalog_unchanged(&self) -> bool {
+        let now = self
+            .runtime
+            .block_on(catalog_tag(self.store.object_store().as_ref()));
+        now.is_none() || now == self.catalog_tag
+    }
+
+    /// What the tiers before the bucket answered, when there are any.
+    pub fn tiers(&self) -> Option<tuile_tile_server::TieredStats> {
+        self.tiered.as_ref().map(Tiered::stats)
     }
 
     /// The store on `objects`, whose catalog names its layers: a bucket of
     /// the caller's own (a test's, in memory).
     pub fn over(objects: Arc<dyn object_store::ObjectStore>) -> Result<Self, String> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(runtime_threads())
-            .enable_all()
-            .build()
-            .map_err(|e| format!("tile store runtime: {e}"))?;
-        let store = runtime
-            .block_on(TileStore::open(
-                objects,
-                StoreConfig {
-                    manifest_ttl: BAKE_MANIFEST_TTL,
-                    ..StoreConfig::default()
-                },
-            ))
-            .map_err(|e| format!("tile store: {e}"))?;
-        Ok(Self {
-            runtime,
-            store: Arc::new(store),
-        })
+        Self::open("tile store", objects, Vec::new(), Tiers::default())
     }
 
     /// From now on a projection by reference asks `reader` — the host's
@@ -521,8 +740,20 @@ impl Tiles {
             projection_misses = stats.projection_misses,
             remote = stats.remote,
             absent = stats.absent,
+            disk = stats.disk,
             "TILES-READS"
         );
+        if let Some(t) = self.tiers() {
+            tracing::info!(
+                tiers = ?t.tiers,
+                origin_requests = t.origin_requests,
+                origin_mb = t.origin_bytes as f64 / 1e6,
+                written = t.written,
+                already_there = t.already_there,
+                ranges_passed = t.ranges_passed,
+                "TILES-TIERS"
+            );
+        }
         let began = std::time::Instant::now();
         let zones = self
             .runtime
@@ -609,5 +840,46 @@ mod eviction_tests {
         assert_eq!(evict_oldest(dir.path(), 0), (2, 800));
         assert!(making.exists() && renaming.exists());
         assert_eq!(evict_oldest(&dir.path().join("none"), 0), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use object_store::{ObjectStoreExt, PutMode, PutOptions};
+
+    /// A global tier on a disk keeps the first copy of an archive: a second
+    /// writer is told it is there, as a bucket's conditional write tells it.
+    #[test]
+    fn a_tier_on_a_disk_is_written_once() {
+        let dir = tempfile::tempdir().expect("dir");
+        let url = url::Url::from_directory_path(dir.path()).expect("url");
+        let tier = super::global_tier(url.as_str()).expect("tier");
+        let at = object_store::path::Path::from(
+            "layer/top/1-000000000000000000000001-0123456789abcdef.pmtiles",
+        );
+        let create = || PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                tier.put_opts(&at, "first".into(), create())
+                    .await
+                    .expect("first");
+                let second = tier.put_opts(&at, "second".into(), create()).await;
+                assert!(
+                    matches!(second, Err(object_store::Error::AlreadyExists { .. })),
+                    "{second:?}"
+                );
+                let kept = tier
+                    .get(&at)
+                    .await
+                    .expect("get")
+                    .bytes()
+                    .await
+                    .expect("bytes");
+                assert_eq!(&kept[..], b"first");
+            });
     }
 }

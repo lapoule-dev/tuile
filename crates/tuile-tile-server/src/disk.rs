@@ -57,8 +57,13 @@ pub const LARGE_ARCHIVE_BYTES: u64 = 16 * MIB;
 /// is read by ranges rather than copied whole.
 pub const DEFAULT_MAX_ARCHIVE_BYTES: u64 = 256 * MIB;
 
-/// Suffix of a download not yet complete; such files are removed on open.
+/// Suffix of a download not yet complete; such files are removed on open
+/// once they are older than [`PARTIAL_STALE`].
 const PARTIAL: &str = "part";
+/// A partial download this old is left over by a process that died: the
+/// directory may be shared by the processes of a machine, and a younger one
+/// is another's download in flight.
+const PARTIAL_STALE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Where and how much to keep on disk.
 #[derive(Debug, Clone)]
@@ -149,7 +154,14 @@ impl ArchiveCache {
                 if meta.is_dir() {
                     stack.push(path);
                 } else if path.extension().is_some_and(|e| e == PARTIAL) {
-                    let _ = std::fs::remove_file(&path);
+                    let stale = meta
+                        .modified()
+                        .ok()
+                        .and_then(|at| at.elapsed().ok())
+                        .is_none_or(|age| age >= PARTIAL_STALE);
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                    }
                 } else if path.extension().is_some_and(|e| e == "pmtiles") {
                     if let Ok(rel) = path.strip_prefix(&cfg.dir) {
                         let key = rel
@@ -290,6 +302,22 @@ impl ArchiveCache {
             return Ok(r);
         }
         let path = self.cfg.dir.join(key);
+        // Copied by another process sharing the directory: an archive is
+        // never rewritten, so the file there is the one this would download.
+        if let Ok(local) = archive::open_local(&path).await {
+            let len = std::fs::metadata(&path)?.len();
+            let reader = Arc::new(local);
+            metrics::counter!("tuile_tiles_archive_copies_shared_total").increment(1);
+            let evicted = self
+                .readers
+                .lock()
+                .map_err(|_| StoreError::Poisoned)?
+                .insert(key.to_string(), reader.clone(), len);
+            for (gone, _) in evicted {
+                let _ = std::fs::remove_file(self.cfg.dir.join(gone));
+            }
+            return Ok(reader);
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

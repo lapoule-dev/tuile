@@ -339,6 +339,9 @@ pub struct ProjectionReport {
     /// Layers whose zones were listed from the bucket, and from the register.
     pub layers_listed: usize,
     pub layers_from_register: usize,
+    /// Zones whose projection was already made from the same archives, by
+    /// this bake's process or an earlier one: nothing downloaded for them.
+    pub zones_reused: usize,
 }
 
 /// What a projection did of one layer: its cell zones, and its `top`.
@@ -380,6 +383,7 @@ impl ProjectionReport {
         self.tiles_registered += r.tiles_registered;
         self.register_batches += r.register_batches;
         self.register_millis += r.register_millis;
+        self.zones_reused += r.zones_reused;
         let l = self.layers.entry(layer.to_string()).or_default();
         l.targeted |= targeted;
         l.zones_seen += r.zones_seen;
@@ -460,6 +464,54 @@ pub fn merge_ranges(
 /// Where a zone's projection lives under `dir`.
 pub fn projection_path(dir: &FsPath, layer: &Layer, zone: Zone) -> PathBuf {
     dir.join(format!("{}.pmtiles", layer.zone_prefix(zone)))
+}
+
+/// Where the archives a projection was made from are named, beside it: the
+/// keys of the zone's live archives, one a line, in the manifest's order.
+/// Archives are never rewritten, so the same keys are the same bytes: a
+/// projection made from them is good for any bake, of any process that
+/// shares the directory, until the zone's manifest names other archives.
+pub fn projection_source_path(path: &FsPath) -> PathBuf {
+    path.with_extension("pmtiles.source")
+}
+
+fn source_of(keys: &[String]) -> String {
+    keys.join("\n")
+}
+
+/// Tile entries of archive listings kept in memory, unless
+/// `TUILE_LISTING_CACHE_TILES` says: some 24 bytes each.
+const LISTING_CACHE_TILES: usize = 2_000_000;
+
+pub(crate) fn listing_cache_tiles() -> u64 {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::knob::count(&N, "TUILE_LISTING_CACHE_TILES", LISTING_CACHE_TILES) as u64
+}
+
+/// The ids a projection holds, from its directories alone.
+async fn ids_of(
+    reader: &Arc<archive::LocalReader>,
+) -> Result<std::collections::HashSet<u64>, StoreError> {
+    let mut ids = std::collections::HashSet::new();
+    let mut entries = reader.clone().entries();
+    while let Some(entry) = entries.try_next().await? {
+        ids.extend(entry.iter_coords().map(|tid| tid.value()));
+    }
+    Ok(ids)
+}
+
+/// Every tile of a projection, read back.
+async fn tiles_of(reader: &Arc<archive::LocalReader>) -> Result<BTreeMap<u64, Bytes>, StoreError> {
+    let mut tiles = BTreeMap::new();
+    let mut entries = reader.clone().entries();
+    while let Some(entry) = entries.try_next().await? {
+        for tid in entry.iter_coords() {
+            if let Some(bytes) = reader.get_tile(tid).await? {
+                tiles.insert(tid.value(), bytes);
+            }
+        }
+    }
+    Ok(tiles)
 }
 
 impl TileStore {
@@ -738,6 +790,70 @@ impl TileStore {
         Ok(out)
     }
 
+    /// An archive's listing: from memory when this store listed it before
+    /// (`false`), from its directories otherwise (`true`). `None`: the
+    /// archive is gone.
+    async fn listing_of(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Arc<archive::Listing>, bool)>, StoreError> {
+        if let Some(held) = self
+            .listings
+            .lock()
+            .ok()
+            .and_then(|mut l| l.get(&key.to_string()))
+        {
+            return Ok(Some((held, false)));
+        }
+        let Some(listing) = archive::list_remote(self.object_store().as_ref(), key).await? else {
+            return Ok(None);
+        };
+        let listing = Arc::new(listing);
+        if let Ok(mut l) = self.listings.lock() {
+            l.insert(
+                key.to_string(),
+                listing.clone(),
+                listing.tiles.len() as u64 + 1,
+            );
+        }
+        Ok(Some((listing, true)))
+    }
+
+    /// Held while the projection at `path` is being made or checked: a second
+    /// bake of this process that wants the same zone waits for the first, and
+    /// then finds it made.
+    async fn projection_lock(&self, path: &FsPath) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self
+            .projection_locks
+            .lock()
+            .map(|mut l| l.entry(path.to_path_buf()).or_default().clone())
+            .unwrap_or_default();
+        lock.lock_owned().await
+    }
+
+    /// The projection at `path`, if it was made from exactly the archives
+    /// `source` names; touched, so that the eviction of the least recently
+    /// used keeps it.
+    async fn projection_made_from(
+        &self,
+        path: &FsPath,
+        source: &str,
+    ) -> Option<Arc<archive::LocalReader>> {
+        let said = std::fs::read_to_string(projection_source_path(path)).ok()?;
+        if said != source {
+            return None;
+        }
+        let reader = archive::open_local(path).await.ok()?;
+        let now = std::time::SystemTime::now();
+        for p in [path.to_path_buf(), projection_source_path(path)] {
+            if let Ok(f) = std::fs::File::options().write(true).open(&p) {
+                let _ = f.set_modified(now);
+            }
+        }
+        metrics::counter!("tuile_tiles_projections_reused_total").increment(1);
+        Some(Arc::new(reader))
+    }
+
     /// Where every tile of a zone lies, newest archive first: each live
     /// archive listed from its directories, and each tile id given to the
     /// newest archive that holds it, as a reader of the zone would see it.
@@ -753,11 +869,12 @@ impl TileStore {
             .filter(|a| !layer.is_expired(&a.epoch, now))
             .cloned()
             .collect();
-        let listed: Vec<Option<archive::Listing>> = futures_util::stream::iter(&archives)
-            .map(|a| archive::list_remote(self.object_store().as_ref(), &a.key))
-            .buffered(ranges_in_flight())
-            .try_collect()
-            .await?;
+        let listed: Vec<Option<(Arc<archive::Listing>, bool)>> =
+            futures_util::stream::iter(&archives)
+                .map(|a| self.listing_of(&a.key))
+                .buffered(ranges_in_flight())
+                .try_collect()
+                .await?;
         let mut out = ZoneListing {
             whole_bytes: archives.iter().map(|a| a.bytes).sum(),
             archives: archives.iter().map(|a| a.key.clone()).collect(),
@@ -766,12 +883,16 @@ impl TileStore {
         };
         for (i, listing) in listed.into_iter().enumerate().rev() {
             // Vanished under us (expired, compacted): nothing of it to take.
-            let Some(listing) = listing else { continue };
-            out.requests += listing.requests;
-            out.bytes += listing.bytes;
+            let Some((listing, fetched)) = listing else {
+                continue;
+            };
+            if fetched {
+                out.requests += listing.requests;
+                out.bytes += listing.bytes;
+            }
             out.listed += listing.tiles.len() as u64;
-            for (id, range) in listing.tiles {
-                out.tiles.entry(id).or_insert((i, range));
+            for (id, range) in &listing.tiles {
+                out.tiles.entry(*id).or_insert((i, range.clone()));
             }
         }
         Ok(out)
@@ -788,6 +909,10 @@ impl TileStore {
     ) -> Result<ProjectionReport, StoreError> {
         let layer = self.layer(layer_name)?.clone();
         let factor = footprint.factor_for(layer_name);
+        let path = projection_path(dir, &layer, zone);
+        // Before the listing: a second bake that wants this zone waits, then
+        // lists it from memory and finds its tiles projected.
+        let _made = self.projection_lock(&path).await;
         let listing = self.zone_listing(&layer, zone).await?;
         let mut report = ProjectionReport {
             zones_seen: 1,
@@ -810,6 +935,25 @@ impl TileStore {
         if kept.is_empty() {
             return Ok(report);
         }
+        let source = source_of(&listing.archives);
+        // Made before from the same archives: what it holds is not fetched
+        // again; it is enough if it holds every tile kept now.
+        let mut tiles: BTreeMap<u64, Bytes> = BTreeMap::new();
+        if let Some(reader) = self.projection_made_from(&path, &source).await {
+            let held = ids_of(&reader).await?;
+            if kept.iter().all(|(id, _, _)| held.contains(id)) {
+                report.tiles_kept = kept.len() as u64;
+                report.zones_projected = 1;
+                report.zones_reused = 1;
+                self.attach_projection_reader(&layer, zone, reader);
+                return Ok(report);
+            }
+            tiles = tiles_of(&reader).await?;
+        }
+        let kept: Vec<(u64, usize, Range<u64>)> = kept
+            .into_iter()
+            .filter(|(id, _, _)| !tiles.contains_key(id))
+            .collect();
 
         // Archive by archive, the kept tiles' ranges merged where they lie
         // close, then fetched a few at once.
@@ -852,7 +996,6 @@ impl TileStore {
             report.bytes += bytes.len() as u64;
             blobs.entry(archive).or_default().push((range, bytes));
         }
-        let mut tiles: BTreeMap<u64, Bytes> = BTreeMap::new();
         for (id, archive, range) in kept {
             let blob = blobs.get(&archive).and_then(|b| {
                 b.iter()
@@ -874,7 +1017,7 @@ impl TileStore {
         }
         report.tiles_kept = tiles.len() as u64;
         report.zones_projected = 1;
-        self.persist_projection(dir, &layer, zone, &listing.epoch, tiles)
+        self.persist_projection(dir, &layer, zone, &listing.epoch, tiles, &source)
             .await?;
         Ok(report)
     }
@@ -888,21 +1031,28 @@ impl TileStore {
         zone: Zone,
         epoch: &str,
         tiles: BTreeMap<u64, Bytes>,
+        source: &str,
     ) -> Result<(), StoreError> {
         let path = projection_path(dir, layer, zone);
         let near = path.parent().unwrap_or(dir).to_path_buf();
         std::fs::create_dir_all(&near)?;
+        // No longer said to be made from anything until it is in place.
+        let said = projection_source_path(&path);
+        let _ = std::fs::remove_file(&said);
         let zooms = archive::zoom_range(tiles.keys());
-        let (l, epoch) = (layer.clone(), epoch.to_string());
+        let (l, epoch, at) = (layer.clone(), epoch.to_string(), near.clone());
         // Written beside where it goes: a rename does not leave its file
         // system, and the projections may have a volume of their own.
         let file = tokio::task::spawn_blocking(move || {
-            archive::write_in(&near, &l, &epoch, zooms, tiles.into_iter().map(Ok))
+            archive::write_in(&at, &l, &epoch, zooms, tiles.into_iter().map(Ok))
         })
         .await
         .map_err(|e| StoreError::Corrupt(format!("projection writer: {e}")))??
         .0;
         file.persist(&path).map_err(|e| StoreError::Io(e.error))?;
+        let mut note = tempfile::NamedTempFile::new_in(&near)?;
+        std::io::Write::write_all(&mut note, source.as_bytes())?;
+        note.persist(&said).map_err(|e| StoreError::Io(e.error))?;
         self.attach_projection(layer, zone, &path).await
     }
 
@@ -917,6 +1067,9 @@ impl TileStore {
             zones_seen: 1,
             ..Default::default()
         };
+        let _made = self
+            .projection_lock(&projection_path(dir, &layer, zone))
+            .await;
         let now = self.now();
         let m = manifest::read(self.object_store().as_ref(), &layer.zone_prefix(zone))
             .await?
@@ -927,6 +1080,21 @@ impl TileStore {
             .filter(|a| !layer.is_expired(&a.epoch, now))
             .cloned()
             .collect();
+        // Said whole: a projection of only some tiles of the same archives
+        // is not this one.
+        let source = format!(
+            "whole\n{}",
+            source_of(&archives.iter().map(|a| a.key.clone()).collect::<Vec<_>>())
+        );
+        if let Some(reader) = self
+            .projection_made_from(&projection_path(dir, &layer, zone), &source)
+            .await
+        {
+            report.zones_projected = 1;
+            report.zones_reused = 1;
+            self.attach_projection_reader(&layer, zone, reader);
+            return Ok(report);
+        }
 
         // Newest first: the first archive to hold a tile wins it. Each archive
         // comes down in one request, then is read locally.
@@ -970,24 +1138,9 @@ impl TileStore {
         }
         report.tiles_kept = tiles.len() as u64;
         report.zones_projected = 1;
-
-        let path = projection_path(dir, &layer, zone);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let epoch = archives.last().map(|a| a.epoch.clone()).unwrap_or_default();
-        let zooms = archive::zoom_range(tiles.keys());
-        let (l, near) = (layer.clone(), path.parent().unwrap_or(dir).to_path_buf());
-        // Written beside where it goes: a rename does not leave its file
-        // system, and the projections may have a volume of their own.
-        let file = tokio::task::spawn_blocking(move || {
-            archive::write_in(&near, &l, &epoch, zooms, tiles.into_iter().map(Ok))
-        })
-        .await
-        .map_err(|e| StoreError::Corrupt(format!("projection writer: {e}")))??
-        .0;
-        file.persist(&path).map_err(|e| StoreError::Io(e.error))?;
-        self.attach_projection(&layer, zone, &path).await?;
+        self.persist_projection(dir, &layer, zone, &epoch, tiles, &source)
+            .await?;
         Ok(report)
     }
 }

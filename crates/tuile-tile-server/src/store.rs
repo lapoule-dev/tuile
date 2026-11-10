@@ -332,6 +332,12 @@ pub struct TileStore {
     gate: Mutex<Option<Arc<Gate>>>,
     /// Local projections of remote zones, read before the bucket.
     projections: Mutex<HashMap<ZoneKey, Arc<archive::LocalReader>>>,
+    /// One projection made at a time per file: a second bake that wants the
+    /// same zone waits, then finds it made (see [`crate::projection`]).
+    pub(crate) projection_locks: Mutex<HashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    /// Archives' directories as listed, by archive key: an archive is never
+    /// rewritten, so its listing never goes stale.
+    pub(crate) listings: Mutex<Lru<String, Arc<archive::Listing>>>,
     /// Zones known by their archives' indexes alone: which tiles they hold
     /// and a digest of each, nothing downloaded (see [`crate::index`]).
     indexes: Mutex<HashMap<ZoneKey, Arc<ZoneIndex>>>,
@@ -405,6 +411,8 @@ impl TileStore {
             fault: AtomicU8::new(Fault::None as u8),
             gate: Mutex::default(),
             projections: Mutex::default(),
+            projection_locks: Mutex::default(),
+            listings: Mutex::new(Lru::new(crate::projection::listing_cache_tiles())),
             indexes: Mutex::default(),
             announcer: None,
             ledger: None,
@@ -682,6 +690,18 @@ impl TileStore {
             p.insert((layer.name.clone(), zone), reader);
         }
         Ok(())
+    }
+
+    /// Reads the zone through `reader`, a projection already open, from now on.
+    pub(crate) fn attach_projection_reader(
+        &self,
+        layer: &Layer,
+        zone: Zone,
+        reader: Arc<archive::LocalReader>,
+    ) {
+        if let Ok(mut p) = self.projections.lock() {
+            p.insert((layer.name.clone(), zone), reader);
+        }
     }
 
     /// Knows the zone by its index from now on: see [`TileStore::indexed`].
