@@ -690,7 +690,9 @@ impl Sink for VtFilm {
         let path = self.path.clone();
         let keys = self.keys.clone();
         self.pictures = Some(pictures);
+        let span = crate::sink::encoder_span();
         self.encoder = Some(std::thread::spawn(move || {
+            let _in = span.enter();
             let input = spec.input;
             let frames = waiting.into_iter().enumerate().map(|(i, i420)| {
                 Ok(Frame {
