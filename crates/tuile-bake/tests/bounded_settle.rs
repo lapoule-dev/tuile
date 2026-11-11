@@ -32,9 +32,28 @@ use tuile_terrain::{LayerJson, TerrainSource, TerrainSourceError, TileCoord};
 
 /// Many more frames than grounds may be out for reading.
 const FRAMES: u32 = 4 * READING as u32;
-/// How long each ground takes to read: far longer than a frame takes to
-/// converge and its ground to build.
-const READ: Duration = Duration::from_millis(150);
+/// How long a reading waits, at most, for more grounds to be out than a
+/// settle may have: readings that lag behind the building, as a 4K bake's
+/// audits do.
+const LAG: Duration = Duration::from_secs(4);
+/// Threads enough for every reading waiting at once to leave the building
+/// threads of its own: what is out is then what settling lets out, not what
+/// the pool happens to have room for.
+const THREADS: usize = 64;
+
+/// Reads `ground` once more than [`READING`] grounds are out, or after
+/// [`LAG`]: a settle that lets them pile up meets its readings; one that
+/// keeps them bounded waits for each.
+fn lagging(i: u32, ground: &Ground, out: &AtomicU64) -> Vec<Option<u64>> {
+    let m = tuile_core::metrics::metrics();
+    let deadline = std::time::Instant::now() + LAG;
+    while m.ground_reads_pending.get() <= READING as u64 && std::time::Instant::now() < deadline {
+        out.fetch_max(m.ground_reads_pending.get(), Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    out.fetch_max(m.ground_reads_pending.get(), Ordering::SeqCst);
+    heights(i, ground)
+}
 
 /// The finest terrain the made-up source has.
 const DEEPEST: u32 = 15;
@@ -166,6 +185,10 @@ fn heights(i: u32, ground: &Ground) -> Vec<Option<u64>> {
 /// The only test of this binary: the gauges it reads are the process's.
 #[test]
 fn grounds_out_for_reading_and_selections_held_are_bounded() {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(THREADS)
+        .build_global()
+        .expect("the first pool of this binary");
     let m = tuile_core::metrics::metrics();
     let numbers: Vec<u32> = (0..FRAMES).collect();
     let views = |i: u32, _: &Session| vec![pose_view(&pose(i), VIEWPORT)];
@@ -176,16 +199,21 @@ fn grounds_out_for_reading_and_selections_held_are_bounded() {
     let reference: Vec<(u64, Vec<Option<u64>>)> = numbers
         .iter()
         .map(|&i| {
-            reference_session.frame(views(i, &reference_session)).expect("a frame");
+            reference_session
+                .frame(views(i, &reference_session))
+                .expect("a frame");
             let selected = reference_session.selected_ground().expect("kept");
             let ground = reference_drawer.ground(&selected, DRAWN.how, DRAWN.stitch);
-            (reference_session.selection_digest().expect("live"), heights(i, &ground))
+            (
+                reference_session.selection_digest().expect("live"),
+                heights(i, &ground),
+            )
         })
         .collect();
 
     // Settled in stages, the readings slower than the building; every
     // fourth frame's selection kept.
-    let kept = |i: u32| i % 4 == 0;
+    let kept = |i: u32| i.is_multiple_of(4);
     let (out, held) = (AtomicU64::new(0), AtomicU64::new(0));
     let mut drawer = GroundDrawer::new();
     let started = std::time::Instant::now();
@@ -196,16 +224,16 @@ fn grounds_out_for_reading_and_selections_held_are_bounded() {
         &numbers,
         views,
         |i, ground: &Arc<Ground>| {
-            std::thread::sleep(READ);
-            out.fetch_max(m.ground_reads_pending.get(), Ordering::SeqCst);
             held.fetch_max(m.settled_tiles.get(), Ordering::SeqCst);
-            heights(i, ground)
+            lagging(i, ground, &out)
         },
         kept,
     )
     .expect("settled");
-    let read: Vec<(u64, Vec<Option<u64>>)> =
-        frames.iter().map(|s| (s.selection, s.value.clone())).collect();
+    let read: Vec<(u64, Vec<Option<u64>>)> = frames
+        .iter()
+        .map(|s| (s.selection, s.value.clone()))
+        .collect();
     assert_eq!(read, reference, "read as reading them in turn reads");
 
     let out = out.load(Ordering::SeqCst);
@@ -228,15 +256,15 @@ fn grounds_out_for_reading_and_selections_held_are_bounded() {
         "{out} grounds out for reading at once, more than {READING}"
     );
 
-    // Only the selections kept come back, and only they were held.
-    for s in &frames {
-        assert_eq!(s.selected.is_some(), kept(s.number), "frame {}", s.number);
-    }
+    // Only the selections kept were held, and only they come back.
     assert!(
         held <= only_kept.tiles() as u64,
         "{held} tiles held, more than the {} of the selections kept",
         only_kept.tiles()
     );
+    for s in &frames {
+        assert_eq!(s.selected.is_some(), kept(s.number), "frame {}", s.number);
+    }
     assert_eq!(m.settled_tiles.get(), 0, "the selections handed over");
 
     // Grounds built again from their selections are bounded alike.
@@ -250,9 +278,7 @@ fn grounds_out_for_reading_and_selections_held_are_bounded() {
     }
     let out = AtomicU64::new(0);
     let read = read_each(&mut drawer, DRAWN, &many, |i, ground| {
-        std::thread::sleep(READ);
-        out.fetch_max(m.ground_reads_pending.get(), Ordering::SeqCst);
-        heights(i, ground)
+        lagging(i, ground, &out)
     });
     let out = out.load(Ordering::SeqCst);
     eprintln!("reading again: at most {out} grounds out of {}", many.len());

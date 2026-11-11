@@ -267,7 +267,8 @@ fn what_settling_holds_is_counted_while_held_and_let_go_after() {
 
     // A tile shared by neighbouring frames is held, and counted, once.
     let mut held = Held::default();
-    let kept: Vec<&tuile_bake::Selected> = frames.iter().filter_map(|s| s.selected.as_ref()).collect();
+    let kept: Vec<&tuile_bake::Selected> =
+        frames.iter().filter_map(|s| s.selected.as_ref()).collect();
     assert_eq!(kept.len(), frames.len(), "every selection kept");
     for s in &kept {
         held.add(s);
@@ -290,8 +291,11 @@ fn what_settling_holds_is_counted_while_held_and_let_go_after() {
     assert!(drawer.built() > 0, "and built the grounds");
 
     // Grounds built again from their selections wait for their reads alike.
-    let frozen: Vec<(u32, &tuile_bake::Selected)> =
-        frames.iter().zip(&kept).map(|(s, k)| (s.number, *k)).collect();
+    let frozen: Vec<(u32, &tuile_bake::Selected)> = frames
+        .iter()
+        .zip(&kept)
+        .map(|(s, k)| (s.number, *k))
+        .collect();
     let waited = AtomicU64::new(0);
     read_each(&mut drawer, drawn, &frozen, |_, _| {
         waited.fetch_max(m.ground_reads_pending.get(), Ordering::SeqCst);
