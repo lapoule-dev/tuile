@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::support::{encoded, measured, LAT, LON};
+use crate::support::{measured, LAT, LON};
 use glam::DVec3;
 use tuile_bake::settle::{read_each, settle_each, Drawn};
 use tuile_bake::{pose_view, Finish, GlobeConfig, GroundDrawer, Session, SourcesHandle};
@@ -40,8 +40,53 @@ impl TerrainSource for Relief {
         if coord.level > DEEPEST {
             return Err(TerrainSourceError::no_such_tile(format!("{coord:?}")));
         }
-        Ok(Fetched::undated(encoded(&measured(coord, self.steps))))
+        Ok(Fetched::undated(with_normals(&measured(coord, self.steps))))
     }
+}
+
+/// A terrain tile's bytes as a real source serves them: the relief, its
+/// four edges (so the ground hangs skirts from them) and the oct-encoded
+/// normals extension a real source sends — the vertices numbered in the
+/// order the triangles first use them, as the format codes its indices.
+pub fn with_normals(mesh: &tuile_terrain::QuantizedMesh) -> Vec<u8> {
+    let mut order: Vec<u32> = Vec::new();
+    let mut renumbered = vec![u32::MAX; mesh.vertex_count()];
+    for &i in &mesh.indices {
+        if renumbered[i as usize] == u32::MAX {
+            renumbered[i as usize] = order.len() as u32;
+            order.push(i);
+        }
+    }
+    let pick = |values: &[f64]| -> Vec<f64> { order.iter().map(|&i| values[i as usize]).collect() };
+    // Up, leaned by the relief's own slope across the tile: a normal a
+    // vertex of its own, as a real tile's are.
+    let normals: Vec<[f32; 3]> = order
+        .iter()
+        .map(|&i| {
+            let (u, v) = (mesh.u[i as usize], mesh.v[i as usize]);
+            let lean = 0.2 * (mesh.height[i as usize] - 0.5);
+            let n = DVec3::new(0.3 + lean * u, -0.2 + lean * v, 1.0).normalize();
+            [n.x as f32, n.y as f32, n.z as f32]
+        })
+        .collect();
+    let indices: Vec<u32> = mesh
+        .indices
+        .iter()
+        .map(|&i| renumbered[i as usize])
+        .collect();
+    let edges = mesh
+        .edges
+        .clone()
+        .map(|edge| edge.iter().map(|&i| renumbered[i as usize]).collect());
+    tuile_terrain::decode::encode(
+        &mesh.header,
+        &pick(&mesh.u),
+        &pick(&mesh.v),
+        &pick(&mesh.height),
+        &indices,
+        Some(&normals),
+        &edges,
+    )
 }
 
 /// Imagery the farm's store describes without its bytes: a stamp of a

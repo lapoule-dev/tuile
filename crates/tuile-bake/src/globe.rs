@@ -361,9 +361,12 @@ impl<P: tuile_core::raster::ImageryProvider, C: tuile_core::raster::ImageryProvi
     }
 }
 
-/// Whether this globe's imagery is named and never drawn: a session that
+/// Whether this globe's tiles are named and never drawn: a session that
 /// finishes its tiles by identity composes no drape, so a tile the store can
-/// describe need not be downloaded (see `GlobeOptions::imagery_by_stamp`).
+/// describe need not be downloaded (see `GlobeOptions::imagery_by_stamp`),
+/// and lights no mesh, so no terrain tile's normals are decoded
+/// (`GlobeOptions::decode_normals`) — the render decodes the store's bytes
+/// again, normals and all.
 fn names_only(config: &GlobeConfig) -> bool {
     config.session.finish == crate::session::Finish::Identity
 }
@@ -423,6 +426,7 @@ async fn resolve(
             // a tile stored compressed is unpacked to RGBA8.
             imagery_plan: ImageryPlanHandle::new(ImageryPlan::RGBA8),
             stored_imagery: StoredPlan::OFF,
+            decode_normals: !names_only(config),
         };
         return Ok(match config.imagery_asset_id {
             None => globe_with_provenance(terrain, NoImagery, layer, options(true), decode_pool()),
@@ -490,6 +494,7 @@ async fn resolve(
                 // a tile stored compressed is unpacked to RGBA8.
                 imagery_plan: ImageryPlanHandle::new(ImageryPlan::RGBA8),
                 stored_imagery: StoredPlan::OFF,
+                decode_normals: !names_only(config),
             },
             decode_pool(),
         );
@@ -521,6 +526,7 @@ async fn resolve(
             // a tile stored compressed is unpacked to RGBA8.
             imagery_plan: ImageryPlanHandle::new(ImageryPlan::RGBA8),
             stored_imagery: StoredPlan::OFF,
+            decode_normals: !names_only(config),
         };
         return Ok(globe_with_provenance(
             terrain,
@@ -560,6 +566,7 @@ async fn resolve(
         // a tile stored compressed is unpacked to RGBA8.
         imagery_plan: ImageryPlanHandle::new(ImageryPlan::RGBA8),
         stored_imagery: StoredPlan::OFF,
+        decode_normals: !names_only(config),
     };
 
     // Ce que l'endpoint est, et non ce qu'on espère qu'il soit.
@@ -788,6 +795,124 @@ mod tests {
                 .push(format!("imagery {asset}"));
             Err("no imagery here".into())
         }
+    }
+
+    /// Terrain whose every tile is one made-up mesh carrying normals and
+    /// its four edges, as a real source's do; no imagery.
+    struct Lit;
+
+    #[async_trait::async_trait]
+    impl tuile_terrain::TerrainSource for Lit {
+        async fn fetch_tile(
+            &self,
+            _coord: tuile_terrain::TileCoord,
+        ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError>
+        {
+            // A 3 × 3 grid, numbered in the order its triangles use it.
+            let (u, v) = (
+                [0.0, 0.5, 0.0, 0.5, 1.0, 1.0, 0.0, 0.5, 1.0],
+                [0.0, 0.0, 0.5, 0.5, 0.0, 0.5, 1.0, 1.0, 1.0],
+            );
+            let height = [0.1, 0.4, 0.3, 0.9, 0.2, 0.6, 0.0, 0.7, 1.0];
+            let indices = [
+                0, 1, 2, 2, 1, 3, 1, 4, 3, 3, 4, 5, 2, 3, 6, 6, 3, 7, 3, 5, 7, 7, 5, 8,
+            ];
+            let normals = [[0.0f32, 0.0, 1.0]; 9];
+            let header = tuile_terrain::Header {
+                center: [6_378_137.0, 0.0, 0.0],
+                min_height: 10.0,
+                max_height: 250.0,
+                bounding_sphere_center: [6_378_137.0, 0.0, 0.0],
+                bounding_sphere_radius: 1.0e6,
+                horizon_occlusion: [0.0; 3],
+            };
+            let edges = [vec![0, 2, 6], vec![0, 1, 4], vec![4, 5, 8], vec![6, 7, 8]];
+            Ok(tuile_core::fetch::Fetched::undated(
+                tuile_terrain::decode::encode(
+                    &header,
+                    &u,
+                    &v,
+                    &height,
+                    &indices,
+                    Some(&normals),
+                    &edges,
+                ),
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Sources for Lit {
+        async fn terrain(
+            &self,
+            _asset: i64,
+        ) -> Result<
+            (
+                tuile_terrain::LayerJson,
+                Arc<dyn tuile_terrain::TerrainSource>,
+            ),
+            String,
+        > {
+            let layer = tuile_terrain::LayerJson::from_slice(
+                br#"{"tilejson":"2.1.0","format":"quantized-mesh-1.0","scheme":"tms",
+                    "projection":"EPSG:4326","tiles":["{z}/{x}/{y}.terrain"],
+                    "bounds":[-180,-90,180,90],"available":[[{"startX":0,"startY":0,"endX":1,"endY":0}]]}"#,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok((layer, Arc::new(Lit)))
+        }
+        async fn imagery(
+            &self,
+            _asset: i64,
+        ) -> Result<Arc<dyn tuile_core::raster::ImageryProvider>, String> {
+            Err("no imagery here".into())
+        }
+    }
+
+    /// The mesh a globe's loader hands over for tile 0/0/0, under `finish`.
+    #[allow(clippy::panic, reason = "a test asserting by panicking")]
+    fn loaded(finish: crate::session::Finish) -> tuile_core::content::DecodedMesh {
+        let mut config = GlobeConfig::new("");
+        config.sources = Some(SourcesHandle(Arc::new(Lit)));
+        config.imagery_asset_id = None;
+        config.session.finish = finish;
+        let runtime = Session::runtime().expect("runtime");
+        let (_tree, loader, _heights, _provenance) =
+            runtime.block_on(resolve(&config)).expect("resolved");
+        let tile = tuile_core::source::TileId::from_terrain(0, 0, 0);
+        match runtime.block_on(loader.load(tile)).expect("loaded") {
+            tuile_core::source::Loaded::Content(content) => content.meshes[0].clone(),
+            _ => panic!("terrain loads content"),
+        }
+    }
+
+    /// A bake that names its tiles lights none of them: their normals are
+    /// not decoded, and the mesh is otherwise the one a bake that draws
+    /// gets, bit for bit — the same vertices, so the same counts in its pack.
+    #[test]
+    fn a_bake_by_identity_decodes_no_normals() {
+        use crate::session::Finish;
+        let (named, drawn) = (loaded(Finish::Identity), loaded(Finish::Pictures));
+        assert_eq!(
+            drawn.normals.as_ref().map(Vec::len),
+            Some(drawn.positions.len())
+        );
+        assert!(
+            named.normals.is_none(),
+            "a bake by identity decoded normals"
+        );
+        let bits = |m: &tuile_core::content::DecodedMesh| {
+            let p: Vec<u32> = m.positions.iter().flatten().map(|f| f.to_bits()).collect();
+            let uv: Vec<u32> = m
+                .uvs
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|f| f.to_bits())
+                .collect();
+            (p, uv, m.indices.clone())
+        };
+        assert_eq!(bits(&named), bits(&drawn));
     }
 
     /// With a host's sources the globe resolves nothing itself: no token is

@@ -25,7 +25,7 @@ pub use http::HttpTerrainSource;
 pub use layer::{AvailabilityRange, LayerError, LayerJson, TileUrlError};
 pub use mesh::{
     fill_content, globe_shell, skirt_depth, skirt_depth_cut, skirt_height, surface_uvs, to_decoded,
-    to_ground,
+    to_decoded_with, to_ground, to_ground_with,
 };
 pub use source::{CachedTerrain, TerrainSource, TerrainSourceError};
 pub use tiling::{level_geometric_error, GeoRect, GeographicTilingScheme, TileCoord};

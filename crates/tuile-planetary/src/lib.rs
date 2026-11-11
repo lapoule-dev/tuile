@@ -24,8 +24,8 @@ use tuile_core::offload::{self, Offload};
 use tuile_core::raster::{self, GeoRect, ImageryCoord, ImageryProvider, RasterError};
 use tuile_core::source::{DrapeReach, LoadError, Loaded, TileId, TileLoader, TileTree};
 use tuile_terrain::{
-    to_ground, Availability, AvailabilityRange, GeographicTilingScheme, LayerJson, TerrainHeights,
-    TerrainSource, TerrainTree, TileCoord,
+    to_ground_with, Availability, AvailabilityRange, GeographicTilingScheme, LayerJson,
+    TerrainHeights, TerrainSource, TerrainTree, TileCoord,
 };
 
 /// How coarse the guaranteed bottom layer is.
@@ -428,7 +428,7 @@ impl ImageryCache {
 /// Its default is the interactive contract: in particular no deterministic
 /// floor, for a viewer showing blur it did not have to show is a
 /// regression.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GlobeOptions {
     /// When true, terrain only (no imagery) — the geometry debug view.
     pub no_imagery: bool,
@@ -532,6 +532,35 @@ pub struct GlobeOptions {
     /// unpacks UASTC to RGBA8 and holds nothing as blocks. A JPEG or PNG
     /// tile ignores it.
     pub stored_imagery: tuile_core::texels::StoredPlan,
+    /// Whether a terrain tile's normals are decoded and handed over with
+    /// its mesh. True by default: a consumer that lights the ground needs
+    /// them.
+    ///
+    /// Off, the oct-encoded normals a source sends are let go as soon as
+    /// the tile is decoded, and no mesh carries any
+    /// ([`tuile_terrain::to_ground_with`]): twelve bytes a vertex, held as
+    /// long as the tile, for a consumer that never lights what it holds — a
+    /// bake that names its tiles, whose render decodes their bytes again,
+    /// normals and all. What is fetched, and what the tile is named by, is
+    /// the same either way.
+    pub decode_normals: bool,
+}
+
+impl Default for GlobeOptions {
+    fn default() -> Self {
+        Self {
+            no_imagery: false,
+            max_level: None,
+            imagery_slots: LayerBudget::default(),
+            deterministic_floor: false,
+            held_drape: None,
+            composed_at: 0,
+            imagery_by_stamp: false,
+            imagery_plan: ImageryPlanHandle::default(),
+            stored_imagery: tuile_core::texels::StoredPlan::default(),
+            decode_normals: true,
+        }
+    }
 }
 
 /// The consumer's imagery plan, shared with the loader and set once the
@@ -1105,9 +1134,15 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                         let job = jobs::TerrainDecode {
                             bytes: fetched.value,
                         };
-                        let decoded = offload::run_portable(off.as_ref(), job)
+                        let mut decoded = offload::run_portable(off.as_ref(), job)
                             .await
                             .map_err(LoadError::Failed)?;
+                        // Let go at once when nothing will light the mesh:
+                        // the cache below keeps the tile, and every tile cut
+                        // from it, without them.
+                        if !self.opts.decode_normals {
+                            decoded.normals = None;
+                        }
                         // Decoding is also what reveals which descendants exist —
                         // the source may have served these bytes from a cache, but
                         // the ranges still reach the shared availability, so
@@ -1703,7 +1738,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
         // Skirts, at the size both reference implementations use. `mesh.edges`
         // arrives in whatever order the server wrote it, and `append_skirts`
         // sorts each edge before stitching it into a wall.
-        let mut content = to_ground(&qm, &rect);
+        let mut content = to_ground_with(&qm, &rect, self.opts.decode_normals);
         if !self.opts.no_imagery {
             for mesh in &mut content.meshes {
                 // Terrain owns no base-colour texture: its drapes are the

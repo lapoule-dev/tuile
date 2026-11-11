@@ -22,6 +22,22 @@ use tuile_core::geo::{geodetic_to_ecef, Geodetic, WGS84_A};
 /// (meters) extrudes the edges downward; pass `0.0` to disable skirts.
 /// The rebasing origin is the tile's quantized-mesh center.
 pub fn to_decoded(mesh: &QuantizedMesh, rect: &GeoRect, skirt_height: f64) -> DecodedTileContent {
+    to_decoded_with(mesh, rect, skirt_height, true)
+}
+
+/// [`to_decoded`], with the mesh's normals or without them.
+///
+/// `normals: false` leaves [`DecodedMesh::normals`] `None` whatever the tile
+/// carries: for a consumer that never lights the mesh it holds — a bake that
+/// names its tiles and lets the render decode their bytes again — the
+/// normals are twelve bytes a vertex it would only copy. Everything else is
+/// [`to_decoded`]'s, bit for bit.
+pub fn to_decoded_with(
+    mesh: &QuantizedMesh,
+    rect: &GeoRect,
+    skirt_height: f64,
+    normals: bool,
+) -> DecodedTileContent {
     let origin = DVec3::from(mesh.header.center);
     let min_h = mesh.header.min_height as f64;
     let max_h = mesh.header.max_height as f64;
@@ -41,7 +57,7 @@ pub fn to_decoded(mesh: &QuantizedMesh, rect: &GeoRect, skirt_height: f64) -> De
 
     let vc = mesh.vertex_count();
     let mut positions: Vec<[f32; 3]> = (0..vc).map(|i| local(to_ecef(i, 0.0, 0.0, 0.0))).collect();
-    let mut normals: Option<Vec<[f32; 3]>> = mesh.normals.clone();
+    let mut normals: Option<Vec<[f32; 3]>> = if normals { mesh.normals.clone() } else { None };
     let mut indices = mesh.indices.clone();
     let mut uvs = surface_uvs(mesh);
 
@@ -207,7 +223,13 @@ pub fn skirt_depth_cut(rect: &GeoRect, cut: u32) -> f64 {
 /// through here, so that what closes a seam is decided once and no renderer
 /// has a rule of its own.
 pub fn to_ground(mesh: &QuantizedMesh, rect: &GeoRect) -> DecodedTileContent {
-    to_decoded(mesh, rect, skirt_depth(mesh, rect))
+    to_ground_with(mesh, rect, true)
+}
+
+/// [`to_ground`], with the mesh's normals or without them
+/// ([`to_decoded_with`]).
+pub fn to_ground_with(mesh: &QuantizedMesh, rect: &GeoRect, normals: bool) -> DecodedTileContent {
+    to_decoded_with(mesh, rect, skirt_depth(mesh, rect), normals)
 }
 
 /// Which side of the tile a wall stands on, and everything that follows from it.
@@ -336,6 +358,41 @@ mod tests {
             metadata_available: None,
             cut: 0,
         }
+    }
+
+    /// Without its normals a tile is the same tile, bit for bit: the same
+    /// positions, texture coordinates and indices, skirts included.
+    #[test]
+    fn a_tile_without_normals_is_the_same_tile() {
+        let rect = GeographicTilingScheme::default().tile_rect(TileCoord::new(9, 507, 385));
+        let (lon, lat) = rect.center();
+        let centre = tuile_core::geo::geodetic_to_ecef(tuile_core::geo::Geodetic {
+            lon,
+            lat,
+            height: 0.0,
+        });
+        let mesh = quad_mesh([centre.x, centre.y, centre.z]);
+        let lit = to_ground(&mesh, &rect);
+        let unlit = to_ground_with(&mesh, &rect, false);
+        let (lit, unlit) = (&lit.meshes[0], &unlit.meshes[0]);
+        assert_eq!(
+            lit.normals.as_ref().map(Vec::len),
+            Some(lit.positions.len())
+        );
+        assert!(unlit.normals.is_none());
+        let bits = |m: &DecodedMesh| {
+            let p: Vec<u32> = m.positions.iter().flatten().map(|f| f.to_bits()).collect();
+            let uv: Vec<u32> = m
+                .uvs
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|f| f.to_bits())
+                .collect();
+            (p, uv, m.indices.clone())
+        };
+        assert_eq!(bits(lit), bits(unlit));
+        assert!(lit.positions.len() > 4, "with its skirts");
     }
 
     /// The antimeridian seam, as a unit test.
