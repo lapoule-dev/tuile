@@ -36,7 +36,20 @@ use tuile_film::ground::Ground;
 
 /// What the probe recorded on the bake as it was before its memory was cut
 /// down (stack #218, on #217): the line every change must give back.
-const RECORDED: &str = "";
+const RECORDED: &str = concat!(
+    "{\"frames\":12,\"viewport\":[960,540],\"scene\":\"cb6dbb6b0f25b499\",\"pack_sha256\":\"c82c",
+    "cb38cad7e7375929fe0b2967ccb46a4af6434c6be97a6735cf963e9abeb1\",\"pack_bytes\":27640",
+    "8,\"survey_selections\":[\"19adb3d41723caa0\",\"b4879f3f9e6c2af7\",\"dd2d755e5c18b770\",",
+    "\"d118ab7d241ba867\",\"4671d8fab96d1d5d\",\"962255ab19c23e10\",\"a24e598ad5f01791\",\"88b",
+    "c520ac19b797a\",\"d5237d54142d4696\",\"d59163f861c4ae79\",\"729331bcffe91daf\",\"8e87029",
+    "f9110e4bd\"],\"grounds\":[\"41ef35e9ac9beed8\",\"738744d005755792\",\"aa5b0e1dcd8a3983\",",
+    "\"240f09ea8bd30951\",\"2fced8c5bf42aa5c\",\"b6254a798081b476\",\"9558ac90b68d9947\",\"278",
+    "c9f78edeec081\",\"351af89c7229f063\",\"2f6cd9f30ead5e27\",\"fd0b1ade1ed9e442\",\"97e3da5",
+    "c25d8da6b\"],\"bake_selections\":[\"37cf57d6f04843d4\",\"b5d21a375aae8bb4\",\"50db4c96cd",
+    "ed2843\",\"e38bfeae4d803f20\",\"cb77927e21ed0c4f\",\"62cb517f577e915a\",\"e3d0e6538429dc",
+    "d3\",\"62e6c88cf844d638\",\"76bd5dd09034afd8\",\"15d924223b1980a3\",\"729331bcffe91daf\",",
+    "\"8e87029f9110e4bd\"]}",
+);
 
 /// Places a side the ground's height is read at, each frame.
 const GRID: u32 = 8;
@@ -163,8 +176,7 @@ fn a_bake_by_identity_is_the_one_recorded() {
         "every frame's ground answered"
     );
     let default_flight = frames == 12 && viewport == (960.0, 540.0);
-    if std::env::var_os("BAKE_IDENTITY_RECORD").is_none() && default_flight && !RECORDED.is_empty()
-    {
+    if std::env::var_os("BAKE_IDENTITY_RECORD").is_none() && default_flight {
         assert_eq!(line, RECORDED, "the bake is not the one recorded");
     }
 }
