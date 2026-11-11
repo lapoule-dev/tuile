@@ -3042,7 +3042,7 @@ pub(crate) mod tests {
             let flown = views
                 .iter()
                 .map(|view| {
-                    let frame = session.frame(vec![view.clone()]).expect("frame");
+                    let frame = session.frame(vec![*view]).expect("frame");
                     let tiles = frame
                         .tiles
                         .iter()
