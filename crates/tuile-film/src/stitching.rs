@@ -22,13 +22,15 @@ use tuile_core::stitch::{self, Edges, Stitch};
 
 use tuile_core::geo::Geodetic;
 
-use crate::ground::{middle_of, place_of, places_of, Drawn};
+use crate::ground::{indices_of, middle_of, place_of, places_of, positions_of, Drawn, Part};
 use crate::{Mesh, TileKey};
 
 struct Held {
     at: (u32, u64, u64),
     source: u32,
-    mesh: DecodedMesh,
+    /// The tile as it entered: held once, and shared with the grounds that
+    /// read it where a plan leaves it ([`crate::ground::Part`]).
+    mesh: Arc<DecodedMesh>,
     factor: [f32; 4],
     edges: Edges,
     /// What the renderer was last told.
@@ -60,7 +62,7 @@ impl Held {
                 .ground
                 .iter()
                 .filter_map(OnceLock::get)
-                .map(|drawn| drawn.heap_bytes())
+                .map(|drawn| drawn.own_bytes())
                 .sum::<usize>()
             + self
                 .places
@@ -240,7 +242,7 @@ impl Stitching {
             held: Held {
                 at,
                 source: source.unwrap_or(at.0),
-                mesh: decoded,
+                mesh: Arc::new(decoded),
                 factor: mesh.base_color_factor,
                 edges,
                 told: Stitch::default(),
@@ -282,7 +284,7 @@ impl Stitching {
 
     fn drawn_mesh(&self, held: &Held) -> DecodedMesh {
         let mut mesh = if held.told.inserts.iter().all(Vec::is_empty) {
-            held.mesh.clone()
+            DecodedMesh::clone(&held.mesh)
         } else {
             stitch::split(&held.mesh, held.edges.origin, &held.told.inserts)
         };
@@ -319,23 +321,26 @@ impl Stitching {
             let entered = held
                 .places
                 .get_or_init(|| places_of(key, origin, &mesh.positions).into());
+            // The mesh as it entered is read where it is, not copied: a
+            // tile drawn as it entered is the one mesh held.
             if !stitched {
                 return Arc::new(Drawn::placed(
                     key,
                     origin,
-                    mesh.positions.clone(),
-                    mesh.indices.clone(),
+                    Part::entered(mesh, positions_of),
+                    Part::entered(mesh, indices_of),
                     entered,
                 ));
             }
             let (positions, indices) = if held.told.inserts.iter().all(Vec::is_empty) {
-                // As `drawn_mesh`, without copying what heights do not read.
+                // As `drawn_mesh`, without copying what heights do not read:
+                // the vertices move, the triangles are the mesh's own.
                 let mut positions = mesh.positions.clone();
                 self.offset(held, &mut positions, mesh.uvs.as_deref());
-                (positions, mesh.indices.clone())
+                (Part::from(positions), Part::entered(mesh, indices_of))
             } else {
                 let drawn = self.drawn_mesh(held);
-                (drawn.positions, drawn.indices)
+                (Part::from(drawn.positions), Part::from(drawn.indices))
             };
             // A vertex the plan left where it was — the same bits — is
             // where it was: its place is read, not worked out again. A
@@ -368,7 +373,7 @@ impl Stitching {
     /// nothing is stitched. `None` for a tile not held.
     pub fn held(&self, key: &TileKey) -> Option<(DVec3, &DecodedMesh)> {
         let held = self.held.get(key)?;
-        Some((held.edges.origin, &held.mesh))
+        Some((held.edges.origin, &*held.mesh))
     }
 
     pub fn leave(&mut self, key: &TileKey) {
@@ -484,6 +489,35 @@ mod tests {
             },
             encoded(&mesh, origin.to_array(), [1.0; 4]),
         )
+    }
+
+    /// **A tile is held once.** The ground read off a tile as it entered is
+    /// that tile's mesh, not a copy of it: building it adds what a ground
+    /// reads it by — the cells its triangles are listed in, the places of
+    /// its vertices — and none of its vertices or triangles. A tile drawn
+    /// moved by a plan shares its triangles likewise.
+    #[test]
+    fn a_ground_read_off_a_tile_shares_its_mesh() {
+        let (key, mesh) = flat(9, 300, 200, 250.0);
+        let mut stitching = Stitching::default();
+        stitching.enter(key, None, &mesh);
+        let entered = stitching.held_bytes(&key);
+        let (_, held) = stitching.held(&key).expect("held");
+        let mesh_bytes = std::mem::size_of_val(held.positions.as_slice())
+            + std::mem::size_of_val(held.indices.as_slice());
+        let ground = stitching.ground(&key, false).expect("held");
+        let built = stitching.held_bytes(&key);
+        let places = std::mem::size_of::<Geodetic>() * held.positions.len();
+        assert_eq!(
+            built - entered,
+            ground.own_bytes() + places,
+            "the ground adds its own bytes and its places"
+        );
+        assert_eq!(
+            ground.heap_bytes() - ground.own_bytes(),
+            mesh_bytes,
+            "none of its vertices or triangles is copied"
+        );
     }
 
     #[test]
