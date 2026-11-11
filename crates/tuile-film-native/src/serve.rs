@@ -26,10 +26,31 @@
 //! [`NoOverlays`], whose order says nothing.
 //!
 //! A segment and a final stage are `tracing` spans, their steps spans inside
-//! them — `segment` (`pack_wait`, `fetch_extracts`, `render`, `upload`) and
-//! `compress` (`gather`, `encode`, `upload`) — for whatever subscriber the
-//! host installs; the CPU-bound steps (`render`, `encode`) are entered on the
-//! blocking thread that does the work, for the whole of it.
+//! them, for whatever subscriber the host installs (none: they cost
+//! nothing):
+//!
+//! ```text
+//! segment       out, pack, first, last; frames, bytes once known
+//!   pack_wait     the pack looked for until it is there
+//!   plan          the film's packs read, the segment's sun placed
+//!   fetch_tiles   the extracts fetched, or the pins read (pins, parts, bytes)
+//!   card_wait     the segment's turn for the card
+//!   render        every frame: its steps' milliseconds summed on the span
+//!                 (read_ms, draw_ms, readback_ms, sink_ms…)
+//!     encode        the encoder's own thread, when the sink has one
+//!   upload        the segment and its receipt put in the store (bytes)
+//! compress      run, render_id, chunks, delivery
+//!   gather        the segments fetched and joined
+//!   card_wait
+//!   encode        the delivery encoded
+//!   upload
+//! ```
+//!
+//! A segment's spans are as many whatever its length: a frame's steps are
+//! summed on `render`, never a span each. The CPU-bound steps (`render`,
+//! `encode`) are entered once, on the thread that does the work, for the
+//! whole of it: a host that tags a thread's CPU samples from its spans tags
+//! a segment's CPU by its step.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -193,6 +214,31 @@ pub struct SegmentDone {
 
 /// How often the pack is looked for.
 const LOOK_EVERY: Duration = Duration::from_secs(2);
+
+/// A render's steps summed over its frames, in milliseconds, on its span.
+fn record_steps(span: &tracing::Span, done: &crate::render::Done) {
+    let mut all = done.opening;
+    all.add(&done.timings);
+    let ms = |s: f64| s.round() as u64;
+    span.record("frames", done.frames);
+    span.record("setup_ms", ms(done.setup_seconds * 1000.0));
+    span.record(
+        "read_ms",
+        ms(all.read_terrain + all.read_imagery + all.read_pack),
+    );
+    span.record(
+        "build_ms",
+        ms(all.mesh + all.decode + all.upload + all.enter),
+    );
+    span.record("stitch_ms", ms(all.stitch));
+    span.record("draw_ms", ms(all.draw));
+    span.record("readback_ms", ms(all.readback));
+    span.record("leave_ms", ms(all.leave));
+    span.record("observe_ms", ms(all.observe));
+    span.record("sink_ms", ms(all.sink));
+    span.record("tiles_from_store", done.tiles_from_store);
+    span.record("tiles_from_pack", done.tiles_from_pack);
+}
 
 /// A render's phases, the costliest first, in seconds.
 fn phases(t: &Timings) -> String {
@@ -488,36 +534,49 @@ impl<F: OverlayFactory> Service<F> {
         // were, by an earlier segment of this generation, are read again —
         // its clock stands still, and a manifest held is believed.
         sources.store.tiles.forget_manifests();
-        let rendering = order.rendering.rendering()?;
-        let film = Film::of(sources.packs.objects.as_ref(), &[order.pack.as_str()]).await?;
-        let mut render_order = rendering.order.clone();
-        render_order.frames = Some(order.frames);
-        match (order.to_sun, rendering.sun) {
-            (Some(to_sun), _) => {
-                render_order.look.to_sun = glam::Vec3::from_array(to_sun).normalize()
+        let (rendering, film, render_order) = async {
+            let rendering = order.rendering.rendering()?;
+            let film = Film::of(sources.packs.objects.as_ref(), &[order.pack.as_str()]).await?;
+            let mut render_order = rendering.order.clone();
+            render_order.frames = Some(order.frames);
+            match (order.to_sun, rendering.sun) {
+                (Some(to_sun), _) => {
+                    render_order.look.to_sun = glam::Vec3::from_array(to_sun).normalize()
+                }
+                // Placed where the segment begins: the one asked for, or the
+                // default sun — never the look's unoriented one.
+                (None, sun) => {
+                    let head = &film.packs.first().ok_or("a film of no pack")?.head;
+                    let eye = tuile_film::Pack::open_table(head)?
+                        .view_of(order.frames.0)?
+                        .position;
+                    render_order.look.to_sun = placed_sun(eye, sun);
+                }
             }
-            // Placed where the segment begins: the one asked for, or the
-            // default sun — never the look's unoriented one.
-            (None, sun) => {
-                let head = &film.packs.first().ok_or("a film of no pack")?.head;
-                let eye = tuile_film::Pack::open_table(head)?
-                    .view_of(order.frames.0)?
-                    .position;
-                render_order.look.to_sun = placed_sun(eye, sun);
-            }
+            Ok::<_, Error>((rendering, film, render_order))
         }
+        .instrument(tracing::info_span!("plan"))
+        .await?;
         // Under the cache: on a serverless container, the disk it was given
         // rather than a /tmp in memory.
         std::fs::create_dir_all(&self.cache)?;
         let scratch = tempfile::tempdir_in(&self.cache)?;
         let local = scratch.path().join("segment.mp4");
+        let fetch = tracing::info_span!(
+            "fetch_tiles",
+            pins = order.pins.is_some(),
+            extracts = order.extracts.len(),
+            parts = Empty,
+            bytes = Empty,
+        );
         let extract = self
             .fetch_extracts(sources, &film, order, &scratch.path().join("store"))
-            .instrument(tracing::info_span!(
-                "fetch_extracts",
-                extracts = order.extracts.len()
-            ))
+            .instrument(fetch.clone())
             .await?;
+        if let Some(fetched) = &extract {
+            fetch.record("parts", fetched.parts);
+            fetch.record("bytes", fetched.bytes);
+        }
         if let Some(fetched) = &extract {
             eprintln!(
                 "segment {}: {} extracts, {} parts, {:.1} MB in {:.1} s ({:.0} MB/s)",
@@ -529,7 +588,12 @@ impl<F: OverlayFactory> Service<F> {
                 fetched.mb_per_second()
             );
         }
-        let _card = self.renders.acquire().await.map_err(|e| e.to_string())?;
+        let _card = self
+            .renders
+            .acquire()
+            .instrument(tracing::info_span!("card_wait"))
+            .await
+            .map_err(|e| e.to_string())?;
         let waited_seconds = began.elapsed().as_secs_f64();
 
         // The render holds its thread: on one of its own, its reads waited
@@ -537,14 +601,23 @@ impl<F: OverlayFactory> Service<F> {
         let rendered = Instant::now();
         let runtime = tokio::runtime::Handle::current();
         let (to, kept) = (local.clone(), generation.clone());
-        // Encoding is the sink's, frame by frame: inside the render, its
-        // seconds recorded on the span as `sink_seconds`.
+        // A frame's steps summed over the segment, in milliseconds: the
+        // encoder's own thread is a span of its own inside this one
+        // (`encode`), `sink_ms` the render's wait for its room.
         let render_span = tracing::info_span!(
             "render",
             frames = Empty,
-            setup_seconds = Empty,
-            draw_seconds = Empty,
-            sink_seconds = Empty,
+            setup_ms = Empty,
+            read_ms = Empty,
+            build_ms = Empty,
+            stitch_ms = Empty,
+            draw_ms = Empty,
+            readback_ms = Empty,
+            leave_ms = Empty,
+            observe_ms = Empty,
+            sink_ms = Empty,
+            tiles_from_store = Empty,
+            tiles_from_pack = Empty,
         );
         let on_its_thread = render_span.clone();
         let done = tokio::task::spawn_blocking(move || -> Result<crate::render::Done, Error> {
@@ -569,10 +642,7 @@ impl<F: OverlayFactory> Service<F> {
         .map_err(|e| e.to_string())??;
         let render_seconds = rendered.elapsed().as_secs_f64();
         drop(_card);
-        render_span.record("frames", done.frames);
-        render_span.record("setup_seconds", done.setup_seconds);
-        render_span.record("draw_seconds", done.opening.draw + done.timings.draw);
-        render_span.record("sink_seconds", done.opening.sink + done.timings.sink);
+        record_steps(&render_span, &done);
         let render = RenderTimes {
             setup_seconds: done.setup_seconds,
             opening: done.opening,
@@ -680,7 +750,12 @@ impl<F: OverlayFactory> Service<F> {
             )
             .into());
         };
-        let card = self.renders.acquire().await.map_err(|e| e.to_string())?;
+        let card = self
+            .renders
+            .acquire()
+            .instrument(tracing::info_span!("card_wait"))
+            .await
+            .map_err(|e| e.to_string())?;
         let delivered = scratch.path().join("film.mp4");
         let (to, delivery) = (delivered.clone(), order.delivery.clone());
         let fps = order.fps.round().max(1.0) as u32;
@@ -748,8 +823,10 @@ impl<F: OverlayFactory> Service<F> {
         notify: Arc<dyn Notify<F::Order>>,
     ) {
         let service = self.clone();
+        // Under the span it was accepted in: the request's.
+        let accepted = tracing::Span::current();
         tokio::spawn(async move {
-            let outcome = service.segment(&order).await;
+            let outcome = service.segment(&order).instrument(accepted).await;
             match &outcome {
                 Ok(done) => eprintln!(
                     "segment {} done: {} frames, waited {:.0} s, rendered in {:.0} s",
@@ -942,10 +1019,22 @@ mod tests {
         );
     }
 
-    /// Every span opened on this thread while `f` runs: its name and its
-    /// fields, the ones recorded later included.
+    /// What a span was: its name, its parent's, its fields — those recorded
+    /// after it opened too — and whether it was entered on a thread other
+    /// than the one it was opened on.
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct Seen {
+        name: String,
+        parent: Option<String>,
+        fields: Vec<(String, String)>,
+        opened_on: Option<std::thread::ThreadId>,
+        entered_elsewhere: bool,
+    }
+
+    /// Every span the subscriber it makes is told of, in the order they
+    /// opened.
     #[derive(Clone, Default)]
-    struct Spans(Arc<std::sync::Mutex<Vec<(String, Vec<(String, String)>)>>>);
+    pub(crate) struct Spans(Arc<std::sync::Mutex<Vec<(tracing::span::Id, Seen)>>>);
 
     struct Fields<'a>(&'a mut Vec<(String, String)>);
 
@@ -963,37 +1052,80 @@ mod tests {
         fn on_new_span(
             &self,
             attrs: &tracing::span::Attributes<'_>,
-            _: &tracing::span::Id,
-            _: tracing_subscriber::layer::Context<'_, S>,
+            id: &tracing::span::Id,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
             let mut fields = Vec::new();
             attrs.record(&mut Fields(&mut fields));
-            self.0
-                .lock()
-                .expect("lock")
-                .push((attrs.metadata().name().to_string(), fields));
+            let parent = ctx
+                .span(id)
+                .and_then(|span| span.parent())
+                .map(|parent| parent.name().to_string());
+            self.0.lock().expect("lock").push((
+                id.clone(),
+                Seen {
+                    name: attrs.metadata().name().to_string(),
+                    parent,
+                    fields,
+                    opened_on: Some(std::thread::current().id()),
+                    entered_elsewhere: false,
+                },
+            ));
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut spans = self.0.lock().expect("lock");
+            if let Some((_, seen)) = spans.iter_mut().rev().find(|(at, _)| at == id) {
+                values.record(&mut Fields(&mut seen.fields));
+            }
+        }
+
+        fn on_enter(&self, id: &tracing::span::Id, _: tracing_subscriber::layer::Context<'_, S>) {
+            let mut spans = self.0.lock().expect("lock");
+            if let Some((_, seen)) = spans.iter_mut().rev().find(|(at, _)| at == id) {
+                seen.entered_elsewhere |= seen.opened_on != Some(std::thread::current().id());
+            }
         }
     }
 
     impl Spans {
-        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+        pub(crate) fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
             use tracing_subscriber::layer::SubscriberExt;
             tracing_subscriber::registry().with(self.clone())
         }
 
-        fn names(&self) -> Vec<String> {
+        pub(crate) fn names(&self) -> Vec<String> {
             let spans = self.0.lock().expect("lock");
-            spans.iter().map(|(name, _)| name.clone()).collect()
+            spans.iter().map(|(_, seen)| seen.name.clone()).collect()
         }
 
-        fn field(&self, span: &str, field: &str) -> Option<String> {
+        pub(crate) fn span(&self, name: &str) -> Option<Seen> {
             let spans = self.0.lock().expect("lock");
             spans
                 .iter()
-                .filter(|(name, _)| name == span)
-                .flat_map(|(_, fields)| fields.iter())
-                .find(|(name, _)| name == field)
-                .map(|(_, value)| value.clone())
+                .find(|(_, seen)| seen.name == name)
+                .map(|(_, seen)| seen.clone())
+        }
+
+        /// The parent of the first span named `name`.
+        pub(crate) fn parent(&self, name: &str) -> Option<String> {
+            self.span(name).and_then(|seen| seen.parent)
+        }
+
+        /// The last value of `field` on the first span named `name`.
+        pub(crate) fn field(&self, name: &str, field: &str) -> Option<String> {
+            self.span(name).and_then(|seen| {
+                seen.fields
+                    .iter()
+                    .rev()
+                    .find(|(at, _)| at == field)
+                    .map(|(_, value)| value.clone())
+            })
         }
     }
 
@@ -1020,7 +1152,7 @@ mod tests {
         service.segment(&order).await.expect_err("no pack");
         let names = spans.names();
         assert!(names.iter().any(|n| n == "segment"), "{names:?}");
-        assert!(names.iter().any(|n| n == "pack_wait"), "{names:?}");
+        assert_eq!(spans.parent("pack_wait").as_deref(), Some("segment"));
         assert_eq!(
             spans.field("segment", "out").as_deref(),
             Some("films/a/parts/31-60.mp4")
@@ -1101,9 +1233,18 @@ mod tests {
         // tile is absent — and its manifest is not read.
         use tuile_repository::TileRepository;
         let asked = generation.sources.live.so_far().reads;
-        let tile = generation.sources.store.tiles.tile("imagery", 7, 77, 50).await;
+        let tile = generation
+            .sources
+            .store
+            .tiles
+            .tile("imagery", 7, 77, 50)
+            .await;
         assert!(matches!(tile, Ok(None)), "{tile:?}");
-        assert_eq!(generation.sources.live.so_far().reads, asked, "no manifest read");
+        assert_eq!(
+            generation.sources.live.so_far().reads,
+            asked,
+            "no manifest read"
+        );
         assert!(service
             .read_pinned(&generation.sources, "_pins/none.json")
             .await
@@ -1396,5 +1537,153 @@ mod tests {
             serde_json::json!({"workflow": "film-1", "chunk": 3})
         );
         assert!(outcome.expect_err("no pack").contains("did not come"));
+    }
+
+    /// A segment whose pack is there but cannot be read: its wait for the
+    /// pack and its plan are steps inside it, and nothing past the plan
+    /// opened.
+    #[tokio::test]
+    async fn a_segments_steps_are_spans_inside_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("catalog.json"), br#"{"layers": []}"#).expect("catalog");
+        std::fs::create_dir_all(dir.path().join("packs")).expect("packs");
+        std::fs::write(dir.path().join("packs/torn.tuilepack"), b"not a pack").expect("pack");
+        let runs = Arc::new(
+            ObjectRunStore::local(dir.path(), tuile_farm::Tuning::default()).expect("store"),
+        );
+        let tiles: Arc<dyn tuile_repository::Objects> = runs.clone();
+        let service = Service::new(runs, tiles, dir.path().join("cache"), Limits::default());
+        let order: SegmentOrder = serde_json::from_value(serde_json::json!({
+            "pack": "packs/torn.tuilepack",
+            "frames": [1, 30],
+            "out": "films/a/parts/1-30.mp4",
+            "pack_within_seconds": 0,
+        }))
+        .expect("order");
+        let spans = Spans::default();
+        let _default = tracing::subscriber::set_default(spans.subscriber());
+        service.segment(&order).await.expect_err("a torn pack");
+        assert_eq!(spans.parent("segment"), None);
+        for step in ["pack_wait", "plan"] {
+            assert_eq!(
+                spans.parent(step).as_deref(),
+                Some("segment"),
+                "{step}: {:?}",
+                spans.names()
+            );
+        }
+        for later in ["fetch_tiles", "card_wait", "render", "upload"] {
+            assert!(spans.span(later).is_none(), "{later}: {:?}", spans.names());
+        }
+    }
+
+    /// A render's steps, summed over its frames, are fields of its span in
+    /// milliseconds: what a trace shows of the frames without a span each.
+    #[test]
+    fn a_renders_steps_are_summed_on_its_span() {
+        let spans = Spans::default();
+        let _default = tracing::subscriber::set_default(spans.subscriber());
+        let span = tracing::info_span!(
+            "render",
+            frames = Empty,
+            setup_ms = Empty,
+            read_ms = Empty,
+            build_ms = Empty,
+            stitch_ms = Empty,
+            draw_ms = Empty,
+            readback_ms = Empty,
+            leave_ms = Empty,
+            observe_ms = Empty,
+            sink_ms = Empty,
+            tiles_from_store = Empty,
+            tiles_from_pack = Empty,
+        );
+        let opening = Timings {
+            read_terrain: 100.0,
+            readback: 40.0,
+            sink: 2.0,
+            draw: 5.0,
+            ..Timings::default()
+        };
+        let timings = Timings {
+            read_imagery: 50.0,
+            readback: 960.0,
+            sink: 18.0,
+            draw: 95.0,
+            mesh: 7.0,
+            ..Timings::default()
+        };
+        let done = crate::render::Done {
+            frames: 30,
+            setup_seconds: 1.25,
+            opening,
+            timings,
+            tiles_from_store: 12,
+            ..Default::default()
+        };
+        record_steps(&span, &done);
+        let field = |name: &str| spans.field("render", name);
+        assert_eq!(field("frames").as_deref(), Some("30"));
+        assert_eq!(field("setup_ms").as_deref(), Some("1250"));
+        assert_eq!(field("read_ms").as_deref(), Some("150"));
+        assert_eq!(field("build_ms").as_deref(), Some("7"));
+        assert_eq!(field("draw_ms").as_deref(), Some("100"));
+        assert_eq!(field("readback_ms").as_deref(), Some("1000"));
+        assert_eq!(field("sink_ms").as_deref(), Some("20"));
+        assert_eq!(field("tiles_from_store").as_deref(), Some("12"));
+    }
+
+    /// The encoder's own thread works in an `encode` span inside the span
+    /// the sink was opened in — a segment's `render` — entered there, not on
+    /// the thread that opened it.
+    #[test]
+    fn an_encoders_thread_works_in_an_encode_span_inside_the_render() {
+        use crate::sink::Sink;
+        let dir = tempfile::tempdir().expect("dir");
+        let spans = Spans::default();
+        let _default = tracing::subscriber::set_default(spans.subscriber());
+        let render = tracing::info_span!("render");
+        let mut film = crate::sink::Av1Film::at(dir.path().join("film.mp4"), 1_000_000);
+        render.in_scope(|| {
+            film.open(64, 64, 30).expect("open");
+            let i420 = vec![128u8; 64 * 64 + 2 * 32 * 32];
+            film.picture(0, 0, &[], &i420).expect("picture");
+            film.close().expect("close");
+        });
+        let encode = spans.span("encode").expect("an encode span");
+        assert_eq!(encode.parent.as_deref(), Some("render"));
+        assert!(encode.entered_elsewhere, "{encode:?}");
+    }
+
+    /// A segment accepted in the background is traced under the span it
+    /// was accepted in: the request's, whose trace it continues.
+    #[tokio::test]
+    async fn a_segment_accepted_in_the_background_is_under_the_request() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("catalog.json"), br#"{"layers": []}"#).expect("catalog");
+        let runs = Arc::new(
+            ObjectRunStore::local(dir.path(), tuile_farm::Tuning::default()).expect("store"),
+        );
+        let tiles: Arc<dyn tuile_repository::Objects> = runs.clone();
+        let service = Arc::new(Service::new(
+            runs,
+            tiles,
+            dir.path().join("cache"),
+            Limits::default(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let order: SegmentOrder = serde_json::from_value(serde_json::json!({
+            "pack": "packs/never.tuilepack",
+            "frames": [1, 2],
+            "out": "out.mp4",
+            "pack_within_seconds": 0,
+        }))
+        .expect("order");
+        let spans = Spans::default();
+        let _default = tracing::subscriber::set_default(spans.subscriber());
+        tracing::info_span!("request").in_scope(|| service.accept(order, Arc::new(Heard(tx))));
+        let (_, outcome) = rx.recv().await.expect("told");
+        assert!(outcome.is_err(), "no pack");
+        assert_eq!(spans.parent("segment").as_deref(), Some("request"));
     }
 }

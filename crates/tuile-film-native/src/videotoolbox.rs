@@ -679,7 +679,9 @@ impl Sink for VtFilm {
         let (pictures, waiting) = sync_channel::<Vec<u8>>(WAITING);
         let path = self.path.clone();
         self.pictures = Some(pictures);
+        let span = crate::sink::encoder_span();
         self.encoder = Some(std::thread::spawn(move || {
+            let _in = span.enter();
             let input = spec.input;
             let frames = waiting.into_iter().enumerate().map(|(i, i420)| {
                 Ok(Frame {

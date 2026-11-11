@@ -186,6 +186,14 @@ impl Av1Film {
     }
 }
 
+/// The span an encoder's own thread works in, for the whole of a film:
+/// opened on the thread that opens the sink — under the span it is in, a
+/// segment's `render` — and entered by the encoder's thread, so the
+/// encoding is a step of its own beside the render that feeds it.
+pub(crate) fn encoder_span() -> tracing::Span {
+    tracing::info_span!("encode")
+}
+
 impl Sink for Av1Film {
     fn open(&mut self, width: u32, height: u32, fps: u32) -> Result<(), Error> {
         let mut enc = EncoderConfig::with_speed_preset(10);
@@ -225,7 +233,9 @@ impl Sink for Av1Film {
         self.size = (w, h);
         let (pictures, waiting) = std::sync::mpsc::sync_channel::<Vec<u8>>(WAITING);
         self.pictures = Some(pictures);
+        let span = encoder_span();
         self.encoder = Some(std::thread::spawn(move || {
+            let _in = span.enter();
             let (luma, chroma) = (w * h, (w / 2) * (h / 2));
             let mut busy = 0.0f64;
             for i420 in waiting {
