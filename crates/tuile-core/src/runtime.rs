@@ -581,6 +581,10 @@ impl GeometryServer {
         // changed.
         let mut scene = composite.as_ref().map(Composite::changes);
 
+        #[allow(
+            clippy::large_enum_variant,
+            reason = "an arrival is moved once, from its load to the step that takes it in"
+        )]
         enum Event {
             Load(Result<Arrival, Aborted>),
             Client(ClientMessage),
