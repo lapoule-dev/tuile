@@ -106,5 +106,7 @@ arrow-array = "58.4.0"
 parquet = { version = "58.4.0", default-features = false, features = ["arrow", "snap"] }
 # Where the bench's bytes were allocated (`tests/bake_memory_sites.rs`).
 dhat = "0.3"
+# The identity probe's pack digest (`tests/bake_identity.rs`).
+sha2 = "0.11"
 # The projection probe (`examples/projection_probe.rs`) runs on its own runtime.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
