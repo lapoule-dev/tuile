@@ -56,6 +56,7 @@ const SIZE: u32 = 256;
 /// its own reprojection into a question that has nothing to do with any of them.
 fn quad() -> DecodedTileContent {
     DecodedTileContent {
+        shed: Vec::new(),
         withheld_drape: None,
         copyright: None,
         meshes: vec![DecodedMesh {

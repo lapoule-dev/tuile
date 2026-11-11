@@ -1176,6 +1176,7 @@ mod tests {
     impl TileLoader for StubLoader {
         async fn load(&self, _id: TileId) -> Result<Loaded, LoadError> {
             Ok(Loaded::Content(DecodedTileContent {
+                shed: Vec::new(),
                 withheld_drape: None,
                 copyright: None,
                 meshes: Vec::new(),

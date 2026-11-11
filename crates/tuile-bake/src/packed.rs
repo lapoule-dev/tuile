@@ -251,6 +251,7 @@ impl Packed {
             id,
             origin,
             DecodedTileContent {
+                shed: Vec::new(),
                 withheld_drape: None,
                 copyright: None,
                 meshes: vec![mesh],

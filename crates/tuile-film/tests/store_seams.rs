@@ -43,6 +43,7 @@ fn built(tile: TileCoord, from: TileCoord, bytes: &[u8]) -> DecodedTileContent {
     let mesh = terrain_mesh(id, &refs, bytes, [1.0; 4]).expect("mesh");
     let f = |b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
     DecodedTileContent {
+        shed: Vec::new(),
         withheld_drape: None,
         copyright: None,
         meshes: vec![DecodedMesh {

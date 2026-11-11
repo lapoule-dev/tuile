@@ -85,6 +85,17 @@ pub struct DecodedTileContent {
     /// Imagery draped over this tile, referenced rather than owned. Empty for
     /// content that carries its own texturing.
     pub imagery: Vec<crate::raster::ImageryLayer>,
+    /// Meshes that were let go before this content was handed over, by
+    /// what they were: their counts and their colour, after
+    /// [`Self::meshes`]. Empty for content that keeps every mesh — all of
+    /// it but a bake's that names its tiles and draws none of them, whose
+    /// loader keeps of each mesh only what it needs and sheds the rest.
+    ///
+    /// The budget charges a shed mesh exactly what it charged it whole
+    /// ([`Self::cost_held`]): what is selected, loaded and let go is a
+    /// function of those charges, and a consumer that holds less must not
+    /// select differently because of it.
+    pub shed: Vec<ShedMesh>,
     /// The drape this tile would have carried, when its layers were
     /// deliberately **not** fetched because the consumer already holds the
     /// composed result.
@@ -110,6 +121,29 @@ pub struct DecodedTileContent {
     /// Residual transform to apply at render time (identity: everything is
     /// baked into the positions; kept for future non-baking strategies).
     pub transform_local: Mat4,
+}
+
+/// A mesh let go before its content was handed over: what it was, without
+/// any of it ([`DecodedTileContent::shed`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShedMesh {
+    pub vertex_count: u32,
+    pub index_count: u32,
+    pub base_color_factor: [f32; 4],
+    /// Whether it had texture coordinates.
+    pub uvs: bool,
+}
+
+impl ShedMesh {
+    /// What `mesh` was.
+    pub fn of(mesh: &DecodedMesh) -> Self {
+        Self {
+            vertex_count: mesh.positions.len() as u32,
+            index_count: mesh.indices.len() as u32,
+            base_color_factor: mesh.material.base_color_factor,
+            uvs: mesh.uvs.is_some(),
+        }
+    }
 }
 
 impl DecodedTileContent {
@@ -138,6 +172,15 @@ impl DecodedTileContent {
             .sum();
         let textures: usize = self.textures.iter().map(|t| t.texels.byte_len()).sum();
         meshes + textures
+    }
+
+    /// Lets every mesh go, keeping what each was in [`Self::shed`], and
+    /// hands them over: what the content holds from then on is charged as
+    /// it was ([`Self::cost_held`]).
+    pub fn shed_meshes(&mut self) -> Vec<DecodedMesh> {
+        let meshes = std::mem::take(&mut self.meshes);
+        self.shed.splice(0..0, meshes.iter().map(ShedMesh::of));
+        meshes
     }
 
     /// What this tile's imagery would cost **if it were not shared** — the sum
@@ -175,8 +218,11 @@ impl DecodedTileContent {
     /// (`Class::is_ground`).
     pub fn cost_held(&self, cpu_copy: bool) -> crate::budget::cost::Cost {
         use crate::budget::cost::mesh_cost;
-        let vertices: u64 = self.meshes.iter().map(|m| m.positions.len() as u64).sum();
-        let indices: u64 = self.meshes.iter().map(|m| m.indices.len() as u64).sum();
+        // A shed mesh is charged as it was whole: see `Self::shed`.
+        let vertices: u64 = self.meshes.iter().map(|m| m.positions.len() as u64).sum::<u64>()
+            + self.shed.iter().map(|m| u64::from(m.vertex_count)).sum::<u64>();
+        let indices: u64 = self.meshes.iter().map(|m| m.indices.len() as u64).sum::<u64>()
+            + self.shed.iter().map(|m| u64::from(m.index_count)).sum::<u64>();
         let mut cost = mesh_cost(vertices, VERTEX_STRIDE, indices, cpu_copy);
         for t in &self.textures {
             let c = t.cost();
@@ -496,6 +542,7 @@ fn decode_glb(
         .map(std::sync::Arc::from);
 
     Ok(DecodedTileContent {
+        shed: Vec::new(),
         withheld_drape: None,
         copyright,
         meshes,
@@ -959,6 +1006,7 @@ pub(crate) mod tests {
             meshes: Vec::new(),
             textures,
             imagery: Vec::new(),
+            shed: Vec::new(),
             withheld_drape: None,
             copyright: None,
             local_origin_ecef: DVec3::ZERO,
@@ -1123,5 +1171,41 @@ pub(crate) mod tests {
         assert_eq!(tile.byte_size(), 87_408);
         tile.imagery = vec![whole(rgba), whole(blocks_256(BlockFormat::Bc7))];
         assert_eq!(tile.imagery_byte_size_unshared(), 256 * 256 * 4 + 87_408);
+    }
+
+    /// A mesh let go is charged what it was charged whole, on the ground
+    /// (with the copy a stitch reads) and off it: what a consumer that sheds
+    /// its meshes selects, loads and lets go is what one that keeps them does.
+    #[test]
+    fn a_shed_mesh_is_charged_what_it_was_whole() {
+        let mesh = DecodedMesh {
+            positions: vec![[0.0; 3]; 1089],
+            normals: None,
+            uvs: Some(vec![[0.0; 2]; 1089]),
+            indices: vec![0; 6144],
+            material: MaterialDesc {
+                base_color_factor: [0.1, 0.2, 0.3, 1.0],
+                ..MaterialDesc::default()
+            },
+        };
+        let mut content = owning(Vec::new());
+        content.meshes = vec![mesh.clone()];
+        let whole = content.clone();
+        let let_go = content.shed_meshes();
+        assert!(content.meshes.is_empty());
+        assert_eq!(let_go.len(), 1);
+        assert_eq!(
+            content.shed,
+            vec![ShedMesh {
+                vertex_count: 1089,
+                index_count: 6144,
+                base_color_factor: [0.1, 0.2, 0.3, 1.0],
+                uvs: true,
+            }]
+        );
+        for ground in [true, false] {
+            assert_eq!(content.cost_held(ground), whole.cost_held(ground), "{ground}");
+        }
+        assert_eq!(content.cost(), whole.cost());
     }
 }

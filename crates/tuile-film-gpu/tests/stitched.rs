@@ -488,6 +488,7 @@ fn contents(stitched: bool) -> Vec<((u32, u64, u64), tuile_core::content::Decode
             let bytes = if from == a { &bytes_a } else { &bytes_b };
             let mesh = terrain_mesh(id, &refs, bytes, [1.0; 4]).expect("mesh");
             let content = tuile_core::content::DecodedTileContent {
+                shed: Vec::new(),
                 withheld_drape: None,
                 copyright: None,
                 meshes: vec![stitching::decoded(&mesh)],

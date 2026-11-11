@@ -78,6 +78,7 @@ pub fn to_decoded_with(
     }
 
     DecodedTileContent {
+        shed: Vec::new(),
         withheld_drape: None,
         copyright: None,
         meshes: vec![DecodedMesh {
@@ -891,6 +892,7 @@ pub fn fill_content(
     }
 
     DecodedTileContent {
+        shed: Vec::new(),
         withheld_drape: None,
         copyright: None,
         meshes: vec![DecodedMesh {
@@ -1062,6 +1064,7 @@ pub fn globe_shell(colour: [f32; 4]) -> DecodedTileContent {
     }
 
     DecodedTileContent {
+        shed: Vec::new(),
         withheld_drape: None,
         copyright: None,
         meshes: vec![DecodedMesh {

@@ -1311,6 +1311,7 @@ mod tests {
                 meshes: Vec::new(),
                 textures: Vec::new(),
                 imagery: Vec::new(),
+                shed: Vec::new(),
                 withheld_drape: None,
                 copyright: None,
                 local_origin_ecef: DVec3::ZERO,

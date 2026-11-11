@@ -675,6 +675,7 @@ impl Writer {
             meshes,
             textures,
             imagery,
+            shed,
             withheld_drape,
             copyright,
             local_origin_ecef,
@@ -722,6 +723,16 @@ impl Writer {
         self.len(imagery.len());
         for layer in imagery {
             self.layer(layer);
+        }
+        // Meshes the loader let go, by their size: what the budget charges.
+        self.len(shed.len());
+        for m in shed {
+            self.u32(m.vertex_count);
+            self.u32(m.index_count);
+            for f in m.base_color_factor {
+                self.f32(f);
+            }
+            self.u8(u8::from(m.uvs));
         }
         self.option_u64(*withheld_drape);
         // Who the tile credits: shown below the picture while it is drawn.
@@ -1058,10 +1069,21 @@ impl<'a> Reader<'a> {
         for _ in 0..n {
             imagery.push(self.layer()?);
         }
+        let n = self.len()?;
+        let mut shed = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            shed.push(tuile_core::content::ShedMesh {
+                vertex_count: self.u32()?,
+                index_count: self.u32()?,
+                base_color_factor: self.f32s()?,
+                uvs: self.u8()? != 0,
+            });
+        }
         Ok(DecodedTileContent {
             meshes,
             textures,
             imagery,
+            shed,
             withheld_drape: self.option_u64()?,
             copyright: match self.u8()? {
                 0 => None,
@@ -1111,6 +1133,12 @@ mod tests {
                 translation: [0.125, -0.5],
                 scale: [2.0, 4.0],
             }],
+            shed: vec![tuile_core::content::ShedMesh {
+                vertex_count: 1089,
+                index_count: 6144,
+                base_color_factor: [0.25, 0.5, 0.75, 1.0],
+                uvs: true,
+            }],
             withheld_drape: Some(u64::MAX - 1),
             copyright: Some(Arc::from("Data © someone; Imagery © someone else")),
             // The anti-jitter origin: every bit of the f64 must survive.
@@ -1146,6 +1174,7 @@ mod tests {
                 (k.coverage, k.translation, k.scale)
             );
         }
+        assert_eq!(a.shed, b.shed, "the shed meshes' sizes cross");
         assert_eq!(a.withheld_drape, b.withheld_drape);
         assert_eq!(a.copyright, b.copyright, "the credits cross");
         assert_eq!(
