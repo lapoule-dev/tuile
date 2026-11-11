@@ -251,6 +251,7 @@ fn what_settling_holds_is_counted_while_held_and_let_go_after() {
             }
             settled_bytes.fetch_max(m.settled_bytes.get(), Ordering::SeqCst);
         },
+        |_| true,
     )
     .expect("settled");
     assert!(reads.load(Ordering::SeqCst) >= 1, "a ground waited");
@@ -266,11 +267,14 @@ fn what_settling_holds_is_counted_while_held_and_let_go_after() {
 
     // A tile shared by neighbouring frames is held, and counted, once.
     let mut held = Held::default();
-    for s in &frames {
-        held.add(&s.selected);
+    let kept: Vec<&tuile_bake::Selected> =
+        frames.iter().filter_map(|s| s.selected.as_ref()).collect();
+    assert_eq!(kept.len(), frames.len(), "every selection kept");
+    for s in &kept {
+        held.add(s);
     }
-    let selected: usize = frames.iter().map(|s| s.selected.len()).sum();
-    let widest = frames.iter().map(|s| s.selected.len()).max().unwrap_or(0);
+    let selected: usize = kept.iter().map(|s| s.len()).sum();
+    let widest = kept.iter().map(|s| s.len()).max().unwrap_or(0);
     assert!(
         (widest..selected).contains(&held.tiles()),
         "{} tiles of {selected} selected, the widest frame {widest}",
@@ -287,8 +291,11 @@ fn what_settling_holds_is_counted_while_held_and_let_go_after() {
     assert!(drawer.built() > 0, "and built the grounds");
 
     // Grounds built again from their selections wait for their reads alike.
-    let frozen: Vec<(u32, &tuile_bake::Selected)> =
-        frames.iter().map(|s| (s.number, &s.selected)).collect();
+    let frozen: Vec<(u32, &tuile_bake::Selected)> = frames
+        .iter()
+        .zip(&kept)
+        .map(|(s, k)| (s.number, *k))
+        .collect();
     let waited = AtomicU64::new(0);
     read_each(&mut drawer, drawn, &frozen, |_, _| {
         waited.fetch_max(m.ground_reads_pending.get(), Ordering::SeqCst);
