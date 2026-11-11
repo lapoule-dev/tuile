@@ -793,7 +793,7 @@ impl TileStore {
     /// An archive's listing: from memory when this store listed it before
     /// (`false`), from its directories otherwise (`true`). `None`: the
     /// archive is gone.
-    async fn listing_of(
+    pub(crate) async fn listing_of(
         &self,
         key: &str,
     ) -> Result<Option<(Arc<archive::Listing>, bool)>, StoreError> {
