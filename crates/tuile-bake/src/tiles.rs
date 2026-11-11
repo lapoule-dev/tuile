@@ -779,7 +779,22 @@ impl Tiles {
         }
         let dir =
             std::env::var("TUILE_TILES_DIR").unwrap_or_else(|_| DEFAULT_PROJECTION_DIR.into());
-        let report = self.project_footprint(&footprint, std::path::Path::new(&dir))?;
+        let span = tracing::info_span!(
+            "tiles.project",
+            eyes = footprint.eyes().len(),
+            zones = tracing::field::Empty,
+            tiles = tracing::field::Empty,
+            requests = tracing::field::Empty,
+            bytes = tracing::field::Empty,
+            reused = tracing::field::Empty,
+        );
+        let report =
+            span.in_scope(|| self.project_footprint(&footprint, std::path::Path::new(&dir)))?;
+        span.record("zones", report.zones_projected as u64);
+        span.record("tiles", report.tiles_kept);
+        span.record("requests", report.requests);
+        span.record("bytes", report.bytes);
+        span.record("reused", report.zones_reused as u64);
         tracing::info!(
             eyes = footprint.eyes().len(),
             factor,
@@ -900,6 +915,7 @@ impl Tiles {
     /// Publishes whatever is still buffered. Called on the way out, success or
     /// not: tiles fetched by a failed bake are still worth keeping.
     pub fn flush(&self) -> Result<(), String> {
+        let _span = tracing::info_span!("tiles.flush").entered();
         let stats = self.store.stats();
         tracing::info!(
             buffer = stats.buffer,

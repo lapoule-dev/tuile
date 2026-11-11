@@ -221,6 +221,7 @@ where
     R: Fn(u32, &Arc<Ground>) -> T + Sync,
     K: Fn(u32) -> bool + Sync,
 {
+    let _span = tracing::info_span!("bake.settle", frames = numbers.len()).entered();
     type Frozen = (usize, u32, u64, Selected, Duration);
     let read = &read;
     let keep = &keep;
@@ -344,6 +345,7 @@ where
     T: Send,
     R: Fn(u32, &Arc<Ground>) -> T + Sync,
 {
+    let _span = tracing::info_span!("bake.settle.read", frames = frames.len()).entered();
     let read = &read;
     let out: Mutex<Vec<(usize, Timed<T>)>> = Mutex::new(Vec::with_capacity(frames.len()));
     let out_ref = &out;

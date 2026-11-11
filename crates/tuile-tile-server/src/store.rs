@@ -1023,7 +1023,7 @@ impl TileStore {
             .map(|p| p.bytes.clone())
     }
 
-    fn disk_reader(&self, archive_key: &str) -> Option<Arc<LocalReader>> {
+    pub(crate) fn disk_reader(&self, archive_key: &str) -> Option<Arc<LocalReader>> {
         self.disk.as_ref()?.reader(archive_key)
     }
 
