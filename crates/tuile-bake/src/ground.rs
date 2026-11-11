@@ -394,7 +394,9 @@ impl Kept {
             material: Default::default(),
         };
         if let Some(skirts) = &self.skirts {
-            skirts.skirts(&self.vertices).hang_on(self.origin, &mut mesh);
+            skirts
+                .skirts(&self.vertices)
+                .hang_on(self.origin, &mut mesh);
         }
         mesh
     }
@@ -470,7 +472,10 @@ impl Kept {
     pub(crate) fn heap_bytes(&self) -> usize {
         use std::mem::size_of_val;
         self.skirts.as_ref().map_or(0, |s| {
-            s.walks.iter().map(|w| size_of_val(w.as_slice())).sum::<usize>()
+            s.walks
+                .iter()
+                .map(|w| size_of_val(w.as_slice()))
+                .sum::<usize>()
                 + size_of_val(s.heights.as_slice())
                 + s.places.as_deref().map_or(0, size_of_val)
         }) + size_of_val(self.indices.as_slice())
@@ -696,7 +701,10 @@ mod tests {
                         kept_whole.heap_bytes()
                     );
                     let (exceptions, of) = apart.exceptions();
-                    assert!(exceptions <= of / 100, "level {level}: {exceptions} of {of}");
+                    assert!(
+                        exceptions <= of / 100,
+                        "level {level}: {exceptions} of {of}"
+                    );
                 }
                 assert!(apart.same_as(&Kept::of_apart(tile, origin, &surface.meshes[0], &skirts)));
                 assert!(!apart.same_as(&kept_whole));

@@ -377,7 +377,9 @@ impl Skirts {
         self.sides
             .iter()
             .filter(|feet| feet.len() >= 2)
-            .fold((0, 0), |(v, i), feet| (v + feet.len(), i + 6 * (feet.len() - 1)))
+            .fold((0, 0), |(v, i), feet| {
+                (v + feet.len(), i + 6 * (feet.len() - 1))
+            })
     }
 
     /// Hangs the skirts under the surface they were taken with, its
@@ -552,8 +554,18 @@ mod tests {
     fn every_bit(m: &DecodedMesh) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
         (
             m.positions.iter().flatten().map(|f| f.to_bits()).collect(),
-            m.normals.iter().flatten().flatten().map(|f| f.to_bits()).collect(),
-            m.uvs.iter().flatten().flatten().map(|f| f.to_bits()).collect(),
+            m.normals
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|f| f.to_bits())
+                .collect(),
+            m.uvs
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|f| f.to_bits())
+                .collect(),
             m.indices.clone(),
         )
     }
@@ -569,8 +581,16 @@ mod tests {
             let mesh = relief_mesh(&rect, n);
             let whole = to_ground(&mesh, &rect);
             let whole = &whole.meshes[0];
-            assert_eq!(whole.positions.capacity(), whole.positions.len(), "{level}: built at its size");
-            assert_eq!(whole.indices.capacity(), whole.indices.len(), "{level}: built at its size");
+            assert_eq!(
+                whole.positions.capacity(),
+                whole.positions.len(),
+                "{level}: built at its size"
+            );
+            assert_eq!(
+                whole.indices.capacity(),
+                whole.indices.len(),
+                "{level}: built at its size"
+            );
 
             let (surface, skirts) = to_ground_apart(&mesh, &rect, true);
             let mut hung = surface.meshes[0].clone();
@@ -581,7 +601,10 @@ mod tests {
             skirts.hang_on(surface.local_origin_ecef, &mut hung);
             assert_eq!(hung.positions.len(), whole.positions.len());
             assert_eq!(hung.indices.len(), whole.indices.len());
-            assert!(every_bit(&hung) == every_bit(whole), "{level}: hung back, the same tile");
+            assert!(
+                every_bit(&hung) == every_bit(whole),
+                "{level}: hung back, the same tile"
+            );
         }
     }
 

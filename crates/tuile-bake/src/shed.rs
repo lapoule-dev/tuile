@@ -162,7 +162,9 @@ impl Shedding {
             // Skirts that came apart from the surface: counted as the walls
             // they would have been, and kept as what they hang from.
             let apart = content.apart.take();
-            let skirts = apart.as_ref().and_then(|a| a.get::<tuile_terrain::Skirts>());
+            let skirts = apart
+                .as_ref()
+                .and_then(|a| a.get::<tuile_terrain::Skirts>());
             let mut let_go = content.shed_meshes().into_iter();
             if let (Some(skirts), Some(first)) = (skirts, content.shed.first_mut()) {
                 let (vertices, indices) = skirts.counts();
@@ -432,7 +434,10 @@ mod tests {
     #[test]
     fn a_tile_whose_skirts_came_apart_is_shed_as_the_whole_tile() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let (whole, apart) = (Shedding::new(Arc::new(Relief)), Shedding::new(Arc::new(ReliefApart)));
+        let (whole, apart) = (
+            Shedding::new(Arc::new(Relief)),
+            Shedding::new(Arc::new(ReliefApart)),
+        );
         whole.keep_ground(true);
         apart.keep_ground(true);
         let shed = |s: &Shedding| match runtime.block_on(s.load(tile())) {
@@ -444,7 +449,10 @@ mod tests {
         assert_eq!(from_apart.shed, from_whole.shed, "the same counts");
         assert_eq!(from_apart.cost(), from_whole.cost(), "the same charge");
         let came = relief();
-        let (kept_whole, kept_apart) = (whole.take(tile()).expect("kept"), apart.take(tile()).expect("kept"));
+        let (kept_whole, kept_apart) = (
+            whole.take(tile()).expect("kept"),
+            apart.take(tile()).expect("kept"),
+        );
         assert_eq!(bits(&kept_apart.kept.mesh(tile())), bits(&came.meshes[0]));
         assert_eq!(bits(&kept_whole.kept.mesh(tile())), bits(&came.meshes[0]));
         assert!(kept_apart.kept.heap_bytes() < kept_whole.kept.heap_bytes());
