@@ -241,9 +241,8 @@ mod tests {
         let pick = |values: &[f64]| order.iter().map(|&i| values[i]).collect::<Vec<_>>();
         let normals: Vec<[f32; 3]> = order.iter().map(|&i| normals[i]).collect();
         let indices: Vec<u32> = indices.iter().map(|&i| renumbered[i as usize]).collect();
-        let line = |f: &dyn Fn(usize) -> usize| -> Vec<u32> {
-            (0..n).map(|k| renumbered[f(k)]).collect()
-        };
+        let line =
+            |f: &dyn Fn(usize) -> usize| -> Vec<u32> { (0..n).map(|k| renumbered[f(k)]).collect() };
         let rect = GeographicTilingScheme::default().tile_rect(coord);
         let (lon, lat) = rect.center();
         let centre = tuile_core::geo::geodetic_to_ecef(tuile_core::geo::Geodetic {

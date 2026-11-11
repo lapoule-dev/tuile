@@ -814,7 +814,9 @@ mod tests {
                 [0.0, 0.0, 0.5, 0.5, 0.0, 0.5, 1.0, 1.0, 1.0],
             );
             let height = [0.1, 0.4, 0.3, 0.9, 0.2, 0.6, 0.0, 0.7, 1.0];
-            let indices = [0, 1, 2, 2, 1, 3, 1, 4, 3, 3, 4, 5, 2, 3, 6, 6, 3, 7, 3, 5, 7, 7, 5, 8];
+            let indices = [
+                0, 1, 2, 2, 1, 3, 1, 4, 3, 3, 4, 5, 2, 3, 6, 6, 3, 7, 3, 5, 7, 7, 5, 8,
+            ];
             let normals = [[0.0f32, 0.0, 1.0]; 9];
             let header = tuile_terrain::Header {
                 center: [6_378_137.0, 0.0, 0.0],
@@ -891,11 +893,23 @@ mod tests {
     fn a_bake_by_identity_decodes_no_normals() {
         use crate::session::Finish;
         let (named, drawn) = (loaded(Finish::Identity), loaded(Finish::Pictures));
-        assert_eq!(drawn.normals.as_ref().map(Vec::len), Some(drawn.positions.len()));
-        assert!(named.normals.is_none(), "a bake by identity decoded normals");
+        assert_eq!(
+            drawn.normals.as_ref().map(Vec::len),
+            Some(drawn.positions.len())
+        );
+        assert!(
+            named.normals.is_none(),
+            "a bake by identity decoded normals"
+        );
         let bits = |m: &tuile_core::content::DecodedMesh| {
             let p: Vec<u32> = m.positions.iter().flatten().map(|f| f.to_bits()).collect();
-            let uv: Vec<u32> = m.uvs.iter().flatten().flatten().map(|f| f.to_bits()).collect();
+            let uv: Vec<u32> = m
+                .uvs
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|f| f.to_bits())
+                .collect();
             (p, uv, m.indices.clone())
         };
         assert_eq!(bits(&named), bits(&drawn));

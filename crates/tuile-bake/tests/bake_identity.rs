@@ -58,9 +58,12 @@ fn ground_digest(i: u32, ground: &Ground) -> u64 {
 
 /// FNV-1a over `values` in their order (`determinism::digest` sorts).
 fn in_order(values: &[u64]) -> u64 {
-    values.iter().flat_map(|v| v.to_le_bytes()).fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-    })
+    values
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .fold(0xcbf2_9ce4_8422_2325, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        })
 }
 
 fn hex(digests: &[u64]) -> String {
@@ -154,7 +157,9 @@ fn a_bake_by_identity_is_the_one_recorded() {
     );
     eprintln!("IDENTITY {line}");
     assert!(
-        grounds.iter().all(|g| *g != in_order(&[u64::MAX; (GRID * GRID) as usize])),
+        grounds
+            .iter()
+            .all(|g| *g != in_order(&[u64::MAX; (GRID * GRID) as usize])),
         "every frame's ground answered"
     );
     let default_flight = frames == 12 && viewport == (960.0, 540.0);

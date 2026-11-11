@@ -24,8 +24,8 @@ use tuile_core::offload::{self, Offload};
 use tuile_core::raster::{self, GeoRect, ImageryCoord, ImageryProvider, RasterError};
 use tuile_core::source::{DrapeReach, LoadError, Loaded, TileId, TileLoader, TileTree};
 use tuile_terrain::{
-    to_ground_with, Availability, AvailabilityRange, GeographicTilingScheme, LayerJson, TerrainHeights,
-    TerrainSource, TerrainTree, TileCoord,
+    to_ground_with, Availability, AvailabilityRange, GeographicTilingScheme, LayerJson,
+    TerrainHeights, TerrainSource, TerrainTree, TileCoord,
 };
 
 /// How coarse the guaranteed bottom layer is.

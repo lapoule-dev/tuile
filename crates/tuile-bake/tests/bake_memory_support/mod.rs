@@ -69,7 +69,11 @@ pub fn with_normals(mesh: &tuile_terrain::QuantizedMesh) -> Vec<u8> {
             [n.x as f32, n.y as f32, n.z as f32]
         })
         .collect();
-    let indices: Vec<u32> = mesh.indices.iter().map(|&i| renumbered[i as usize]).collect();
+    let indices: Vec<u32> = mesh
+        .indices
+        .iter()
+        .map(|&i| renumbered[i as usize])
+        .collect();
     let edges = mesh
         .edges
         .clone()

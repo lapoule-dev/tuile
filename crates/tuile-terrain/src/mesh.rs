@@ -375,11 +375,20 @@ mod tests {
         let lit = to_ground(&mesh, &rect);
         let unlit = to_ground_with(&mesh, &rect, false);
         let (lit, unlit) = (&lit.meshes[0], &unlit.meshes[0]);
-        assert_eq!(lit.normals.as_ref().map(Vec::len), Some(lit.positions.len()));
+        assert_eq!(
+            lit.normals.as_ref().map(Vec::len),
+            Some(lit.positions.len())
+        );
         assert!(unlit.normals.is_none());
         let bits = |m: &DecodedMesh| {
             let p: Vec<u32> = m.positions.iter().flatten().map(|f| f.to_bits()).collect();
-            let uv: Vec<u32> = m.uvs.iter().flatten().flatten().map(|f| f.to_bits()).collect();
+            let uv: Vec<u32> = m
+                .uvs
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|f| f.to_bits())
+                .collect();
             (p, uv, m.indices.clone())
         };
         assert_eq!(bits(lit), bits(unlit));
