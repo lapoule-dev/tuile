@@ -310,8 +310,17 @@ mod tests {
 
     fn bits(mesh: &DecodedMesh) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         (
-            mesh.positions.iter().flatten().map(|f| f.to_bits()).collect(),
-            mesh.uvs.iter().flatten().flatten().map(|f| f.to_bits()).collect(),
+            mesh.positions
+                .iter()
+                .flatten()
+                .map(|f| f.to_bits())
+                .collect(),
+            mesh.uvs
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|f| f.to_bits())
+                .collect(),
             mesh.indices.clone(),
         )
     }
@@ -339,14 +348,19 @@ mod tests {
         let kept = shedding.take(tile()).expect("handed over");
         assert_eq!(shedding.waiting(), 0);
         let reference = Kept::of(tile(), whole.local_origin_ecef, came);
-        assert!(kept.kept.same_as(&reference), "kept as the session keeps it");
+        assert!(
+            kept.kept.same_as(&reference),
+            "kept as the session keeps it"
+        );
         assert_eq!(bits(&kept.kept.mesh(tile())), bits(came));
         assert_eq!(
             bits(kept.as_it_came.as_deref().expect("as it came")),
             bits(came)
         );
 
-        let again = runtime.block_on(shedding.reread(tile())).expect("read again");
+        let again = runtime
+            .block_on(shedding.reread(tile()))
+            .expect("read again");
         assert!(again.kept.same_as(&reference), "read again, kept the same");
         assert_eq!(shedding.waiting(), 0, "a reading again hands nothing over");
     }

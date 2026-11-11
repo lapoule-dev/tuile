@@ -530,7 +530,11 @@ mod tests {
             north: 1.0,
         };
         let layer = ImageryLayer::placed(
-            ImageryCoord { level: 9, x: 3, y: 4 },
+            ImageryCoord {
+                level: 9,
+                x: 3,
+                y: 4,
+            },
             Arc::new(crate::content::DecodedTexture::from_rgba8(1, 1, vec![0; 4])),
             &rect,
             &rect,

@@ -991,7 +991,6 @@ struct Grounds {
     as_it_came: Option<HashMap<TileId, (DVec3, Arc<DecodedMesh>)>>,
 }
 
-
 /// What the session holds of the stream, kept across frames: each mesh and
 /// drape with the arrival it came by and the generation it was delivered
 /// at, until the server evicts it.
@@ -1650,9 +1649,10 @@ fn start_finish(
                 GroundFrom::None => None,
                 GroundFrom::Handed(kept) => Some(kept),
                 GroundFrom::Reread(_) => reread,
-                GroundFrom::Build => mesh.meshes.first().map(|first| {
-                    KeptTile::of(tile, mesh.local_origin_ecef, first, keep_meshes)
-                }),
+                GroundFrom::Build => mesh
+                    .meshes
+                    .first()
+                    .map(|first| KeptTile::of(tile, mesh.local_origin_ecef, first, keep_meshes)),
             };
             // A tile only named is dressed without a copy of its meshes.
             let dressed = match finish {
@@ -3055,8 +3055,10 @@ pub(crate) mod tests {
                     let heights = (0..8)
                         .flat_map(|i| (0..8).map(move |j| (i, j)))
                         .map(|(i, j)| {
-                            let (u, north) = (0.05 + 0.12 * f64::from(i), 0.05 + 0.12 * f64::from(j));
-                            let g = tuile_core::geo::ecef_to_geodetic(geo_at(l, x, y, u, north, 0.0));
+                            let (u, north) =
+                                (0.05 + 0.12 * f64::from(i), 0.05 + 0.12 * f64::from(j));
+                            let g =
+                                tuile_core::geo::ecef_to_geodetic(geo_at(l, x, y, u, north, 0.0));
                             ground.height_at(g.lon, g.lat).map(f64::to_bits)
                         })
                         .collect();
@@ -3071,7 +3073,9 @@ pub(crate) mod tests {
             kept.iter().all(|(_, h)| h.iter().all(Option::is_some)),
             "the ground answers everywhere"
         );
-        assert!(kept.iter().all(|(t, _)| t.iter().all(|(_, _, s)| s.is_some())));
+        assert!(kept
+            .iter()
+            .all(|(t, _)| t.iter().all(|(_, _, s)| s.is_some())));
         let (let_go, _) = fly(Some(0), false);
         assert_eq!(let_go, kept, "let go and delivered again");
         let (read_again, rereads) = fly(Some(0), true);

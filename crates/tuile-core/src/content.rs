@@ -224,10 +224,26 @@ impl DecodedTileContent {
     pub fn cost_held(&self, cpu_copy: bool) -> crate::budget::cost::Cost {
         use crate::budget::cost::mesh_cost;
         // A shed mesh is charged as it was whole: see `Self::shed`.
-        let vertices: u64 = self.meshes.iter().map(|m| m.positions.len() as u64).sum::<u64>()
-            + self.shed.iter().map(|m| u64::from(m.vertex_count)).sum::<u64>();
-        let indices: u64 = self.meshes.iter().map(|m| m.indices.len() as u64).sum::<u64>()
-            + self.shed.iter().map(|m| u64::from(m.index_count)).sum::<u64>();
+        let vertices: u64 = self
+            .meshes
+            .iter()
+            .map(|m| m.positions.len() as u64)
+            .sum::<u64>()
+            + self
+                .shed
+                .iter()
+                .map(|m| u64::from(m.vertex_count))
+                .sum::<u64>();
+        let indices: u64 = self
+            .meshes
+            .iter()
+            .map(|m| m.indices.len() as u64)
+            .sum::<u64>()
+            + self
+                .shed
+                .iter()
+                .map(|m| u64::from(m.index_count))
+                .sum::<u64>();
         let mut cost = mesh_cost(vertices, VERTEX_STRIDE, indices, cpu_copy);
         for t in &self.textures {
             let c = t.cost();
@@ -1209,7 +1225,11 @@ pub(crate) mod tests {
             }]
         );
         for ground in [true, false] {
-            assert_eq!(content.cost_held(ground), whole.cost_held(ground), "{ground}");
+            assert_eq!(
+                content.cost_held(ground),
+                whole.cost_held(ground),
+                "{ground}"
+            );
         }
         assert_eq!(content.cost(), whole.cost());
     }
