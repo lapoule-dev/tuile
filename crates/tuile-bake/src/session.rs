@@ -2006,7 +2006,7 @@ fn finished_as(
         let shape = decoded
             .meshes
             .first()
-            .map(tuile_core::content::ShedMesh::of)
+            .map(|m| tuile_core::content::ShedMesh::of(m, decoded.local_origin_ecef))
             .or_else(|| decoded.shed.first().copied())
             .map(|mesh| Shape {
                 vertex_count: mesh.vertex_count,

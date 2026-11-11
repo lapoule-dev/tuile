@@ -137,18 +137,50 @@ pub struct ShedMesh {
     pub base_color_factor: [f32; 4],
     /// Whether it had texture coordinates.
     pub uvs: bool,
+    /// The cosine of its steepest face against the globe's up, skirts left
+    /// out ([`steepest_face`]): what the imagery level a tile is draped at
+    /// reads of its ground, kept as the mesh gave it.
+    pub steepest: Option<f64>,
 }
 
 impl ShedMesh {
-    /// What `mesh` was.
-    pub fn of(mesh: &DecodedMesh) -> Self {
+    /// What `mesh`, about `origin`, was.
+    pub fn of(mesh: &DecodedMesh, origin: DVec3) -> Self {
         Self {
             vertex_count: mesh.positions.len() as u32,
             index_count: mesh.indices.len() as u32,
             base_color_factor: mesh.material.base_color_factor,
             uvs: mesh.uvs.is_some(),
+            steepest: steepest_face(mesh, origin),
         }
     }
+}
+
+/// The cosine of a terrain mesh's steepest face, about `origin`, against
+/// the globe's up at the tile: 1 for flat ground, 0 for a vertical face.
+/// Skirts are left out (they are vertical by construction). `None` for a
+/// mesh with no triangle to measure.
+///
+/// Computed with `+ − × ÷ √` and comparisons only, as the imagery level it
+/// feeds (`budget::imagery`): the same mesh gives the same value everywhere.
+pub fn steepest_face(mesh: &DecodedMesh, origin: DVec3) -> Option<f64> {
+    let up = origin.normalize_or_zero();
+    if up == DVec3::ZERO {
+        return None;
+    }
+    let ground = crate::stitch::without_skirts(mesh, origin);
+    let at = |i: u32| glam::Vec3::from(ground.positions[i as usize]).as_dvec3();
+    let mut steepest: Option<f64> = None;
+    for face in ground.indices.as_chunks::<3>().0 {
+        let normal = (at(face[1]) - at(face[0])).cross(at(face[2]) - at(face[0]));
+        let length = normal.length();
+        if length.is_nan() || length <= 0.0 {
+            continue;
+        }
+        let cos = (normal.dot(up) / length).abs().min(1.0);
+        steepest = Some(steepest.map_or(cos, |s| s.min(cos)));
+    }
+    steepest
 }
 
 impl DecodedTileContent {
@@ -184,7 +216,9 @@ impl DecodedTileContent {
     /// it was ([`Self::cost_held`]).
     pub fn shed_meshes(&mut self) -> Vec<DecodedMesh> {
         let meshes = std::mem::take(&mut self.meshes);
-        self.shed.splice(0..0, meshes.iter().map(ShedMesh::of));
+        let origin = self.local_origin_ecef;
+        self.shed
+            .splice(0..0, meshes.iter().map(|m| ShedMesh::of(m, origin)));
         meshes
     }
 
@@ -1222,6 +1256,7 @@ pub(crate) mod tests {
                 index_count: 6144,
                 base_color_factor: [0.1, 0.2, 0.3, 1.0],
                 uvs: true,
+                steepest: None,
             }]
         );
         for ground in [true, false] {

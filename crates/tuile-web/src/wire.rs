@@ -733,6 +733,13 @@ impl Writer {
                 self.f32(f);
             }
             self.u8(u8::from(m.uvs));
+            match m.steepest {
+                Some(cos) => {
+                    self.u8(1);
+                    self.f64(cos);
+                }
+                None => self.u8(0),
+            }
         }
         self.option_u64(*withheld_drape);
         // Who the tile credits: shown below the picture while it is drawn.
@@ -1077,6 +1084,10 @@ impl<'a> Reader<'a> {
                 index_count: self.u32()?,
                 base_color_factor: self.f32s()?,
                 uvs: self.u8()? != 0,
+                steepest: match self.u8()? {
+                    0 => None,
+                    _ => Some(self.f64()?),
+                },
             });
         }
         Ok(DecodedTileContent {
@@ -1138,6 +1149,7 @@ mod tests {
                 index_count: 6144,
                 base_color_factor: [0.25, 0.5, 0.75, 1.0],
                 uvs: true,
+                steepest: Some(0.875),
             }],
             withheld_drape: Some(u64::MAX - 1),
             copyright: Some(Arc::from("Data © someone; Imagery © someone else")),

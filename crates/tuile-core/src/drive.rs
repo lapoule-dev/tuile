@@ -191,7 +191,7 @@ pub fn dress_named(
         shed: mesh
             .meshes
             .iter()
-            .map(crate::content::ShedMesh::of)
+            .map(|m| crate::content::ShedMesh::of(m, mesh.local_origin_ecef))
             .chain(mesh.shed.iter().copied())
             .collect(),
         withheld_drape: mesh.withheld_drape,
@@ -583,7 +583,10 @@ mod tests {
         dressed.shed_meshes();
         assert!(named.meshes.is_empty());
         assert_eq!(named.shed, dressed.shed);
-        assert_eq!(named.shed[0], ShedMesh::of(&mesh.meshes[0]));
+        assert_eq!(
+            named.shed[0],
+            ShedMesh::of(&mesh.meshes[0], mesh.local_origin_ecef)
+        );
         assert_eq!(named.withheld_drape, Some(77));
         assert_eq!(named.withheld_drape, dressed.withheld_drape);
         assert_eq!(
