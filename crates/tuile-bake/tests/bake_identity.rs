@@ -149,6 +149,26 @@ fn a_bake_by_identity_is_the_one_recorded() {
     )
     .expect("baked");
     let pack = std::fs::read(&out).expect("the pack");
+    // Every tile record, one line each, when asked: to tell two packs apart.
+    if let Ok(dump) = std::env::var("BAKE_IDENTITY_DUMP") {
+        let opened = tuile_pack::Pack::open(&pack).expect("a pack");
+        let mut lines = Vec::new();
+        for n in 1..=frames {
+            for t in opened.frame(n).expect("a frame") {
+                lines.push(format!(
+                    "{n} {} {:x} {} {} {:?} {:?} {:?}",
+                    t.id(),
+                    t.drape(),
+                    t.vertex_count(),
+                    t.index_count(),
+                    t.origin_ecef().map(|v| v.iter().collect::<Vec<_>>()),
+                    t.base_color_factor().map(|v| v.iter().collect::<Vec<_>>()),
+                    tuile_pack::refs_of(&t),
+                ));
+            }
+        }
+        std::fs::write(dump, lines.join("\n")).expect("dumped");
+    }
     let sha256 = {
         use sha2::Digest;
         sha2::Sha256::digest(&pack)
