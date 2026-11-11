@@ -80,11 +80,12 @@ pub fn dressed(entry: Codec) -> Codec {
 }
 
 /// The width and height an entry describes, for the video codecs read here.
-fn size_of(entry: &Codec) -> Option<(u16, u16)> {
+pub(crate) fn size_of(entry: &Codec) -> Option<(u16, u16)> {
     match entry {
         Codec::Avc1(e) => Some((e.visual.width, e.visual.height)),
         Codec::Hvc1(e) => Some((e.visual.width, e.visual.height)),
         Codec::Av01(e) => Some((e.visual.width, e.visual.height)),
+        Codec::Hev1(e) => Some((e.visual.width, e.visual.height)),
         _ => None,
     }
 }
@@ -125,21 +126,19 @@ impl Track {
     }
 }
 
-fn io(e: std::io::Error) -> Mp4Error {
+pub(crate) fn io(e: std::io::Error) -> Mp4Error {
     Mp4Error::Atom(e.to_string())
 }
 
-fn atom(e: mp4_atom::Error) -> Mp4Error {
+pub(crate) fn atom(e: mp4_atom::Error) -> Mp4Error {
     Mp4Error::Atom(e.to_string())
 }
 
-/// The video track of the film in `file`: its `moov` read, its `mdat` left
-/// where it is. `Ok(None)` for a file with no `moov`, or whose first track
-/// is not H.264, HEVC or AV1 video.
-pub fn read_track<R: Read + Seek>(file: &mut R) -> Result<Option<Track>, Mp4Error> {
+/// The `moov` of the file in `file`, its `mdat` left where it is: `Ok(None)`
+/// for a file with none.
+pub(crate) fn read_moov<R: Read + Seek>(file: &mut R) -> Result<Option<Moov>, Mp4Error> {
     let end = file.seek(SeekFrom::End(0)).map_err(io)?;
     let mut at = 0u64;
-    let mut moov = None;
     while at + 8 <= end {
         file.seek(SeekFrom::Start(at)).map_err(io)?;
         let mut head = [0u8; 16];
@@ -161,12 +160,18 @@ pub fn read_track<R: Read + Seek>(file: &mut R) -> Result<Option<Track>, Mp4Erro
             file.seek(SeekFrom::Start(at)).map_err(io)?;
             let mut bytes = vec![0u8; size as usize];
             file.read_exact(&mut bytes).map_err(io)?;
-            moov = Some(Moov::decode(&mut bytes.as_slice()).map_err(atom)?);
-            break;
+            return Ok(Some(Moov::decode(&mut bytes.as_slice()).map_err(atom)?));
         }
         at += size;
     }
-    let Some(moov) = moov else {
+    Ok(None)
+}
+
+/// The video track of the film in `file`: its `moov` read, its `mdat` left
+/// where it is. `Ok(None)` for a file with no `moov`, or whose first track
+/// is not H.264, HEVC or AV1 video.
+pub fn read_track<R: Read + Seek>(file: &mut R) -> Result<Option<Track>, Mp4Error> {
+    let Some(moov) = read_moov(file)? else {
         return Ok(None);
     };
     let Some(trak) = moov
@@ -176,11 +181,17 @@ pub fn read_track<R: Read + Seek>(file: &mut R) -> Result<Option<Track>, Mp4Erro
     else {
         return Ok(None);
     };
+    match trak.mdia.minf.stbl.stsd.codecs.first() {
+        Some(e @ (Codec::Avc1(_) | Codec::Hvc1(_) | Codec::Av01(_))) => {
+            track_of(trak, e.clone()).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The samples of `trak`, described by `entry`.
+pub(crate) fn track_of(trak: &Trak, entry: Codec) -> Result<Track, Mp4Error> {
     let stbl = &trak.mdia.minf.stbl;
-    let entry = match stbl.stsd.codecs.first() {
-        Some(e @ (Codec::Avc1(_) | Codec::Hvc1(_) | Codec::Av01(_))) => e.clone(),
-        _ => return Ok(None),
-    };
     let sizes: Vec<u32> = match &stbl.stsz.samples {
         StszSamples::Different { sizes } => sizes.clone(),
         StszSamples::Identical { count, size } => vec![*size; *count as usize],
@@ -246,15 +257,15 @@ pub fn read_track<R: Read + Seek>(file: &mut R) -> Result<Option<Track>, Mp4Erro
         .and_then(|e| e.elst.as_ref())
         .and_then(|l| l.entries.iter().find_map(|e| e.media_time))
         .map_or(0, |t| t as i64);
-    Ok(Some(Track {
+    Ok(Track {
         entry,
         timescale: trak.mdia.mdhd.timescale,
         samples,
         start,
-    }))
+    })
 }
 
-fn ftyp(entry: &Codec) -> Ftyp {
+pub(crate) fn ftyp(entry: &Codec) -> Ftyp {
     let codec = match entry {
         Codec::Avc1(_) => b"avc1",
         Codec::Hvc1(_) => b"hvc1",
@@ -268,7 +279,7 @@ fn ftyp(entry: &Codec) -> Ftyp {
 }
 
 /// Values as runs: (count, value).
-fn runs<T: PartialEq + Copy>(values: &[T]) -> Vec<(u32, T)> {
+pub(crate) fn runs<T: PartialEq + Copy>(values: &[T]) -> Vec<(u32, T)> {
     let mut out: Vec<(u32, T)> = Vec::new();
     for &v in values {
         match out.last_mut() {
@@ -294,13 +305,20 @@ pub(crate) struct Table {
 }
 
 impl Table {
-    fn moov(&self, first_sample: u64) -> Moov {
-        let (width, height) = size_of(&self.entry).unwrap_or((0, 0));
-        let frames = self.sizes.len() as u32;
+    /// The film's length in the movie's timescale (milliseconds), and in
+    /// its media's.
+    pub(crate) fn lengths(&self) -> (u64, u64) {
         let media: u64 = self.durations.iter().map(|&d| u64::from(d)).sum();
         let timescale = u64::from(self.timescale.max(1));
         // Rounded, not cut: a film's last frame is a whole frame.
-        let movie = (media * 1000 + timescale / 2) / timescale;
+        ((media * 1000 + timescale / 2) / timescale, media)
+    }
+
+    /// The track, as track `track_id` of a movie, its samples in chunks
+    /// starting at `chunks` (file offsets) as `stsc` runs them.
+    pub(crate) fn trak(&self, track_id: u32, chunks: Vec<u64>, stsc: Vec<StscEntry>) -> Trak {
+        let (width, height) = size_of(&self.entry).unwrap_or((0, 0));
+        let (movie, media) = self.lengths();
         let ctts = self.composition.iter().any(|&o| o != 0).then(|| Ctts {
             entries: runs(&self.composition)
                 .into_iter()
@@ -319,6 +337,78 @@ impl Table {
                 }],
             }),
         });
+        Trak {
+            tkhd: Tkhd {
+                track_id,
+                duration: movie,
+                enabled: true,
+                in_movie: true,
+                width: width.into(),
+                height: height.into(),
+                ..Default::default()
+            },
+            edts,
+            mdia: Mdia {
+                mdhd: Mdhd {
+                    timescale: self.timescale,
+                    duration: media,
+                    language: "und".into(),
+                    ..Default::default()
+                },
+                hdlr: Hdlr {
+                    handler: FourCC::new(b"vide"),
+                    name: "VideoHandler".into(),
+                },
+                minf: Minf {
+                    vmhd: Some(Vmhd::default()),
+                    dinf: Dinf {
+                        dref: Dref {
+                            urls: vec![Url {
+                                location: "".into(),
+                            }],
+                        },
+                    },
+                    stbl: Stbl {
+                        stsd: Stsd {
+                            codecs: vec![self.entry.clone()],
+                        },
+                        stts: Stts {
+                            entries: runs(&self.durations)
+                                .into_iter()
+                                .map(|(sample_count, sample_delta)| SttsEntry {
+                                    sample_count,
+                                    sample_delta,
+                                })
+                                .collect(),
+                        },
+                        ctts,
+                        stss: Some(Stss {
+                            entries: self.sync.clone(),
+                        }),
+                        stsc: Stsc { entries: stsc },
+                        stsz: Stsz {
+                            samples: StszSamples::Different {
+                                sizes: self.sizes.clone(),
+                            },
+                        },
+                        stco: None::<Stco>,
+                        co64: Some(Co64 { entries: chunks }),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            },
+            ..Default::default()
+        }
+    }
+
+    fn moov(&self, first_sample: u64) -> Moov {
+        let (movie, _) = self.lengths();
+        let stsc = vec![StscEntry {
+            first_chunk: 1,
+            samples_per_chunk: self.sizes.len() as u32,
+            sample_description_index: 1,
+        }];
         Moov {
             mvhd: Mvhd {
                 timescale: 1000,
@@ -328,77 +418,7 @@ impl Table {
                 next_track_id: 2,
                 ..Default::default()
             },
-            trak: vec![Trak {
-                tkhd: Tkhd {
-                    track_id: 1,
-                    duration: movie,
-                    enabled: true,
-                    in_movie: true,
-                    width: width.into(),
-                    height: height.into(),
-                    ..Default::default()
-                },
-                edts,
-                mdia: Mdia {
-                    mdhd: Mdhd {
-                        timescale: self.timescale,
-                        duration: media,
-                        language: "und".into(),
-                        ..Default::default()
-                    },
-                    hdlr: Hdlr {
-                        handler: FourCC::new(b"vide"),
-                        name: "VideoHandler".into(),
-                    },
-                    minf: Minf {
-                        vmhd: Some(Vmhd::default()),
-                        dinf: Dinf {
-                            dref: Dref {
-                                urls: vec![Url {
-                                    location: "".into(),
-                                }],
-                            },
-                        },
-                        stbl: Stbl {
-                            stsd: Stsd {
-                                codecs: vec![self.entry.clone()],
-                            },
-                            stts: Stts {
-                                entries: runs(&self.durations)
-                                    .into_iter()
-                                    .map(|(sample_count, sample_delta)| SttsEntry {
-                                        sample_count,
-                                        sample_delta,
-                                    })
-                                    .collect(),
-                            },
-                            ctts,
-                            stss: Some(Stss {
-                                entries: self.sync.clone(),
-                            }),
-                            stsc: Stsc {
-                                entries: vec![StscEntry {
-                                    first_chunk: 1,
-                                    samples_per_chunk: frames,
-                                    sample_description_index: 1,
-                                }],
-                            },
-                            stsz: Stsz {
-                                samples: StszSamples::Different {
-                                    sizes: self.sizes.clone(),
-                                },
-                            },
-                            stco: None::<Stco>,
-                            co64: Some(Co64 {
-                                entries: vec![first_sample],
-                            }),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                },
-                ..Default::default()
-            }],
+            trak: vec![self.trak(1, vec![first_sample], stsc)],
             ..Default::default()
         }
     }

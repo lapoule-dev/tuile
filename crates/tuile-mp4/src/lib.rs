@@ -3,7 +3,9 @@
 
 #![doc = include_str!("../README.md")]
 
+pub mod audio;
 mod av1;
+pub mod clip;
 pub mod film;
 pub mod spatial;
 

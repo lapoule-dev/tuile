@@ -15,6 +15,16 @@ That only joins into something decodable if they all produced the same
 parameter sets, so every slice's `avcC` is checked against the first and a
 mismatch is an error, never a film that turns to garbage half-way.
 
+Two more things a film needs from its container:
+
+- **Phone clips** (`clip`): the video track of an mp4 or a QuickTime movie,
+  with the turn its track header asks to show it upright and the colour it
+  says (BT.709, or BT.2020 with HLG or PQ, from its `colr` box or its HEVC
+  stream's VUI), for a decoder to read.
+- **Sound** (`audio`): AAC frames laid beside a film's pictures, which are
+  copied untouched — faststart, interleaved by the second, the encoder's
+  priming hidden, cut at the pictures' end.
+
 ## Where it sits
 
 No workspace dependency. Used by `tuile-farm` (joining segments) and
