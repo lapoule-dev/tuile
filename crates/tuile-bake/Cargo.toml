@@ -101,5 +101,10 @@ jemalloc_pprof = { version = "0.9", features = ["flamegraph"], optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The memory bench's table (`tests/bake_memory.rs`): Parquet, never CSV.
+arrow-array = "58.4.0"
+parquet = { version = "58.4.0", default-features = false, features = ["arrow", "snap"] }
+# Where the bench's bytes were allocated (`tests/bake_memory_sites.rs`).
+dhat = "0.3"
 # The projection probe (`examples/projection_probe.rs`) runs on its own runtime.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
