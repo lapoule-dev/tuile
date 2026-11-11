@@ -28,7 +28,18 @@
 //! their reading at once, and the builder waits for a reading to end
 //! before it builds one more — whichever of converging, building and
 //! reading is the slowest sets the pace, and nothing piles up in front of
-//! it. A frozen selection pins its tiles' terrain after the session has
+//! it.
+//!
+//! Nor does it grow with the picture. A count bounds grounds of a size: a
+//! 4K frame at SSE 3 selects ten thousand tiles and more, and its ground
+//! weighs some 220 kB a tile (measured, `tests/bake_memory_sites.rs`) —
+//! two gigabytes, eight of which a count of [`READING`] let out at once. So
+//! the grounds out are bounded by their bytes too ([`reading_bytes`],
+//! `TUILE_GROUND_READING_MIB`): the builder builds the next one only while
+//! those out weigh less than that. One ground is always let out, whatever
+//! it weighs — the bound is on what waits, never a frame refused — so what
+//! a settle holds in grounds is at most that budget, one ground out past
+//! it, and the one being built. A frozen selection pins its tiles' terrain after the session has
 //! let them go: so only the frames the caller says it keeps
 //! ([`settle_each`]'s `keep`) are handed back with theirs; the others' are
 //! let go as soon as their ground is read.
@@ -51,30 +62,53 @@ const LEAD: usize = 4;
 /// has this many out waits for one to be read before it builds the next.
 pub const READING: usize = 8;
 
-/// The grounds out for reading, counted, so a builder waits while there
-/// are [`READING`] of them.
-#[derive(Default)]
+/// What the grounds out for reading may weigh between them before the
+/// builder waits, unless `TUILE_GROUND_READING_MIB` says: 1.5 GiB. One
+/// ground is let out whatever it weighs. See the module.
+pub fn reading_bytes() -> usize {
+    crate::session::count_knob("TUILE_GROUND_READING_MIB").unwrap_or(READING_MIB) << 20
+}
+
+/// [`reading_bytes`]'s default, in MiB.
+pub const READING_MIB: usize = 1536;
+
+/// The grounds out for reading, counted and weighed, so a builder waits
+/// while there are [`READING`] of them or they weigh [`reading_bytes`].
 struct Out {
-    count: std::sync::Mutex<usize>,
+    /// How many grounds are out, and what they weigh.
+    out: std::sync::Mutex<(usize, usize)>,
     read: std::sync::Condvar,
+    budget: usize,
+}
+
+impl Default for Out {
+    fn default() -> Self {
+        Self {
+            out: std::sync::Mutex::new((0, 0)),
+            read: std::sync::Condvar::new(),
+            budget: reading_bytes(),
+        }
+    }
 }
 
 impl Out {
-    /// Waits until fewer than [`READING`] grounds are out, then counts one
-    /// more. On a thread of the pool, it reads what is queued meanwhile
-    /// rather than block the readings it waits for.
+    /// Waits until fewer than [`READING`] grounds are out and they weigh
+    /// less than the budget — or none is out — then counts one more. On a
+    /// thread of the pool, it reads what is queued meanwhile rather than
+    /// block the readings it waits for.
     fn take(&self) {
         loop {
             {
-                let mut count = self.count.lock().unwrap_or_else(|e| e.into_inner());
-                if *count < READING {
-                    *count += 1;
+                let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
+                let (count, bytes) = *out;
+                if count == 0 || (count < READING && bytes < self.budget) {
+                    out.0 += 1;
                     return;
                 }
                 if rayon::current_thread_index().is_none() {
                     let _ = self
                         .read
-                        .wait_timeout(count, Duration::from_millis(50))
+                        .wait_timeout(out, Duration::from_millis(50))
                         .unwrap_or_else(|e| e.into_inner());
                     continue;
                 }
@@ -85,21 +119,34 @@ impl Out {
         }
     }
 
-    /// One ground read: a builder waiting may build the next.
-    fn give(&self) {
-        let mut count = self.count.lock().unwrap_or_else(|e| e.into_inner());
-        *count -= 1;
+    /// The ground just taken out weighs `bytes`.
+    fn weigh(&self, bytes: usize) {
+        self.out.lock().unwrap_or_else(|e| e.into_inner()).1 += bytes;
+    }
+
+    /// One ground of `bytes` read: a builder waiting may build the next.
+    fn give(&self, bytes: usize) {
+        let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
+        out.0 -= 1;
+        out.1 -= bytes;
         self.read.notify_one();
     }
 }
 
 /// A ground out for reading, given back to [`Out`] however its reading
-/// ends.
-struct Lent<'a>(&'a Out);
+/// ends, with what it weighs once built.
+struct Lent<'a>(&'a Out, usize);
+
+impl Lent<'_> {
+    fn weighs(&mut self, bytes: usize) {
+        self.0.weigh(bytes);
+        self.1 = bytes;
+    }
+}
 
 impl Drop for Lent<'_> {
     fn drop(&mut self) {
-        self.0.give();
+        self.0.give(self.1);
     }
 }
 
@@ -237,10 +284,11 @@ where
             rayon::in_place_scope(|reads| {
                 for (index, number, selection, selected, converged_in) in thawed {
                     out_ref.take();
-                    let lent = Lent(out_ref);
+                    let mut lent = Lent(out_ref, 0);
                     let started = Instant::now();
                     let ground = Arc::new(drawer.ground(&selected, drawn.how, drawn.stitch));
                     let built_in = started.elapsed();
+                    lent.weighs(drawer.built());
                     let unread = Unread::new(drawer.built());
                     reads.spawn(move |_| {
                         let _lent = lent;
@@ -334,7 +382,7 @@ type Timed<T> = (T, Duration, Duration);
 /// that kept the selections rather than the grounds. Back in the order
 /// given, with how long each took to build and to read; a ground lives as
 /// long as its reading keeps it, and at most [`READING`] are built and not
-/// read at once.
+/// read at once — fewer when they weigh [`reading_bytes`].
 pub fn read_each<T, R>(
     drawer: &mut GroundDrawer,
     drawn: Drawn,
@@ -354,10 +402,11 @@ where
     rayon::in_place_scope(|reads| {
         for (index, (number, selected)) in frames.iter().enumerate() {
             lending.take();
-            let lent = Lent(lending);
+            let mut lent = Lent(lending, 0);
             let started = Instant::now();
             let ground = Arc::new(drawer.ground(selected, drawn.how, drawn.stitch));
             let built_in = started.elapsed();
+            lent.weighs(drawer.built());
             let number = *number;
             let unread = Unread::new(drawer.built());
             reads.spawn(move |_| {
