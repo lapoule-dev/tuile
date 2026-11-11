@@ -442,7 +442,10 @@ impl Engine {
         Ok(Self {
             tiles: {
                 let layers = bake.store_layers();
-                OffRuntime::open(move || Tiles::from_env_with_layers(layers)).await?
+                // The store's requests on the host's runtime, which outlives
+                // the engine.
+                let io = tokio::runtime::Handle::current();
+                OffRuntime::open(move || Tiles::from_env_with_layers(&io, layers)).await?
             },
             sources: Sources::open(runs, tiles, cache).await?,
             bake,
