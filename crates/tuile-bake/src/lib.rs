@@ -4,6 +4,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod bake;
+mod cancel;
 #[cfg(test)]
 mod by_index_tests;
 mod drawer;
@@ -19,6 +20,7 @@ pub mod settle;
 pub mod tape;
 pub mod tiles;
 
+pub use cancel::Cancel;
 pub use drawer::{GroundDrawer, Held, Selected};
 pub use globe::{
     asset_of_namespace, duration_or, source_namespace, GlobeConfig, GlobeError, ReferenceFetched,

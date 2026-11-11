@@ -140,6 +140,9 @@ impl From<&FrameError> for TuileStatus {
             FrameError::MissingContent { .. } => TuileStatus::TilesFailed,
             FrameError::TextureEncode(_) => TuileStatus::EncodeFailed,
             FrameError::Poisoned => TuileStatus::InternalError,
+            // A host of the ABI has no way to raise a session's cancel: a
+            // frame it is told was cancelled is a fault of ours.
+            FrameError::Cancelled => TuileStatus::InternalError,
         }
     }
 }

@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::Cancel;
+
 use glam::DVec3;
 use tuile_core::budget::{BudgetConfig, DrawItem, Generation, ResourceId, Role};
 use tuile_core::content::{DecodedMesh, DecodedTileContent, DrapeContent};
@@ -79,6 +81,12 @@ pub struct SessionConfig {
     /// when a later frame needs it. `None` keeps everything.
     /// `TUILE_BAKE_KEEP_GIB` when the environment says.
     pub release_beyond: Option<u64>,
+    /// The host's word that the work is no longer wanted ([`Cancel`]):
+    /// looked at before every frame and listened to while one waits on its
+    /// loads. Raised, every frame fails with [`FrameError::Cancelled`] and
+    /// the session is good for nothing but being dropped. Never raised by
+    /// default.
+    pub cancel: Cancel,
 }
 
 /// What a session makes of a tile once its content has arrived.
@@ -135,6 +143,7 @@ impl Default for SessionConfig {
                 .ok()
                 .and_then(|gib| gib.parse::<f64>().ok())
                 .map(|gib| (gib * f64::from(1u32 << 30)) as u64),
+            cancel: Cancel::new(),
         }
     }
 }
@@ -163,6 +172,10 @@ pub enum FrameError {
     /// into a second panic.
     #[error("the frame's texture cache was left poisoned")]
     Poisoned,
+    /// The host raised the session's [`Cancel`]: the frame was given up,
+    /// before it started or while it waited on its loads.
+    #[error("the bake was cancelled")]
+    Cancelled,
 }
 
 impl TextureKey {
@@ -3494,5 +3507,149 @@ pub(crate) mod tests {
         // The first frame still answers, from its own map.
         let again = frame.texture_png(0, 0).expect("encoding").expect("present");
         assert!(Arc::ptr_eq(&png, &again));
+    }
+
+    /// Answers after `.0`: a load as slow as a cold store's.
+    struct SlowLoader(Duration);
+
+    #[async_trait::async_trait]
+    impl TileLoader for SlowLoader {
+        async fn load(
+            &self,
+            _id: TileId,
+        ) -> Result<tuile_core::source::Loaded, tuile_core::source::LoadError> {
+            tokio::time::sleep(self.0).await;
+            Ok(tuile_core::source::Loaded::Content(draped_content()))
+        }
+    }
+
+    /// A frame waiting on loads that take half a minute is given up as soon
+    /// as the host raises the flag, not when they come; every frame after it
+    /// is refused at once, and the session goes as fast. On 11 Nov. 2026 a
+    /// cancelled film's bakes ran on for 35 minutes, 10 GiB each, because
+    /// nothing in them could hear it.
+    #[test]
+    fn a_frame_waiting_on_its_loads_stops_as_soon_as_the_bake_is_cancelled() {
+        let cancel = Cancel::new();
+        let mut session = Session::new(
+            Box::new(TwoTiles),
+            Arc::new(SlowLoader(Duration::from_secs(30))),
+            SessionConfig {
+                cancel: cancel.clone(),
+                ..SessionConfig::default()
+            },
+        )
+        .expect("session");
+        let raiser = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                cancel.cancel();
+            })
+        };
+        let began = std::time::Instant::now();
+        let waited = session.frame(vec![a_view()]);
+        let took = began.elapsed();
+        raiser.join().expect("raised");
+        assert!(
+            matches!(waited, Err(FrameError::Cancelled)),
+            "{:?}",
+            waited.map(|f| f.tiles.len())
+        );
+        assert!(
+            took < Duration::from_secs(5),
+            "given up in {took:?}, not when the loads came"
+        );
+        let again = std::time::Instant::now();
+        assert!(matches!(
+            session.frame(vec![a_view()]),
+            Err(FrameError::Cancelled)
+        ));
+        assert!(
+            again.elapsed() < Duration::from_secs(1),
+            "every frame after it refused at once"
+        );
+        let dropping = std::time::Instant::now();
+        drop(session);
+        assert!(
+            dropping.elapsed() < Duration::from_secs(5),
+            "and what it held let go at once: {:?}",
+            dropping.elapsed()
+        );
+    }
+
+    /// A bake asked to stop stops at the frame it is on: the frames after
+    /// it are never asked for, and the bake says why it ended.
+    #[test]
+    fn a_bake_cancelled_between_frames_bakes_no_frame_after() {
+        use crate::bake::{
+            bake_frames, BakeFrames, PackContent, PackedMirror, PoseSource, SceneName,
+        };
+
+        struct Raising {
+            cancel: Cancel,
+            at: u32,
+            asked: Vec<u32>,
+        }
+        impl PoseSource for Raising {
+            fn pose(&mut self, number: u32, _: &mut Session) -> Result<tuile_tape::Frame, String> {
+                self.asked.push(number);
+                if number == self.at {
+                    self.cancel.cancel();
+                }
+                let v = a_view();
+                Ok(tuile_tape::Frame {
+                    position: v.position.to_array(),
+                    direction: v.direction.to_array(),
+                    up: v.up.to_array(),
+                    fovy: v.fovy_rad,
+                })
+            }
+        }
+
+        let cancel = Cancel::new();
+        let mut session = Session::new(
+            Box::new(TwoTiles),
+            Arc::new(CountingLoader(Arc::default())),
+            SessionConfig {
+                cancel: cancel.clone(),
+                bake_max_size: 64,
+                ..SessionConfig::default()
+            },
+        )
+        .expect("session");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("p.tuilepack");
+        let (content, packed) = (PackContent::embedded(), PackedMirror::new());
+        let mut source = Raising {
+            cancel,
+            at: 3,
+            asked: Vec::new(),
+        };
+        let baked = bake_frames(
+            &mut session,
+            &BakeFrames {
+                first: 1,
+                last: 10,
+                viewport: (960.0, 720.0),
+                out: &out,
+                scene: SceneName::Given("s".into()),
+                culling: "full",
+                content: &content,
+                packed: &packed,
+            },
+            &mut source,
+        );
+        let said = baked.expect_err("cancelled at frame 3");
+        assert!(
+            said.contains("frame 3") && said.contains("cancelled"),
+            "{said}"
+        );
+        assert_eq!(
+            source.asked,
+            vec![1, 2, 3],
+            "no frame after the one it was on"
+        );
+        assert!(!out.exists(), "no pack");
     }
 }
