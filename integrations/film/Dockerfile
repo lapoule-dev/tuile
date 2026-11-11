@@ -56,20 +56,34 @@ RUN mkdir -p /tmp/vk && cd /tmp/vk \
     && rm -rf /tmp/vk
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 ENV PATH=/root/.cargo/bin:$PATH CUDA_PATH=/usr/local/cuda
+# sccache, installed always and used only when the build is given a bucket and
+# a key (integrations/docker/sccache-env.sh): without them, nothing changes.
+COPY integrations/docker/sccache-install.sh integrations/docker/sccache-env.sh /usr/local/share/tuile/
+RUN sh /usr/local/share/tuile/sccache-install.sh
 WORKDIR /src
 COPY . .
 # How many compilers at once: the builder's memory decides, not the recipe.
 ARG FILM_BUILD_JOBS=4
+# The shared compilation cache, all optional (integrations/docker/sccache-env.sh):
+# the bucket by build arg, the key by BuildKit secret only.
+ARG SCCACHE_BUCKET
+ARG SCCACHE_REGION
+ARG SCCACHE_ENDPOINT
+ARG SCCACHE_PREFIX
 # x86 has an assembler here, so rav1e's assembly comes along for the
 # machines whose card encodes nothing. The registry and the build directory
 # stay with the builder between two builds, so a correction costs the crates
 # it touches and not the whole tree. The last line shows what the binary
 # asks the machine for: the card's encoder must be in it.
-RUN --mount=type=cache,target=/root/.cargo/registry \
+RUN --mount=type=secret,id=sccache_key_id \
+    --mount=type=secret,id=sccache_secret \
+    --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -j ${FILM_BUILD_JOBS} \
+    . /usr/local/share/tuile/sccache-env.sh \
+    && cargo build --release --locked -j ${FILM_BUILD_JOBS} \
         -p tuile-film-native --features nvenc,asm \
         --bin tuile-film-produce --bin tuile-film-serve --bin tuile-film-render --bin tuile-film-compress \
+    && tuile_sccache_stop \
     && cp target/release/tuile-film-produce target/release/tuile-film-serve target/release/tuile-film-render target/release/tuile-film-compress /usr/local/bin/ \
     && ldd /usr/local/bin/tuile-film-produce \
     && for bin in tuile-film-produce tuile-film-serve tuile-film-render tuile-film-compress; do \
