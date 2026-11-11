@@ -29,10 +29,22 @@
 //!
 //! The projections, under `TUILE_TILES_DIR`, are reused whenever the zone's
 //! archives are the ones they were made from.
+//!
+//! **Its I/O on the host's runtime.** The bucket and the global tier are
+//! read over HTTP by clients that pool their connections, and a connection
+//! lives on the runtime that opened it. A shared store is read from the
+//! runtime of every bake, each ending with its bake: a connection a bake
+//! opened, handed by the pool to a converge, dies under the converge's
+//! request when the bake ends (`error sending request`, which is not
+//! retried). So every request of these clients runs on a runtime the host
+//! passes in ([`tokio::runtime::Handle`]), one that lives as long as the
+//! process and has threads of its own (a multi-threaded runtime): the
+//! store's own runtime, and each bake's, only wait for the answers.
 
 use std::sync::{Arc, Mutex};
 
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use object_store::client::SpawnedReqwestConnector;
 use tuile_tile_server::projection::width_m;
 use tuile_tile_server::{
     DiskCacheConfig, Eye, Footprint, Grid, LayerDef, StoreConfig, StoreContent, Tier, Tiered,
@@ -197,7 +209,8 @@ pub struct Tiers {
 }
 
 impl Tiers {
-    pub fn from_env() -> Result<Self, String> {
+    /// Their clients' requests run on `io`: see the [module](self).
+    pub fn from_env(io: &tokio::runtime::Handle) -> Result<Self, String> {
         let disk = var("TUILE_TILES_CACHE_DIR").ok().map(|dir| {
             let gib = std::env::var("TUILE_TILES_CACHE_GIB")
                 .ok()
@@ -209,15 +222,19 @@ impl Tiers {
             }
         });
         let global = match var("TUILE_TILES_GLOBAL") {
-            Ok(url) => Some(Tier::new("global", global_tier(&url)?)),
+            Ok(url) => Some(Tier::new("global", global_tier(&url, io)?)),
             Err(_) => None,
         };
         Ok(Self { disk, global })
     }
 }
 
-/// The global tier at `url`: `gs://bucket[/prefix]` or `file:///dir`.
-fn global_tier(url: &str) -> Result<Arc<dyn object_store::ObjectStore>, String> {
+/// The global tier at `url`: `gs://bucket[/prefix]` or `file:///dir`, a
+/// bucket's requests run on `io`.
+fn global_tier(
+    url: &str,
+    io: &tokio::runtime::Handle,
+) -> Result<Arc<dyn object_store::ObjectStore>, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("TUILE_TILES_GLOBAL {url}: {e}"))?;
     let prefix = parsed.path().trim_matches('/').to_string();
     let objects: Arc<dyn object_store::ObjectStore> = match parsed.scheme() {
@@ -227,6 +244,7 @@ fn global_tier(url: &str) -> Result<Arc<dyn object_store::ObjectStore>, String> 
                 .ok_or_else(|| format!("TUILE_TILES_GLOBAL {url}: no bucket"))?;
             Arc::new(
                 object_store::gcp::GoogleCloudStorageBuilder::from_env()
+                    .with_http_connector(SpawnedReqwestConnector::new(io.clone()))
                     .with_bucket_name(bucket)
                     .build()
                     .map_err(|e| format!("TUILE_TILES_GLOBAL {url}: {e}"))?,
@@ -284,12 +302,14 @@ impl SharedTiles {
         }
     }
 
-    /// The store the environment names ([`Tiles::from_env`]), each opening
-    /// set up by `set_up`.
+    /// The store the environment names ([`Tiles::from_env`]), its requests
+    /// on `io` — a runtime that lives as long as the process — and each
+    /// opening set up by `set_up`.
     pub fn from_env(
+        io: tokio::runtime::Handle,
         set_up: impl Fn(Tiles) -> Result<Tiles, String> + Send + Sync + 'static,
     ) -> Self {
-        Self::new(move || Tiles::from_env()?.map(&set_up).transpose())
+        Self::new(move || Tiles::from_env(&io)?.map(&set_up).transpose())
     }
 
     /// The store, `None` when the environment names none.
@@ -317,6 +337,14 @@ impl SharedTiles {
     }
 }
 
+/// The store's bucket, before it is told where it is: its requests on `io`.
+fn s3_builder(io: &tokio::runtime::Handle) -> AmazonS3Builder {
+    AmazonS3Builder::new()
+        .with_http_connector(SpawnedReqwestConnector::new(io.clone()))
+        // The store's manifests are replaced by conditional writes only.
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+}
+
 fn var(name: &str) -> Result<String, String> {
     std::env::var(name)
         .ok()
@@ -332,28 +360,36 @@ async fn catalog_tag(objects: &dyn object_store::ObjectStore) -> Option<String> 
 }
 
 impl Tiles {
-    /// Opens the store named by the environment, or `None` when there is none.
-    pub fn from_env() -> Result<Option<Self>, String> {
-        Self::from_env_with(None)
+    /// Opens the store named by the environment, or `None` when there is
+    /// none. Its bucket's and its tiers' requests run on `io`, a runtime that
+    /// lives as long as the process: see the [module](self).
+    pub fn from_env(io: &tokio::runtime::Handle) -> Result<Option<Self>, String> {
+        Self::from_env_with(io, None)
     }
 
     /// The same, with `layer` declared in the store's catalog first if the
     /// store does not know it yet: a store keeps a source's tiles only once
     /// it has a layer for them. A layer the store already has is left as the
     /// store describes it. Says whether the layer was added.
-    pub fn from_env_with(layer: Option<LayerDef>) -> Result<Option<Self>, String> {
-        Self::from_env_with_layers(layer.into_iter().collect())
+    pub fn from_env_with(
+        io: &tokio::runtime::Handle,
+        layer: Option<LayerDef>,
+    ) -> Result<Option<Self>, String> {
+        Self::from_env_with_layers(io, layer.into_iter().collect())
     }
 
     /// The same, with every one of `layers` declared that the store does not
     /// know yet. The store is the bucket `TUILE_TILES_BUCKET`, or a
     /// directory here, `TUILE_TILES_LOCAL` — the same store, its archives,
     /// manifests and catalog written the same way, on a disk.
-    pub fn from_env_with_layers(layers: Vec<LayerDef>) -> Result<Option<Self>, String> {
+    pub fn from_env_with_layers(
+        io: &tokio::runtime::Handle,
+        layers: Vec<LayerDef>,
+    ) -> Result<Option<Self>, String> {
         let (bucket, s3): (String, Arc<dyn object_store::ObjectStore>) =
             match var("TUILE_TILES_BUCKET") {
                 Ok(bucket) => {
-                    let s3 = AmazonS3Builder::new()
+                    let s3 = s3_builder(io)
                         .with_bucket_name(&bucket)
                         .with_endpoint(var("TUILE_STORE_ENDPOINT")?)
                         .with_region(
@@ -362,8 +398,6 @@ impl Tiles {
                         )
                         .with_access_key_id(var("TUILE_STORE_ACCESS_KEY_ID")?)
                         .with_secret_access_key(var("TUILE_STORE_SECRET_ACCESS_KEY")?)
-                        // The store's manifests are replaced by conditional writes only.
-                        .with_conditional_put(S3ConditionalPut::ETagMatch)
                         .build()
                         .map_err(|e| format!("tile bucket {bucket}: {e}"))?;
                     (bucket, Arc::new(s3))
@@ -383,7 +417,7 @@ impl Tiles {
             Ok(prefix) => Arc::new(object_store::prefix::PrefixStore::new(s3, prefix)),
             Err(_) => s3,
         };
-        Self::open(&bucket, s3, layers, Tiers::from_env()?).map(Some)
+        Self::open(&bucket, s3, layers, Tiers::from_env(io)?).map(Some)
     }
 
     /// The store on `origin` (named `name` in what is said of it), `layers`
@@ -853,7 +887,8 @@ mod tier_tests {
     fn a_tier_on_a_disk_is_written_once() {
         let dir = tempfile::tempdir().expect("dir");
         let url = url::Url::from_directory_path(dir.path()).expect("url");
-        let tier = super::global_tier(url.as_str()).expect("tier");
+        let io = tokio::runtime::Runtime::new().expect("io");
+        let tier = super::global_tier(url.as_str(), io.handle()).expect("tier");
         let at = object_store::path::Path::from(
             "layer/top/1-000000000000000000000001-0123456789abcdef.pmtiles",
         );
@@ -881,5 +916,122 @@ mod tier_tests {
                     .expect("bytes");
                 assert_eq!(&kept[..], b"first");
             });
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use object_store::ObjectStoreExt;
+
+    /// How long the bucket below takes to answer for `slow`.
+    const SLOW: Duration = Duration::from_millis(600);
+
+    /// A bucket over HTTP/1.1 that keeps its connections open, on threads of
+    /// its own (no runtime): every GET is answered its key, the key `slow`
+    /// only after [`SLOW`].
+    fn keep_alive_bucket() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let at = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                    let mut writer = stream;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        // The headers, to the blank line; no request has a body.
+                        loop {
+                            let mut header = String::new();
+                            if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if header == "\r\n" {
+                                break;
+                            }
+                        }
+                        // `GET /bucket/key HTTP/1.1`
+                        let key = line
+                            .split_whitespace()
+                            .nth(1)
+                            .and_then(|path| path.rsplit('/').next())
+                            .unwrap_or_default()
+                            .to_string();
+                        if key == "slow" {
+                            std::thread::sleep(SLOW);
+                        }
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\netag: \"1\"\r\n\
+                             last-modified: Wed, 11 Nov 2026 00:00:00 GMT\r\n\
+                             connection: keep-alive\r\n\r\n",
+                            key.len()
+                        );
+                        if writer.write_all(head.as_bytes()).is_err()
+                            || writer.write_all(key.as_bytes()).is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        at
+    }
+
+    /// A store shared by a process outlives the runtime of each bake that
+    /// reads through it, and a converge reads through it while bakes end
+    /// beside it. The connection a bake opened is the one the client's pool
+    /// hands the converge next; were its I/O on the bake's runtime, it would
+    /// die under the converge's request when the bake ends (`error sending
+    /// request`). Every request of the store runs on the runtime the host
+    /// gives it, which lives as long as the process.
+    #[test]
+    fn a_reader_outlives_the_runtime_that_opened_its_connection() {
+        let endpoint = keep_alive_bucket();
+        // The process's own runtime, which the host passes in.
+        let process = tokio::runtime::Runtime::new().expect("the process's runtime");
+        let bucket: Arc<dyn object_store::ObjectStore> = Arc::new(
+            super::s3_builder(process.handle())
+                .with_bucket_name("tiles")
+                .with_endpoint(&endpoint)
+                .with_allow_http(true)
+                .with_region("auto")
+                .with_access_key_id("key")
+                .with_secret_access_key("secret")
+                .build()
+                .expect("bucket"),
+        );
+        let read = |bucket: Arc<dyn object_store::ObjectStore>, key: &'static str| async move {
+            let got = bucket.get(&object_store::path::Path::from(key)).await?;
+            got.bytes().await
+        };
+        // A bake reads, on its own runtime: one connection, then idle.
+        let bake = tokio::runtime::Runtime::new().expect("a bake's runtime");
+        let got = bake.block_on(read(bucket.clone(), "first"));
+        assert_eq!(&got.expect("the bake reads")[..], b"first");
+        // A converge reads, on a runtime of its own, through that connection…
+        let converge = {
+            let bucket = bucket.clone();
+            std::thread::spawn(move || {
+                tokio::runtime::Runtime::new()
+                    .expect("the converge's runtime")
+                    .block_on(read(bucket, "slow"))
+            })
+        };
+        // …and the bake ends before it is answered.
+        std::thread::sleep(SLOW / 4);
+        drop(bake);
+        let got = converge.join().expect("the converge");
+        assert!(
+            matches!(&got, Ok(bytes) if &bytes[..] == b"slow"),
+            "the converge, once the bake that opened its connection ended: {got:?}"
+        );
     }
 }

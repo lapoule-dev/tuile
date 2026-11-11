@@ -527,6 +527,20 @@ fn parse_args() -> Result<Job, String> {
     }))
 }
 
+/// Worker threads of the runtime a store's requests run on.
+const IO_THREADS: usize = 2;
+
+/// The runtime a store's requests run on, kept by the caller for as long as
+/// the store: threads of its own, so the store's own runtime only waits.
+fn io_runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(IO_THREADS)
+        .thread_name("tuile-store-io")
+        .enable_all()
+        .build()
+        .map_err(|e| format!("the store's I/O runtime: {e}"))
+}
+
 fn main() -> std::process::ExitCode {
     // The determinism trace (`tuile_det`) is off unless asked for, with
     // `TUILE_LOG=tuile_det=info` (a farm job's `--trace`). It writes a line per visited tile per
@@ -624,10 +638,8 @@ fn reference(path: &std::path::Path, asset: i64, cap: u32) -> Result<(), String>
     if let Ok(dir) = std::env::var("TUILE_CACHE_DIR") {
         config.cache_dir = Some(dir.into());
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("runtime: {e}"))?;
+    // The store's requests run on it too (`tiles` module).
+    let runtime = io_runtime()?;
     // The reference first, to know what it is; then the store, with a layer
     // for it; then its tiles. Each on its own turn of the runtime: the store
     // drives one of its own.
@@ -647,7 +659,7 @@ fn reference(path: &std::path::Path, asset: i64, cap: u32) -> Result<(), String>
             ))
         }
     };
-    let store = tiles::Tiles::from_env_with(Some(tuile_tile_server::LayerDef {
+    let reference_layer = tuile_tile_server::LayerDef {
         name: layer.clone(),
         grid,
         tile_type: tile_type.into(),
@@ -663,8 +675,9 @@ fn reference(path: &std::path::Path, asset: i64, cap: u32) -> Result<(), String>
         index: false,
         licence: None,
         attribution: None,
-    }))?
-    .ok_or("TUILE_TILES_BUCKET is not set: there is no store to bring the reference into")?;
+    };
+    let store = tiles::Tiles::from_env_with(runtime.handle(), Some(reference_layer))?
+        .ok_or("TUILE_TILES_BUCKET is not set: there is no store to bring the reference into")?;
     // The grid the film's own imagery is addressed on, from the store.
     let own = match store.grid(imagery_layer) {
         Some(Grid::Geographic) => TilingScheme::geographic(),
@@ -1055,7 +1068,9 @@ fn same_plan(old: &Plan, new: &std::path::Path) -> Result<(), String> {
 
 fn bake(args: Args) -> Result<(), String> {
     tuile_bake::memory::export_metrics_if_asked();
-    let tiles = tiles::Tiles::from_env()?;
+    // The store's requests, for as long as the bake: see the `tiles` module.
+    let io = io_runtime()?;
+    let tiles = tiles::Tiles::from_env(io.handle())?;
     let result = bake_with(args, tiles.as_ref());
     // Whatever the bake fetched is published, even if it failed.
     let flushed = tiles.as_ref().map(tiles::Tiles::flush).transpose();
