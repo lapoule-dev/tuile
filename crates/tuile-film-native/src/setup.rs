@@ -35,16 +35,21 @@ pub fn bucket(name: &str) -> Result<Arc<dyn Objects>, Error> {
 /// the region's copy, and what the bucket gives is copied there once for
 /// every other instance. The catalog and the manifests always come from
 /// the bucket.
-pub fn tile_bucket(name: &str) -> Result<Arc<dyn Objects>, Error> {
+/// The global tier's requests run on `io`, a runtime that outlives every
+/// render (the host's).
+pub fn tile_bucket(name: &str, io: &tokio::runtime::Handle) -> Result<Arc<dyn Objects>, Error> {
     let config = BucketConfig {
         bucket: name.to_string(),
         ..BucketConfig::from_env()?
     };
     let store = ObjectRunStore::bucket(&config, Tuning::from_env())?;
-    let tiers = tuile_bake::tiles::Tiers::from_env()?;
+    let tiers = tuile_bake::tiles::Tiers::from_env(io)?;
     Ok(Arc::new(match tiers.global {
         Some(global) => {
-            println!("tile store: bucket {name}, its archives behind {}", global.name);
+            println!(
+                "tile store: bucket {name}, its archives behind {}",
+                global.name
+            );
             store.wrapped(
                 |origin| Arc::new(tuile_tile_server::Tiered::new(origin, vec![global])),
                 "behind its global tier",
@@ -111,9 +116,13 @@ pub async fn tile_store(cache: &Path) -> Result<TileStore, Error> {
             })
         }
         None => Ok(TileStore {
-            objects: tile_bucket(&std::env::var("TUILE_TILES_BUCKET").map_err(|_| {
-                "no tile store: neither TUILE_TILES_REMOTE nor TUILE_TILES_BUCKET is set"
-            })?)?,
+            objects: tile_bucket(
+                &std::env::var("TUILE_TILES_BUCKET").map_err(|_| {
+                    "no tile store: neither TUILE_TILES_REMOTE nor TUILE_TILES_BUCKET is set"
+                })?,
+                // The host's runtime: this runs on it, and it outlives the render.
+                &tokio::runtime::Handle::current(),
+            )?,
             remote_blocks: None,
             block_store: None,
         }),
