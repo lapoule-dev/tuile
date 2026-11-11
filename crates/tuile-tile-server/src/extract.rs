@@ -21,13 +21,15 @@
 //! layer's own ids for the first, the same plus [`BANDS`]`[1]` for the
 //! second, in the PMTiles numbering's zoom 30 where no grid tile reaches.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
 use pmtiles::TileCoord;
+use tracing::Instrument;
 
 use crate::archive;
 use crate::layer::{Layer, Zone};
@@ -98,6 +100,10 @@ pub struct ExtractReport {
     pub tiles: u64,
     pub bytes: u64,
     pub millis: u64,
+    /// Requests made of the bucket to gather it: manifests, archives'
+    /// directories, tiles' bytes.
+    #[serde(default)]
+    pub requests: u64,
     /// Putting it in the bucket, when it went there.
     #[serde(default)]
     pub put_millis: u64,
@@ -125,6 +131,27 @@ impl ExtractReport {
         }
         Some(said)
     }
+}
+
+/// Where an archive of a zone gives its tiles from.
+enum Source {
+    /// A copy on this disk.
+    Local(Arc<archive::LocalReader>),
+    /// The bucket, at the ranges its directories say.
+    Listed(Arc<archive::Listing>),
+    /// Nowhere: gone from the bucket.
+    Gone,
+}
+
+/// What one zone of an extract was read from.
+#[derive(Debug, Default)]
+struct ZoneSources {
+    /// Archives read from a copy on this disk, and from the bucket.
+    local: u64,
+    listed: u64,
+    /// Ranges read of the bucket, and their bytes.
+    ranges: u64,
+    bytes: u64,
 }
 
 /// Which tiles of a zone are kept.
@@ -193,6 +220,33 @@ impl TileStore {
         &self,
         asks: &[ExtractAsk],
     ) -> Result<(tempfile::NamedTempFile, ExtractReport), StoreError> {
+        let span = tracing::info_span!(
+            "tiles.extract",
+            layers = asks.len(),
+            zones = tracing::field::Empty,
+            archives = tracing::field::Empty,
+            requests = tracing::field::Empty,
+            tiles = tracing::field::Empty,
+            absent = tracing::field::Empty,
+            archive_bytes = tracing::field::Empty,
+            bytes = tracing::field::Empty,
+        );
+        let made = self.gather(asks).instrument(span.clone()).await?;
+        let report = &made.1;
+        span.record("zones", report.zones);
+        span.record("archives", report.archives);
+        span.record("requests", report.requests);
+        span.record("tiles", report.tiles);
+        span.record("absent", report.absent);
+        span.record("archive_bytes", report.archive_bytes);
+        span.record("bytes", report.bytes);
+        Ok(made)
+    }
+
+    async fn gather(
+        &self,
+        asks: &[ExtractAsk],
+    ) -> Result<(tempfile::NamedTempFile, ExtractReport), StoreError> {
         let began = Instant::now();
         if asks.len() > BANDS.len() {
             return Err(StoreError::Corrupt(format!(
@@ -223,6 +277,7 @@ impl TileStore {
             for (zone_tiles, zone) in read {
                 report.archives += zone.archives;
                 report.archive_bytes += zone.archive_bytes;
+                report.requests += zone.requests;
                 tiles.extend(zone_tiles.into_iter().map(|(id, b)| (id + band, b)));
             }
             // Every tile named, found or said absent: an extract is read by
@@ -252,7 +307,9 @@ impl TileStore {
         }
         report.tiles = tiles.len() as u64;
         let metadata = serde_json::json!({ "tuile:extract": layers }).to_string();
+        let written = tracing::info_span!("tiles.extract.write", tiles = tiles.len());
         let file = tokio::task::spawn_blocking(move || {
+            let _in = written.enter();
             archive::write_raw(
                 &metadata,
                 pmtiles::TileType::Unknown,
@@ -276,7 +333,12 @@ impl TileStore {
     ) -> Result<ExtractReport, StoreError> {
         let (file, mut report) = self.extract(asks).await?;
         let began = Instant::now();
-        put_file(self.object_store().as_ref(), file.path(), key).await?;
+        put_file(self.object_store().as_ref(), file.path(), key)
+            .instrument(tracing::info_span!(
+                "tiles.extract.put",
+                bytes = report.bytes
+            ))
+            .await?;
         report.put_millis = began.elapsed().as_millis() as u64;
         Ok(report)
     }
@@ -299,13 +361,28 @@ impl TileStore {
             });
         }
         let began = Instant::now();
-        put_file(self.object_store().as_ref(), file.path(), key).await?;
+        put_file(self.object_store().as_ref(), file.path(), key)
+            .instrument(tracing::info_span!(
+                "tiles.extract.put",
+                bytes = report.bytes
+            ))
+            .await?;
         report.put_millis = began.elapsed().as_millis() as u64;
         Ok(report)
     }
 
-    /// The tiles `keep` wants of one zone, from its live archives, newest
-    /// first.
+    /// The tiles `keep` wants of one zone, each from the newest live archive
+    /// that holds it: the copy a reader of the zone gets.
+    ///
+    /// Where each lies comes from the archive's copy on this disk when there
+    /// is one, read there; otherwise from its directories, listed once a
+    /// process ([`TileStore::listing_of`]) — a bake that projected the zone
+    /// has listed them already. The tiles one archive gives are then read
+    /// together: their byte ranges merged where they lie close
+    /// ([`crate::projection::coalesce`]), one request a merged range rather
+    /// than one a tile. An archive gone from the bucket (merged, expired) is
+    /// passed over, as a reader passes it over, and its tiles are looked for
+    /// in the older ones.
     async fn extract_zone(
         &self,
         layer: &Layer,
@@ -315,58 +392,209 @@ impl TileStore {
         if keep.whole.contains(&zone) {
             return self.extract_zone_whole(layer, zone, keep).await;
         }
-        // The tiles asked for, and only them: each live archive, newest
-        // first, opened by its header and directories, and a range read for
-        // each tile it holds that no newer one did.
+        let span = tracing::info_span!(
+            "tiles.extract.zone",
+            layer = %layer.name,
+            zone = ?zone,
+            archives = tracing::field::Empty,
+            local = tracing::field::Empty,
+            listed = tracing::field::Empty,
+            ranges = tracing::field::Empty,
+            requests = tracing::field::Empty,
+            bytes = tracing::field::Empty,
+            tiles = tracing::field::Empty,
+        );
+        let read = self
+            .extract_zone_ranged(layer, zone, keep)
+            .instrument(span.clone())
+            .await?;
+        let (tiles, report, sources) = &read;
+        span.record("archives", report.archives);
+        span.record("local", sources.local);
+        span.record("listed", sources.listed);
+        span.record("ranges", sources.ranges);
+        span.record("requests", report.requests);
+        span.record("bytes", sources.bytes);
+        span.record("tiles", tiles.len() as u64);
+        let (tiles, report, _) = read;
+        Ok((tiles, report))
+    }
+
+    async fn extract_zone_ranged(
+        &self,
+        layer: &Layer,
+        zone: Zone,
+        keep: &Keep,
+    ) -> Result<(BTreeMap<u64, Bytes>, ExtractReport, ZoneSources), StoreError> {
         let mut report = ExtractReport::default();
+        let mut sources = ZoneSources::default();
         let now = self.now();
         let m = manifest::read(self.object_store().as_ref(), &layer.zone_prefix(zone))
             .await?
             .manifest;
+        report.requests += 1;
         let mut missing: Vec<u64> = keep.by_zone.get(&zone).cloned().unwrap_or_default();
         let mut tiles = BTreeMap::new();
-        for archive in m.archives.iter().rev() {
-            if missing.is_empty() {
-                break;
-            }
-            if layer.is_expired(&archive.epoch, now) {
-                continue;
-            }
-            let reader = match archive::open_remote(self.object_store().clone(), &archive.key).await
-            {
-                Ok(reader) => Arc::new(reader),
-                // Gone under us (merged, expired): nothing of it to take.
-                Err(e) => match object_store::ObjectStoreExt::head(
-                    self.object_store().as_ref(),
-                    &object_store::path::Path::from(archive.key.as_str()),
-                )
-                .await
-                {
-                    Err(object_store::Error::NotFound { .. }) => continue,
-                    _ => return Err(e),
-                },
-            };
-            report.archives += 1;
-            let found: Vec<(u64, Option<Bytes>)> = futures_util::stream::iter(missing.clone())
-                .map(|id| {
-                    let reader = reader.clone();
-                    async move {
-                        let tile = reader.get_tile(pmtiles::TileId::new(id)?).await?;
-                        Ok::<_, StoreError>((id, tile))
-                    }
+        if missing.is_empty() {
+            return Ok((tiles, report, sources));
+        }
+        // Newest first, each with where its tiles lie.
+        let live: Vec<&manifest::ArchiveRef> = m
+            .archives
+            .iter()
+            .rev()
+            .filter(|a| !layer.is_expired(&a.epoch, now))
+            .collect();
+        let mut held: Vec<Source> = futures_util::stream::iter(&live)
+            .map(|a| async move {
+                if let Some(local) = self.disk_reader(&a.key) {
+                    return Ok::<_, StoreError>((Source::Local(local), 0));
+                }
+                Ok(match self.listing_of(&a.key).await? {
+                    Some((listing, fetched)) => (
+                        Source::Listed(listing.clone()),
+                        if fetched { listing.requests } else { 0 },
+                    ),
+                    // Gone under us (merged, expired): nothing of it to take.
+                    None => (Source::Gone, 1),
                 })
-                .buffer_unordered(tiles_at_once())
-                .try_collect()
-                .await?;
-            for (id, tile) in found {
-                if let Some(bytes) = tile {
-                    report.archive_bytes += bytes.len() as u64;
-                    tiles.insert(id, bytes);
+            })
+            .buffered(zones_at_once())
+            .map_ok(|(held, requests)| {
+                report.requests += requests;
+                held
+            })
+            .try_collect()
+            .await?;
+        let mut consulted = HashSet::new();
+        loop {
+            // Each missing tile given to the newest archive that holds it:
+            // read at once from a local copy, or its range kept for later.
+            let mut ranged: BTreeMap<usize, Vec<(u64, Range<u64>)>> = BTreeMap::new();
+            for (i, h) in held.iter().enumerate() {
+                if missing.is_empty() {
+                    break;
+                }
+                match h {
+                    Source::Gone => continue,
+                    Source::Local(reader) => {
+                        consulted.insert(i);
+                        sources.local += 1;
+                        let mut rest = Vec::with_capacity(missing.len());
+                        for id in missing {
+                            match reader.get_tile(pmtiles::TileId::new(id)?).await? {
+                                Some(bytes) => {
+                                    report.archive_bytes += bytes.len() as u64;
+                                    tiles.insert(id, bytes);
+                                }
+                                None => rest.push(id),
+                            }
+                        }
+                        missing = rest;
+                    }
+                    Source::Listed(listing) => {
+                        consulted.insert(i);
+                        let mut rest = Vec::with_capacity(missing.len());
+                        for id in missing {
+                            match listing.tiles.binary_search_by_key(&id, |(t, _)| *t) {
+                                Ok(at) => ranged
+                                    .entry(i)
+                                    .or_default()
+                                    .push((id, listing.tiles[at].1.clone())),
+                                Err(_) => rest.push(id),
+                            }
+                        }
+                        missing = rest;
+                    }
                 }
             }
-            missing.retain(|id| !tiles.contains_key(id));
+            sources.listed = consulted.len() as u64 - sources.local;
+            // The ranges of each archive merged where they lie close, all
+            // read at once.
+            let fetches: Vec<(usize, Range<u64>)> = ranged
+                .iter()
+                .flat_map(|(&i, at)| {
+                    crate::projection::coalesce(
+                        at.iter().map(|(_, r)| (r.start, r.end - r.start)).collect(),
+                    )
+                    .into_iter()
+                    .map(move |r| (i, r))
+                })
+                .collect();
+            let live = &live;
+            let fetched: Vec<(usize, Range<u64>, Option<Bytes>)> =
+                futures_util::stream::iter(fetches)
+                    .map(|(i, range)| async move {
+                        let at = object_store::path::Path::from(live[i].key.as_str());
+                        match object_store::ObjectStoreExt::get_range(
+                            self.object_store().as_ref(),
+                            &at,
+                            range.clone(),
+                        )
+                        .await
+                        {
+                            Ok(bytes) => Ok((i, range, Some(bytes))),
+                            Err(object_store::Error::NotFound { .. }) => Ok((i, range, None)),
+                            Err(e) => Err(StoreError::from(e)),
+                        }
+                    })
+                    .buffer_unordered(tiles_at_once())
+                    .try_collect()
+                    .await?;
+            let mut blobs: HashMap<usize, Vec<(Range<u64>, Bytes)>> = HashMap::new();
+            let mut gone = HashSet::new();
+            for (i, range, bytes) in fetched {
+                report.requests += 1;
+                sources.ranges += 1;
+                match bytes {
+                    Some(bytes) => {
+                        sources.bytes += bytes.len() as u64;
+                        blobs.entry(i).or_default().push((range, bytes));
+                    }
+                    None => {
+                        gone.insert(i);
+                    }
+                }
+            }
+            for (i, at) in ranged {
+                if gone.contains(&i) {
+                    // Gone since it was listed: its tiles go back to be
+                    // looked for in the older archives.
+                    missing.extend(at.into_iter().map(|(id, _)| id));
+                    continue;
+                }
+                for (id, range) in at {
+                    let blob = blobs.get(&i).and_then(|b| {
+                        b.iter()
+                            .find(|(r, _)| r.start <= range.start && range.end <= r.end)
+                    });
+                    let Some((r, bytes)) = blob else {
+                        return Err(StoreError::Corrupt(format!(
+                            "{}: tile {id} outside the ranges read",
+                            live[i].key
+                        )));
+                    };
+                    let from = (range.start - r.start) as usize;
+                    let to = from + (range.end - range.start) as usize;
+                    if to > bytes.len() {
+                        return Err(StoreError::Corrupt(format!(
+                            "{}: tile {id} runs past the end of the archive",
+                            live[i].key
+                        )));
+                    }
+                    report.archive_bytes += (to - from) as u64;
+                    tiles.insert(id, bytes.slice(from..to));
+                }
+            }
+            if gone.is_empty() || missing.is_empty() {
+                break;
+            }
+            for i in gone {
+                held[i] = Source::Gone;
+            }
         }
-        Ok((tiles, report))
+        report.archives = consulted.len() as u64;
+        Ok((tiles, report, sources))
     }
 
     /// A zone taken whole: each live archive fetched whole, newest first.
@@ -381,6 +609,7 @@ impl TileStore {
         let m = manifest::read(self.object_store().as_ref(), &layer.zone_prefix(zone))
             .await?
             .manifest;
+        report.requests += 1;
         let archives: Vec<_> = m
             .archives
             .iter()
@@ -407,6 +636,7 @@ impl TileStore {
                 .buffered(zones_at_once())
                 .try_collect()
                 .await?;
+        report.requests += local.len() as u64;
         let mut tiles = BTreeMap::new();
         for path in local.into_iter().rev().flatten() {
             report.archives += 1;
