@@ -333,6 +333,9 @@ impl Sink for SpatialFilm {
     fn wants_i420(&self) -> bool {
         true
     }
+    fn wants_rgba(&self) -> bool {
+        false
+    }
 
     fn picture(&mut self, _: u32, _: u32, _: &[u8], _: &[u8]) -> Result<(), Error> {
         Err("a spatial film has two eyes: render it in stereo".into())

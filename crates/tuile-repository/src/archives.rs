@@ -226,10 +226,112 @@ pub struct ArchivedTiles {
     /// Zones read from an extract rather than their manifest: by zone,
     /// where it lies, its key there, and what is added to a tile's id in it.
     extracts: Mutex<HashMap<String, ZoneExtract>>,
+    /// Zones read from the archives they were pinned to rather than their
+    /// manifest ([`Self::read_zone_pinned`]).
+    pinned: Mutex<HashMap<String, Arc<Vec<String>>>>,
 }
 
 /// Where a zone's extract lies, its key there, and its band.
 type ZoneExtract = (Arc<dyn Objects>, String, u64);
+
+/// Where pin sets are kept in the store: `_pins/<digest>.json`.
+pub const PINS_PREFIX: &str = "_pins/";
+
+/// A tile asked for: its id in the archives, and its address.
+type AskedTile = (u64, (u8, u32, u32));
+
+/// Zones pinned while one layer's tiles were looked for at once.
+const ZONES_AT_ONCE: usize = 16;
+/// Tiles of one archive looked for at once, each by its directories.
+const TILES_AT_ONCE: usize = 32;
+/// Absent tiles a [`PinReport`] names, at most.
+const ABSENT_NAMED: usize = 16;
+
+/// One layer's zones as a reader is to read them: for each zone a reader
+/// will ask tiles of, the archives that hold them, newest first — the
+/// store as it was when the tiles were looked for, frozen. Archives are
+/// immutable, so a reader of these keys reads, tile for tile, what was
+/// there then, from any copy of them: a bucket's, a disk's, another
+/// region's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinnedLayer {
+    pub layer: String,
+    /// By zone prefix, the archive keys, newest first.
+    pub zones: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// The pinned zones of every layer a reader draws: what a render reads in
+/// place of an extract. Kept in the store under its own digest
+/// ([`Pins::key`]): the same zones pinned the same way are one object,
+/// however many chunks and films pin them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pins {
+    pub layers: Vec<PinnedLayer>,
+}
+
+impl Pins {
+    /// As kept: JSON, its zones in order, so the same pins are the same
+    /// bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    /// Its key in the store: `_pins/<sha-256 of its bytes>.json`.
+    pub fn key(&self) -> String {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(self.to_bytes());
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{PINS_PREFIX}{hex}.json")
+    }
+
+    /// Every archive the pins name, once.
+    pub fn archives(&self) -> std::collections::BTreeSet<&str> {
+        self.layers
+            .iter()
+            .flat_map(|l| l.zones.values().flatten())
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// What pinning a layer's tiles found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PinReport {
+    pub zones: u64,
+    /// Archives pinned: those holding at least one tile asked for.
+    pub archives: u64,
+    pub tiles: u64,
+    /// Tiles asked for that no live archive holds, and the first
+    /// [`ABSENT_NAMED`] of them.
+    pub absent: u64,
+    pub absent_first: Vec<(String, u8, u32, u32)>,
+}
+
+impl PinReport {
+    pub fn add(&mut self, other: PinReport) {
+        self.zones += other.zones;
+        self.archives += other.archives;
+        self.tiles += other.tiles;
+        self.absent += other.absent;
+        let room = ABSENT_NAMED.saturating_sub(self.absent_first.len());
+        self.absent_first
+            .extend(other.absent_first.into_iter().take(room));
+    }
+
+    /// Says what is missing, if anything is: how many tiles, and the first.
+    pub fn incomplete(&self) -> Option<String> {
+        if self.absent == 0 {
+            return None;
+        }
+        let mut said = format!("{} tiles asked for are not in the store", self.absent);
+        if let Some((layer, level, x, y)) = self.absent_first.first() {
+            said.push_str(&format!(", {layer} {level}/{x}/{y} the first of them"));
+        }
+        Some(said)
+    }
+}
 
 /// A zone's manifest as read, with when: `None` if the zone has none.
 type HeldManifest = (u64, Option<Arc<Manifest>>);
@@ -285,6 +387,7 @@ impl ArchivedTiles {
             manifests: Mutex::new(HashMap::new()),
             opening: Mutex::new(HashMap::new()),
             extracts: Mutex::new(HashMap::new()),
+            pinned: Mutex::new(HashMap::new()),
         })
     }
 
@@ -311,11 +414,164 @@ impl ArchivedTiles {
         }
     }
 
-    /// Forgets every extract: zones are read from their manifests again.
+    /// Reads the zone `zone_prefix` from `archives` alone from now on,
+    /// newest first, as [`Self::pin`] pinned them: a tile none of them holds
+    /// is not there, and the zone's manifest is no longer read. An archive
+    /// gone from the store holds nothing: its tiles are then absent, and
+    /// the reader says so.
+    pub fn read_zone_pinned(&self, zone_prefix: &str, archives: Vec<String>) {
+        if let Ok(mut pinned) = self.pinned.lock() {
+            pinned.insert(zone_prefix.to_string(), Arc::new(archives));
+        }
+    }
+
+    /// Reads every zone of `pins` from its pinned archives
+    /// ([`Self::read_zone_pinned`]). Returns the zones pinned.
+    pub fn read_pinned(&self, pins: &Pins) -> usize {
+        let mut zones = 0;
+        for layer in &pins.layers {
+            for (zone, archives) in &layer.zones {
+                self.read_zone_pinned(zone, archives.clone());
+                zones += 1;
+            }
+        }
+        zones
+    }
+
+    /// Forgets every extract and every pinned zone: zones are read from
+    /// their manifests again.
     pub fn forget_extracts(&self) {
         if let Ok(mut extracts) = self.extracts.lock() {
             extracts.clear();
         }
+        if let Ok(mut pinned) = self.pinned.lock() {
+            pinned.clear();
+        }
+    }
+
+    /// Pins the zones `tiles` of `layer` lie in: for each, its live
+    /// archives that hold at least one of the tiles, newest first, found
+    /// by their directories alone — no tile is read. A reader of the
+    /// pinned archives, newest first, finds each tile where a reader of the
+    /// zone's manifest finds it now, the first archive holding it winning.
+    /// Tiles no live archive holds are counted absent, the first named.
+    pub async fn pin(
+        &self,
+        layer: &str,
+        tiles: &[(u8, u32, u32)],
+    ) -> Result<(PinnedLayer, PinReport), RepoError> {
+        use futures_util::{StreamExt, TryStreamExt};
+        let Some(l) = self.layers.iter().find(|l| l.name == layer) else {
+            return Err(RepoError::NotFound(format!("layer {layer}")));
+        };
+        // By zone, its tiles' ids and addresses, each once.
+        let mut by_zone: std::collections::BTreeMap<String, Vec<AskedTile>> = Default::default();
+        let mut seen = std::collections::HashSet::with_capacity(tiles.len());
+        for &(level, x, y) in tiles {
+            let Some(id) = l.grid.id(level, x, y) else {
+                return Err(RepoError::NotFound(format!(
+                    "{} has no tile {level}/{x}/{y}",
+                    l.grid.name()
+                )));
+            };
+            if seen.insert(id) {
+                by_zone
+                    .entry(l.zone_prefix(level, x, y))
+                    .or_default()
+                    .push((id, (level, x, y)));
+            }
+        }
+        self.open_zones(layer, tiles.iter().copied()).await?;
+        let pinned: Vec<(String, Vec<String>, PinReport)> = futures_util::stream::iter(by_zone)
+            .map(|(zone, asked)| async move {
+                let (archives, report) = self.pin_zone(l, &zone, &asked).await?;
+                Ok::<_, RepoError>((zone, archives, report))
+            })
+            .buffer_unordered(ZONES_AT_ONCE)
+            .try_collect()
+            .await?;
+        let mut report = PinReport::default();
+        let mut out = PinnedLayer {
+            layer: layer.to_string(),
+            zones: Default::default(),
+        };
+        for (zone, archives, zone_report) in pinned {
+            report.add(zone_report);
+            if !archives.is_empty() {
+                out.zones.insert(zone, archives);
+            }
+        }
+        Ok((out, report))
+    }
+
+    /// One zone pinned: see [`Self::pin`].
+    async fn pin_zone(
+        &self,
+        l: &Layer,
+        zone: &str,
+        asked: &[AskedTile],
+    ) -> Result<(Vec<String>, PinReport), RepoError> {
+        use futures_util::{StreamExt, TryStreamExt};
+        let now = (self.now)();
+        // Twice at most, as a read: a manifest held may name an archive
+        // merged and removed since.
+        for fresh in [false, true] {
+            if fresh {
+                self.forget(zone);
+            }
+            let mut report = PinReport {
+                zones: 1,
+                tiles: asked.len() as u64,
+                ..PinReport::default()
+            };
+            let mut missing: Vec<AskedTile> = asked.to_vec();
+            let mut archives = Vec::new();
+            let mut gone = false;
+            if let Some(manifest) = self.manifest(zone).await? {
+                for archive in manifest.archives.iter().rev() {
+                    if missing.is_empty() {
+                        break;
+                    }
+                    if l.is_expired(&archive.epoch, now) {
+                        continue;
+                    }
+                    let key = archive.key.as_str();
+                    let held: Vec<bool> = match futures_util::stream::iter(missing.iter())
+                        .map(|(id, _)| self.locate(self.archives.as_ref(), key, *id))
+                        .buffered(TILES_AT_ONCE)
+                        .map_ok(|at| at.is_some())
+                        .try_collect()
+                        .await
+                    {
+                        Ok(held) => held,
+                        Err(RepoError::NotFound(_)) => {
+                            gone = true;
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if held.iter().any(|h| *h) {
+                        archives.push(archive.key.clone());
+                        let mut held = held.into_iter();
+                        missing.retain(|_| !held.next().unwrap_or(false));
+                    }
+                }
+            }
+            if gone {
+                continue;
+            }
+            report.archives = archives.len() as u64;
+            report.absent = missing.len() as u64;
+            report.absent_first = missing
+                .iter()
+                .take(ABSENT_NAMED)
+                .map(|(_, (level, x, y))| (l.name.clone(), *level, *x, *y))
+                .collect();
+            return Ok((archives, report));
+        }
+        Err(RepoError::Store(format!(
+            "{zone}: its archives went while it was pinned, twice"
+        )))
     }
 
     /// Forgets every zone's manifest read so far: the next read of a zone
@@ -514,6 +770,20 @@ impl ArchivedTiles {
         key: &str,
         id: u64,
     ) -> Result<Option<Vec<u8>>, RepoError> {
+        match self.locate(objects, key, id).await? {
+            Some(at) => Ok(Some(objects.read(key, at).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Where tile `id`'s bytes lie in one archive, found by its directories
+    /// alone, or `None` when the archive does not hold it.
+    async fn locate(
+        &self,
+        objects: &dyn Objects,
+        key: &str,
+        id: u64,
+    ) -> Result<Option<std::ops::Range<u64>>, RepoError> {
         let opened = self.opened(objects, key).await?;
         let header = &opened.header;
         let id = TileId::new(id).map_err(|e| malformed(key, e))?;
@@ -526,7 +796,7 @@ impl ArchivedTiles {
             let (offset, length) = (entry.offset(), u64::from(entry.length()));
             if !entry.points_to_leaf() {
                 let start = header.data_offset() + offset;
-                return Ok(Some(objects.read(key, start..start + length).await?));
+                return Ok(Some(start..start + length));
             }
             let start = header.leaf_offset() + offset;
             leaf = Some(self.leaf(objects, key, header, start, length).await?);
@@ -601,6 +871,24 @@ impl TileRepository for ArchivedTiles {
                     bytes,
                     content_type: l.content_type.clone(),
                 }));
+        }
+        let pinned = self.pinned.lock().ok().and_then(|p| p.get(&zone).cloned());
+        if let Some(archives) = pinned {
+            for key in archives.iter() {
+                match self.read_tile(self.archives.as_ref(), key, id).await {
+                    Ok(Some(bytes)) => {
+                        return Ok(Some(Tile {
+                            bytes,
+                            content_type: l.content_type.clone(),
+                        }))
+                    }
+                    Ok(None) => {}
+                    // Gone from every copy: what it held is absent.
+                    Err(RepoError::NotFound(_)) => return Ok(None),
+                    Err(e) => return Err(e),
+                }
+            }
+            return Ok(None);
         }
         let now = (self.now)();
         // Twice at most: a manifest held from a moment ago may name an

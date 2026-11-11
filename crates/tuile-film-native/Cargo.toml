@@ -26,6 +26,8 @@ rav1e = { version = "0.8", default-features = false, features = ["threading"] }
 tokio = { workspace = true }
 # The film's own bake, called by `tuile-film-produce` as a function.
 tuile-bake = { version = "0.16.1", path = "../tuile-bake" }
+# The tile bucket behind the region's tier (`setup::tile_bucket`).
+tuile-tile-server = { version = "0.16.1", path = "../tuile-tile-server" }
 tuile-pack = { version = "0.16.1", path = "../tuile-pack" }
 clap = { version = "4.6", features = ["derive"] }
 # The render as a service (`tuile-film-serve`): its requests and receipts.

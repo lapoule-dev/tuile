@@ -128,8 +128,9 @@ pub struct FrameOut<'a> {
     pub index: u32,
     pub width: u32,
     pub height: u32,
-    /// Tightly packed RGBA8, sRGB-encoded: what a viewer sees.
-    pub rgba: &'a [u8],
+    /// Tightly packed RGBA8, sRGB-encoded: what a viewer sees — when an
+    /// observer asked for it ([`Observer::wants_picture`]).
+    pub rgba: Option<&'a [u8]>,
     /// Tiles drawn, and how many of them entered with this frame.
     pub tiles: usize,
     pub entered: usize,
@@ -169,6 +170,11 @@ pub trait Observer {
     fn wants_light(&self) -> bool {
         false
     }
+    /// Whether it reads a frame's picture ([`FrameOut::rgba`]): read back
+    /// only when an observer, or the sink, does.
+    fn wants_picture(&self) -> bool {
+        false
+    }
 }
 
 /// Watches nothing.
@@ -187,5 +193,8 @@ impl Observer for Vec<Box<dyn Observer>> {
     }
     fn wants_light(&self) -> bool {
         self.iter().any(|o| o.wants_light())
+    }
+    fn wants_picture(&self) -> bool {
+        self.iter().any(|o| o.wants_picture())
     }
 }

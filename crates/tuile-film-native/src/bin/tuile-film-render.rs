@@ -404,6 +404,9 @@ impl Observer for Two<'_> {
     fn wants_light(&self) -> bool {
         self.0.wants_light() || self.1.wants_light()
     }
+    fn wants_picture(&self) -> bool {
+        self.0.wants_picture() || self.1.wants_picture()
+    }
 }
 
 /// The pictures to several sinks at once.
@@ -417,6 +420,9 @@ impl Sink for Both {
     }
     fn wants_i420(&self) -> bool {
         self.0.iter().any(|s| s.wants_i420())
+    }
+    fn wants_rgba(&self) -> bool {
+        self.0.iter().any(|s| s.wants_rgba())
     }
     fn picture(&mut self, index: u32, frame: u32, rgba: &[u8], i420: &[u8]) -> Result<(), Error> {
         self.0

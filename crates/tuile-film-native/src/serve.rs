@@ -64,6 +64,15 @@ pub struct SegmentOrder<O = NoOrder> {
     /// first frame and read in place of the store. None: the store is read.
     #[serde(default)]
     pub extracts: Vec<ExtractRef>,
+    /// The film's store tiles for these frames, pinned as the bake ended:
+    /// the key of a [`tuile_repository::Pins`] in the tile store, which
+    /// names, for each zone the frames read, the archives that hold their
+    /// tiles. Read in place of `extracts` when both are named: each archive
+    /// is read from the store by its key, which never changes, so what one
+    /// segment brought down — this instance's caches, the region's tier —
+    /// serves every other segment that reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pins: Option<String>,
     /// The sun's direction, earth-centred, for every segment of a film
     /// alike; else `rendering.sun`, placed at this segment's first frame.
     #[serde(default)]
@@ -346,6 +355,9 @@ impl<F: OverlayFactory> Service<F> {
         order: &SegmentOrder<F::Order>,
         dir: &Path,
     ) -> Result<Option<Fetched>, Error> {
+        if let Some(key) = &order.pins {
+            return self.read_pinned(sources, key).await.map(Some);
+        }
         if order.extracts.is_empty() {
             return Ok(None);
         }
@@ -385,6 +397,24 @@ impl<F: OverlayFactory> Service<F> {
             }
         }
         Ok(Some(fetched))
+    }
+
+    /// The pins under `key` read from the tile store, and every zone they
+    /// name read from its pinned archives from now on.
+    async fn read_pinned(&self, sources: &Sources, key: &str) -> Result<Fetched, Error> {
+        let began = Instant::now();
+        let bytes = self.tiles.read_all(key).await?;
+        let pins: tuile_repository::Pins =
+            serde_json::from_slice(&bytes).map_err(|e| format!("{key}: {e}"))?;
+        let store = &sources.store.tiles;
+        store.forget_extracts();
+        store.read_pinned(&pins);
+        Ok(Fetched {
+            extracts: 0,
+            parts: pins.archives().len() as u64,
+            bytes: bytes.len() as u64,
+            seconds: began.elapsed().as_secs_f64(),
+        })
     }
 
     /// The overlays `order` asks for, made by the host's factory; none if
@@ -853,6 +883,7 @@ mod tests {
             store: Default::default(),
             rendering: RenderSpec::default(),
             extracts: Vec::new(),
+            pins: None,
             context: serde_json::Value::Null,
             to_sun: None,
             pack_within_seconds: Some(0),
@@ -860,6 +891,60 @@ mod tests {
         };
         let refused = service.segment(&order).await.expect_err("no pack");
         assert!(refused.to_string().contains("did not come"), "{refused}");
+    }
+
+    /// An order that names pins has every zone they name read from its
+    /// pinned archives, the pins read from the tile store by their key; a
+    /// key the store does not hold fails the segment before it renders.
+    #[tokio::test]
+    async fn pins_named_are_read_from_the_tile_store_and_pin_their_zones() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join("catalog.json"),
+            br#"{"layers": [{"name": "imagery", "grid": "web-mercator", "zone_level": 4, "content_type": "image/png"}]}"#,
+        )
+        .expect("catalog");
+        let pins = tuile_repository::Pins {
+            layers: vec![tuile_repository::PinnedLayer {
+                layer: "imagery".into(),
+                zones: [(
+                    "imagery/zones/z4/9/6".to_string(),
+                    vec!["imagery/zones/z4/9/6/gone.pmtiles".to_string()],
+                )]
+                .into_iter()
+                .collect(),
+            }],
+        };
+        // The zone's manifest, which a reader of the zone unpinned reads.
+        let zone = dir.path().join("imagery/zones/z4/9/6");
+        std::fs::create_dir_all(&zone).expect("zone");
+        std::fs::write(zone.join("manifest.json"), br#"{"archives": []}"#).expect("manifest");
+        let key = pins.key();
+        let at = dir.path().join(&key);
+        std::fs::create_dir_all(at.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&at, pins.to_bytes()).expect("pins");
+        let runs = Arc::new(
+            ObjectRunStore::local(dir.path(), tuile_farm::Tuning::default()).expect("store"),
+        );
+        let tiles: Arc<dyn tuile_repository::Objects> = runs.clone();
+        let service = Service::new(runs, tiles, dir.path().join("cache"), Limits::default());
+        let generation = service.generation().await.expect("generation");
+        let fetched = service
+            .read_pinned(&generation.sources, &key)
+            .await
+            .expect("read");
+        assert_eq!(fetched.parts, 1, "one archive pinned");
+        // The zone is read from its pinned archive alone — gone, so the
+        // tile is absent — and its manifest is not read.
+        use tuile_repository::TileRepository;
+        let asked = generation.sources.live.so_far().reads;
+        let tile = generation.sources.store.tiles.tile("imagery", 7, 77, 50).await;
+        assert!(matches!(tile, Ok(None)), "{tile:?}");
+        assert_eq!(generation.sources.live.so_far().reads, asked, "no manifest read");
+        assert!(service
+            .read_pinned(&generation.sources, "_pins/none.json")
+            .await
+            .is_err());
     }
 
     /// A film's final stage on the service: its receipts read from the run

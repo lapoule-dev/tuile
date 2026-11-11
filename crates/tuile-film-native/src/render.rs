@@ -320,9 +320,10 @@ fn ms(since: Instant) -> f64 {
 }
 
 /// Where one picture of a frame is read back to: its RGBA rows, padded to
-/// what a copy wants, and its I420 planes when the sink takes them.
+/// what a copy wants, when the sink, an observer or the hole probe reads
+/// them, and its I420 planes when the sink takes them.
 struct Readback {
-    picture: wgpu::Buffer,
+    picture: Option<wgpu::Buffer>,
     planes: Option<wgpu::Buffer>,
     /// The picture's light, for an observer that reads it, and its rows'
     /// stride in bytes.
@@ -332,8 +333,8 @@ struct Readback {
     padded: u32,
 }
 
-/// One picture of the frame, drawn and read back: its RGBA, its I420
-/// when the sink takes it, and its light ([`FilmGpu::write_linear`]) when
+/// One picture of the frame, drawn and read back: its RGBA when anything
+/// reads it, its I420 when the sink takes it, and its light ([`FilmGpu::write_linear`]) when
 /// an observer reads it — empty otherwise.
 async fn shoot(
     gpu: &mut FilmGpu,
@@ -361,18 +362,20 @@ async fn shoot(
             texture.size(),
         );
     }
-    encoder.copy_texture_to_buffer(
-        gpu.output().as_image_copy(),
-        wgpu::TexelCopyBufferInfo {
-            buffer: &back.picture,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(back.padded),
-                rows_per_image: Some(back.height),
+    if let Some(picture) = &back.picture {
+        encoder.copy_texture_to_buffer(
+            gpu.output().as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: picture,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(back.padded),
+                    rows_per_image: Some(back.height),
+                },
             },
-        },
-        gpu.output().size(),
-    );
+            gpu.output().size(),
+        );
+    }
     if let Some(planes) = &back.planes {
         gpu.encode_i420(&mut encoder)?;
         encoder.copy_buffer_to_buffer(gpu.i420_planes(), 0, planes, 0, planes.size());
@@ -384,10 +387,13 @@ async fn shoot(
     }
     timings.draw += ms(t);
     let t = Instant::now();
-    let rows = read_back(gpu, &back.picture).await?;
-    let mut rgba = Vec::with_capacity((back.width * back.height * 4) as usize);
-    for row in rows.chunks(back.padded as usize) {
-        rgba.extend_from_slice(&row[..(back.width * 4) as usize]);
+    let mut rgba = Vec::new();
+    if let Some(picture) = &back.picture {
+        let rows = read_back(gpu, picture).await?;
+        rgba.reserve((back.width * back.height * 4) as usize);
+        for row in rows.chunks(back.padded as usize) {
+            rgba.extend_from_slice(&row[..(back.width * 4) as usize]);
+        }
     }
     let i420 = match &back.planes {
         Some(planes) => read_back(gpu, planes).await?,
@@ -525,12 +531,18 @@ pub async fn render(
     gpu.smoothing_probe(order.smooth_strength, order.wire);
     let mut stitching = order.stitch.then(Stitching::default);
     let padded = (width * 4).div_ceil(256) * 256;
+    // The picture's RGBA crosses back from the GPU only for what reads it:
+    // a sink of I420 alone, under observers that do not look at it, never
+    // waits for it.
+    let wants_rgba = sink.wants_rgba() || observer.wants_picture() || order.holes;
     let back = Readback {
-        picture: gpu.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("film picture readback"),
-            size: u64::from(padded * height),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
+        picture: wants_rgba.then(|| {
+            gpu.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("film picture readback"),
+                size: u64::from(padded * height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
         }),
         planes: sink.wants_i420().then(|| {
             gpu.device().create_buffer(&wgpu::BufferDescriptor {
@@ -1197,8 +1209,13 @@ pub async fn render(
                     } else {
                         Vec::new()
                     };
+                    let rgba = if back.picture.is_some() {
+                        tuile_film::pack_rgba(stereo.packing, &left.0, &right.0, width, height)
+                    } else {
+                        Vec::new()
+                    };
                     let packed = (
-                        tuile_film::pack_rgba(stereo.packing, &left.0, &right.0, width, height),
+                        rgba,
                         i420,
                         Vec::new(),
                     );
@@ -1256,7 +1273,8 @@ pub async fn render(
                 index,
                 width: picture_width,
                 height: picture_height,
-                rgba: &rgba,
+                rgba: (back.picture.is_some() && observer.wants_picture())
+                    .then_some(rgba.as_slice()),
                 tiles: diff.selection.len(),
                 entered,
                 layers: &layers,

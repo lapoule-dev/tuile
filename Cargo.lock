@@ -8801,6 +8801,7 @@ version = "0.16.1"
 dependencies = [
  "async-trait",
  "bytes",
+ "chrono",
  "futures-util",
  "glam 0.33.2",
  "image",
@@ -8808,6 +8809,7 @@ dependencies = [
  "object_store",
  "pprof",
  "rayon",
+ "reqwest",
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemallocator",
@@ -9088,6 +9090,7 @@ dependencies = [
  "tuile-repository",
  "tuile-storage-foyer",
  "tuile-tape",
+ "tuile-tile-server",
  "wgpu",
 ]
 
@@ -9330,6 +9333,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

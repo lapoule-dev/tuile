@@ -20,8 +20,14 @@ pub trait Sink {
     fn wants_i420(&self) -> bool {
         false
     }
-    /// One picture: `rgba` tightly packed, `i420` planar BT.709 limited
-    /// range (empty unless asked for). `index` counts from 0.
+    /// Whether [`Self::picture`] reads `rgba`: reading it back from the GPU
+    /// costs a copy and a wait each picture. A sink of I420 alone says no.
+    fn wants_rgba(&self) -> bool {
+        true
+    }
+    /// One picture: `rgba` tightly packed (empty unless asked for), `i420`
+    /// planar BT.709 limited range (empty unless asked for). `index`
+    /// counts from 0.
     fn picture(&mut self, index: u32, frame: u32, rgba: &[u8], i420: &[u8]) -> Result<(), Error>;
     /// For a film of two eyes, in place of [`Self::open`]: the packed
     /// picture's size, and one eye's. A sink that takes the eyes apart —
@@ -89,6 +95,9 @@ pub fn stereo_info(eyes: &Eyes<'_>) -> tuile_mp4::spatial::StereoInfo {
 pub struct Nothing;
 
 impl Sink for Nothing {
+    fn wants_rgba(&self) -> bool {
+        false
+    }
     fn picture(&mut self, _: u32, _: u32, _: &[u8], _: &[u8]) -> Result<(), Error> {
         Ok(())
     }
@@ -241,6 +250,9 @@ impl Sink for Av1Film {
 
     fn wants_i420(&self) -> bool {
         true
+    }
+    fn wants_rgba(&self) -> bool {
+        false
     }
 
     fn picture(&mut self, _index: u32, _frame: u32, _: &[u8], i420: &[u8]) -> Result<(), Error> {
