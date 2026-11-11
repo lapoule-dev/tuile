@@ -17,6 +17,7 @@ pub mod open;
 pub mod packed;
 mod session;
 pub mod settle;
+mod shed;
 pub mod tape;
 pub mod tiles;
 

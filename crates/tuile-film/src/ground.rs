@@ -21,6 +21,7 @@
 use std::sync::Arc;
 
 use glam::DVec3;
+use tuile_core::content::DecodedMesh;
 use tuile_core::geo::{geodetic_to_ecef, Geodetic};
 use tuile_core::source::TileId;
 use tuile_core::stitch;
@@ -68,12 +69,58 @@ const ABOVE_M: f64 = 12_000.0;
 pub(crate) struct Drawn {
     rect: GeoRect,
     origin: DVec3,
-    positions: Vec<[f32; 3]>,
-    indices: Vec<u32>,
+    positions: Part<[f32; 3]>,
+    indices: Part<u32>,
     cells: Cells,
     /// The triangles no cell can vouch for ([`span`]): read wherever the
     /// tile is.
     everywhere: Vec<u32>,
+}
+
+/// A drawn tile's vertices or triangles: its own, or those of the mesh it
+/// entered the stitching with, shared rather than copied — a tile a plan
+/// leaves where it entered is drawn from the one mesh the stitching holds.
+pub(crate) enum Part<T> {
+    Own(Vec<T>),
+    Entered(Arc<DecodedMesh>, fn(&DecodedMesh) -> &[T]),
+}
+
+impl<T> Part<T> {
+    /// What `mesh` holds of it, shared.
+    pub(crate) fn entered(mesh: &Arc<DecodedMesh>, of: fn(&DecodedMesh) -> &[T]) -> Self {
+        Self::Entered(Arc::clone(mesh), of)
+    }
+
+    /// Whether it is shared with the mesh it entered as.
+    fn is_shared(&self) -> bool {
+        matches!(self, Self::Entered(..))
+    }
+}
+
+impl<T> std::ops::Deref for Part<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        match self {
+            Self::Own(values) => values,
+            Self::Entered(mesh, of) => of(mesh),
+        }
+    }
+}
+
+impl<T> From<Vec<T>> for Part<T> {
+    fn from(values: Vec<T>) -> Self {
+        Self::Own(values)
+    }
+}
+
+/// A mesh's positions, for [`Part::entered`].
+pub(crate) fn positions_of(mesh: &DecodedMesh) -> &[[f32; 3]] {
+    &mesh.positions
+}
+
+/// A mesh's indices, for [`Part::entered`].
+pub(crate) fn indices_of(mesh: &DecodedMesh) -> &[u32] {
+    &mesh.indices
 }
 
 /// A tile's triangles by cell ([`span`]), numbered as narrowly as they can
@@ -91,10 +138,11 @@ impl Drawn {
     pub(crate) fn placed(
         key: &TileKey,
         origin: DVec3,
-        positions: Vec<[f32; 3]>,
-        indices: Vec<u32>,
+        positions: impl Into<Part<[f32; 3]>>,
+        indices: impl Into<Part<u32>>,
         places: &[Geodetic],
     ) -> Self {
+        let (positions, indices) = (positions.into(), indices.into());
         let rect = rect_of(key);
         let triangles = indices.as_chunks::<3>().0;
         let boxes: Vec<Option<[f64; 4]>> = triangles
@@ -121,12 +169,26 @@ impl Drawn {
         }
     }
 
-    /// The bytes its vertices, triangles and cells take.
+    /// The bytes its vertices, triangles and cells take — those it shares
+    /// with the mesh it entered as too, which it keeps alive as long as it
+    /// is held.
     pub(crate) fn heap_bytes(&self) -> usize {
         use std::mem::size_of_val;
-        size_of_val(self.positions.as_slice())
-            + size_of_val(self.indices.as_slice())
-            + size_of_val(self.everywhere.as_slice())
+        size_of_val(&*self.positions) + size_of_val(&*self.indices) + self.cells_bytes()
+    }
+
+    /// [`Self::heap_bytes`], but for what it shares with the mesh it
+    /// entered as: what holding it adds to holding that mesh.
+    pub(crate) fn own_bytes(&self) -> usize {
+        use std::mem::size_of_val;
+        let own = |shared: bool, bytes: usize| if shared { 0 } else { bytes };
+        own(self.positions.is_shared(), size_of_val(&*self.positions))
+            + own(self.indices.is_shared(), size_of_val(&*self.indices))
+            + self.cells_bytes()
+    }
+
+    fn cells_bytes(&self) -> usize {
+        std::mem::size_of_val(self.everywhere.as_slice())
             + match &self.cells {
                 Cells::Narrow(grid) => grid.heap_bytes(),
                 Cells::Wide(grid) => grid.heap_bytes(),

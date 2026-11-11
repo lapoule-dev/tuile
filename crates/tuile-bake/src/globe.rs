@@ -366,7 +366,9 @@ impl<P: tuile_core::raster::ImageryProvider, C: tuile_core::raster::ImageryProvi
 /// describe need not be downloaded (see `GlobeOptions::imagery_by_stamp`),
 /// and lights no mesh, so no terrain tile's normals are decoded
 /// (`GlobeOptions::decode_normals`) — the render decodes the store's bytes
-/// again, normals and all.
+/// again, normals and all — and keeps no skirt as walls: they come apart
+/// from the surface (`GlobeOptions::skirts_apart`), kept as the few numbers
+/// they hang from and hung again where the ground is drawn.
 fn names_only(config: &GlobeConfig) -> bool {
     config.session.finish == crate::session::Finish::Identity
 }
@@ -427,6 +429,7 @@ async fn resolve(
             imagery_plan: ImageryPlanHandle::new(ImageryPlan::RGBA8),
             stored_imagery: StoredPlan::OFF,
             decode_normals: !names_only(config),
+            skirts_apart: names_only(config),
         };
         return Ok(match config.imagery_asset_id {
             None => globe_with_provenance(terrain, NoImagery, layer, options(true), decode_pool()),
@@ -495,6 +498,7 @@ async fn resolve(
                 imagery_plan: ImageryPlanHandle::new(ImageryPlan::RGBA8),
                 stored_imagery: StoredPlan::OFF,
                 decode_normals: !names_only(config),
+                skirts_apart: names_only(config),
             },
             decode_pool(),
         );
@@ -527,6 +531,7 @@ async fn resolve(
             imagery_plan: ImageryPlanHandle::new(ImageryPlan::RGBA8),
             stored_imagery: StoredPlan::OFF,
             decode_normals: !names_only(config),
+            skirts_apart: names_only(config),
         };
         return Ok(globe_with_provenance(
             terrain,
@@ -567,6 +572,7 @@ async fn resolve(
         imagery_plan: ImageryPlanHandle::new(ImageryPlan::RGBA8),
         stored_imagery: StoredPlan::OFF,
         decode_normals: !names_only(config),
+        skirts_apart: names_only(config),
     };
 
     // Ce que l'endpoint est, et non ce qu'on espère qu'il soit.
@@ -881,7 +887,19 @@ mod tests {
             runtime.block_on(resolve(&config)).expect("resolved");
         let tile = tuile_core::source::TileId::from_terrain(0, 0, 0);
         match runtime.block_on(loader.load(tile)).expect("loaded") {
-            tuile_core::source::Loaded::Content(content) => content.meshes[0].clone(),
+            tuile_core::source::Loaded::Content(content) => {
+                let mut mesh = content.meshes[0].clone();
+                // Skirts that came apart, hung back to compare whole tiles.
+                if let Some(skirts) = content
+                    .apart
+                    .as_ref()
+                    .and_then(|a| a.get::<tuile_terrain::Skirts>())
+                {
+                    assert_eq!(finish, crate::session::Finish::Identity);
+                    skirts.hang_on(content.local_origin_ecef, &mut mesh);
+                }
+                mesh
+            }
             _ => panic!("terrain loads content"),
         }
     }

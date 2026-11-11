@@ -37,7 +37,7 @@ use glam::DVec3;
 use tuile_core::content::DecodedMesh;
 use tuile_core::geo::{ecef_to_geodetic, geodetic_to_ecef, Geodetic};
 use tuile_core::source::TileId;
-use tuile_terrain::{GeoRect, GeographicTilingScheme, TileCoord};
+use tuile_terrain::{Foot, GeoRect, GeographicTilingScheme, Skirts, TileCoord};
 
 /// The quantized-mesh grid: `u` and `v` are `q / 32767`.
 const GRID: f64 = 32767.0;
@@ -74,6 +74,27 @@ pub(crate) struct Kept {
     /// order its triangles first use its vertices — the quantized-mesh
     /// order.
     indices: Vec<u8>,
+    /// The tile's skirts, when they came apart from its surface: kept as
+    /// what they hang from, and hung again by [`Self::mesh`].
+    skirts: Option<KeptSkirts>,
+}
+
+/// A tile's skirts, as what they hang from (`tuile_terrain::Skirts`): the
+/// tile's rectangle, the depth, each side's edge vertices in the order the
+/// wall walks them, and each one's height. Twelve bytes an edge vertex,
+/// where the walls themselves were a vertex kept as it came and two
+/// triangles each.
+#[derive(Debug, Clone)]
+struct KeptSkirts {
+    rect: GeoRect,
+    depth: f64,
+    walks: [Vec<u32>; 4],
+    /// Each walked vertex's height, side after side.
+    heights: Vec<f64>,
+    /// Each walked vertex's place, side after side — only when the kept
+    /// surface does not state it exactly: a mesh kept as it came, or one
+    /// whose places are not the grid's.
+    places: Option<Vec<[f64; 2]>>,
 }
 
 #[derive(Debug, Clone)]
@@ -296,7 +317,43 @@ impl Kept {
             vertices,
             index_count: mesh.indices.len(),
             indices: pack_indices(&mesh.indices),
+            skirts: None,
         }
+    }
+
+    /// What is kept of `surface`, terrain tile `tile`'s surface about
+    /// `origin`, and of the `skirts` that came apart from it: the mesh that
+    /// [`Self::mesh`] gives back is the surface with its skirts hung under
+    /// it, bit for bit what the tile would have come as whole.
+    pub(crate) fn of_apart(
+        tile: TileId,
+        origin: DVec3,
+        surface: &DecodedMesh,
+        skirts: &Skirts,
+    ) -> Self {
+        let mut kept = Self::of(tile, origin, surface);
+        let feet = || skirts.sides.iter().flatten();
+        let places = match &kept.vertices {
+            Vertices::Grid { places, .. } => Some(places),
+            Vertices::AsCame { .. } => None,
+        };
+        // The places the surface states, when they are each foot's exactly.
+        let stated = places.is_some_and(|places| {
+            feet().all(|foot| {
+                places.get(foot.vertex as usize).is_some_and(|p| {
+                    let (u, v) = (f64::from(p[0]) / GRID, f64::from(p[1]) / GRID);
+                    u.to_bits() == foot.u.to_bits() && v.to_bits() == foot.v.to_bits()
+                })
+            })
+        });
+        kept.skirts = Some(KeptSkirts {
+            rect: skirts.rect,
+            depth: skirts.depth,
+            walks: std::array::from_fn(|k| skirts.sides[k].iter().map(|f| f.vertex).collect()),
+            heights: feet().map(|f| f.height).collect(),
+            places: (!stated).then(|| feet().map(|f| [f.u, f.v]).collect()),
+        });
+        kept
     }
 
     pub(crate) fn origin(&self) -> DVec3 {
@@ -329,13 +386,19 @@ impl Kept {
                 (positions, Some(places.iter().map(|p| uv_of(*p)).collect()))
             }
         };
-        DecodedMesh {
+        let mut mesh = DecodedMesh {
             positions,
             normals: None,
             uvs,
             indices: unpack_indices(&self.indices, self.index_count),
             material: Default::default(),
+        };
+        if let Some(skirts) = &self.skirts {
+            skirts
+                .skirts(&self.vertices)
+                .hang_on(self.origin, &mut mesh);
         }
+        mesh
     }
 
     /// Whether `other` keeps the same mesh, bit for bit: what a tile that
@@ -393,7 +456,13 @@ impl Kept {
             }
             _ => false,
         };
+        let same_skirts = match (&self.skirts, &other.skirts) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same_as(b),
+            _ => false,
+        };
         self.origin.to_array().map(f64::to_bits) == other.origin.to_array().map(f64::to_bits)
+            && same_skirts
             && self.index_count == other.index_count
             && self.indices == other.indices
             && same_vertices
@@ -402,7 +471,14 @@ impl Kept {
     /// The bytes it holds.
     pub(crate) fn heap_bytes(&self) -> usize {
         use std::mem::size_of_val;
-        size_of_val(self.indices.as_slice())
+        self.skirts.as_ref().map_or(0, |s| {
+            s.walks
+                .iter()
+                .map(|w| size_of_val(w.as_slice()))
+                .sum::<usize>()
+                + size_of_val(s.heights.as_slice())
+                + s.places.as_deref().map_or(0, size_of_val)
+        }) + size_of_val(self.indices.as_slice())
             + match &self.vertices {
                 Vertices::Grid {
                     places,
@@ -429,6 +505,58 @@ impl Kept {
             } => (exceptions.len(), places.len()),
             Vertices::AsCame { positions, .. } => (positions.len(), positions.len()),
         }
+    }
+}
+
+impl KeptSkirts {
+    /// The skirts kept, as `tuile_terrain` hangs them: each foot's place
+    /// from the surface `vertices` keep, unless kept here.
+    fn skirts(&self, vertices: &Vertices) -> Skirts {
+        let mut heights = self.heights.iter();
+        let mut places = self.places.iter().flatten();
+        let sides = std::array::from_fn(|k| {
+            self.walks[k]
+                .iter()
+                .map(|&vertex| {
+                    let [u, v] = match (places.next(), vertices) {
+                        (Some(place), _) => *place,
+                        (None, Vertices::Grid { places, .. }) => {
+                            let p = places[vertex as usize];
+                            [f64::from(p[0]) / GRID, f64::from(p[1]) / GRID]
+                        }
+                        // Never: a surface kept as it came keeps its places here.
+                        (None, Vertices::AsCame { .. }) => [0.0, 0.0],
+                    };
+                    Foot {
+                        vertex,
+                        u,
+                        v,
+                        height: heights.next().copied().unwrap_or_default(),
+                    }
+                })
+                .collect()
+        });
+        Skirts {
+            rect: self.rect,
+            depth: self.depth,
+            sides,
+        }
+    }
+
+    fn same_as(&self, other: &Self) -> bool {
+        let f64s = |a: &[f64], b: &[f64]| {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
+        };
+        let rect = |r: &GeoRect| [r.west, r.south, r.east, r.north].map(f64::to_bits);
+        rect(&self.rect) == rect(&other.rect)
+            && self.depth.to_bits() == other.depth.to_bits()
+            && self.walks == other.walks
+            && f64s(&self.heights, &other.heights)
+            && match (&self.places, &other.places) {
+                (None, None) => true,
+                (Some(a), Some(b)) => f64s(a.as_flattened(), b.as_flattened()),
+                _ => false,
+            }
     }
 }
 
@@ -532,6 +660,55 @@ mod tests {
                 "level {level}: {} bytes of {whole}",
                 kept.heap_bytes()
             );
+        }
+    }
+
+    /// A tile whose skirts came apart from its surface is kept as its
+    /// surface and the numbers its skirts hang from, and comes back whole —
+    /// the skirts hung again — in every bit of the tile it would have come
+    /// as, from fewer bytes than that tile kept whole. A surface off the
+    /// grid keeps its feet's places, and comes back the same (no smaller:
+    /// its walls were kept as they came, and so are their places).
+    #[test]
+    fn a_tile_kept_apart_comes_back_whole_bit_for_bit() {
+        use tuile_terrain::to_ground_apart;
+        for (level, x, y) in [(14, 16253, 12320), (9, 507, 385), (17, 130030, 98560)] {
+            let coord = TileCoord::new(level, x, y);
+            let rect = GeographicTilingScheme::default().tile_rect(coord);
+            let tile = TileId::from_terrain(level, x, y);
+            for off_the_grid in [false, true] {
+                let mut mesh = quantized(coord, 64);
+                if off_the_grid {
+                    for u in &mut mesh.u {
+                        *u = (*u * 0.75 + 0.1).min(1.0);
+                    }
+                }
+                let whole = to_ground(&mesh, &rect);
+                let (surface, skirts) = to_ground_apart(&mesh, &rect, false);
+                let origin = surface.local_origin_ecef;
+                let apart = Kept::of_apart(tile, origin, &surface.meshes[0], &skirts);
+                assert_eq!(
+                    bits(&apart.mesh(tile)),
+                    bits(&whole.meshes[0]),
+                    "level {level}, off the grid {off_the_grid}"
+                );
+                let kept_whole = Kept::of(tile, whole.local_origin_ecef, &whole.meshes[0]);
+                if !off_the_grid {
+                    assert!(
+                        apart.heap_bytes() < kept_whole.heap_bytes(),
+                        "level {level}: {} bytes apart, {} whole",
+                        apart.heap_bytes(),
+                        kept_whole.heap_bytes()
+                    );
+                    let (exceptions, of) = apart.exceptions();
+                    assert!(
+                        exceptions <= of / 100,
+                        "level {level}: {exceptions} of {of}"
+                    );
+                }
+                assert!(apart.same_as(&Kept::of_apart(tile, origin, &surface.meshes[0], &skirts)));
+                assert!(!apart.same_as(&kept_whole));
+            }
         }
     }
 

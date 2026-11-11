@@ -33,8 +33,9 @@
 //! Nor does it grow with the picture. A count bounds grounds of a size: a
 //! 4K frame at SSE 3 selects ten thousand tiles and more, and its ground
 //! weighs some 220 kB a tile (measured, `tests/bake_memory_sites.rs`) —
-//! two gigabytes, eight of which a count of [`READING`] let out at once. So
-//! the grounds out are bounded by their bytes too ([`reading_bytes`],
+//! two gigabytes, eight of which a count of eight let out at once. So one
+//! ground is out at a time ([`READING`]), and the grounds out are bounded
+//! by their bytes too, as a guard ([`reading_bytes`],
 //! `TUILE_GROUND_READING_MIB`): the builder builds the next one only while
 //! those out weigh less than that. One ground is always let out, whatever
 //! it weighs — the bound is on what waits, never a frame refused — so what
@@ -60,7 +61,13 @@ const LEAD: usize = 4;
 /// How many grounds may be built and not read yet, at most, at once: those
 /// read on the pool and those waiting for a thread of it. A builder that
 /// has this many out waits for one to be read before it builds the next.
-pub const READING: usize = 8;
+///
+/// One. A 4K frame's ground weighs two gigabytes; eight out at once was a
+/// farm worker killed for memory, and the bytes bound below caught it only
+/// for grounds already known to be large. With one out, a ground is read
+/// while the next is built and the frame after converges — the three stages
+/// still overlap — and no two grounds wait for a reading together.
+pub const READING: usize = 1;
 
 /// What the grounds out for reading may weigh between them before the
 /// builder waits, unless `TUILE_GROUND_READING_MIB` says: 1.5 GiB. One

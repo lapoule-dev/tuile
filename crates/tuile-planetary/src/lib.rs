@@ -544,6 +544,15 @@ pub struct GlobeOptions {
     /// normals and all. What is fetched, and what the tile is named by, is
     /// the same either way.
     pub decode_normals: bool,
+    /// Whether a terrain tile's skirts are handed over apart from its mesh
+    /// rather than hung under it: the mesh is the surface alone, and
+    /// [`tuile_core::content::DecodedTileContent::apart`] carries the
+    /// [`tuile_terrain::Skirts`] that hang under it, bit for bit as they
+    /// would have been hung ([`tuile_terrain::to_ground_apart`]). Off by
+    /// default; for a consumer in this process that keeps the skirts as the
+    /// numbers they hang from — a bake that names its tiles — and charges
+    /// the mesh as the whole of it.
+    pub skirts_apart: bool,
 }
 
 impl Default for GlobeOptions {
@@ -559,6 +568,7 @@ impl Default for GlobeOptions {
             imagery_plan: ImageryPlanHandle::default(),
             stored_imagery: tuile_core::texels::StoredPlan::default(),
             decode_normals: true,
+            skirts_apart: false,
         }
     }
 }
@@ -1738,7 +1748,14 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
         // Skirts, at the size both reference implementations use. `mesh.edges`
         // arrives in whatever order the server wrote it, and `append_skirts`
         // sorts each edge before stitching it into a wall.
-        let mut content = to_ground_with(&qm, &rect, self.opts.decode_normals);
+        let mut content = if self.opts.skirts_apart {
+            let (mut content, skirts) =
+                tuile_terrain::to_ground_apart(&qm, &rect, self.opts.decode_normals);
+            content.apart = Some(tuile_core::content::Apart::new(skirts));
+            content
+        } else {
+            to_ground_with(&qm, &rect, self.opts.decode_normals)
+        };
         if !self.opts.no_imagery {
             for mesh in &mut content.meshes {
                 // Terrain owns no base-colour texture: its drapes are the

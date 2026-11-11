@@ -55,19 +55,30 @@ pub fn to_decoded_with(
         [r.x as f32, r.y as f32, r.z as f32]
     };
 
+    // The skirts are counted before anything is built, so that every array
+    // is allocated once at its size rather than doubled on the way.
+    let skirts = (skirt_height > 0.0).then(|| Skirts::with_depth(mesh, rect, skirt_height));
+    let (skirt_vertices, skirt_indices) = skirts.as_ref().map_or((0, 0), Skirts::counts);
     let vc = mesh.vertex_count();
-    let mut positions: Vec<[f32; 3]> = (0..vc).map(|i| local(to_ecef(i, 0.0, 0.0, 0.0))).collect();
-    let mut normals: Option<Vec<[f32; 3]>> = if normals { mesh.normals.clone() } else { None };
-    let mut indices = mesh.indices.clone();
-    let mut uvs = surface_uvs(mesh);
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(vc + skirt_vertices);
+    positions.extend((0..vc).map(|i| local(to_ecef(i, 0.0, 0.0, 0.0))));
+    let mut normals: Option<Vec<[f32; 3]>> = if normals {
+        mesh.normals.as_ref().map(|n| {
+            let mut all = Vec::with_capacity(n.len() + skirt_vertices);
+            all.extend_from_slice(n);
+            all
+        })
+    } else {
+        None
+    };
+    let mut indices = Vec::with_capacity(mesh.indices.len() + skirt_indices);
+    indices.extend_from_slice(&mesh.indices);
+    let mut uvs = Vec::with_capacity(vc + skirt_vertices);
+    uvs.extend(surface_uvs(mesh));
 
-    if skirt_height > 0.0 {
-        append_skirts(
-            mesh,
-            rect,
-            skirt_height,
-            &to_ecef,
-            &local,
+    if let Some(skirts) = &skirts {
+        skirts.hang(
+            origin,
             &mut Vertices {
                 positions: &mut positions,
                 normals: &mut normals,
@@ -78,6 +89,8 @@ pub fn to_decoded_with(
     }
 
     DecodedTileContent {
+        shed: Vec::new(),
+        apart: None,
         withheld_drape: None,
         copyright: None,
         meshes: vec![DecodedMesh {
@@ -281,55 +294,174 @@ impl Side {
     }
 }
 
-/// Extrudes each edge downward into a wall that hides the crack between this
-/// tile and its neighbour.
+/// A tile's skirts, apart from its mesh: how deep they hang and, side by
+/// side, the edge vertices they hang from — each with its place in the tile
+/// and its height — in the order its wall is stitched.
 ///
-/// The edge lists arrive in whatever order the server wrote them — the format
-/// promises no ordering, and `decode` passes them through untouched. An earlier
-/// version of this walked them as given and joined consecutive entries, which
-/// stitches a wall out of a shuffled list: long triangles sweeping right across
-/// the tile, read on screen as horizontal smears over every slope. The reference
-/// implementation sorts first, for this reason, and so does this.
-fn append_skirts(
-    mesh: &QuantizedMesh,
-    rect: &GeoRect,
-    skirt_height: f64,
-    to_ecef: &dyn Fn(usize, f64, f64, f64) -> DVec3,
-    local: &dyn Fn(DVec3) -> [f32; 3],
-    out: &mut Vertices<'_>,
-) {
-    for (side, edge) in Side::IN_FILE_ORDER.iter().zip(&mesh.edges) {
-        if edge.len() < 2 {
-            continue;
-        }
-        let mut walk: Vec<u32> = edge.clone();
-        walk.sort_by(|&a, &b| {
-            side.position_along(mesh, a as usize)
-                .total_cmp(&side.position_along(mesh, b as usize))
-        });
+/// What [`to_decoded`] hangs under a tile, and what [`Skirts::hang`] hangs
+/// again under the same surface, bit for bit: the one function does both.
+/// So a consumer that keeps a tile's surface can keep its skirts as this —
+/// a few numbers an edge vertex — rather than as the walls themselves.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Skirts {
+    /// The tile's rectangle, which the places are in.
+    pub rect: GeoRect,
+    /// How far below its edge a skirt hangs, in metres.
+    pub depth: f64,
+    /// West, south, east, north: each side's edge vertices, walked. A side
+    /// of fewer than two has no wall and is left empty.
+    pub sides: [Vec<Foot>; 4],
+}
 
-        let (dlon, dlat) = side.outward(rect);
-        let base = out.positions.len() as u32;
-        for &vi in &walk {
-            out.positions
-                .push(local(to_ecef(vi as usize, dlon, dlat, -skirt_height)));
-            // The skirt vertex stands at its edge vertex's place in the tile, so
-            // it takes that vertex's texture and its light with it. That is what
-            // makes a wall that does show through invisible rather than a stripe
-            // of some other colour.
-            out.uvs.push(out.uvs[vi as usize]);
-            if let Some(ns) = out.normals.as_mut() {
-                ns.push(ns[vi as usize]);
+/// An edge vertex a skirt hangs from: its index in the mesh, its place in
+/// the tile and its height, exactly as the tile states them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Foot {
+    pub vertex: u32,
+    pub u: f64,
+    pub v: f64,
+    /// Metres over the ellipsoid.
+    pub height: f64,
+}
+
+impl Skirts {
+    /// The skirts [`to_ground`] hangs under `mesh` over `rect`.
+    pub fn of(mesh: &QuantizedMesh, rect: &GeoRect) -> Self {
+        Self::with_depth(mesh, rect, skirt_depth(mesh, rect))
+    }
+
+    /// The skirts of `mesh` hung `depth` metres deep.
+    ///
+    /// The edge lists arrive in whatever order the server wrote them — the
+    /// format promises no ordering, and `decode` passes them through
+    /// untouched. An earlier version walked them as given and joined
+    /// consecutive entries, which stitches a wall out of a shuffled list:
+    /// long triangles sweeping right across the tile, read on screen as
+    /// horizontal smears over every slope. The reference implementation sorts
+    /// first, for this reason, and so does this.
+    pub fn with_depth(mesh: &QuantizedMesh, rect: &GeoRect, depth: f64) -> Self {
+        let min_h = mesh.header.min_height as f64;
+        let max_h = mesh.header.max_height as f64;
+        let sides = std::array::from_fn(|k| {
+            let (side, edge) = (Side::IN_FILE_ORDER[k], &mesh.edges[k]);
+            if edge.len() < 2 {
+                return Vec::new();
             }
-        }
-
-        for seg in 0..walk.len() - 1 {
-            let (top0, top1) = (walk[seg], walk[seg + 1]);
-            let (bot0, bot1) = (base + seg as u32, base + seg as u32 + 1);
-            out.indices
-                .extend_from_slice(&[top0, top1, bot0, bot0, top1, bot1]);
+            let mut walk: Vec<u32> = edge.clone();
+            walk.sort_by(|&a, &b| {
+                side.position_along(mesh, a as usize)
+                    .total_cmp(&side.position_along(mesh, b as usize))
+            });
+            walk.iter()
+                .map(|&vertex| {
+                    let i = vertex as usize;
+                    Foot {
+                        vertex,
+                        u: mesh.u[i],
+                        v: mesh.v[i],
+                        height: lerp(min_h, max_h, mesh.height[i]),
+                    }
+                })
+                .collect()
+        });
+        Self {
+            rect: *rect,
+            depth,
+            sides,
         }
     }
+
+    /// How many vertices and indices hanging them adds to a mesh: each edge
+    /// vertex once more, and two triangles a segment of each side.
+    pub fn counts(&self) -> (usize, usize) {
+        self.sides
+            .iter()
+            .filter(|feet| feet.len() >= 2)
+            .fold((0, 0), |(v, i), feet| {
+                (v + feet.len(), i + 6 * (feet.len() - 1))
+            })
+    }
+
+    /// Hangs the skirts under the surface they were taken with, its
+    /// vertices about `origin`: a wall down from each edge, appended to its
+    /// arrays. A surface without texture coordinates gets none for its walls
+    /// either.
+    pub fn hang_on(&self, origin: DVec3, mesh: &mut DecodedMesh) {
+        let had_uvs = mesh.uvs.is_some();
+        let mut uvs = mesh
+            .uvs
+            .take()
+            .unwrap_or_else(|| vec![[0.0; 2]; mesh.positions.len()]);
+        self.hang(
+            origin,
+            &mut Vertices {
+                positions: &mut mesh.positions,
+                normals: &mut mesh.normals,
+                uvs: &mut uvs,
+                indices: &mut mesh.indices,
+            },
+        );
+        mesh.uvs = had_uvs.then_some(uvs);
+    }
+
+    /// Extrudes each edge downward into a wall that hides the crack between
+    /// this tile and its neighbour.
+    fn hang(&self, origin: DVec3, out: &mut Vertices<'_>) {
+        let rect = &self.rect;
+        let (vertices, indices) = self.counts();
+        out.positions.reserve(vertices);
+        out.uvs.reserve(vertices);
+        if let Some(ns) = out.normals.as_mut() {
+            ns.reserve(vertices);
+        }
+        out.indices.reserve(indices);
+        for (side, feet) in Side::IN_FILE_ORDER.iter().zip(&self.sides) {
+            if feet.len() < 2 {
+                continue;
+            }
+            let (dlon, dlat) = side.outward(rect);
+            let base = out.positions.len() as u32;
+            for foot in feet {
+                // Below its edge vertex and a hair outside the tile: the
+                // expression the surface is computed by, offset.
+                let lon = lerp(rect.west, rect.east, foot.u) + dlon;
+                let lat = lerp(rect.south, rect.north, foot.v) + dlat;
+                let height = foot.height + -self.depth;
+                let r = geodetic_to_ecef(Geodetic { lon, lat, height }) - origin;
+                out.positions.push([r.x as f32, r.y as f32, r.z as f32]);
+                // The skirt vertex stands at its edge vertex's place in the
+                // tile, so it takes that vertex's texture and its light with
+                // it. That is what makes a wall that does show through
+                // invisible rather than a stripe of some other colour.
+                let vi = foot.vertex as usize;
+                out.uvs.push(out.uvs[vi]);
+                if let Some(ns) = out.normals.as_mut() {
+                    ns.push(ns[vi]);
+                }
+            }
+
+            for seg in 0..feet.len() - 1 {
+                let (top0, top1) = (feet[seg].vertex, feet[seg + 1].vertex);
+                let (bot0, bot1) = (base + seg as u32, base + seg as u32 + 1);
+                out.indices
+                    .extend_from_slice(&[top0, top1, bot0, bot0, top1, bot1]);
+            }
+        }
+    }
+}
+
+/// A terrain tile as ground, its skirts apart: [`to_ground_with`]'s surface,
+/// and the [`Skirts`] it would have hung under it. Hung back with
+/// [`Skirts::hang_on`], the mesh is [`to_ground_with`]'s, bit for bit.
+pub fn to_ground_apart(
+    mesh: &QuantizedMesh,
+    rect: &GeoRect,
+    normals: bool,
+) -> (DecodedTileContent, Skirts) {
+    (
+        to_decoded_with(mesh, rect, 0.0, normals),
+        Skirts::of(mesh, rect),
+    )
 }
 
 #[cfg(test)]
@@ -357,6 +489,122 @@ mod tests {
             edges: [vec![0, 2], vec![0, 1], vec![1, 3], vec![2, 3]],
             metadata_available: None,
             cut: 0,
+        }
+    }
+
+    /// A grid of `n` × `n` vertices with a relief, normals and its four edge
+    /// lists — given in shuffled order, as a server may write them.
+    fn relief_mesh(rect: &GeoRect, n: usize) -> QuantizedMesh {
+        let q = |f: f64| (f * 32767.0).round() / 32767.0;
+        let (mut u, mut v, mut height, mut normals) = (vec![], vec![], vec![], vec![]);
+        for j in 0..n {
+            for i in 0..n {
+                let (fu, fv) = (i as f64 / (n - 1) as f64, j as f64 / (n - 1) as f64);
+                u.push(q(fu));
+                v.push(q(fv));
+                height.push(q(0.5 + 0.5 * (7.0 * fu).sin() * (5.0 * fv).cos()));
+                normals.push([0.1 * fu as f32, 0.0, 1.0]);
+            }
+        }
+        let mut indices = Vec::new();
+        for j in 0..n - 1 {
+            for i in 0..n - 1 {
+                let a = (j * n + i) as u32;
+                let (b, c, d) = (a + 1, a + n as u32, a + n as u32 + 1);
+                indices.extend_from_slice(&[a, b, c, c, b, d]);
+            }
+        }
+        let (lon, lat) = rect.center();
+        let centre = geodetic_to_ecef(Geodetic {
+            lon,
+            lat,
+            height: 400.0,
+        });
+        let line = |f: &dyn Fn(usize) -> usize| {
+            let mut l: Vec<u32> = (0..n).map(|k| f(k) as u32).collect();
+            l.reverse();
+            l.swap(0, n / 2);
+            l
+        };
+        QuantizedMesh {
+            header: Header {
+                center: centre.to_array(),
+                min_height: -35.5,
+                max_height: 1832.25,
+                bounding_sphere_center: centre.to_array(),
+                bounding_sphere_radius: 1.0e5,
+                horizon_occlusion: [0.0; 3],
+            },
+            u,
+            v,
+            height,
+            indices,
+            normals: Some(normals),
+            edges: [
+                line(&|k| k * n),
+                line(&|k| k),
+                line(&|k| k * n + n - 1),
+                line(&|k| (n - 1) * n + k),
+            ],
+            metadata_available: None,
+            cut: 0,
+        }
+    }
+
+    fn every_bit(m: &DecodedMesh) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
+        (
+            m.positions.iter().flatten().map(|f| f.to_bits()).collect(),
+            m.normals
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|f| f.to_bits())
+                .collect(),
+            m.uvs
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|f| f.to_bits())
+                .collect(),
+            m.indices.clone(),
+        )
+    }
+
+    /// A tile's surface with its skirts hung back on is the tile, bit for
+    /// bit — positions, normals, texture coordinates and indices — and the
+    /// skirts count what they add. A tile is built at its size: no array
+    /// was grown on the way.
+    #[test]
+    fn a_tile_apart_hangs_back_to_the_same_tile() {
+        for (level, x, y, n) in [(14, 16253, 12320, 65), (9, 507, 385, 17), (3, 2, 5, 9)] {
+            let rect = GeographicTilingScheme::default().tile_rect(TileCoord::new(level, x, y));
+            let mesh = relief_mesh(&rect, n);
+            let whole = to_ground(&mesh, &rect);
+            let whole = &whole.meshes[0];
+            assert_eq!(
+                whole.positions.capacity(),
+                whole.positions.len(),
+                "{level}: built at its size"
+            );
+            assert_eq!(
+                whole.indices.capacity(),
+                whole.indices.len(),
+                "{level}: built at its size"
+            );
+
+            let (surface, skirts) = to_ground_apart(&mesh, &rect, true);
+            let mut hung = surface.meshes[0].clone();
+            assert_eq!(hung.positions.len(), n * n, "{level}: the surface alone");
+            let (vertices, indices) = skirts.counts();
+            assert_eq!(vertices, 4 * n, "{level}");
+            assert_eq!(indices, 4 * 6 * (n - 1), "{level}");
+            skirts.hang_on(surface.local_origin_ecef, &mut hung);
+            assert_eq!(hung.positions.len(), whole.positions.len());
+            assert_eq!(hung.indices.len(), whole.indices.len());
+            assert!(
+                every_bit(&hung) == every_bit(whole),
+                "{level}: hung back, the same tile"
+            );
         }
     }
 
@@ -891,6 +1139,8 @@ pub fn fill_content(
     }
 
     DecodedTileContent {
+        shed: Vec::new(),
+        apart: None,
         withheld_drape: None,
         copyright: None,
         meshes: vec![DecodedMesh {
@@ -1062,6 +1312,8 @@ pub fn globe_shell(colour: [f32; 4]) -> DecodedTileContent {
     }
 
     DecodedTileContent {
+        shed: Vec::new(),
+        apart: None,
         withheld_drape: None,
         copyright: None,
         meshes: vec![DecodedMesh {

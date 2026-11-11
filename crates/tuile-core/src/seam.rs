@@ -616,6 +616,8 @@ mod tests {
             indices.extend_from_slice(&[m as u32, n as u32, 4, 4, n as u32, 5]);
         }
         DecodedTileContent {
+            shed: Vec::new(),
+            apart: None,
             withheld_drape: None,
             copyright: None,
             meshes: vec![DecodedMesh {

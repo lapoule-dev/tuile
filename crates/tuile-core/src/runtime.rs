@@ -581,6 +581,10 @@ impl GeometryServer {
         // changed.
         let mut scene = composite.as_ref().map(Composite::changes);
 
+        #[allow(
+            clippy::large_enum_variant,
+            reason = "an arrival is moved once, from its load to the step that takes it in"
+        )]
         enum Event {
             Load(Result<Arrival, Aborted>),
             Client(ClientMessage),
@@ -1166,6 +1170,8 @@ impl State {
                             meshes: Vec::new(),
                             textures: Vec::new(),
                             imagery: Vec::new(),
+                            shed: Vec::new(),
+                            apart: None,
                             withheld_drape: None,
                             copyright: None,
                             local_origin_ecef: glam::DVec3::ZERO,
@@ -1905,27 +1911,18 @@ impl State {
 ///
 /// Computed with `+ − × ÷ √` and comparisons only, as the imagery level it
 /// feeds (`budget::imagery`): the same mesh gives the same value everywhere.
+///
+/// A mesh the loader shed is measured as it was, before it was let go
+/// ([`crate::content::ShedMesh::steepest`]).
 fn steepest_ground(content: &DecodedTileContent) -> Option<f64> {
     let origin = content.local_origin_ecef;
-    let up = origin.normalize_or_zero();
-    if up == glam::DVec3::ZERO {
-        return None;
-    }
-    let mut steepest: Option<f64> = None;
-    for mesh in &content.meshes {
-        let ground = crate::stitch::without_skirts(mesh, origin);
-        let at = |i: u32| glam::Vec3::from(ground.positions[i as usize]).as_dvec3();
-        for face in ground.indices.as_chunks::<3>().0 {
-            let normal = (at(face[1]) - at(face[0])).cross(at(face[2]) - at(face[0]));
-            let length = normal.length();
-            if length.is_nan() || length <= 0.0 {
-                continue;
-            }
-            let cos = (normal.dot(up) / length).abs().min(1.0);
-            steepest = Some(steepest.map_or(cos, |s| s.min(cos)));
-        }
-    }
-    steepest
+    content
+        .meshes
+        .iter()
+        .map(|mesh| crate::content::steepest_face(mesh, origin))
+        .chain(content.shed.iter().map(|m| m.steepest))
+        .flatten()
+        .reduce(f64::min)
 }
 
 /// The cosine of the angle a surface is seen at, for a view ray at
@@ -2000,6 +1997,8 @@ mod tests {
             }],
             textures: Vec::new(),
             imagery: Vec::new(),
+            shed: Vec::new(),
+            apart: None,
             withheld_drape: None,
             copyright: None,
             local_origin_ecef: origin,
@@ -2024,6 +2023,16 @@ mod tests {
         let cos = super::steepest_ground(&ramp).expect("a ramp");
         assert!(cos < 1.0 && cos > 0.0, "{cos}");
         assert!(super::steepest_ground(&content(Vec::new(), Vec::new())).is_none());
+
+        // Shed by its loader, a tile is measured as it was: the imagery
+        // level it is draped at is the one it had whole.
+        let mut shed = ramp.clone();
+        shed.shed_meshes();
+        assert!(shed.meshes.is_empty());
+        assert_eq!(
+            super::steepest_ground(&shed).map(f64::to_bits),
+            Some(cos.to_bits())
+        );
     }
 
     use super::*;
@@ -3004,6 +3013,8 @@ mod tests {
             }],
             textures: Vec::new(),
             imagery: Vec::new(),
+            shed: Vec::new(),
+            apart: None,
             withheld_drape: None,
             copyright: None,
             local_origin_ecef: glam::DVec3::new(0.0, 0.0, 6_371_000.0),

@@ -23,6 +23,8 @@ use tuile_core::runtime::in_process_with;
 use tuile_core::source::{TileId, TileLoader, TileTree};
 use tuile_core::traversal::{Config, ViewState, ViewStateParams};
 
+use crate::shed::KeptTile;
+
 /// What a renderer must decide before the first frame.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -607,6 +609,10 @@ pub(crate) struct Live {
     /// asked to keep it ([`Session::keep_ground`]): what
     /// [`Session::ground`] draws the ground from, whatever `finish` lets go.
     grounds: Option<Grounds>,
+    /// The loader's side of a session that finishes by identity: its meshes
+    /// shed as they load, the ground kept of each handed over by tile
+    /// ([`crate::shed`]). `None` for a session that keeps its meshes.
+    shedding: Option<Arc<crate::shed::Shedding>>,
     /// The ground last drawn, tile by tile, prepared and held for
     /// stitching: a tile selected again is not prepared again.
     drawer: crate::drawer::GroundDrawer,
@@ -712,6 +718,9 @@ impl Session {
     pub fn keep_ground(&mut self) {
         if let Source::Live(live) = &mut self.0 {
             live.grounds.get_or_insert_with(Grounds::default);
+            if let Some(shedding) = &live.shedding {
+                shedding.keep_ground(false);
+            }
         }
     }
 
@@ -726,6 +735,9 @@ impl Session {
                 .get_or_insert_with(Grounds::default)
                 .as_it_came
                 .get_or_insert_with(HashMap::new);
+            if let Some(shedding) = &live.shedding {
+                shedding.keep_ground(true);
+            }
         }
     }
 
@@ -976,13 +988,7 @@ struct Grounds {
     kept: HashMap<TileId, (u64, Arc<crate::ground::Kept>)>,
     /// Each tile's mesh as it came, when asked
     /// ([`Session::keep_ground_and_meshes`]).
-    as_it_came: Option<HashMap<TileId, (DVec3, DecodedMesh)>>,
-}
-
-/// What the finish pool keeps of a tile's mesh for the ground.
-struct KeptTile {
-    kept: crate::ground::Kept,
-    as_it_came: Option<DecodedMesh>,
+    as_it_came: Option<HashMap<TileId, (DVec3, Arc<DecodedMesh>)>>,
 }
 
 /// What the session holds of the stream, kept across frames: each mesh and
@@ -997,6 +1003,10 @@ struct Held {
     /// Counts the deliveries, so that a resource that came again is told
     /// from the one before it.
     arrivals: u64,
+    /// The ground kept of each held mesh that was shed as it loaded, handed
+    /// over by the loader ([`crate::shed::Shedding::take`]) when it was
+    /// delivered.
+    ground: HashMap<TileId, KeptTile>,
 }
 
 impl Held {
@@ -1024,6 +1034,7 @@ impl Held {
         match resource {
             ResourceId::Mesh(tile) => {
                 self.meshes.remove(&tile);
+                self.ground.remove(&tile);
             }
             ResourceId::Drape { .. } => {
                 self.drapes.remove(&resource);
@@ -1169,6 +1180,14 @@ impl Live {
         // not what a pass drew while tiles were on their way.
         let spawn = tuile_core::runtime::Spawn::Tokio(runtime.handle().clone());
         tracing::info!(loads = ?spawn, "where the session's loads run");
+        // A session that names its tiles holds none of their meshes: they
+        // are shed as they load, and the ground it keeps handed over.
+        let shedding = (config.finish == Finish::Identity)
+            .then(|| Arc::new(crate::shed::Shedding::new(loader.clone())));
+        let loader: Arc<dyn TileLoader> = match &shedding {
+            Some(shedding) => shedding.clone(),
+            None => loader,
+        };
         let (stream, server) = in_process_with(tree, loader, traversal, budget)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         let server = server.with_spawn(spawn);
@@ -1195,6 +1214,7 @@ impl Live {
             scene: SceneState::default(),
             generation: 0,
             grounds: None,
+            shedding,
             drawer: crate::drawer::GroundDrawer::new(),
             _server: server_thread,
         })
@@ -1258,6 +1278,7 @@ impl Live {
             bake_max_size: self.config.bake_max_size,
             finish: self.config.finish,
             provenance: self.provenance.clone(),
+            shedding: self.shedding.clone(),
         };
         // Destructured so the pump can borrow the pieces it needs while the
         // runtime is borrowed too.
@@ -1393,6 +1414,8 @@ struct Finisher {
     bake_max_size: u32,
     finish: Finish,
     provenance: Option<Arc<tuile_planetary::Provenance>>,
+    /// Where a shed mesh's ground is read again ([`crate::shed`]).
+    shedding: Option<Arc<crate::shed::Shedding>>,
 }
 
 /// A tile finished on the pool: the tile, the dressing it was finished
@@ -1461,7 +1484,7 @@ async fn converge(
                                 {
                                     meshes.insert(tile, (kept.kept.origin(), mesh));
                                 }
-                                grounds.kept.insert(tile, (dressing.mesh, Arc::new(kept.kept)));
+                                grounds.kept.insert(tile, (dressing.mesh, kept.kept));
                             }
                             resident.insert(tile, Finished { dressing, geometry: Arc::new(geometry) });
                         }
@@ -1494,6 +1517,15 @@ async fn converge(
                     // moment a resource can be taken in. Acknowledged at once
                     // with what holding it costs: the budget counts it held.
                     ServerMessage::Content { resource, gen, content, .. } => {
+                        // The ground its loader kept, taken beside it — or
+                        // none, for a mesh the server sent again without
+                        // loading it: that one is read again when kept.
+                        if let (ResourceId::Mesh(tile), Some(shedding)) = (resource, &finisher.shedding) {
+                            match shedding.take(tile) {
+                                Some(kept) => held.ground.insert(tile, kept),
+                                None => held.ground.remove(&tile),
+                            };
+                        }
                         let bytes = held.deliver(resource, gen, content);
                         stream.send(ClientMessage::Ack { resource, gen, bytes })?;
                     }
@@ -1579,56 +1611,85 @@ fn start_finish(
                 .map(|(_, d)| (c.resource, Arc::clone(d)))
         })
         .collect();
-    // The ground is kept once per mesh that came, whatever it wears.
+    // The ground is kept once per mesh that came, whatever it wears: handed
+    // over by a loader that shed the mesh, read again when it handed none,
+    // or kept here from the mesh as it came.
     let keep_ground =
         grounds.is_some_and(|g| g.kept.get(&tile).map(|(a, _)| *a) != Some(dressing.mesh));
     let keep_meshes = keep_ground && grounds.is_some_and(|g| g.as_it_came.is_some());
+    let ground = if !keep_ground {
+        GroundFrom::None
+    } else if let Some(kept) = held.ground.get(&tile) {
+        GroundFrom::Handed(kept.clone())
+    } else if mesh.meshes.is_empty() {
+        match &finisher.shedding {
+            Some(shedding) if !mesh.shed.is_empty() => GroundFrom::Reread(Arc::clone(shedding)),
+            _ => GroundFrom::None,
+        }
+    } else {
+        GroundFrom::Build
+    };
     started.insert(tile, dressing.clone());
     let item = item.clone();
     let memo = Arc::clone(&finisher.memo);
     let dataset = finisher.dataset.clone();
     let provenance = finisher.provenance.clone();
     let (bake_max_size, finish) = (finisher.bake_max_size, finisher.finish);
-    let (done, result) = tokio::sync::oneshot::channel();
-    finish_pool().spawn(move || {
-        // The mesh as it came, before a finish by identity lets it go: the
-        // ground a camera is kept over. Kept on the pool, beside the finish,
-        // rather than on the thread that receives the stream.
-        let kept = mesh
-            .meshes
-            .first()
-            .filter(|_| keep_ground)
-            .map(|first| KeptTile {
-                kept: crate::ground::Kept::of(tile, mesh.local_origin_ecef, first),
-                as_it_came: keep_meshes.then(|| DecodedMesh {
-                    positions: first.positions.clone(),
-                    normals: None,
-                    uvs: first.uvs.clone(),
-                    indices: first.indices.clone(),
-                    material: Default::default(),
-                }),
-            });
-        let dressed = tuile_core::drive::dress(&mesh, &item, &drapes);
-        let geometry = finish_tile_as(
-            &memo,
-            &dataset,
-            tile,
-            dressed,
-            bake_max_size,
-            provenance.as_deref(),
-            finish,
-        );
-        let _ = done.send((geometry, kept));
-    });
     finishing.spawn(async move {
+        let reread = match &ground {
+            GroundFrom::Reread(shedding) => shedding.reread(tile).await,
+            _ => None,
+        };
+        let (done, result) = tokio::sync::oneshot::channel();
+        finish_pool().spawn(move || {
+            // The ground a camera is kept over, before a finish by identity
+            // lets the mesh go. Kept on the pool, beside the finish, rather
+            // than on the thread that receives the stream.
+            let kept = match ground {
+                GroundFrom::None => None,
+                GroundFrom::Handed(kept) => Some(kept),
+                GroundFrom::Reread(_) => reread,
+                GroundFrom::Build => mesh
+                    .meshes
+                    .first()
+                    .map(|first| KeptTile::of(tile, mesh.local_origin_ecef, first, keep_meshes)),
+            };
+            // A tile only named is dressed without a copy of its meshes.
+            let dressed = match finish {
+                Finish::Identity => tuile_core::drive::dress_named(&mesh, &item, &drapes),
+                Finish::Pictures => tuile_core::drive::dress(&mesh, &item, &drapes),
+            };
+            let geometry = finish_tile_as(
+                &memo,
+                &dataset,
+                tile,
+                dressed,
+                bake_max_size,
+                provenance.as_deref(),
+                finish,
+            );
+            let _ = done.send((geometry, kept));
+        });
         let (geometry, kept) = result.await.expect("a tile finish panicked");
         (tile, dressing, geometry, kept)
     });
 }
 
+/// Where a finished tile's ground comes from.
+enum GroundFrom {
+    /// Nowhere: none is kept, or it is kept already.
+    None,
+    /// Its loader kept it and handed it over.
+    Handed(KeptTile),
+    /// Its mesh was shed and nothing was handed over: read again.
+    Reread(Arc<crate::shed::Shedding>),
+    /// Its mesh came whole: kept from it.
+    Build,
+}
+
 /// The pool tiles are finished on: one thread per core (unless
 /// `TUILE_FINISH_THREADS` says), built once per process.
-fn finish_pool() -> &'static rayon::ThreadPool {
+pub(crate) fn finish_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         let threads = std::env::var("TUILE_FINISH_THREADS")
@@ -1941,11 +2002,18 @@ fn finished_as(
         // The layers, the mesh and any texture go now rather than at the end
         // of the film: they are megabytes a tile, and nothing will read them.
         let origin_ecef = decoded.local_origin_ecef;
-        let shape = decoded.meshes.first().map(|mesh| Shape {
-            vertex_count: mesh.positions.len() as u32,
-            index_count: mesh.indices.len() as u32,
-            base_color_factor: mesh.material.base_color_factor,
-        });
+        // Its first mesh, held or shed: what a pack by reference records.
+        let shape = decoded
+            .meshes
+            .first()
+            .map(|m| tuile_core::content::ShedMesh::of(m, decoded.local_origin_ecef))
+            .or_else(|| decoded.shed.first().copied())
+            .map(|mesh| Shape {
+                vertex_count: mesh.vertex_count,
+                index_count: mesh.index_count,
+                base_color_factor: mesh.base_color_factor,
+            });
+        decoded.shed.clear();
         decoded.imagery.clear();
         decoded.textures.clear();
         decoded.meshes.clear();
@@ -2071,6 +2139,7 @@ fn drape_key(tile: TileId, content: &DecodedTileContent, bake_max_size: u32) -> 
     if content.imagery.is_empty()
         || !content.textures.is_empty()
         || content.meshes.iter().any(|m| m.uvs.is_none())
+        || content.shed.iter().any(|m| !m.uvs)
     {
         return None;
     }
@@ -2114,6 +2183,8 @@ pub(crate) mod tests {
                 tile: TileId(7),
                 origin_ecef: DVec3::ZERO,
                 content: DecodedTileContent {
+                    shed: Vec::new(),
+                    apart: None,
                     withheld_drape: None,
                     copyright: None,
                     meshes: Vec::new(),
@@ -2419,6 +2490,8 @@ pub(crate) mod tests {
         let positions = vec![[0.0f32; 3]; 3];
         let uvs = uvs_geographic(&positions, origin, &rect);
         DecodedTileContent {
+            shed: Vec::new(),
+            apart: None,
             withheld_drape: None,
             copyright: None,
             meshes: vec![DecodedMesh {
@@ -2470,6 +2543,8 @@ pub(crate) mod tests {
         let positions = vec![[0.0f32; 3]; 3];
         let uvs = uvs_geographic(&positions, origin, &rect);
         let decoded = DecodedTileContent {
+            shed: Vec::new(),
+            apart: None,
             withheld_drape: None,
             copyright: None,
             meshes: vec![DecodedMesh {
@@ -2923,6 +2998,92 @@ pub(crate) mod tests {
         let ground = kept.ground(how, true).expect("kept");
         let h = ground.height_at(lon, lat).expect("on a child");
         assert!((h - geo_height(l + 1)).abs() < 0.05, "{h}");
+    }
+
+    /// **No black ground when a shed tile comes back.** A session that names
+    /// its tiles holds none of their meshes, only the ground kept of each,
+    /// handed over by its loader. Flown over the same views, it draws the
+    /// same ground and names the same tiles, with the same counts, whether
+    /// everything is kept between frames, or let go and delivered again —
+    /// or whether nothing is handed over at all and every ground is read
+    /// again from the store.
+    #[test]
+    fn a_shed_tile_let_go_and_delivered_again_draws_the_same_ground() {
+        let views = [
+            geo_view(0.3, 0.3, 200_000.0),
+            geo_view(0.3, 0.3, 300.0),
+            geo_view(0.7, 0.6, 200_000.0),
+            geo_view(0.7, 0.6, 300.0),
+            geo_view(0.3, 0.3, 200_000.0),
+            geo_view(0.3, 0.3, 300.0),
+        ];
+        let how = tuile_film::ground::Prepare {
+            skirts: true,
+            ..tuile_film::ground::Prepare::default()
+        };
+        let (l, x, y) = GEO_ROOT;
+        type Flown = Vec<(Vec<(u64, u64, Option<Shape>)>, Vec<Option<u64>>)>;
+        let fly = |release_beyond: Option<u64>, hand_nothing: bool| -> (Flown, usize) {
+            let mut session = Session::new(
+                Box::new(GeoQuad),
+                Arc::new(GeoLoader),
+                SessionConfig {
+                    finish: Finish::Identity,
+                    release_beyond,
+                    ..SessionConfig::default()
+                },
+            )
+            .expect("session");
+            session.keep_ground();
+            let Source::Live(live) = &session.0 else {
+                unreachable!("live");
+            };
+            let shedding = Arc::clone(live.shedding.as_ref().expect("a session by identity sheds"));
+            shedding
+                .hand_nothing
+                .store(hand_nothing, std::sync::atomic::Ordering::SeqCst);
+            let flown = views
+                .iter()
+                .map(|view| {
+                    let frame = session.frame(vec![*view]).expect("frame");
+                    let tiles = frame
+                        .tiles
+                        .iter()
+                        .map(|t| {
+                            assert!(t.content.meshes.is_empty(), "named, not drawn");
+                            (t.tile.0, t.drape(), t.shape)
+                        })
+                        .collect();
+                    let ground = session.ground(how, true).expect("kept");
+                    let heights = (0..8)
+                        .flat_map(|i| (0..8).map(move |j| (i, j)))
+                        .map(|(i, j)| {
+                            let (u, north) =
+                                (0.05 + 0.12 * f64::from(i), 0.05 + 0.12 * f64::from(j));
+                            let g =
+                                tuile_core::geo::ecef_to_geodetic(geo_at(l, x, y, u, north, 0.0));
+                            ground.height_at(g.lon, g.lat).map(f64::to_bits)
+                        })
+                        .collect();
+                    (tiles, heights)
+                })
+                .collect();
+            let rereads = shedding.rereads.load(std::sync::atomic::Ordering::SeqCst);
+            (flown, rereads)
+        };
+        let (kept, _) = fly(None, false);
+        assert!(
+            kept.iter().all(|(_, h)| h.iter().all(Option::is_some)),
+            "the ground answers everywhere"
+        );
+        assert!(kept
+            .iter()
+            .all(|(t, _)| t.iter().all(|(_, _, s)| s.is_some())));
+        let (let_go, _) = fly(Some(0), false);
+        assert_eq!(let_go, kept, "let go and delivered again");
+        let (read_again, rereads) = fly(Some(0), true);
+        assert!(rereads > 0, "every ground read again from the store");
+        assert_eq!(read_again, kept, "read again from the store");
     }
 
     /// A flat square of ground as a quadtree five levels deep: 341 tiles, each

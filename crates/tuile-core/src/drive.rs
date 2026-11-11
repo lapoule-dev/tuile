@@ -171,6 +171,45 @@ pub fn dress(
     drapes: &HashMap<ResourceId, Arc<DrapeContent>>,
 ) -> DecodedTileContent {
     let mut content = mesh.clone();
+    wear(&mut content, item, drapes);
+    content
+}
+
+/// [`dress`], for a consumer that names the tile and draws none of it — a
+/// bake by reference: the drapes worn, and every mesh by its size only
+/// ([`DecodedTileContent::shed`]). Not one vertex is copied; what a pack by
+/// reference records of the tile is what [`dress`] would have given.
+pub fn dress_named(
+    mesh: &DecodedTileContent,
+    item: &crate::budget::DrawItem,
+    drapes: &HashMap<ResourceId, Arc<DrapeContent>>,
+) -> DecodedTileContent {
+    let mut content = DecodedTileContent {
+        meshes: Vec::new(),
+        textures: mesh.textures.clone(),
+        imagery: mesh.imagery.clone(),
+        shed: mesh
+            .meshes
+            .iter()
+            .map(|m| crate::content::ShedMesh::of(m, mesh.local_origin_ecef))
+            .chain(mesh.shed.iter().copied())
+            .collect(),
+        apart: mesh.apart.clone(),
+        withheld_drape: mesh.withheld_drape,
+        copyright: mesh.copyright.clone(),
+        local_origin_ecef: mesh.local_origin_ecef,
+        transform_local: mesh.transform_local,
+    };
+    wear(&mut content, item, drapes);
+    content
+}
+
+/// Puts `item`'s drapes on `content`.
+fn wear(
+    content: &mut DecodedTileContent,
+    item: &crate::budget::DrawItem,
+    drapes: &HashMap<ResourceId, Arc<DrapeContent>>,
+) {
     for choice in &item.drapes {
         let Some(drape) = drapes.get(&choice.resource) else {
             continue;
@@ -182,7 +221,6 @@ pub fn dress(
             .imagery
             .extend(drape.tiles.iter().filter_map(|l| l.through(choice.uv)));
     }
-    content
 }
 
 /// Bulk policy: send `views` once, then pump the stream until the frame is
@@ -340,6 +378,8 @@ mod tests {
             meshes: Vec::new(),
             textures: Vec::new(),
             imagery: Vec::new(),
+            shed: Vec::new(),
+            apart: None,
             withheld_drape: None,
             copyright: None,
             local_origin_ecef: glam::DVec3::ZERO,
@@ -475,5 +515,88 @@ mod tests {
             );
         }
         assert!(frame.errors.is_empty());
+    }
+
+    /// A tile dressed to be named is the tile dressed, its meshes by their
+    /// size: the same drapes, the same withheld identity, the same origin.
+    #[test]
+    fn a_tile_dressed_to_be_named_is_the_tile_dressed_without_its_meshes() {
+        use crate::budget::{DrapeChoice, DrawItem, LayerId, Role, UvTransform};
+        use crate::content::{DecodedMesh, MaterialDesc, ShedMesh};
+        use crate::raster::{ImageryCoord, ImageryLayer};
+        let tile = TileId::from_terrain(9, 507, 385);
+        let rect = crate::raster::GeoRect {
+            west: 0.0,
+            south: 0.0,
+            east: 1.0,
+            north: 1.0,
+        };
+        let layer = ImageryLayer::placed(
+            ImageryCoord {
+                level: 9,
+                x: 3,
+                y: 4,
+            },
+            Arc::new(crate::content::DecodedTexture::from_rgba8(1, 1, vec![0; 4])),
+            &rect,
+            &rect,
+        );
+        let drape = DrapeContent {
+            layer: LayerId(0),
+            level: 9,
+            tiles: vec![layer],
+            floor_tiles: 0,
+            identity: 77,
+            withheld: true,
+        };
+        let resource = ResourceId::drape(tile, drape.layer, drape.level);
+        let item = DrawItem {
+            mesh: ResourceId::Mesh(tile),
+            role: Role::Exact,
+            drapes: [DrapeChoice {
+                resource,
+                layer: drape.layer,
+                level: drape.level,
+                uv: UvTransform::IDENTITY,
+            }]
+            .into_iter()
+            .collect(),
+            serves: [tile].into_iter().collect(),
+        };
+        let drapes = HashMap::from([(resource, Arc::new(drape))]);
+        let mesh = DecodedTileContent {
+            meshes: vec![DecodedMesh {
+                positions: vec![[1.0, 2.0, 3.0]; 5],
+                normals: None,
+                uvs: Some(vec![[0.5; 2]; 5]),
+                indices: vec![0, 1, 2, 2, 1, 3, 3, 1, 4],
+                material: MaterialDesc::default(),
+            }],
+            textures: Vec::new(),
+            imagery: Vec::new(),
+            shed: Vec::new(),
+            apart: None,
+            withheld_drape: None,
+            copyright: None,
+            local_origin_ecef: glam::DVec3::new(1.0e6, 2.0e6, 3.0e6),
+            transform_local: glam::Mat4::IDENTITY,
+        };
+        let mut dressed = dress(&mesh, &item, &drapes);
+        let named = dress_named(&mesh, &item, &drapes);
+        dressed.shed_meshes();
+        assert!(named.meshes.is_empty());
+        assert_eq!(named.shed, dressed.shed);
+        assert_eq!(
+            named.shed[0],
+            ShedMesh::of(&mesh.meshes[0], mesh.local_origin_ecef)
+        );
+        assert_eq!(named.withheld_drape, Some(77));
+        assert_eq!(named.withheld_drape, dressed.withheld_drape);
+        assert_eq!(
+            named.imagery.iter().map(|l| l.coord).collect::<Vec<_>>(),
+            dressed.imagery.iter().map(|l| l.coord).collect::<Vec<_>>()
+        );
+        assert_eq!(named.local_origin_ecef, dressed.local_origin_ecef);
+        assert_eq!(named.cost(), dressed.cost());
     }
 }

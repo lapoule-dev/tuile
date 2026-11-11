@@ -9,9 +9,9 @@
 //! built. Built grounds used to pile up in front of their readings, one per
 //! frame settled, each some fifteen times its selection; and every frozen
 //! selection was held until the last frame was settled, pinning tiles the
-//! session had let go. Now at most [`READING`] grounds are out for reading
-//! at once, whichever stage is slowest, and only the selections the caller
-//! keeps are held. What is read is what reading them in turn reads.
+//! session had let go. Now one ground at a time is out for reading
+//! ([`READING`]), whichever stage is slowest, and only the selections the
+//! caller keeps are held. What is read is what reading them in turn reads.
 
 #[path = "../../tuile-terrain/tests/support/mod.rs"]
 mod support;
@@ -31,11 +31,11 @@ use tuile_film::smoothing::{Smooth, DEFAULT_BOUND_M};
 use tuile_terrain::{LayerJson, TerrainSource, TerrainSourceError, TileCoord};
 
 /// Many more frames than grounds may be out for reading.
-const FRAMES: u32 = 4 * READING as u32;
+const FRAMES: u32 = 8;
 /// How long a reading waits, at most, for more grounds to be out than a
 /// settle may have: readings that lag behind the building, as a 4K bake's
 /// audits do.
-const LAG: Duration = Duration::from_secs(4);
+const LAG: Duration = Duration::from_millis(1500);
 /// Threads enough for every reading waiting at once to leave the building
 /// threads of its own: what is out is then what settling lets out, not what
 /// the pool happens to have room for.
@@ -252,8 +252,8 @@ fn grounds_out_for_reading_and_selections_held_are_bounded() {
     );
     assert!(out >= 1, "a ground was out");
     assert!(
-        out <= READING as u64,
-        "{out} grounds out for reading at once, more than {READING}"
+        out <= 1,
+        "{out} grounds out for reading at once: one at a time"
     );
 
     // Only the selections kept were held, and only they come back.
@@ -283,8 +283,8 @@ fn grounds_out_for_reading_and_selections_held_are_bounded() {
     let out = out.load(Ordering::SeqCst);
     eprintln!("reading again: at most {out} grounds out of {}", many.len());
     assert!(
-        out <= READING as u64,
-        "{out} grounds out for reading again at once, more than {READING}"
+        out <= 1,
+        "{out} grounds out for reading again at once: one at a time"
     );
     for ((i, _), (heights, _, _)) in many.iter().zip(read) {
         assert_eq!(heights, reference[*i as usize].1, "frame {i} read again");

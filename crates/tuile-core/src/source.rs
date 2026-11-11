@@ -197,6 +197,11 @@ pub trait TileTree: Send + Sync {
 }
 
 /// Outcome of a [`TileLoader::load`].
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a load's answer is moved once, from the loader to the server; boxing it would \
+              add an allocation a tile for what a content carries beside its meshes"
+)]
 pub enum Loaded {
     /// Render-ready content: the server caches it and streams it to the
     /// consumer (terrain → draped imagery, glb → intrinsic textures).
@@ -1176,6 +1181,8 @@ mod tests {
     impl TileLoader for StubLoader {
         async fn load(&self, _id: TileId) -> Result<Loaded, LoadError> {
             Ok(Loaded::Content(DecodedTileContent {
+                shed: Vec::new(),
+                apart: None,
                 withheld_drape: None,
                 copyright: None,
                 meshes: Vec::new(),
