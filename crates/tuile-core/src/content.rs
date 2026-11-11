@@ -40,6 +40,11 @@ pub enum ContentFormat {
 /// the same `Content` protocol message carries either, only the form varies
 /// with the binding (in-process = decoded, network = raw glb).
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a content is moved whole from its decoding to its consumer, once; boxing it \
+              would add an allocation a tile for what it carries beside its meshes"
+)]
 pub enum TileContent {
     Raw { format: ContentFormat, bytes: Bytes },
     Decoded(DecodedTileContent),
