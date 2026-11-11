@@ -1231,6 +1231,10 @@ impl Live {
                 vp_h = v.viewport_px.y,
             );
         }
+        // Given up before it starts: nothing is sent, nothing loaded.
+        if self.config.cancel.is_cancelled() {
+            return Err(FrameError::Cancelled);
+        }
         let views: Vec<ViewState> = views.into_iter().map(Into::into).collect();
 
         // One camera, one generation. The server echoes it on every `Select`,
@@ -1268,22 +1272,32 @@ impl Live {
         } = self;
         let mut errors: Vec<(Option<TileId>, String)> = Vec::new();
 
+        // A frame waits on its loads for as long as they take — minutes, on
+        // a cold store — and a host that gave up is not kept waiting for
+        // them: the wait ends when the flag is raised, the frame half
+        // converged, and the session with it ([`SessionConfig::cancel`]).
+        let cancel = self.config.cancel.clone();
         let pumped = runtime.block_on(async {
-            tokio::time::timeout(
-                timeout,
-                converge(
-                    stream,
-                    scene,
-                    held,
-                    resident,
-                    grounds.as_mut(),
-                    &finisher,
-                    generation,
-                    &mut errors,
-                ),
-            )
-            .await
+            tokio::select! {
+                pumped = tokio::time::timeout(
+                    timeout,
+                    converge(
+                        stream,
+                        scene,
+                        held,
+                        resident,
+                        grounds.as_mut(),
+                        &finisher,
+                        generation,
+                        &mut errors,
+                    ),
+                ) => Some(pumped),
+                () = cancel.cancelled() => None,
+            }
         });
+        let Some(pumped) = pumped else {
+            return Err(FrameError::Cancelled);
+        };
         match pumped {
             Ok(Ok(())) => {}
             // The stream closing on us is normally "the server went away", and
