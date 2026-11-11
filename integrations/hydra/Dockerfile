@@ -24,6 +24,10 @@ FROM ${BASE}
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --default-toolchain stable --profile minimal
 ENV PATH=/root/.cargo/bin:$PATH
+# sccache, installed always and used only when the build is given a bucket and
+# a key (integrations/docker/sccache-env.sh): without them, nothing changes.
+COPY integrations/docker/sccache-install.sh integrations/docker/sccache-env.sh /usr/local/share/tuile/
+RUN sh /usr/local/share/tuile/sccache-install.sh
 
 WORKDIR /work
 
@@ -41,10 +45,21 @@ COPY crates ./crates
 COPY examples ./examples
 COPY integrations ./integrations
 
-RUN cmake -S integrations/hydra -B build \
+# The shared compilation cache, all optional (integrations/docker/sccache-env.sh):
+# the bucket by build arg, the key by BuildKit secret only. CMake's cargo step
+# inherits the wrapper from the environment.
+ARG SCCACHE_BUCKET
+ARG SCCACHE_REGION
+ARG SCCACHE_ENDPOINT
+ARG SCCACHE_PREFIX
+RUN --mount=type=secret,id=sccache_key_id \
+    --mount=type=secret,id=sccache_secret \
+    . /usr/local/share/tuile/sccache-env.sh \
+    && cmake -S integrations/hydra -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DTUILE_WORKSPACE_ROOT=/work \
         -DCMAKE_PREFIX_PATH=/opt/usd \
-    && cmake --build build -j "$(nproc)"
+    && cmake --build build -j "$(nproc)" \
+    && tuile_sccache_stop
 
 CMD ["/bin/bash"]

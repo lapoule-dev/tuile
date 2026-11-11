@@ -19,19 +19,33 @@ ARG DEBIAN=bookworm
 FROM rust:1-slim-${DEBIAN} AS build
 # The TLS provider (aws-lc) and zstd are C, built from source by their crates.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake pkg-config perl \
+        build-essential ca-certificates cmake curl pkg-config perl \
     && rm -rf /var/lib/apt/lists/*
+# sccache, installed always and used only when the build is given a bucket and
+# a key (integrations/docker/sccache-env.sh): without them, nothing changes.
+COPY integrations/docker/sccache-install.sh integrations/docker/sccache-env.sh /usr/local/share/tuile/
+RUN sh /usr/local/share/tuile/sccache-install.sh
 WORKDIR /src
 COPY . .
 # How many compilers at once: the builder's memory decides, not the recipe.
 ARG BAKE_BUILD_JOBS=4
+# The shared compilation cache, all optional (integrations/docker/sccache-env.sh):
+# the bucket by build arg, the key by BuildKit secret only.
+ARG SCCACHE_BUCKET
+ARG SCCACHE_REGION
+ARG SCCACHE_ENDPOINT
+ARG SCCACHE_PREFIX
 # The registry and the build directory stay with the builder between two
 # builds. The build directory has an id of its own: another image's, built on
 # another distribution, holds C objects this one must not link.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=secret,id=sccache_key_id \
+    --mount=type=secret,id=sccache_secret \
+    --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=tuile-bake-target,target=/src/target \
-    cargo build --release --locked -j ${BAKE_BUILD_JOBS} \
+    . /usr/local/share/tuile/sccache-env.sh \
+    && cargo build --release --locked -j ${BAKE_BUILD_JOBS} \
         -p tuile-bake -p tuile-farm --bin tuile-bake --bin tuile-migrate-packs \
+    && tuile_sccache_stop \
     && cp target/release/tuile-bake target/release/tuile-migrate-packs /usr/local/bin/ \
     && ldd /usr/local/bin/tuile-bake /usr/local/bin/tuile-migrate-packs
 

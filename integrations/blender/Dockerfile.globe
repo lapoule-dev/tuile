@@ -51,19 +51,37 @@ ARG BLENDER_SERIES=5.2
 
 # ----------------------------------------------------------------- rustlib --
 FROM rust:1-bookworm AS rustlib
+# sccache, installed always and used only when the build is given a bucket and
+# a key (integrations/docker/sccache-env.sh): without them, nothing changes.
+COPY integrations/docker/sccache-install.sh integrations/docker/sccache-env.sh /usr/local/share/tuile/
+RUN sh /usr/local/share/tuile/sccache-install.sh
+# The shared compilation cache, all optional (integrations/docker/sccache-env.sh):
+# the bucket by build arg, the key by BuildKit secret only.
+ARG SCCACHE_BUCKET
+ARG SCCACHE_REGION
+ARG SCCACHE_ENDPOINT
+ARG SCCACHE_PREFIX
 WORKDIR /src
 # The whole workspace manifest set: cargo refuses to parse a workspace with
 # absent members, and the members ARE the context (sources only, few MiB).
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY examples ./examples
-RUN cargo --version \
+RUN --mount=type=secret,id=sccache_key_id \
+    --mount=type=secret,id=sccache_secret \
+    . /usr/local/share/tuile/sccache-env.sh \
+    && cargo --version \
     && cargo build --release -p tuile-hydra \
+    && tuile_sccache_stop \
     && test -f target/release/libtuile_hydra.a
 # The trajectory generators and the manifest writer: a generative farm job
 # carries six numbers, not fourteen hundred baked camera matrices. Baked
 # samples remain the road for REAL recorded tracks (JOB_STAGE_URL).
-RUN cargo build --release -p tuile-tape -p tuile-usd --bins \
+RUN --mount=type=secret,id=sccache_key_id \
+    --mount=type=secret,id=sccache_secret \
+    . /usr/local/share/tuile/sccache-env.sh \
+    && cargo build --release -p tuile-tape -p tuile-usd --bins \
+    && tuile_sccache_stop \
     && for b in tuile-tape tuile-tape-to-usd-stage; do \
         test -x "target/release/$b" && strip "target/release/$b"; done
 # The bake, with its profiler compiled in.
@@ -75,13 +93,21 @@ RUN cargo build --release -p tuile-tape -p tuile-usd --bins \
 #
 # NOT stripped, and that is the point. Stripping is exactly what made a live
 # profile come back with every Rust frame as `???`.
-RUN cargo build --release -p tuile-bake --features profiling \
+RUN --mount=type=secret,id=sccache_key_id \
+    --mount=type=secret,id=sccache_secret \
+    . /usr/local/share/tuile/sccache-env.sh \
+    && cargo build --release -p tuile-bake --features profiling \
+    && tuile_sccache_stop \
     && test -x target/release/tuile-bake
 # Every byte the job moves: the pack in by parallel ranged reads, segments,
 # logs and the film out by multipart upload, the film assembled by whichever
 # task finishes last. Talks to the bucket with the job's own key — nothing is
 # presigned any more.
-RUN cargo build --release -p tuile-farm \
+RUN --mount=type=secret,id=sccache_key_id \
+    --mount=type=secret,id=sccache_secret \
+    . /usr/local/share/tuile/sccache-env.sh \
+    && cargo build --release -p tuile-farm \
+    && tuile_sccache_stop \
     && strip target/release/tuile-farm
 
 # ------------------------------------------------------------------ plugin --

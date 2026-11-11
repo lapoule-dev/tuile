@@ -56,6 +56,15 @@
 #   TUILE_GCP_REPO       Artifact Registry repository, default tuile
 #   TUILE_RUNPOD_CRED    name of the RunPod registry credential      (--runpod)
 #
+# The shared compilation cache, all optional (integrations/docker/sccache-env.sh);
+# with no bucket or no key the images compile as they always did:
+#
+#   TUILE_SCCACHE_BUCKET    S3 bucket of the sccache cache
+#   TUILE_SCCACHE_REGION    its region
+#   TUILE_SCCACHE_ENDPOINT  an S3-compatible endpoint, if not AWS
+#   TUILE_SCCACHE_KEY_ID    access key id     } handed to the build as BuildKit
+#   TUILE_SCCACHE_SECRET    secret access key } secrets, never as build args
+#
 set -euo pipefail
 
 # Fails with the variable's name and what it is for when it is unset.
@@ -242,6 +251,19 @@ for pair in ${TUILE_EXTRA_BUILD_ARGS:-}; do
     BUILD_ARGS+=(--build-arg "$pair")
     echo "   build-arg: $pair"
 done
+# The compilation cache: its bucket as build args, its key as secrets read by
+# buildx from this environment (the value never appears on a command line).
+if [ -n "${TUILE_SCCACHE_BUCKET:-}" ] && [ -n "${TUILE_SCCACHE_KEY_ID:-}" ] \
+    && [ -n "${TUILE_SCCACHE_SECRET:-}" ]; then
+    BUILD_ARGS+=(--build-arg "SCCACHE_BUCKET=${TUILE_SCCACHE_BUCKET}"
+        --secret "id=sccache_key_id,env=TUILE_SCCACHE_KEY_ID"
+        --secret "id=sccache_secret,env=TUILE_SCCACHE_SECRET")
+    [ -n "${TUILE_SCCACHE_REGION:-}" ] && BUILD_ARGS+=(--build-arg "SCCACHE_REGION=${TUILE_SCCACHE_REGION}")
+    [ -n "${TUILE_SCCACHE_ENDPOINT:-}" ] && BUILD_ARGS+=(--build-arg "SCCACHE_ENDPOINT=${TUILE_SCCACHE_ENDPOINT}")
+    echo "   sccache: s3://${TUILE_SCCACHE_BUCKET}"
+else
+    echo "   sccache: off (TUILE_SCCACHE_BUCKET / _KEY_ID / _SECRET not all set)"
+fi
 docker buildx build --builder "$BUILDER" --platform linux/amd64 \
     -f "$DOCKERFILE" "${TAGS[@]}" "${BUILD_ARGS[@]}" \
     --push "$CONTEXT"
