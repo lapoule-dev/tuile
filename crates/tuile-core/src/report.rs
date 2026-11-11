@@ -207,6 +207,7 @@ mod tests {
         };
         let content = DecodedTileContent {
             shed: Vec::new(),
+            apart: None,
             withheld_drape: None,
             copyright: None,
             meshes: vec![mesh],

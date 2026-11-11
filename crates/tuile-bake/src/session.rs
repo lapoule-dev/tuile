@@ -2184,6 +2184,7 @@ pub(crate) mod tests {
                 origin_ecef: DVec3::ZERO,
                 content: DecodedTileContent {
                     shed: Vec::new(),
+                    apart: None,
                     withheld_drape: None,
                     copyright: None,
                     meshes: Vec::new(),
@@ -2490,6 +2491,7 @@ pub(crate) mod tests {
         let uvs = uvs_geographic(&positions, origin, &rect);
         DecodedTileContent {
             shed: Vec::new(),
+            apart: None,
             withheld_drape: None,
             copyright: None,
             meshes: vec![DecodedMesh {
@@ -2542,6 +2544,7 @@ pub(crate) mod tests {
         let uvs = uvs_geographic(&positions, origin, &rect);
         let decoded = DecodedTileContent {
             shed: Vec::new(),
+            apart: None,
             withheld_drape: None,
             copyright: None,
             meshes: vec![DecodedMesh {

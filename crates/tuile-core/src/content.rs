@@ -101,6 +101,14 @@ pub struct DecodedTileContent {
     /// function of those charges, and a consumer that holds less must not
     /// select differently because of it.
     pub shed: Vec<ShedMesh>,
+    /// What the loader kept apart from the meshes for a consumer in its own
+    /// process that knows what to make of it — a terrain tile's skirts, for
+    /// a bake that keeps them as the few numbers they hang from rather than
+    /// as walls (`tuile_terrain::Skirts`). `None` for everything else, and
+    /// never sent over a wire. Opaque here: the core neither reads nor
+    /// charges it; a consumer that takes it charges the meshes it stands
+    /// for itself ([`Self::shed`]).
+    pub apart: Option<Apart>,
     /// The drape this tile would have carried, when its layers were
     /// deliberately **not** fetched because the consumer already holds the
     /// composed result.
@@ -126,6 +134,28 @@ pub struct DecodedTileContent {
     /// Residual transform to apply at render time (identity: everything is
     /// baked into the positions; kept for future non-baking strategies).
     pub transform_local: Mat4,
+}
+
+/// Something a loader kept apart from a content's meshes, for a consumer
+/// that knows its type ([`DecodedTileContent::apart`]).
+#[derive(Clone)]
+pub struct Apart(pub std::sync::Arc<dyn std::any::Any + Send + Sync>);
+
+impl Apart {
+    pub fn new<T: std::any::Any + Send + Sync>(value: T) -> Self {
+        Self(std::sync::Arc::new(value))
+    }
+
+    /// What was kept apart, if it is a `T`.
+    pub fn get<T: std::any::Any>(&self) -> Option<&T> {
+        self.0.downcast_ref()
+    }
+}
+
+impl std::fmt::Debug for Apart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Apart(..)")
+    }
 }
 
 /// A mesh let go before its content was handed over: what it was, without
@@ -598,6 +628,7 @@ fn decode_glb(
 
     Ok(DecodedTileContent {
         shed: Vec::new(),
+        apart: None,
         withheld_drape: None,
         copyright,
         meshes,
@@ -1062,6 +1093,7 @@ pub(crate) mod tests {
             textures,
             imagery: Vec::new(),
             shed: Vec::new(),
+            apart: None,
             withheld_drape: None,
             copyright: None,
             local_origin_ecef: DVec3::ZERO,

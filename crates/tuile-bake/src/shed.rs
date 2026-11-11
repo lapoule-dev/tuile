@@ -63,18 +63,32 @@ impl KeptTile {
         }
     }
 
-    /// [`Self::of`], from a mesh that is let go: the mesh as it came is
-    /// moved, not copied.
-    fn of_owned(tile: TileId, origin: glam::DVec3, mesh: DecodedMesh, as_it_came: bool) -> Self {
-        let kept = Arc::new(Kept::of(tile, origin, &mesh));
+    /// [`Self::of`], from a mesh that is let go, its `skirts` apart when
+    /// they came apart: the mesh as it came is moved, not copied, and its
+    /// skirts hung back on it.
+    fn of_owned(
+        tile: TileId,
+        origin: glam::DVec3,
+        mesh: DecodedMesh,
+        skirts: Option<&tuile_terrain::Skirts>,
+        as_it_came: bool,
+    ) -> Self {
+        let kept = Arc::new(match skirts {
+            Some(skirts) => Kept::of_apart(tile, origin, &mesh, skirts),
+            None => Kept::of(tile, origin, &mesh),
+        });
         Self {
             kept,
             as_it_came: as_it_came.then(|| {
-                Arc::new(DecodedMesh {
+                let mut mesh = DecodedMesh {
                     normals: None,
                     material: Default::default(),
                     ..mesh
-                })
+                };
+                if let Some(skirts) = skirts {
+                    skirts.hang_on(origin, &mut mesh);
+                }
+                Arc::new(mesh)
             }),
         }
     }
@@ -145,11 +159,20 @@ impl Shedding {
         let (done, result) = tokio::sync::oneshot::channel();
         crate::session::finish_pool().spawn(move || {
             let origin = content.local_origin_ecef;
+            // Skirts that came apart from the surface: counted as the walls
+            // they would have been, and kept as what they hang from.
+            let apart = content.apart.take();
+            let skirts = apart.as_ref().and_then(|a| a.get::<tuile_terrain::Skirts>());
             let mut let_go = content.shed_meshes().into_iter();
+            if let (Some(skirts), Some(first)) = (skirts, content.shed.first_mut()) {
+                let (vertices, indices) = skirts.counts();
+                first.vertex_count += vertices as u32;
+                first.index_count += indices as u32;
+            }
             let kept = let_go
                 .next()
                 .filter(|_| keep)
-                .map(|first| KeptTile::of_owned(tile, origin, first, meshes));
+                .map(|first| KeptTile::of_owned(tile, origin, first, skirts, meshes));
             drop(let_go);
             let _ = done.send((content, kept));
         });
@@ -238,6 +261,28 @@ mod tests {
     struct Relief;
 
     fn relief() -> DecodedTileContent {
+        let (mesh, rect) = quantized();
+        let mut content = to_ground(&mesh, &rect);
+        content.meshes[0].material = MaterialDesc {
+            base_color_factor: [0.3, 0.4, 0.2, 1.0],
+            ..MaterialDesc::default()
+        };
+        content
+    }
+
+    /// [`relief`], its skirts apart, as a bake's globe hands it over.
+    fn relief_apart() -> DecodedTileContent {
+        let (mesh, rect) = quantized();
+        let (mut content, skirts) = tuile_terrain::to_ground_apart(&mesh, &rect, false);
+        content.apart = Some(tuile_core::content::Apart::new(skirts));
+        content.meshes[0].material = MaterialDesc {
+            base_color_factor: [0.3, 0.4, 0.2, 1.0],
+            ..MaterialDesc::default()
+        };
+        content
+    }
+
+    fn quantized() -> (QuantizedMesh, tuile_terrain::GeoRect) {
         let coord = TileCoord::new(14, 16253, 12320);
         let rect = GeographicTilingScheme::default().tile_rect(coord);
         let n = 17usize;
@@ -289,12 +334,16 @@ mod tests {
             metadata_available: None,
             cut: 0,
         };
-        let mut content = to_ground(&mesh, &rect);
-        content.meshes[0].material = MaterialDesc {
-            base_color_factor: [0.3, 0.4, 0.2, 1.0],
-            ..MaterialDesc::default()
-        };
-        content
+        (mesh, rect)
+    }
+
+    struct ReliefApart;
+
+    #[async_trait]
+    impl TileLoader for ReliefApart {
+        async fn load(&self, _id: TileId) -> Result<Loaded, LoadError> {
+            Ok(Loaded::Content(relief_apart()))
+        }
     }
 
     #[async_trait]
@@ -375,5 +424,33 @@ mod tests {
         };
         assert!(shed.meshes.is_empty());
         assert_eq!(shedding.waiting(), 0);
+    }
+
+    /// A tile whose skirts came apart from its surface is shed as the whole
+    /// tile: charged and counted with its walls, its ground kept so that it
+    /// comes back with them, bit for bit, as it came whole.
+    #[test]
+    fn a_tile_whose_skirts_came_apart_is_shed_as_the_whole_tile() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let (whole, apart) = (Shedding::new(Arc::new(Relief)), Shedding::new(Arc::new(ReliefApart)));
+        whole.keep_ground(true);
+        apart.keep_ground(true);
+        let shed = |s: &Shedding| match runtime.block_on(s.load(tile())) {
+            Ok(Loaded::Content(content)) => content,
+            _ => unreachable!("the relief loads"),
+        };
+        let (from_whole, from_apart) = (shed(&whole), shed(&apart));
+        assert!(from_apart.apart.is_none(), "taken, not passed on");
+        assert_eq!(from_apart.shed, from_whole.shed, "the same counts");
+        assert_eq!(from_apart.cost(), from_whole.cost(), "the same charge");
+        let came = relief();
+        let (kept_whole, kept_apart) = (whole.take(tile()).expect("kept"), apart.take(tile()).expect("kept"));
+        assert_eq!(bits(&kept_apart.kept.mesh(tile())), bits(&came.meshes[0]));
+        assert_eq!(bits(&kept_whole.kept.mesh(tile())), bits(&came.meshes[0]));
+        assert!(kept_apart.kept.heap_bytes() < kept_whole.kept.heap_bytes());
+        assert_eq!(
+            bits(kept_apart.as_it_came.as_deref().expect("as it came")),
+            bits(&came.meshes[0])
+        );
     }
 }

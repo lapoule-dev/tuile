@@ -194,6 +194,7 @@ pub fn dress_named(
             .map(|m| crate::content::ShedMesh::of(m, mesh.local_origin_ecef))
             .chain(mesh.shed.iter().copied())
             .collect(),
+        apart: mesh.apart.clone(),
         withheld_drape: mesh.withheld_drape,
         copyright: mesh.copyright.clone(),
         local_origin_ecef: mesh.local_origin_ecef,
@@ -378,6 +379,7 @@ mod tests {
             textures: Vec::new(),
             imagery: Vec::new(),
             shed: Vec::new(),
+            apart: None,
             withheld_drape: None,
             copyright: None,
             local_origin_ecef: glam::DVec3::ZERO,
@@ -573,6 +575,7 @@ mod tests {
             textures: Vec::new(),
             imagery: Vec::new(),
             shed: Vec::new(),
+            apart: None,
             withheld_drape: None,
             copyright: None,
             local_origin_ecef: glam::DVec3::new(1.0e6, 2.0e6, 3.0e6),

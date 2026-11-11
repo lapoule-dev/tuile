@@ -2146,6 +2146,7 @@ mod tests {
         };
         let mut content = DecodedTileContent {
             shed: Vec::new(),
+            apart: None,
             withheld_drape: None,
             copyright: None,
             meshes: vec![DecodedMesh {
@@ -3036,6 +3037,7 @@ mod tests {
         let uvs = uvs_geographic(&positions, origin, &rect);
         let mut content = DecodedTileContent {
             shed: Vec::new(),
+            apart: None,
             withheld_drape: None,
             copyright: None,
             meshes: vec![DecodedMesh {

@@ -1182,6 +1182,7 @@ mod tests {
         async fn load(&self, _id: TileId) -> Result<Loaded, LoadError> {
             Ok(Loaded::Content(DecodedTileContent {
                 shed: Vec::new(),
+                apart: None,
                 withheld_drape: None,
                 copyright: None,
                 meshes: Vec::new(),

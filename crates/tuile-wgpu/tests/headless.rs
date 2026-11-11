@@ -32,6 +32,7 @@ fn gpu() -> Option<GpuContext> {
 fn quad_content(origin: DVec3) -> DecodedTileContent {
     DecodedTileContent {
         shed: Vec::new(),
+        apart: None,
         withheld_drape: None,
         copyright: None,
         meshes: vec![DecodedMesh {
@@ -726,6 +727,7 @@ fn a_coarse_tableland_seen_from_orbit_through_the_air_shows_none_of_its_facets()
     }
     let content = DecodedTileContent {
         shed: Vec::new(),
+        apart: None,
         withheld_drape: None,
         copyright: None,
         meshes: vec![DecodedMesh {

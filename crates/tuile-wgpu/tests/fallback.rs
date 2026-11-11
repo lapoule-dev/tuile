@@ -38,6 +38,7 @@ use tuile_wgpu::ContentPump;
 fn surface() -> DecodedTileContent {
     DecodedTileContent {
         shed: Vec::new(),
+        apart: None,
         withheld_drape: None,
         copyright: None,
         meshes: vec![DecodedMesh {

@@ -676,6 +676,9 @@ impl Writer {
             textures,
             imagery,
             shed,
+            // What a loader kept apart for a consumer in its own process:
+            // never sent.
+            apart: _,
             withheld_drape,
             copyright,
             local_origin_ecef,
@@ -1095,6 +1098,7 @@ impl<'a> Reader<'a> {
             textures,
             imagery,
             shed,
+            apart: None,
             withheld_drape: self.option_u64()?,
             copyright: match self.u8()? {
                 0 => None,
@@ -1151,6 +1155,7 @@ mod tests {
                 uvs: true,
                 steepest: Some(0.875),
             }],
+            apart: None,
             withheld_drape: Some(u64::MAX - 1),
             copyright: Some(Arc::from("Data © someone; Imagery © someone else")),
             // The anti-jitter origin: every bit of the f64 must survive.
