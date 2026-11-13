@@ -27,7 +27,7 @@ use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use futures_util::future::{BoxFuture, FutureExt, Shared};
+use futures_util::future::{BoxFuture, FutureExt, Shared, WeakShared};
 use object_store::ObjectStore;
 
 use crate::archive::{self, LocalReader};
@@ -102,7 +102,14 @@ impl DiskCacheConfig {
 pub(crate) struct ArchiveCache {
     pub(crate) cfg: DiskCacheConfig,
     readers: Mutex<Lru<String, Arc<LocalReader>>>,
-    inflight: Mutex<HashMap<String, ArchiveCopy>>,
+    /// The copies in flight, held weakly: a copy lives as long as its task
+    /// or a reader awaiting it, never because it is listed here. Held
+    /// strongly, a copy whose task ended with its runtime — a bake's —
+    /// stayed here unpolled and counted as a small copy for ever, and every
+    /// large copy waited on it ([`InFlight`]).
+    inflight: Mutex<HashMap<String, Listed>>,
+    /// Numbers the copies, so that one ending takes its own entry only.
+    copies: std::sync::atomic::AtomicU64,
     /// The number of downloads in flight, so a caller can wait for quiet.
     pending: tokio::sync::watch::Sender<usize>,
     permits: Arc<tokio::sync::Semaphore>,
@@ -129,6 +136,39 @@ impl Drop for SmallCopy<'_> {
 
 /// A copy in flight: resolves to whether the archive is now local.
 pub(crate) type ArchiveCopy = Shared<BoxFuture<'static, bool>>;
+
+/// A copy as the table of copies in flight lists it: its number, and a
+/// handle that does not keep it alive.
+type Listed = (u64, WeakShared<BoxFuture<'static, bool>>);
+
+/// A copy counted in flight for as long as its future lives: dropped when the
+/// copy ends, and when it is abandoned unfinished (its task dropped with its
+/// runtime, no reader awaiting it), so that it is then neither counted
+/// ([`ArchiveCache::pending`]) nor listed — the archive can be asked for again.
+struct InFlight {
+    cache: std::sync::Weak<ArchiveCache>,
+    key: String,
+    id: u64,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let Some(cache) = self.cache.upgrade() else {
+            return;
+        };
+        if let Ok(mut inflight) = cache.inflight.lock() {
+            // Only this copy's entry: a newer copy of the key, started once
+            // this one could no longer be reached, stays.
+            if inflight
+                .get(&self.key)
+                .is_some_and(|(id, _)| *id == self.id)
+            {
+                inflight.remove(&self.key);
+            }
+        }
+        cache.pending.send_modify(|n| *n = n.saturating_sub(1));
+    }
+}
 
 /// Is this archive key a plain relative path, safe to join under the cache
 /// directory?
@@ -201,6 +241,7 @@ impl ArchiveCache {
             cfg,
             readers: Mutex::new(lru),
             inflight: Mutex::default(),
+            copies: std::sync::atomic::AtomicU64::new(0),
             pending,
             small,
         }))
@@ -238,29 +279,39 @@ impl ArchiveCache {
         }
         let runtime = tokio::runtime::Handle::try_current().ok()?;
         let mut inflight = self.inflight.lock().ok()?;
-        if let Some(c) = inflight.get(key) {
-            return Some((c.clone(), false));
+        if let Some(c) = inflight.get(key).and_then(|(_, w)| w.upgrade()) {
+            return Some((c, false));
         }
         self.pending.send_modify(|n| *n += 1);
+        // Counted until the copy's future is dropped, finished or not.
+        let id = self
+            .copies
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let flight = InFlight {
+            cache: Arc::downgrade(self),
+            key: key.to_string(),
+            id,
+        };
         let this = self.clone();
         let k = key.to_string();
         let copy = async move {
-            let ok = match this.fetch(objects.as_ref(), &k, bytes).await {
+            let _flight = flight;
+            match this.fetch(objects.as_ref(), &k, bytes).await {
                 Ok(_) => true,
                 Err(e) => {
                     tracing::debug!(key = k, error = %e, "archive copy failed; reads stay remote");
                     false
                 }
-            };
-            if let Ok(mut inflight) = this.inflight.lock() {
-                inflight.remove(&k);
             }
-            this.pending.send_modify(|n| *n = n.saturating_sub(1));
-            ok
         }
         .boxed()
         .shared();
-        inflight.insert(key.to_string(), copy.clone());
+        // A future not yet polled always has a weak handle.
+        if let Some(weak) = copy.downgrade() {
+            inflight.insert(key.to_string(), (id, weak));
+        }
+        // Released before anything can drop the copy: its end takes the lock.
+        drop(inflight);
         runtime.spawn(copy.clone());
         Some((copy, true))
     }
@@ -377,6 +428,204 @@ impl ArchiveCache {
 #[cfg(test)]
 mod tests {
     use super::safe_relative;
+
+    mod orphaned {
+        use std::fmt;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+        use futures_util::stream::BoxStream;
+        use object_store::memory::InMemory;
+        use object_store::path::Path;
+        use object_store::{
+            CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+            ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+            Result,
+        };
+
+        use super::super::{ArchiveCache, DiskCacheConfig, LARGE_ARCHIVE_BYTES};
+
+        /// An origin whose `small` archive never finishes coming down: a
+        /// copy of it is in flight for as long as it lives.
+        #[derive(Debug, Default)]
+        struct Stuck {
+            inner: InMemory,
+        }
+
+        const SMALL: &str = "asset-2/zones/z10/1/2/small.pmtiles";
+        const LARGE: &str = "asset-2/zones/top/large.pmtiles";
+
+        impl fmt::Display for Stuck {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "Stuck")
+            }
+        }
+
+        #[async_trait]
+        impl ObjectStore for Stuck {
+            async fn put_opts(&self, l: &Path, p: PutPayload, o: PutOptions) -> Result<PutResult> {
+                self.inner.put_opts(l, p, o).await
+            }
+            async fn put_multipart_opts(
+                &self,
+                l: &Path,
+                o: PutMultipartOptions,
+            ) -> Result<Box<dyn MultipartUpload>> {
+                self.inner.put_multipart_opts(l, o).await
+            }
+            async fn get_opts(&self, l: &Path, o: GetOptions) -> Result<GetResult> {
+                if l.as_ref() == SMALL {
+                    std::future::pending::<()>().await;
+                }
+                self.inner.get_opts(l, o).await
+            }
+            fn delete_stream(
+                &self,
+                l: BoxStream<'static, Result<Path>>,
+            ) -> BoxStream<'static, Result<Path>> {
+                self.inner.delete_stream(l)
+            }
+            fn list(&self, p: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+                self.inner.list(p)
+            }
+            async fn list_with_delimiter(&self, p: Option<&Path>) -> Result<ListResult> {
+                self.inner.list_with_delimiter(p).await
+            }
+            async fn copy_opts(&self, f: &Path, t: &Path, o: CopyOptions) -> Result<()> {
+                self.inner.copy_opts(f, t, o).await
+            }
+        }
+
+        /// The bug of 13 November 2026 (videos 220 and 221): a small copy
+        /// started on a bake's runtime, the bake ended and its runtime with
+        /// it, and the copy's future stayed in the table of copies in
+        /// flight, unpolled, counted as a small copy forever. Every large
+        /// copy waits for the small ones to be done: the next bake of the
+        /// process that read a large archive (a film's first or last chunk,
+        /// its coarse `top` zone) waited on it for ever, at no CPU.
+        ///
+        /// A copy whose runtime ended is abandoned whole: it no longer
+        /// counts, and the archive can be asked for again.
+        #[test]
+        fn a_copy_whose_runtime_ended_holds_up_no_other() {
+            let dir = tempfile::tempdir().expect("a directory");
+            let origin: Arc<dyn ObjectStore> = Arc::new(Stuck::default());
+            let large_bytes = LARGE_ARCHIVE_BYTES + 1;
+
+            // The bake's runtime: it starts the small copy, which gets as
+            // far as its download, then ends.
+            let bake = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            let cache = bake
+                .block_on(ArchiveCache::open(DiskCacheConfig::new(dir.path())))
+                .expect("the cache");
+            bake.block_on(async {
+                let (_copy, started) = cache.copy(origin.clone(), SMALL, 1024).expect("a copy");
+                assert!(started, "this call started it");
+                // Long enough for the copy to reach its download.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            });
+            drop(bake);
+
+            // Another runtime, as the next bake or the tile store's flush:
+            // a large copy is not held up by the abandoned small one.
+            let next = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            next.block_on(async {
+                origin
+                    .put(&Path::from(LARGE), vec![0u8; 64].into())
+                    .await
+                    .expect("put");
+                let fetched = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    cache.fetch(origin.as_ref(), LARGE, large_bytes),
+                )
+                .await;
+                // Not a valid archive, so an error: what matters is that it
+                // answered at all.
+                assert!(
+                    fetched.is_ok(),
+                    "a large copy waited on a small one abandoned with its runtime"
+                );
+                // And the small archive can be asked for again: a new copy,
+                // not the dead one.
+                let (_again, started) = cache.copy(origin.clone(), SMALL, 1024).expect("a copy");
+                assert!(started, "the abandoned copy is no longer in flight");
+            });
+        }
+
+        /// The other half of the same bug: an abandoned copy also held one of
+        /// the permits small copies download under, for ever. With all of
+        /// them held, the small copies readers wait on (a zone's first read,
+        /// the tile store's flush) never started.
+        #[test]
+        fn a_copy_whose_runtime_ended_holds_no_download_permit() {
+            let dir = tempfile::tempdir().expect("a directory");
+            let origin: Arc<dyn ObjectStore> = Arc::new(Stuck::default());
+            let mut cfg = DiskCacheConfig::new(dir.path());
+            cfg.downloads_in_flight = 1;
+            let bake = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            let cache = bake.block_on(ArchiveCache::open(cfg)).expect("the cache");
+            bake.block_on(async {
+                let _ = cache.copy(origin.clone(), SMALL, 1024).expect("a copy");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            });
+            drop(bake);
+
+            let next = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            next.block_on(async {
+                let other = "asset-2/zones/z10/5/6/other.pmtiles";
+                origin
+                    .put(&Path::from(other), vec![0u8; 64].into())
+                    .await
+                    .expect("put");
+                let (copy, _) = cache.copy(origin.clone(), other, 64).expect("a copy");
+                let done = tokio::time::timeout(Duration::from_secs(5), copy).await;
+                assert!(
+                    done.is_ok(),
+                    "a small copy waited for a permit an abandoned copy held"
+                );
+            });
+        }
+
+        /// A copy that ends leaves the table and the count, however many
+        /// readers still hold it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+        async fn a_finished_copy_is_no_longer_in_flight() {
+            let dir = tempfile::tempdir().expect("a directory");
+            let origin: Arc<dyn ObjectStore> = Arc::new(Stuck::default());
+            let key = "asset-2/zones/z10/3/4/gone.pmtiles";
+            let cache = ArchiveCache::open(DiskCacheConfig::new(dir.path()))
+                .await
+                .expect("the cache");
+            // Not in the origin: the copy ends at once, unsuccessful.
+            let (copy, started) = cache.copy(origin.clone(), key, 1024).expect("a copy");
+            assert!(started);
+            assert!(!copy.clone().await, "nothing to copy");
+            assert!(
+                cache.inflight.lock().unwrap().is_empty(),
+                "its entry is gone though a reader holds it"
+            );
+            assert_eq!(*cache.pending.borrow(), 0, "and it is no longer counted");
+            let (_again, started) = cache.copy(origin.clone(), key, 1024).expect("a copy");
+            assert!(started, "asked again, it is copied again");
+        }
+    }
 
     #[test]
     fn only_plain_relative_keys_land_on_disk() {
