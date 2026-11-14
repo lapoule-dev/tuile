@@ -14,10 +14,10 @@
 //! So [`settle_each`] runs them as three stages: the session converges
 //! frame after frame on the calling thread; each selection, frozen
 //! ([`crate::Selected`]), goes to a thread that builds the grounds in order
-//! (its tiles on every core); each ground is read on the rayon pool while
-//! the next is built and the one after converges. What it hands back is
-//! what settling, building and reading each frame in turn hands back, bit
-//! for bit: the same views converged in the same order, each ground a
+//! (its tiles on every core); each ground goes to a reader thread of its own
+//! and is read there while the next is built and the one after converges.
+//! What it hands back is what settling, building and reading each frame in
+//! turn hands back, bit for bit: the same views converged in the same order, each ground a
 //! function of its selection, each reading a function of its ground.
 //!
 //! # Bounded
@@ -44,8 +44,18 @@
 //! let them go: so only the frames the caller says it keeps
 //! ([`settle_each`]'s `keep`) are handed back with theirs; the others' are
 //! let go as soon as their ground is read.
+//!
+//! # Pushed, never polled
+//!
+//! Nothing here waits by looking again. The grounds go to their reading
+//! down a channel, to one thread that blocks on it while there is none —
+//! not as tasks of the rayon pool, whose idle threads spin for the one job
+//! at a time a single ground out gives them. The reading that ends gives its
+//! ground back and wakes the builder ([`Out`]'s condition variable), which
+//! sleeps until then: no timeout, no yield, no sleep in a loop. A reading
+//! is free to use the pool itself; what it runs there is its own work.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use tuile_core::traversal::ViewStateParams;
@@ -58,9 +68,9 @@ use crate::session::{FrameError, Session};
 /// of tiles held frozen at once beyond the one being built.
 const LEAD: usize = 4;
 
-/// How many grounds may be built and not read yet, at most, at once: those
-/// read on the pool and those waiting for a thread of it. A builder that
-/// has this many out waits for one to be read before it builds the next.
+/// How many grounds may be built and not read yet, at most, at once: the
+/// one being read and those queued for the reader. A builder that has this
+/// many out waits for one to be read before it builds the next.
 ///
 /// One. A 4K frame's ground weighs two gigabytes; eight out at once was a
 /// farm worker killed for memory, and the bytes bound below caught it only
@@ -83,16 +93,16 @@ pub const READING_MIB: usize = 1536;
 /// while there are [`READING`] of them or they weigh [`reading_bytes`].
 struct Out {
     /// How many grounds are out, and what they weigh.
-    out: std::sync::Mutex<(usize, usize)>,
-    read: std::sync::Condvar,
+    out: Mutex<(usize, usize)>,
+    read: Condvar,
     budget: usize,
 }
 
 impl Default for Out {
     fn default() -> Self {
         Self {
-            out: std::sync::Mutex::new((0, 0)),
-            read: std::sync::Condvar::new(),
+            out: Mutex::new((0, 0)),
+            read: Condvar::new(),
             budget: reading_bytes(),
         }
     }
@@ -100,30 +110,19 @@ impl Default for Out {
 
 impl Out {
     /// Waits until fewer than [`READING`] grounds are out and they weigh
-    /// less than the budget — or none is out — then counts one more. On a
-    /// thread of the pool, it reads what is queued meanwhile rather than
-    /// block the readings it waits for.
+    /// less than the budget — or none is out — then counts one more. It
+    /// sleeps until a reading gives its ground back ([`Out::give`]): the
+    /// readings run on their own thread ([`reading_beside`]), never on the
+    /// one that waits for them, so blocking here holds none of them up.
     fn take(&self) {
-        loop {
-            {
-                let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
-                let (count, bytes) = *out;
-                if count == 0 || (count < READING && bytes < self.budget) {
-                    out.0 += 1;
-                    return;
-                }
-                if rayon::current_thread_index().is_none() {
-                    let _ = self
-                        .read
-                        .wait_timeout(out, Duration::from_millis(50))
-                        .unwrap_or_else(|e| e.into_inner());
-                    continue;
-                }
-            }
-            if rayon::yield_now() != Some(rayon::Yield::Executed) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
+        let out = self.out.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = self
+            .read
+            .wait_while(out, |&mut (count, bytes)| {
+                count != 0 && (count >= READING || bytes >= self.budget)
+            })
+            .unwrap_or_else(|e| e.into_inner());
+        out.0 += 1;
     }
 
     /// The ground just taken out weighs `bytes`.
@@ -138,6 +137,35 @@ impl Out {
         out.1 -= bytes;
         self.read.notify_one();
     }
+}
+
+/// A ground's reading, run on the reader thread.
+type Reading<'a> = Box<dyn FnOnce() + Send + 'a>;
+
+/// Runs `body` with a queue of readings that one thread of its own — not
+/// the rayon pool's — runs in the order queued, blocked on the queue while
+/// it is empty; returns once `body` has and every reading queued is run. A
+/// reading that panics stops the reader: what `body` queues after that is
+/// dropped unread (the sending fails, and `body` stops on it), and the
+/// panic goes on up from here once `body` is done.
+fn reading_beside<'a, O>(body: impl FnOnce(&mpsc::Sender<Reading<'a>>) -> O) -> O {
+    std::thread::scope(|scope| {
+        let (readings, queued) = mpsc::channel::<Reading<'a>>();
+        let reader = std::thread::Builder::new()
+            .name("tuile-ground-reader".to_string())
+            .spawn_scoped(scope, move || {
+                for reading in queued {
+                    reading();
+                }
+            })
+            .expect("a thread to read the grounds on");
+        let done = body(&readings);
+        drop(readings);
+        if let Err(panic) = reader.join() {
+            std::panic::resume_unwind(panic);
+        }
+        done
+    })
 }
 
 /// A ground out for reading, given back to [`Out`] however its reading
@@ -288,7 +316,7 @@ where
     let failed = std::thread::scope(|scope| {
         let (frozen, thawed) = std::sync::mpsc::sync_channel::<Frozen>(LEAD);
         let builder = scope.spawn(move || {
-            rayon::in_place_scope(|reads| {
+            reading_beside(|reads| {
                 for (index, number, selection, selected, converged_in) in thawed {
                     out_ref.take();
                     let mut lent = Lent(out_ref, 0);
@@ -297,7 +325,7 @@ where
                     let built_in = started.elapsed();
                     lent.weighs(drawer.built());
                     let unread = Unread::new(drawer.built());
-                    reads.spawn(move |_| {
+                    let reading: Reading<'_> = Box::new(move || {
                         let _lent = lent;
                         let _unread = unread;
                         let started = Instant::now();
@@ -323,6 +351,10 @@ where
                             ));
                         }
                     });
+                    // The reader is gone, panicked: nothing more to read.
+                    if reads.send(reading).is_err() {
+                        break;
+                    }
                 }
             });
         });
@@ -384,10 +416,10 @@ type Timed<T> = (T, Duration, Duration);
 
 /// The grounds of frames settled before, built again from their frozen
 /// selections ([`Settled::selected`]) in their order by `drawer` — their
-/// tiles on every core — and each `read` on the rayon pool while the next
-/// is built: what [`settle_each`] read them as, bit for bit, for a caller
-/// that kept the selections rather than the grounds. Back in the order
-/// given, with how long each took to build and to read; a ground lives as
+/// tiles on every core — and each `read` on a reader thread of its own
+/// while the next is built: what [`settle_each`] read them as, bit for
+/// bit, for a caller that kept the selections rather than the grounds.
+/// Back in the order given, with how long each took to build and to read; a ground lives as
 /// long as its reading keeps it, and at most [`READING`] are built and not
 /// read at once — fewer when they weigh [`reading_bytes`].
 pub fn read_each<T, R>(
@@ -406,7 +438,7 @@ where
     let out_ref = &out;
     let lending = Out::default();
     let lending = &lending;
-    rayon::in_place_scope(|reads| {
+    reading_beside(|reads| {
         for (index, (number, selected)) in frames.iter().enumerate() {
             lending.take();
             let mut lent = Lent(lending, 0);
@@ -416,7 +448,7 @@ where
             lent.weighs(drawer.built());
             let number = *number;
             let unread = Unread::new(drawer.built());
-            reads.spawn(move |_| {
+            let reading: Reading<'_> = Box::new(move || {
                 let _lent = lent;
                 let _unread = unread;
                 let started = Instant::now();
@@ -426,9 +458,41 @@ where
                     out.push((index, (value, built_in, read_in)));
                 }
             });
+            // The reader is gone, panicked: nothing more to read.
+            if reads.send(reading).is_err() {
+                break;
+            }
         }
     });
     let mut out = out.into_inner().unwrap_or_else(|e| e.into_inner());
     out.sort_unstable_by_key(|(index, _)| *index);
     out.into_iter().map(|(_, v)| v).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The builder sleeps on the condition variable until the reading gives
+    /// its ground back, and wakes on that alone.
+    #[test]
+    fn a_builder_waiting_is_woken_by_the_reading_that_ends() {
+        let out = Out::default();
+        out.take();
+        let woken = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                out.take();
+                woken.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !woken.load(std::sync::atomic::Ordering::SeqCst),
+                "a builder let through while a ground is out"
+            );
+            out.give(0);
+            waiting.join().expect("woken");
+        });
+        assert!(woken.load(std::sync::atomic::Ordering::SeqCst));
+    }
 }
