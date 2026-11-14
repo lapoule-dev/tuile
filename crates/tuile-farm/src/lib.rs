@@ -24,6 +24,7 @@ pub mod job;
 pub mod jobs;
 pub mod launch;
 pub mod produce;
+pub mod progress;
 
 /// What went wrong, in terms a job script can act on.
 #[derive(Debug, thiserror::Error)]

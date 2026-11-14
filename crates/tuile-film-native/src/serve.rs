@@ -51,6 +51,15 @@
 //! `encode`) are entered once, on the thread that does the work, for the
 //! whole of it: a host that tags a thread's CPU samples from its spans tags
 //! a segment's CPU by its step.
+//!
+//! A request that asks for it (`Accept: application/x-ndjson`) is answered
+//! in lines while it works ([`tuile_farm::progress`]): a line whenever the
+//! work has moved on — a step begun, a frame drawn or taken by the encoder,
+//! bytes fetched or put — and only then, a wait for the pack or the card
+//! said as one; then the answer a plain request gets, or why there is none.
+//! A piece of work that has stopped moving goes silent, and its asker can
+//! tell it from one that takes its time. Any other request is answered as
+//! it always was, once the work is done.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,12 +68,14 @@ use std::time::{Duration, Instant};
 use serde::de::DeserializeOwned;
 use tracing::field::Empty;
 use tracing::Instrument;
+use tuile_farm::progress::{asks_for_lines, said, Cadence, Line, NDJSON};
 use tuile_farm::{ObjectRunStore, RunStore};
 use tuile_film::Overlays;
 
 use crate::engine::RenderSpec;
 use crate::extract::{local_key, ExtractRef, Fetched};
 use crate::observe::Timings;
+use crate::progress::{Drawn, Progress, Step, Taken};
 use crate::render::render;
 use crate::setup::{film_sink, placed_sun};
 use crate::source::{Film, Sources};
@@ -279,6 +290,8 @@ pub struct Service<F: OverlayFactory = NoOverlays> {
     /// Where generations of caches are opened.
     pub cache: PathBuf,
     pub limits: Limits,
+    /// How often a request answered in lines is told of its progress.
+    pub cadence: Cadence,
     kept: tokio::sync::Mutex<Option<Arc<Generation>>>,
     /// Renders at once on this instance.
     renders: tokio::sync::Semaphore,
@@ -372,6 +385,7 @@ impl<F: OverlayFactory> Service<F> {
             tiles,
             cache,
             limits,
+            cadence: Cadence::default(),
             kept: tokio::sync::Mutex::new(None),
             renders: tokio::sync::Semaphore::new(limits.renders_at_once.max(1)),
             overlays,
@@ -492,6 +506,17 @@ impl<F: OverlayFactory> Service<F> {
 
     /// Renders `order` to the store, once its pack is there.
     pub async fn segment(&self, order: &SegmentOrder<F::Order>) -> Result<SegmentDone, Error> {
+        self.segment_watched(order, &Progress::new()).await
+    }
+
+    /// [`Self::segment`], its progress told to `progress` as it goes: each
+    /// step as it begins, each frame drawn and taken by the encoder, the
+    /// bytes fetched and put.
+    pub async fn segment_watched(
+        &self,
+        order: &SegmentOrder<F::Order>,
+        progress: &Progress,
+    ) -> Result<SegmentDone, Error> {
         let span = tracing::info_span!(
             "segment",
             out = %order.out,
@@ -501,10 +526,14 @@ impl<F: OverlayFactory> Service<F> {
             frames = Empty,
             bytes = Empty,
         );
-        self.segment_in(order).instrument(span).await
+        self.segment_in(order, progress).instrument(span).await
     }
 
-    async fn segment_in(&self, order: &SegmentOrder<F::Order>) -> Result<SegmentDone, Error> {
+    async fn segment_in(
+        &self,
+        order: &SegmentOrder<F::Order>,
+        progress: &Progress,
+    ) -> Result<SegmentDone, Error> {
         let began = Instant::now();
         // Before anything is waited for: an order the host cannot draw
         // fails now, not an hour on.
@@ -512,6 +541,7 @@ impl<F: OverlayFactory> Service<F> {
         let within = Duration::from_secs(order.pack_within_seconds.unwrap_or(3600));
         let generation = self.generation().await?;
         let sources = &generation.sources;
+        progress.step(Step::PackWait);
         async {
             loop {
                 if self.runs.exists(&order.pack).await? {
@@ -534,6 +564,7 @@ impl<F: OverlayFactory> Service<F> {
         // were, by an earlier segment of this generation, are read again —
         // its clock stands still, and a manifest held is believed.
         sources.store.tiles.forget_manifests();
+        progress.step(Step::Plan);
         let (rendering, film, render_order) = async {
             let rendering = order.rendering.rendering()?;
             let film = Film::of(sources.packs.objects.as_ref(), &[order.pack.as_str()]).await?;
@@ -569,6 +600,7 @@ impl<F: OverlayFactory> Service<F> {
             parts = Empty,
             bytes = Empty,
         );
+        progress.step(Step::FetchTiles);
         let extract = self
             .fetch_extracts(sources, &film, order, &scratch.path().join("store"))
             .instrument(fetch.clone())
@@ -576,6 +608,7 @@ impl<F: OverlayFactory> Service<F> {
         if let Some(fetched) = &extract {
             fetch.record("parts", fetched.parts);
             fetch.record("bytes", fetched.bytes);
+            progress.bytes(fetched.bytes);
         }
         if let Some(fetched) = &extract {
             eprintln!(
@@ -588,6 +621,7 @@ impl<F: OverlayFactory> Service<F> {
                 fetched.mb_per_second()
             );
         }
+        progress.step(Step::CardWait);
         let _card = self
             .renders
             .acquire()
@@ -595,6 +629,10 @@ impl<F: OverlayFactory> Service<F> {
             .await
             .map_err(|e| e.to_string())?;
         let waited_seconds = began.elapsed().as_secs_f64();
+        progress.step(Step::Render);
+        progress.of(u64::from(
+            (order.frames.1 + 1).saturating_sub(order.frames.0),
+        ));
 
         // The render holds its thread: on one of its own, its reads waited
         // for on this runtime.
@@ -620,20 +658,24 @@ impl<F: OverlayFactory> Service<F> {
             tiles_from_pack = Empty,
         );
         let on_its_thread = render_span.clone();
+        let told = progress.clone();
         let done = tokio::task::spawn_blocking(move || -> Result<crate::render::Done, Error> {
             let _entered = on_its_thread.enter();
-            let mut sink = film_sink(
-                to.to_string_lossy().into_owned(),
-                rendering.bitrate,
-                rendering.codec.as_deref(),
-            )?;
+            let mut sink = Taken {
+                sink: film_sink(
+                    to.to_string_lossy().into_owned(),
+                    rendering.bitrate,
+                    rendering.codec.as_deref(),
+                )?,
+                progress: told.clone(),
+            };
             let done = runtime.block_on(render(
                 &kept.sources,
                 &film,
                 &render_order,
                 overlays.as_mut(),
-                sink.as_mut(),
-                &mut (),
+                &mut sink,
+                &mut Drawn(told),
             ))?;
             drop(sink);
             Ok(done)
@@ -661,10 +703,12 @@ impl<F: OverlayFactory> Service<F> {
 
         let store = self.store(order.store);
         let upload = tracing::info_span!("upload", bytes = Empty);
+        progress.step(Step::Upload);
         let bytes = store
             .put(&local, &order.out)
             .instrument(upload.clone())
             .await?;
+        progress.bytes(bytes);
         upload.record("bytes", bytes);
         tracing::Span::current().record("frames", frames);
         tracing::Span::current().record("bytes", bytes);
@@ -708,6 +752,17 @@ impl<F: OverlayFactory> Service<F> {
         &self,
         order: &tuile_farm::compress::CompressOrder,
     ) -> Result<tuile_farm::compress::CompressDone, Error> {
+        self.compress_watched(order, &Progress::new()).await
+    }
+
+    /// [`Self::compress`], its progress told to `progress` as it goes: each
+    /// step as it begins, the segments' bytes as they come in, each frame
+    /// decoded and encoded, each encode of the film, the bytes put.
+    pub async fn compress_watched(
+        &self,
+        order: &tuile_farm::compress::CompressOrder,
+        progress: &Progress,
+    ) -> Result<tuile_farm::compress::CompressDone, Error> {
         let span = tracing::info_span!(
             "compress",
             run = %order.run,
@@ -715,17 +770,19 @@ impl<F: OverlayFactory> Service<F> {
             chunks = order.chunks,
             delivery = %order.delivery.key(),
         );
-        self.compress_in(order).instrument(span).await
+        self.compress_in(order, progress).instrument(span).await
     }
 
     async fn compress_in(
         &self,
         order: &tuile_farm::compress::CompressOrder,
+        progress: &Progress,
     ) -> Result<tuile_farm::compress::CompressDone, Error> {
         use tuile_farm::assemble::{gather, Gathered, RunKeys};
         std::fs::create_dir_all(&self.cache)?;
         let scratch = tempfile::tempdir_in(&self.cache)?;
         let run = RunKeys::new(&order.run, &order.render_id);
+        progress.step(Step::Gather);
         let gathered = gather(
             self.runs.as_ref(),
             self.store(order.segments),
@@ -733,6 +790,7 @@ impl<F: OverlayFactory> Service<F> {
             order.chunks,
             &scratch.path().join("join"),
             Some(order.fps),
+            progress,
         )
         .instrument(tracing::info_span!("gather"))
         .await?;
@@ -750,12 +808,15 @@ impl<F: OverlayFactory> Service<F> {
             )
             .into());
         };
+        progress.step(Step::CardWait);
         let card = self
             .renders
             .acquire()
             .instrument(tracing::info_span!("card_wait"))
             .await
             .map_err(|e| e.to_string())?;
+        progress.step(Step::Encode);
+        progress.of(frames);
         let delivered = scratch.path().join("film.mp4");
         let (to, delivery) = (delivered.clone(), order.delivery.clone());
         let fps = order.fps.round().max(1.0) as u32;
@@ -764,9 +825,10 @@ impl<F: OverlayFactory> Service<F> {
             .and_then(|d| d.parse().ok())
             .unwrap_or(0);
         let encode = tracing::info_span!("encode", fps);
+        let told = progress.clone();
         let compressed = tokio::task::spawn_blocking(move || {
             let _entered = encode.enter();
-            crate::compress::compress(&joined, &to, &delivery, fps, device)
+            crate::compress::compress_watched(&joined, &to, &delivery, fps, device, &told)
         })
         .await
         .map_err(|e| e.to_string())??;
@@ -784,11 +846,13 @@ impl<F: OverlayFactory> Service<F> {
             .out
             .clone()
             .unwrap_or_else(|| tuile_farm::compress::film_key(&order.run, &order.delivery));
+        progress.step(Step::Upload);
         let bytes = self
             .runs
             .put(&delivered, &key)
             .instrument(tracing::info_span!("upload"))
             .await?;
+        progress.bytes(bytes);
         let bitrate = (bytes as f64 * 8.0 / probe.seconds.max(1e-3)).round() as u64;
         eprintln!(
             "compress {key}: {frames} frames, {:.1} MB from {:.1} MB joined ({:.1} Mb/s), \
@@ -886,11 +950,61 @@ pub async fn service_from_env_with<F: OverlayFactory>(overlays: F) -> Result<Ser
     Ok(service)
 }
 
+/// `work` answered in lines ([`tuile_farm::progress`]): its progress as it
+/// moves, read from `progress`, then its answer or why there is none. The
+/// work runs on a task of its own, under the request's span, for as long as
+/// the answer is read: once the asker has gone, it is dropped — as a plain
+/// request's work is when its connection closes.
+fn in_lines<T>(
+    progress: Progress,
+    cadence: Cadence,
+    work: impl std::future::Future<Output = Result<T, Error>> + Send + 'static,
+) -> axum::response::Response
+where
+    T: serde::Serialize + Send + 'static,
+{
+    use axum::response::IntoResponse;
+    let (lines, answer) = tokio::sync::mpsc::channel::<Line<T>>(16);
+    tokio::spawn(
+        async move { said(work, &progress, cadence, lines).await }
+            .instrument(tracing::Span::current()),
+    );
+    let body = futures_util::stream::unfold(answer, |mut answer| async move {
+        let line = answer.recv().await?;
+        Some((
+            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(line.to_bytes())),
+            answer,
+        ))
+    });
+    axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, NDJSON)
+        .body(axum::body::Body::from_stream(body))
+        .unwrap_or_else(|e| {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        })
+}
+
+/// Whether a request asks to be answered in lines.
+fn asks_lines(headers: &axum::http::HeaderMap) -> bool {
+    asks_for_lines(
+        headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+
 /// The service's routes: `GET /`, `POST /segments` — answered once the
 /// segment is in the store, or at once (202) when there is a `notify` to
 /// tell how it ends — and `POST /compress`, a film's final stage
 /// ([`Service::compress`]), answered once the delivered film is in the run
 /// store.
+///
+/// A request whose `Accept` is `application/x-ndjson` is answered in lines
+/// ([`tuile_farm::progress`]) as the work goes — its steps, its frames
+/// drawn and encoded, its bytes — then the same answer as a plain request's,
+/// or why there is none: an asker can tell a piece of work that has stopped
+/// moving from one that takes its time. Any other request is answered as it
+/// always was.
 pub fn router<F: OverlayFactory>(
     service: Arc<Service<F>>,
     notify: Option<Arc<dyn Notify<F::Order>>>,
@@ -905,6 +1019,7 @@ pub fn router<F: OverlayFactory>(
     );
     async fn segment<F: OverlayFactory>(
         State((service, notify)): State<Held<F>>,
+        headers: axum::http::HeaderMap,
         Json(order): Json<SegmentOrder<F::Order>>,
     ) -> axum::response::Response {
         eprintln!(
@@ -920,6 +1035,21 @@ pub fn router<F: OverlayFactory>(
                     Json(serde_json::json!({ "accepted": out })),
                 )
                     .into_response()
+            }
+            None if asks_lines(&headers) => {
+                let progress = Progress::new();
+                let (told, cadence) = (progress.clone(), service.cadence);
+                in_lines(progress, cadence, async move {
+                    let outcome = service.segment_watched(&order, &told).await;
+                    match &outcome {
+                        Ok(done) => eprintln!(
+                            "segment {} done: {} frames, waited {:.0} s, rendered in {:.0} s",
+                            done.out, done.frames, done.waited_seconds, done.render_seconds
+                        ),
+                        Err(e) => eprintln!("segment {} failed: {e}", order.out),
+                    }
+                    outcome
+                })
             }
             None => match service.segment(&order).await {
                 Ok(done) => {
@@ -938,6 +1068,7 @@ pub fn router<F: OverlayFactory>(
     }
     async fn compress<F: OverlayFactory>(
         State((service, _)): State<Held<F>>,
+        headers: axum::http::HeaderMap,
         Json(order): Json<tuile_farm::compress::CompressOrder>,
     ) -> axum::response::Response {
         eprintln!(
@@ -946,6 +1077,17 @@ pub fn router<F: OverlayFactory>(
             order.render_id,
             order.delivery.key()
         );
+        if asks_lines(&headers) {
+            let progress = Progress::new();
+            let (told, cadence) = (progress.clone(), service.cadence);
+            return in_lines(progress, cadence, async move {
+                let outcome = service.compress_watched(&order, &told).await;
+                if let Err(e) = &outcome {
+                    eprintln!("compress {} failed: {e}", order.run);
+                }
+                outcome
+            });
+        }
         match service.compress(&order).await {
             Ok(done) => Json(done).into_response(),
             Err(e) => {
@@ -1251,32 +1393,29 @@ mod tests {
             .is_err());
     }
 
-    /// A film's final stage on the service: its receipts read from the run
-    /// store, its segments from the mezzanine store, joined, delivered under
-    /// the run as the order says — every frame there — and a render whose
-    /// receipts are not all in refused.
-    #[tokio::test]
-    async fn a_film_is_compressed_from_its_mezzanine_into_the_run_store() {
+    /// A service, its run store and a render of two segments in its
+    /// mezzanine store, their receipts in the run store, and the order that
+    /// delivers it as it is.
+    async fn a_render_to_compress(
+        dir: &Path,
+    ) -> (
+        Service,
+        Arc<ObjectRunStore>,
+        tuile_farm::compress::CompressOrder,
+    ) {
         use tuile_farm::assemble::{Receipt, RunKeys};
-        use tuile_farm::compress::{CompressOrder, Delivery, Store};
-        let dir = tempfile::tempdir().expect("dir");
-        std::fs::write(dir.path().join("catalog.json"), br#"{"layers": []}"#).expect("catalog");
+        std::fs::create_dir_all(dir).expect("dir");
+        std::fs::write(dir.join("catalog.json"), br#"{"layers": []}"#).expect("catalog");
         let tuning = tuile_farm::Tuning::default;
-        let runs =
-            Arc::new(ObjectRunStore::local(&dir.path().join("runs"), tuning()).expect("store"));
+        let runs = Arc::new(ObjectRunStore::local(&dir.join("runs"), tuning()).expect("store"));
         let mezzanine =
-            Arc::new(ObjectRunStore::local(&dir.path().join("mezz"), tuning()).expect("store"));
+            Arc::new(ObjectRunStore::local(&dir.join("mezz"), tuning()).expect("store"));
         let tiles: Arc<dyn tuile_repository::Objects> =
-            Arc::new(ObjectRunStore::local(dir.path(), tuning()).expect("store"));
-        let mut service = Service::new(
-            runs.clone(),
-            tiles,
-            dir.path().join("cache"),
-            Limits::default(),
-        );
+            Arc::new(ObjectRunStore::local(dir, tuning()).expect("store"));
+        let mut service = Service::new(runs.clone(), tiles, dir.join("cache"), Limits::default());
         service.mezzanine = Some(mezzanine.clone());
         let keys = RunKeys::new("1557732/20261020T1000Z-ab12", "video-9-run");
-        let scratch = dir.path().join("scratch");
+        let scratch = dir.join("scratch");
         std::fs::create_dir_all(&scratch).expect("scratch");
         for (task, first, last) in [(0u32, 1u64, 3u64), (1, 4, 5)] {
             let segment = scratch.join(format!("{task}.mp4"));
@@ -1304,11 +1443,24 @@ mod tests {
                 .await
                 .expect("receipt");
         }
-        let order: CompressOrder = serde_json::from_value(serde_json::json!({
-            "run": "1557732/20261020T1000Z-ab12", "render_id": "video-9-run", "chunks": 2,
-            "fps": 30.0, "segments": "mezzanine", "delivery": {"kind": "copy"},
-        }))
-        .expect("order");
+        let order: tuile_farm::compress::CompressOrder =
+            serde_json::from_value(serde_json::json!({
+                "run": "1557732/20261020T1000Z-ab12", "render_id": "video-9-run", "chunks": 2,
+                "fps": 30.0, "segments": "mezzanine", "delivery": {"kind": "copy"},
+            }))
+            .expect("order");
+        (service, runs, order)
+    }
+
+    /// A film's final stage on the service: its receipts read from the run
+    /// store, its segments from the mezzanine store, joined, delivered under
+    /// the run as the order says — every frame there — and a render whose
+    /// receipts are not all in refused.
+    #[tokio::test]
+    async fn a_film_is_compressed_from_its_mezzanine_into_the_run_store() {
+        use tuile_farm::compress::{CompressOrder, Delivery, Store};
+        let dir = tempfile::tempdir().expect("dir");
+        let (service, runs, order) = a_render_to_compress(dir.path()).await;
         assert_eq!(order.segments, Store::Mezzanine);
         let spans = Spans::default();
         let traced = tracing::subscriber::set_default(spans.subscriber());
@@ -1685,5 +1837,183 @@ mod tests {
         let (_, outcome) = rx.recv().await.expect("told");
         assert!(outcome.is_err(), "no pack");
         assert_eq!(spans.parent("segment").as_deref(), Some("request"));
+    }
+
+    /// `router` served on a port of this machine: its address.
+    async fn served(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let at = format!("http://{}", listener.local_addr().expect("address"));
+        tokio::spawn(async move { axum::serve(listener, router).await.expect("served") });
+        at
+    }
+
+    /// `order` posted to `url`, asking for lines when `lines`: the
+    /// answer's status, content type and every line as it came, with when
+    /// it came — or its body, whole, as one line.
+    async fn asked(
+        url: &str,
+        order: &impl serde::Serialize,
+        lines: bool,
+    ) -> (u16, String, Vec<(Duration, String)>) {
+        let mut request = reqwest::Client::new()
+            .post(url)
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(order).expect("an order"));
+        if lines {
+            request = request.header("accept", NDJSON);
+        }
+        let began = Instant::now();
+        let mut answer = request.send().await.expect("answered");
+        let status = answer.status().as_u16();
+        let kind = answer
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let (mut got, mut pending) = (Vec::new(), Vec::new());
+        while let Some(chunk) = answer.chunk().await.expect("a chunk") {
+            pending.extend_from_slice(&chunk);
+            while let Some(end) = pending.iter().position(|b| *b == b'\n') {
+                let line = String::from_utf8(pending.drain(..=end).collect()).expect("utf-8");
+                got.push((began.elapsed(), line.trim_end().to_string()));
+            }
+        }
+        if !pending.is_empty() {
+            got.push((began.elapsed(), String::from_utf8(pending).expect("utf-8")));
+        }
+        (status, kind, got)
+    }
+
+    /// A final stage asked in lines says each step as it begins — the
+    /// segments' bytes as they come in, the encode with the frames it has,
+    /// the upload — then the answer a plain request gets; a plain request
+    /// is answered as it always was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_final_stage_asked_in_lines_says_its_steps_then_its_answer() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (service, _, order) = a_render_to_compress(dir.path()).await;
+        let at = served(router(Arc::new(service), None)).await;
+        let url = format!("{at}/compress");
+
+        let (status, kind, plain) = asked(&url, &order, false).await;
+        assert_eq!((status, kind.as_str()), (200, "application/json"));
+        let plain: tuile_farm::compress::CompressDone =
+            serde_json::from_str(&plain[0].1).expect("the answer, whole");
+        assert_eq!(plain.frames, 5);
+
+        let (status, kind, lines) = asked(&url, &order, true).await;
+        assert_eq!((status, kind.as_str()), (200, NDJSON));
+        let lines: Vec<Line<tuile_farm::compress::CompressDone>> = lines
+            .iter()
+            .map(|(_, l)| serde_json::from_str(l).expect("a line"))
+            .collect();
+        let reports: Vec<tuile_farm::progress::Report> = lines
+            .iter()
+            .filter_map(|l| match l {
+                Line::Progress(r) => Some(*r),
+                _ => None,
+            })
+            .collect();
+        assert!(!reports.is_empty(), "progress said: {lines:?}");
+        assert!(
+            reports.iter().all(|r| !r.waiting || r.step.is_wait()),
+            "only a wait is said waiting: {reports:?}"
+        );
+        let Some(Line::Done { output }) = lines.last() else {
+            panic!("the answer last: {lines:?}")
+        };
+        assert_eq!(
+            (output.key.as_str(), output.frames),
+            (plain.key.as_str(), 5)
+        );
+        // What the work told: the segments' bytes as they came in, the
+        // film's frames for its encode, the delivered film's bytes put.
+        let again = dir.path().join("again");
+        let (service, _, order) = a_render_to_compress(&again).await;
+        let segment_bytes: u64 = {
+            use tuile_farm::RunStore;
+            let mezzanine = service.mezzanine.clone().expect("a mezzanine");
+            let listed = mezzanine
+                .list("1557732/20261020T1000Z-ab12")
+                .await
+                .expect("list");
+            assert_eq!(listed.len(), 2, "two segments: {listed:?}");
+            listed.iter().map(|e| e.size).sum()
+        };
+        let progress = Progress::new();
+        let done = service
+            .compress_watched(&order, &progress)
+            .await
+            .expect("compressed");
+        let told = progress.report();
+        assert_eq!(told.step, Step::Upload, "{told:?}");
+        assert_eq!(told.of, 5, "the encode has the film's frames: {told:?}");
+        assert_eq!(
+            told.bytes,
+            segment_bytes + done.bytes,
+            "the segments' bytes and the film's told: {told:?}"
+        );
+    }
+
+    /// A segment asked in lines says it waits for its pack — again and
+    /// again while it does — then why it failed; asked plainly, it is
+    /// refused as it always was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_segment_asked_in_lines_says_it_waits_for_its_pack_then_why_it_failed() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("catalog.json"), br#"{"layers": []}"#).expect("catalog");
+        let runs = Arc::new(
+            ObjectRunStore::local(dir.path(), tuile_farm::Tuning::default()).expect("store"),
+        );
+        let tiles: Arc<dyn tuile_repository::Objects> = runs.clone();
+        let mut service = Service::new(runs, tiles, dir.path().join("cache"), Limits::default());
+        service.cadence = Cadence {
+            line_every: Duration::from_millis(20),
+            waiting_every: Duration::from_millis(300),
+        };
+        let at = served(router(Arc::new(service), None)).await;
+        let url = format!("{at}/segments");
+        let order = serde_json::json!({
+            "pack": "packs/never.tuilepack", "frames": [1, 2], "out": "out.mp4",
+            "pack_within_seconds": 3,
+        });
+
+        let (status, _, lines) = asked(&url, &order, true).await;
+        assert_eq!(status, 200);
+        let lines: Vec<(Duration, Line<SegmentDone>)> = lines
+            .iter()
+            .map(|(at, l)| (*at, serde_json::from_str(l).expect("a line")))
+            .collect();
+        let waits: Vec<Duration> = lines
+            .iter()
+            .filter(
+                |(_, l)| matches!(l, Line::Progress(r) if r.step == Step::PackWait && r.waiting),
+            )
+            .map(|(at, _)| *at)
+            .collect();
+        assert!(
+            waits.len() >= 6,
+            "a 3 s wait said every 300 ms: {} lines",
+            waits.len()
+        );
+        assert!(
+            waits
+                .windows(2)
+                .all(|w| w[1] - w[0] < Duration::from_millis(1000)),
+            "never silent while it waits: {waits:?}"
+        );
+        match lines.last() {
+            Some((_, Line::Failed { failure })) => {
+                assert!(failure.message.contains("did not come"), "{failure:?}")
+            }
+            other => panic!("its failure last: {other:?}"),
+        }
+
+        let (status, _, plain) = asked(&url, &order, false).await;
+        assert_eq!(status, 500);
+        assert!(plain[0].1.contains("did not come"), "{plain:?}");
     }
 }

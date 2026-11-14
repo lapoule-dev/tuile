@@ -301,6 +301,27 @@ pub fn compress(
     fps: u32,
     device: usize,
 ) -> Result<Compressed, crate::Error> {
+    compress_watched(
+        joined,
+        out,
+        delivery,
+        fps,
+        device,
+        &tuile_farm::progress::Progress::new(),
+    )
+}
+
+/// [`compress`], told to `progress` as it goes: each encode of the film
+/// begun, and in it each frame decoded and each frame encoded — where the
+/// machine's decoder and encoder say so.
+pub fn compress_watched(
+    joined: &Path,
+    out: &Path,
+    delivery: &tuile_farm::compress::Delivery,
+    fps: u32,
+    device: usize,
+    progress: &tuile_farm::progress::Progress,
+) -> Result<Compressed, crate::Error> {
     let began = std::time::Instant::now();
     match delivery {
         tuile_farm::compress::Delivery::Copy => {
@@ -316,7 +337,7 @@ pub fn compress(
         }
         tuile_farm::compress::Delivery::Encode { profile } => {
             let profile = tuned(profile.clone(), |name| std::env::var(name).ok())?;
-            let (written, passes) = by_the_machine(joined, out, &profile, fps, device)?;
+            let (written, passes) = by_the_machine(joined, out, &profile, fps, device, progress)?;
             Ok(Compressed {
                 frames: written.frames,
                 bytes: written.bytes,
@@ -337,13 +358,15 @@ fn by_the_machine(
     profile: &tuile_farm::compress::Profile,
     fps: u32,
     device: usize,
+    progress: &tuile_farm::progress::Progress,
 ) -> Result<(tuile_mp4::film::Written, u32), crate::Error> {
     #[cfg(all(target_os = "linux", feature = "nvenc"))]
     {
-        gpu::encode_profile(joined, out, profile, fps, device)
+        gpu::encode_profile(joined, out, profile, fps, device, progress)
     }
     #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
     {
+        // The Mac's encode is a workstation's: its progress is not told.
         crate::videotoolbox::compress_profile(joined, out, profile, fps)
     }
     #[cfg(not(any(
@@ -429,6 +452,7 @@ mod gpu {
     use cudarc::driver::CudaContext;
     use nvidia_video_codec_sdk::{DecodeCodec, Decoder};
     use tuile_farm::compress::Profile;
+    use tuile_farm::progress::Progress;
 
     use super::{deliver, input_for, p016_to_nv12, Stream};
     use crate::nvenc::{encode, Frame, Input, Package, Spec};
@@ -444,6 +468,7 @@ mod gpu {
         profile: &Profile,
         fps: u32,
         device: usize,
+        progress: &Progress,
     ) -> Result<(tuile_mp4::film::Written, u32), crate::Error> {
         let mut file = std::fs::File::open(joined)?;
         let track =
@@ -452,7 +477,8 @@ mod gpu {
         let size = stream.size().ok_or("a track of no size")?;
         let input = input_for(stream.bit_depth, profile);
         deliver(profile, input, size, fps, stream.frames(), |spec| {
-            pass(joined, &stream, out, spec, device)
+            progress.next_pass();
+            pass(joined, &stream, out, spec, device, progress)
         })
     }
 
@@ -464,6 +490,7 @@ mod gpu {
         out: &Path,
         spec: &Spec,
         device: usize,
+        progress: &Progress,
     ) -> Result<tuile_mp4::film::Written, crate::Error> {
         let (send, pictures) = sync_channel::<Result<Frame, String>>(AHEAD);
         let mut package = Package::at(out, spec.out, spec.size, spec.fps)?;
@@ -494,6 +521,7 @@ mod gpu {
                             if send.send(Ok(Frame { data, shown })).is_err() {
                                 return Err("the encoder stopped".into());
                             }
+                            progress.frame();
                             shown += 1;
                         }
                         Ok(())
@@ -513,7 +541,10 @@ mod gpu {
                 }
                 decoded.map_err(|e| e.to_string())
             });
-            let encoded = encode(device, spec, pictures, |e| package.take(e));
+            let encoded = encode(device, spec, pictures, |e| {
+                progress.encoded(1);
+                package.take(e)
+            });
             let decoded = decoding.join().map_err(|_| "the decoder panicked")?;
             // The encoder's failure first: a decoder told the encoder
             // stopped says nothing of why.

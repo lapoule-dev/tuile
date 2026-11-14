@@ -79,6 +79,8 @@ cudarc = { version = "0.16.4", optional = true, features = ["cuda-version-from-b
 
 [dev-dependencies]
 pollster = { workspace = true }
+# A request answered in lines, read as an asker reads it: over a socket.
+reqwest = { workspace = true }
 # The spans a segment opens, read back by a test subscriber.
 tracing-subscriber = { workspace = true }
 
