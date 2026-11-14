@@ -65,10 +65,9 @@ fn no_zoom() -> (f64, f64) {
 pub struct CompositeOrder {
     /// The run's prefix in the run store.
     pub run: String,
-    /// The render whose receipts name the segments.
+    /// The render whose receipts name the segments: those that hold the
+    /// range must be in, the others need not be.
     pub render_id: String,
-    /// Its chunks: as many receipts are expected.
-    pub chunks: u32,
     /// Where the render's segments are; the inserted segment goes there
     /// too, under [`Self::out`].
     #[serde(default)]
@@ -192,7 +191,7 @@ mod tests {
     #[test]
     fn an_order_reads_from_json_and_says_its_splice() {
         let order: CompositeOrder = serde_json::from_value(serde_json::json!({
-            "run": "1/2", "render_id": "r", "chunks": 3, "fps": 30.0,
+            "run": "1/2", "render_id": "r", "fps": 30.0,
             "first": 121, "last": 270,
             "layer": {"kind": "still", "key": "1/2/media/0.jpg"},
             "codec": "mezzanine", "out": "1/2/inserts/0.mp4",
@@ -208,7 +207,7 @@ mod tests {
         assert_eq!(order.insert().key, "1/2/inserts/0.mp4");
         assert_eq!(order.layer.key(), "1/2/media/0.jpg");
         assert!(serde_json::from_value::<CompositeOrder>(serde_json::json!({
-            "run": "1/2", "render_id": "r", "chunks": 3, "fps": 30.0, "first": 1, "last": 2,
+            "run": "1/2", "render_id": "r", "fps": 30.0, "first": 1, "last": 2,
             "layer": {"kind": "still", "key": "k"}, "codec": "mezzanine", "out": "o",
             "zoom_to": 1.08,
         }))

@@ -206,7 +206,8 @@ Branch `feat/composite-at-join`, stacked on A with `gh stack`.
        refuse it later, so it is refused now, with both descriptions said).
 3. **Service**: `Service::composite` and `POST /composite`, beside
    `/compress`. It reads the receipts, fetches only the segments that hold
-   `first..=last`, fetches the layer, and waits its turn for the card (the
+   `first..=last` — as soon as their receipts are in, the rest of the film
+   still rendering — fetches the layer, and waits its turn for the card (the
    renders' semaphore). It writes the inserted segment to the segments'
    store and answers `CompositeDone`.
 
