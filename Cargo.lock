@@ -9110,6 +9110,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "tuile-atmosphere",
  "tuile-bake",
  "tuile-core",

@@ -705,7 +705,9 @@ impl Sink for NvencFilm {
         let (device, path) = (self.device, self.path.clone());
         let keys = self.keys.clone();
         self.pictures = Some(pictures);
+        let span = crate::sink::encoder_span();
         self.encoder = Some(std::thread::spawn(move || {
+            let _in = span.enter();
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
             }
@@ -782,7 +784,9 @@ impl Sink for NvencFilm {
             let bitrate = if bitrate == 0 { 30_000_000 } else { bitrate };
             let path = self.path.clone();
             self.eyes = Some(sender);
+            let span = crate::sink::encoder_span();
             self.encoder = Some(std::thread::spawn(move || {
+                let _in = span.enter();
                 encode_eyes(waiting, device, size, fps, bitrate, stereo, path)
             }));
         }
