@@ -235,38 +235,47 @@ Tests (B):
 
 ## Step C — the host (sportstracklive-rails)
 
-Branch `feat/composite-media-at-join` from `origin/production`. tuile is
-pinned on PR B's head commit while it is unreleased.
+Branch `feat/composite-media-at-join` from `origin/production`.
 
-- Key frames: the segment order carries `key_frames` = each pause's
-  `first` and `last + 1`, from `Film::pauses()`, known before rendering.
-- Photo preparation stays in Rust (`media::prepare_photo`). Each media is
-  fetched by its URL and uploaded to the run store
-  (`<run>/media/<i>.jpg` or `.mp4`) by a new activity `prepare_media`. It
-  runs while the film renders and returns the composite orders' layers.
-- Workflow, behind `ctx.patched("media-at-join")`, asked early:
-  - once rendering is done (all receipts), one `composite_media` activity
-    per pause, in parallel; each posts `/composite` to the render service;
-  - then `compress` with `inserts`;
-  - no `insert_media` afterwards;
-  - `add_music` unchanged.
+**The pin.** STL was pinned on `pin/stl-bbf6427c`, whose film-native
+tracing spans are not on `main`. So it is pinned on `pin/stl-composite`:
+that pin with PRs A and B cherry-picked onto it (one conflict in `serve.rs`,
+spans and key frames both kept). It stays on that pin until A and B are
+merged and released.
 
-  Unpatched histories replay as they ran (render → compress →
-  insert_media → add_music).
-- The ffmpeg path of `insert_media` (`media::filter_graph`, `ffmpeg_args`,
-  `compose`, `probe`) is removed. The activity stays registered so that old
-  histories can still be completed by a worker: it is the old workflow's
-  step until no workflow from before the patch is running. Removing it
-  follows once none is (an open question for Laurent: the activity without
-  ffmpeg would fail. Either keep the ffmpeg path for in-flight films until
-  they drain, or accept that they fail and retry).
-- Tests:
-  - workflow: activity order with and without the patch, composite jobs
-    one per pause, inserts passed to compress;
-  - media prep: the uploaded still's size and orientation;
-  - the `key_frames` order field.
-
-  Tests run on the k8s builder.
+- **Pauses and key frames.**
+  - `prepare` writes `Prepared::pauses`, from `Film::pauses()`. It does so
+    only for a film with media that carries pictures.
+  - The workflow turns the pauses into `cook::key_frames`: each pause's
+    `first` and `last + 1`.
+  - Each `SegmentJob` carries the key frames, and `render_segment` adds
+    them to the order as `key_frames`.
+- **`prepare_media`** (cooking queue, `stl-farm/prepare_media`):
+  - fetches each pause's media while the film bakes and renders;
+  - photos go through `media::prepare_photo` (EXIF, cover, zoom room) and
+    are put at `<run>/media/<render>/<i>.jpg`;
+  - clips are put as they are, at `.mov`;
+  - an unfetchable or unreadable media is skipped, as before;
+  - it returns `MediaLayer`s with their fade and zoom (`media::motion`).
+- **`composite_media`** (render worker, `POST /composite`): one per pause.
+  - Each starts as soon as the chunks that hold its pause are rendered
+    (`ProduceFilm::rendered`, `chunks_holding`).
+  - It writes `<run>/inserts/<render>/<i>.mp4` in the segments' store.
+  - A failed composite fails the film, as a failed `insert_media` did.
+- **`compress_film`** sends `inserts`. After it, no `insert_media`
+  (`media_after_delivery`), and `add_music` runs as before.
+- **The patch.** All of this sits behind `ctx.patched("media-at-join")`,
+  asked at the start and only for a request with media that carries
+  pictures. Unpatched histories replay as they ran. The replay test edits
+  the fixture's request and its `prepare` result to name media and pauses.
+- **`insert_media` without ffmpeg.** The ffmpeg path is removed. The
+  activity stays registered: a film from before the patch, in flight at the
+  deploy, is delivered without its pictures (with a warning) rather than
+  failed. **For Laurent to decide.**
+- **Deploy order.** The render service (`stl-film-serve` with this tuile)
+  must be deployed before the stl-render worker. An older service refuses a
+  segment order with `key_frames` (`deny_unknown_fields`) and has no
+  `/composite`.
 
 ## Step D — validation (not deployed by this work)
 
