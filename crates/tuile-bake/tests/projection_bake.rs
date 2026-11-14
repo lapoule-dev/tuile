@@ -687,6 +687,90 @@ fn a_global_tier_spares_the_bucket_a_second_download() {
     assert!(std::fs::read(&a).expect("pack") == std::fs::read(&b).expect("pack"));
 }
 
+/// **A zone projected whole is made once for every machine behind the
+/// tier.** The first machine makes the `top` zones and the imagery's zones
+/// and keeps each there as one object; a second machine reads each of them
+/// in one request — not one of their archives, from the tier or from the
+/// bucket — and cuts the terrain's cells from their archives as before. Its
+/// pack is the pack a store without any tier bakes, byte for byte.
+#[test]
+fn a_second_machine_reads_each_whole_zone_as_one_object() {
+    std::env::set_var("TUILE_FETCHES", "1");
+    let counted = warm_bucket();
+    let global = Counted::over(Arc::new(object_store::memory::InMemory::new()));
+    let dir = tempfile::tempdir().expect("dir");
+    let tiers = || tuile_bake::tiles::Tiers {
+        disk: None,
+        global: Some(tuile_tile_server::Tier::new(
+            "global",
+            global.clone() as Arc<dyn object_store::ObjectStore>,
+        )),
+    };
+
+    // As before: no tier, the reference pack.
+    let alone = Tiles::over(counted.clone()).expect("store");
+    alone
+        .project_footprint(&footprint(), &dir.path().join("alone"))
+        .expect("project");
+    let reference = dir.path().join("alone.tuilepack");
+    bake(&alone, &reference);
+    drop(alone);
+
+    let here = Tiles::open("bucket", counted.clone(), Vec::new(), tiers()).expect("store");
+    let made = here
+        .project_footprint(&footprint(), &dir.path().join("here"))
+        .expect("project");
+    // Every zone but the terrain's cells: the tops, the imagery's zones.
+    let cells: usize = made
+        .layers
+        .values()
+        .filter(|l| l.targeted)
+        .map(|l| l.zones_projected - usize::from(l.top_tiles > 0))
+        .sum();
+    let whole = made.zones_projected - cells;
+    assert!(whole >= 2, "a top and an imagery zone at least: {made:?}");
+    assert_eq!(made.zones_shared_written, whole, "{made:?}");
+    let a = dir.path().join("here.tuilepack");
+    bake(&here, &a);
+
+    let there = Tiles::open("bucket", counted.clone(), Vec::new(), tiers()).expect("store");
+    let (origin_before, global_before) = (counted.archive_gets(), global.archive_gets());
+    let read = there
+        .project_footprint(&footprint(), &dir.path().join("there"))
+        .expect("project");
+    assert_eq!(
+        (read.zones_shared, read.zones_shared_written),
+        (whole, 0),
+        "{read:?}"
+    );
+    assert_eq!(
+        counted.archive_gets(),
+        origin_before,
+        "nothing from the bucket"
+    );
+    let cut: u64 = read
+        .layers
+        .values()
+        .filter(|l| l.targeted)
+        .map(|l| l.requests)
+        .sum();
+    assert!(
+        global.archive_gets() - global_before <= cut,
+        "archives read only for the terrain's cells: {read:?}"
+    );
+    let b = dir.path().join("there.tuilepack");
+    bake(&there, &b);
+
+    let pack = std::fs::read(&reference).expect("pack");
+    for p in [&a, &b] {
+        assert!(
+            std::fs::read(p).expect("pack") == pack,
+            "{} differs from the pack baked without a tier",
+            p.display()
+        );
+    }
+}
+
 /// **Bench, before and after: two consecutive chunks of one film in one
 /// process.** Before, each chunk opens a store of its own and projects its
 /// zones anew (as each bake did); after, both read through one
