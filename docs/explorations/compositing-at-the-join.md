@@ -207,8 +207,8 @@ Branch `feat/composite-at-join`, stacked on A with `gh stack`.
 3. **Service**: `Service::composite` and `POST /composite`, beside
    `/compress`. It reads the receipts, fetches only the segments that hold
    `first..=last`, fetches the layer, and waits its turn for the card (the
-   renders' semaphore). It writes the inserted segment and its receipt
-   (`<out>.json` = `CompositeDone`) to the segments' store.
+   renders' semaphore). It writes the inserted segment to the segments'
+   store and answers `CompositeDone`.
 
 Tests (B):
 - Pure CPU:

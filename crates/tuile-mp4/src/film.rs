@@ -111,9 +111,23 @@ pub struct Track {
     /// Where the edit list starts the film in the media, in ticks: the
     /// first picture shown when frames are reordered, else zero.
     pub start: i64,
+    /// Degrees the pictures are turned clockwise to be shown, as the
+    /// track header's matrix says: 0, 90, 180 or 270 (a phone held upright
+    /// writes 90).
+    pub rotation: u16,
 }
 
 impl Track {
+    /// The track cut down to samples `samples` (decoding order, from 0),
+    /// each where it is in the file: a run that starts on a sync sample
+    /// decodes on its own.
+    pub fn range(&self, samples: std::ops::Range<usize>) -> Track {
+        Track {
+            samples: self.samples[samples].to_vec(),
+            ..self.clone()
+        }
+    }
+
     /// Its length, from its samples' durations.
     pub fn seconds(&self) -> f64 {
         let ticks: u64 = self.samples.iter().map(|s| u64::from(s.duration)).sum();
@@ -246,11 +260,19 @@ pub fn read_track<R: Read + Seek>(file: &mut R) -> Result<Option<Track>, Mp4Erro
         .and_then(|e| e.elst.as_ref())
         .and_then(|l| l.entries.iter().find_map(|e| e.media_time))
         .map_or(0, |t| t as i64);
+    let m = &trak.tkhd.matrix;
+    let rotation = match (m.a.signum(), m.b.signum(), m.c.signum(), m.d.signum()) {
+        (0, 1, -1, 0) => 90,
+        (-1, 0, 0, -1) => 180,
+        (0, -1, 1, 0) => 270,
+        _ => 0,
+    };
     Ok(Some(Track {
         entry,
         timescale: trak.mdia.mdhd.timescale,
         samples,
         start,
+        rotation,
     }))
 }
 
@@ -813,6 +835,46 @@ mod tests {
 
     const SPS: &[u8] = &[0x67, 0x64, 0x00, 0x28, 0xac, 0xd9];
     const PPS: &[u8] = &[0x68, 0xeb, 0xe3, 0xcb];
+
+    /// A phone's film says how it is to be turned in its track header's
+    /// matrix: read as degrees clockwise; and a track cut to a run of its
+    /// samples keeps them where they are in the file.
+    #[test]
+    fn a_track_says_its_rotation_and_cuts_to_a_run_of_samples() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("f.mp4");
+        let mut w =
+            FilmWriter::create(&path, avc1(64, 48, SPS, PPS).expect("entry"), 30).expect("writer");
+        for i in 0..5u8 {
+            w.push(&[0, 0, 0, 1, i], i % 2 == 0, u64::from(i))
+                .expect("push");
+        }
+        w.finish().expect("finish");
+        let plain = std::fs::read(&path).expect("film");
+        let at = plain.windows(4).position(|b| b == b"tkhd").expect("tkhd") - 4;
+        let matrix = at + if plain[at + 8] == 1 { 60 } else { 48 };
+        let turned = |abcd: [i32; 4]| {
+            let mut bytes = plain.clone();
+            for (k, v) in [(0, abcd[0]), (1, abcd[1]), (3, abcd[2]), (4, abcd[3])] {
+                bytes[matrix + 4 * k..matrix + 4 * k + 4].copy_from_slice(&(v << 16).to_be_bytes());
+            }
+            read_track(&mut std::io::Cursor::new(bytes))
+                .expect("read")
+                .expect("track")
+                .rotation
+        };
+        assert_eq!(turned([1, 0, 0, 1]), 0);
+        assert_eq!(turned([0, 1, -1, 0]), 90);
+        assert_eq!(turned([-1, 0, 0, -1]), 180);
+        assert_eq!(turned([0, -1, 1, 0]), 270);
+        let t = read_track(&mut std::io::Cursor::new(&plain))
+            .expect("read")
+            .expect("track");
+        let cut = t.range(2..4);
+        assert_eq!(cut.samples, t.samples[2..4]);
+        assert!(cut.samples[0].key);
+        assert_eq!(&plain[cut.samples[0].offset as usize + 4], &2u8);
+    }
 
     fn moov_of(file: &[u8]) -> (Vec<[u8; 4]>, Moov) {
         let mut kinds = Vec::new();

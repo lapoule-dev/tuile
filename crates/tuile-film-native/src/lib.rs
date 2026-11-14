@@ -4,7 +4,9 @@
 #![doc = include_str!("../README.md")]
 
 pub mod av1;
+pub mod composite;
 pub mod compress;
+pub mod decode;
 pub mod discs;
 pub mod encode;
 pub mod engine;

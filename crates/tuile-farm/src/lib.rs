@@ -18,6 +18,7 @@ use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutPayload
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub mod assemble;
+pub mod composite;
 pub mod compress;
 pub mod concat;
 pub mod job;
