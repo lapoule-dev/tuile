@@ -673,6 +673,85 @@ impl<F: OverlayFactory> Service<F> {
 }
 
 impl<F: OverlayFactory> Service<F> {
+    /// A layer laid over a range of a render ([`crate::composite`]): the
+    /// segments that hold the range fetched from where they are kept —
+    /// only those — and the layer from the run store; the range decoded,
+    /// laid over and encoded again by the render's own encoder; the
+    /// inserted segment put beside the render's segments, for the join to
+    /// splice in (`CompressOrder::inserts`). Waits its turn for the card
+    /// with the renders.
+    pub async fn composite(
+        &self,
+        order: &tuile_farm::composite::CompositeOrder,
+    ) -> Result<tuile_farm::composite::CompositeDone, Error> {
+        use tuile_farm::assemble::{fetch_range, RunKeys};
+        use tuile_farm::composite::Layer;
+        let began = Instant::now();
+        std::fs::create_dir_all(&self.cache)?;
+        let scratch = tempfile::tempdir_in(&self.cache)?;
+        let run = RunKeys::new(&order.run, &order.render_id);
+        let segments = self.store(order.segments);
+        let film = fetch_range(
+            self.runs.as_ref(),
+            segments,
+            &run,
+            order.chunks,
+            (order.first, order.last),
+            &scratch.path().join("film"),
+        )
+        .await?;
+        let layer_path = scratch.path().join("layer");
+        self.runs.get(order.layer.key(), &layer_path).await?;
+        let fetch_seconds = began.elapsed().as_secs_f64();
+        let card = self.renders.acquire().await.map_err(|e| e.to_string())?;
+        let job = crate::composite::Job {
+            film,
+            layer: match &order.layer {
+                Layer::Still { .. } => crate::composite::LayerFile::Still(layer_path),
+                Layer::Clip { .. } => crate::composite::LayerFile::Clip(layer_path),
+            },
+            fps: order.fps.round().max(1.0) as u32,
+            fade_seconds: order.fade_seconds,
+            zoom: order.zoom,
+            views: order.views,
+            codec: order.codec.clone(),
+            bitrate: order.mbps.map_or(0, |mbps| (mbps * 1e6) as u32),
+            device: std::env::var("TUILE_CUDA_DEVICE")
+                .ok()
+                .and_then(|d| d.parse().ok())
+                .unwrap_or(0),
+        };
+        let local = scratch.path().join("insert.mp4");
+        let to = local.clone();
+        let composited = Instant::now();
+        let done = tokio::task::spawn_blocking(move || crate::composite::composite(&job, &to))
+            .await
+            .map_err(|e| e.to_string())??;
+        let composite_seconds = composited.elapsed().as_secs_f64();
+        drop(card);
+        let bytes = segments.put(&local, &order.out).await?;
+        eprintln!(
+            "composite {}: frames {}..={} in {composite_seconds:.1} s (decode {:.1} s, lay {:.1} s, \
+             encode {:.1} s), {:.1} MB",
+            order.out,
+            order.first,
+            order.last,
+            done.decode_seconds,
+            done.lay_seconds,
+            done.encode_seconds,
+            bytes as f64 / 1e6
+        );
+        Ok(tuile_farm::composite::CompositeDone {
+            key: order.out.clone(),
+            frames: done.frames,
+            bytes,
+            fetch_seconds,
+            composite_seconds,
+        })
+    }
+}
+
+impl<F: OverlayFactory> Service<F> {
     /// Accepts `order`, renders it in the background and tells `notify` how
     /// it ended; returns at once. Renders wait their turn for the card
     /// ([`Limits::renders_at_once`]).
@@ -759,7 +838,9 @@ pub async fn service_from_env_with<F: OverlayFactory>(overlays: F) -> Result<Ser
 
 /// The service's routes: `GET /`, `POST /segments` — answered once the
 /// segment is in the store, or at once (202) when there is a `notify` to
-/// tell how it ends — and `POST /compress`, a film's final stage
+/// tell how it ends — `POST /composite`, a layer laid over a range of a
+/// render ([`Service::composite`]), answered once the inserted segment is
+/// beside the render's, and `POST /compress`, a film's final stage
 /// ([`Service::compress`]), answered once the delivered film is in the run
 /// store.
 pub fn router<F: OverlayFactory>(
@@ -825,10 +906,27 @@ pub fn router<F: OverlayFactory>(
             }
         }
     }
+    async fn composite<F: OverlayFactory>(
+        State((service, _)): State<Held<F>>,
+        Json(order): Json<tuile_farm::composite::CompositeOrder>,
+    ) -> axum::response::Response {
+        eprintln!(
+            "composite {} ← render {} frames {}..={}",
+            order.out, order.render_id, order.first, order.last
+        );
+        match service.composite(&order).await {
+            Ok(done) => Json(done).into_response(),
+            Err(e) => {
+                eprintln!("composite {} failed: {e}", order.out);
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        }
+    }
     axum::Router::new()
         .route("/", axum::routing::get(|| async { "tuile-film-serve" }))
         .route("/segments", axum::routing::post(segment::<F>))
         .route("/compress", axum::routing::post(compress::<F>))
+        .route("/composite", axum::routing::post(composite::<F>))
         .with_state((service, notify))
 }
 
@@ -1067,6 +1165,129 @@ mod tests {
             .await
             .expect_err("a chunk missing");
         assert!(refused.to_string().contains("not all in"), "{refused}");
+    }
+
+    /// A film's whole path on the service, on the Mac's own decoder and
+    /// encoder: two segments rendered with key frames where a still is to
+    /// go, the still laid over frames 21..=50 (across both) and put beside
+    /// them, then the film joined with it spliced in and delivered — every
+    /// frame there. A composite of a render not done is refused.
+    #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+    #[tokio::test]
+    async fn a_still_is_composited_beside_the_segments_and_spliced_in_at_the_join() {
+        use tuile_farm::assemble::{Receipt, RunKeys};
+        use tuile_farm::composite::CompositeOrder;
+        use tuile_farm::compress::{CompressOrder, Store};
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("catalog.json"), br#"{"layers": []}"#).expect("catalog");
+        let tuning = tuile_farm::Tuning::default;
+        let runs =
+            Arc::new(ObjectRunStore::local(&dir.path().join("runs"), tuning()).expect("store"));
+        let mezzanine =
+            Arc::new(ObjectRunStore::local(&dir.path().join("mezz"), tuning()).expect("store"));
+        let tiles: Arc<dyn tuile_repository::Objects> =
+            Arc::new(ObjectRunStore::local(dir.path(), tuning()).expect("store"));
+        let mut service = Service::new(
+            runs.clone(),
+            tiles,
+            dir.path().join("cache"),
+            Limits::default(),
+        );
+        service.mezzanine = Some(mezzanine.clone());
+        let keys = RunKeys::new("1/20261114T1000Z-ab12", "video-1-run");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        let (w, h) = (192usize, 108usize);
+        let key_frames = [21u32, 51];
+        for (task, first, last) in [(0u32, 1u32, 40u32), (1, 41, 75)] {
+            let segment = scratch.join(format!("{task}.mp4"));
+            let mut sink = crate::setup::film_sink_with_keys(
+                segment.to_string_lossy().into_owned(),
+                0,
+                Some("mezzanine"),
+                keys_within(&key_frames, (first, last)),
+            )
+            .expect("sink");
+            sink.open(w as u32, h as u32, 30).expect("open");
+            for f in first..=last {
+                let mut i420 = vec![(40 + f) as u8; w * h];
+                i420.extend(std::iter::repeat_n(128u8, w * h / 2));
+                sink.picture(f - first, f - first, &[], &i420)
+                    .expect("picture");
+            }
+            sink.close().expect("close");
+            mezzanine
+                .put(&segment, &keys.segment(u64::from(task)))
+                .await
+                .expect("segment");
+            let receipt = scratch.join(format!("{task}.json"));
+            let r = Receipt {
+                task,
+                first: u64::from(first),
+                last: u64::from(last),
+                segments: vec![u64::from(task)],
+            };
+            std::fs::write(&receipt, serde_json::to_vec(&r).expect("json")).expect("receipt");
+            runs.put(&receipt, &keys.receipt(task))
+                .await
+                .expect("receipt");
+        }
+        let still = scratch.join("still.png");
+        image::RgbImage::from_pixel(64, 64, image::Rgb([200, 30, 30]))
+            .save(&still)
+            .expect("still");
+        runs.put(&still, "1/20261114T1000Z-ab12/media/0.png")
+            .await
+            .expect("still");
+        let order: CompositeOrder = serde_json::from_value(serde_json::json!({
+            "run": "1/20261114T1000Z-ab12", "render_id": "video-1-run", "chunks": 2,
+            "segments": "mezzanine", "fps": 30.0, "first": 21, "last": 50,
+            "layer": {"kind": "still", "key": "1/20261114T1000Z-ab12/media/0.png"},
+            "fade_seconds": 0.2, "zoom": [1.0, 1.08], "codec": "mezzanine",
+            "out": "1/20261114T1000Z-ab12/inserts/0.mp4",
+        }))
+        .expect("order");
+        assert_eq!(order.key_frames().map(|f| f as u32), key_frames);
+        let done = service.composite(&order).await.expect("composited");
+        assert_eq!((done.frames, done.key.as_str()), (30, order.out.as_str()));
+        assert!(mezzanine.exists(&order.out).await.expect("exists"));
+        let compress: CompressOrder = serde_json::from_value(serde_json::json!({
+            "run": "1/20261114T1000Z-ab12", "render_id": "video-1-run", "chunks": 2,
+            "fps": 30.0, "segments": "mezzanine", "delivery": {"kind": "copy"},
+            "inserts": [order.insert()],
+        }))
+        .expect("order");
+        assert_eq!(compress.segments, Store::Mezzanine);
+        let film = service.compress(&compress).await.expect("compressed");
+        assert_eq!(film.frames, 75);
+        // The delivered film: the render's grey outside the range, the
+        // still's red in its middle.
+        let delivered = scratch.join("delivered.mp4");
+        runs.get(&film.key, &delivered).await.expect("film");
+        let mut file = std::fs::File::open(&delivered).expect("film");
+        let track = tuile_mp4::film::read_track(&mut file)
+            .expect("read")
+            .expect("track");
+        let mut cr = Vec::new();
+        crate::decode::pictures(&delivered, track, 0, |p| {
+            cr.push(p.i420[w * h + w * h / 4 + (h / 4) * (w / 2) + w / 4]);
+            Ok(())
+        })
+        .expect("decoded");
+        assert_eq!(cr.len(), 75);
+        assert!(
+            (cr[9] as i32 - 128).abs() < 4 && (cr[60] as i32 - 128).abs() < 4,
+            "{cr:?}"
+        );
+        assert!(cr[35] > 200, "the still's red at frame 36: {cr:?}");
+        let refused = service
+            .composite(&CompositeOrder {
+                chunks: 3,
+                ..order.clone()
+            })
+            .await
+            .expect_err("not done");
+        assert!(refused.to_string().contains("not done"), "{refused}");
     }
 
     #[tokio::test]

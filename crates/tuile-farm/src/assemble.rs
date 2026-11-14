@@ -299,6 +299,98 @@ pub async fn gather_with(
     })
 }
 
+/// The render's frames `first..=last` fetched into `work`: the segments
+/// that hold them, and only those, each with the run of its samples (from
+/// 0) that are those frames — in film order. The run starts on a key frame,
+/// where it decodes on its own, or the fetch is refused, the frame named:
+/// the render was not asked for one there. Every receipt must be in.
+pub async fn fetch_range(
+    receipts_store: &dyn RunStore,
+    segments_store: &dyn RunStore,
+    run: &RunKeys,
+    task_count: u32,
+    (first, last): (u64, u64),
+    work: &Path,
+) -> Result<Vec<(PathBuf, std::ops::Range<usize>)>, AssembleError> {
+    let mut receipts = read_receipts(receipts_store, run).await?;
+    if receipts.len() < task_count as usize {
+        return Err(AssembleError::BadReceipt {
+            key: run.receipts(),
+            reason: format!(
+                "{} receipts of {task_count}: the render is not done",
+                receipts.len()
+            ),
+        });
+    }
+    check_receipts(&receipts, task_count)?;
+    receipts.sort_by_key(|r| r.first);
+    let (start, end) = (
+        receipts.first().map_or(1, |r| r.first),
+        receipts.last().map_or(0, |r| r.last),
+    );
+    if last < first || first < start || last > end {
+        return Err(AssembleError::BadReceipt {
+            key: run.receipts(),
+            reason: format!("frames {first}..={last} are not all in the film's {start}..={end}"),
+        });
+    }
+    tokio::fs::create_dir_all(work)
+        .await
+        .map_err(|source| AssembleError::Io {
+            path: work.to_path_buf(),
+            source,
+        })?;
+    let mut pieces = Vec::new();
+    for r in receipts
+        .iter()
+        .filter(|r| r.last >= first && r.first <= last)
+    {
+        let mut at = r.first;
+        for &g in &r.segments {
+            let local = work.join(format!("seg{g}.mp4"));
+            segments_store.get(&run.segment(g), &local).await?;
+            let path = local.clone();
+            let track = tokio::task::spawn_blocking(move || {
+                let mut file = std::fs::File::open(&path)?;
+                tuile_mp4::film::read_track(&mut file)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                    .ok_or_else(|| std::io::Error::other("no video track"))
+            })
+            .await
+            .map_err(|e| AssembleError::Join(e.to_string()))?
+            .map_err(|source| AssembleError::Io {
+                path: local.clone(),
+                source,
+            })?;
+            let frames = track.samples.len() as u64;
+            let (a, b) = (at, at + frames.saturating_sub(1));
+            at += frames;
+            if frames == 0 || b < first || a > last {
+                continue;
+            }
+            let (from, to) = (first.max(a) - a, last.min(b) - a + 1);
+            if pieces.is_empty() && !track.samples[from as usize].key {
+                return Err(AssembleError::BadReceipt {
+                    key: run.segment(g),
+                    reason: format!(
+                        "frame {} is not a key frame: the render was not asked for one there",
+                        first.max(a)
+                    ),
+                });
+            }
+            pieces.push((local, from as usize..to as usize));
+        }
+    }
+    let held: u64 = pieces.iter().map(|(_, r)| r.len() as u64).sum();
+    if held != last + 1 - first {
+        return Err(AssembleError::FrameCount {
+            got: held,
+            expected: last + 1 - first,
+        });
+    }
+    Ok(pieces)
+}
+
 async fn read_receipts(store: &dyn RunStore, run: &RunKeys) -> Result<Vec<Receipt>, AssembleError> {
     let mut receipts = Vec::new();
     for entry in store.list(&run.receipts()).await? {
@@ -629,6 +721,77 @@ mod tests {
         .await
         .expect_err("no such insert");
         assert!(matches!(err, AssembleError::MissingSegment(_)), "{err}");
+    }
+
+    /// Frames 5..=8 of a render of two segments (1..=6, 7..=12): both
+    /// fetched, each with its run of samples; a range that starts on no key
+    /// frame, or a render not done, is refused.
+    #[tokio::test]
+    async fn a_range_is_fetched_from_the_segments_that_hold_it() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let receipts =
+            crate::ObjectRunStore::local(&root.path().join("run"), crate::Tuning::default())
+                .expect("store");
+        let mezzanine =
+            crate::ObjectRunStore::local(&root.path().join("mezz"), crate::Tuning::default())
+                .expect("store");
+        let run = RunKeys::new("renders/r", "e1");
+        let src = root.path().join("r.json");
+        let sps = [0x67, 0x64, 0x00, 0x0c, 0xac, 0xd9, 0x42];
+        for (t, first, last) in [(0u32, 1u64, 6u64), (1, 7, 12), (2, 13, 20)] {
+            std::fs::write(
+                &src,
+                serde_json::to_vec(&receipt(t, first, last, &[u64::from(t)])).expect("json"),
+            )
+            .expect("write");
+            store_put(&receipts, &src, &run.receipt(t)).await;
+            let seg = root.path().join(format!("s{t}.mp4"));
+            crate::concat::write_test_segment_with(
+                &seg,
+                (last + 1 - first) as u32,
+                &sps,
+                t as u8,
+                &|i| i == 0 || (t == 0 && i == 4),
+                false,
+            )
+            .expect("segment");
+            store_put(&mezzanine, &seg, &run.segment(u64::from(t))).await;
+        }
+        let work = tempfile::tempdir().expect("tempdir");
+        let pieces = fetch_range(&receipts, &mezzanine, &run, 3, (5, 8), work.path())
+            .await
+            .expect("fetched");
+        let runs: Vec<_> = pieces
+            .iter()
+            .map(|(p, r)| {
+                (
+                    p.file_name().unwrap().to_string_lossy().into_owned(),
+                    r.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                ("seg0.mp4".to_string(), 4..6),
+                ("seg1.mp4".to_string(), 0..2)
+            ]
+        );
+        assert!(
+            !work.path().join("seg2.mp4").exists(),
+            "only what holds the range"
+        );
+        let err = fetch_range(&receipts, &mezzanine, &run, 3, (4, 8), work.path())
+            .await
+            .expect_err("no key at 4");
+        assert!(
+            err.to_string().contains("frame 4 is not a key frame"),
+            "{err}"
+        );
+        let err = fetch_range(&receipts, &mezzanine, &run, 4, (5, 8), work.path())
+            .await
+            .expect_err("a receipt missing");
+        assert!(err.to_string().contains("not done"), "{err}");
     }
 
     async fn store_put(store: &crate::ObjectRunStore, from: &Path, key: &str) {
