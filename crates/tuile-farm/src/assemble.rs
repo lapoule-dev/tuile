@@ -303,35 +303,36 @@ pub async fn gather_with(
 /// that hold them, and only those, each with the run of its samples (from
 /// 0) that are those frames — in film order. The run starts on a key frame,
 /// where it decodes on its own, or the fetch is refused, the frame named:
-/// the render was not asked for one there. Every receipt must be in.
+/// the render was not asked for one there.
+///
+/// Only the receipts of the tasks that hold the range need be in: a range
+/// is taken as soon as its own segments are rendered, while the rest of
+/// the film still is.
 pub async fn fetch_range(
     receipts_store: &dyn RunStore,
     segments_store: &dyn RunStore,
     run: &RunKeys,
-    task_count: u32,
     (first, last): (u64, u64),
     work: &Path,
 ) -> Result<Vec<(PathBuf, std::ops::Range<usize>)>, AssembleError> {
     let mut receipts = read_receipts(receipts_store, run).await?;
-    if receipts.len() < task_count as usize {
+    receipts.sort_by_key(|r| r.first);
+    receipts.retain(|r| r.last >= first && r.first <= last);
+    // The range covered from its first frame to its last, without a gap.
+    let mut next = first;
+    for r in &receipts {
+        if r.first > next || r.last < r.first || r.segments.is_empty() {
+            break;
+        }
+        next = next.max(r.last + 1);
+    }
+    if last < first || next <= last {
         return Err(AssembleError::BadReceipt {
             key: run.receipts(),
             reason: format!(
-                "{} receipts of {task_count}: the render is not done",
-                receipts.len()
+                "frames {first}..={last}: not all rendered yet (in up to {})",
+                next.saturating_sub(1)
             ),
-        });
-    }
-    check_receipts(&receipts, task_count)?;
-    receipts.sort_by_key(|r| r.first);
-    let (start, end) = (
-        receipts.first().map_or(1, |r| r.first),
-        receipts.last().map_or(0, |r| r.last),
-    );
-    if last < first || first < start || last > end {
-        return Err(AssembleError::BadReceipt {
-            key: run.receipts(),
-            reason: format!("frames {first}..={last} are not all in the film's {start}..={end}"),
         });
     }
     tokio::fs::create_dir_all(work)
@@ -723,9 +724,10 @@ mod tests {
         assert!(matches!(err, AssembleError::MissingSegment(_)), "{err}");
     }
 
-    /// Frames 5..=8 of a render of two segments (1..=6, 7..=12): both
+    /// Frames 5..=8 of a render of three segments (1..=6, 7..=12,
+    /// 13..=20) whose fourth is not rendered yet: the two that hold them
     /// fetched, each with its run of samples; a range that starts on no key
-    /// frame, or a render not done, is refused.
+    /// frame, or one not all rendered yet, is refused.
     #[tokio::test]
     async fn a_range_is_fetched_from_the_segments_that_hold_it() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -758,7 +760,7 @@ mod tests {
             store_put(&mezzanine, &seg, &run.segment(u64::from(t))).await;
         }
         let work = tempfile::tempdir().expect("tempdir");
-        let pieces = fetch_range(&receipts, &mezzanine, &run, 3, (5, 8), work.path())
+        let pieces = fetch_range(&receipts, &mezzanine, &run, (5, 8), work.path())
             .await
             .expect("fetched");
         let runs: Vec<_> = pieces
@@ -781,17 +783,18 @@ mod tests {
             !work.path().join("seg2.mp4").exists(),
             "only what holds the range"
         );
-        let err = fetch_range(&receipts, &mezzanine, &run, 3, (4, 8), work.path())
+        let err = fetch_range(&receipts, &mezzanine, &run, (4, 8), work.path())
             .await
             .expect_err("no key at 4");
         assert!(
             err.to_string().contains("frame 4 is not a key frame"),
             "{err}"
         );
-        let err = fetch_range(&receipts, &mezzanine, &run, 4, (5, 8), work.path())
+        // Frames 18..=22: task 3 (21..) has not rendered yet.
+        let err = fetch_range(&receipts, &mezzanine, &run, (18, 22), work.path())
             .await
-            .expect_err("a receipt missing");
-        assert!(err.to_string().contains("not done"), "{err}");
+            .expect_err("not rendered");
+        assert!(err.to_string().contains("not all rendered yet"), "{err}");
     }
 
     async fn store_put(store: &crate::ObjectRunStore, from: &Path, key: &str) {

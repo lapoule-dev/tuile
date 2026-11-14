@@ -846,7 +846,6 @@ impl<F: OverlayFactory> Service<F> {
             self.runs.as_ref(),
             segments,
             &run,
-            order.chunks,
             (order.first, order.last),
             &scratch.path().join("film"),
         )
@@ -1546,7 +1545,7 @@ mod tests {
             .await
             .expect("still");
         let order: CompositeOrder = serde_json::from_value(serde_json::json!({
-            "run": "1/20261114T1000Z-ab12", "render_id": "video-1-run", "chunks": 2,
+            "run": "1/20261114T1000Z-ab12", "render_id": "video-1-run",
             "segments": "mezzanine", "fps": 30.0, "first": 21, "last": 50,
             "layer": {"kind": "still", "key": "1/20261114T1000Z-ab12/media/0.png"},
             "fade_seconds": 0.2, "zoom": [1.0, 1.08], "codec": "mezzanine",
@@ -1588,12 +1587,17 @@ mod tests {
         assert!(cr[35] > 200, "the still's red at frame 36: {cr:?}");
         let refused = service
             .composite(&CompositeOrder {
-                chunks: 3,
+                first: 60,
+                last: 80,
+                out: "1/20261114T1000Z-ab12/inserts/1.mp4".into(),
                 ..order.clone()
             })
             .await
-            .expect_err("not done");
-        assert!(refused.to_string().contains("not done"), "{refused}");
+            .expect_err("not rendered");
+        assert!(
+            refused.to_string().contains("not all rendered yet"),
+            "{refused}"
+        );
     }
 
     #[tokio::test]
