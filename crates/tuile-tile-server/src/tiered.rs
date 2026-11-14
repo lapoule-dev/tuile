@@ -254,6 +254,56 @@ impl Tiered {
         &self.inner.origin
     }
 
+    /// An object the tiers keep and the origin never holds — one written by
+    /// [`Self::keep_in_tiers`] — from the nearest tier that has it, touched
+    /// there and farther as an archive read is; `None` when no tier has it.
+    /// The origin is never asked: it would only answer that it has none.
+    pub async fn get_kept(&self, location: &Path) -> Result<Option<GetResult>> {
+        self.get_kept_opts(location, GetOptions::default()).await
+    }
+
+    /// The same, read with `options`: a range of it, for one.
+    pub async fn get_kept_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<Option<GetResult>> {
+        let inner = &self.inner;
+        for (i, tier) in inner.tiers.iter().enumerate() {
+            match tier.objects.get_opts(location, options.clone()).await {
+                Ok(got) => {
+                    inner.hit(i, got.range.end - got.range.start);
+                    inner.touch_from(i, location).await;
+                    return Ok(Some(got));
+                }
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(error) => {
+                    tracing::warn!(tier = %tier.name, key = %location, %error, "TIER-READ-FAILED");
+                    continue;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// `bytes` kept under `location` in every tier that does not hold it
+    /// yet, never in the origin: for an object made from archives — named by
+    /// what it was made from, so that the same key is the same content —
+    /// that the next reader behind these tiers then reads whole instead of
+    /// making it again. Written once ([`PutMode::Create`]), touched as an
+    /// archive written is; a tier that holds it already is not sent the
+    /// bytes again. A tier that fails is told in the log.
+    pub async fn keep_in_tiers(&self, location: &Path, bytes: Bytes) {
+        let inner = &self.inner;
+        for i in 0..inner.tiers.len() {
+            if inner.tiers[i].objects.head(location).await.is_ok() {
+                inner.counters.already_there.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            inner.keep_one(i, location, &bytes).await;
+        }
+    }
+
     pub fn stats(&self) -> TieredStats {
         let c = &self.inner.counters;
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -342,32 +392,38 @@ impl Inner {
     /// already. A tier that fails to keep them is told in the log: the
     /// read goes on.
     async fn keep(&self, nearest: usize, at: &Path, bytes: &Bytes) {
-        for (i, tier) in self.tiers[..nearest].iter().enumerate() {
-            let opts = PutOptions {
-                mode: PutMode::Create,
-                ..PutOptions::default()
-            };
-            match tier
-                .objects
-                .put_opts(at, PutPayload::from_bytes(bytes.clone()), opts)
-                .await
-            {
-                Ok(_) => {
-                    self.counters.written.fetch_add(1, Ordering::Relaxed);
-                    metrics::counter!("tuile_tiles_tier_writes_total", "tier" => tier.name.clone())
-                        .increment(1);
-                    // A copy written now is in use now.
-                    self.touch_if_due(i, at, true).await;
-                }
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    self.counters.already_there.fetch_add(1, Ordering::Relaxed);
-                    self.touch_if_due(i, at, false).await;
-                }
-                Err(error) => {
-                    tracing::warn!(tier = %tier.name, key = %at, %error, "TIER-WRITE-FAILED");
-                    metrics::counter!("tuile_tiles_tier_write_failures_total", "tier" => tier.name.clone())
-                        .increment(1);
-                }
+        for i in 0..nearest {
+            self.keep_one(i, at, bytes).await;
+        }
+    }
+
+    /// `bytes` written into tier `i`, unless it holds them already.
+    async fn keep_one(&self, i: usize, at: &Path, bytes: &Bytes) {
+        let tier = &self.tiers[i];
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        match tier
+            .objects
+            .put_opts(at, PutPayload::from_bytes(bytes.clone()), opts)
+            .await
+        {
+            Ok(_) => {
+                self.counters.written.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("tuile_tiles_tier_writes_total", "tier" => tier.name.clone())
+                    .increment(1);
+                // A copy written now is in use now.
+                self.touch_if_due(i, at, true).await;
+            }
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                self.counters.already_there.fetch_add(1, Ordering::Relaxed);
+                self.touch_if_due(i, at, false).await;
+            }
+            Err(error) => {
+                tracing::warn!(tier = %tier.name, key = %at, %error, "TIER-WRITE-FAILED");
+                metrics::counter!("tuile_tiles_tier_write_failures_total", "tier" => tier.name.clone())
+                    .increment(1);
             }
         }
     }

@@ -27,6 +27,26 @@
 //! terrain tiles below `top`, out of 17 500 (380 MB) in the zones their
 //! cameras reach. `top` stays whole there too: every bake pins it.
 //!
+//! # Made once for every machine
+//!
+//! A zone projected whole is the same file for every bake that reaches it,
+//! on any machine, as long as the zone's live archives are the same. A store
+//! given tiers ([`TileStore::with_shared_projections`]) keeps it there as
+//! **one object**, under a key derived from the archives it was made from
+//! ([`shared_projection_key`]): the next machine behind those tiers reads
+//! that one object — the file itself, in slices a few at once, written to
+//! disk as they come, nothing merged again — instead of every archive of the
+//! zone. Archives are never rewritten, so the key names its content: it is
+//! written once and never again, and a zone that gains or loses an archive
+//! has a new key. Never in the origin. The `top` zone, which every bake
+//! reaches and which holds the coarse pyramid of the whole globe, is what
+//! this is for: measured (2026-11-14), 225 of the 238 MB a fresh machine
+//! fetched to project a bake, in ten archives read one after the other.
+//!
+//! A targeted zone is not shared this way: what it holds depends on the
+//! footprint, and what it fetches — a few ranges of each archive — is
+//! already read from the tiers, archive by archive.
+//!
 //! # Which tiles a scene can use
 //!
 //! A tile of level `L` is drawn only while the camera is close enough for its
@@ -342,6 +362,12 @@ pub struct ProjectionReport {
     /// Zones whose projection was already made from the same archives, by
     /// this bake's process or an earlier one: nothing downloaded for them.
     pub zones_reused: usize,
+    /// Zones whose projection another machine made: read from the tiers as
+    /// one object ([`TileStore::with_shared_projections`]). Their request
+    /// and bytes are counted with the others'.
+    pub zones_shared: usize,
+    /// Zones made here and kept in the tiers for the others.
+    pub zones_shared_written: usize,
 }
 
 /// What a projection did of one layer: its cell zones, and its `top`.
@@ -384,6 +410,8 @@ impl ProjectionReport {
         self.register_batches += r.register_batches;
         self.register_millis += r.register_millis;
         self.zones_reused += r.zones_reused;
+        self.zones_shared += r.zones_shared;
+        self.zones_shared_written += r.zones_shared_written;
         let l = self.layers.entry(layer.to_string()).or_default();
         l.targeted |= targeted;
         l.zones_seen += r.zones_seen;
@@ -477,6 +505,38 @@ pub fn projection_source_path(path: &FsPath) -> PathBuf {
 
 fn source_of(keys: &[String]) -> String {
     keys.join("\n")
+}
+
+/// A shared projection is read in slices of this many bytes,
+/// [`ranges_in_flight`] at once: one stream from a bucket is slower than
+/// several.
+const SHARED_SLICE: u64 = 16 << 20;
+
+/// What a shared projection's key is derived from besides its archives:
+/// bumped whenever what a projection holds for the same archives changes.
+const SHARED_PROJECTION_FORMAT: &str = "tuile projection 1";
+
+/// Where a zone's projection made from the archives `source` names is kept
+/// in the tiers: `projections/<zone's prefix>/<digest>.pmtiles`, the digest a
+/// SHA-256 of the projection's format, the layer as its archives are written
+/// (grid, tile type, compression) and `source`. Two projections with the
+/// same key hold the same tiles.
+pub fn shared_projection_key(layer: &Layer, zone: Zone, source: &str) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    for part in [
+        SHARED_PROJECTION_FORMAT,
+        &layer.name,
+        &format!("{:?}", layer.grid),
+        &format!("{:?}", layer.tile_type),
+        &format!("{:?}", layer.tile_compression),
+        source,
+    ] {
+        h.update(part.as_bytes());
+        h.update(b"\0");
+    }
+    let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    format!("projections/{}/{digest}.pmtiles", layer.zone_prefix(zone))
 }
 
 /// Tile entries of archive listings kept in memory, unless
@@ -1095,6 +1155,18 @@ impl TileStore {
             self.attach_projection_reader(&layer, zone, reader);
             return Ok(report);
         }
+        // Made by another machine from the same archives: one object.
+        let shared = shared_projection_key(&layer, zone, &source);
+        if let Some((bytes, requests)) = self
+            .projection_from_tiers(&shared, dir, &layer, zone, &source)
+            .await?
+        {
+            report.zones_projected = 1;
+            report.zones_shared = 1;
+            report.requests = requests;
+            report.bytes = bytes;
+            return Ok(report);
+        }
 
         // Newest first: the first archive to hold a tile wins it. Each archive
         // comes down in one request, then is read locally.
@@ -1141,7 +1213,143 @@ impl TileStore {
         let epoch = archives.last().map(|a| a.epoch.clone()).unwrap_or_default();
         self.persist_projection(dir, &layer, zone, &epoch, tiles, &source)
             .await?;
+        if self
+            .share_projection(&shared, &projection_path(dir, &layer, zone))
+            .await
+        {
+            report.zones_shared_written = 1;
+        }
         Ok(report)
+    }
+
+    /// The projection kept in the tiers under `key`, written to its place
+    /// under `dir` as it comes and read through from now on, said to be made
+    /// from `source` as one made here would be. Its bytes and the requests
+    /// they took, or `None` when the store has no tiers or none holds it. A
+    /// copy that breaks on the way is told in the log and left: the zone is
+    /// made here.
+    async fn projection_from_tiers(
+        &self,
+        key: &str,
+        dir: &FsPath,
+        layer: &Layer,
+        zone: Zone,
+        source: &str,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        let Some(tiers) = &self.shared_projections else {
+            return Ok(None);
+        };
+        let at = object_store::path::Path::from(key);
+        // Its first slice says whether a tier has it, and how long it is.
+        let slice = |range: Range<u64>| object_store::GetOptions {
+            range: Some(range.into()),
+            ..Default::default()
+        };
+        let first = match tiers.get_kept_opts(&at, slice(0..SHARED_SLICE)).await {
+            Ok(Some(got)) => got,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                tracing::warn!(key, %error, "PROJECTION-SHARED-READ-FAILED: made here");
+                return Ok(None);
+            }
+        };
+        let size = first.meta.size;
+        let path = projection_path(dir, layer, zone);
+        let near = path.parent().unwrap_or(dir).to_path_buf();
+        std::fs::create_dir_all(&near)?;
+        let said = projection_source_path(&path);
+        let _ = std::fs::remove_file(&said);
+        // Written beside where it goes, then renamed: a reader never sees
+        // half of it.
+        let file = tempfile::NamedTempFile::new_in(&near)?;
+        let copied = async {
+            use tokio::io::AsyncWriteExt;
+            let mut out = tokio::fs::File::from_std(file.reopen()?);
+            let mut bytes = 0u64;
+            let mut stream = first.into_stream();
+            while let Some(chunk) = stream.try_next().await? {
+                bytes += chunk.len() as u64;
+                out.write_all(&chunk).await?;
+            }
+            // The other slices a few at once, written in their order.
+            let rest: Vec<Range<u64>> = (bytes..size)
+                .step_by(SHARED_SLICE as usize)
+                .map(|start| start..(start + SHARED_SLICE).min(size))
+                .collect();
+            let requests = 1 + rest.len() as u64;
+            let mut slices = futures_util::stream::iter(rest)
+                .map(|range| {
+                    let at = &at;
+                    let options = slice(range);
+                    async move {
+                        match tiers.get_kept_opts(at, options).await? {
+                            Some(got) => Ok(got.bytes().await?),
+                            None => Err(StoreError::Corrupt(format!(
+                                "{at}: gone from the tiers while read"
+                            ))),
+                        }
+                    }
+                })
+                .buffered(ranges_in_flight());
+            while let Some(chunk) = slices.try_next().await? {
+                bytes += chunk.len() as u64;
+                out.write_all(&chunk).await?;
+            }
+            out.flush().await?;
+            if bytes != size {
+                return Err(StoreError::Corrupt(format!(
+                    "{at}: {bytes} bytes read of {size}"
+                )));
+            }
+            Ok::<_, StoreError>((bytes, requests))
+        }
+        .await;
+        let read = match copied {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::warn!(key, %error, "PROJECTION-SHARED-READ-FAILED: made here");
+                return Ok(None);
+            }
+        };
+        // Not an archive (cut short in a tier, put there by something else):
+        // left, and the zone made here.
+        if let Err(error) = archive::open_local(file.path()).await {
+            tracing::warn!(key, %error, "PROJECTION-SHARED-READ-FAILED: made here");
+            return Ok(None);
+        }
+        file.persist(&path).map_err(|e| StoreError::Io(e.error))?;
+        let mut note = tempfile::NamedTempFile::new_in(&near)?;
+        std::io::Write::write_all(&mut note, source.as_bytes())?;
+        note.persist(&said).map_err(|e| StoreError::Io(e.error))?;
+        self.attach_projection(layer, zone, &path).await?;
+        metrics::counter!("tuile_tiles_projections_shared_total", "how" => "read").increment(1);
+        Ok(Some(read))
+    }
+
+    /// The projection at `path`, just made, kept in the tiers under `key`
+    /// for every other machine behind them. Whether it was written there
+    /// now; a tier that fails is told in the log, and the bake goes on.
+    async fn share_projection(&self, key: &str, path: &FsPath) -> bool {
+        let Some(tiers) = &self.shared_projections else {
+            return false;
+        };
+        let bytes = match tokio::fs::read(path).await {
+            Ok(bytes) => Bytes::from(bytes),
+            Err(error) => {
+                tracing::warn!(key, %error, "PROJECTION-SHARE-FAILED");
+                return false;
+            }
+        };
+        let before = tiers.stats().written;
+        tiers
+            .keep_in_tiers(&object_store::path::Path::from(key), bytes)
+            .await;
+        let written = tiers.stats().written > before;
+        if written {
+            metrics::counter!("tuile_tiles_projections_shared_total", "how" => "written")
+                .increment(1);
+        }
+        written
     }
 }
 

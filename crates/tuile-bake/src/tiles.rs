@@ -32,7 +32,11 @@
 //!   no custom time and is never touched.
 //!
 //! The projections, under `TUILE_TILES_DIR`, are reused whenever the zone's
-//! archives are the ones they were made from.
+//! archives are the ones they were made from. A zone projected whole — the
+//! `top` zone, every bake's — is also kept in the tiers as one object, under
+//! a key derived from those archives: another machine reads it in one
+//! request instead of the zone's archives
+//! ([`tuile_tile_server::projection`]).
 //!
 //! **Its I/O on the host's runtime.** The bucket and the global tier are
 //! read over HTTP by clients that pool their connections, and a connection
@@ -615,6 +619,12 @@ impl Tiles {
                 }
             })
             .map_err(|e| format!("tile bucket {bucket}: {e}"))?;
+        // A zone projected whole is made once for every machine behind the
+        // tiers, and kept there as one object.
+        let store = match &tiered {
+            Some(t) => store.with_shared_projections(t.clone()),
+            None => store,
+        };
         tracing::info!(
             bucket,
             layers = store.layers().count(),
@@ -787,6 +797,8 @@ impl Tiles {
             requests = tracing::field::Empty,
             bytes = tracing::field::Empty,
             reused = tracing::field::Empty,
+            shared = tracing::field::Empty,
+            shared_written = tracing::field::Empty,
         );
         let report =
             span.in_scope(|| self.project_footprint(&footprint, std::path::Path::new(&dir)))?;
@@ -795,6 +807,8 @@ impl Tiles {
         span.record("requests", report.requests);
         span.record("bytes", report.bytes);
         span.record("reused", report.zones_reused as u64);
+        span.record("shared", report.zones_shared as u64);
+        span.record("shared_written", report.zones_shared_written as u64);
         tracing::info!(
             eyes = footprint.eyes().len(),
             factor,
@@ -817,6 +831,9 @@ impl Tiles {
             register_s = report.register_millis as f64 / 1e3,
             layers_listed = report.layers_listed,
             layers_from_register = report.layers_from_register,
+            zones_reused = report.zones_reused,
+            zones_shared = report.zones_shared,
+            zones_shared_written = report.zones_shared_written,
             seconds = report.millis as f64 / 1e3,
             "TILES-PROJECTED"
         );

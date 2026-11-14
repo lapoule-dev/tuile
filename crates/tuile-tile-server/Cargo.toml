@@ -32,6 +32,8 @@ metrics = "0.24"
 rand = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
+# A shared projection's key: a digest of the archives it was made from.
+sha2 = "0.11"
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "fs", "io-util", "time", "rt"] }

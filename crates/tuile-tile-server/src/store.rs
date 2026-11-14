@@ -349,6 +349,9 @@ pub struct TileStore {
     index_reader: Option<Arc<dyn crate::IndexReader>>,
     /// Where absences are kept instead of the absence siblings' archives.
     absences: Option<Arc<dyn crate::Absences>>,
+    /// The tiers a projection made whole is kept in, as one object, for
+    /// every store behind them (see [`crate::projection`]).
+    pub(crate) shared_projections: Option<crate::Tiered>,
     stats: Stats,
 }
 
@@ -418,6 +421,7 @@ impl TileStore {
             ledger: None,
             index_reader: None,
             absences: None,
+            shared_projections: None,
             stats: Stats::default(),
         }
     }
@@ -518,6 +522,21 @@ impl TileStore {
     /// The same, on a store already built.
     pub fn set_index_reader(&mut self, reader: Arc<dyn crate::IndexReader>) {
         self.index_reader = Some(reader);
+    }
+
+    /// From now on a zone projected whole is kept in `tiers` as one object,
+    /// under a key derived from the archives it was made from, and a
+    /// projection of the same archives is read from there in one request
+    /// rather than made again: see [`crate::projection`]. Never in the
+    /// origin: the tiers are `tiers`' own.
+    pub fn with_shared_projections(mut self, tiers: crate::Tiered) -> Self {
+        self.shared_projections = Some(tiers);
+        self
+    }
+
+    /// The same, on a store already built.
+    pub fn set_shared_projections(&mut self, tiers: crate::Tiered) {
+        self.shared_projections = Some(tiers);
     }
 
     /// From now on every write to an absence sibling is recorded in
