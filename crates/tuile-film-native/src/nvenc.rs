@@ -37,9 +37,9 @@ use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
     NV_ENC_BUFFER_FORMAT, NV_ENC_CAPS, NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_H264_GUID,
     NV_ENC_CODEC_HEVC_GUID, NV_ENC_CONFIG, NV_ENC_CONFIG_H264_VUI_PARAMETERS,
     NV_ENC_H264_PROFILE_HIGH_GUID, NV_ENC_HEVC_PROFILE_MAIN10_GUID, NV_ENC_HEVC_PROFILE_MAIN_GUID,
-    NV_ENC_MULTI_PASS, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_PARAMS_HEVC, NV_ENC_PIC_TYPE,
-    NV_ENC_PRESET_P1_GUID, NV_ENC_PRESET_P2_GUID, NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P4_GUID,
-    NV_ENC_PRESET_P5_GUID, NV_ENC_PRESET_P6_GUID, NV_ENC_PRESET_P7_GUID,
+    NV_ENC_MULTI_PASS, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_FLAGS, NV_ENC_PIC_PARAMS_HEVC,
+    NV_ENC_PIC_TYPE, NV_ENC_PRESET_P1_GUID, NV_ENC_PRESET_P2_GUID, NV_ENC_PRESET_P3_GUID,
+    NV_ENC_PRESET_P4_GUID, NV_ENC_PRESET_P5_GUID, NV_ENC_PRESET_P6_GUID, NV_ENC_PRESET_P7_GUID,
     NV_ENC_TEMPORAL_FILTER_LEVEL, NV_ENC_TUNING_INFO, NV_ENC_VUI_COLOR_PRIMARIES,
     NV_ENC_VUI_MATRIX_COEFFS, NV_ENC_VUI_TRANSFER_CHARACTERISTIC, NV_ENC_VUI_VIDEO_FORMAT,
 };
@@ -335,6 +335,11 @@ pub fn encode(
         loop {
             let params = EncodePictureParams {
                 input_timestamp: frame.shown,
+                flags: if frame.key {
+                    NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_FORCEIDR as u32
+                } else {
+                    0
+                },
                 ..Default::default()
             };
             let result = session.encode_picture(&mut inputs[slot], &mut outputs[slot], params);
@@ -407,6 +412,8 @@ pub struct NvencFilm {
     encoder: Option<JoinHandle<Result<f64, String>>>,
     size: (usize, usize),
     seconds: f64,
+    /// Pictures (from 0) on which an IDR is forced.
+    keys: Vec<u64>,
 }
 
 impl NvencFilm {
@@ -415,6 +422,7 @@ impl NvencFilm {
             path: path.into(),
             bitrate,
             codec,
+            keys: Vec::new(),
             device: 0,
             pictures: None,
             eyes: None,
@@ -423,6 +431,14 @@ impl NvencFilm {
             size: (0, 0),
             seconds: 0.0,
         }
+    }
+
+    /// An IDR forced on each of these pictures (from 0), beside the GOP's.
+    /// A single view only: a spatial film's encoder refuses them.
+    #[must_use]
+    pub fn with_keys(mut self, keys: Vec<u64>) -> Self {
+        self.keys = keys;
+        self
     }
 
     /// Opens the encoder on this CUDA device rather than the first.
@@ -687,6 +703,7 @@ impl Sink for NvencFilm {
         let spec = self.spec(size, fps)?;
         let (pictures, waiting) = sync_channel::<Vec<u8>>(WAITING);
         let (device, path) = (self.device, self.path.clone());
+        let keys = self.keys.clone();
         self.pictures = Some(pictures);
         self.encoder = Some(std::thread::spawn(move || {
             if let Some(dir) = path.parent() {
@@ -697,6 +714,7 @@ impl Sink for NvencFilm {
                 Ok(Frame {
                     data: i420,
                     shown: i as u64,
+                    key: keys.contains(&(i as u64)),
                 })
             });
             let busy = encode(device, &spec, frames, |e| film.take(e))?;

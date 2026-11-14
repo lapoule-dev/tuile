@@ -448,31 +448,85 @@ pub fn join(segments: &[PathBuf], out: &Path) -> Result<u64, Mp4Error> {
 /// `consume` is set: where the disk is memory, the film and its segments
 /// are then never held whole twice.
 pub fn join_into(segments: &[PathBuf], out: &Path, consume: bool) -> Result<u64, Mp4Error> {
-    let mut tracks = Vec::with_capacity(segments.len());
-    for path in segments {
+    let pieces: Vec<Piece> = segments.iter().map(|p| Piece::whole(p.clone())).collect();
+    join_pieces(&pieces, out, consume)
+}
+
+/// A run of one film's samples, for [`join_pieces`]: the film at `path`,
+/// all of it or its samples `samples` (decoding order, from 0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Piece {
+    pub path: PathBuf,
+    pub samples: Option<std::ops::Range<usize>>,
+}
+
+impl Piece {
+    /// The whole film at `path`.
+    pub fn whole(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            samples: None,
+        }
+    }
+
+    /// Samples `samples` of the film at `path`: the first must be a sync
+    /// sample, or the join refuses the piece.
+    pub fn cut(path: impl Into<PathBuf>, samples: std::ops::Range<usize>) -> Self {
+        Self {
+            path: path.into(),
+            samples: Some(samples),
+        }
+    }
+}
+
+/// Pieces of films one after the other into one at `out`, as [`join`]
+/// joins whole films: the same stream description and timescale in each,
+/// samples copied, nothing decoded. A piece cut out of a film starts on a
+/// sync sample — what decodes on its own — or the join is refused, the
+/// sample named; an empty piece is refused too. With `consume`, a film's
+/// file is removed once the last piece read from it is copied.
+pub fn join_pieces(pieces: &[Piece], out: &Path, consume: bool) -> Result<u64, Mp4Error> {
+    let mut tracks = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        let path = &piece.path;
         let mut file = File::open(path).map_err(io)?;
         let track = read_track(&mut file)?
             .ok_or_else(|| Mp4Error::Atom(format!("{}: no video track", path.display())))?;
-        tracks.push((file, track));
+        let range = piece.samples.clone().unwrap_or(0..track.samples.len());
+        if range.end > track.samples.len() || (piece.samples.is_some() && range.is_empty()) {
+            return Err(Mp4Error::Atom(format!(
+                "{}: samples {range:?} of {}",
+                path.display(),
+                track.samples.len()
+            )));
+        }
+        if piece.samples.is_some() && !track.samples[range.start].key {
+            return Err(Mp4Error::Atom(format!(
+                "{}: sample {} is not a key frame, and a piece cut there would not decode",
+                path.display(),
+                range.start
+            )));
+        }
+        tracks.push((file, track, range));
     }
-    let Some((_, first)) = tracks.first() else {
+    let Some((_, first, _)) = tracks.first() else {
         return Err(Mp4Error::Atom("nothing to join".into()));
     };
     let (entry, timescale) = (dressed(first.entry.clone()), first.timescale);
-    for ((_, t), path) in tracks.iter().zip(segments) {
+    for ((_, t, _), piece) in tracks.iter().zip(pieces) {
         if !same_stream(&t.entry, &entry) {
             return Err(Mp4Error::Mismatch("stream description"));
         }
         if t.timescale != timescale {
             return Err(Mp4Error::Atom(format!(
                 "{}: another timescale",
-                path.display()
+                piece.path.display()
             )));
         }
     }
     // Each segment shown from its own start: brought to one start, the
     // latest, so that no offset is negative.
-    let start = tracks.iter().map(|(_, t)| t.start).max().unwrap_or(0);
+    let start = tracks.iter().map(|(_, t, _)| t.start).max().unwrap_or(0);
     let mut table = Table {
         entry,
         timescale,
@@ -483,8 +537,8 @@ pub fn join_into(segments: &[PathBuf], out: &Path, consume: bool) -> Result<u64,
         start,
     };
     let mut bytes = 0u64;
-    for (_, track) in &tracks {
-        for s in &track.samples {
+    for (_, track, range) in &tracks {
+        for s in &track.samples[range.clone()] {
             table.sizes.push(s.size);
             if s.key {
                 table.sync.push(table.sizes.len() as u32);
@@ -497,17 +551,18 @@ pub fn join_into(segments: &[PathBuf], out: &Path, consume: bool) -> Result<u64,
     let mut writer = BufWriter::new(File::create(out).map_err(io)?);
     writer.write_all(&table.head(bytes)?).map_err(io)?;
     let mut buffer = Vec::new();
-    for ((file, track), path) in tracks.into_iter().zip(segments) {
+    for (i, ((file, track, range), piece)) in tracks.into_iter().zip(pieces).enumerate() {
         let mut file = file;
-        for s in &track.samples {
+        for s in &track.samples[range] {
             buffer.resize(s.size as usize, 0);
             file.seek(SeekFrom::Start(s.offset)).map_err(io)?;
             file.read_exact(&mut buffer).map_err(io)?;
             writer.write_all(&buffer).map_err(io)?;
         }
         drop(file);
-        if consume {
-            std::fs::remove_file(path).map_err(io)?;
+        let read_again = pieces[i + 1..].iter().any(|p| p.path == piece.path);
+        if consume && !read_again {
+            std::fs::remove_file(&piece.path).map_err(io)?;
         }
     }
     writer.flush().map_err(io)?;

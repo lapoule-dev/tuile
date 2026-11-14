@@ -198,24 +198,43 @@ pub fn bitrate_for(bitrate: u32, width: u32, height: u32, fps: u32) -> u32 {
 /// ([`crate::compress`]): HEVC Main10, near-transparent, by an NVIDIA card
 /// or a Mac's VideoToolbox.
 pub fn film_sink(path: String, bitrate: u32, codec: Option<&str>) -> Result<Box<dyn Sink>, Error> {
+    film_sink_with_keys(path, bitrate, codec, Vec::new())
+}
+
+/// [`film_sink`], an IDR forced on each of `keys` (pictures from 0) beside
+/// the GOP's: where the film is to be cut without decoding
+/// (`tuile_farm::concat::join_pieces`). The single-view encoders of the
+/// machine — NVENC, VideoToolbox — force them; an encoder that cannot
+/// (AV1 in software, a spatial film) refuses a film that asks for any,
+/// rather than write one that would not cut there.
+pub fn film_sink_with_keys(
+    path: String,
+    bitrate: u32,
+    codec: Option<&str>,
+    keys: Vec<u64>,
+) -> Result<Box<dyn Sink>, Error> {
+    let refuse = |codec: &str| -> Result<(), Error> {
+        if keys.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("the {codec} encoder does not force key frames").into())
+        }
+    };
     #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
     if matches!(codec, Some("h264") | None) {
-        return Ok(Box::new(crate::VtFilm::at(
-            path,
-            bitrate,
-            crate::VtCodec::H264,
-        )));
+        return Ok(Box::new(
+            crate::VtFilm::at(path, bitrate, crate::VtCodec::H264).with_keys(keys),
+        ));
     }
     #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
     if codec == Some("mezzanine") {
-        return Ok(Box::new(crate::VtFilm::at(
-            path,
-            bitrate,
-            crate::VtCodec::Mezzanine,
-        )));
+        return Ok(Box::new(
+            crate::VtFilm::at(path, bitrate, crate::VtCodec::Mezzanine).with_keys(keys),
+        ));
     }
     #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
     if codec == Some("mv-hevc") {
+        refuse("mv-hevc")?;
         return Ok(Box::new(crate::SpatialFilm::at(path, bitrate)));
     }
     #[cfg(all(target_os = "linux", feature = "nvenc"))]
@@ -228,29 +247,39 @@ pub fn film_sink(path: String, bitrate: u32, codec: Option<&str>) -> Result<Box<
         match codec {
             Some("nvenc-av1") | None => {
                 return Ok(Box::new(
-                    NvencFilm::at(path, bitrate, NvencCodec::Av1).on_device(device),
+                    NvencFilm::at(path, bitrate, NvencCodec::Av1)
+                        .on_device(device)
+                        .with_keys(keys),
                 ))
             }
             Some("mezzanine") => {
                 return Ok(Box::new(
-                    NvencFilm::at(path, bitrate, NvencCodec::Mezzanine).on_device(device),
+                    NvencFilm::at(path, bitrate, NvencCodec::Mezzanine)
+                        .on_device(device)
+                        .with_keys(keys),
                 ))
             }
             Some("nvenc-mv-hevc") | Some("mv-hevc") => {
+                refuse("mv-hevc")?;
                 return Ok(Box::new(
                     NvencFilm::at(path, bitrate, NvencCodec::MvHevc).on_device(device),
-                ))
+                ));
             }
             Some("nvenc-h264") | Some("h264") => {
                 return Ok(Box::new(
-                    NvencFilm::at(path, bitrate, NvencCodec::H264).on_device(device),
+                    NvencFilm::at(path, bitrate, NvencCodec::H264)
+                        .on_device(device)
+                        .with_keys(keys),
                 ))
             }
             _ => {}
         }
     }
     match codec {
-        Some("av1") | None => Ok(Box::new(Av1Film::at(path, bitrate))),
+        Some("av1") | None => {
+            refuse("av1")?;
+            Ok(Box::new(Av1Film::at(path, bitrate)))
+        }
         Some(other) => Err(format!("no {other} encoder was built into this binary").into()),
     }
 }

@@ -182,6 +182,41 @@ pub async fn gather(
     work: &Path,
     fps: Option<f64>,
 ) -> Result<Gathered, AssembleError> {
+    gather_joined(
+        receipts_store,
+        segments_store,
+        run,
+        task_count,
+        work,
+        fps,
+        Box::new(|segments, _, film| crate::concat::concat_into(segments, film, true)),
+    )
+    .await
+}
+
+/// How a render's segments become its film, for a host that joins them
+/// its own way: handed the segments fetched — in film order, their frames
+/// numbered from the second argument (the receipts' first) — it writes
+/// the film at the third, letting go of each segment once it is read for
+/// the last time, and returns the frames written. It may cut segments on
+/// their sync samples and put pieces of its own between them
+/// ([`tuile_mp4::film::join_pieces`]). [`gather`]'s is
+/// [`crate::concat::concat_into`].
+pub type Join =
+    Box<dyn FnOnce(&[PathBuf], u64, &Path) -> Result<u64, crate::concat::ConcatError> + Send>;
+
+/// [`gather`], the segments joined by the host's `join`. The film it
+/// writes is checked as [`gather`]'s is: it carries every frame the
+/// receipts add up to, at its cadence, or the gather fails.
+pub async fn gather_joined(
+    receipts_store: &dyn RunStore,
+    segments_store: &dyn RunStore,
+    run: &RunKeys,
+    task_count: u32,
+    work: &Path,
+    fps: Option<f64>,
+    join_by: Join,
+) -> Result<Gathered, AssembleError> {
     let receipts = read_receipts(receipts_store, run).await?;
     if receipts.len() < task_count as usize {
         return Ok(Gathered::Waiting {
@@ -190,6 +225,7 @@ pub async fn gather(
         });
     }
     let segments = check_receipts(&receipts, task_count)?;
+    let first_frame = receipts.iter().map(|r| r.first).min().unwrap_or(1);
     let expected: u64 = receipts.iter().map(Receipt::frames).sum();
 
     // Every vouched-for segment, present and plausible, before downloading a
@@ -233,7 +269,7 @@ pub async fn gather(
     // in: the number that matters is the one a player will find.
     // Each segment let go once it is in: where the disk is memory, the
     // film and its segments are never held whole twice.
-    let probe = join(locals, film.clone(), true).await?;
+    let probe = join(locals, first_frame, film.clone(), join_by).await?;
     let join_seconds = began.elapsed().as_secs_f64();
     let got = probe.frames;
     if got != expected {
@@ -258,7 +294,11 @@ pub async fn gather(
     })
 }
 
-async fn read_receipts(store: &dyn RunStore, run: &RunKeys) -> Result<Vec<Receipt>, AssembleError> {
+/// The receipts of `run` in `store`, those deposited so far, by task.
+pub async fn read_receipts(
+    store: &dyn RunStore,
+    run: &RunKeys,
+) -> Result<Vec<Receipt>, AssembleError> {
     let mut receipts = Vec::new();
     for entry in store.list(&run.receipts()).await? {
         let bytes = store.get_range(&entry.key, 0..entry.size).await?;
@@ -316,11 +356,12 @@ fn check_receipts(receipts: &[Receipt], task_count: u32) -> Result<Vec<u64>, Ass
 /// start to end, and the runtime's workers have uploads to drive meanwhile.
 async fn join(
     segments: Vec<PathBuf>,
+    first_frame: u64,
     film: PathBuf,
-    consume: bool,
+    join_by: Join,
 ) -> Result<crate::concat::Probe, AssembleError> {
     tokio::task::spawn_blocking(move || {
-        crate::concat::concat_into(&segments, &film, consume)?;
+        join_by(&segments, first_frame, &film)?;
         Ok(crate::concat::probe(&film)?)
     })
     .await
@@ -496,6 +537,121 @@ mod tests {
                 .await
                 .is_err(),
             "the segments are not in the run store"
+        );
+    }
+
+    /// A host's join: handed the render's two segments (frames 1..=6,
+    /// 7..=12) in film order with their first frame, it puts two frames of
+    /// its own in place of frames 7..=8, the second segment cut on the key
+    /// frame the render put at 9 — and the film it writes is checked as any
+    /// gather's: one that does not carry the receipts' frames is refused.
+    #[tokio::test]
+    async fn a_host_joins_the_segments_its_own_way_and_the_film_is_checked() {
+        use crate::concat::join_pieces;
+        use tuile_mp4::film::Piece;
+        let root = tempfile::tempdir().expect("tempdir");
+        let receipts =
+            crate::ObjectRunStore::local(&root.path().join("run"), crate::Tuning::default())
+                .expect("store");
+        let mezzanine =
+            crate::ObjectRunStore::local(&root.path().join("mezz"), crate::Tuning::default())
+                .expect("store");
+        let run = RunKeys::new("renders/r", "e1");
+        let src = root.path().join("r.json");
+        let sps = [0x67, 0x64, 0x00, 0x0c, 0xac, 0xd9, 0x42];
+        for (t, first, last, key) in [(0u32, 1u64, 6u64, 99u32), (1, 7, 12, 2)] {
+            std::fs::write(
+                &src,
+                serde_json::to_vec(&receipt(t, first, last, &[u64::from(t)])).expect("json"),
+            )
+            .expect("write");
+            store_put(&receipts, &src, &run.receipt(t)).await;
+            let seg = root.path().join(format!("s{t}.mp4"));
+            crate::concat::write_test_segment_with(
+                &seg,
+                (last + 1 - first) as u32,
+                &sps,
+                t as u8,
+                &|i| i == 0 || i == key,
+                false,
+            )
+            .expect("segment");
+            store_put(&mezzanine, &seg, &run.segment(u64::from(t))).await;
+        }
+        let own = root.path().join("own.mp4");
+        crate::concat::write_test_segment_with(&own, 2, &sps, 9, &|i| i == 0, false).expect("own");
+        let work = tempfile::tempdir().expect("tempdir");
+        let handed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen = handed.clone();
+        let piece = own.clone();
+        let gathered = gather_joined(
+            &receipts,
+            &mezzanine,
+            &run,
+            2,
+            work.path(),
+            Some(60.0),
+            Box::new(move |segments, first, film| {
+                *seen.lock().unwrap() = Some((segments.to_vec(), first));
+                join_pieces(
+                    &[
+                        Piece::whole(&segments[0]),
+                        Piece::whole(&piece),
+                        Piece::cut(&segments[1], 2..6),
+                    ],
+                    film,
+                    true,
+                )
+            }),
+        )
+        .await
+        .expect("gather");
+        let Gathered::Joined { path, frames, .. } = gathered else {
+            panic!("joined: {gathered:?}")
+        };
+        assert_eq!(frames, 12);
+        let (segments, first) = handed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the join was the host's");
+        assert_eq!(first, 1);
+        let names: Vec<_> = segments
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["seg0.mp4", "seg1.mp4"]);
+        let bytes = std::fs::read(&path).expect("film");
+        let t = tuile_mp4::film::read_track(&mut std::io::Cursor::new(&bytes))
+            .expect("read")
+            .expect("track");
+        let tags: Vec<u8> = t
+            .samples
+            .iter()
+            .map(|s| bytes[s.offset as usize + 5])
+            .collect();
+        assert_eq!(tags, [0, 0, 0, 0, 0, 0, 9, 9, 1, 1, 1, 1]);
+        // A join that leaves frames out: the receipts say twelve.
+        let err = gather_joined(
+            &receipts,
+            &mezzanine,
+            &run,
+            2,
+            work.path(),
+            None,
+            Box::new(|segments, _, film| join_pieces(&[Piece::whole(&segments[0])], film, true)),
+        )
+        .await
+        .expect_err("frames missing");
+        assert!(
+            matches!(
+                err,
+                AssembleError::FrameCount {
+                    got: 6,
+                    expected: 12
+                }
+            ),
+            "{err}"
         );
     }
 
