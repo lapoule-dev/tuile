@@ -1214,11 +1214,7 @@ pub async fn render(
                     } else {
                         Vec::new()
                     };
-                    let packed = (
-                        rgba,
-                        i420,
-                        Vec::new(),
-                    );
+                    let packed = (rgba, i420, Vec::new());
                     apart = Some((eyes, *pair, camera.eye(pair, Eye::Left)));
                     packed
                 }

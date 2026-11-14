@@ -772,7 +772,10 @@ async fn a_pinned_zone_is_read_as_it_was_when_pinned() {
     };
     let pinner = open().await;
     let (pinned, report) = pinner
-        .pin("imagery", &[(7, 77, 50), (7, 78, 50), (7, 77, 50), (7, 76, 50)])
+        .pin(
+            "imagery",
+            &[(7, 77, 50), (7, 78, 50), (7, 77, 50), (7, 76, 50)],
+        )
         .await
         .expect("pinned");
     // A in the newest archive, B in the second: the first archive, whose A
@@ -780,7 +783,10 @@ async fn a_pinned_zone_is_read_as_it_was_when_pinned() {
     assert_eq!(report.zones, 1);
     assert_eq!((report.tiles, report.archives), (3, 2));
     assert_eq!(report.absent, 1);
-    assert_eq!(report.absent_first, vec![("imagery".to_string(), 7, 76, 50)]);
+    assert_eq!(
+        report.absent_first,
+        vec![("imagery".to_string(), 7, 76, 50)]
+    );
     assert!(report.incomplete().is_some());
     let zone = pinner.zone_of("imagery", 7, 77, 50).expect("zone");
     let archives = &pinned.zones[&zone];
@@ -789,7 +795,11 @@ async fn a_pinned_zone_is_read_as_it_was_when_pinned() {
         layers: vec![pinned.clone()],
     };
     assert!(pins.key().starts_with(tuile_repository::PINS_PREFIX));
-    assert_eq!(pins.key(), pins.clone().key(), "the same pins, the same key");
+    assert_eq!(
+        pins.key(),
+        pins.clone().key(),
+        "the same pins, the same key"
+    );
     let back: tuile_repository::Pins = serde_json::from_slice(&pins.to_bytes()).expect("json");
     assert_eq!(back, pins);
 

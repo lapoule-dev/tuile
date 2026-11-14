@@ -453,7 +453,8 @@ impl Inner {
             let key = (i, at.to_string());
             let due = written
                 || touched.get(&key).is_none_or(|last| {
-                    now.duration_since(*last).is_ok_and(|idle| idle >= TOUCH_EVERY)
+                    now.duration_since(*last)
+                        .is_ok_and(|idle| idle >= TOUCH_EVERY)
                 });
             if !due {
                 return;
