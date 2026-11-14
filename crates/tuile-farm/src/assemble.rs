@@ -139,7 +139,8 @@ pub async fn assemble(
     work: &Path,
     fps: Option<f64>,
 ) -> Result<Outcome, AssembleError> {
-    match gather(store, store, run, task_count, work, fps).await? {
+    let progress = crate::progress::Progress::new();
+    match gather(store, store, run, task_count, work, fps, &progress).await? {
         Gathered::Waiting { done, of } => Ok(Outcome::Waiting { done, of }),
         Gathered::Joined { path, frames, .. } => {
             let bytes = store.put(&path, &run.film()).await?;
@@ -173,7 +174,8 @@ pub enum Gathered {
 /// `receipts`, the segments they vouch for fetched from `segments` (the
 /// same store, or the one that keeps a render's mezzanine), checked, and
 /// joined into `work/render.mp4` — counted by reading the film back, and
-/// with `fps`, its cadence checked.
+/// with `fps`, its cadence checked. Each segment's bytes are told to
+/// `progress` as it comes in.
 pub async fn gather(
     receipts_store: &dyn RunStore,
     segments_store: &dyn RunStore,
@@ -181,6 +183,7 @@ pub async fn gather(
     task_count: u32,
     work: &Path,
     fps: Option<f64>,
+    progress: &crate::progress::Progress,
 ) -> Result<Gathered, AssembleError> {
     gather_joined(
         receipts_store,
@@ -190,6 +193,7 @@ pub async fn gather(
         work,
         fps,
         Box::new(|segments, _, film| crate::concat::concat_into(segments, film, true)),
+        progress,
     )
     .await
 }
@@ -207,7 +211,9 @@ pub type Join =
 
 /// [`gather`], the segments joined by the host's `join`. The film it
 /// writes is checked as [`gather`]'s is: it carries every frame the
-/// receipts add up to, at its cadence, or the gather fails.
+/// receipts add up to, at its cadence, or the gather fails. Each
+/// segment's bytes are told to `progress` as it comes in.
+#[allow(clippy::too_many_arguments)]
 pub async fn gather_joined(
     receipts_store: &dyn RunStore,
     segments_store: &dyn RunStore,
@@ -216,6 +222,7 @@ pub async fn gather_joined(
     work: &Path,
     fps: Option<f64>,
     join_by: Join,
+    progress: &crate::progress::Progress,
 ) -> Result<Gathered, AssembleError> {
     let receipts = read_receipts(receipts_store, run).await?;
     if receipts.len() < task_count as usize {
@@ -255,7 +262,8 @@ pub async fn gather_joined(
     let locals: Vec<PathBuf> = stream::iter(segments.iter().copied())
         .map(|g| async move {
             let local = work.join(format!("seg{g}.mp4"));
-            segments_store.get(&run.segment(g), &local).await?;
+            let bytes = segments_store.get(&run.segment(g), &local).await?;
+            progress.bytes(bytes);
             Ok::<_, StoreError>(local)
         })
         .buffered(crate::assemble_segments())
@@ -515,10 +523,26 @@ mod tests {
             .expect("segment");
             store_put(&mezzanine, &seg, &run.segment(u64::from(t))).await;
         }
+        let segment_bytes: u64 = {
+            use crate::RunStore;
+            mezzanine
+                .list(&run.prefix)
+                .await
+                .expect("list")
+                .iter()
+                .map(|e| e.size)
+                .sum()
+        };
         let work = tempfile::tempdir().expect("tempdir");
-        let gathered = gather(&receipts, &mezzanine, &run, 2, work.path(), None)
+        let progress = crate::progress::Progress::new();
+        let gathered = gather(&receipts, &mezzanine, &run, 2, work.path(), None, &progress)
             .await
             .expect("gather");
+        assert_eq!(
+            progress.report().bytes,
+            segment_bytes,
+            "every segment's bytes told as it came in"
+        );
         let Gathered::Joined { path, frames, .. } = gathered else {
             panic!("joined: {gathered:?}")
         };
@@ -533,7 +557,7 @@ mod tests {
             "nothing uploaded"
         );
         assert!(
-            gather(&receipts, &receipts, &run, 2, work.path(), None)
+            gather(&receipts, &receipts, &run, 2, work.path(), None, &progress)
                 .await
                 .is_err(),
             "the segments are not in the run store"
@@ -603,6 +627,7 @@ mod tests {
                     true,
                 )
             }),
+            &crate::progress::Progress::new(),
         )
         .await
         .expect("gather");
@@ -640,6 +665,7 @@ mod tests {
             work.path(),
             None,
             Box::new(|segments, _, film| join_pieces(&[Piece::whole(&segments[0])], film, true)),
+            &crate::progress::Progress::new(),
         )
         .await
         .expect_err("frames missing");

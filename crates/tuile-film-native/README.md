@@ -58,7 +58,7 @@ impl Observer for Frames {
 |---|---|
 | `tuile-film-produce` | A whole film from a tape of cameras: bake, render, join, all kept in the run store and resumable. |
 | `tuile-film-render` | Renders a film from its packs and the tile store, to an mp4, PNGs, or measurements. |
-| `tuile-film-serve` | The render as an HTTP service: `POST /segments`. |
+| `tuile-film-serve` | The render as an HTTP service: `POST /segments`, `POST /compress`; asked with `Accept: application/x-ndjson`, each answered in lines of progress while it works ([`progress`]). |
 | `tuile-film-compress` | One film in, delivered by a profile (`h264`, `hevc-main10`, `mezzanine`, `copy`); or `--probe` a film. |
 | `tuile-film-timelapse` | Writes the tape of a time-lapse of the sky. |
 
