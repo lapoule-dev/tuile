@@ -129,7 +129,12 @@ fn light_of(frame: &FrameOut<'_>) -> Light {
     let mut bands = [0.0f64; 3];
     let mut bins = vec![0u32; BINS + 1];
     let third = (height / 3).max(1);
-    for (row, texels) in frame.rgba.unwrap_or_default().chunks_exact(width * 4).enumerate() {
+    for (row, texels) in frame
+        .rgba
+        .unwrap_or_default()
+        .chunks_exact(width * 4)
+        .enumerate()
+    {
         let (mut r, mut g, mut b) = (0.0f32, 0.0f32, 0.0f32);
         for p in texels.as_chunks::<4>().0 {
             let rgb = [

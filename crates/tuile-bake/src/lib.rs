@@ -4,9 +4,9 @@
 #![doc = include_str!("../README.md")]
 
 pub mod bake;
-mod cancel;
 #[cfg(test)]
 mod by_index_tests;
+mod cancel;
 mod drawer;
 mod globe;
 mod ground;
