@@ -135,6 +135,33 @@ pub fn concat_into(segments: &[PathBuf], out: &Path, consume: bool) -> Result<u6
     })
 }
 
+/// Pieces of films joined into `out` in the order given
+/// ([`tuile_mp4::film::join_pieces`]): each a whole film or a run of its
+/// samples cut on a sync sample, all of one stream description. What a host
+/// joins a render's segments with when it cuts them and puts pieces of its
+/// own between ([`crate::assemble::gather_joined`]). With `consume`, a
+/// film's file is removed once the last piece read from it is copied.
+/// Returns the frame count.
+pub fn join_pieces(
+    pieces: &[tuile_mp4::film::Piece],
+    out: &Path,
+    consume: bool,
+) -> Result<u64, ConcatError> {
+    if pieces.is_empty() {
+        return Err(ConcatError::Empty);
+    }
+    tuile_mp4::film::join_pieces(pieces, out, consume).map_err(|e| match e {
+        tuile_mp4::Mp4Error::Mismatch(what) => ConcatError::Mismatch {
+            path: out.to_path_buf(),
+            what,
+        },
+        other => ConcatError::Film {
+            path: out.to_path_buf(),
+            why: other.to_string(),
+        },
+    })
+}
+
 /// A synthetic H.264 segment: real container, placeholder NAL payloads. Enough
 /// for everything here, which never decodes a picture.
 #[doc(hidden)]
@@ -143,6 +170,20 @@ pub fn write_test_segment(
     frames: u32,
     sps: &[u8],
     tag: u8,
+) -> Result<(), ConcatError> {
+    write_test_segment_with(path, frames, sps, tag, &|i| i % 10 == 0, true)
+}
+
+/// [`write_test_segment`], its key frames where `key` says, and its
+/// frames shown in the order decoded unless `reordered`.
+#[doc(hidden)]
+pub fn write_test_segment_with(
+    path: &Path,
+    frames: u32,
+    sps: &[u8],
+    tag: u8,
+    key: &dyn Fn(u32) -> bool,
+    reordered: bool,
 ) -> Result<(), ConcatError> {
     let io = |source| ConcatError::Io {
         path: path.to_path_buf(),
@@ -182,8 +223,8 @@ pub fn write_test_segment(
             &Mp4Sample {
                 start_time: u64::from(i) * 256,
                 duration: 256,
-                rendering_offset: if i % 3 == 1 { 512 } else { 0 },
-                is_sync: i % 10 == 0,
+                rendering_offset: if reordered && i % 3 == 1 { 512 } else { 0 },
+                is_sync: key(i),
                 bytes,
             },
         )
@@ -330,5 +371,138 @@ mod tests {
             ),
             "{err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod pieces {
+    use super::*;
+    use sha2::Digest;
+    use tuile_mp4::film::Piece;
+
+    const SPS: &[u8] = &[0x67, 0x64, 0x00, 0x0c, 0xac, 0xd9, 0x42];
+
+    /// The join of three synthetic segments, byte for byte what it was
+    /// before a join could be made of pieces: whole segments joined are the
+    /// film they always were.
+    #[test]
+    fn a_join_of_whole_segments_is_the_join_it_always_was() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths: Vec<PathBuf> = [(0xa, 12), (0xb, 7), (0xc, 21)]
+            .into_iter()
+            .map(|(tag, frames)| {
+                let p = dir.path().join(format!("{tag}.mp4"));
+                write_test_segment(&p, frames, SPS, tag).expect("segment");
+                p
+            })
+            .collect();
+        let out = dir.path().join("film.mp4");
+        assert_eq!(concat(&paths, &out).expect("joined"), 40);
+        let digest = sha2::Sha256::digest(std::fs::read(&out).expect("film"));
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "a59100745254499313b5ce60520d48bfbcd4eb505e2d5a942e1507d33687a3ab"
+        );
+    }
+
+    /// One sample's payload: the segment's tag and the frame's index.
+    fn payloads(path: &Path) -> Vec<(u8, u8, bool)> {
+        let t = track(path).expect("track");
+        let bytes = std::fs::read(path).expect("film");
+        t.samples
+            .iter()
+            .map(|s| {
+                let at = s.offset as usize + 5;
+                (bytes[at], bytes[at + 1], s.key)
+            })
+            .collect()
+    }
+
+    fn plain(dir: &Path, name: &str, frames: u32, tag: u8, keys: &'static [u32]) -> PathBuf {
+        let p = dir.join(name);
+        write_test_segment_with(
+            &p,
+            frames,
+            SPS,
+            tag,
+            &|i| i == 0 || keys.contains(&i),
+            false,
+        )
+        .expect("segment");
+        p
+    }
+
+    /// Pieces cut out of two films on their sync samples, and a third
+    /// whole between them, in the order given: every sample copied once,
+    /// in order, its key flag kept, the timestamps contiguous.
+    #[test]
+    fn pieces_cut_on_sync_samples_are_joined_in_the_order_given() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = plain(dir.path(), "a.mp4", 10, 0xa, &[7]);
+        let b = plain(dir.path(), "b.mp4", 10, 0xb, &[4]);
+        let c = plain(dir.path(), "c.mp4", 7, 0x1, &[]);
+        let out = dir.path().join("film.mp4");
+        let pieces = [
+            Piece::cut(&a, 0..7),
+            Piece::whole(&c),
+            Piece::cut(&b, 4..10),
+            Piece::cut(&a, 7..10),
+        ];
+        assert_eq!(join_pieces(&pieces, &out, false).expect("joined"), 23);
+        let want: Vec<(u8, u8, bool)> = (0..7u8)
+            .map(|f| (0xa, f, f == 0))
+            .chain((0..7u8).map(|f| (0x1, f, f == 0)))
+            .chain((4..10u8).map(|f| (0xb, f, f == 4)))
+            .chain((7..10u8).map(|f| (0xa, f, f == 7)))
+            .collect();
+        assert_eq!(payloads(&out), want);
+        let t = track(&out).expect("track");
+        assert!(t.samples.iter().all(|s| s.duration == 256));
+        assert!((t.seconds() - 23.0 * 256.0 / 15360.0).abs() < 1e-9);
+    }
+
+    /// With `consume`, a film is removed once the last piece read from it
+    /// is copied, not before.
+    #[test]
+    fn a_film_is_consumed_after_its_last_piece() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = plain(dir.path(), "a.mp4", 10, 0xa, &[3]);
+        let c = plain(dir.path(), "c.mp4", 2, 0x2, &[]);
+        let out = dir.path().join("film.mp4");
+        let pieces = [
+            Piece::cut(&a, 0..3),
+            Piece::whole(&c),
+            Piece::cut(&a, 3..10),
+        ];
+        assert_eq!(join_pieces(&pieces, &out, true).expect("joined"), 12);
+        let tags: Vec<u8> = payloads(&out).iter().map(|p| p.0).collect();
+        assert_eq!(
+            tags,
+            [0xa, 0xa, 0xa, 2, 2, 0xa, 0xa, 0xa, 0xa, 0xa, 0xa, 0xa]
+        );
+        assert!(!a.exists() && !c.exists(), "both read for the last time");
+    }
+
+    /// A piece cut on a sample that is not a sync sample would not decode:
+    /// refused, the sample named. A piece past its film's end, or empty, is
+    /// refused too; nothing to join is refused.
+    #[test]
+    fn wrong_cuts_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = plain(dir.path(), "a.mp4", 10, 0xa, &[6]);
+        let out = dir.path().join("film.mp4");
+        let err = join_pieces(&[Piece::cut(&a, 0..3), Piece::cut(&a, 3..10)], &out, false)
+            .expect_err("no key at 3");
+        assert!(
+            err.to_string().contains("sample 3 is not a key frame"),
+            "{err}"
+        );
+        let err = join_pieces(&[Piece::cut(&a, 6..11)], &out, false).expect_err("past the end");
+        assert!(err.to_string().contains("samples 6..11 of 10"), "{err}");
+        let err = join_pieces(&[Piece::cut(&a, 6..6)], &out, false).expect_err("empty");
+        assert!(err.to_string().contains("samples 6..6 of 10"), "{err}");
+        assert!(join_pieces(&[], &out, false).is_err());
+        assert!(a.exists(), "nothing consumed by a refused join");
     }
 }
