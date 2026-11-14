@@ -135,6 +135,141 @@ pub fn concat_into(segments: &[PathBuf], out: &Path, consume: bool) -> Result<u6
     })
 }
 
+/// Frames `first..=last` of a film (numbered as its receipts number
+/// them) laid over by another segment: the segment at `key`, in the store
+/// the film's own segments are kept in, which holds exactly those frames
+/// and starts on a key frame.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Insert {
+    pub first: u64,
+    pub last: u64,
+    pub key: String,
+}
+
+impl Insert {
+    pub fn frames(&self) -> u64 {
+        self.last + 1 - self.first
+    }
+}
+
+/// The film's `segments` (in film order, its frames numbered from
+/// `first_frame`) joined into `out` with frames laid over: each of
+/// `inserts` — its frames, and the file that holds them — takes the place
+/// of the render's frames `first..=last`. Samples are copied, nothing is
+/// decoded: the render's segments are cut where an insert ends, which
+/// must be a key frame (the render is asked for one there), and the
+/// inserted segments are taken whole. Returns the frames written.
+///
+/// Without inserts this is [`concat_into`], byte for byte.
+pub fn splice(
+    segments: &[PathBuf],
+    first_frame: u64,
+    inserts: &[(Insert, PathBuf)],
+    out: &Path,
+    consume: bool,
+) -> Result<u64, ConcatError> {
+    if inserts.is_empty() {
+        return concat_into(segments, out, consume);
+    }
+    if segments.is_empty() {
+        return Err(ConcatError::Empty);
+    }
+    let film = |path: &Path, why: String| ConcatError::Film {
+        path: path.to_path_buf(),
+        why,
+    };
+    let mut tracks = Vec::with_capacity(segments.len());
+    let mut at = first_frame;
+    for path in segments {
+        let t = track(path)?;
+        let frames = t.samples.len() as u64;
+        tracks.push((path, at, t));
+        at += frames;
+    }
+    let last_frame = at.saturating_sub(1);
+    let mut sorted: Vec<&(Insert, PathBuf)> = inserts.iter().collect();
+    sorted.sort_by_key(|(i, _)| i.first);
+    let mut after = first_frame;
+    for (insert, path) in &sorted {
+        if insert.last < insert.first || insert.first < after || insert.last > last_frame {
+            return Err(film(
+                path,
+                format!(
+                    "frames {}..={} overlap another insert or lie outside the film's {first_frame}..={last_frame}",
+                    insert.first, insert.last
+                ),
+            ));
+        }
+        let held = track(path)?.samples.len() as u64;
+        if held != insert.frames() {
+            return Err(film(
+                path,
+                format!(
+                    "holds {held} frames for frames {}..={} ({})",
+                    insert.first,
+                    insert.last,
+                    insert.frames()
+                ),
+            ));
+        }
+        after = insert.last + 1;
+    }
+    let mut pieces = Vec::new();
+    for (path, a, t) in &tracks {
+        let b = a + t.samples.len() as u64 - 1;
+        let mut pos = *a;
+        while pos <= b {
+            if let Some((insert, inserted)) =
+                sorted.iter().find(|(i, _)| i.first <= pos && pos <= i.last)
+            {
+                if pos == insert.first {
+                    let n = insert.frames() as usize;
+                    pieces.push(tuile_mp4::film::Piece::cut(inserted.clone(), 0..n));
+                }
+                pos = insert.last.min(b) + 1;
+                continue;
+            }
+            let end = sorted
+                .iter()
+                .find(|(i, _)| i.first > pos)
+                .map_or(b, |(i, _)| (i.first - 1).min(b));
+            let (from, to) = ((pos - a) as usize, (end - a) as usize + 1);
+            if from == 0 && to == t.samples.len() {
+                pieces.push(tuile_mp4::film::Piece::whole(path.to_path_buf()));
+            } else {
+                if t.samples
+                    .iter()
+                    .any(|s| s.composition != t.samples[0].composition)
+                {
+                    return Err(film(
+                        path,
+                        "frames shown in another order than decoded: not cut by samples".into(),
+                    ));
+                }
+                if !t.samples[from].key {
+                    return Err(film(
+                        path,
+                        format!(
+                            "frame {pos} is not a key frame, and the film resumes there after an insert: \
+                             the render was not asked for one there"
+                        ),
+                    ));
+                }
+                pieces.push(tuile_mp4::film::Piece::cut(path.to_path_buf(), from..to));
+            }
+            pos = end + 1;
+        }
+    }
+    tuile_mp4::film::join_pieces(&pieces, out, consume).map_err(|e| match e {
+        tuile_mp4::Mp4Error::Mismatch(what) => ConcatError::Mismatch {
+            path: out.to_path_buf(),
+            what,
+        },
+        other => film(out, other.to_string()),
+    })
+}
+
 /// A synthetic H.264 segment: real container, placeholder NAL payloads. Enough
 /// for everything here, which never decodes a picture.
 #[doc(hidden)]
@@ -143,6 +278,20 @@ pub fn write_test_segment(
     frames: u32,
     sps: &[u8],
     tag: u8,
+) -> Result<(), ConcatError> {
+    write_test_segment_with(path, frames, sps, tag, &|i| i % 10 == 0, true)
+}
+
+/// [`write_test_segment`], its key frames where `key` says, and its
+/// frames shown in the order decoded unless `reordered`.
+#[doc(hidden)]
+pub fn write_test_segment_with(
+    path: &Path,
+    frames: u32,
+    sps: &[u8],
+    tag: u8,
+    key: &dyn Fn(u32) -> bool,
+    reordered: bool,
 ) -> Result<(), ConcatError> {
     let io = |source| ConcatError::Io {
         path: path.to_path_buf(),
@@ -182,8 +331,8 @@ pub fn write_test_segment(
             &Mp4Sample {
                 start_time: u64::from(i) * 256,
                 duration: 256,
-                rendering_offset: if i % 3 == 1 { 512 } else { 0 },
-                is_sync: i % 10 == 0,
+                rendering_offset: if reordered && i % 3 == 1 { 512 } else { 0 },
+                is_sync: key(i),
                 bytes,
             },
         )
@@ -330,5 +479,191 @@ mod tests {
             ),
             "{err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod splices {
+    use super::*;
+    use sha2::Digest;
+
+    const SPS: &[u8] = &[0x67, 0x64, 0x00, 0x0c, 0xac, 0xd9, 0x42];
+
+    /// The join of three synthetic segments, byte for byte what it was
+    /// before the splice came in: a film joined with nothing spliced is
+    /// the film it always was.
+    #[test]
+    fn a_join_without_inserts_is_the_join_it_always_was() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths: Vec<PathBuf> = [(0xa, 12), (0xb, 7), (0xc, 21)]
+            .into_iter()
+            .map(|(tag, frames)| {
+                let p = dir.path().join(format!("{tag}.mp4"));
+                write_test_segment(&p, frames, SPS, tag).expect("segment");
+                p
+            })
+            .collect();
+        let out = dir.path().join("film.mp4");
+        assert_eq!(concat(&paths, &out).expect("joined"), 40);
+        let digest = sha2::Sha256::digest(std::fs::read(&out).expect("film"));
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "a59100745254499313b5ce60520d48bfbcd4eb505e2d5a942e1507d33687a3ab"
+        );
+    }
+
+    /// One sample's payload: the segment's tag and the frame's index.
+    fn payloads(path: &Path) -> Vec<(u8, u8, bool)> {
+        let t = track(path).expect("track");
+        let bytes = std::fs::read(path).expect("film");
+        t.samples
+            .iter()
+            .map(|s| {
+                let at = s.offset as usize + 5;
+                (bytes[at], bytes[at + 1], s.key)
+            })
+            .collect()
+    }
+
+    fn plain(dir: &Path, name: &str, frames: u32, tag: u8, keys: &'static [u32]) -> PathBuf {
+        let p = dir.join(name);
+        write_test_segment_with(
+            &p,
+            frames,
+            SPS,
+            tag,
+            &|i| i == 0 || keys.contains(&i),
+            false,
+        )
+        .expect("segment");
+        p
+    }
+
+    /// Frames 8..=14 of a film of two segments (1..=10, 11..=20) laid
+    /// over by a segment of seven frames: the render's frames to 7, the
+    /// insert's seven, the render's again from 15, which the render made a
+    /// key frame — every sample copied, in order, timestamps contiguous.
+    #[test]
+    fn an_insert_spanning_two_segments_takes_their_frames_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = plain(dir.path(), "a.mp4", 10, 0xa, &[7]);
+        let b = plain(dir.path(), "b.mp4", 10, 0xb, &[4]);
+        let i = plain(dir.path(), "i.mp4", 7, 0x1, &[]);
+        let insert = Insert {
+            first: 8,
+            last: 14,
+            key: "i".into(),
+        };
+        let out = dir.path().join("film.mp4");
+        let n = splice(&[a, b], 1, &[(insert, i)], &out, false).expect("spliced");
+        assert_eq!(n, 20);
+        let got = payloads(&out);
+        let want: Vec<(u8, u8, bool)> = (0..7u8)
+            .map(|f| (0xa, f, f == 0))
+            .chain((0..7u8).map(|f| (0x1, f, f == 0)))
+            .chain((4..10u8).map(|f| (0xb, f, f == 4)))
+            .collect();
+        assert_eq!(got, want);
+        let t = track(&out).expect("track");
+        assert!(t.samples.iter().all(|s| s.duration == 256));
+        assert!((t.seconds() - 20.0 * 256.0 / 15360.0).abs() < 1e-9);
+    }
+
+    /// An insert at the film's very first frame, and one at its very last.
+    #[test]
+    fn inserts_at_either_end_of_the_film() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = plain(dir.path(), "a.mp4", 10, 0xa, &[3]);
+        let first = plain(dir.path(), "i1.mp4", 3, 0x1, &[]);
+        let last = plain(dir.path(), "i2.mp4", 2, 0x2, &[]);
+        let out = dir.path().join("film.mp4");
+        let inserts = [
+            (
+                Insert {
+                    first: 9,
+                    last: 10,
+                    key: "2".into(),
+                },
+                last,
+            ),
+            (
+                Insert {
+                    first: 1,
+                    last: 3,
+                    key: "1".into(),
+                },
+                first,
+            ),
+        ];
+        assert_eq!(splice(&[a], 1, &inserts, &out, true).expect("spliced"), 10);
+        let tags: Vec<u8> = payloads(&out).iter().map(|p| p.0).collect();
+        assert_eq!(tags, [1, 1, 1, 0xa, 0xa, 0xa, 0xa, 0xa, 2, 2]);
+        assert!(
+            !dir.path().join("a.mp4").exists(),
+            "consumed once read for the last time"
+        );
+    }
+
+    /// Where the film resumes after an insert on a frame that is not a
+    /// key frame, the splice is refused and says which frame.
+    #[test]
+    fn a_film_that_resumes_on_no_key_frame_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = plain(dir.path(), "a.mp4", 10, 0xa, &[]);
+        let i = plain(dir.path(), "i.mp4", 3, 0x1, &[]);
+        let out = dir.path().join("film.mp4");
+        let err = splice(
+            std::slice::from_ref(&a),
+            1,
+            &[(
+                Insert {
+                    first: 4,
+                    last: 6,
+                    key: "i".into(),
+                },
+                i.clone(),
+            )],
+            &out,
+            false,
+        )
+        .expect_err("no key at 7");
+        assert!(
+            err.to_string().contains("frame 7 is not a key frame"),
+            "{err}"
+        );
+        // An insert of the wrong length, or one past the film, likewise.
+        let err = splice(
+            std::slice::from_ref(&a),
+            1,
+            &[(
+                Insert {
+                    first: 4,
+                    last: 7,
+                    key: "i".into(),
+                },
+                i.clone(),
+            )],
+            &out,
+            false,
+        )
+        .expect_err("wrong length");
+        assert!(err.to_string().contains("holds 3 frames"), "{err}");
+        let err = splice(
+            &[a],
+            1,
+            &[(
+                Insert {
+                    first: 9,
+                    last: 11,
+                    key: "i".into(),
+                },
+                i,
+            )],
+            &out,
+            false,
+        )
+        .expect_err("past the end");
+        assert!(err.to_string().contains("outside"), "{err}");
     }
 }

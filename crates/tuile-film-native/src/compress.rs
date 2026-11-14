@@ -491,7 +491,7 @@ mod gpu {
                                 (Input::Nv12, true) => p016_to_nv12(&picture.data, size),
                                 _ => return Err("an 8-bit picture for a 10-bit input".into()),
                             };
-                            if send.send(Ok(Frame { data, shown })).is_err() {
+                            if send.send(Ok(Frame { data, shown, key: false })).is_err() {
                                 return Err("the encoder stopped".into());
                             }
                             shown += 1;
