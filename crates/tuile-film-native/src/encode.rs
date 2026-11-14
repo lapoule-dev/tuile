@@ -169,6 +169,10 @@ impl Spec {
 pub struct Frame {
     pub data: Vec<u8>,
     pub shown: u64,
+    /// An IDR forced on this picture, beside the GOP's own: where a film
+    /// is to be cut and spliced without decoding
+    /// (`tuile_farm::concat::splice`).
+    pub key: bool,
 }
 
 /// One picture out of the encoder, in decoding order: Annex B (H.264,

@@ -5844,7 +5844,7 @@ dependencies = [
 [[package]]
 name = "nvidia-video-codec-sdk"
 version = "0.5.0-lapoule.1"
-source = "git+https://github.com/lapoule-dev/nvidia-video-codec-sdk?rev=ee2e29f41b494b75b74d2190b53fcdbcd808cc0b#ee2e29f41b494b75b74d2190b53fcdbcd808cc0b"
+source = "git+https://github.com/lapoule-dev/nvidia-video-codec-sdk?rev=b6f94330d0e6b46cb936973172ba820c843efd5f#b6f94330d0e6b46cb936973172ba820c843efd5f"
 dependencies = [
  "cudarc",
  "lazy_static",

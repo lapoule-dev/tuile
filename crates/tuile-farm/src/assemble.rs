@@ -182,6 +182,31 @@ pub async fn gather(
     work: &Path,
     fps: Option<f64>,
 ) -> Result<Gathered, AssembleError> {
+    gather_with(
+        receipts_store,
+        segments_store,
+        run,
+        task_count,
+        work,
+        fps,
+        &[],
+    )
+    .await
+}
+
+/// [`gather`], frames laid over by `inserts` ([`crate::concat::splice`]):
+/// each insert's segment fetched from `segments_store` with the render's,
+/// and spliced in at the join. The film carries the frames the receipts
+/// add up to all the same.
+pub async fn gather_with(
+    receipts_store: &dyn RunStore,
+    segments_store: &dyn RunStore,
+    run: &RunKeys,
+    task_count: u32,
+    work: &Path,
+    fps: Option<f64>,
+    inserts: &[crate::concat::Insert],
+) -> Result<Gathered, AssembleError> {
     let receipts = read_receipts(receipts_store, run).await?;
     if receipts.len() < task_count as usize {
         return Ok(Gathered::Waiting {
@@ -190,6 +215,7 @@ pub async fn gather(
         });
     }
     let segments = check_receipts(&receipts, task_count)?;
+    let first_frame = receipts.iter().map(|r| r.first).min().unwrap_or(1);
     let expected: u64 = receipts.iter().map(Receipt::frames).sum();
 
     // Every vouched-for segment, present and plausible, before downloading a
@@ -203,6 +229,11 @@ pub async fn gather(
                 return Err(AssembleError::EmptySegment { key, size: e.size })
             }
             Some(_) => {}
+        }
+    }
+    for insert in inserts {
+        if !segments_store.exists(&insert.key).await? {
+            return Err(AssembleError::MissingSegment(insert.key.clone()));
         }
     }
 
@@ -225,6 +256,16 @@ pub async fn gather(
         .buffered(crate::assemble_segments())
         .try_collect()
         .await?;
+    let inserted: Vec<(crate::concat::Insert, PathBuf)> =
+        stream::iter(inserts.iter().cloned().enumerate())
+            .map(|(n, insert)| async move {
+                let local = work.join(format!("insert{n}.mp4"));
+                segments_store.get(&insert.key, &local).await?;
+                Ok::<_, StoreError>((insert, local))
+            })
+            .buffered(crate::assemble_segments())
+            .try_collect()
+            .await?;
     let fetch_seconds = began.elapsed().as_secs_f64();
 
     let film = work.join("render.mp4");
@@ -233,7 +274,7 @@ pub async fn gather(
     // in: the number that matters is the one a player will find.
     // Each segment let go once it is in: where the disk is memory, the
     // film and its segments are never held whole twice.
-    let probe = join(locals, film.clone(), true).await?;
+    let probe = join(locals, first_frame, inserted, film.clone(), true).await?;
     let join_seconds = began.elapsed().as_secs_f64();
     let got = probe.frames;
     if got != expected {
@@ -316,11 +357,13 @@ fn check_receipts(receipts: &[Receipt], task_count: u32) -> Result<Vec<u64>, Ass
 /// start to end, and the runtime's workers have uploads to drive meanwhile.
 async fn join(
     segments: Vec<PathBuf>,
+    first_frame: u64,
+    inserts: Vec<(crate::concat::Insert, PathBuf)>,
     film: PathBuf,
     consume: bool,
 ) -> Result<crate::concat::Probe, AssembleError> {
     tokio::task::spawn_blocking(move || {
-        crate::concat::concat_into(&segments, &film, consume)?;
+        crate::concat::splice(&segments, first_frame, &inserts, &film, consume)?;
         Ok(crate::concat::probe(&film)?)
     })
     .await
@@ -497,6 +540,95 @@ mod tests {
                 .is_err(),
             "the segments are not in the run store"
         );
+    }
+
+    /// A render of two segments (frames 1..=6, 7..=12) and an insert over
+    /// frames 5..=8 kept beside them: fetched with them and spliced in,
+    /// the film's frames those the receipts add up to; an insert the store
+    /// does not hold is refused before anything is fetched.
+    #[tokio::test]
+    async fn an_insert_is_fetched_with_the_segments_and_spliced_in() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let receipts =
+            crate::ObjectRunStore::local(&root.path().join("run"), crate::Tuning::default())
+                .expect("store");
+        let mezzanine =
+            crate::ObjectRunStore::local(&root.path().join("mezz"), crate::Tuning::default())
+                .expect("store");
+        let run = RunKeys::new("renders/r", "e1");
+        let src = root.path().join("r.json");
+        let sps = [0x67, 0x64, 0x00, 0x0c, 0xac, 0xd9, 0x42];
+        // Key frames where the inserts end: the second segment's frame 9.
+        for (t, first, last, key) in [(0u32, 1u64, 6u64, 99u32), (1, 7, 12, 2)] {
+            std::fs::write(
+                &src,
+                serde_json::to_vec(&receipt(t, first, last, &[u64::from(t)])).expect("json"),
+            )
+            .expect("write");
+            store_put(&receipts, &src, &run.receipt(t)).await;
+            let seg = root.path().join(format!("s{t}.mp4"));
+            crate::concat::write_test_segment_with(
+                &seg,
+                (last + 1 - first) as u32,
+                &sps,
+                t as u8,
+                &|i| i == 0 || i == key,
+                false,
+            )
+            .expect("segment");
+            store_put(&mezzanine, &seg, &run.segment(u64::from(t))).await;
+        }
+        let seg = root.path().join("i.mp4");
+        crate::concat::write_test_segment_with(&seg, 4, &sps, 9, &|i| i == 0, false)
+            .expect("insert");
+        store_put(&mezzanine, &seg, "renders/r/inserts/0.mp4").await;
+        let insert = crate::concat::Insert {
+            first: 5,
+            last: 8,
+            key: "renders/r/inserts/0.mp4".into(),
+        };
+        let work = tempfile::tempdir().expect("tempdir");
+        let gathered = gather_with(
+            &receipts,
+            &mezzanine,
+            &run,
+            2,
+            work.path(),
+            Some(60.0),
+            std::slice::from_ref(&insert),
+        )
+        .await
+        .expect("gather");
+        let Gathered::Joined { path, frames, .. } = gathered else {
+            panic!("joined: {gathered:?}")
+        };
+        assert_eq!(frames, 12);
+        let bytes = std::fs::read(&path).expect("film");
+        let t = tuile_mp4::film::read_track(&mut std::io::Cursor::new(&bytes))
+            .expect("read")
+            .expect("track");
+        let tags: Vec<u8> = t
+            .samples
+            .iter()
+            .map(|s| bytes[s.offset as usize + 5])
+            .collect();
+        assert_eq!(tags, [0, 0, 0, 0, 9, 9, 9, 9, 1, 1, 1, 1]);
+        let missing = crate::concat::Insert {
+            key: "renders/r/inserts/none.mp4".into(),
+            ..insert
+        };
+        let err = gather_with(
+            &receipts,
+            &mezzanine,
+            &run,
+            2,
+            work.path(),
+            None,
+            &[missing],
+        )
+        .await
+        .expect_err("no such insert");
+        assert!(matches!(err, AssembleError::MissingSegment(_)), "{err}");
     }
 
     async fn store_put(store: &crate::ObjectRunStore, from: &Path, key: &str) {

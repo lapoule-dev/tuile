@@ -324,6 +324,11 @@ pub struct CompressOrder {
     #[serde(default)]
     pub segments: Store,
     pub delivery: Delivery,
+    /// Frames laid over by other segments, spliced in at the join
+    /// ([`crate::concat::splice`]) before the delivery: the compression
+    /// itself never knows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inserts: Vec<crate::concat::Insert>,
     /// The delivered file's key in the run store; [`film_key`] when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub out: Option<String>,

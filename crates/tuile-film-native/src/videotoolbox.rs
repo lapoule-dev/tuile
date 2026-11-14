@@ -581,7 +581,7 @@ pub fn encode(
     for frame in frames {
         let frame = frame?;
         let buffer = picture_buffer(spec.input, spec.size, &frame.data)?;
-        let options = (frame.shown % gop == 0).then(|| key_frame.as_opaque());
+        let options = (frame.key || frame.shown % gop == 0).then(|| key_frame.as_opaque());
         // SAFETY: the session is ours and valid; the buffer is retained by
         // the encoder for as long as it needs it.
         check(
@@ -643,6 +643,8 @@ pub struct VtFilm {
     encoder: Option<JoinHandle<Result<f64, String>>>,
     size: (usize, usize),
     seconds: f64,
+    /// Pictures (from 0) on which an IDR is forced.
+    keys: Vec<u64>,
 }
 
 impl VtFilm {
@@ -651,11 +653,19 @@ impl VtFilm {
             path: path.into(),
             bitrate,
             codec,
+            keys: Vec::new(),
             pictures: None,
             encoder: None,
             size: (0, 0),
             seconds: 0.0,
         }
+    }
+
+    /// An IDR forced on each of these pictures (from 0), beside the GOP's.
+    #[must_use]
+    pub fn with_keys(mut self, keys: Vec<u64>) -> Self {
+        self.keys = keys;
+        self
     }
 
     /// The session a film of `size` at `fps` is encoded by: the mezzanine
@@ -678,6 +688,7 @@ impl Sink for VtFilm {
         let spec = self.spec(size, fps.max(1));
         let (pictures, waiting) = sync_channel::<Vec<u8>>(WAITING);
         let path = self.path.clone();
+        let keys = self.keys.clone();
         self.pictures = Some(pictures);
         let span = crate::sink::encoder_span();
         self.encoder = Some(std::thread::spawn(move || {
@@ -690,6 +701,7 @@ impl Sink for VtFilm {
                         _ => i420,
                     },
                     shown: i as u64,
+                    key: keys.contains(&(i as u64)),
                 })
             });
             let (_, seconds) = encode(&spec, frames, &path)?;
@@ -961,7 +973,11 @@ impl Decoder {
             }
             self.collect(stream, &mut waiting)?;
             while let Some(data) = waiting.remove(&next) {
-                take(Frame { data, shown: next })?;
+                take(Frame {
+                    data,
+                    shown: next,
+                    key: false,
+                })?;
                 next += 1;
             }
         }
@@ -972,7 +988,11 @@ impl Decoder {
         )?;
         self.collect(stream, &mut waiting)?;
         while let Some(data) = waiting.remove(&next) {
-            take(Frame { data, shown: next })?;
+            take(Frame {
+                data,
+                shown: next,
+                key: false,
+            })?;
             next += 1;
         }
         if !waiting.is_empty() || next != stream.frames() as u64 {
@@ -1050,6 +1070,7 @@ fn pass(joined: &Path, stream: &Stream, out: &Path, spec: &Spec) -> Result<Writt
                     send.send(Ok(Frame {
                         data,
                         shown: frame.shown,
+                        key: false,
                     }))
                     .map_err(|_| "the encoder stopped".to_string())
                 })?;
@@ -1169,6 +1190,100 @@ mod tests {
         assert!(faststart(&path));
     }
 
+    /// A render asked for key frames gets them where asked, beside the
+    /// GOP's; a second session's mezzanine — the same encoder, the same
+    /// spec — carries the same stream description, so it is spliced over
+    /// those frames by sample copy, and the film decodes back whole: the
+    /// render's pictures, then the inserted ones, then the render's.
+    #[test]
+    fn a_mezzanine_cut_at_its_forced_key_frames_takes_another_session_s_frames() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (w, h) = (256, 144);
+        let film = dir.path().join("m.mp4");
+        let mut sink = VtFilm::at(&film, 0, VtCodec::Mezzanine).with_keys(vec![17, 41]);
+        render(&mut sink, w, h, 75);
+        // Where asked; the GOP's own are the encoder's to place around
+        // them (VideoToolbox counts its second from a forced one).
+        let rendered_keys = keys(&track(&film));
+        assert!(
+            [0, 17, 41].iter().all(|k| rendered_keys.contains(k)),
+            "{rendered_keys:?}"
+        );
+        // Frames 18..=41 of the film (pictures 17..=40), from noise.
+        let insert = dir.path().join("i.mp4");
+        let mut other = VtFilm::at(&insert, 0, VtCodec::Mezzanine);
+        other.open(w as u32, h as u32, 30).expect("open");
+        let noise = noisy(w, h, 24);
+        for (i, picture) in noise.iter().enumerate() {
+            other
+                .picture(i as u32, i as u32, &[], picture)
+                .expect("picture");
+        }
+        other.close().expect("close");
+        assert_eq!(
+            track(&insert).entry,
+            track(&film).entry,
+            "one encoder, one description"
+        );
+        let joined = dir.path().join("j.mp4");
+        let spliced = tuile_farm::concat::splice(
+            std::slice::from_ref(&film),
+            1,
+            &[(
+                tuile_farm::concat::Insert {
+                    first: 18,
+                    last: 41,
+                    key: "i".into(),
+                },
+                insert,
+            )],
+            &joined,
+            false,
+        )
+        .expect("spliced");
+        assert_eq!(spliced, 75);
+        let t = track(&joined);
+        let joined_keys = keys(&t);
+        assert!(
+            joined_keys.contains(&17) && joined_keys.contains(&41),
+            "{joined_keys:?}"
+        );
+        let stream = Stream::of(t).expect("stream");
+        let decoder = Decoder::of(&stream).expect("decoder");
+        let mut file = std::fs::File::open(&joined).expect("film");
+        let rendered = moving(w, h, 75);
+        let mut luma_error = Vec::new();
+        let decoded = decoder
+            .decode_all(&stream, &mut file, |frame| {
+                let n = frame.shown as usize;
+                let want = if (17..=40).contains(&n) {
+                    &noise[n - 17]
+                } else {
+                    &rendered[n]
+                };
+                // P010: the luma's ten bits in the high ones of each pair.
+                let err: f64 = frame.data[..2 * w * h]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(&want[..w * h])
+                    .map(|(p, &v)| {
+                        (f64::from(u16::from_le_bytes([p[0], p[1]]) >> 8) - f64::from(v)).abs()
+                    })
+                    .sum::<f64>()
+                    / (w * h) as f64;
+                luma_error.push(err);
+                Ok(())
+            })
+            .expect("decoded");
+        assert_eq!(decoded, 75);
+        let worst = luma_error.iter().copied().fold(0.0, f64::max);
+        assert!(
+            worst < 4.0,
+            "a picture off by {worst} on average: {luma_error:?}"
+        );
+    }
+
     /// The final stage on the Mac: the mezzanine decoded, its ten bits
     /// dithered to eight, one H.264 session with B-frames — reordered,
     /// every frame, a key frame every two seconds — and back again: the
@@ -1281,6 +1396,7 @@ mod tests {
                 Ok(Frame {
                     data: crate::encode::i420_to_nv12(&i420, (w, h)),
                     shown: i as u64,
+                    key: false,
                 })
             });
             let path = dir.path().join(format!("q{quality}.mp4"));

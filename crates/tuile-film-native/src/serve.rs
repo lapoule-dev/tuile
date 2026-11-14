@@ -66,7 +66,7 @@ use crate::engine::RenderSpec;
 use crate::extract::{local_key, ExtractRef, Fetched};
 use crate::observe::Timings;
 use crate::render::render;
-use crate::setup::{film_sink, placed_sun};
+use crate::setup::{film_sink_with_keys, placed_sun};
 use crate::source::{Film, Sources};
 use crate::Error;
 
@@ -113,6 +113,13 @@ pub struct SegmentOrder<O = NoOrder> {
     /// in the background ([`Notify`]): which film, which chunk.
     #[serde(default)]
     pub context: serde_json::Value,
+    /// Frames of the film (numbered as `frames` is) on which the encoder
+    /// forces a key frame — an IDR, beside the GOP's own — so that the film
+    /// can be cut there and other frames spliced in at the join without
+    /// decoding (`tuile_farm::concat::splice`). Those outside `frames` are
+    /// another segment's. Empty: the GOP's alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_frames: Vec<u32>,
     /// The host's overlays for the segment, in the host's own type: handed
     /// to its [`OverlayFactory`]. None: the segment has none.
     #[serde(default = "none", skip_serializing_if = "Option::is_none")]
@@ -620,12 +627,14 @@ impl<F: OverlayFactory> Service<F> {
             tiles_from_pack = Empty,
         );
         let on_its_thread = render_span.clone();
+        let keys = keys_within(&order.key_frames, order.frames);
         let done = tokio::task::spawn_blocking(move || -> Result<crate::render::Done, Error> {
             let _entered = on_its_thread.enter();
-            let mut sink = film_sink(
+            let mut sink = film_sink_with_keys(
                 to.to_string_lossy().into_owned(),
                 rendering.bitrate,
                 rendering.codec.as_deref(),
+                keys,
             )?;
             let done = runtime.block_on(render(
                 &kept.sources,
@@ -722,17 +731,18 @@ impl<F: OverlayFactory> Service<F> {
         &self,
         order: &tuile_farm::compress::CompressOrder,
     ) -> Result<tuile_farm::compress::CompressDone, Error> {
-        use tuile_farm::assemble::{gather, Gathered, RunKeys};
+        use tuile_farm::assemble::{gather_with, Gathered, RunKeys};
         std::fs::create_dir_all(&self.cache)?;
         let scratch = tempfile::tempdir_in(&self.cache)?;
         let run = RunKeys::new(&order.run, &order.render_id);
-        let gathered = gather(
+        let gathered = gather_with(
             self.runs.as_ref(),
             self.store(order.segments),
             &run,
             order.chunks,
             &scratch.path().join("join"),
             Some(order.fps),
+            &order.inserts,
         )
         .instrument(tracing::info_span!("gather"))
         .await?;
@@ -839,6 +849,20 @@ impl<F: OverlayFactory> Service<F> {
                 .await;
         });
     }
+}
+
+/// The film's `key_frames` that fall in a segment of `frames`, as its
+/// pictures count them (from 0). The segment's first frame is a key frame
+/// anyway.
+fn keys_within(key_frames: &[u32], (first, last): (u32, u32)) -> Vec<u64> {
+    let mut keys: Vec<u64> = key_frames
+        .iter()
+        .filter(|&&f| f > first && f <= last)
+        .map(|&f| u64::from(f - first))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 /// A number from the environment.
@@ -973,6 +997,20 @@ pub async fn serve(router: axum::Router) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The film's key frames are the segment's pictures from 0, those of
+    /// other segments left out, its first frame left to the encoder.
+    #[test]
+    fn a_film_s_key_frames_are_counted_within_the_segment() {
+        assert_eq!(keys_within(&[1, 451, 460, 905, 460], (451, 900)), [9]);
+        assert_eq!(keys_within(&[900, 452], (451, 900)), [1, 449]);
+        assert!(keys_within(&[], (1, 450)).is_empty());
+        let order: SegmentOrder = serde_json::from_str(
+            r#"{"pack": "p", "frames": [1, 450], "out": "o", "key_frames": [120, 271]}"#,
+        )
+        .expect("an order");
+        assert_eq!(order.key_frames, [120, 271]);
+    }
 
     #[test]
     fn an_order_reads_from_json_with_only_what_it_must_say() {
@@ -1182,6 +1220,7 @@ mod tests {
             context: serde_json::Value::Null,
             to_sun: None,
             pack_within_seconds: Some(0),
+            key_frames: Vec::new(),
             overlay: None,
         };
         let refused = service.segment(&order).await.expect_err("no pack");
