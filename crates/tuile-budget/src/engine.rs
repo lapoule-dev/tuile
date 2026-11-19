@@ -3038,6 +3038,18 @@ impl Budget {
             .map(|l| now.since(l))
             .unwrap_or(Micros::ZERO)
             .0;
+        // A pressure lifted lifts the relaxation it drove: under a warning,
+        // a critical or a background pressure the targets shrink and the
+        // scale climbs to its ceiling in seconds, and it would come down at
+        // its own pace — a quarter a second, half a minute from the ceiling
+        // — with the view coarse and called converged the while. Back under
+        // `Normal` it comes down sixteen times as fast, a couple of seconds
+        // from the ceiling: not at once, which would ask for every finer
+        // level in one step. What still presses raises it again.
+        if self.pressure == Pressure::Normal && self.pressure_relaxed != Pressure::Normal {
+            self.relax_lifted = true;
+        }
+        self.pressure_relaxed = self.pressure;
         let mut over = strained
             || Class::ALL
                 .iter()
@@ -3072,9 +3084,15 @@ impl Budget {
                     <= eff.target[c].scaled(u64::from(self.cfg.watermarks.low_percent), 100)
             });
             if calm {
-                let down = u64::from(r.down_per_second).saturating_mul(dt);
+                let haste = if self.relax_lifted { 16 } else { 1 };
+                let down = u64::from(r.down_per_second)
+                    .saturating_mul(haste)
+                    .saturating_mul(dt);
                 self.scale_fine = self.scale_fine.saturating_sub(down).max(one);
             }
+        }
+        if self.scale_fine <= one {
+            self.relax_lifted = false;
         }
         // At most `max_scale`, a u32: `scale_fine` is capped at it.
         self.scale = u32::try_from(self.scale_fine / 1_000_000).unwrap_or(u32::MAX);

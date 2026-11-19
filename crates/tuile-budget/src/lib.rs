@@ -324,6 +324,11 @@ pub struct Budget {
     last_now: Option<Micros>,
     scale: u32,
     scale_fine: u64,
+    /// The pressure the last relaxation step saw, and whether a pressure
+    /// was lifted since the scale last stood at one: the relaxation it drove
+    /// comes down fast ([`engine`]'s `relax`).
+    pressure_relaxed: Pressure,
+    relax_lifted: bool,
     ledger: Ledger,
     in_flight: PerClass<u32>,
     local_reads: u32,
@@ -378,6 +383,8 @@ impl Budget {
             last_now: None,
             scale: 1_000,
             scale_fine: 1_000_000_000,
+            pressure_relaxed: Pressure::Normal,
+            relax_lifted: false,
             ledger: Ledger::default(),
             in_flight: PerClass::splat(0),
             local_reads: 0,
