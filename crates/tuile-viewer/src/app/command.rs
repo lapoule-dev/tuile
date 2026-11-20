@@ -99,6 +99,19 @@ impl App {
                 tracing::info!("traversal freeze: {on}");
             }
             Command::Wireframe(on) => self.views.wireframe = on,
+            Command::Budget(ask) => {
+                // The viewer's ordinary navigation runs the interactive
+                // specification: that is its context. An override is a
+                // diagnostic, said so in the log and on the line.
+                let (query, overridden) = ask.query(tuile_core::budget::SpecKind::Interactive);
+                tracing::info!(%query, overridden, "budget specification asked");
+                self.budget_ask = ask;
+                super::gestures::Carry::send(
+                    self,
+                    tuile_core::protocol::ClientMessage::Specify { query, overridden },
+                );
+            }
+            Command::BudgetLine(on) => self.views.budget_line = on,
             Command::Diagnostic(view) => {
                 let view = view % DIAGNOSTICS.len();
                 if self.views.diagnostic != view {
@@ -230,6 +243,8 @@ impl App {
                 tilesets: self.tilesets.bits(),
                 metrics: tuile_telemetry::metrics_on(),
                 profiling: tuile_telemetry::profiling_on(),
+                budget_line: self.views.budget_line,
+                budget_spec: self.budget_ask.kind,
             },
             |snapshot| crate::menu::State::of(&snapshot, layers),
         )
@@ -262,6 +277,8 @@ impl App {
             clock: self.clock_state(),
             recording: self.is_recording(),
             tilesets: self.tilesets.bits(),
+            budget_line: self.views.budget_line,
+            budget_spec: self.budget_ask.kind,
             ..Snapshot::of(&self.controller, size)
         };
         crate::snapshot::publish(snapshot);

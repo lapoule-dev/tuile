@@ -145,6 +145,16 @@ pub(crate) struct Glance {
     pub thermal_level: u8,
     pub floor_in: bool,
     pub converged: bool,
+    /// The quality deficit and the specification in force (its index in
+    /// `SpecKind::ALL`), for the budget's line.
+    #[serde(default)]
+    pub under_need_tiles: [u32; 2],
+    #[serde(default)]
+    pub deficit_levels: [u32; 2],
+    #[serde(default)]
+    pub spec: u8,
+    #[serde(default)]
+    pub spec_overridden: bool,
 }
 
 impl Glance {
@@ -168,6 +178,14 @@ impl Glance {
             thermal_level: s.thermal_level,
             floor_in: s.floor_in,
             converged: s.converged,
+            under_need_tiles: s.under_need_tiles,
+            deficit_levels: s.deficit_levels,
+            spec: tuile_core::budget::SpecKind::ALL
+                .iter()
+                .position(|k| *k == s.spec)
+                .and_then(|i| u8::try_from(i).ok())
+                .unwrap_or(0),
+            spec_overridden: s.spec_overridden,
         }
     }
 
@@ -192,6 +210,13 @@ impl Glance {
         s.thermal_level = self.thermal_level;
         s.floor_in = self.floor_in;
         s.converged = self.converged;
+        s.under_need_tiles = self.under_need_tiles;
+        s.deficit_levels = self.deficit_levels;
+        s.spec = tuile_core::budget::SpecKind::ALL
+            .get(usize::from(self.spec))
+            .copied()
+            .unwrap_or_default();
+        s.spec_overridden = self.spec_overridden;
         s
     }
 }

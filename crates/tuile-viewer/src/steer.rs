@@ -31,6 +31,7 @@
 //! | `tuile://imagery?name=<key>` | drapes another of the host's imagery layers; `name=next` takes the one after the present |
 //! | `tuile://import?src=https://…` | fetches a configuration file and imports it, as opening it would (`crate::import`) |
 //! | `tuile://telemetry?metrics=on\|off&profiling=on\|off` | the performance numbers sent to the configured collector, or not: see `tuile_telemetry` (nothing happens where none is configured) |
+//! | `tuile://budget?spec=auto\|interactive\|fpv\|known_path\|film\|fpv_film&margin=&horizon_ms=&speculation_slots=&line=on\|off` | **a diagnostic**: forces the budget's specification (the context chooses it otherwise: ordinary navigation runs `interactive`), a few of its numbers, and the budget's line over the view; `spec=auto` gives the choice back to the context (`docs/explorations/budget-eviction-prefetch-spec.md` §3.3) |
 //!
 //! ## The scene's clock in a link
 //!
@@ -124,9 +125,46 @@ pub(crate) enum Retime {
 /// The longest glide a URL may ask for, seconds.
 pub(crate) const LONGEST_GLIDE: f64 = 60.0;
 
+/// A diagnostic override of the budget's specification
+/// (`docs/explorations/budget-eviction-prefetch-spec.md` §3.3): the
+/// specification follows the use context, and this forces one — a named
+/// one with a few numbers overridden — to compare them live. `kind: None`
+/// clears the override: back to the context's.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct BudgetAsk {
+    pub kind: Option<tuile_core::budget::SpecKind>,
+    pub margin: Option<u32>,
+    pub horizon_ms: Option<u32>,
+    pub speculation_slots: Option<u16>,
+}
+
+impl BudgetAsk {
+    /// The query the budget is given, and whether it is an override: the
+    /// context's specification when nothing is forced.
+    pub(crate) fn query(&self, context: tuile_core::budget::SpecKind) -> (String, bool) {
+        use tuile_core::budget::Specification;
+        let mut s = Specification::of_kind(self.kind.unwrap_or(context));
+        if let Some(m) = self.margin {
+            s.params.margin_permille = m;
+        }
+        if let Some(h) = self.horizon_ms {
+            s.params.horizon = tuile_core::budget::Micros::from_millis(u64::from(h));
+        }
+        if let Some(q) = self.speculation_slots {
+            s.params.speculation.slots_permille = q;
+        }
+        (s.to_query(), self.kind.is_some())
+    }
+}
+
 /// One thing the view can be told to do, whoever is telling it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Command {
+    /// A diagnostic override of the budget's specification, or its end.
+    Budget(BudgetAsk),
+    /// The budget's line over the view (its specification, the tiles under
+    /// their need), shown or not.
+    BudgetLine(bool),
     Goto(Goto),
     NorthUp,
     /// Centre on the current location.
@@ -413,6 +451,72 @@ pub(crate) fn parse_url_among(
                     }
                 })
                 .collect()
+        }
+        "budget" => {
+            if pairs.is_empty() {
+                return Err(
+                    "budget changes nothing: give spec=, margin=, horizon_ms=, \
+                     speculation_slots= or line="
+                        .to_owned(),
+                );
+            }
+            let mut ask = BudgetAsk::default();
+            let mut forced = false;
+            let mut out = Vec::new();
+            for (key, text) in &pairs {
+                let number = || {
+                    text.parse::<u32>()
+                        .map_err(|_| format!("{key} is a whole number, not {text:?}"))
+                };
+                match *key {
+                    "spec" if *text == "auto" => forced = true,
+                    "spec" => {
+                        let kind = tuile_core::budget::SpecKind::from_label(text).ok_or_else(|| {
+                            format!(
+                                "spec is auto or one of {}, not {text:?}",
+                                tuile_core::budget::SpecKind::ALL
+                                    .map(|k| k.label())
+                                    .join(", ")
+                            )
+                        })?;
+                        ask.kind = Some(kind);
+                        forced = true;
+                    }
+                    "margin" => {
+                        ask.margin = Some(number()?);
+                        forced = true;
+                    }
+                    "horizon_ms" => {
+                        ask.horizon_ms = Some(number()?);
+                        forced = true;
+                    }
+                    "speculation_slots" => {
+                        let n = number()?;
+                        ask.speculation_slots =
+                            Some(u16::try_from(n).map_err(|_| format!("{key} is at most 1000"))?);
+                        forced = true;
+                    }
+                    "line" => out.push(Command::BudgetLine(match *text {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("line is on or off, not {text:?}")),
+                    })),
+                    _ => {
+                        return Err(format!(
+                            "budget takes spec=, margin=, horizon_ms=, speculation_slots= \
+                             and line=, not {key:?}"
+                        ))
+                    }
+                }
+            }
+            // Numbers alone override the interactive one.
+            if ask.kind.is_none() && ask != BudgetAsk::default() {
+                ask.kind = Some(tuile_core::budget::SpecKind::Interactive);
+            }
+            if forced {
+                out.insert(0, Command::Budget(ask));
+            }
+            Ok(out)
         }
         "view" => {
             if pairs.is_empty() {
@@ -1090,6 +1194,63 @@ mod tests {
         ] {
             assert!(parse_url(bad).is_err(), "{bad}");
         }
+    }
+
+    /// The budget's diagnostic override and its line: a named
+    /// specification with numbers, numbers alone over the interactive one,
+    /// `auto` back to the context, the line alone; the rest refused.
+    #[test]
+    fn the_budget_override_is_a_url() {
+        use tuile_core::budget::SpecKind;
+        assert_eq!(
+            parse_url("tuile://budget?spec=fpv&margin=300&line=on"),
+            Ok(vec![
+                Command::Budget(BudgetAsk {
+                    kind: Some(SpecKind::Fpv),
+                    margin: Some(300),
+                    ..BudgetAsk::default()
+                }),
+                Command::BudgetLine(true),
+            ])
+        );
+        assert_eq!(
+            parse_url("tuile://budget?horizon_ms=1500"),
+            Ok(vec![Command::Budget(BudgetAsk {
+                kind: Some(SpecKind::Interactive),
+                horizon_ms: Some(1500),
+                ..BudgetAsk::default()
+            })])
+        );
+        assert_eq!(
+            parse_url("tuile://budget?spec=auto"),
+            Ok(vec![Command::Budget(BudgetAsk::default())])
+        );
+        assert_eq!(
+            parse_url("tuile://budget?line=off"),
+            Ok(vec![Command::BudgetLine(false)])
+        );
+        for bad in [
+            "tuile://budget",
+            "tuile://budget?spec=warp",
+            "tuile://budget?margin=lots",
+            "tuile://budget?speculation_slots=70000",
+            "tuile://budget?line=maybe",
+            "tuile://budget?endpoint=x",
+        ] {
+            assert!(parse_url(bad).is_err(), "{bad}");
+        }
+        // The query the budget is given: the context's when nothing is
+        // forced, said not to be an override.
+        let (q, overridden) = BudgetAsk::default().query(SpecKind::Interactive);
+        assert!(q.starts_with("spec=interactive&") && !overridden);
+        let (q, overridden) = BudgetAsk {
+            kind: Some(SpecKind::Fpv),
+            margin: Some(300),
+            ..BudgetAsk::default()
+        }
+        .query(SpecKind::Interactive);
+        assert!(q.starts_with("spec=fpv&margin=300&") && overridden, "{q}");
+        assert!(tuile_core::budget::Specification::from_query(&q).is_ok());
     }
 
     #[test]

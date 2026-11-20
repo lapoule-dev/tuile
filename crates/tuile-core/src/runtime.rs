@@ -1119,6 +1119,17 @@ impl State {
                 self.budget.retarget(Bytes(total_bytes));
                 self.events.push(BudgetEvent::Retarget(Bytes(total_bytes)));
             }
+            ClientMessage::Specify { query, overridden } => {
+                let spec = crate::budget::Specification::from_query(&query)
+                    .and_then(|s| self.budget.specify(s.clone()).map(|()| s));
+                match spec {
+                    Ok(s) => {
+                        tracing::info!(spec = s.kind.label(), overridden, %query, "budget specified");
+                        self.events.push(BudgetEvent::Specify(s.kind, s.digest(), overridden));
+                    }
+                    Err(e) => tracing::warn!(%query, "budget specification refused: {e}"),
+                }
+            }
             // Between frames, now: against what the last step drew.
             // Announced as any eviction is.
             ClientMessage::ReleaseBeyond { bytes } => {

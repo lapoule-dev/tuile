@@ -348,6 +348,9 @@ pub struct App {
     // beside its behaviour rather than here.
     pointer: input::Pointer,
     views: input::Views,
+    /// The diagnostic override of the budget's specification in force
+    /// (`steer::BudgetAsk`; none: the context's).
+    budget_ask: crate::steer::BudgetAsk,
     recording: tape::Recording,
     warmup: warmup::Warmup,
     pacing: pacing::Pacing,
@@ -510,6 +513,7 @@ impl App {
             pressure_read: None,
             pointer: input::Pointer::default(),
             views: input::Views::default(),
+            budget_ask: crate::steer::BudgetAsk::default(),
             recording: tape::Recording {
                 tape: crate::recording::open_tape(config.record.path.as_deref()),
                 trace: crate::recording::open_trace(),

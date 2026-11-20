@@ -85,6 +85,13 @@ pub enum ClientMessage {
     /// selects is the same with or without them; only when its tiles
     /// arrive changes. Replaces the views ahead given before; empty, none.
     Ahead { views: Vec<ViewState> },
+    /// The budget's specification from the next step on, as its query
+    /// (`tuile_budget::Specification::to_query`, the `tuile://budget?…`
+    /// grammar): the host's, chosen by its use context, or — `overridden` —
+    /// a diagnostic override. An invalid one is refused and the one in
+    /// force kept (`docs/explorations/budget-eviction-prefetch-spec.md`
+    /// §3.3).
+    Specify { query: String, overridden: bool },
 }
 
 /// What the tree knows about a tile, travelling with every message that names
