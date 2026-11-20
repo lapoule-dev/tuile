@@ -586,6 +586,63 @@ is expected to serve, pays for its restore cost.
   full recomputation (`check_wants`, debug builds) at the same `now` agrees. Until a tier is
   measured (§4.2), the cost is the network's — the crossing time is an upper bound.
 
+### 5.4 Films: the schedule is a file, and time is frames (Laurent, 2026-11-20)
+
+**A film predicts nothing.** The list of tiles each frame needs is produced upstream by the
+bake and the convergence and **is available as a file**: the **tuile pack**
+(`crates/tuile-pack`, FlatBuffers, schema `crates/tuile-pack/schema/tuile_pack.fbs`, magic
+`TUILEPK\0`, version 3), written as `Content::References` ("the plan alone"):
+
+| Pack item | Fields | Decider input |
+|---|---|---|
+| `Frame` (fbs:141) | `frame: u32`, `tiles: [u32]` (indices into `Pack.tiles`), the `View` | the frame index is the step; `tiles` is the frame's exact need |
+| `Tile` | `id: u64`, `drape: u64`, `TerrainRef{x, y, level, digest}` (possibly an ancestor), `imagery: [ImageryRef{x, y, level, …}]` bottom layer first | `ResourceId::Mesh(TileId)` and `ResourceId::Drape(TileId, layer, level)` per imagery reference |
+| `Pack` | `first_frame`, `last_frame`, `terrain_layer`, `imagery_layer`, `night_layer` | the layers, once per film |
+
+Reader: `Pack::open`, `Pack::frame(n)` (`crates/tuile-pack/src/lib.rs:1152`), `refs_of(tile)`;
+the film's `tuile_film::Cursor` walks it frame by frame into `FrameDiff { enter, leave }`.
+**Today the film path does not feed the budget at all**: `tuile-film-native`'s render loop
+uploads from `enter` and drops on `leave`, and fetches every referenced tile once, ahead
+(`render.rs`, `serve.rs`); `ClientMessage::Ahead` / `release_beyond` / `Policy::Batch` are
+used by `tuile-bake`'s session only. The film's memory is therefore whatever the pack's
+window needs — unbounded by any budget.
+
+The decider reads the pack **as an injected input** — a `KnownSchedule` source (dependency
+injection; the budget does not open files):
+
+```rust
+/// The exact future of a film: for each resource, the frames it is used at.
+pub trait KnownSchedule {
+    /// The next frame at or after `frame` that uses `r`, if any.
+    fn next_use(&self, r: ResourceId, frame: u64) -> Option<u64>;
+    /// The resources frame `frame` needs (its exact need).
+    fn frame(&self, frame: u64) -> &[ResourceId];
+}
+```
+
+built by the film host from the pack (one pass: a next-use index per resource, the pack's
+frames in order). `fpv-film` uses the same file. The film specification orders by **next
+use** (Bélády; Cao et al.'s known-future rules), the restore cost per tier breaking ties
+(weighted caching); loads follow the schedule's order (first missing, Cao's *First
+Opportunity*); a release never takes a resource needed before the one loaded (*Do No Harm*).
+Interactive modes keep the probabilistic predictions of §5.2.
+
+**Time is an abstract axis.** The core's clock is a monotonic **step index**: the
+interactive host maps it to wall-clock microseconds (measured, recorded, as `FrameInput::now`
+today), a film to **frame numbers**. In the film path there are **no seconds**: the horizon
+is N frames, a next use is a frame index, urgency is "frames until needed" (minus the load
+cost expressed in frames of work, or simply the next-use order), and a step is one rendered
+frame, whatever its wall-clock length (the film renders offline). The specification's
+horizon, dwell and blend are given in the axis' unit (`Params` gains `axis: Axis::{Wall,
+Frames}`; a film specification's numbers are frames).
+
+**Catalogue scenario** `film-pack`: a film driven by a pack file (the fixture pack of
+`tuile-pack`'s tests, and a pack baked from `long-pan`), on a bounded budget. Acceptance:
+**no load later than its frame's need** (every frame ready when rendered), **no eviction of
+a resource needed before the one loaded** (Do No Harm), reloads within the offline bound
+(LP / 4-approximation, §10b), and **the same decisions whatever the simulated render
+speed** (the frame clock run at 1×, 0.1× and 10× wall time gives identical digests).
+
 ## 6. The control model: an equilibrium regime
 
 The budget is a **dynamical system** that must settle into a steady state working at the
@@ -936,7 +993,7 @@ scenario set, before/after.
 | 5 | **Viewer wiring** (desktop and web, same code). The context selects the spec (ordinary navigation: `interactive`; the FPV camera mode, once it exists: `fpv`; flights and tapes: `known_path`); a **diagnostic override** in the menu and `tuile://budget?spec=…&margin=…` (`spec=auto` clears it), labelled as such; `spec_active`, deficit and reasons through tuile-telemetry (labels allow-listed); the HUD line. | steering parse tests; telemetry label test | — |
 | 6 | **The simulator crate, the scenario catalogue and the search** (§9.3), with the **exact TIP reference** (§1c) and its acceptance test. `tuile-budget-sim` library (the `budget_sim` harness moved), simulated measured inputs, the objective, `tuile-budget-tune` with Parquet out. | the objective of a known run; determinism of the search | unchanged (moved, not changed) |
 | 7 | **The controller** (§6): headroom set-point, proactive release, token buckets, the LOD actuator replacing `relax()`; the equilibrium scenarios of §9.2 with their bounds. | `pressure-ramp` (no 16× haste, monotone recovery), "a load never waits for an emergency eviction" | re-recorded, reason: the sweep and `relax()` are gone |
-| 8 | **Speculation and predictions**: `Urgency::Predicted`, quotas, the film schedule into `release_beyond`, the viewer's known paths (Glide, tape) into predictions. | law 4 and 8 invariants; Bélády optimum on small traces (B3) | re-recorded where predictions are given |
+| 8 | **Speculation and predictions**: `Urgency::Predicted`, quotas, the viewer's known paths (Glide, tape) into predictions; **the film's `KnownSchedule` from the pack** (§5.4), the frame axis, and the film host (`tuile-film-native`) driving its residency through the budget. | `film-pack`: no late load, Do No Harm, same decisions at any render speed | | law 4 and 8 invariants; Bélády optimum on small traces (B3) | re-recorded where predictions are given |
 
 Order note: PR 5 comes before the simulator so that Laurent can try the value rule live as
 soon as it exists; the simulator (6) is what proves the equilibrium of 7 and tunes 7–8. If
