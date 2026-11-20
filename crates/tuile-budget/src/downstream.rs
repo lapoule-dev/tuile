@@ -1343,7 +1343,7 @@ impl Budget {
         d.contrib.apply(&mut l.c_contrib, |_| {});
         d.coarsening.apply(&mut l.c_coarsening, |_| {});
         d.reach.apply(&mut l.c_reach, |_| {});
-        d.readers.apply(&mut l.c_readers, |_| {});
+        d.readers.apply_unordered(&mut l.c_readers, |_| {});
     }
 
     /// The draw set: the items of the meshes whose runs changed, serving a
@@ -1474,7 +1474,7 @@ impl Budget {
         let d = &mut self.down;
         d.items.apply(&mut l.c_items, |_| {});
         d.reach.apply(&mut l.c_reach, |_| {});
-        d.readers.apply(&mut l.c_readers, |_| {});
+        d.readers.apply_unordered(&mut l.c_readers, |_| {});
         self.wear(l);
         #[cfg(debug_assertions)]
         self.check_items(&expected);
