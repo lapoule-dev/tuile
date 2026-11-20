@@ -291,6 +291,18 @@ pub struct Budget {
     last_now: Option<Micros>,
     scale: u32,
     scale_fine: u64,
+    /// Since when no drawn tile's floats have moved: the view holding
+    /// still.
+    quiet_since: Option<Micros>,
+    /// The pressure the last relaxation step saw, and whether a pressure
+    /// was lifted since the scale last stood at one: the relaxation it drove
+    /// comes down fast ([`engine`]'s `relax`).
+    pressure_relaxed: Pressure,
+    relax_lifted: bool,
+    /// Whether the view is still: no tile's floats moved for
+    /// [`engine::STILL_AFTER`]. A drape worn a level under its need is
+    /// asked for then, and then only, when nothing presses.
+    still: bool,
     ledger: Ledger,
     in_flight: PerClass<u32>,
     local_reads: u32,
@@ -330,6 +342,10 @@ impl Budget {
             last_now: None,
             scale: 1_000,
             scale_fine: 1_000_000_000,
+            quiet_since: None,
+            pressure_relaxed: Pressure::Normal,
+            relax_lifted: false,
+            still: false,
             ledger: Ledger::default(),
             in_flight: PerClass::splat(0),
             local_reads: 0,
@@ -620,6 +636,9 @@ impl Budget {
             layer_epochs: self.layer_epochs.iter().map(|(k, v)| (*k, *v)).collect(),
             next_gen: self.next_gen,
             last_now: self.last_now,
+            still: self.still,
+            still_cursor: self.down_still_cursor(),
+            caught: self.down_caught(),
             scale: self.scale,
             scale_fine: self.scale_fine,
             ledger: self.ledger,

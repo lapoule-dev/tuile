@@ -250,6 +250,9 @@ struct Support {
     whole: bool,
 }
 
+/// How many readers a still view catches up with each step.
+const STILL_CATCHUP_PER_STEP: usize = 8;
+
 /// What the passes after the need keep from one step to the next.
 #[derive(Debug, Default)]
 pub(super) struct Downstream {
@@ -262,16 +265,20 @@ pub(super) struct Downstream {
     /// the presence index's generation when the levels asked it.
     scale: u32,
     pressure: Pressure,
-    /// Tiles whose wants read the pressure (`Budget::tile_wants`), sorted:
-    /// the only ones a change of pressure to or from `Normal` reads again.
-    /// A vector, not the sorted blocks, and its room given back when it is
-    /// four times what it holds: a few tiles at a time (a drape worn one
-    /// level finer than its need, a moment in a zoom out), where the
-    /// blocks' first block and spare one, or a burst's room kept, cost one
-    /// byte per tracked resource on the tour (one reader in a room of 64 at
-    /// its end, 512 B); the entries an insertion or a removal shifts are
-    /// counted in `work`.
-    pressure_readers: Vec<TileId>,
+    /// The catch-up of a still view: the readers up to this tile were read
+    /// again since the view came to be still (`None`: none yet), every one
+    /// once `caught`. A few a step (`STILL_CATCHUP_PER_STEP`), so the step
+    /// the view comes to rest costs no more than one where nothing changes.
+    still_cursor: Option<TileId>,
+    caught: bool,
+    /// Tiles whose wants read the regime — the pressure, the stillness
+    /// (`Budget::tile_wants`): a drape worn a level off its need either
+    /// way — sorted: the only ones a change of pressure to or from
+    /// `Normal` reads again, and the ones a still view catches up with.
+    /// The sorted blocks, as there may be hundreds (every tile approached
+    /// a level at a time); a vector shifted at each change cost its length
+    /// in work per tile caught up.
+    pressure_readers: Set<TileId>,
     oracle: Option<u64>,
     /// Tiles whose levels asked the presence index; whose levels moved.
     levels_far: Set<TileId>,
@@ -1046,6 +1053,7 @@ impl Budget {
         #[cfg(debug_assertions)]
         self.check_ancestry();
         self.levels_pass(tiles, presence, &mut l);
+        st.levels_moved = u32::try_from(l.moved.len()).unwrap_or(u32::MAX);
         #[cfg(debug_assertions)]
         self.check_levels(tiles, presence, &last);
         self.floor_pass(tiles, &mut l);
@@ -1056,6 +1064,13 @@ impl Budget {
         self.items_pass(tiles, full, floor_in, &mut l);
         let pressure_moved =
             (self.down.pressure == Pressure::Normal) != (self.pressure == Pressure::Normal);
+        self.still_catchup(&mut l);
+        st.regime_reads = u32::try_from(l.wants_dirty.len()).unwrap_or(u32::MAX);
+        if pressure_moved && !full {
+            st.regime_reads = st.regime_reads.saturating_add(
+                u32::try_from(self.down.pressure_readers.len()).unwrap_or(u32::MAX),
+            );
+        }
         self.wants_pass(tiles, full, pressure_moved, &mut l);
         self.refresh_pass(full, &mut l);
         #[cfg(debug_assertions)]
@@ -1089,6 +1104,63 @@ impl Budget {
         } else {
             self.down.coarsening = t.coarsening;
         }
+    }
+
+    /// The catch-up of a still view, into `l.wants_dirty`: while the view
+    /// is still, the next few readers past the cursor are read again (a
+    /// drape worn a level under its need is asked for then,
+    /// `Budget::drape_fits`); when it moves again, the readers caught up
+    /// are read again once (an ask not started falls; a load started is
+    /// kept), and the cursor is cleared.
+    fn still_catchup(&mut self, l: &mut StepLists) {
+        let readers = &self.down.pressure_readers;
+        if self.still {
+            if self.down.caught {
+                return;
+            }
+            let cursor = self.down.still_cursor;
+            let before = l.wants_dirty.len();
+            l.wants_dirty.extend(
+                readers
+                    .keys()
+                    .skip_while(|t| cursor.is_some_and(|c| **t <= c))
+                    .take(STILL_CATCHUP_PER_STEP)
+                    .copied(),
+            );
+            let taken = l.wants_dirty.len() - before;
+            self.walk(taken);
+            match l.wants_dirty.last().filter(|_| taken > 0) {
+                Some(last) => self.down.still_cursor = Some(*last),
+                None => self.down.caught = true,
+            }
+        } else if self.down.caught || self.down.still_cursor.is_some() {
+            let (caught, cursor) = (self.down.caught, self.down.still_cursor);
+            let before = l.wants_dirty.len();
+            l.wants_dirty.extend(
+                readers
+                    .keys()
+                    .take_while(|t| caught || cursor.is_some_and(|c| **t <= c))
+                    .copied(),
+            );
+            self.walk(l.wants_dirty.len() - before);
+            self.down.still_cursor = None;
+            self.down.caught = false;
+        }
+    }
+
+    /// The catch-up's cursor, for the snapshot.
+    pub(crate) fn down_still_cursor(&self) -> Option<TileId> {
+        self.down.still_cursor
+    }
+
+    /// Whether the catch-up reached every reader, for the snapshot.
+    pub(crate) fn down_caught(&self) -> bool {
+        self.down.caught
+    }
+
+    /// Whether reader `t` was read again since the view came to be still.
+    pub(super) fn caught_up(&self, t: TileId) -> bool {
+        self.down.caught || self.down.still_cursor.is_some_and(|c| t <= c)
     }
 
     /// The drape levels of the tiles in `l.lev` that ask for drapes,
@@ -1582,7 +1654,7 @@ impl Budget {
             add(&mut dirty, tiles.keys().copied());
             add(&mut dirty, self.down.wants.keys().map(|r| r.0.tile()));
         } else if pressure {
-            add(&mut dirty, self.down.pressure_readers.iter().copied());
+            add(&mut dirty, self.down.pressure_readers.keys().copied());
         }
         dirty.sort_unstable();
         dirty.dedup();
@@ -1599,18 +1671,12 @@ impl Budget {
                 }
             };
             let readers = &mut self.down.pressure_readers;
-            let shifted = match (readers.binary_search(&t), reads) {
-                (Err(i), true) => {
-                    readers.insert(i, t);
-                    readers.len() - i
-                }
-                (Ok(i), false) => {
-                    readers.remove(i);
-                    readers.len() - i + 1
-                }
-                _ => 0,
-            };
-            self.walk(shifted);
+            if reads {
+                readers.insert(t, ());
+            } else {
+                readers.remove(&t);
+            }
+            self.walk(1);
             l.old_wants.clear();
             l.old_wants
                 .extend(of_tile(&self.down.wants, t).map(|(r, w)| (r, *w)));
@@ -1648,11 +1714,6 @@ impl Budget {
             }
         }
         self.down.wants.apply(&mut l.c_wants, |_| {});
-        // A zoom out's burst of readers does not keep its room.
-        let readers = &mut self.down.pressure_readers;
-        if readers.capacity() > 4 * readers.len() + 4 {
-            readers.shrink_to(2 * readers.len());
-        }
         l.wants_dirty = dirty;
     }
 
@@ -3066,8 +3127,13 @@ impl Budget {
             want.extend(put.iter().map(|(r, _, w)| (*r, *w)));
         }
         assert_eq!(
-            self.down.pressure_readers, readers,
-            "the tiles kept as reading the pressure are those that do"
+            self.down
+                .pressure_readers
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            readers,
+            "the tiles kept as reading the regime are those that do"
         );
         want.sort_unstable_by_key(|e| ByTile(e.0));
         let kept: Vec<(ResourceId, Want)> =

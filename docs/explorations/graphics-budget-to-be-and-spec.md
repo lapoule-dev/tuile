@@ -625,11 +625,23 @@ a test that failed, mostly a livelock the simulation found. Spec and code now ag
 ### 11.4 Imagery
 - The footprint is relaxed with `sse_scale`: under pressure imagery coarsens as terrain
   does. Without it the low clamp (160 MiB) never converged.
-- When the level asked is held nowhere locally, a level held on the GPU, decoded or in a
-  store, within one level of the window between the relaxed and the unrelaxed need, is
-  taken instead: a relaxation never sends to the network what a local tier can show (I15).
-  Batch takes the exact level, with no hysteresis, so a frame is a function of its inputs.
-- A finer drape already worn is kept; under pressure the downgrade wins.
+- Under a relaxation, when the level asked is held nowhere locally, a level held on the
+  GPU, decoded or in a store, within one level of the window between the relaxed and the
+  unrelaxed need, is taken instead: a relaxation never sends to the network what a local
+  tier can show (I15). At `sse_scale` 1 the need's own level is the level, a held
+  neighbour of it dressing the tile meanwhile as for any load: a stand-in taken without a
+  relaxation was remembered as the tile's level, kept by the hysteresis and within the ±1
+  tolerance of `underdraped`, and the tile stayed a level coarser than its neighbours for
+  good — the viewer converged on a patchwork of levels. Batch takes the exact level, with
+  no hysteresis, so a frame is a function of its inputs.
+- A drape worn a level under its need is kept in motion (the need moves a level at a time
+  as the camera comes closer, and the tile would be fetched at every level on the way) and
+  under a relaxation or a pressure. Once the view is still — no drawn tile's floats moved
+  for a quarter of a second — and nothing presses, the need's own is asked for, a few
+  tiles a step (the still view's catch-up, `stats.regime_reads`), and an ask whose load
+  started is kept through the motion that follows. Without that a tile left a level under
+  its need stayed so for good. A finer drape already worn is kept; under pressure the
+  downgrade wins. Two levels off either way, the need's own is asked for.
 - The decoded tier releases copies of protected GPU residents first, then of evictable
   ones, then demoted ones, so an eviction demotes rather than drops.
 

@@ -929,7 +929,17 @@ impl P64 {
             .prev
             .as_ref()
             .map_or_else(|| listed(need).len() as u64, |p| need_delta(p, need));
-        let mut e = sim.step_events + self.decided;
+        // An imagery level that moved is a change the need did not name:
+        // the level follows the texel footprint with hysteresis and what
+        // the local tiers hold, and a tile whose level moved is read again
+        // past the levels (its wants, its requests).
+        // So is a want read again for a change of regime alone: the
+        // pressure, or the view coming to be still (a few tiles a step) or
+        // moving again (the tiles caught up, once).
+        let mut e = sim.step_events
+            + self.decided
+            + u64::from(d.stats.levels_moved)
+            + u64::from(d.stats.regime_reads);
         if sim.pressure_set != self.pressure {
             // A change of pressure is one input whose effect is a set: the
             // copies the new limits no longer hold are evicted and

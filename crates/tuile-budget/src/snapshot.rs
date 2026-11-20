@@ -103,6 +103,11 @@ pub struct Snapshot {
     pub next_gen: u64,
     /// The last step's time.
     pub last_now: Option<Micros>,
+    /// Whether the view was still, and its catch-up: the reader the
+    /// catch-up reached, and whether it reached every one.
+    pub still: bool,
+    pub still_cursor: Option<TileId>,
+    pub caught: bool,
     /// The SSE scale, thousandths.
     pub scale: u32,
     /// The SSE scale, fine.
@@ -186,6 +191,9 @@ impl Snapshot {
         eq("layer_epochs", self.layer_epochs == o.layer_epochs);
         eq("next_gen", self.next_gen == o.next_gen);
         eq("last_now", self.last_now == o.last_now);
+        eq("still", self.still == o.still);
+        eq("still_cursor", self.still_cursor == o.still_cursor);
+        eq("caught", self.caught == o.caught);
         eq("scale", self.scale == o.scale);
         eq("scale_fine", self.scale_fine == o.scale_fine);
         eq("ledger", self.ledger == o.ledger);

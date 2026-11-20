@@ -1149,6 +1149,75 @@ mod tiers {
         assert!(ds.iter().all(|d| d.deliver.is_empty()));
     }
 
+    /// I14 within its bounds: once the view is still, a drape worn a level
+    /// coarser than the need no longer serves it — the need's own level is
+    /// fetched, else a tile left a level under its need stays so for good,
+    /// a level coarser than its neighbours.
+    #[test]
+    fn once_still_a_coarser_drape_worn_no_longer_serves_the_need() {
+        let mut r = Rig::interactive();
+        let a = t(3, 2, 2);
+        r.settle(&drawn_draped(&[a], 4), 10);
+        assert_eq!(
+            r.b.resource(dr(a, 4)).map(|v| v.tier),
+            Some(Tier::Gpu),
+            "{RED}: the coarser drape is on the GPU"
+        );
+        let ds = r.idle_for(&drawn_draped(&[a], 5), Micros::from_secs(1));
+        assert!(
+            ds.iter().all(|d| d.sse_scale_milli == 1_000),
+            "{RED}: at rest"
+        );
+        assert!(
+            !ds[0].stats.still && ds.last().is_some_and(|d| d.stats.still),
+            "{RED}: the view comes to be still over the second"
+        );
+        assert!(
+            started(&ds, dr(a, 5)),
+            "{RED}: the need's own level is fetched: starts {:?}; dr5 {:?}; worn {:?}; underdraped {:?}",
+            ds.iter().map(|d| d.start.clone()).collect::<Vec<_>>(),
+            r.b.resource(dr(a, 5)),
+            ds.last().and_then(|d| d.draw.get(mesh(a))).and_then(base_drape),
+            ds.last().map(|d| d.stats.underdraped)
+        );
+        let d = r.settle(&drawn_draped(&[a], 5), 10);
+        let worn = d.draw.items.iter().find_map(base_drape);
+        assert_eq!(
+            worn.map(|w| w.resource),
+            Some(dr(a, 5)),
+            "{RED}: and worn once it arrives"
+        );
+    }
+
+    /// I15: under a relaxation the stand-in holds: a drape held a level
+    /// coarser than the need is worn and nothing is sent to the network for
+    /// the need's own level.
+    #[test]
+    fn under_a_relaxation_a_coarser_drape_held_stands_in_for_the_need() {
+        let mut r = Rig::new(small(1));
+        let tiles: Vec<_> = (0..4).map(|x| t(3, x, 0)).collect();
+        r.settle(&drawn_draped(&tiles, 4), 60);
+        let up = r.idle_for(&drawn_draped(&tiles, 4), Micros::from_secs(2));
+        let scale = up.last().map(|d| d.sse_scale_milli).unwrap_or(0);
+        assert!(scale > 1_000, "{RED}: relaxed, {scale}");
+        let ds = r.idle_for(&drawn_draped(&tiles, 5), Micros::from_secs(1));
+        for a in &tiles {
+            assert!(
+                !started(&ds, dr(*a, 5)),
+                "{RED}: the need's own level is not fetched under a relaxation"
+            );
+            let worn = ds
+                .last()
+                .and_then(|d| d.draw.get(mesh(*a)))
+                .and_then(base_drape);
+            assert_eq!(
+                worn.map(|w| w.resource),
+                Some(dr(*a, 4)),
+                "{RED}: the held one is worn"
+            );
+        }
+    }
+
     fn evicted_but_decoded() -> (Rig, tuile_budget::TileId) {
         let mut c = small(1);
         c.decoded_target = Bytes::mib(64);

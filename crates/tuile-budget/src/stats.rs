@@ -186,6 +186,18 @@ pub struct BudgetStats {
     /// Every wanted tile drawn exactly with its needed drape, and no work
     /// left for the view.
     pub converged: bool,
+    /// Whether the view held still this step (no tile's floats moved for a
+    /// quarter of a second): drapes worn a level under their need are then
+    /// asked for.
+    pub still: bool,
+    /// Drawn tiles whose imagery level moved this step: a change the need
+    /// did not name (the level follows the texel footprint with hysteresis,
+    /// and what the local tiers hold), read again past the levels.
+    pub levels_moved: u32,
+    /// Tiles whose wants were read again this step for a change of regime
+    /// alone — the pressure to or from `Normal`, the view coming to be
+    /// still (a few a step) or moving again — not for a change of the need.
+    pub regime_reads: u32,
 }
 
 impl BudgetStats {
@@ -241,6 +253,9 @@ impl BudgetStats {
             u64::from(self.underdraped),
             u64::from(self.rejected_inputs),
             u64::from(self.converged),
+            u64::from(self.still),
+            u64::from(self.levels_moved),
+            u64::from(self.regime_reads),
         ] {
             put(v);
         }
