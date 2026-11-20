@@ -92,23 +92,52 @@ resources, retaining held resources likely to be reused, and the rest — by est
 **one common unit**, the benefit of giving a buffer to a use and the cost of taking it from
 another, and moving buffers while the exchange is profitable.
 
-**The unit is expected screen quality gained per byte over a short horizon.** For a resource
-`r`, at step time `t₀`, over a horizon `H` sampled at steps `tᵢ`:
+**The unit is expected screen quality gained per byte over a short horizon.** The
+currency has a dimension: **pixel · level · step** — px·lvl·s in interactive use, px·lvl·frame
+in a film (the step axis is abstract, §5.4). Its name is Laurent's to choose (proposal:
+*tessera*, plural *tesserae*); the code uses one newtype for it (`value::Tessera`) and
+renames it once chosen. A value in µs does not compile.
 
 ```
-benefit(r) = Σ_{tᵢ ∈ [t₀, t₀+H]}  P(r visible at tᵢ) × Δq(r) × w(r) × δ(tᵢ − t₀)
-cost(r)    = size(r) × c(tier(r))
-value(r)   = benefit(r) / cost(r)
+benefit(r) = Σᵢ P(r visible at tᵢ) · Δq(r) · w(r) · δ(tᵢ) · Δtᵢ          [px·lvl·step]
 ```
+
+with `Δq` in levels, `w` in pixels of screen covered, `P` and `δ` dimensionless, `Δt` in
+steps. The two sides of the exchange, each in currency, then per byte:
+
+- **loss of releasing a held `r`** = `P(r needed again within H) · Δq · w · T_restore(tier)`
+  — the quality missing while it comes back: the **restore cost is in the numerator**, so a
+  resource dear to restore (network) is worth more held than a cheap one (decoded RAM), as
+  GreedyDual / TIP and law 6 say;
+- **gain of loading a missing `r`** = its benefit counted only **from its arrival**
+  (`now + T_fetch(tier)`) onward — slow fetches earn less, and urgency follows from it;
+- **exchange**: load `A` releasing `B` iff `gain(A)/size(A) > loss(B)/size(B) + margin`, both
+  in currency per byte;
+- **each limit `k`** (GPU bytes, RAM bytes, upload bytes, GPU ms, …) has a **price `λₖ`** in
+  currency per unit of that resource; the objective `Σ gains − Σₖ λₖ · useₖ` is homogeneous
+  (the regulator of §6 sets the prices).
+
+*(Correction, 2026-11-20: an earlier version of this section divided the benefit by
+`size × c(tier)` with `c` in µs — dimensionally wrong, and inverted for eviction: it would
+have released the network-tier resource first. The implementation of PR 4 keeps the restore
+cost in the numerator — see its test `a_dear_restore_is_worth_more_held`.)*
 
 | Term | Unit | Meaning | Set by |
 |---|---|---|---|
-| `P(r visible at t)` | ‰ | probability that `r` is drawn at `t` | the need (P = 1000 for the present need), the predictions (§5): film / FPV film P = 1000 on the known path; known path decaying where the user may interrupt; interactive decaying fast with time |
-| `Δq(r)` | levels | the deficit reduction holding `r` brings: `need − worn` for the place it serves (§1) | the step |
-| `w(r)` | ‰ | the place's screen weight (centre, size on screen) | the need; `Term::ScreenSize` weight |
-| `δ(τ)` | ‰ | discount with delay: 1000 at τ = 0, falling to 0 at `H` | the specification's horizon and discount shape (FPV: `H` grows with speed) |
+| `P(r visible at t)` | dimensionless (‰ in code) | probability that `r` is drawn at `t` | the need (P = 1 for the present need), the predictions (§5): film / FPV film P = 1 on the known path; known path decaying where the user may interrupt; interactive decaying fast with time |
+| `Δq(r)` | levels (level-equivalents) | the deficit reduction holding `r` brings: `need − worn` for the place it serves (§1) | the step; every resource class's producer states it through its dimensionless `quality_scale` (below) |
+| `w(r)` | pixels | the screen area the place covers | the need; `Term::ScreenSize`'s weight |
+| `δ(t)` | dimensionless | discount with delay: 1 at 0, 0 at `H` | the specification's horizon and discount shape (FPV: `H` grows with speed) |
+| `Δtᵢ` | steps (s or frames) | the sampling interval of the discrete horizon (§1c) | the specification |
 | `size(r)` | bytes | what holding it takes | the cost estimator |
-| `c(tier)` | µs per reference size | restore cost of the tier it would come back from: decoded, RAM, local store or browser cache, network | measured (§4.2), the specification's defaults until then — GreedyDual-Size / Landlord's credit and rent (Young; Cao & Irani) |
+| `T_restore(tier)`, `T_fetch(tier)` | steps | time to bring it back from the tier it would come from: decoded, RAM, local store or browser cache, network | measured (§4.2), the specification's defaults until then — GreedyDual-Size / Landlord's credit and rent (Young; Cao & Irani) |
+| `λₖ` | currency per unit of resource `k` | the price of a limit | the regulator (§6) |
+
+**Contract for every resource class** (terrain, drapes, 3D Tiles, and the classes of the
+atmosphere / voxels / procedural study, #260): its producer gives `Δq` in **level-equivalents**
+— through a dimensionless `quality_scale` that maps its own refinement steps onto levels —
+and `w` in **screen pixels** (a cloud's weighted by its transmittance). With that, every class
+is valued in the same currency and shares the one pool.
 
 Consequences, by construction rather than by rule:
 
@@ -291,7 +320,7 @@ pub enum Predicate {
     Any(Vec<Predicate>),      // or
 }
 
-/// A value term, in micro-seconds of "worth keeping" (one unit across terms).
+/// A value term, in the currency (px·lvl·step; `value::Tessera`).
 pub enum Term {
     /// Recency: the time it was last needed (LRU's key; GreedyDual's L).
     Recency,
@@ -754,7 +783,7 @@ Histograms have fixed buckets. Units are in the name (`_seconds`, `_bytes`, `_to
 | `under_need_still_seconds` | gauge | | s | views still and some place under its need, for how long |
 | **Decisions and their score** | | | | |
 | `decisions_total` | counter | `list` = `start`\|`evict`\|`release`, `reason`, `class` | decisions | per decision reason (§7.2) |
-| `decision_value` | histogram | `list`, `class`, `reason` | µs of value (`le` 1 ms … 60 s, doubling) | the value at decision time: what was loaded / released was worth this |
+| `decision_value` | histogram | `list`, `class`, `reason` | currency per byte (px·lvl·step / B; buckets doubling) | the value at decision time: what was loaded / released was worth this |
 | `decision_leaf_total` | counter | `list`, `term` = `recency`\|`restore`\|`next_use`\|`deficit`\|`screen` | decisions | the specification's term that dominated the value (provenance, §10b) |
 | `mechanism_corrections_total` | counter | `law` = `1`…`5` | decisions | a proposal the mechanism refused (absolute laws) |
 | **Prefetch outcome** | | | | |
