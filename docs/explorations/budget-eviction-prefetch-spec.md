@@ -507,7 +507,9 @@ A release that the bucket refuses waits for the next step; since releases are pr
 
 ### 6.4 The controller
 
-One damped controller per pool (and per class outside it), in integers, evaluated every step
+Derived from Lyapunov drift-plus-penalty (Neely; BOLA as the worked transposition, §10b):
+the headroom and each tier's flow are virtual queues, the deficit is the penalty, one knob
+`V` trades quality against headroom. In its linearised form it is one damped controller per pool (and per class outside it), in integers, evaluated every step
 with the step's `dt` (time-based, so 30 Hz and 120 Hz settle alike):
 
 ```
@@ -560,6 +562,7 @@ ds/dt  = Ks·p − Kd·(s − 1)·[p == 0]               (LOD scale: rises with 
 | `decisions_total` | counter | `list` = `start` \| `evict` \| `release`, `reason` | per decision reason (§7.2) |
 | `spec_active` | gauge | `spec` = `interactive` \| `known_path` \| `film` \| `fpv` \| `fpv_film` \| `custom` | 1 for the one in force |
 | `spec_blend` | gauge | | 0–1 progress of a re-specification |
+| `prefetch_used_total`, `prefetch_wasted_bytes_total` | counter | `class` | speculative loads used before release / released unused (SARC's waste, §10b) |
 | `bucket_refused_total` | counter | `flow` = `start` \| `speculative` \| `upload` \| `release` | congestion: tokens refused |
 | `queue_depth`, `wait_seconds` | gauge, histogram | `class` | congestion |
 | `measured_cost_seconds` | gauge | `tier` | the smoothed restore cost per tier |
@@ -739,6 +742,48 @@ scenario set, before/after.
 Order note: PR 5 comes before the simulator so that Laurent can try the value rule live as
 soon as it exists; the simulator (6) is what proves the equilibrium of 7 and tunes 7–8. If
 Laurent prefers the simulator first, 5 and 6 swap without other change.
+
+## 10b. Prior art: what is taken, adapted to the laws
+
+From the literature review (`reports/Bibliographie éviction et préchargement.md` in the
+working tree, 2026-11-20). Evidence levels are the review's: **V** full text read, **R**
+abstract or extracts only, **C** prior knowledge not re-checked. What is R or C is a
+**hypothesis to confirm on the simulator**, not a fact. The review's own caveat holds: the
+pieces are published, their assembly here is not.
+
+| Source (level) | What it gives | How it is taken here |
+|---|---|---|
+| Funkhouser & Séquin 1993 (V) | LOD selection as a multiple-choice knapsack, greedy by benefit/cost, solved incrementally from the last choices | §1's objective is that knapsack **plus** a tree constraint (a held tile has its coarser ancestors), a pinned floor and two budgets (resident bytes, bandwidth); a hole is a **hard constraint** kept by the mechanism, never a weight. The incremental solve is O1's dirty sets |
+| van Waveren 2012, id Tech 5 virtual texturing (V) | priority = (wanted − resident level) × screen samples; evict finest first; coarsest pinned; high/low marks with a dead band | the priority is §1's screen-weighted deficit and §5.3's Deficit term; finest first is law 2's band; the dead band is the headroom band (§6.2). **Its swap order is not taken**: it unmaps the old page first; ours is new active before old released (law 1) |
+| TIP, Patterson et al. 1995 (V) | one cost/benefit currency between announced prefetch, retention and the rest | the one value per resource (law 6): the same score serves both ends — load the top missing, release the bottom held. Value per byte: `v / size` orders the release side |
+| GreedyDual / Landlord (Young; Cao & Irani GreedyDual-Size) (C for Cao & Irani) | credit = restore cost, rent ∝ size | `Term::RestoreCost` with `ref_bytes / size`; the tiers grouped into ≤ 4 cost classes (GPU-decoded, store, HTTP cache, network) so the weighted-paging guarantee of Bansal et al. applies |
+| Cao, Felten, Karlin & Li 1995 (V) | fetch the next missing; evict the furthest next use; **Do No Harm** (never evict A to fetch B if A is used before B); **First Opportunity** | Do No Harm is an invariant of law 4/7 in the known-path and film specifications (sim check: no eviction whose next use precedes the fetched one's); First Opportunity is the start rule under the start bucket. Conservative ↔ aggressive is a **continuous** parameter (the speculation quota and the margin), not a switch |
+| Kimbrel & Karlin (R) | reverse aggressive for parallel channels | a hypothesis for the film's several load channels (network and store quotas), to try in PR 8 |
+| Albers, Garg & Leonardi (R); Bar-Noy et al. (C) | offline optimum by LP; with sizes it is NP-hard, 4-approximation | the film oracle in the simulator is an **LP bound or the 4-approximation, not exact Bélády** (sizes vary); the online decider is scored against it on the catalogue |
+| Bansal et al. SODA 2022, Lykouris & Vassilvitskii, Rohatgi (R) | prediction-augmented weighted paging, robust fallback (≤ O(log) worse when predictions are wrong) | the interactive predictions are used under a **Marker-style guard**: nothing selected in the current phase (drawn within `min_dwell`) is released on a prediction — wrong predictions cost bounded reloads |
+| Im et al. 2022 (R) | evaluate the predictor on a sample of candidates | the release side asks the value of the first k candidates of the persistent index only (k = 64), never the whole set — keeps P6.4's bound |
+| TRACK, Qian et al., Gül et al. (R) | linear/Kalman extrapolation beats deep models below ~1–2 s; "still camera" is the mandatory baseline | the interactive and `fpv` predictors are a constant-turn-rate extrapolation first, Kalman (an established crate) next; every predictor is scored against "still camera" in the simulator |
+| Teler & Lischinski 2001 (R); Ng et al. 2005 (V); Funkhouser 1996 (R) | expected benefit along the predicted path under a bandwidth limit; conservative frustum = union of future frusta; one manager for prefetch, LOD and replacement | the runtime's predicted views (§5.2) are the union of future frusta over the horizon; the one decider is Funkhouser's single manager |
+| Flare, Duanmu (V for Flare) | two-tier 360° streaming: coarse base everywhere with a long horizon, fine on the predicted view with a short one; out-of-view margin `k = c₀ + ⌈ξ(1−S)(n−c₀)⌉` growing as recent accuracy `S` drops | coarse band with a long horizon, fine band with a short one (horizon per band in `Params`, PR 8); the corridor's margin grows **continuously** with `1 − S`, `S` the measured prediction accuracy over the last seconds (recorded) |
+| 2Q / ARC idea; SARC/AMP (V for SARC) | seen-once apart from reused; prefetched data in its own list sized by marginal utility; pollution and waste counters | a resource loaded on a prediction and not used yet counts as speculative bytes (the quota of law 8); metrics `prefetch_used_total`, `prefetch_wasted_bytes_total` (prefetched then released unused) |
+| Neely, drift-plus-penalty; BOLA (R for Neely's book; V for BOLA) | per-step regulator on virtual queues with a penalty; utility within O(1/V) of optimal, queues O(V) | §6.4's controller is **derived from drift-plus-penalty**: virtual queues for GPU headroom, RAM headroom and each tier's flow; the deficit is the penalty; `V` is the one knob between quality and headroom; the LOD scale (B6) is its actuator of last resort. The only formal stability guarantee available — and it bounds averages, not oscillation, so §6.5's SASO checks stay |
+| Linux kswapd watermarks (V); Kalyvianaki (R); Lu & Abdelzaher (R) | background reclaim between marks, synchronous fallback; target = filtered working set + safety margin; feedback split of one pool between classes | the headroom band (§6.2) with the hard-limit bypass as the synchronous fallback; `H*` = filtered demand + margin; the pool split stays the shared pool (no fixed reservation) |
+| Token bucket (V); TCP Vegas (V); BBR (V, draft); RFC 6298 (V) | hard burst bound; dead band on bytes in flight; per-source windowed max bandwidth and min latency with pacing; integer smoothing of mean and deviation | §6.3's buckets; a dead band ≥ the largest tile on in-flight bytes; per-tier windowed max throughput / min latency next to §4.2's EMA; RFC 6298's integer mean/deviation for latency (cheaper and as deterministic as the EMA — to compare on the simulator) |
+| PANDA, BOLA-O (R / V) | climb slowly, drop fast — as continuous gains; cap a rise on the previous measurement | the controller's asymmetric gains (continuous, not a mode); a rise of the LOD scale capped per step |
+| Evans & Fowler, Specification (V) | composable selection/validation predicates | §3's predicates, extended with **score combinators** (terms × weights) as a serialisable AST — the review finds no "specification with scores" in the DDD literature: ours is an extension |
+| Hydra 1975, Simplex 2001, shielding (R / C) | policy proposes, mechanism validates, a simple safe fallback | the absolute laws live in the mechanism (protection, bands, hard limit); a specification only scores; the safe fallback is "evict the oldest finest first" (§3.5) |
+| Bumpless transfer; Dragan & Srinivasa blending (C) | a switch of controller ramped by α | §3.5's linear blend of weights over `blend`, under the bounded release rate |
+
+**Patents** (review's warning, claims not read): MPC-DASH, US 10271112 (Yin et al.'s MPC),
+and map-tile prefetch US 8204966 / 8805959 / 10304238. The film's receding-horizon schedule
+(§5.2, PR 8) is planned from the exact known future and **not** a reproduction of Yin et
+al.'s method; before anything resembling MPC-DASH lands, the claims are read.
+
+**Gaps the review found** (open problems, so measured, not assumed): no published result
+combines prediction, prefetch under a bandwidth limit and heterogeneous costs and sizes; no
+stability analysis exists for a residency/LOD controller; no primary source on eviction
+bursts. §6.5's SASO criteria on the catalogue (overshoot, settling time, the spectral peak
+of the eviction rate, the upload peak per frame) are therefore this project's own evidence.
 
 ## 11. Open questions, with proposed defaults
 
