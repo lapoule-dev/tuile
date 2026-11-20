@@ -791,6 +791,37 @@ M-sim table. The film golden is expected to stay (Batch with no prediction: the 
 specification's order reduces to restore cost then the old tie-breaks — to verify, and if
 it moves, said so).
 
+## 8b. Module map (Laurent, 2026-11-20: no god-module, no god-crate)
+
+Split by responsibility; each module has a small public surface, its own tests, and states
+the law it serves. Dependencies point one way (no cycles). A separate crate only where the
+boundary is real.
+
+| Module (crate `tuile-budget` unless said) | Responsibility | Laws | Depends on |
+|---|---|---|---|
+| `spec` | the Specification: AST of predicates and value terms, composition, validation, digest, query form; the named specifications | 11, 12 | `types`, `tier`, `need` |
+| `inputs` | measured inputs (`Measured`, `TierSample`) and their integer filters (`Smoothed`); predictions (`Prediction`) — injected by the host, never read from a global | 5 | `types` |
+| `value` | the one currency: a resource's value from the specification's tabulated terms, the restore-cost credit, the deficit term and its due time (`Valuation`, `deficit_due`) | 6, 7, 9 | `spec`, `inputs`, `types`, `tier` |
+| `state` (exists) | the arena and the ledger; the persistent held-side index keyed by `value` | 3, 5 | `value` |
+| `exchange` (PR 4b) | the two ordered structures (missing by value per byte, held by value per byte), the bounded exchange loop with the margin, sampled held candidates | 6, 7 | `value`, `state` |
+| `mechanism` (PR 4b, from today's protection code in `engine`/`downstream`) | the absolute laws: protected sets, coverage first, hard limits incl. the transient peak, the safe fallback; validates every proposal, counts corrections | 1–4 | `state` |
+| `regulator` (PR 7) | headroom set-points, token buckets, the damped controller and the LOD actuator (replaces `relax`) | 9, 10 | `inputs`, `state` |
+| `observe` (exists) + `provenance` (PR 4b) | signals, series, closed label sets; the reason and the dominating term of each decision | 13 | everything above, read-only |
+| `engine`, `downstream` (exist) | the step's order of passes, calling the modules above; to shrink as `exchange` and `mechanism` take their parts | — | all |
+| crate `tuile-budget-sim` (PR 6) | the simulator, the scenario catalogue, the exact-TIP reference, the objective | — | `tuile-budget` |
+| crate `tuile-budget-tune` binary in `tuile-budget-sim` (PR 6) | the parameter search, Parquet out | — | `tuile-budget-sim` |
+
+Policy proposes, mechanism validates (Simplex): `value`/`exchange` propose loads and
+releases; `mechanism` accepts or corrects them; a specification never reaches `mechanism`.
+Dependency injection: the host gives measured inputs, predictions and the presence oracle
+with the step; no module reads a global or reaches into another's state.
+
+Today `engine.rs` (≈3 000 lines) and `downstream.rs` (≈3 500) predate this map; each PR of
+the stack moves out what it touches rather than adding to them (PR 4 adds `value`).
+
+**Every PR that changes runtime behaviour builds and runs in the viewer, desktop and web**,
+and says in its description how to observe the change live (what to look at, which series).
+
 ## 9. Acceptance
 
 ### 9.1 Quality at rest (#251's measurement)
