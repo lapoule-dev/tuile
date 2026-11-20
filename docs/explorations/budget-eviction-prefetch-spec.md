@@ -93,13 +93,45 @@ specification. **Specification laws** say what a specification is.
 
 ### 2.1 Absolute laws (outside any specification)
 
+Refined after Laurent's review (2026-11-20): the laws constrain the decider's **actions**,
+not outcomes it cannot control.
+
 | # | Law | Testable invariant |
 |---|---|---|
-| 1 | **Never a hole.** What is drawn, the fallback chain of every needed-but-absent place, and both halves of a swap group are never evicted; a replacement is active before what it replaces is released. | Every sim step: `lost == 0` and `bare == 0` once the floor is in (I1); no `evict`/`release` entry is in the protected set P (I11); for every swap, the step that stops drawing the old drew the new (I9). Proptest over random needs, arrivals, pressures **and random specifications** (§3.6): the same three hold. |
-| 2 | **Coarse first.** A coarser resource is loaded before a finer one of the same place and evicted after it; the floor (`pinned_level`) is always held. Lexicographic, never a weight. | Within a step: no `start` of a level-`l+1` resource of a place before its level-`l` ancestor is held or started (for wanted chains); no eviction of a coarse-band resource while a fine-band one of the same class is evictable; the floor is never in `evict`. Proptest: for any specification, the eviction order restricted to one class is sorted by band first. |
-| 3 | **The hard limit is never crossed.** A load starts (a delivery is made) only if room exists, or can be made by releasing something worth less. | Every step, every class and the pool: `gpu ≤ hard_limit`, `decoded ≤ decoded_hard` (the existing I2/§11.2 check); a `start` whose room needs an eviction names a victim of lower value than itself (recorded reason §7.2). |
-| 4 | **The present need before anticipation.** A prefetch never delays or displaces a load the picture needs now. | For every step: no speculative `start` (band Ring/Ancestor/Predicted) while a present-need want (Floor/Hole/Blocker/Drape) of the same quota is waiting and admissible; no eviction of a present-need resource to make room for a speculative one; a selection is the same with and without predictions (proptest: `draw` identical when the predictions are dropped, for the first step they differ). |
-| 5 | **Reproducible.** Same inputs, same decisions. Predictions, specifications and measured inputs are recorded step inputs; replay gives identical decisions. Executor-measured numbers enter `decide` only as recorded inputs. | The decision digest (`det!`, goldens) is a function of the recorded inputs only: a step stream recorded to MCAP (a catalogue run, or a viewer session tape) replayed gives the same digest, bit for bit; nothing in `tuile-budget` reads a clock, a hash order or a float that was not quantised once at the boundary. |
+| 1 | **The decider never creates a hole.** No eviction, release or swap of the decider leaves a place uncovered: what is drawn, the fallback chain of every needed-but-absent place, and both halves of a swap group are never released, and a replacement is active before what it replaces is released. Coverage has priority over every other want. It cannot promise what the network does not deliver — a first load, a floor tile that never arrives — so those are **measured** (time to first complete view, §7.1), not violations. | Every sim step: no `evict`/`release` entry is in the protected set P (I11); for every swap, the step that stops drawing the old drew the new (I9); a place covered at step k−1 is covered at step k unless no copy of it or an ancestor was ever drawable (`swap_gaps_total == 0`). `lost` and `bare` are reported (time-to-coverage bounds per scenario), and must be 0 once the floor is in. Proptest over random needs, arrivals, pressures **and random specifications** (§3.6). |
+| 2 | **Coverage first.** The coarse floor covering the view is loaded before any detail, and a fine level is never drawn without an ancestor drawable behind it. It does **not** mean loading every intermediate level in order: skipping intermediate levels is allowed and desirable (a fast dive; skip-LOD saves 30–50 % of loads in the reference engines, to measure on the catalogue). The floor is always held. | Within a step: no fine-band `start` while a floor tile of the view is wanted and admissible and not started; every drawn `Exact`/`Held` mesh has a drawable ancestor chain to the floor (or is the floor); the floor is never in `evict`. A dive scenario counts the intermediate levels skipped (`levels_skipped_total`) — more is better, never a hole. |
+| 3 | **The hard limits are never crossed.** The limits are the GPU bytes of each class and of the pool (`hard_limit`, refined by the measured device limit, §4) and the decoded RAM (`decoded_target` and its hard bound from the measured available RAM). They account for the **transient peak**: uploads in flight and the overlap that "new before old" costs during a swap (`hard_reserve_percent` keeps that overlap). When the floor and the drawn set cannot fit, **quality yields** (the LOD scale relaxes the screen-space error), never the limit. | Every step, every class and the pool: `gpu + in_transit ≤ hard_limit`, `decoded ≤ decoded hard`; a step whose protected set exceeds the target raises the LOD scale rather than delivering past the limit (sim: pressure ramp, memory squeeze). |
+| 4 | **Present need before anticipation — a priority, not starvation.** A prefetch never displaces a load the picture needs now, but anticipation keeps a **reserved, bounded share** of bandwidth and memory (the speculation quota) that varies **continuously** with speed and with the recent prediction accuracy (a Flare-like margin, §10b), so prefetch is never starved in fast motion (FPV). | Every step: no eviction of a present-need resource for a speculative one; speculative in-flight ≥ min(reserved share, speculative wants) whenever speculative wants exist (no starvation) and ≤ the share's ceiling; the share is a continuous function of the recorded speed and accuracy (unit test: no step of the share larger than its rate bound). |
+| 5 | **Reproducible.** Same inputs, same decisions. Predictions, specifications and measured inputs are recorded step inputs; integer arithmetic; stable tie-breaks; replay gives identical decisions. Executor-measured numbers enter `decide` only as recorded inputs. | The decision digest (`det!`, goldens) is a function of the recorded inputs only: a step stream recorded to MCAP (a catalogue run, or a viewer session tape) replayed gives the same digest, bit for bit; nothing in `tuile-budget` reads a clock, a hash order or a float that was not quantised once at the boundary. |
+
+**Hierarchy when laws conflict**, strongest first: **hard limit > no hole created by the
+decider > coverage first > present need > anticipation under its quota**. When one cannot
+hold, **quality yields** (the LOD scale, the deficit), never a higher law.
+
+**Near-absolute requirements**, with their invariants: **stability** (no oscillation, bounded
+settling — §6.5's SASO checks, I3, I4) and a **bounded decide compute time** (≤ 10 % of a
+frame at p99, the P6.4 work bound — §11 Q2).
+
+### 2.1b First load: the same decider from an empty state
+
+Nothing is special-cased; from an empty state the laws and the value give, in order:
+
+1. the **minimal coarse coverage** of the camera's view — terrain coarse **and** its drape
+   together (one without the other is not a usable view: the floor's mesh and drape are one
+   swap group, `Urgency::Floor`) — as fast as possible;
+2. at equal value, **cheapest first** — the local store or the browser cache before the
+   network (`PriorityKey`'s tier tie-break; local reads on their own quota), so a warm start
+   is near-instant;
+3. then refinement by value (deficit × screen weight; centre first), skipping useless
+   intermediate levels (law 2);
+4. anticipation only once coverage is reached, under its quota (law 4).
+
+Metrics: `time_to_first_complete_view_seconds` (first step with the floor in and `lost ==
+bare == 0`; today's `floor_seconds` is its first part) and `time_to_settled_view_seconds`
+(first step with the deficit under its threshold, after `converged_seconds`). Catalogue
+scenarios: `cold-start` (empty cache, `slow` network) and `warm-start` (full cache), each ×
+device budget, with bounds: cold desktop first complete view ≤ 3 s, settled ≤ 8 s; warm ≤ 0.5 s
+and ≤ 2 s (first proposals, to measure).
 
 Law 5 amends the plan's rule "executor-measured numbers never enter `decide`" (Laurent,
 2026-11-20): measured numbers (§4) **do** enter, but only as fields of the step's input, so
