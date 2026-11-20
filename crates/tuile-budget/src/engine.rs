@@ -237,6 +237,11 @@ pub(super) struct ItemStats {
     pub bare: bool,
     /// Exact, but some layer worn more than a level off its need.
     pub underdraped: bool,
+    /// Exact: the levels its drapes are worn under their need, summed over
+    /// its layers (the quality deficit's imagery part).
+    pub under_levels: u16,
+    /// Exact: the levels its drapes are worn over their need, summed.
+    pub over_levels: u16,
     /// Its tile's level, for the imagery-over-terrain histogram.
     pub tile_level: u32,
 }
@@ -740,7 +745,7 @@ impl Budget {
         tn: &TileNeed,
         presence: &dyn PresenceOracle,
         last: KeptLevels<'_>,
-        out: &mut Vec<(LayerId, u32, u32)>,
+        out: &mut Vec<(LayerId, u32, u32, u32)>,
         asked: &mut bool,
     ) {
         out.clear();
@@ -762,19 +767,20 @@ impl Budget {
             };
             if batch {
                 let level = needed_level(None, img.footprint, clamp);
-                out.push((reach.layer, level, level));
+                out.push((reach.layer, level, level, level));
                 continue;
             }
             // The hysteresis reads the footprint's last level, never a
             // stand-in worn in its place.
             let prev = last.1.get(&key).or_else(|| last.0.get(&key)).copied();
             let relaxed = needed_level(prev, img.footprint.relaxed(self.scale), clamp);
+            // What the picture needs at scale 1, for the quality deficit.
+            let full = needed_level(prev, img.footprint, clamp);
             let mut level = relaxed;
             let tier = |r: ResourceId, asked: &mut bool| {
                 self.tier_asked(r, self.arena.find(r), Class::Drape, presence, asked)
             };
             if self.relaxing() && tier(drape(relaxed), asked) == Tier::Remote {
-                let full = needed_level(prev, img.footprint, clamp);
                 let ceiling = tn.need.level.saturating_add(cap).min(reach.max_level);
                 let lo = relaxed.min(full).saturating_sub(1).max(floor);
                 let hi = relaxed.max(full).saturating_add(1).min(ceiling);
@@ -791,7 +797,7 @@ impl Budget {
                     }
                 }
             }
-            out.push((reach.layer, level, relaxed));
+            out.push((reach.layer, level, relaxed, full));
         }
         // The layers in order, a layer listed twice in the order listed
         // (a stable sort); then the last listing's levels.
@@ -801,6 +807,7 @@ impl Budget {
             if same {
                 earlier.1 = later.1;
                 earlier.2 = later.2;
+                earlier.3 = later.3;
             }
             same
         });
@@ -1171,6 +1178,8 @@ impl Budget {
         let mut stats = ItemStats {
             bare: missing && !switching,
             underdraped: false,
+            under_levels: 0,
+            over_levels: 0,
             tile_level: self.tiles.get(&tile).map(|i| i.level).unwrap_or(0),
         };
         if role == Role::Exact {
@@ -1179,6 +1188,19 @@ impl Budget {
                     .iter()
                     .any(|d| d.layer == *layer && d.level.abs_diff(*n) <= 1)
             });
+            // The deficit: each layer's worn level against the level the
+            // step decided for it (what the decided level is short of the
+            // unrelaxed need is counted apart, `imagery_short`). A layer
+            // worn by nothing is bare, not a deficit.
+            let (mut under, mut over) = (0u32, 0u32);
+            for (layer, n) in needs.iter() {
+                if let Some(d) = chosen.iter().find(|d| d.layer == *layer) {
+                    under = under.saturating_add(n.saturating_sub(d.level));
+                    over = over.saturating_add(d.level.saturating_sub(*n));
+                }
+            }
+            stats.under_levels = u16::try_from(under).unwrap_or(u16::MAX);
+            stats.over_levels = u16::try_from(over).unwrap_or(u16::MAX);
         }
         stats
     }
