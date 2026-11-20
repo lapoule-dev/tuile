@@ -131,7 +131,7 @@ A specification is a value, built from composable parts. It lives in `tuile-budg
 ```rust
 /// What a specification is for: a label for telemetry and the menu, never
 /// branched on by the decision code (law 11).
-pub enum SpecKind { Interactive, KnownPath, Film, Custom }
+pub enum SpecKind { Interactive, KnownPath, Film, Fpv, FpvFilm, Custom }
 
 pub struct Specification {
     pub kind: SpecKind,
@@ -176,6 +176,8 @@ pub enum Term {
     /// The quality gained by holding it: `w_i × |need − worn| × dwell`
     /// (the load side of the deficit, §5.2).
     Deficit,
+    /// The place's screen weight `w_i` (§1): large on screen first (§3.7).
+    ScreenSize,
 }
 
 pub struct Params {
@@ -267,6 +269,45 @@ A specification change is smooth by construction, at no refile storm:
 params). Every absolute law (§2.1) is asserted under them, on the same scripts as the
 existing `budget_properties` suite. This is the proof that "a bad specification costs
 reloads, never a hole".
+
+### 3.7 Worked example: the FPV specification
+
+First-person-view flight (Laurent, 2026-11-20): a drone-like camera, low over the terrain,
+fast, banking and yawing, always moving forward — in films and in interactive use. It is a
+**specification composed from the generic rules**, not a mode: no line of the decider knows
+it exists.
+
+What FPV needs, and the rule that gives it:
+
+| Need | How the generic model expresses it |
+|---|---|
+| What lies ahead is used next | **NextUse** on predictions along the predicted forward path: exact from the plan in a film (the film's schedule), from velocity and attitude extrapolation in interactive use (§5.2) |
+| The look-ahead grows with speed | the horizon is `horizon = clamp(k_h × speed, h_min, h_max)`: a **corridor** (a cone ahead of the camera) whose length is time, not distance; the producer of the predictions applies it (it knows the speed), and records it with them |
+| Soon-visible and large on screen first | NextUse's `p × (horizon − delay)⁺` already favours time-to-visibility; a **ScreenSize** term (`w_i`, §1) weighted ×2000 for FPV |
+| The near field matters most | `Rule { when: All[Membership(Drawn), LevelAtLeast(near_level)], term: Deficit, weight: 2000 }` with `near_level` = the deepest level drawn (the near terrain and its drapes), and the same for `Class(Drape)` |
+| Behind the camera, or out of the corridor, loses value fast | `Rule { when: Not(Predicted), term: Recency, weight: 250 }` — recency counts a quarter as much as in the interactive spec, so what left the corridor sinks below everything predicted within a fraction of a second and is released early, **proactively and rate-shaped** (the release bucket of §6.3), never in a burst |
+| Speculation sized for speed | `speculation.slots = clamp(k_s × speed, 25 %, 60 %)`, `speculation.memory = 35 %` — the quotas are parameters, and the interactive FPV variant's producer reports the speed so the blend (§3.5) follows it smoothly |
+| Coarse first still holds | unchanged: the corridor's coarse band is loaded before its fine band (law 2); absolute laws untouched |
+
+The two variants:
+
+| | `fpv` (interactive) | `fpv-film` |
+|---|---|---|
+| Predictions | probabilistic: velocity/attitude extrapolation (first a constant-turn-rate model on the camera's last 250 ms, later C5's Kalman), `p` decaying with delay | exact: the film's schedule along the plan, `p = 1000` |
+| Speculation | the speed-sized quota | 0 (nothing speculative: the schedule is the need) |
+| Recency | ×250 | ×0 |
+| NextUse | ×3000 | ×4000 |
+| Deficit (near field) | ×2000 | — (Batch) |
+| ScreenSize | ×2000 | ×1000 (ties) |
+| Margin, min dwell | 15 %, 0.5 s (a fast camera changes its need faster) | 0, 0 |
+| Parameters exposed | `k_h` (s of look-ahead per m/s, default 0.04), `h_min` 0.5 s, `h_max` 4 s, `k_s`, `near_level` offset, the weights | the same, from the plan |
+
+`Term::ScreenSize` is the one term FPV adds to the closed set of §3.1; it reads the place's
+screen weight (`w_i`), so every specification may use it.
+
+In the viewer `fpv` is selectable live (menu, `tuile://budget?spec=fpv`) to compare against
+`interactive` on the same flight; in a film, `fpv-film` is the specification the film host
+passes with the schedule.
 
 ## 4. Measured inputs (recorded)
 
@@ -499,7 +540,7 @@ ds/dt  = Ks·p − Kd·(s − 1)·[p == 0]               (LOD scale: rises with 
 | `headroom_target_bytes` | gauge | `class` | `H*` |
 | `release_rate_bytes` | gauge | | the controller's `r` |
 | `decisions_total` | counter | `list` = `start` \| `evict` \| `release`, `reason` | per decision reason (§7.2) |
-| `spec_active` | gauge | `spec` = `interactive` \| `known_path` \| `film` \| `custom` | 1 for the one in force |
+| `spec_active` | gauge | `spec` = `interactive` \| `known_path` \| `film` \| `fpv` \| `fpv_film` \| `custom` | 1 for the one in force |
 | `spec_blend` | gauge | | 0–1 progress of a re-specification |
 | `bucket_refused_total` | counter | `flow` = `start` \| `speculative` \| `upload` \| `release` | congestion: tokens refused |
 | `queue_depth`, `wait_seconds` | gauge, histogram | `class` | congestion |
@@ -609,6 +650,9 @@ Camera paths (each also exists in its 3D Tiles variant where marked ●):
 | `zoom-thrash` | zoom in ×8 / out ×8, ten times in 20 s (thrash bait) | yes |
 | `headset-jitter` | two eyes at 90 Hz, ±0.5° head jitter at 4 Hz, slow translation | no |
 | `known-path` | the `long-pan` path given as an exact schedule (film-like specification) | yes |
+| `fpv-valley` | FPV flight at 40–80 m above a valley floor, 35 m/s, banking turns of 30° at 0.5 rad/s, 45 s; interactive (scripted stick inputs, predictions from extrapolation, `fpv` spec) | yes |
+| `fpv-ridge` | FPV along a ridge line at 20 m, 45 m/s, yaw reversals every 4 s, a dive off the ridge at 30 s; interactive | yes |
+| `fpv-valley-film`, `fpv-ridge-film` | the same paths as films: the plan's exact schedule, `fpv-film` spec | yes |
 
 Input profiles, crossed with every path (the full cross product is the catalogue; the CI
 job runs it in release):
@@ -630,7 +674,8 @@ Acceptance bounds per scenario (asserted, and reported as columns):
 | settling of `H` after a disturbance | ≤ 3 τ_H, overshoot ≤ 10 % of the band (§6.5) |
 | congestion | queue depth ≤ `request_heap`; wait p95 ≤ 2 × the tier's latency; upload deferrals ≤ 5 % of frames outside the disturbance windows |
 | thrash | `zoom-thrash`: network refetches of evicted resources ≤ a recorded ratchet |
-| speculation | `known-path`: `wasted_starts == 0`; interactive: speculative bytes ≤ the share |
+| speculation | `known-path`, `fpv-*-film`: `wasted_starts == 0`; interactive: speculative bytes ≤ the share |
+| FPV forward view | `fpv-*`: the deficit **in the forward view** (places within the forward 60° cone and the first second of the corridor) ≤ 1 level on average over the flight and 0 holes; `fpv-*-film`: 0 under need on every frame (the film waits for complete frames, law 8); `fpv` beats `interactive` on the forward-view deficit integral on both paths (the reason FPV exists) |
 
 The existing `budget_sim` scenarios and patterns (P1–P6, goldens) stay; the catalogue is
 added beside them and reuses their world, network and GPU models.
@@ -668,7 +713,7 @@ scenario set, before/after.
 | 2 | **The quality metric.** `D(k)`, `under_need_tiles`, `over_need_tiles` in `BudgetStats` (computed in `downstream` from the items, incrementally); `BudgetSignals` and the exporters; the objective `J` integrated by the sim; the scenario `rest-after-approach` written and shown **red on main** (kept `#[ignore]` with its reason until PR 4 turns it green — the only ignore of the stack). | the metric's unit tests (a drape a level under counts 1, an ancestor fallback counts its gap) | unchanged (stats only; the stats are not in the digest) |
 | 3 | **The specification and the recorded inputs.** `spec` module (§3), `Measured` (§4.1), `Prediction` (§5.1), `FrameInput::with_spec/with_measured/with_predictions`, validation, digest, serial form (`to_query`/`from_query`), recorded in `StepRecord`; random-spec proptest strategy. No decision reads them yet. | round-trip and validation tests | byte-identical |
 | 4 | **The value.** The eviction key (§8 row 1) and the deficit want (§5.3, deadlines), restore cost per tier (constants then smoothed measured), margin, `min_dwell`, reasons (§7.2). `rest-after-approach` green. Law invariants 1, 2, 6, 7 in the sim and proptest under random specs. | `rest-after-approach`; "eviction follows value order"; "a load below the margin does not displace" | re-recorded, reason: the LRU key and the ±1 tolerance are gone |
-| 5 | **Viewer wiring** (desktop and web, same code). The interactive spec by default; the active spec and its main parameters in the menu and `tuile://budget?spec=…&margin=…`; `spec_active`, deficit and reasons through tuile-telemetry (labels allow-listed); the HUD line. | steering parse tests; telemetry label test | — |
+| 5 | **Viewer wiring** (desktop and web, same code). The interactive spec by default; the active spec (`interactive`, `fpv`, …) and its main parameters in the menu and `tuile://budget?spec=…&margin=…`; `spec_active`, deficit and reasons through tuile-telemetry (labels allow-listed); the HUD line. | steering parse tests; telemetry label test | — |
 | 6 | **The simulator crate, the scenario catalogue and the search** (§9.3). `tuile-budget-sim` library (the `budget_sim` harness moved), simulated measured inputs, the objective, `tuile-budget-tune` with Parquet out. | the objective of a known run; determinism of the search | unchanged (moved, not changed) |
 | 7 | **The controller** (§6): headroom set-point, proactive release, token buckets, the LOD actuator replacing `relax()`; the equilibrium scenarios of §9.2 with their bounds. | `pressure-ramp` (no 16× haste, monotone recovery), "a load never waits for an emergency eviction" | re-recorded, reason: the sweep and `relax()` are gone |
 | 8 | **Speculation and predictions**: `Urgency::Predicted`, quotas, the film schedule into `release_beyond`, the viewer's known paths (Glide, tape) into predictions. | law 4 and 8 invariants; Bélády optimum on small traces (B3) | re-recorded where predictions are given |
