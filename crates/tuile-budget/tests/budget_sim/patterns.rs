@@ -878,6 +878,9 @@ fn a_change_of_pressure_reads_again_only_the_wants_that_read_it() {
 struct P64 {
     meter: tuile_budget::BudgetMeter,
     prev: Option<NeedSet>,
+    /// The draw set of the step before: the items a step changed are part
+    /// of its output, each at least a unit of work.
+    drawn: Vec<tuile_budget::DrawItem>,
     pressure: tuile_budget::Pressure,
     /// The decisions of the step before, counted in this step's #E.
     decided: u64,
@@ -899,6 +902,7 @@ impl P64 {
         P64 {
             meter: tuile_budget::BudgetMeter::new(sim.budget.config()),
             prev: None,
+            drawn: Vec::new(),
             pressure: tuile_budget::Pressure::Normal,
             decided: 0,
             levels_moved: 0,
@@ -936,8 +940,26 @@ impl P64 {
         // hysteresis reads the last level): a change the need did not name
         // — the footprint, the scale, a local tier — counted as the
         // decisions of the step before are.
-        let mut e = sim.step_events + self.decided + self.levels_moved;
+        // A deficit want falling due is a time-driven event of its step,
+        // as a deadline is (eviction/prefetch spec §5.3).
+        let mut e =
+            sim.step_events + self.decided + self.levels_moved + u64::from(d.stats.rewants);
         self.levels_moved = u64::from(d.stats.levels_moved);
+        // The draw items that changed — an arrival re-dresses every item
+        // that falls back on it, at rest as in motion (the deficit want
+        // brings such arrivals at rest): output, so changes.
+        let changed = d
+            .draw
+            .items
+            .iter()
+            .filter(|i| {
+                self.drawn
+                    .binary_search_by(|o| o.mesh.cmp(&i.mesh))
+                    .map_or(true, |k| self.drawn[k] != **i)
+            })
+            .count();
+        e += changed as u64;
+        self.drawn.clone_from(&d.draw.items);
         if sim.pressure_set != self.pressure {
             // A change of pressure is one input whose effect is a set: the
             // copies the new limits no longer hold are evicted and

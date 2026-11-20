@@ -193,6 +193,11 @@ pub struct BudgetStats {
     /// Every wanted tile drawn exactly with its needed drape, and no work
     /// left for the view.
     pub converged: bool,
+    /// Tiles whose wants were read again this step because a deficit want
+    /// fell due (`docs/explorations/budget-eviction-prefetch-spec.md`
+    /// §5.3): time-driven events, like a cancel's grace. Not in
+    /// [`BudgetStats::digest`].
+    pub rewants: u32,
     /// The quality deficit: what is drawn against what the step needs
     /// (`docs/explorations/budget-eviction-prefetch-spec.md` §1). Not in
     /// [`BudgetStats::digest`]: a measure of the decisions, not one.

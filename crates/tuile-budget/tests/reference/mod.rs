@@ -366,6 +366,15 @@ impl Lockstep {
         self.real.retarget(total);
     }
 
+    /// Another specification, from the next step.
+    #[allow(dead_code)]
+    pub fn specify(
+        &mut self,
+        s: tuile_budget::Specification,
+    ) -> Result<(), tuile_budget::SpecError> {
+        self.real.specify(s)
+    }
+
     /// Arrivals applied ahead of the step; the ledger folded.
     pub fn apply_arrivals(&mut self, now: Micros) {
         self.real.apply_arrivals(now);

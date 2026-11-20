@@ -378,6 +378,15 @@ pub(super) struct Downstream {
     /// When a load or transit may next be cancelled: a load's timeout, an
     /// unneeded resource's grace (`Budget::cancel`), earliest first.
     deadlines: BinaryHeap<Reverse<(Micros, ResourceId)>>,
+    /// When a tile's wants are to be read again because a deficit want
+    /// falls due then (`Budget::deficit_due`), earliest first; an entry for
+    /// a tile read since is merely read once more.
+    rewant: BinaryHeap<Reverse<(Micros, TileId)>>,
+    /// Each tile's one live entry in `rewant`: an entry whose time is not
+    /// its tile's here is stale, and dropped when it surfaces.
+    rewant_at: std::collections::BTreeMap<TileId, Micros>,
+    /// The tiles `rewant` gave this step.
+    rewanted: u32,
     /// The deadlines are not kept: the next cancel looks at every load.
     deadlines_lost: bool,
     /// Prunes in a row that found the arena's room far more than its
@@ -894,6 +903,7 @@ impl Downstream {
         st.bare += s.bare;
         st.underdraped += s.underdraped;
         st.held += s.held;
+        st.rewants += self.rewanted;
         st.deficit.mesh_under_tiles += sel.fallback;
         st.deficit.mesh_under_levels += sel.depth_levels();
         st.deficit.mesh_over_tiles += s.held;
@@ -1196,6 +1206,16 @@ impl Budget {
         }
         self.down.levels_moved.apply(&mut l.c_moved, |_| {});
         self.down.levels_far.apply(&mut l.c_far, |_| {});
+        // The deficit's dwell counts from the last change of a tile's need
+        // (spec §5.3): a tile whose need moves — the camera moving — is not
+        // expected to keep its level, and is not fetched at every one.
+        let now = self.now;
+        for &t in &l.named {
+            let range = (t, LayerId(0))..=(t, LayerId(u16::MAX));
+            for (k, _) in self.imagery_prev.range(range) {
+                self.level_since.insert(*k, now);
+            }
+        }
     }
 
     /// Whether each dirty floor tile is in.
@@ -1641,6 +1661,20 @@ impl Budget {
         add(&mut dirty, l.dirty.iter().copied());
         add(&mut dirty, l.named.iter().copied());
         add(&mut dirty, l.moved.iter().copied());
+        // The deficit wants that fell due.
+        let now = self.now;
+        self.down.rewanted = 0;
+        while let Some(&Reverse((at, t))) = self.down.rewant.peek() {
+            if at > now {
+                break;
+            }
+            self.down.rewant.pop();
+            if self.down.rewant_at.get(&t) == Some(&at) {
+                self.down.rewant_at.remove(&t);
+                self.down.rewanted += 1;
+                dirty.push(t);
+            }
+        }
         if all {
             add(&mut dirty, tiles.keys().copied());
             add(&mut dirty, self.down.wants.keys().map(|r| r.0.tile()));
@@ -1654,10 +1688,32 @@ impl Budget {
             let reads = match tiles.get(&t) {
                 Some(tn) => {
                     let item = self.down.drawn(ResourceId::Mesh(t));
-                    self.tile_wants(t, tn, item, meshes_in, &mut l.drapes, &mut l.tile_wants)
+                    let mut reread = None;
+                    let reads = self.tile_wants(
+                        t,
+                        tn,
+                        item,
+                        meshes_in,
+                        &mut l.drapes,
+                        &mut l.tile_wants,
+                        &mut reread,
+                    );
+                    // One live entry per tile, the earliest: a later time
+                    // waits behind it (the tile read then registers it
+                    // again), so a tile read every step pushes once.
+                    let kept = self.down.rewant_at.get(&t).copied();
+                    match (reread, kept) {
+                        (Some(at), k) if k.is_none_or(|k| at < k) => {
+                            self.down.rewant_at.insert(t, at);
+                            self.down.rewant.push(Reverse((at, t)));
+                        }
+                        _ => {}
+                    }
+                    reads
                 }
                 None => {
                     l.tile_wants.clear();
+                    self.down.rewant_at.remove(&t);
                     false
                 }
             };
@@ -2506,6 +2562,7 @@ impl Budget {
         for k in &gone {
             self.imagery_prev.remove(k);
             self.imagery_stood_in.remove(k);
+            self.level_since.remove(k);
             let was = self.imagery_short.remove(k);
             self.short_sum(was, false);
         }
@@ -3138,7 +3195,7 @@ impl Budget {
         let (mut drapes, mut put) = (Vec::new(), Vec::new());
         for (t, tn) in tiles.iter() {
             let item = self.down.drawn(ResourceId::Mesh(*t));
-            if self.tile_wants(*t, tn, item, meshes_in, &mut drapes, &mut put) {
+            if self.tile_wants(*t, tn, item, meshes_in, &mut drapes, &mut put, &mut None) {
                 readers.push(*t);
             }
             want.extend(put.iter().map(|(r, _, w)| (*r, *w)));

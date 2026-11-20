@@ -392,6 +392,52 @@ fn trace(cfg: BudgetConfig, ops: &[Op]) -> Vec<Record> {
     Harness::new(cfg, 7).run(ops, false)
 }
 
+/// A random valid specification (eviction/prefetch spec §3.6): any kind,
+/// any weights, a coarse band anywhere, rules under random predicates.
+fn spec() -> impl Strategy<Value = tuile_budget::Specification> {
+    use tuile_budget::{Predicate, Rule, SpecKind, Specification, Term};
+    let predicate = prop_oneof![
+        Just(Predicate::Always),
+        (0u32..6).prop_map(Predicate::LevelAtMost),
+        (0u32..6).prop_map(Predicate::LevelAtLeast),
+        Just(Predicate::Class(Class::Drape)),
+        Just(!Predicate::Class(Class::Drape)),
+        Just(Predicate::Predicted),
+    ];
+    let term = prop_oneof![
+        Just(Term::Recency),
+        Just(Term::RestoreCost),
+        Just(Term::NextUse),
+        Just(Term::Deficit),
+        Just(Term::ScreenSize),
+    ];
+    let rule = (predicate, term, 0u32..=16_000).prop_map(|(when, term, weight)| Rule {
+        when,
+        term,
+        weight,
+    });
+    (
+        0usize..SpecKind::ALL.len(),
+        proptest::collection::vec(rule, 0..8),
+        0u32..8,
+        0u32..4_000,
+    )
+        .prop_map(|(k, rules, coarse, margin)| {
+            let mut s = Specification::of_kind(SpecKind::ALL[k]);
+            s.rules.extend(rules);
+            s.params.coarse_through = coarse;
+            s.params.margin_permille = margin;
+            s
+        })
+}
+
+/// [`trace`] under the specification `s`, given before the first step.
+fn trace_spec(cfg: BudgetConfig, s: tuile_budget::Specification, ops: &[Op]) -> Vec<Record> {
+    let mut h = Harness::new(cfg, 7);
+    h.b.specify(s).expect("a valid specification");
+    h.run(ops, false)
+}
+
 /// Covered: the tile, an ancestor of it, or all four children are drawn.
 fn covered(d: &Decisions, tile: TileId, depth: u32) -> bool {
     let mut up = Some(tile);
@@ -468,6 +514,34 @@ proptest! {
                 prop_assert!(rec.gpu_before.contains(e), "{:?} evicted but not on the GPU", e);
                 prop_assert!(!rec.transit_before.contains(e), "{:?} evicted in transit", e);
                 prop_assert_ne!(e.tile(), t(0, 0, 0));
+            }
+        }
+        prop_assume!(decided_something(&tr));
+    }
+
+    /// The absolute laws stand outside every specification (eviction/
+    /// prefetch spec §2.1, §3.6): under any valid specification nothing
+    /// protected is evicted, the ground stays covered once the floor is in,
+    /// and no class crosses its hard limit — a bad specification costs
+    /// reloads, never a hole.
+    #[test]
+    fn the_absolute_laws_hold_under_any_specification(ops in script(), s in spec()) {
+        let cfg = interactive();
+        let tr = trace_spec(cfg.clone(), s, &ops);
+        for rec in &tr {
+            for e in &rec.d.evict {
+                prop_assert!(!rec.d.draw.items.iter().any(|i| i.mesh == *e || i.drapes.iter().any(|x| x.resource == *e)));
+                prop_assert!(!rec.transit_before.contains(e), "{:?} evicted in transit", e);
+                prop_assert_ne!(e.tile(), t(0, 0, 0));
+            }
+            for class in Class::ALL {
+                prop_assert!(rec.d.stats.gpu[class] <= cfg.hard_limit[class]);
+            }
+            if rec.floor_in {
+                prop_assert_eq!(rec.d.stats.lost, 0);
+                for (tile, _) in &rec.need.drawn {
+                    prop_assert!(covered(&rec.d, *tile, DEPTH), "{:?} uncovered", tile);
+                }
             }
         }
         prop_assume!(decided_something(&tr));
