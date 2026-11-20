@@ -225,6 +225,23 @@ The numbers are first proposals, to be tuned by the simulator's parameter search
 
 ### 3.3 How a specification is supplied
 
+**The specification follows the context** (Laurent, 2026-11-20: "in the viewer it will be
+the viewer's budget… in FPV it will be different"). Nobody picks a budget from a list in
+ordinary use:
+
+| Who selects | From what | Example |
+|---|---|---|
+| The **host**, from its use context | what the camera is doing | the viewer's ordinary navigation runs `interactive`; entering the viewer's FPV camera/navigation mode (or a host app's FPV flight) runs `fpv`; leaving it returns to `interactive`; a Glide flight or a tape replay runs `known_path` while it plays |
+| The **film**, from its plan | the plan's camera | a film runs `film`; an FPV film runs `fpv-film` with its schedule |
+| An **override**, for tests and diagnosis only | the menu's *Budget (diagnostic)* entry, `tuile://budget?spec=…`, the control API | comparing `fpv` against `interactive` on the same flight; clearly labelled as a diagnostic, cleared by `tuile://budget?spec=auto` (back to the context's) |
+
+A context's specification carries its own numbers where they differ — memory share of
+speculation, horizon, quotas. Entering or leaving a context is a re-specification like any
+other: recorded with the step, blended (§3.5), absolute laws untouched.
+
+The mechanics:
+
+
 - The host gives it with the step: `FrameInput::with_spec(&Specification)`. A step given a
   specification whose digest differs from the one in force starts a re-specification (§3.5).
   A step given none keeps the one in force. `Budget::new` starts on
@@ -305,9 +322,10 @@ The two variants:
 `Term::ScreenSize` is the one term FPV adds to the closed set of §3.1; it reads the place's
 screen weight (`w_i`), so every specification may use it.
 
-In the viewer `fpv` is selectable live (menu, `tuile://budget?spec=fpv`) to compare against
-`interactive` on the same flight; in a film, `fpv-film` is the specification the film host
-passes with the schedule.
+In the viewer `fpv` is the specification of the FPV camera mode (§3.3: the context selects
+it); the diagnostic override (`tuile://budget?spec=fpv`) forces it on ordinary navigation to
+compare against `interactive` on the same flight. In a film, `fpv-film` is the specification
+the film host passes with the schedule.
 
 ## 4. Measured inputs (recorded)
 
@@ -713,7 +731,7 @@ scenario set, before/after.
 | 2 | **The quality metric.** `D(k)`, `under_need_tiles`, `over_need_tiles` in `BudgetStats` (computed in `downstream` from the items, incrementally); `BudgetSignals` and the exporters; the objective `J` integrated by the sim; the scenario `rest-after-approach` written and shown **red on main** (kept `#[ignore]` with its reason until PR 4 turns it green — the only ignore of the stack). | the metric's unit tests (a drape a level under counts 1, an ancestor fallback counts its gap) | unchanged (stats only; the stats are not in the digest) |
 | 3 | **The specification and the recorded inputs.** `spec` module (§3), `Measured` (§4.1), `Prediction` (§5.1), `FrameInput::with_spec/with_measured/with_predictions`, validation, digest, serial form (`to_query`/`from_query`), recorded in `StepRecord`; random-spec proptest strategy. No decision reads them yet. | round-trip and validation tests | byte-identical |
 | 4 | **The value.** The eviction key (§8 row 1) and the deficit want (§5.3, deadlines), restore cost per tier (constants then smoothed measured), margin, `min_dwell`, reasons (§7.2). `rest-after-approach` green. Law invariants 1, 2, 6, 7 in the sim and proptest under random specs. | `rest-after-approach`; "eviction follows value order"; "a load below the margin does not displace" | re-recorded, reason: the LRU key and the ±1 tolerance are gone |
-| 5 | **Viewer wiring** (desktop and web, same code). The interactive spec by default; the active spec (`interactive`, `fpv`, …) and its main parameters in the menu and `tuile://budget?spec=…&margin=…`; `spec_active`, deficit and reasons through tuile-telemetry (labels allow-listed); the HUD line. | steering parse tests; telemetry label test | — |
+| 5 | **Viewer wiring** (desktop and web, same code). The context selects the spec (ordinary navigation: `interactive`; the FPV camera mode, once it exists: `fpv`; flights and tapes: `known_path`); a **diagnostic override** in the menu and `tuile://budget?spec=…&margin=…` (`spec=auto` clears it), labelled as such; `spec_active`, deficit and reasons through tuile-telemetry (labels allow-listed); the HUD line. | steering parse tests; telemetry label test | — |
 | 6 | **The simulator crate, the scenario catalogue and the search** (§9.3). `tuile-budget-sim` library (the `budget_sim` harness moved), simulated measured inputs, the objective, `tuile-budget-tune` with Parquet out. | the objective of a known run; determinism of the search | unchanged (moved, not changed) |
 | 7 | **The controller** (§6): headroom set-point, proactive release, token buckets, the LOD actuator replacing `relax()`; the equilibrium scenarios of §9.2 with their bounds. | `pressure-ramp` (no 16× haste, monotone recovery), "a load never waits for an emergency eviction" | re-recorded, reason: the sweep and `relax()` are gone |
 | 8 | **Speculation and predictions**: `Urgency::Predicted`, quotas, the film schedule into `release_beyond`, the viewer's known paths (Glide, tape) into predictions. | law 4 and 8 invariants; Bélády optimum on small traces (B3) | re-recorded where predictions are given |
@@ -728,5 +746,5 @@ Laurent prefers the simulator first, 5 and 6 swap without other change.
 |---|---|---|
 | Q1 | Is law 7 (margin) enough, or add a per-resource maximum change rate? | **Add a minimum dwell** (`min_dwell`, default 1 s interactive, 0 film): a resource loaded is not released before it, unless the hard limit forces it (reason `Hard`). The margin prevents thrash between two resources of near-equal value; the dwell prevents it for one resource whose value oscillates with the input (a place at the edge of the view). Cheaper and easier to test than a rate per resource. |
 | Q2 | A compute budget for the decider (a fraction of a frame)? | **Yes, ≤ 10 % of a frame at the profile's rate** (1.6 ms at 60 Hz, 1.1 ms at 90 Hz) at p99, measured by `budget_decide` (M-bench) and by the viewer's `decide` time metric — never enforced by a clock inside `decide` (law 5). The deterministic proxy is the work bound per step (P6.4: work grows with changes, not with the view). |
-| Q3 | Who may re-specify: the host only, or also `tuile://` / the control API? | **The host API, and the viewer's steering (`tuile://budget?…`) and control API**, which are the host's own surfaces; a remote client of a `tuile-server` session may not (its budget is the session's). URLs and the control API take a named specification with numeric overrides only, validated and clamped — no free predicate trees. Absolute laws are not reachable from any of them. |
+| Q3 | Who may re-specify: the host only, or also `tuile://` / the control API? | **The host, from its context** (§3.3) — that is how specifications are chosen. The viewer's steering (`tuile://budget?…`) and control API may **override** it for tests and diagnosis only, labelled so; a remote client of a `tuile-server` session may not (its budget is the session's). URLs and the control API take a named specification with numeric overrides only, validated and clamped — no free predicate trees. Absolute laws are not reachable from any of them. |
 | Q4 | Measured inputs smoothed where? | **Inside `decide`**, over the recorded raw samples (§4.2), so the filter is part of the replay and its constants part of the specification. |
