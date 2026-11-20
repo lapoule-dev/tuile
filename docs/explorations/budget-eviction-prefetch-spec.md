@@ -94,9 +94,12 @@ another, and moving buffers while the exchange is profitable.
 
 **The unit is expected screen quality gained per byte over a short horizon.** The
 currency has a dimension: **pixel · level · step** — px·lvl·s in interactive use, px·lvl·frame
-in a film (the step axis is abstract, §5.4). Its name is Laurent's to choose (proposal:
-*tessera*, plural *tesserae*); the code uses one newtype for it (`value::Tessera`) and
-renames it once chosen. A value in µs does not compile.
+in a film (the step axis is abstract, §5.4). Its name is the **flouz** (Laurent,
+2026-11-20: French slang for money, and it holds *flou*, blur — what it measures is blur
+removed; invariable plural): **1 flouz = one level of detail gained over one screen pixel for
+one step** (a second in interactive use, a frame in a film). In code the newtypes `Flouz` and
+`FlouzPerByte`, prices as flouz per unit of resource; in telemetry the unit `flouz`. A value
+in µs does not compile.
 
 ```
 benefit(r) = Σᵢ P(r visible at tᵢ) · Δq(r) · w(r) · δ(tᵢ) · Δtᵢ          [px·lvl·step]
@@ -320,7 +323,7 @@ pub enum Predicate {
     Any(Vec<Predicate>),      // or
 }
 
-/// A value term, in the currency (px·lvl·step; `value::Tessera`).
+/// A value term, in the currency (px·lvl·step; `value::Flouz`).
 pub enum Term {
     /// Recency: the time it was last needed (LRU's key; GreedyDual's L).
     Recency,
@@ -783,7 +786,7 @@ Histograms have fixed buckets. Units are in the name (`_seconds`, `_bytes`, `_to
 | `under_need_still_seconds` | gauge | | s | views still and some place under its need, for how long |
 | **Decisions and their score** | | | | |
 | `decisions_total` | counter | `list` = `start`\|`evict`\|`release`, `reason`, `class` | decisions | per decision reason (§7.2) |
-| `decision_value` | histogram | `list`, `class`, `reason` | currency per byte (px·lvl·step / B; buckets doubling) | the value at decision time: what was loaded / released was worth this |
+| `decision_value_flouz` | histogram | `list`, `class`, `reason` | flouz per byte (buckets doubling) | the value at decision time: what was loaded / released was worth this |
 | `decision_leaf_total` | counter | `list`, `term` = `recency`\|`restore`\|`next_use`\|`deficit`\|`screen` | decisions | the specification's term that dominated the value (provenance, §10b) |
 | `mechanism_corrections_total` | counter | `law` = `1`…`5` | decisions | a proposal the mechanism refused (absolute laws) |
 | **Prefetch outcome** | | | | |
