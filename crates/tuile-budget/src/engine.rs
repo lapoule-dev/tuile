@@ -1329,13 +1329,7 @@ impl Budget {
         reads_pressure
     }
 
-    /// When tile `t`'s own drape of `layer` at its need becomes worth
-    /// loading while the tile wears one `gap` levels under it (spec §5.3,
-    /// law 7): once `w × gap × dwell ≥ cost × (1 + margin)`, the dwell
-    /// counted from when the need came to be its level, `w` the place's
-    /// screen weight times the specification's deficit weight, `cost` the
-    /// network's restore cost (the dearest tier: the time is an upper
-    /// bound). `None` when the specification gives the deficit no weight.
+    /// [`super::value::deficit_due`] for tile `t`'s layer `layer`.
     pub(super) fn deficit_due(
         &self,
         t: TileId,
@@ -1343,37 +1337,26 @@ impl Budget {
         tn: &TileNeed,
         gap: u32,
     ) -> Option<Micros> {
-        use super::spec::{Facts, Term};
         let level = tn.need.level;
-        let facts = Facts {
-            class: Class::Drape,
-            level,
-            tier: Tier::Remote,
-            band: self.spec.band(Class::Drape, level, self.cfg.pinned_level),
-            membership: Some(tn.membership),
-            predicted: false,
+        let input = super::value::DeficitInput {
+            tile: t,
+            centrality: tn.q.centrality,
+            gap,
+            since: self
+                .level_since
+                .get(&(t, layer))
+                .copied()
+                .unwrap_or(Micros::ZERO),
+            facts: super::spec::Facts {
+                class: Class::Drape,
+                level,
+                tier: Tier::Remote,
+                band: self.spec.band(Class::Drape, level, self.cfg.pinned_level),
+                membership: Some(tn.membership),
+                predicted: false,
+            },
         };
-        let weight = u64::from(self.spec.weight(Term::Deficit, &facts));
-        // The screen weight, ‰: half for a tile at the edge, all at the
-        // centre (the priority's own weighting).
-        let screen = 500 + u64::try_from(tn.q.centrality.clamp(0, 1_000)).unwrap_or(0) / 2;
-        let per_us = weight * screen * u64::from(gap.max(1)) / 1_000;
-        if per_us == 0 {
-            return None;
-        }
-        let p = &self.spec.params;
-        let cost = u128::from(p.restore.remote.0) * u128::from(1_000 + p.margin_permille);
-        let dwell = u64::try_from(cost / u128::from(per_us)).unwrap_or(u64::MAX);
-        let since = self
-            .level_since
-            .get(&(t, layer))
-            .copied()
-            .unwrap_or(Micros::ZERO);
-        // Spread over 64 ms by the tile, a fixed function of its id: the
-        // tiles a stop brought to rest together fall due over a few steps,
-        // not in one burst (spec §6.3, no peaks).
-        let spread = t.0.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 58;
-        Some(since.plus(Micros(dwell)).plus(Micros::from_millis(spread)))
+        super::value::deficit_due(&self.spec, &input)
     }
 
     /// Whether Batch may want drapes this step: every mesh the frame draws

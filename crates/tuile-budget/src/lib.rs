@@ -32,6 +32,7 @@ pub mod stats;
 pub mod tier;
 pub mod tile_id;
 pub mod types;
+mod value;
 pub mod view;
 
 pub use config::{BudgetConfig, FailurePolicy, Pool, PressureFractions, Relaxation, Watermarks};
@@ -380,7 +381,7 @@ impl Budget {
             measured_next: None,
         })
         .map(|mut b: Budget| {
-            let v = state::Valuation::of(&b.spec, b.cfg.pinned_level);
+            let v = value::Valuation::of(&b.spec, b.cfg.pinned_level);
             b.arena.set_valuation(v);
             b
         })
@@ -422,7 +423,7 @@ impl Budget {
         self.now = now;
         if let Some(s) = self.spec_next.take() {
             self.spec = s;
-            let v = state::Valuation::of(&self.spec, self.cfg.pinned_level);
+            let v = value::Valuation::of(&self.spec, self.cfg.pinned_level);
             let refiled = self.arena.set_valuation(v);
             self.walk(refiled);
         }
