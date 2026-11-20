@@ -383,6 +383,23 @@ pub(crate) struct LayerSpec {
     pub scheme: Option<Grid>,
     #[serde(default)]
     pub max_level: Option<u32>,
+    /// Another layer of the list its far tiles are drawn from: `None`, the
+    /// default, substitutes nothing.
+    #[serde(default)]
+    pub substitute: Option<SubstituteSpec>,
+}
+
+/// A layer's substitute: another layer of `sources.imagery`, by key, and
+/// the fallback rule's numbers (defaults: a gap of 4, a level of
+/// hysteresis). See `docs/explorations/imagery-layer-substitution.md`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SubstituteSpec {
+    pub layer: String,
+    #[serde(default)]
+    pub gap: Option<u32>,
+    #[serde(default)]
+    pub hysteresis: Option<u32>,
 }
 
 /// The grid a template's tiles are cut on.
@@ -433,6 +450,43 @@ impl SourcesSpec {
                 asset,
                 &layer.attribution,
             ));
+        }
+        // A substitute is another layer of the list, by its key.
+        for (i, layer) in self.imagery.iter().enumerate() {
+            let Some(spec) = &layer.substitute else {
+                continue;
+            };
+            let of = layers
+                .iter()
+                .find(|l| l.key == spec.layer)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "imagery {:?}: its substitute {:?} is not a layer of the list",
+                        layer.key, spec.layer
+                    )
+                })?;
+            if of.key == layer.key {
+                return Err(format!(
+                    "imagery {:?} cannot stand in for itself",
+                    layer.key
+                ));
+            }
+            let choice = layers[i]
+                .clone()
+                .with_substitute(crate::embed::SubstituteChoice {
+                    asset: of.asset,
+                    cache: of.cache.clone(),
+                    gap: spec.gap.unwrap_or(tuile_core::budget::FallbackRule::GAP),
+                    hysteresis: spec
+                        .hysteresis
+                        .unwrap_or(tuile_core::budget::FallbackRule::HYSTERESIS),
+                });
+            choice
+                .fallbacks()
+                .validate()
+                .map_err(|e| format!("imagery {:?}: {e}", layer.key))?;
+            layers[i] = choice;
         }
         let terrain = match &self.terrain {
             TerrainSpec::Asset(asset) => TerrainChoice {
@@ -551,6 +605,44 @@ mod tests {
             o.sources.catalog_base().map(String::from).as_deref(),
             Ok("https://tiles.test/catalog/"),
             "a base the catalog's paths are read under"
+        );
+    }
+
+    /// A layer names another of the list as its substitute — a catalog
+    /// asset or a template alike — with the rule's numbers; a layer
+    /// without one has none, and an unknown key is refused. The web reads
+    /// the same `ImageryChoice` the desktop does, so the session it runs is
+    /// the same.
+    #[test]
+    fn a_layer_names_its_substitute() {
+        let with = CATALOG.replace(
+            r#""asset": 2 }"#,
+            r#""asset": 2, "substitute": { "layer": "streets", "gap": 3 } }"#,
+        );
+        let o = options(&with).expect("valid");
+        let (_, layers) = o.sources.choices().expect("valid");
+        let sub = layers[0].substitute.clone().expect("a substitute");
+        assert_eq!(sub.asset, layers[1].asset, "the template's number");
+        assert_eq!((sub.gap, sub.hysteresis), (3, 1));
+        assert_eq!(
+            layers[0].fallbacks().to_query(),
+            "layer=0&gap=3&hysteresis=1"
+        );
+        assert!(layers[1].fallbacks().is_none());
+        let unknown = with.replace(r#""layer": "streets""#, r#""layer": "nowhere""#);
+        assert!(options(&unknown)
+            .expect("parses")
+            .sources
+            .choices()
+            .is_err());
+        let (_, plain) = options(CATALOG)
+            .expect("valid")
+            .sources
+            .choices()
+            .expect("valid");
+        assert!(
+            plain.iter().all(|l| l.substitute.is_none()),
+            "none by default"
         );
     }
 

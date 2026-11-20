@@ -82,6 +82,32 @@ pub fn drape_identity(coords: impl IntoIterator<Item = ImageryCoord>, composed_a
     hasher.finish()
 }
 
+/// The bit of [`ImageryLayer::source`] that marks a tile of a **substitute**
+/// layer (`docs/explorations/imagery-layer-substitution.md`): the other half
+/// of its identity, so a substitute tile never shares a texture, a cache
+/// entry or a drape identity with the source tile of the same coord. The
+/// rest of the number is the imagery generation, as for any layer.
+pub const SUBSTITUTE_SOURCE: u32 = 0x8000_0000;
+
+/// [`drape_identity`], for a drape of `layer`: the same number for a base
+/// layer — every drape there was before substitutes — and, for a substitute,
+/// that number mixed with the layer, so the two drapes of one tile at one
+/// level never share an identity.
+pub fn drape_identity_of(
+    layer: crate::budget::LayerId,
+    coords: impl IntoIterator<Item = ImageryCoord>,
+    composed_at: u32,
+) -> u64 {
+    let base = drape_identity(coords, composed_at);
+    if layer.is_substitute() {
+        // FNV-1a's step over the layer: cheap, fixed, and a bijection of
+        // `base` for a given layer.
+        (base ^ u64::from(layer.0)).wrapping_mul(0x0100_0000_01b3)
+    } else {
+        base
+    }
+}
+
 /// A geographic rectangle, radians, WGS84. No antimeridian crossing in v1
 /// (split rectangles upstream).
 #[derive(Debug, Clone, Copy, PartialEq)]

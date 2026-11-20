@@ -96,5 +96,5 @@ pub use web::worker::run_worker;
 
 pub use embed::{
     credential, renamed_by_environment, Identity, ImageryChoice, MissingCredential, Sources,
-    TerrainChoice, TilesetChoice, ViewerHost,
+    SubstituteChoice, TerrainChoice, TilesetChoice, ViewerHost,
 };

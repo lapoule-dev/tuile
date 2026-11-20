@@ -24,7 +24,7 @@ pub use camera::{
 };
 pub use ground::{GroundHeight, GroundHit, LonLat, TuileGround};
 pub use render::BARE_GROUND;
-pub use sources::{GlobeSources, ImagerySpec, TerrainSpec, XyzTemplate};
+pub use sources::{GlobeSources, ImagerySpec, Substitute, TerrainSpec, XyzTemplate};
 pub use status::{SessionState, TuileLight, TuileStatus};
 pub use tuile_camera::GlobeCamera;
 pub use tuile_core::texels::ImageryCompression;

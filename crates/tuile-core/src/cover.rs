@@ -292,6 +292,7 @@ mod tests {
                     north: 0.2,
                 },
                 layers: Vec::new(),
+                substitutes: Vec::new(),
             })
         }
     }

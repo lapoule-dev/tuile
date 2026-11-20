@@ -481,3 +481,105 @@ fn the_index_digest_is_the_provenance_digest() {
         );
     }
 }
+
+/// The substitute: the origin's pictures, tinted — another acquisition of
+/// the same ground, with other bytes.
+struct Tinted;
+
+fn tinted(c: ImageryCoord) -> Bytes {
+    let mut img = image::RgbaImage::new(256, 256);
+    for p in img.pixels_mut() {
+        *p = image::Rgba([(c.x % 251) as u8, (c.y % 251) as u8, 200, 255]);
+    }
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .expect("png");
+    Bytes::from(out)
+}
+
+#[async_trait::async_trait]
+impl ImageryProvider for Tinted {
+    fn tiling_scheme(&self) -> TilingScheme {
+        TilingScheme::web_mercator()
+    }
+
+    async fn fetch_tile_bytes(&self, c: ImageryCoord) -> Result<Fetched<Bytes>, RasterError> {
+        Ok(Fetched::undated(tinted(c)))
+    }
+}
+
+/// **A bake by reference names a substitute's tiles in the substitute's
+/// store** (`docs/explorations/imagery-layer-substitution.md` §5): a far
+/// tile's drape of the substitute layer is referred to by the substitute
+/// bit on each of its mosaic's tiles, with the digest of the substitute's
+/// bytes, over a floor that stays the source's. The same tile's source
+/// drape names no substitute tile at all.
+#[test]
+fn a_bake_names_a_substitutes_tiles_in_its_store() {
+    use tuile_core::budget::LayerId;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let layer = tuile_terrain::LayerJson::from_slice(
+            br#"{"format":"quantized-mesh-1.0","tiles":["{z}/{x}/{y}.terrain"],"maxzoom":16}"#,
+        )
+        .expect("layer.json");
+        let (_tree, loader, _heights, provenance) = globe_with_provenance(
+            Flat,
+            Origin(AtomicU64::new(0)),
+            layer,
+            GlobeOptions {
+                deterministic_floor: true,
+                substitute: Some(tuile_planetary::SubstituteImagery(Arc::new(Tinted))),
+                ..GlobeOptions::default()
+            },
+            tuile_core::offload::threaded(),
+        );
+        let id = patch()[4];
+        let Loaded::Content(mesh) = loader.load(id).await.expect("load") else {
+            unreachable!("terrain loads content");
+        };
+        let refs_of = |layer: LayerId, drape| {
+            let content = dressed(&mesh, id, drape);
+            finish_tile_as(
+                &Arc::new(TextureMemo::default()),
+                "t",
+                id,
+                content,
+                BAKE_SIZE,
+                Some(&provenance),
+                Finish::Identity,
+            )
+            .refs
+            .unwrap_or_else(|| panic!("{layer:?}: the tile named"))
+        };
+        let level = TERRAIN_LEVEL - 4;
+        let source = loader
+            .load_drape(id, LayerId(0), level)
+            .await
+            .expect("source drape");
+        let refs = refs_of(LayerId(0), source);
+        assert!(refs.imagery.iter().all(|p| !p.tile.is_substitute()));
+        let sub = loader
+            .load_drape(id, LayerId(0).substitute(), level)
+            .await
+            .expect("substitute drape");
+        let refs = refs_of(LayerId(0).substitute(), sub);
+        let (floor, mosaic) = refs.imagery.split_first().expect("a floor");
+        assert!(!floor.tile.is_substitute(), "the floor is the source's");
+        assert!(!mosaic.is_empty());
+        for p in mosaic {
+            assert!(p.tile.is_substitute(), "{:?}", p.tile);
+            let c = ImageryCoord {
+                level: u32::from(p.tile.store_level()),
+                x: u64::from(p.tile.x),
+                y: u64::from(p.tile.y),
+            };
+            assert_eq!(p.tile.digest, tuile_planetary::digest(&tinted(c)));
+            assert_ne!(p.tile.digest, tuile_planetary::digest(&png_of(c)));
+        }
+    });
+}

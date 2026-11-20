@@ -85,6 +85,12 @@ pub enum ClientMessage {
     /// selects is the same with or without them; only when its tiles
     /// arrive changes. Replaces the views ahead given before; empty, none.
     Ahead { views: Vec<ViewState> },
+    /// The fallback specification in force from the next step: which
+    /// imagery layers are drawn from a substitute, and where
+    /// ([`crate::budget::fallback`]). Empty, the default, is none: the
+    /// session substitutes nothing. Replaces the one given before; a tile
+    /// changing layer swaps new before old, never bare.
+    Fallbacks(crate::budget::FallbackSpec),
 }
 
 /// What the tree knows about a tile, travelling with every message that names

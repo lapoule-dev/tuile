@@ -89,6 +89,13 @@ pub struct SessionConfig {
     /// the session is good for nothing but being dropped. Never raised by
     /// default.
     pub cancel: Cancel,
+    /// The fallback specification the session's geometry server runs under:
+    /// which imagery layers' far tiles are draped from a substitute
+    /// (`docs/explorations/imagery-layer-substitution.md`). None, the
+    /// default, substitutes nothing; a rule names a substitute only where
+    /// the globe was opened with one ([`crate::GlobeConfig::substitute`]).
+    /// Batch decides it from each frame alone: the near level of the frame.
+    pub fallbacks: tuile_core::budget::FallbackSpec,
 }
 
 /// What a session makes of a tile once its content has arrived.
@@ -146,6 +153,7 @@ impl Default for SessionConfig {
                 .and_then(|gib| gib.parse::<f64>().ok())
                 .map(|gib| (gib * f64::from(1u32 << 30)) as u64),
             cancel: Cancel::new(),
+            fallbacks: tuile_core::budget::FallbackSpec::none(),
         }
     }
 }
@@ -1191,6 +1199,13 @@ impl Live {
         let (stream, server) = in_process_with(tree, loader, traversal, budget)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         let server = server.with_spawn(spawn);
+        // The fallback specification before the first frame, when there is
+        // one: a session without sends nothing it did not send before.
+        if !config.fallbacks.is_none() {
+            stream
+                .send(ClientMessage::Fallbacks(config.fallbacks.clone()))
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
 
         // The server runs on its own runtime handle so a frame call can block
         // the calling thread — which is what Hydra's cook wants — without
@@ -1884,12 +1899,22 @@ fn refs_of(
         .imagery
         .iter()
         .map(|layer| {
+            // A substitute's tile is named in the substitute's store: the
+            // level's top bit, the digest its lane noted.
+            let substitute = layer.source & tuile_core::raster::SUBSTITUTE_SOURCE != 0;
+            let level = u8::try_from(layer.coord.level)
+                .ok()
+                .filter(|l| *l < StoreTile::SUBSTITUTE)?;
             Some(ImageryPlacement {
                 tile: StoreTile {
-                    level: u8::try_from(layer.coord.level).ok()?,
+                    level: if substitute {
+                        level | StoreTile::SUBSTITUTE
+                    } else {
+                        level
+                    },
                     x: u32::try_from(layer.coord.x).ok()?,
                     y: u32::try_from(layer.coord.y).ok()?,
-                    digest: provenance.imagery(layer.coord)?,
+                    digest: provenance.imagery_of(substitute, layer.coord)?,
                 },
                 coverage: layer.coverage,
                 translation: layer.translation,

@@ -93,6 +93,7 @@ pub fn sources() -> GlobeSources {
             source: Arc::new(terrain),
         },
         imagery: ImagerySpec::Provider(Arc::new(Greens)),
+        substitute: None,
     }
 }
 

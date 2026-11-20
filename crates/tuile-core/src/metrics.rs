@@ -641,6 +641,119 @@ pub struct Metrics {
     /// tiles (exact, its coarser stand-ins, the covering ones), each with
     /// its mesh on the GPU. Of `selected_by_level`, what reached the screen.
     pub drawn_by_level: ByLevel,
+
+    // --- Imagery layer substitution ---
+    /// What a source layer and its substitute cost and answer, what the
+    /// fallback specification decided: see [`LayerMetrics`].
+    pub layer: LayerMetrics,
+}
+
+/// The role of an imagery layer, as the `layer` label says it: the source a
+/// layer is, or the substitute drawn in its place
+/// (`docs/explorations/imagery-layer-substitution.md`). A closed set of two:
+/// a role, never a layer's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerRole {
+    Source,
+    Substitute,
+}
+
+impl LayerRole {
+    /// Both, in label order.
+    pub const ALL: [LayerRole; 2] = [LayerRole::Source, LayerRole::Substitute];
+
+    /// The `layer` label's value.
+    pub fn label(self) -> &'static str {
+        match self {
+            LayerRole::Source => "source",
+            LayerRole::Substitute => "substitute",
+        }
+    }
+
+    /// The role of an imagery set stamped `source`
+    /// ([`crate::raster::ImageryLayer::source`]).
+    pub fn of_source(source: u32) -> Self {
+        if source & crate::raster::SUBSTITUTE_SOURCE != 0 {
+            LayerRole::Substitute
+        } else {
+            LayerRole::Source
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// One layer role's fetches.
+#[derive(Debug, Default)]
+pub struct LayerFetches {
+    /// Imagery tiles asked of the provider.
+    pub requests: Counter,
+    /// Answered with a picture.
+    pub hits: Counter,
+    /// Answered "absent" (404, or the provider's picture for no imagery).
+    pub absents: Counter,
+    /// Not answered: a transport or decode error.
+    pub errors: Counter,
+    /// Bytes received.
+    pub bytes: Counter,
+    /// How long a fetch took.
+    pub seconds: Timer,
+    /// Absent tiles stood on an ancestor of the same layer.
+    pub ancestor_fallbacks: Counter,
+}
+
+/// The `gap` label's values, −8 to 8.
+pub const GAPS: usize = 17;
+
+/// Imagery layer substitution, measured: per layer role, its fetches and
+/// the drapes drawn; the fallback specification's decisions and health.
+#[derive(Debug, Default)]
+pub struct LayerMetrics {
+    fetches: [LayerFetches; 2],
+    /// Drapes drawn from a source layer, by imagery level.
+    pub drawn_source: ByLevel,
+    /// Drapes drawn from a substitute, by imagery level.
+    pub drawn_substitute: ByLevel,
+    /// Tiles moved to a substitute, by the gap they were decided at.
+    pub to_substitute: [Counter; GAPS],
+    /// Tiles moved back to the source, by gap.
+    pub to_source: [Counter; GAPS],
+    /// Times an unreachable substitute was backed off from.
+    pub backoffs: Counter,
+    /// 1 while some rule is suspended.
+    pub suspended: Gauge,
+    /// 1 while a fallback specification is in force.
+    pub fallback_active: Gauge,
+    /// The first rule's reference level.
+    pub reference_level: Gauge,
+}
+
+impl LayerMetrics {
+    /// The fetches of `role`.
+    pub fn of(&self, role: LayerRole) -> &LayerFetches {
+        &self.fetches[role.index()]
+    }
+
+    /// Folds one step's decisions in.
+    pub fn note(&self, r: &tuile_budget::FallbackReport) {
+        for (i, n) in r.to_substitute.iter().enumerate() {
+            self.to_substitute[i].add(u64::from(*n));
+        }
+        for (i, n) in r.to_source.iter().enumerate() {
+            self.to_source[i].add(u64::from(*n));
+        }
+        self.backoffs.add(u64::from(r.backoffs));
+    }
+
+    /// The drapes drawn of `role`.
+    pub fn drawn(&self, role: LayerRole) -> &ByLevel {
+        match role {
+            LayerRole::Source => &self.drawn_source,
+            LayerRole::Substitute => &self.drawn_substitute,
+        }
+    }
 }
 
 impl Metrics {

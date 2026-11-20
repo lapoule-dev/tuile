@@ -16,6 +16,7 @@ pub mod decisions;
 mod downstream;
 mod engine;
 pub mod error;
+pub mod fallback;
 mod held;
 pub mod imagery;
 pub mod need;
@@ -38,6 +39,7 @@ pub use decisions::{
     Decisions, DrapeChoice, Drapes, DrawItem, DrawSet, Role, Serves, Start, SwapGroup, UploadPlan,
 };
 pub use error::{AuditError, ConfigError, SessionError};
+pub use fallback::{FallbackContext, FallbackReport, FallbackRule, FallbackSpec, FallbackState};
 pub use imagery::{DrapeCandidate, GeoRect, LevelClamp, TexelFootprint, UvTransform};
 pub use need::{ImageryNeed, LayerReach, Membership, Need, NeedDelta, NeedSet};
 pub use observe::{

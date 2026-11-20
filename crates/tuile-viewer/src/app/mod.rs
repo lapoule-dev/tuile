@@ -681,6 +681,7 @@ impl App {
             );
         }
         self.session = Some(started);
+        self.declare_the_fallbacks(self.imagery.layer);
         self.demand.poke();
     }
 

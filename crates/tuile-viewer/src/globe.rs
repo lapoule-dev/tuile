@@ -71,6 +71,10 @@ pub(crate) struct Layers {
     /// Layers already resolved, so that going back to one costs nothing — and
     /// does not open a second session with a service that counts them.
     resolved: Arc<Mutex<HashMap<usize, Arc<dyn ImageryProvider>>>>,
+    /// The substitute lane the globe was built over, when some layer of the
+    /// host's has a substitute: switched with the layer that names one.
+    /// `None` otherwise — and then the loader has no substitute at all.
+    substitute: Option<SwitchableImagery>,
 }
 
 impl Layers {
@@ -94,6 +98,14 @@ impl Layers {
         };
         if let Ok(mut resolved) = self.resolved.lock() {
             resolved.insert(layer, Arc::clone(&provider));
+        }
+        // The layer's substitute first: its drapes are only asked for once
+        // the fallback specification that names it is sent, after this.
+        if let (Some(lane), Some(sub)) = (&self.substitute, choice.substitute_layer()) {
+            let provider = imagery(self.sources.as_ref(), &sub, self.store.as_ref())
+                .await
+                .map_err(|e| e.to_string())?;
+            lane.switch_to(provider);
         }
         Ok(self.switch.switch_to(provider))
     }
@@ -172,6 +184,18 @@ pub(crate) async fn assemble(
     // then be changed under a running session, and the engine refreshes each
     // tile behind the old picture. See `tuile_planetary::SwitchableImagery`.
     let switch = SwitchableImagery::new(Arc::clone(&picture));
+    // A substitute lane only where some layer names a substitute: it starts
+    // on the opening layer's, or on the opening picture, which nothing asks
+    // of it until a fallback specification names it.
+    let substitute = if layers.iter().any(|l| l.substitute.is_some()) {
+        let first = match opening_layer.substitute_layer() {
+            Some(sub) => imagery(sources, &sub, store.as_ref()).await?,
+            None => Arc::clone(&picture),
+        };
+        Some(SwitchableImagery::new(first))
+    } else {
+        None
+    };
 
     // How many imagery layers a drape may carry is the renderer's answer, and
     // the renderer does not exist yet — the window comes after the stream. The
@@ -189,6 +213,9 @@ pub(crate) async fn assemble(
             deepest.max(DEPTH_FOR_ANY_LAYER)
         } else {
             deepest
+        }),
+        substitute: substitute.clone().map(|lane| {
+            tuile_planetary::SubstituteImagery(Arc::new(lane) as Arc<dyn ImageryProvider>)
         }),
         ..Default::default()
     };
@@ -208,6 +235,7 @@ pub(crate) async fn assemble(
             store,
             switch,
             resolved: Arc::new(Mutex::new(HashMap::from([(opening, picture)]))),
+            substitute,
         },
     })
 }

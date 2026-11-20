@@ -98,6 +98,13 @@ pub struct GlobeConfig {
     /// Sources for the imagery alone, the terrain staying ion's: an open
     /// imagery over ion's relief. Ignored when [`Self::sources`] is set.
     pub imagery_sources: Option<SourcesHandle>,
+    /// The asset the imagery's far tiles are draped from, asked of the same
+    /// sources as the imagery ([`Self::sources`] or
+    /// [`Self::imagery_sources`]) and cached under its own namespace. What
+    /// tiles wear it is [`SessionConfig::fallbacks`]' to say; `None`, the
+    /// default, has no substitute. See
+    /// `docs/explorations/imagery-layer-substitution.md`.
+    pub substitute_asset_id: Option<i64>,
     pub session: SessionConfig,
 }
 
@@ -147,8 +154,19 @@ impl GlobeConfig {
             tile_cache: None,
             sources: None,
             imagery_sources: None,
+            substitute_asset_id: None,
             session: SessionConfig::default(),
         }
+    }
+
+    /// The same globe, its far tiles draped from imagery asset `asset` under
+    /// `rule` (the base layer's): the substitute and its specification set
+    /// together.
+    #[must_use]
+    pub fn with_substitute(mut self, asset: i64, rule: tuile_core::budget::FallbackRule) -> Self {
+        self.substitute_asset_id = Some(asset);
+        self.session.fallbacks = tuile_core::budget::FallbackSpec::one(rule);
+        self
     }
 }
 
@@ -373,6 +391,24 @@ fn names_only(config: &GlobeConfig) -> bool {
     config.session.finish == crate::session::Finish::Identity
 }
 
+/// The substitute imagery of `config`, asked of `sources` and cached under
+/// its own namespace, or `None` when it names none.
+async fn substitute_of(
+    config: &GlobeConfig,
+    sources: &Arc<dyn Sources>,
+) -> Result<Option<tuile_planetary::SubstituteImagery>, GlobeError> {
+    let Some(asset) = config.substitute_asset_id else {
+        return Ok(None);
+    };
+    let provider = sources.imagery(asset).await.map_err(GlobeError::Sources)?;
+    let cached = Cached::wrap_imagery(
+        Held(provider),
+        config.tile_cache.clone().map(|c| c.0),
+        asset,
+    );
+    Ok(Some(tuile_planetary::SubstituteImagery(Arc::new(cached))))
+}
+
 /// Resolves terrain and imagery into the two seams the core consumes.
 ///
 /// A near-transcription of what the example apps do, and deliberately so: the
@@ -406,6 +442,17 @@ async fn resolve(
     // abandonner jette tout ce qui est déjà cuit. Le 19 septembre 2026 une
     // cuisson est morte à la frame 2807 sur 2880, après vingt-sept minutes, sur
     // un unique `http status 500`. Voir `RetryConfig::patient`.
+    // A substitute is asked of the host's sources, like an open imagery:
+    // never silently dropped where there are none.
+    if config.substitute_asset_id.is_some()
+        && config.sources.is_none()
+        && config.imagery_sources.is_none()
+    {
+        return Err(GlobeError::Sources(
+            "a substitute imagery is resolved through the host's sources, and none were given"
+                .to_owned(),
+        ));
+    }
     // The host's own sources: the same globe, the same options, the same
     // cache in front — and nothing resolved here.
     if let Some(sources) = &config.sources {
@@ -430,6 +477,7 @@ async fn resolve(
             stored_imagery: StoredPlan::OFF,
             decode_normals: !names_only(config),
             skirts_apart: names_only(config),
+            substitute: None,
         };
         return Ok(match config.imagery_asset_id {
             None => globe_with_provenance(terrain, NoImagery, layer, options(true), decode_pool()),
@@ -440,7 +488,9 @@ async fn resolve(
                     .await
                     .map_err(GlobeError::Sources)?;
                 let imagery = Cached::wrap_imagery(Held(imagery), cache(), asset);
-                globe_with_provenance(terrain, imagery, layer, options(false), decode_pool())
+                let mut options = options(false);
+                options.substitute = substitute_of(config, &sources.0).await?;
+                globe_with_provenance(terrain, imagery, layer, options, decode_pool())
             }
         });
     }
@@ -499,6 +549,7 @@ async fn resolve(
                 stored_imagery: StoredPlan::OFF,
                 decode_normals: !names_only(config),
                 skirts_apart: names_only(config),
+                substitute: None,
             },
             decode_pool(),
         );
@@ -518,6 +569,7 @@ async fn resolve(
             config.tile_cache.clone().map(|c| c.0),
             imagery_asset_id,
         );
+        let substitute = substitute_of(config, &sources.0).await?;
         let options = GlobeOptions {
             no_imagery: false,
             max_level: max_level(),
@@ -532,6 +584,7 @@ async fn resolve(
             stored_imagery: StoredPlan::OFF,
             decode_normals: !names_only(config),
             skirts_apart: names_only(config),
+            substitute,
         };
         return Ok(globe_with_provenance(
             terrain,
@@ -573,6 +626,8 @@ async fn resolve(
         stored_imagery: StoredPlan::OFF,
         decode_normals: !names_only(config),
         skirts_apart: names_only(config),
+        // ion's own imagery: a substitute is a host's (refused above).
+        substitute: None,
     };
 
     // Ce que l'endpoint est, et non ce qu'on espère qu'il soit.

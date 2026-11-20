@@ -132,6 +132,22 @@ impl App {
             Command::Record(on) => self.record(on),
             Command::Metrics(on) => tuile_telemetry::set_metrics(on),
             Command::Profiling(on) => tuile_telemetry::set_profiling(on),
+            Command::Fallback(rule) => {
+                use tuile_core::budget::{FallbackRule, FallbackSpec, LayerId};
+                let spec = rule.map_or_else(FallbackSpec::none, |(gap, hysteresis)| {
+                    FallbackSpec::one(
+                        FallbackRule::new(LayerId(0))
+                            .with_gap(gap)
+                            .with_hysteresis(hysteresis),
+                    )
+                });
+                if let Some(session) = self.session.as_mut() {
+                    let _ = tuile_core::protocol::GeometryStream::send(
+                        &session.stream,
+                        tuile_core::protocol::ClientMessage::Fallbacks(spec),
+                    );
+                }
+            }
             Command::ClockNow => {
                 self.atmosphere.clock.now(super::wall_seconds());
                 self.resume_rate = 1.0;

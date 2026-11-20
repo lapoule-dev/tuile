@@ -216,6 +216,25 @@ pub struct ImageryChoice {
     /// Per layer, always: the store is keyed by tile address, and two layers
     /// under one namespace serve each other's pictures.
     pub cache: String,
+    /// Another imagery its far tiles are draped from, while it is the layer
+    /// shown: `None` — the default — substitutes nothing. See
+    /// `docs/explorations/imagery-layer-substitution.md`.
+    pub substitute: Option<SubstituteChoice>,
+}
+
+/// A layer's substitute, as the host names it: an asset of its sources,
+/// the namespace its tiles are stored under, and the fallback rule's two
+/// numbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubstituteChoice {
+    /// The number [`Sources::imagery`] is asked for.
+    pub asset: i64,
+    /// Its own namespace in the store: its tiles have the layer's coords.
+    pub cache: String,
+    /// How many levels below the finest drawn a tile must be to wear it.
+    pub gap: u32,
+    /// Levels of hysteresis.
+    pub hysteresis: u32,
 }
 
 impl ImageryChoice {
@@ -227,7 +246,37 @@ impl ImageryChoice {
             asset,
             attribution: attribution.to_owned(),
             cache: format!("imagery-{key}"),
+            substitute: None,
         }
+    }
+
+    /// The same layer, its far tiles draped from `substitute`.
+    #[must_use]
+    pub fn with_substitute(mut self, substitute: SubstituteChoice) -> Self {
+        self.substitute = Some(substitute);
+        self
+    }
+
+    /// The fallback specification the session runs under while this layer
+    /// is shown: none without a substitute.
+    pub fn fallbacks(&self) -> tuile_core::budget::FallbackSpec {
+        use tuile_core::budget::{FallbackRule, FallbackSpec, LayerId};
+        match &self.substitute {
+            Some(s) => FallbackSpec::one(
+                FallbackRule::new(LayerId(0))
+                    .with_gap(s.gap)
+                    .with_hysteresis(s.hysteresis),
+            ),
+            None => FallbackSpec::none(),
+        }
+    }
+
+    /// The substitute as a layer of its own: what resolving it takes.
+    pub(crate) fn substitute_layer(&self) -> Option<ImageryChoice> {
+        self.substitute.as_ref().map(|s| {
+            ImageryChoice::new(&format!("{}-substitute", self.key), &self.name, s.asset, "")
+                .cached_as(&s.cache)
+        })
     }
 
     /// The same layer, stored under a namespace the host chooses — one that

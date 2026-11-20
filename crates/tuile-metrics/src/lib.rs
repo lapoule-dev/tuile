@@ -580,6 +580,64 @@ pub fn publish(m: &Metrics) {
                 .set(values.get(level) as f64);
         }
     }
+    publish_layers(&m.layer);
+}
+
+/// Imagery layer substitution: per layer role (`layer_role` = `source` |
+/// `substitute`, a closed set), its fetches, their answers, bytes and
+/// latency, the drapes drawn by level; the fallback specification's
+/// decisions by gap, its back-offs, whether it is in force. See
+/// `docs/explorations/imagery-layer-substitution.md` §7.
+fn publish_layers(l: &tuile_core::metrics::LayerMetrics) {
+    use metrics::{counter, gauge};
+    use tuile_core::metrics::LayerRole;
+    for role in LayerRole::ALL {
+        let layer = role.label();
+        let f = l.of(role);
+        counter!("tuile_layer_requests_total", "layer_role" => layer).absolute(f.requests.get());
+        for (outcome, c) in [
+            ("hit", &f.hits),
+            ("absent", &f.absents),
+            ("error", &f.errors),
+        ] {
+            counter!("tuile_layer_responses_total", "layer_role" => layer, "outcome" => outcome)
+                .absolute(c.get());
+        }
+        counter!("tuile_layer_bytes_total", "layer_role" => layer).absolute(f.bytes.get());
+        counter!("tuile_layer_fetch_seconds_count", "layer_role" => layer)
+            .absolute(f.seconds.count());
+        gauge!("tuile_layer_fetch_seconds_sum", "layer_role" => layer)
+            .set(f.seconds.total_seconds());
+        gauge!("tuile_layer_fetch_seconds_peak", "layer_role" => layer)
+            .set(f.seconds.peak_millis() / 1000.0);
+        counter!("tuile_layer_ancestor_fallbacks_total", "layer_role" => layer)
+            .absolute(f.ancestor_fallbacks.get());
+    }
+    for (name, values) in [
+        ("drapes_source", &l.drawn_source),
+        ("drapes_substitute", &l.drawn_substitute),
+    ] {
+        for level in 0..LEVELS as u32 {
+            gauge!("tuile_by_level", "series" => name, "level" => level.to_string())
+                .set(values.get(level) as f64);
+        }
+    }
+    const GAP: [&str; tuile_core::metrics::GAPS] = [
+        "-8", "-7", "-6", "-5", "-4", "-3", "-2", "-1", "0", "1", "2", "3", "4", "5", "6", "7", "8",
+    ];
+    for (reason, counts) in [
+        ("to_substitute", &l.to_substitute),
+        ("to_source", &l.to_source),
+    ] {
+        for (gap, c) in GAP.iter().zip(counts.iter()) {
+            counter!("tuile_layer_switches_total", "reason" => reason, "gap" => *gap)
+                .absolute(c.get());
+        }
+    }
+    counter!("tuile_layer_backoffs_total").absolute(l.backoffs.get());
+    gauge!("tuile_layer_fallback_suspended").set(l.suspended.get() as f64);
+    gauge!("tuile_layer_fallback_active").set(l.fallback_active.get() as f64);
+    gauge!("tuile_layer_reference_level").set(l.reference_level.get() as f64);
 }
 
 #[cfg(test)]
