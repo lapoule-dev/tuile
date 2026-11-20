@@ -279,6 +279,11 @@ pub struct Budget {
     imagery_short: std::collections::BTreeMap<(TileId, LayerId), u32>,
     /// `imagery_short`'s entries and their gaps, summed.
     short_sums: (u32, u32),
+    /// When each drape level in `imagery_prev` came to be: the dwell the
+    /// deficit want weighs (`Budget::deficit_due`).
+    level_since: std::collections::BTreeMap<(TileId, LayerId), Micros>,
+    /// The time of the step being taken.
+    now: Micros,
     /// The tiles whose meshes were drawn last step as themselves or held
     /// (not as a fallback).
     held_last: sorted::SortedMap<TileId, ()>,
@@ -348,6 +353,8 @@ impl Budget {
             imagery_stood_in: Default::default(),
             imagery_short: Default::default(),
             short_sums: (0, 0),
+            level_since: Default::default(),
+            now: Micros::ZERO,
             held_last: Default::default(),
             ranked_last: Vec::new(),
             steps: 0,
@@ -371,6 +378,11 @@ impl Budget {
             spec_next: None,
             smoothed: inputs::Smoothed::default(),
             measured_next: None,
+        })
+        .map(|mut b: Budget| {
+            let v = state::Valuation::of(&b.spec, b.cfg.pinned_level);
+            b.arena.set_valuation(v);
+            b
         })
     }
 
@@ -407,8 +419,12 @@ impl Budget {
     /// Takes in what the host gave since the last step: called first in a
     /// step, at its time.
     pub(crate) fn take_inputs(&mut self, now: Micros) {
+        self.now = now;
         if let Some(s) = self.spec_next.take() {
             self.spec = s;
+            let v = state::Valuation::of(&self.spec, self.cfg.pinned_level);
+            let refiled = self.arena.set_valuation(v);
+            self.walk(refiled);
         }
         if let Some(m) = self.measured_next.take() {
             self.smoothed.take(&m, now);

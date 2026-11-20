@@ -350,7 +350,12 @@ impl Specification {
                 Rule::always(Term::ScreenSize, 1_000),
             ],
             params: Params {
-                coarse_through: 5,
+                // The coarse band is a parameter for the search (PR 6): by
+                // default only the floor is a band of its own — measured on
+                // the five-minute soak, a band through level 5 lengthened
+                // the mesh waits' p95 (law 2 per place is kept by the
+                // fallback chain's protection and the finer-first ties).
+                coarse_through: 0,
                 margin_permille: 250,
                 min_dwell: Micros::from_secs(1),
                 horizon: Micros::from_secs(1),
@@ -380,16 +385,25 @@ impl Specification {
     }
 
     /// A film's: Bélády weighted by restore cost — the exact next use, the
-    /// restore cost for ties, no recency, no speculation, no margin.
+    /// restore cost for ties, no speculation, no margin. Recency stands in
+    /// for the next use until the film's schedule is given as predictions
+    /// (PR 8 of the plan): what the last frames needed is what the next
+    /// ones need most likely.
     pub fn film() -> Self {
         Specification {
             kind: SpecKind::Film,
             rules: vec![
+                Rule::always(Term::Recency, 1_000),
                 Rule::always(Term::RestoreCost, 1_000),
                 Rule::always(Term::NextUse, 4_000),
             ],
             params: Params {
-                coarse_through: 5,
+                // The coarse band is a parameter for the search (PR 6): by
+                // default only the floor is a band of its own — measured on
+                // the five-minute soak, a band through level 5 lengthened
+                // the mesh waits' p95 (law 2 per place is kept by the
+                // fallback chain's protection and the finer-first ties).
+                coarse_through: 0,
                 margin_permille: 0,
                 min_dwell: Micros::ZERO,
                 horizon: Micros::from_secs(10),
@@ -436,7 +450,12 @@ impl Specification {
                 Rule::always(Term::ScreenSize, 2_000),
             ],
             params: Params {
-                coarse_through: 5,
+                // The coarse band is a parameter for the search (PR 6): by
+                // default only the floor is a band of its own — measured on
+                // the five-minute soak, a band through level 5 lengthened
+                // the mesh waits' p95 (law 2 per place is kept by the
+                // fallback chain's protection and the finer-first ties).
+                coarse_through: 0,
                 margin_permille: 150,
                 min_dwell: Micros::from_millis(500),
                 horizon: Micros::from_secs(2),
@@ -747,7 +766,8 @@ mod tests {
 
     #[test]
     fn the_bands_put_the_floor_and_the_coarse_first() {
-        let s = Specification::interactive();
+        let mut s = Specification::interactive();
+        s.params.coarse_through = 5;
         assert_eq!(s.band(Class::TerrainMesh, 2, Some(2)), Band::Floor);
         assert_eq!(s.band(Class::Tiles3dMesh, 2, Some(2)), Band::Coarse);
         assert_eq!(s.band(Class::Drape, 5, Some(2)), Band::Coarse);

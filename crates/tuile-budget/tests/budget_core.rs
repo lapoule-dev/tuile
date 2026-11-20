@@ -2976,7 +2976,6 @@ mod stats {
     /// then stopping — reaches its need within two seconds of rest, and
     /// stays there.
     #[test]
-    #[ignore = "red on main (the drape a level under is never asked for); green with the decider's deficit want, PR 4 of the stack"]
     fn a_tile_approached_a_level_at_a_time_reaches_its_need_within_two_seconds_of_rest() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);

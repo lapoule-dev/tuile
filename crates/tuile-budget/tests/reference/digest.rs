@@ -279,6 +279,7 @@ impl Feed for BudgetStats {
         let deficit = format!("{:?}", s.deficit);
         let text = format!("{s:?}")
             .replace(", levels_moved: 0", "")
+            .replace(&format!(", rewants: {}", s.rewants), "")
             .replace(&format!(", deficit: {deficit}"), "")
             .replace(&format!(", drawable_by_level: {bytes}"), "")
             .replace(&format!(", transit_by_level: {bytes}"), "")

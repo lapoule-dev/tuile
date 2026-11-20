@@ -1212,6 +1212,9 @@ impl Budget {
     /// Returns whether they read the pressure: a drape worn one level finer
     /// than its need is wanted coarser under pressure only, and a change of
     /// pressure to or from `Normal` moves no other want.
+    // The buffers a step reuses, and the re-read time it hands back: no
+    // struct of its own for one caller and the debug check.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn tile_wants(
         &self,
         t: TileId,
@@ -1220,8 +1223,10 @@ impl Budget {
         meshes_in: bool,
         drapes: &mut Vec<(LayerId, u32)>,
         out: &mut Vec<(ResourceId, u32, Want)>,
+        reread: &mut Option<Micros>,
     ) -> bool {
         out.clear();
+        *reread = None;
         let mut reads_pressure = false;
         let batch = self.cfg.policy == Policy::Batch;
         // Every want put, in order; merged below.
@@ -1279,6 +1284,18 @@ impl Budget {
                             None => true,
                             Some(w) if batch => w.resource != drape,
                             Some(w) if w.level.abs_diff(n) > 1 => true,
+                            Some(w) if w.level < n => {
+                                // A level under its need: wanted once the
+                                // quality it brings over the time it is
+                                // expected to serve pays for its restore
+                                // cost (spec §5.3); until then, read again
+                                // when it will.
+                                let at = self.deficit_due(t, layer, tn, n - w.level);
+                                if let Some(at) = at.filter(|at| *at > self.now) {
+                                    *reread = Some(reread.map_or(at, |r| r.min(at)));
+                                }
+                                at.is_some_and(|at| at <= self.now)
+                            }
                             Some(w) => {
                                 reads_pressure |= w.level > n;
                                 self.pressure != Pressure::Normal && w.level > n
@@ -1310,6 +1327,53 @@ impl Budget {
         out.sort_unstable_by_key(|(r, seq, w)| (*r, w.urgency, Reverse(w.q), *seq));
         out.dedup_by_key(|e| e.0);
         reads_pressure
+    }
+
+    /// When tile `t`'s own drape of `layer` at its need becomes worth
+    /// loading while the tile wears one `gap` levels under it (spec §5.3,
+    /// law 7): once `w × gap × dwell ≥ cost × (1 + margin)`, the dwell
+    /// counted from when the need came to be its level, `w` the place's
+    /// screen weight times the specification's deficit weight, `cost` the
+    /// network's restore cost (the dearest tier: the time is an upper
+    /// bound). `None` when the specification gives the deficit no weight.
+    pub(super) fn deficit_due(
+        &self,
+        t: TileId,
+        layer: LayerId,
+        tn: &TileNeed,
+        gap: u32,
+    ) -> Option<Micros> {
+        use super::spec::{Facts, Term};
+        let level = tn.need.level;
+        let facts = Facts {
+            class: Class::Drape,
+            level,
+            tier: Tier::Remote,
+            band: self.spec.band(Class::Drape, level, self.cfg.pinned_level),
+            membership: Some(tn.membership),
+            predicted: false,
+        };
+        let weight = u64::from(self.spec.weight(Term::Deficit, &facts));
+        // The screen weight, ‰: half for a tile at the edge, all at the
+        // centre (the priority's own weighting).
+        let screen = 500 + u64::try_from(tn.q.centrality.clamp(0, 1_000)).unwrap_or(0) / 2;
+        let per_us = weight * screen * u64::from(gap.max(1)) / 1_000;
+        if per_us == 0 {
+            return None;
+        }
+        let p = &self.spec.params;
+        let cost = u128::from(p.restore.remote.0) * u128::from(1_000 + p.margin_permille);
+        let dwell = u64::try_from(cost / u128::from(per_us)).unwrap_or(u64::MAX);
+        let since = self
+            .level_since
+            .get(&(t, layer))
+            .copied()
+            .unwrap_or(Micros::ZERO);
+        // Spread over 64 ms by the tile, a fixed function of its id: the
+        // tiles a stop brought to rest together fall due over a few steps,
+        // not in one burst (spec §6.3, no peaks).
+        let spread = t.0.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 58;
+        Some(since.plus(Micros(dwell)).plus(Micros::from_millis(spread)))
     }
 
     /// Whether Batch may want drapes this step: every mesh the frame draws
