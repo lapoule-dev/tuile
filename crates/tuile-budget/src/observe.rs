@@ -61,6 +61,11 @@ pub enum BudgetEvent {
     NewEpoch(Class, Option<LayerId>),
     /// `release_beyond`, and how many GPU copies it dropped.
     ReleaseBeyond(Bytes, u32),
+    /// `specify`: the kind and the digest of the specification given (its
+    /// whole text travels in the host's record, as its query).
+    Specify(crate::spec::SpecKind, u64),
+    /// `measure`: the samples given.
+    Measured(crate::inputs::Measured),
 }
 
 /// One decision step, as the host saw it.
