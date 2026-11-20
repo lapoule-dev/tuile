@@ -138,6 +138,43 @@ moves the load side's `PriorityKey` onto the same value — the urgency tiers re
 absolute laws' bands (floor and coverage, blockers of a swap) with the value ordering
 everything else (§10).
 
+### 1c. The mechanics: TIP's principle, per-frame mechanics (Laurent, 2026-11-20)
+
+TIP's **principle** is kept (one currency; exchange a buffer while the gain exceeds the
+loss); its **mechanics** are adapted to per-frame decisions over thousands of resources, in
+a fraction of a millisecond, native and wasm:
+
+1. **Two ordered structures, no global recomputation**: the missing resources by value per
+   byte descending, the held ones by value per byte ascending (the persistent eviction
+   index of O1.2 is the second). Each step **exchanges while best-missing > worst-held × (1 +
+   margin)**: O(k log n), `k` bounded by the rate shaping (8).
+2. **Values quantised into integer buckets** (a bucket queue, plan item O1.5) for near-O(1)
+   insert and extract; ties inside a bucket by the stable tie-breaks.
+3. **Incremental recomputation** through the existing dirty sets: only resources whose
+   inputs changed are re-valued (the deficit's re-read deadline, §5.3, is one such input:
+   time).
+4. **Precision near the frontier only** (LRB's insight): resources far above or below the
+   exchange frontier keep an approximate value refreshed less often; the order is exact
+   where a decision is taken.
+5. **Sampled candidates on the held side** (hyperbolic caching; Im et al.): the first `k`
+   of the index and a deterministic sample, not a perfect order over the whole held set.
+6. **A discrete horizon**: the value summed at a few instants — now, +0.5 s, +1 s, +2 s,
+   specification parameters — with `P(visible)` from cheap geometry (the union of predicted
+   frusta), no ray casting.
+7. **Costs from a small table**: the per-tier restore cost (smoothed from measurements,
+   §4.2) × the known size; no disk model à la TIP.
+8. **A bounded number of exchanges per step** (a token bucket), so per-frame work is
+   bounded — P6.4: work grows with changes, not with the scene.
+
+**Validation — the exact reference as judge.** The simulator keeps an **exact TIP**
+implementation (the whole value recomputed for every resource every step, every exchange
+evaluated exactly; slow, small scenarios only), as Albers' offline optimum judges the online
+policy. The fast decider is run beside it on the catalogue's small variants and compared on
+the objective `J` (time-integrated screen-weighted deficit, §1). **Acceptance**: the fast
+version's `J` within 2 % of the exact one on every small scenario (a first proposal: the gap
+must be negligible), and never a law the exact one keeps broken. This is PR 6's
+`exact_tip_reference` test; the approximations 2, 4 and 5 are only accepted with it green.
+
 ## 2. The laws
 
 Thirteen laws, each with the invariant that tests it. **Absolute laws** stand outside any
@@ -866,7 +903,7 @@ scenario set, before/after.
 | 4 | **The value.** The eviction key (§8 row 1) and the deficit want (§5.3, deadlines), restore cost per tier (constants then smoothed measured), margin, `min_dwell`, reasons (§7.2). `rest-after-approach` green. Law invariants 1, 2, 6, 7 in the sim and proptest under random specs. | `rest-after-approach`; "eviction follows value order"; "a load below the margin does not displace" | re-recorded, reason: the LRU key and the ±1 tolerance are gone |
 | 4b | **The load side on the same value** (§1b): `PriorityKey` reduced to the absolute laws' bands (floor and coverage, swap blockers), the value ordering the rest; the release side's sampled candidates. | "a load and a release read the same value"; Do No Harm on small traces | re-recorded, reason: the urgency tiers below coverage are gone |
 | 5 | **Viewer wiring** (desktop and web, same code). The context selects the spec (ordinary navigation: `interactive`; the FPV camera mode, once it exists: `fpv`; flights and tapes: `known_path`); a **diagnostic override** in the menu and `tuile://budget?spec=…&margin=…` (`spec=auto` clears it), labelled as such; `spec_active`, deficit and reasons through tuile-telemetry (labels allow-listed); the HUD line. | steering parse tests; telemetry label test | — |
-| 6 | **The simulator crate, the scenario catalogue and the search** (§9.3). `tuile-budget-sim` library (the `budget_sim` harness moved), simulated measured inputs, the objective, `tuile-budget-tune` with Parquet out. | the objective of a known run; determinism of the search | unchanged (moved, not changed) |
+| 6 | **The simulator crate, the scenario catalogue and the search** (§9.3), with the **exact TIP reference** (§1c) and its acceptance test. `tuile-budget-sim` library (the `budget_sim` harness moved), simulated measured inputs, the objective, `tuile-budget-tune` with Parquet out. | the objective of a known run; determinism of the search | unchanged (moved, not changed) |
 | 7 | **The controller** (§6): headroom set-point, proactive release, token buckets, the LOD actuator replacing `relax()`; the equilibrium scenarios of §9.2 with their bounds. | `pressure-ramp` (no 16× haste, monotone recovery), "a load never waits for an emergency eviction" | re-recorded, reason: the sweep and `relax()` are gone |
 | 8 | **Speculation and predictions**: `Urgency::Predicted`, quotas, the film schedule into `release_beyond`, the viewer's known paths (Glide, tape) into predictions. | law 4 and 8 invariants; Bélády optimum on small traces (B3) | re-recorded where predictions are given |
 
