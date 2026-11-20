@@ -60,6 +60,9 @@ D⁺(k)  = Σ_i Σ_c  w_i · max(0, worn_c(i) − need_c(i))          (over-deta
 J      = Σ_k D(k) · (t_{k+1} − t_k)  +  λ_q · Q  +  ∞ · holes
 ```
 
+- As implemented (PR 2), `D(k)` adds two measured parts: the levels a drawn place wears
+  under the level the step decided for it, and the levels that decided level is coarser than
+  the unrelaxed need (a stand-in, a relaxation: `imagery_short`).
 - `need_c(i)` is the level the picture needs **at scale 1** — the unrelaxed footprint level
   with its ±½-level hysteresis (`imagery::needed_level` on the unrelaxed footprint) for a
   drape, the wanted tile's level for a mesh. It is deliberately *not* the relaxed level or
@@ -271,11 +274,13 @@ A specification change is smooth by construction, at no refile storm:
   `t₀`, every rule's effective weight is `w_old + (w_new − w_old) × min(1, (t − t₀)/blend)`,
   in integers; rules present in one spec only blend from or to 0. Parameters with a natural
   rate (margin, quotas, headroom band) blend the same way.
-- **Values are filed, not recomputed**: a held resource's value is computed when it is
-  (re)filed in the persistent eviction index (`state::EvictIndex`, on every change of its
-  copies, its last-needed time or its prediction). A resource filed under the old blend keeps
-  the value it was given; GreedyDual's aging (the recency term grows with time for the
-  others) retires it naturally. No step re-files the whole index because of a switch.
+- **Values are tabulated, then filed**: the specification's terms are evaluated once into
+  a table per class, level and copies held (`state::Valuation`), which the persistent
+  eviction index's key reads. A switch replaces the table and files every filed resource
+  again under its new key, once — O(N log N), counted in `work` (the first implementation,
+  PR 4). With the blend (PR 7) the table is re-made at a bounded number of blend points
+  (e.g. 4 over `blend`), not every step, and the release bucket bounds what any re-filing can
+  evict per step.
 - **Absolute laws stay outside**: protection and bands are not terms. The shaped release
   rate (§6.3) bounds what a switch can evict per step. A specification that values
   everything at zero degrades to "evict the oldest finest first" — reloads, never a hole.
@@ -453,9 +458,10 @@ is expected to serve, pays for its restore cost.
   150 ms, margin 25 %, weight ≥ 500 ‰, one level), `T ≤ 375 ms` after the need settled; from
   the store, 15 ms.
 - No regime, no stillness detector, no cursor: the crossing time is computed when the want is
-  read and set as a **deadline** (`downstream`'s deadline heap, already used for the cancel
-  grace), so the incremental passes re-read exactly the places whose crossing came, and the
-  full recomputation (`check_wants`) at the same `now` agrees.
+  read and kept as a **re-read deadline** (`downstream`'s `rewant` heap, one live entry per
+  place), so the incremental passes re-read exactly the places whose crossing came, and the
+  full recomputation (`check_wants`, debug builds) at the same `now` agrees. Until a tier is
+  measured (§4.2), the cost is the network's — the crossing time is an upper bound.
 
 ## 6. The control model: an equilibrium regime
 
