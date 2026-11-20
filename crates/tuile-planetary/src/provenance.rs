@@ -61,6 +61,9 @@ pub struct Provenance {
     /// source tile's own, carried through every cut, so it says which.
     terrain: Mutex<HashMap<MeshKey, (TileCoord, u64)>>,
     imagery: Mutex<HashMap<ImageryCoord, u64>>,
+    /// The same, for the tiles of the substitute layer
+    /// (`GlobeOptions::substitute`): another store, the same coords.
+    substitute: Mutex<HashMap<ImageryCoord, u64>>,
 }
 
 impl Provenance {
@@ -80,6 +83,37 @@ impl Provenance {
     /// The digest of an imagery tile's bytes, once the loader has fetched it.
     pub fn imagery(&self, tile: ImageryCoord) -> Option<u64> {
         self.imagery.lock().ok()?.get(&tile).copied()
+    }
+
+    /// [`Self::imagery`], of the source layer or of its substitute.
+    pub fn imagery_of(&self, substitute: bool, tile: ImageryCoord) -> Option<u64> {
+        if substitute {
+            self.substitute.lock().ok()?.get(&tile).copied()
+        } else {
+            self.imagery(tile)
+        }
+    }
+
+    fn map(&self, substitute: bool) -> &Mutex<HashMap<ImageryCoord, u64>> {
+        if substitute {
+            &self.substitute
+        } else {
+            &self.imagery
+        }
+    }
+
+    /// [`Self::fetched_imagery`], of the source layer or of its substitute.
+    pub fn fetched_imagery_of(&self, substitute: bool, tile: ImageryCoord, bytes: &[u8]) {
+        if let Ok(mut imagery) = self.map(substitute).lock() {
+            imagery.insert(tile, digest(bytes));
+        }
+    }
+
+    /// [`Self::stamped_imagery`], of the source layer or of its substitute.
+    pub fn stamped_imagery_of(&self, substitute: bool, tile: ImageryCoord, digest: u64) {
+        if let Ok(mut imagery) = self.map(substitute).lock() {
+            imagery.insert(tile, digest);
+        }
     }
 
     // What follows is the loader's side: what it notes as it fetches. Public

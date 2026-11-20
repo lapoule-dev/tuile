@@ -896,13 +896,33 @@ impl Budget {
         }
     }
 
+    /// The drawable drapes of `layer`'s family on `x`, with their levels
+    /// and whether each is of the other layer of the family: `layer`'s own,
+    /// then its sibling's ([`LayerId::sibling`]). A tile waiting for its
+    /// substitute is dressed by the source it wore, or the other way round
+    /// (never black ground); without a fallback rule no substitute drape
+    /// exists and the sibling's range is empty.
+    fn family_drapes(
+        &self,
+        x: TileId,
+        layer: LayerId,
+    ) -> impl Iterator<Item = (ResourceId, u32, bool)> + '_ {
+        self.drawable_drapes(x, layer)
+            .map(|(r, l)| (r, l, false))
+            .chain(
+                self.drawable_drapes(x, layer.sibling())
+                    .map(|(r, l)| (r, l, true)),
+            )
+    }
+
     /// The drawable drapes of `layer` on `x`, with their levels.
     fn drawable_drapes(
         &self,
         x: TileId,
         layer: LayerId,
     ) -> impl Iterator<Item = (ResourceId, u32)> + '_ {
-        // Only this layer's drapes: a layer never falls back on another's.
+        // Only this layer's drapes: a layer never falls back on another's
+        // but its family's (`family_drapes`).
         // Those on the GPU, by level: a range of the arena's ordered index.
         let lo = ResourceId::drape(x, layer, 0);
         let hi = ResourceId::drape(x, layer, u32::MAX);
@@ -936,8 +956,9 @@ impl Budget {
             });
         }
         let rect = self.tiles.get(&tile).and_then(|i| i.rect());
-        // `best_drape`'s fold, walked lazily: the first of equal ranks wins.
-        let mut best: Option<(DrapeCandidate, ResourceId, UvTransform)> = None;
+        // `best_drape`'s fold, walked lazily: the first of equal ranks wins,
+        // and of equal ranks the wanted layer's before its sibling's.
+        let mut best: Option<(DrapeCandidate, bool, ResourceId, UvTransform)> = None;
         for (up, x) in std::iter::once(tile)
             .chain(self.ancestors(tile))
             .enumerate()
@@ -946,23 +967,25 @@ impl Budget {
             let Some(uv) = self.uv_into(rect, up, x) else {
                 continue;
             };
-            for (r, level) in self.drawable_drapes(x, layer) {
+            for (r, level, other) in self.family_drapes(x, layer) {
                 let c = DrapeCandidate {
                     level,
                     up: sat_u32(up),
                 };
-                if best.is_none_or(|(b, ..)| drape_rank(need, c) < drape_rank(need, b)) {
-                    best = Some((c, r, uv));
+                if best.is_none_or(|(b, bo, ..)| {
+                    (drape_rank(need, c), other) < (drape_rank(need, b), bo)
+                }) {
+                    best = Some((c, other, r, uv));
                 }
             }
-            // A drape at exactly the need: nothing farther up ranks before
-            // it (the closer owner wins a tie), so the walk ends — the same
-            // answer, fewer ancestors read.
-            if best.is_some_and(|(b, ..)| b.level == need) {
+            // A drape of the wanted layer at exactly the need: nothing
+            // farther up ranks before it (the closer owner wins a tie), so
+            // the walk ends — the same answer, fewer ancestors read.
+            if best.is_some_and(|(b, other, ..)| b.level == need && !other) {
                 break;
             }
         }
-        best.map(|(c, resource, uv)| DrapeChoice {
+        best.map(|(c, _, resource, uv)| DrapeChoice {
             resource,
             layer,
             level: c.level,
@@ -976,14 +999,13 @@ impl Budget {
     /// read when the tile's own drapes did not answer.
     fn has_drape(&self, tile: TileId, layer: LayerId, reach: &mut Reach) -> bool {
         // Its own first: they need no mapping.
-        if self.drawable_drapes(tile, layer).next().is_some() {
+        if self.family_drapes(tile, layer).next().is_some() {
             return true;
         }
         let rect = self.tiles.get(&tile).and_then(|i| i.rect());
         self.ancestors(tile).enumerate().any(|(up, x)| {
             reach.saw(x, PLACE | DRAPES);
-            self.drawable_drapes(x, layer).next().is_some()
-                && self.uv_into(rect, up + 1, x).is_some()
+            self.family_drapes(x, layer).next().is_some() && self.uv_into(rect, up + 1, x).is_some()
         })
     }
 
@@ -1219,6 +1241,10 @@ impl Budget {
                         let off = match worn {
                             None => true,
                             Some(w) if batch => w.resource != drape,
+                            // A stand-in of the other layer of the family
+                            // (a switch to or from a substitute): its own
+                            // is wanted, whatever its level.
+                            Some(w) if w.resource.layer() != Some(layer) => true,
                             Some(w) if w.level.abs_diff(n) > 1 => true,
                             Some(w) => {
                                 reads_pressure |= w.level > n;

@@ -9796,6 +9796,7 @@ version = "0.17.1"
 dependencies = [
  "async-trait",
  "bytemuck",
+ "bytes",
  "futures-executor",
  "futures-util",
  "glam 0.33.2",

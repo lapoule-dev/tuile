@@ -343,6 +343,24 @@ pub struct DrapeReach {
     pub rect: crate::budget::GeoRect,
     /// The layers that drape the tile, in stacking order.
     pub layers: Vec<crate::budget::LayerReach>,
+    /// The substitutes the loader can drape in place of a layer, each named
+    /// by its substitute id ([`crate::budget::LayerId::substitute`]) with
+    /// how deep it reaches here. Empty — the usual case — when the loader
+    /// was given no substitute source: a fallback rule then changes nothing
+    /// (`docs/explorations/imagery-layer-substitution.md`).
+    pub substitutes: Vec<crate::budget::LayerReach>,
+}
+
+impl DrapeReach {
+    /// How deep the substitute of `layer` reaches over the tile, if the
+    /// loader has one.
+    pub fn substitute(&self, layer: crate::budget::LayerId) -> Option<u32> {
+        let want = layer.substitute();
+        self.substitutes
+            .iter()
+            .find(|r| r.layer == want)
+            .map(|r| r.max_level)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

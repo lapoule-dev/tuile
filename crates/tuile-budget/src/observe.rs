@@ -61,6 +61,9 @@ pub enum BudgetEvent {
     NewEpoch(Class, Option<LayerId>),
     /// `release_beyond`, and how many GPU copies it dropped.
     ReleaseBeyond(Bytes, u32),
+    /// A fallback specification put in force: its digest
+    /// ([`crate::FallbackSpec::digest`]).
+    Fallbacks(u64),
 }
 
 /// One decision step, as the host saw it.

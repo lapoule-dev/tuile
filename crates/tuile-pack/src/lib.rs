@@ -58,11 +58,32 @@ pub const READABLE: std::ops::RangeInclusive<u32> = 1..=3;
 /// the bake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreTile {
+    /// The tile's level; for an imagery tile, with
+    /// [`StoreTile::SUBSTITUTE`] set when it is a tile of the scene's
+    /// **substitute** imagery store rather than its imagery's.
     pub level: u8,
     pub x: u32,
     pub y: u32,
     /// FNV-1a of the bytes as the store held them ([`Fnv1a`]).
     pub digest: u64,
+}
+
+impl StoreTile {
+    /// The bit of [`StoreTile::level`] that names an imagery tile of the
+    /// substitute store (`docs/explorations/imagery-layer-substitution.md`).
+    /// Levels are below 32, so it was always clear: a pack baked without a
+    /// substitute is the pack it was.
+    pub const SUBSTITUTE: u8 = 0x80;
+
+    /// Whether it is a tile of the substitute imagery store.
+    pub fn is_substitute(&self) -> bool {
+        self.level & Self::SUBSTITUTE != 0
+    }
+
+    /// Its level in its store, the substitute bit apart.
+    pub fn store_level(&self) -> u8 {
+        self.level & !Self::SUBSTITUTE
+    }
 }
 
 /// One imagery tile of a drape, and where it lies on the terrain tile.

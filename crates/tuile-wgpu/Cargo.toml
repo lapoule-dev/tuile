@@ -48,4 +48,6 @@ tuile-planetary = { path = "../tuile-planetary" }
 # The flights of `tests/sky_flicker.rs` traced to MCAP, as every tape is.
 tuile-tape = { path = "../tuile-tape" }
 async-trait = { workspace = true }
+# The local test layers of `examples/substitute_snapshot.rs` answer bytes.
+bytes = { workspace = true }
 url = { workspace = true }

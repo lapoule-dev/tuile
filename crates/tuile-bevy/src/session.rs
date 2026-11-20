@@ -119,9 +119,14 @@ async fn assemble(
 ) -> Result<Assembled, String> {
     let resolved = plan.sources.resolve().await?;
     let layer_budget = LayerBudget::default();
+    let fallbacks = plan.sources.substitute.as_ref().map(|s| s.spec());
     let options = GlobeOptions {
         imagery_slots: layer_budget.clone(),
         max_level: Some(resolved.imagery.tiling_scheme().maximum_level),
+        substitute: resolved
+            .substitute
+            .clone()
+            .map(tuile_planetary::SubstituteImagery),
         ..Default::default()
     }
     .with_imagery_compression(plan.compression, plan.caps);
@@ -140,6 +145,15 @@ async fn assemble(
         plan.budget.config(),
     )
     .map_err(|e| format!("the graphics budget cannot run: {e}"))?;
+    // The fallback specification, before the first view: a substitute
+    // declared is drawn from the first step.
+    if let Some(spec) = fallbacks {
+        tuile_core::protocol::GeometryStream::send(
+            &stream,
+            tuile_core::protocol::ClientMessage::Fallbacks(spec),
+        )
+        .map_err(|e| format!("the geometry server: {e}"))?;
+    }
     Ok(Assembled {
         stream,
         server,

@@ -939,11 +939,13 @@ impl ContentPump {
                         (ResourceId, &PreparedDrape),
                     > = BTreeMap::new();
                     for (r, d) in self.drapes.iter().filter(|(r, _)| r.tile() == tile) {
+                        // One per family: a layer and its substitute are
+                        // one picture of the ground, never stacked.
                         let finer = own
-                            .get(&d.layer)
+                            .get(&d.layer.base())
                             .is_none_or(|(_, held)| d.level > held.level);
                         if finer {
-                            own.insert(d.layer, (*r, d));
+                            own.insert(d.layer.base(), (*r, d));
                         }
                     }
                     let wear: Vec<(ResourceId, &PreparedDrape, tuile_core::budget::UvTransform)> =

@@ -103,6 +103,19 @@ pub fn encode_client(message: &ClientMessage) -> Vec<u8> {
             w.u8(7);
             write_views(&mut w, views);
         }
+        // Every number of every rule, as given: the worker's session
+        // validates it, as an in-process one does.
+        ClientMessage::Fallbacks(spec) => {
+            w.u8(8);
+            w.len(spec.rules.len());
+            for rule in &spec.rules {
+                w.u32(u32::from(rule.layer.0));
+                w.u32(rule.gap);
+                w.u32(rule.hysteresis);
+                w.u32(rule.failures);
+                w.u64(rule.backoff.0);
+            }
+        }
     }
     w.0
 }
@@ -213,6 +226,20 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, WireError> {
         7 => ClientMessage::Ahead {
             views: read_views(&mut r)?,
         },
+        8 => {
+            let n = r.len()?;
+            let mut rules = Vec::with_capacity(n.min(16));
+            for _ in 0..n {
+                rules.push(tuile_core::budget::FallbackRule {
+                    layer: tuile_core::budget::LayerId(r.u32()? as u16),
+                    gap: r.u32()?,
+                    hysteresis: r.u32()?,
+                    failures: r.u32()?,
+                    backoff: tuile_core::budget::Micros(r.u64()?),
+                });
+            }
+            ClientMessage::Fallbacks(tuile_core::budget::FallbackSpec { rules })
+        }
         tag => {
             return Err(WireError::Tag {
                 what: "a client message",
@@ -1567,6 +1594,20 @@ mod tests {
                 total_bytes: 3 << 30,
             },
             ClientMessage::ReleaseBeyond { bytes: 1 << 30 },
+            // A fallback specification declared, a substitute drape acked,
+            // and the specification removed: what the page sends to turn
+            // substitution on and off, as a native host does in process.
+            ClientMessage::Fallbacks(tuile_core::budget::FallbackSpec::one(
+                tuile_core::budget::FallbackRule::new(LayerId(0))
+                    .with_gap(5)
+                    .with_hysteresis(2),
+            )),
+            ClientMessage::Ack {
+                resource: ResourceId::drape(TileId(4), LayerId(0).substitute(), 9),
+                gen: Generation(2),
+                bytes: 4096,
+            },
+            ClientMessage::Fallbacks(tuile_core::budget::FallbackSpec::none()),
         ];
         messages.extend(
             [

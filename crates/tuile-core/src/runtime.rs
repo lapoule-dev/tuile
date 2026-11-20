@@ -1037,6 +1037,12 @@ struct State {
     need_last: Option<NeedSet>,
     /// What changed, in a buffer kept across steps.
     need_delta: NeedDelta,
+    /// The fallback specification in force and what it remembers: which
+    /// tiles wear a substitute layer ([`crate::budget::fallback`]). Empty —
+    /// the default — substitutes nothing and reads nothing.
+    fallback: crate::budget::FallbackState,
+    /// The last step's time: when a substitute's failure is noted.
+    last_now: Micros,
 }
 
 impl State {
@@ -1077,6 +1083,8 @@ impl State {
             thermal: crate::budget::Thermal::Nominal,
             need_last: None,
             need_delta: NeedDelta::new(),
+            fallback: crate::budget::FallbackState::new(),
+            last_now: Micros::ZERO,
         }
     }
 
@@ -1092,6 +1100,24 @@ impl State {
                 self.ahead = views;
                 self.ahead_moved = true;
             }
+            // From the next step. An invalid one is refused here, with a
+            // word to the consumer, and the one in force stays.
+            ClientMessage::Fallbacks(spec) => match spec.validate() {
+                Ok(()) => {
+                    let m = crate::metrics::metrics();
+                    m.layer.fallback_active.set(u64::from(!spec.is_none()));
+                    self.events.push(BudgetEvent::Fallbacks(spec.digest()));
+                    self.fallback.set_spec(spec);
+                }
+                Err(e) => {
+                    tracing::warn!("fallback specification refused: {e}");
+                    let _ = tx.unbounded_send(ServerMessage::Error {
+                        resource: None,
+                        message: e.to_string(),
+                    });
+                    return false;
+                }
+            },
             ClientMessage::Ack {
                 resource,
                 gen,
@@ -1203,6 +1229,9 @@ impl State {
                     }
                 };
                 m.loads_completed.inc();
+                if let Some(layer) = r.layer() {
+                    self.fallback.on_loaded(layer);
+                }
                 crate::det!("load_ok", resource = format!("{r:?}"));
                 self.decoded.insert(r, (gen, content));
                 self.budget.on_loaded(r, gen, cost);
@@ -1210,6 +1239,9 @@ impl State {
             }
             Err(e) => {
                 m.loads_failed.inc();
+                if let Some(layer) = r.layer() {
+                    self.fallback.on_failed(layer, self.last_now);
+                }
                 crate::det!("load_err", resource = format!("{r:?}"));
                 tracing::warn!(?r, "load failed: {e}");
                 self.budget.on_failed(r, gen, Failure::Transient);
@@ -1641,7 +1673,34 @@ impl State {
             in_flight = self.in_flight.len(),
             camera_moved = camera_moved,
         );
-        let need = self.need(host);
+        let mut need = self.need(host);
+        self.last_now = now;
+        // The layer each tile's imagery is drawn from, where a fallback
+        // specification is in force: an input to the want, before the budget
+        // reads the need. None in force, nothing read.
+        if self.fallback.active() {
+            let cfg = self.budget.config();
+            let ctx = crate::budget::FallbackContext {
+                pinned_level: cfg.pinned_level,
+                over_terrain_cap: cfg.imagery_cap(),
+                batch: cfg.policy == crate::budget::Policy::Batch,
+                now,
+            };
+            let loader = host.loader;
+            let report = self.fallback.apply(
+                &mut need,
+                |t, layer| loader.drapes(t).and_then(|r| r.substitute(layer)),
+                ctx,
+            );
+            let lm = &crate::metrics::metrics().layer;
+            lm.note(&report);
+            lm.suspended
+                .set(u64::from(self.fallback.any_suspended(now)));
+            if let Some(rule) = self.fallback.spec().rules.first() {
+                lm.reference_level
+                    .set(u64::from(self.fallback.reference(rule.layer).unwrap_or(0)));
+            }
+        }
         // The answers the store's events since the last step may have
         // changed are asked again, before the budget asks anything.
         self.presence.follow(host.loader.as_ref());
@@ -1680,6 +1739,17 @@ impl State {
         m.selected_by_level.clear();
         for item in &d.draw.items {
             m.selected_by_level.inc(tree.level(item.mesh.tile()));
+        }
+        // The drapes drawn, by the layer they are of and their level.
+        m.layer.drawn_source.clear();
+        m.layer.drawn_substitute.clear();
+        for item in &d.draw.items {
+            for drape in &item.drapes {
+                match drape.resource.layer() {
+                    Some(l) if l.is_substitute() => m.layer.drawn_substitute.inc(drape.level),
+                    _ => m.layer.drawn_source.inc(drape.level),
+                }
+            }
         }
         m.queued_by_level.clear();
         for s in &d.start {
@@ -2886,9 +2956,21 @@ mod tests {
         epoch: Arc<AtomicU64>,
         meshes: Arc<AtomicUsize>,
         drapes: Arc<Mutex<Vec<ResourceId>>>,
+        /// The substitutes it reports: none, but for the tests of the
+        /// fallback specification.
+        substitutes: Vec<LayerReach>,
     }
 
     impl Draped {
+        /// How deep its layer reaches: 4, or the deepest substitute's.
+        fn reach(&self) -> u32 {
+            self.substitutes
+                .iter()
+                .map(|r| r.max_level)
+                .max()
+                .unwrap_or(4)
+        }
+
         /// A footprint in the budget's radians that nests as the fixture's
         /// spheres do: the root's square holds its children's.
         fn rect(&self, id: TileId) -> GeoRect {
@@ -2921,8 +3003,9 @@ mod tests {
                 rect: self.rect(id),
                 layers: vec![LayerReach {
                     layer: LayerId(0),
-                    max_level: 4,
+                    max_level: self.reach(),
                 }],
+                substitutes: self.substitutes.clone(),
             })
         }
         async fn load_drape(
@@ -2975,6 +3058,20 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<Mutex<Vec<ResourceId>>>,
     ) {
+        draped_session_with(dir, Vec::new())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn draped_session_with(
+        dir: &std::path::Path,
+        substitutes: Vec<LayerReach>,
+    ) -> (
+        InProcessStream,
+        GeometryServer,
+        Arc<AtomicU64>,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<ResourceId>>>,
+    ) {
         let tileset = deep_tileset(dir);
         let arena = Arc::new(RwLock::new(tileset));
         let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
@@ -2987,9 +3084,17 @@ mod tests {
             epoch: Arc::clone(&epoch),
             meshes: Arc::clone(&meshes),
             drapes: Arc::clone(&drapes),
+            substitutes: substitutes.clone(),
         });
+        // With substitutes, imagery free to climb over its terrain: the
+        // levels then follow the distance alone, and differ over the view.
+        let mut budget = roomy();
+        if !substitutes.is_empty() {
+            budget.imagery_over_terrain_cap = 16;
+            budget.max_drape_side = 1 << 30;
+        }
         let (stream, server) =
-            in_process_with(tree, loader, Config::default(), roomy()).expect("budget");
+            in_process_with(tree, loader, Config::default(), budget).expect("budget");
         (stream, server, epoch, meshes, drapes)
     }
 
@@ -3106,6 +3211,7 @@ mod tests {
                     epoch: Arc::new(AtomicU64::new(1)),
                     meshes: Arc::new(AtomicUsize::new(0)),
                     drapes: Arc::new(Mutex::new(Vec::new())),
+                    substitutes: Vec::new(),
                 }),
                 crate::source::SourceOptions::default(),
             )
@@ -3496,6 +3602,105 @@ mod tests {
         }
     }
 
+    /// **A fallback specification is the host's to declare, at runtime, and
+    /// to remove** (`docs/explorations/imagery-layer-substitution.md`). By
+    /// default no substitute drape is ever asked for, even of a loader that
+    /// has one. Declared, the far tiles' drapes are asked of the substitute
+    /// layer, and every drawn tile stays dressed; removed, every tile wears
+    /// the source again. An invalid specification is refused with an error
+    /// and the one in force stays.
+    #[test]
+    fn a_fallback_specification_is_declared_and_removed_at_runtime() {
+        use crate::budget::{FallbackRule, FallbackSpec};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = LayerId(0).substitute();
+        let (mut stream, server, _, _, drapes) = draped_session_with(
+            dir.path(),
+            vec![LayerReach {
+                layer: sub,
+                max_level: 30,
+            }],
+        );
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        let substituted = |drapes: &Arc<Mutex<Vec<ResourceId>>>| {
+            drapes
+                .lock()
+                .expect("drapes")
+                .iter()
+                .filter(|r| r.layer() == Some(sub))
+                .count()
+        };
+        let dressed = |consumer: &Consumer| {
+            !consumer.draw.items.is_empty()
+                && consumer.draw.items.iter().all(|i| !i.drapes.is_empty())
+        };
+        look(&stream, near_view(), 1);
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        assert_eq!(substituted(&drapes), 0, "a substitute asked for by default");
+        assert!(dressed(&consumer));
+        let levels: Vec<u32> = consumer
+            .draw
+            .items
+            .iter()
+            .flat_map(|i| i.drapes.iter().map(|d| d.level))
+            .collect();
+        let (lo, hi) = (
+            levels.iter().copied().min().unwrap_or(0),
+            levels.iter().copied().max().unwrap_or(0),
+        );
+        assert!(hi > lo, "the scene's drapes span levels {lo}..={hi}");
+
+        // An invalid one is refused.
+        stream
+            .send(ClientMessage::Fallbacks(FallbackSpec::one(
+                FallbackRule::new(LayerId(0)).with_gap(0),
+            )))
+            .expect("send");
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        assert!(
+            consumer.errors.iter().any(|(_, m)| m.contains("gap")),
+            "{:?}",
+            consumer.errors
+        );
+        assert_eq!(substituted(&drapes), 0);
+
+        let gap = hi - lo;
+        stream
+            .send(ClientMessage::Fallbacks(FallbackSpec::one(
+                FallbackRule::new(LayerId(0))
+                    .with_gap(gap)
+                    .with_hysteresis(0),
+            )))
+            .expect("send");
+        look(&stream, near_view(), 2);
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        assert!(substituted(&drapes) > 0, "no substitute drape asked for");
+        assert!(dressed(&consumer), "a tile drawn bare");
+        let worn_sub = |consumer: &Consumer| {
+            consumer
+                .draw
+                .items
+                .iter()
+                .flat_map(|i| i.drapes.iter())
+                .filter(|d| d.resource.layer() == Some(sub))
+                .count()
+        };
+        assert!(worn_sub(&consumer) > 0, "no tile wears its substitute");
+        assert!(
+            crate::metrics::metrics().layer.drawn_substitute.total() > 0,
+            "drawn substitutes counted"
+        );
+
+        stream
+            .send(ClientMessage::Fallbacks(FallbackSpec::none()))
+            .expect("send");
+        look(&stream, near_view(), 3);
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        assert!(dressed(&consumer), "a tile drawn bare");
+        assert_eq!(worn_sub(&consumer), 0, "removed, the source again");
+    }
+
     /// **A still view asks the loader nothing while its store stands still,
     /// and the first step after a store event reads the new answer** (O1.5
     /// part 3, `TileLoader::store_events`). The drapes never arrive, so every
@@ -3568,6 +3773,7 @@ mod tests {
                 epoch: Arc::new(AtomicU64::new(1)),
                 meshes: Arc::new(AtomicUsize::new(0)),
                 drapes: Arc::new(Mutex::new(Vec::new())),
+                substitutes: Vec::new(),
             },
             stored: Arc::clone(&stored),
             asked: Arc::clone(&asked),

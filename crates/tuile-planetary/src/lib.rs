@@ -554,6 +554,11 @@ pub struct GlobeOptions {
     /// numbers they hang from — a bake that names its tiles — and charges
     /// the mesh as the whole of it.
     pub skirts_apart: bool,
+    /// The substitute of the imagery layer: another source the loader can
+    /// drape a tile from, in the layer's place, when the session's fallback
+    /// specification says so. `None` by default: no substitute is ever
+    /// asked for, and nothing changes.
+    pub substitute: Option<SubstituteImagery>,
 }
 
 impl Default for GlobeOptions {
@@ -570,6 +575,7 @@ impl Default for GlobeOptions {
             stored_imagery: tuile_core::texels::StoredPlan::default(),
             decode_normals: true,
             skirts_apart: false,
+            substitute: None,
         }
     }
 }
@@ -629,6 +635,60 @@ impl HeldDrape {
 impl std::fmt::Debug for HeldDrape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("HeldDrape(..)")
+    }
+}
+
+/// Which imagery a fetch is of: the source layer, or its substitute
+/// ([`GlobeOptions::substitute`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lane {
+    Source,
+    Substitute,
+}
+
+impl Lane {
+    /// The lane of a drape of `layer`, for a loader that has a substitute
+    /// or not: a substitute layer asked of a loader without one is drawn
+    /// from the source.
+    fn of(layer: LayerId, has_substitute: bool) -> Self {
+        if layer.is_substitute() && has_substitute {
+            Lane::Substitute
+        } else {
+            Lane::Source
+        }
+    }
+
+    fn role(self) -> tuile_core::metrics::LayerRole {
+        match self {
+            Lane::Source => tuile_core::metrics::LayerRole::Source,
+            Lane::Substitute => tuile_core::metrics::LayerRole::Substitute,
+        }
+    }
+}
+
+/// The substitute's half of the loader: its provider, its decoded tiles,
+/// its fetches in flight — the source's, again, for another imagery set.
+struct SubstituteLane {
+    provider: Arc<dyn ImageryProvider>,
+    cache: Mutex<ImageryCache>,
+    fetching: ImageryInFlight,
+}
+
+/// Why a substitute tile has no picture: absent at its level and at every
+/// level above. Its drape leaves it out, and the source floor covers.
+const ABSENT_EVERYWHERE: &str = "absent at every level of the substitute";
+
+/// An imagery source to draw a layer's far tiles from, in its place: any
+/// provider — a URL template, a catalog entry, a repository source. What
+/// tiles wear it is a fallback specification's to say
+/// (`tuile_core::budget::fallback`), not the loader's. See
+/// `docs/explorations/imagery-layer-substitution.md`.
+#[derive(Clone)]
+pub struct SubstituteImagery(pub Arc<dyn ImageryProvider>);
+
+impl std::fmt::Debug for SubstituteImagery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SubstituteImagery(..)")
     }
 }
 
@@ -750,6 +810,8 @@ pub struct PlanetaryLoader<T: TerrainSource, I: ImageryProvider> {
     /// The imagery tiles being fetched, so a tile several terrain tiles want
     /// at once is fetched once: see [`ImageryInFlight`].
     fetching: ImageryInFlight,
+    /// The substitute layer's lane, when the host gave one.
+    substitute: Option<SubstituteLane>,
     /// The terrain tiles being fetched or built, likewise.
     building: TerrainInFlight,
     /// What changed in what [`TileLoader::holds`] reads, as it changed: the
@@ -770,11 +832,56 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
     /// **now**. Every access goes through here, so no lookup can answer with
     /// a tile fetched before a switch.
     fn decoded(&self) -> std::sync::MutexGuard<'_, ImageryCache> {
-        let mut cache = self.cache.lock().expect("imagery cache");
-        if cache.turn_to(self.imagery.generation()) {
+        self.decoded_of(Lane::Source)
+    }
+
+    /// [`Self::decoded`], of the source or of the substitute.
+    fn decoded_of(&self, lane: Lane) -> std::sync::MutexGuard<'_, ImageryCache> {
+        let mut cache = self.cache_of(lane).lock().expect("imagery cache");
+        if cache.turn_to(self.provider(lane).generation()) && lane == Lane::Source {
             self.changes.note(store_log::Change::All);
         }
         cache
+    }
+
+    /// The provider of `lane`: the source's, or the substitute's when there
+    /// is one.
+    fn provider(&self, lane: Lane) -> &dyn ImageryProvider {
+        match (&self.substitute, lane) {
+            (Some(s), Lane::Substitute) => s.provider.as_ref(),
+            _ => &self.imagery,
+        }
+    }
+
+    fn cache_of(&self, lane: Lane) -> &Mutex<ImageryCache> {
+        match (&self.substitute, lane) {
+            (Some(s), Lane::Substitute) => &s.cache,
+            _ => &self.cache,
+        }
+    }
+
+    fn flights(&self, lane: Lane) -> &ImageryInFlight {
+        match (&self.substitute, lane) {
+            (Some(s), Lane::Substitute) => &s.fetching,
+            _ => &self.fetching,
+        }
+    }
+
+    /// Keeps a decoded tile of `lane`: the source's as
+    /// [`Self::keep_imagery`] does, the substitute's in its own cache (its
+    /// store's presence is not followed by the store log: see the design).
+    fn keep_of(
+        &self,
+        lane: Lane,
+        cache: &mut ImageryCache,
+        scheme: &raster::TilingScheme,
+        c: ImageryCoord,
+        tex: Arc<DecodedTexture>,
+    ) {
+        match lane {
+            Lane::Source => self.keep_imagery(cache, scheme, c, tex),
+            Lane::Substitute => cache.put(c, tex, &mut |_, _| {}),
+        }
     }
 
     /// Notes a change to what a drape's presence reads at imagery tile `c`:
@@ -838,10 +945,35 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         scheme: &raster::TilingScheme,
         c: ImageryCoord,
     ) -> Result<tuile_core::fetch::Fetched<bytes::Bytes>, RasterError> {
-        let before = self.imagery.holds(c);
-        let fetched = self.imagery.fetch_tile_bytes(c).await;
-        let after = self.imagery.holds(c);
-        if after != before {
+        self.imagery_bytes_of(Lane::Source, scheme, c).await
+    }
+
+    /// [`Self::imagery_bytes`], of `lane`, measured by layer role: the
+    /// request, its answer (a picture, an absence, an error), its bytes and
+    /// how long it took.
+    async fn imagery_bytes_of(
+        &self,
+        lane: Lane,
+        scheme: &raster::TilingScheme,
+        c: ImageryCoord,
+    ) -> Result<tuile_core::fetch::Fetched<bytes::Bytes>, RasterError> {
+        let provider = self.provider(lane);
+        let m = tuile_core::metrics::metrics().layer.of(lane.role());
+        m.requests.inc();
+        let started = tuile_core::metrics::stamp();
+        let before = provider.holds(c);
+        let fetched = provider.fetch_tile_bytes(c).await;
+        let after = provider.holds(c);
+        m.seconds.record(started.elapsed());
+        match &fetched {
+            Ok(f) => {
+                m.hits.inc();
+                m.bytes.add(f.value.len() as u64);
+            }
+            Err(RasterError::Fetch(FetchError::NotFound(_))) => m.absents.inc(),
+            Err(_) => m.errors.inc(),
+        }
+        if after != before && lane == Lane::Source {
             self.imagery_changed(scheme, c, false, store_log::Way::of(after));
         }
         fetched
@@ -899,7 +1031,18 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         &self,
         c: ImageryCoord,
     ) -> Result<(ImageryCoord, Arc<DecodedTexture>), LoadError> {
-        if let Some(tex) = self.decoded().get(&c) {
+        self.fetch_imagery_in(Lane::Source, c).await
+    }
+
+    /// [`Self::fetch_imagery`], of the source or of the substitute. An
+    /// absent substitute stands on its own ancestors, exactly as the source
+    /// does, never on the source.
+    async fn fetch_imagery_in(
+        &self,
+        lane: Lane,
+        c: ImageryCoord,
+    ) -> Result<(ImageryCoord, Arc<DecodedTexture>), LoadError> {
+        if let Some(tex) = self.decoded_of(lane).get(&c) {
             return Ok((c, tex));
         }
         // One fetch per tile at a time: an imagery tile spans several terrain
@@ -907,19 +1050,20 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // fetches; the others wait for its answer. If that first one is
         // cancelled — its terrain tile left the view — the next in line
         // fetches instead, so nobody waits on a fetch nobody makes.
-        let key = (self.imagery.generation(), c);
+        let key = (self.provider(lane).generation(), c);
+        let fetching = self.flights(lane);
         loop {
-            match self.fetching.join(key) {
+            match fetching.join(key) {
                 Turn::Wait(answer) => match answer.await {
                     Ok(answer) => return answer.map_err(LoadError::Failed),
                     Err(futures_channel::oneshot::Canceled) => continue,
                 },
                 Turn::Lead => {
                     let lead = Leading {
-                        flight: &self.fetching,
+                        flight: fetching,
                         key,
                     };
-                    let answer = self.fetch_imagery_once(c).await.map_err(|e| match e {
+                    let answer = self.fetch_imagery_once(lane, c).await.map_err(|e| match e {
                         LoadError::Failed(why) => why,
                         other => other.to_string(),
                     });
@@ -933,28 +1077,40 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
     /// [`Self::fetch_imagery`], for the one asker that fetches.
     async fn fetch_imagery_once(
         &self,
+        lane: Lane,
         c: ImageryCoord,
     ) -> Result<(ImageryCoord, Arc<DecodedTexture>), LoadError> {
+        let provider = self.provider(lane);
+        let sub = lane == Lane::Substitute;
+        // An absent tile stood on its parent, counted by layer role.
+        let stand_on_parent = || {
+            tuile_core::metrics::metrics()
+                .layer
+                .of(lane.role())
+                .ancestor_fallbacks
+                .inc();
+            Box::pin(self.fetch_imagery_in(lane, parent_of(c)))
+        };
         // Read before the fetch, and compared after it: bytes that were asked
         // of one imagery set and answered across a switch belong to neither
         // side's cache.
-        let generation = self.imagery.generation();
-        if let Some(tex) = self.decoded().get(&c) {
+        let generation = provider.generation();
+        if let Some(tex) = self.decoded_of(lane).get(&c) {
             return Ok((c, tex));
         }
-        let scheme = self.imagery.tiling_scheme();
+        let scheme = provider.tiling_scheme();
         if self.opts.imagery_by_stamp {
-            match self.imagery.fetch_tile_stamp(c).await {
+            match provider.fetch_tile_stamp(c).await {
                 // The digest of a picture the provider sends for "no
                 // imagery": the absence it stands for, as below.
                 tuile_core::storage::Stamp::Present(stamp)
                     if c.level > scheme.minimum_level
                         && tuile_bing::is_empty_digest(stamp.digest) =>
                 {
-                    return Box::pin(self.fetch_imagery(parent_of(c))).await;
+                    return stand_on_parent().await;
                 }
                 tuile_core::storage::Stamp::Present(stamp) => {
-                    self.provenance.stamped_imagery(c, stamp.digest);
+                    self.provenance.stamped_imagery_of(sub, c, stamp.digest);
                     // The size the bytes would have decoded to — reprojection
                     // keeps it — and no pixels: nothing composes this drape.
                     let tex = Arc::new(DecodedTexture::from_rgba8(
@@ -962,9 +1118,9 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                         stamp.height,
                         Vec::new(),
                     ));
-                    let mut cache = self.decoded();
+                    let mut cache = self.decoded_of(lane);
                     if cache.generation == generation {
-                        self.keep_imagery(&mut cache, &scheme, c, Arc::clone(&tex));
+                        self.keep_of(lane, &mut cache, &scheme, c, Arc::clone(&tex));
                     }
                     return Ok((c, tex));
                 }
@@ -972,7 +1128,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                 // `NotFound` below would. At the coarsest level the bytes
                 // path says what it says.
                 tuile_core::storage::Stamp::Absent if c.level > scheme.minimum_level => {
-                    return Box::pin(self.fetch_imagery(parent_of(c))).await;
+                    return stand_on_parent().await;
                 }
                 _ => {}
             }
@@ -986,7 +1142,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // Bytes, not the decoded texture: decoding is CPU work, and taking it
         // here rather than inside the provider is what lets it leave this
         // thread together with the resampling below, in one hop.
-        let fetched = self.imagery_bytes(&scheme, c).await;
+        let fetched = self.imagery_bytes_of(lane, &scheme, c).await;
         drop(outstanding);
         // Below the coarsest level, what stands for no imagery is stood over:
         // never draped, never a hole — the ancestor's picture of the same
@@ -1001,11 +1157,11 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                     y = c.y,
                     "the provider's no-imagery picture, standing on parent"
                 );
-                Box::pin(self.fetch_imagery(parent_of(c))).await
+                stand_on_parent().await
             }
             Ok(fetched) => {
                 tracing::debug!(z = c.level, x = c.x, y = c.y, "imagery tile");
-                self.provenance.fetched_imagery(c, &fetched.value);
+                self.provenance.fetched_imagery_of(sub, c, &fetched.value);
                 // Decode, resample and inspect in a single offloaded job. All
                 // three are pure CPU over the same buffer, so splitting them
                 // would only pay the hop three times and undo the locality.
@@ -1038,13 +1194,13 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                     );
                     tuile_core::metrics::metrics().black_textures.inc();
                     if stands_over {
-                        return Box::pin(self.fetch_imagery(parent_of(c))).await;
+                        return stand_on_parent().await;
                     }
                 }
                 {
-                    let mut cache = self.decoded();
+                    let mut cache = self.decoded_of(lane);
                     if cache.generation == generation {
-                        self.keep_imagery(&mut cache, &scheme, c, Arc::clone(&tex));
+                        self.keep_of(lane, &mut cache, &scheme, c, Arc::clone(&tex));
                     }
                 }
                 Ok((c, tex))
@@ -1059,7 +1215,13 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                     y = c.y,
                     "imagery absent, standing on parent"
                 );
-                Box::pin(self.fetch_imagery(parent_of(c))).await
+                stand_on_parent().await
+            }
+            // A substitute absent all the way up: its drape leaves the tile
+            // out and the source floor covers the ground. Not an error — an
+            // answer — so it never backs the substitute off.
+            Err(RasterError::Fetch(FetchError::NotFound(_))) if sub => {
+                Err(LoadError::Failed(ABSENT_EVERYWHERE.to_owned()))
             }
             Err(e) => Err(LoadError::Failed(format!("imagery {c:?}: {e}"))),
         }
@@ -1324,21 +1486,35 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         false
     }
 
-    /// The imagery tiles `id`'s drape at the budget's `level` would be made
-    /// of — the floor under it first — without fetching any.
-    fn drape_coords(&self, id: TileId, level: u32) -> Vec<ImageryCoord> {
+    /// The imagery tiles `id`'s drape of `lane` at the budget's `level`
+    /// would be made of, without fetching any: the floor (always the
+    /// source's), and the tiles to hold — for the source the floor first,
+    /// then the mosaic; for the substitute its mosaic alone.
+    fn drape_coords_of(
+        &self,
+        lane: Lane,
+        id: TileId,
+        level: u32,
+    ) -> (ImageryCoord, Vec<ImageryCoord>) {
         let (z, x, y) = id.terrain_coord();
         let rect = self.georect(TileCoord::new(z, x, y));
-        let scheme = self.imagery.tiling_scheme();
+        let floor_scheme = self.imagery.tiling_scheme();
+        let scheme = self.provider(lane).tiling_scheme();
         let lat = 0.5 * (rect.south + rect.north);
         let mosaic = scheme.mosaic_at_level(
             &rect,
             self.provider_level(&scheme, level, lat),
             self.opts.imagery_slots.get() - 1,
         );
-        let mut coords = vec![self.opts.floor_under(&scheme, &rect, &self.cache)];
-        coords.extend(mosaic.tiles());
-        coords
+        let floor = self.opts.floor_under(&floor_scheme, &rect, &self.cache);
+        match lane {
+            Lane::Source => {
+                let mut coords = vec![floor];
+                coords.extend(mosaic.tiles());
+                (floor, coords)
+            }
+            Lane::Substitute => (floor, mosaic.tiles()),
+        }
     }
 
     /// Composes `id`'s drape of `layer` at the budget's imagery `level`,
@@ -1359,14 +1535,26 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
     ) -> Result<DrapeContent, LoadError> {
         let (z, x, y) = id.terrain_coord();
         let rect = self.georect(TileCoord::new(z, x, y));
+        let lane = Lane::of(layer, self.substitute.is_some());
         loop {
             let generation = self.imagery.generation();
+            let lane_generation = self.provider(lane).generation();
             let mut drape = self.compose_once(&rect, id, layer, level).await?;
-            if self.imagery.generation() == generation {
-                for tile in &mut drape.tiles {
+            if self.imagery.generation() == generation
+                && self.provider(lane).generation() == lane_generation
+            {
+                let floor_tiles = drape.floor_tiles;
+                for (i, tile) in drape.tiles.iter_mut().enumerate() {
                     // Truncated on purpose: an identity among the imagery sets
-                    // one session holds at once, of which there are two.
-                    tile.source = generation as u32;
+                    // one session holds at once, of which there are two. A
+                    // substitute's tiles carry its bit: another picture of
+                    // the same coords (the floor is the source's).
+                    tile.source = if lane == Lane::Substitute && i >= floor_tiles {
+                        (lane_generation as u32 & !raster::SUBSTITUTE_SOURCE)
+                            | raster::SUBSTITUTE_SOURCE
+                    } else {
+                        generation as u32
+                    };
                 }
                 return Ok(drape);
             }
@@ -1383,7 +1571,13 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // The cache is turned to the imagery being served before anything
         // looks into it — `floor_under` below does, by its own lock.
         drop(self.decoded());
-        let scheme = self.imagery.tiling_scheme();
+        // A drape of the substitute layer: its mosaic from the substitute,
+        // its floor from the source — the pinned floor is one set of tiles,
+        // and the guarantee against black ground is not the substitute's.
+        let lane = Lane::of(layer, self.substitute.is_some());
+        drop(self.decoded_of(lane));
+        let floor_scheme = self.imagery.tiling_scheme();
+        let scheme = self.provider(lane).tiling_scheme();
         // The level the budget asked for, on the provider's grid: chosen per
         // tile from how large a texel looks on screen, independently of the
         // terrain level (I10) — not from a global altitude, not frozen when
@@ -1427,7 +1621,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // which was fine while every layer was going to be fetched anyway. It
         // has to move up here because it is part of what identifies the drape,
         // and the identity has to exist before the first request.
-        let floor = self.opts.floor_under(&scheme, rect, &self.cache);
+        let floor = self.opts.floor_under(&floor_scheme, rect, &self.cache);
 
         // Already composed by the consumer: fetch nothing, decode nothing.
         //
@@ -1437,7 +1631,8 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // composed the drape it is holding. See `raster::drape_identity` for
         // why the two agree, and for the one direction in which they may not.
         if let Some(held) = &self.opts.held_drape {
-            let identity = tuile_core::raster::drape_identity(
+            let identity = tuile_core::raster::drape_identity_of(
+                layer,
                 std::iter::once(floor).chain(coords.iter().copied()),
                 self.opts.composed_at,
             );
@@ -1458,7 +1653,8 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         }
 
         let fetched =
-            futures_util::future::join_all(coords.iter().map(|c| self.fetch_imagery(*c))).await;
+            futures_util::future::join_all(coords.iter().map(|c| self.fetch_imagery_in(lane, *c)))
+                .await;
 
         let mut layers = Vec::with_capacity(coords.len() + 1);
 
@@ -1488,9 +1684,9 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                     texture,
                     rect,
                     &to_the_pole(
-                        scheme.tile_rect(floor),
+                        floor_scheme.tile_rect(floor),
                         floor,
-                        scheme.tiles_at(floor.level).1,
+                        floor_scheme.tiles_at(floor.level).1,
                     ),
                 );
                 if layer.is_visible() {
@@ -1529,7 +1725,17 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
             );
         }
         for (got, covers) in fetched.into_iter().zip(coverage) {
-            let (served, texture) = got?;
+            let (served, texture) = match got {
+                // A substitute absent all the way up: left out, the source
+                // floor covers its ground. Never the source retried for it.
+                Err(LoadError::Failed(why))
+                    if lane == Lane::Substitute && why == ABSENT_EVERYWHERE =>
+                {
+                    dropped += 1;
+                    continue;
+                }
+                got => got?,
+            };
             let layer = raster::ImageryLayer::substituted(
                 served,
                 texture,
@@ -1658,7 +1864,8 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                 );
             }
         }
-        let identity = tuile_core::raster::drape_identity(
+        let identity = tuile_core::raster::drape_identity_of(
+            layer,
             layers.iter().map(|l| l.coord),
             self.opts.composed_at,
         );
@@ -1694,7 +1901,12 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
     /// The imagery being served: a switch of imagery is a change of what
     /// every tile's content is, which is exactly what an epoch says.
     fn epoch(&self) -> u64 {
-        self.imagery.generation()
+        // A switch of the substitute is a change of what its drapes are too.
+        self.imagery.generation().wrapping_add(
+            self.substitute
+                .as_ref()
+                .map_or(0, |s| s.provider.generation()),
+        )
     }
 
     async fn warm_up(&self, through_level: u32) {
@@ -1814,6 +2026,21 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
                 layer: LayerId(0),
                 max_level: deepest,
             }],
+            // The substitute's reach, on its own grid, when there is one.
+            substitutes: self
+                .substitute
+                .as_ref()
+                .map(|sub| {
+                    let scheme = sub.provider.tiling_scheme();
+                    LayerReach {
+                        layer: LayerId(0).substitute(),
+                        max_level: (i64::from(scheme.maximum_level)
+                            - self.level_offset(&scheme, lat))
+                        .max(0) as u32,
+                    }
+                })
+                .into_iter()
+                .collect(),
         })
     }
 
@@ -1840,14 +2067,31 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
                 let (z, x, y) = t.terrain_coord();
                 self.mesh_held(TileCoord::new(z, x, y))
             }
-            ResourceId::Drape { tile, level, .. } => {
+            ResourceId::Drape { tile, layer, level } => {
                 // The coords first: choosing the floor reads the cache under
                 // its own lock, which must not be held here yet.
-                let coords = self.drape_coords(tile, level);
-                let cache = self.decoded();
-                coords
-                    .into_iter()
-                    .all(|c| cache.has(&c) || self.imagery.holds(c))
+                let lane = Lane::of(layer, self.substitute.is_some());
+                let (floor, coords) = self.drape_coords_of(lane, tile, level);
+                match lane {
+                    Lane::Source => {
+                        let cache = self.decoded();
+                        coords
+                            .into_iter()
+                            .all(|c| cache.has(&c) || self.imagery.holds(c))
+                    }
+                    Lane::Substitute => {
+                        let floor_held = {
+                            let source = self.decoded();
+                            source.has(&floor) || self.imagery.holds(floor)
+                        };
+                        let cache = self.decoded_of(lane);
+                        let provider = self.provider(lane);
+                        floor_held
+                            && coords
+                                .into_iter()
+                                .all(|c| cache.has(&c) || provider.holds(c))
+                    }
+                }
             }
         };
         if held {
@@ -2017,6 +2261,11 @@ where
             .with_max_level(deepest_useful),
     );
     let heights = Arc::new(TerrainHeights::new(scheme));
+    let substitute = opts.substitute.clone().map(|s| SubstituteLane {
+        provider: s.0,
+        cache: Mutex::new(ImageryCache::new(512)),
+        fetching: ImageryInFlight::default(),
+    });
     let loader: Arc<dyn TileLoader> = Arc::new(PlanetaryLoader {
         terrain,
         imagery,
@@ -2025,6 +2274,7 @@ where
         cache: Mutex::new(ImageryCache::new(512)),
         meshes: Mutex::new(MeshCache::new(512)),
         fetching: ImageryInFlight::default(),
+        substitute,
         building: TerrainInFlight::default(),
         changes: store_log::StoreLog::default(),
         availability,
@@ -2147,6 +2397,7 @@ mod tests {
             cache: Mutex::new(ImageryCache::new(8)),
             meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
+            substitute: None,
             building: TerrainInFlight::default(),
             changes: store_log::StoreLog::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
@@ -2195,6 +2446,7 @@ mod tests {
             cache: Mutex::new(ImageryCache::new(8)),
             meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
+            substitute: None,
             building: TerrainInFlight::default(),
             changes: store_log::StoreLog::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
@@ -2283,6 +2535,7 @@ mod tests {
             cache: Mutex::new(ImageryCache::new(64)),
             meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
+            substitute: None,
             building: TerrainInFlight::default(),
             changes: store_log::StoreLog::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
@@ -2436,6 +2689,7 @@ mod tests {
             cache: Mutex::new(ImageryCache::new(64)),
             meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
+            substitute: None,
             building: TerrainInFlight::default(),
             changes: store_log::StoreLog::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
@@ -2708,6 +2962,7 @@ mod tests {
             cache: Mutex::new(ImageryCache::new(cap)),
             meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
+            substitute: None,
             building: TerrainInFlight::default(),
             changes: store_log::StoreLog::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
@@ -2762,7 +3017,10 @@ mod tests {
         let here = ResourceId::drape(ground_id(), LayerId(0), 9);
         let far = TileId::from_terrain(GROUND.level, 3 * GROUND.x, GROUND.y);
         let there = ResourceId::drape(far, LayerId(0), 9);
-        let cap = store_loader(1).drape_coords(ground_id(), 9).len();
+        let cap = store_loader(1)
+            .drape_coords_of(Lane::Source, ground_id(), 9)
+            .1
+            .len();
         let loader = store_loader(cap);
         let start = loader.store_events();
         assert_eq!(loader.holds(here), Presence::Absent);
@@ -2930,6 +3188,7 @@ mod tests {
             cache: Mutex::new(ImageryCache::new(8)),
             meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
+            substitute: None,
             building: TerrainInFlight::default(),
             changes: store_log::StoreLog::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
@@ -3047,6 +3306,7 @@ mod tests {
             cache: Mutex::new(ImageryCache::new(8)),
             meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
+            substitute: None,
             building: TerrainInFlight::default(),
             changes: store_log::StoreLog::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
@@ -3128,5 +3388,197 @@ mod tests {
         assert_eq!(served(&loader, top), top);
         // And below it, black stands on black up to the top: still ground.
         assert_eq!(served(&loader, IN_THE_BAY), top);
+    }
+
+    /// A flat shade that logs what it is asked, absent at and below level
+    /// `absent_from`, or unreachable.
+    struct Logged {
+        shade: u8,
+        absent_from: u32,
+        unreachable: bool,
+        asked: Mutex<Vec<ImageryCoord>>,
+    }
+
+    impl Logged {
+        fn new(shade: u8) -> Arc<Self> {
+            Arc::new(Logged {
+                shade,
+                absent_from: u32::MAX,
+                unreachable: false,
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+        fn asked(&self) -> Vec<ImageryCoord> {
+            self.asked.lock().expect("asked").clone()
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl raster::ImageryProvider for Logged {
+        fn tiling_scheme(&self) -> raster::TilingScheme {
+            raster::TilingScheme::geographic()
+        }
+
+        async fn fetch_tile_bytes(
+            &self,
+            coord: ImageryCoord,
+        ) -> Result<tuile_core::fetch::Fetched<bytes::Bytes>, raster::RasterError> {
+            self.asked.lock().expect("asked").push(coord);
+            if self.unreachable {
+                return Err(RasterError::Fetch(FetchError::Io {
+                    url: url::Url::parse("https://substitute.invalid/").expect("a url"),
+                    message: "unreachable".to_owned(),
+                }));
+            }
+            if coord.level >= self.absent_from {
+                return Err(RasterError::Fetch(FetchError::NotFound(
+                    url::Url::parse(&format!("https://substitute.invalid/{}", coord.level))
+                        .expect("a url"),
+                )));
+            }
+            Painted(self.shade).fetch_tile_bytes(coord).await
+        }
+    }
+
+    /// A loader over `source`, with `substitute` as its substitute lane.
+    fn lane_loader(
+        source: &Arc<Logged>,
+        substitute: Option<&Arc<Logged>>,
+    ) -> PlanetaryLoader<NoTerrain, Held<dyn ImageryProvider>> {
+        let scheme = GeographicTilingScheme::default();
+        let source: Arc<dyn ImageryProvider> = Arc::clone(source) as Arc<dyn ImageryProvider>;
+        let sub = substitute.map(|s| SubstituteImagery(Arc::clone(s) as Arc<dyn ImageryProvider>));
+        PlanetaryLoader {
+            terrain: NoTerrain,
+            imagery: Held(source),
+            scheme,
+            opts: GlobeOptions {
+                substitute: sub.clone(),
+                ..GlobeOptions::default()
+            },
+            cache: Mutex::new(ImageryCache::new(64)),
+            meshes: Mutex::new(MeshCache::new(8)),
+            fetching: ImageryInFlight::default(),
+            substitute: sub.map(|s| SubstituteLane {
+                provider: s.0,
+                cache: Mutex::new(ImageryCache::new(64)),
+                fetching: ImageryInFlight::default(),
+            }),
+            building: TerrainInFlight::default(),
+            changes: store_log::StoreLog::default(),
+            availability: Arc::new(tuile_terrain::Availability::default()),
+            provenance: Arc::default(),
+            heights: Arc::new(TerrainHeights::new(scheme)),
+            offload: offload::inline(),
+        }
+    }
+
+    fn drape_of(
+        loader: &PlanetaryLoader<NoTerrain, Held<dyn ImageryProvider>>,
+        layer: LayerId,
+    ) -> Result<DrapeContent, LoadError> {
+        futures_executor::block_on(loader.load_drape(ground_id(), layer, 9))
+    }
+
+    /// **A substitute drape is its own picture**: its mosaic asked of the
+    /// substitute and stamped with the substitute's bit, its floor the
+    /// source's, its identity another than the source drape's of the same
+    /// tile and level. The source drape asks the substitute nothing.
+    #[test]
+    fn a_substitute_drape_is_composed_from_the_substitute_over_the_source_floor() {
+        let (source, sub) = (Logged::new(200), Logged::new(60));
+        let loader = lane_loader(&source, Some(&sub));
+        let plain = drape_of(&loader, LayerId(0)).expect("the source drape");
+        assert!(
+            sub.asked().is_empty(),
+            "the source drape asked the substitute"
+        );
+        assert!(plain.tiles.iter().all(|t| t.source == 0));
+        let asked_before = source.asked().len();
+        let drape = drape_of(&loader, LayerId(0).substitute()).expect("the substitute drape");
+        assert!(!sub.asked().is_empty());
+        assert_eq!(drape.floor_tiles, 1);
+        assert_eq!(drape.tiles[0].source, 0, "the floor is the source's");
+        assert!(drape.tiles[1..]
+            .iter()
+            .all(|t| t.source & raster::SUBSTITUTE_SOURCE != 0));
+        assert!(drape.tiles[1..]
+            .iter()
+            .all(|t| t.texture.rgba8().and_then(|p| p.first()) == Some(&60)));
+        assert_eq!(
+            source.asked().len(),
+            asked_before,
+            "the source asked again for a substitute drape"
+        );
+        assert_ne!(drape.identity, plain.identity);
+        let reach = loader.drapes(ground_id()).expect("draped");
+        assert_eq!(
+            reach.substitute(LayerId(0)),
+            Some(reach.layers[0].max_level)
+        );
+    }
+
+    /// **By default there is no substitute**: none reported, none asked.
+    #[test]
+    fn without_a_substitute_none_is_reported_or_asked() {
+        let source = Logged::new(200);
+        let loader = lane_loader(&source, None);
+        assert!(loader
+            .drapes(ground_id())
+            .expect("draped")
+            .substitutes
+            .is_empty());
+        // A substitute layer asked of a loader without one is the source.
+        let drape = drape_of(&loader, LayerId(0).substitute()).expect("drape");
+        assert!(drape.tiles.iter().all(|t| t.source == 0));
+    }
+
+    /// **An absent substitute stands on its own ancestor, never on the
+    /// source**; absent all the way up, the tile is left to the source
+    /// floor — a drape, never an empty one, never an error.
+    #[test]
+    fn an_absent_substitute_stands_on_its_ancestor_then_on_the_floor() {
+        let source = Logged::new(200);
+        let sub = Arc::new(Logged {
+            absent_from: 7,
+            ..Arc::try_unwrap(Logged::new(60)).ok().expect("one")
+        });
+        let loader = lane_loader(&source, Some(&sub));
+        let before = source.asked().len();
+        let drape = drape_of(&loader, LayerId(0).substitute()).expect("a drape");
+        let mosaic = &drape.tiles[drape.floor_tiles..];
+        assert!(!mosaic.is_empty());
+        assert!(mosaic.iter().all(|t| t.coord.level < 7), "its ancestor");
+        let floor_only = drape.floor_tiles;
+        assert!(
+            source.asked().len() <= before + floor_only,
+            "the source retried for a substitute tile"
+        );
+        let nowhere = Arc::new(Logged {
+            absent_from: 0,
+            ..Arc::try_unwrap(Logged::new(60)).ok().expect("one")
+        });
+        let loader = lane_loader(&source, Some(&nowhere));
+        let drape = drape_of(&loader, LayerId(0).substitute()).expect("a drape");
+        assert_eq!(drape.tiles.len(), 1, "the floor alone");
+        assert_eq!(drape.tiles[0].source, 0);
+    }
+
+    /// **An unreachable substitute fails its drape** — so the session backs
+    /// off from it — and the source's drapes are untouched.
+    #[test]
+    fn an_unreachable_substitute_fails_its_drape_only() {
+        let source = Logged::new(200);
+        let sub = Arc::new(Logged {
+            unreachable: true,
+            ..Arc::try_unwrap(Logged::new(60)).ok().expect("one")
+        });
+        let loader = lane_loader(&source, Some(&sub));
+        assert!(drape_of(&loader, LayerId(0).substitute()).is_err());
+        assert!(drape_of(&loader, LayerId(0)).is_ok());
+        let m = tuile_core::metrics::metrics()
+            .layer
+            .of(tuile_core::metrics::LayerRole::Substitute);
+        assert!(m.errors.get() > 0, "the substitute's errors counted");
     }
 }

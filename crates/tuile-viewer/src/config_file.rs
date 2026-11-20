@@ -15,6 +15,9 @@
 //! name = "Aerial"
 //! asset = 2
 //! attribution = "© Microsoft and its data suppliers"
+//! substitute = "aerial-coarse"          # optional: the layer its far tiles are drawn from
+//! substitute_gap = 4                    # optional: levels below the finest drawn (default 4)
+//! substitute_hysteresis = 1             # optional: levels of hysteresis (default 1)
 //!
 //! [start]                               # optional: where the first session opens
 //! lon = 6.86
@@ -299,6 +302,8 @@ fn read_section(
 
 fn read_imagery(section: &str, layers: &[Value]) -> Result<Vec<ImageryChoice>, Problem> {
     let mut out: Vec<ImageryChoice> = Vec::new();
+    // (layer, the key of its substitute, gap, hysteresis, where it was said)
+    let mut substitutes: Vec<(usize, String, u32, u32, String)> = Vec::new();
     for (i, layer) in layers.iter().enumerate() {
         let at = |key: &str| {
             format!(
@@ -316,13 +321,44 @@ fn read_imagery(section: &str, layers: &[Value]) -> Result<Vec<ImageryChoice>, P
                 Some(_) => Err((at(key), "must be a non-empty string".into())),
             }
         };
+        const KEYS: [&str; 7] = [
+            "key",
+            "name",
+            "asset",
+            "attribution",
+            "substitute",
+            "substitute_gap",
+            "substitute_hysteresis",
+        ];
         for key in layer.keys() {
-            if !["key", "name", "asset", "attribution"].contains(&key.as_str()) {
+            if !KEYS.contains(&key.as_str()) {
                 return Err((
                     at(key),
-                    "unknown key; a layer has key, name, asset and attribution".into(),
+                    "unknown key; a layer has key, name, asset, attribution, substitute, \
+                     substitute_gap and substitute_hysteresis"
+                        .into(),
                 ));
             }
+        }
+        let number = |key: &str, default: u32| -> Result<u32, Problem> {
+            match layer.get(key) {
+                None => Ok(default),
+                Some(Value::Integer(n)) => u32::try_from(*n)
+                    .map_err(|_| (at(key), "must be a small positive number".into())),
+                Some(_) => Err((at(key), "must be a number".into())),
+            }
+        };
+        if let Some(of) = text("substitute")? {
+            substitutes.push((
+                out.len(),
+                of,
+                number("substitute_gap", tuile_core::budget::FallbackRule::GAP)?,
+                number(
+                    "substitute_hysteresis",
+                    tuile_core::budget::FallbackRule::HYSTERESIS,
+                )?,
+                at("substitute"),
+            ));
         }
         let asset = asset(
             layer
@@ -346,6 +382,28 @@ fn read_imagery(section: &str, layers: &[Value]) -> Result<Vec<ImageryChoice>, P
         let name = text("name")?.unwrap_or_else(|| key.clone());
         let attribution = text("attribution")?.unwrap_or_default();
         out.push(ImageryChoice::new(&key, &name, asset, &attribution));
+    }
+    // A substitute is another layer of the list, by its key; the rule's
+    // numbers are checked as the session will check them.
+    for (i, of, gap, hysteresis, at) in substitutes {
+        let Some(sub) = out.iter().find(|l| l.key == of).cloned() else {
+            return Err((at, format!("names no layer of this list: {of:?}")));
+        };
+        if sub.key == out[i].key {
+            return Err((at, "a layer cannot stand in for itself".into()));
+        }
+        let choice = crate::embed::SubstituteChoice {
+            asset: sub.asset,
+            cache: sub.cache.clone(),
+            gap,
+            hysteresis,
+        };
+        let layer = out[i].clone().with_substitute(choice);
+        layer
+            .fallbacks()
+            .validate()
+            .map_err(|e| (at.clone(), e.to_string()))?;
+        out[i] = layer;
     }
     Ok(out)
 }
@@ -502,6 +560,21 @@ pub(crate) fn settings_text(section: &str, settings: &Settings) -> String {
                 if !l.attribution.is_empty() {
                     t.insert("attribution".into(), Value::String(l.attribution.clone()));
                 }
+                let named = l.substitute.as_ref().and_then(|s| {
+                    settings
+                        .imagery
+                        .iter()
+                        .find(|o| o.cache == s.cache)
+                        .map(|o| (o.key.clone(), s))
+                });
+                if let Some((key, s)) = named {
+                    t.insert("substitute".into(), Value::String(key));
+                    t.insert("substitute_gap".into(), Value::Integer(i64::from(s.gap)));
+                    t.insert(
+                        "substitute_hysteresis".into(),
+                        Value::Integer(i64::from(s.hysteresis)),
+                    );
+                }
                 Value::Table(t)
             })
             .collect();
@@ -592,6 +665,50 @@ mod tests {
         assert_eq!(s.imagery[1].key, "asset3954");
         assert_eq!(s.start.len(), 3);
         assert_eq!(s.headline().as_deref(), Some("Aerial (asset 2)"));
+    }
+
+    /// A layer names another as its substitute, by key: its asset and its
+    /// namespace, and the rule's numbers; written back as read. A layer
+    /// without one has none; a missing layer and a bad gap are refused.
+    #[test]
+    fn a_layer_names_its_substitute() {
+        let text = format!(
+            r#"
+            [ion]
+            token = "{FAKE}"
+
+            [[ion.imagery]]
+            key = "aerial"
+            asset = 2
+            substitute = "aerial-coarse"
+            substitute_gap = 5
+
+            [[ion.imagery]]
+            key = "aerial-coarse"
+            asset = 7
+            "#
+        );
+        let s = read(&text).expect("a file").settings;
+        let sub = s.imagery[0].substitute.clone().expect("a substitute");
+        assert_eq!((sub.asset, sub.gap, sub.hysteresis), (7, 5, 1));
+        assert_eq!(sub.cache, s.imagery[1].cache);
+        assert_eq!(
+            s.imagery[0].fallbacks().to_query(),
+            "layer=0&gap=5&hysteresis=1"
+        );
+        assert!(s.imagery[1].substitute.is_none());
+        assert!(s.imagery[1].fallbacks().is_none());
+        let again = read(&format!(
+            "[ion]\ntoken = \"{FAKE}\"\n{}",
+            settings_text("ion", &s).replace("[ion]\n", "")
+        ))
+        .expect("written back")
+        .settings;
+        assert_eq!(again.imagery, s.imagery, "round trip");
+        let missing = text.replace("substitute = \"aerial-coarse\"", "substitute = \"none\"");
+        assert!(read(&missing).is_err());
+        let bad = text.replace("substitute_gap = 5", "substitute_gap = 0");
+        assert!(read(&bad).is_err());
     }
 
     #[test]

@@ -190,8 +190,61 @@ pub struct Generation(pub u64);
 
 /// An imagery layer: one source draped over the ground. Layers stack in
 /// their order, 0 at the bottom (the base imagery), overlays above.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// A layer with [`LayerId::SUBSTITUTE`] set is the **substitute** of the
+/// layer without it: the same ground from another source, worn in its place
+/// where a fallback rule says so ([`crate::fallback`]). The two are one
+/// family: a substitute sorts right after its base layer, so the stacking
+/// of overlays is untouched, and a tile waiting for one is dressed by the
+/// other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LayerId(pub u16);
+
+impl LayerId {
+    /// The bit that marks a substitute layer.
+    pub const SUBSTITUTE: u16 = 0x8000;
+
+    /// This layer's substitute.
+    pub const fn substitute(self) -> LayerId {
+        LayerId(self.0 | Self::SUBSTITUTE)
+    }
+
+    /// The layer this one stands for: itself, for a base layer.
+    pub const fn base(self) -> LayerId {
+        LayerId(self.0 & !Self::SUBSTITUTE)
+    }
+
+    /// Whether this is a substitute layer.
+    pub const fn is_substitute(self) -> bool {
+        self.0 & Self::SUBSTITUTE != 0
+    }
+
+    /// The other layer of its family: the substitute of a base layer, the
+    /// base of a substitute.
+    pub const fn sibling(self) -> LayerId {
+        LayerId(self.0 ^ Self::SUBSTITUTE)
+    }
+
+    /// The stacking key: the base layer, then the substitute after it.
+    const fn key(self) -> (u16, bool) {
+        (self.0 & !Self::SUBSTITUTE, self.is_substitute())
+    }
+}
+
+impl PartialOrd for LayerId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+// By family: a layer, then its substitute, then the next layer. For layers
+// without the bit — every session without a fallback rule — the order is
+// the numbers', as it always was.
+impl Ord for LayerId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
 
 /// What the budget manages: a tile's mesh, or a tile's drape — its imagery
 /// of one layer at one level (D-A4). Requests, the ledger and evictions are

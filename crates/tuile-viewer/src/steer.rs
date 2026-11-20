@@ -181,6 +181,12 @@ pub(crate) enum Command {
     /// The CPU profiles taken and pushed, or not
     /// (`tuile_telemetry::set_profiling`).
     Profiling(bool),
+    /// The base layer's far tiles drawn from its substitute — tiles `gap`
+    /// levels or more below the finest drawn, `hysteresis` levels of
+    /// hysteresis — or (`None`) from the layer itself: a fallback
+    /// specification, for a host whose layer has a substitute
+    /// (`docs/explorations/imagery-layer-substitution.md`).
+    Fallback(Option<(u32, u32)>),
 }
 
 /// Which of `layers` a person, a flag, a URL or a script means by `text`: a
@@ -392,6 +398,20 @@ pub(crate) fn parse_url_among(
                 _ => Err("tileset takes asset= and show=on|off".to_owned()),
             }
         }
+        "fallback" => match pairs.as_slice() {
+            [("show", "off")] => Ok(vec![Command::Fallback(None)]),
+            _ => {
+                let query: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                let spec = tuile_core::budget::FallbackSpec::from_query(&query.join("&"))
+                    .map_err(|e| e.to_string())?;
+                match spec.rules.as_slice() {
+                    [rule] if rule.layer.0 == 0 => {
+                        Ok(vec![Command::Fallback(Some((rule.gap, rule.hysteresis)))])
+                    }
+                    _ => Err("fallback takes gap= and hysteresis=, or show=off".to_owned()),
+                }
+            }
+        },
         "telemetry" => {
             if pairs.is_empty() {
                 return Err("telemetry changes nothing: give metrics= or profiling=".to_owned());
@@ -1062,6 +1082,23 @@ mod tests {
                 ..Goto::default()
             })
         );
+    }
+
+    /// A fallback specification at runtime: declared with its numbers,
+    /// removed with `show=off`; a gap out of bounds is refused.
+    #[test]
+    fn a_fallback_is_declared_and_removed_by_url() {
+        assert_eq!(
+            one("tuile://fallback?gap=5&hysteresis=2"),
+            Command::Fallback(Some((5, 2)))
+        );
+        assert_eq!(
+            one("tuile://fallback?gap=4"),
+            Command::Fallback(Some((4, 1)))
+        );
+        assert_eq!(one("tuile://fallback?show=off"), Command::Fallback(None));
+        assert!(parse_url("tuile://fallback?gap=0").is_err());
+        assert!(parse_url("tuile://fallback?layer=3").is_err());
     }
 
     #[test]

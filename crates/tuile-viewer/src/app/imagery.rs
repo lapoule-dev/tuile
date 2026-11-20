@@ -131,6 +131,7 @@ impl App {
                         peak: before,
                     });
                     self.say(&format!("imagery: {name}"));
+                    self.declare_the_fallbacks(switched.layer);
                     self.imagery.answered(switched.layer, Some(generation))
                 }
                 // Nothing changed, and nothing was taken off the screen to
@@ -144,6 +145,25 @@ impl App {
             if let (Some(next), Some(session)) = (next, self.session.as_ref()) {
                 session.switcher.ask(next, &self.imagery.layers[next]);
             }
+        }
+    }
+
+    /// Puts layer `layer`'s fallback specification in force: its substitute
+    /// drawn on the far tiles, or none. Sent only by a host some layer of
+    /// which has a substitute: every other session's stream is as it was.
+    pub(super) fn declare_the_fallbacks(&mut self, layer: usize) {
+        if !self.imagery.layers.iter().any(|l| l.substitute.is_some()) {
+            return;
+        }
+        let Some(spec) = self.imagery.layers.get(layer).map(ImageryChoice::fallbacks) else {
+            return;
+        };
+        if let Some(session) = self.session.as_mut() {
+            // Best effort: a closed stream means the session is over.
+            let _ = tuile_core::protocol::GeometryStream::send(
+                &session.stream,
+                tuile_core::protocol::ClientMessage::Fallbacks(spec),
+            );
         }
     }
 

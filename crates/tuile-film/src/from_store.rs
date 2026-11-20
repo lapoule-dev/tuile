@@ -143,9 +143,11 @@ pub fn terrain_mesh(
     })
 }
 
+/// The tile's coord in its own store — the substitute's, for a tile with
+/// [`StoreTile::SUBSTITUTE`] set.
 fn coord_of(tile: &StoreTile) -> ImageryCoord {
     ImageryCoord {
-        level: u32::from(tile.level),
+        level: u32::from(tile.store_level()),
         x: u64::from(tile.x),
         y: u64::from(tile.y),
     }
@@ -184,7 +186,11 @@ pub fn compose(
         .imagery
         .iter()
         .map(|placed| ImageryLayer {
-            source: 0,
+            source: if placed.tile.is_substitute() {
+                raster::SUBSTITUTE_SOURCE
+            } else {
+                0
+            },
             coord: coord_of(&placed.tile),
             texture: texture(&placed.tile),
             coverage: placed.coverage,

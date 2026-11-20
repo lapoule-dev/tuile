@@ -227,6 +227,14 @@ mod tests {
             metrics::histogram!("tuile_frame_time_seconds").record(0.012);
             metrics::counter!("tuile_tiles_fetch_total", "url" => "https://tiles.example/1.png")
                 .increment(1);
+            // The imagery layers' series, by role, as the engine publishes
+            // them: a substitute asked, answered absent, a decision made.
+            let layer = &tuile_core::metrics::metrics().layer;
+            let sub = layer.of(tuile_core::metrics::LayerRole::Substitute);
+            sub.requests.inc();
+            sub.absents.inc();
+            layer.fallback_active.set(1);
+            tuile_metrics::publish(tuile_core::metrics::metrics());
         });
         // The engine's series reach it too, through `tuile_metrics::publish`
         // — which writes to the global recorder, absent in a test: the
@@ -256,6 +264,35 @@ mod tests {
             .iter()
             .any(|m| m["name"] == "tuile_frame_time_seconds"));
         assert!(!req.body.contains("tiles.example"), "{}", req.body);
+        // The substitution's series, labelled by layer role, allow-listed.
+        let named = |n: &str| {
+            metrics
+                .as_array()
+                .expect("metrics")
+                .iter()
+                .find(|m| m["name"] == n)
+                .cloned()
+        };
+        let requests = named("tuile_layer_requests_total").expect("requests by layer");
+        let points = requests["sum"]["dataPoints"].to_string();
+        assert!(
+            points.contains("\"layer_role\"") && points.contains("\"substitute\""),
+            "{points}"
+        );
+        for n in [
+            "tuile_layer_responses_total",
+            "tuile_layer_bytes_total",
+            "tuile_layer_fetch_seconds_sum",
+            "tuile_layer_ancestor_fallbacks_total",
+            "tuile_layer_switches_total",
+            "tuile_layer_backoffs_total",
+            "tuile_layer_fallback_active",
+            "tuile_layer_fallback_suspended",
+        ] {
+            assert!(named(n).is_some(), "{n} not pushed");
+        }
+        let drawn = req.body.contains("drapes_substitute");
+        assert!(drawn, "the drapes drawn by layer and level");
         // The camera's pose, from the first push after it is handed over.
         assert!(
             !req.body.contains("tuile_camera_"),

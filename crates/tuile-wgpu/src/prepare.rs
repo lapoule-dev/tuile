@@ -431,7 +431,14 @@ pub fn prepare(
         .collect();
     let passes = passes(gpu, &worn);
     let sharpest_imagery_level = own.iter().map(|l| l.coord.level).max();
-    let imagery_source = own.iter().map(|l| l.source).max();
+    // The imagery generation the tile shows, read off its source tiles: a
+    // substitute's tiles carry their own lane's generation, and the floor
+    // under them — the source's — says which source picture this is.
+    let imagery_source = own
+        .iter()
+        .filter(|l| l.source & tuile_core::raster::SUBSTITUTE_SOURCE == 0)
+        .map(|l| l.source)
+        .max();
     drop(worn);
 
     // Each mesh with its normals, made where it has none: what is uploaded,

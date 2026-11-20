@@ -125,6 +125,33 @@ pub enum ImagerySpec {
 pub struct GlobeSources {
     pub terrain: TerrainSpec,
     pub imagery: ImagerySpec,
+    /// A substitute for the imagery's far tiles, and the fallback rule that
+    /// says which: `None` (the default) substitutes nothing. See
+    /// `docs/explorations/imagery-layer-substitution.md`.
+    pub substitute: Option<Substitute>,
+}
+
+/// Another imagery the far tiles are draped from, and the rule that says
+/// where: tiles at least `rule.gap` levels coarser than the finest drawn.
+#[derive(Clone)]
+pub struct Substitute {
+    pub imagery: ImagerySpec,
+    pub rule: tuile_core::budget::FallbackRule,
+}
+
+impl Substitute {
+    /// `imagery` in the base layer's place, with the default rule.
+    pub fn new(imagery: ImagerySpec) -> Self {
+        Self {
+            imagery,
+            rule: tuile_core::budget::FallbackRule::new(tuile_core::budget::LayerId(0)),
+        }
+    }
+
+    /// The fallback specification this substitute is drawn under.
+    pub fn spec(&self) -> tuile_core::budget::FallbackSpec {
+        tuile_core::budget::FallbackSpec::one(self.rule)
+    }
 }
 
 impl GlobeSources {
@@ -133,6 +160,7 @@ impl GlobeSources {
         Self {
             terrain: TerrainSpec::Url(terrain),
             imagery: ImagerySpec::Xyz(imagery),
+            substitute: None,
         }
     }
 }
@@ -143,6 +171,8 @@ pub(crate) struct Resolved {
     pub layer: LayerJson,
     pub terrain: Arc<dyn TerrainSource>,
     pub imagery: Arc<dyn ImageryProvider>,
+    /// The substitute's provider, resolved like the imagery.
+    pub substitute: Option<Arc<dyn ImageryProvider>>,
 }
 
 /// The transport an address is fetched through: the native HTTP stack, or a
@@ -171,7 +201,11 @@ impl GlobeSources {
     /// Resolves both halves: an address is opened, a hosted asset asked for.
     pub(crate) async fn resolve(&self) -> Result<Resolved, String> {
         let needs_http = matches!(self.terrain, TerrainSpec::Url(_))
-            || matches!(self.imagery, ImagerySpec::Xyz(_));
+            || matches!(self.imagery, ImagerySpec::Xyz(_))
+            || matches!(
+                self.substitute.as_ref().map(|s| &s.imagery),
+                Some(ImagerySpec::Xyz(_))
+            );
         let http = if needs_http {
             Some(http().await?)
         } else {
@@ -196,28 +230,42 @@ impl GlobeSources {
                 .await
                 .map_err(|why| format!("terrain {asset}: {why}"))?,
         };
-        let imagery: Arc<dyn ImageryProvider> = match &self.imagery {
-            ImagerySpec::Xyz(template) => {
-                template.check()?;
-                let http = http.ok_or("no HTTP client")?;
-                Arc::new(tuile_core::raster::TemplateProvider::new(
-                    template.template.clone(),
-                    http,
-                    template.scheme(),
-                ))
-            }
-            ImagerySpec::Provider(provider) => Arc::clone(provider),
-            ImagerySpec::Hosted { sources, asset } => sources
-                .imagery(*asset)
-                .await
-                .map_err(|why| format!("imagery {asset}: {why}"))?,
+        let imagery = imagery_of(&self.imagery, http.clone()).await?;
+        let substitute = match &self.substitute {
+            Some(s) => Some(imagery_of(&s.imagery, http).await?),
+            None => None,
         };
         Ok(Resolved {
             layer,
             terrain,
             imagery,
+            substitute,
         })
     }
+}
+
+/// An imagery spec, resolved: a template opened over `http`, a provider as
+/// it is, a hosted asset asked for.
+async fn imagery_of(
+    spec: &ImagerySpec,
+    http: Option<Arc<Http>>,
+) -> Result<Arc<dyn ImageryProvider>, String> {
+    Ok(match spec {
+        ImagerySpec::Xyz(template) => {
+            template.check()?;
+            let http = http.ok_or("no HTTP client")?;
+            Arc::new(tuile_core::raster::TemplateProvider::new(
+                template.template.clone(),
+                http,
+                template.scheme(),
+            ))
+        }
+        ImagerySpec::Provider(provider) => Arc::clone(provider),
+        ImagerySpec::Hosted { sources, asset } => sources
+            .imagery(*asset)
+            .await
+            .map_err(|why| format!("imagery {asset}: {why}"))?,
+    })
 }
 
 #[cfg(test)]
