@@ -18,6 +18,7 @@ mod engine;
 pub mod error;
 mod held;
 pub mod imagery;
+pub mod inputs;
 pub mod need;
 mod need_state;
 pub mod observe;
@@ -25,6 +26,7 @@ pub mod priority;
 #[doc(hidden)]
 pub mod snapshot;
 mod sorted;
+pub mod spec;
 mod state;
 pub mod stats;
 pub mod tier;
@@ -38,6 +40,7 @@ pub use decisions::{
     Decisions, DrapeChoice, Drapes, DrawItem, DrawSet, Role, Serves, Start, SwapGroup, UploadPlan,
 };
 pub use error::{AuditError, ConfigError, SessionError};
+pub use inputs::{Measured, Prediction, Smoothed, TierSample};
 pub use imagery::{DrapeCandidate, GeoRect, LevelClamp, TexelFootprint, UvTransform};
 pub use need::{ImageryNeed, LayerReach, Membership, Need, NeedDelta, NeedSet};
 pub use observe::{
@@ -45,6 +48,10 @@ pub use observe::{
     Histogram, StepRecord, Violations,
 };
 pub use priority::{PriorityKey, Quantised, Urgency};
+pub use spec::{
+    Band, Facts, Params, Predicate, RestoreCosts, Rule, SpecError, SpecKind, Specification,
+    Speculation, Term,
+};
 pub use stats::{level_index, BudgetStats, CancelReason, Deficit, EvictReason, LEVELS};
 pub use tier::{NoStore, Presence, PresenceOracle, Source, Tier};
 pub use types::{
@@ -313,12 +320,21 @@ pub struct Budget {
     /// The statistics of arrivals applied ahead of their step
     /// ([`Budget::apply_arrivals`]), reported by it.
     pending: BudgetStats,
+    /// The specification in force (`spec`), and one given for the next
+    /// step.
+    spec: spec::Specification,
+    spec_next: Option<spec::Specification>,
+    /// The measured inputs as smoothed from the samples given
+    /// (`inputs`), and the sample given for the next step.
+    smoothed: inputs::Smoothed,
+    measured_next: Option<inputs::Measured>,
 }
 
 impl Budget {
     /// A budget running on `cfg`.
     pub fn new(cfg: BudgetConfig) -> Result<Self, ConfigError> {
         cfg.validate()?;
+        let policy = cfg.policy;
         Ok(Budget {
             arena: state::Arena::new(cfg.pinned_level),
             cfg,
@@ -351,7 +367,52 @@ impl Budget {
             underflows: 0,
             fatal: None,
             pending: BudgetStats::default(),
+            spec: spec::Specification::for_policy(policy),
+            spec_next: None,
+            smoothed: inputs::Smoothed::default(),
+            measured_next: None,
         })
+    }
+
+    /// The specification in force: the policy of the decider
+    /// (`docs/explorations/budget-eviction-prefetch-spec.md` §3).
+    pub fn specification(&self) -> &spec::Specification {
+        &self.spec
+    }
+
+    /// Gives the decider another specification, from the next step on: the
+    /// host's, chosen by its use context (ordinary navigation, an FPV
+    /// flight, a film's plan), or a diagnostic override. Refused when
+    /// invalid; the one in force stays. The host records it with the step
+    /// (`BudgetEvent::Specify`), so a replay gives it back at the same step.
+    pub fn specify(&mut self, s: spec::Specification) -> Result<(), spec::SpecError> {
+        s.validate()?;
+        self.spec_next = Some(s);
+        Ok(())
+    }
+
+    /// What the host measured (the device's memory, each tier's cost), for
+    /// the next step: smoothed by the budget, deterministically over the
+    /// samples given (spec §4). The host records it with the step
+    /// (`BudgetEvent::Measured`).
+    pub fn measure(&mut self, m: inputs::Measured) {
+        self.measured_next = Some(m);
+    }
+
+    /// The measured inputs, smoothed.
+    pub fn smoothed(&self) -> &inputs::Smoothed {
+        &self.smoothed
+    }
+
+    /// Takes in what the host gave since the last step: called first in a
+    /// step, at its time.
+    pub(crate) fn take_inputs(&mut self, now: Micros) {
+        if let Some(s) = self.spec_next.take() {
+            self.spec = s;
+        }
+        if let Some(m) = self.measured_next.take() {
+            self.smoothed.take(&m, now);
+        }
     }
 
     /// The configuration.
