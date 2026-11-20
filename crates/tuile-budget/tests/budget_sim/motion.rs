@@ -293,6 +293,7 @@ fn slow_dive_converges(profile: Profile, seed: u64, bound: Micros) {
     let watch = (bound.0 as f64 / 1e6).max(8.0);
     sim.run(watch, &|_| slow_dive(10.0));
     let took = converged_within(&sim, stop);
+    eprintln!("slow dive, {name}: converged {took:?} after the stop");
     assert!(
         took <= bound,
         "P2.4, {name}: converged {took:?} after the stop"

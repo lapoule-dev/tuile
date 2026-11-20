@@ -188,6 +188,16 @@ fn soak(minutes: u64) {
     }
     // `decide` alone: the budget's own cost per step, not the simulation's.
     let decide = sim.decide_us.clone();
+    // The drapes fetched over the tour, from the network and locally, for
+    // the record (`--nocapture`): what a change of the drape wants costs.
+    let drape_starts = sim.log.iter().fold([0u64; 2], |a, l| {
+        let s = l.stats.starts[tuile_budget::Class::Drape];
+        [a[0] + u64::from(s[0]), a[1] + u64::from(s[1])]
+    });
+    eprintln!(
+        "soak {minutes} min: drape starts {} local, {} network",
+        drape_starts[0], drape_starts[1]
+    );
     // The first window warms the caches; the slope is measured from the
     // second one on.
     let span = Micros::from_secs(60).0 * minutes.min(5) / 5;
