@@ -546,30 +546,68 @@ ds/dt  = Ks·p − Kd·(s − 1)·[p == 0]               (LOD scale: rises with 
 
 ## 7. Telemetry and the reason view
 
-### 7.1 Metrics (`tuile_budget_*`, through `BudgetSignals` and the existing exporters)
+### 7.1 Metrics (`tuile_budget_*`, OpenTelemetry through tuile-metrics → tuile-telemetry)
 
-| Name | Type | Labels | What |
-|---|---|---|---|
-| `deficit_levels` | gauge | `kind` = `mesh` \| `imagery` | `D(k)`, unweighted levels |
-| `deficit_weighted` | gauge | `kind` | `D(k)`, screen-weighted (‰) |
-| `under_need_tiles` | gauge | `kind` | drawn places with `worn < need` (#251's count) |
-| `over_need_tiles` | gauge | `kind` | `worn > need` |
-| `deficit_seconds_total` | counter | `kind` | `Σ D(k)·dt`, the objective's integral |
-| `rest_deficit_seconds` | histogram | | time from the views going still to `D = 0` |
-| `headroom_bytes` | gauge | `class` | `H` |
-| `headroom_target_bytes` | gauge | `class` | `H*` |
-| `release_rate_bytes` | gauge | | the controller's `r` |
-| `decisions_total` | counter | `list` = `start` \| `evict` \| `release`, `reason` | per decision reason (§7.2) |
-| `spec_active` | gauge | `spec` = `interactive` \| `known_path` \| `film` \| `fpv` \| `fpv_film` \| `custom` | 1 for the one in force |
-| `spec_blend` | gauge | | 0–1 progress of a re-specification |
-| `prefetch_used_total`, `prefetch_wasted_bytes_total` | counter | `class` | speculative loads used before release / released unused (SARC's waste, §10b) |
-| `bucket_refused_total` | counter | `flow` = `start` \| `speculative` \| `upload` \| `release` | congestion: tokens refused |
-| `queue_depth`, `wait_seconds` | gauge, histogram | `class` | congestion |
-| `measured_cost_seconds` | gauge | `tier` | the smoothed restore cost per tier |
+Everything the decider does is trackable (Laurent, 2026-11-20). Every series below is a
+field of `BudgetSignals`, exported by `BudgetSignals::series` (the one list both the
+Prometheus endpoint and the OTLP push read), the same natively and on the web (the worker
+publishes its signals to the page, which pushes them). **Cardinality is bounded by
+construction**: every label is a closed set listed in `observe::labels` and in
+`tuile_telemetry::resource::ALLOWED_LABELS`; no tile, place, URL or path ever is a label.
+Histograms have fixed buckets. Units are in the name (`_seconds`, `_bytes`, `_total`).
 
-The labels `kind`, `list`, `flow` and `spec` are closed sets, added to
-`tuile_telemetry::resource::ALLOWED_LABELS` and to `observe::labels` (the existing
-`reason`, `class`, `tier` are reused). No tile, place or path in any label.
+| Name | Type | Labels | Unit | What |
+|---|---|---|---|---|
+| **Quality** | | | | |
+| `under_need_tiles` | gauge | `kind` = `mesh`\|`imagery` | tiles | drawn places under their need (#251's count) |
+| `over_need_tiles` | gauge | `kind` | tiles | over their need |
+| `deficit_levels` | gauge | `kind` | levels | `D(k)` unweighted |
+| `deficit_weighted` | gauge | `kind` | level·‰ | `D(k)` screen-weighted |
+| `deficit_level_seconds_total` | counter | `kind` | level·s | the objective's integral |
+| `deficit_by_level` | gauge | `kind`, `level` | levels | `D(k)` by the need's level (0–24) |
+| `under_need_still_seconds` | gauge | | s | views still and some place under its need, for how long |
+| **Decisions and their score** | | | | |
+| `decisions_total` | counter | `list` = `start`\|`evict`\|`release`, `reason`, `class` | decisions | per decision reason (§7.2) |
+| `decision_value` | histogram | `list`, `class`, `reason` | µs of value (`le` 1 ms … 60 s, doubling) | the value at decision time: what was loaded / released was worth this |
+| `decision_leaf_total` | counter | `list`, `term` = `recency`\|`restore`\|`next_use`\|`deficit`\|`screen` | decisions | the specification's term that dominated the value (provenance, §10b) |
+| `mechanism_corrections_total` | counter | `law` = `1`…`5` | decisions | a proposal the mechanism refused (absolute laws) |
+| **Prefetch outcome** | | | | |
+| `prefetch_started_total` | counter | `class`, `band` = `ring`\|`ancestor`\|`predicted` | loads | speculative starts |
+| `prefetch_used_total` | counter | `class` | loads | drawn before released |
+| `prefetch_wasted_bytes_total` | counter | `class` | bytes | released unused (waste) |
+| `prefetch_pollution_total` | counter | `class` | evictions | a resource released for a speculative load and needed again before it (Do No Harm broken: must stay 0) |
+| **Loads** | | | | |
+| `starts_total` (exists) | counter | `class`, `source` = `local`\|`network` | loads | |
+| `loads_by_tier_total` | counter | `class`, `tier` = `decoded`\|`stored`\|`http_cache`\|`remote` | loads | by the tier they came from |
+| `loads_by_layer_total` | counter | `layer` = `0`…`7` (the session's imagery layer slots) | loads | drape loads per layer — the label scheme shared with the layer-substitution work (one `layer` slot index, never a layer's name or URL) |
+| **Headroom, flows, congestion** | | | | |
+| `headroom_bytes`, `headroom_target_bytes` | gauge | `class` | bytes | `H`, `H*` |
+| `release_rate_bytes_per_second` | gauge | | B/s | the controller's `r` |
+| `evictions_total` (exists) | counter | `class`, `reason` | evictions | reasons extended: `headroom`\|`pressure`\|`room`\|`hard`\|`respecified`\|`replaced` |
+| `bucket_refused_total` | counter | `flow` = `start`\|`speculative`\|`upload`\|`release` | tokens | congestion |
+| `queue_depth` | gauge | `class` | wants | ranked, not started |
+| `in_flight` (exists) | gauge | `class`, `source` | loads | |
+| `wait_seconds` | histogram | `class` | s | want → start |
+| `deadline_deferrals_total` (exists) | counter | | uploads | upload deferrals |
+| `measured_cost_seconds` | gauge | `tier` | s | the smoothed restore cost per tier (§4.2) |
+| **Specification** | | | | |
+| `spec_info` | gauge (= 1) | `spec` = `interactive`\|`known_path`\|`film`\|`fpv`\|`fpv_film`\|`custom`, `source` = `context`\|`override` | | the specification in force, and whether a diagnostic override set it |
+| `spec_changes_total` | counter | `spec`, `source` | changes | re-specifications |
+| `spec_blend` | gauge | | 0–1 | a re-specification's progress |
+| **Regulator** | | | | |
+| `sse_scale` (exists) | gauge | | ratio | the LOD actuator |
+| `controller_error_bytes`, `controller_integral` | gauge | `class` | bytes, B·s | the controller's state (§6.4) |
+| **Cost of deciding** | | | | |
+| `decide_seconds`, `decide_work` (exist) | histogram, gauge | | s, units | |
+
+The labels `kind`, `list`, `term`, `law`, `band`, `layer`, `flow`, `spec` are added to the
+allow-list with this module (`tier`, `class`, `reason`, `level`, `source` are already on it).
+An export test drives a budget through a fake OTLP receiver (`tuile-telemetry`'s test
+collector) and asserts every name above arrives, with only allow-listed labels.
+
+The first PR that wires the viewer (PR 5) exports the quality, specification and existing
+series; the score histograms, prefetch outcome and flow series come with the PRs that
+create what they measure (4, 7, 8), each with its export test.
 
 ### 7.2 Decision reasons (law 13)
 
