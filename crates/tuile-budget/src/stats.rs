@@ -114,6 +114,13 @@ pub struct BudgetStats {
     /// Resources the step visited: need entries, wants, ranked work and
     /// tracked entries scanned. Deterministic: P6.4's work counter.
     pub work: u32,
+    /// Draped tiles whose imagery level moved this step (or the level its
+    /// hysteresis carries under a stand-in): a change the need
+    /// did not name (the level follows the footprint, the scale, what the
+    /// local tiers hold), whose tiles the next step reads again (the
+    /// hysteresis reads the last level). A count of work, as `work` is:
+    /// out of the recorded reference's digest.
+    pub levels_moved: u32,
     /// Decoded CPU bytes held.
     pub decoded: Bytes,
     /// Bytes delivered and not yet acknowledged.
@@ -270,6 +277,7 @@ impl BudgetStats {
         put(u64::from(self.local_waits));
         put(u64::from(self.fallback_depth_max));
         put(u64::from(self.work));
+        put(u64::from(self.levels_moved));
         for n in self.imagery_over_terrain.iter().chain(&self.latency_ms) {
             put(u64::from(*n));
         }

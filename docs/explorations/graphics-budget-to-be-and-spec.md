@@ -625,9 +625,13 @@ a test that failed, mostly a livelock the simulation found. Spec and code now ag
 ### 11.4 Imagery
 - The footprint is relaxed with `sse_scale`: under pressure imagery coarsens as terrain
   does. Without it the low clamp (160 MiB) never converged.
-- When the level asked is held nowhere locally, a level held on the GPU, decoded or in a
-  store, within one level of the window between the relaxed and the unrelaxed need, is
-  taken instead: a relaxation never sends to the network what a local tier can show (I15).
+- Under a relaxation (an SSE scale above one), when the level asked is held nowhere
+  locally, a level held on the GPU, decoded or in a store, within one level of the window
+  between the relaxed and the unrelaxed need, is taken instead: a relaxation never sends to
+  the network what a local tier can show (I15). At scale one the level is the need's own and
+  is fetched; a held neighbour dresses the tile meanwhile, as for any load, and never
+  settles in its place. The hysteresis remembers the level the footprint gave, never the
+  stand-in worn in its place, so a tile back at scale one re-levels to its need.
   Batch takes the exact level, with no hysteresis, so a frame is a function of its inputs.
 - A finer drape already worn is kept; under pressure the downgrade wins.
 - The decoded tier releases copies of protected GPU residents first, then of evictable

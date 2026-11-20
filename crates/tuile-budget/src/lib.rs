@@ -260,6 +260,11 @@ pub struct Budget {
     /// counted into `work`, put P6.4 over its bound on the tour's big zoom
     /// (115 978 against 113 728) and on a still step by one unit (O1.5).
     imagery_prev: std::collections::BTreeMap<(TileId, LayerId), u32>,
+    /// Where a stand-in is worn in place of the level the footprint gave
+    /// (`engine`'s `drape_levels`, under a relaxation), that level: the
+    /// one the hysteresis reads, never the stand-in, so a tile back at
+    /// scale one re-levels to its need. Sparse: the stand-ins only.
+    imagery_stood_in: std::collections::BTreeMap<(TileId, LayerId), u32>,
     /// The tiles whose meshes were drawn last step as themselves or held
     /// (not as a fallback).
     held_last: sorted::SortedMap<TileId, ()>,
@@ -317,6 +322,7 @@ impl Budget {
             tiles: Default::default(),
             need: Default::default(),
             imagery_prev: Default::default(),
+            imagery_stood_in: Default::default(),
             held_last: Default::default(),
             ranked_last: Vec::new(),
             steps: 0,
@@ -582,6 +588,11 @@ impl Budget {
                 .map(|(t, i)| (*t, i.parent(), i.level, i.rect().map(snapshot::rect_bits)))
                 .collect(),
             imagery_prev: self.imagery_prev.iter().map(|(k, v)| (*k, *v)).collect(),
+            imagery_stood_in: self
+                .imagery_stood_in
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
             held_last: self.held_last.keys().copied().collect(),
             drawn_last: marked(state::Mark::Drawn),
             worn_last: self

@@ -405,7 +405,7 @@ struct StepLists {
     marks: Vec<ResourceId>,
     slots: Vec<Slot>,
     held: Vec<TileId>,
-    levels: Vec<(LayerId, u32)>,
+    levels: Vec<(LayerId, u32, u32)>,
     layers: Vec<LayerId>,
     entries: Vec<(ResourceId, Role)>,
     old_entries: Vec<(ResourceId, Role)>,
@@ -1042,12 +1042,13 @@ impl Budget {
         }
 
         #[cfg(debug_assertions)]
-        let last = self.imagery_prev.clone();
+        let last = (self.imagery_prev.clone(), self.imagery_stood_in.clone());
         #[cfg(debug_assertions)]
         self.check_ancestry();
         self.levels_pass(tiles, presence, &mut l);
+        st.levels_moved = sat_u32(l.moved.len());
         #[cfg(debug_assertions)]
-        self.check_levels(tiles, presence, &last);
+        self.check_levels(tiles, presence, &last.0, &last.1);
         self.floor_pass(tiles, &mut l);
         self.selection_pass(tiles, full, &mut l);
         #[cfg(debug_assertions)]
@@ -1110,14 +1111,23 @@ impl Budget {
                     t,
                     tn,
                     presence,
-                    &self.imagery_prev,
+                    self.kept_levels(),
                     &mut l.levels,
                     &mut asked,
                 );
-                for &(layer, level) in &l.levels {
-                    if self.imagery_prev.insert((t, layer), level) != Some(level) {
+                for &(layer, level, footprint) in &l.levels {
+                    let key = (t, layer);
+                    if self.imagery_prev.insert(key, level) != Some(level) {
                         moved = true;
                     }
+                    // A move of the hysteresis' own level is a move too:
+                    // the next step reads it.
+                    let stood = if footprint == level {
+                        self.imagery_stood_in.remove(&key).is_some()
+                    } else {
+                        self.imagery_stood_in.insert(key, footprint) != Some(footprint)
+                    };
+                    moved |= stood;
                 }
             }
             if moved {
@@ -2442,6 +2452,7 @@ impl Budget {
         }
         for k in &gone {
             self.imagery_prev.remove(k);
+            self.imagery_stood_in.remove(k);
         }
         self.down.step.gone = gone;
         visited
@@ -2859,6 +2870,7 @@ impl Budget {
         tiles: &SortedMap<TileId, TileNeed>,
         presence: &dyn PresenceOracle,
         last: &std::collections::BTreeMap<(TileId, LayerId), u32>,
+        stood_in: &std::collections::BTreeMap<(TileId, LayerId), u32>,
     ) {
         /// Asked, it answers nothing and says so.
         struct Silent(std::cell::Cell<bool>);
@@ -2880,16 +2892,22 @@ impl Budget {
             let silent = Silent(std::cell::Cell::new(false));
             let oracle: &dyn PresenceOracle = if far { presence } else { &silent };
             let mut asked = false;
-            self.drape_levels(*t, tn, oracle, last, &mut levels, &mut asked);
+            self.drape_levels(*t, tn, oracle, (last, stood_in), &mut levels, &mut asked);
             assert!(
                 far || (!asked && !silent.0.get()),
                 "{t:?} asked the presence index but is not read when it may have changed"
             );
-            for (layer, level) in &levels {
+            for (layer, level, footprint) in &levels {
                 assert_eq!(
                     self.imagery_prev.get(&(*t, *layer)),
                     Some(level),
                     "the level of {t:?}'s layer {layer:?} is the one a reading gives"
+                );
+                assert_eq!(
+                    self.imagery_stood_in.get(&(*t, *layer)),
+                    (footprint != level).then_some(footprint),
+                    "the level {t:?}'s layer {layer:?} carries under a stand-in is the one a \
+                     reading gives"
                 );
             }
         }

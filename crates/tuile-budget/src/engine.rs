@@ -186,6 +186,14 @@ pub(super) const MESH: u8 = 1 << 1;
 pub(super) const DRAPES: u8 = 1 << 2;
 pub(super) const WORN: u8 = 1 << 3;
 
+/// The imagery levels kept from the step before: the level chosen, and,
+/// where a stand-in was worn in its place, the level the hysteresis carries
+/// (`Budget::drape_levels`).
+pub(super) type KeptLevels<'a> = (
+    &'a BTreeMap<(TileId, LayerId), u32>,
+    &'a BTreeMap<(TileId, LayerId), u32>,
+);
+
 impl Reach {
     /// It read `what` of `t`.
     pub fn saw(&mut self, t: TileId, what: u8) {
@@ -707,23 +715,32 @@ impl Budget {
     }
 
     /// The imagery level of each layer tile `t` asks for this step, into
-    /// `out` in layer order, a layer listed twice at its last listing's
-    /// level. `asked` is set when the presence index was asked: the levels
-    /// then hold for this step only.
+    /// `out` in layer order with the level the hysteresis carries (the
+    /// footprint's, the same unless a stand-in is taken), a layer listed
+    /// twice at its last listing's levels. `last` holds the levels kept
+    /// from the step before: `imagery_prev`, and `imagery_stood_in` (the
+    /// hysteresis' level where a stand-in was worn). `asked` is set when
+    /// the presence index was
+    /// asked: the levels then hold for this step only.
     ///
     /// The level follows the texel footprint (relaxed with the LOD, with
-    /// hysteresis). When that level is held nowhere locally, a level already
-    /// held (GPU, decoded, store) is taken instead if it lies within one
-    /// level of the window between the relaxed and the unrelaxed need: a
-    /// relaxation never sends to the network what a local tier can show
-    /// (I14, I15). Batch takes the exact level, a function of the frame.
+    /// hysteresis). Under a relaxation (`Budget::relaxing`), when that
+    /// level is held nowhere locally, a level already held (GPU, decoded,
+    /// store) is taken instead if it lies within one level of the window
+    /// between the relaxed and the unrelaxed need: a relaxation never sends
+    /// to the network what a local tier can show (I14, I15). With none in
+    /// force the level is the need's own, fetched: a held neighbour of it
+    /// dresses the tile meanwhile, as for any load, and never settles in
+    /// its place — else a tile stood in for stayed a level coarser than its
+    /// neighbours for good. Batch takes the exact level, a function of the
+    /// frame.
     pub(super) fn drape_levels(
         &self,
         t: TileId,
         tn: &TileNeed,
         presence: &dyn PresenceOracle,
-        last: &BTreeMap<(TileId, LayerId), u32>,
-        out: &mut Vec<(LayerId, u32)>,
+        last: KeptLevels<'_>,
+        out: &mut Vec<(LayerId, u32, u32)>,
         asked: &mut bool,
     ) {
         out.clear();
@@ -744,16 +761,19 @@ impl Budget {
                 source_max: reach.max_level,
             };
             if batch {
-                out.push((reach.layer, needed_level(None, img.footprint, clamp)));
+                let level = needed_level(None, img.footprint, clamp);
+                out.push((reach.layer, level, level));
                 continue;
             }
-            let prev = last.get(&key).copied();
+            // The hysteresis reads the footprint's last level, never a
+            // stand-in worn in its place.
+            let prev = last.1.get(&key).or_else(|| last.0.get(&key)).copied();
             let relaxed = needed_level(prev, img.footprint.relaxed(self.scale), clamp);
             let mut level = relaxed;
             let tier = |r: ResourceId, asked: &mut bool| {
                 self.tier_asked(r, self.arena.find(r), Class::Drape, presence, asked)
             };
-            if tier(drape(relaxed), asked) == Tier::Remote {
+            if self.relaxing() && tier(drape(relaxed), asked) == Tier::Remote {
                 let full = needed_level(prev, img.footprint, clamp);
                 let ceiling = tn.need.level.saturating_add(cap).min(reach.max_level);
                 let lo = relaxed.min(full).saturating_sub(1).max(floor);
@@ -771,18 +791,35 @@ impl Budget {
                     }
                 }
             }
-            out.push((reach.layer, level));
+            out.push((reach.layer, level, relaxed));
         }
         // The layers in order, a layer listed twice in the order listed
-        // (a stable sort); then the last listing's level.
+        // (a stable sort); then the last listing's levels.
         out.sort_by_key(|e| e.0);
         out.dedup_by(|later, earlier| {
             let same = later.0 == earlier.0;
             if same {
                 earlier.1 = later.1;
+                earlier.2 = later.2;
             }
             same
         });
+    }
+
+    /// The levels a step keeps for the next: the chosen ones
+    /// (`imagery_prev`), and the hysteresis' own where a stand-in was worn
+    /// (`imagery_stood_in`).
+    pub(super) fn kept_levels(&self) -> KeptLevels<'_> {
+        (&self.imagery_prev, &self.imagery_stood_in)
+    }
+
+    /// Whether a relaxation is in force: the LOD scale above one. A local
+    /// stand-in is taken for a drape level under one only
+    /// (`Budget::drape_levels`). A memory pressure relaxes through the
+    /// scale (its targets shrink, the scale climbs); every level is read
+    /// again when the scale moves, so the stand-ins follow it.
+    pub(super) fn relaxing(&self) -> bool {
+        self.scale > 1_000
     }
 
     /// Tile `t`'s drape needs this step — each layer it asks for, in layer
