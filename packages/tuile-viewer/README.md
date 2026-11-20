@@ -115,6 +115,7 @@ two minutes. In a query `+` reads as a space: write an instant's zone as `Z`
 | `on(event, listener)` | Subscribes; returns the function that unsubscribes. |
 | `resize()` | Draws a frame now. The canvas size is observed, so this is rarely needed. |
 | `pause()` / `resume()` | Holds drawing and loading, as a hidden tab does (that one is automatic). |
+| `diagnostic(view)` | Draws a diagnostic view until another is asked — `normal`, `unlit`, `coverage`, `geometry`, `levels`, `lag` or `cap`, the views the `D` key cycles. `levels` colours each tile by the imagery level it wears, one hue a level round a wheel of eight (red 8 and 16, orange 9, yellow 10, green 11, cyan 12, blue 13, violet 14, magenta 15); `lag` colours each tile by how far under the level it asked for it wears (green at it, yellow one under, orange two, red three or more, blue finer than asked); `cap` colours each tile by the levels its terrain's level denies its imagery — the screen asks finer than the terrain level plus the imagery cap allows, so the tile is soft while green in `lag` (green none, yellow one, orange two, red three or more). Tiles are edged dark, and a mesh drawn in another's place is hatched. |
 | `destroy()` | Releases the GPU device, the worker and every listener, and removes the canvas the viewer created. |
 
 `debug` is reserved for the graphics budget's control API (budgets, GPU figures, frame

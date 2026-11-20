@@ -88,6 +88,52 @@ struct MaterialUniform {
     /// cost anyway. Named `flags` rather than `pass` because WGSL reserves
     /// that word, and the two declarations must match.
     flags: [f32; 4],
+    /// [`Levels::row`]: what the two level views colour the tile by.
+    levels: [f32; 4],
+}
+
+/// Where [`Levels::row`] sits in the material uniform: after the base
+/// colour and the flags.
+const LEVELS_AT: u64 = 32;
+
+/// The imagery levels a drawn tile is told, for the diagnostic views that
+/// colour tiles by them (`DIAGNOSTIC_LEVELS`, `DIAGNOSTIC_LAG` and
+/// `DIAGNOSTIC_CAP` in `shader.wgsl`): what its base layer wears and what
+/// that layer asked for this step, the tile's own level, the role it is
+/// drawn in and the levels the terrain denied it. They
+/// change without the dressing changing — the budget asks for a finer
+/// level as the eye comes down while the tile wears the same drape — so a
+/// tile dressed as it was is told them again, in place.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Levels {
+    /// The imagery level of the base layer's drape the tile wears; 0 for
+    /// none.
+    pub worn: u32,
+    /// The level that layer asked for this step; 0 when it asked nothing.
+    pub asked: u32,
+    /// The tile's own level in its tree.
+    pub tile: u32,
+    /// How the mesh is drawn: 0 as itself, 1 held in a coarser tile's
+    /// place, 2 standing in for finer ones (a fallback, or the backdrop).
+    pub role: u32,
+    /// The levels the terrain's level denied the base layer: how far the
+    /// level the screen alone asks lies above the tile's terrain level plus
+    /// the imagery cap ([`tuile_core::budget::DrapeChoice::capped`]).
+    pub capped: u32,
+}
+
+impl Levels {
+    /// The row the uniform carries, in the shader's order.
+    fn row(self) -> [f32; 4] {
+        [
+            self.worn as f32,
+            self.asked as f32,
+            self.tile as f32,
+            // One lane for two small numbers: the role in the low two
+            // bits, the capped levels above them.
+            (self.role.min(3) + 4 * self.capped.min(1 << 20)) as f32,
+        ]
+    }
 }
 
 /// GPU-resident tile, ready to draw.
@@ -128,6 +174,8 @@ pub struct PreparedTile {
     /// What the tile is dressed with: each drape and the uv transform it is
     /// worn through. Empty while undressed.
     dressing: Vec<(ResourceId, [u64; 4])>,
+    /// The levels the tile was last told ([`Self::dress`]).
+    levels: Levels,
     /// Approximate GPU memory of this tile, bytes — **excluding draped
     /// imagery**, which is its drapes' own (see [`PreparedDrape`]).
     pub gpu_bytes: usize,
@@ -278,18 +326,29 @@ impl PreparedTile {
 
     /// Dresses the tile with `drapes`, each worn through its uv transform:
     /// the layers of each, placed in this tile's uv square, in stacking
-    /// order. Nothing is uploaded — the drapes' textures are bound — and a
-    /// tile already dressed so is left as it is.
+    /// order, and tells it `levels`. Nothing is uploaded — the drapes'
+    /// textures are bound — and a tile already dressed so is left as it
+    /// is, its levels rewritten in place when they moved.
     pub fn dress(
         &mut self,
         gpu: &GpuContext,
         drapes: &[(ResourceId, &PreparedDrape, UvTransform)],
+        levels: Levels,
     ) {
         let key: Vec<(ResourceId, [u64; 4])> =
             drapes.iter().map(|(r, _, uv)| (*r, uv_bits(*uv))).collect();
         if key == self.dressing && !self._imagery.is_empty() {
+            if levels != self.levels {
+                self.levels = levels;
+                let row = levels.row();
+                for buf in self.meshes.iter().flat_map(|m| &m._material_bufs) {
+                    gpu.queue
+                        .write_buffer(buf, LEVELS_AT, bytemuck::cast_slice(&row));
+                }
+            }
             return;
         }
+        self.levels = levels;
         let mut layers: Vec<(Placement, &Arc<GpuImagery>, ImageryCoord, u32)> = self
             .own
             .iter()
@@ -311,7 +370,7 @@ impl PreparedTile {
         self.imagery_source = layers.iter().map(|(_, _, _, s)| *s).max();
         let passes = passes(gpu, &layers);
         for (prepared, mesh) in self.meshes.iter_mut().zip(&self.source) {
-            let (bgs, bufs) = materials(gpu, mesh, &self._textures, &passes);
+            let (bgs, bufs) = materials(gpu, mesh, &self._textures, &passes, levels);
             prepared.material_bgs = bgs;
             prepared._material_bufs = bufs;
         }
@@ -326,7 +385,7 @@ impl PreparedTile {
         if self.dressing.is_empty() {
             return;
         }
-        self.dress(gpu, &[]);
+        self.dress(gpu, &[], Levels::default());
         self.dressing.clear();
     }
 
@@ -475,6 +534,7 @@ pub fn prepare(
         own,
         _imagery: passes,
         dressing: Vec::new(),
+        levels: Levels::default(),
         gpu_bytes,
     }
 }
@@ -783,7 +843,7 @@ fn prepare_mesh(
 ) -> PreparedMesh {
     let (vertex_buf, index_buf, bytes) = mesh_buffers(gpu, mesh);
     *gpu_bytes += bytes;
-    let (material_bgs, material_bufs) = materials(gpu, mesh, textures, passes);
+    let (material_bgs, material_bufs) = materials(gpu, mesh, textures, passes, Levels::default());
     PreparedMesh {
         vertex_buf,
         index_buf,
@@ -802,6 +862,7 @@ fn materials(
     mesh: &DecodedMesh,
     textures: &[GpuImagery],
     passes: &[ImageryPass],
+    levels: Levels,
 ) -> (Vec<wgpu::BindGroup>, Vec<wgpu::Buffer>) {
     let texture_view = mesh
         .material
@@ -816,13 +877,15 @@ fn materials(
         let uniform = MaterialUniform {
             base_color: mesh.material.base_color_factor,
             flags: [first, f32::from(u8::from(mesh.material.unlit)), 0.0, 0.0],
+            levels: levels.row(),
         };
+        // Written to when the levels move under an unchanged dressing.
         let material_buf = gpu
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("tuile material"),
                 contents: bytemuck::bytes_of(&uniform),
-                usage: wgpu::BufferUsages::UNIFORM,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
         // Every slot is bound, always. An unused one reads the 1×1 white texture
         // and is masked out by an empty coverage rectangle, so the shader needs

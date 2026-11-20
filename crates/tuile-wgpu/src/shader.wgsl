@@ -121,6 +121,12 @@ struct MaterialUniform {
     // with untextured ground.
     // `pass` would be the name; WGSL reserves it.
     flags: vec4f,
+    // The imagery levels the tile is told, for the three views that colour
+    // tiles by them: x = the level its base layer wears (0 for none), y =
+    // the level that layer asked for this step (0 for nothing), z = the
+    // tile's own level, w = its role (0 itself, 1 held, 2 standing in) plus
+    // four times the levels the terrain's level denied it.
+    levels: vec4f,
 }
 @group(2) @binding(0) var<uniform> material: MaterialUniform;
 @group(2) @binding(1) var base_tex: texture_2d<f32>;
@@ -207,6 +213,76 @@ const DIAGNOSTIC_OFF: f32 = 0.0;
 const DIAGNOSTIC_UNLIT: f32 = 1.0;
 const DIAGNOSTIC_COVERAGE: f32 = 2.0;
 const DIAGNOSTIC_GEOMETRY: f32 = 3.0;
+// The two views after those answer a different question — not "why is
+// this black" but "why is this soft": they colour each tile by the imagery
+// level it wears (`material.levels`), so a coarse patch is read as a
+// number rather than guessed from the blur.
+//
+// Levels: one hue a level round a wheel of eight — red at a multiple of
+// eight (8, 16), then orange, yellow, green, cyan, blue, violet, magenta
+// (15) — dark grey wearing nothing. Two tiles a level apart are a step
+// round the wheel; the top of a tilted view, farther, is expected a step
+// or two behind the foreground.
+const DIAGNOSTIC_LEVELS: f32 = 4.0;
+// Lag: each tile's imagery against what it asked for this step. Green at
+// the level asked; yellow one level under it, orange two, red three or
+// more; blue finer than asked; grey asking or wearing nothing. Red is a
+// tile wearing an ancestor's picture while its own loads — the stand-in
+// that smears — and a lag that stays once the loads land is the budget
+// asking for less than the eye needs.
+const DIAGNOSTIC_LAG: f32 = 5.0;
+// Cap: each tile by the levels its terrain's level denies its imagery —
+// the screen asks finer than the tile's terrain level plus the imagery cap
+// allows, so the tile wears what it asked for (green in the lag view) and
+// is soft all the same. Green none, yellow one level denied, orange two,
+// red three or more; grey wearing nothing. A band of it across the far top
+// of a tilted view is the cap, not the loads.
+const DIAGNOSTIC_CAP: f32 = 6.0;
+
+// The level view's hue for `level`.
+fn level_hue(level: f32) -> vec3f {
+    let step = i32(round(level)) % 8;
+    switch step {
+        case 0: { return vec3f(0.95, 0.15, 0.15); }
+        case 1: { return vec3f(1.0, 0.55, 0.1); }
+        case 2: { return vec3f(0.95, 0.9, 0.1); }
+        case 3: { return vec3f(0.2, 0.8, 0.2); }
+        case 4: { return vec3f(0.1, 0.85, 0.9); }
+        case 5: { return vec3f(0.2, 0.35, 1.0); }
+        case 6: { return vec3f(0.6, 0.25, 0.95); }
+        default: { return vec3f(0.95, 0.3, 0.8); }
+    }
+}
+
+// The lag view's colour for a tile wearing `worn` that asked for `asked`.
+fn lag_colour(worn: f32, asked: f32) -> vec3f {
+    if (worn < 0.5 || asked < 0.5) { return vec3f(0.35); }
+    let under = asked - worn;
+    if (under < -0.5) { return vec3f(0.2, 0.4, 1.0); }
+    if (under < 0.5) { return vec3f(0.15, 0.75, 0.2); }
+    if (under < 1.5) { return vec3f(0.95, 0.9, 0.1); }
+    if (under < 2.5) { return vec3f(1.0, 0.5, 0.05); }
+    return vec3f(0.95, 0.1, 0.1);
+}
+
+// The cap view's colour for a tile wearing `worn` denied `capped` levels.
+fn cap_colour(worn: f32, capped: f32) -> vec3f {
+    if (worn < 0.5) { return vec3f(0.35); }
+    return lag_colour(1.0, 1.0 + capped);
+}
+
+// What the level views draw over a tile's colour: the relief, faintly,
+// so the ground stays readable; a dark edge round the tile, so tiles can
+// be counted; hatching on a mesh drawn in another's place (held, or
+// standing in). `uv_px` is the uv a pixel spans, for an edge a pixel and
+// a half wide at every distance.
+fn tile_marks(colour: vec3f, uv: vec2f, role: f32, lambert: f32, uv_px: f32) -> vec3f {
+    var c = colour * (0.65 + 0.35 * lambert);
+    let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    if (edge < 1.5 * uv_px) { c *= 0.3; }
+    if (role > 0.5 && fract((uv.x + uv.y) * 6.0) < 0.5) { c *= 0.6; }
+    return c;
+}
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
@@ -253,6 +329,25 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let lit = albedo.rgb * (ambient + (1.0 - ambient) * lambert);
 
     let mode = view.params.y;
+    // The uv a pixel spans: taken here, in uniform control flow, for the
+    // level views' tile edges.
+    let uv_px = max(fwidth(in.uv).x, fwidth(in.uv).y);
+    // The role and the capped levels share the last lane.
+    let role = material.levels.w % 4.0;
+    let capped = floor(material.levels.w / 4.0);
+    if (mode == DIAGNOSTIC_LEVELS) {
+        var c = vec3f(0.25);
+        if (material.levels.x > 0.5) { c = level_hue(material.levels.x); }
+        return vec4f(tile_marks(c, in.uv, role, lambert, uv_px), first);
+    }
+    if (mode == DIAGNOSTIC_LAG) {
+        let c = lag_colour(material.levels.x, material.levels.y);
+        return vec4f(tile_marks(c, in.uv, role, lambert, uv_px), first);
+    }
+    if (mode == DIAGNOSTIC_CAP) {
+        let c = cap_colour(material.levels.x, capped);
+        return vec4f(tile_marks(c, in.uv, role, lambert, uv_px), first);
+    }
     // Geometry: a flat lit surface, imagery and air removed. Anything visible
     // here IS a mesh. Black here means nothing was drawn at all, which is a
     // traversal or upload fault and never a texture one.

@@ -728,9 +728,13 @@ impl App {
                 " | {:.0} fps, worst {worst:.0} ms, jerk {jerk:.1}x",
                 since as f64 / interval.max(1.0e-3),
             );
+            // The imagery levels drawn, as the level views colour them: the
+            // numbers a soft picture is read by, beside the counts that say
+            // whether it is complete.
+            let levels = resolution.levels_line();
             tracing::info!(
                 "alt {:.0} km | ground {:.0} m | {} tiles, {complete}, {sharpness} | \
-                 {} bare | {} loading | {:.0} MiB | {budget} | \
+                 {} bare | {} loading | {:.0} MiB | {budget} | {levels} | \
                  near {:.0} m far {:.0} km{pacing}{view}",
                 cam.altitude() / 1000.0,
                 self.controller.height_above_ground(),

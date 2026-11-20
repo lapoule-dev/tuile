@@ -183,6 +183,9 @@ export interface ViewerEvents {
   attributionChanged: { layer: string; name: string; attribution: string };
 }
 
+/** The diagnostic views, in the order the `D` key cycles them. */
+export type DiagnosticView = "normal" | "unlit" | "coverage" | "geometry" | "levels" | "lag" | "cap";
+
 export interface Viewer {
   /** What the viewer draws through. */
   readonly backend: "webgpu" | "webgl2" | undefined;
@@ -200,6 +203,15 @@ export interface Viewer {
   pause(): void;
   /** Draws and loads again. */
   resume(): void;
+  /**
+   * Draws a diagnostic view until another is asked; the `D` key cycles the
+   * same views. `levels` colours each tile by the imagery level it wears,
+   * one hue a level round a wheel of eight (red 8 and 16, orange 9, yellow
+   * 10, green 11, cyan 12, blue 13, violet 14, magenta 15); `lag` colours
+   * each tile by how far under the level it asked for it wears (green at
+   * it, yellow one under, orange two, red three or more, blue finer).
+   */
+  diagnostic(view: DiagnosticView): void;
   /** Releases the GPU, the worker and every listener. The viewer is unusable after. */
   destroy(): void;
   /**

@@ -29,7 +29,7 @@ pub use context::{
 pub use host::{view_proj_from_world, DepthDirection, HostFrame, HostPass, TargetLayout};
 pub use overlay::{OverlayMask, OverlayRenderer, OverlayVertex};
 pub use prepare::{
-    prepare, prepare_drape, PreparedDrape, PreparedMesh, PreparedTile, Vertex, STITCH_ROWS,
+    prepare, prepare_drape, Levels, PreparedDrape, PreparedMesh, PreparedTile, Vertex, STITCH_ROWS,
 };
 pub use pump::{ContentPump, Drawn, Resolution, STITCH_SLIDE_FRAMES, UPLOAD_SHARE_PERMILLE};
 pub use readback::{MappedFrame, Readback, ReadbackRing};

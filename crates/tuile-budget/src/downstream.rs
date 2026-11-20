@@ -52,7 +52,9 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 
 use super::decisions::{DrapeChoice, DrawItem, DrawSet, Role};
-use super::engine::{ItemBufs, ItemStats, Reach, TileSelection, Want, DRAPES, MESH, PLACE, WORN};
+use super::engine::{
+    DrapeLevel, ItemBufs, ItemStats, Reach, TileSelection, Want, DRAPES, MESH, PLACE, WORN,
+};
 use super::held::{morton, Morton};
 use super::need::Membership;
 use super::need_state::{Named, TileNeed};
@@ -1091,9 +1093,9 @@ impl Budget {
         }
     }
 
-    /// The drape levels of the tiles in `l.lev` that ask for drapes,
-    /// written to `imagery_prev`; the tiles whose levels moved, into
-    /// `l.moved`.
+    /// The drape levels of the tiles in `l.lev` that ask for drapes, and
+    /// the levels their terrain denies them, written to `imagery_prev`; the
+    /// tiles whose levels moved (either), into `l.moved`.
     fn levels_pass(
         &mut self,
         tiles: &SortedMap<TileId, TileNeed>,
@@ -1106,7 +1108,7 @@ impl Budget {
             let t = l.lev[i];
             let (mut asked, mut moved) = (false, false);
             if let Some(tn) = tiles.get(&t).filter(|tn| Self::draped(tn)) {
-                self.drape_levels(
+                let capped = self.drape_levels(
                     t,
                     tn,
                     presence,
@@ -1115,7 +1117,8 @@ impl Budget {
                     &mut asked,
                 );
                 for &(layer, level) in &l.levels {
-                    if self.imagery_prev.insert((t, layer), level) != Some(level) {
+                    let read = DrapeLevel { level, capped };
+                    if self.imagery_prev.insert((t, layer), read) != Some(read) {
                         moved = true;
                     }
                 }
@@ -1439,8 +1442,14 @@ impl Budget {
             } else {
                 let built = l.built.get_or_insert_with(|| DrawItem::new(m, Role::Exact));
                 let drapes = |s: TileId, out: &mut Vec<(LayerId, u32)>| match tiles.get(&s) {
-                    Some(tn) => self.drapes_of(s, tn, out),
-                    None => out.clear(),
+                    Some(tn) => {
+                        self.drapes_of(s, tn, out);
+                        self.capped_of(tn)
+                    }
+                    None => {
+                        out.clear();
+                        0
+                    }
                 };
                 let stats = self.build_item(m, &l.run, drapes, &mut l.reach, &mut l.bufs, built);
                 l.reach.beyond(m.tile(), &mut l.beyond);
@@ -2858,7 +2867,7 @@ impl Budget {
         &self,
         tiles: &SortedMap<TileId, TileNeed>,
         presence: &dyn PresenceOracle,
-        last: &std::collections::BTreeMap<(TileId, LayerId), u32>,
+        last: &std::collections::BTreeMap<(TileId, LayerId), DrapeLevel>,
     ) {
         /// Asked, it answers nothing and says so.
         struct Silent(std::cell::Cell<bool>);
@@ -2880,16 +2889,17 @@ impl Budget {
             let silent = Silent(std::cell::Cell::new(false));
             let oracle: &dyn PresenceOracle = if far { presence } else { &silent };
             let mut asked = false;
-            self.drape_levels(*t, tn, oracle, last, &mut levels, &mut asked);
+            let capped = self.drape_levels(*t, tn, oracle, last, &mut levels, &mut asked);
             assert!(
                 far || (!asked && !silent.0.get()),
                 "{t:?} asked the presence index but is not read when it may have changed"
             );
-            for (layer, level) in &levels {
+            for &(layer, level) in &levels {
                 assert_eq!(
-                    self.imagery_prev.get(&(*t, *layer)),
-                    Some(level),
-                    "the level of {t:?}'s layer {layer:?} is the one a reading gives"
+                    self.imagery_prev.get(&(*t, layer)),
+                    Some(&DrapeLevel { level, capped }),
+                    "the level of {t:?}'s layer {layer:?}, and the levels its terrain \
+                     denies, are the ones a reading gives"
                 );
             }
         }
@@ -2982,8 +2992,14 @@ impl Budget {
             let run: Vec<(TileId, Role)> = run.iter().map(|x| (x.1, x.2)).collect();
             let mut reach = Reach::default();
             let drapes = |s: TileId, out: &mut Vec<(LayerId, u32)>| match tiles.get(&s) {
-                Some(tn) => self.drapes_of(s, tn, out),
-                None => out.clear(),
+                Some(tn) => {
+                    self.drapes_of(s, tn, out);
+                    self.capped_of(tn)
+                }
+                None => {
+                    out.clear();
+                    0
+                }
             };
             let mut built = DrawItem::new(m, Role::Exact);
             let stats = self.build_item(m, &run, drapes, &mut reach, &mut bufs, &mut built);

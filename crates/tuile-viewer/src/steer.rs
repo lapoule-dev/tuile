@@ -26,7 +26,7 @@
 //! | `tuile://goto?…&time=&timeOffset=&timeRate=` | also sets the scene's clock, as `--time`, `--time-offset` and `--time-rate` do: see below |
 //! | `tuile://north` | north up, about the point at the centre of the view |
 //! | `tuile://here` | centres on the current location (the system still asks the person) |
-//! | `tuile://view?freeze=on\|off&wireframe=on\|off&diagnostic=normal\|unlit\|coverage\|geometry` | the display switches, and the diagnostic view `D` cycles |
+//! | `tuile://view?freeze=on\|off&wireframe=on\|off&diagnostic=normal\|unlit\|coverage\|geometry\|levels\|lag\|cap` | the display switches, and the diagnostic view `D` cycles |
 //! | `tuile://tileset?asset=<n>&show=on\|off` | one of the host's 3D Tiles tilesets drawn over the globe, or not |
 //! | `tuile://imagery?name=<key>` | drapes another of the host's imagery layers; `name=next` takes the one after the present |
 //! | `tuile://import?src=https://…` | fetches a configuration file and imports it, as opening it would (`crate::import`) |

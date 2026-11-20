@@ -320,6 +320,26 @@ impl WebViewer {
         self.wake(Wake::Hidden(self.id, false))
     }
 
+    /// Draws this diagnostic view until another is asked: one of the views
+    /// the `D` key cycles, by name — `normal`, `unlit`, `coverage`,
+    /// `geometry`, `levels`, `lag` — in any case. An unknown name is an
+    /// error naming them.
+    pub fn diagnostic(&self, view: &str) -> Result<(), JsError> {
+        let index = crate::menu::DIAGNOSTICS
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(view))
+            .ok_or_else(|| {
+                JsError::new(&format!(
+                    "diagnostic is one of {}, not {view:?}",
+                    crate::menu::DIAGNOSTICS.join(", ").to_lowercase()
+                ))
+            })?;
+        if self.current() {
+            crate::desktop::queue(Request::Do(Command::Diagnostic(index)));
+        }
+        self.wake(Wake::Poke(self.id))
+    }
+
     /// Ends the viewer: the GPU device, the surface, the worker and every
     /// listener are let go of. The canvas stays the page's.
     pub fn destroy(&self) -> Result<(), JsError> {

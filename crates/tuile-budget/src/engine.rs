@@ -44,7 +44,9 @@ use super::cost::within_drift;
 use super::decisions::{Decisions, DrapeChoice, DrawItem, Role, Start, UploadPlan};
 use super::downstream::{Item, Wants};
 use super::error::{AuditError, SessionError};
-use super::imagery::{drape_rank, needed_level, DrapeCandidate, GeoRect, LevelClamp, UvTransform};
+use super::imagery::{
+    drape_rank, ideal_level, needed_level, DrapeCandidate, GeoRect, LevelClamp, UvTransform,
+};
 use super::need::{LayerReach, Membership};
 use super::need_state::{NeedState, TileNeed, WantedImagery};
 use super::priority::{score, PriorityKey, Quantised, Urgency};
@@ -213,6 +215,17 @@ impl Reach {
             }
         }
     }
+}
+
+/// What a drawn tile's layer was last read as: the imagery level it asks
+/// for, and the levels the terrain's level denies the tile's imagery
+/// ([`DrapeChoice::capped`], the same for each of its layers). The second
+/// moves with the footprint while the first stays, and a change of either
+/// is a level that moved: the items that say it are built again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DrapeLevel {
+    pub level: u32,
+    pub capped: u32,
 }
 
 /// A draw item's buffers while it is built.
@@ -717,18 +730,20 @@ impl Budget {
     /// level of the window between the relaxed and the unrelaxed need: a
     /// relaxation never sends to the network what a local tier can show
     /// (I14, I15). Batch takes the exact level, a function of the frame.
+    /// Returns the levels the terrain's level denies the tile's imagery
+    /// ([`Self::capped_of`]), read in the same pass.
     pub(super) fn drape_levels(
         &self,
         t: TileId,
         tn: &TileNeed,
         presence: &dyn PresenceOracle,
-        last: &BTreeMap<(TileId, LayerId), u32>,
+        last: &BTreeMap<(TileId, LayerId), DrapeLevel>,
         out: &mut Vec<(LayerId, u32)>,
         asked: &mut bool,
-    ) {
+    ) -> u32 {
         out.clear();
         let Some(img) = tn.need.imagery.as_ref() else {
-            return;
+            return 0;
         };
         let floor = self.cfg.pinned_level.unwrap_or(0);
         let batch = self.cfg.policy == Policy::Batch;
@@ -747,7 +762,7 @@ impl Budget {
                 out.push((reach.layer, needed_level(None, img.footprint, clamp)));
                 continue;
             }
-            let prev = last.get(&key).copied();
+            let prev = last.get(&key).map(|p| p.level);
             let relaxed = needed_level(prev, img.footprint.relaxed(self.scale), clamp);
             let mut level = relaxed;
             let tier = |r: ResourceId, asked: &mut bool| {
@@ -783,6 +798,7 @@ impl Budget {
             }
             same
         });
+        self.capped_of(tn)
     }
 
     /// Tile `t`'s drape needs this step — each layer it asks for, in layer
@@ -803,8 +819,26 @@ impl Budget {
                 self.imagery_prev.contains_key(&(t, *layer)),
                 "a drape need's level is chosen before it is read"
             );
-            *level = self.imagery_prev.get(&(t, *layer)).copied().unwrap_or(0);
+            *level = self.imagery_prev.get(&(t, *layer)).map_or(0, |p| p.level);
         }
+    }
+
+    /// The levels the terrain's level denies tile `tn`'s imagery, the most
+    /// over its layers: how far the level the footprint alone asks (the
+    /// source's deepest at most) lies above the tile's terrain level plus
+    /// the imagery cap ([`DrapeChoice::capped`]). Relaxation and hysteresis
+    /// play no part: it measures the ceiling, not the step.
+    pub(super) fn capped_of(&self, tn: &TileNeed) -> u32 {
+        let Some(img) = tn.need.imagery.as_ref() else {
+            return 0;
+        };
+        let ideal = ideal_level(img.footprint);
+        let ceiling = tn.need.level.saturating_add(self.cfg.imagery_cap());
+        layers(img)
+            .iter()
+            .map(|r| ideal.min(r.max_level).saturating_sub(ceiling))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Whether floor tile `t` is drawable with its floor drape of every
@@ -932,6 +966,8 @@ impl Budget {
                 resource: own,
                 layer,
                 level: need,
+                need,
+                capped: 0,
                 uv: UvTransform::IDENTITY,
             });
         }
@@ -966,6 +1002,8 @@ impl Budget {
             resource,
             layer,
             level: c.level,
+            need,
+            capped: 0,
             uv,
         })
     }
@@ -1062,14 +1100,16 @@ impl Budget {
     /// The draw item of `mesh`, drawn for `run` — (tile served, role) by
     /// tile, at least one — into `out` (its buffers reused), with what it
     /// adds to the step's statistics. `drapes` gives a served tile's drape
-    /// needs. `reach` gets what it read beyond its own tile's drapes at the
+    /// needs, and the levels the terrain denies its imagery
+    /// ([`Self::capped_of`]), told to every drape chosen (the most over the
+    /// tiles served). `reach` gets what it read beyond its own tile's drapes at the
     /// levels needed (an ancestor's drapes; its own last item, in a layer
     /// switch).
     pub(super) fn build_item(
         &self,
         mesh: ResourceId,
         run: &[(TileId, Role)],
-        drapes: impl Fn(TileId, &mut Vec<(LayerId, u32)>),
+        drapes: impl Fn(TileId, &mut Vec<(LayerId, u32)>) -> u32,
         reach: &mut Reach,
         bufs: &mut ItemBufs,
         out: &mut DrawItem,
@@ -1087,8 +1127,9 @@ impl Budget {
         // for the finest of the tiles it serves.
         let ItemBufs { needs, own } = bufs;
         needs.clear();
+        let mut capped = 0;
         for s in &out.serves {
-            drapes(*s, own);
+            capped = capped.max(drapes(*s, own));
             for (layer, n) in own.iter() {
                 match needs.binary_search_by_key(layer, |x| x.0) {
                     Ok(i) => needs[i].1 = needs[i].1.max(*n),
@@ -1099,7 +1140,7 @@ impl Budget {
         if role == Role::Held {
             for (layer, n) in needs.iter_mut() {
                 if let Some(p) = self.imagery_prev.get(&(tile, *layer)) {
-                    *n = *p;
+                    *n = p.level;
                 }
             }
         }
@@ -1124,6 +1165,9 @@ impl Budget {
             }
             // One drape per layer: an unstable sort is the stable one.
             chosen.sort_unstable_by_key(|d| d.layer);
+        }
+        for c in chosen.iter_mut() {
+            c.capped = capped;
         }
         // Bare: a layer the tiles need is worn by no drape, and no old
         // layer stands in for it during a switch.
