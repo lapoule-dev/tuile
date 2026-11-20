@@ -193,6 +193,68 @@ pub struct BudgetStats {
     /// Every wanted tile drawn exactly with its needed drape, and no work
     /// left for the view.
     pub converged: bool,
+    /// The quality deficit: what is drawn against what the step needs
+    /// (`docs/explorations/budget-eviction-prefetch-spec.md` §1). Not in
+    /// [`BudgetStats::digest`]: a measure of the decisions, not one.
+    pub deficit: Deficit,
+}
+
+/// The quality deficit of one step: the levels the picture is drawn under
+/// (and over) the levels the step needs, for the meshes and the drapes.
+///
+/// A mesh's deficit is a wanted tile standing on an ancestor: the tile
+/// counts once, its levels are the ancestor's depth under it. A drape's is
+/// an exactly drawn tile wearing, for a layer, a level other than the one
+/// the step decided for it: the tile counts once, its levels are summed
+/// over its layers; and a layer whose decided level is coarser than the
+/// level the picture needs at scale 1 (a stand-in, a relaxation). A tile drawn with nothing is a hole (`lost`, `bare`),
+/// not a deficit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Deficit {
+    /// Wanted tiles drawn by a coarser ancestor (`fallback`).
+    pub mesh_under_tiles: u32,
+    /// Their levels under their need, summed.
+    pub mesh_under_levels: u32,
+    /// Finer meshes kept for a coarser wanted tile (`held`).
+    pub mesh_over_tiles: u32,
+    /// Exactly drawn tiles wearing some layer under the level needed.
+    pub imagery_under_tiles: u32,
+    /// Their levels under, summed over tiles and layers.
+    pub imagery_under_levels: u32,
+    /// Exactly drawn tiles wearing some layer over the level needed.
+    pub imagery_over_tiles: u32,
+    /// Their levels over, summed.
+    pub imagery_over_levels: u32,
+    /// Drawn or blocking tiles' layers whose decided level is coarser than
+    /// the level the picture needs at scale 1 — a local stand-in, a
+    /// relaxation (counted per layer).
+    pub imagery_short_layers: u32,
+    /// Their levels short, summed.
+    pub imagery_short_levels: u32,
+}
+
+impl Deficit {
+    /// Tiles drawn under their need, meshes and drapes (a tile counted in
+    /// each it is short of).
+    pub fn under_tiles(&self) -> u32 {
+        self.mesh_under_tiles
+            .saturating_add(self.imagery_under())
+    }
+
+    /// Imagery under its need: tiles worn under the level decided, and
+    /// layers decided under the level needed (a tile may count in both).
+    pub fn imagery_under(&self) -> u32 {
+        self.imagery_under_tiles
+            .saturating_add(self.imagery_short_layers)
+    }
+
+    /// Levels under need, meshes and drapes.
+    pub fn under_levels(&self) -> u32 {
+        self.mesh_under_levels
+            .saturating_add(self.imagery_under_levels)
+            .saturating_add(self.imagery_short_levels)
+    }
 }
 
 impl BudgetStats {

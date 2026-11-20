@@ -261,7 +261,8 @@ impl Feed for BudgetStats {
     /// exist to lower, and the per-level splits — the ledger's bytes and the
     /// evictions by level, a breakdown of what the chains already digest,
     /// checked against their totals by the signals' tests: by its `Debug`,
-    /// with those zeroed.
+    /// with those zeroed; and the quality deficit, a measure of the
+    /// decisions, not one of them.
     fn feed(&self, h: &mut Fnv) {
         let mut s = self.clone();
         s.work = 0;
@@ -273,8 +274,12 @@ impl Feed for BudgetStats {
         // recorded with.
         let bytes = format!("{:?}", s.drawable_by_level);
         let counts = format!("{:?}", s.evictions_by_level);
+        // The quality deficit, a measure of the decisions recorded after
+        // the reference was: out of it, as a breakdown is.
+        let deficit = format!("{:?}", s.deficit);
         let text = format!("{s:?}")
             .replace(", levels_moved: 0", "")
+            .replace(&format!(", deficit: {deficit}"), "")
             .replace(&format!(", drawable_by_level: {bytes}"), "")
             .replace(&format!(", transit_by_level: {bytes}"), "")
             .replace(&format!(", evictions_by_level: {counts}"), "");

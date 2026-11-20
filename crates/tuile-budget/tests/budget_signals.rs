@@ -519,6 +519,47 @@ fn the_swaps_signal_counts_refines_and_coarsenings_and_never_a_gap() {
     assert_eq!(meter.signals().swap_gaps_total, 1, "{RED}: gap");
 }
 
+/// The quality deficit (eviction/prefetch spec §1, §7.1): a drape worn
+/// under the level the step needs counts its tile once and its levels, as
+/// the `under_need_tiles{kind="imagery"}` and `deficit_levels` signals.
+#[test]
+fn the_deficit_signals_count_the_drapes_worn_under_their_need() {
+    let a = t(3, 2, 2);
+    let mut m = Metered::interactive();
+    m.settle(&drawn_draped(&[a], 3), 20);
+    assert_eq!(m.s().under_need_tiles, [0, 0]);
+    assert_eq!(m.s().deficit_levels, [0, 0]);
+    let d = m.step(&drawn_draped(&[a], 6));
+    assert_eq!(d.stats.deficit.imagery_under(), 1, "{RED}");
+    assert_eq!(d.stats.deficit.under_levels(), 3, "three levels short");
+    assert_eq!(m.s().under_need_tiles, [0, 1], "{RED}");
+    assert_eq!(m.s().deficit_levels, [0, 3]);
+    let before = m.s().deficit_level_micros_total[1];
+    m.step(&drawn_draped(&[a], 6));
+    assert!(
+        m.s().deficit_level_micros_total[1] > before,
+        "the deficit integrates over time"
+    );
+    m.settle(&drawn_draped(&[a], 6), 20);
+    assert_eq!(m.s().under_need_tiles, [0, 0], "worn at its need");
+    assert_eq!(m.s().deficit_levels, [0, 0]);
+}
+
+/// A wanted tile standing on its parent is a mesh deficit of one level.
+#[test]
+fn the_deficit_counts_a_tile_drawn_by_its_ancestor() {
+    let p = t(3, 2, 2);
+    let c = children(p)[0];
+    let mut m = Metered::interactive();
+    m.settle(&drawn(&[p]), 20);
+    let d = m.step(&drawn(&[c]));
+    assert_eq!(d.stats.deficit.mesh_under_tiles, 1, "{RED}");
+    assert_eq!(d.stats.deficit.mesh_under_levels, 1);
+    assert_eq!(m.s().under_need_tiles, [1, 0]);
+    m.settle(&drawn(&[c]), 20);
+    assert_eq!(m.s().under_need_tiles, [0, 0]);
+}
+
 /// I10: `underdraped_tiles` and `imagery_over_terrain{gap}` follow the
 /// drapes worn.
 #[test]
@@ -795,6 +836,7 @@ fn labels_stay_within_their_closed_sets() {
                 .iter()
                 .chain(&labels::FLAP)
                 .chain(&labels::SWAP)
+                .chain(&labels::DEFICIT)
                 .copied()
                 .collect(),
             "gap" => labels::GAP.to_vec(),
