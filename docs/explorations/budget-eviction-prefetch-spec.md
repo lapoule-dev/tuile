@@ -84,6 +84,60 @@ Eviction and prefetch are **two faces of one choice**: which set of resources to
 Loading a resource and keeping one are both "hold it"; releasing and not loading are both
 "don't". The decider makes that one choice from one value per resource.
 
+## 1b. The core: one currency (Laurent, 2026-11-20)
+
+After Patterson et al., *Informed Prefetching and Caching* (TIP, SOSP 1995): **one manager
+arbitrates every byte** between competing uses — prefetching announced or predicted
+resources, retaining held resources likely to be reused, and the rest — by estimating, in
+**one common unit**, the benefit of giving a buffer to a use and the cost of taking it from
+another, and moving buffers while the exchange is profitable.
+
+**The unit is expected screen quality gained per byte over a short horizon.** For a resource
+`r`, at step time `t₀`, over a horizon `H` sampled at steps `tᵢ`:
+
+```
+benefit(r) = Σ_{tᵢ ∈ [t₀, t₀+H]}  P(r visible at tᵢ) × Δq(r) × w(r) × δ(tᵢ − t₀)
+cost(r)    = size(r) × c(tier(r))
+value(r)   = benefit(r) / cost(r)
+```
+
+| Term | Unit | Meaning | Set by |
+|---|---|---|---|
+| `P(r visible at t)` | ‰ | probability that `r` is drawn at `t` | the need (P = 1000 for the present need), the predictions (§5): film / FPV film P = 1000 on the known path; known path decaying where the user may interrupt; interactive decaying fast with time |
+| `Δq(r)` | levels | the deficit reduction holding `r` brings: `need − worn` for the place it serves (§1) | the step |
+| `w(r)` | ‰ | the place's screen weight (centre, size on screen) | the need; `Term::ScreenSize` weight |
+| `δ(τ)` | ‰ | discount with delay: 1000 at τ = 0, falling to 0 at `H` | the specification's horizon and discount shape (FPV: `H` grows with speed) |
+| `size(r)` | bytes | what holding it takes | the cost estimator |
+| `c(tier)` | µs per reference size | restore cost of the tier it would come back from: decoded, RAM, local store or browser cache, network | measured (§4.2), the specification's defaults until then — GreedyDual-Size / Landlord's credit and rent (Young; Cao & Irani) |
+
+Consequences, by construction rather than by rule:
+
+- **The present need ranks highest**: P = 1000 and no discount. No separate "present first"
+  tier is needed for ordering; law 4 stays as the guarantee and the anticipation quota as
+  its bound.
+- **Anticipation is discounted** by uncertainty (P) and time (δ); a near-certain known
+  future (film, FPV film) can outrank a marginal present refinement.
+- **Urgency rises continuously** as a deadline approaches: the slack `deadline − estimated
+  fetch time` (the measured tier costs) enters δ — no thresholds.
+- **Prefetch and eviction read the same order**: load the top missing, release the bottom
+  held; a swap is made only if the gain exceeds the loss by the margin (law 7; Cao, Felten,
+  Karlin & Li's *Do No Harm*: never release A to fetch B if A is used before B).
+- **Outside the currency**: the absolute laws (coverage floor first, no hole by the
+  decider's actions, the hard limits) and the anticipation quota.
+
+**It replaces today's two disjoint orders**: the load `PriorityKey` (lexicographic urgency
+tiers Floor / Hole / Blocker / Drape / Ring / Ancestor / Refresh, then `sse_excess × (0.5 +
+0.5 × centrality) + age + cover`, then the residency tier) and the `EvictKey` (LRU last
+needed, then finer, then farther). Kept from them: integer and fixed-point arithmetic, a
+total order with stable tie-breaks, the protected sets, the incremental dirty-set
+recomputation, and sampled candidates on the release side to bound `decide`'s time.
+
+Where it lands: PR 4 puts the release side on the value (restore cost per tier, size,
+recency standing for P until predictions exist) and the present-need deficit term; **PR 4b**
+moves the load side's `PriorityKey` onto the same value — the urgency tiers reduced to the
+absolute laws' bands (floor and coverage, blockers of a swap) with the value ordering
+everything else (§10).
+
 ## 2. The laws
 
 Thirteen laws, each with the invariant that tests it. **Absolute laws** stand outside any
@@ -810,6 +864,7 @@ scenario set, before/after.
 | 2 | **The quality metric.** `D(k)`, `under_need_tiles`, `over_need_tiles` in `BudgetStats` (computed in `downstream` from the items, incrementally); `BudgetSignals` and the exporters; the objective `J` integrated by the sim; the scenario `rest-after-approach` written and shown **red on main** (kept `#[ignore]` with its reason until PR 4 turns it green — the only ignore of the stack). | the metric's unit tests (a drape a level under counts 1, an ancestor fallback counts its gap) | unchanged (stats only; the stats are not in the digest) |
 | 3 | **The specification and the recorded inputs.** `spec` module (§3), `Measured` (§4.1), `Prediction` (§5.1), `FrameInput::with_spec/with_measured/with_predictions`, validation, digest, serial form (`to_query`/`from_query`), recorded in `StepRecord`; random-spec proptest strategy. No decision reads them yet. | round-trip and validation tests | byte-identical |
 | 4 | **The value.** The eviction key (§8 row 1) and the deficit want (§5.3, deadlines), restore cost per tier (constants then smoothed measured), margin, `min_dwell`, reasons (§7.2). `rest-after-approach` green. Law invariants 1, 2, 6, 7 in the sim and proptest under random specs. | `rest-after-approach`; "eviction follows value order"; "a load below the margin does not displace" | re-recorded, reason: the LRU key and the ±1 tolerance are gone |
+| 4b | **The load side on the same value** (§1b): `PriorityKey` reduced to the absolute laws' bands (floor and coverage, swap blockers), the value ordering the rest; the release side's sampled candidates. | "a load and a release read the same value"; Do No Harm on small traces | re-recorded, reason: the urgency tiers below coverage are gone |
 | 5 | **Viewer wiring** (desktop and web, same code). The context selects the spec (ordinary navigation: `interactive`; the FPV camera mode, once it exists: `fpv`; flights and tapes: `known_path`); a **diagnostic override** in the menu and `tuile://budget?spec=…&margin=…` (`spec=auto` clears it), labelled as such; `spec_active`, deficit and reasons through tuile-telemetry (labels allow-listed); the HUD line. | steering parse tests; telemetry label test | — |
 | 6 | **The simulator crate, the scenario catalogue and the search** (§9.3). `tuile-budget-sim` library (the `budget_sim` harness moved), simulated measured inputs, the objective, `tuile-budget-tune` with Parquet out. | the objective of a known run; determinism of the search | unchanged (moved, not changed) |
 | 7 | **The controller** (§6): headroom set-point, proactive release, token buckets, the LOD actuator replacing `relax()`; the equilibrium scenarios of §9.2 with their bounds. | `pressure-ramp` (no 16× haste, monotone recovery), "a load never waits for an emergency eviction" | re-recorded, reason: the sweep and `relax()` are gone |
