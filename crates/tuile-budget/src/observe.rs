@@ -62,8 +62,9 @@ pub enum BudgetEvent {
     /// `release_beyond`, and how many GPU copies it dropped.
     ReleaseBeyond(Bytes, u32),
     /// `specify`: the kind and the digest of the specification given (its
-    /// whole text travels in the host's record, as its query).
-    Specify(crate::spec::SpecKind, u64),
+    /// whole text travels in the host's record, as its query), and whether
+    /// a diagnostic override gave it rather than the host's context.
+    Specify(crate::spec::SpecKind, u64, bool),
     /// `measure`: the samples given.
     Measured(crate::inputs::Measured),
 }
@@ -450,6 +451,13 @@ pub struct BudgetSignals {
     /// `under_need_still_seconds`: the views still and some tile under its
     /// need, for how long, µs (0 once none is).
     pub under_need_still_micros: u64,
+    /// `spec_info{spec,source}`: the specification in force (1 for it, 0
+    /// for the others), and whether a diagnostic override set it
+    /// (`source` = `override`) rather than the host's context.
+    pub spec: crate::spec::SpecKind,
+    pub spec_overridden: bool,
+    /// `spec_changes_total`: re-specifications recorded.
+    pub spec_changes_total: u64,
 }
 
 /// The closed label sets of spec §16.5.
@@ -481,6 +489,8 @@ pub mod labels {
     pub const FLAP: [&str; 2] = ["terrain", "imagery"];
     /// `kind` of a deficit.
     pub const DEFICIT: [&str; 2] = ["mesh", "imagery"];
+    /// `source` of the specification in force.
+    pub const SPEC_SOURCE: [&str; 2] = ["context", "override"];
     /// `kind` of a swap.
     pub const SWAP: [&str; 4] = ["refine", "coarsen", "mesh_drape", "layer"];
     /// `eye`.
@@ -640,6 +650,15 @@ impl BudgetSignals {
             vec![],
             secs(self.under_need_still_micros),
         ));
+        let source = labels::SPEC_SOURCE[usize::from(self.spec_overridden)];
+        for k in crate::spec::SpecKind::ALL {
+            out.push((
+                "spec_info",
+                vec![("spec", k.label()), ("source", source)],
+                f64::from(u8::from(k == self.spec)),
+            ));
+        }
+        out.push(("spec_changes_total", vec![], self.spec_changes_total as f64));
         for (i, k) in labels::FLAP.iter().enumerate() {
             out.push(("flaps_total", vec![("kind", k)], self.flaps_total[i] as f64));
         }
@@ -857,11 +876,13 @@ fn run_of<'v, K: Ord, V>(v: &'v [(K, V)], k: &K) -> &'v [(K, V)] {
 impl BudgetMeter {
     /// A meter for a budget on `cfg`.
     pub fn new(cfg: &BudgetConfig) -> Self {
-        BudgetMeter {
+        let mut m = BudgetMeter {
             cfg_pinned: cfg.pinned_level,
             cfg_policy: Some(cfg.policy),
             ..BudgetMeter::default()
-        }
+        };
+        m.s.spec = crate::spec::Specification::for_policy(cfg.policy).kind;
+        m
     }
 
     /// The profile's convergence bound and `decide`'s share of a frame:
@@ -968,6 +989,13 @@ impl BudgetObserver for BudgetMeter {
         s.bare_item_steps_total += u64::from(st.bare);
         s.drawn_tiles = [st.exact, st.held, st.fallback];
         s.fallback_depth_max = s.fallback_depth_max.max(st.fallback_depth_max);
+        for e in r.events {
+            if let BudgetEvent::Specify(kind, _, overridden) = e {
+                s.spec = *kind;
+                s.spec_overridden = *overridden;
+                s.spec_changes_total += 1;
+            }
+        }
         s.underdraped_tiles = st.underdraped;
         s.imagery_over_terrain = st.imagery_over_terrain;
         let q = &st.deficit;

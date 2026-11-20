@@ -45,6 +45,8 @@ pub(super) struct Views {
     /// Whether the traversal is frozen, which is what makes `F` a test of the
     /// renderer against a fixed selection.
     pub(super) freeze: bool,
+    /// Whether the budget's line is shown over the view (`Command::BudgetLine`).
+    pub(super) budget_line: bool,
 }
 
 impl App {

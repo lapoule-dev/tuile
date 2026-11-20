@@ -76,6 +76,24 @@ impl Credits {
     }
 }
 
+/// The budget's line: the specification in force (and whether a diagnostic
+/// override forced it), the tiles under their need and their levels, the
+/// LOD scale (`docs/explorations/budget-eviction-prefetch-spec.md` §7.3).
+pub(super) fn budget_line(signals: Option<&tuile_core::budget::BudgetSignals>) -> String {
+    let Some(s) = signals else {
+        return "budget: not yet".to_owned();
+    };
+    format!(
+        "budget {}{} · under need {} mesh, {} imagery ({} levels) · scale {:.2}",
+        s.spec.label(),
+        if s.spec_overridden { " (diagnostic)" } else { "" },
+        s.under_need_tiles[0],
+        s.under_need_tiles[1],
+        s.deficit_levels[0] + s.deficit_levels[1],
+        f64::from(s.sse_scale_milli) / 1000.0,
+    )
+}
+
 /// The 3D view in a frame of `frame` device pixels with a bar `bar` pixels
 /// tall: the frame above the bar. A frame the bar would leave nothing of
 /// keeps its whole height, and no bar is the frame itself.
@@ -91,7 +109,17 @@ impl App {
     /// Lays the credits bar out for this frame, from what the tilesets'
     /// last frame drew. Before anything reads the viewport.
     pub(super) fn lay_out_the_credits(&mut self) {
-        let text = self.surface_credits().unwrap_or_default();
+        let mut text = self.surface_credits().unwrap_or_default();
+        // The budget's line, when asked for, shares the bar: a diagnostic
+        // over the view, the same on every shell.
+        if self.views.budget_line {
+            let line = budget_line(tuile_core::metrics::budget().as_ref());
+            text = if text.is_empty() {
+                line
+            } else {
+                format!("{line}  ·  {text}")
+            };
+        }
         let Some(active) = self.active.as_ref() else {
             return;
         };
@@ -111,6 +139,23 @@ mod tests {
 
     const FRAME: (u32, u32) = (1280, 800);
     const WHOLE: (f64, f64, f64, f64) = (0.0, 0.0, 1280.0, 800.0);
+
+    /// The budget's line names the specification, a diagnostic override,
+    /// and the tiles under their need.
+    #[test]
+    fn the_budget_line_says_the_specification_and_the_deficit() {
+        assert_eq!(budget_line(None), "budget: not yet");
+        let mut s = tuile_core::budget::BudgetSignals::default();
+        s.spec = tuile_core::budget::SpecKind::Fpv;
+        s.spec_overridden = true;
+        s.under_need_tiles = [1, 4];
+        s.deficit_levels = [1, 5];
+        s.sse_scale_milli = 1_250;
+        assert_eq!(
+            budget_line(Some(&s)),
+            "budget fpv (diagnostic) · under need 1 mesh, 4 imagery (6 levels) · scale 1.25"
+        );
+    }
 
     /// Nothing to credit — no tileset in the session — and the view is the
     /// whole frame, exactly as before the bar existed.

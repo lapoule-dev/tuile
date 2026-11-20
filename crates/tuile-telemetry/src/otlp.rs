@@ -192,6 +192,82 @@ mod tests {
         r
     }
 
+    /// The eviction/prefetch decider's series (its spec §7.1) reach the
+    /// collector, every label on the allow-list: the quality deficit and the
+    /// specification in force, with whether a diagnostic override set it.
+    #[test]
+    fn the_budget_decider_s_series_reach_the_collector() {
+        let registry = Registry::new();
+        let mut s = tuile_core::budget::BudgetSignals::default();
+        s.under_need_tiles = [1, 2];
+        s.deficit_levels = [1, 3];
+        s.deficit_level_micros_total = [1_000_000, 2_000_000];
+        s.spec = tuile_core::budget::SpecKind::Fpv;
+        s.spec_overridden = true;
+        s.spec_changes_total = 2;
+        tuile_core::metrics::publish_budget(s);
+        metrics::with_local_recorder(&registry, || {
+            tuile_metrics::publish(tuile_core::metrics::metrics())
+        });
+        let out = encode(&resource(), &registry.snapshot(), 1_000, 2_000);
+        assert_eq!(out.withheld, 0, "every label is allowed");
+        let v: Json = serde_json::from_str(&out.body).expect("JSON");
+        let metrics = v["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array()
+            .expect("metrics")
+            .clone();
+        let point = |name: &str, labels: &[(&str, &str)]| -> Option<Json> {
+            let m = metrics.iter().find(|m| m["name"] == name)?;
+            let data = m.get("gauge").or_else(|| m.get("sum"))?;
+            data["dataPoints"]
+                .as_array()?
+                .iter()
+                .find(|p| {
+                    labels.iter().all(|(k, val)| {
+                        p["attributes"].as_array().is_some_and(|a| {
+                            a.contains(&json!({"key": k, "value": {"stringValue": val}}))
+                        })
+                    })
+                })
+                .cloned()
+        };
+        let value = |p: Option<Json>| {
+            p.map(|p| {
+                p["asDouble"]
+                    .as_f64()
+                    .or_else(|| p["asInt"].as_str().and_then(|x| x.parse().ok()))
+                    .unwrap_or(f64::NAN)
+            })
+        };
+        assert_eq!(
+            value(point("tuile_budget_under_need_tiles", &[("kind", "imagery")])),
+            Some(2.0)
+        );
+        assert_eq!(
+            value(point("tuile_budget_deficit_levels", &[("kind", "imagery")])),
+            Some(3.0)
+        );
+        assert_eq!(
+            value(point("tuile_budget_deficit_level_seconds_total", &[("kind", "mesh")])),
+            Some(1.0)
+        );
+        assert_eq!(
+            value(point(
+                "tuile_budget_spec_info",
+                &[("spec", "fpv"), ("source", "override")]
+            )),
+            Some(1.0)
+        );
+        assert_eq!(
+            value(point(
+                "tuile_budget_spec_info",
+                &[("spec", "interactive"), ("source", "override")]
+            )),
+            Some(0.0)
+        );
+        assert_eq!(value(point("tuile_budget_spec_changes_total", &[])), Some(2.0));
+    }
+
     /// The mapping: names, kinds, temporality, labels, the 64-bit integers
     /// as strings, the buckets as the protocol counts them.
     #[test]

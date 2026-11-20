@@ -72,6 +72,10 @@ pub(crate) struct Snapshot {
     /// Which of the session's 3D Tiles tilesets are drawn, a bit each by
     /// their order (`crate::menu::State::tilesets`).
     pub tilesets: u32,
+    /// Whether the budget's line is shown, and the budget specification a
+    /// diagnostic override forces (`None`: the context's).
+    pub budget_line: bool,
+    pub budget_spec: Option<tuile_core::budget::SpecKind>,
 }
 
 impl Snapshot {
@@ -112,6 +116,8 @@ impl Snapshot {
             clock: crate::menu::Clock::default(),
             recording: false,
             tilesets: 0,
+            budget_line: false,
+            budget_spec: None,
         }
     }
 }
