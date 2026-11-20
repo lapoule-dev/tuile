@@ -257,82 +257,10 @@ const BAND_SHIFT: u32 = 62;
 /// The value's bits under the band's.
 const VALUE_MASK: u64 = (1 << BAND_SHIFT) - 1;
 
-/// The specification's terms of a held resource's value, tabulated for the
-/// arena's key (`Specification` evaluated once per class, level and copies
-/// held, not per key): what the key reads of the specification, so a key
-/// filed is the key found as long as the table stands.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Valuation {
-    /// Levels up to this are the coarse band.
-    coarse_through: u32,
-    /// The restore-cost credit, µs for a resource of `ref_bytes`, by class,
-    /// level (`level_index`) and copies held: what releasing it would cost
-    /// to undo (GreedyDual-Size's credit).
-    credit: PerClass<[[u32; 3]; LEVELS]>,
-    /// The recency weight, ‰, by class and level.
-    recency: PerClass<[u32; LEVELS]>,
-    /// The size the credit is given for.
-    ref_bytes: u64,
-}
-
-impl Default for Valuation {
-    /// Recency alone, no credit, no coarse band: least recently needed
-    /// first.
-    fn default() -> Self {
-        Valuation {
-            coarse_through: 0,
-            credit: PerClass::splat([[0; 3]; LEVELS]),
-            recency: PerClass::splat([1_000; LEVELS]),
-            ref_bytes: 1,
-        }
-    }
-}
-
-impl Valuation {
-    /// The table of `spec`, for a floor ending at `pinned`.
-    pub fn of(spec: &crate::spec::Specification, pinned: Option<u32>) -> Self {
-        use crate::spec::{Facts, Term};
-        let mut v = Valuation {
-            coarse_through: spec.params.coarse_through,
-            ref_bytes: spec.params.ref_bytes.0.max(1),
-            ..Valuation::default()
-        };
-        for class in Class::ALL {
-            for at in 0..LEVELS {
-                let level = u32::try_from(at).unwrap_or(u32::MAX);
-                let band = spec.band(class, level, pinned);
-                let facts = |tier| Facts {
-                    class,
-                    level,
-                    tier,
-                    band,
-                    membership: None,
-                    predicted: false,
-                };
-                v.recency[class][at] = spec.weight(Term::Recency, &facts(Tier::Remote));
-                for h in Held::ALL {
-                    // Releasing the GPU copy of one held twice demotes it to
-                    // its decoded copy; any other release sends it back to
-                    // the network.
-                    let tier = match h {
-                        Held::Both => Tier::Decoded,
-                        Held::Gpu | Held::Cpu => Tier::Remote,
-                    };
-                    let w = u64::from(spec.weight(Term::RestoreCost, &facts(tier)));
-                    let cost = spec.params.restore.of(tier).0;
-                    v.credit[class][at][h.i()] =
-                        u32::try_from(cost.saturating_mul(w) / 1_000).unwrap_or(u32::MAX);
-                }
-            }
-        }
-        v
-    }
-}
-
 /// The copies a resource outside transit holds, as the eviction index files
 /// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Held {
+pub(crate) enum Held {
     /// A GPU copy and a decoded one.
     Both,
     /// A GPU copy only.
@@ -347,7 +275,7 @@ impl Held {
     /// Every one.
     pub const ALL: [Held; 3] = [Held::Both, Held::Gpu, Held::Cpu];
 
-    fn i(self) -> usize {
+    pub(crate) fn i(self) -> usize {
         match self {
             Held::Both => 0,
             Held::Gpu => 1,
@@ -538,7 +466,7 @@ pub(super) struct Arena {
     /// The floor's last level (`BudgetConfig::pinned_level`).
     pinned: Option<u32>,
     /// The specification's terms the eviction key reads.
-    valuation: Valuation,
+    valuation: super::value::Valuation,
     evict: EvictIndex,
     /// Every resource whose copies, load or tier changed, in order, with
     /// what changed ([`Change`]), since the step last took them
@@ -611,7 +539,7 @@ impl Default for Arena {
             gpu_by_level: PerClass::splat([Bytes::ZERO; LEVELS]),
             gpu_drapes: BTreeSet::new(),
             pinned: None,
-            valuation: Valuation::default(),
+            valuation: super::value::Valuation::default(),
             evict: EvictIndex::default(),
             changed: Vec::new(),
             protected: PerClass::splat(Bytes::ZERO),
@@ -1142,22 +1070,20 @@ impl Arena {
         let at = level_index(o.level);
         let band: u64 = if self.is_floor(s) {
             2
-        } else if o.level <= v.coarse_through {
+        } else if v.coarse(o.level) {
             1
         } else {
             0
         };
-        let recency = u128::from(self.last_needed(s).0) * u128::from(v.recency[class][at]) / 1_000;
-        let credit = self.held(s).map_or(0, |h| {
+        let held = self.held(s).map(|h| {
             let bytes = match h {
-                Held::Cpu => self.cpu[s.i()].cost.gpu.0,
-                Held::Both | Held::Gpu => self.gpu[s.i()].bytes.0,
+                Held::Cpu => self.cpu[s.i()].cost.gpu,
+                Held::Both | Held::Gpu => self.gpu[s.i()].bytes,
             };
-            let size = bytes.max(v.ref_bytes / 16).max(1);
-            u128::from(v.credit[class][at][h.i()]) * u128::from(v.ref_bytes) / u128::from(size)
+            (h, bytes)
         });
-        let value = u64::try_from(recency.saturating_add(credit))
-            .unwrap_or(u64::MAX)
+        let value = v
+            .held_value(class, at, self.last_needed(s), held)
             .min(VALUE_MASK);
         (
             band << BAND_SHIFT | value,
@@ -1170,7 +1096,7 @@ impl Arena {
     /// Takes the specification's table: when it changes, every filed
     /// resource is filed again under its new key (a re-specification's
     /// one-off cost, O(N log N)). Returns how many were.
-    pub fn set_valuation(&mut self, v: Valuation) -> usize {
+    pub fn set_valuation(&mut self, v: super::value::Valuation) -> usize {
         if self.valuation == v {
             return 0;
         }
@@ -2006,6 +1932,7 @@ mod tests {
     #[test]
     fn the_release_order_follows_the_value_coarse_band_last() {
         use crate::spec::Specification;
+        use crate::value::Valuation;
         let mut a = Arena::new(Some(1));
         let mut spec = Specification::interactive();
         spec.params.coarse_through = 5;
