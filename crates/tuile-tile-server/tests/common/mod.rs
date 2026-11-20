@@ -306,6 +306,7 @@ pub fn catalog() -> tuile_tile_server::Catalog {
                 index: false,
                 licence: None,
                 attribution: None,
+                derived_from: None,
             },
             LayerDef {
                 name: TERRAIN.into(),
@@ -318,6 +319,7 @@ pub fn catalog() -> tuile_tile_server::Catalog {
                 index: false,
                 licence: None,
                 attribution: None,
+                derived_from: None,
             },
         ],
     }

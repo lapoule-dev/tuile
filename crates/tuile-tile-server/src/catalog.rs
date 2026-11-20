@@ -63,6 +63,12 @@ pub struct LayerDef {
     /// layer's attribution is shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attribution: Option<String>,
+    /// The layer this one is derived from, when its tiles are made rather
+    /// than fetched: each tile is the parent of four tiles of that layer one
+    /// level finer, downsampled ([`crate::derived`]). Absent: a layer with a
+    /// source of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<String>,
 }
 
 /// A bucket's layers.

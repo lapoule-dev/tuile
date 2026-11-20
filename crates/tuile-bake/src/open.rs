@@ -389,6 +389,7 @@ pub fn black_marble_layer() -> tuile_tile_server::LayerDef {
         attribution: Some(
             "Imagery: NASA Earth Observatory, Black Marble 2016, served by NASA EOSDIS GIBS".into(),
         ),
+        derived_from: None,
     }
 }
 
@@ -471,6 +472,7 @@ fn blue_marble_layer() -> tuile_tile_server::LayerDef {
             "Imagery: NASA Earth Observatory, Blue Marble: Next Generation, served by NASA EOSDIS GIBS"
                 .into(),
         ),
+        derived_from: None,
     }
 }
 
@@ -487,6 +489,7 @@ pub fn store_layers(ground: Ground, ion: (i64, Option<i64>)) -> Vec<tuile_tile_s
         index: false,
         licence: Some("CC0-1.0 (made by tuile: the WGS84 ellipsoid)".into()),
         attribution: None,
+        derived_from: None,
     };
     match ground {
         Ground::Ion => {
@@ -515,6 +518,7 @@ pub fn store_layers(ground: Ground, ion: (i64, Option<i64>)) -> Vec<tuile_tile_s
                     licence: proprietary(),
                     // Credited per view, as the source's session lists it.
                     attribution: None,
+                    derived_from: None,
                 });
             }
             layers

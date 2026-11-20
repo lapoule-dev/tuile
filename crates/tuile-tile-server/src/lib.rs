@@ -7,6 +7,7 @@ pub mod absences;
 pub mod archive;
 pub mod catalog;
 pub mod content;
+pub mod derived;
 pub mod disk;
 pub mod due;
 pub mod extract;
@@ -31,6 +32,7 @@ pub mod upstream;
 pub use absences::{Absence, Absences};
 pub use catalog::{Catalog, LayerDef};
 pub use content::StoreContent;
+pub use derived::{Derivations, ParentConfig, ParentLayer, ServedLayer};
 pub use disk::DiskCacheConfig;
 pub use due::{due, Due, Why};
 pub use extract::{ExtractAsk, ExtractReport, Extracts};
@@ -42,7 +44,7 @@ pub use pmtiles::{Compression, TileType};
 pub use projection::{Eye, Footprint, LayerProjection, ProjectionReport, ZoneListing};
 pub use register::MemoryRegister;
 pub use service::{
-    etag_of, LayerMeta, ServiceConfig, ServiceError, ServiceStats, Source, TileResponse,
+    etag_of, LayerMeta, Refreshed, ServiceConfig, ServiceError, ServiceStats, Source, TileResponse,
     TileService,
 };
 pub use store::{Census, Clock, Compaction, Fresh, Scrub, StatsSnapshot, StoreConfig, TileStore};

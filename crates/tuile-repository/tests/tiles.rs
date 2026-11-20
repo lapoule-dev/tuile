@@ -86,6 +86,7 @@ fn layer(name: &str, grid: Grid, expiry_days: Option<u64>) -> LayerDef {
         index: false,
         licence: None,
         attribution: None,
+        derived_from: None,
     }
 }
 

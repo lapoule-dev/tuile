@@ -121,6 +121,19 @@ impl TileResponse {
     }
 }
 
+/// What [`TileService::refresh`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refreshed {
+    /// The store held nothing of the tile: nothing was asked.
+    NotHeld,
+    /// The source answered what the store already holds: nothing handed on.
+    Unchanged,
+    /// The source answered this tile, handed on in place of the copy held.
+    Tile(Bytes),
+    /// The source has no such tile now: an absence, handed on.
+    Absent,
+}
+
 /// What a client needs to address a layer.
 #[derive(Debug, Clone, Serialize)]
 pub struct LayerMeta {
@@ -304,6 +317,7 @@ impl TileService {
             return Ok(match hot {
                 Some((bytes, etag)) => {
                     self.counters.memory.fetch_add(1, Ordering::Relaxed);
+                    served(layer, "memory");
                     Some(TileResponse {
                         bytes,
                         content_type,
@@ -314,6 +328,7 @@ impl TileService {
                 }
                 None => {
                     self.counters.absent.fetch_add(1, Ordering::Relaxed);
+                    served(layer, "absent");
                     None
                 }
             });
@@ -335,6 +350,7 @@ impl TileService {
         // An absence store answers only absences newer than any copy.
         if absent && self.store.absences_first() {
             self.counters.absent.fetch_add(1, Ordering::Relaxed);
+            served(layer, "absent");
             self.hot_put(key, None);
             return Ok(None);
         }
@@ -346,11 +362,13 @@ impl TileService {
         {
             crate::store::empty_tile_seen(layer, "read");
             self.counters.absent.fetch_add(1, Ordering::Relaxed);
+            served(layer, "absent");
             self.hot_put(key, None);
             return Ok(None);
         }
         if let Some(bytes) = stored {
             self.counters.store.fetch_add(1, Ordering::Relaxed);
+            served(layer, "store");
             let etag = etag_of(&bytes);
             self.hot_put(key, Some((bytes.clone(), etag.clone())));
             return Ok(Some(TileResponse {
@@ -363,11 +381,20 @@ impl TileService {
         }
         if absent {
             self.counters.absent.fetch_add(1, Ordering::Relaxed);
+            served(layer, "absent");
             self.hot_put(key, None);
             return Ok(None);
         }
 
-        let (fetched, source) = self.fetch_once(layer, level, x, y).await?;
+        let (flight, joined) = self.fetch_once(layer, level, x, y);
+        let waited = Instant::now();
+        let (fetched, source) = flight.await?;
+        if joined {
+            // A request that found the tile already being fetched, and
+            // waited for that fetch rather than asking the source again.
+            metrics::histogram!("tuile_tiles_flight_wait_seconds", "layer" => layer.to_string())
+                .record(waited.elapsed().as_secs_f64());
+        }
         // Fetched here it was looked at already; shared by an instance from
         // before, perhaps not.
         let fetched = fetched.filter(|bytes| !self.store.is_known_empty_tile(layer, bytes));
@@ -380,6 +407,14 @@ impl TileService {
             &self.counters.upstream
         };
         counter.fetch_add(1, Ordering::Relaxed);
+        served(
+            layer,
+            match (&fetched, hit) {
+                (None, _) => "absent",
+                (Some(_), true) => "shared",
+                (Some(_), false) => "upstream",
+            },
+        );
         match fetched {
             Some(bytes) => {
                 let etag = etag_of(&bytes);
@@ -397,6 +432,77 @@ impl TileService {
                 Ok(None)
             }
         }
+    }
+
+    /// Asks the layer's source again for a tile the store already answers
+    /// for — a tile, or an absence — and, when the source says something
+    /// else now, hands it on as any fetch is (to the sink, or to the store),
+    /// so that it replaces the copy held: the newer copy wins, and the old
+    /// one is served until it does. The same bytes are handed to nobody
+    /// ([`Refreshed::Unchanged`]). A tile the store holds nothing of is left
+    /// alone ([`Refreshed::NotHeld`]): it is fetched when it is first asked
+    /// for. Not single flight: for the one process that refreshes a tile.
+    ///
+    /// What a layer made from another one ([`crate::derived`]) is told when
+    /// one of the tiles it was made from has changed.
+    pub async fn refresh(
+        &self,
+        layer: &str,
+        level: u8,
+        x: u32,
+        y: u32,
+    ) -> Result<Refreshed, ServiceError> {
+        let l = self.store.layer(layer)?;
+        l.grid
+            .check(level, x, y)
+            .map_err(|e| ServiceError::OutOfGrid(e.to_string()))?;
+        let absence = format!("{layer}{ABSENT_SUFFIX}");
+        let held = self.store.get(layer, level, x, y).await?;
+        let held_absent = held.is_none()
+            && self.store.layer(&absence).is_ok()
+            && self.store.get(&absence, level, x, y).await?.is_some();
+        if held.is_none() && !held_absent {
+            return Ok(Refreshed::NotHeld);
+        }
+        let upstream = self
+            .upstreams
+            .get(layer)
+            .ok_or_else(|| ServiceError::UnknownLayer(layer.to_string()))?;
+        metrics::counter!("tuile_tiles_upstream_total", "layer" => layer.to_string()).increment(1);
+        let got = upstream
+            .fetch(level, x, y)
+            .await
+            .map_err(|e| ServiceError::Upstream(e.0))?;
+        let got = not_empty(&self.store, layer, got);
+        // What the store already answers is not handed on again.
+        let unchanged = match (&got, &held) {
+            (Some(bytes), Some(kept)) => bytes == kept,
+            (None, None) => held_absent,
+            _ => false,
+        };
+        if unchanged {
+            return Ok(Refreshed::Unchanged);
+        }
+        let key: Key = (layer.to_string(), level, x, y);
+        hand_on(
+            &self.store,
+            self.sink.as_ref(),
+            self.shared.as_ref(),
+            &key,
+            got.clone(),
+        )
+        .await?;
+        Ok(match got {
+            Some(bytes) => {
+                let etag = etag_of(&bytes);
+                self.hot_put(key, Some((bytes.clone(), etag)));
+                Refreshed::Tile(bytes)
+            }
+            None => {
+                self.hot_put(key, None);
+                Refreshed::Absent
+            }
+        })
     }
 
     /// `Some(entry)` when a fresh hot entry exists; the entry itself is
@@ -434,14 +540,18 @@ impl TileService {
         }
     }
 
-    fn fetch_once(&self, layer: &str, level: u8, x: u32, y: u32) -> Flight {
+    /// The one fetch of a tile in flight, and whether it was already in
+    /// flight (this caller joins it) rather than started here.
+    fn fetch_once(&self, layer: &str, level: u8, x: u32, y: u32) -> (Flight, bool) {
         let key = (layer.to_string(), level, x, y);
         let mut inflight = match self.inflight.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
         if let Some(f) = inflight.get(&key) {
-            return f.clone();
+            metrics::counter!("tuile_tiles_flight_joined_total", "layer" => layer.to_string())
+                .increment(1);
+            return (f.clone(), true);
         }
         let upstream = self.upstreams.get(layer).cloned();
         let store = self.store.clone();
@@ -511,7 +621,7 @@ impl TileService {
         .boxed()
         .shared();
         inflight.insert(key, flight.clone());
-        flight
+        (flight, false)
     }
 }
 
@@ -530,15 +640,32 @@ async fn fetch(
         .fetch(k.1, k.2, k.3)
         .await
         .map_err(|e| ServiceError::Upstream(e.0))?;
-    // A source's "no imagery" sent as a picture is its "no such tile": served,
-    // shared and stored as that, never as the picture.
-    let got = got.filter(|bytes| {
-        let empty = store.is_empty_tile(&k.0, bytes);
+    let got = not_empty(store, &k.0, got);
+    hand_on(store, sink, shared, k, got).await
+}
+
+/// A source's "no imagery" sent as a picture is its "no such tile": served,
+/// shared and stored as that, never as the picture.
+fn not_empty(store: &TileStore, layer: &str, got: Option<Bytes>) -> Option<Bytes> {
+    got.filter(|bytes| {
+        let empty = store.is_empty_tile(layer, bytes);
         if empty {
-            crate::store::empty_tile_seen(&k.0, "upstream");
+            crate::store::empty_tile_seen(layer, "upstream");
         }
         !empty
-    });
+    })
+}
+
+/// Hands on what a source has just said of a tile: to the sink when there
+/// is one — and then that is all — or else to the other instances, if there
+/// is something to share it through, and to the store.
+async fn hand_on(
+    store: &Arc<TileStore>,
+    sink: Option<&Arc<dyn FreshTiles>>,
+    shared: Option<&Arc<dyn SharedTiles>>,
+    k: &Key,
+    got: Option<Bytes>,
+) -> Result<Fetched, ServiceError> {
     let fetched = store.now();
     let fetched_ms = fetched
         .duration_since(std::time::UNIX_EPOCH)
@@ -607,6 +734,13 @@ async fn fetch(
         }
     }
     Ok((got, Source::Upstream))
+}
+
+/// Counts a tile request of `layer` by where it was answered from: `memory`,
+/// `store`, `upstream`, `shared`, or `absent` (answered "no such tile").
+fn served(layer: &str, from: &'static str) {
+    metrics::counter!("tuile_tiles_served_total", "layer" => layer.to_string(), "from" => from)
+        .increment(1);
 }
 
 /// The strong validator of a tile's bytes.
