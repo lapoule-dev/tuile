@@ -309,7 +309,13 @@ fn slow_dive_converges(profile: Profile, seed: u64, bound: Micros) {
 )]
 fn a_slow_zoom_in_converges_at_the_deepest_level() {
     for (profile, seed) in [(Profile::desktop(), 87), (Profile::handheld_low(), 89)] {
-        let bound = profile.converge_within;
+        // The decider's deficit want (eviction/prefetch spec §5.3) asks, at
+        // rest, for the drapes a level under their need that the ±1
+        // tolerance used to leave for good: the dive converges exact, a few
+        // hundred milliseconds later (desktop, seed 87: 2.13 s against the
+        // profile's 2 s) — the bound is the profile's plus that half second,
+        // as #251 measured for the same fetches.
+        let bound = profile.converge_within.plus(Micros::from_millis(500));
         slow_dive_converges(profile, seed, bound);
     }
 }
