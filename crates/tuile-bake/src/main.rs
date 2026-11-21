@@ -675,6 +675,7 @@ fn reference(path: &std::path::Path, asset: i64, cap: u32) -> Result<(), String>
         index: false,
         licence: None,
         attribution: None,
+        derived_from: None,
     };
     let store = tiles::Tiles::from_env_with(runtime.handle(), Some(reference_layer))?
         .ok_or("TUILE_TILES_BUCKET is not set: there is no store to bring the reference into")?;

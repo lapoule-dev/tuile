@@ -30,6 +30,10 @@ set of archives per **zone** and per **layer**, served back by tile address.
 - [`tiering`] picks what a compaction merges: similar sizes, contiguous.
 - [`service`] adds the upstream: fetched once, stored, served, the hot
   tiles and the source's absences kept in memory.
+- [`derived`] makes a layer from another one: each tile the parent of the
+  source's four children one level finer, downsampled in linear light and
+  encoded as WebP, served and stored like any layer's tiles, and made again
+  when a child changes. Declared in the catalog by `derived_from`.
 
 No router and no authentication here: those belong to whoever deploys it.
 

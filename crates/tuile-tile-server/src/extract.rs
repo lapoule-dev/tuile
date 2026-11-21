@@ -881,6 +881,7 @@ mod tests {
             index: false,
             licence: None,
             attribution: None,
+            derived_from: None,
         };
         catalog::write(memory.as_ref(), &Catalog { layers: vec![def] })
             .await
@@ -980,6 +981,7 @@ mod tests {
             index: false,
             licence: None,
             attribution: None,
+            derived_from: None,
         };
         catalog::write(
             memory.as_ref(),

@@ -1552,6 +1552,7 @@ mod tests {
             index: false,
             licence: None,
             attribution: None,
+            derived_from: None,
         };
         catalog::write(
             disk.as_ref(),

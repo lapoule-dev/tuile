@@ -161,6 +161,7 @@ fn bucket() -> Arc<dyn object_store::ObjectStore> {
                 index: false,
                 licence: None,
                 attribution: None,
+                derived_from: None,
             },
             LayerDef {
                 name: imagery,
@@ -175,6 +176,7 @@ fn bucket() -> Arc<dyn object_store::ObjectStore> {
                 index: true,
                 licence: None,
                 attribution: None,
+                derived_from: None,
             },
         ],
     };

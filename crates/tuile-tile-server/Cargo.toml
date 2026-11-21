@@ -27,7 +27,7 @@ bytes = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures-util = { workspace = true }
 # An index records each image tile's size, read from its header alone.
-image = { workspace = true }
+image = { workspace = true, features = ["webp"] }
 metrics = "0.24"
 # What a process keeps of the immutable archives it reads through its
 # tiers: byte-weighted caches whose loads are single flight.
@@ -45,6 +45,10 @@ tuile-core = { version = "0.17.1", path = "../tuile-core" }
 # What a source sends for "no imagery" (`index::is_empty_tile`).
 tuile-bing = { version = "0.17.1", path = "../tuile-bing" }
 url = { workspace = true }
+# A parent layer's tiles (`derived`), encoded by libwebp — the reference
+# encoder, built from its C sources (no system library): lossy WebP, which
+# image's own encoder does not write.
+webp = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 # Counters read back in the tests, from a recorder of the test's own thread.
