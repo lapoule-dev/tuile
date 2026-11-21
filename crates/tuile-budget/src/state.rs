@@ -1082,9 +1082,7 @@ impl Arena {
             };
             (h, bytes)
         });
-        let value = v
-            .held_value(class, at, self.last_needed(s), held)
-            .min(VALUE_MASK);
+        let value = v.held_value(class, at, self.last_needed(s), held).0.min(VALUE_MASK);
         (
             band << BAND_SHIFT | value,
             Reverse(o.level),

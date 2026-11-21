@@ -12,6 +12,10 @@
 //! - [`deficit_due`]: when a drawn tile's own level, a level or more over
 //!   the one it wears, becomes worth its restore cost with the margin.
 //!
+//! The currency is the **flouz** (spec §1b): one level of detail gained
+//! over one screen pixel for one step — px·lvl·step. [`Flouz`] and
+//! [`FlouzPerByte`] carry it; a time is a [`Micros`] and never a value.
+//!
 //! Nothing here reads a clock or a global: every input is a parameter.
 
 use crate::spec::{Facts, Specification, Term};
@@ -19,6 +23,28 @@ use crate::state::Held;
 use crate::stats::LEVELS;
 use crate::tier::Tier;
 use crate::types::{Bytes, Class, Micros, PerClass, TileId};
+
+/// An amount of the currency, in millionths of a flouz (µflouz): px·lvl·µs
+/// at one level over one pixel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Flouz(pub u64);
+
+impl Flouz {
+    /// What releasing a resource loses (spec §1b): the quality missing
+    /// while it comes back — `P × Δq × w × T_restore` — here at `P` = 1, one
+    /// level over `pixels`, for the restore time `restore`. The restore cost
+    /// is in the numerator: what is dear to restore is worth more held.
+    pub fn loss(pixels: u64, levels: u64, restore: Micros) -> Flouz {
+        Flouz(pixels.saturating_mul(levels).saturating_mul(restore.0))
+    }
+}
+
+/// The currency per byte held, in a fixed-point scale of the specification
+/// — `ref_bytes / ref_pixels` µflouz per byte, one unit per µs of recency
+/// for a resource of the reference size: the release order compares only
+/// values of one specification, so the scale is the same on both sides.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FlouzPerByte(pub u64);
 
 /// The specification's terms of a held resource's value, tabulated for the
 /// arena's key (`Specification` evaluated once per class, level and copies
@@ -82,7 +108,9 @@ impl Valuation {
                         Held::Gpu | Held::Cpu => Tier::Remote,
                     };
                     let w = u64::from(spec.weight(Term::RestoreCost, &facts(tier)));
-                    let cost = spec.params.restore.of(tier).0;
+                    // The loss of a release, one level over one pixel
+                    // (the reference size's), in µflouz.
+                    let cost = Flouz::loss(1, 1, spec.params.restore.of(tier)).0;
                     v.credit[class][at][h.i()] =
                         u32::try_from(cost.saturating_mul(w) / 1_000).unwrap_or(u32::MAX);
                 }
@@ -110,14 +138,14 @@ impl Valuation {
         at: usize,
         last_needed: Micros,
         held: Option<(Held, Bytes)>,
-    ) -> u64 {
+    ) -> FlouzPerByte {
         let recency = u128::from(last_needed.0) * u128::from(self.recency[class][at]) / 1_000;
         let credit = held.map_or(0, |(h, bytes)| {
             let size = bytes.0.max(self.ref_bytes / 16).max(1);
             u128::from(self.credit[class][at][h.i()]) * u128::from(self.ref_bytes)
                 / u128::from(size)
         });
-        u64::try_from(recency.saturating_add(credit)).unwrap_or(u64::MAX)
+        FlouzPerByte(u64::try_from(recency.saturating_add(credit)).unwrap_or(u64::MAX))
     }
 }
 
@@ -182,6 +210,22 @@ mod tests {
                 predicted: false,
             },
         }
+    }
+
+    /// The inversion the first draft of the spec had (dividing by the
+    /// restore cost) is not the code: with the same recency, size and
+    /// class, a resource that would come back from the network is worth
+    /// more held than one that would come back from its decoded copy, and
+    /// so is released after it (law 6).
+    #[test]
+    fn a_dear_restore_is_worth_more_held() {
+        let v = Valuation::of(&Specification::interactive(), None);
+        let at = crate::stats::level_index(9);
+        let bytes = Bytes(256 << 10);
+        let network = v.held_value(Class::Drape, at, Micros(1_000), Some((Held::Gpu, bytes)));
+        let decoded = v.held_value(Class::Drape, at, Micros(1_000), Some((Held::Both, bytes)));
+        assert!(network > decoded, "{network:?} {decoded:?}");
+        assert!(Flouz::loss(1, 1, Micros(150_000)) > Flouz::loss(1, 1, Micros(2_000)));
     }
 
     /// Law 9 made a number: with the interactive defaults (network 150 ms,
