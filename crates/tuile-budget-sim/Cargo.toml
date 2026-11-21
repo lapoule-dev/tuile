@@ -1,0 +1,25 @@
+[package]
+name = "tuile-budget-sim"
+description = "The graphics budget's simulator: the scenario catalogue, the objective and the parameter search of the eviction/prefetch decider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Native only, never a dependency of the budget: it runs the budget headless
+# over scripted scenarios (`docs/explorations/budget-eviction-prefetch-spec.md`
+# §9.3) and writes its results as Parquet tables.
+[dependencies]
+tuile-budget = { version = "0.17.1", path = "../tuile-budget" }
+parquet = { version = "58.4.0", default-features = false, features = ["arrow", "snap"] }
+arrow-array = "58.4.0"
+arrow-schema = "58.4.0"
+
+[[bin]]
+name = "tuile-budget-tune"
+path = "src/bin/tune.rs"

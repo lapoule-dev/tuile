@@ -7,6 +7,7 @@ members = [
     "crates/tuile-bevy",
     "crates/tuile-bing",
     "crates/tuile-budget",
+    "crates/tuile-budget-sim",
     "crates/tuile-ground",
     "crates/tuile-cesium-ion",
     "crates/tuile-farm",
