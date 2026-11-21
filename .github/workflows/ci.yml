@@ -13,6 +13,18 @@ concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Where the Linux jobs run. `tuile-linux` is a self-hosted runner scale set
+# (ARC, on the project's own Kubernetes cluster): one ephemeral pod per job,
+# one job at a time, 2 CPU / 4 GiB (beside the cluster's control plane: a
+# build that needs more is OOMKilled in its own pod, never the node's
+# problem), cargo and rustup caches kept between jobs.
+# A pull request from a FORK never gets it: the repository is public, and a
+# self-hosted runner would run a stranger's code on our cluster. Forks keep
+# the GitHub-hosted image they had. The stock runner image carries no
+# compiler: `.github/actions/linux-host` installs what the hosted image has
+# (and does nothing on a hosted runner). Not moved: macOS (no macOS in a
+# Linux pod), and android, which needs the hosted image's SDK and NDK.
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -22,7 +34,7 @@ jobs:
   # goes through the same check as the local hook (`.githooks/commit-msg`).
   commit-messages:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,9 +52,10 @@ jobs:
           exit $status
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/linux-host
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -56,9 +69,10 @@ jobs:
   # pinned to a patch release: every other job runs on stable, so nothing
   # else would notice a newer language feature creeping in.
   msrv:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/linux-host
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: clippy
@@ -99,7 +113,7 @@ jobs:
     # ubuntu-26.04 (Mesa 26.0.8), whose lavapipe dies with SIGSEGV in
     # `tuile-film-gpu`'s headless and atmosphere tests. Moving the image
     # is a deliberate change, made here with the driver it brings.
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || 'tuile-linux' }}
     env:
       # A GPU test that finds no adapter fails instead of passing empty.
       TUILE_REQUIRE_GPU: 1
@@ -108,6 +122,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/linux-host
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -179,11 +194,12 @@ jobs:
   # and the properties run at 10 000 cases here. The golden decision digests
   # are checked on Linux as on the Mac that recorded them.
   budget-sim:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
     env:
       PROPTEST_CASES: 10000
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/linux-host
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -199,9 +215,10 @@ jobs:
       - run: cargo nextest run --profile ci --cargo-profile release -p tuile-core --test budget_imagery
 
   wasm-guard:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/linux-host
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -242,9 +259,10 @@ jobs:
   # The package a page imports: the wasm build and its bindings, the
   # typings checked by tsc, and a bundler that ships the worker and the wasm.
   web-package:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/linux-host
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -292,11 +310,12 @@ jobs:
         run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" crates/tuile-viewer/android/build.sh
 
   docs:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/linux-host
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

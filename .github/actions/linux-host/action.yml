@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+name: Linux host packages
+description: >-
+  On a self-hosted Linux runner (tuile-linux), installs what the GitHub-hosted
+  Ubuntu image already carries and the workspace needs to build: a C
+  toolchain and linker, pkg-config, cmake, the ALSA and Wayland headers, and
+  lavapipe. On a GitHub-hosted runner it does nothing.
+runs:
+  using: composite
+  steps:
+    # The runner pod is the stock actions-runner image (Ubuntu 24.04, noble):
+    # git, curl and sudo, nothing to compile with. The same noble archive as
+    # the hosted ubuntu-24.04 image, so lavapipe is the same Mesa.
+    - if: runner.environment == 'self-hosted'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          build-essential pkg-config cmake zstd xz-utils \
+          libasound2-dev libwayland-dev libxkbcommon-dev \
+          mesa-vulkan-drivers libvulkan1
