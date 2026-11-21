@@ -265,6 +265,7 @@ impl Feed for BudgetStats {
     fn feed(&self, h: &mut Fnv) {
         let mut s = self.clone();
         s.work = 0;
+        s.levels_moved = 0;
         s.drawable_by_level = PerClass::default();
         s.transit_by_level = PerClass::default();
         s.evictions_by_level = PerClass::default();
@@ -273,6 +274,7 @@ impl Feed for BudgetStats {
         let bytes = format!("{:?}", s.drawable_by_level);
         let counts = format!("{:?}", s.evictions_by_level);
         let text = format!("{s:?}")
+            .replace(", levels_moved: 0", "")
             .replace(&format!(", drawable_by_level: {bytes}"), "")
             .replace(&format!(", transit_by_level: {bytes}"), "")
             .replace(&format!(", evictions_by_level: {counts}"), "");
@@ -309,6 +311,11 @@ impl Feed for Snapshot {
         self.resources.feed(h);
         self.tiles.feed(h);
         self.imagery_prev.feed(h);
+        // Fed when it holds something: a state with no stand-in digests as
+        // it did before the map was kept.
+        if !self.imagery_stood_in.is_empty() {
+            self.imagery_stood_in.feed(h);
+        }
         self.held_last.feed(h);
         self.drawn_last.feed(h);
         self.worn_last.feed(h);

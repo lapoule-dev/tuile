@@ -3,14 +3,14 @@ p1-cold handheld 27fe4333ed3bc720
 p1-cold handheld-low 8968dedafcb7ca55
 p1-cold headset-90 f52d7279af425942
 p1-cold web b4805451bdd7fcae
-p2-fast-dive desktop 3755f554b5b8f087
-p2-fast-dive handheld 2e2cefe327339b33
-p2-fast-dive headset-90 a2d5e6be0f7c7be2
-p3-fast-climb desktop 8ead45d97ef064ac
-p3-fast-climb handheld-low 31b318f3e48ec577
+p2-fast-dive desktop 7ac93d10059a4e89
+p2-fast-dive handheld 4c3eb3292c0a9cc1
+p2-fast-dive headset-90 611ea1591a04451f
+p3-fast-climb desktop 3cb4df3f74d365ea
+p3-fast-climb handheld-low b9494819879f6063
 p4-head-rate-yaw desktop 83dc15ad5974cc60
 p4-head-rate-yaw headset-90 4439aa65916f9ffe
-p4-orbit desktop cc57cc0d27fc6171
-p5-rotation handheld cec08bc1485d113d
+p4-orbit desktop 420a4db77a306b5f
+p5-rotation handheld d02e8dc8546b6824
 p6-look-around headset-90 7ff3afba16387016
 film 637d8d592a23cef6

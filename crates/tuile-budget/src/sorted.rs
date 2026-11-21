@@ -77,10 +77,6 @@ impl<K: Ord + Copy, V> Block<K, V> {
         self.vals.push(v);
     }
 
-    fn pop(&mut self) -> Option<(K, V)> {
-        Some((self.keys.pop()?, self.vals.pop()?))
-    }
-
     fn insert(&mut self, i: usize, k: K, v: V) {
         self.keys.insert(i, k);
         self.vals.insert(i, v);
@@ -93,6 +89,19 @@ impl<K: Ord + Copy, V> Block<K, V> {
     fn clear(&mut self) {
         self.keys.clear();
         self.vals.clear();
+    }
+
+    /// The last `m` entries, moved to the front of `into`.
+    fn pass_end(&mut self, m: usize, into: &mut Self) {
+        let at = self.len() - m;
+        into.keys.splice(0..0, self.keys.drain(at..));
+        into.vals.splice(0..0, self.vals.drain(at..));
+    }
+
+    /// The first `m` entries, moved to the end of `into`.
+    fn pass_front(&mut self, m: usize, into: &mut Self) {
+        into.keys.extend(self.keys.drain(..m));
+        into.vals.extend(self.vals.drain(..m));
     }
 
     /// The entries from `at` on, moved to the end of `into`.
@@ -496,29 +505,60 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
             }
             return None;
         }
-        // Full, a neighbour with room: one entry passes to it, and the key
-        // goes in (blocks stay nearly full, as a single vector's room is).
+        // Full, a neighbour with room: half that room's worth of entries
+        // pass to it, then the key goes in (blocks stay nearly full, as a
+        // single vector's room is). Half, not one: a run of keys into one
+        // full block — the ancestry a tile dressed by an ancestor reads, in
+        // the readers' index — paid both blocks' shift for every key when
+        // one entry passed at a time; now the next keys find room.
         if b + 1 < self.blocks.len() && self.blocks[b + 1].len() < BLOCK {
             if i == BLOCK {
                 self.kept(self.blocks[b + 1].len() + 1);
                 self.blocks[b + 1].insert(0, k, v);
             } else {
-                let Some(last) = self.blocks[b].pop() else {
-                    unreachable!("a full block has a last entry")
+                let m = (BLOCK - self.blocks[b + 1].len()).div_ceil(2);
+                let keep = BLOCK - m;
+                let (left, right) = self.blocks.split_at_mut(b + 1);
+                let (cur, next) = (&mut left[b], &mut right[0]);
+                self.upkeep = self
+                    .upkeep
+                    .saturating_add((next.len() + 2 * m) as u64);
+                cur.pass_end(m, next);
+                let into_next = i > keep;
+                let (blk, at) = if into_next {
+                    (next, i - keep)
+                } else {
+                    (cur, i)
                 };
-                self.kept(self.blocks[b + 1].len() + 1 + BLOCK - i);
-                self.blocks[b + 1].insert(0, last.0, last.1);
-                self.blocks[b].insert(i, k, v);
+                self.upkeep = self
+                    .upkeep
+                    .saturating_add((blk.len() - at + 1) as u64);
+                blk.insert(at, k, v);
                 self.heads[b] = self.blocks[b].head();
             }
             self.heads[b + 1] = self.blocks[b + 1].head();
             return None;
         }
         if b > 0 && self.blocks[b - 1].len() < BLOCK && i > 0 {
-            let first = self.blocks[b].remove(0);
-            self.kept(BLOCK + 1 + i);
-            self.blocks[b - 1].push(first.0, first.1);
-            self.blocks[b].insert(i - 1, k, v);
+            // The same toward the block before: half its room's worth of
+            // the first entries pass to it.
+            let room = BLOCK - self.blocks[b - 1].len();
+            // The key itself goes before when it falls among the entries
+            // passed, which leaves room for it there only when `m < room`.
+            let m = room.div_ceil(2).min(i);
+            let (left, right) = self.blocks.split_at_mut(b);
+            let (prev, cur) = (&mut left[b - 1], &mut right[0]);
+            self.upkeep = self.upkeep.saturating_add((BLOCK + m) as u64);
+            cur.pass_front(m, prev);
+            if i < m {
+                let at = prev.len() - m + i;
+                self.upkeep = self.upkeep.saturating_add((prev.len() - at + 1) as u64);
+                prev.insert(at, k, v);
+            } else {
+                let at = i - m;
+                self.upkeep = self.upkeep.saturating_add((cur.len() - at + 1) as u64);
+                cur.insert(at, k, v);
+            }
             self.heads[b] = self.blocks[b].head();
             return None;
         }
@@ -674,23 +714,174 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
 
     /// Applies `changes` — a value to set at a key, or `None` to remove the
     /// key — in order, the last change of a key winning; `changes` is left
-    /// empty. `spent` receives each value replaced or removed. Each change
-    /// costs what an insertion or a removal does: a batch costs its changes.
+    /// empty. `spent` receives each value replaced or removed (in no set
+    /// order: a merged run gives its replaced values, then its removed
+    /// ones). Each change
+    /// costs what an insertion or a removal does: a batch costs its changes;
+    /// but a run of changes in key order within one block — what a unit
+    /// reads of several tiles, the ancestry a tile dressed by an ancestor
+    /// reads, as the reach index takes it — is merged into the block in one
+    /// pass, the block's entries moved once, not once per change.
     pub fn apply(&mut self, changes: &mut Vec<(K, Option<V>)>, mut spent: impl FnMut(V)) {
         if changes.is_empty() {
             return;
         }
         let used = changes.len();
-        for (k, v) in changes.drain(..) {
-            let old = match v {
+        let mut j = 0;
+        while j < used {
+            let end = self.run_end(changes, j);
+            if end - j >= 2 {
+                self.merge_run(&mut changes[j..end], &mut spent);
+                j = end;
+                continue;
+            }
+            let k = changes[j].0;
+            let old = match changes[j].1.take() {
                 Some(v) => self.insert(k, v),
                 None => self.remove(&k),
             };
             if let Some(o) = old {
                 spent(o);
             }
+            j += 1;
         }
+        changes.clear();
         trim(changes, used);
+    }
+
+    /// [`SortedMap::apply`] on changes to distinct keys that come in
+    /// another order than the map's — the readers' index, keyed by the tile
+    /// read, takes them unit by unit: sorted by key first, so that the
+    /// changes within one block merge in one pass. The sort costs `c·⌈log2 c⌉` for `c` changes,
+    /// and allocates nothing.
+    pub fn apply_unordered(&mut self, changes: &mut Vec<(K, Option<V>)>, spent: impl FnMut(V)) {
+        let c = changes.len();
+        if c > 1 && !changes.windows(2).all(|w| w[0].0 < w[1].0) {
+            changes.sort_unstable_by_key(|e| e.0);
+            debug_assert!(
+                changes.windows(2).all(|w| w[0].0 < w[1].0),
+                "changes to distinct keys"
+            );
+            let log = usize::BITS - (c - 1).leading_zeros();
+            self.kept(c * log as usize);
+        }
+        self.apply(changes, spent);
+    }
+
+    /// Where the run of `changes` from `j` ends: keys strictly ascending,
+    /// all in the block of the first, the block left with between one and
+    /// [`BLOCK`] entries. `j + 1` when there is no such run of two.
+    fn run_end(&self, changes: &[(K, Option<V>)], j: usize) -> usize {
+        let Some(b) = self.block_of(&changes[j].0) else {
+            return j + 1;
+        };
+        let blk = &self.blocks[b];
+        let next = self.heads.get(b + 1).copied();
+        let mut len = blk.len();
+        let mut end = j;
+        let mut last = None;
+        for (k, v) in &changes[j..] {
+            if last.is_some_and(|l| *k <= l) || next.is_some_and(|h| *k >= h) {
+                break;
+            }
+            // The head of the block bounds it below, but the first block's.
+            if b > 0 && *k < self.heads[b] {
+                break;
+            }
+            let held = blk.search(k).is_ok();
+            let after = match (held, v.is_some()) {
+                (false, true) => len + 1,
+                (true, false) => len - 1,
+                _ => len,
+            };
+            if after == 0 || after > BLOCK {
+                break;
+            }
+            len = after;
+            last = Some(*k);
+            end += 1;
+        }
+        end.max(j + 1)
+    }
+
+    /// The run `run` (`run_end`) merged into its block in place, in a few
+    /// passes over it, allocating nothing: the values replaced and the keys
+    /// removed first (the kept entries moved up once), then the new
+    /// entries appended and every entry swapped once to its place.
+    fn merge_run(&mut self, run: &mut [(K, Option<V>)], spent: &mut impl FnMut(V)) {
+        let Some(b) = self.block_of(&run[0].0) else {
+            unreachable!("a run is within a block");
+        };
+        let blk = &mut self.blocks[b];
+        let before = blk.len();
+        // Replaced in place; removed, marked (a block holds at most 32).
+        let mut gone = 0u32;
+        let mut fresh = 0;
+        let mut i = 0;
+        for (k, v) in run.iter_mut() {
+            i += blk.keys[i..].partition_point(|h| h < k);
+            if blk.keys.get(i) == Some(k) {
+                match v.take() {
+                    Some(v) => spent(std::mem::replace(&mut blk.vals[i], v)),
+                    None => gone |= 1 << i,
+                }
+            } else if v.is_some() {
+                fresh += 1;
+            }
+        }
+        // The kept entries moved up, in order; the removed ones out. What
+        // the merge costs is the entries it moves, as an insertion's is.
+        let mut moved = 0;
+        let mut w = 0;
+        for r in 0..before {
+            if gone & (1 << r) == 0 {
+                if w != r {
+                    blk.keys.swap(w, r);
+                    blk.vals.swap(w, r);
+                    moved += 1;
+                }
+                w += 1;
+            }
+        }
+        moved += before - w;
+        blk.keys.truncate(w);
+        for v in blk.vals.drain(w..) {
+            spent(v);
+        }
+        // The new entries after them, then each swapped to its place: the
+        // places from a merge of the two sorted parts' keys.
+        for (k, v) in run.iter_mut() {
+            if let Some(v) = v.take() {
+                blk.push(*k, v);
+                moved += 1;
+            }
+        }
+        let n = blk.len();
+        let mut to = [0u8; BLOCK];
+        let (mut x, mut y) = (0, w);
+        for slot in 0..n {
+            let take_old = y == n || (x < w && blk.keys[x] < blk.keys[y]);
+            let from = if take_old {
+                x += 1;
+                x - 1
+            } else {
+                y += 1;
+                y - 1
+            };
+            to[from] = u8::try_from(slot).unwrap_or(u8::MAX);
+        }
+        for at in 0..n {
+            while usize::from(to[at]) != at {
+                let t = usize::from(to[at]);
+                blk.keys.swap(at, t);
+                blk.vals.swap(at, t);
+                to.swap(at, t);
+                moved += 1;
+            }
+        }
+        self.len = self.len + fresh - (before - w);
+        self.heads[b] = blk.head();
+        self.kept(moved);
     }
 
     /// The map's invariants: keys sorted across the blocks, no block empty
@@ -745,6 +936,7 @@ mod tests {
         Insert(u16, u32),
         Remove(u16),
         Apply(Vec<(u16, Option<u32>)>),
+        Unordered(Vec<(u16, Option<u32>)>),
         Rebuild(Vec<u16>),
         Retain(u16),
         Clear,
@@ -756,6 +948,24 @@ mod tests {
             6 => (0u16..600).prop_map(Op::Remove),
             4 => prop::collection::vec((0u16..600, prop::option::of(any::<u32>())), 0..120)
                 .prop_map(Op::Apply),
+            // Changes to distinct keys, out of order.
+            2 => prop::collection::btree_map(0u16..600, prop::option::of(any::<u32>()), 0..80)
+                .prop_map(|m| Op::Unordered(m.into_iter().rev().collect())),
+            // Runs of changes in key order — values set, keys removed —
+            // some within one block: `apply`'s runs.
+            3 => (0u16..600, prop::collection::vec((1u16..4, prop::option::of(any::<u32>())), 1..40))
+                .prop_map(|(from, steps)| {
+                    let mut k = from;
+                    Op::Apply(
+                        steps
+                            .into_iter()
+                            .map(|(d, v)| {
+                                k = k.saturating_add(d);
+                                (k, v)
+                            })
+                            .collect(),
+                    )
+                }),
             1 => prop::collection::btree_set(0u16..600, 0..400)
                 .prop_map(|s| Op::Rebuild(s.into_iter().collect())),
             1 => (1u16..7).prop_map(Op::Retain),
@@ -827,6 +1037,25 @@ mod tests {
                         let mut spent = Vec::new();
                         m.apply(&mut c, |v| spent.push(v));
                         prop_assert!(c.is_empty());
+                        spent.sort_unstable();
+                        want.sort_unstable();
+                        prop_assert_eq!(spent, want);
+                    }
+                    Op::Unordered(mut c) => {
+                        let mut want: Vec<(u16, u32)> = Vec::new();
+                        for (k, v) in &c {
+                            let old = match v {
+                                Some(v) => o.insert(*k, *v),
+                                None => o.remove(k),
+                            };
+                            want.extend(old.map(|x| (*k, x)));
+                        }
+                        let mut want: Vec<u32> = want.into_iter().map(|w| w.1).collect();
+                        want.sort_unstable();
+                        let mut spent = Vec::new();
+                        m.apply_unordered(&mut c, |v| spent.push(v));
+                        prop_assert!(c.is_empty());
+                        spent.sort_unstable();
                         prop_assert_eq!(spent, want);
                     }
                     Op::Rebuild(keys) => {

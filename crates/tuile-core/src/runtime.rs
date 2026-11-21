@@ -3498,8 +3498,13 @@ mod tests {
 
     /// **A still view asks the loader nothing while its store stands still,
     /// and the first step after a store event reads the new answer** (O1.5
-    /// part 3, `TileLoader::store_events`). The drapes never arrive, so every
-    /// drawn tile's level is chosen by asking the loader's presence index.
+    /// part 3, `TileLoader::store_events`). A level asks the store under a
+    /// relaxation only (for a held level to stand in for the need's own,
+    /// spec I15; at scale one the level is the need's own): the view is
+    /// relaxed from its first still step and for good — its meshes over a
+    /// target of one byte, the LOD scale at its ceiling within that step.
+    /// The drapes never arrive, so every drawn tile's level is chosen by
+    /// asking the loader's presence index.
     /// Five seconds of still steps at 60 a second: between events the loader
     /// is asked nothing and no level is read again. The store fills (an
     /// event per drape it now holds): the very next step asks the loader
@@ -3573,12 +3578,27 @@ mod tests {
             asked: Arc::clone(&asked),
             events: Arc::clone(&events),
         };
+        // Relaxed: the meshes over a target of one byte (no pool to lend
+        // them more), the scale at its ceiling the first step the clock
+        // moves, and there for good.
+        let mut relaxed = roomy();
+        relaxed.pool = crate::budget::Pool::NONE;
+        for c in [
+            crate::budget::Class::TerrainMesh,
+            crate::budget::Class::Tiles3dMesh,
+        ] {
+            relaxed.target[c] = Bytes(1);
+            relaxed.overflow[c] = Bytes::ZERO;
+        }
+        relaxed.relax.up_per_second = 1_000_000;
+        relaxed.relax.max_scale = 2_000;
         let (mut stream, server) =
-            in_process_with(tree, Arc::new(loader), Config::default(), roomy()).expect("budget");
+            in_process_with(tree, Arc::new(loader), Config::default(), relaxed).expect("budget");
         let clock = Arc::new(AtomicU64::new(1));
         let at = Arc::clone(&clock);
         let server = server.with_clock(Arc::new(move || Micros(at.load(Ordering::SeqCst))));
         let meter = server.meter();
+        let scale = || meter.lock().expect("meter").signals().sse_scale_milli;
         let mut server = Box::pin(server.run());
         let mut consumer = Consumer::default();
         look(&stream, near_view(), 1);
@@ -3634,6 +3654,7 @@ mod tests {
                 .collect();
             asks.push(step);
         }
+        assert_eq!(scale(), 2_000, "the view is relaxed");
         assert!(!filled.is_empty(), "no level asked the store");
         // No resource is asked twice in one step.
         for (i, step) in asks.iter().enumerate() {

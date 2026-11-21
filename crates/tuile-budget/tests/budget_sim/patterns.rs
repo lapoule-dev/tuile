@@ -881,6 +881,8 @@ struct P64 {
     pressure: tuile_budget::Pressure,
     /// The decisions of the step before, counted in this step's #E.
     decided: u64,
+    /// The imagery levels the step before moved, counted in this step's #E.
+    levels_moved: u64,
     /// The events and decisions since the last prune, counted in the next
     /// prune's #E.
     since_prune: u64,
@@ -899,6 +901,7 @@ impl P64 {
             prev: None,
             pressure: tuile_budget::Pressure::Normal,
             decided: 0,
+            levels_moved: 0,
             since_prune: 0,
             tracked: 0,
             over: Vec::new(),
@@ -929,7 +932,12 @@ impl P64 {
             .prev
             .as_ref()
             .map_or_else(|| listed(need).len() as u64, |p| need_delta(p, need));
-        let mut e = sim.step_events + self.decided;
+        // The levels that moved last step are read again this one (the
+        // hysteresis reads the last level): a change the need did not name
+        // — the footprint, the scale, a local tier — counted as the
+        // decisions of the step before are.
+        let mut e = sim.step_events + self.decided + self.levels_moved;
+        self.levels_moved = u64::from(d.stats.levels_moved);
         if sim.pressure_set != self.pressure {
             // A change of pressure is one input whose effect is a set: the
             // copies the new limits no longer hold are evicted and

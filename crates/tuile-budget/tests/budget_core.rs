@@ -1149,6 +1149,110 @@ mod tiers {
         assert!(ds.iter().all(|d| d.deliver.is_empty()));
     }
 
+    /// A draped need whose texel footprint ratio is `ratio`: its ideal
+    /// level is `ceil(log2 ratio)`.
+    fn at_ratio(id: tuile_budget::TileId, ratio: f64) -> tuile_budget::Need {
+        let fp = tuile_budget::TexelFootprint::new(1.0e6 / ratio, 1.0, 1.0e6, 1.0, 1.0)
+            .expect("a valid footprint");
+        need(id).with_imagery(tuile_budget::ImageryNeed::base(fp, 22))
+    }
+
+    /// `tiles` drawn, each at the footprint ratio `ratio`.
+    fn drawn_at(tiles: &[tuile_budget::TileId], ratio: f64) -> NeedSet {
+        NeedSet {
+            drawn: tiles.iter().map(|&a| (a, at_ratio(a, ratio))).collect(),
+            ..NeedSet::default()
+        }
+    }
+
+    /// The base layer's level tile `a` asks for, as the budget keeps it.
+    fn level_of(r: &Rig, a: tuile_budget::TileId) -> Option<u32> {
+        r.b.snapshot()
+            .imagery_prev
+            .iter()
+            .find(|e| e.0 == (a, LayerId(0)))
+            .map(|e| e.1)
+    }
+
+    /// The base drape tile `a` wears in `d`.
+    fn worn(d: &Decisions, a: tuile_budget::TileId) -> Option<ResourceId> {
+        d.draw.get(mesh(a)).and_then(base_drape).map(|w| w.resource)
+    }
+
+    /// I15: a level held locally stands in for the need's own under a
+    /// relaxation only. At scale one a tile's level is its need's own,
+    /// fetched, though the level under it is in the store.
+    #[test]
+    fn at_scale_one_the_needs_own_level_is_fetched_not_a_stored_neighbour() {
+        let mut r = Rig::interactive();
+        let a = t(3, 2, 2);
+        r.store.0.insert(dr(a, 4));
+        let d = r.settle(&drawn_draped(&[a], 5), 20);
+        assert_eq!(d.sse_scale_milli, 1_000, "at scale one");
+        assert_eq!(level_of(&r, a), Some(5), "{RED}: the need's own level");
+        assert_eq!(worn(&d, a), Some(dr(a, 5)), "{RED}: fetched and worn");
+    }
+
+    /// I15: under a relaxation the stand-in holds: a drape held a level
+    /// under the need is worn and nothing is sent to the network for the
+    /// need's own.
+    #[test]
+    fn under_a_relaxation_a_coarser_drape_held_stands_in_for_the_need() {
+        let mut r = Rig::new(small(1));
+        let tiles: Vec<_> = (0..4).map(|x| t(3, x, 0)).collect();
+        r.settle(&drawn_draped(&tiles, 4), 60);
+        let up = r.idle_for(&drawn_draped(&tiles, 4), Micros::from_secs(2));
+        let scale = up.last().map(|d| d.sse_scale_milli).unwrap_or(0);
+        assert!(scale > 1_000, "{RED}: relaxed, {scale}");
+        let ds = r.idle_for(&drawn_draped(&tiles, 5), Micros::from_secs(1));
+        for a in &tiles {
+            assert!(
+                !started(&ds, dr(*a, 5)),
+                "{RED}: the need's own level is not fetched under a relaxation"
+            );
+            assert_eq!(
+                ds.last().and_then(|d| worn(d, *a)),
+                Some(dr(*a, 4)),
+                "{RED}: the held one is worn"
+            );
+        }
+    }
+
+    /// The hysteresis remembers the level the footprint gave, never the
+    /// stand-in worn in its place: back at scale one after a relaxation,
+    /// a tile re-levels to its need. (Remembered, a stand-in a level under
+    /// stays the tile's level through half of the need's level range.)
+    #[test]
+    fn a_stand_in_is_never_the_level_the_hysteresis_remembers() {
+        let mut r = Rig::new(small(3));
+        let tiles = [t(3, 0, 0), t(3, 1, 0)];
+        r.settle(&drawn_draped(&tiles, 4), 30);
+        // From level 6 to a ratio in the lower half of level 5's range:
+        // the level is 5, held nowhere; level 4 is on the GPU.
+        r.idle_for(&drawn_at(&tiles, 0.9 * 64.0), Micros::from_millis(100));
+        let mid = drawn_at(&tiles, 0.6 * 32.0);
+        r.idle_for(&mid, Micros::from_millis(100));
+        // A short relaxation, under 1.7 where the relaxed level is still
+        // 5: level 4 stands in.
+        r.b.set_pressure(Pressure::Warning);
+        let up = r.idle_for(&mid, Micros::from_millis(300));
+        let peak = up.iter().map(|d| d.sse_scale_milli).max().unwrap_or(0);
+        assert!(peak > 1_000 && peak < 1_700, "a short relaxation: {peak}");
+        for a in &tiles {
+            assert_eq!(level_of(&r, *a), Some(4), "level 4 stands in");
+        }
+        r.b.set_pressure(Pressure::Normal);
+        let down = r.idle_for(&mid, Micros::from_secs(10));
+        assert_eq!(
+            down.last().map(|d| d.sse_scale_milli),
+            Some(1_000),
+            "back at scale one"
+        );
+        for a in &tiles {
+            assert_eq!(level_of(&r, *a), Some(5), "{RED}: the need's level");
+        }
+    }
+
     fn evicted_but_decoded() -> (Rig, tuile_budget::TileId) {
         let mut c = small(1);
         c.decoded_target = Bytes::mib(64);
