@@ -9087,6 +9087,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuile-budget-sim"
+version = "0.17.1"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "parquet",
+ "tuile-budget",
+]
+
+[[package]]
 name = "tuile-camera"
 version = "0.17.1"
 dependencies = [
