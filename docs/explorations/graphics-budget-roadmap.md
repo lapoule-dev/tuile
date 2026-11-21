@@ -621,6 +621,7 @@ A6. Loading and decoding: GPU-compressed textures (BC7/ASTC/ETC2 via KTX2 + Basi
     The budget accounting of compression is the next step (see the status above).
 
 ### B — The GC: the ledger's eviction side (after A)
+**2026-11-20: B and C are built as one decider — laws, specification model, control model and plan in `budget-eviction-prefetch-spec.md`, which supersedes B1–B6 and C1–C5 below where they differ.**
 Inspiration: OS virtual memory (page-frame database = ledger, working set = need, mlock = protected,
 Clock/LRU = eviction, swap = demotion to the stored tier), caches (ARC, 2Q, GreedyDual), GPU residency
 managers (D3D12 residency, QueryVideoMemoryInfo).
