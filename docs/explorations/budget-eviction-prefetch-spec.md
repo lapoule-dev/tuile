@@ -595,6 +595,20 @@ The **load side** reads the same value: a want's urgency band (Floor, Hole, Bloc
 value orders within the band. The `Predicted` band sits **below Ancestor** (roadmap C), is
 never protected, and is under the speculation quota (law 8).
 
+### 5.2b The reachable coarse neighbourhood (interactive, Laurent 2026-11-21)
+
+In the interactive specification the coarse neighbourhood's `P(revealed)` does **not** come
+from the extrapolated motion: it comes from the **reachable set** — every view the user can
+reach within the horizon with the fastest gestures the viewer allows (the maximum zoom-out
+rate, a full rotation, the maximum tilt, a fast pan). The coarse levels covering that
+reachable footprint get `P ≈ 1`, **omnidirectionally, whatever the current motion**; with the
+hole penalty they rank first in flouz per byte, are loaded **to the GPU** first (not only
+decoded or stored) and released last. The traversal lists them in the need's ring (it is the
+only one that knows the tree and the gestures' bounds); the budget values them. Coarse tiles
+are small: the GPU bytes this ring costs per profile (desktop, phone) are measured and
+reported, and must stay a small, bounded share of the pool (`tuile_budget_bytes_by_level` for
+the levels of the ring).
+
 ### 5.3 The deficit term on the load side (what fixes #251)
 
 For a drawn place wearing level `worn` of a content whose need is `n ≠ worn`, the want of
@@ -950,6 +964,7 @@ Camera paths (each also exists in its 3D Tiles variant where marked ●):
 
 | Path | Script | Ends at rest |
 |---|---|---|
+| **`aggressive-sequence`** (head of the catalogue, the gate of every PR that changes behaviour) | one continuous sequence, aggressive at every phase: zoom-in (300 km → 1 km in 3 s), fast pan (20 km in 3 s), tilt (80° → 10° in 2 s), full rotation (360° in 3 s), zoom-out (1 km → 300 km in 3 s); acceptance **zero hole at every step** by the footprint coverage check, across every profile; reported per phase: holes, deficit (flouz), convergence, bytes, prefetch used/wasted; also a headless motion test (fails on the first hole) and a scripted gesture replayable in the viewer | yes |
 | `still-low`, `still-mid`, `still-high` | still view at 300 m, 3 km, 300 km | yes |
 | `slow-dive` | 400 km → 500 m over 40 s, eased | yes |
 | `fast-dive` | 400 km → 500 m over 4 s | yes |
