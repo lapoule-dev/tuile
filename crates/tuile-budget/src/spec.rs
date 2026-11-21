@@ -32,9 +32,10 @@ use super::types::{Bytes, Class, Micros, Policy};
 
 /// What a specification is for: a label for telemetry and menus, never
 /// branched on by the decision code (law 11).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SpecKind {
     /// A viewer or a game: probabilistic, short horizon.
+    #[default]
     Interactive,
     /// A Glide flight or a tape replay: near-exact next use.
     KnownPath,

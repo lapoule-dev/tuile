@@ -55,6 +55,11 @@ pub(crate) enum Ask {
     Do(Command),
     ToggleWireframe,
     ToggleFreeze,
+    /// The budget's line over the view.
+    ToggleBudgetLine,
+    /// A diagnostic override of the budget's specification; `None` back to
+    /// the context's.
+    BudgetSpec(Option<tuile_core::budget::SpecKind>),
     Diagnostic(usize),
     NextDiagnostic,
     Imagery(usize),
@@ -119,6 +124,9 @@ pub(crate) struct State {
     /// process's switches (`tuile_telemetry`).
     pub metrics: bool,
     pub profiling: bool,
+    /// The budget's line shown; the specification an override forces.
+    pub budget_line: bool,
+    pub budget_spec: Option<tuile_core::budget::SpecKind>,
 }
 
 impl State {
@@ -134,6 +142,8 @@ impl State {
             tilesets: snapshot.tilesets,
             metrics: tuile_telemetry::metrics_on(),
             profiling: tuile_telemetry::profiling_on(),
+            budget_line: snapshot.budget_line,
+            budget_spec: snapshot.budget_spec,
         }
     }
 
@@ -163,6 +173,11 @@ impl Ask {
             Self::Do(command) => command,
             Self::ToggleWireframe => Command::Wireframe(!now.wireframe),
             Self::ToggleFreeze => Command::Freeze(!now.frozen),
+            Self::ToggleBudgetLine => Command::BudgetLine(!now.budget_line),
+            Self::BudgetSpec(kind) => Command::Budget(crate::steer::BudgetAsk {
+                kind,
+                ..Default::default()
+            }),
             Self::ToggleRecording => Command::Record(!now.recording),
             Self::ToggleTileset { index, asset } => Command::Tileset {
                 asset,
@@ -218,6 +233,8 @@ impl Ask {
         match self {
             Self::ToggleWireframe => Some(now.wireframe),
             Self::ToggleFreeze => Some(now.frozen),
+            Self::ToggleBudgetLine => Some(now.budget_line),
+            Self::BudgetSpec(kind) => Some(now.budget_spec == kind),
             Self::Diagnostic(view) => Some(now.diagnostic == view),
             Self::Imagery(layer) => Some(now.layer == layer),
             Self::Pause => Some(now.clock.rate == 0.0),
@@ -359,11 +376,27 @@ pub(crate) fn layout(
         Entry::Separator,
         item("Now, in Real Time", Ask::Do(Command::ClockNow)),
     ];
+    // The budget: its line, and a diagnostic override of the
+    // specification the context selects (spec §3.3) — to compare them live.
+    let mut budget = vec![
+        item("Budget Line", Ask::ToggleBudgetLine),
+        Entry::Separator,
+        item("Specification of the Context", Ask::BudgetSpec(None)),
+    ];
+    budget.extend(
+        [
+            ("Interactive", tuile_core::budget::SpecKind::Interactive),
+            ("FPV", tuile_core::budget::SpecKind::Fpv),
+            ("Known Path", tuile_core::budget::SpecKind::KnownPath),
+        ]
+        .map(|(name, kind)| item(&format!("Diagnostic: Force {name}"), Ask::BudgetSpec(Some(kind)))),
+    );
     let mut sections = vec![
         ("View", view),
         ("Go", go),
         ("Imagery", imagery),
         ("Time", time),
+        ("Budget", budget),
     ];
     // The host's 3D Tiles, each a switch, when it offers any.
     if !tilesets.is_empty() {
@@ -677,6 +710,8 @@ impl Default for State {
             tilesets: 0,
             metrics: false,
             profiling: false,
+            budget_line: false,
+            budget_spec: None,
         }
     }
 }
@@ -822,6 +857,8 @@ mod tests {
             tilesets: 0b10,
             metrics: false,
             profiling: false,
+            budget_line: false,
+            budget_spec: None,
         };
         let marked: Vec<String> = items(&layers)
             .into_iter()
@@ -834,6 +871,7 @@ mod tests {
                 "Wireframe",
                 "Diagnostic View: Coverage",
                 "Aerial with labels",
+                "Specification of the Context",
                 "3D Tiles 96188"
             ]
         );
@@ -916,6 +954,8 @@ mod tests {
             tilesets: 0b1,
             metrics: false,
             profiling: false,
+            budget_line: false,
+            budget_spec: None,
         };
         for (ask, command) in [
             (Ask::ToggleWireframe, Command::Wireframe(true)),

@@ -103,6 +103,11 @@ pub fn encode_client(message: &ClientMessage) -> Vec<u8> {
             w.u8(7);
             write_views(&mut w, views);
         }
+        ClientMessage::Specify { query, overridden } => {
+            w.u8(8);
+            w.bytes(query.as_bytes());
+            w.u8(u8::from(*overridden));
+        }
     }
     w.0
 }
@@ -212,6 +217,10 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, WireError> {
         6 => ClientMessage::ReleaseBeyond { bytes: r.u64()? },
         7 => ClientMessage::Ahead {
             views: read_views(&mut r)?,
+        },
+        8 => ClientMessage::Specify {
+            query: String::from_utf8_lossy(r.bytes()?).into_owned(),
+            overridden: r.u8()? != 0,
         },
         tag => {
             return Err(WireError::Tag {
@@ -1567,6 +1576,10 @@ mod tests {
                 total_bytes: 3 << 30,
             },
             ClientMessage::ReleaseBeyond { bytes: 1 << 30 },
+            ClientMessage::Specify {
+                query: "spec=fpv&margin=300".to_owned(),
+                overridden: true,
+            },
         ];
         messages.extend(
             [

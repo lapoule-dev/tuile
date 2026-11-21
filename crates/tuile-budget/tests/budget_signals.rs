@@ -545,6 +545,44 @@ fn the_deficit_signals_count_the_drapes_worn_under_their_need() {
     assert_eq!(m.s().deficit_levels, [0, 0]);
 }
 
+/// The specification in force and its changes, as the host recorded them:
+/// `spec_info{spec,source}` and `spec_changes_total`.
+#[test]
+fn the_spec_signals_follow_the_recorded_specifications() {
+    use tuile_budget::{BudgetEvent, SpecKind};
+    let mut m = Metered::interactive();
+    let a = t(3, 2, 2);
+    m.step(&drawn(&[a]));
+    assert_eq!(m.s().spec, SpecKind::Interactive);
+    assert_eq!(m.s().spec_changes_total, 0);
+    let d = m.r.step(&drawn(&[a]));
+    let events = [BudgetEvent::Specify(SpecKind::Fpv, 1, true)];
+    m.meter.step(&StepRecord {
+        step: 99,
+        frame: 0,
+        now: m.r.now,
+        views_changed: false,
+        eyes: 1,
+        need: &drawn(&[a]),
+        events: &events,
+        presence: &[],
+        decisions: &d,
+        ledger: m.r.b.ledger(),
+        pressure: Pressure::Normal,
+        thermal: Thermal::Nominal,
+        decide_wall: None,
+    });
+    let s = m.s();
+    assert_eq!((s.spec, s.spec_overridden, s.spec_changes_total), (SpecKind::Fpv, true, 1), "{RED}");
+    let info: Vec<_> = s
+        .series()
+        .into_iter()
+        .filter(|(n, _, v)| *n == "spec_info" && *v == 1.0)
+        .map(|(_, l, _)| l)
+        .collect();
+    assert_eq!(info, vec![vec![("spec", "fpv"), ("source", "override")]]);
+}
+
 /// A wanted tile standing on its parent is a mesh deficit of one level.
 #[test]
 fn the_deficit_counts_a_tile_drawn_by_its_ancestor() {
@@ -825,7 +863,12 @@ fn labels_stay_within_their_closed_sets() {
         let set: Vec<&str> = match key {
             "class" => classes.clone(),
             "state" => labels::STATE.to_vec(),
-            "source" => labels::SOURCE.to_vec(),
+            "source" => labels::SOURCE
+                .iter()
+                .chain(&labels::SPEC_SOURCE)
+                .copied()
+                .collect(),
+            "spec" => tuile_budget::SpecKind::ALL.map(|k| k.label()).to_vec(),
             "role" => labels::ROLE.to_vec(),
             "reason" => labels::CANCEL
                 .iter()

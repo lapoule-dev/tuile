@@ -55,7 +55,7 @@ pub const ALLOWED: [&str; 16] = [
 ];
 
 /// The metric label keys a series may carry.
-pub const ALLOWED_LABELS: [&str; 17] = [
+pub const ALLOWED_LABELS: [&str; 18] = [
     // tuile_core::metrics: the per-level and per-eye series.
     "series",
     "level",
@@ -73,6 +73,10 @@ pub const ALLOWED_LABELS: [&str; 17] = [
     "gap",
     "invariant",
     "phase",
+    // The budget's specification in force (`tuile_budget::SpecKind`'s
+    // labels: interactive, known_path, film, fpv, fpv_film, custom), with
+    // `source` = context | override (`tuile_budget_spec_info`).
+    "spec",
     "step",
     "quantile",
     // Histograms' bucket bound, where a recorder writes one as a label.

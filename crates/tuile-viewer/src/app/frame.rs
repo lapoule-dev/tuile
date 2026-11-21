@@ -941,7 +941,7 @@ impl fmt::Display for BudgetLine {
         write!(
             f,
             "budget {:.0}/{:.0} MiB (hard {:.0}), {} in flight + {} local, {} evicted, \
-             {} timed out, {} failed, scale {:.2}, {}",
+             {} timed out, {} failed, scale {:.2}, {}, spec {}{}, {} under need",
             mib(held),
             mib(self.1),
             mib(self.2),
@@ -951,7 +951,10 @@ impl fmt::Display for BudgetLine {
             s.cancels_total[1],
             failed,
             f64::from(s.sse_scale_milli) / 1000.0,
-            if s.converged { "converged" } else { "settling" }
+            if s.converged { "converged" } else { "settling" },
+            s.spec.label(),
+            if s.spec_overridden { " (diagnostic)" } else { "" },
+            s.under_need_tiles[0] + s.under_need_tiles[1],
         )
     }
 }
