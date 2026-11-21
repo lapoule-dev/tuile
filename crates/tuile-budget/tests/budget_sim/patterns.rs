@@ -960,6 +960,14 @@ impl P64 {
             .count();
         e += changed as u64;
         self.drawn.clone_from(&d.draw.items);
+        // A delivery and a release of decoded copies are chosen by walking
+        // the held order on the step that makes them (`deliver`,
+        // `release_decoded`, whose sort of the recently needed holders O1
+        // left whole): counted on that step too. The load side on the
+        // value (PR 4b) brought one onto a still step of the flight
+        // (W 687 for one delivery and one release). Debt, listed: the
+        // exchange's held index covering the grouped holders.
+        e += (d.deliver.len() + d.release.len()) as u64;
         if sim.pressure_set != self.pressure {
             // A change of pressure is one input whose effect is a set: the
             // copies the new limits no longer hold are evicted and

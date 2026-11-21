@@ -4,4 +4,4 @@ motion-allocs-per-step-p99 26
 diff-allocs-per-step-p99 0
 scratch-bytes-after-tour 230880
 bytes-per-tracked-resource 453
-bytes-per-tracked-resource-after-shrinking 863
+bytes-per-tracked-resource-after-shrinking 857
