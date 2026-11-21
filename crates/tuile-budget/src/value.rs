@@ -21,6 +21,7 @@
 use crate::spec::{Facts, Specification, Term};
 use crate::state::Held;
 use crate::stats::LEVELS;
+use crate::priority::Urgency;
 use crate::tier::Tier;
 use crate::types::{Bytes, Class, Micros, PerClass, TileId};
 
@@ -149,6 +150,26 @@ impl Valuation {
     }
 }
 
+/// What loading a missing resource of the value band gains (spec §1b), in
+/// flouz: `P × Δq × w × (H − T_fetch)⁺` — its probability of use (the
+/// present need's drape 1, the ring's and an ancestor's the
+/// specification's anticipation, a refresh a tenth), one level, the
+/// place's screen weight (‰ of the reference pixel), counted only from its
+/// arrival on over the specification's horizon: a slow fetch earns less, a
+/// local one is preferred at equal worth.
+pub fn load_gain(spec: &Specification, u: Urgency, centrality: i32, tier: Tier) -> Flouz {
+    let p = &spec.params;
+    let probability = u64::from(match u {
+        Urgency::Ring => p.anticipation.ring_permille,
+        Urgency::Ancestor => p.anticipation.ancestor_permille,
+        Urgency::Refresh => 100,
+        _ => 1_000,
+    });
+    let screen = 500 + u64::try_from(centrality.clamp(0, 1_000)).unwrap_or(0) / 2;
+    let after = p.horizon.0.saturating_sub(p.restore.of(tier).0);
+    Flouz(probability.saturating_mul(screen).saturating_mul(after) / 1_000_000)
+}
+
 /// What [`deficit_due`] reads of a drawn tile.
 #[derive(Clone, Copy, Debug)]
 pub struct DeficitInput {
@@ -226,6 +247,19 @@ mod tests {
         let decoded = v.held_value(Class::Drape, at, Micros(1_000), Some((Held::Both, bytes)));
         assert!(network > decoded, "{network:?} {decoded:?}");
         assert!(Flouz::loss(1, 1, Micros(150_000)) > Flouz::loss(1, 1, Micros(2_000)));
+    }
+
+    /// The load side of the currency: the present need over anticipation,
+    /// the centre over the edge, a local tier over the network.
+    #[test]
+    fn a_load_gains_by_probability_place_and_arrival() {
+        let s = Specification::interactive();
+        let g = |u, c, t| load_gain(&s, u, c, t);
+        assert!(g(Urgency::Drape, 0, Tier::Remote) > g(Urgency::Ring, 0, Tier::Remote));
+        assert!(g(Urgency::Ring, 0, Tier::Remote) > g(Urgency::Ancestor, 0, Tier::Remote));
+        assert!(g(Urgency::Drape, 1_000, Tier::Remote) > g(Urgency::Drape, 0, Tier::Remote));
+        assert!(g(Urgency::Drape, 0, Tier::Stored) > g(Urgency::Drape, 0, Tier::Remote));
+        assert!(g(Urgency::Refresh, 1_000, Tier::Decoded) < g(Urgency::Drape, 0, Tier::Remote));
     }
 
     /// Law 9 made a number: with the interactive defaults (network 150 ms,

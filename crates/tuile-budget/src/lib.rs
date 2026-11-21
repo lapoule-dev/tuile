@@ -48,9 +48,9 @@ pub use observe::{
     check, BudgetEvent, BudgetMeter, BudgetObserver, BudgetSignals, EyeCoverage, FrameRecord,
     Histogram, StepRecord, Violations,
 };
-pub use priority::{PriorityKey, Quantised, Urgency};
+pub use priority::{Precedence, PriorityKey, Quantised, Urgency};
 pub use spec::{
-    Band, Facts, Params, Predicate, RestoreCosts, Rule, SpecError, SpecKind, Specification,
+    Anticipation, Band, Facts, Params, Predicate, RestoreCosts, Rule, SpecError, SpecKind, Specification,
     Speculation, Term,
 };
 pub use stats::{level_index, BudgetStats, CancelReason, Deficit, EvictReason, LEVELS};
