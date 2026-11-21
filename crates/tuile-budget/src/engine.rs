@@ -1482,6 +1482,7 @@ impl Budget {
     /// The step, into `d` (emptied by the caller, its buffers kept).
     pub(super) fn step(&mut self, input: FrameInput<'_>, d: &mut Decisions) {
         let now = input.now;
+        self.take_inputs(now);
         let mut st = std::mem::take(&mut self.pending);
         let eff = self.eff();
         self.scratch.room = None;

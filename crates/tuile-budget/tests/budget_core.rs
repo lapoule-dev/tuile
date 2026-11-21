@@ -152,6 +152,54 @@ mod config {
     }
 }
 
+mod specification {
+    use super::*;
+    use tuile_budget::{Measured, SpecKind, Specification, TierSample};
+
+    /// A budget starts on its policy's specification; another is taken at
+    /// the next step, an invalid one refused and the one in force kept.
+    #[test]
+    fn a_specification_is_taken_at_the_next_step_and_an_invalid_one_refused() {
+        let mut r = Rig::interactive();
+        assert_eq!(r.b.specification().kind, SpecKind::Interactive);
+        assert_eq!(Rig::batch().b.specification().kind, SpecKind::Film);
+        r.b.specify(Specification::fpv()).unwrap();
+        assert_eq!(
+            r.b.specification().kind,
+            SpecKind::Interactive,
+            "{RED}: not before the next step"
+        );
+        r.step(&drawn(&[t(3, 2, 2)]));
+        assert_eq!(r.b.specification().kind, SpecKind::Fpv);
+        let mut bad = Specification::interactive();
+        bad.params.margin_permille = 1_000_000;
+        assert!(r.b.specify(bad).is_err());
+        r.step(&drawn(&[t(3, 2, 2)]));
+        assert_eq!(r.b.specification().kind, SpecKind::Fpv, "the one in force stays");
+    }
+
+    /// Measured samples are smoothed at the step they are given for, once
+    /// per interval.
+    #[test]
+    fn measured_samples_are_smoothed_at_the_next_step() {
+        let mut r = Rig::interactive();
+        let m = Measured {
+            interval: 1,
+            network: TierSample {
+                latency_us: 80_000,
+                bytes_per_ms: 4_000,
+                failures_permille: 0,
+                samples: 12,
+            },
+            ..Measured::default()
+        };
+        r.b.measure(m);
+        assert_eq!(r.b.smoothed().network.latency_us.get(), None, "{RED}");
+        r.step(&drawn(&[t(3, 2, 2)]));
+        assert_eq!(r.b.smoothed().network.latency_us.get(), Some(80_000));
+    }
+}
+
 mod pool {
     use super::*;
 
