@@ -1162,6 +1162,9 @@ pub async fn render(
                 diff.frame,
                 &look,
             ));
+            // The mist the frame is seen through, the host's statement:
+            // marched from each eye's own camera when the picture is drawn.
+            gpu.set_mist(overlays.mist(diff.frame));
             let camera = FrameCamera::of(&diff.view, aspect);
             let pair = stereo.as_ref().map(|stereo| stereo.eyes(&camera));
             // The frame's overlays, once for every picture of it: made for

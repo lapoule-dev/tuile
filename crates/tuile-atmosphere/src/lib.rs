@@ -12,6 +12,7 @@ pub mod gpu;
 pub mod hillaire;
 pub mod illumination;
 pub mod look;
+pub mod mist;
 pub mod moon;
 pub mod params;
 pub mod planets;

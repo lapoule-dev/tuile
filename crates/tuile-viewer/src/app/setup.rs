@@ -428,6 +428,9 @@ impl App {
         // A host's shapes in the world, drawn into the same frame with the
         // film's own overlay light: see `tuile_wgpu::WorldOverlayRenderer`.
         let world_overlay = tuile_wgpu::WorldOverlayRenderer::new(&gpu, surface_format);
+        // The mist pass, where the frame's depth can be read in a shader.
+        let mist = tuile_wgpu::MistRenderer::supported(&gpu)
+            .then(|| tuile_wgpu::MistRenderer::new(&gpu, surface_format));
         // The render origin tracks the eye (set each frame); start there.
         // The display's refresh, which each frame's upload deadline is made
         // of; sixty when the window cannot say.
@@ -461,6 +464,7 @@ impl App {
             renderer,
             overlay,
             world_overlay,
+            mist,
             pump,
             targets,
             size,

@@ -8,7 +8,7 @@ mod frame;
 
 use std::collections::HashMap;
 
-use glam::{DVec3, Vec3};
+use glam::{DVec3, Mat4, Vec3};
 // The vertex every renderer of overlays packs, and the light they share: the
 // viewer draws these same meshes, and the HUD has to come out of both alike.
 use tuile_film::{
@@ -211,6 +211,8 @@ struct Targets {
     scatter_bg: wgpu::BindGroup,
     resolve_bg: wgpu::BindGroup,
     present_bg: wgpu::BindGroup,
+    /// The mist's field and the ground's depth, for `present`.
+    mist_bg: wgpu::BindGroup,
     y_bg: wgpu::BindGroup,
     uv_bg: wgpu::BindGroup,
 }
@@ -343,6 +345,10 @@ pub struct FilmGpu {
     /// with. The ordered look itself, in `settings`, is never changed.
     light: FrameLight,
     lit: Look,
+    /// The mist the frame being drawn is seen through ([`Self::set_mist`]),
+    /// and its uniform, written for every picture's eye.
+    mist: Option<tuile_atmosphere::mist::MistField>,
+    mist_buf: wgpu::Buffer,
     /// The physical atmosphere's tables, uniform and sky-view.
     atmosphere: atmosphere::AtmosphereGpu,
     /// The frame's light, made on the GPU — the viewer's own pass
@@ -554,6 +560,24 @@ fn penumbra_tangent(scale: f32) -> f32 {
         return 0.0;
     }
     (SUN_ANGULAR_RADIUS * scale).min(1.2).tan()
+}
+
+/// Samples along a layer's crossing of the mist, offline: more than the
+/// viewer takes, for a film.
+const MIST_STEPS: u32 = 56;
+/// How far a line of sight that meets nothing is marched for mist, metres.
+const MIST_FARTHEST: f64 = 300_000.0;
+
+/// A projection inverted in f64 and narrowed after: the f32 inverse of a
+/// near-singular projection is not one.
+fn inverse_in_f64(m: &Mat4) -> Mat4 {
+    let inverse = glam::DMat4::from_cols_array(&m.to_cols_array().map(f64::from)).inverse();
+    let inverse = inverse.as_mat4();
+    if inverse.is_finite() {
+        inverse
+    } else {
+        Mat4::IDENTITY
+    }
 }
 
 fn shader(device: &wgpu::Device, name: &str, body: &str) -> wgpu::ShaderModule {
@@ -1099,17 +1123,28 @@ impl FilmGpu {
             &device,
             "film present",
             &format!(
-                "{}{}\n{}{}{}",
+                "{}{}\n{}{}{}{}{}",
                 atmosphere::declarations(1),
                 tuile_atmosphere::hillaire::WGSL,
                 tuile_atmosphere::gpu::SEEN_WGSL,
                 include_str!("shaders/air.wgsl"),
+                // The mist a host states (`tuile_atmosphere::mist`): its
+                // field at group 2, binding 1, the ground's depth beside it.
+                tuile_atmosphere::mist::wgsl_bindings(2, 1),
+                tuile_atmosphere::mist::WGSL,
                 include_str!("shaders/present.wgsl")
             ),
         );
+        let mist_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("film mist"),
+            entries: &[
+                uniform(1, compute_only, false),
+                texture(2, wgpu::TextureSampleType::Depth),
+            ],
+        });
         let present_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("film present"),
-            bind_group_layouts: &[Some(&present_bgl), Some(&atmosphere_bgl)],
+            bind_group_layouts: &[Some(&present_bgl), Some(&atmosphere_bgl), Some(&mist_bgl)],
             immediate_size: 0,
         });
         let linear_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1160,6 +1195,13 @@ impl FilmGpu {
             size: std::mem::size_of::<FrameUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
+        });
+        // No mist until a frame states a field: a count of zero layers,
+        // which `present` reads and leaves the picture as it was.
+        let mist_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("film mist"),
+            contents: bytemuck::bytes_of(&tuile_atmosphere::mist::MistUniform::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let tiles_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("film tiles"),
@@ -1357,6 +1399,7 @@ impl FilmGpu {
             &resolve_bgl,
             settings,
             &frame_buf,
+            &mist_buf,
             &tiles_buf,
             &counts,
             &starts,
@@ -1387,6 +1430,8 @@ impl FilmGpu {
         Self {
             light: FrameLight::of(&settings.look),
             lit: settings.look,
+            mist: None,
+            mist_buf,
             atmosphere,
             frame_light,
             light_pending: false,
@@ -1443,6 +1488,7 @@ impl FilmGpu {
         resolve_bgl: &wgpu::BindGroupLayout,
         settings: Settings,
         frame_buf: &wgpu::Buffer,
+        mist_buf: &wgpu::Buffer,
         tiles_buf: &wgpu::Buffer,
         counts: &wgpu::Buffer,
         starts: &wgpu::Buffer,
@@ -1579,6 +1625,14 @@ impl FilmGpu {
             present_bg: Self::present_bg(
                 device, pipelines, frame_buf, &hdr, &vis, &out_view, blank,
             ),
+            mist_bg: device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("film mist"),
+                layout: &pipelines.present.get_bind_group_layout(2),
+                entries: &[
+                    entry(1, mist_buf.as_entire_binding()),
+                    entry(2, wgpu::BindingResource::TextureView(&depth)),
+                ],
+            }),
             y_bg: auto(
                 &pipelines.y_plane,
                 "film y",
@@ -1721,6 +1775,20 @@ impl FilmGpu {
     pub fn set_light(&mut self, light: FrameLight) {
         self.light = light;
         self.lit = self.settings.look.lit_by(light);
+    }
+
+    /// The mist what is drawn from now on is seen through
+    /// ([`tuile_atmosphere::mist`]): a stated field, marched over the
+    /// picture after the ground and under the overlays, once a picture,
+    /// from that picture's own eye. `None`, the default: no mist, and the
+    /// picture to the byte as without.
+    pub fn set_mist(&mut self, field: Option<tuile_atmosphere::mist::MistField>) {
+        self.mist = field.filter(|f| !f.is_empty());
+    }
+
+    /// Whether the frame being drawn has mist to march.
+    fn mist_on(&self) -> bool {
+        self.mist.is_some()
     }
 
     /// The sky-view table of the frame last drawn under a physical
@@ -2617,6 +2685,24 @@ impl FilmGpu {
         self.shadow_texel = sun.as_ref().map(|(view, _)| view.texel);
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&uniform));
+        // The mist, from this picture's eye: an eye-relative frame, so the
+        // render origin is the eye.
+        let mist_uniform = match &self.mist {
+            Some(field) => tuile_atmosphere::mist::MistUniform::of(
+                field,
+                &tuile_atmosphere::mist::MistView {
+                    origin: camera.eye,
+                    eye: camera.eye,
+                    inverse_view_proj: inverse_in_f64(&camera.view_projection()),
+                    to_sun: self.lit.to_sun.as_dvec3(),
+                    farthest: MIST_FARTHEST,
+                    steps: MIST_STEPS,
+                },
+            ),
+            None => tuile_atmosphere::mist::MistUniform::default(),
+        };
+        self.queue
+            .write_buffer(&self.mist_buf, 0, bytemuck::bytes_of(&mist_uniform));
         // The air's sphere, placed for this picture's eye.
         if let Some(light) = &self.atmosphere.light {
             let placed = self.atmosphere.frame_uniform.seen_from(light, camera.eye);
@@ -2702,7 +2788,7 @@ impl FilmGpu {
                         load: wgpu::LoadOp::Clear(0.0),
                         // Kept only for overlays to be tested against, and
                         // for the ground projected shadows fall on.
-                        store: if overlaid || !projected.is_empty() {
+                        store: if overlaid || !projected.is_empty() || self.mist_on() {
                             wgpu::StoreOp::Store
                         } else {
                             wgpu::StoreOp::Discard
@@ -2845,6 +2931,7 @@ impl FilmGpu {
             pass.set_pipeline(&self.pipelines.present);
             pass.set_bind_group(0, &self.targets.present_bg, &[]);
             pass.set_bind_group(1, &self.atmosphere.bind, &[]);
+            pass.set_bind_group(2, &self.targets.mist_bg, &[]);
             pass.dispatch_workgroups(
                 self.settings.width.div_ceil(8),
                 self.settings.height.div_ceil(8),

@@ -280,6 +280,16 @@ impl Picture {
     }
 }
 
+/// Where a pass of its own draws: the frame's colour attachment, the
+/// view it resolves to when multisampled, the attachment's size and where
+/// the picture sits in it.
+struct Target<'a> {
+    colour: &'a wgpu::TextureView,
+    resolve: Option<&'a wgpu::TextureView>,
+    size: (u32, u32),
+    picture: Picture,
+}
+
 /// Draws `tuile_overlay::OverlayMesh` in the world, through the frame's
 /// camera.
 ///
@@ -542,6 +552,50 @@ impl WorldOverlayRenderer {
             .any(|b| b.pass == Pass::OverlaysOnly)
     }
 
+    /// Whether any mesh is never hidden ([`OverlayDepth::Always`]): what
+    /// [`Self::render_terrain_only`] leaves for [`Self::render_after_mist`].
+    pub fn has_always(&self) -> bool {
+        self.packed
+            .batches
+            .iter()
+            .any(|b| b.pass == Pass::InFrame(InFrame::Always))
+    }
+
+    /// Draws the meshes hidden by the ground alone ([`OverlayDepth::Terrain`]),
+    /// inside the frame's pass: what a mist drawn after the frame's pass
+    /// may veil. The never-hidden ones ([`OverlayDepth::Always`]) wait for
+    /// [`Self::render_after_mist`], so a HUD stands in front of the mist.
+    pub fn render_terrain_only(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.draw(pass, |p| p == Pass::InFrame(InFrame::Terrain));
+    }
+
+    /// Draws what [`Self::render_terrain_only`] left — the never-hidden
+    /// meshes — and those tested against overlays alone, in the pass of
+    /// their own ([`Self::render_overlays_only`] with the never-hidden ones
+    /// in it): after the mist, over it.
+    pub fn render_after_mist(
+        &mut self,
+        gpu: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        colour: &wgpu::TextureView,
+        resolve: Option<&wgpu::TextureView>,
+        size: (u32, u32),
+        picture: Picture,
+    ) {
+        if !self.needs_own_depth() && !self.has_always() {
+            return;
+        }
+        let target = Target {
+            colour,
+            resolve,
+            size,
+            picture,
+        };
+        self.own_pass(gpu, encoder, target, |p| {
+            p == Pass::OverlaysOnly || p == Pass::InFrame(InFrame::Always)
+        });
+    }
+
     /// Draws every mesh tested against the frame's own depth — the ground's:
     /// [`OverlayDepth::Terrain`] and [`OverlayDepth::Always`].
     ///
@@ -587,6 +641,30 @@ impl WorldOverlayRenderer {
         if !self.needs_own_depth() {
             return;
         }
+        let target = Target {
+            colour,
+            resolve,
+            size,
+            picture,
+        };
+        self.own_pass(gpu, encoder, target, |p| p == Pass::OverlaysOnly);
+    }
+
+    /// The pass with a depth of its own, cleared to the far plane, drawing
+    /// the batches `wanted` into `target`.
+    fn own_pass(
+        &mut self,
+        gpu: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: Target<'_>,
+        wanted: impl Fn(Pass) -> bool,
+    ) {
+        let Target {
+            colour,
+            resolve,
+            size,
+            picture,
+        } = target;
         let size = (size.0.max(1), size.1.max(1));
         let depth = match &self.own_depth {
             Some((view, had)) if *had == size => view,
@@ -650,7 +728,7 @@ impl WorldOverlayRenderer {
             );
             pass.set_scissor_rect(picture.x, picture.y, picture.width, picture.height);
         }
-        self.draw(&mut pass, |p| p == Pass::OverlaysOnly);
+        self.draw(&mut pass, wanted);
     }
 
     fn draw(&self, pass: &mut wgpu::RenderPass<'_>, wanted: impl Fn(Pass) -> bool) {

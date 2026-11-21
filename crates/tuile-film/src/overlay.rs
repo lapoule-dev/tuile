@@ -85,6 +85,14 @@ pub trait Overlays {
         let _ = frame;
         None
     }
+
+    /// The mist `frame` is seen through ([`tuile_atmosphere::mist`]): a
+    /// stated field, marched over the picture after the ground and under
+    /// the overlays that are never hidden. `None`, the default: no mist.
+    fn mist(&mut self, frame: u32) -> Option<tuile_atmosphere::mist::MistField> {
+        let _ = frame;
+        None
+    }
 }
 
 /// No overlays.

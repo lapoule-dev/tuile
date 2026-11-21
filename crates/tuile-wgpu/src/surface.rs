@@ -79,6 +79,10 @@ pub struct FramePass<'a> {
     pub colour: &'a wgpu::TextureView,
     /// What it resolves into.
     pub resolve: &'a wgpu::TextureView,
+    /// The frame's depth, viewed for a shader to read — the ground's, for
+    /// a pass that marches up to it ([`crate::MistRenderer`]). `None`
+    /// where the device cannot bind it ([`crate::FrameTargets::depth_binding`]).
+    pub depth: Option<&'a wgpu::TextureView>,
     /// The frame in device pixels.
     pub size: (u32, u32),
 }
@@ -261,6 +265,7 @@ fn encode_frame(
         &FramePass {
             colour: &targets.colour,
             resolve,
+            depth: targets.depth_binding.as_ref(),
             size: targets.size(),
         },
     );

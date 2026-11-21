@@ -7,6 +7,7 @@ mod compress;
 mod context;
 mod encode;
 mod host;
+mod mist;
 mod overlay;
 mod prepare;
 mod pump;
@@ -27,6 +28,7 @@ pub use context::{
     ContextError, GpuContext, ImageryTextures, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT,
 };
 pub use host::{view_proj_from_world, DepthDirection, HostFrame, HostPass, TargetLayout};
+pub use mist::{mist_wgsl, MistFrame, MistRenderer};
 pub use overlay::{OverlayMask, OverlayRenderer, OverlayVertex};
 pub use prepare::{
     prepare, prepare_drape, PreparedDrape, PreparedMesh, PreparedTile, Vertex, STITCH_ROWS,

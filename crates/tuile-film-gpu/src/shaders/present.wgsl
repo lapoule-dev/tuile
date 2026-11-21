@@ -19,6 +19,27 @@
 // Premultiplied, at the supersampled size; read only when `frame.size.w`
 // says the frame drew into it.
 @group(0) @binding(4) var overlay: texture_2d<f32>;
+// The ground's depth, reverse-Z, 0 at infinity: how far the mist is
+// marched. Its field is `mist` (group 2, binding 1), declared before this.
+@group(2) @binding(2) var film_depth: texture_depth_2d;
+
+// The mist on this pixel's line of sight, premultiplied, up to the ground
+// at the pixel's centre sample: nothing without a stated field.
+fn mist_here(pixel: vec2u, size: vec2u, k: u32) -> vec4f {
+    if (u32(mist.anchor.w) == 0u) {
+        return vec4f(0.0);
+    }
+    let ndc = (vec2f(pixel) + 0.5) / vec2f(size) * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0);
+    let mid = mist.inverse_view_proj * vec4f(ndc, 0.5, 1.0);
+    let direction = normalize(mid.xyz / mid.w - mist.eye.xyz);
+    var farthest = mist.reach.x;
+    let depth = textureLoad(film_depth, pixel * k + k / 2u, 0);
+    if (depth > 0.0) {
+        let hit = mist.inverse_view_proj * vec4f(ndc, depth, 1.0);
+        farthest = min(length(hit.xyz / hit.w - mist.eye.xyz), farthest);
+    }
+    return mist_march(mist.eye.xyz, direction, farthest, mist_jitter(vec2f(pixel)));
+}
 
 fn oetf(c: vec3f) -> vec3f {
     let x = clamp(c, vec3f(0.0), vec3f(1.0));
@@ -157,6 +178,12 @@ fn present(@builtin(global_invocation_id) id: vec3u) {
     }
     // Highlights are rolled off, not cut (`roll_off`).
     linear = roll_off(linear, frame.white_balance.w);
+    // The mist, over the picture as the display would show it and under
+    // the overlays, as the viewer lays it: display-linear, premultiplied.
+    let m = mist_here(id.xy, size, k);
+    if (m.a > 0.0) {
+        linear = clamp(linear, vec3f(0.0), vec3f(1.0)) * (1.0 - m.a) + m.rgb;
+    }
     if (overlaid) {
         // Over what the display would show: the picture is clipped first,
         // as the curve below clips it anyway, so a pixel no overlay touches

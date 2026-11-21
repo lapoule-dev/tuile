@@ -132,6 +132,7 @@ impl App {
                 preload: &mut preload,
                 overlays: &mut overlays,
                 atmosphere: &mut self.atmosphere,
+                mist: &mut self.mist,
                 wall: super::wall_seconds(),
                 viewport: (w as u32, h as u32),
                 // The viewer's own relief, the one the controller keeps its
@@ -296,11 +297,25 @@ impl App {
             atmosphere.lights.at(self.instant, sky.eye).to_sun,
         );
         let views = self.view_uniforms();
+        let to_sun = atmosphere.lights.at(self.instant, sky.eye).to_sun;
+        let eye = self.controller.camera.position;
         let Some(active) = self.active.as_mut() else {
             return;
         };
         if let Some(view) = views.first() {
             active.renderer.set_view(&active.gpu.queue, view);
+            // The mist a host stated, seen from this frame's eye: the
+            // render origin is the eye (`view_uniforms`).
+            if let Some(mist) = active.mist.as_mut() {
+                let frame = self.mist.as_ref().map(|field| tuile_wgpu::MistFrame {
+                    field,
+                    origin: eye,
+                    eye,
+                    view_proj: view.view_proj,
+                    to_sun,
+                });
+                mist.set(&active.gpu.queue, frame.as_ref());
+            }
         }
         active
             .renderer
@@ -501,6 +516,11 @@ impl App {
         );
         let world = std::cell::RefCell::new(&mut active.world_overlay);
         let world_gpu = &active.gpu;
+        // The mist, when a host stated one this frame: drawn after the
+        // frame's pass, over the ground and the overlays the ground hides,
+        // and under the never-hidden ones, which then wait for the pass
+        // after it.
+        let mist = active.mist.as_ref().filter(|m| m.is_on());
         // The picture, inside whatever the window is: everything of the scene
         // is drawn in it, and the bars around it keep the clear.
         let box_ = picture;
@@ -547,8 +567,12 @@ impl App {
             );
             // A host's shapes, after the ground that may hide them. What asked
             // for `OverlaysOnly` is not here: it goes in the pass that
-            // follows, which has a depth of its own.
-            world.borrow().render(pass);
+            // follows, which has a depth of its own — and so does what is
+            // never hidden, on a frame with mist, to stand in front of it.
+            match mist {
+                Some(_) => world.borrow().render_terrain_only(pass),
+                None => world.borrow().render(pass),
+            }
             // The on-screen control, over everything and in the whole frame:
             // it is laid out in device pixels, not in the picture.
             if box_.width != 0 && box_.height != 0 {
@@ -562,18 +586,39 @@ impl App {
         // closed: the HUD's mode needs a depth attachment the ground never
         // reached, and that is a second pass or nothing.
         let after = |encoder: &mut wgpu::CommandEncoder, frame: &tuile_wgpu::FramePass<'_>| {
-            world.borrow_mut().render_overlays_only(
-                world_gpu,
-                encoder,
-                frame.colour,
-                Some(frame.resolve),
-                frame.size,
-                // The picture, not the frame: this pass is held to the same
-                // rectangle the frame's own pass was, or a HUD laid out in
-                // fractions of the film would be laid out in fractions of
-                // the window instead.
-                box_.into(),
-            );
+            // The picture, not the frame: these passes are held to the same
+            // rectangle the frame's own pass was, or a HUD laid out in
+            // fractions of the film would be laid out in fractions of the
+            // window instead.
+            let picture: tuile_wgpu::Picture = box_.into();
+            match (mist, frame.depth) {
+                (Some(mist), Some(depth)) => {
+                    mist.render(
+                        world_gpu,
+                        encoder,
+                        frame.colour,
+                        Some(frame.resolve),
+                        depth,
+                        picture,
+                    );
+                    world.borrow_mut().render_after_mist(
+                        world_gpu,
+                        encoder,
+                        frame.colour,
+                        Some(frame.resolve),
+                        frame.size,
+                        picture,
+                    );
+                }
+                _ => world.borrow_mut().render_overlays_only(
+                    world_gpu,
+                    encoder,
+                    frame.colour,
+                    Some(frame.resolve),
+                    frame.size,
+                    picture,
+                ),
+            }
         };
         let outcome = match &mut active.screen {
             super::screen::Screen::Window(windowed) => {

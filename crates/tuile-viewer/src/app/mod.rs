@@ -194,6 +194,10 @@ struct Active {
     /// the frame's own camera. Nothing is drawn through it in a session with
     /// no host, and it costs three pipelines.
     world_overlay: tuile_wgpu::WorldOverlayRenderer,
+    /// The mist pass ([`tuile_wgpu::MistRenderer`]), where the device can
+    /// read the frame's depth; nothing is drawn through it until a host
+    /// states a field.
+    mist: Option<tuile_wgpu::MistRenderer>,
     pump: ContentPump,
     /// The multisampled colour target and its depth buffer. The surface itself
     /// has one sample, so the scene is drawn here and *resolved* into it —
@@ -266,6 +270,8 @@ pub struct App {
     /// its clock running from the wall's — the instant each frame is lit
     /// for — its lights, its air and its look.
     atmosphere: tuile_wgpu::Atmosphere,
+    /// The mist a host states ([`crate::HostFrame::mist`]).
+    mist: Option<tuile_atmosphere::mist::MistField>,
     /// The rate the clock ran at before it was paused: what `P` runs it at
     /// again.
     resume_rate: f64,
@@ -477,6 +483,7 @@ impl App {
             instant: atmosphere.instant(wall),
             sun: tuile_atmosphere::Sun::at_unix_seconds(atmosphere.instant(wall)),
             atmosphere,
+            mist: None,
             air: config.air.viewer,
             active: None,
             session: None,

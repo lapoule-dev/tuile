@@ -28,6 +28,10 @@ pub struct FrameTargets {
     /// Draw into this; resolve into the surface texture.
     pub colour: wgpu::TextureView,
     pub depth: wgpu::TextureView,
+    /// The depth alone, viewed for a shader to read sample by sample
+    /// (the mist pass, [`crate::MistRenderer`]) — where the device can
+    /// bind a multisampled depth, which WebGL2 cannot; there, `None`.
+    pub depth_binding: Option<wgpu::TextureView>,
     format: wgpu::TextureFormat,
     size: (u32, u32),
     /// The surface's format, when the frame reaches it through an encoding
@@ -41,9 +45,29 @@ impl FrameTargets {
     /// not what a stylesheet would call a point.
     pub fn new(gpu: &GpuContext, format: wgpu::TextureFormat, size: (u32, u32)) -> Self {
         let size = (size.0.max(1), size.1.max(1));
+        let readable = crate::MistRenderer::supported(gpu);
+        let depth = texture(
+            gpu,
+            DEPTH_FORMAT,
+            size,
+            "tuile frame depth",
+            if readable {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
+        );
+        let depth_binding = readable.then(|| {
+            depth.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("tuile frame depth (read)"),
+                aspect: wgpu::TextureAspect::DepthOnly,
+                ..Default::default()
+            })
+        });
         Self {
             colour: attachment(gpu, format, size, "tuile frame colour"),
-            depth: attachment(gpu, DEPTH_FORMAT, size, "tuile frame depth"),
+            depth: depth.create_view(&wgpu::TextureViewDescriptor::default()),
+            depth_binding,
             format,
             size,
             surface: None,
@@ -111,21 +135,36 @@ fn attachment(
     size: (u32, u32),
     label: &str,
 ) -> wgpu::TextureView {
-    gpu.device
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d {
-                width: size.0,
-                height: size.1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            // The one number that must match the pipelines. See the module doc.
-            sample_count: SAMPLES,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        })
-        .create_view(&wgpu::TextureViewDescriptor::default())
+    texture(
+        gpu,
+        format,
+        size,
+        label,
+        wgpu::TextureUsages::RENDER_ATTACHMENT,
+    )
+    .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn texture(
+    gpu: &GpuContext,
+    format: wgpu::TextureFormat,
+    size: (u32, u32),
+    label: &str,
+    usage: wgpu::TextureUsages,
+) -> wgpu::Texture {
+    gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        // The one number that must match the pipelines. See the module doc.
+        sample_count: SAMPLES,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage,
+        view_formats: &[],
+    })
 }

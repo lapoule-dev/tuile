@@ -497,6 +497,13 @@ pub struct HostFrame<'a> {
     /// the physical atmosphere nor the closed-form haze that stands in for
     /// it when the person unticks its checkbox.
     pub atmosphere: &'a mut tuile_wgpu::Atmosphere,
+    /// A stated field of mist ([`tuile_atmosphere::mist::MistField`]):
+    /// layers of a procedural medium the camera flies through, marched
+    /// over the picture after the ground and under the never-hidden
+    /// overlays (a HUD). Kept until the host sets it again; `None`, the
+    /// default, draws nothing of it. Not drawn where the device cannot
+    /// read the frame's depth (WebGL2): the picture is then as without.
+    pub mist: &'a mut Option<tuile_atmosphere::mist::MistField>,
     /// The wall's present, Unix seconds UTC: what the clock's methods take.
     pub wall: f64,
     /// The relief the viewer itself stands on, read through
@@ -678,6 +685,7 @@ mod tests {
             preload: &mut preload,
             overlays: &mut overlays,
             atmosphere: &mut tuile_wgpu::Atmosphere::new(Default::default(), 0.0, glam::DVec3::X),
+            mist: &mut None,
             wall: 0.0,
             ground: None,
             viewport: (1920, 1080),
@@ -702,6 +710,7 @@ mod tests {
             preload: &mut preload,
             overlays: &mut overlays,
             atmosphere: &mut tuile_wgpu::Atmosphere::new(Default::default(), 0.0, glam::DVec3::X),
+            mist: &mut None,
             wall: 0.0,
             ground: None,
             viewport: (1920, 1080),
@@ -718,6 +727,7 @@ mod tests {
             preload: &mut preload,
             overlays: &mut overlays,
             atmosphere: &mut tuile_wgpu::Atmosphere::new(Default::default(), 0.0, glam::DVec3::X),
+            mist: &mut None,
             wall: 0.0,
             ground: None,
             viewport: (0, 0),
@@ -953,6 +963,7 @@ mod tests {
             preload: &mut preload,
             overlays: &mut overlays,
             atmosphere: &mut tuile_wgpu::Atmosphere::new(Default::default(), 0.0, glam::DVec3::X),
+            mist: &mut None,
             wall: 0.0,
             ground: Some(&ridge),
             viewport: (1920, 1080),
@@ -973,6 +984,7 @@ mod tests {
             preload: &mut preload,
             overlays: &mut overlays,
             atmosphere: &mut tuile_wgpu::Atmosphere::new(Default::default(), 0.0, glam::DVec3::X),
+            mist: &mut None,
             wall: 0.0,
             ground: None,
             viewport: (1920, 1080),
@@ -993,6 +1005,7 @@ mod tests {
             preload: &mut preload,
             overlays: &mut overlays,
             atmosphere: &mut tuile_wgpu::Atmosphere::new(Default::default(), 0.0, glam::DVec3::X),
+            mist: &mut None,
             wall: 0.0,
             ground: None,
             viewport: (1000, 1000),
