@@ -1513,15 +1513,26 @@ impl Budget {
             Some(i) if i.role == Role::Fallback => sat_u32(self.down.serves(r)),
             _ => 0,
         };
-        let mut sc = score(w.q, waited, self.cfg.age_full, cover);
-        if urgency == Urgency::Hole && coarsening(r.tile()) {
-            // At the ceiling a coarser covering tile frees bytes: first.
-            sc += 1_000_000;
-        }
+        let tier = self.tier(r, e, class, presence);
+        let precedence = super::priority::Precedence::of(urgency);
+        let sc = if precedence == super::priority::Precedence::Value {
+            // The one currency (spec §1b): what loading it gains, from its
+            // arrival on.
+            let gain = super::value::load_gain(&self.spec, urgency, w.q.centrality, tier);
+            i64::try_from(gain.0).unwrap_or(i64::MAX)
+        } else {
+            let mut sc = score(w.q, waited, self.cfg.age_full, cover);
+            if urgency == Urgency::Hole && coarsening(r.tile()) {
+                // At the ceiling a coarser covering tile frees bytes: first.
+                sc += 1_000_000;
+            }
+            sc
+        };
         PriorityKey {
+            precedence,
             urgency,
             score: Reverse(sc),
-            tier: self.tier(r, e, class, presence),
+            tier,
             resource: r,
         }
     }
@@ -2375,6 +2386,7 @@ impl Budget {
                 continue;
             };
             let k = key(self, r).unwrap_or(PriorityKey {
+                precedence: super::priority::Precedence::Value,
                 urgency: Urgency::Refresh,
                 score: Reverse(i64::MIN),
                 tier: Tier::Remote,

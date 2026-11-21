@@ -263,6 +263,22 @@ pub struct Speculation {
     pub memory_permille: u16,
 }
 
+/// The probability of use the value band gives anticipation (law 4: a
+/// share, never a starvation), thousandths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Anticipation {
+    /// A tile of the prefetch ring.
+    pub ring_permille: u16,
+    /// A preloaded ancestor.
+    pub ancestor_permille: u16,
+}
+
+/// The defaults: the ring before the ancestors, as the tiers were.
+const ANTICIPATION: Anticipation = Anticipation {
+    ring_permille: 500,
+    ancestor_permille: 250,
+};
+
 /// The numbers of the choice laws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Params {
@@ -284,6 +300,8 @@ pub struct Params {
     pub speculation: Speculation,
     /// How long a re-specification blends (law 12).
     pub blend: Micros,
+    /// Anticipation's probabilities in the value band.
+    pub anticipation: Anticipation,
 }
 
 /// The policy of the decider: rules and numbers. See the [module
@@ -367,6 +385,7 @@ impl Specification {
                     memory_permille: 200,
                 },
                 blend: Micros::from_secs(2),
+                anticipation: ANTICIPATION,
             },
         }
     }
@@ -415,6 +434,7 @@ impl Specification {
                     memory_permille: 0,
                 },
                 blend: Micros::ZERO,
+                anticipation: ANTICIPATION,
             },
         }
     }
@@ -467,6 +487,10 @@ impl Specification {
                     memory_permille: 350,
                 },
                 blend: Micros::from_secs(1),
+                anticipation: Anticipation {
+                    ring_permille: 700,
+                    ancestor_permille: 250,
+                },
             },
         }
     }
@@ -565,6 +589,8 @@ impl Specification {
             ),
             ("coarse_through", u64::from(p.coarse_through), 30),
             ("restore_remote_ms", p.restore.remote.0 / 1_000, 60_000),
+            ("p_ring", u64::from(p.anticipation.ring_permille), 1_000),
+            ("p_ancestor", u64::from(p.anticipation.ancestor_permille), 1_000),
         ];
         if let Some((name, ..)) = bounded.iter().find(|(_, v, max)| v > max) {
             return Err(SpecError::OutOfBounds(name));
@@ -599,7 +625,7 @@ impl Specification {
             "spec={}&margin={}&min_dwell_ms={}&horizon_ms={}&blend_ms={}\
              &speculation_slots={}&speculation_memory={}&coarse_through={}\
              &restore_decoded_ms={}&restore_stored_ms={}&restore_http_cache_ms={}\
-             &restore_remote_ms={}",
+             &restore_remote_ms={}&p_ring={}&p_ancestor={}",
             self.kind.label(),
             p.margin_permille,
             ms(p.min_dwell),
@@ -612,6 +638,8 @@ impl Specification {
             ms(p.restore.stored),
             ms(p.restore.http_cache),
             ms(p.restore.remote),
+            p.anticipation.ring_permille,
+            p.anticipation.ancestor_permille,
         );
         // A term's weight when all its rules share one; a term weighed
         // differently by predicate (FPV's recency) keeps its kind's rules.
@@ -663,6 +691,8 @@ impl Specification {
                 "restore_stored_ms" => p.restore.stored = millis,
                 "restore_http_cache_ms" => p.restore.http_cache = millis,
                 "restore_remote_ms" => p.restore.remote = millis,
+                "p_ring" => p.anticipation.ring_permille = n16,
+                "p_ancestor" => p.anticipation.ancestor_permille = n16,
                 _ => match k
                     .strip_prefix("w_")
                     .and_then(|t| Term::ALL.into_iter().find(|x| term_key(*x) == t))

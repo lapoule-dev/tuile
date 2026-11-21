@@ -135,6 +135,7 @@ impl Rank {
     /// The full key, for `resource`.
     pub fn key(self, resource: ResourceId) -> PriorityKey {
         PriorityKey {
+            precedence: super::priority::Precedence::of(self.urgency),
             urgency: self.urgency,
             score: self.score,
             tier: self.tier,

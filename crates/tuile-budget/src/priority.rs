@@ -98,13 +98,50 @@ pub fn score(q: Quantised, waited: Micros, age_full: Micros, waiting_descendants
     sse + age + cover
 }
 
+/// What a load's place in the order is fixed by before any value: the
+/// absolute laws' bands (`docs/explorations/budget-eviction-prefetch-spec.md`
+/// §1b, §2.1) — the floor, then coverage (a hole: law 1), then a swap's
+/// blockers — and below them one band ordered by the decider's value
+/// alone, the present need and anticipation together (the present need
+/// ranks first there by its probability, not by a tier).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Precedence {
+    /// The pinned floor (law 2, coverage first).
+    Floor,
+    /// A wanted tile not drawable (law 1).
+    Coverage,
+    /// A child a held parent waits on (law 1, a swap completes).
+    Swap,
+    /// Everything else, by value.
+    Value,
+}
+
+impl Precedence {
+    /// The band of `u`.
+    pub fn of(u: Urgency) -> Self {
+        match u {
+            Urgency::Floor => Precedence::Floor,
+            Urgency::Hole => Precedence::Coverage,
+            Urgency::Blocker => Precedence::Swap,
+            Urgency::Drape | Urgency::Ring | Urgency::Ancestor | Urgency::Refresh => {
+                Precedence::Value
+            }
+        }
+    }
+}
+
 /// The full priority key; smaller sorts first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PriorityKey {
-    /// The urgency tier.
-    pub urgency: Urgency,
-    /// The score, reversed so that higher sorts first.
+    /// The absolute laws' band.
+    pub precedence: Precedence,
+    /// The score, reversed so that higher sorts first: in the
+    /// [`Precedence::Value`] band, the load's gain in flouz
+    /// (`value::load_gain`); above it, the need's score.
     pub score: Reverse<i64>,
+    /// The urgency tier: what the want is (a tie-break here; the
+    /// admission rules read it).
+    pub urgency: Urgency,
     /// The residency tier, cheaper first.
     pub tier: Tier,
     /// The final tie-break.
