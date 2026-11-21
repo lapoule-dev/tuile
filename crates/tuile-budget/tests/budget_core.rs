@@ -2922,6 +2922,40 @@ mod stats {
         assert_eq!(d.stats.sse_scale_milli, 1_000);
     }
 
+    /// The acceptance of the eviction/prefetch decider (spec §9.1, #251's
+    /// measurement): a tile whose need moved up one level while it wore the
+    /// level before — a camera approaching the ground a level at a time,
+    /// then stopping — reaches its need within two seconds of rest, and
+    /// stays there.
+    #[test]
+    #[ignore = "red on main (the drape a level under is never asked for); green with the decider's deficit want, PR 4 of the stack"]
+    fn a_tile_approached_a_level_at_a_time_reaches_its_need_within_two_seconds_of_rest() {
+        let mut r = Rig::interactive();
+        let a = t(3, 2, 2);
+        // The finer drape is in the local store, so no stand-in takes its
+        // place (that rule is `fix/budget-standin-under-relaxation`'s): what
+        // is left is the want's own ±1 tolerance.
+        r.settle(&drawn_draped(&[a], 3), 20);
+        r.store.0.insert(dr(a, 4));
+        let need = drawn_draped(&[a], 4);
+        let rest = r.now;
+        let mut d = r.step(&need);
+        while r.now.since(rest) < Micros::from_secs(2) {
+            r.complete(&d);
+            d = r.step(&need);
+        }
+        assert_eq!(
+            d.stats.deficit.under_tiles(),
+            0,
+            "{RED}: a tile is still a level under its need two seconds after rest"
+        );
+        for _ in 0..120 {
+            r.complete(&d);
+            d = r.step(&need);
+            assert_eq!(d.stats.deficit.under_tiles(), 0, "it stays at its need");
+        }
+    }
+
     /// C28, audit: completed loads land in the latency histogram.
     #[test]
     fn completed_loads_land_in_the_latency_histogram() {

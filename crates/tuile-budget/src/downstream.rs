@@ -180,6 +180,12 @@ struct Sums {
     underdraped: u32,
     held: u32,
     over_terrain: [u32; GAP_BUCKETS],
+    /// The exact items' drape levels under and over their need, summed;
+    /// and the items with any.
+    under_levels: u32,
+    over_levels: u32,
+    under_tiles: u32,
+    over_tiles: u32,
 }
 
 impl Sums {
@@ -212,6 +218,13 @@ impl Sums {
         add(&mut self.bare, i.stats.bare);
         add(&mut self.underdraped, i.stats.underdraped);
         add(&mut self.held, i.role == Role::Held);
+        add(&mut self.under_tiles, i.stats.under_levels > 0);
+        add(&mut self.over_tiles, i.stats.over_levels > 0);
+        let sum = |x: &mut u32, v: u16| {
+            *x = if on { *x + u32::from(v) } else { *x - u32::from(v) };
+        };
+        sum(&mut self.under_levels, i.stats.under_levels);
+        sum(&mut self.over_levels, i.stats.over_levels);
         if i.role == Role::Exact {
             for d in i.drapes() {
                 let b = gap_bucket(d.level, i.stats.tile_level);
@@ -226,6 +239,14 @@ impl Sums {
 
     fn depth(&self) -> u32 {
         self.depths.keys().last().copied().unwrap_or(0)
+    }
+
+    /// The levels the wanted tiles standing on an ancestor stand under
+    /// their need: each fallback's depth, summed.
+    fn depth_levels(&self) -> u32 {
+        self.depths
+            .iter()
+            .fold(0u32, |a, (d, n)| a.saturating_add(d.saturating_mul(*n)))
     }
 }
 
@@ -405,7 +426,7 @@ struct StepLists {
     marks: Vec<ResourceId>,
     slots: Vec<Slot>,
     held: Vec<TileId>,
-    levels: Vec<(LayerId, u32, u32)>,
+    levels: Vec<(LayerId, u32, u32, u32)>,
     layers: Vec<LayerId>,
     entries: Vec<(ResourceId, Role)>,
     old_entries: Vec<(ResourceId, Role)>,
@@ -862,7 +883,7 @@ impl Downstream {
     }
 
     /// The selection's and the draw set's statistics, into `st`.
-    pub fn stats(&self, floor_in: bool, st: &mut BudgetStats) {
+    pub fn stats(&self, floor_in: bool, short: (u32, u32), st: &mut BudgetStats) {
         let s = &self.sums;
         let sel = self.capped_sel.as_ref().unwrap_or(s);
         st.floor_in = floor_in;
@@ -873,6 +894,15 @@ impl Downstream {
         st.bare += s.bare;
         st.underdraped += s.underdraped;
         st.held += s.held;
+        st.deficit.mesh_under_tiles += sel.fallback;
+        st.deficit.mesh_under_levels += sel.depth_levels();
+        st.deficit.mesh_over_tiles += s.held;
+        st.deficit.imagery_under_tiles += s.under_tiles;
+        st.deficit.imagery_under_levels += s.under_levels;
+        st.deficit.imagery_short_layers += short.0;
+        st.deficit.imagery_short_levels += short.1;
+        st.deficit.imagery_over_tiles += s.over_tiles;
+        st.deficit.imagery_over_levels += s.over_levels;
         for (b, n) in st.imagery_over_terrain.iter_mut().zip(&s.over_terrain) {
             *b += n;
         }
@@ -1062,7 +1092,7 @@ impl Budget {
         #[cfg(debug_assertions)]
         self.check_wants(tiles);
 
-        self.down.stats(floor_in, st);
+        self.down.stats(floor_in, self.short_sums, st);
         self.down.scale = self.scale;
         self.down.pressure = self.pressure;
         self.down.oracle = oracle;
@@ -1092,6 +1122,21 @@ impl Budget {
         }
     }
 
+    /// Counts a gap of `imagery_short` in (`on`) or out of its sums.
+    fn short_sum(&mut self, gap: Option<u32>, on: bool) {
+        let Some(g) = gap else {
+            return;
+        };
+        let (n, levels) = &mut self.short_sums;
+        if on {
+            *n += 1;
+            *levels += g;
+        } else {
+            *n -= 1;
+            *levels -= g;
+        }
+    }
+
     /// The drape levels of the tiles in `l.lev` that ask for drapes,
     /// written to `imagery_prev`; the tiles whose levels moved, into
     /// `l.moved`.
@@ -1115,7 +1160,7 @@ impl Budget {
                     &mut l.levels,
                     &mut asked,
                 );
-                for &(layer, level, footprint) in &l.levels {
+                for &(layer, level, footprint, full) in &l.levels {
                     let key = (t, layer);
                     if self.imagery_prev.insert(key, level) != Some(level) {
                         moved = true;
@@ -1128,6 +1173,14 @@ impl Budget {
                         self.imagery_stood_in.insert(key, footprint) != Some(footprint)
                     };
                     moved |= stood;
+                    let gap = full.saturating_sub(level);
+                    let was = if gap > 0 {
+                        self.imagery_short.insert(key, gap)
+                    } else {
+                        self.imagery_short.remove(&key)
+                    };
+                    self.short_sum(was, false);
+                    self.short_sum((gap > 0).then_some(gap), true);
                 }
             }
             if moved {
@@ -2453,6 +2506,8 @@ impl Budget {
         for k in &gone {
             self.imagery_prev.remove(k);
             self.imagery_stood_in.remove(k);
+            let was = self.imagery_short.remove(k);
+            self.short_sum(was, false);
         }
         self.down.step.gone = gone;
         visited
@@ -2897,7 +2952,7 @@ impl Budget {
                 far || (!asked && !silent.0.get()),
                 "{t:?} asked the presence index but is not read when it may have changed"
             );
-            for (layer, level, footprint) in &levels {
+            for (layer, level, footprint, full) in &levels {
                 assert_eq!(
                     self.imagery_prev.get(&(*t, *layer)),
                     Some(level),
@@ -2908,6 +2963,11 @@ impl Budget {
                     (footprint != level).then_some(footprint),
                     "the level {t:?}'s layer {layer:?} carries under a stand-in is the one a \
                      reading gives"
+                );
+                assert_eq!(
+                    self.imagery_short.get(&(*t, *layer)).copied(),
+                    (full > level).then_some(full - level),
+                    "the need {t:?}'s layer {layer:?} is short of is the one a reading gives"
                 );
             }
         }

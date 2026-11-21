@@ -432,6 +432,19 @@ pub struct BudgetSignals {
     pub invariant_violations_total: [u64; 18],
     /// `rejected_inputs_total`.
     pub rejected_inputs_total: u64,
+    /// `under_need_tiles{kind}`: mesh, imagery — drawn tiles under the level
+    /// the step needs (the quality deficit, `BudgetStats::deficit`).
+    pub under_need_tiles: [u32; 2],
+    /// `over_need_tiles{kind}`.
+    pub over_need_tiles: [u32; 2],
+    /// `deficit_levels{kind}`: the levels under need, summed.
+    pub deficit_levels: [u32; 2],
+    /// `deficit_level_seconds_total{kind}`: the deficit integrated over
+    /// time, level·µs — the objective's integral.
+    pub deficit_level_micros_total: [u64; 2],
+    /// `under_need_still_seconds`: the views still and some tile under its
+    /// need, for how long, µs (0 once none is).
+    pub under_need_still_micros: u64,
 }
 
 /// The closed label sets of spec §16.5.
@@ -461,6 +474,8 @@ pub mod labels {
     pub const FAILURE: [&str; 2] = ["transient", "permanent"];
     /// `kind` of a flap.
     pub const FLAP: [&str; 2] = ["terrain", "imagery"];
+    /// `kind` of a deficit.
+    pub const DEFICIT: [&str; 2] = ["mesh", "imagery"];
     /// `kind` of a swap.
     pub const SWAP: [&str; 4] = ["refine", "coarsen", "mesh_drape", "layer"];
     /// `eye`.
@@ -603,6 +618,22 @@ impl BudgetSignals {
             "converge_bound_seconds",
             vec![],
             secs(self.converge_bound_micros),
+        ));
+        for (i, k) in labels::DEFICIT.iter().enumerate() {
+            let kind = || vec![("kind", *k)];
+            out.push(("under_need_tiles", kind(), f64::from(self.under_need_tiles[i])));
+            out.push(("over_need_tiles", kind(), f64::from(self.over_need_tiles[i])));
+            out.push(("deficit_levels", kind(), f64::from(self.deficit_levels[i])));
+            out.push((
+                "deficit_level_seconds_total",
+                kind(),
+                secs(self.deficit_level_micros_total[i]),
+            ));
+        }
+        out.push((
+            "under_need_still_seconds",
+            vec![],
+            secs(self.under_need_still_micros),
         ));
         for (i, k) in labels::FLAP.iter().enumerate() {
             out.push(("flaps_total", vec![("kind", k)], self.flaps_total[i] as f64));
@@ -934,6 +965,26 @@ impl BudgetObserver for BudgetMeter {
         s.fallback_depth_max = s.fallback_depth_max.max(st.fallback_depth_max);
         s.underdraped_tiles = st.underdraped;
         s.imagery_over_terrain = st.imagery_over_terrain;
+        let q = &st.deficit;
+        s.under_need_tiles = [q.mesh_under_tiles, q.imagery_under()];
+        s.over_need_tiles = [q.mesh_over_tiles, q.imagery_over_tiles];
+        s.deficit_levels = [
+            q.mesh_under_levels,
+            q.imagery_under_levels
+                .saturating_add(q.imagery_short_levels),
+        ];
+        for (t, l) in s
+            .deficit_level_micros_total
+            .iter_mut()
+            .zip(s.deficit_levels)
+        {
+            *t = t.saturating_add(u64::from(l).saturating_mul(dt));
+        }
+        s.under_need_still_micros = if r.views_changed || q.under_tiles() == 0 {
+            0
+        } else {
+            s.under_need_still_micros.saturating_add(dt)
+        };
         // Convergence, from the views going still.
         s.converged = st.converged;
         if r.views_changed {

@@ -45,7 +45,7 @@ pub use observe::{
     Histogram, StepRecord, Violations,
 };
 pub use priority::{PriorityKey, Quantised, Urgency};
-pub use stats::{level_index, BudgetStats, CancelReason, EvictReason, LEVELS};
+pub use stats::{level_index, BudgetStats, CancelReason, Deficit, EvictReason, LEVELS};
 pub use tier::{NoStore, Presence, PresenceOracle, Source, Tier};
 pub use types::{
     Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure, ResourceId,
@@ -265,6 +265,13 @@ pub struct Budget {
     /// one the hysteresis reads, never the stand-in, so a tile back at
     /// scale one re-levels to its need. Sparse: the stand-ins only.
     imagery_stood_in: std::collections::BTreeMap<(TileId, LayerId), u32>,
+    /// By how many levels the drape level chosen is coarser than the level
+    /// the picture needs at scale 1, where it is (a stand-in, a
+    /// relaxation): the quality deficit reads them. Few entries; none at
+    /// rest once every tile wears its need.
+    imagery_short: std::collections::BTreeMap<(TileId, LayerId), u32>,
+    /// `imagery_short`'s entries and their gaps, summed.
+    short_sums: (u32, u32),
     /// The tiles whose meshes were drawn last step as themselves or held
     /// (not as a fallback).
     held_last: sorted::SortedMap<TileId, ()>,
@@ -323,6 +330,8 @@ impl Budget {
             need: Default::default(),
             imagery_prev: Default::default(),
             imagery_stood_in: Default::default(),
+            imagery_short: Default::default(),
+            short_sums: (0, 0),
             held_last: Default::default(),
             ranked_last: Vec::new(),
             steps: 0,
