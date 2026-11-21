@@ -534,6 +534,7 @@ pub fn traverse(
         &mut seen_tiles,
     );
     ring(views, tau, tile(0, 0, 0), &mut need, &seen_tiles);
+    reachable(views, tau, &mut need, &seen_tiles);
     if city {
         visit(
             views,
@@ -682,6 +683,47 @@ fn visit(
         for k in visible_kids {
             need.blockers
                 .push((k, need_of(views, k, tau_of(tau, drawn_last, k))));
+        }
+    }
+}
+
+/// How far, in multiples of the eye's height, the reachable view reaches:
+/// the fastest zoom-out within the horizon, then the horizon of that view
+/// (`docs/explorations/budget-eviction-prefetch-spec.md` §5.2b) — the same
+/// number as the runtime's `REACH_FACTOR`.
+pub const REACH_FACTOR: f64 = 12.0;
+
+/// The reachable coarse neighbourhood (spec §5.2b): every tile around the
+/// eye, in all directions, within [`REACH_FACTOR`] heights, at the level
+/// whose side is half that reach — what the fastest zoom-out, rotation or
+/// tilt can reveal within the horizon, whatever the present motion. Listed
+/// in the ring (never drawn as wanted; the budget values them with the hole
+/// penalty and draws the resident ones under the selection).
+fn reachable(views: &[View], tau: f64, need: &mut NeedSet, seen_tiles: &BTreeSet<TileId>) {
+    let listed: BTreeSet<TileId> = need.entries().map(|(_, t, _)| t).collect();
+    let mut out = BTreeSet::new();
+    for v in views {
+        let reach = (v.cam.h * REACH_FACTOR).clamp(2_000.0, SIDE);
+        let mut stack = vec![tile(0, 0, 0)];
+        while let Some(id) = stack.pop() {
+            let [x0, x1, y0, y1] = square(id);
+            let (dx, dy) = (
+                (v.cam.x - v.cam.x.clamp(x0, x1)).abs(),
+                (v.cam.y - v.cam.y.clamp(y0, y1)).abs(),
+            );
+            if dx > reach || dy > reach {
+                continue;
+            }
+            if x1 - x0 <= reach / 2.0 || !has_children(id) {
+                out.insert(id);
+            } else {
+                stack.extend(children(id));
+            }
+        }
+    }
+    for id in out {
+        if !seen_tiles.contains(&id) && !listed.contains(&id) {
+            need.ring.push((id, need_of(views, id, tau)));
         }
     }
 }

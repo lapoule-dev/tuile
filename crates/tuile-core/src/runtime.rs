@@ -1393,9 +1393,16 @@ impl State {
                 ancestors.insert(t);
             }
         }
+        // The reachable coarse neighbourhood (spec §5.2b): what the fastest
+        // zoom-out, rotation or tilt can reveal within the horizon, in all
+        // directions, whatever the present motion.
+        let mut reachable = reachable_ring(tree, &self.views);
+        reachable.retain(|t| {
+            !drawn.contains(t) && !blockers.contains(t) && !ancestors.contains(t)
+        });
         // The ring: what the views ahead select and ask for, beyond what
         // the current ones need — loaded when they leave a slot, never drawn.
-        let ring: BTreeSet<TileId> = if self.ahead.is_empty() {
+        let mut ring: BTreeSet<TileId> = if self.ahead.is_empty() {
             BTreeSet::new()
         } else {
             self.ahead_out
@@ -1411,6 +1418,8 @@ impl State {
                 })
                 .collect()
         };
+        let ahead_ring = ring.len();
+        ring.extend(reachable);
         let list = |set: &BTreeSet<TileId>, views: &[ViewState]| -> Vec<(TileId, Need)> {
             set.iter()
                 .map(|t| (*t, Self::need_of(host, &self.steepest, views, tau, *t)))
@@ -1421,7 +1430,13 @@ impl State {
             drawn: list(&drawn, views),
             blockers: list(&blockers, views),
             ancestors: list(&ancestors, views),
-            ring: list(&ring, &self.ahead),
+            // The tiles of the views ahead are needed as those views see
+            // them; the reachable ones as the present views do.
+            ring: if ahead_ring == 0 {
+                list(&ring, views)
+            } else {
+                list(&ring, &self.ahead)
+            },
         }
     }
 
@@ -1953,6 +1968,49 @@ fn seen_on_slope(against_up: f64, steepest: f64) -> f64 {
     }
     let sin = |c: f64| (1.0 - c * c).max(0.0).sqrt();
     (cos_b * cos_a + sin(cos_b) * sin(cos_a)).min(1.0)
+}
+
+/// How far, in multiples of the eye's height above the ellipsoid, the
+/// reachable view reaches: the fastest zoom-out within the horizon, then the
+/// horizon of that view (`docs/explorations/budget-eviction-prefetch-spec.md`
+/// §5.2b). The simulation's `REACH_FACTOR` is the same number.
+pub const REACH_FACTOR: f64 = 12.0;
+
+/// The reachable coarse neighbourhood of `views` (spec §5.2b): every ground
+/// tile within [`REACH_FACTOR`] heights of an eye, in all directions, at
+/// the depth where its bounding radius falls under a quarter of that reach
+/// — a few dozen coarse tiles, what any gesture can reveal within the
+/// horizon. The budget values them with the hole penalty; the resident ones
+/// are drawn under the selection.
+pub fn reachable_ring(tree: &dyn TileTree, views: &[ViewState]) -> BTreeSet<TileId> {
+    const EARTH_RADIUS_M: f64 = 6_371_000.0;
+    let mut out = BTreeSet::new();
+    for v in views {
+        let p = v.position();
+        let height = (p.length() - EARTH_RADIUS_M).max(1.0);
+        let reach = (height * REACH_FACTOR).clamp(2_000.0, 2.0 * EARTH_RADIUS_M);
+        let mut stack: Vec<TileId> = tree
+            .roots()
+            .into_iter()
+            .filter(|r| tree.mesh_class(*r).is_ground())
+            .collect();
+        while let Some(t) = stack.pop() {
+            let props = tree.properties(t);
+            if props.bounding_volume.distance_to_point(p) > reach {
+                continue;
+            }
+            let (_, radius) = props.bounding_volume.bounding_sphere();
+            let kids = tree.children(t);
+            if radius <= reach / 4.0 || kids.is_empty() {
+                if props.has_content {
+                    out.insert(t);
+                }
+            } else {
+                stack.extend(kids);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
