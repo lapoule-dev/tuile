@@ -245,14 +245,22 @@ pub(super) enum Advance {
     Back,
 }
 
-/// The eviction order: least recently needed first, then finer, then
-/// farther; the resource last, so the order is total.
-pub(super) type EvictKey = (Micros, Reverse<u32>, Reverse<u32>, ResourceId);
+/// The release order, the low end of the decider's one value
+/// (`docs/explorations/budget-eviction-prefetch-spec.md` §3.1, §8): the
+/// band first — the fine before the coarse, whatever the value (law 2) —
+/// packed in the top bits of the value; then the value, lowest first; then
+/// finer, then farther; the resource last, so the order is total.
+pub(super) type EvictKey = (u64, Reverse<u32>, Reverse<u32>, ResourceId);
+
+/// The band's place in [`EvictKey`]'s first field: its top two bits.
+const BAND_SHIFT: u32 = 62;
+/// The value's bits under the band's.
+const VALUE_MASK: u64 = (1 << BAND_SHIFT) - 1;
 
 /// The copies a resource outside transit holds, as the eviction index files
 /// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Held {
+pub(crate) enum Held {
     /// A GPU copy and a decoded one.
     Both,
     /// A GPU copy only.
@@ -267,7 +275,7 @@ impl Held {
     /// Every one.
     pub const ALL: [Held; 3] = [Held::Both, Held::Gpu, Held::Cpu];
 
-    fn i(self) -> usize {
+    pub(crate) fn i(self) -> usize {
         match self {
             Held::Both => 0,
             Held::Gpu => 1,
@@ -457,6 +465,8 @@ pub(super) struct Arena {
     gpu_drapes: BTreeSet<ResourceId>,
     /// The floor's last level (`BudgetConfig::pinned_level`).
     pinned: Option<u32>,
+    /// The specification's terms the eviction key reads.
+    valuation: super::value::Valuation,
     evict: EvictIndex,
     /// Every resource whose copies, load or tier changed, in order, with
     /// what changed ([`Change`]), since the step last took them
@@ -529,6 +539,7 @@ impl Default for Arena {
             gpu_by_level: PerClass::splat([Bytes::ZERO; LEVELS]),
             gpu_drapes: BTreeSet::new(),
             pinned: None,
+            valuation: super::value::Valuation::default(),
             evict: EvictIndex::default(),
             changed: Vec::new(),
             protected: PerClass::splat(Bytes::ZERO),
@@ -1047,15 +1058,61 @@ impl Arena {
         self.evict.prev = cur;
     }
 
-    /// The eviction key of the resource of `s`.
+    /// The eviction key of the resource of `s`: its band, then its value —
+    /// when it was last needed, weighed by the recency term, plus what
+    /// releasing it would cost to undo per byte (the restore-cost credit,
+    /// scaled by the reference size over its own, at most sixteen times) —
+    /// then finer, farther, the resource.
     pub fn evict_key(&self, s: Slot) -> EvictKey {
         let o = self.order[s.i()];
+        let v = &self.valuation;
+        let class = self.class(s);
+        let at = level_index(o.level);
+        let band: u64 = if self.is_floor(s) {
+            2
+        } else if v.coarse(o.level) {
+            1
+        } else {
+            0
+        };
+        let held = self.held(s).map(|h| {
+            let bytes = match h {
+                Held::Cpu => self.cpu[s.i()].cost.gpu,
+                Held::Both | Held::Gpu => self.gpu[s.i()].bytes,
+            };
+            (h, bytes)
+        });
+        let value = v.held_value(class, at, self.last_needed(s), held).0.min(VALUE_MASK);
         (
-            self.last_needed(s),
+            band << BAND_SHIFT | value,
             Reverse(o.level),
             Reverse(o.distance),
             self.id[s.i()],
         )
+    }
+
+    /// Takes the specification's table: when it changes, every filed
+    /// resource is filed again under its new key (a re-specification's
+    /// one-off cost, O(N log N)). Returns how many were.
+    pub fn set_valuation(&mut self, v: super::value::Valuation) -> usize {
+        if self.valuation == v {
+            return 0;
+        }
+        let mut filed: Vec<Slot> = Vec::new();
+        for c in Class::ALL {
+            for h in Held::ALL {
+                filed.extend(self.evict.filed[c][h.i()].iter().map(|(_, s)| *s));
+                self.evict.filed[c][h.i()].clear();
+            }
+        }
+        self.valuation = v;
+        for &s in &filed {
+            let (k, class, h) = (self.node_key(s.0), self.class(s), self.held(s));
+            if let Some(h) = h {
+                self.evict.filed[class][h.i()].insert(k);
+            }
+        }
+        filed.len()
     }
 
     /// Whether the resource of `s` is of the floor.
@@ -1863,6 +1920,67 @@ mod tests {
             after = Some(n);
         }
         out
+    }
+
+    /// The release order is the decider's value (spec §3.1, laws 2 and 6):
+    /// the fine band before the coarse whatever the recency; within a band,
+    /// what is cheap to restore (a decoded copy kept) and large before what
+    /// is dear and small; a re-specification files everything again under
+    /// its keys.
+    #[test]
+    fn the_release_order_follows_the_value_coarse_band_last() {
+        use crate::spec::Specification;
+        use crate::value::Valuation;
+        let mut a = Arena::new(Some(1));
+        let mut spec = Specification::interactive();
+        spec.params.coarse_through = 5;
+        assert_eq!(a.set_valuation(Valuation::of(&spec, Some(1))), 0);
+        let mut l = Ledger::default();
+        let g = |b| Gpu {
+            gen: Generation(1),
+            bytes: Bytes(b),
+            epoch: 0,
+        };
+        let c = CpuCopy {
+            gen: Generation(1),
+            cost: Cost::flat(Bytes(5)),
+            epoch: 0,
+            delivered_before: false,
+        };
+        let r = 256 << 10;
+        // Needed at 10: a coarse mesh (level 4); at 20, two fine ones
+        // (level 9), one of them also decoded, and a small fine one.
+        a.advance(Micros(10), &[]);
+        let coarse = a.find_or_insert(mesh(1), Class::TerrainMesh, 4, Micros(10));
+        a.put_gpu(coarse, &mut l, g(r));
+        a.advance(Micros::from_secs(20), &[coarse]);
+        let fine: Vec<Slot> = (2..=4)
+            .map(|n| a.find_or_insert(mesh(n), Class::TerrainMesh, 9, Micros::from_secs(20)))
+            .collect();
+        a.put_gpu(fine[0], &mut l, g(r));
+        a.put_gpu(fine[1], &mut l, g(r));
+        a.put_cpu(fine[1], &mut l, c);
+        a.put_gpu(fine[2], &mut l, g(r / 16));
+        a.advance(Micros::from_secs(30), &fine);
+        a.advance(Micros::from_secs(40), &[]);
+        let order = filed(&a, Class::TerrainMesh, &Held::GPU[..]);
+        assert_eq!(
+            order,
+            vec![mesh(3), mesh(2), mesh(4), mesh(1)],
+            "the decoded one first (cheap to restore), the small one after the \
+             large (dear per byte), the coarse one last though needed earliest"
+        );
+        assert!(a.evict_index_consistent());
+        // A specification that values restore cost nothing: recency alone
+        // within the fine band, ties by finer then the resource.
+        let mut flat = spec.clone();
+        flat.set_weight(crate::spec::Term::RestoreCost, 0);
+        assert_eq!(a.set_valuation(Valuation::of(&flat, Some(1))), 4);
+        assert!(a.evict_index_consistent());
+        assert_eq!(
+            filed(&a, Class::TerrainMesh, &Held::GPU[..]),
+            vec![mesh(2), mesh(3), mesh(4), mesh(1)]
+        );
     }
 
     #[test]

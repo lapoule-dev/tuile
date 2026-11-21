@@ -1212,6 +1212,9 @@ impl Budget {
     /// Returns whether they read the pressure: a drape worn one level finer
     /// than its need is wanted coarser under pressure only, and a change of
     /// pressure to or from `Normal` moves no other want.
+    // The buffers a step reuses, and the re-read time it hands back: no
+    // struct of its own for one caller and the debug check.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn tile_wants(
         &self,
         t: TileId,
@@ -1220,8 +1223,10 @@ impl Budget {
         meshes_in: bool,
         drapes: &mut Vec<(LayerId, u32)>,
         out: &mut Vec<(ResourceId, u32, Want)>,
+        reread: &mut Option<Micros>,
     ) -> bool {
         out.clear();
+        *reread = None;
         let mut reads_pressure = false;
         let batch = self.cfg.policy == Policy::Batch;
         // Every want put, in order; merged below.
@@ -1279,6 +1284,18 @@ impl Budget {
                             None => true,
                             Some(w) if batch => w.resource != drape,
                             Some(w) if w.level.abs_diff(n) > 1 => true,
+                            Some(w) if w.level < n => {
+                                // A level under its need: wanted once the
+                                // quality it brings over the time it is
+                                // expected to serve pays for its restore
+                                // cost (spec §5.3); until then, read again
+                                // when it will.
+                                let at = self.deficit_due(t, layer, tn, n - w.level);
+                                if let Some(at) = at.filter(|at| *at > self.now) {
+                                    *reread = Some(reread.map_or(at, |r| r.min(at)));
+                                }
+                                at.is_some_and(|at| at <= self.now)
+                            }
                             Some(w) => {
                                 reads_pressure |= w.level > n;
                                 self.pressure != Pressure::Normal && w.level > n
@@ -1310,6 +1327,36 @@ impl Budget {
         out.sort_unstable_by_key(|(r, seq, w)| (*r, w.urgency, Reverse(w.q), *seq));
         out.dedup_by_key(|e| e.0);
         reads_pressure
+    }
+
+    /// [`super::value::deficit_due`] for tile `t`'s layer `layer`.
+    pub(super) fn deficit_due(
+        &self,
+        t: TileId,
+        layer: LayerId,
+        tn: &TileNeed,
+        gap: u32,
+    ) -> Option<Micros> {
+        let level = tn.need.level;
+        let input = super::value::DeficitInput {
+            tile: t,
+            centrality: tn.q.centrality,
+            gap,
+            since: self
+                .level_since
+                .get(&(t, layer))
+                .copied()
+                .unwrap_or(Micros::ZERO),
+            facts: super::spec::Facts {
+                class: Class::Drape,
+                level,
+                tier: Tier::Remote,
+                band: self.spec.band(Class::Drape, level, self.cfg.pinned_level),
+                membership: Some(tn.membership),
+                predicted: false,
+            },
+        };
+        super::value::deficit_due(&self.spec, &input)
     }
 
     /// Whether Batch may want drapes this step: every mesh the frame draws
