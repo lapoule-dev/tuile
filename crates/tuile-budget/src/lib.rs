@@ -287,6 +287,9 @@ pub struct Budget {
     epochs: PerClass<u64>,
     /// Per imagery layer, added to the drape class's epoch.
     layer_epochs: std::collections::BTreeMap<LayerId, u64>,
+    /// An epoch moved since the old epochs' copies were last recycled:
+    /// the next step looks at every slot (`engine::recycle`).
+    recycle: bool,
     next_gen: u64,
     last_now: Option<Micros>,
     scale: u32,
@@ -326,6 +329,7 @@ impl Budget {
             recent_horizon: Micros::ZERO,
             epochs: PerClass::splat(0),
             layer_epochs: Default::default(),
+            recycle: false,
             next_gen: 1,
             last_now: None,
             scale: 1_000,
@@ -408,11 +412,18 @@ impl Budget {
     /// or source update): every resident resource of the class — of
     /// `layer` only, for a drape layer's update (D-A4) — is refreshed at the
     /// lowest urgency, new before old, without a hole.
+    ///
+    /// Everything else of the old content goes, from the next step: its
+    /// loads in flight are cancelled, its decoded copies released, and its
+    /// GPU copies not drawn (nor in a swap, nor of the floor) evicted. Only
+    /// what is on screen keeps the old content, until its refresh is
+    /// drawable.
     pub fn new_epoch(&mut self, class: Class, layer: Option<LayerId>) {
         match (class, layer) {
             (Class::Drape, Some(l)) => *self.layer_epochs.entry(l).or_insert(0) += 1,
             _ => self.epochs[class] += 1,
         }
+        self.recycle = true;
         // Every copy's freshness moved: the next step reads it again.
         self.down.everything_again();
     }

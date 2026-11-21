@@ -3103,6 +3103,78 @@ mod refresh {
             Some(Urgency::Refresh)
         );
     }
+    /// The epochs a snapshot's copies are of, against the current drape
+    /// epoch: every copy, load or transit of an older one.
+    fn old_drapes(r: &Rig) -> Vec<ResourceId> {
+        let snap = r.b.snapshot();
+        let now = snap.epochs[Class::Drape];
+        snap.resources
+            .iter()
+            .filter(|x| x.class == Class::Drape)
+            .filter(|x| {
+                x.load.is_some_and(|l| l.3 < now)
+                    || x.cpu.is_some_and(|c| c.2 < now)
+                    || x.transit.is_some_and(|t| t.2 < now)
+                    || x.gpu.is_some_and(|g| g.2 < now)
+            })
+            .map(|x| x.id)
+            .collect()
+    }
+
+    /// A switch of imagery recycles everything of the old one: the drapes
+    /// still resident but no longer needed (the warm ones the view left)
+    /// and the loads still in flight are of the old picture and go, not
+    /// only the drapes on screen. Switched ten times, the ledger and the
+    /// tracked set come back to where they were, and no copy, load or
+    /// transit of an older epoch is left.
+    #[test]
+    fn a_switch_recycles_every_copy_of_the_old_imagery() {
+        let mut r = Rig::interactive();
+        let (a, b, c) = (t(3, 2, 2), t(3, 5, 5), t(3, 6, 1));
+        // `b` drawn then left: its mesh and drape stay warm.
+        r.settle(&drawn_draped(&[a, b], 4), 20);
+        let here = drawn_draped(&[a], 4);
+        r.settle(&here, 20);
+        assert!(
+            r.b.resource(dr(b, 4)).is_some_and(|v| v.gpu.0 > 0),
+            "the rig keeps a warm drape"
+        );
+        // Before any switch: `a` and `b` resident. After one: `a` only, as
+        // after every later one.
+        let before = r.b.ledger();
+        let mut after_first = None;
+        for n in 0..10 {
+            // A load of the old picture is in flight when the switch lands.
+            let d = r.step(&drawn_draped(&[a, c], 4));
+            r.load_where(|x| x != dr(c, 4));
+            r.upload(&d);
+            r.b.new_epoch(Class::Drape, None);
+            r.settle(&here, 40);
+            // The old picture's load answers late.
+            r.load_where(|_| true);
+            r.settle(&here, 40);
+            assert_eq!(
+                old_drapes(&r),
+                Vec::new(),
+                "{RED}: switch {n} kept the old imagery"
+            );
+            let d = r.step(&here);
+            let worn = d.draw.get(mesh(a)).and_then(base_drape).map(|x| x.resource);
+            assert_eq!(worn, Some(dr(a, 4)), "never a hole");
+            // The imagery's bytes: meshes are not the imagery's.
+            let now = (r.b.ledger().gpu[Class::Drape], r.b.ledger().decoded);
+            match after_first {
+                None => after_first = Some(now),
+                Some(first) => assert_eq!(now, first, "{RED}: switch {n} left more behind"),
+            }
+        }
+        let after = after_first.expect("ten switches");
+        assert!(
+            after.0 < before.gpu[Class::Drape] && after.1 < before.decoded,
+            "{RED}: the warm drape outlived its imagery: {after:?} after, {before:?} before"
+        );
+        r.b.audit().expect("the ledger is its resources");
+    }
 }
 
 mod drape_caps {

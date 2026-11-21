@@ -21,7 +21,12 @@
 //!   [`epoch`](tuile_core::source::TileLoader::epoch), and the geometry
 //!   server's budget refreshes every drape of an earlier one — **new before
 //!   old: the old drape stays worn until the new one is drawable**. Meshes are
-//!   untouched: a drape is a resource of its own.
+//!   untouched: a drape is a resource of its own;
+//! - everything else of the old imagery goes at the step that sees the new
+//!   epoch: the loader's decoded tiles of it, and in the budget its drape
+//!   loads in flight (cancelled), its decoded copies (released) and its GPU
+//!   copies not on screen (evicted). Switched N times, the bytes come back
+//!   to what one imagery holds.
 //!
 //! So a switch is one call here and no black anywhere.
 //!
