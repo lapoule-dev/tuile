@@ -1454,8 +1454,12 @@ impl Budget {
         // sets; the eviction order's newest group.
         self.mark(now, tiles, named, wants);
 
-        // 5. Cancellations: grace and timeouts.
+        // 5. Cancellations: grace and timeouts; then what an epoch left
+        // behind.
         self.cancel(now, &eff, d, &mut st);
+        if !eff.batch {
+            self.recycle(now, d, &mut st);
+        }
 
         // 6. Rank the work: the wanted resources with a load or a delivery
         // to start, kept up to date.
@@ -1648,6 +1652,76 @@ impl Budget {
         self.walk_upkeep();
         st.work = st.work.saturating_add(self.scratch.walked.swap(0, Relaxed));
         d.stats = st;
+    }
+
+    /// What a new epoch left of the old content, let go: the drape loads
+    /// still in flight for it cancelled, its decoded copies released, and its GPU
+    /// copies evicted — but those drawn or in a swap this step, which stay
+    /// worn until their refresh is drawable (new before old), and those of
+    /// the floor, which are wanted and refreshed in place. Looks at every
+    /// slot on the step after an epoch moved, then, while some GPU copy is
+    /// still of an older epoch, at those the step no longer keeps.
+    fn recycle(&mut self, now: Micros, d: &mut Decisions, st: &mut BudgetStats) {
+        let first = std::mem::take(&mut self.recycle);
+        if !first && !self.any_stale() {
+            return;
+        }
+        let a = &self.arena;
+        let mut old: Vec<(ResourceId, Slot)> = a
+            .iter()
+            .filter(|&s| {
+                let epoch = self.epoch(a.id(s), a.class(s));
+                let loading = matches!(a.load(s), Load::Loading { epoch: e, .. } if e < epoch)
+                    && a.class(s) == Class::Drape;
+                let cpu = a.cpu(s).is_some_and(|c| c.epoch < epoch) && !a.has_transit(s);
+                (first && (loading || cpu)) || a.stale_gpu(s, epoch)
+            })
+            .map(|s| (a.id(s), s))
+            .collect();
+        self.walk(self.arena.len());
+        // By resource: the order the consumer is told in.
+        old.sort_unstable();
+        for (r, s) in old {
+            let class = self.arena.class(s);
+            let epoch = self.epoch(r, class);
+            if let Load::Loading {
+                gen,
+                source,
+                epoch: e,
+                ..
+            } = self.arena.load(s)
+            {
+                // A drape's only: what a mesh load answers across a mesh
+                // epoch is refreshed like any copy, and its slot is kept.
+                if e < epoch && class == Class::Drape {
+                    self.arena.set_load(s, Load::Idle);
+                    match source {
+                        Source::Network => {
+                            release(&mut self.in_flight[class], &mut self.underflows)
+                        }
+                        Source::Local => release(&mut self.local_reads, &mut self.underflows),
+                    }
+                    d.cancel.push((r, gen));
+                    st.cancelled += 1;
+                    st.recycled[class][0] += 1;
+                    st.wasted_starts[class] += 1;
+                }
+            }
+            let keep = self.kept(s) || self.is_floor(class, self.arena.level(s));
+            if self.arena.stale_gpu(s, epoch) && !self.arena.has_transit(s) && !keep {
+                let r = self.arena.id(s);
+                self.arena.take_gpu(s, &mut self.ledger);
+                d.evict.push(r);
+                st.evicted += 1;
+                st.recycled[class][1] += 1;
+                st.evictions_by_level[class][super::stats::level_index(self.arena.level(s))] += 1;
+                self.evicted(r, now);
+            }
+            if self.arena.cpu(s).is_some_and(|c| c.epoch < epoch) && !self.arena.has_transit(s) {
+                self.release_one(s, d, st);
+                st.recycled[class][2] += 1;
+            }
+        }
     }
 
     fn protected_bytes(&self) -> PerClass<Bytes> {

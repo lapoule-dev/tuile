@@ -268,14 +268,17 @@ impl Feed for BudgetStats {
         s.drawable_by_level = PerClass::default();
         s.transit_by_level = PerClass::default();
         s.evictions_by_level = PerClass::default();
+        s.recycled = PerClass::default();
         // Out of the text too, so the encoding is the one the reference was
         // recorded with.
         let bytes = format!("{:?}", s.drawable_by_level);
         let counts = format!("{:?}", s.evictions_by_level);
+        let recycled = format!("{:?}", s.recycled);
         let text = format!("{s:?}")
             .replace(&format!(", drawable_by_level: {bytes}"), "")
             .replace(&format!(", transit_by_level: {bytes}"), "")
-            .replace(&format!(", evictions_by_level: {counts}"), "");
+            .replace(&format!(", evictions_by_level: {counts}"), "")
+            .replace(&format!(", recycled: {recycled}"), "");
         h.bytes(text.as_bytes());
     }
 }
