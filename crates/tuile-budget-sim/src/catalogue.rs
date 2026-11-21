@@ -128,6 +128,18 @@ pub(crate) fn profile(device: Device, network: Network, headset: bool) -> Profil
     p
 }
 
+/// The desktop's profile on the budget `cfg` (the viewer-scale runs).
+pub fn desktop_on(cfg: tuile_budget::BudgetConfig) -> Profile {
+    let mut p = Profile::desktop();
+    p.budget = cfg;
+    p
+}
+
+/// The soak's four-minute tour, looped: orbit, pan, zoom, turn.
+pub fn tour(t: f64) -> Camera {
+    crate::soak::tour(t)
+}
+
 /// Over the mountains, east of the plain.
 const MOUNTAINS: (f64, f64) = (0.78 * SIDE, 0.5 * SIDE);
 /// Over the plain.

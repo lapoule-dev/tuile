@@ -23,3 +23,7 @@ arrow-schema = "58.4.0"
 [[bin]]
 name = "tuile-budget-tune"
 path = "src/bin/tune.rs"
+
+[[bin]]
+name = "tuile-budget-viewer-scale"
+path = "src/bin/viewer_scale.rs"
