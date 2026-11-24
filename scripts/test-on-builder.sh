@@ -47,6 +47,12 @@
 #   TUILE_TEST_COMMANDS    a file of commands, one step each (above)
 #   TUILE_CARGO_JOBS       CARGO_BUILD_JOBS on the builder (default 4)
 #   TUILE_TEST_THREADS     nextest --test-threads (default 4)
+#   TUILE_TEST_PARTITION   K/N: only partition K of N of the test step
+#                          (nextest --partition hash:K/N). A long run cut
+#                          into N shorter builds, each its own scheduled job:
+#                          a dropped connection costs one part, not the run.
+#                          Merge the parts' junit.xml and exit codes after.
+#   TUILE_TEST_OUT         the output directory (default target/test-on-builder/<time>)
 #   TUILE_TEST_SLOT        the builder slot the run holds, when a scheduler
 #                          gives one: one target directory per slot (default 0)
 #
@@ -94,7 +100,7 @@ REF="${TUILE_TEST_REF:-$(git -C "$REPO_ROOT" stash create 2>/dev/null || true)}"
 REF="${REF:-HEAD}"
 COMMIT="$(git -C "$REPO_ROOT" rev-parse --short "$REF")"
 
-OUT="${REPO_ROOT}/target/test-on-builder/$(date +%Y%m%d-%H%M%S)"
+OUT="${TUILE_TEST_OUT:-${REPO_ROOT}/target/test-on-builder/$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT"
 CTX="${OUT}/context.tar"
 git -C "$REPO_ROOT" archive --format=tar -o "$CTX" "$REF"
@@ -118,6 +124,7 @@ BUILD_ARGS=(
     --build-arg "CARGO_JOBS=${TUILE_CARGO_JOBS:-4}"
     --build-arg "TEST_THREADS=${TUILE_TEST_THREADS:-4}"
     --build-arg "TARGET_SLOT=${TUILE_TEST_SLOT:-0}"
+    --build-arg "PARTITION=${TUILE_TEST_PARTITION:-}"
 )
 # The compilation cache: its bucket as build args, its key as secrets read by
 # buildx from this environment (the value never appears on a command line).
@@ -135,7 +142,7 @@ else
     echo "   sccache: off (TUILE_SCCACHE_BUCKET / _KEY_ID / _SECRET not all set)"
 fi
 
-echo "=== ${STEPS}${COMMANDS:+ + commands of ${COMMANDS}} (cargo nextest run ${TEST_ARGS}) on ${TUILE_BUILDER} (${COMMIT}) → ${OUT}"
+echo "=== ${STEPS}${TUILE_TEST_PARTITION:+ (partition ${TUILE_TEST_PARTITION})}${COMMANDS:+ + commands of ${COMMANDS}} (cargo nextest run ${TEST_ARGS}) on ${TUILE_BUILDER} (${COMMIT}) → ${OUT}"
 # Only what buildx prints of the steps: the "===" lines and the summaries.
 # No pipefail for this one pipeline: PIPESTATUS keeps buildx's own status.
 set +o pipefail

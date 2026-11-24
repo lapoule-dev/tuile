@@ -27,6 +27,7 @@
 # The steps (TEST_STEPS, space-separated; each one's log and exit code in the
 # output, every step run past a failure):
 #   test    cargo nextest run --profile ci ${CARGO_TEST_ARGS}    (CI: test)
+#           (one partition of it with PARTITION=K/N)
 #   doc     cargo test --workspace --doc                         (CI: test)
 #   budget  the budget's simulation and properties, in release   (CI: budget-sim)
 #   clippy  cargo clippy --workspace --all-targets -D warnings   (CI: lint)
@@ -114,6 +115,9 @@ ARG CARGO_TEST_ARGS="--workspace"
 ARG TEST_STEPS="test doc budget clippy wasm"
 ARG CARGO_JOBS=4
 ARG TEST_THREADS=4
+# One partition of the test step (`K/N`, nextest --partition hash:K/N), when a
+# run is split into several shorter builds; empty = every test.
+ARG PARTITION=""
 ARG SCCACHE_BUCKET=""
 ARG SCCACHE_REGION=""
 ARG SCCACHE_ENDPOINT=""
@@ -168,7 +172,7 @@ step() { # $1=name, then the commands, run by bash -c
 for s in ${TEST_STEPS}; do
     case "$s" in
         test)
-            step test "cargo nextest run --profile ci --test-threads ${TEST_THREADS} ${CARGO_TEST_ARGS}"
+            step test "cargo nextest run --profile ci --test-threads ${TEST_THREADS} ${PARTITION:+--partition hash:${PARTITION}} ${CARGO_TEST_ARGS}"
             cp target/nextest/ci/junit.xml /out/junit.xml 2>/dev/null ;;
         doc)
             step doc "cargo test --workspace --doc" ;;
