@@ -425,10 +425,9 @@ fn a_fast_zoom_under(plan: &str, gpu: &GpuContext) {
         [90 + (x % 128) as u8 * 4, 140, 90 + (y % 128) as u8 * 4, 255]
     }));
     let tree: Box<dyn TileTree> = tuile_planetary::terrain_tree(everywhere());
-    let config = Config {
-        maximum_screen_space_error: 2.0,
-        ..Config::default()
-    };
+    // The host's own traversal: no hold-until-ready, the budget standing in
+    // for what is missing.
+    let config = Config::interactive_globe();
     // Under memory pressure, deliberately. A session that never evicts is
     // not the session anyone runs: the viewer reclaims constantly — 19 326
     // evictions against 26 915 uploads, measured — and an eviction that

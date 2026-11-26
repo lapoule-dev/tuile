@@ -161,7 +161,15 @@ fn covered(selected: &HashSet<(u32, u64, u64)>, max_level: u32, geo: Geodetic) -
 fn every_visible_ground_point_is_selected() {
     let tree = tuile_planetary::terrain_tree(boundary_layer());
     let residency = all_resident(tree.as_ref());
-    let config = Config::interactive_globe();
+    // The recorder's traversal holds its refinements (`exact_traversal` in
+    // tuile-bake turns `forbid_holes` on whatever it is given): there, the
+    // selection alone is the covered ground. The interactive globe holds
+    // none (#330), its budget standing in tile by tile for what is missing,
+    // so its selection alone is not the picture and is not asked here.
+    let config = Config {
+        forbid_holes: true,
+        ..Config::interactive_globe()
+    };
 
     // The recorder's target: on the ground just west of the availability
     // boundary, inside the fine window — where the flight was.
