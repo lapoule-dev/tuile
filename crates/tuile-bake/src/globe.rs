@@ -478,6 +478,8 @@ async fn resolve(
             decode_normals: !names_only(config),
             skirts_apart: names_only(config),
             substitute: None,
+            imagery_cache_tiles: 512,
+            mesh_cache_tiles: 512,
         };
         return Ok(match config.imagery_asset_id {
             None => globe_with_provenance(terrain, NoImagery, layer, options(true), decode_pool()),
@@ -550,6 +552,8 @@ async fn resolve(
                 decode_normals: !names_only(config),
                 skirts_apart: names_only(config),
                 substitute: None,
+                imagery_cache_tiles: 512,
+                mesh_cache_tiles: 512,
             },
             decode_pool(),
         );
@@ -585,6 +589,8 @@ async fn resolve(
             decode_normals: !names_only(config),
             skirts_apart: names_only(config),
             substitute,
+            imagery_cache_tiles: 512,
+            mesh_cache_tiles: 512,
         };
         return Ok(globe_with_provenance(
             terrain,
@@ -628,6 +634,8 @@ async fn resolve(
         skirts_apart: names_only(config),
         // ion's own imagery: a substitute is a host's (refused above).
         substitute: None,
+        imagery_cache_tiles: 512,
+        mesh_cache_tiles: 512,
     };
 
     // Ce que l'endpoint est, et non ce qu'on espère qu'il soit.

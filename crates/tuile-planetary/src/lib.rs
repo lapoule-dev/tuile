@@ -561,6 +561,13 @@ pub struct GlobeOptions {
     /// specification says so. `None` by default: no substitute is ever
     /// asked for, and nothing changes.
     pub substitute: Option<SubstituteImagery>,
+    /// How many decoded, reprojected imagery tiles the loader remembers for
+    /// the terrain tiles that share them (each lane: the imagery and its
+    /// substitute). 512 by default: 128 MiB of RGBA8 256-pixel tiles held
+    /// outside the budget, which a phone may want smaller.
+    pub imagery_cache_tiles: usize,
+    /// How many decoded terrain meshes the loader remembers. 512 by default.
+    pub mesh_cache_tiles: usize,
 }
 
 impl Default for GlobeOptions {
@@ -578,6 +585,8 @@ impl Default for GlobeOptions {
             decode_normals: true,
             skirts_apart: false,
             substitute: None,
+            imagery_cache_tiles: 512,
+            mesh_cache_tiles: 512,
         }
     }
 }
@@ -2197,7 +2206,11 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
         if let Some(s) = &self.substitute {
             let mut by = ByLevel::default();
             known |= s.provider.stored(&mut by);
-            out.add(Class::Drape, Some(layer_index(LayerId(0).substitute())), &by);
+            out.add(
+                Class::Drape,
+                Some(layer_index(LayerId(0).substitute())),
+                &by,
+            );
         }
         known
     }
@@ -2336,9 +2349,10 @@ where
             .with_max_level(deepest_useful),
     );
     let heights = Arc::new(TerrainHeights::new(scheme));
+    let (imagery_cache_tiles, mesh_cache_tiles) = (opts.imagery_cache_tiles, opts.mesh_cache_tiles);
     let substitute = opts.substitute.clone().map(|s| SubstituteLane {
         provider: s.0,
-        cache: Mutex::new(ImageryCache::new(512)),
+        cache: Mutex::new(ImageryCache::new(imagery_cache_tiles)),
         fetching: ImageryInFlight::default(),
     });
     let loader: Arc<dyn TileLoader> = Arc::new(PlanetaryLoader {
@@ -2346,8 +2360,8 @@ where
         imagery,
         scheme,
         opts,
-        cache: Mutex::new(ImageryCache::new(512)),
-        meshes: Mutex::new(MeshCache::new(512)),
+        cache: Mutex::new(ImageryCache::new(imagery_cache_tiles)),
+        meshes: Mutex::new(MeshCache::new(mesh_cache_tiles)),
         fetching: ImageryInFlight::default(),
         substitute,
         building: TerrainInFlight::default(),
@@ -2566,7 +2580,11 @@ mod tests {
                 bounding_sphere_radius: rect.height().max(rect.width()) * WGS84_A,
                 horizon_occlusion: [0.0; 3],
             };
-            let (u, v, height) = ([0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 0.0, 1.0]);
+            let (u, v, height) = (
+                [0.0, 1.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0, 1.0],
+                [0.0, 1.0, 0.0, 1.0],
+            );
             let edges = [vec![0, 2], vec![0, 1], vec![1, 3], vec![2, 3]];
             let mut bytes = tuile_terrain::decode::encode(
                 &header,
