@@ -557,6 +557,11 @@ impl Config {
     /// them in their level-2 stand-in drape: the whole view olive for a
     /// frame (lapoule-dev/tuile#330). Without the hold, the same scripted
     /// turns load as many meshes and drapes, and the flash is gone.
+    ///
+    /// This is a default of the configuration, not a mode: a host that
+    /// wants the hold back builds `Config { forbid_holes: true,
+    /// ..Config::interactive_globe() }` when it instantiates its session
+    /// (the recorder does, whatever it is given).
     pub fn interactive_globe() -> Self {
         Self {
             maximum_screen_space_error: 2.0,
@@ -3311,6 +3316,36 @@ pub(crate) mod tests {
             "nothing is held: {:?}",
             out.awaiting
         );
+    }
+
+    /// **The hold is the instance's configuration, not a property of the
+    /// globe**: the default configuration (the recorder's, which
+    /// `exact_traversal` forces anyway) keeps it, and a host that builds
+    /// from [`Config::interactive_globe`] may ask for it back. Same inputs
+    /// as the test above: with the hold, two of four children resident
+    /// select the parent alone.
+    #[test]
+    fn the_hold_is_supplied_by_the_configuration() {
+        assert!(Config::default().forbid_holes, "the default holds");
+        assert!(
+            !Config::interactive_globe().forbid_holes,
+            "the interactive globe's default does not"
+        );
+
+        let ts = mini_tileset();
+        let root = ts.root();
+        let children = ts.tile(root).children.clone();
+        let mut residency = ResidentSet::default();
+        residency.insert(root);
+        residency.insert(children[0]);
+        residency.insert(children[1]);
+
+        let held = Config {
+            forbid_holes: true,
+            ..Config::interactive_globe()
+        };
+        let out = run_with(&ts, &residency, &[camera_at(150.0)], &held, &HashSet::new());
+        assert_eq!(ids(&out.selected), vec![root], "the hold falls back to the parent");
     }
 
     /// Ground just off the edge of the screen is selected, not merely fetched.
