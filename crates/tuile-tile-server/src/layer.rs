@@ -221,6 +221,7 @@ mod tests {
     /// id of a zone's ranges (down to where it is checked) is a tile of
     /// that zone: on both grids.
     #[test]
+    #[ignore = "slow: every id of a zone's ranges, on both grids, ~21 s in debug; run with `cargo nextest run --profile slow --run-ignored only`"]
     fn a_zone_s_tiles_are_exactly_its_id_ranges() {
         for grid in [Grid::WebMercator, Grid::Geographic] {
             let l = layer(grid, 3);

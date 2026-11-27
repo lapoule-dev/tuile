@@ -162,6 +162,7 @@ fn mib(bytes: usize) -> f64 {
 }
 
 #[test]
+#[ignore = "slow: a bake's heights against the meshes, ~37 s in debug; run with `cargo nextest run --profile slow --run-ignored only`"]
 fn the_ground_kept_small_answers_the_heights_of_the_meshes_as_they_came() {
     let mut config = GlobeConfig::new("");
     config.sources = Some(SourcesHandle(Arc::new(MadeUp)));

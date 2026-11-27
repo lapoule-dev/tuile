@@ -1014,6 +1014,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: a fit repeated over many tilings, ~10 s in debug; run with `cargo nextest run --profile slow --run-ignored only`"]
     fn the_field_is_the_same_fit_whatever_the_tiles_are_measured_by() {
         // The same film, measured two ways: the same seams, the same
         // breaks — none — and the same tone at every corner.

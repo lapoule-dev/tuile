@@ -1040,6 +1040,7 @@ mod tests {
     /// bits — on irregular and regular tiles, with skirts and without,
     /// smoothed or not, stitched across levels or not.
     #[test]
+    #[ignore = "slow: every triangle's answer, bit for bit, ~18 s in debug; run with `cargo nextest run --profile slow --run-ignored only`"]
     fn the_height_is_every_triangle_s_answer_bit_for_bit() {
         let mut dice = Dice(0x5EED_6E0D);
         let tiles = landscape(&mut dice);

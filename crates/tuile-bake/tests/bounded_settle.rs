@@ -184,6 +184,7 @@ fn heights(i: u32, ground: &Ground) -> Vec<Option<u64>> {
 
 /// The only test of this binary: the gauges it reads are the process's.
 #[test]
+#[ignore = "slow: a long settle held to its bounds, ~41 s in debug; run with `cargo nextest run --profile slow --run-ignored only`"]
 fn grounds_out_for_reading_and_selections_held_are_bounded() {
     rayon::ThreadPoolBuilder::new()
         .num_threads(THREADS)

@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# The tests tagged `#[ignore = "slow: ..."]`: the normal runs skip them, this
+# one runs them on demand (Actions > slow-tests > Run workflow). No schedule.
+# The list is the `slow` profile of `.config/nextest.toml`.
+name: slow-tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  slow-tests:
+    runs-on: tuile-linux
+    env:
+      TUILE_REQUIRE_GPU: 1
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/linux-host
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: false
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.148
+      - run: cargo nextest run --profile slow --run-ignored only --workspace

@@ -45,6 +45,7 @@
 - Every public trait has tests; every parser is tested on real data.
 - **A green suite is not proof.** Write the test in the same change as the behaviour, then revert the behaviour and confirm the test fails. Say plainly what a test does not cover.
 - Never pipe a test, build or clippy run through `head` or `tail`: redirect the whole run to a file and grep it.
+- **Slow tests are tagged, not deleted.** A test that takes more than 10 s in a debug run and has no GPU or black-ground duty carries `#[ignore = "slow: <what it checks>, ~<N> s in debug; ..."]`, so `cargo nextest run` and the CI `test` job skip it; the `slow:` prefix tells it from the tests ignored for credentials, network, OS or as benches. Add it to the `slow` profile of `.config/nextest.toml` too, then run them all with `cargo nextest run --profile slow --run-ignored only --workspace`, or from GitHub Actions with the manually dispatched `slow-tests` workflow.
 - **A render is a picture**: when a run produces a render, open it and look at it. Renders go to `videos/` (gitignored), with their parameters in `videos/README.md`.
 
 ## CI (GitHub Actions, `.github/workflows/ci.yml`)

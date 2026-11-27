@@ -72,6 +72,7 @@ async fn thousands_of_random_tiles_come_back_byte_for_byte() {
 }
 
 #[tokio::test]
+#[ignore = "slow: an archive big enough for leaf directories, ~34 s in debug; run with `cargo nextest run --profile slow --run-ignored only`"]
 async fn enough_tiles_to_need_leaf_directories_still_read_back() {
     // Well past what a 16 KiB root directory can index.
     let tiles = random_tiles(40_000, 11);
@@ -290,6 +291,7 @@ async fn writes_samples_for_the_reference_tool() {
 /// returns — for an archive of ours with leaf directories, and for the
 /// reference fixtures. This is what projections fetch by coalesced ranges.
 #[tokio::test]
+#[ignore = "slow: every directory entry of a large archive, ~34 s in debug; run with `cargo nextest run --profile slow --run-ignored only`"]
 async fn directory_entries_locate_tile_bytes_exactly() {
     use futures_util::TryStreamExt;
     async fn check(path: &std::path::Path) -> usize {

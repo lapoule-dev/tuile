@@ -57,6 +57,7 @@ fn lagging(i: u32, ground: &Ground, out: &AtomicU64, bytes: &AtomicU64) -> Optio
 
 /// The only test of this binary: the budget is the process's.
 #[test]
+#[ignore = "slow: a long bake held to its byte budget, ~84 s in debug; run with `cargo nextest run --profile slow --run-ignored only`"]
 fn grounds_out_for_reading_weigh_no_more_than_the_budget() {
     // Below one ground's weight: one ground out at a time.
     std::env::set_var("TUILE_GROUND_READING_MIB", "1");
