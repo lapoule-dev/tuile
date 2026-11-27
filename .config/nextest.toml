@@ -43,14 +43,14 @@ path = "junit.xml"
 # (docs/20-conventions.md).
 [profile.slow]
 default-filter = '''
-    test(=the_height_is_every_triangle_s_answer_bit_for_bit)
-    | test(=a_zone_s_tiles_are_exactly_its_id_ranges)
-    | test(=the_ground_kept_small_answers_the_heights_of_the_meshes_as_they_came)
-    | test(=grounds_out_for_reading_weigh_no_more_than_the_budget)
-    | test(=grounds_out_for_reading_and_selections_held_are_bounded)
-    | test(=enough_tiles_to_need_leaf_directories_still_read_back)
-    | test(=directory_entries_locate_tile_bytes_exactly)
-    | test(=the_field_is_the_same_fit_whatever_the_tiles_are_measured_by)
+    test(the_height_is_every_triangle_s_answer_bit_for_bit)
+    | test(a_zone_s_tiles_are_exactly_its_id_ranges)
+    | test(the_ground_kept_small_answers_the_heights_of_the_meshes_as_they_came)
+    | test(grounds_out_for_reading_weigh_no_more_than_the_budget)
+    | test(grounds_out_for_reading_and_selections_held_are_bounded)
+    | test(enough_tiles_to_need_leaf_directories_still_read_back)
+    | test(directory_entries_locate_tile_bytes_exactly)
+    | test(the_field_is_the_same_fit_whatever_the_tiles_are_measured_by)
 '''
 fail-fast = false
 failure-output = "immediate-final"
