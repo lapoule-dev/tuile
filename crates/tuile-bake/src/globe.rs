@@ -478,6 +478,7 @@ async fn resolve(
             decode_normals: !names_only(config),
             skirts_apart: names_only(config),
             substitute: None,
+            imagery_draws: tuile_planetary::DEFAULT_IMAGERY_PASSES,
             imagery_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
             mesh_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
         };
@@ -552,6 +553,7 @@ async fn resolve(
                 decode_normals: !names_only(config),
                 skirts_apart: names_only(config),
                 substitute: None,
+                imagery_draws: tuile_planetary::DEFAULT_IMAGERY_PASSES,
                 imagery_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
                 mesh_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
             },
@@ -589,6 +591,7 @@ async fn resolve(
             decode_normals: !names_only(config),
             skirts_apart: names_only(config),
             substitute,
+            imagery_draws: tuile_planetary::DEFAULT_IMAGERY_PASSES,
             imagery_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
             mesh_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
         };
@@ -634,6 +637,7 @@ async fn resolve(
         skirts_apart: names_only(config),
         // ion's own imagery: a substitute is a host's (refused above).
         substitute: None,
+        imagery_draws: tuile_planetary::DEFAULT_IMAGERY_PASSES,
         imagery_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
         mesh_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
     };

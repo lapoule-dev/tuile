@@ -269,8 +269,17 @@ impl LayerBudget {
     /// The argument is therefore what the *device reported*, not a budget the
     /// host already computed.
     pub fn set_from_device(&self, max_sampled_textures_per_stage: u32) {
+        self.set_from_device_capped(max_sampled_textures_per_stage, raster::USEFUL_IMAGERY_SLOTS);
+    }
+
+    /// [`Self::set_from_device`] under the host's own ceiling
+    /// ([`raster::imagery_slots_capped`]): the number the renderer's shader
+    /// was built for (`GpuContext::with_slot_ceiling`), so the loader asks for
+    /// drapes of the width the shader reads. A phone passes
+    /// [`raster::MIN_IMAGERY_SLOTS`]; the floor holds whatever is asked.
+    pub fn set_from_device_capped(&self, max_sampled_textures_per_stage: u32, ceiling: u32) {
         self.0.store(
-            raster::imagery_slots(max_sampled_textures_per_stage),
+            raster::imagery_slots_capped(max_sampled_textures_per_stage, ceiling),
             std::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -455,6 +464,26 @@ pub struct GlobeOptions {
     /// A handle rather than a number because the renderer usually does not
     /// exist yet when the loader is built — see [`LayerBudget`].
     pub imagery_slots: LayerBudget,
+    /// How many draws of a tile a drape may spend its layers on:
+    /// [`DEFAULT_IMAGERY_PASSES`] (1) by default, clamped to
+    /// `1..=`[`raster::MAX_IMAGERY_PASSES`].
+    ///
+    /// **This is what a ceiling on the slots does to a mosaic.** One pass: the
+    /// mosaic is at most `slots - 1` tiles (the floor takes the last slot), and
+    /// where the imagery wanted more the whole mosaic coarsens a level until
+    /// it fits — the ground waits at a coarser level instead of drawing, which
+    /// is what was measured when passes were first spent on a finer mosaic (24
+    /// layers raised to 99: sixteen times the imagery to fetch and upload, a
+    /// globe that spent its time waiting). With `n` passes the mosaic may be
+    /// `n × slots - 1` tiles and the renderer draws the tile `n` times, the
+    /// shader still reading only `slots` fetches a fragment; only the tiles
+    /// that need the width pay for the extra draws. Neither leaves ground
+    /// bare: the floor layer is always drawn, in the first pass.
+    ///
+    /// A phone that caps its slots at 9 and wants the 3×3 and 5×5 mosaics of
+    /// a desktop sets 3 (27 layers), at the price of three draws of the tiles
+    /// that straddle worst.
+    pub imagery_draws: u32,
     /// Whether the coarse layer under a drape is chosen by geometry alone.
     ///
     /// **This is the difference between a render that reproduces and one that
@@ -576,6 +605,7 @@ impl Default for GlobeOptions {
             no_imagery: false,
             max_level: None,
             imagery_slots: LayerBudget::default(),
+            imagery_draws: DEFAULT_IMAGERY_PASSES,
             deterministic_floor: false,
             held_drape: None,
             composed_at: 0,
@@ -591,11 +621,27 @@ impl Default for GlobeOptions {
     }
 }
 
+/// The draws of a tile a drape spends its layers on unless the host says
+/// otherwise ([`GlobeOptions::imagery_draws`]): one, as it has always been.
+pub const DEFAULT_IMAGERY_PASSES: u32 = 1;
+
 /// The entries each of the loader's two caches holds unless the host says
 /// otherwise ([`GlobeOptions::imagery_cache_tiles`], [`GlobeOptions::mesh_cache_tiles`]).
 pub const DEFAULT_CACHE_TILES: usize = 512;
 
 impl GlobeOptions {
+    /// The most imagery tiles a mosaic may hold, the floor's slot left
+    /// out: what one draw binds, times the draws the options allow, less
+    /// that one.
+    ///
+    /// At the default of one draw this is `slots - 1`, as it has always been.
+    /// A budget set unbounded ([`LayerBudget::set_unbounded`]) stays
+    /// unbounded: the product saturates.
+    fn mosaic_layers(&self) -> u32 {
+        let draws = self.imagery_draws.clamp(1, raster::MAX_IMAGERY_PASSES);
+        self.imagery_slots.get().saturating_mul(draws) - 1
+    }
+
     /// The loader's cache of decoded imagery, sized by these options.
     fn imagery_cache(&self) -> ImageryCache {
         ImageryCache::new(self.imagery_cache_tiles)
@@ -1578,7 +1624,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         let mosaic = scheme.mosaic_at_level(
             &rect,
             self.provider_level(&scheme, level, lat),
-            self.opts.imagery_slots.get() - 1,
+            self.opts.mosaic_layers(),
         );
         let floor = self.opts.floor_under(&floor_scheme, &rect, &self.cache);
         match lane {
@@ -1671,7 +1717,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // its time waiting rather than drawing. If a deeper drape is wanted it
         // has to be asked for on its own, with the memory and the fetch count
         // in front of it.
-        let mosaic = scheme.mosaic_at_level(rect, level, self.opts.imagery_slots.get() - 1);
+        let mosaic = scheme.mosaic_at_level(rect, level, self.opts.mosaic_layers());
         let terrain_level = id.terrain_coord().0;
         // The four numbers that decide how sharp the ground gets, in the order
         // they constrain each other: what the terrain's own error asks for, what
@@ -3279,6 +3325,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **The host's ceiling on the slots, and its draws, decide how wide a
+    /// mosaic may be: coarsen at one draw, spill at several.**
+    ///
+    /// The mosaic is capped at what one draw binds less the floor's slot.
+    /// With the 9 a phone asks for, a drape that wants more than 8 tiles
+    /// steps back a level (the ground waits at a coarser level, never bare);
+    /// with draws allowed the same drape keeps its level and the renderer
+    /// draws the tile again for the rest. The default is one draw, as ever.
+    #[test]
+    fn the_slot_ceiling_and_the_draws_bound_the_mosaic() {
+        let scheme = tuile_core::raster::TilingScheme::web_mercator();
+        let rect = GeoRect {
+            west: 0.100,
+            south: 0.200,
+            east: 0.104,
+            north: 0.206,
+        };
+        // A level whose full mosaic does not fit in one draw of 9, and fits
+        // in the four draws of 9 the renderer allows.
+        let count = |level| scheme.mosaic_at_level(&rect, level, u32::MAX).tile_count();
+        let wanted = (0..=scheme.maximum_level)
+            .find(|&level| (9..=35).contains(&count(level)))
+            .expect("some level needs between 9 and 35 tiles");
+        let full = count(wanted);
+
+        let options = |ceiling: u32, draws: u32| {
+            let options = GlobeOptions {
+                imagery_draws: draws,
+                ..GlobeOptions::default()
+            };
+            // A device that binds a hundred: the ceiling decides.
+            options.imagery_slots.set_from_device_capped(100, ceiling);
+            options
+        };
+        let phone = options(raster::MIN_IMAGERY_SLOTS, 1);
+        assert_eq!(phone.imagery_slots.get(), 9);
+        assert_eq!(phone.mosaic_layers(), 8);
+        let coarse = scheme.mosaic_at_level(&rect, wanted, phone.mosaic_layers());
+        assert!(
+            coarse.level < wanted,
+            "one draw of 9 coarsens: {full} tiles"
+        );
+        assert!(coarse.tile_count() <= 8);
+
+        // Draws enough for the whole mosaic: the level is kept.
+        let draws = (full as u32 + 1).div_ceil(9);
+        let spilled = options(raster::MIN_IMAGERY_SLOTS, draws);
+        assert_eq!(spilled.mosaic_layers(), 9 * draws - 1);
+        let kept = scheme.mosaic_at_level(&rect, wanted, spilled.mosaic_layers());
+        assert_eq!(kept.level, wanted);
+        assert_eq!(kept.tile_count(), full);
+        // Drawn again no more often than the renderer will: the floor's slot
+        // and the mosaic fit `draws` passes of 9.
+        assert!(
+            raster::imagery_passes(kept.tile_count() as usize + 1, 9) <= raster::MAX_IMAGERY_PASSES
+        );
+
+        // The default ceiling is today's: a wide device gets 25, 24 for the
+        // mosaic, and the draws asked for are bounded by what the renderer does.
+        let desktop = options(raster::USEFUL_IMAGERY_SLOTS, DEFAULT_IMAGERY_PASSES);
+        assert_eq!(desktop.mosaic_layers(), 24);
+        let greedy = options(raster::MIN_IMAGERY_SLOTS, u32::MAX);
+        assert_eq!(greedy.mosaic_layers(), 9 * raster::MAX_IMAGERY_PASSES - 1);
+        let none = options(raster::MIN_IMAGERY_SLOTS, 0);
+        assert_eq!(none.mosaic_layers(), 8, "never fewer than one draw");
+        // Unbounded (the bake's) stays unbounded.
+        let bulk = GlobeOptions {
+            imagery_draws: raster::MAX_IMAGERY_PASSES,
+            ..GlobeOptions::default()
+        };
+        bulk.imagery_slots.set_unbounded();
+        assert_eq!(bulk.mosaic_layers(), u32::MAX - 1);
     }
 
     /// **The detected budget never exceeds what the device said it would bind.**

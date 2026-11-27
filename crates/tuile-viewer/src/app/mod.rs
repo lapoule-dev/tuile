@@ -800,12 +800,13 @@ impl App {
         let Some(active) = self.active.as_ref() else {
             return;
         };
-        self.layer_budget.set_from_device(
+        self.layer_budget.set_from_device_capped(
             active
                 .gpu
                 .device
                 .limits()
                 .max_sampled_textures_per_shader_stage,
+            self.profile.imagery_slot_ceiling,
         );
         if let Some(plan) = &self.imagery_plan {
             plan.set(active.gpu.imagery_plan());

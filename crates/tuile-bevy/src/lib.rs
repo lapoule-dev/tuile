@@ -40,6 +40,12 @@ pub struct TuilePlugin {
     /// asks. Resolved against the device; a format the device cannot sample
     /// falls back to RGBA8.
     pub compression: ImageryCompression,
+    /// The most imagery slots the ground shader is built for: each one is a
+    /// texture fetch on every fragment. The default is
+    /// [`tuile_core::raster::USEFUL_IMAGERY_SLOTS`]; a phone host asks for
+    /// [`tuile_core::raster::MIN_IMAGERY_SLOTS`] (9) and a wide drape coarsens
+    /// to fit. Never below that floor, never above what the device binds.
+    pub imagery_slot_ceiling: u32,
     /// In a browser, the module worker script the decode workers are made
     /// from (`web` (wasm32 only)); `None` decodes on the page's thread. Ignored
     /// elsewhere, where decoding has threads of its own.
@@ -59,6 +65,7 @@ impl TuilePlugin {
             sources,
             budget: TuileBudget::default(),
             compression: ImageryCompression::Off,
+            imagery_slot_ceiling: tuile_core::raster::USEFUL_IMAGERY_SLOTS,
             decode_workers: None,
             telemetry: None,
         }
@@ -90,6 +97,13 @@ impl TuilePlugin {
     #[must_use]
     pub fn with_compression(mut self, compression: ImageryCompression) -> Self {
         self.compression = compression;
+        self
+    }
+
+    /// See [`Self::imagery_slot_ceiling`].
+    #[must_use]
+    pub fn with_imagery_slot_ceiling(mut self, ceiling: u32) -> Self {
+        self.imagery_slot_ceiling = ceiling;
         self
     }
 }
@@ -146,7 +160,13 @@ impl Plugin for TuilePlugin {
         }
         render::add_to(
             app,
-            render::GlobeRender::new(slot, self.compression, Arc::clone(&shared.0), ground),
+            render::GlobeRender::new(
+                slot,
+                self.compression,
+                self.imagery_slot_ceiling,
+                Arc::clone(&shared.0),
+                ground,
+            ),
         );
     }
 }

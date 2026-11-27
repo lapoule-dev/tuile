@@ -331,7 +331,9 @@ impl Handles {
                     tracing::info!(asset, "3D Tiles tileset out of the scene");
                 }
             }
-            Ok(ToWorker::Slots { reported }) => self.budget.set_from_device(reported),
+            Ok(ToWorker::Slots { reported, ceiling }) => {
+                self.budget.set_from_device_capped(reported, ceiling)
+            }
             Ok(ToWorker::Pause { paused: true }) => self.gate.shut(),
             Ok(ToWorker::Pause { paused: false }) => self.gate.open(),
             Ok(ToWorker::Imagery { layer }) => {

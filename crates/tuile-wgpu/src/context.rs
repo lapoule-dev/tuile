@@ -249,14 +249,33 @@ impl GpuContext {
 
     /// Wraps an existing device/queue (the viewer path: the host created
     /// them against its surface).
+    ///
+    /// The ground shader gets the default ceiling of imagery slots
+    /// ([`tuile_core::raster::USEFUL_IMAGERY_SLOTS`]); a host that weighs the
+    /// per-fragment cost otherwise uses [`Self::with_slot_ceiling`].
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        Self::with_slot_ceiling(device, queue, tuile_core::raster::USEFUL_IMAGERY_SLOTS)
+    }
+
+    /// [`Self::new`], with the most imagery slots the ground shader may be
+    /// built for: the host's own number, raised or lowered as it weighs the
+    /// cost of a fetch per slot on every fragment against the sharpness of a
+    /// wider mosaic. A phone passes
+    /// [`tuile_core::raster::MIN_IMAGERY_SLOTS`]. Never below that floor, and
+    /// never above what the device binds ([`tuile_core::raster::imagery_slots_capped`]).
+    ///
+    /// The loader's `tuile_planetary` budget must be told the same
+    /// number (`LayerBudget::set_from_device_capped`), or it asks for drapes
+    /// of another width than the shader reads.
+    pub fn with_slot_ceiling(device: wgpu::Device, queue: wgpu::Queue, ceiling: u32) -> Self {
         // The physical atmosphere's tables share the ground's fragment
         // stage with the imagery.
-        let imagery_slots = tuile_core::raster::imagery_slots(
+        let imagery_slots = tuile_core::raster::imagery_slots_capped(
             device
                 .limits()
                 .max_sampled_textures_per_shader_stage
                 .saturating_sub(tuile_atmosphere::gpu::GROUND_TEXTURES),
+            ceiling,
         );
         let uniform_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,

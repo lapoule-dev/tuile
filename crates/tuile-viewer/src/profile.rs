@@ -90,6 +90,16 @@ pub(crate) struct Profile {
     /// The most imagery levels a drape may sit above its tile's terrain
     /// level: what one draw's slots hold (a 5 × 5 mosaic is two levels).
     pub imagery_over_terrain_cap: u32,
+    /// The most imagery slots the ground shader is built for: every one is a
+    /// texture fetch on every fragment, covered or not, so it is the number
+    /// that sets a fragment's cost. A desktop's
+    /// [`USEFUL_IMAGERY_SLOTS`](tuile_core::raster::USEFUL_IMAGERY_SLOTS) (25,
+    /// a 5 × 5 mosaic and the floor); a phone's
+    /// [`MIN_IMAGERY_SLOTS`](tuile_core::raster::MIN_IMAGERY_SLOTS) (9, the
+    /// 3 × 3 a drape needs to be correct), which an iPhone 12 Pro Max drew in
+    /// 17 ms a frame against 61–71 ms at 25. What a lower ceiling gives up is
+    /// the width of the mosaic: it coarsens a level to fit.
+    pub imagery_slot_ceiling: u32,
     /// The traversal's screen-space error threshold, logical pixels (D-L1):
     /// a desktop's 1, the 2 device pixels it always drew at on a display of
     /// density 2; a phone's ⅔, the same 2 at its density 3. A window moved
@@ -161,6 +171,7 @@ impl Profile {
             reach_tiles: 4,
             max_local_reads: 32,
             imagery_over_terrain_cap: 2,
+            imagery_slot_ceiling: tuile_core::raster::USEFUL_IMAGERY_SLOTS,
             sse_threshold: 1.0,
             load_timeout_s: 4.0,
             runtime_workers: cores,
@@ -195,6 +206,7 @@ impl Profile {
             max_local_reads: 8,
             // The low clamp drapes one level over its terrain, the rest two.
             imagery_over_terrain_cap: if gpu_bytes <= 192 * MIB { 1 } else { 2 },
+            imagery_slot_ceiling: tuile_core::raster::MIN_IMAGERY_SLOTS,
             sse_threshold: 2.0 / 3.0,
             load_timeout_s: 4.0,
             runtime_workers: 2,
@@ -417,6 +429,39 @@ mod tests {
             phone
         );
         assert_eq!(android.gpu_bytes, GIB / 5);
+    }
+
+    /// The fetches a fragment pays are the machine's to weigh: a desktop keeps
+    /// the 25 slots it always drew with, a phone (and a page on one) the 9 of
+    /// the 3 × 3 floor. The viewer builds its shader, and tells its loader,
+    /// from this number.
+    #[test]
+    fn the_slot_ceiling_is_the_machines() {
+        use tuile_core::raster::{MIN_IMAGERY_SLOTS, USEFUL_IMAGERY_SLOTS};
+        let memory = DeviceMemory {
+            physical: 6 * GIB,
+            available: None,
+        };
+        assert_eq!(
+            Profile::desktop_with(16 * GIB).imagery_slot_ceiling,
+            USEFUL_IMAGERY_SLOTS
+        );
+        assert_eq!(
+            Profile::handheld(memory, 6).imagery_slot_ceiling,
+            MIN_IMAGERY_SLOTS
+        );
+        assert_eq!(
+            Profile::android(memory, 6).imagery_slot_ceiling,
+            MIN_IMAGERY_SLOTS
+        );
+        assert_eq!(
+            Profile::browser(true, Some(4.0)).imagery_slot_ceiling,
+            MIN_IMAGERY_SLOTS
+        );
+        assert_eq!(
+            Profile::browser(false, Some(16.0)).imagery_slot_ceiling,
+            USEFUL_IMAGERY_SLOTS
+        );
     }
 
     /// A page fits a wasm32 heap, opens at once on its indicator, draws on

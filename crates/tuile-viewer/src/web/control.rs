@@ -57,7 +57,14 @@ pub(crate) enum ToWorker {
     /// texture slots, not of memory: the memory the session may use is the
     /// budget's, sized at the start from the device's and changed by
     /// `ClientMessage::Retarget` on the stream.
-    Slots { reported: u32 },
+    ///
+    /// `ceiling` is the host's most slots a draw may carry, as the page's
+    /// shader was built for (`tuile_core::raster::imagery_slots_capped`).
+    Slots {
+        reported: u32,
+        #[serde(default = "useful_slots")]
+        ceiling: u32,
+    },
     /// Drape the host's layer of this index.
     Imagery { layer: usize },
     /// Hold imagery so from now on: the page's device's plans after a
@@ -385,4 +392,9 @@ mod tests {
         );
         assert!(glance.signals().converged);
     }
+}
+
+/// The ceiling a page that does not state one gets: the default.
+fn useful_slots() -> u32 {
+    tuile_core::raster::USEFUL_IMAGERY_SLOTS
 }

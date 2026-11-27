@@ -795,7 +795,8 @@ pub const WGSL: &str = include_str!("raster.wgsl");
 /// symptom this whole model exists to remove.
 pub const MIN_IMAGERY_SLOTS: u32 = 9;
 
-/// The most a mosaic can usefully spend.
+/// The most a mosaic can usefully spend, unless the host says otherwise
+/// ([`imagery_slots_capped`]).
 ///
 /// **This is a rendering-cost decision, not a device one.** The blend is
 /// branch-free on purpose — a coverage test that skipped the fetch would
@@ -806,29 +807,45 @@ pub const MIN_IMAGERY_SLOTS: u32 = 9;
 /// per stage, and a hundred and twenty-eight fetches a fragment would cost far
 /// more than the coarsening it saves.
 ///
-/// The floor, 3×3: a drape that needs more is drawn again for the rest
-/// ([`imagery_passes`], up to [`MAX_IMAGERY_PASSES`]), and only those tiles
-/// pay for it, where a wider shader makes every fragment of every tile pay.
-/// Measured on an iPhone 12 Pro Max (Metal reports 96, so the ceiling was in
-/// force): 25 slots cost 61–71 ms of GPU a frame in a continuous orbit,
-/// 14–16 fps; 9 slots 17 ms, 40 fps.
-pub const USEFUL_IMAGERY_SLOTS: u32 = 9;
-
-/// How many imagery slots to build a shader for, given what the device reports.
+/// 5×5 is a tile draped *two* levels finer than its match. Past that the mosaic
+/// is asking for imagery at a scale nobody is looking at — a coarse backdrop
+/// tile under a close camera, which is drawn behind the selection and never
+/// seen sharp.
 ///
-/// Clamped between what correctness needs and what the fragment cost allows.
-/// The two are the same today, 9, which every device reachable binds (16 on
-/// WebGL2 and the WebGPU baseline, 96–128 on Metal); the clamp stays so either
-/// bound can move on its own.
+/// This is the default ceiling, not a law: the cost is the host's to weigh. A
+/// phone that cannot afford it asks for [`MIN_IMAGERY_SLOTS`] (measured on an
+/// iPhone 12 Pro Max, Metal reporting 96, in a continuous orbit: 25 slots cost
+/// 61–71 ms of GPU a frame, 14–16 fps; 9 slots 17 ms, 40 fps). What a lower
+/// ceiling gives up is sharpness, not ground: the mosaic coarsens to fit, or,
+/// where the host allows drawing a drape again ([`imagery_passes`]), spills
+/// onto further passes.
+pub const USEFUL_IMAGERY_SLOTS: u32 = 25;
+
+/// How many imagery slots to build a shader for, given what the device reports,
+/// at the default ceiling [`USEFUL_IMAGERY_SLOTS`].
+///
+/// See [`imagery_slots_capped`].
+pub fn imagery_slots(max_sampled_textures_per_stage: u32) -> u32 {
+    imagery_slots_capped(max_sampled_textures_per_stage, USEFUL_IMAGERY_SLOTS)
+}
+
+/// How many imagery slots to build a shader for, given what the device reports
+/// and the most the host is willing to pay for.
+///
+/// Detected rather than written down. The floor is what correctness needs, the
+/// ceiling is what the fragment cost allows — `cap`, the host's number — and in
+/// between it is whatever the hardware will bind: 16 on WebGL2 and the WebGPU
+/// baseline, 128 on Metal. A `cap` below [`MIN_IMAGERY_SLOTS`] is the floor: no
+/// host can ask for a drape that disagrees with its neighbours.
 ///
 /// One texture unit is reserved for the tile's own base colour, which is bound
 /// alongside the imagery in the same group.
-pub fn imagery_slots(max_sampled_textures_per_stage: u32) -> u32 {
+pub fn imagery_slots_capped(max_sampled_textures_per_stage: u32, cap: u32) -> u32 {
     /// The tile's own base-colour texture shares the stage.
     const RESERVED: u32 = 1;
     max_sampled_textures_per_stage
         .saturating_sub(RESERVED)
-        .clamp(MIN_IMAGERY_SLOTS, USEFUL_IMAGERY_SLOTS)
+        .clamp(MIN_IMAGERY_SLOTS, cap.max(MIN_IMAGERY_SLOTS))
 }
 
 /// How many times a tile may be redrawn to spend layers it could not bind at
@@ -2159,6 +2176,32 @@ mod tests {
     use glam::Mat4;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    /// The host's ceiling is a number: a device that binds more than it
+    /// allows gets the ceiling, one that binds less gets what it binds, and
+    /// no ceiling takes a shader below the 3×3 a drape needs. The default
+    /// ceiling is the one `imagery_slots` has always applied.
+    #[test]
+    fn the_slot_ceiling_is_the_hosts_and_never_below_the_floor() {
+        // Metal reports 96–128: the ceiling decides.
+        assert_eq!(imagery_slots_capped(96, MIN_IMAGERY_SLOTS), 9);
+        assert_eq!(imagery_slots_capped(96, 16), 16);
+        assert_eq!(imagery_slots_capped(128, 1024), 127);
+        // WebGL2 and the WebGPU baseline report 16, one for the base colour.
+        assert_eq!(imagery_slots_capped(16, 25), 15);
+        assert_eq!(imagery_slots_capped(16, 9), 9);
+        // A ceiling under the floor is the floor.
+        assert_eq!(imagery_slots_capped(96, 0), MIN_IMAGERY_SLOTS);
+        assert_eq!(imagery_slots_capped(96, 4), MIN_IMAGERY_SLOTS);
+        // The default ceiling is USEFUL_IMAGERY_SLOTS, as before.
+        for reported in [10, 16, 32, 96, 128, 1024] {
+            assert_eq!(
+                imagery_slots(reported),
+                imagery_slots_capped(reported, USEFUL_IMAGERY_SLOTS)
+            );
+        }
+        assert_eq!(imagery_slots(128), 25);
+    }
 
     #[test]
     fn containing_tile_is_deepest_single_cover() {

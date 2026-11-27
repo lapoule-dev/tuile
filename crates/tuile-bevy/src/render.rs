@@ -104,6 +104,9 @@ struct Globe {
     targets: HashMap<TargetLayout, (TileRenderer, HostPass)>,
     session: Session,
     compression: ImageryCompression,
+    /// The most imagery slots the ground shader is built for
+    /// ([`crate::TuilePlugin::imagery_slot_ceiling`]).
+    slot_ceiling: u32,
     status: Arc<Mutex<TuileStatus>>,
     /// The drawn ground, as the main world reads it ([`crate::TuileGround`]),
     /// and the snapshot last handed over.
@@ -115,6 +118,7 @@ impl GlobeRender {
     pub(crate) fn new(
         slot: SessionSlot,
         compression: ImageryCompression,
+        slot_ceiling: u32,
         status: Arc<Mutex<TuileStatus>>,
         ground: SharedSurface,
     ) -> Self {
@@ -130,6 +134,7 @@ impl GlobeRender {
             targets: HashMap::new(),
             session: Session::Starting(slot),
             compression,
+            slot_ceiling,
             status,
             ground,
             surface: Surface::default(),
@@ -196,7 +201,12 @@ fn advance_globe(
     let globe = &mut *globe;
     let gpu = globe.gpu.get_or_insert_with(|| {
         let (plan, _) = tuile_wgpu::plan_for(globe.compression, &adapter);
-        GpuContext::new(device.wgpu_device().clone(), (**queue).clone()).with_imagery_plan(plan)
+        GpuContext::with_slot_ceiling(
+            device.wgpu_device().clone(),
+            (**queue).clone(),
+            globe.slot_ceiling,
+        )
+        .with_imagery_plan(plan)
     });
     let shell = globe.shell.get_or_insert_with(|| {
         tuile_wgpu::prepare(gpu, &tuile_terrain::globe_shell(BARE_GROUND), DVec3::ZERO)
@@ -206,9 +216,10 @@ fn advance_globe(
             Some(Ok(started)) => {
                 // The device is known: the loader is told how many imagery
                 // layers one draw binds, and how the device holds imagery.
-                started
-                    .layer_budget
-                    .set_from_device(gpu.device.limits().max_sampled_textures_per_shader_stage);
+                started.layer_budget.set_from_device_capped(
+                    gpu.device.limits().max_sampled_textures_per_shader_stage,
+                    globe.slot_ceiling,
+                );
                 started.plan.set(gpu.imagery_plan());
                 globe.session = Session::Running(Box::new(started));
                 set_state(&globe.status, SessionState::Running);

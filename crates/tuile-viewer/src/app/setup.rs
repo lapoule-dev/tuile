@@ -54,6 +54,7 @@ impl GpuOnItsWay {
         backends: Option<wgpu::Backends>,
         compression: tuile_wgpu::ImageryCompression,
         encode_level: u32,
+        slot_ceiling: u32,
     ) -> Self {
         let mut refusals = Vec::new();
         let mut answer = Err(String::from("no backend to try"));
@@ -65,6 +66,7 @@ impl GpuOnItsWay {
                 attempt,
                 compression,
                 encode_level,
+                slot_ceiling,
             ));
             match &answer {
                 Ok(_) => break,
@@ -86,12 +88,20 @@ impl GpuOnItsWay {
         backends: Option<wgpu::Backends>,
         compression: tuile_wgpu::ImageryCompression,
         encode_level: u32,
+        slot_ceiling: u32,
     ) -> Self {
         let slot = Rc::new(RefCell::new(None));
         let answer = Rc::clone(&slot);
         let viewer = crate::web::imagery::viewer();
         wasm_bindgen_futures::spawn_local(async move {
-            let up = bring_up(Arc::clone(&window), backends, compression, encode_level).await;
+            let up = bring_up(
+                Arc::clone(&window),
+                backends,
+                compression,
+                encode_level,
+                slot_ceiling,
+            )
+            .await;
             // How the device holds imagery, for the session's worker waiting
             // on it: RGBA8 where there is no device — nothing will draw, and
             // the session must not wait for ever.
@@ -166,11 +176,15 @@ pub(crate) fn backend_named(name: Option<&str>) -> Result<Option<wgpu::Backends>
 /// `compression` is the person's choice of how imagery is held: resolved
 /// against this adapter, it asks the device for its format's feature, and
 /// for nothing when it is off.
+///
+/// `slot_ceiling` is the most imagery slots the ground shader is built for
+/// (`crate::profile::Profile::imagery_slot_ceiling`).
 async fn bring_up(
     window: Arc<Window>,
     backends: Option<wgpu::Backends>,
     compression: tuile_wgpu::ImageryCompression,
     encode_level: u32,
+    slot_ceiling: u32,
 ) -> Result<Gpu, String> {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     if let Some(backends) = backends {
@@ -275,7 +289,7 @@ async fn bring_up(
         instance,
         surface,
         format,
-        gpu: GpuContext::new(device, queue)
+        gpu: GpuContext::with_slot_ceiling(device, queue, slot_ceiling)
             .with_texture_caps(tuile_wgpu::texture_caps(&adapter))
             .with_encode_level(encode_level)
             .with_imagery_plan(imagery_plan),
@@ -325,6 +339,7 @@ impl App {
             self.backends,
             self.imagery_compression,
             self.imagery_encode_level,
+            self.profile.imagery_slot_ceiling,
         ));
         self.take_the_gpu();
     }
