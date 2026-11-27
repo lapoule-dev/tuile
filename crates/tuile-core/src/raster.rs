@@ -806,17 +806,20 @@ pub const MIN_IMAGERY_SLOTS: u32 = 9;
 /// per stage, and a hundred and twenty-eight fetches a fragment would cost far
 /// more than the coarsening it saves.
 ///
-/// 5×5 is a tile draped *two* levels finer than its match. Past that the mosaic
-/// is asking for imagery at a scale nobody is looking at — a coarse backdrop
-/// tile under a close camera, which is drawn behind the selection and never
-/// seen sharp.
-pub const USEFUL_IMAGERY_SLOTS: u32 = 25;
+/// The floor, 3×3: a drape that needs more is drawn again for the rest
+/// ([`imagery_passes`], up to [`MAX_IMAGERY_PASSES`]), and only those tiles
+/// pay for it, where a wider shader makes every fragment of every tile pay.
+/// Measured on an iPhone 12 Pro Max (Metal reports 96, so the ceiling was in
+/// force): 25 slots cost 61–71 ms of GPU a frame in a continuous orbit,
+/// 14–16 fps; 9 slots 17 ms, 40 fps.
+pub const USEFUL_IMAGERY_SLOTS: u32 = 9;
 
 /// How many imagery slots to build a shader for, given what the device reports.
 ///
-/// Detected rather than written down. The floor is what correctness needs, the
-/// ceiling is what the fragment cost allows, and in between it is whatever the
-/// hardware will bind — 16 on WebGL2 and the WebGPU baseline, 128 on Metal.
+/// Clamped between what correctness needs and what the fragment cost allows.
+/// The two are the same today, 9, which every device reachable binds (16 on
+/// WebGL2 and the WebGPU baseline, 96–128 on Metal); the clamp stays so either
+/// bound can move on its own.
 ///
 /// One texture unit is reserved for the tile's own base colour, which is bound
 /// alongside the imagery in the same group.
