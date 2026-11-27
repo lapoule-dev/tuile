@@ -43,10 +43,11 @@ pub enum Urgency {
 /// A need's floats, quantised once at the boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Quantised {
-    /// SSE excess in thousandths, clamped to ±16 000.
-    pub sse_excess: i32,
+    /// SSE excess in thousandths, clamped to ±16 000 (an `i16`: the
+    /// record stays 16 bytes with the predicted use beside it).
+    pub sse_excess: i16,
     /// Centrality in thousandths, `0..=1000`.
-    pub centrality: i32,
+    pub centrality: i16,
     /// Distance in whole metres.
     pub distance: u32,
     /// Whether any input float was not finite (it then counts as zero).
@@ -59,7 +60,19 @@ pub struct Quantised {
     /// `D(d)` stays under the margin at `ρ` = 2: `(1 + 1/32)²` < 1.25); [`Quantised::NO_PLACE`] when the need
     /// gives no proximity.
     pub away: u16,
+    /// The predicted use's delay, whole milliseconds, saturated at
+    /// [`u16::MAX`] (65 s: a use that far ahead weighs nothing over the
+    /// horizon), when [`Quantised::ahead_permille`] is not 0
+    /// ([`super::need::AheadUse::next_use_in`]).
+    pub ahead_ms: u16,
+    /// The predicted use's probability, thousandths, 0 when the need
+    /// carries no prediction ([`super::need::AheadUse::probability`]).
+    pub ahead_permille: u16,
 }
+
+// One per wanted tile and per want, read every step: the predicted use
+// rides in the room the narrowed floats left.
+const _: () = assert!(std::mem::size_of::<Quantised>() == 16);
 
 impl Quantised {
     /// [`Quantised::away`] of a need without a proximity.
@@ -68,6 +81,17 @@ impl Quantised {
     /// Whether the need placed the tile against the present need.
     pub fn placed(&self) -> bool {
         self.away != Quantised::NO_PLACE
+    }
+
+    /// The predicted use, when the need carries one: its delay and its
+    /// probability in thousandths.
+    pub fn ahead(&self) -> Option<(Micros, u32)> {
+        (self.ahead_permille > 0).then(|| {
+            (
+                Micros::from_millis(u64::from(self.ahead_ms)),
+                u32::from(self.ahead_permille),
+            )
+        })
     }
 }
 
@@ -80,6 +104,8 @@ impl Default for Quantised {
             rejected: false,
             need_level: 0,
             away: Quantised::NO_PLACE,
+            ahead_ms: 0,
+            ahead_permille: 0,
         }
     }
 }
@@ -112,11 +138,20 @@ impl Quantised {
             }
             None => (0, Quantised::NO_PLACE),
         };
+        let (ahead_ms, ahead_permille) = match need.ahead {
+            Some(a) if a.probability > 0 => (
+                u16::try_from(a.next_use_in.0 / 1_000).unwrap_or(u16::MAX),
+                a.probability.min(1_000),
+            ),
+            _ => (0, 0),
+        };
         Quantised {
             need_level,
             away,
-            sse_excess: (sse.clamp(-16.0, 16.0) * 1000.0).round() as i32,
-            centrality: (centrality.clamp(0.0, 1.0) * 1000.0).round() as i32,
+            ahead_ms,
+            ahead_permille,
+            sse_excess: (sse.clamp(-16.0, 16.0) * 1000.0).round() as i16,
+            centrality: (centrality.clamp(0.0, 1.0) * 1000.0).round() as i16,
             distance: distance.clamp(0.0, u32::MAX as f32) as u32,
             rejected,
         }

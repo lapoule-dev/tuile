@@ -102,6 +102,39 @@ each placed against the need; every other tile of the neighbourhood goes in the 
 (urgency `Ring`): wanted, scored, released by the score, never protected. A preload's drapes
 take the preload's own urgency and score, never the present need's.
 
+### The views ahead (#282's `Need.ahead`)
+
+A ring tile a prediction names carries `AheadUse { next_use_in, probability }`, part of the
+need and so recorded in every `StepRecord`: the budget reads it as an input, never computes
+it. It enters the one score through `P` alone, read in time with the same terms:
+
+```
+P_ahead = p × D_t(slack)       D_t = H² / (H + slack)²,  slack = (next_use_in − R(tier))⁺
+P       = max(P_place, P_ahead)   a placed ring tile (the prediction only raises it)
+        = P_ahead                 a ring tile the traversal did not place (the flat
+                                  anticipation stood in for a probability it did not have)
+```
+
+`p` is the prediction's probability (‰ → `CERTAIN`), `H` the specification's horizon, `R` the
+restore cost of the tier the copy would come from, measured (`Budget::restore_costs`): a use
+due within its load time is as urgent as the present place (`D_t` = 1), one a horizon past it
+weighs a quarter, as `D` at `d = ρ`. The load side (`P·S·(H+R)`) and the release side
+(`P·R/bytes`) read the same `P`, so a tile predicted soon and likely is loaded first and
+released last. In integers (`Quantised::{ahead_ms, ahead_permille}`, sixteen bytes with the
+narrowed floats beside them).
+
+A predicted tile is preloaded whole: its drapes are decided and loaded as the views ahead will
+wear them (preloads of its own `P`, never counted as the present need's deficit), and its mesh
+is delivered to the GPU only once its drapes are loaded, so the view it was predicted for draws
+it at its need rather than its geometry under a coarser drape.
+
+The absolute laws stay outside any prediction: what is drawn, a swap, the chain and the
+floor are never released on one, and a wrong prediction costs a reload, never a hole. **A
+prediction never delays a current need**: a drawn tile's drape or a swap's blocker facing full
+slots preempts a predicted preload in flight (a hole preempts any preload, as before). Without
+views ahead nothing changes, to the work counted: the goldens, the pattern goldens and the
+decision digests do not move.
+
 ## 3. Above the score: the absolute laws
 
 The score orders the value band only. Before it, in this order and whatever the score:

@@ -1233,7 +1233,13 @@ impl Budget {
                         self.imagery_stood_in.insert(key, footprint) != Some(footprint)
                     };
                     moved |= stood;
-                    let gap = full.saturating_sub(level);
+                    // The deficit is the present need's: a predicted
+                    // tile's levels are decided, never counted short.
+                    let gap = if Self::present(tn) {
+                        full.saturating_sub(level)
+                    } else {
+                        0
+                    };
                     let was = if gap > 0 {
                         self.imagery_short.insert(key, gap)
                     } else {
@@ -2307,9 +2313,20 @@ impl Budget {
                     // A preload the traversal did not place (the views
                     // ahead without a probability, a refresh) keeps the
                     // release order's full credit: its flat anticipation
-                    // orders loads only.
-                    let p = if w.q.placed() {
-                        super::value::probability(&self.spec, rho, w.urgency, w.level, &w.q)
+                    // orders loads only. A ring tile a prediction names
+                    // is weighed by it, placed or not (#282's views ahead).
+                    let predicted = w.urgency == Urgency::Ring && w.q.ahead().is_some();
+                    let p = if w.q.placed() || predicted {
+                        super::value::probability(
+                            &self.costed,
+                            rho,
+                            w.urgency,
+                            w.level,
+                            &w.q,
+                            // What a release sends it back to: the
+                            // network, the dearest tier.
+                            crate::tier::Tier::Remote,
+                        )
                     } else {
                         super::value::CERTAIN
                     };
@@ -3180,7 +3197,7 @@ impl Budget {
                 );
                 assert_eq!(
                     self.imagery_short.get(&(*t, layer)).copied(),
-                    (full > level).then_some(full - level),
+                    (Self::present(tn) && full > level).then_some(full - level),
                     "the need {t:?}'s layer {layer:?} is short of is the one a reading gives"
                 );
             }

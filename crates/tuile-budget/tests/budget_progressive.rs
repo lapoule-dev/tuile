@@ -1141,3 +1141,321 @@ fn the_sweep_never_takes_what_the_view_wants_within_the_horizon() {
         "{over} steps over a low watermark: the sweep had nothing to do"
     );
 }
+
+// The views ahead (#282's `Need.ahead`): a prediction is an input of the
+// need, read by the one score — `P` is the larger of the place's and the
+// prediction's (its probability × the time term, `H² / (H + slack)²`).
+
+/// `n`, named by a prediction: used in `in_ms` milliseconds with a
+/// probability of `permille` thousandths.
+fn predicted(n: Need, in_ms: u64, permille: u16) -> Need {
+    n.with_ahead(tuile_budget::AheadUse {
+        next_use_in: tuile_budget::Micros::from_millis(in_ms),
+        probability: permille,
+    })
+}
+
+/// `need` with its ring cleared: what the view draws and its chain.
+fn without_ring(need: &NeedSet) -> NeedSet {
+    NeedSet {
+        ring: Vec::new(),
+        ..need.clone()
+    }
+}
+
+/// The ring tile the place weighs least: one level under the need, the
+/// farthest from the view.
+fn least_placed(need: &NeedSet) -> TileId {
+    need.ring
+        .iter()
+        .filter(|(id, _)| id.terrain_coord().0 == 14)
+        .max_by(|a, b| {
+            let d = |n: &Need| n.proximity.map_or(0.0, |p| p.tiles_away);
+            d(&a.1).total_cmp(&d(&b.1)).then(a.0.cmp(&b.0))
+        })
+        .map(|(id, _)| *id)
+        .expect("a ring at level 14")
+}
+
+/// A prediction raises the preload of the tile it names: with the view and
+/// its chain resident, the ring's first step starts as many preloads as
+/// the slots take; the ring tile the place weighs least is not among them,
+/// and is once a prediction says it is used now. Red with the prediction
+/// not read.
+#[test]
+fn a_prediction_raises_the_preload_of_the_tile_it_names() {
+    let v = View::at(0.5531, 0.4412, 13);
+    let need = v.need(4);
+    let x = least_placed(&need);
+    let first = |need: &NeedSet| {
+        let mut r = Rig::new(config(Bytes::mib(512), 4));
+        settle(&mut r, &without_ring(need), 600);
+        r.step(need)
+    };
+    let plain = first(&need);
+    // Not vacuous: the slots take a few of the ring's tiles only.
+    assert!(
+        plain.start.len() < need.ring.len() / 4,
+        "{} starts for {} ring tiles: no contention",
+        plain.start.len(),
+        need.ring.len()
+    );
+    assert!(
+        !plain
+            .start
+            .iter()
+            .any(|s| s.resource == ResourceId::Mesh(x)),
+        "{x:?} started without a prediction: the test proves nothing"
+    );
+    let mut named = need.clone();
+    for (id, n) in &mut named.ring {
+        if *id == x {
+            *n = predicted(n.clone(), 0, 1_000);
+        }
+    }
+    let d = first(&named);
+    assert!(
+        d.start.iter().any(|s| s.resource == ResourceId::Mesh(x)),
+        "the predicted {x:?} waited behind the place's preloads"
+    );
+}
+
+/// A tile predicted soon and likely is released after one predicted late
+/// and unlikely, at the same place: under a cut budget the unlikely one
+/// goes first; swap the predictions and the order swaps. Red with the
+/// prediction not read (the two tie, and the id decides).
+#[test]
+fn a_likely_soon_tile_is_released_after_an_unlikely_one() {
+    let v = View::at(0.3713, 0.6178, 12);
+    let need = v.need(4);
+    // Two ring tiles of one level, placed alike.
+    let mut pair: Vec<TileId> = need
+        .ring
+        .iter()
+        .filter(|(id, _)| id.terrain_coord().0 == 12)
+        .map(|(id, _)| *id)
+        .collect();
+    pair.truncate(2);
+    let (a, b) = (pair[0], pair[1]);
+    let order = |likely: TileId, unlikely: TileId| -> (Option<usize>, Option<usize>) {
+        let mut need = need.clone();
+        for (id, n) in &mut need.ring {
+            let placed = n.clone().with_proximity(12, 3.0);
+            if *id == likely {
+                *n = predicted(placed, 100, 900);
+            } else if *id == unlikely {
+                *n = predicted(placed, 3_000, 100);
+            }
+        }
+        let mut r = Rig::new(config(Bytes::mib(512), 4));
+        let held = settle(&mut r, &need, 800).stats.gpu[Class::TerrainMesh];
+        assert!(
+            gpu(&r, likely) && gpu(&r, unlikely),
+            "the pair is not resident"
+        );
+        r.b.retarget(Bytes(held.0 * 400 / 1_000));
+        let mut evicted: Vec<ResourceId> = Vec::new();
+        for _ in 0..60 {
+            let d = r.step(&need);
+            evicted.extend(&d.evict);
+            r.complete(&d);
+        }
+        let at = |t: TileId| evicted.iter().position(|e| *e == ResourceId::Mesh(t));
+        (at(likely), at(unlikely))
+    };
+    for (likely, unlikely) in [(a, b), (b, a)] {
+        let (l, u) = order(likely, unlikely);
+        let Some(u) = u else {
+            panic!("the unlikely {unlikely:?} was kept: the cut proves nothing");
+        };
+        assert!(
+            l.is_none_or(|l| l > u),
+            "the likely {likely:?} went at {l:?}, before the unlikely {unlikely:?} at {u}"
+        );
+    }
+}
+
+/// Absolute protections stay outside any prediction: every ring tile
+/// predicted certain and now, a budget cut to a twentieth evicts preloads
+/// only — never a drawn tile, its chain or the floor — and opens no hole.
+#[test]
+fn a_prediction_never_releases_what_is_protected() {
+    let v = View::at(0.6213, 0.3149, 13);
+    let mut need = v.need(4);
+    for (_, n) in &mut need.ring {
+        *n = predicted(n.clone(), 0, 1_000);
+    }
+    let mut r = Rig::new(config(Bytes::mib(256), 4));
+    settle(&mut r, &need, 800);
+    let protected: BTreeSet<TileId> = need
+        .drawn
+        .iter()
+        .chain(&need.ancestors)
+        .map(|(id, _)| *id)
+        .collect();
+    r.b.retarget(Bytes::mib(12));
+    let mut evicted = 0;
+    for _ in 0..30 {
+        let d = r.step(&need);
+        assert_eq!(d.stats.lost, 0, "a hole on a prediction");
+        for e in &d.evict {
+            assert!(
+                !protected.contains(&e.tile()),
+                "{e:?}, drawn, of the chain or the floor, released on a prediction"
+            );
+        }
+        evicted += d.evict.len();
+        r.complete(&d);
+    }
+    assert!(
+        evicted > 0,
+        "the cut evicted nothing: the test proves nothing"
+    );
+}
+
+/// A prediction never delays a current need: the drape slots full of a
+/// predicted ring's drapes (preloads of the views ahead), a drawn tile's
+/// drape two levels finer than it wears (wanted at once) starts on the step
+/// it is wanted, in the slot of a predicted preload cancelled for it. Red
+/// with the present need's drape waiting for a slot (only a hole preempted
+/// a preload), and with a predicted tile's drapes not preloaded.
+#[test]
+fn a_drawn_tiles_drape_takes_the_slot_of_a_predicted_preload() {
+    let v = View::at(0.4411, 0.5623, 13);
+    let base = v.need(4);
+    let drape_at = |need: &NeedSet, level: u32| NeedSet {
+        drawn: need
+            .drawn
+            .iter()
+            .map(|(id, _)| (*id, draped(*id, level)))
+            .collect(),
+        ..need.clone()
+    };
+    let mut r = Rig::new(config(Bytes::mib(512), 4));
+    settle(&mut r, &without_ring(&drape_at(&base, 11)), 600);
+    // The ring, draped and predicted: its drapes take the drape slots.
+    let mut need = drape_at(&base, 11);
+    for (id, n) in &mut need.ring {
+        *n = predicted(draped(*id, id.terrain_coord().0), 500, 800);
+        if let Some(p) = base
+            .ring
+            .iter()
+            .find(|(t, _)| t == id)
+            .and_then(|(_, b)| b.proximity)
+        {
+            *n = n.clone().with_proximity(p.need_level, p.tiles_away);
+        }
+    }
+    let mut ring_drapes = 0;
+    for _ in 0..3 {
+        let d = r.step(&need);
+        ring_drapes += d
+            .start
+            .iter()
+            .filter(|s| matches!(s.resource, ResourceId::Drape { .. }))
+            .count();
+        r.upload(&d);
+    }
+    assert!(
+        ring_drapes > 0,
+        "no predicted drape in flight: the test proves nothing"
+    );
+    let full = r.step(&need);
+    assert!(
+        !full
+            .start
+            .iter()
+            .any(|s| matches!(s.resource, ResourceId::Drape { .. })),
+        "the drape slots are not full: the test proves nothing"
+    );
+    // The view wants its drapes two levels finer: the present need.
+    let finer = drape_at(&need, 13);
+    let d = r.step(&finer);
+    let (id, _) = finer.drawn[0];
+    let wanted: BTreeSet<ResourceId> = finer.drawn.iter().map(|(t, _)| dr(*t, 13)).collect();
+    assert!(
+        d.start.iter().any(|s| wanted.contains(&s.resource)),
+        "no drawn tile's drape started ({id:?} and the others wait behind predicted preloads)"
+    );
+    assert!(
+        d.cancel
+            .iter()
+            .any(|(r, _)| need.ring.iter().any(|(t, _)| *t == r.tile())),
+        "no predicted preload gave its slot"
+    );
+}
+
+/// A prediction below what the place gives changes nothing: every ring
+/// tile predicted unlikely and far ahead, the same view stepped with and
+/// without it decides the same, step for step (the decisions' digests).
+/// The runs without views ahead are the goldens' (the reference, the
+/// pattern goldens, the decision digests), unchanged.
+#[test]
+fn a_prediction_under_the_place_changes_nothing() {
+    let v = View::at(0.5531, 0.4412, 13);
+    let plain = v.need(4);
+    let mut named = plain.clone();
+    for (_, n) in &mut named.ring {
+        *n = predicted(n.clone(), 60_000, 1);
+    }
+    let run = |need: &NeedSet| -> Vec<u64> {
+        let mut r = Rig::new(config(Bytes::mib(512), 4));
+        (0..150)
+            .map(|i| {
+                let d = r.step(need);
+                if i % 3 == 2 {
+                    r.load_where(|_| true);
+                }
+                r.upload(&d);
+                d.digest()
+            })
+            .collect()
+    };
+    assert_eq!(run(&plain), run(&named));
+}
+
+/// A predicted tile goes to the GPU whole: its mesh loaded and its drapes
+/// not, the mesh waits decoded; its drapes in, both are delivered — so the
+/// view it was predicted for never draws its geometry under a coarser
+/// drape. Red with the mesh delivered alone.
+#[test]
+fn a_predicted_tile_is_delivered_with_its_drapes() {
+    let v = View::at(0.2719, 0.6331, 12);
+    let base = v.need(4);
+    let mut r = Rig::new(config(Bytes::mib(512), 4));
+    settle(&mut r, &without_ring(&base), 600);
+    let mut need = base.clone();
+    for (id, n) in &mut need.ring {
+        let p = n.proximity;
+        *n = predicted(draped(*id, id.terrain_coord().0), 200, 900);
+        if let Some(p) = p {
+            *n = n.clone().with_proximity(p.need_level, p.tiles_away);
+        }
+    }
+    let ring: BTreeSet<TileId> = need.ring.iter().map(|(t, _)| *t).collect();
+    let mesh_of_ring = |r: &ResourceId| matches!(r, ResourceId::Mesh(t) if ring.contains(t));
+    // Only the meshes arrive.
+    let mut alone = 0;
+    for _ in 0..30 {
+        let d = r.step(&need);
+        alone += d.deliver.iter().filter(|(x, _)| mesh_of_ring(x)).count();
+        r.load_where(|x| matches!(x, ResourceId::Mesh(_)));
+        r.upload(&d);
+    }
+    assert_eq!(
+        alone, 0,
+        "{alone} predicted meshes delivered without their drapes"
+    );
+    // The drapes arrive: the meshes go with them.
+    let mut whole = 0;
+    for _ in 0..30 {
+        let d = r.step(&need);
+        whole += d.deliver.iter().filter(|(x, _)| mesh_of_ring(x)).count();
+        r.load_where(|_| true);
+        r.upload(&d);
+    }
+    assert!(
+        whole > 0,
+        "no predicted mesh delivered once its drapes were in"
+    );
+}

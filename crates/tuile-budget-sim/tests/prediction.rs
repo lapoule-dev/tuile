@@ -28,12 +28,15 @@ fn sequence(device: Device, network: Network, lag: usize, ahead: &Ahead) -> Outc
 
 fn report(what: &str, o: &Outcome) {
     eprintln!(
-        "{what}: under-need {} tile·steps, deficit {:.1} level·s, holes {}, starts {} (wasted {}), settle {:?}",
+        "{what}: under-need {} tile·steps, deficit {:.1} level·s, holes {}, starts {} (wasted {}), thrash {}, work/step {:.0} (peak {}), settle {:?}",
         o.under_tile_steps,
         o.deficit_level_seconds,
         o.hole_tile_steps,
         o.phases.iter().map(|p| p.starts).sum::<u64>(),
         o.phases.iter().map(|p| p.wasted_starts).sum::<u64>(),
+        o.thrash,
+        o.work_sum as f64 / o.steps.max(1) as f64,
+        o.work_max,
         o.settle_seconds,
     );
     for p in &o.phases {
@@ -47,17 +50,26 @@ fn report(what: &str, o: &Outcome) {
 /// With the motion model's views ahead, the sequence leaves fewer tiles
 /// under their need than without, and shows no hole.
 ///
-/// Red on the budget as it is (measured 2026-11-23, Desktop/Fast): the ring
-/// shares the value band with the present need at the specification's flat
-/// probability, so its tiles take the present drapes' slots — 74 196
-/// under-need tile·steps with the model against 23 271 without, and 176 832
-/// with the exact path. Green once anticipation ranks after the present
-/// need and weighs each ring tile by its own predicted use (`AheadUse`).
+/// Red on the budget as it is. Measured 2026-11-23 on #282's decider: the
+/// ring shared the value band with the present need at the specification's
+/// flat probability — 74 196 under-need tile·steps with the model against
+/// 23 271 without. On main after #289 (2026-11-27, Desktop/Fast): 29 369
+/// with the model, 80 196 with the exact path, 17 368 without. With the
+/// decider reading `AheadUse` (the prediction's `P`, its drapes preloaded,
+/// a predicted tile delivered whole, the present need preempting predicted
+/// loads): 21 362 with the model, 47 173 with the path; Phone/Slow 1 576
+/// and 1 846 against 1 073 without (1 335 and 1 691 before). What remains:
+/// the simulation's selection draws what is resident, so a predicted mesh
+/// resident early is drawn early and its geometry gain is not counted,
+/// while its wait for its drape is; and a present need brought to full
+/// detail sooner meets the mesh class's hard limit (all kept: drawn, swap,
+/// chain) and relaxes the picture, whose short layers count as under need.
 #[test]
-#[ignore = "red: the ring competes with the present need until the anticipation band reads AheadUse"]
+#[ignore = "red: under-need with the model 21 362 vs 17 368 without (Desktop/Fast), 1 576 vs 1 073 (Phone/Slow)"]
 fn predicted_views_ahead_leave_fewer_tiles_under_their_need() {
     let model = Ahead::Model(PredictConfig::default());
     let known = Ahead::Known(PredictConfig::default());
+    let mut runs = Vec::new();
     for (d, n) in [
         (Device::Desktop, Network::Fast),
         (Device::Phone, Network::Slow),
@@ -68,6 +80,10 @@ fn predicted_views_ahead_leave_fewer_tiles_under_their_need() {
         report(&format!("{d:?} {n:?} off"), &off);
         report(&format!("{d:?} {n:?} model"), &on);
         report(&format!("{d:?} {n:?} known path"), &exact);
+        runs.push((d, n, off, on, exact));
+    }
+    // Every run reported before the first assertion.
+    for (d, n, off, on, exact) in &runs {
         assert_eq!(on.hole_tile_steps, 0, "{d:?} {n:?}: holes with the model");
         assert_eq!(exact.hole_tile_steps, 0, "{d:?} {n:?}: holes with the path");
         assert!(
