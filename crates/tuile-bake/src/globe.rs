@@ -478,8 +478,8 @@ async fn resolve(
             decode_normals: !names_only(config),
             skirts_apart: names_only(config),
             substitute: None,
-            imagery_cache_tiles: 512,
-            mesh_cache_tiles: 512,
+            imagery_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
+            mesh_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
         };
         return Ok(match config.imagery_asset_id {
             None => globe_with_provenance(terrain, NoImagery, layer, options(true), decode_pool()),
@@ -552,8 +552,8 @@ async fn resolve(
                 decode_normals: !names_only(config),
                 skirts_apart: names_only(config),
                 substitute: None,
-                imagery_cache_tiles: 512,
-                mesh_cache_tiles: 512,
+                imagery_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
+                mesh_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
             },
             decode_pool(),
         );
@@ -589,8 +589,8 @@ async fn resolve(
             decode_normals: !names_only(config),
             skirts_apart: names_only(config),
             substitute,
-            imagery_cache_tiles: 512,
-            mesh_cache_tiles: 512,
+            imagery_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
+            mesh_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
         };
         return Ok(globe_with_provenance(
             terrain,
@@ -634,8 +634,8 @@ async fn resolve(
         skirts_apart: names_only(config),
         // ion's own imagery: a substitute is a host's (refused above).
         substitute: None,
-        imagery_cache_tiles: 512,
-        mesh_cache_tiles: 512,
+        imagery_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
+        mesh_cache_tiles: tuile_planetary::DEFAULT_CACHE_TILES,
     };
 
     // Ce que l'endpoint est, et non ce qu'on espère qu'il soit.

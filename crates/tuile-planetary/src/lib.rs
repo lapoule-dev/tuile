@@ -585,9 +585,25 @@ impl Default for GlobeOptions {
             decode_normals: true,
             skirts_apart: false,
             substitute: None,
-            imagery_cache_tiles: 512,
-            mesh_cache_tiles: 512,
+            imagery_cache_tiles: DEFAULT_CACHE_TILES,
+            mesh_cache_tiles: DEFAULT_CACHE_TILES,
         }
+    }
+}
+
+/// The entries each of the loader's two caches holds unless the host says
+/// otherwise ([`GlobeOptions::imagery_cache_tiles`], [`GlobeOptions::mesh_cache_tiles`]).
+pub const DEFAULT_CACHE_TILES: usize = 512;
+
+impl GlobeOptions {
+    /// The loader's cache of decoded imagery, sized by these options.
+    fn imagery_cache(&self) -> ImageryCache {
+        ImageryCache::new(self.imagery_cache_tiles)
+    }
+
+    /// The loader's cache of decoded terrain meshes, sized by these options.
+    fn mesh_cache(&self) -> MeshCache {
+        MeshCache::new(self.mesh_cache_tiles)
     }
 }
 
@@ -2206,11 +2222,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
         if let Some(s) = &self.substitute {
             let mut by = ByLevel::default();
             known |= s.provider.stored(&mut by);
-            out.add(
-                Class::Drape,
-                Some(layer_index(LayerId(0).substitute())),
-                &by,
-            );
+            out.add(Class::Drape, Some(layer_index(LayerId(0).substitute())), &by);
         }
         known
     }
@@ -2349,10 +2361,10 @@ where
             .with_max_level(deepest_useful),
     );
     let heights = Arc::new(TerrainHeights::new(scheme));
-    let (imagery_cache_tiles, mesh_cache_tiles) = (opts.imagery_cache_tiles, opts.mesh_cache_tiles);
+    let (cache, meshes) = (opts.imagery_cache(), opts.mesh_cache());
     let substitute = opts.substitute.clone().map(|s| SubstituteLane {
         provider: s.0,
-        cache: Mutex::new(ImageryCache::new(imagery_cache_tiles)),
+        cache: Mutex::new(opts.imagery_cache()),
         fetching: ImageryInFlight::default(),
     });
     let loader: Arc<dyn TileLoader> = Arc::new(PlanetaryLoader {
@@ -2360,8 +2372,8 @@ where
         imagery,
         scheme,
         opts,
-        cache: Mutex::new(ImageryCache::new(imagery_cache_tiles)),
-        meshes: Mutex::new(MeshCache::new(mesh_cache_tiles)),
+        cache: Mutex::new(cache),
+        meshes: Mutex::new(meshes),
         fetching: ImageryInFlight::default(),
         substitute,
         building: TerrainInFlight::default(),
@@ -2377,6 +2389,38 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two caches take their size from the options; the default is the
+    /// 512 entries they have always held. A cache that ignored its option
+    /// (or kept a literal) would hold 512 here and never let a tile go.
+    #[test]
+    fn the_loaders_caches_are_sized_by_the_options() {
+        let defaults = GlobeOptions::default();
+        assert_eq!(defaults.imagery_cache().cap, 512);
+        assert_eq!(defaults.mesh_cache().cap, 512);
+
+        let small = GlobeOptions {
+            imagery_cache_tiles: 2,
+            mesh_cache_tiles: 3,
+            ..GlobeOptions::default()
+        };
+        let (mut imagery, meshes) = (small.imagery_cache(), small.mesh_cache());
+        assert_eq!((imagery.cap, meshes.cap), (2, 3));
+
+        let mut let_go = Vec::new();
+        let tile = |x| ImageryCoord { level: 3, x, y: 0 };
+        for x in 0..3 {
+            let texture = Arc::new(DecodedTexture::from_rgba8(1, 1, vec![0; 4]));
+            imagery.put(tile(x), texture, &mut |c, way| {
+                if matches!(way, store_log::Way::LetGo) {
+                    let_go.push(c);
+                }
+            });
+        }
+        assert_eq!(let_go, vec![tile(0)], "the oldest of three goes at two");
+        assert_eq!(imagery.map.len(), 2);
+        assert_eq!(meshes.order.len(), 0);
+    }
 
     /// The loader compresses nothing unless its consumer asks.
     #[test]
@@ -2580,11 +2624,7 @@ mod tests {
                 bounding_sphere_radius: rect.height().max(rect.width()) * WGS84_A,
                 horizon_occlusion: [0.0; 3],
             };
-            let (u, v, height) = (
-                [0.0, 1.0, 0.0, 1.0],
-                [0.0, 0.0, 1.0, 1.0],
-                [0.0, 1.0, 0.0, 1.0],
-            );
+            let (u, v, height) = ([0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 0.0, 1.0]);
             let edges = [vec![0, 2], vec![0, 1], vec![1, 3], vec![2, 3]];
             let mut bytes = tuile_terrain::decode::encode(
                 &header,
