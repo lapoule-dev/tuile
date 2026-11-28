@@ -2100,7 +2100,8 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
         // The header already carries the tile's relief, so the surface a camera
         // is clamped against sharpens for free as the globe refines, and so do
         // the tree's bounding volumes (`TerrainTree::height_range`).
-        self.heights.record_range(coord, qm.header.min_height, qm.header.max_height);
+        self.heights
+            .record_range(coord, qm.header.min_height, qm.header.max_height);
         let rect = self.scheme.tile_rect(coord);
         // Skirts, at the size both reference implementations use. `mesh.edges`
         // arrives in whatever order the server wrote it, and `append_skirts`

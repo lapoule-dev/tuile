@@ -113,7 +113,7 @@ impl TerrainTree {
 
     /// Bounds each tile's volume by the decoded height ranges in `heights`
     /// (the loader's [`TerrainHeights::record_range`]), the same `Arc` the
-    /// loader writes. See [`Self::height_range`].
+    /// loader writes. See `TerrainTree::height_range`.
     pub fn with_heights(mut self, heights: Arc<TerrainHeights>) -> Self {
         self.heights = Some(heights);
         self
@@ -255,7 +255,7 @@ impl TileTree for TerrainTree {
     /// caller.
     ///
     /// `properties` does read the decoded height ranges (a tile's volume,
-    /// [`TerrainTree::height_range`]), so the revision is their generation:
+    /// `TerrainTree::height_range`), so the revision is their generation:
     /// it moves when a range is folded in, between two passes. Without
     /// heights, a constant.
     fn revision(&self) -> Option<u64> {
@@ -363,7 +363,7 @@ impl TileTree for TerrainTree {
     }
 
     /// Once its own range is decoded, with heights: its children's volumes
-    /// are made of it ([`TerrainTree::height_range`]). Always, without.
+    /// are made of it (`TerrainTree::height_range`). Always, without.
     fn can_refine(&self, id: TileId) -> bool {
         self.heights
             .as_ref()
