@@ -1061,7 +1061,7 @@ impl Budget {
                     &mut l.lev,
                     tiles
                         .iter()
-                        .filter(|(_, tn)| Self::draped(tn))
+                        .filter(|(_, tn)| self.draped(tn))
                         .map(|(t, _)| *t),
                 );
             }
@@ -1210,7 +1210,7 @@ impl Budget {
         for i in 0..l.lev.len() {
             let t = l.lev[i];
             let (mut asked, mut moved) = (false, false);
-            if let Some(tn) = tiles.get(&t).filter(|tn| Self::draped(tn)) {
+            if let Some(tn) = tiles.get(&t).filter(|tn| self.draped(tn)) {
                 let capped = self.drape_levels(
                     t,
                     tn,
@@ -2674,7 +2674,7 @@ impl Budget {
         let keeps = |b: &Budget, t: TileId, l: LayerId| {
             b.held_last.contains_key(&t)
                 || tiles.get(&t).is_some_and(|tn| {
-                    Self::draped(tn)
+                    b.draped(tn)
                         && tn
                             .need
                             .imagery
@@ -3151,7 +3151,7 @@ impl Budget {
         // An index that tells its generation is asked again: its answers
         // hold. One that does not is not asked twice in a step.
         let stable = presence.generation().is_some();
-        for (t, tn) in tiles.iter().filter(|(_, tn)| Self::draped(tn)) {
+        for (t, tn) in tiles.iter().filter(|(_, tn)| self.draped(tn)) {
             let far = self.down.levels_far.contains_key(t);
             if far && !stable {
                 continue;

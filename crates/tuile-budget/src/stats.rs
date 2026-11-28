@@ -289,6 +289,10 @@ pub struct BudgetStats {
     pub floor_in: bool,
     /// Drawn tiles whose drape is more than one level from their need.
     pub underdraped: u32,
+    /// The preload envelope this step (`regulator`, E2): the bytes and the
+    /// network slots each class reserved for the present need.
+    pub envelope: PerClass<Bytes>,
+    pub envelope_slots: PerClass<u32>,
     /// Drawn tiles per imagery-minus-terrain level gap (`gap + 8`).
     pub imagery_over_terrain: [u32; GAP_BUCKETS],
     /// Load latencies of the loads completed this step.

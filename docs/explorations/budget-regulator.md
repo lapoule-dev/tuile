@@ -86,16 +86,21 @@ retirés ; le nouveau est actif avant que l'ancien parte.
   À chaque pas, `présent_d + préchargé_d + réserve_d ≤ capacité_d`, où la
   capacité est la cible du pas (la part que le pool laisse à la classe, la
   cible du décodé, le crédit).
-- **E2. La réserve suit le rythme du besoin présent (loi de Little), et
-  vaut zéro au repos.** `réserve_d = λ_d · W` :
-  - `λ_d`, les octets que le besoin présent a consommés par pas dans `d`
-    (livrés, décodés, envoyés), filtrés ;
-  - `W`, le temps de chargement en pas (paramètre tant que M1 ne le mesure
-    pas).
+- **E2. La réserve, c'est ce que le besoin présent a demandé et pas encore
+  reçu, et elle vaut zéro au repos.** C'est le `L` de la loi de Little (le
+  travail dans le système), compté directement plutôt qu'estimé par
+  `λ · W` : ses chargements classés et en vol, à leur taille estimée (la
+  moyenne apprise des livraisons de la classe), et ses copies décodées non
+  livrées, à leur coût exact. Un ancêtre en file attend l'admission du
+  score comme un préchargement : il compte une fois en vol.
 
-  Le filtre monte vite et redescend lentement. La place est donc libérée
-  quand le geste commence, avant que le besoin n'arrive, et elle n'est pas
-  rendue au préchargement entre deux à-coups du même geste.
+  Le filtre monte d'un coup et redescend d'une fraction par pas
+  (`fall_permille`). La place est donc prise dès que le geste demande, et
+  elle n'est pas rendue au préchargement entre deux à-coups du même geste.
+  *Révision, mesure à l'appui :* la première version (`λ · W`, `W` = 30 pas)
+  réservait d'emblée 45 Mo sur une classe de 4 Mio dès la première
+  livraison ; la réserve ne savait pas quand le besoin était servi.
+  Compter `L` n'a plus besoin de `W`, donc plus besoin de M1 pour ce nombre.
 - **E3. Le préchargement n'entre que dans l'enveloppe, et en sort le
   premier.**
   - *Entrer* : un préchargement est lancé, livré ou envoyé seulement si ses
@@ -105,12 +110,19 @@ retirés ; le nouveau est actif avant que l'ancien parte.
   - *Attendre* : un préchargement décodé que l'enveloppe refuse sort de la
     file et n'est plus classé. Il revient quand la place revient dans sa
     classe.
-  - *Sortir* : quand l'enveloppe se resserre (le besoin ou la réserve
-    monte), les préchargements sont relâchés dans l'ordre d'éviction
-    jusqu'à ce qu'elle tienne. Cela se fait avant que le besoin présent ne
-    demande la place, jamais à sa place. Le cache sous la cible est libéré
-    de la même façon, jusqu'à `cible − réserve` : c'est ce qui remplace les
-    paliers.
+  - *Sortir* : quand le besoin présent a des octets en attente, le
+    balayage fait sa place d'avance, jusqu'à `cible − en attente` (sans
+    filtre, et décompté à chaque livraison du pas). Les préchargements y
+    passent outre la loi d'horizon (raison `envelope`), le cache sous la
+    loi. Une fois le besoin servi, plus rien n'est retiré : la ligne
+    d'entrée (`cible − réserve`, filtrée) et la ligne de sortie
+    (`cible − en attente`) forment l'hystérésis qui remplace les paliers,
+    tirée d'un seul signal. Retirer à la ligne filtrée relâchait un
+    préchargement pour des octets déjà livrés (mesuré : l'anneau évincé
+    au pas même où le besoin arrivait, puis relivré au suivant).
+  - *Échanger* : au lancement, les préchargements évinçables de l'anneau ne
+    comptent pas ; un préchargement plus fort que la marge prend la place
+    d'un plus faible à la livraison, où E1 est tenue.
 - **E4. Un préchargement arrive avec son drapé** (§2, lecture (c)) : un
   maillage préchargé veut le drapé de sa tuile au niveau dont il aura besoin
   une fois dessiné. Les deux passent ensemble par E3.
@@ -122,9 +134,9 @@ retirés ; le nouveau est actif avant que l'ancien parte.
 - la fin des paliers (`Watermarks` disparaît) ;
 - la fin des parts fixes de mémoire.
 
-**Les nombres.** Ce sont `W` et les deux coefficients du filtre (montée et
-descente), dans `Params`, donc dans la spécification, son digest et sa
-requête. Il n'y a aucun interrupteur. Le régulateur est en entiers, ses
+**Les nombres.** Un seul : `envelope.fall_permille` (100 ‰, une demi-vie
+d'environ sept pas), dans `Params`, donc dans la spécification, son digest
+et sa requête (`envelope_fall`). Il n'y a aucun interrupteur. Le régulateur est en entiers, ses
 signaux viennent des entrées enregistrées, et aucune mesure de l'exécuteur
 n'entre dans `decide`.
 
@@ -357,9 +369,9 @@ Ce qu'on lit dans ce tableau :
   la réserve arriverait après le geste, à l'urgence. À confirmer par
   Laurent.
 - **Q2 (la règle maillage + drapé)** : voir §2.3.
-- **Q3 (W avant M1).** Tant que M1 n'a pas livré les distributions de temps
-  de chargement, `W_c` est un paramètre : 30 pas, soit 0,5 s à 60 Hz.
-  Ensuite il devient une entrée enregistrée (le p90 mesuré par classe).
+- **Q3 (W avant M1).** Sans objet depuis la révision d'E2 : la réserve
+  compte `L` au lieu d'estimer `λ · W`. M1 reste utile pour la taille
+  estimée d'un chargement et pour le crédit de livraison (T3).
 - **Q4 (les planchers du pool).** `Pool::floor_percent` (sol 25 %, drapés
   40 %) est une part fixe qui ne joue qu'en contention. Le régulateur ne la
   touche pas. À rouvrir si Laurent veut aussi l'enlever.

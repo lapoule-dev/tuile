@@ -85,6 +85,69 @@ struct Eff {
     /// The pooled ledger's numbers (D-A3); `None` with no member, and
     /// under Batch.
     pool: Option<PoolEff>,
+    /// The preload envelope (`regulator`, E1–E2): the bytes and network
+    /// slots each class reserves for the present need, and the decoded
+    /// bytes; all zero under Batch.
+    env: PerClass<Bytes>,
+    env_slots: PerClass<u32>,
+    env_decoded: Bytes,
+}
+
+impl Eff {
+    /// The line a class's preloads fit under, with the present need's
+    /// bytes: its target less its reserve.
+    fn line(&self, c: Class) -> Bytes {
+        self.target[c].minus(self.env[c])
+    }
+
+    /// The pool members' reserves together.
+    fn pool_env(&self, p: &PoolEff) -> Bytes {
+        Class::ALL
+            .iter()
+            .filter(|c| p.members[**c])
+            .fold(Bytes::ZERO, |a, c| a.plus(self.env[*c]))
+    }
+}
+
+/// Whether work of `urgency` on `r` is a preload (`regulator`): the ring, a
+/// refresh, an ancestor's own drapes (E4) — never what the view draws, the
+/// chain of meshes it falls back on, or a drape a drawn tile wears.
+pub(super) fn is_preload(urgency: Urgency, r: ResourceId) -> bool {
+    matches!(urgency, Urgency::Ring | Urgency::Refresh)
+        || (urgency == Urgency::Ancestor && matches!(r, ResourceId::Drape { .. }))
+}
+
+/// What a step's preloads may still take (E1, E3): per class the GPU bytes
+/// held outside the cache (what nothing wants, which any admission takes
+/// first) with what the preloads have pending — in flight at their
+/// estimate, decoded at their cost — and the decoded bytes with the loads
+/// in flight.
+struct EnvUse {
+    gpu: PerClass<Bytes>,
+    pool: Bytes,
+    decoded: Bytes,
+}
+
+impl EnvUse {
+    /// Whether a preload of `bytes` of class `c` fits every envelope it
+    /// will take: its class's, the pool's, the decoded tier's.
+    fn admits(&self, eff: &Eff, c: Class, bytes: Bytes) -> bool {
+        use super::regulator::fits;
+        fits(self.gpu[c], bytes, eff.target[c], eff.env[c])
+            && eff.pool.filter(|p| p.members[c]).is_none_or(|p| {
+                fits(self.pool, bytes, p.target, eff.pool_env(&p))
+            })
+            && fits(self.decoded, bytes, eff.decoded, eff.env_decoded)
+    }
+
+    /// Counts a preload of `bytes` of class `c` started.
+    fn take(&mut self, eff: &Eff, c: Class, bytes: Bytes) {
+        self.gpu[c] = self.gpu[c].plus(bytes);
+        if eff.pool.is_some_and(|p| p.members[c]) {
+            self.pool = self.pool.plus(bytes);
+        }
+        self.decoded = self.decoded.plus(bytes);
+    }
 }
 
 /// The pool's numbers for a step (D-A3): its totals after pressure and
@@ -393,6 +456,15 @@ fn urgency_bucket(u: Urgency) -> usize {
     1 + u as usize
 }
 
+/// Whether `room` holds grouped bytes of `class` wanted at a preload's
+/// urgency (`is_preload`; an ancestor's meshes counted with its drapes):
+/// what the envelope's release must walk the grouped copies for (E3).
+fn holds_preloads(room: &Room, class: Class) -> bool {
+    [Urgency::Ring, Urgency::Ancestor, Urgency::Refresh]
+        .iter()
+        .any(|u| room.bytes[class][urgency_bucket(*u)] > Bytes::ZERO)
+}
+
 /// A walk of the eviction order: the arena's filed resources, by key,
 /// merged with a step's grouped ones, sorted. The two are disjoint (a
 /// resource is filed or grouped), and both stay ordered while the walk
@@ -635,6 +707,10 @@ impl Budget {
             hard[c] = off(hard[c], reserved[c]);
         }
         Eff {
+            // Read after the ranking (`Budget::envelope_step`).
+            env: PerClass::splat(Bytes::ZERO),
+            env_slots: PerClass::splat(0),
+            env_decoded: Bytes::ZERO,
             pool,
             target,
             overflow,
@@ -939,18 +1015,37 @@ impl Budget {
         st.work = st.work.saturating_add(named);
     }
 
-    /// Whether `tn` asks for drapes at its own levels this step: drawn or
-    /// blocking, with imagery.
+    /// Whether `tn` asks for drapes at its own levels this step, with
+    /// imagery: drawn or blocking, or a preload of the interactive view
+    /// ([`Self::preload`]): a preloaded mesh comes with its drape (E4,
+    /// `docs/explorations/budget-regulator.md`). A preload's drapes are
+    /// preloads too, of the tile's own urgency and score, at the level it
+    /// needs once drawn, and they enter only the preload envelope
+    /// (`regulator`): the chain's drapes asked at their places were a load
+    /// per ancestor and per layer at the finest levels, still views that
+    /// never converged (`budget_sim`), and before the envelope they were
+    /// admitted to the load and refused at the delivery (#364).
     ///
-    /// An ancestor does not: the whole chain of every drawn tile asking for
-    /// its drapes is a load per ancestor and per layer whatever its
-    /// children wear (measured on `budget_sim`: still views that never
-    /// converge, the work bound broken on still steps). What a drawn tile
-    /// wears while its own drape loads is asked by its parent only, and
-    /// only while a child needs it ([`Self::stand_ins_of`]).
-    pub(super) fn draped(tn: &TileNeed) -> bool {
-        matches!(tn.membership, Membership::Drawn | Membership::Blocker)
-            && tn.need.imagery.is_some()
+    /// What a drawn tile wears while its own drape loads is asked of its
+    /// parent at the present need's urgency, and only while a child needs
+    /// it ([`Self::stand_ins_of`]).
+    pub(super) fn draped(&self, tn: &TileNeed) -> bool {
+        tn.need.imagery.is_some()
+            && (matches!(tn.membership, Membership::Drawn | Membership::Blocker)
+                || self.preload(tn))
+    }
+
+    /// Whether `tn` is a preload of the interactive view: a ring or
+    /// ancestor tile above the floor. Its drape levels are the ones it
+    /// needs once drawn
+    /// ([`TexelFootprint::at_threshold`](super::imagery::TexelFootprint::at_threshold)),
+    /// not the ones its place asks now (an ancestor under the eye would ask
+    /// the finest its terrain allows). Batch preloads meshes only: a
+    /// frame's chain holds no drape back.
+    pub(super) fn preload(&self, tn: &TileNeed) -> bool {
+        self.cfg.policy != Policy::Batch
+            && matches!(tn.membership, Membership::Ring | Membership::Ancestor)
+            && !self.is_floor(tn.need.class, tn.need.level)
     }
 
     /// The drapes ancestor `p` (`pn` its need) asks for as its drawn
@@ -1050,6 +1145,12 @@ impl Budget {
         let floor = self.cfg.pinned_level.unwrap_or(0);
         let batch = self.cfg.policy == Policy::Batch;
         let cap = self.cfg.imagery_cap();
+        // A preload's footprint is the one it will have once drawn.
+        let footprint = if self.preload(tn) {
+            img.footprint.at_threshold(tn.q.sse_excess)
+        } else {
+            img.footprint
+        };
         for reach in layers(img) {
             self.walk(1);
             let key = (t, reach.layer);
@@ -1061,7 +1162,7 @@ impl Budget {
                 source_max: reach.max_level,
             };
             if batch {
-                let level = needed_level(None, img.footprint, clamp);
+                let level = needed_level(None, footprint, clamp);
                 out.push((reach.layer, level, level, level));
                 continue;
             }
@@ -1072,9 +1173,9 @@ impl Budget {
                 .get(&key)
                 .copied()
                 .or_else(|| last.0.get(&key).map(|p| p.level));
-            let relaxed = needed_level(prev, img.footprint.relaxed(self.scale), clamp);
+            let relaxed = needed_level(prev, footprint.relaxed(self.scale), clamp);
             // What the picture needs at scale 1, for the quality deficit.
-            let full = needed_level(prev, img.footprint, clamp);
+            let full = needed_level(prev, footprint, clamp);
             let mut level = relaxed;
             let tier = |r: ResourceId, asked: &mut bool| {
                 self.tier_asked(r, self.arena.find(r), Class::Drape, presence, asked)
@@ -1133,7 +1234,7 @@ impl Budget {
     /// order, at the level chosen — when it asks for drapes; into `out`.
     pub(super) fn drapes_of(&self, t: TileId, tn: &TileNeed, out: &mut Vec<(LayerId, u32)>) {
         out.clear();
-        if !Self::draped(tn) {
+        if !self.draped(tn) {
             return;
         }
         let Some(img) = tn.need.imagery.as_ref() else {
@@ -1534,7 +1635,7 @@ impl Budget {
             if self.tiles.get(&s).and_then(|i| i.parent()) != Some(p) {
                 return true;
             }
-            let own: SmallVec<[LayerId; 4]> = if Self::draped(tn) {
+            let own: SmallVec<[LayerId; 4]> = if self.draped(tn) {
                 tn.need
                     .imagery
                     .as_ref()
@@ -1750,10 +1851,13 @@ impl Budget {
                     }
                     // A ring tile not drawn (the neighbourhood, the views
                     // ahead): its drapes are preloads too, of the tile's own
-                    // score — never the present need's. (An ancestor of
-                    // what is drawn asks for no drape of its own levels: its
-                    // children's stand-in only, below.)
+                    // score — never the present need's.
                     Membership::Ring if item.is_none() => Some(urgency),
+                    // A preload drawn for another tile (an ancestor standing
+                    // in for its children): its own drapes stay preloads;
+                    // what its children wear meanwhile is their stand-in,
+                    // asked below at the present need's urgency.
+                    _ if self.preload(tn) => Some(urgency),
                     _ => {
                         let worn = item.and_then(|i| i.drape(layer).copied());
                         let off = match worn {
@@ -2072,7 +2176,7 @@ impl Budget {
         let now = input.now;
         self.take_inputs(now);
         let mut st = std::mem::take(&mut self.pending);
-        let eff = self.eff();
+        let mut eff = self.eff();
         self.scratch.room = None;
         let mut ranked = std::mem::take(&mut self.ranked_last);
         self.walk(ranked.len());
@@ -2173,6 +2277,11 @@ impl Budget {
                 .map(|w| b.key_of(r, w, now, &is_coarsening, input.presence))
         };
 
+        // The envelope (E2): what the present need has pending, reserved.
+        if !eff.batch {
+            self.envelope_step(&mut eff, &jobs, wants, &mut st);
+        }
+
         let mut picked = std::mem::take(&mut self.scratch.picked);
         picked.clear();
         // Places: a `u32` each, as many as the jobs.
@@ -2272,6 +2381,8 @@ impl Budget {
         };
         d.sse_scale_milli = self.scale.max(thermal_floor);
         self.measure_uploads(now);
+        st.envelope = eff.env;
+        st.envelope_slots = eff.env_slots;
         self.last_now = Some(now);
 
         // Batch completeness. What the view waits on: work ranked, or in
@@ -2645,8 +2756,7 @@ impl Budget {
     /// evicting (law 4). And its hard limit, which no compression's
     /// transient crosses.
     fn compress_limits(&self, eff: &Eff) -> (PerClass<bool>, PerClass<Bytes>) {
-        let w = self.cfg.watermarks;
-        let pct = |b: Bytes| b.scaled(u64::from(w.low_percent), 100);
+        // Where the release starts (E3): the target less the reserve.
         let settled = self.settled();
         let signalled = self.pressure != Pressure::Normal;
         let pool_over = eff.pool.is_some_and(|p| {
@@ -2654,13 +2764,15 @@ impl Budget {
                 .iter()
                 .filter(|c| p.members[**c])
                 .fold(Bytes::ZERO, |a, c| a.plus(settled.gpu[*c]));
-            used > pct(p.target)
+            used > p.target.minus(eff.pool_env(&p))
         });
         let pressed = PerClass::from_fn(|c| {
             signalled
                 || match eff.pool {
-                    Some(p) if p.members[c] => pool_over || settled.gpu[c] > pct(p.ceil_target[c]),
-                    _ => eff.target[c] != Bytes::MAX && settled.gpu[c] > pct(eff.target[c]),
+                    Some(p) if p.members[c] => {
+                        pool_over || settled.gpu[c] > p.ceil_target[c].minus(eff.env[c])
+                    }
+                    _ => eff.target[c] != Bytes::MAX && settled.gpu[c] > eff.line(c),
                 }
         });
         let hard = PerClass::from_fn(|c| match eff.pool {
@@ -2821,6 +2933,128 @@ impl Budget {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// The envelope's reserve this step (E2), into `eff`: per class, what
+    /// the present need has pending — its loads ranked and in flight at
+    /// their estimate, its decoded copies at their cost — through the
+    /// filter; the decoded tier's, their sum; and the network slots its
+    /// ranked loads wait for.
+    fn envelope_step(
+        &mut self,
+        eff: &mut Eff,
+        jobs: &[(PriorityKey, Job, Want)],
+        wants: Wants<'_>,
+        st: &mut BudgetStats,
+    ) {
+        let ref_bytes = self.spec.params.ref_bytes;
+        let mut pending = PerClass::splat(Bytes::ZERO);
+        let mut waiting = PerClass::splat(0u32);
+        let a = &self.arena;
+        for (key, job, w) in jobs {
+            let r = key.resource;
+            if is_preload(w.urgency, r) {
+                continue;
+            }
+            let c = self.class_of(r, w.class);
+            match job {
+                // A queued ancestor waits on the score's admission, as a
+                // preload does: counted once it is in flight.
+                Job::Load if w.urgency >= Urgency::Ancestor => {}
+                Job::Load => {
+                    pending[c] = pending[c].plus(self.envelope.estimate(c, ref_bytes));
+                    if key.tier != Tier::Stored {
+                        waiting[c] = waiting[c].saturating_add(1);
+                    }
+                }
+                Job::Deliver => {
+                    if let Some(cpu) = a.find(r).and_then(|s| a.fresh_cpu(s, self.epoch(r, c))) {
+                        pending[c] = pending[c].plus(cpu.cost.gpu);
+                    }
+                }
+            }
+        }
+        for &s in a.active() {
+            let r = a.id(s);
+            if a.loading(s) && wants.get(&r).is_some_and(|w| !is_preload(w.urgency, r)) {
+                let c = a.class(s);
+                pending[c] = pending[c].plus(self.envelope.estimate(c, ref_bytes));
+            }
+        }
+        st.work = st
+            .work
+            .saturating_add(sat_u32(jobs.len() + a.active().len()));
+        self.envelope.observe(&self.spec.params.envelope, pending);
+        self.ahead = pending;
+        eff.env = PerClass::from_fn(|c| self.envelope.reserve(c));
+        eff.env_decoded = eff.env.iter().fold(Bytes::ZERO, |x, (_, b)| x.plus(b));
+        eff.env_slots = PerClass::from_fn(|c| waiting[c].min(eff.quota[c]));
+    }
+
+    /// The step's [`EnvUse`], with its [`Room`] (kept for the step's
+    /// admissions).
+    fn envelope_use(
+        &mut self,
+        eff: &Eff,
+        jobs: &[(PriorityKey, Job, Want)],
+        wants: Wants<'_>,
+        st: &mut BudgetStats,
+    ) -> EnvUse {
+        let room = match self.scratch.room.take() {
+            Some(room) => room,
+            None => self.room(wants, st),
+        };
+        let ref_bytes = self.spec.params.ref_bytes;
+        // What a start cannot count on: the GPU less the cache (unwanted)
+        // and less the ring's and refreshes' evictable preloads, which a
+        // stronger preload may take the place of at its delivery (the
+        // margin's swap, which holds E1 there).
+        let mut gpu = PerClass::from_fn(|c| {
+            self.ledger.gpu[c]
+                .minus(self.arena.idle(c))
+                .minus(room.bytes[c][0])
+                .minus(room.bytes[c][urgency_bucket(Urgency::Ring)])
+                .minus(room.bytes[c][urgency_bucket(Urgency::Refresh)])
+        });
+        // The decoded tier: what is on its way to the GPU — the present
+        // need's in its reserve, the preloads' counted below. The rest is
+        // its cache (copies of residents, demoted copies), released for
+        // room down to its target.
+        let mut decoded = Bytes::ZERO;
+        let a = &self.arena;
+        st.work = st.work.saturating_add(sat_u32(a.active().len()));
+        for &vs in a.active() {
+            let vr = a.id(vs);
+            if !a.loading(vs) || !wants.get(&vr).is_some_and(|w| is_preload(w.urgency, vr)) {
+                continue;
+            }
+            let c = a.class(vs);
+            let est = self.envelope.estimate(c, ref_bytes);
+            gpu[c] = gpu[c].plus(est);
+            decoded = decoded.plus(est);
+        }
+        for (key, job, w) in jobs {
+            let r = key.resource;
+            if *job != Job::Deliver || !is_preload(w.urgency, r) {
+                continue;
+            }
+            if let Some(s) = a.find(r) {
+                let c = a.class(s);
+                if let Some(cpu) = a.fresh_cpu(s, self.epoch(r, c)) {
+                    gpu[c] = gpu[c].plus(cpu.cost.gpu);
+                    decoded = decoded.plus(cpu.cost.gpu);
+                }
+            }
+        }
+        st.work = st.work.saturating_add(sat_u32(jobs.len()));
+        let pool = eff.pool.map_or(Bytes::ZERO, |p| {
+            Class::ALL
+                .iter()
+                .filter(|c| p.members[**c])
+                .fold(Bytes::ZERO, |x, c| x.plus(gpu[*c]))
+        });
+        self.scratch.room = Some(room);
+        EnvUse { gpu, pool, decoded }
+    }
+
     fn start(
         &mut self,
         now: Micros,
@@ -2839,9 +3073,30 @@ impl Budget {
         // quota: a network load of lower priority starting after them is a
         // local wait (I15).
         let mut skipped_stored = 0u32;
+        // The envelope (E1, E3), read at the first preload.
+        let mut env: Option<EnvUse> = None;
+        let ref_bytes = self.spec.params.ref_bytes;
         for (key, _, w) in loads.iter().filter_map(|i| jobs.get(*i as usize)) {
             let r = &key.resource;
             let class = self.class_of(*r, w.class);
+            let preload = is_preload(w.urgency, *r);
+            if preload && !eff.batch {
+                // A preload starts only into room it will find at its
+                // delivery, and into the slots the present need leaves.
+                let est = self.envelope.estimate(class, ref_bytes);
+                if env.is_none() {
+                    env = Some(self.envelope_use(eff, jobs, wants, st));
+                }
+                let roomy = env.as_ref().is_some_and(|u| u.admits(eff, class, est));
+                let slots = key.tier == Tier::Stored
+                    || self.in_flight[class].saturating_add(eff.env_slots[class]) < eff.quota[class];
+                if !roomy || !slots {
+                    if key.tier == Tier::Stored {
+                        skipped_stored += 1;
+                    }
+                    continue;
+                }
+            }
             if decoded_full && w.urgency >= Urgency::Ring {
                 // Backpressure: preload that could neither be delivered nor
                 // kept decoded is not fetched.
@@ -2866,7 +3121,10 @@ impl Budget {
                         continue;
                     }
                     if self.in_flight[class] >= eff.quota[class] {
-                        if w.urgency > Urgency::Hole {
+                        // The present need never waits behind a preload
+                        // (law 8): up to a drawn tile's drape, it takes a
+                        // preload's slot.
+                        if w.urgency > Urgency::Drape || preload {
                             if key.tier == Tier::Stored {
                                 skipped_stored += 1;
                             }
@@ -2891,7 +3149,9 @@ impl Budget {
                                         }
                                     )
                                     && (wants.get(&vr).is_some_and(|vw| {
-                                        matches!(vw.urgency, Urgency::Ring | Urgency::Ancestor)
+                                        is_preload(vw.urgency, vr)
+                                            || (w.urgency <= Urgency::Hole
+                                                && vw.urgency == Urgency::Ancestor)
                                     }) || a.urgency(vs) == Some(Urgency::Refresh)))
                                 .then_some(vr)
                             })
@@ -2986,6 +3246,11 @@ impl Budget {
                         Source::Network => st.thrash += 1,
                         Source::Local => st.rereads += 1,
                     }
+                }
+            }
+            if preload {
+                if let Some(u) = env.as_mut() {
+                    u.take(eff, class, self.envelope.estimate(class, ref_bytes));
                 }
             }
             d.start.push(Start {
@@ -3265,18 +3530,17 @@ impl Budget {
         if !eff.batch {
             let shrinking = matches!(r, ResourceId::Mesh(t) if coarsening.contains_key(&t));
             let urgent = matches!(w.urgency, Urgency::Floor | Urgency::Hole | Urgency::Drape);
-            // Speculation — the ring, a refresh — waits under the headroom;
-            // the chain of ancestors is what is drawn's fallback (coverage)
-            // and takes the room the present need takes.
-            let preload = matches!(w.urgency, Urgency::Ring | Urgency::Refresh);
+            // A preload (`is_preload`) enters only the envelope: under the
+            // target less the present need's reserve (E1, E3); the chain of
+            // ancestors' meshes is what is drawn's fallback (coverage) and
+            // takes the room the present need takes.
+            let preload = is_preload(w.urgency, r);
             let mut limit = if shrinking {
                 eff.hard[class]
             } else if urgent {
                 eff.hard[class].minus(eff.reserve[class])
             } else if preload {
-                // Preload only into room the view does not use, and it
-                // never displaces anything wanted.
-                eff.target[class].scaled(u64::from(self.cfg.watermarks.low_percent), 100)
+                eff.line(class)
             } else {
                 eff.target[class].min(eff.hard[class].minus(eff.reserve[class]))
             };
@@ -3289,8 +3553,7 @@ impl Budget {
                 } else if urgent {
                     p.hard.minus(reserve)
                 } else if preload {
-                    p.target
-                        .scaled(u64::from(self.cfg.watermarks.low_percent), 100)
+                    p.target.minus(eff.pool_env(&p))
                 } else {
                     p.target.min(p.hard.minus(reserve))
                 };
@@ -3369,6 +3632,11 @@ impl Budget {
         }
         st.delivered += 1;
         self.delivered_bytes = self.delivered_bytes.plus(c.cost.gpu);
+        self.envelope.learn(class, c.cost.gpu);
+        if !is_preload(w.urgency, r) {
+            // Delivered: no longer room to make ahead of it.
+            self.ahead[class] = self.ahead[class].minus(c.cost.gpu);
+        }
         d.deliver.push((r, c.gen));
     }
 
@@ -3521,7 +3789,6 @@ impl Budget {
             None,
             "the room counts the bytes of its residents still evictable"
         );
-        let w = self.cfg.watermarks;
         if let Some(p) = eff.pool {
             self.evict_pooled(now, p, wants, d, st);
         }
@@ -3531,10 +3798,14 @@ impl Budget {
             }
             // What the compressions in flight give back counts as given
             // back (CB9, law 4): the sweep evicts what they cannot free.
+            // E3: back to the target less what the present need has
+            // pending now — its room made ahead, the preloads leaving it
+            // first; not less the reserve, which bounds what enters (a
+            // preload is not evicted for bytes already delivered).
             let used = self.settled().gpu[class];
-            let high = eff.target[class].scaled(u64::from(w.high_percent), 100);
-            let low = eff.target[class].scaled(u64::from(w.low_percent), 100);
-            if used <= high {
+            let high = eff.target[class];
+            let low = high.minus(self.ahead[class]);
+            if used <= low {
                 continue;
             }
             let room = match self.scratch.room.take() {
@@ -3542,7 +3813,7 @@ impl Budget {
                 None => self.room(wants, st),
             };
             let mut law = self.sweep_law();
-            let grouped: &[_] = if law.walks_grouped() {
+            let grouped: &[_] = if law.walks_grouped() || holds_preloads(&room, class) {
                 &room.grouped
             } else {
                 &[]
@@ -3564,13 +3835,23 @@ impl Budget {
                 if !evictable {
                     continue;
                 }
-                // Not what the view wants now or wanted within the horizon.
-                match law.judge(wants.contains_key(&r), self.arena.poses_since_wanted(s)) {
-                    Verdict::Release => {}
-                    Verdict::Keep => continue,
-                    Verdict::Stop => break,
+                // Not what the view wants now or wanted within the horizon;
+                // a preload leaves the envelope first (E3).
+                let preload = wants.get(&r).is_some_and(|w| is_preload(w.urgency, r));
+                if !preload && wants.contains_key(&r) && !law.walks_grouped() {
+                    // Walked for the preloads among the grouped copies: one
+                    // the view wants now is passed over, uncounted.
+                    continue;
                 }
-                self.evict_one(now, s, class, d, st);
+                if !preload {
+                    match law.judge(wants.contains_key(&r), self.arena.poses_since_wanted(s)) {
+                        Verdict::Release => {}
+                        Verdict::Keep => continue,
+                        Verdict::Stop => break,
+                    }
+                }
+                let why = preload.then_some(Reason::Envelope);
+                self.evict_as(now, s, class, why, d, st);
             }
             // Still over the target: back within it, the law's keepers
             // included (`Reason::Fit`).
@@ -3785,7 +4066,8 @@ impl Budget {
     }
 
     /// D-A3: one sweep over the pool's members, in the one eviction order,
-    /// down to the low watermark of the pool's target, no member below its
+    /// down to the pool's target less what its members' present need has
+    /// pending, no member below its
     /// floor except to keep I2, none left above its ceiling.
     fn evict_pooled(
         &mut self,
@@ -3795,31 +4077,35 @@ impl Budget {
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) {
-        let w = self.cfg.watermarks;
         let used = |l: &Ledger| {
             Class::ALL
                 .iter()
                 .filter(|c| p.members[**c])
                 .fold(Bytes::ZERO, |a, c| a.plus(l.gpu[*c]))
         };
-        let pct = |b: Bytes, percent: u8| b.scaled(u64::from(percent), 100);
         let floor = |c: Class| p.floor(c, p.target);
-        // A member over its own ceiling (its own high watermark) is trimmed
-        // to its own low one, as a class outside the pool is.
-        let ceiling_high = |c: Class| pct(p.ceil_target[c], w.high_percent);
-        let ceiling_low = |c: Class| pct(p.ceil_target[c], w.low_percent);
+        // A member over its own ceiling (its own target) is trimmed to its
+        // line, as a class outside the pool is (E3).
+        let ceiling_high = |c: Class| p.ceil_target[c];
+        let ahead = self.ahead;
+        let ceiling_low = |c: Class| p.ceil_target[c].minus(ahead[c]);
         // What the compressions in flight give back counts as given back
         // (CB9, law 4).
-        let high = pct(p.target, w.high_percent);
-        let pool_over = used(&self.settled()) > high;
+        let high = p.target;
+        let low = p.target.minus(
+            Class::ALL
+                .iter()
+                .filter(|c| p.members[**c])
+                .fold(Bytes::ZERO, |a, c| a.plus(ahead[*c])),
+        );
+        let pool_over = used(&self.settled()) > low;
         if !pool_over
             && Class::ALL
                 .iter()
-                .all(|c| !(p.members[*c] && self.settled().gpu[*c] > ceiling_high(*c)))
+                .all(|c| !(p.members[*c] && self.settled().gpu[*c] > ceiling_low(*c)))
         {
             return;
         }
-        let low = pct(p.target, w.low_percent);
         // I2 (Laurent, 2026-10-21): what is not protected fits in the
         // member's target. The sweep evicts only unprotected residents, so
         // the protected bytes do not move while it runs; the target does, as
@@ -3847,9 +4133,10 @@ impl Budget {
         // pass below.
         let mut law = self.sweep_law();
         for lawful in [true, false] {
+            let line = |c: Class| if lawful { ceiling_low(c) } else { ceiling_high(c) };
             let mut over: PerClass<bool> =
-                PerClass::from_fn(|c| p.members[c] && self.settled().gpu[c] > ceiling_high(c));
-            let pool_over = used(&self.settled()) > high;
+                PerClass::from_fn(|c| p.members[c] && self.settled().gpu[c] > line(c));
+            let pool_over = used(&self.settled()) > if lawful { low } else { high };
             if !pool_over && Class::ALL.iter().all(|c| !over[*c]) {
                 break;
             }
@@ -3861,7 +4148,10 @@ impl Budget {
                     ceiling_high(c)
                 }
             };
-            let grouped: &[_] = if !lawful || law.walks_grouped() {
+            let preloads = Class::ALL
+                .iter()
+                .any(|c| p.members[*c] && holds_preloads(&room, *c));
+            let grouped: &[_] = if !lawful || law.walks_grouped() || preloads {
                 &room.grouped
             } else {
                 &[]
@@ -3872,7 +4162,11 @@ impl Budget {
                 if !candidate(self, s) {
                     continue;
                 }
-                if lawful {
+                let preload = wants.get(&r).is_some_and(|w| is_preload(w.urgency, r));
+                if lawful && !preload && wants.contains_key(&r) && !law.walks_grouped() {
+                    continue;
+                }
+                if lawful && !preload {
                     match law.judge(wants.contains_key(&r), self.arena.poses_since_wanted(s)) {
                         Verdict::Release => {}
                         Verdict::Keep => continue,
@@ -3896,7 +4190,11 @@ impl Budget {
                 let goes =
                     over[class] || (pool_trim && settled.gpu[class].minus(bytes) >= floor(class));
                 if goes {
-                    let why = (!lawful).then_some(Reason::Fit);
+                    let why = if !lawful {
+                        Some(Reason::Fit)
+                    } else {
+                        preload.then_some(Reason::Envelope)
+                    };
                     self.evict_as(now, s, class, why, d, st);
                 }
             }
@@ -3927,19 +4225,6 @@ impl Budget {
             self.spec.params.release_visits,
             self.pressure == Pressure::Normal,
         )
-    }
-
-    /// Evicts the resource of `s`, of `class`, from the GPU for the sweep,
-    /// and counts it.
-    fn evict_one(
-        &mut self,
-        now: Micros,
-        s: Slot,
-        class: Class,
-        d: &mut Decisions,
-        st: &mut BudgetStats,
-    ) {
-        self.evict_as(now, s, class, None, d, st);
     }
 
     /// Evicts the resource of `s`, of `class`, from the GPU, and counts it:
@@ -4027,17 +4312,15 @@ impl Budget {
             // class between its watermarks relaxed for ever (Laurent's stall,
             // 2026-11-23: drapes at 97–99 % of target, imagery under need,
             // nothing loading).
-            let low = |b: Bytes| b.scaled(u64::from(self.cfg.watermarks.low_percent), 100);
-            let high = |b: Bytes| b.scaled(u64::from(self.cfg.watermarks.high_percent), 100);
-            let mut calm = Class::ALL.iter().all(|&c| {
-                protected[c] <= low(eff.target[c]) && self.ledger.gpu[c] <= high(eff.target[c])
-            });
+            let mut calm = Class::ALL
+                .iter()
+                .all(|&c| protected[c] <= eff.line(c) && self.ledger.gpu[c] <= eff.target[c]);
             if let Some(p) = eff.pool {
                 let pooled = Class::ALL
                     .iter()
                     .filter(|c| p.members[**c])
                     .fold(Bytes::ZERO, |a, c| a.plus(protected[*c]));
-                calm &= pooled <= low(p.target);
+                calm &= pooled <= p.target.minus(eff.pool_env(&p));
             }
             if calm {
                 let down = u64::from(r.down_per_second).saturating_mul(dt);
@@ -4535,6 +4818,11 @@ mod tests {
         cfg.target[t3d] = Bytes::mib(4);
         cfg.hard_limit[t3d] = Bytes::mib(6);
         let mut b = Budget::new(cfg).unwrap();
+        // The recycle, not the envelope: the present need's reserve follows
+        // its pending bytes, so the ring is not held back after `v`.
+        let mut spec = crate::spec::Specification::interactive();
+        spec.params.envelope.fall_permille = 1_000;
+        b.specify(spec).unwrap();
         let tile = |x| TileId::from_terrain(1, x, 0);
         let (v, r, r1) = (tile(0), tile(1), tile(2));
         let want = |t: TileId, sse: f32| (t, Need::new(1, t3d).with_sse_excess(sse));

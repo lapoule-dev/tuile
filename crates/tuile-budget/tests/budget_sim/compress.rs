@@ -19,11 +19,12 @@ fn clean(mut p: Profile) -> Profile {
     p
 }
 
-/// Whether the step's drapes were over their low watermark: where the age
+/// Whether the step's drapes were over their line (the target less the
+/// present need's reserve, `regulator`): where the age
 /// is waived (law 4).
-fn pressed(l: &super::server::StepLog, low_percent: u64) -> bool {
-    let target = l.stats.target[Class::Drape];
-    l.stats.gpu[Class::Drape].0 > target.0 / 100 * low_percent
+fn pressed(l: &super::server::StepLog) -> bool {
+    let line = l.stats.target[Class::Drape].minus(l.stats.envelope[Class::Drape]);
+    l.stats.gpu[Class::Drape] > line
 }
 
 /// **A still view compresses what survives:** on a desktop holding BC7,
@@ -31,7 +32,7 @@ fn pressed(l: &super::server::StepLog, low_percent: u64) -> bool {
 /// with a very high score, and by the end are held compressed — but the
 /// few the encoder refused. No compression is decided in the steps before
 /// the first drape could have survived its count, unless the drapes are
-/// over their low watermark.
+/// over their line.
 #[test]
 #[cfg_attr(
     debug_assertions,
@@ -39,7 +40,6 @@ fn pressed(l: &super::server::StepLog, low_percent: u64) -> bool {
 )]
 fn a_still_view_compresses_what_survives() {
     let profile = clean(Profile::desktop_bc7());
-    let low = u64::from(profile.budget.watermarks.low_percent);
     let n = usize::from(tuile_budget::spec::COMPRESS.decisions);
     let mut sim = Sim::new(profile, 241);
     sim.run(8.0, &|_| home());
@@ -54,7 +54,7 @@ fn a_still_view_compresses_what_survives() {
         .position(|l| l.stats.compress.started > 0)
         .unwrap_or_else(|| panic!("nothing compressed in eight still seconds: {RED}"));
     assert!(
-        first >= first_drawn + n || pressed(&sim.log[first], low),
+        first >= first_drawn + n || pressed(&sim.log[first]),
         "compressed at step {first}, {n} decisions after {first_drawn} not yet passed, with room"
     );
     let last = sim.log.last().unwrap();

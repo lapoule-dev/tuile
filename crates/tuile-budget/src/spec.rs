@@ -446,6 +446,9 @@ pub struct Params {
     /// is the previous pass's choice — recorded state, no clock. Read by the
     /// session's traversal (`tuile_core::traversal::Config::refine_hysteresis`).
     pub level_margin_permille: u16,
+    /// The preload envelope (`regulator`): how fast the present need's
+    /// reserve falls once it is served.
+    pub envelope: super::regulator::EnvelopeParams,
 }
 
 /// The policy of the decider: rules and numbers. See the [module
@@ -539,6 +542,7 @@ impl Specification {
                 finer_gap_permille: FINER_GAP,
                 compress: COMPRESS,
                 level_margin_permille: LEVEL_MARGIN,
+                envelope: super::regulator::ENVELOPE,
             },
         }
     }
@@ -597,6 +601,7 @@ impl Specification {
                 finer_gap_permille: FINER_GAP,
                 compress: COMPRESS,
                 level_margin_permille: LEVEL_MARGIN,
+                envelope: super::regulator::ENVELOPE,
             },
         }
     }
@@ -662,6 +667,7 @@ impl Specification {
                 finer_gap_permille: FINER_GAP,
                 compress: COMPRESS,
                 level_margin_permille: LEVEL_MARGIN,
+                envelope: super::regulator::ENVELOPE,
             },
         }
     }
@@ -802,6 +808,7 @@ impl Specification {
             ),
             ("compress_visits", u64::from(p.compress.visits), 4_096),
             ("level_margin", u64::from(p.level_margin_permille), 1_000),
+            ("envelope_fall", u64::from(p.envelope.fall_permille), 1_000),
         ];
         if let Some((name, ..)) = bounded.iter().find(|(_, v, max)| v > max) {
             return Err(SpecError::OutOfBounds(name));
@@ -839,7 +846,7 @@ impl Specification {
              &restore_remote_ms={}&p_ring={}&p_ancestor={}&a0={}&a_desc={}&headroom={}&floor_value={}\
              &release_visits={}&rho={}&finer_gap={}&coarse_from={}&coarse_boost={}\
              &sweep_keep_poses={}&compress_p={}&compress_decisions={}&compress_still_poses={}&compress_visits={}\
-             &compress_flight_tiles={}&level_margin={}",
+             &compress_flight_tiles={}&level_margin={}&envelope_fall={}",
             self.kind.label(),
             p.margin_permille,
             ms(p.min_dwell),
@@ -870,6 +877,7 @@ impl Specification {
             p.compress.visits,
             p.compress.flight_tiles,
             p.level_margin_permille,
+            p.envelope.fall_permille,
         );
         // A term's weight when all its rules share one; a term weighed
         // differently by predicate (FPV's recency) keeps its kind's rules.
@@ -939,6 +947,7 @@ impl Specification {
                 "compress_flight_tiles" => p.compress.flight_tiles = n16,
                 "compress_visits" => p.compress.visits = n16,
                 "level_margin" => p.level_margin_permille = n16,
+                "envelope_fall" => p.envelope.fall_permille = n16,
                 _ => match k
                     .strip_prefix("w_")
                     .and_then(|t| Term::ALL.into_iter().find(|x| term_key(*x) == t))

@@ -28,6 +28,7 @@ mod need_state;
 pub mod observe;
 mod origin;
 pub mod priority;
+pub mod regulator;
 pub mod score;
 #[doc(hidden)]
 pub mod snapshot;
@@ -46,7 +47,7 @@ pub mod waits;
 
 pub use blocked::{Blocked, BLOCKED, BLOCKED_LABELS, REASONS as BLOCKED_REASONS};
 pub use config::{
-    BudgetConfig, FailurePolicy, OriginBackoff, Pool, PressureFractions, Relaxation, Watermarks,
+    BudgetConfig, FailurePolicy, OriginBackoff, Pool, PressureFractions, Relaxation,
 };
 pub use deadline::{swap_unit, EncodeBucket, FrameDeadline};
 pub use decisions::{
@@ -331,6 +332,11 @@ pub struct Budget {
     /// The bytes delivered this step, and their rate, bytes a second,
     /// smoothed: the dynamic headroom's measure.
     delivered_bytes: Bytes,
+    /// The preload envelope's reserve and size estimates (`regulator`).
+    envelope: regulator::Envelope,
+    /// What the present need has pending this step and not yet delivered:
+    /// the room the sweep makes ahead of it (E3).
+    ahead: PerClass<Bytes>,
     upload_rate: inputs::Ema,
     /// What the passes after the need keep from one step to the next: the
     /// draw set, the wants, the work, and what changed (O1.4).
@@ -419,6 +425,8 @@ impl Budget {
             need_level: None,
             places: 0,
             delivered_bytes: Bytes::ZERO,
+            envelope: regulator::Envelope::default(),
+            ahead: PerClass::splat(Bytes::ZERO),
             upload_rate: inputs::Ema::default(),
             down: Default::default(),
             scratch: Default::default(),

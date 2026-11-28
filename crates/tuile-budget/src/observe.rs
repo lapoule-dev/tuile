@@ -1560,6 +1560,7 @@ impl BudgetObserver for BudgetMeter {
                         | crate::score::Reason::Fit
                         | crate::score::Reason::Admission
                         | crate::score::Reason::Swap
+                        | crate::score::Reason::Envelope
                 )
         }) {
             s.score_lambda = Some(

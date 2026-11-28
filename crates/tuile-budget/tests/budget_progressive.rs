@@ -778,12 +778,19 @@ fn a_re_specification_changes_the_next_steps_order() {
         }
         let v = View::at(0.45, 0.55, 12);
         let need = v.need(4);
-        let drawn: BTreeSet<TileId> = v.drawn().into_iter().collect();
+        // The ring's preloads: neither drawn nor the chain of ancestors the
+        // view falls back on, which is present work ordered by urgency
+        // (`regulator`, E1).
+        let present: BTreeSet<TileId> = v
+            .drawn()
+            .into_iter()
+            .chain(need.ancestors.iter().map(|(t, _)| *t))
+            .collect();
         for _ in 0..400 {
             let d = r.step(&need);
             if let Some(e) = d.scores.iter().find(|e| {
                 e.side == Side::Preload
-                    && matches!(e.resource, ResourceId::Mesh(t) if !drawn.contains(&t))
+                    && matches!(e.resource, ResourceId::Mesh(t) if !present.contains(&t))
             }) {
                 return (e.level, d.stats.score.params);
             }

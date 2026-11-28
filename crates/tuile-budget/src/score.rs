@@ -314,6 +314,9 @@ pub enum Reason {
     Fit,
     /// What an epoch's change left behind.
     Recycled,
+    /// A preload leaving the envelope as it tightens (`regulator`, E3):
+    /// the present need, or its reserve, needs its room.
+    Envelope,
 }
 
 impl Reason {
@@ -328,6 +331,7 @@ impl Reason {
             Reason::Pressure => "pressure",
             Reason::Fit => "fit_target",
             Reason::Recycled => "recycled",
+            Reason::Envelope => "envelope",
         }
     }
 }
@@ -546,7 +550,7 @@ pub const RELEASE_REASONS: [&str; 3] = ["headroom", "below_floor_value", "make_r
 /// The [`RELEASE_REASONS`] index of `r`; `None` for an epoch's recycling.
 pub fn release_reason(r: Reason) -> Option<usize> {
     match r {
-        Reason::Sweep | Reason::Pressure => Some(0),
+        Reason::Sweep | Reason::Pressure | Reason::Envelope => Some(0),
         Reason::BelowFloorValue => Some(1),
         Reason::Admission | Reason::Swap | Reason::Fit => Some(2),
         Reason::Preload | Reason::Recycled => None,

@@ -46,6 +46,15 @@ fn small(target_meshes: u64) -> BudgetConfig {
     c
 }
 
+/// The present need's reserve follows its pending bytes exactly
+/// (`regulator`, E2): once it is served, the envelope's line is the target,
+/// as the low watermark at 100 % was.
+fn no_reserve(r: &mut Rig) {
+    let mut s = tuile_budget::spec::Specification::interactive();
+    s.params.envelope.fall_permille = 1_000;
+    r.b.specify(s).expect("a valid specification");
+}
+
 mod config {
     use super::*;
 
@@ -60,18 +69,6 @@ mod config {
         assert_eq!(c.failure, FailurePolicy::EndSession);
         assert_eq!(c.cancel_grace, Micros::NEVER);
         assert!(Budget::new(c).is_ok());
-    }
-
-    /// Engineering bar: incoherent numbers are refused with a typed error.
-    #[test]
-    fn incoherent_watermarks_are_refused_with_a_typed_error() {
-        let mut c = BudgetConfig::interactive(Bytes::mib(256));
-        c.watermarks.low_percent = 95;
-        c.watermarks.high_percent = 90;
-        assert_eq!(
-            Budget::new(c).err(),
-            Some(ConfigError::Watermarks { low: 95, high: 90 })
-        );
     }
 
     /// I13: a batch budget that would retry is refused.
@@ -1661,9 +1658,8 @@ mod protection {
     /// C8, S3 (M3.3): ancestors outlive their descendants.
     #[test]
     fn ancestors_outlive_their_descendants() {
-        let mut c = small(3);
-        c.watermarks.low_percent = 100;
-        let mut r = Rig::new(c);
+        let mut r = Rig::new(small(3));
+        no_reserve(&mut r);
         let p = t(2, 1, 1);
         let c = children(p)[0];
         r.settle(&drawn(&[p, c]), 10);
@@ -1673,16 +1669,16 @@ mod protection {
         assert!(r.b.residency().drawable(p));
     }
 
-    /// C3: a sweep starts above the high watermark and trims to the low one
-    /// — under the target, only what has been out of the need for the
-    /// horizon (`Params::sweep_keep_poses`); what was needed within it is
-    /// only brought back within the target.
+    /// C3, E3 (`regulator`): the sweep makes room ahead of the present
+    /// need — down to the target less what it has pending — under the
+    /// target, only what has been out of the need for the horizon
+    /// (`Params::sweep_keep_poses`); what was needed within it is only
+    /// brought back within the target. No hysteresis: each crossing that
+    /// asks for two meshes makes their room (the watermarks waited for the
+    /// high one).
     #[test]
-    fn eviction_trims_to_the_low_watermark_and_waits_for_the_high_one() {
-        let mut c = small(10);
-        c.watermarks.high_percent = 100;
-        c.watermarks.low_percent = 80;
-        let mut r = Rig::new(c);
+    fn eviction_trims_to_the_line_the_present_need_leaves() {
+        let mut r = Rig::new(small(10));
         let row = |y: u64, n: u64| (0..n).map(|x| t(4, x, y)).collect::<Vec<_>>();
         let held = Class::TerrainMesh;
         r.settle(&drawn(&row(0, 9)), 30);
@@ -1695,26 +1691,24 @@ mod protection {
         for _ in 0..keep {
             r.step(&drawn(&row(1, 2)));
         }
-        // Past the horizon, the next crossing trims row 0 to the low mark.
-        r.settle(&drawn(&row(2, 2)), 30);
+        // Past the horizon, the next crossing makes its two meshes' room
+        // ahead, as their loads start: row 0 trimmed to the target less
+        // them.
+        let d = r.step(&drawn(&row(2, 2)));
         assert_eq!(r.b.ledger().gpu[held], Bytes(MESH.0 * 8), "{RED}");
-        r.settle(&drawn(&row(3, 2)), 30);
-        assert_eq!(
-            r.b.ledger().gpu[held],
-            Bytes(MESH.0 * 10),
-            "no sweep at the high mark"
-        );
+        r.complete(&d);
+        // Served, the cache is back at the target: no room held once the
+        // need has it.
+        r.settle(&drawn(&row(2, 2)), 30);
+        assert_eq!(r.b.ledger().gpu[held], Bytes(MESH.0 * 10), "{RED}");
     }
 
-    /// The GPU meshes once a sweep crossed the high watermark `since`
-    /// poses of `dt` after the last pose that wanted row 0, under a horizon
-    /// of [`KEEP_POSES`] poses: 10 when row 0 was kept, 8 when it was swept
-    /// down to the low watermark.
+    /// The GPU meshes once a crossing's loads started, `since` poses of
+    /// `dt` after the last pose that wanted row 0, under a horizon of
+    /// [`KEEP_POSES`] poses: 10 when row 0 was kept, 8 when the sweep made
+    /// the crossing's room ahead.
     fn swept_after(dt: Micros, since: u64) -> Bytes {
-        let mut c = small(10);
-        c.watermarks.high_percent = 100;
-        c.watermarks.low_percent = 80;
-        let mut r = Rig::new(c);
+        let mut r = Rig::new(small(10));
         r.dt = dt;
         let mut s = tuile_budget::spec::Specification::interactive();
         s.params.sweep_keep_poses = KEEP_POSES;
@@ -1724,17 +1718,15 @@ mod protection {
         // The last pose that wanted row 0.
         let wanted = r.frame - 1;
         r.settle(&drawn(&row(1, 2)), 30);
-        // Row 2's first step starts its loads; the next one takes them in,
-        // over the high watermark, and sweeps: at `wanted + since`.
+        // Row 2's first step starts its loads and makes their room ahead:
+        // at `wanted + since`.
         let sweep = wanted + since;
         let idle = sweep
-            .checked_sub(r.frame + 1)
+            .checked_sub(r.frame)
             .expect("row 1 settled within the poses asked");
         for _ in 0..idle {
             r.step(&drawn(&row(1, 2)));
         }
-        let first = r.step(&drawn(&row(2, 2)));
-        r.complete(&first);
         assert_eq!(r.frame, sweep, "the sweep's pose");
         let d = r.step(&drawn(&row(2, 2)));
         assert!(
@@ -1756,7 +1748,7 @@ mod protection {
         assert_eq!(held, Bytes(MESH.0 * 10), "{RED}");
     }
 
-    /// C3: a copy wanted N + 1 poses ago is swept to the low watermark,
+    /// C3: a copy wanted N + 1 poses ago is swept for the crossing's room,
     /// though the poses were a millisecond apart: 41 ms.
     #[test]
     fn a_copy_wanted_beyond_the_horizon_poses_is_swept_however_recently() {
@@ -1786,9 +1778,8 @@ mod protection {
     /// C9: needed-but-undrawn resources go only after unneeded ones.
     #[test]
     fn a_needed_blocker_is_evicted_only_after_unneeded_resources() {
-        let mut c = small(3);
-        c.watermarks.low_percent = 100;
-        let mut r = Rig::new(c);
+        let mut r = Rig::new(small(3));
+        no_reserve(&mut r);
         let (p, u) = (t(2, 0, 0), t(3, 7, 7));
         let b = children(p)[0];
         r.settle(&drawn(&[u]), 10);
@@ -2310,21 +2301,28 @@ mod draw {
     }
 
     /// The stand-in is the parent's drape one level under the drawn tile's
-    /// need, and nothing further up: a chain of ancestors listed with
-    /// imagery asks for one drape, not one per ancestor. Red with every
-    /// ancestor asking for its drapes (the grandparent's is loaded too: a
-    /// load per ancestor and per layer, whatever the children wear, which
-    /// `budget_sim` measured as still views that never converge) and red on
-    /// `main`, where no ancestor's drape is asked at all.
+    /// need; an ancestor further up asks for its own drape as a preload
+    /// (the chain arrives with its imagery), at the level it needs once
+    /// drawn and not the one its place asks now. Here the grandparent's
+    /// place asks level 6 (an ancestor under the eye) three levels over its
+    /// threshold: it loads level 3, never the finest its terrain allows (the
+    /// whole chain asking at its places was a load per ancestor and per
+    /// layer at the finest levels, which `budget_sim` measured as still
+    /// views that never converge). Red where no ancestor's drape is asked
+    /// but its children's stand-in, and red with the chain's drapes asked
+    /// at their places.
     #[test]
-    fn a_drawn_tile_asks_for_its_parents_drape_only_as_its_stand_in() {
+    fn a_drawn_tile_wears_its_parents_drape_as_its_stand_in_and_the_chain_preloads_its_own() {
         let mut r = Rig::interactive();
         let g = t(3, 2, 2);
         let a = children(g)[0];
         let k = children(a)[0];
         let need = NeedSet {
             drawn: vec![(k, draped(k, 5))],
-            ancestors: vec![(g, draped(g, 3)), (a, draped(a, 4))],
+            ancestors: vec![
+                (g, draped(g, 6).with_sse_excess(3.0)),
+                (a, draped(a, 4)),
+            ],
             ..NeedSet::new()
         };
         let own = |res: ResourceId| matches!(res, ResourceId::Drape { tile, .. } if tile == k);
@@ -2340,11 +2338,15 @@ mod draw {
             started.contains(&dr(a, 4)),
             "{RED}: the parent's drape, one level under the need"
         );
-        assert!(
-            !started
-                .iter()
-                .any(|res| matches!(res, ResourceId::Drape { tile, .. } if *tile == g)),
-            "{RED}: no drape of an ancestor further up: {started:?}"
+        let further_up: Vec<ResourceId> = started
+            .iter()
+            .copied()
+            .filter(|res| matches!(res, ResourceId::Drape { tile, .. } if *tile == g))
+            .collect();
+        assert_eq!(
+            further_up,
+            vec![dr(g, 3)],
+            "{RED}: the ancestor further up preloads its drape at the level it needs once drawn"
         );
         let item = d.draw.get(mesh(k)).expect("the tile is drawn");
         assert_eq!(base_drape(item).map(|c| c.resource), Some(dr(a, 4)));

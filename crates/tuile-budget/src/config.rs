@@ -61,20 +61,11 @@ pub struct Relaxation {
     /// Rise of the scale per second while the protected set exceeds
     /// `target + overflow` (thousandths: 1000 = +1.0 per second).
     pub up_per_second: u32,
-    /// Decay per second while every class is under its low watermark.
+    /// Decay per second while every class's protected bytes fit under its
+    /// target less the present need's reserve (`regulator`).
     pub down_per_second: u32,
     /// The ceiling of the scale (thousandths: 8000 = ×8).
     pub max_scale: u32,
-}
-
-/// Eviction hysteresis, in percent of the target: a sweep starts above `high`
-/// and stops at `low`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Watermarks {
-    /// Percent of the target above which a sweep starts.
-    pub high_percent: u8,
-    /// Percent of the target a sweep trims down to.
-    pub low_percent: u8,
 }
 
 /// The fractions of the configured targets kept under each [`Pressure`](super::Pressure)
@@ -185,8 +176,6 @@ pub struct BudgetConfig {
     pub load_timeout: Micros,
     /// LOD relaxation under overflow.
     pub relax: Relaxation,
-    /// Eviction hysteresis.
-    pub watermarks: Watermarks,
     /// Target fractions under memory pressure.
     pub pressure: PressureFractions,
     /// The coarse floor (terrain and imagery): levels `0..=pinned_level` are
@@ -288,10 +277,6 @@ impl BudgetConfig {
                 down_per_second: 250,
                 max_scale: 8_000,
             },
-            watermarks: Watermarks {
-                high_percent: 100,
-                low_percent: 90,
-            },
             pressure: PressureFractions {
                 warning_percent: 50,
                 critical_percent: 25,
@@ -336,10 +321,6 @@ impl BudgetConfig {
                 down_per_second: 0,
                 max_scale: 1_000,
             },
-            watermarks: Watermarks {
-                high_percent: 100,
-                low_percent: 100,
-            },
             pressure: PressureFractions {
                 warning_percent: 100,
                 critical_percent: 100,
@@ -373,13 +354,6 @@ impl BudgetConfig {
 
     /// Checks the numbers are coherent.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let w = self.watermarks;
-        if w.low_percent > w.high_percent || w.high_percent > 100 {
-            return Err(ConfigError::Watermarks {
-                low: w.low_percent,
-                high: w.high_percent,
-            });
-        }
         if self.request_heap == 0 {
             return Err(ConfigError::ZeroRequestHeap);
         }

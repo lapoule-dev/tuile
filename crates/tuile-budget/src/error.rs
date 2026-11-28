@@ -9,14 +9,6 @@ use super::types::{Class, ResourceId};
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConfigError {
-    /// `low > high`, or `high > 100`.
-    #[error("watermarks out of order: low {low}% high {high}%")]
-    Watermarks {
-        /// The low watermark.
-        low: u8,
-        /// The high watermark.
-        high: u8,
-    },
     /// A request heap of zero schedules nothing.
     #[error("the request heap is empty")]
     ZeroRequestHeap,
