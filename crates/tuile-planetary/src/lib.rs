@@ -2098,8 +2098,10 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
         let coord = TileCoord::new(z, x, y);
         let qm = self.terrain_mesh(coord).await?;
         // The header already carries the tile's relief, so the surface a camera
-        // is clamped against sharpens for free as the globe refines.
-        self.heights.record(coord, qm.header.max_height);
+        // is clamped against sharpens for free as the globe refines, and so do
+        // the tree's bounding volumes (`TerrainTree::height_range`).
+        self.heights
+            .record_range(coord, qm.header.min_height, qm.header.max_height);
         let rect = self.scheme.tile_rect(coord);
         // Skirts, at the size both reference implementations use. `mesh.edges`
         // arrives in whatever order the server wrote it, and `append_skirts`
@@ -2406,11 +2408,14 @@ where
     let deepest_useful = opts
         .max_level
         .unwrap_or_else(|| imagery.tiling_scheme().maximum_level);
+    // The decoded height ranges bound the tree's volumes: the loader records
+    // each tile's, the tree reads them (`TerrainTree::with_heights`).
+    let heights = Arc::new(TerrainHeights::new(scheme));
     let tree: Box<dyn TileTree> = Box::new(
         TerrainTree::with_availability(layer, Arc::clone(&availability))
-            .with_max_level(deepest_useful),
+            .with_max_level(deepest_useful)
+            .with_heights(Arc::clone(&heights)),
     );
-    let heights = Arc::new(TerrainHeights::new(scheme));
     let (cache, meshes) = (opts.imagery_cache(), opts.mesh_cache());
     let substitute = opts.substitute.clone().map(|s| SubstituteLane {
         provider: s.0,

@@ -176,6 +176,12 @@ impl TileTree for Covered<'_> {
     fn covers_ground(&self, id: TileId) -> bool {
         self.tree.covers_ground(id)
     }
+    fn can_refine(&self, id: TileId) -> bool {
+        self.tree.can_refine(id)
+    }
+    fn prior_properties(&self, id: TileId) -> TileProperties {
+        self.tree.prior_properties(id)
+    }
     fn defer_edits(&self) {
         self.tree.defer_edits();
     }

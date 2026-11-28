@@ -50,19 +50,26 @@ use tuile_film::ground::Ground;
 /// And again with the skirts at the references' rule (`LEVELS_OF_REACH`
 /// 0): the pack's skirt depths move, so its digest; its size, the
 /// selections and every frame's ground are the same.
+/// And again with each terrain tile's volume made of its parent's decoded
+/// height range rather than the global -1000..9000 m: the
+/// eye no longer sits inside the column over the ground under it, so that
+/// ground is no longer refined to the bottom of the tree. 248 tiles a frame
+/// become about 120, the deepest level 19 becomes 16, the pack 247 472
+/// bytes becomes 81 384; the selections, the pack and every frame's ground
+/// (read from coarser tiles) move. The same line came out of every run.
 const RECORDED: &str = concat!(
-    "{\"frames\":12,\"viewport\":[960,540],\"scene\":\"cb6dbb6b0f25b499\",\"pack_sha256\":\"b7c9",
-    "d35578f344ca459bedcbe6a7359e54ac9f9aa1c76daf121219209d10d02a\",\"pack_bytes\":24747",
-    "2,\"survey_selections\":[\"234d658eb1bc893d\",\"e1996e439b9e1a5a\",\"a228670483cb67ad\",",
-    "\"ed15d6e63102e802\",\"12affd49c30bbe38\",\"82b539bfc86dadcd\",\"94e9a6652bdb0814\",\"978",
-    "e4f34d3fdbc87\",\"a70812ed2b993543\",\"fe08c3a03d1cac80\",\"c2f73448bb9bab96\",\"0354ec6",
-    "05271e8c8\"],\"grounds\":[\"41ef35e9ac9beed8\",\"738744d005755792\",\"f6878e21cca4a5d5\",",
-    "\"f34e250855f7e60c\",\"b474d80745827c16\",\"1db1d149f3a98d91\",\"a87838404bf2ffbd\",\"9e6",
-    "179bc49716b7f\",\"defff811dd2fe618\",\"e3b864ac882bc92f\",\"fa6b053081bf2102\",\"354138c",
-    "150626494\"],\"bake_selections\":[\"4c4f3f214ce50df5\",\"00fe1b70e5159359\",\"8b6b14595b",
-    "6c9c9e\",\"8ff7c05bc1353ec1\",\"f6246a7d9dbf8c9e\",\"7e0cd6ba39db57eb\",\"c457b1672e8ecd",
-    "d2\",\"d798edc2a98f0319\",\"5086f159bcdddc29\",\"702b40b81f82f2b6\",\"c2f73448bb9bab96\",",
-    "\"0354ec605271e8c8\"]}",
+    "{\"frames\":12,\"viewport\":[960,540],\"scene\":\"cb6dbb6b0f25b499\",\"pack_sha256\":\"4",
+    "4aa812ad2bd9ad44f23062a635a9936e183f58f7cee0a1542ea61aece93fbf2\",\"pack_bytes\":81384,\"",
+    "survey_selections\":[\"695dfb50e1629ca4\",\"fa2ea7dfb3590923\",\"d67c0f3a55b4823b\",\"d6",
+    "7c0f3a55b4823b\",\"d87843c3f9c106a3\",\"0577ebb7dd71ddfc\",\"d665b9a09809e3a4\",\"40a650",
+    "076e0f2011\",\"40a650076e0f2011\",\"3aa047c5e32091d5\",\"107f35b921999aaf\",\"107f35b921",
+    "999aaf\"],\"grounds\":[\"caf4264263cf1ea6\",\"461d5c14c2b2ffd9\",\"43358125717c151f\",\"",
+    "fb3990667f2e2b51\",\"546e2e370b959614\",\"09cec59def24161f\",\"8519c892c66071de\",\"3165",
+    "263121bb4880\",\"8437f7cd2e296373\",\"ff6cbf5dd127a039\",\"ccc00947a070c350\",\"91ec0424",
+    "3af1a96c\"],\"bake_selections\":[\"d230e4cf0d49dd86\",\"792210c85473191b\",\"dbc11687c65",
+    "471cb\",\"dbc11687c65471cb\",\"0577ebb7dd71ddfc\",\"0577ebb7dd71ddfc\",\"d665b9a09809e3a",
+    "4\",\"40a650076e0f2011\",\"40a650076e0f2011\",\"3aa047c5e32091d5\",\"107f35b921999aaf\",",
+    "\"107f35b921999aaf\"]}",
 );
 
 /// Places a side the ground's height is read at, each frame.
