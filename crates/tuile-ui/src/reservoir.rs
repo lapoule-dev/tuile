@@ -40,6 +40,8 @@ pub struct ReservoirEye {
     /// ([`drawn_outside`]), and outside it and the host's views too.
     pub outside_present: Vec<Outside>,
     pub outside_any: Vec<Outside>,
+    /// Whether the tile picked is inside the present view's frustum.
+    pub selected_in_view: Option<bool>,
 }
 
 /// The plan's half-extent, in tiles of the level shown.
@@ -175,6 +177,123 @@ pub struct Outside {
 /// sphere does not know. The test is only ever a "surely outside".
 const RELIEF_M: f64 = 60.0;
 
+/// Whether the terrain tile `(level, x, y)` is inside one of `views`'
+/// frusta, as a sphere about its ground centre ([`RELIEF_M`]).
+pub fn tile_in_views(tile: (u32, u64, u64), views: &[tuile_core::traversal::ViewState]) -> bool {
+    use tuile_core::geo::{geodetic_to_ecef, Geodetic};
+    use tuile_core::math::{BoundingVolume, Sphere};
+    const R: f64 = 6_371_000.0;
+    let (w, s, e, n) = tile_rect(tile.0, tile.1, tile.2);
+    let (lon, lat) = ((w + e) / 2.0, (s + n) / 2.0);
+    let half = 0.5 * ((n - s) * R).hypot((e - w) * R * lat.cos());
+    let volume = BoundingVolume::Sphere(Sphere {
+        center: geodetic_to_ecef(Geodetic { lon, lat, height: 0.0 }),
+        radius: half + RELIEF_M,
+    });
+    views.iter().any(|v| volume.intersects_frustum(v.frustum()))
+}
+
+/// The outline of a picked tile for the main view, and its arrow when the
+/// tile is out of the frame: lines in the overlay, never the ground's mesh.
+#[derive(Debug, Clone, Default)]
+pub struct Outline {
+    pub mesh: Mesh,
+    pub labels: Vec<crate::Label>,
+}
+
+/// Draws the outline of terrain tile `tile` in `colour`, for a frame of
+/// `size` device pixels. `project` takes `(lon, lat)` on the ground to the
+/// pixel it lands on (`None` behind the eye), unclipped. A tile with no
+/// edge point in the frame gets an arrow at the frame's edge toward it,
+/// with `distance_m`.
+pub fn outline(
+    tile: (u32, u64, u64),
+    colour: [f32; 4],
+    project: &dyn Fn(f64, f64) -> Option<(f64, f64)>,
+    size: (f64, f64),
+    distance_m: f64,
+    scale: f64,
+) -> Outline {
+    const STEPS: usize = 8;
+    let (w, s, e, n) = tile_rect(tile.0, tile.1, tile.2);
+    let corners = [(w, s), (e, s), (e, n), (w, n)];
+    let mut ring: Vec<(f64, f64)> = Vec::new();
+    for i in 0..4 {
+        let (a, b) = (corners[i], corners[(i + 1) % 4]);
+        for k in 0..STEPS {
+            let t = k as f64 / STEPS as f64;
+            ring.push((a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t));
+        }
+    }
+    let px: Vec<Option<(f64, f64)>> = ring.iter().map(|&(lo, la)| project(lo, la)).collect();
+    let inside = |q: (f64, f64)| q.0 >= 0.0 && q.1 >= 0.0 && q.0 <= size.0 && q.1 <= size.1;
+    let mut out = Outline::default();
+    let width = 2.0 * scale.max(1.0);
+    let quad = |mesh: &mut Mesh, a: (f64, f64), b: (f64, f64), w: f64| {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let l = dx.hypot(dy);
+        if l < 1e-6 || l > 1.0e5 {
+            return;
+        }
+        let (nx, ny) = (-dy / l * w / 2.0, dx / l * w / 2.0);
+        let v = |x: f64, y: f64| crate::Vertex::new(x, y, colour);
+        for q in [
+            (a.0 + nx, a.1 + ny),
+            (b.0 + nx, b.1 + ny),
+            (a.0 - nx, a.1 - ny),
+            (a.0 - nx, a.1 - ny),
+            (b.0 + nx, b.1 + ny),
+            (b.0 - nx, b.1 - ny),
+        ] {
+            mesh.push(v(q.0, q.1));
+        }
+    };
+    for i in 0..px.len() {
+        if let (Some(a), Some(b)) = (px[i], px[(i + 1) % px.len()]) {
+            quad(&mut out.mesh, a, b, width);
+        }
+    }
+    if px.iter().flatten().any(|&q| inside(q)) {
+        return out;
+    }
+    // Out of the frame: an arrow at its edge, toward the tile's centre.
+    let centre = project((w + e) / 2.0, (s + n) / 2.0);
+    let (cx, cy) = (size.0 / 2.0, size.1 / 2.0);
+    let (mut dx, mut dy) = centre.map_or((0.0, 1.0), |c| (c.0 - cx, c.1 - cy));
+    let l = dx.hypot(dy);
+    if l < 1e-6 {
+        (dx, dy) = (0.0, 1.0);
+    } else {
+        (dx, dy) = (dx / l, dy / l);
+    }
+    let margin = 28.0 * scale.max(1.0);
+    let t = ((cx - margin) / dx.abs().max(1e-9)).min((cy - margin) / dy.abs().max(1e-9));
+    let tip = (cx + dx * t, cy + dy * t);
+    let k = 14.0 * scale.max(1.0);
+    let back = (tip.0 - dx * k * 1.6, tip.1 - dy * k * 1.6);
+    let side = (-dy * k, dx * k);
+    for q in [tip, (back.0 + side.0, back.1 + side.1), (back.0 - side.0, back.1 - side.1)] {
+        out.mesh.push(crate::Vertex::new(q.0, q.1, colour));
+    }
+    let text = if distance_m >= 1000.0 {
+        format!("{:.1} km", distance_m / 1000.0)
+    } else {
+        format!("{distance_m:.0} m")
+    };
+    let px_size = (12.0 * scale.max(1.0)) as f32;
+    let mask = Font::bundled().rasterize(&text, px_size);
+    let (mw, mh) = (f64::from(mask.width), f64::from(mask.height));
+    out.labels.push(crate::Label {
+        mask,
+        position: [
+            (back.0 - dx * k * 0.5 - mw / 2.0).round() as f32,
+            (back.1 - dy * k * 0.5 - mh / 2.0).round() as f32,
+        ],
+        color: colour,
+    });
+    out
+}
+
 /// The terrain tiles marked drawn in `report`, by level, and how many of
 /// them are outside all of `views`' frusta. A tile is a sphere about its
 /// ground centre, the radius its half diagonal and [`RELIEF_M`]: a tile
@@ -213,8 +332,84 @@ pub fn drawn_outside(
     out.into_values().collect()
 }
 
+/// Why a tile is held and not drawn, as the budget's report says it: the
+/// urgency tier that ranked it this step, or that nothing did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Why {
+    /// The prefetch ring (the need's ring membership).
+    Ring,
+    /// A preloaded ancestor of the drawn cut.
+    Ancestor,
+    /// The pinned coarse floor.
+    Floor,
+    /// Ranked for another reason: a hole, a blocker, a drape, a refresh.
+    Other,
+    /// Held, no longer wanted by any need: left from an older one.
+    LeftOver,
+    /// Held and wanted or kept, not ranked for loading this step.
+    Unranked,
+}
+
+impl Why {
+    pub const ALL: [Why; 6] = [
+        Why::Ring,
+        Why::Ancestor,
+        Why::Floor,
+        Why::Other,
+        Why::LeftOver,
+        Why::Unranked,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Why::Ring => "ring",
+            Why::Ancestor => "ancestors",
+            Why::Floor => "floor",
+            Why::Other => "other",
+            Why::LeftOver => "left over",
+            Why::Unranked => "unranked",
+        }
+    }
+}
+
+/// The reason a tile held and not drawn is held; `None` for a tile that is
+/// drawn or not held.
+pub fn why(t: &RingTile) -> Option<Why> {
+    use tuile_core::budget::priority::Urgency as U;
+    match t.state {
+        RingState::Floor => return Some(Why::Floor),
+        RingState::Left => return Some(Why::LeftOver),
+        RingState::Kept | RingState::Wanted => {}
+        _ => return None,
+    }
+    Some(match t.urgency {
+        Some(U::Ring) => Why::Ring,
+        Some(U::Ancestor) => Why::Ancestor,
+        Some(U::Floor) => Why::Floor,
+        Some(_) => Why::Other,
+        None => Why::Unranked,
+    })
+}
+
+/// The held, undrawn terrain tiles by reason.
+pub fn why_counts(report: &HeldReport) -> [(Why, usize); 6] {
+    Why::ALL.map(|w| {
+        (
+            w,
+            report
+                .ring
+                .iter()
+                .filter(|t| t.class == Class::TerrainMesh && why(t) == Some(w))
+                .count(),
+        )
+    })
+}
+
 /// The urgency tier that ranked a resource, in words.
 pub fn reason(t: &RingTile) -> &'static str {
+    if t.state == RingState::Left {
+        return "left over from an older need (no longer wanted)";
+    }
     use tuile_core::budget::priority::Urgency as U;
     match t.urgency {
         Some(U::Floor) => "the floor",
@@ -291,6 +486,29 @@ fn seg(p: &mut Painter<'_>, a: (f64, f64), b: (f64, f64), w: f64, c: [f32; 4]) {
     p.tri([(a.0 - nx, a.1 - ny), (b.0 + nx, b.1 + ny), (b.0 - nx, b.1 - ny)], c);
 }
 
+/// A frame of width `w` just inside `r`.
+fn frame(p: &mut Painter<'_>, r: (f64, f64, f64, f64), w: f64, c: [f32; 4]) {
+    p.rect(r.0, r.1, r.2 - r.0, w, c);
+    p.rect(r.0, r.3 - w, r.2 - r.0, w, c);
+    p.rect(r.0, r.1, w, r.3 - r.1, c);
+    p.rect(r.2 - w, r.1, w, r.3 - r.1, c);
+}
+
+/// The mark of a reason on a cell: a white frame for the ring, an orange
+/// one for the ancestors, a dark square for what is left over. Never a
+/// fill: the score's colour stays under it.
+fn mark(p: &mut Painter<'_>, why: Option<Why>, r: (f64, f64, f64, f64)) {
+    match why {
+        Some(Why::Ring) => frame(p, r, 1.5, srgb(0xFFFFFF, 1.0)),
+        Some(Why::Ancestor) => frame(p, r, 1.5, srgb(0xE69F00, 1.0)),
+        Some(Why::LeftOver) => {
+            let (w, h) = (r.2 - r.0, r.3 - r.1);
+            p.rect(r.0 + w * 0.35, r.1 + h * 0.35, w * 0.3, h * 0.3, srgb(0x101010, 0.85));
+        }
+        _ => {}
+    }
+}
+
 fn clamp_rect(r: (f64, f64, f64, f64), lo: (f64, f64), hi: (f64, f64)) -> Option<(f64, f64, f64, f64)> {
     let (x0, y0, x1, y1) = (r.0.max(lo.0), r.1.max(lo.1), r.2.min(hi.0), r.3.min(hi.1));
     (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
@@ -303,6 +521,7 @@ pub fn draw(
     report: Option<&HeldReport>,
     eye: Option<&ReservoirEye>,
     level: Option<u32>,
+    selected: Option<(u32, u64, u64)>,
     cache: &mut TextCache,
     scale: f64,
 ) -> Drawing {
@@ -369,7 +588,20 @@ pub fn draw(
         EM - 1.0,
         dim,
     );
-    let top = top + 44.0;
+    let held_why = why_counts(report)
+        .iter()
+        .filter(|(_, c)| *c > 0)
+        .map(|(w, c)| format!("{} {c}", w.label()))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    p.text(
+        MARGIN,
+        MARGIN + 98.0,
+        &format!("held, not drawn, by reason: {held_why} — marks: white frame ring, orange frame ancestors, dark square left over"),
+        EM - 1.0,
+        dim,
+    );
+    let top = top + 58.0;
     let Some(shown) = shown else {
         p.text(left, top, "no terrain tile drawn yet", EM, dim);
         return finish(p, scale);
@@ -459,7 +691,11 @@ pub fn draw(
             match tiles.get(&(shown, gx, gy)) {
                 Some(t) => {
                     p.rect(x0, y0, x1 - x0, y1 - y0, state_colour(t.state, t.terms.score));
-                    p.hit(x0, y0, x1 - x0, y1 - y0, legend_of(t, (shown, gx, gy)));
+                    mark(&mut p, why(t), (x0, y0, x1, y1));
+                    if selected == Some((shown, gx, gy)) {
+                        frame(&mut p, (x0, y0, x1, y1), 2.5, srgb(0xF0E442, 1.0));
+                    }
+                    p.hit_tile(x0, y0, x1 - x0, y1 - y0, legend_of(t, (shown, gx, gy)), (shown, gx, gy));
                 }
                 None => p.rect(x0, y0, x1 - x0, y1 - y0, srgb(0x262626, 1.0)),
             }
@@ -519,7 +755,7 @@ pub fn draw(
             Some(t) => {
                 p.rect(sx + 34.0, y + 1.0, 26.0, ROW - 4.0, state_colour(t.state, t.terms.score));
                 p.text(sx + 68.0, y, &format!("{} · score {}", t.state.label(), t.terms.score), EM, dim);
-                p.hit(sx, y, SECTION, ROW, legend_of(t, (l, x, yy)));
+                p.hit_tile(sx, y, SECTION, ROW, legend_of(t, (l, x, yy)), (l, x, yy));
             }
             None => {
                 p.rect(sx + 34.0, y + 1.0, 26.0, ROW - 4.0, srgb(0x262626, 1.0));
@@ -528,8 +764,24 @@ pub fn draw(
         }
         y += ROW;
     }
+    if let Some((sl, sx_, sy_)) = selected {
+        let line = match tiles.get(&(sl, sx_, sy_)) {
+            Some(t) => format!(
+                "selected {sl}/{sx_}/{sy_}: {} — {}{}",
+                t.state.label(),
+                if t.state == RingState::Drawn { "drawn" } else { "not drawn: outline only in the view" },
+                match eye.and_then(|e| e.selected_in_view) {
+                    Some(true) => ", in the view",
+                    Some(false) => ", out of the view (arrow at the edge)",
+                    None => "",
+                }
+            ),
+            None => format!("selected {sl}/{sx_}/{sy_}: not held"),
+        };
+        p.text(left, plan_top + PLAN + 8.0, &line, EM, srgb(0xF0E442, 1.0));
+    }
     // The legend.
-    let mut ly = plan_top + PLAN + 12.0;
+    let mut ly = plan_top + PLAN + 28.0;
     let mut lx = left;
     for (c, label) in [
         (srgb(DRAWN, 1.0), "drawn"),
@@ -685,6 +937,45 @@ mod tests {
         glam::DVec2::new(1600.0, 900.0)
     }
 
+    /// A picked tile held and not drawn still gets its outline in the main
+    /// view; out of the frame it gets an arrow and its distance.
+    #[test]
+    fn a_picked_tile_has_an_outline_or_an_edge_arrow() {
+        let l = 12;
+        let (x, y) = tile_at(l, 0.1, 0.6);
+        let (w, s, e, n) = tile_rect(l, x, y);
+        let (lon0, lat0) = ((w + e) / 2.0, (s + n) / 2.0);
+        let k = 1.0 / (e - w); // one tile is one pixel wide per k
+        let at = |dx: f64| {
+            move |lon: f64, lat: f64| {
+                Some((200.0 + (lon - lon0) * k * 100.0 + dx, 150.0 - (lat - lat0) * k * 100.0))
+            }
+        };
+        let seen = outline((l, x, y), score_colour(5), &at(0.0), (400.0, 300.0), 900.0, 1.0);
+        assert_eq!(seen.mesh.len(), 4 * 8 * 6, "four edges, eight segments each, two triangles");
+        assert!(seen.labels.is_empty());
+        let off = outline((l, x, y), score_colour(5), &at(5_000.0), (400.0, 300.0), 2_500.0, 1.0);
+        assert_eq!(off.labels.len(), 1, "the distance is written at the arrow");
+        assert!(off.mesh.len() > 3, "the arrow is drawn");
+        assert!(off.mesh.iter().rev().take(3).all(|v| v.position[0] > 200.0), "it points toward the tile");
+    }
+
+    /// The reasons of held tiles come from the published urgency.
+    #[test]
+    fn a_held_tile_has_the_reason_the_report_gives() {
+        use tuile_core::budget::priority::Urgency;
+        let mut t = tile(10, 1, 1, RingState::Wanted, 7);
+        assert_eq!(why(&t), Some(Why::Unranked));
+        t.urgency = Some(Urgency::Ring);
+        assert_eq!(why(&t), Some(Why::Ring));
+        t.urgency = Some(Urgency::Ancestor);
+        assert_eq!(why(&t), Some(Why::Ancestor));
+        t.state = RingState::Left;
+        assert_eq!(why(&t), Some(Why::LeftOver));
+        t.state = RingState::Drawn;
+        assert_eq!(why(&t), None);
+    }
+
     /// The drawing carries one region per tile with its score in the legend,
     /// and shows the ring and the drawn tiles apart.
     #[test]
@@ -703,12 +994,12 @@ mod tests {
             ..ReservoirEye::default()
         };
         let mut cache = TextCache::default();
-        let d = draw(Some(&r), Some(&eye), None, &mut cache, 1.0);
+        let d = draw(Some(&r), Some(&eye), None, None, &mut cache, 1.0);
         assert!(d.hits.iter().any(|h| h.lines.iter().any(|l| l.text.contains("score 123456"))));
         assert!(d.hits.iter().any(|h| h.lines[0].text.contains("held, wanted")));
         assert!(d.hits.iter().any(|h| h.lines[0].text.contains("drawn")));
         // Waiting for a report draws a line, not a plan.
-        let none = draw(None, None, None, &mut cache, 1.0);
+        let none = draw(None, None, None, None, &mut cache, 1.0);
         assert!(none.hits.is_empty());
     }
 }

@@ -487,7 +487,12 @@ impl App {
                 tuile_ui::reservoir::drawn_outside(&r, &all),
             )
         });
+        let selected_in_view = self
+            .budget_window
+            .selected()
+            .map(|t| tuile_ui::reservoir::tile_in_views(t, &all[..present]));
         Some(tuile_ui::reservoir::ReservoirEye {
+            selected_in_view,
             outside_present,
             outside_any,
             lon: g.lon,
@@ -892,6 +897,7 @@ mod tests {
             .expect("a row with a legend")
             .clone();
         let blank = Hit {
+            pick: None,
             rect: row.rect,
             lines: vec![
                 Legend {

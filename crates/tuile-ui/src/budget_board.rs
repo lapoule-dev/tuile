@@ -67,6 +67,9 @@ pub struct Hit {
     /// Left, top, width, height, device pixels.
     pub rect: [f64; 4],
     pub lines: Vec<Legend>,
+    /// The terrain tile `(level, x, y)` a click on it picks (the
+    /// reservoir's cells); none for the board's regions.
+    pub pick: Option<(u32, u64, u64)>,
 }
 
 /// One line of a legend: its swatch, as drawn on the board, and its words.
@@ -668,7 +671,16 @@ impl Painter<'_> {
         self.hits.push(Hit {
             rect: [x * k, y * k, w * k, h * k],
             lines,
+            pick: None,
         });
+    }
+
+    /// As [`Self::hit`], a click on it picks `tile`.
+    pub(crate) fn hit_tile(&mut self, x: f64, y: f64, w: f64, h: f64, lines: Vec<Legend>, tile: (u32, u64, u64)) {
+        self.hit(x, y, w, h, lines);
+        if let Some(last) = self.hits.last_mut() {
+            last.pick = Some(tile);
+        }
     }
 
     pub(crate) fn grow(&mut self, x: f64, y: f64) {
@@ -3079,6 +3091,9 @@ pub struct BoardControl {
     bar: Option<Scrollbar>,
     regions: usize,
     view: f64,
+    /// The last drawing's cells a click picks, and the tile picked.
+    tiles: Vec<([f64; 4], (u32, u64, u64))>,
+    picked: Option<(u32, u64, u64)>,
 }
 
 impl BoardControl {
@@ -3104,6 +3119,16 @@ impl BoardControl {
                     (x, y)
                 };
                 self.pointer = Some((x, y));
+                let cell = self
+                    .tiles
+                    .iter()
+                    .rev()
+                    .find(|(r, _)| x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3])
+                    .map(|(_, t)| *t);
+                if let (Some(t), None) = (cell, self.bar.filter(|b| b.on_track((x, y)))) {
+                    // A second click on the tile picked lets it go.
+                    self.picked = if self.picked == Some(t) { None } else { Some(t) };
+                }
                 if let Some(bar) = self.bar.filter(|b| b.on_track((x, y))) {
                     let (top, h) = bar.thumb;
                     let grab = if (top..top + h).contains(&y) {
@@ -3133,7 +3158,10 @@ impl BoardControl {
                         (Some(i), _) => (i + n - 1) % n,
                     });
                 }
-                BoardKey::Clear => self.focus = None,
+                BoardKey::Clear => {
+                    self.focus = None;
+                    self.picked = None;
+                }
                 BoardKey::PageDown => self.offset += self.view * 0.9,
                 BoardKey::PageUp => self.offset -= self.view * 0.9,
                 BoardKey::Top => self.offset = 0.0,
@@ -3174,6 +3202,11 @@ impl BoardControl {
         let focused = self.focus.and_then(|i| d.hits.get(i).cloned());
         let (mut d, bar) = fit(d, frame, &mut self.offset, scale);
         self.bar = bar;
+        self.tiles = d
+            .hits
+            .iter()
+            .filter_map(|h| h.pick.map(|t| (h.rect, t)))
+            .collect();
         self.regions = regions;
         self.view = f64::from(frame.1);
         let shown = match focused {
@@ -3189,6 +3222,11 @@ impl BoardControl {
             tooltip(&mut d, &h, frame, cache, scale);
         }
         d
+    }
+
+    /// The tile a click picked, until a second click or a clear.
+    pub fn picked(&self) -> Option<(u32, u64, u64)> {
+        self.picked
     }
 
     /// Whether the content is taller than the window: a bar is drawn.

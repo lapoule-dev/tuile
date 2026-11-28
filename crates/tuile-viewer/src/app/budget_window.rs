@@ -86,6 +86,8 @@ pub(super) struct BudgetWindow {
     reservoir_level: Option<u32>,
     /// The camera, for the reservoir's plan.
     eye: Option<tuile_ui::reservoir::ReservoirEye>,
+    /// The tile a click picked in the reservoir: outlined in the view.
+    selected: Option<(u32, u64, u64)>,
 }
 
 impl BudgetWindow {
@@ -134,6 +136,11 @@ impl BudgetWindow {
         // The budget lists the reservoir's tiles only while a window shows
         // it: a session without the view pays nothing for it.
         tuile_core::metrics::want_reservoir(self.shown && self.reservoir);
+    }
+
+    /// The tile picked in the reservoir, if it is shown.
+    pub(super) fn selected(&self) -> Option<(u32, u64, u64)> {
+        (self.shown && self.reservoir).then_some(self.selected).flatten()
     }
 
     /// Whether the reservoir is what the window shows.
@@ -199,7 +206,9 @@ impl BudgetWindow {
     pub(super) fn input(&mut self, input: tuile_ui::budget_board::BoardInput) -> bool {
         use tuile_ui::budget_board::BoardKey as K;
         self.laid = None;
-        let asked = match self.control.input(input) {
+        let key = self.control.input(input);
+        self.selected = self.control.picked();
+        let asked = match key {
             Some(K::Tables) => WindowAsk::Tables(!self.tables),
             Some(K::Cumulative) => WindowAsk::Cumulative(!self.cumulative),
             Some(K::Reset) => WindowAsk::Reset,
@@ -299,6 +308,7 @@ impl BudgetWindow {
                 signals.and_then(|s| s.score_held.as_ref()),
                 self.eye.as_ref(),
                 self.reservoir_level,
+                self.selected,
                 texts,
                 scale,
             );
