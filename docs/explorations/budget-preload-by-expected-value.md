@@ -16,9 +16,7 @@ garde intacts les lois absolues de `budget-eviction-prefetch-spec.md` §2.1, la 
 §1b (le flouz) et la mécanique du §1c. Il précise la loi 8 (quotas) et la loi 2b (voisinage
 grossier), qui ne sont pas appliquées aujourd'hui.
 
-Il ne traite **pas** du point 3 du plan du 2026-11-23 (le besoin évalué à `t + L` pour
-compenser le retard). C'est un chantier distinct, qu'il ne remplace pas. Le §2.5 n'en fixe
-que la définition, la garde et la composition avec le préchargement.
+Le forecast de la caméra (la pose à afficher dans les N prochaines secondes) est un trait exposé par l'hôte, traité dans un document séparé (docs/explorations/camera-forecast-trait.md, branche feat/camera-forecast-trait) ; ce document-ci n'en dépend pas et n'en fait pas dépendre le préchargement.
 
 Légende des appuis : **[code]** vérifié dans l'arbre à d7ac8133 ; **[spec]** déjà écrit et
 validé par Laurent ; **[lit.]** une référence publiée (rapports `Bibliographie éviction et
@@ -120,14 +118,11 @@ lois 1–13 du spec. Les lois absolues du spec restent au-dessus de tout.
 
 - `k = 1..K` : les instants de l'horizon, `τ_k` secondes après maintenant. Ce sont les
   horizons de `PredictConfig` (aujourd'hui 0,25 / 0,5 / 1 / 2 s, `predict.rs:275`) **[code]**.
-  `τ_0 = L` est l'instant du **besoin** : la pose présente aujourd'hui (`L = 0`), la pose à
-  `t + L` une fois le chantier distinct du §2.5 livré. Il relève de la bande du besoin et
-  n'entre pas dans le préchargement. Seuls les instants `τ_k > L` sont du préchargement.
-  `H = τ_K`.
+  `τ_0 = 0` est la vue présente : elle relève du besoin présent et de sa propre bande,
+  inchangée. `H = τ_K`.
 - `Δt_k` : le poids de l'instant `k` (règle des trapèzes),
-  `Δt_k = (τ_{k+1} − τ_{k−1})/2`, avec `τ_{K+1} = τ_K`. On a `Σ_k Δt_k = H − (L + τ_1)/2`.
-  C'est la discrétisation de l'intégrale de l'objectif `J` du spec §1 sur `]L, H]` **[dérivé]**.
-  `[0, L]` appartient au besoin (§2.5).
+  `Δt_k = (τ_{k+1} − τ_{k−1})/2`, avec `τ_{K+1} = τ_K`. On a `Σ_k Δt_k = H − τ_1/2`. C'est
+  la discrétisation de l'intégrale de l'objectif `J` du spec §1 **[dérivé]**.
 - Pose prévue à `τ_k` : moyenne `μ_k` (5 canaux : est, nord, `ln h`, cap, tangage) et écarts
   types `σ_k` du filtre (`MotionModel::predict`) **[code]**. **Nouveau** : `σ_k` voyage dans
   `AheadView` (5 × `f32`). Aujourd'hui seule la moyenne voyage.
@@ -363,92 +358,6 @@ chargement ne les corrige. Ils relèvent de l'instrument géométrique de la loi
 | `Speculation.slots_permille`, `memory_permille` | **remplacés** | par la réserve de Little et l'échange (§3) |
 | `Urgency::Refresh` à 100 ‰ | **inchangé, signalé** | sans fondement, hors périmètre |
 | `Compress.probability_permille` (lit « le P progressif ») | **adapté** | il lit `max_k P_k` (une copie dessinée a `P = 1`) |
-
-### 2.5 Besoin à `t + L` (compensation du retard) : un chantier distinct
-
-**Ce n'est pas du préchargement.** C'est le point 3 du plan du 2026-11-23 (« décider sur la
-vue à `t + L` »), précisé par Laurent le 2026-11-28. Le **besoin** lui-même, ce qu'il faut
-avoir à l'écran, est évalué sur la pose de la caméra dans `L` (de l'ordre de 200 ms) au lieu
-de la pose présente. Le but est que ce qui est nécessaire soit déjà arrivé quand l'image qui
-en a besoin est affichée. Le préchargement (P1–P12) est un autre sujet : c'est un réservoir
-de maillages et de textures tenus en mémoire GPU, jamais affichés tant qu'aucune vue ne les
-sélectionne. Ce document ne remplace pas ce point du plan. Il en fixe seulement l'interface,
-pour que les deux se composent (§2.5.4).
-
-#### 2.5.1 Définition
-
-- **Pose du besoin.** C'est `p_L = μ(L)`, la moyenne du filtre à `L` (`MotionModel::predict(L)`)
-  **[code]**. Au repos, `p_L` = la pose présente, et rien ne change.
-- **Besoin décalé.** La traversée qui produit `drawn`, `blockers` et `ancestors`
-  (`State::need`, `runtime.rs:1598`) est faite sur `p_L` plutôt que sur la pose présente.
-  Ses voulus prennent les bandes du besoin présent (`Hole`, `Blocker`, `Drape`, `P = 1`),
-  parce qu'ils sont **certains à leur échéance** : c'est la définition même du besoin.
-- **Ce qui reste à la pose présente.** Le **dessin** (la sélection affichée à cette image)
-  et la **protection**, voir 2.5.3. La couverture immédiate reste aussi à la pose
-  présente : une place de la vue présente sans rien de dessinable reste un `Hole` de la vue
-  présente. Le décalage ne déplace que le raffinement, jamais la couverture.
-
-#### 2.5.2 Entrée enregistrée, conflation
-
-- **Rejouable.** `p_L` voyage comme une vue de `ClientMessage::Ahead`, à `in_us = L`. Elle
-  est calculée hors du décideur (`tuile-camera`) et enregistrée avec le pas, comme les vues
-  anticipées aujourd'hui (`BudgetEvent::Predictor`, l'événement qui enregistre les
-  paramètres du prédicteur) **[code]**. `L` est une donnée de la spécification, enregistrée.
-  Un rejeu redonne le même besoin, bit à bit.
-- **Conflation** (plan §3). La traversée du besoin décalé n'est refaite que si `p_L` a assez
-  bougé. Le seuil se mesure dans l'unité de la traversée : la tuile de sol sous l'œil prévu
-  ou le niveau voulu sous lui changent, comme la clé de `Neighbourhood::update`
-  aujourd'hui. Elle est refaite au plus une fois par période en mouvement. Le dernier besoin
-  gagne : les voulus mis en file qui n'y sont plus sont retirés, et les chargements en vol
-  vont à leur terme. Le seuil et la période sont des nombres de la spécification, à régler
-  sur la mesure du travail par pas.
-
-#### 2.5.3 La garde : une erreur de prédiction coûte des chargements, jamais un trou
-
-L'ensemble protégé `Π` (G1) est calculé sur **l'union** de deux ensembles. Le premier
-comprend les tuiles dessinées à la pose **présente**, leur chaîne de repli, leurs groupes
-d'échange et le plancher épinglé. Le second comprend la même chose pour le besoin à `p_L`.
-Quoi que dise `p_L`, rien de ce qui est à l'écran maintenant ni de ce qui le couvre ne peut
-être relâché. La preuve de G1 s'applique telle quelle : `Π` ne lit pas la prédiction pour
-retirer quoi que ce soit, il ne fait que s'agrandir. Une pose prévue fausse produit des
-chargements à côté (gaspillés) et un raffinement de la vue présente en retard (déficit
-mesuré). Elle ne produit jamais un trou.
-
-#### 2.5.4 Composition avec le préchargement, sans double comptage
-
-- **Partage du temps.** Le besoin couvre `[0, L]` : il est certain à son échéance, avec
-  `P = 1`, dans sa bande. Le préchargement couvre `]L, H]` : instants `τ_k > L`, avec un `P`
-  calibré, dans la bande d'anticipation (§2.1). Aucun instant n'est compté deux fois.
-- **Partage des tuiles.** Une tuile voulue par le besoin décalé prend cette appartenance, et
-  elle est retirée de `C`. C'est déjà la règle d'aujourd'hui : « une tuile déjà dessinée,
-  bloqueur ou ancêtre garde cette appartenance » (`runtime.rs:1660-1689`) **[code]**. Sa
-  valeur est celle du besoin. Elle n'est pas augmentée par une valeur `V` en plus.
-- **Partage de la latence.** Le besoin décalé ne gagne rien si `L` est trop court pour le
-  chargement (le cas d'aujourd'hui, `L = 0`). Le préchargement prend en charge ce qui est au
-  delà, avec `F(τ_k)` comptée depuis maintenant.
-- **Quand `L = 0`**, le préchargement par valeur attendue fonctionne seul, tel que le
-  décrivent §2.2–§2.4. Le chantier du préchargement n'attend donc pas celui-ci.
-
-#### 2.5.5 Calibrer `L`, et ce qui se passe quand `L` est mauvais
-
-- **Calibration.** `L` doit couvrir ce qui sépare une décision de l'image qui en profite : le
-  temps du départ à l'arrivée **dessinable** (récupération, décodage, upload, encode), soit
-  l'histogramme de M1. Point de départ : `L = q50` de ce temps pour la classe dominante.
-  L'optimum est un compromis mesurable. Plus `L` est grand, plus de chargements arrivent à
-  temps, mais plus l'erreur de prédiction est grande (elle croît avec l'horizon,
-  `PredictionErrors`). On choisit `L` par un balayage (0, 100, 200, 300, 500 ms) qui
-  minimise `J` dans le simulateur recalé (§5.5), puis on le confirme sur Prometheus par
-  révision. Le « 200 ms » de Laurent et le « 500 ms » du plan sont deux points de ce balayage.
-- **`L` trop court.** On retombe vers aujourd'hui : du raffinement en retard, sans autre
-  dommage.
-- **`L` trop long, ou une prédiction fausse** (demi-tour brusque). Le besoin vise un endroit
-  où la caméra n'ira pas. On perd des chargements, de l'ordre de `L` de travail (plan §3,
-  risque), et la vue présente n'est raffinée qu'à travers sa couverture (bande `Hole`), donc
-  plus floue pendant environ `L`. Il n'y a pas de trou, par 2.5.3. Le filtre voit le
-  demi-tour en quelques images, `p_L` revient, et la conflation laisse le dernier besoin
-  gagner.
-- **Mesures** : `J`, tuiles sous le besoin à la pose **affichée** (pas à `p_L`), départs
-  gaspillés, et erreur de `p_L` (`PredictionErrors` à l'horizon `L`).
 
 ---
 
@@ -718,7 +627,6 @@ aucune décision.
 | **B2** | comportement | **ensemble candidat + score** : `σ` dans `AheadView`, `P_k` fermé, `Need.ahead[K]`, `V` et `U` par groupe de frères, `C_plancher` ; suppression de `neighbourhood.rs`, `A × D`, `Progressive`, `Anticipation`, `Proximity`, `rho` | T1, T2, T5–T8, T10, T11, T13 |
 | **B3** | comportement | **côté tenu** : le crédit de `Valuation` devient `L(r)` ; l'échange compare `V` et `L` en seaux, avec la borne basse contre la borne haute | T6 (version éviction), T9, T12 |
 | **R** | validation | références (a)–(c) de §5.2 dans `tuile-budget-sim` | acceptation 2 % |
-| **N1** | comportement, chantier distinct (§2.5) | besoin évalué à `p_L` (vue enregistrée), conflation, `Π` sur l'union présente ∪ `p_L`, `L` calibré par balayage sur M1 | demi-tour brusque à `L` = 500 ms : 0 trou (rouge si `Π` ne lit que `p_L`) ; balayage de `L` : `J(L*) < J(0)` |
 
 B2 est gros, mais il ne peut pas se couper sans interrupteur. Retirer le disque sans
 `C_plancher` casserait la loi 2b. Mettre `P_k` sans retirer `A × D` ferait deux scores en
@@ -787,25 +695,12 @@ même temps. C'est donc **un** changement de comportement, et on le prouve par l
 
 ## 9. Décisions demandées à Laurent
 
-- **D1. Deux chantiers : lequel en premier ?** *(corrigé le 2026-11-28 : la version
-  précédente confondait le besoin à `t + L` et le préchargement)*. Ce sont deux mécanismes
-  distincts qui se composent sans double comptage (§2.5.4). Le **besoin à `t + L`** compense
-  le retard sur ce qui doit être à l'écran, sur `[0, L]`, avec `P = 1`. Le **préchargement
-  par valeur attendue** remplit le réservoir pour `]L, H]`, avec un `P` calibré. Il reste à
-  décider de l'ordre. **Le plus sûr à implémenter en premier est le préchargement** (B1
-  puis B2), pour trois raisons :
-  - (a) il n'agit que dans la bande d'anticipation, derrière le besoin présent, avec les
-    preuves G1 et G2 : une erreur n'y coûte que des chargements de réservoir ;
-  - (b) le besoin à `t + L` change ce que l'écran reçoit, et une erreur dégrade la vue
-    présente pendant environ `L`, même sans trou. Il dépend en outre de `L`, donc de M1
-    (latence de bout en bout), qui n'est pas mesuré ;
-  - (c) à `L = 0`, le préchargement tient seul, et l'interface de composition (instants
-    `τ_k > L`) est déjà dans B2 : le besoin décalé viendra ensuite (PR N1) sans rien
-    refaire.
-
-  En sens contraire : le besoin décalé attaque directement le retard et coûte peu (une pose
-  de plus, conflationnée). S'il s'agit d'abord de corriger le retard visible, on peut
-  l'avancer juste après B1. **À trancher.**
+- **D1. Les `K` instants prévus, avec un `P` par tuile.** Le besoin reste la vue présente,
+  avec `P = 1` et sa bande. Le préchargement n'agit que derrière lui, sur les `K` instants
+  de l'horizon, avec un `P` par tuile, en anticipation. Les raisons : (a) une seule pose
+  prévue jetterait `σ` et l'échéance, donc `U` ; (b) c'est déjà la passe de #282, qui ne
+  coûte qu'une traversée de plus, bornée par `AHEAD_EVERY`, les ensembles sales et la
+  quantification. **À trancher.**
 - **D2. Le disque isotrope supprimé, remplacé par le plancher atteignable de P8, et la
   valeur de `G`.** `G` est la seule grandeur non mesurée de la loi : le flou toléré, en
   niveaux, pendant un geste imprévu de vitesse maximale. Je propose `G = 1`. `G = 0`
@@ -829,8 +724,7 @@ même temps. C'est donc **un** changement de comportement, et on le prouve par l
   `crates/tuile-camera/src/predict.rs` ; `crates/tuile-viewer/src/app/predicting.rs` ;
   `crates/tuile-budget-sim/tests/prediction.rs` ; `crates/tuile-budget/tests/budget_sim/net.rs`.
 - Documents : `budget-eviction-prefetch-spec.md` (§1, §1b, §1c, §2, §4, §5, §6.3) ;
-  `budget-progressive-coarse-preload.md` ; plan du 2026-11-23 §3 (le besoin à `t + L`,
-  chantier distinct, §2.5 ; non remplacé par ce document) ; `reports/anneau-du-budget.md`, `reports/cercles-concentriques.md`,
+  `budget-progressive-coarse-preload.md` ; `reports/anneau-du-budget.md`, `reports/cercles-concentriques.md`,
   `reports/Bibliographie éviction et préchargement.md`,
   `reports/Monnaie unique et approximations rapides.md`.
 - Littérature (niveaux de preuve tels que les rapports les donnent) : Patterson et al.,
