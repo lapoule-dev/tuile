@@ -676,7 +676,15 @@ impl Painter<'_> {
     }
 
     /// As [`Self::hit`], a click on it picks `tile`.
-    pub(crate) fn hit_tile(&mut self, x: f64, y: f64, w: f64, h: f64, lines: Vec<Legend>, tile: (u32, u64, u64)) {
+    pub(crate) fn hit_tile(
+        &mut self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        lines: Vec<Legend>,
+        tile: (u32, u64, u64),
+    ) {
         self.hit(x, y, w, h, lines);
         if let Some(last) = self.hits.last_mut() {
             last.pick = Some(tile);
@@ -739,7 +747,14 @@ impl Painter<'_> {
     }
 
     /// `text` ending at `right`.
-    pub(crate) fn text_right(&mut self, right: f64, y: f64, text: &str, size: f64, colour: [f32; 4]) {
+    pub(crate) fn text_right(
+        &mut self,
+        right: f64,
+        y: f64,
+        text: &str,
+        size: f64,
+        colour: [f32; 4],
+    ) {
         let w = self.width(text, size);
         self.text(right - w, y, text, size, colour);
     }
@@ -779,7 +794,15 @@ impl Painter<'_> {
 
     /// A bar of `w × h` at `(x, y)`: its track, then `parts` stacked from
     /// the left, each its share of `max`.
-    pub(crate) fn bar(&mut self, x: f64, y: f64, w: f64, h: f64, parts: &[(f64, [f32; 4])], max: f64) {
+    pub(crate) fn bar(
+        &mut self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        parts: &[(f64, [f32; 4])],
+        max: f64,
+    ) {
         self.rect(x, y, w, h, srgb(TRACK, 1.0));
         if max <= 0.0 {
             return;
@@ -3127,7 +3150,11 @@ impl BoardControl {
                     .map(|(_, t)| *t);
                 if let (Some(t), None) = (cell, self.bar.filter(|b| b.on_track((x, y)))) {
                     // A second click on the tile picked lets it go.
-                    self.picked = if self.picked == Some(t) { None } else { Some(t) };
+                    self.picked = if self.picked == Some(t) {
+                        None
+                    } else {
+                        Some(t)
+                    };
                 }
                 if let Some(bar) = self.bar.filter(|b| b.on_track((x, y))) {
                     let (top, h) = bar.thumb;

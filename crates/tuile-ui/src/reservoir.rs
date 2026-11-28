@@ -168,7 +168,12 @@ pub fn auto_level(report: &HeldReport, near: Option<(f64, f64)>) -> Option<u32> 
         .filter(|&(_, n)| n >= RING_MIN)
         .map(|(l, _)| l)
         .max()
-        .or_else(|| drawn.into_iter().max_by_key(|&(l, n)| (n, l)).map(|(l, _)| l))
+        .or_else(|| {
+            drawn
+                .into_iter()
+                .max_by_key(|&(l, n)| (n, l))
+                .map(|(l, _)| l)
+        })
 }
 
 /// How many terrain tiles marked drawn at one level lie outside the views:
@@ -196,7 +201,11 @@ pub fn tile_in_views(tile: (u32, u64, u64), views: &[tuile_core::traversal::View
     let (lon, lat) = ((w + e) / 2.0, (s + n) / 2.0);
     let half = 0.5 * ((n - s) * R).hypot((e - w) * R * lat.cos());
     let volume = BoundingVolume::Sphere(Sphere {
-        center: geodetic_to_ecef(Geodetic { lon, lat, height: 0.0 }),
+        center: geodetic_to_ecef(Geodetic {
+            lon,
+            lat,
+            height: 0.0,
+        }),
         radius: half + RELIEF_M,
     });
     views.iter().any(|v| volume.intersects_frustum(v.frustum()))
@@ -281,7 +290,11 @@ pub fn outline(
     let k = 14.0 * scale.max(1.0);
     let back = (tip.0 - dx * k * 1.6, tip.1 - dy * k * 1.6);
     let side = (-dy * k, dx * k);
-    for q in [tip, (back.0 + side.0, back.1 + side.1), (back.0 - side.0, back.1 - side.1)] {
+    for q in [
+        tip,
+        (back.0 + side.0, back.1 + side.1),
+        (back.0 - side.0, back.1 - side.1),
+    ] {
         out.mesh.push(crate::Vertex::new(q.0, q.1, colour));
     }
     let text = if distance_m >= 1000.0 {
@@ -419,6 +432,9 @@ pub fn reason(t: &RingTile) -> &'static str {
     if t.state == RingState::Left {
         return "left over from an older need (no longer wanted)";
     }
+    if t.state == RingState::Drawn {
+        return "drawn now; the tier it was wanted at is not its reason";
+    }
     use tuile_core::budget::priority::Urgency as U;
     match t.urgency {
         Some(U::Floor) => "the floor",
@@ -491,8 +507,22 @@ fn seg(p: &mut Painter<'_>, a: (f64, f64), b: (f64, f64), w: f64, c: [f32; 4]) {
         return;
     }
     let (nx, ny) = (-dy / n * w / 2.0, dx / n * w / 2.0);
-    p.tri([(a.0 + nx, a.1 + ny), (b.0 + nx, b.1 + ny), (a.0 - nx, a.1 - ny)], c);
-    p.tri([(a.0 - nx, a.1 - ny), (b.0 + nx, b.1 + ny), (b.0 - nx, b.1 - ny)], c);
+    p.tri(
+        [
+            (a.0 + nx, a.1 + ny),
+            (b.0 + nx, b.1 + ny),
+            (a.0 - nx, a.1 - ny),
+        ],
+        c,
+    );
+    p.tri(
+        [
+            (a.0 - nx, a.1 - ny),
+            (b.0 + nx, b.1 + ny),
+            (b.0 - nx, b.1 - ny),
+        ],
+        c,
+    );
 }
 
 /// A frame of width `w` just inside `r`.
@@ -512,13 +542,23 @@ fn mark(p: &mut Painter<'_>, why: Option<Why>, r: (f64, f64, f64, f64)) {
         Some(Why::Ancestor) => frame(p, r, 1.5, srgb(0xE69F00, 1.0)),
         Some(Why::LeftOver) => {
             let (w, h) = (r.2 - r.0, r.3 - r.1);
-            p.rect(r.0 + w * 0.35, r.1 + h * 0.35, w * 0.3, h * 0.3, srgb(0x101010, 0.85));
+            p.rect(
+                r.0 + w * 0.35,
+                r.1 + h * 0.35,
+                w * 0.3,
+                h * 0.3,
+                srgb(0x101010, 0.85),
+            );
         }
         _ => {}
     }
 }
 
-fn clamp_rect(r: (f64, f64, f64, f64), lo: (f64, f64), hi: (f64, f64)) -> Option<(f64, f64, f64, f64)> {
+fn clamp_rect(
+    r: (f64, f64, f64, f64),
+    lo: (f64, f64),
+    hi: (f64, f64),
+) -> Option<(f64, f64, f64, f64)> {
     let (x0, y0, x1, y1) = (r.0.max(lo.0), r.1.max(lo.1), r.2.min(hi.0), r.3.min(hi.1));
     (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
 }
@@ -534,7 +574,11 @@ pub fn draw(
     cache: &mut TextCache,
     scale: f64,
 ) -> Drawing {
-    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
     let mut p = Painter {
         font: Font::bundled(),
         scale,
@@ -623,7 +667,10 @@ pub fn draw(
         return finish(p, scale);
     };
     let auto = level.is_none();
-    let total = |v: &[Outside]| v.iter().fold((0, 0), |a, o| (a.0 + o.outside, a.1 + o.drawn));
+    let total = |v: &[Outside]| {
+        v.iter()
+            .fold((0, 0), |a, o| (a.0 + o.outside, a.1 + o.drawn))
+    };
     if let Some(e) = eye {
         let (o, d) = total(&e.outside_present);
         let (oa, _) = total(&e.outside_any);
@@ -646,7 +693,14 @@ pub fn draw(
         p.text(
             MARGIN,
             MARGIN + 98.0,
-            &format!("  by level (out/drawn): {}", if worst.is_empty() { "none".to_owned() } else { worst.join(", ") }),
+            &format!(
+                "  by level (out/drawn): {}",
+                if worst.is_empty() {
+                    "none".to_owned()
+                } else {
+                    worst.join(", ")
+                }
+            ),
             EM - 1.0,
             dim,
         );
@@ -678,7 +732,11 @@ pub fn draw(
                     n += 1.0;
                 }
             }
-            if n > 0.0 { (sx / n, sy / n) } else { (0.0, 0.0) }
+            if n > 0.0 {
+                (sx / n, sy / n)
+            } else {
+                (0.0, 0.0)
+            }
         },
         |e| (e.lon, e.lat),
     );
@@ -688,7 +746,9 @@ pub fn draw(
     let tile_m = (n0 - s0) * R;
     let half_m = PLAN_TILES * tile_m;
     let k = (PLAN / 2.0) / half_m;
-    let wrap = |d: f64| (d + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
+    let wrap = |d: f64| {
+        (d + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
+    };
     let to_px = |lon: f64, lat: f64| (cx + wrap(lon - lon0) * kx * k, cy - (lat - lat0) * R * k);
     let (lo, hi) = ((plan_left, plan_top), (plan_left + PLAN, plan_top + PLAN));
     p.rect(plan_left, plan_top, PLAN, PLAN, srgb(0x1A1A1A, 1.0));
@@ -707,18 +767,32 @@ pub fn draw(
             let (w, s, e2, n) = tile_rect(shown, gx, gy);
             let (x0, y1) = to_px(w, s);
             let (x1, y0) = to_px(e2, n);
-            let Some((x0, y0, x1, y1)) = clamp_rect((x0 + 0.5, y0 + 0.5, x1 - 0.5, y1 - 0.5), lo, hi)
+            let Some((x0, y0, x1, y1)) =
+                clamp_rect((x0 + 0.5, y0 + 0.5, x1 - 0.5, y1 - 0.5), lo, hi)
             else {
                 continue;
             };
             match tiles.get(&(shown, gx, gy)) {
                 Some(t) => {
-                    p.rect(x0, y0, x1 - x0, y1 - y0, state_colour(t.state, t.terms.score));
+                    p.rect(
+                        x0,
+                        y0,
+                        x1 - x0,
+                        y1 - y0,
+                        state_colour(t.state, t.terms.score),
+                    );
                     mark(&mut p, why(t), (x0, y0, x1, y1));
                     if selected == Some((shown, gx, gy)) {
                         frame(&mut p, (x0, y0, x1, y1), 2.5, srgb(0xF0E442, 1.0));
                     }
-                    p.hit_tile(x0, y0, x1 - x0, y1 - y0, legend_of(t, (shown, gx, gy)), (shown, gx, gy));
+                    p.hit_tile(
+                        x0,
+                        y0,
+                        x1 - x0,
+                        y1 - y0,
+                        legend_of(t, (shown, gx, gy)),
+                        (shown, gx, gy),
+                    );
                 }
                 None => p.rect(x0, y0, x1 - x0, y1 - y0, srgb(0x262626, 1.0)),
             }
@@ -732,8 +806,16 @@ pub fn draw(
         let inside = |q: (f64, f64)| {
             let (dx, dy) = (q.0 - cx, q.1 - cy);
             let t = [
-                if dx.abs() > 1e-9 { (PLAN / 2.0 - 1.0) / dx.abs() } else { f64::MAX },
-                if dy.abs() > 1e-9 { (PLAN / 2.0 - 1.0) / dy.abs() } else { f64::MAX },
+                if dx.abs() > 1e-9 {
+                    (PLAN / 2.0 - 1.0) / dx.abs()
+                } else {
+                    f64::MAX
+                },
+                if dy.abs() > 1e-9 {
+                    (PLAN / 2.0 - 1.0) / dy.abs()
+                } else {
+                    f64::MAX
+                },
             ]
             .into_iter()
             .fold(1.0f64, f64::min);
@@ -745,26 +827,44 @@ pub fn draw(
             .map(|&(lo_, la)| inside(to_px(lo_, la)))
             .collect();
         if pts.len() >= 3 {
-            let c = pts
-                .iter()
-                .fold((0.0, 0.0), |a, q| (a.0 + q.0 / pts.len() as f64, a.1 + q.1 / pts.len() as f64));
+            let c = pts.iter().fold((0.0, 0.0), |a, q| {
+                (a.0 + q.0 / pts.len() as f64, a.1 + q.1 / pts.len() as f64)
+            });
             for i in 0..pts.len() {
                 let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
                 p.tri([c, a, b], srgb(EYE, 0.16));
                 seg(&mut p, a, b, 1.5, srgb(EYE, 0.9));
             }
-            for far in [pts[pts.len() / 2], pts[pts.len() / 2 + 1 .. ].first().copied().unwrap_or(pts[0])] {
+            for far in [
+                pts[pts.len() / 2],
+                pts[pts.len() / 2 + 1..].first().copied().unwrap_or(pts[0]),
+            ] {
                 seg(&mut p, (cx, cy), far, 1.0, srgb(EYE, 0.7));
             }
         }
         let (sn, cs) = e.heading.sin_cos();
         let pt = |f: f64, s: f64| (cx + sn * f + cs * s, cy - cs * f + sn * s);
-        p.tri([pt(11.0, 0.0), pt(-6.0, 6.0), pt(-6.0, -6.0)], srgb(EYE, 1.0));
+        p.tri(
+            [pt(11.0, 0.0), pt(-6.0, 6.0), pt(-6.0, -6.0)],
+            srgb(EYE, 1.0),
+        );
     }
     // The section: the chain of tiles under the eye, level by level.
     let sx = left + PLAN + 24.0;
-    p.text(sx, top - 2.0, "The tile under the eye, at each level", EM, text);
-    p.text(sx, top + 10.0, "state · score in µflouz per reference byte", EM - 1.0, dim);
+    p.text(
+        sx,
+        top - 2.0,
+        "The tile under the eye, at each level",
+        EM,
+        text,
+    );
+    p.text(
+        sx,
+        top + 10.0,
+        "state · score in µflouz per reference byte",
+        EM - 1.0,
+        dim,
+    );
     let deepest = tiles.keys().map(|k| k.0).max().unwrap_or(shown);
     let mut y = plan_top;
     for l in 0..=deepest {
@@ -776,8 +876,20 @@ pub fn draw(
         p.text(sx, y, &format!("L{l}"), EM, if sel { text } else { dim });
         match tiles.get(&(l, x, yy)) {
             Some(t) => {
-                p.rect(sx + 34.0, y + 1.0, 26.0, ROW - 4.0, state_colour(t.state, t.terms.score));
-                p.text(sx + 68.0, y, &format!("{} · score {}", t.state.label(), t.terms.score), EM, dim);
+                p.rect(
+                    sx + 34.0,
+                    y + 1.0,
+                    26.0,
+                    ROW - 4.0,
+                    state_colour(t.state, t.terms.score),
+                );
+                p.text(
+                    sx + 68.0,
+                    y,
+                    &format!("{} · score {}", t.state.label(), t.terms.score),
+                    EM,
+                    dim,
+                );
                 p.hit_tile(sx, y, SECTION, ROW, legend_of(t, (l, x, yy)), (l, x, yy));
             }
             None => {
@@ -792,7 +904,11 @@ pub fn draw(
             Some(t) => format!(
                 "selected {sl}/{sx_}/{sy_}: {} — {}{}",
                 t.state.label(),
-                if t.state == RingState::Drawn { "drawn" } else { "not drawn: outline only in the view" },
+                if t.state == RingState::Drawn {
+                    "outlined in the view"
+                } else {
+                    "not drawn: outline only in the view"
+                },
                 match eye.and_then(|e| e.selected_in_view) {
                     Some(true) => ", in the view",
                     Some(false) => ", out of the view (arrow at the edge)",
@@ -822,8 +938,18 @@ pub fn draw(
     let steps = 48;
     for i in 0..steps {
         let t = f64::from(i) / f64::from(steps - 1);
-        let score = if i == 0 { 0 } else { (t * HOT_BUCKET).exp2() as u64 };
-        p.rect(bx + f64::from(i) * 5.0, ly + 1.0, 5.0, ROW - 4.0, score_colour(score));
+        let score = if i == 0 {
+            0
+        } else {
+            (t * HOT_BUCKET).exp2() as u64
+        };
+        p.rect(
+            bx + f64::from(i) * 5.0,
+            ly + 1.0,
+            5.0,
+            ROW - 4.0,
+            score_colour(score),
+        );
     }
     ly += ROW;
     p.text(bx, ly, "0 (cold)", EM - 1.0, dim);
@@ -861,7 +987,9 @@ mod tests {
     /// the score goes up, and its brightness follows.
     #[test]
     fn the_score_ramp_is_monotone() {
-        let scores: Vec<u64> = (0..40).map(|i| if i == 0 { 0 } else { 1u64 << i.min(40) }).collect();
+        let scores: Vec<u64> = (0..40)
+            .map(|i| if i == 0 { 0 } else { 1u64 << i.min(40) })
+            .collect();
         let mut last_t = -1.0;
         let mut last_l = -1.0;
         for s in scores {
@@ -880,7 +1008,10 @@ mod tests {
     /// the score, and none is a point of the ramp.
     #[test]
     fn states_are_told_apart_by_colour() {
-        let ramp: Vec<[f32; 4]> = [0, 1, 1 << 10, 1 << 20].iter().map(|&s| score_colour(s)).collect();
+        let ramp: Vec<[f32; 4]> = [0, 1, 1 << 10, 1 << 20]
+            .iter()
+            .map(|&s| score_colour(s))
+            .collect();
         for st in [RingState::Drawn, RingState::InFlight, RingState::Hole] {
             let c = state_colour(st, 5);
             assert_eq!(c, state_colour(st, 1 << 30), "{st:?} ignores its score");
@@ -895,7 +1026,11 @@ mod tests {
 
     #[test]
     fn a_tile_holds_the_point_it_was_found_by() {
-        for (lon, lat, l) in [(-0.0092f64, 0.783f64, 14u32), (2.0, -0.5, 3), (-3.1, 1.5, 20)] {
+        for (lon, lat, l) in [
+            (-0.0092f64, 0.783f64, 14u32),
+            (2.0, -0.5, 3),
+            (-3.1, 1.5, 20),
+        ] {
             let (x, y) = tile_at(l, lon, lat);
             let (w, s, e, n) = tile_rect(l, x, y);
             assert!(w <= lon && lon <= e && s <= lat && lat <= n, "{l}/{x}/{y}");
@@ -913,7 +1048,11 @@ mod tests {
         for i in 0..2 {
             r.ring.push(tile(13, i, 0, RingState::Drawn, 5));
         }
-        assert_eq!(auto_level(&r, None), Some(12), "no ring: the most drawn level");
+        assert_eq!(
+            auto_level(&r, None),
+            Some(12),
+            "no ring: the most drawn level"
+        );
         for i in 0..4 {
             r.ring.push(tile(13, i + 10, 0, RingState::Wanted, 50));
         }
@@ -929,7 +1068,11 @@ mod tests {
         );
         assert_eq!(auto_level(&HeldReport::default(), None), None);
         // Near an eye far from every tile, none is shown at a level of its own.
-        assert_eq!(auto_level(&r, Some((2.0, -1.0))), None, "nothing near the eye");
+        assert_eq!(
+            auto_level(&r, Some((2.0, -1.0))),
+            None,
+            "nothing near the eye"
+        );
         assert_eq!(terrain_tiles(&r).len(), 16);
     }
 
@@ -955,7 +1098,14 @@ mod tests {
         let ahead = tile_at(l, lon, lat + 670.0 / 6_371_000.0);
         r.ring.push(tile(l, ahead.0, ahead.1, RingState::Drawn, 1));
         let o = drawn_outside(&r, &[view]);
-        assert_eq!(o, vec![Outside { level: l, drawn: 2, outside: 1 }]);
+        assert_eq!(
+            o,
+            vec![Outside {
+                level: l,
+                drawn: 2,
+                outside: 1
+            }]
+        );
     }
 
     fn glam_viewport() -> glam::DVec2 {
@@ -973,16 +1123,40 @@ mod tests {
         let k = 1.0 / (e - w); // one tile is one pixel wide per k
         let at = |dx: f64| {
             move |lon: f64, lat: f64| {
-                Some((200.0 + (lon - lon0) * k * 100.0 + dx, 150.0 - (lat - lat0) * k * 100.0))
+                Some((
+                    200.0 + (lon - lon0) * k * 100.0 + dx,
+                    150.0 - (lat - lat0) * k * 100.0,
+                ))
             }
         };
-        let seen = outline((l, x, y), score_colour(5), &at(0.0), (400.0, 300.0), 900.0, 1.0);
-        assert_eq!(seen.mesh.len(), 4 * 8 * 6, "four edges, eight segments each, two triangles");
+        let seen = outline(
+            (l, x, y),
+            score_colour(5),
+            &at(0.0),
+            (400.0, 300.0),
+            900.0,
+            1.0,
+        );
+        assert_eq!(
+            seen.mesh.len(),
+            4 * 8 * 6,
+            "four edges, eight segments each, two triangles"
+        );
         assert!(seen.labels.is_empty());
-        let off = outline((l, x, y), score_colour(5), &at(5_000.0), (400.0, 300.0), 2_500.0, 1.0);
+        let off = outline(
+            (l, x, y),
+            score_colour(5),
+            &at(5_000.0),
+            (400.0, 300.0),
+            2_500.0,
+            1.0,
+        );
         assert_eq!(off.labels.len(), 1, "the distance is written at the arrow");
         assert!(off.mesh.len() > 3, "the arrow is drawn");
-        assert!(off.mesh.iter().rev().take(3).all(|v| v.position[0] > 200.0), "it points toward the tile");
+        assert!(
+            off.mesh.iter().rev().take(3).all(|v| v.position[0] > 200.0),
+            "it points toward the tile"
+        );
     }
 
     /// The reasons of held tiles come from the published urgency.
@@ -1020,8 +1194,14 @@ mod tests {
         };
         let mut cache = TextCache::default();
         let d = draw(Some(&r), Some(&eye), None, None, &mut cache, 1.0);
-        assert!(d.hits.iter().any(|h| h.lines.iter().any(|l| l.text.contains("score 123456"))));
-        assert!(d.hits.iter().any(|h| h.lines[0].text.contains("held, wanted")));
+        assert!(d
+            .hits
+            .iter()
+            .any(|h| h.lines.iter().any(|l| l.text.contains("score 123456"))));
+        assert!(d
+            .hits
+            .iter()
+            .any(|h| h.lines[0].text.contains("held, wanted")));
         assert!(d.hits.iter().any(|h| h.lines[0].text.contains("drawn")));
         // Waiting for a report draws a line, not a plan.
         let none = draw(None, None, None, None, &mut cache, 1.0);
