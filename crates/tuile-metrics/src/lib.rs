@@ -234,6 +234,10 @@ pub fn describe() {
     );
     describe_gauge!("tuile_tier_bytes", "Their bytes, by tier, class and level.");
     describe_counter!("tuile_traversals", "Traversal passes run.");
+    describe_counter!(
+        "tuile_traversals_truncated",
+        "Passes cut at their bound on visited tiles and discarded."
+    );
     describe_counter!("tuile_loads_started", "Tile loads begun.");
     describe_counter!("tuile_loads_completed", "Tile loads that produced content.");
     describe_counter!("tuile_loads_failed", "Tile loads that errored.");
@@ -558,6 +562,7 @@ pub fn publish(m: &Metrics) {
     use metrics::{counter, gauge};
 
     counter!("tuile_traversals").absolute(m.traversals.get());
+    counter!("tuile_traversals_truncated").absolute(m.traversals_truncated.get());
     counter!("tuile_loads_started").absolute(m.loads_started.get());
     counter!("tuile_loads_completed").absolute(m.loads_completed.get());
     counter!("tuile_loads_failed").absolute(m.loads_failed.get());

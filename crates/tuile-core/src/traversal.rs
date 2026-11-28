@@ -527,6 +527,19 @@ pub struct Config {
     /// What a rotation turns onto. Off by default, again as in the reference:
     /// the cost is real and constant, the benefit only shows on movement.
     pub preload_siblings: bool,
+    /// The most tiles one pass may visit: a bound on the work, counted in
+    /// nodes and never in seconds, so that a replay decides what the
+    /// original decided.
+    ///
+    /// A pass that reaches it stops descending and reports
+    /// [`TraversalOutput::truncated`]; its output is partial, and a session
+    /// keeps its previous selection instead of using it. The ordinary pass
+    /// visits a few thousand tiles at any altitude. What the bound is for
+    /// is a view the refinement test cannot bound by itself: an eye on a
+    /// pole, within metres of the ground, is at distance ~0 from every
+    /// tile of the polar row of every level, and they all refine to the
+    /// deepest one - about 1e8 tiles, and 20 GB.
+    pub max_visits: u32,
 }
 
 impl Config {
@@ -583,9 +596,15 @@ impl Default for Config {
             loading_descendant_limit: 20,
             preload_ancestors: true,
             preload_siblings: false,
+            max_visits: DEFAULT_MAX_VISITS,
         }
     }
 }
+
+/// [`Config::max_visits`] by default: some two hundred times what an
+/// ordinary pass visits (1 300 to 1 500 tiles from the ground or from the
+/// pole at altitude), and far below the 1e8 of a pole at ground level.
+pub const DEFAULT_MAX_VISITS: u32 = 250_000;
 
 /// What the traversal needs to know about content residency: whether a
 /// tile may be treated as resident. The graphics budget answers it in a
@@ -711,6 +730,23 @@ pub struct TraversalOutput {
     /// children. Fed back as the next views' `chosen_before`.
     pub chosen: Vec<TileId>,
     pub stats: TraversalStats,
+    /// The pass reached [`Config::max_visits`] and stopped descending: its
+    /// output is partial, and must not replace a complete one. Not in
+    /// [`TraversalStats`], which crosses the wire.
+    pub truncated: bool,
+}
+
+impl TraversalOutput {
+    /// Empty, keeping the buffers.
+    pub fn clear(&mut self) {
+        self.selected.clear();
+        self.requests.clear();
+        self.awaiting.clear();
+        self.blockers.clear();
+        self.chosen.clear();
+        self.stats = TraversalStats::default();
+        self.truncated = false;
+    }
 }
 
 /// Pure selection: `(arena, residency, views, config) → output`.
@@ -760,12 +796,7 @@ pub fn traverse_with(
     near: &mut NearestContent,
     out: &mut TraversalOutput,
 ) {
-    out.selected.clear();
-    out.requests.clear();
-    out.awaiting.clear();
-    out.blockers.clear();
-    out.chosen.clear();
-    out.stats = TraversalStats::default();
+    out.clear();
     let roots = tree.roots();
     if views.is_empty() || roots.is_empty() {
         return;
@@ -1118,6 +1149,13 @@ fn visit(
     out: &mut TraversalOutput,
     requested: &mut HashMap<TileId, usize>,
 ) -> Visit {
+    // The bound on the work, before any of it: a tile past it is not looked at.
+    // Reported as ready so that no ancestor holds on it; the pass is flagged
+    // and its output is the caller's to discard.
+    if out.stats.visited >= config.max_visits {
+        out.truncated = true;
+        return Visit::READY;
+    }
     let props = tree.properties(id);
     out.stats.visited += 1;
     out.stats.max_depth = out.stats.max_depth.max(depth);
@@ -1950,6 +1988,45 @@ pub(crate) mod tests {
                 radius: self.radius,
             })
         }
+    }
+
+    /// The bound on a pass's work is counted in tiles: past it the pass stops
+    /// descending and says so, and below it nothing is flagged.
+    #[test]
+    fn a_pass_stops_at_its_bound_and_says_so() {
+        const R: f64 = 6_356_752.0;
+        let tree = PlanetTree { radius: R };
+        let views = vec![ViewState::perspective(
+            dvec3(R + 5_000.0, 0.0, 0.0),
+            dvec3(-1.0, 0.0, 0.0),
+            dvec3(0.0, 0.0, 1.0),
+            dvec2(1024.0, 1024.0),
+            60.0f64.to_radians(),
+        )];
+        let none = HashSet::new();
+        let run = |max_visits| {
+            let mut out = TraversalOutput::default();
+            traverse(
+                &tree,
+                &ResidentSet::default(),
+                &views,
+                &Config {
+                    max_visits,
+                    ..Config::default()
+                },
+                0,
+                &none,
+                &none,
+                &mut out,
+            );
+            out
+        };
+        let whole = run(DEFAULT_MAX_VISITS);
+        assert_eq!(whole.stats.visited, 2);
+        assert!(!whole.truncated);
+        let cut = run(1);
+        assert_eq!(cut.stats.visited, 1, "one tile, then it stops");
+        assert!(cut.truncated);
     }
 
     /// Ground behind the planet is not selected, and the traversal has to be
