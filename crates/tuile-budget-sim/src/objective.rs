@@ -112,6 +112,9 @@ pub struct Outcome {
     pub under_tile_steps: u64,
     /// The motion model's error per horizon ([`Ahead::Model`] only).
     pub ahead_errors: Vec<HorizonError>,
+    /// The budget's work, summed over the steps and at its peak.
+    pub work_sum: u64,
+    pub work_max: u32,
 }
 
 /// Whether `t` is covered by the draw set for `views`: drawn, under a
@@ -341,6 +344,8 @@ fn score(
         floor_in |= st.floor_in;
         let under = st.deficit.under_levels();
         o.under_tile_steps += u64::from(st.deficit.under_tiles());
+        o.work_sum += u64::from(st.work);
+        o.work_max = o.work_max.max(st.work);
         let h = if floor_in { holes(shown, &views) } else { 0 };
         let k = phases
             .iter()

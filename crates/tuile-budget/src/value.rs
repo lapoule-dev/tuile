@@ -220,9 +220,20 @@ pub fn progressive_terms(
     } else {
         a
     };
-    let r = u64::from(rho) * 16;
-    let d = u64::from(away);
-    let near = if r == 0 {
+    (
+        u32::try_from(a).unwrap_or(CERTAIN),
+        near(u64::from(rho) * 16, u64::from(away)),
+    )
+}
+
+/// `D`'s shape, `r² / (r + d)²` in [`CERTAIN`] units: 1 at `d` = 0, ¼ at
+/// `d = r`; with `r` = 0, 1 at `d` = 0 and 0 beyond. The progressive
+/// score's distance term (`r` = `ρ`, `d` in sixteenths of a tile) and the
+/// predicted use's time term (`r` = the horizon, `d` the slack in µs).
+fn near(r: u64, d: u64) -> u32 {
+    let c = u128::from(CERTAIN);
+    let (r, d) = (u128::from(r), u128::from(d));
+    let v = if r == 0 {
         if d == 0 {
             c
         } else {
@@ -231,16 +242,67 @@ pub fn progressive_terms(
     } else {
         c * r * r / ((r + d) * (r + d))
     };
-    (
-        u32::try_from(a).unwrap_or(CERTAIN),
-        u32::try_from(near).unwrap_or(CERTAIN),
-    )
+    u32::try_from(v).unwrap_or(CERTAIN)
+}
+
+/// The predicted use's terms (#282's [`crate::AheadUse`]), each in
+/// [`CERTAIN`] units, the progressive score's `A` and `D` read in time:
+/// `A` is the prediction's probability, `D` the same `r² / (r + d)²` as
+/// the distance term with `r` the horizon `H` and `d` the slack — the
+/// delay before the use less the restore cost of the tier the resource
+/// would come from, `(t_use − R(tier))⁺`. A use due within its load time
+/// is as urgent as the present place (`D` = 1); one a horizon past it
+/// weighs a quarter. The tier's restore cost is the one the budget
+/// measures (`Budget::restore_costs`), when `spec` carries it.
+pub fn predicted_terms(
+    spec: &Specification,
+    ahead: Micros,
+    permille: u32,
+    tier: Tier,
+) -> (u32, u32) {
+    let p = &spec.params;
+    let a = permille.min(1_000) * (CERTAIN / 1_000);
+    let slack = ahead.0.saturating_sub(p.restore.of(tier).0);
+    (a, near(p.horizon.0, slack))
 }
 
 /// A want's `A` and `D` ([`probability`]'s terms), in [`CERTAIN`] units: a
 /// want the traversal did not place has `D` = 1 and its flat probability
 /// as `A`.
+///
+/// A ring tile a prediction names (`Quantised::ahead`) takes the larger of
+/// its place's terms and the prediction's ([`predicted_terms`], the tier
+/// `tier` it would come from): a prediction only ever raises a placed
+/// preload's probability — it adds to the preload band and keeps a tile
+/// predicted soon longer, never lowers what the place gives. A ring tile
+/// the traversal did not place takes the prediction's terms: the flat
+/// anticipation is what it takes without one.
 pub fn probability_terms(
+    spec: &Specification,
+    rho: u32,
+    u: Urgency,
+    level: u32,
+    q: &Quantised,
+    tier: Tier,
+) -> (u32, u32) {
+    let placed = place_terms(spec, rho, u, level, q);
+    match (u, q.ahead()) {
+        (Urgency::Ring, Some((ahead, permille))) => {
+            let predicted = predicted_terms(spec, ahead, permille, tier);
+            // Unplaced, the flat anticipation stood in for a probability
+            // the need did not give; given one, it is the prediction's.
+            if !q.placed() || product(predicted.0, predicted.1) > product(placed.0, placed.1) {
+                predicted
+            } else {
+                placed
+            }
+        }
+        _ => placed,
+    }
+}
+
+/// [`probability_terms`] without the prediction: the place's.
+fn place_terms(
     spec: &Specification,
     rho: u32,
     u: Urgency,
@@ -268,8 +330,15 @@ pub fn probability_terms(
 /// is certain; a preload the traversal placed against the need takes the
 /// progressive score ([`progressive`]), one it did not the specification's
 /// flat anticipation; a refresh a tenth.
-pub fn probability(spec: &Specification, rho: u32, u: Urgency, level: u32, q: &Quantised) -> u32 {
-    let (a, d) = probability_terms(spec, rho, u, level, q);
+pub fn probability(
+    spec: &Specification,
+    rho: u32,
+    u: Urgency,
+    level: u32,
+    q: &Quantised,
+    tier: Tier,
+) -> u32 {
+    let (a, d) = probability_terms(spec, rho, u, level, q, tier);
     if d == CERTAIN {
         a
     } else {
@@ -421,7 +490,7 @@ mod tests {
     fn a_load_gains_by_probability_place_and_arrival() {
         let s = Specification::interactive();
         let q = Quantised::default();
-        let g = |u, c, t| load_gain(&s, probability(&s, 4, u, 9, &q), c, t, false);
+        let g = |u, c, t| load_gain(&s, probability(&s, 4, u, 9, &q, t), c, t, false);
         assert!(g(Urgency::Drape, 0, Tier::Remote) > g(Urgency::Ring, 0, Tier::Remote));
         assert!(g(Urgency::Ring, 0, Tier::Remote) > g(Urgency::Ancestor, 0, Tier::Remote));
         assert!(g(Urgency::Drape, 1_000, Tier::Remote) > g(Urgency::Drape, 0, Tier::Remote));

@@ -940,7 +940,8 @@ impl Budget {
     }
 
     /// Whether `tn` asks for drapes at its own levels this step: drawn or
-    /// blocking, with imagery.
+    /// blocking, or a ring tile a prediction names (the views ahead will
+    /// wear its drapes: preloads of its own score), with imagery.
     ///
     /// An ancestor does not: the whole chain of every drawn tile asking for
     /// its drapes is a load per ancestor and per layer whatever its
@@ -949,8 +950,17 @@ impl Budget {
     /// wears while its own drape loads is asked by its parent only, and
     /// only while a child needs it ([`Self::stand_ins_of`]).
     pub(super) fn draped(tn: &TileNeed) -> bool {
+        tn.need.imagery.is_some() && (Self::present(tn) || Self::predicted(tn))
+    }
+
+    /// Whether `tn` is the present need's: drawn or blocking.
+    pub(super) fn present(tn: &TileNeed) -> bool {
         matches!(tn.membership, Membership::Drawn | Membership::Blocker)
-            && tn.need.imagery.is_some()
+    }
+
+    /// Whether `tn` is a ring tile a prediction names.
+    pub(super) fn predicted(tn: &TileNeed) -> bool {
+        tn.membership == Membership::Ring && tn.q.ahead().is_some()
     }
 
     /// The drapes ancestor `p` (`pn` its need) asks for as its drawn
@@ -1852,7 +1862,7 @@ impl Budget {
         let level = tn.need.level;
         let input = super::value::DeficitInput {
             tile: t,
-            centrality: tn.q.centrality,
+            centrality: i32::from(tn.q.centrality),
             gap,
             finer,
             since: self
@@ -2045,10 +2055,17 @@ impl Budget {
         let sc = if precedence >= super::priority::Precedence::Value {
             // The one currency (spec §1b): what loading it gains, from its
             // arrival on.
-            let p =
-                super::value::probability(&self.spec, self.reach_tiles(), urgency, w.level, &w.q);
+            let p = super::value::probability(
+                &self.costed,
+                self.reach_tiles(),
+                urgency,
+                w.level,
+                &w.q,
+                tier,
+            );
             let preload = urgency >= Urgency::Ring;
-            let gain = super::value::load_gain(&self.costed, p, w.q.centrality, tier, preload);
+            let gain =
+                super::value::load_gain(&self.costed, p, i32::from(w.q.centrality), tier, preload);
             i64::try_from(gain.0).unwrap_or(i64::MAX)
         } else {
             let mut sc = score(w.q, waited, self.cfg.age_full, cover);
@@ -2866,7 +2883,35 @@ impl Budget {
                         continue;
                     }
                     if self.in_flight[class] >= eff.quota[class] {
-                        if w.urgency > Urgency::Hole {
+                        // A hole preempts any preload in flight; the rest of
+                        // the present need (a swap's blocker, a drawn tile's
+                        // drape) only a predicted one: a prediction never
+                        // delays a current need (the views ahead, #282).
+                        let predicted_only = w.urgency > Urgency::Hole;
+                        let network_load = |a: &Arena, vs: Slot| {
+                            a.class(vs) == class
+                                && matches!(
+                                    a.load(vs),
+                                    Load::Loading {
+                                        source: Source::Network,
+                                        ..
+                                    }
+                                )
+                        };
+                        let predicted = |vr: &ResourceId| {
+                            wants.get(vr).is_some_and(|vw| {
+                                vw.urgency == Urgency::Ring && vw.q.ahead().is_some()
+                            })
+                        };
+                        // Without a predicted load in flight, nothing to
+                        // preempt and nothing counted: a run without views
+                        // ahead decides as before, to the work.
+                        let preempts = !predicted_only
+                            || (w.urgency < Urgency::Ring
+                                && self.arena.active().iter().any(|&vs| {
+                                    network_load(&self.arena, vs) && predicted(&self.arena.id(vs))
+                                }));
+                        if !preempts {
                             if key.tier == Tier::Stored {
                                 skipped_stored += 1;
                             }
@@ -2882,17 +2927,14 @@ impl Budget {
                             .filter_map(|&vs| {
                                 let a = &self.arena;
                                 let vr = a.id(vs);
-                                (a.class(vs) == class
-                                    && matches!(
-                                        a.load(vs),
-                                        Load::Loading {
-                                            source: Source::Network,
-                                            ..
-                                        }
-                                    )
-                                    && (wants.get(&vr).is_some_and(|vw| {
-                                        matches!(vw.urgency, Urgency::Ring | Urgency::Ancestor)
-                                    }) || a.urgency(vs) == Some(Urgency::Refresh)))
+                                (network_load(a, vs)
+                                    && if predicted_only {
+                                        predicted(&vr)
+                                    } else {
+                                        wants.get(&vr).is_some_and(|vw| {
+                                            matches!(vw.urgency, Urgency::Ring | Urgency::Ancestor)
+                                        }) || a.urgency(vs) == Some(Urgency::Refresh)
+                                    })
                                 .then_some(vr)
                             })
                             .filter_map(|vr| key_now(self, vr).map(|k| (k, vr)))
@@ -3184,6 +3226,31 @@ impl Budget {
         self.arena.idle(class).plus(b[0]).plus(wanted_less)
     }
 
+    /// Whether `r` is the mesh of a ring tile a prediction names whose
+    /// drapes are not loaded yet: a predicted tile goes to the GPU whole,
+    /// its mesh with its drapes, so that the view it was predicted for
+    /// draws it at its need — never its geometry under a coarser drape.
+    /// Its drapes go alone (nothing draws a drape without its mesh).
+    fn awaits_its_drapes(&self, r: ResourceId, tiles: &SortedMap<TileId, TileNeed>) -> bool {
+        let ResourceId::Mesh(t) = r else {
+            return false;
+        };
+        let Some(tn) = tiles.get(&t).filter(|tn| Self::predicted(tn)) else {
+            return false;
+        };
+        let mut drapes = Vec::new();
+        self.drapes_of(t, tn, &mut drapes);
+        let a = &self.arena;
+        !drapes.iter().all(|&(layer, level)| {
+            let m = ResourceId::drape(t, layer, level);
+            a.find(m).is_some_and(|s| {
+                a.has_gpu(s)
+                    || a.has_transit(s)
+                    || a.fresh_cpu(s, self.epoch(m, a.class(s))).is_some()
+            })
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn deliver(
         &mut self,
@@ -3201,6 +3268,9 @@ impl Budget {
         for (key, _, w) in picked.iter().filter_map(|i| jobs.get(*i as usize)) {
             let r = &key.resource;
             let Some(group) = floor_group(tiles, *r, |c, l| self.is_floor(c, l)) else {
+                if self.awaits_its_drapes(*r, tiles) {
+                    continue;
+                }
                 self.deliver_one(now, eff, *r, w, coarsening, wants, d, st, &mut flags);
                 continue;
             };
@@ -3309,8 +3379,16 @@ impl Budget {
                 }
             }
             let mut strain = false;
-            let prob =
-                super::value::probability(&self.spec, self.reach_tiles(), w.urgency, w.level, &w.q);
+            let prob = super::value::probability(
+                &self.costed,
+                self.reach_tiles(),
+                w.urgency,
+                w.level,
+                &w.q,
+                // As the places it is weighed against are (`downstream`):
+                // a swap compares one probability with another.
+                Tier::Remote,
+            );
             // Room for its peak: resident, and what an encode on the GPU
             // holds beside it until it has run.
             let ok = self.make_room(
@@ -4333,11 +4411,12 @@ impl Budget {
         tier: Tier,
     ) -> ScoreEvent {
         let (pa, pd) = super::value::probability_terms(
-            &self.spec,
+            &self.costed,
             self.reach_tiles(),
             w.urgency,
             w.level,
             &w.q,
+            tier,
         );
         let p = if pd == super::value::CERTAIN {
             pa
