@@ -397,11 +397,6 @@ impl App {
         };
         if let Some(view) = views.first() {
             active.renderer.set_view(&active.gpu.queue, view);
-            // What the underlay is culled against: the first eye's view, in
-            // the render space every tile is rebased onto, and its ECEF eye.
-            active
-                .pump
-                .set_underlay_view(view.view_proj, self.controller.camera.position);
         }
         active
             .renderer
@@ -720,7 +715,7 @@ impl App {
                 );
                 pass.set_scissor_rect(box_.x, box_.y, box_.width, box_.height);
             }
-            renderer.paint_under(
+            renderer.paint_replacing(
                 pass,
                 // The shell first — the only thing that can cover ground
                 // before any tile has arrived at all — then the complete
@@ -732,12 +727,6 @@ impl App {
                     .then_some(shell)
                     .into_iter()
                     .chain(coarse.iter().copied()),
-                // Held relief under the ground the selection has not
-                // reached, with depth: where a camera turned faster than
-                // the selection, ground instead of the depthless backdrop
-                // — and no skirt standing in the open. Empty, this is the
-                // frame as it was drawn without it.
-                drawn.underlay.iter().copied(),
                 // The 3D Tiles over the globe, before the globe's own
                 // tiles: where they are drawn they replace the ground, which
                 // keeps out of every pixel they took and covers the rest.

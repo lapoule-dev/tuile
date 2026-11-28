@@ -5,7 +5,7 @@
 //! the render pass; this type owns the pipelines and the view uniform.
 
 use crate::context::GpuContext;
-use crate::host::{DepthDirection, TargetLayout};
+use crate::host::TargetLayout;
 use crate::prepare::{PreparedTile, Vertex};
 use glam::Mat4;
 use tuile_atmosphere::AerialPerspective;
@@ -70,49 +70,6 @@ const OWNED: u32 = 1;
 /// it, so the ground is never bare.
 const REPLACED: u32 = 2;
 
-/// The mark an underlay tile stamps (`Pass::Underlay`): drawn the finest
-/// first, each underlay tile draws only where no surface and no finer
-/// underlay tile did, so two levels of it never fight over a pixel.
-const UNDER: u32 = 4;
-
-/// What shapes the underlay (`ContentPump::set_underlay_level`), supplied when
-/// the renderer and the pump are made: numbers in the units of what they
-/// scale, so they hold from a globe seen from orbit down to a street.
-///
-/// - `push`: how far behind the ground the underlay sits, as a fraction of its
-///   distance from the eye (`Pass::Underlay`). The default, 1 %, is 50 m at five
-///   kilometres: more than a coarse level's relief stands above the fine ground
-///   it approximates over most of a view, less than the skirts hang under it.
-///   It is proportional to the distance, so it grows with the depth buffer's
-///   own step. 0 puts the underlay at the ground's depth; a negative or
-///   non-finite value is taken as 0 (an underlay in front of the ground would
-///   win its pixels).
-/// - `reach`: how far from the eye an underlay tile may be, in its own widths.
-///   A selection at a few pixels of error takes a tile at four to eight widths;
-///   the default, twelve, keeps a level and a half finer than it at most, never
-///   the fine leftovers of a view far from this one.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct UnderlayOptions {
-    pub push: f32,
-    pub reach: f64,
-}
-
-impl UnderlayOptions {
-    /// The push of an underlay nobody tuned.
-    pub const DEFAULT_PUSH: f32 = 0.01;
-    /// The reach of an underlay nobody tuned.
-    pub const DEFAULT_REACH: f64 = 12.0;
-}
-
-impl Default for UnderlayOptions {
-    fn default() -> Self {
-        Self {
-            push: Self::DEFAULT_PUSH,
-            reach: Self::DEFAULT_REACH,
-        }
-    }
-}
-
 pub struct TileRenderer {
     pipeline: wgpu::RenderPipeline,
     /// Draws without touching depth — see [`TileRenderer::render_background`].
@@ -123,14 +80,6 @@ pub struct TileRenderer {
     /// Draws ancestors standing in for ground that is not theirs: tests depth,
     /// never writes it, drawn last. See `Pass::Fallback`.
     fallback: wgpu::RenderPipeline,
-    /// Coarse relief under ground nobody owns: see `Pass::Underlay`.
-    underlay: wgpu::RenderPipeline,
-    /// The surfaces' skirts, after the underlay: see `Pass::Skirt`.
-    skirts: wgpu::RenderPipeline,
-    /// `pipeline` and `layers` without the skirts, for a frame with an
-    /// underlay: see [`TileRenderer::paint_under`].
-    skirtless: wgpu::RenderPipeline,
-    skirtless_layers: wgpu::RenderPipeline,
     /// Draws a surface that replaces the ground where it is drawn, and its
     /// stand-ins. See [`REPLACED`] and [`TileRenderer::paint_replacing`].
     replacing: wgpu::RenderPipeline,
@@ -159,31 +108,13 @@ impl TileRenderer {
     /// ([`TargetLayout::own`]). Wireframe is created only when the device has
     /// `POLYGON_MODE_LINE`.
     pub fn new(gpu: &GpuContext, target_format: wgpu::TextureFormat) -> Self {
-        Self::new_with(gpu, target_format, &UnderlayOptions::default())
-    }
-
-    /// [`TileRenderer::new`], with the underlay's `push` the host chose.
-    pub fn new_with(
-        gpu: &GpuContext,
-        target_format: wgpu::TextureFormat,
-        underlay: &UnderlayOptions,
-    ) -> Self {
-        Self::for_layout_with(gpu, TargetLayout::own(target_format), underlay)
+        Self::for_layout(gpu, TargetLayout::own(target_format))
     }
 
     /// The pipelines for targets of `layout`: a host's colour format, sample
     /// count and depth convention, drawn through a [`crate::HostPass`] of the
     /// same layout.
     pub fn for_layout(gpu: &GpuContext, layout: TargetLayout) -> Self {
-        Self::for_layout_with(gpu, layout, &UnderlayOptions::default())
-    }
-
-    /// [`TileRenderer::for_layout`], with the underlay's `push` the host chose.
-    pub fn for_layout_with(
-        gpu: &GpuContext,
-        layout: TargetLayout,
-        underlay: &UnderlayOptions,
-    ) -> Self {
         let target_format = layout.colour;
         let depth_format = layout.drawn_depth(&gpu.device);
         let direction = layout.direction;
@@ -200,9 +131,7 @@ impl TileRenderer {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("tuile ground"),
-                source: wgpu::ShaderSource::Wgsl(
-                    ground_wgsl_with(gpu.imagery_slots, underlay.push).into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(ground_wgsl(gpu.imagery_slots).into()),
             });
         // The physical atmosphere: the ground reads its tables (group 3),
         // the sky its sky-view besides.
@@ -278,16 +207,6 @@ impl TileRenderer {
             /// of its own tiles is ready: only where no replacing tile
             /// drew, and then replacing as they do.
             ReplacingFallback,
-            /// Coarse relief under ground nobody owns (`Drawn::underlay`):
-            /// only where no surface stamped the mark, as a fallback; writes
-            /// depth, pushed back by [`UNDERLAY_PUSH`], so the skirts drawn
-            /// after it sink into it instead of standing in the open.
-            Underlay,
-            /// The skirts of the surfaces, after the underlay: depth as
-            /// `Solid`, and no mark — a skirt closes a seam, it owns no
-            /// ground, and stamping it kept the underlay out of the very
-            /// pixels where it hung as a wall.
-            Skirt,
         }
         /// How a pass treats the ownership mark. See `stencil` below.
         fn stencil_face(kind: Pass) -> wgpu::StencilFaceState {
@@ -310,12 +229,6 @@ impl TileRenderer {
                 Pass::Fallback => {
                     face(wgpu::CompareFunction::Greater, wgpu::StencilOperation::Keep)
                 }
-                // Where nothing at all is marked (against a reference of 0),
-                // and marks it: `Invert` through a write mask of `UNDER`
-                // alone sets that bit, and only that bit.
-                Pass::Underlay => {
-                    face(wgpu::CompareFunction::Equal, wgpu::StencilOperation::Invert)
-                }
                 // Replaces it: stamp both marks, unconditionally.
                 Pass::Replacing => face(
                     wgpu::CompareFunction::Always,
@@ -328,26 +241,16 @@ impl TileRenderer {
                     wgpu::StencilOperation::Replace,
                 ),
                 Pass::Backdrop => wgpu::StencilFaceState::IGNORE,
-                // Out of what a replacing surface took, as the ground; marks
-                // nothing.
-                Pass::Skirt => face(wgpu::CompareFunction::Equal, wgpu::StencilOperation::Keep),
             }
         }
-        // `skirtless`: the surface passes of a frame with an underlay, which
-        // leave the skirts to `Pass::Skirt`. Without an underlay the surfaces
-        // draw their skirts themselves, as they always have.
-        let make = |polygon_mode: wgpu::PolygonMode, kind: Pass, skirtless: bool| {
+        let make_pipeline = |polygon_mode: wgpu::PolygonMode, kind: Pass| {
             gpu.device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("tuile tiles"),
                     layout: Some(&layout),
                     vertex: wgpu::VertexState {
                         module: &shader,
-                        entry_point: Some(match (kind, direction) {
-                            (Pass::Underlay, DepthDirection::Forward) => "vs_underlay_forward",
-                            (Pass::Underlay, DepthDirection::Reverse) => "vs_underlay_reverse",
-                            _ => "vs_main",
-                        }),
+                        entry_point: Some("vs_main"),
                         compilation_options: Default::default(),
                         buffers: &[Some(Vertex::LAYOUT)],
                     },
@@ -373,18 +276,11 @@ impl TileRenderer {
                         // at once.
                         depth_write_enabled: Some(matches!(
                             kind,
-                            Pass::Solid
-                                | Pass::Layers
-                                | Pass::Replacing
-                                | Pass::ReplacingFallback
-                                | Pass::Underlay
-                                | Pass::Skirt
+                            Pass::Solid | Pass::Layers | Pass::Replacing | Pass::ReplacingFallback
                         )),
                         depth_compare: Some(match kind {
                             Pass::Backdrop => wgpu::CompareFunction::Always,
                             Pass::Solid
-                            | Pass::Underlay
-                            | Pass::Skirt
                             | Pass::Fallback
                             | Pass::Replacing
                             | Pass::ReplacingFallback => direction.nearer(),
@@ -426,16 +322,14 @@ impl TileRenderer {
                             front: stencil_face(kind),
                             back: stencil_face(kind),
                             read_mask: match kind {
-                                Pass::Solid | Pass::Layers | Pass::Skirt => REPLACED,
+                                Pass::Solid | Pass::Layers => REPLACED,
                                 Pass::Fallback | Pass::ReplacingFallback => OWNED | REPLACED,
-                                Pass::Underlay => OWNED | REPLACED | UNDER,
                                 Pass::Replacing | Pass::Backdrop => 0,
                             },
                             write_mask: match kind {
                                 Pass::Solid | Pass::Layers => OWNED,
                                 Pass::Replacing | Pass::ReplacingFallback => OWNED | REPLACED,
-                                Pass::Underlay => UNDER,
-                                Pass::Backdrop | Pass::Fallback | Pass::Skirt => 0,
+                                Pass::Backdrop | Pass::Fallback => 0,
                             },
                         },
                         bias: Default::default(),
@@ -446,15 +340,7 @@ impl TileRenderer {
                     },
                     fragment: Some(wgpu::FragmentState {
                         module: &shader,
-                        entry_point: Some(match kind {
-                            // Under an underlay the ground's own surfaces mark
-                            // it without their skirts; the skirts follow the
-                            // underlay.
-                            Pass::Solid | Pass::Layers if skirtless => "fs_surface",
-                            Pass::Underlay => "fs_surface",
-                            Pass::Skirt => "fs_skirt",
-                            _ => "fs_main",
-                        }),
+                        entry_point: Some("fs_main"),
                         compilation_options: Default::default(),
                         targets: &[Some(wgpu::ColorTargetState {
                             format: target_format,
@@ -467,15 +353,10 @@ impl TileRenderer {
                     cache: None,
                 })
         };
-        let make_pipeline = |polygon_mode, kind| make(polygon_mode, kind, false);
         let pipeline = make_pipeline(wgpu::PolygonMode::Fill, Pass::Solid);
-        let skirtless = make(wgpu::PolygonMode::Fill, Pass::Solid, true);
-        let skirtless_layers = make(wgpu::PolygonMode::Fill, Pass::Layers, true);
         let background = make_pipeline(wgpu::PolygonMode::Fill, Pass::Backdrop);
         let layers = make_pipeline(wgpu::PolygonMode::Fill, Pass::Layers);
         let fallback = make_pipeline(wgpu::PolygonMode::Fill, Pass::Fallback);
-        let underlay = make_pipeline(wgpu::PolygonMode::Fill, Pass::Underlay);
-        let skirts = make_pipeline(wgpu::PolygonMode::Fill, Pass::Skirt);
         let replacing = make_pipeline(wgpu::PolygonMode::Fill, Pass::Replacing);
         let replacing_fallback = make_pipeline(wgpu::PolygonMode::Fill, Pass::ReplacingFallback);
         let wireframe = gpu
@@ -646,10 +527,6 @@ impl TileRenderer {
             background,
             layers,
             fallback,
-            underlay,
-            skirts,
-            skirtless,
-            skirtless_layers,
             wireframe,
             lines,
             sky: sky_state,
@@ -882,22 +759,9 @@ impl TileRenderer {
         tiles: impl Iterator<Item = &'t PreparedTile>,
         wireframe: bool,
     ) {
-        self.render_surfaces(pass, tiles, wireframe, (&self.pipeline, &self.layers));
-    }
-
-    /// The surfaces through `pipelines` (first pass, later passes): with
-    /// their skirts ([`TileRenderer::render`]) or without (under an
-    /// underlay, [`TileRenderer::paint_under`]).
-    fn render_surfaces<'t>(
-        &self,
-        pass: &mut wgpu::RenderPass<'_>,
-        tiles: impl Iterator<Item = &'t PreparedTile>,
-        wireframe: bool,
-        (first_pass, later_passes): (&wgpu::RenderPipeline, &wgpu::RenderPipeline),
-    ) {
         let (solid, wireframing) = match (wireframe, &self.wireframe) {
             (true, Some(wf)) => (wf, true),
-            _ => (first_pass, false),
+            _ => (&self.pipeline, false),
         };
         // Every first pass, then every later one. Grouping by pipeline rather
         // than by mesh is not an optimisation here, it is the correctness: a
@@ -924,7 +788,7 @@ impl TileRenderer {
         // A wireframe is not a surface and has no layers to add; drawing them
         // would fill the lines back in.
         if !wireframing && tiles.iter().any(|t| t.needs_more_passes()) {
-            pass.set_pipeline(later_passes);
+            pass.set_pipeline(&self.layers);
             for tile in &tiles {
                 pass.set_bind_group(1, &tile.tile_bg, &[]);
                 for mesh in &tile.meshes {
@@ -1000,111 +864,14 @@ impl TileRenderer {
         overlay: Option<&crate::overlay::OverlayRenderer>,
         wireframe: bool,
     ) {
-        self.paint_all(
-            pass,
-            backdrop,
-            std::iter::empty(),
-            replacing,
-            replacing_fallback,
-            tiles,
-            fallback,
-            overlay,
-            wireframe,
-        );
-    }
-
-    /// Every pass, in order. Without an underlay this is the scene as
-    /// [`TileRenderer::paint_replacing`] has always drawn it, the surfaces
-    /// with their skirts; with one, the surfaces without their skirts, the
-    /// underlay, the fallback, then the skirts.
-    #[allow(clippy::too_many_arguments)]
-    fn paint_all<'t>(
-        &self,
-        pass: &mut wgpu::RenderPass<'_>,
-        backdrop: impl Iterator<Item = &'t PreparedTile>,
-        underlay: impl Iterator<Item = &'t PreparedTile>,
-        replacing: impl Iterator<Item = &'t PreparedTile>,
-        replacing_fallback: impl Iterator<Item = &'t PreparedTile>,
-        tiles: impl Iterator<Item = &'t PreparedTile>,
-        fallback: impl Iterator<Item = &'t PreparedTile>,
-        overlay: Option<&crate::overlay::OverlayRenderer>,
-        wireframe: bool,
-    ) {
         self.render_sky(pass);
         self.render_background(pass, backdrop);
         self.render_replacing(pass, replacing, replacing_fallback);
-        let underlay: Vec<&PreparedTile> = underlay.collect();
-        if underlay.is_empty() {
-            self.render(pass, tiles, wireframe);
-            self.render_fallback(pass, fallback);
-        } else {
-            let tiles: Vec<&PreparedTile> = tiles.collect();
-            let skirtless = (&self.skirtless, &self.skirtless_layers);
-            self.render_surfaces(pass, tiles.iter().copied(), wireframe, skirtless);
-            self.render_with(pass, &self.underlay, 0, underlay.into_iter());
-            self.render_fallback(pass, fallback);
-            self.render_with(pass, &self.skirts, OWNED, tiles.iter().copied());
-        }
+        self.render(pass, tiles, wireframe);
+        self.render_fallback(pass, fallback);
         if let Some(overlay) = overlay {
             overlay.render(pass);
         }
-    }
-
-    /// One pass of `pipeline` over `tiles`, their first imagery batch: the
-    /// underlay, and the surfaces' skirts.
-    fn render_with<'t>(
-        &self,
-        pass: &mut wgpu::RenderPass<'_>,
-        pipeline: &wgpu::RenderPipeline,
-        reference: u32,
-        tiles: impl Iterator<Item = &'t PreparedTile>,
-    ) {
-        pass.set_stencil_reference(reference);
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &self.view_bg, &[]);
-        pass.set_bind_group(3, &self.ground_air_bg, &[]);
-        for tile in tiles {
-            pass.set_bind_group(1, &tile.tile_bg, &[]);
-            for mesh in &tile.meshes {
-                let Some(first) = mesh.material_bgs.first() else {
-                    continue;
-                };
-                pass.set_bind_group(2, first, &[]);
-                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-            }
-        }
-    }
-
-    /// [`TileRenderer::paint_replacing`], with the underlay
-    /// (`Drawn::underlay`): coarse relief drawn, with depth, where the
-    /// selection has not reached yet, before the surfaces' skirts. With an
-    /// empty underlay it is `paint_replacing`, pass for pass.
-    #[allow(clippy::too_many_arguments)]
-    pub fn paint_under<'t>(
-        &self,
-        pass: &mut wgpu::RenderPass<'_>,
-        backdrop: impl Iterator<Item = &'t PreparedTile>,
-        underlay: impl Iterator<Item = &'t PreparedTile>,
-        replacing: impl Iterator<Item = &'t PreparedTile>,
-        replacing_fallback: impl Iterator<Item = &'t PreparedTile>,
-        tiles: impl Iterator<Item = &'t PreparedTile>,
-        fallback: impl Iterator<Item = &'t PreparedTile>,
-        overlay: Option<&crate::overlay::OverlayRenderer>,
-        wireframe: bool,
-    ) {
-        self.paint_all(
-            pass,
-            backdrop,
-            underlay,
-            replacing,
-            replacing_fallback,
-            tiles,
-            fallback,
-            overlay,
-            wireframe,
-        );
     }
 
     /// The whole scene, in the order it has to go in.
@@ -1163,17 +930,8 @@ impl TileRenderer {
 ///
 /// Public so a test — or a translator aiming at another shading language — can
 /// ask for exactly what the backend compiles, rather than reassembling it and
-/// hoping the order matches. This one is the default underlay push's, for the
-/// tests; the renderer assembles [`ground_wgsl_with`] with the host's.
-#[cfg(test)]
+/// hoping the order matches.
 pub fn ground_wgsl(slots: u32) -> String {
-    ground_wgsl_with(slots, UnderlayOptions::DEFAULT_PUSH)
-}
-
-/// [`ground_wgsl`] with the underlay pushed back by `push` of its distance
-/// ([`UnderlayOptions::push`]); a negative or non-finite `push` is 0.
-pub fn ground_wgsl_with(slots: u32, push: f32) -> String {
-    let push = if push.is_finite() { push.max(0.0) } else { 0.0 };
     let air = format!(
         "{}{}\n{}\n{}",
         tuile_atmosphere::hillaire::wgsl_bindings(3),
@@ -1211,7 +969,6 @@ pub fn ground_wgsl_with(slots: u32, push: f32) -> String {
                 "/*STITCH_BAND*/",
                 &format!("{:?}", tuile_core::stitch::BAND)
             )
-            .replace("/*UNDERLAY_PUSH*/", &format!("{push:?}"))
             .replace("//#IMAGERY_BINDINGS", &bindings)
             .replace("//#IMAGERY_SAMPLES", samples.trim_start()),
     )

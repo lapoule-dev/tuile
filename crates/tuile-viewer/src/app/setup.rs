@@ -457,8 +457,7 @@ impl App {
             reported = gpu.device.limits().max_sampled_textures_per_shader_stage,
             "imagery layers a drape may bind"
         );
-        let renderer =
-            TileRenderer::new_with(&gpu, surface_format, &self.underlay.unwrap_or_default());
+        let renderer = TileRenderer::new(&gpu, surface_format);
         // The viewer's pass carries depth, so the overlay must declare it too.
         let overlay = OverlayRenderer::new(&gpu, surface_format, Some(DEPTH_FORMAT));
         let overlay_on_top = OverlayRenderer::new(&gpu, surface_format, Some(DEPTH_FORMAT));
@@ -482,11 +481,6 @@ impl App {
         // The floor drawn behind everything, each tile in its own drape.
         if crate::backdrop::shell_enabled() {
             pump.set_backdrop_level(Some(crate::backdrop::BASE_LEVEL));
-        }
-        // Held relief under the ground the selection has not reached.
-        if let Some(underlay) = &self.underlay {
-            pump.set_underlay_options(underlay);
-            pump.set_underlay_level(Some(crate::backdrop::UNDERLAY_LEVEL));
         }
         // Every frame recorded with the session's budget, once there is one.
         if let Some(meter) = self.session.as_ref().and_then(|s| s.meter()) {

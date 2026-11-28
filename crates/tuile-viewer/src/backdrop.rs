@@ -32,12 +32,6 @@ const BARE_GROUND: [f32; 4] = [0.09, 0.15, 0.24, 1.0];
 /// make a hole blurry rather than bare, which is all a backstop owes.
 pub(crate) const BASE_LEVEL: u32 = 2;
 
-/// The coarsest level of the underlay: the held relief the selection has not
-/// reached, drawn with depth from this level down. One finer than the backdrop,
-/// which is at [`BASE_LEVEL`] and draws without depth: the level the backdrop
-/// is at is left to it, the underlay is real relief where the ground is close.
-pub(crate) const UNDERLAY_LEVEL: u32 = BASE_LEVEL + 1;
-
 /// The diagnostic colour, from `TUILE_SHELL=green`.
 const MARKER_GROUND: [f32; 4] = [0.35, 0.72, 0.32, 1.0];
 
