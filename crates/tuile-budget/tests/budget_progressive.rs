@@ -778,7 +778,7 @@ fn a_re_specification_changes_the_next_steps_order() {
         }
         let v = View::at(0.45, 0.55, 12);
         let need = v.need(4);
-        // The ring's preloads: neither drawn nor the chain of ancestors the
+        // The preload score's candidates: neither drawn nor the chain of ancestors the
         // view falls back on, which is present work ordered by urgency
         // (`regulator`, E1).
         let present: BTreeSet<TileId> = v

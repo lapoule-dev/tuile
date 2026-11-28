@@ -67,11 +67,11 @@ retirés ; le nouveau est actif avant que l'ancien parte.
   d'échange, transit, plancher) ou voulu à une urgence de la vue : `Floor`,
   `Hole`, `Blocker`, `Drape`, et la chaîne d'ancêtres qui sert de repli.
 - Un **préchargement**, c'est une copie voulue à une urgence de prévision
-  (`Ring`, `Refresh` et les drapés d'un ancêtre) et non dessinée. Le
-  régulateur ne connaît ni l'anneau ni la chaîne. Il ne voit qu'une entrée :
-  une ressource, sa classe, sa taille et sa clé (valeur, échéance). L'anneau
-  peut donc disparaître au profit du plancher « atteignable » sans que rien
-  ne change ici.
+  (un candidat du score de préchargement, un rafraîchissement, les drapés
+  d'un ancêtre) et non dessinée. Le régulateur ne connaît pas la forme du
+  voisinage d'où vient le candidat. Il ne voit qu'une entrée : une
+  ressource, sa classe, sa taille et sa clé (valeur, échéance). Le plancher
+  atteignable peut donc fournir les candidats sans que rien ne change ici.
 - Le **cache**, ce sont les copies que plus rien ne veut. Toute admission
   les prend en premier, comme aujourd'hui.
 
@@ -118,9 +118,9 @@ retirés ; le nouveau est actif avant que l'ancien parte.
     d'entrée (`cible − réserve`, filtrée) et la ligne de sortie
     (`cible − en attente`) forment l'hystérésis qui remplace les paliers,
     tirée d'un seul signal. Retirer à la ligne filtrée relâchait un
-    préchargement pour des octets déjà livrés (mesuré : l'anneau évincé
+    préchargement pour des octets déjà livrés (mesuré : un candidat préchargé évincé
     au pas même où le besoin arrivait, puis relivré au suivant).
-  - *Échanger* : au lancement, les préchargements évinçables de l'anneau ne
+  - *Échanger* : au lancement, les préchargements évinçables (candidats du score) ne
     comptent pas ; un préchargement plus fort que la marge prend la place
     d'un plus faible à la livraison, où E1 est tenue.
 - **E4. Un préchargement arrive avec son drapé** (§2, lecture (c)) : un
@@ -187,7 +187,8 @@ plus.
 **Côté décideur, en mémoire (résidence) :**
 
 - `Budget::draped` n'ouvre les drapés qu'aux tuiles `Drawn | Blocker`.
-- Une tuile de l'anneau ou de la chaîne d'ancêtres se charge **maillage
+- Un candidat du score de préchargement ou une tuile de la chaîne
+  d'ancêtres se charge **maillage
   seul** : c'est #364, test rouge `a preload carries its drapes`.
 - Un maillage résident sans aucun drapé de sa propre tuile est donc l'état
   normal de tout préchargement. Quand la vue le dessine, il porte un drapé

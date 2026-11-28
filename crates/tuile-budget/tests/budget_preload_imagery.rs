@@ -2,7 +2,7 @@
 // Copyright (c) lapoule.dev
 
 //! A preload carries its imagery: a tile the budget preloads (the
-//! neighbourhood's ring, the views ahead, the chain above what is drawn)
+//! preload score's candidates around the pose, the views ahead, the chain above what is drawn)
 //! is wanted with the drapes its need lists, so that when the view draws
 //! it, its ground arrives dressed at its own level and not as geometry under
 //! a coarser ancestor's drape.
@@ -33,7 +33,7 @@ fn drawn_around(x: u64, y: u64) -> Vec<TileId> {
 
 /// The need of a still view drawing `drawn` at level 13, every entry
 /// draped at its own level: the chain of the drawn tiles as ancestors, and
-/// a ring of level-13 neighbours two tiles out. `ahead` marks the ring as
+/// preload candidates, level-13 neighbours two tiles out. `ahead` marks the candidates as
 /// named by the views ahead.
 fn still_view(drawn: &[TileId], ahead: Option<AheadUse>) -> NeedSet {
     let set: BTreeSet<TileId> = drawn.iter().copied().collect();
@@ -99,16 +99,16 @@ fn bare_preloads(list: &[(TileId, Need)], started: &BTreeSet<ResourceId>) -> Vec
         .collect()
 }
 
-/// The neighbourhood's ring (no prediction) and the chain above what is
+/// The preload score's candidates (no prediction) and the chain above what is
 /// drawn are preloaded with their drapes. With room for everything and a
-/// still view (512 MiB, no pinned floor), every ring and ancestor mesh the budget loads has a drape
+/// still view (512 MiB, no pinned floor), every candidate and ancestor mesh the budget loads has a drape
 /// loaded with it.
 ///
 /// Red on main: `Budget::draped` (engine.rs) lets only drawn tiles and
-/// blockers ask for drapes, so a ring or ancestor tile wants its mesh alone
-/// (`tile_wants`' `Membership::Ring if item.is_none()` arm never runs).
+/// blockers ask for drapes, so a candidate or ancestor tile wants its mesh alone
+/// (`tile_wants`' arm for an undrawn candidate never runs).
 #[test]
-fn the_rings_and_the_chains_preloads_carry_their_drapes() {
+fn the_candidates_and_the_chains_preloads_carry_their_drapes() {
     let mut r = Rig::interactive();
     let drawn = drawn_around(4_100, 2_900);
     let need = still_view(&drawn, None);
@@ -119,35 +119,35 @@ fn the_rings_and_the_chains_preloads_carry_their_drapes() {
             "the fixture is wrong: drawn {d:?} not loaded with its drape"
         );
     }
-    let ring = bare_preloads(&need.ring, &started);
+    let candidates = bare_preloads(&need.ring, &started);
     let chain = bare_preloads(&need.ancestors, &started);
-    let ring_meshes = need
+    let candidate_meshes = need
         .ring
         .iter()
         .filter(|(id, _)| started.contains(&ResourceId::Mesh(*id)))
         .count();
     assert!(
-        ring_meshes > 0,
-        "the fixture is wrong: no ring mesh preloaded"
+        candidate_meshes > 0,
+        "the fixture is wrong: no candidate mesh preloaded"
     );
     assert!(
-        ring.is_empty() && chain.is_empty(),
-        "preloaded without imagery: {} of {} ring meshes, {} of {} ancestors",
-        ring.len(),
-        ring_meshes,
+        candidates.is_empty() && chain.is_empty(),
+        "preloaded without imagery: {} of {} candidate meshes, {} of {} ancestors",
+        candidates.len(),
+        candidate_meshes,
         chain.len(),
         need.ancestors.len()
     );
 }
 
-/// A ring the views ahead name is preloaded with its drapes too: the
+/// Candidates the views ahead name is preloaded with its drapes too: the
 /// prediction that loads a mesh ahead of the camera loads its imagery.
 ///
 /// Red on main for the same reason (`Budget::draped`); the case
-/// `feat/budget-reads-ahead` (#355) covers, where `draped` admits a ring
+/// `feat/budget-reads-ahead` (#355) covers, where `draped` admits a candidate
 /// tile with `Need.ahead`.
 #[test]
-fn a_predicted_ring_is_preloaded_with_its_drapes() {
+fn predicted_candidates_are_preloaded_with_their_drapes() {
     let mut r = Rig::interactive();
     let drawn = drawn_around(4_100, 2_900);
     let ahead = AheadUse {
@@ -156,20 +156,20 @@ fn a_predicted_ring_is_preloaded_with_its_drapes() {
     };
     let need = still_view(&drawn, Some(ahead));
     let started = started_settling(&mut r, &need);
-    let ring_meshes = need
+    let candidate_meshes = need
         .ring
         .iter()
         .filter(|(id, _)| started.contains(&ResourceId::Mesh(*id)))
         .count();
     assert!(
-        ring_meshes > 0,
-        "the fixture is wrong: no ring mesh preloaded"
+        candidate_meshes > 0,
+        "the fixture is wrong: no candidate mesh preloaded"
     );
     let bare = bare_preloads(&need.ring, &started);
     assert!(
         bare.is_empty(),
-        "predicted and preloaded without imagery: {} of {} ring meshes",
+        "predicted and preloaded without imagery: {} of {} candidate meshes",
         bare.len(),
-        ring_meshes
+        candidate_meshes
     );
 }

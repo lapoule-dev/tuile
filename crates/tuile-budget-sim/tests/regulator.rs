@@ -146,10 +146,10 @@ pub fn measure(profile: Profile) -> Saso {
     measure_with(profile, false)
 }
 
-/// [`measure`], the ring dropped when `no_ring`.
-pub fn measure_with(profile: Profile, no_ring: bool) -> Saso {
+/// [`measure`], every preload candidate dropped when `no_preloads`.
+pub fn measure_with(profile: Profile, no_preloads: bool) -> Saso {
     let name = profile.name;
-    let run = std::panic::catch_unwind(move || measure_inner(profile, no_ring));
+    let run = std::panic::catch_unwind(move || measure_inner(profile, no_preloads));
     match run {
         Ok(s) => s,
         Err(e) => Saso {
@@ -165,14 +165,14 @@ pub fn measure_with(profile: Profile, no_ring: bool) -> Saso {
     }
 }
 
-fn measure_inner(profile: Profile, no_ring: bool) -> Saso {
+fn measure_inner(profile: Profile, no_preloads: bool) -> Saso {
     let s = named("aggressive-sequence").expect("in the catalogue");
     let mut o = Saso {
         profile: profile.name,
         ..Saso::default()
     };
     let mut sim = Sim::unchecked(profile, 101);
-    sim.no_ring = no_ring;
+    sim.no_preloads = no_preloads;
     sim.budget
         .specify(Specification::interactive())
         .expect("a valid specification");
@@ -340,7 +340,7 @@ fn saso_of_the_acceptance_sequence() {
 }
 
 /// T5: the present view with and without preloading (the neighbourhood's
-/// ring off: `reach_tiles` 0), printed side by side.
+/// preload candidates dropped), printed side by side.
 #[test]
 #[ignore = "a measurement: prints the present view with and without preloads"]
 fn the_present_view_with_and_without_preloads() {

@@ -109,8 +109,8 @@ impl Eff {
     }
 }
 
-/// Whether work of `urgency` on `r` is a preload (`regulator`): the ring, a
-/// refresh, an ancestor's own drapes (E4) — never what the view draws, the
+/// Whether work of `urgency` on `r` is a preload (`regulator`): a candidate of the
+/// preload score, a refresh, an ancestor's own drapes (E4) — never what the view draws, the
 /// chain of meshes it falls back on, or a drape a drawn tile wears.
 pub(super) fn is_preload(urgency: Urgency, r: ResourceId) -> bool {
     matches!(urgency, Urgency::Ring | Urgency::Refresh)
@@ -1035,8 +1035,8 @@ impl Budget {
                 || self.preload(tn))
     }
 
-    /// Whether `tn` is a preload of the interactive view: a ring or
-    /// ancestor tile above the floor. Its drape levels are the ones it
+    /// Whether `tn` is a preload of the interactive view: a preload
+    /// candidate or an ancestor tile above the floor. Its drape levels are the ones it
     /// needs once drawn
     /// ([`TexelFootprint::at_threshold`](super::imagery::TexelFootprint::at_threshold)),
     /// not the ones its place asks now (an ancestor under the eye would ask
@@ -3004,7 +3004,7 @@ impl Budget {
         };
         let ref_bytes = self.spec.params.ref_bytes;
         // What a start cannot count on: the GPU less the cache (unwanted)
-        // and less the ring's and refreshes' evictable preloads, which a
+        // and less the preload candidates' and refreshes' evictable copies, which a
         // stronger preload may take the place of at its delivery (the
         // margin's swap, which holds E1 there).
         let mut gpu = PerClass::from_fn(|c| {
@@ -3055,6 +3055,7 @@ impl Budget {
         EnvUse { gpu, pool, decoded }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start(
         &mut self,
         now: Micros,
@@ -4819,7 +4820,7 @@ mod tests {
         cfg.hard_limit[t3d] = Bytes::mib(6);
         let mut b = Budget::new(cfg).unwrap();
         // The recycle, not the envelope: the present need's reserve follows
-        // its pending bytes, so the ring is not held back after `v`.
+        // its pending bytes, so the candidates are not held back after `v`.
         let mut spec = crate::spec::Specification::interactive();
         spec.params.envelope.fall_permille = 1_000;
         b.specify(spec).unwrap();
