@@ -120,6 +120,32 @@ pub trait TileTree: Send + Sync {
         1.0
     }
 
+    /// [`properties`](TileTree::properties) as they are before any load has
+    /// landed: what a measure that must not depend on which loads have
+    /// landed reads. The same unless loads change them — a terrain's
+    /// bounding volumes, made of decoded height ranges
+    /// (`tuile_terrain::TerrainTree`), are answered here over its global
+    /// range. Read by the nearest-content descent
+    /// ([`crate::traversal::Config::uniform_detail`]), which goes under the
+    /// eye where nothing waits for a load.
+    fn prior_properties(&self, id: TileId) -> TileProperties {
+        self.properties(id)
+    }
+
+    /// Whether the traversal may refine past `id` now: false while what its
+    /// children are — their bounding volumes — waits on this tile's own
+    /// content, not loaded yet. Such a tile is a leaf until it lands:
+    /// selected when resident, asked for first otherwise, its children not
+    /// visited. A terrain's children span the height range its decoded
+    /// header gives (`tuile_terrain::TerrainTree`); priced before it is
+    /// known, they would be priced against a guess, and a selection that
+    /// depends on which guesses were replaced by when is a selection that
+    /// depends on the order tiles landed in. True unless the tree says
+    /// otherwise.
+    fn can_refine(&self, _id: TileId) -> bool {
+        true
+    }
+
     /// Whether the tile, drawn, stands for the ground under it — a mesh of
     /// the whole surface drawn in place of the globe's — rather than
     /// standing on it ([`SourceOptions::covers_ground`]). False unless the
@@ -797,6 +823,11 @@ impl TileTree for CompositeTileTree {
         })
     }
 
+    fn can_refine(&self, id: TileId) -> bool {
+        self.with(id, |s| s.can_refine(id.payload()))
+            .unwrap_or(true)
+    }
+
     fn covers_ground(&self, id: TileId) -> bool {
         let sources = self.shared.read();
         sources.entry(id.tag()).is_some_and(|e| {
@@ -875,6 +906,11 @@ impl TileTree for CompositeTileTree {
                 refine: Refine::Replace,
                 has_content: false,
             })
+    }
+
+    fn prior_properties(&self, id: TileId) -> TileProperties {
+        self.with(id, |s| s.prior_properties(id.payload()))
+            .unwrap_or_else(|| self.properties(id))
     }
 
     fn parent(&self, id: TileId) -> Option<TileId> {

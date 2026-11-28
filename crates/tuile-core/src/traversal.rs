@@ -1082,6 +1082,10 @@ const DESCENT_DEPTH: u32 = 64;
 /// flattens the whole film; the offset from the view AXIS elects the antipode,
 /// which sits exactly on the line of sight 12 783 km away.
 ///
+/// It reads [`TileTree::prior_properties`]: under the eye, where this descent
+/// goes, nothing waits for a load, so volumes that tighten as loads land
+/// would give a distance that depends on which had landed by then.
+///
 /// When the ray enters no child at all — a camera aimed away from the ground,
 /// and the flat toy scenes of the tests — the distances are all strictly
 /// positive, so they discriminate, and the classic nearest child is followed
@@ -1093,7 +1097,7 @@ fn deepest_content_along(
     id: TileId,
     budget: u32,
 ) -> Option<f64> {
-    let props = tree.properties(id);
+    let props = tree.prior_properties(id);
     let here = props
         .has_content
         .then(|| props.bounding_volume.distance_to_point(view.position()));
@@ -1103,7 +1107,7 @@ fn deepest_content_along(
     }
 
     let hit = |&id: &TileId| {
-        tree.properties(id)
+        tree.prior_properties(id)
             .bounding_volume
             .hit_by_ray(view.position(), view.direction())
     };
@@ -1114,7 +1118,7 @@ fn deepest_content_along(
             .into_iter()
             .min_by(|&a, &b| {
                 let to = |id| {
-                    tree.properties(id)
+                    tree.prior_properties(id)
                         .bounding_volume
                         .distance_to_point(view.position())
                 };
@@ -1289,7 +1293,16 @@ fn visit(
         // Déjà coupée : il faut nettement mieux pour la recoller.
         tau / (1.0 + config.refine_hysteresis)
     };
-    let refines = has_children && (sse > threshold || !has_content);
+    let wants_finer = has_children && (sse > threshold || !has_content);
+    // Not past a tile whose children the tree cannot describe yet
+    // (`TileTree::can_refine`): their volumes wait on this tile's content,
+    // and children priced against a guess are selected by the order tiles
+    // land in. The tile is a leaf until it lands — the ground under it is
+    // covered by it, or by what stands in for it meanwhile.
+    let refines = wants_finer && (!has_content || tree.can_refine(id));
+    if wants_finer && !refines {
+        crate::det!("tile", id = id.0, depth = depth, act = "unbounded");
+    }
 
     // Coarse ground over the whole visible region, held ready for a zoom-out.
     //
