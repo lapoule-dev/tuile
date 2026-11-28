@@ -212,7 +212,6 @@ fn start_viewer_with(
         // start message.
         imagery_compression: compression,
         imagery_encode_level: options.imagery_encode_level,
-        underlay: Some(tuile_wgpu::UnderlayOptions::default()),
         lighting,
         // A page has no file to record into.
         record: Default::default(),

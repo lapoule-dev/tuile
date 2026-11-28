@@ -173,33 +173,6 @@ struct VsOut {
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
-    return vertex(in);
-}
-
-// The underlay (`ContentPump::set_underlay_level`): the same vertex, pushed
-// away from the eye by the underlay's push (`UnderlayOptions::push`) of its distance — in depth only, the
-// picture where it was. Scaling the view-space position by `s` about the eye
-// leaves `xy / w` as it was and moves the depth: with the far plane far
-// beyond the near (`A ≈ -1`), forward depth `d` goes to `d + (d - 1)(1/s - 1)`,
-// reverse depth to `d / s`. Coarse relief standing a little above the fine
-// ground then never wins a pixel from it, and still stands in front of the
-// skirts hanging under that ground.
-@vertex
-fn vs_underlay_forward(in: VsIn) -> VsOut {
-    var out = vertex(in);
-    let d = out.clip.z / out.clip.w;
-    out.clip.z = (d + (d - 1.0) * (1.0 / (1.0 + /*UNDERLAY_PUSH*/) - 1.0)) * out.clip.w;
-    return out;
-}
-
-@vertex
-fn vs_underlay_reverse(in: VsIn) -> VsOut {
-    var out = vertex(in);
-    out.clip.z = out.clip.z / (1.0 + /*UNDERLAY_PUSH*/);
-    return out;
-}
-
-fn vertex(in: VsIn) -> VsOut {
     var out: VsOut;
     let world = tile.model * vec4f(stitched(in.position, in.uv), 1.0);
     out.clip = view.view_proj * world;
@@ -341,37 +314,6 @@ fn outlined(colour: vec3f, uv: vec2f, d: vec2f) -> vec3f {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-    return shade(in);
-}
-
-// A skirt's fragment: a skirt hangs from a tile's edge carrying that edge's
-// uv all the way down, so one of its coordinates is 0 or 1 over the whole
-// wall, where a surface fragment touches those values on a line a pixel
-// wide at most. Shaded first and discarded after, so the derivatives the
-// shading takes stay in uniform control flow.
-fn is_skirt(uv: vec2f) -> bool {
-    let e = 1e-5;
-    return uv.x < e || uv.x > 1.0 - e || uv.y < e || uv.y > 1.0 - e;
-}
-
-// The surface without its skirts: what marks the ground as owned.
-@fragment
-fn fs_surface(in: VsOut) -> @location(0) vec4f {
-    let c = shade(in);
-    if (is_skirt(in.uv)) { discard; }
-    return c;
-}
-
-// The skirts alone, drawn after the underlay: they close a seam where they
-// stand in front of the ground, and sink into it where there is a hole.
-@fragment
-fn fs_skirt(in: VsOut) -> @location(0) vec4f {
-    let c = shade(in);
-    if (!is_skirt(in.uv)) { discard; }
-    return c;
-}
-
-fn shade(in: VsOut) -> vec4f {
     let first = material.flags.x;
     var albedo = textureSample(base_tex, base_samp, in.uv) * material.base_color;
     // Content that owns its texturing has no layers, and terrain has no base

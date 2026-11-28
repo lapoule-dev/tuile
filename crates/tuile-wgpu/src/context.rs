@@ -752,37 +752,6 @@ mod tests {
         }
     }
 
-    /// **The underlay's push is the number the shader is assembled with.**
-    ///
-    /// The default is today's 1 %; another is written into both vertex
-    /// entry points of the underlay, none of the marker is left, and a
-    /// push that would bring the underlay in front of the ground (negative,
-    /// not a number) is 0.
-    #[test]
-    fn the_underlays_push_is_written_into_the_shader() {
-        let slots = tuile_core::raster::MIN_IMAGERY_SLOTS;
-        let default = ground(slots);
-        assert_eq!(
-            default,
-            crate::renderer::ground_wgsl_with(slots, crate::UnderlayOptions::DEFAULT_PUSH)
-        );
-        assert!(default.contains("(1.0 + 0.01)"), "the default push is 1 %");
-        let quarter = crate::renderer::ground_wgsl_with(slots, 0.25);
-        assert_eq!(
-            quarter.matches("(1.0 + 0.25)").count(),
-            2,
-            "forward and reverse depth both carry the push"
-        );
-        assert!(!quarter.contains("/*UNDERLAY_PUSH*/"));
-        for bad in [-0.5, f32::NAN, f32::NEG_INFINITY] {
-            assert_eq!(
-                crate::renderer::ground_wgsl_with(slots, bad),
-                crate::renderer::ground_wgsl_with(slots, 0.0),
-                "a push of {bad} is 0"
-            );
-        }
-    }
-
     /// **The assembled shader carries both fragments, once each.**
     ///
     /// Cheap, and it catches the one way the split can fail silently: an

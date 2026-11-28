@@ -612,10 +612,6 @@ impl Headless {
             backends: None,
             imagery_compression: start.imagery_compression,
             imagery_encode_level: tuile_wgpu::DEFAULT_ENCODE_LEVEL,
-            // None: a run's digests are the picture of the ground the
-            // selection drew, held relief under what it has not reached
-            // included in none of them.
-            underlay: None,
             // Lit, always: a run's pictures and digests are the renderer's
             // whole picture, and the viewers' default (off) is a person's
             // choice, not a scenario's.
