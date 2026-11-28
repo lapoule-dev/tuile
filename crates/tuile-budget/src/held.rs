@@ -243,21 +243,35 @@ impl Budget {
 mod tests {
     use super::*;
 
+    /// The bits a terrain id holds for each coordinate.
+    const COORD_BITS: u32 = 27;
+
     #[test]
     fn a_subtree_is_a_morton_interval() {
         let t = |l, x, y| TileId::from_terrain(l, x, y);
         let a = t(3, 5, 2);
         let r = subtree(a).unwrap();
-        // Every descendant down to level 9 is in the interval, nothing else.
+        // Every descendant down to level 9 is in the interval, nothing else
+        // — the eastern root's tiles (`x ≥ 2^l`) of a geographic grid
+        // included.
+        let east = t(3, 13, 2);
+        let e = subtree(east).unwrap();
         for l in 0..10u32 {
-            for x in 0..(1u64 << l).min(64) {
+            for x in (0..(2u64 << l)).filter(|x| *x < 64 || *x >= (2u64 << l) - 64) {
                 for y in 0..(1u64 << l).min(64) {
                     let d = t(l, x, y);
-                    let below = l >= 3 && (x >> (l - 3), y >> (l - 3)) == (5, 2);
-                    assert_eq!(r.contains(&morton(d).unwrap()), below, "{l} {x} {y}");
+                    let key = morton(d).unwrap();
+                    let under =
+                        |(ax, ay): (u64, u64)| l >= 3 && (x >> (l - 3), y >> (l - 3)) == (ax, ay);
+                    assert_eq!(r.contains(&key), under((5, 2)), "{l} {x} {y}");
+                    assert_eq!(e.contains(&key), under((13, 2)), "east {l} {x} {y}");
                 }
             }
         }
+        for c in geometric_children(east).unwrap() {
+            assert_eq!(geometric_parent(c), Some(east));
+        }
+        assert_eq!(geometric_parent(t(1, 3, 1)), Some(t(0, 1, 0)));
         assert_eq!(geometric_parent(t(4, 11, 5)), Some(a));
         assert_eq!(geometric_parent(t(0, 0, 0)), None);
         for c in geometric_children(a).unwrap() {
@@ -265,7 +279,63 @@ mod tests {
         }
         // Another source's tiles are elsewhere.
         assert!(!r.contains(&morton(t(4, 11, 5).with_tag(1)).unwrap()));
-        // Not a coordinate: no key.
-        assert_eq!(morton(t(2, 4, 0)), None);
+        // Not a coordinate: no key (a level holds two roots' columns, no
+        // more, and one root's rows).
+        assert_eq!(morton(t(2, 8, 0)), None);
+        assert_eq!(morton(t(2, 0, 4)), None);
+    }
+
+    /// A tile of the geographic grid: level `l` below [`DEPTH`] (and within
+    /// the id's 27 coordinate bits), `x` below `2^(l+1)`, `y` below `2^l`.
+    fn grid_tile() -> impl proptest::strategy::Strategy<Value = (u32, u64, u64, u8)> {
+        use proptest::prelude::*;
+        (0u32..27).prop_flat_map(|l| (Just(l), 0..(2u64 << l), 0..(1u64 << l), 0u8..16))
+    }
+
+    proptest::proptest! {
+        /// Every tile of a two-root grid is a coordinate: its id reads back,
+        /// its parent's children hold it, its children's parent is it, they
+        /// lie in its Morton interval, and the interval holds no tile of the
+        /// other root nor of a sibling.
+        #[test]
+        fn a_two_root_grid_is_a_quadtree((l, x, y, tag) in grid_tile()) {
+            let id = TileId::from_terrain(l, x, y).with_tag(tag);
+            proptest::prop_assert_eq!(coord(id), Some((l, x, y)));
+            let r = subtree(id).unwrap();
+            proptest::prop_assert!(r.contains(&morton(id).unwrap()));
+            match geometric_parent(id) {
+                None => proptest::prop_assert_eq!(l, 0),
+                Some(p) => {
+                    proptest::prop_assert_eq!(coord(p), Some((l - 1, x / 2, y / 2)));
+                    proptest::prop_assert_eq!(p.tag(), tag);
+                    proptest::prop_assert!(geometric_children(p).unwrap().contains(&id));
+                    proptest::prop_assert!(subtree(p).unwrap().contains(&morton(id).unwrap()));
+                }
+            }
+            match geometric_children(id) {
+                // Only the eastern root's deepest level has children no id
+                // holds.
+                None => proptest::prop_assert!(2 * x + 1 >= 1 << COORD_BITS),
+                Some(kids) => {
+                    for c in kids {
+                        proptest::prop_assert_eq!(geometric_parent(c), Some(id));
+                        proptest::prop_assert!(r.contains(&morton(c).unwrap()));
+                    }
+                }
+            }
+            // The same place in the other hemisphere, and the next column:
+            // outside its interval.
+            let other = TileId::from_terrain(l, x ^ (1 << l), y).with_tag(tag);
+            proptest::prop_assert!(!r.contains(&morton(other).unwrap()));
+            let next = TileId::from_terrain(l, (x + 1) % (2 << l), y).with_tag(tag);
+            if next != id {
+                proptest::prop_assert!(!r.contains(&morton(next).unwrap()));
+            }
+            // Beyond the two roots: not a coordinate.
+            if x + (2 << l) < 1 << COORD_BITS {
+                let beyond = TileId::from_terrain(l, x + (2 << l), y);
+                proptest::prop_assert_eq!(coord(beyond), None);
+            }
+        }
     }
 }
