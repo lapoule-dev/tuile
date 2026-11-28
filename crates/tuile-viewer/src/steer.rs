@@ -1479,7 +1479,9 @@ mod tests {
         assert!(parse_url("tuile://budget?window=maybe").is_err());
         assert_eq!(
             parse_url("tuile://budget?reservoir_level=14"),
-            Ok(vec![Command::BudgetWindow(WindowAsk::ReservoirLevel(Some(14)))])
+            Ok(vec![Command::BudgetWindow(WindowAsk::ReservoirLevel(
+                Some(14)
+            ))])
         );
         assert_eq!(
             parse_url("tuile://budget?reservoir_level=auto"),

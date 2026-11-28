@@ -416,6 +416,18 @@ pub enum RingState {
 }
 
 impl RingState {
+    /// Every state, drawn first.
+    pub const ALL: [RingState; 8] = [
+        RingState::Drawn,
+        RingState::Floor,
+        RingState::Kept,
+        RingState::Wanted,
+        RingState::Left,
+        RingState::InFlight,
+        RingState::Queued,
+        RingState::Hole,
+    ];
+
     /// Its label.
     pub fn label(self) -> &'static str {
         match self {

@@ -1157,7 +1157,10 @@ fn the_reservoir_report_lists_the_ring_and_leaves_the_held_report_alone() {
     let full = r.b.reservoir_report();
     let mut stripped = full.clone();
     stripped.ring.clear();
-    assert_eq!(stripped, plain, "the ring is an addition, nothing else moves");
+    assert_eq!(
+        stripped, plain,
+        "the ring is an addition, nothing else moves"
+    );
     let count = |s: RingState| full.ring.iter().filter(|t| t.state == s).count();
     assert!(count(RingState::Drawn) > 0, "the drawn tiles are listed");
     assert!(

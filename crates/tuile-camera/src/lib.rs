@@ -310,9 +310,8 @@ impl GlobeCamera {
         ]
         .into_iter()
         .map(|(sx, sy)| {
-            let d = (self.direction + right * (sx * half_w) + self.up * (sy * half_h))
-                .normalize()
-                * k;
+            let d =
+                (self.direction + right * (sx * half_w) + self.up * (sy * half_h)).normalize() * k;
             let (a, b, c) = (d.length_squared(), o.dot(d), o.length_squared() - 1.0);
             let disc = b * b - a * c;
             let t = if disc >= 0.0 && (-b - disc.sqrt()) / a > 0.0 {
@@ -1755,7 +1754,14 @@ mod tests {
     /// about the point under the eye, and it is centred on it.
     #[test]
     fn the_footprint_of_a_nadir_view_surrounds_the_ground_under_the_eye() {
-        let cam = GlobeCamera::from_geodetic(0.78, -0.009, 1_000.0, 0.0, std::f64::consts::FRAC_PI_2, 0.8);
+        let cam = GlobeCamera::from_geodetic(
+            0.78,
+            -0.009,
+            1_000.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+            0.8,
+        );
         let f = cam.ground_footprint(1.5);
         assert_eq!(f.len(), 8);
         let (lon, lat) = (-0.009, 0.78);

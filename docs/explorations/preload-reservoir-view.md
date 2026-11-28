@@ -12,11 +12,21 @@ third view of the budget window (board, tables, reservoir), in the same window
 on a desktop, a page and a phone: the code is `tuile-ui::reservoir`, the same
 everywhere.
 
-- **Plan**: the terrain tiles of one level, 17 by 17 around the eye, north up,
-  the eye at the centre with its heading; the camera's footprint on the ground
-  and the cone to its far corners in white. `[` `]` change the level, `A` is
-  auto: the finest level with at least three tiles held and not drawn near the
-  eye, else the level of most drawn tiles.
+- **Plan**: a nested mosaic of the terrain tiles of every level shown, each
+  tile at its own size, coarse first so that finer tiles lie over them, 17
+  tiles of the selected level wide around the eye, north up, the eye at the
+  centre with its heading; the camera's footprint on the ground and the cone
+  to its far corners in white. A tile drawn is solid green at any level
+  (brighter at the selected level). At the selected level a held tile is
+  filled by its score; at other levels a held tile is a faint fill and an
+  outline, so that a held parent and its drawn children are both seen. A black
+  cell means "not held", nothing else; a real hole is orange. `[` `]` change
+  the selected level, `A` is auto (the finest level with at least three tiles
+  held and not drawn near the eye, else the level of most drawn tiles), `B`
+  and `U` hide the levels below and above, `W` limits the span to 2, 1 or all.
+  The line under the plan counts the cells laid out by state; a test checks
+  that, with every tile in the plan, they are the report's counts by level and
+  state.
 - **Section**: the tile under the eye at each level, with its state and score.
 - **Colour**: drawn is green; in flight sky blue; queued grey; missing (a hole)
   vermilion; held and not drawn is on a fixed score ramp (indigo cold, pale

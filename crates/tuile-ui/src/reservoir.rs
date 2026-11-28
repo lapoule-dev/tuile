@@ -66,7 +66,7 @@ const HOLE: u32 = 0xD55E00;
 const EYE: u32 = 0xFFFFFF;
 
 /// Where a score falls on the ramp, `0` (cold) to `1` (hot): the log2 of the
-/// score, on the fixed scale of the histograms ([`HOT_BUCKET`]). Monotone.
+/// score, on the fixed scale of the histograms (`HOT_BUCKET`). Monotone.
 pub fn score_t(score: u64) -> f64 {
     (f64::from(tuile_core::budget::score::score_bucket(score) as u32) / HOT_BUCKET).clamp(0.0, 1.0)
 }
@@ -142,7 +142,7 @@ const RING_MIN: u32 = 3;
 
 /// The level shown when none is asked for: the finest level of terrain tiles
 /// held and not drawn (a preload, a kept tile, a left one; not the floor),
-/// at least [`RING_MIN`] of them — the level where the ring can be seen.
+/// at least `RING_MIN` of them — the level where the ring can be seen.
 /// Failing that, the level of most drawn tiles (the finest on a tie).
 pub fn auto_level(report: &HeldReport, near: Option<(f64, f64)>) -> Option<u32> {
     let mut ahead: HashMap<u32, u32> = HashMap::new();
@@ -192,7 +192,7 @@ pub struct Outside {
 const RELIEF_M: f64 = 60.0;
 
 /// Whether the terrain tile `(level, x, y)` is inside one of `views`'
-/// frusta, as a sphere about its ground centre ([`RELIEF_M`]).
+/// frusta, as a sphere about its ground centre (`RELIEF_M`).
 pub fn tile_in_views(tile: (u32, u64, u64), views: &[tuile_core::traversal::ViewState]) -> bool {
     use tuile_core::geo::{geodetic_to_ecef, Geodetic};
     use tuile_core::math::{BoundingVolume, Sphere};
@@ -250,7 +250,7 @@ pub fn outline(
     let quad = |mesh: &mut Mesh, a: (f64, f64), b: (f64, f64), w: f64| {
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
         let l = dx.hypot(dy);
-        if l < 1e-6 || l > 1.0e5 {
+        if !(1e-6..=1.0e5).contains(&l) {
             return;
         }
         let (nx, ny) = (-dy / l * w / 2.0, dx / l * w / 2.0);
@@ -318,7 +318,7 @@ pub fn outline(
 
 /// The terrain tiles marked drawn in `report`, by level, and how many of
 /// them are outside all of `views`' frusta. A tile is a sphere about its
-/// ground centre, the radius its half diagonal and [`RELIEF_M`]: a tile
+/// ground centre, the radius its half diagonal and `RELIEF_M`: a tile
 /// counted outside is outside by more than its own size and relief.
 pub fn drawn_outside(
     report: &HeldReport,
@@ -425,6 +425,105 @@ pub fn why_counts(report: &HeldReport) -> [(Why, usize); 6] {
                 .count(),
         )
     })
+}
+
+/// What the plan shows of the levels around the selected one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Options {
+    /// The selected level; `None`: [`auto_level`].
+    pub level: Option<u32>,
+    /// Show the levels coarser than the selected one.
+    pub below: bool,
+    /// Show the levels finer than the selected one.
+    pub above: bool,
+    /// Only the levels within this many of the selected one; `None`: all.
+    pub span: Option<u32>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            level: None,
+            below: true,
+            above: true,
+            span: None,
+        }
+    }
+}
+
+impl Options {
+    /// Whether level `l` is shown when `shown` is selected.
+    pub fn shows(&self, shown: u32, l: u32) -> bool {
+        match l.cmp(&shown) {
+            std::cmp::Ordering::Equal => true,
+            std::cmp::Ordering::Less => self.below && self.span.is_none_or(|s| shown - l <= s),
+            std::cmp::Ordering::Greater => self.above && self.span.is_none_or(|s| l - shown <= s),
+        }
+    }
+
+    /// The next span: all, within 2, within 1, back to all.
+    pub fn next_span(self) -> Options {
+        Options {
+            span: match self.span {
+                None => Some(2),
+                Some(2) => Some(1),
+                _ => None,
+            },
+            ..self
+        }
+    }
+}
+
+/// One cell of the plan's mosaic: a published terrain tile, where it lands.
+#[derive(Debug, Clone, Copy)]
+pub struct Cell<'a> {
+    pub tile: (u32, u64, u64),
+    /// Left, top, right, bottom, clipped to the plan, points.
+    pub rect: (f64, f64, f64, f64),
+    pub t: &'a RingTile,
+}
+
+/// The cells by level and state: what the plan shows, to set against what
+/// the report holds.
+pub fn cell_counts(cells: &[Cell<'_>]) -> std::collections::BTreeMap<(u32, &'static str), usize> {
+    let mut out = std::collections::BTreeMap::new();
+    for c in cells {
+        *out.entry((c.tile.0, c.t.state.label())).or_default() += 1;
+    }
+    out
+}
+
+/// The least side of a cell worth drawing, points.
+const MIN_CELL: f64 = 0.75;
+
+/// The cells of the mosaic: every terrain tile of the levels `opts` shows
+/// that the plan `lo..hi` covers, coarse levels first so that finer ones
+/// lie over them. `to_px` takes `(lon, lat)` to a point of the plan.
+pub fn cells<'a>(
+    report: &'a HeldReport,
+    shown: u32,
+    opts: &Options,
+    to_px: &dyn Fn(f64, f64) -> (f64, f64),
+    lo: (f64, f64),
+    hi: (f64, f64),
+) -> Vec<Cell<'a>> {
+    let mut out: Vec<Cell<'a>> = terrain_tiles(report)
+        .into_iter()
+        .filter(|&((l, _, _), _)| opts.shows(shown, l))
+        .filter_map(|(tile, t)| {
+            let (w, s, e, n) = tile_rect(tile.0, tile.1, tile.2);
+            let (x0, y1) = to_px(w, s);
+            let (x1, y0) = to_px(e, n);
+            let rect = clamp_rect((x0, y0, x1, y1), lo, hi)?;
+            (rect.2 - rect.0 >= MIN_CELL && rect.3 - rect.1 >= MIN_CELL).then_some(Cell {
+                tile,
+                rect,
+                t,
+            })
+        })
+        .collect();
+    out.sort_by_key(|c| (c.tile.0, c.tile.1, c.tile.2));
+    out
 }
 
 /// The urgency tier that ranked a resource, in words.
@@ -569,7 +668,7 @@ fn clamp_rect(
 pub fn draw(
     report: Option<&HeldReport>,
     eye: Option<&ReservoirEye>,
-    level: Option<u32>,
+    opts: &Options,
     selected: Option<(u32, u64, u64)>,
     cache: &mut TextCache,
     scale: f64,
@@ -602,7 +701,9 @@ pub fn draw(
         return finish(p, scale);
     };
     let tiles = terrain_tiles(report);
-    let shown = level.or_else(|| auto_level(report, eye.map(|e| (e.lon, e.lat))));
+    let shown = opts
+        .level
+        .or_else(|| auto_level(report, eye.map(|e| (e.lon, e.lat))));
     let top = MARGIN + 44.0;
     let left = MARGIN;
     let counts = counts(report);
@@ -666,7 +767,7 @@ pub fn draw(
         p.text(left, top, "no terrain tile drawn yet", EM, dim);
         return finish(p, scale);
     };
-    let auto = level.is_none();
+    let auto = opts.level.is_none();
     let total = |v: &[Outside]| {
         v.iter()
             .fold((0, 0), |a, o| (a.0 + o.outside, a.1 + o.drawn))
@@ -706,8 +807,11 @@ pub fn draw(
         );
     }
     let head = format!(
-        "level {shown}{} · [ ] level · A auto{}",
+        "level {shown}{} · [ ] level · A auto · B below {} · U above {} · W span {}{}",
         if auto { " (auto)" } else { "" },
+        if opts.below { "on" } else { "off" },
+        if opts.above { "on" } else { "off" },
+        opts.span.map_or("all".to_owned(), |n| format!("±{n}")),
         eye.map_or(String::new(), |e| format!(
             " · eye {:.4}°, {:.4}° at {:.0} m",
             e.lon.to_degrees(),
@@ -752,7 +856,7 @@ pub fn draw(
     let to_px = |lon: f64, lat: f64| (cx + wrap(lon - lon0) * kx * k, cy - (lat - lat0) * R * k);
     let (lo, hi) = ((plan_left, plan_top), (plan_left + PLAN, plan_top + PLAN));
     p.rect(plan_left, plan_top, PLAN, PLAN, srgb(0x1A1A1A, 1.0));
-    // The grid cells the plan covers, then the tiles listed in them.
+    // The grid of the selected level, dark: a cell nothing holds is black.
     let (ex, ey) = tile_at(shown, lon0, lat0);
     let reach = PLAN_TILES.ceil() as i64 + 1;
     let max_x = (2u64 << shown) as i64;
@@ -763,40 +867,52 @@ pub fn draw(
             if gx < 0 || gy < 0 || gx >= max_x || gy >= max_y {
                 continue;
             }
-            let (gx, gy) = (gx as u64, gy as u64);
-            let (w, s, e2, n) = tile_rect(shown, gx, gy);
+            let (w, s, e2, n) = tile_rect(shown, gx as u64, gy as u64);
             let (x0, y1) = to_px(w, s);
             let (x1, y0) = to_px(e2, n);
-            let Some((x0, y0, x1, y1)) =
+            if let Some((x0, y0, x1, y1)) =
                 clamp_rect((x0 + 0.5, y0 + 0.5, x1 - 0.5, y1 - 0.5), lo, hi)
-            else {
-                continue;
-            };
-            match tiles.get(&(shown, gx, gy)) {
-                Some(t) => {
-                    p.rect(
-                        x0,
-                        y0,
-                        x1 - x0,
-                        y1 - y0,
-                        state_colour(t.state, t.terms.score),
-                    );
-                    mark(&mut p, why(t), (x0, y0, x1, y1));
-                    if selected == Some((shown, gx, gy)) {
-                        frame(&mut p, (x0, y0, x1, y1), 2.5, srgb(0xF0E442, 1.0));
-                    }
-                    p.hit_tile(
-                        x0,
-                        y0,
-                        x1 - x0,
-                        y1 - y0,
-                        legend_of(t, (shown, gx, gy)),
-                        (shown, gx, gy),
-                    );
-                }
-                None => p.rect(x0, y0, x1 - x0, y1 - y0, srgb(0x262626, 1.0)),
+            {
+                p.rect(x0, y0, x1 - x0, y1 - y0, srgb(0x262626, 1.0));
             }
         }
+    }
+    // The mosaic: every level shown, each tile its own size, coarse first.
+    let mosaic = cells(report, shown, opts, &to_px, lo, hi);
+    for c in &mosaic {
+        let (x0, y0, x1, y1) = c.rect;
+        let (l, gx, gy) = c.tile;
+        let (rx, ry, rw, rh) = (x0 + 0.3, y0 + 0.3, x1 - x0 - 0.6, y1 - y0 - 0.6);
+        let own = l == shown;
+        let colour = match c.t.state {
+            RingState::Drawn if !own => srgb(0x007A58, 1.0),
+            st => state_colour(st, c.t.terms.score),
+        };
+        if own || c.t.state == RingState::Drawn {
+            // The level selected in full, drawn tiles of any level solid.
+            p.rect(rx, ry, rw, rh, colour);
+            if own {
+                mark(&mut p, why(c.t), (x0, y0, x1, y1));
+            }
+        } else {
+            // Another level held and not drawn: a faint fill and an outline,
+            // under the finer tiles drawn over it, never hiding them.
+            let mut faint = colour;
+            faint[3] *= 0.22;
+            p.rect(rx, ry, rw, rh, faint);
+            frame(&mut p, (x0, y0, x1, y1), 1.0, colour);
+        }
+        if selected == Some(c.tile) {
+            frame(&mut p, (x0, y0, x1, y1), 2.5, srgb(0xF0E442, 1.0));
+        }
+        p.hit_tile(
+            x0,
+            y0,
+            x1 - x0,
+            y1 - y0,
+            legend_of(c.t, (l, gx, gy)),
+            (l, gx, gy),
+        );
     }
     // The camera: its footprint on the ground, the cone from the eye to its
     // far corners, the eye with its heading.
@@ -899,6 +1015,34 @@ pub fn draw(
         }
         y += ROW;
     }
+    {
+        let counts = cell_counts(&mosaic);
+        let by_state: Vec<String> = RingState::ALL
+            .iter()
+            .filter_map(|st| {
+                let n: usize = counts
+                    .iter()
+                    .filter(|((_, l), _)| *l == st.label())
+                    .map(|(_, c)| *c)
+                    .sum();
+                (n > 0).then(|| format!("{n} {}", st.label()))
+            })
+            .collect();
+        let levels: std::collections::BTreeSet<u32> = counts.keys().map(|k| k.0).collect();
+        p.text(
+            left,
+            plan_top + PLAN + 24.0,
+            &format!(
+                "the plan lays out {} cells, levels {}–{}: {}",
+                mosaic.len(),
+                levels.first().copied().unwrap_or(shown),
+                levels.last().copied().unwrap_or(shown),
+                by_state.join(" · ")
+            ),
+            EM - 1.0,
+            dim,
+        );
+    }
     if let Some((sl, sx_, sy_)) = selected {
         let line = match tiles.get(&(sl, sx_, sy_)) {
             Some(t) => format!(
@@ -917,10 +1061,10 @@ pub fn draw(
             ),
             None => format!("selected {sl}/{sx_}/{sy_}: not held"),
         };
-        p.text(left, plan_top + PLAN + 8.0, &line, EM, srgb(0xF0E442, 1.0));
+        p.text(left, plan_top + PLAN + 6.0, &line, EM, srgb(0xF0E442, 1.0));
     }
     // The legend.
-    let mut ly = plan_top + PLAN + 28.0;
+    let mut ly = plan_top + PLAN + 42.0;
     let mut lx = left;
     for (c, label) in [
         (srgb(DRAWN, 1.0), "drawn"),
@@ -1175,6 +1319,82 @@ mod tests {
         assert_eq!(why(&t), None);
     }
 
+    /// The mosaic shows every level, each tile at its own size, and what it
+    /// lays out is what the report holds, by level and state; the options
+    /// take levels away and nothing else.
+    #[test]
+    fn the_mosaic_lays_out_what_the_report_holds() {
+        let (lon, lat) = (0.0, 0.7);
+        let mut r = HeldReport::default();
+        // Drawn at 14 (coarse), 16 (fine, in the same place), a held ring at 16
+        // and an ancestor held at 12, a hole at 16.
+        let at = |l: u32, dx: i64, dy: i64| {
+            let (x, y) = tile_at(l, lon, lat);
+            (x as i64 + dx, y as i64 + dy)
+        };
+        for (l, dx, dy, st) in [
+            (14, 0, 0, RingState::Drawn),
+            (14, 1, 0, RingState::Drawn),
+            (16, 0, 0, RingState::Drawn),
+            (16, 1, 0, RingState::Drawn),
+            (16, 2, 0, RingState::Wanted),
+            (16, 0, 1, RingState::Hole),
+            (12, 0, 0, RingState::Kept),
+        ] {
+            let (x, y) = at(l, dx, dy);
+            r.ring.push(tile(l, x as u64, y as u64, st, 100));
+        }
+        // A map: 1 point a metre-ish, centred; every tile of those levels lands
+        // inside the 400-point plan.
+        let (w, s, e, n) = tile_rect(16, tile_at(16, lon, lat).0, tile_at(16, lon, lat).1);
+        let k = 40.0 / (e - w);
+        let to_px = move |lo: f64, la: f64| {
+            (
+                200.0 + (lo - (w + e) / 2.0) * k,
+                200.0 - (la - (s + n) / 2.0) * k,
+            )
+        };
+        let lo = (0.0, 0.0);
+        let hi = (400.0, 400.0);
+        let all = cells(&r, 16, &Options::default(), &to_px, lo, hi);
+        let held: std::collections::BTreeMap<(u32, &str), usize> =
+            r.ring.iter().fold(Default::default(), |mut m, t| {
+                *m.entry((t.level, t.state.label())).or_default() += 1;
+                m
+            });
+        // Level 12's tile covers the plan, 14's too: all are in, drawn tiles
+        // of both levels among them.
+        assert_eq!(cell_counts(&all), held);
+        assert_eq!(all.len(), 7);
+        // Coarse first: the fine tiles lie over the coarse ones.
+        assert!(all.windows(2).all(|p| p[0].tile.0 <= p[1].tile.0));
+        // The options take levels away, nothing more.
+        let o = Options {
+            above: false,
+            ..Options::default()
+        };
+        assert!(cells(&r, 14, &o, &to_px, lo, hi)
+            .iter()
+            .all(|c| c.tile.0 <= 14));
+        let o = Options {
+            below: false,
+            span: Some(1),
+            ..Options::default()
+        };
+        assert!(cells(&r, 15, &o, &to_px, lo, hi)
+            .iter()
+            .all(|c| c.tile.0 == 15 || c.tile.0 == 16));
+        // The drawn tiles shown are the drawn tiles held.
+        let drawn = |c: &[Cell<'_>]| c.iter().filter(|c| c.t.state == RingState::Drawn).count();
+        assert_eq!(
+            drawn(&all),
+            r.ring
+                .iter()
+                .filter(|t| t.state == RingState::Drawn)
+                .count()
+        );
+    }
+
     /// The drawing carries one region per tile with its score in the legend,
     /// and shows the ring and the drawn tiles apart.
     #[test]
@@ -1193,7 +1413,14 @@ mod tests {
             ..ReservoirEye::default()
         };
         let mut cache = TextCache::default();
-        let d = draw(Some(&r), Some(&eye), None, None, &mut cache, 1.0);
+        let d = draw(
+            Some(&r),
+            Some(&eye),
+            &Options::default(),
+            None,
+            &mut cache,
+            1.0,
+        );
         assert!(d
             .hits
             .iter()
@@ -1204,7 +1431,7 @@ mod tests {
             .any(|h| h.lines[0].text.contains("held, wanted")));
         assert!(d.hits.iter().any(|h| h.lines[0].text.contains("drawn")));
         // Waiting for a report draws a line, not a plan.
-        let none = draw(None, None, None, None, &mut cache, 1.0);
+        let none = draw(None, None, &Options::default(), None, &mut cache, 1.0);
         assert!(none.hits.is_empty());
     }
 }

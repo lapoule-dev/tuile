@@ -3098,6 +3098,10 @@ pub enum BoardKey {
     LevelUp,
     LevelDown,
     LevelAuto,
+    /// The reservoir's levels below, above, and the span of levels shown.
+    Below,
+    Above,
+    Span,
 }
 
 /// The budget window's scroll, pointer and focus: where it is scrolled to,

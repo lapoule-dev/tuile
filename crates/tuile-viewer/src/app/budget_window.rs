@@ -82,8 +82,8 @@ pub(super) struct BudgetWindow {
     /// The preload reservoir rather than the board: the tiles the budget
     /// holds around and under the eye (`tuile_ui::reservoir`).
     reservoir: bool,
-    /// Its level; `None`: the level most tiles are drawn at.
-    reservoir_level: Option<u32>,
+    /// Its level (`None`: auto) and which levels around it the plan shows.
+    reservoir_opts: tuile_ui::reservoir::Options,
     /// The camera, for the reservoir's plan.
     eye: Option<tuile_ui::reservoir::ReservoirEye>,
     /// The tile a click picked in the reservoir: outlined in the view.
@@ -105,7 +105,7 @@ impl BudgetWindow {
                 self.shown = true;
                 self.reservoir = true;
                 self.tables = false;
-                self.reservoir_level = level;
+                self.reservoir_opts.level = level;
             }
             WindowAsk::Cumulative(on) => {
                 self.shown = true;
@@ -217,9 +217,22 @@ impl BudgetWindow {
             Some(K::Issues) => WindowAsk::Levels(!self.issues_only),
             Some(K::Reservoir) => WindowAsk::Reservoir(!self.reservoir),
             Some(K::LevelAuto) => WindowAsk::ReservoirLevel(None),
+            Some(K::Below) if self.reservoir => {
+                self.reservoir_opts.below = !self.reservoir_opts.below;
+                return false;
+            }
+            Some(K::Above) if self.reservoir => {
+                self.reservoir_opts.above = !self.reservoir_opts.above;
+                return false;
+            }
+            Some(K::Span) if self.reservoir => {
+                self.reservoir_opts = self.reservoir_opts.next_span();
+                return false;
+            }
             Some(k @ (K::LevelUp | K::LevelDown)) if self.reservoir => {
                 let at = self
-                    .reservoir_level
+                    .reservoir_opts
+                    .level
                     .or_else(|| {
                         tuile_core::metrics::budget()
                             .and_then(|s| s.score_held)
@@ -314,7 +327,7 @@ impl BudgetWindow {
             return tuile_ui::reservoir::draw(
                 signals.and_then(|s| s.score_held.as_ref()),
                 self.eye.as_ref(),
-                self.reservoir_level,
+                &self.reservoir_opts,
                 self.selected,
                 texts,
                 scale,
