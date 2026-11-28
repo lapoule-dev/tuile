@@ -32,6 +32,9 @@ use super::TileInfo;
 /// hold 27 bits, so its level is at most 27.
 const DEPTH: u32 = 28;
 
+/// The bits a terrain id holds for each coordinate.
+const COORD_BITS: u32 = 27;
+
 /// A tile's place in Morton order: its source tag, its quadtree path to
 /// [`DEPTH`] (two bits a level, the levels below its own zero), its level.
 /// A tile's quadtree descendants follow it, before any tile that is not.
@@ -54,9 +57,16 @@ fn spread(v: u64) -> u64 {
 
 /// The quadtree coordinate a terrain id reads as, when it is one: its
 /// level within [`DEPTH`], its x and y within its level.
+///
+/// A level holds up to two columns per row: a geographic grid has two tiles
+/// at level 0 (west and east of Greenwich), so its level `l` runs `x` to
+/// `2^(l+1)` and `y` to `2^l`; a square grid uses the western half. The
+/// Morton path takes the extra column bit as its first (bit 57, under the
+/// 64 a key holds), a root of its own: each root's descendants are still
+/// one interval ([`subtree`]).
 fn coord(t: TileId) -> Option<(u32, u64, u64)> {
     let (l, x, y) = t.terrain_coord();
-    (l < DEPTH && x >> l == 0 && y >> l == 0).then_some((l, x, y))
+    (l < DEPTH && x >> (l + 1) == 0 && y >> l == 0).then_some((l, x, y))
 }
 
 /// `t`'s Morton key, when its id is a quadtree coordinate.
@@ -90,10 +100,12 @@ pub(super) fn geometric_parent(t: TileId) -> Option<TileId> {
 }
 
 /// The quadtree's four children of `p`, when its id is a coordinate whose
-/// children are coordinates too.
+/// children are coordinates too — within [`DEPTH`], and within the id's
+/// coordinate bits (the eastern root's columns at level 26 have children
+/// no id holds).
 pub(super) fn geometric_children(p: TileId) -> Option<[TileId; 4]> {
     let (l, x, y) = coord(p)?;
-    (l + 1 < DEPTH).then(|| {
+    (l + 1 < DEPTH && (2 * x + 1) >> COORD_BITS == 0).then(|| {
         let c = |dx: u64, dy: u64| {
             TileId::from_terrain(l + 1, 2 * x + dx, 2 * y + dy).with_tag(p.tag())
         };
@@ -242,9 +254,6 @@ impl Budget {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-
-    /// The bits a terrain id holds for each coordinate.
-    const COORD_BITS: u32 = 27;
 
     #[test]
     fn a_subtree_is_a_morton_interval() {
