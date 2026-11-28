@@ -4491,7 +4491,8 @@ impl Budget {
                 }
                 let gpu = a.has_gpu(s);
                 let flying = a.loading(s) || a.has_transit(s);
-                let urgency = a.urgency(s);
+                // Why it is wanted if it is (the want tier), else why it is ranked.
+                let urgency = self.wanted_urgency(a.id(s)).or_else(|| a.urgency(s));
                 let state = if gpu {
                     if a.marked(s, Mark::Drawn) {
                         RingState::Drawn

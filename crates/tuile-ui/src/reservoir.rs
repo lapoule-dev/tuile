@@ -598,12 +598,19 @@ pub fn draw(
         .join(" · ");
     p.text(
         MARGIN,
-        MARGIN + 98.0,
-        &format!("held, not drawn, by reason: {held_why} — marks: white frame ring, orange frame ancestors, dark square left over"),
+        MARGIN + 112.0,
+        &format!("held, not drawn, by reason: {held_why}"),
         EM - 1.0,
         dim,
     );
-    let top = top + 58.0;
+    p.text(
+        MARGIN,
+        MARGIN + 126.0,
+        "marks: white frame = ring · orange frame = ancestors · dark square = left over · yellow = picked",
+        EM - 1.0,
+        dim,
+    );
+    let top = top + 96.0;
     let Some(shown) = shown else {
         p.text(left, top, "no terrain tile drawn yet", EM, dim);
         return finish(p, scale);
@@ -623,12 +630,18 @@ pub fn draw(
             MARGIN,
             MARGIN + 84.0,
             &format!(
-                "drawn out of the present view: {o} of {d} ({oa} out of every view, the host's included) · traversals truncated: {} · by level: {}",
-                e.truncated,
-                if worst.is_empty() { "none".to_owned() } else { worst.join(", ") }
+                "drawn out of the present view: {o} of {d} ({oa} out of every view) · traversals truncated: {}",
+                e.truncated
             ),
             EM - 1.0,
             srgb(0xE69F00, 1.0),
+        );
+        p.text(
+            MARGIN,
+            MARGIN + 98.0,
+            &format!("  by level (out/drawn): {}", if worst.is_empty() { "none".to_owned() } else { worst.join(", ") }),
+            EM - 1.0,
+            dim,
         );
     }
     let head = format!(

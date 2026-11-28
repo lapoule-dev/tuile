@@ -1168,4 +1168,11 @@ fn the_reservoir_report_lists_the_ring_and_leaves_the_held_report_alone() {
         full.ring.iter().any(|t| t.terms.score > 0),
         "its terms are carried"
     );
+    assert!(
+        full.ring
+            .iter()
+            .filter(|t| t.state == RingState::Wanted)
+            .all(|t| t.urgency.is_some()),
+        "a held tile that is wanted says at which tier"
+    );
 }
