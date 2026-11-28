@@ -342,6 +342,11 @@ pub struct Metrics {
     /// Passes run. One per camera update **and one per load completion**, which
     /// is why this climbs far faster than the frame rate.
     pub traversals: Counter,
+    /// Passes that reached the bound on their work
+    /// ([`crate::traversal::Config::max_visits`]) and were not used: the
+    /// previous selection stayed. Should be zero; above zero is a view the
+    /// refinement does not bound by itself.
+    pub traversals_truncated: Counter,
     /// The walk itself, [`crate::traversal::traverse`], and nothing of the
     /// bookkeeping around it.
     pub traversal_seconds: Timer,
@@ -969,6 +974,7 @@ macro_rules! snapshot {
 snapshot! {
     counters: [
         traversals,
+        traversals_truncated,
         loads_started,
         loads_completed,
         loads_failed,

@@ -562,4 +562,84 @@ mod tests {
             }
         }
     }
+
+    /// How many tiles one traversal of the globe visits from an eye at
+    /// `lat` (radians), `lon` (degrees) and `height` (metres), looking almost
+    /// straight down with the interactive configuration, an empty residency
+    /// and a 1920x1080 view.
+    ///
+    /// Run on its own thread and waited for with a deadline, so that a
+    /// traversal which does not come back fails the test instead of hanging
+    /// the suite. The orphaned thread dies with the test binary.
+    fn visited_from(lat: f64, lon_deg: f64, height: f64) -> u32 {
+        use tuile_core::geo::{geodetic_to_ecef, Geodetic};
+        use tuile_core::traversal::{traverse, Config, ResidentSet, TraversalOutput, ViewState};
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let tree = TerrainTree::new(cwt_layer());
+            let lon = lon_deg.to_radians();
+            let eye = geodetic_to_ecef(Geodetic { lon, lat, height });
+            let up = eye.normalize();
+            // The local north at the eye, then pitched 88 degrees below the
+            // horizon: almost the nadir, heading north.
+            let east = glam::DVec3::new(-lon.sin(), lon.cos(), 0.0);
+            let north = up.cross(east).normalize();
+            let pitch = 88f64.to_radians();
+            let forward = north * pitch.cos() - up * pitch.sin();
+            let view = ViewState::perspective(
+                eye,
+                forward.normalize(),
+                up,
+                glam::dvec2(1920.0, 1080.0),
+                60f64.to_radians(),
+            );
+            let mut out = TraversalOutput::default();
+            traverse(
+                &tree,
+                &ResidentSet::default(),
+                &[view],
+                &Config::interactive_globe(),
+                Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &mut out,
+            );
+            let _ = tx.send(out.stats.visited);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the traversal did not come back in 10 s: nothing bounds it")
+    }
+
+    /// Where the predictor's clamp put an eye (`lat = pi/2 - 1e-9`, 100 m up):
+    /// the 2^(l+1) tiles of every level's polar row meet at the pole, are all
+    /// at distance ~0, and all refine to the deepest level - about 1e8 tiles
+    /// and 20 GB. A traversal is bounded in nodes, whatever the view.
+    #[test]
+    fn a_traversal_from_the_pole_at_ground_level_is_bounded() {
+        let visited = visited_from(std::f64::consts::FRAC_PI_2 - 1e-9, 0.7912, 100.0);
+        let bound = tuile_core::traversal::Config::interactive_globe().max_visits;
+        assert!(
+            bound <= 500_000,
+            "the interactive bound ({bound}) is not a bound"
+        );
+        assert!(visited <= bound, "visited {visited} tiles, bound {bound}");
+    }
+
+    /// The same view anywhere else is the ordinary case, and stays far below
+    /// the bound: only the pole explodes.
+    #[test]
+    fn a_traversal_at_an_ordinary_latitude_is_small() {
+        let visited = visited_from(42.8108_f64.to_radians(), 0.7912, 100.0);
+        eprintln!("ordinary visited {visited}");
+        assert!(visited < 50_000, "visited {visited} tiles");
+    }
+
+    /// And the pole seen from far away is ordinary too.
+    #[test]
+    fn a_traversal_from_the_pole_at_altitude_is_small() {
+        let visited = visited_from(std::f64::consts::FRAC_PI_2 - 1e-9, 0.7912, 565_000.0);
+        eprintln!("pole 565 km visited {visited}");
+        assert!(visited < 50_000, "visited {visited} tiles");
+    }
 }

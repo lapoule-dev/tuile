@@ -369,6 +369,9 @@ const PUBLISH_EVERY: Micros = Micros::from_millis(500);
 /// hold still: their ring grows a level each time its tiles arrive, and a
 /// pass over many views is not to be paid at every arrival.
 const AHEAD_EVERY: u64 = 4;
+/// The views ahead are traversed with this fraction of
+/// [`Config::max_visits`].
+const AHEAD_VISITS_DIVISOR: u32 = 4;
 
 /// Creates a geometry server for a **3D Tiles** tileset, bound in-process to
 /// one consumer. Convenience over [`in_process_with`]: it wraps the tileset in
@@ -1124,6 +1127,12 @@ struct State {
     /// they are drawn (a prediction used) or their time is past (unused).
     predicted: BTreeMap<TileId, Micros>,
     ahead_out: TraversalOutput,
+    /// Where the present pass is written, swapped with `out` only when the
+    /// pass is complete: a pass cut at its bound must leave the previous
+    /// selection on screen.
+    out_work: TraversalOutput,
+    /// The last present pass was cut at its bound (logged once per run).
+    truncating: bool,
     ahead_near: NearestContent,
     /// Set when the views ahead changed since the pass over them.
     ahead_moved: bool,
@@ -1203,6 +1212,8 @@ impl State {
             ahead_model: 0,
             predicted: BTreeMap::new(),
             ahead_out: TraversalOutput::default(),
+            out_work: TraversalOutput::default(),
+            truncating: false,
             ahead_near: NearestContent::default(),
             ahead_moved: false,
             rendered_last: HashSet::new(),
@@ -1968,8 +1979,22 @@ impl State {
                 &self.rendered_last,
                 &self.chosen_before,
                 &mut self.near,
-                &mut self.out,
+                &mut self.out_work,
             );
+        }
+        // Double buffer: a pass cut at its bound is partial, and a partial
+        // selection is a hole. The previous one stays, whole.
+        if self.out_work.truncated {
+            crate::metrics::metrics().traversals_truncated.inc();
+            if !std::mem::replace(&mut self.truncating, true) {
+                tracing::warn!(
+                    visited = self.out_work.stats.visited,
+                    "traversal cut at its bound on visited tiles; keeping the previous selection"
+                );
+            }
+        } else {
+            self.truncating = false;
+            std::mem::swap(&mut self.out, &mut self.out_work);
         }
         // The pass over the views ahead, when they moved, and again every few
         // steps while their tiles arrive: it reads the residency and the
@@ -1978,17 +2003,28 @@ impl State {
             && (std::mem::take(&mut self.ahead_moved) || self.steps.is_multiple_of(AHEAD_EVERY))
         {
             let residency = self.budget.residency();
+            // The views ahead are a guess: they get a fraction of the bound,
+            // so that a wild one cannot hold up the present view's select.
+            let ahead_config = Config {
+                max_visits: config.max_visits / AHEAD_VISITS_DIVISOR,
+                ..config.clone()
+            };
             traverse_with(
                 tree,
                 &residency,
                 &self.ahead,
-                &config,
+                &ahead_config,
                 self.frame,
                 &self.rendered_last,
                 &self.chosen_before,
                 &mut self.ahead_near,
                 &mut self.ahead_out,
             );
+            // A pass cut at its bound is thrown away, not used.
+            if self.ahead_out.truncated {
+                crate::metrics::metrics().traversals_truncated.inc();
+                self.ahead_out.clear();
+            }
         }
         let walked = started.elapsed();
         // Every pass of every session these tests drive is checked against
@@ -2533,6 +2569,11 @@ mod tests {
             &mut fresh,
         );
         let at = format!("pass {frame}");
+        if fresh.truncated {
+            // A pass cut at its bound is discarded by the session: `out` is
+            // the previous pass's, which is the point, not a divergence.
+            return;
+        }
         assert_eq!(out.selected, fresh.selected, "{at}: selection");
         assert_eq!(out.requests, fresh.requests, "{at}: requests");
         assert_eq!(out.awaiting, fresh.awaiting, "{at}: awaiting");
@@ -2792,6 +2833,47 @@ mod tests {
         let (total, descents) = CHECKED.with(|c| c.get());
         assert!(total > first, "the second camera was never traversed");
         assert_eq!(descents, 2, "{total} passes under two cameras");
+    }
+
+    /// **A pass cut at its bound leaves the previous selection on screen.**
+    ///
+    /// From far away the root alone satisfies the SSE (one tile visited);
+    /// from near, the tree refines past a bound of three. The cut pass is
+    /// partial - a hole - so the session keeps the root it was drawing, and
+    /// counts the cut.
+    #[test]
+    fn a_pass_cut_at_its_bound_keeps_the_previous_selection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tileset = deep_tileset(dir.path());
+        let config = Config {
+            max_visits: 3,
+            ..Config::default()
+        };
+        let (mut stream, server) =
+            in_process(tileset, Arc::new(FsFetcher), config, roomy()).expect("budget");
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+
+        look(&stream, far_view(), 0);
+        assert!(
+            settle(&mut server, &mut stream, &mut consumer),
+            "far settles"
+        );
+        let drawn: Vec<_> = consumer.draw.items.iter().map(|i| i.mesh.tile()).collect();
+        assert!(!drawn.is_empty(), "the root is drawn from afar");
+
+        let cut = crate::metrics::metrics().traversals_truncated.get();
+        look(&stream, near_view(), 1);
+        assert!(
+            settle(&mut server, &mut stream, &mut consumer),
+            "near settles"
+        );
+        assert!(
+            crate::metrics::metrics().traversals_truncated.get() > cut,
+            "the near pass was never cut"
+        );
+        let now: Vec<_> = consumer.draw.items.iter().map(|i| i.mesh.tile()).collect();
+        assert_eq!(now, drawn, "the previous selection stays, whole");
     }
 
     /// **A load that is woken carries the wake, not the poll.** The loop polls
