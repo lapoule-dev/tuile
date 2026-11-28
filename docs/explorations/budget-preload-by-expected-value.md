@@ -665,6 +665,281 @@ même temps. C'est donc **un** changement de comportement, et on le prouve par l
 
 ---
 
+## 7bis. Le champ de préchargement prolonge la traversée
+
+> Laurent, 28 nov. Recadrage qui prime sur toute formulation antérieure : la traversée
+> actuelle reste une **entrée** du budget, parce qu'il faut aussi gérer les budgets
+> **prédictifs** et les **chemins exacts** (film, Glide, bande). Le contrat n'est donc pas
+> « une traversée élargie qui étiquette tout ». Le budget consomme un **ensemble de résultats
+> de traversée**, chacun étiqueté par sa source et son échéance. Aucune ligne de code avant
+> validation. La sélection exacte (branche `fix/no-selection-outside-view`) n'est ni touchée
+> ni dupliquée ici.
+
+### 7bis.1 Constat, mesuré
+
+Trois mécanismes répondent aujourd'hui à une seule question (« que faut-il avoir avant d'en
+avoir besoin ? ») : l'anneau (`Membership::Ring`, `neighbourhood.rs`, `Need::proximity`, disque
+isotrope de ⌊π(ρ+1)²⌋ tuiles par niveau, aveugle au champ, à la direction et à la vitesse), les
+vues anticipées de #282 (`Need.ahead`, `AheadUse`, enregistrées mais jamais lues par le budget)
+et les drapeaux `preload_ancestors` / `preload_siblings` de la traversée. Mesure rapportée :
+1 196 des 1 480 maillages « dessinés » sont hors champ (c'est l'objet de l'autre agent).
+
+### 7bis.2 Le contrat d'entrée : des poses étiquetées, des faits géométriques
+
+La traversée reste ce qu'elle est : une fonction pure `(arbre, résidence, poses, config) →
+sortie`. Elle ne publie **que des faits géométriques par pose** : les tuiles voulues, leur
+niveau voulu, leur erreur d'écran, leur distance, leur centralité. Elle ne connaît ni valeur,
+ni flouz, ni budget. Ce qui change est ce que le runtime remet au budget : non plus « une
+liste + un anneau », mais **un ensemble de `PoseNeed`**.
+
+```rust
+/// D'où vient une pose, et ce que cela dit de sa certitude et de son échéance.
+pub enum Source {
+    /// La vue qui s'affiche maintenant. Statut PROTÉGÉ.
+    Present,
+    /// Une pose prévue par la prévision de caméra : instant, moyenne, σ, poids.
+    Predicted { at: Micros, spread: Spread, weight_permille: u16 },
+    /// Un chemin exact (film, Glide, bande) : instant connu, certitude 1, σ = 0.
+    Exact { at: Micros },
+}
+
+/// Le résultat d'UNE traversée (une pose, ou un groupe de poses fusionnées, 7bis.5).
+pub struct PoseNeed {
+    pub source: Source,
+    pub protected: bool,          // vrai pour Present, et pour lui seul
+    pub tiles: Vec<WantedTile>,   // (tuile, niveau voulu, sse, distance, centralité)
+    pub truncated: bool,          // #375 : la passe a atteint sa borne
+}
+```
+
+Ce contrat étend ce qui existe sans le casser :
+
+- `AheadView { view, in_us, p_permille }` (`protocol.rs`) porte déjà l'instant et la
+  probabilité ; `AheadView::certain` est déjà le cas « image d'un film ».
+- `CameraForecast` / `ForecastSample` (`camera-forecast-trait.md` §1.2) apporte `at`, `spread`
+  et `weight_permille` ; un chemin exact est un forecast à `σ = 0` et poids 1000.
+- `Need.ahead` (`AheadUse { next_use_in, probability }`) devient la **fusion** de 7bis.4 et
+  est enfin lu par le score ; `Membership::Ring` et `Need::proximity` disparaissent.
+
+**Statut protégé (la loi absolue).** Seule la pose `Present` est protégée : ses tuiles ne
+sont jamais retardées, évincées ni dégradées par un candidat. Le budget le fait par
+construction : une tuile voulue par `Present` garde la priorité de `Drawn` quelle que soit la
+valeur attendue d'un candidat, et aucun candidat ne peut préempter ce qu'elle attend. La
+sélection du présent ne dépend **jamais** d'une pose prédite ou exacte : ce sont des passes
+séparées, la sortie de `Present` est calculée la première et n'est modifiée par rien.
+
+### 7bis.3 Trois régimes, un seul contrat
+
+| | Présent | Prédit (interactif) | Chemin exact (film, Glide, bande) |
+|---|---|---|---|
+| Source | `Present` | `Predicted` | `Exact` |
+| Certitude | 1 | `P < 1`, issue de `σ` | 1 |
+| Échéance | maintenant | `τ_k`, horizons de la prévision | le calendrier connu, exact |
+| Spéculation | non | oui, valorisée | **non** : le plan est fixé à l'avance |
+| Protégé | oui | non | non (mais `P = 1`, donc valeur maximale) |
+
+- **Film = calendrier déterministe sans spéculation.** L'horizon est connu, la probabilité
+  vaut 1, chaque tuile voulue a un instant exact. Le budget n'estime plus de `P` : il fait une
+  **ordonnance** (chargement au plus tard `échéance − F_c^{-1}(q)`), et le plan est reproductible
+  au bit près. Pas de plancher atteignable : personne ne fait de geste imprévu.
+- **Interactif = probabiliste.** `P_k` vient de `σ_k` (§2.3), le plancher atteignable couvre
+  l'imprévu (§2.2 b).
+- **Transition (composite).** Un hôte passe de l'un à l'autre (un film qui rend la main à
+  l'utilisateur, une glissade qui finit, une bande interrompue). `Source` est **par pose** et
+  non par session : le forecast composite (`First(Glide | bande, MotionModel)`, forecast §1.8)
+  rend, à un instant donné, des échantillons `Exact` puis, passé le bout connu ou après un
+  geste, des échantillons `Predicted` dont `σ` démarre à celui du filtre. Le budget ne voit
+  pas de bascule : il voit des poses étiquetées autrement. La génération du forecast change
+  (§1.7) et le plan exact est abandonné sans spéculation résiduelle.
+
+### 7bis.4 Fusion présent + prédit + exact : une tuile voulue par plusieurs poses
+
+Une même tuile `t` est voulue par plusieurs poses `j` (`Present`, `Predicted_k`, `Exact_k`).
+Le score (§2.3) la voit **une fois** :
+
+- **Probabilité agrégée** : `P(t) = 1 − Π_j (1 − P_j(t))` pour des poses indépendantes ; la
+  somme pondérée `Σ_j w_jk P^vis_jk P^niv_jk` du forecast §3.2 quand les poses sont des
+  hypothèses exclusives d'un même instant. Une pose `Present` ou `Exact` a `P_j = 1`, donc
+  `P(t) = 1`. Aucune incertitude n'est comptée deux fois (le `σ` n'entre que dans `P^vis`).
+- **Échéance minimale** : `u(t) = min_j τ_j` (celle de la pose qui en a besoin le plus tôt).
+  C'est le `next_use_in` d'`AheadUse`.
+- **Niveau voulu** : le **plus fin** des niveaux demandés par les poses qui ont `P_j` au-dessus
+  du plancher de valeur (`floor_value_permille`) ; les niveaux plus grossiers sont des
+  ancêtres, présents de toute façon (la chaîne d'ancêtres est gratuite : le chemin de la
+  racine à `t`, `t` voulu par une pose implique ses ancêtres à contenu).
+- **Statut** : protégé si et seulement si `Present` la veut.
+
+Un test rouge fixe la loi : une tuile voulue par le présent et par dix poses prédites a le
+statut et l'échéance du présent, et la retirer des dix poses ne change rien au présent
+(indépendance du présent, cf. 7bis.8).
+
+### 7bis.5 Coût des traversées multiples, et comment le borner
+
+Le contrat multiplie les traversées : une par pose, donc `1 + K` (K = 4 aujourd'hui). La
+décision doit tenir **< 2 ms** ; le coût des traversées est celui du runtime, hors décideur
+(§2.1), mais il se paie sur le même pas. Cinq bornes, de la plus certaine à la plus risquée :
+
+1. **#375 `Config::max_visits`, par passe.** Déjà dans `main` (250 000 par défaut ; la passe
+   anticipée en reçoit `max_visits / AHEAD_VISITS_DIVISOR`). Une passe tronquée est **jetée
+   entière** (sa sortie est partielle) ; seule celle de `Present` garde le repli existant
+   (on garde la sélection précédente). Un candidat tronqué est perdu, jamais la sélection.
+2. **Conflation.** Une pose prédite ne se retraverse que si sa génération change (forecast
+   §1.7) ou si l'arbre change de forme ; `AHEAD_EVERY = 4` existe déjà.
+3. **Réutilisation du travail entre poses voisines (optimisation, pas un contrat).** On peut
+   passer plusieurs poses à **une seule** traversée : `traverse_with(&[vues])` prend déjà un
+   tableau de vues et retient, par tuile, la plus fine erreur d'écran. C'est ce que mesure le
+   tableau ci-dessous. L'étiquetage par pose se perd alors dans l'union : on ne s'en sert donc
+   que pour des poses de **même source et de même échéance** (les `K` échantillons d'un même
+   horizon, par exemple, ou les 4 coins d'une enveloppe de geste), jamais pour mélanger
+   `Present` et `Predicted`.
+4. **Incrémental.** Le présent ne se retraverse pas quand `(pose, lentille, forme de l'arbre,
+   résidence utile)` n'a pas changé ; les poses exactes d'un film se retraversent par fenêtre
+   glissante, pas toutes à chaque image.
+5. **Plafond de poses** : `MAX_INSTANTS = 16`, `MAX_HYPOTHESES = 4` du forecast §1.2.
+
+**Mesure (nœuds, pas des secondes).** Traversée du globe, résidence vide, 1920×1080, 60°,
+config `interactive_globe`, latitude 42,81°, regard à 30° sous l'horizon sauf mention, pose
+présente + 4 poses décalées de ±`m` en cap et en tangage (le **pire cas d'une enveloppe de
+geste de `m` degrés**), **une seule passe** sur les 5 vues. Mesure jetable, branche
+`ci/tmp-measure-margin`, run GHA 46160857127. `chosen` = tuiles choisies à leur propre niveau
+(les niveaux sont ceux de l'arbre tels que le test les imprime).
+
+| Altitude | marge `m` | nœuds visités | tuiles choisies | vs présent seul |
+|---|---|---|---|---|
+| 100 m | 0° (présent) | 2 006 | 1 276 | 1,00 × / 1,00 × |
+| 100 m | 5° | 2 106 | 1 362 | 1,05 × / 1,07 × |
+| 100 m | 20° | 2 290 | 1 492 | 1,14 × / 1,17 × |
+| 100 m | 90° | 3 034 | 2 045 | 1,51 × / 1,60 × |
+| 1 km | 0° | 2 106 | 1 351 | |
+| 1 km | 20° | 2 374 | 1 560 | 1,13 × / 1,15 × |
+| 1 km | 90° | 3 050 | 2 075 | 1,45 × / 1,54 × |
+| 10 km | 0° | 834 | 455 | |
+| 10 km | 5° | 942 | 534 | 1,13 × / 1,17 × |
+| 10 km | 20° | 1 198 | 694 | 1,44 × / 1,53 × |
+| 10 km | 90° | 1 906 | 1 259 | 2,29 × / 2,77 × |
+| 100 km | 0° | 430 | 193 | |
+| 100 km | 20° | 582 | 282 | 1,35 × / 1,46 × |
+| 100 km | 90° | 910 | 527 | 2,12 × / 2,73 × |
+| 10 km, nadir | 0° | 834 | 500 | |
+| 10 km, nadir | 20° | 974 | 574 | 1,17 × / 1,15 × |
+| 10 km, nadir | 90° | 1 346 | 850 | 1,61 × / 1,70 × |
+
+Lecture, et ce que cela prouve **et ne prouve pas** :
+
+- Une passe de présent visite 430 à 2 100 nœuds : **très loin** des 250 000 de `max_visits`.
+  La borne ne mord que dans le cas pathologique du pôle (déjà testé, `tree.rs`).
+- Élargir à 20° coûte +13 % à +44 % de nœuds en **une** passe, et croît en gros linéairement
+  avec `m` ; le gros du surcoût est dans les niveaux **grossiers** (les niveaux fins au
+  premier plan ne bougent pas : à 100 m, les niveaux 18 à 22 restent à 129/141/138/156/176 de
+  0° à 90°). C'est exactement le point (b) de la proposition : la couverture arrière arrive à
+  un niveau grossier, sans disque isotrope. **Le niveau voulu s'adoucit tout seul avec la
+  distance** ; il n'y a pas besoin d'une règle « plus grossier quand la marge croît » de plus.
+- Cinq passes séparées coûteraient 5 × le présent (≈ 10 000 nœuds à 100 m) ; la passe unique
+  en coûte 1,05 à 1,5 ×. Le gain de la réutilisation est donc de l'ordre de **3 à 4 ×**, au
+  prix de l'étiquetage (point 3).
+- **Non établi** : aucun temps mesuré (nombre de nœuds, pas de ms ; le coût par nœud en wasm
+  n'est pas connu) ; une seule scène (Pyrénées, terrain de test de l'arbre) ; résidence
+  vide, donc le coût de l'étape « demandée mais non résidente » n'est pas pesé ; la marge
+  est une rotation de la caméra, **pas** une translation ni un zoom (qui sont l'autre moitié
+  de `Reach`) ; les poses prédites réelles ne sont pas des coins d'enveloppe.
+
+### 7bis.6 Réponses aux points ouverts (avec les nombres)
+
+- **Une passe étiquetée ou deux passes ?** Ni l'un ni l'autre comme contrat : le contrat est
+  **un résultat par pose étiquetée** (7bis.2). En interne, une passe unique par groupe de poses
+  de même source et de même échéance (point 3) ; toujours une passe **séparée** pour `Present`.
+  *Raison mesurée* : mélanger, c'est faire dépendre le présent des candidats, ce que la loi
+  interdit ; séparer coûte, pour K = 4, 4 passes de ≈ 1 à 2 k nœuds, soit quelques milliers de
+  nœuds de plus que le présent.
+- **Coût de l'élargissement par niveau, marge maximale.** Voir le tableau : +5 % (5°) à
+  +50 % (90°) de nœuds à basse altitude, jusqu'à ×2,3 à 10 km. La marge maximale utile est
+  celle de l'enveloppe de geste dans le temps `T_exp` (§2.2 b) ; au-delà de 40° le surcoût
+  dépasse ×1,3 à ×1,6 sans que la valeur attendue d'une tuile à `P ≈ 0` le justifie (loi 7).
+  **Je recommande de ne pas élargir au-delà de ce que `σ` ou `Reach·T_exp` demande**, plutôt
+  que de fixer un nombre.
+- **Contrat `Need`.** `Need.proximity` et `Membership::Ring` sortent ; `Need.ahead` est
+  remplacé par `Vec<(Source, P, échéance)>` fusionné en `(P agrégée, échéance minimale,
+  statut)` par tuile. C'est un **changement de format de l'entrée enregistrée** : version
+  mineure du protocole du journal si les anciens enregistrements restent lisibles, sinon
+  majeure. À trancher (D5).
+- **Régulateur** (`budget-regulator.md`). Le régulateur fixe la part de monnaie et de
+  créneaux qu'un candidat peut consommer ; le contrat ne lui demande rien de plus : un
+  candidat n'a que `protected = false` et une valeur. Une pose `Exact` à `P = 1` peut
+  atteindre le plafond du régulateur ; on ne le contourne pas, on le règle.
+- **M1** (`feat/budget-measure-m1`, en cours). Les `F_c` mesurés fixent `T_exp` et donc la
+  marge maximale : je ne fixe aucun nombre avant eux.
+- **Un maillage va toujours avec son drapé** (régulateur §2.3, lectures a/b/c). Ce contrat
+  est **neutre** : une tuile candidate voulue par une pose est voulue **avec** ses drapés au
+  niveau que la pose demande. Pour un candidat, cela veut dire : le maillage et son drapé
+  partent ensemble, ou aucun (MD1). Je recommande la lecture (b) du régulateur, qui est aussi
+  celle qui ne double pas l'imagerie ; l'écart borné `G` est le même nombre que celui du
+  plancher atteignable (§2.2 b), ce qui évite de créer un second réglage. **Non tranché ici.**
+- **Plancher « atteignable ».** Il devient une pose `Predicted` synthétique à `P = P_plancher`
+  dont le niveau voulu est `n − G`, sur le disque de l'enveloppe, et non un anneau spécial.
+
+### 7bis.7 Le démonstrateur décrit (non codé)
+
+Un scénario est une suite de poses (présent) plus un forecast (prédit ou exact), rejoué sur
+`tuile-budget-sim` avec la même arborescence terrain qu'ici et un réseau simulé fixe.
+
+| Scénario | Présent | Forecast | Ce qu'il doit montrer |
+|---|---|---|---|
+| S1 immobile | fixe | `Still` | aucun candidat hors plancher ; 0 trou |
+| S2 pan rapide | translation 3 h/s | `MotionModel` σ | les tuiles devant arrivent avant le présent ; les tuiles derrière restent grossières |
+| S3 demi-tour | rotation 180° | `MotionModel` σ grand | la couverture arrière grossière évite tout sol noir au tour |
+| S4 film | exact | `Exact`, 60 i/s | plan fixé à l'avance, 0 spéculation (aucune tuile hors calendrier) ; ordonnance reproductible |
+| S5 transition | film puis main rendue | `Exact` puis `Predicted` | aucun trou, plan exact abandonné, pas de pic de nœuds |
+| S6 pôle | pôle à 100 m | n'importe lequel | passes tronquées : candidats perdus, présent intact |
+
+Avant / après, par scénario et par pas : nœuds visités (présent / chaque pose / total), temps
+de CPU de la traversée, tuiles dessinées, tuiles préchargées par pose, requêtes parties
+**hors présent**, tuiles dessinées hors champ (cible : < 1 % de celles de l'état actuel,
+l'autre agent ayant la sélection exacte), **trous = 0** (aucune tuile de la sélection
+présente remplacée par rien, comptée au dessin, pas seulement « sélectionnée ») ; durée de
+`decide` (< 2 ms).
+
+**Test rouge prévu (à voir échouer d'abord).**
+
+1. *Indépendance du présent.* La sélection de `Present` est identique bit à bit avec 0 pose
+   prédite et avec N poses prédites aléatoires, même tronquées. Mutation : laisser une pose
+   prédite tirer `selected`. Le test doit échouer.
+2. *Protégé.* Un candidat de valeur maximale ne retarde ni n'évince une tuile `Present`
+   (mutation : retirer `protected`).
+3. *Fusion.* Une tuile voulue par `Present` et par 10 poses a la `P` de 1, l'échéance 0 ;
+   voulue par deux poses prédites, `P = 1 − (1−P₁)(1−P₂)` et l'échéance min.
+4. *Troncature.* Une passe candidate tronquée perd ses candidats mais la sélection reste
+   celle de la passe complète (cf. #375).
+5. *Film sans spéculation.* En `Exact`, aucune requête n'est émise pour une tuile hors du
+   calendrier.
+
+### 7bis.8 Décisions pour Laurent (D4 à D9)
+
+- **D4. Le contrat : un résultat de traversée par pose, étiqueté `Present | Predicted | Exact`,
+  fusionné par le score.** Recommandé : oui. Le « tout dans une traversée élargie » est
+  abandonné ; la passe unique n'est qu'une optimisation pour les poses de même source et
+  de même échéance.
+- **D5. Format de l'entrée enregistrée : `Need.ahead` devient une liste de `(source, P,
+  échéance)` fusionnée à la lecture.** Recommandé : oui, nouvelle version du journal, anciens
+  enregistrements relus avec `Source::Predicted`.
+- **D6. Le film est un calendrier exact sans spéculation et sans plancher atteignable.**
+  Recommandé : oui, c'est ce qui rend le plan reproductible.
+- **D7. Les bornes : `max_visits` par passe (#375), une borne séparée pour les passes
+  candidates, conflation par génération, plafond `MAX_INSTANTS`.** Recommandé : la borne
+  candidate = `max_visits` du présent / `AHEAD_VISITS_DIVISOR`, déjà en place. Un seuil
+  chiffré en ms n'est pas fixé tant que le coût par nœud n'est pas mesuré en wasm.
+- **D8. Le plancher atteignable est une pose prédite synthétique, pas un anneau.** Recommandé :
+  oui ; l'anneau, `Proximity` et `reach_tiles` sont supprimés dans la PR de bascule (pas
+  d'interrupteur).
+- **D9. Lecture du « maillage avec son drapé » : (b) du régulateur.** Recommandé : (b),
+  avec `G` unique. À trancher avec la décision du régulateur.
+
+**Ce qui n'est pas établi** : le coût en temps (seulement des nœuds, une scène, résidence
+vide) ; la valeur réelle de `T_exp` (M1) ; la précision des poses prédites sur un globe
+(`PredictionErrors` non lues) ; le comportement à la transition film → main (non simulé) ;
+la compatibilité du journal (D5) ; l'interaction avec le régulateur (théorique).
+
+---
+
 ## 8. Ce que je ne sais pas (à mesurer d'abord)
 
 - **La vraie distribution des temps de chargement**, du départ à l'arrivée, par niveau de
