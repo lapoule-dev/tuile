@@ -476,7 +476,20 @@ impl App {
         let cam = &self.controller.camera;
         let g = cam.geodetic();
         let (w, h) = self.viewport();
+        // The tiles marked drawn that no frustum sees: measured against the
+        // present eyes, then those and the host's views as well.
+        let report = tuile_core::metrics::budget().and_then(|s| s.score_held);
+        let all = self.eye_views();
+        let present = self.eyes().len().min(all.len());
+        let (outside_present, outside_any) = report.map_or_else(Default::default, |r| {
+            (
+                tuile_ui::reservoir::drawn_outside(&r, &all[..present]),
+                tuile_ui::reservoir::drawn_outside(&r, &all),
+            )
+        });
         Some(tuile_ui::reservoir::ReservoirEye {
+            outside_present,
+            outside_any,
             lon: g.lon,
             lat: g.lat,
             height_m: g.height,

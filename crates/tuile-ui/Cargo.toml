@@ -38,5 +38,8 @@ muda = { version = "0.21", optional = true, default-features = false }
 # install, and a worker thread of its own rather than a GTK main loop the
 # viewer's event loop never runs. Target-scoped so the menu's thread-safe
 # snapshot state stays off the platforms that do not use it.
+[dev-dependencies]
+glam = { workspace = true }
+
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 tray-icon = { version = "0.26", optional = true, default-features = false, features = ["ksni"] }

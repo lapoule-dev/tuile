@@ -36,6 +36,10 @@ pub struct ReservoirEye {
     /// `(lon, lat)` points around the view's footprint on the ground, in
     /// order ([`tuile_camera::GlobeCamera::ground_footprint`]).
     pub footprint: Vec<(f64, f64)>,
+    /// The tiles drawn outside the present view's frustum, by level
+    /// ([`drawn_outside`]), and outside it and the host's views too.
+    pub outside_present: Vec<Outside>,
+    pub outside_any: Vec<Outside>,
 }
 
 /// The plan's half-extent, in tiles of the level shown.
@@ -128,16 +132,85 @@ pub fn terrain_tiles(report: &HeldReport) -> HashMap<(u32, u64, u64), &RingTile>
         .collect()
 }
 
-/// The level shown when none is asked for: the level of most drawn terrain
-/// tiles (the finest of those on a tie).
+/// Terrain tiles at one level held and not drawn that make a level worth
+/// showing: fewer is a stray, not a ring.
+const RING_MIN: u32 = 3;
+
+/// The level shown when none is asked for: the finest level of terrain tiles
+/// held and not drawn (a preload, a kept tile, a left one; not the floor),
+/// at least [`RING_MIN`] of them — the level where the ring can be seen.
+/// Failing that, the level of most drawn tiles (the finest on a tie).
 pub fn auto_level(report: &HeldReport) -> Option<u32> {
-    let mut count: HashMap<u32, u32> = HashMap::new();
+    let mut ahead: HashMap<u32, u32> = HashMap::new();
+    let mut drawn: HashMap<u32, u32> = HashMap::new();
     for (&(l, ..), t) in &terrain_tiles(report) {
-        if t.state == RingState::Drawn {
-            *count.entry(l).or_default() += 1;
+        match t.state {
+            RingState::Wanted | RingState::Kept | RingState::Left => {
+                *ahead.entry(l).or_default() += 1;
+            }
+            RingState::Drawn => *drawn.entry(l).or_default() += 1,
+            _ => {}
         }
     }
-    count.into_iter().max_by_key(|&(l, n)| (n, l)).map(|(l, _)| l)
+    ahead
+        .into_iter()
+        .filter(|&(_, n)| n >= RING_MIN)
+        .map(|(l, _)| l)
+        .max()
+        .or_else(|| drawn.into_iter().max_by_key(|&(l, n)| (n, l)).map(|(l, _)| l))
+}
+
+/// How many terrain tiles marked drawn at one level lie outside the views:
+/// a measure for the window's header, never a decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Outside {
+    pub level: u32,
+    /// Tiles marked drawn at this level.
+    pub drawn: u32,
+    /// Of them, outside every one of the views asked about.
+    pub outside: u32,
+}
+
+/// The vertical slack of a tile's sphere, metres: the terrain's relief the
+/// sphere does not know. The test is only ever a "surely outside".
+const RELIEF_M: f64 = 60.0;
+
+/// The terrain tiles marked drawn in `report`, by level, and how many of
+/// them are outside all of `views`' frusta. A tile is a sphere about its
+/// ground centre, the radius its half diagonal and [`RELIEF_M`]: a tile
+/// counted outside is outside by more than its own size and relief.
+pub fn drawn_outside(
+    report: &HeldReport,
+    views: &[tuile_core::traversal::ViewState],
+) -> Vec<Outside> {
+    use tuile_core::geo::{geodetic_to_ecef, Geodetic};
+    use tuile_core::math::{BoundingVolume, Sphere};
+    const R: f64 = 6_371_000.0;
+    let mut out: std::collections::BTreeMap<u32, Outside> = std::collections::BTreeMap::new();
+    for (&(l, x, y), t) in &terrain_tiles(report) {
+        if t.state != RingState::Drawn {
+            continue;
+        }
+        let (w, s, e, n) = tile_rect(l, x, y);
+        let (lon, lat) = ((w + e) / 2.0, (s + n) / 2.0);
+        let half = 0.5 * ((n - s) * R).hypot((e - w) * R * lat.cos());
+        let volume = BoundingVolume::Sphere(Sphere {
+            center: geodetic_to_ecef(Geodetic {
+                lon,
+                lat,
+                height: 0.0,
+            }),
+            radius: half + RELIEF_M,
+        });
+        let seen = views.iter().any(|v| volume.intersects_frustum(v.frustum()));
+        let c = out.entry(l).or_insert(Outside {
+            level: l,
+            ..Outside::default()
+        });
+        c.drawn += 1;
+        c.outside += u32::from(!seen);
+    }
+    out.into_values().collect()
 }
 
 /// The urgency tier that ranked a resource, in words.
@@ -261,18 +334,68 @@ pub fn draw(
     let top = MARGIN + 44.0;
     let left = MARGIN;
     let counts = counts(report);
+    let n = |st: RingState| counts.iter().find(|(s, _)| *s == st).map_or(0, |c| c.1);
     let line = counts
         .iter()
-        .filter(|(_, n)| *n > 0)
-        .map(|(s, n)| format!("{n} {}", s.label()))
+        .filter(|(s, c)| *c > 0 && *s != RingState::Left)
+        .map(|(s, c)| format!("{c} {}", s.label()))
         .collect::<Vec<_>>()
         .join(" · ");
     p.text(MARGIN, MARGIN + 20.0, &line, EM, dim);
+    let by_class = |c: Class| report.ring.iter().filter(|t| t.class == c).count();
+    let wanted = n(RingState::Wanted);
+    let stale = n(RingState::Left);
+    let hot = srgb(0xE69F00, 1.0);
+    p.text(
+        MARGIN,
+        MARGIN + 36.0,
+        &format!(
+            "{stale} held, left: copies no longer wanted, released first when room is needed — {} the {wanted} held on purpose",
+            if wanted > 0 { format!("{:.1}×", stale as f64 / wanted as f64) } else { "∞ ×".to_owned() },
+        ),
+        EM,
+        hot,
+    );
+    p.text(
+        MARGIN,
+        MARGIN + 52.0,
+        &format!(
+            "{} resources listed: {} terrain meshes · {} drapes · {} 3D tiles — the counts and the plan are terrain meshes",
+            report.ring.len(),
+            by_class(Class::TerrainMesh),
+            by_class(Class::Drape),
+            by_class(Class::Tiles3dMesh),
+        ),
+        EM - 1.0,
+        dim,
+    );
+    let top = top + 44.0;
     let Some(shown) = shown else {
         p.text(left, top, "no terrain tile drawn yet", EM, dim);
         return finish(p, scale);
     };
     let auto = level.is_none();
+    let total = |v: &[Outside]| v.iter().fold((0, 0), |a, o| (a.0 + o.outside, a.1 + o.drawn));
+    if let Some(e) = eye {
+        let (o, d) = total(&e.outside_present);
+        let (oa, _) = total(&e.outside_any);
+        let worst: Vec<String> = e
+            .outside_present
+            .iter()
+            .filter(|c| c.outside > 0)
+            .map(|c| format!("L{} {}/{}", c.level, c.outside, c.drawn))
+            .collect();
+        p.text(
+            MARGIN,
+            MARGIN + 84.0,
+            &format!(
+                "drawn out of the present view: {o} of {d} ({oa} out of every view, the host's included) · by level: {}",
+                if worst.is_empty() { "none".to_owned() } else { worst.join(", ") }
+            ),
+            EM - 1.0,
+            srgb(0xE69F00, 1.0),
+        );
+    }
     let head = format!(
         "level {shown}{} · [ ] level · A auto{}",
         if auto { " (auto)" } else { "" },
@@ -283,7 +406,7 @@ pub fn draw(
             e.height_m
         )),
     );
-    p.text(MARGIN, MARGIN + 36.0 - 2.0, &head, EM, text);
+    p.text(MARGIN, MARGIN + 70.0, &head, EM, text);
 
     // The plan: east right, north up, the eye at the centre.
     let (cx, cy) = (left + PLAN / 2.0, top + 22.0 + PLAN / 2.0);
@@ -345,7 +468,23 @@ pub fn draw(
     // The camera: its footprint on the ground, the cone from the eye to its
     // far corners, the eye with its heading.
     if let Some(e) = eye {
-        let pts: Vec<(f64, f64)> = e.footprint.iter().map(|&(lo_, la)| to_px(lo_, la)).collect();
+        // A point of the footprint past the plan (the horizon) is held on its
+        // edge, along the ray from the eye.
+        let inside = |q: (f64, f64)| {
+            let (dx, dy) = (q.0 - cx, q.1 - cy);
+            let t = [
+                if dx.abs() > 1e-9 { (PLAN / 2.0 - 1.0) / dx.abs() } else { f64::MAX },
+                if dy.abs() > 1e-9 { (PLAN / 2.0 - 1.0) / dy.abs() } else { f64::MAX },
+            ]
+            .into_iter()
+            .fold(1.0f64, f64::min);
+            (cx + dx * t, cy + dy * t)
+        };
+        let pts: Vec<(f64, f64)> = e
+            .footprint
+            .iter()
+            .map(|&(lo_, la)| inside(to_px(lo_, la)))
+            .collect();
         if pts.len() >= 3 {
             let c = pts
                 .iter()
@@ -365,7 +504,8 @@ pub fn draw(
     }
     // The section: the chain of tiles under the eye, level by level.
     let sx = left + PLAN + 24.0;
-    p.text(sx, top, "Under the eye, by level", EM, text);
+    p.text(sx, top - 2.0, "The tile under the eye, at each level", EM, text);
+    p.text(sx, top + 10.0, "state · score in µflouz per reference byte", EM - 1.0, dim);
     let deepest = tiles.keys().map(|k| k.0).max().unwrap_or(shown);
     let mut y = plan_top;
     for l in 0..=deepest {
@@ -378,7 +518,7 @@ pub fn draw(
         match tiles.get(&(l, x, yy)) {
             Some(t) => {
                 p.rect(sx + 34.0, y + 1.0, 26.0, ROW - 4.0, state_colour(t.state, t.terms.score));
-                p.text(sx + 68.0, y, &format!("{} · {}", t.state.label(), t.terms.score), EM, dim);
+                p.text(sx + 68.0, y, &format!("{} · score {}", t.state.label(), t.terms.score), EM, dim);
                 p.hit(sx, y, SECTION, ROW, legend_of(t, (l, x, yy)));
             }
             None => {
@@ -487,10 +627,10 @@ mod tests {
         }
     }
 
-    /// The selection: the level of most drawn tiles, and only terrain
-    /// meshes.
+    /// The auto level is the finest where tiles are held and not drawn
+    /// (three at least); with none, the level of most drawn tiles.
     #[test]
-    fn the_auto_level_is_that_of_most_drawn_tiles() {
+    fn the_auto_level_is_the_finest_where_the_ring_is() {
         let mut r = HeldReport::default();
         for i in 0..3 {
             r.ring.push(tile(12, i, 0, RingState::Drawn, 5));
@@ -498,12 +638,51 @@ mod tests {
         for i in 0..2 {
             r.ring.push(tile(13, i, 0, RingState::Drawn, 5));
         }
-        for i in 0..9 {
-            r.ring.push(tile(14, i, 0, RingState::Wanted, 50));
+        assert_eq!(auto_level(&r), Some(12), "no ring: the most drawn level");
+        for i in 0..4 {
+            r.ring.push(tile(13, i + 10, 0, RingState::Wanted, 50));
         }
-        assert_eq!(auto_level(&r), Some(12));
+        r.ring.push(tile(15, 0, 0, RingState::Left, 1));
+        r.ring.push(tile(16, 0, 0, RingState::Floor, 1));
+        for i in 0..5 {
+            r.ring.push(tile(14, i, 0, RingState::Kept, 9));
+        }
+        assert_eq!(
+            auto_level(&r),
+            Some(14),
+            "the finest level with a ring: a stray at 15 and the floor at 16 do not count"
+        );
         assert_eq!(auto_level(&HeldReport::default()), None);
-        assert_eq!(terrain_tiles(&r).len(), 14);
+        assert_eq!(terrain_tiles(&r).len(), 16);
+    }
+
+    /// A camera at 800 m looking 50° below the horizon does not see the
+    /// ground under it: a tile there is outside, one ahead is inside.
+    #[test]
+    fn a_drawn_tile_under_the_eye_is_outside_a_tilted_view() {
+        let (lon, lat) = (-0.0092f64, 0.7832f64);
+        let cam = tuile_camera::GlobeCamera::from_geodetic(
+            lat,
+            lon,
+            800.0,
+            0.0,
+            50f64.to_radians(),
+            45f64.to_radians(),
+        );
+        let view = cam.view_state(glam_viewport());
+        let mut r = HeldReport::default();
+        let l = 18;
+        let (x, y) = tile_at(l, lon, lat);
+        r.ring.push(tile(l, x, y, RingState::Drawn, 1));
+        // About 800 m ahead (north) at 50° pitch the ray meets the ground.
+        let ahead = tile_at(l, lon, lat + 670.0 / 6_371_000.0);
+        r.ring.push(tile(l, ahead.0, ahead.1, RingState::Drawn, 1));
+        let o = drawn_outside(&r, &[view]);
+        assert_eq!(o, vec![Outside { level: l, drawn: 2, outside: 1 }]);
+    }
+
+    fn glam_viewport() -> glam::DVec2 {
+        glam::DVec2::new(1600.0, 900.0)
     }
 
     /// The drawing carries one region per tile with its score in the legend,
@@ -521,6 +700,7 @@ mod tests {
             height_m: 900.0,
             heading: 1.0,
             footprint: vec![(0.0, 0.7), (0.0001, 0.7), (0.0001, 0.7001), (0.0, 0.7001)],
+            ..ReservoirEye::default()
         };
         let mut cache = TextCache::default();
         let d = draw(Some(&r), Some(&eye), None, &mut cache, 1.0);
