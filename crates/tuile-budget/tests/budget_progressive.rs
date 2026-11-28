@@ -1141,3 +1141,31 @@ fn the_sweep_never_takes_what_the_view_wants_within_the_horizon() {
         "{over} steps over a low watermark: the sweep had nothing to do"
     );
 }
+
+/// The reservoir view's report: the ring lists what is drawn and what is
+/// held without being drawn (the preload), each with its score's terms,
+/// and asking for it changes nothing the plain held report says.
+#[test]
+fn the_reservoir_report_lists_the_ring_and_leaves_the_held_report_alone() {
+    use tuile_budget::score::RingState;
+    let mut r = Rig::new(config(Bytes::mib(512), 4));
+    let v = View::at(0.4, 0.6, 11);
+    let need = v.need(4);
+    let _ = settle(&mut r, &need, 600);
+    let plain = r.b.held_report();
+    assert!(plain.ring.is_empty(), "not asked for: not built");
+    let full = r.b.reservoir_report();
+    let mut stripped = full.clone();
+    stripped.ring.clear();
+    assert_eq!(stripped, plain, "the ring is an addition, nothing else moves");
+    let count = |s: RingState| full.ring.iter().filter(|t| t.state == s).count();
+    assert!(count(RingState::Drawn) > 0, "the drawn tiles are listed");
+    assert!(
+        count(RingState::Wanted) + count(RingState::Kept) + count(RingState::Left) > 0,
+        "the held, undrawn ring is listed"
+    );
+    assert!(
+        full.ring.iter().any(|t| t.terms.score > 0),
+        "its terms are carried"
+    );
+}

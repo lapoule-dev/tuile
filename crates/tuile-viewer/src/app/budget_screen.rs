@@ -102,6 +102,10 @@ pub(super) fn panel_event(event: &WindowEvent, scale: f64) -> PanelEvent {
                 Key::Character("c" | "C") => K::Cumulative,
                 Key::Character("r" | "R") => K::Reset,
                 Key::Character("i" | "I") => K::Issues,
+                Key::Character("v" | "V") => K::Reservoir,
+                Key::Character("]" | "+") => K::LevelUp,
+                Key::Character("[" | "-") => K::LevelDown,
+                Key::Character("a" | "A") => K::LevelAuto,
                 Key::Named(NamedKey::Tab | NamedKey::ArrowDown) => K::Next,
                 Key::Named(NamedKey::ArrowUp) => K::Previous,
                 Key::Named(NamedKey::Backspace | NamedKey::Delete) => K::Clear,
@@ -462,6 +466,25 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// The camera as the reservoir's plan draws it: its place, heading and
+    /// the ground its frame sees. `None` while no window shows the
+    /// reservoir.
+    pub(super) fn reservoir_eye(&self) -> Option<tuile_ui::reservoir::ReservoirEye> {
+        if !(self.budget_window.shown() && self.budget_window.reservoir()) {
+            return None;
+        }
+        let cam = &self.controller.camera;
+        let g = cam.geodetic();
+        let (w, h) = self.viewport();
+        Some(tuile_ui::reservoir::ReservoirEye {
+            lon: g.lon,
+            lat: g.lat,
+            height_m: g.height,
+            heading: cam.heading(),
+            footprint: cam.ground_footprint(w / h.max(1.0)),
+        })
+    }
+
     /// Opens, draws or closes the budget window's own window, as it is
     /// asked. `event_loop` is the loop's, when the turn has it: an
     /// operating-system window is opened only from there. Nothing here
@@ -501,6 +524,8 @@ impl App {
         }
 
         let names = self.budget_layer_names();
+        let eye = self.reservoir_eye();
+        self.budget_window.set_eye(eye);
         let Some(active) = self.active.as_ref() else {
             return;
         };

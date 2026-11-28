@@ -134,7 +134,7 @@ pub enum Severity {
 }
 
 /// An sRGB colour, as the overlay takes it: linear.
-fn srgb(hex: u32, alpha: f32) -> [f32; 4] {
+pub(crate) fn srgb(hex: u32, alpha: f32) -> [f32; 4] {
     let c = |shift: u32| {
         let v = f32::from(((hex >> shift) & 0xff) as u8) / 255.0;
         if v <= 0.04045 {
@@ -635,9 +635,9 @@ pub struct BoardView<'a> {
     pub issues_only: bool,
 }
 
-const TEXT: u32 = 0xDDDDDD;
-const DIM: u32 = 0x8C8C8C;
-const TRACK: u32 = 0x2A2A2A;
+pub(crate) const TEXT: u32 = 0xDDDDDD;
+pub(crate) const DIM: u32 = 0x8C8C8C;
+pub(crate) const TRACK: u32 = 0x2A2A2A;
 /// Drawn: Okabe and Ito's blue.
 const DRAWN: u32 = 0x0072B2;
 /// Held, not drawn.
@@ -647,23 +647,23 @@ const LOADS: u32 = 0x56B4E9;
 const QUEUED: u32 = 0xF0E442;
 
 /// The text's em, points.
-const EM: f64 = 11.0;
-const ROW: f64 = 16.0;
-const MARGIN: f64 = 12.0;
+pub(crate) const EM: f64 = 11.0;
+pub(crate) const ROW: f64 = 16.0;
+pub(crate) const MARGIN: f64 = 12.0;
 
-struct Painter<'a> {
-    font: &'static Font,
-    scale: f64,
-    mesh: Mesh,
-    labels: Vec<Label>,
-    cache: &'a mut TextCache,
-    extent: (f64, f64),
-    hits: Vec<Hit>,
+pub(crate) struct Painter<'a> {
+    pub(crate) font: &'static Font,
+    pub(crate) scale: f64,
+    pub(crate) mesh: Mesh,
+    pub(crate) labels: Vec<Label>,
+    pub(crate) cache: &'a mut TextCache,
+    pub(crate) extent: (f64, f64),
+    pub(crate) hits: Vec<Hit>,
 }
 
 impl Painter<'_> {
     /// `text` explains the region `x, y, w, h` (points).
-    fn hit(&mut self, x: f64, y: f64, w: f64, h: f64, lines: Vec<Legend>) {
+    pub(crate) fn hit(&mut self, x: f64, y: f64, w: f64, h: f64, lines: Vec<Legend>) {
         let k = self.scale;
         self.hits.push(Hit {
             rect: [x * k, y * k, w * k, h * k],
@@ -671,12 +671,12 @@ impl Painter<'_> {
         });
     }
 
-    fn grow(&mut self, x: f64, y: f64) {
+    pub(crate) fn grow(&mut self, x: f64, y: f64) {
         self.extent.0 = self.extent.0.max(x);
         self.extent.1 = self.extent.1.max(y);
     }
 
-    fn tri(&mut self, p: [(f64, f64); 3], colour: [f32; 4]) {
+    pub(crate) fn tri(&mut self, p: [(f64, f64); 3], colour: [f32; 4]) {
         for (x, y) in p {
             self.grow(x, y);
             self.mesh
@@ -684,7 +684,7 @@ impl Painter<'_> {
         }
     }
 
-    fn rect(&mut self, x: f64, y: f64, w: f64, h: f64, colour: [f32; 4]) {
+    pub(crate) fn rect(&mut self, x: f64, y: f64, w: f64, h: f64, colour: [f32; 4]) {
         if w <= 0.0 || h <= 0.0 {
             return;
         }
@@ -693,12 +693,12 @@ impl Painter<'_> {
         self.tri([(x, y1), (x1, y), (x1, y1)], colour);
     }
 
-    fn width(&self, text: &str, size: f64) -> f64 {
+    pub(crate) fn width(&self, text: &str, size: f64) -> f64 {
         f64::from(self.font.width(text, (size * self.scale) as f32)) / self.scale
     }
 
     /// `text` with its top-left corner at `(x, y)`; returns its width.
-    fn text(&mut self, x: f64, y: f64, text: &str, size: f64, colour: [f32; 4]) -> f64 {
+    pub(crate) fn text(&mut self, x: f64, y: f64, text: &str, size: f64, colour: [f32; 4]) -> f64 {
         if text.is_empty() {
             return 0.0;
         }
@@ -727,14 +727,14 @@ impl Painter<'_> {
     }
 
     /// `text` ending at `right`.
-    fn text_right(&mut self, right: f64, y: f64, text: &str, size: f64, colour: [f32; 4]) {
+    pub(crate) fn text_right(&mut self, right: f64, y: f64, text: &str, size: f64, colour: [f32; 4]) {
         let w = self.width(text, size);
         self.text(right - w, y, text, size, colour);
     }
 
     /// The severity's shape, `size` points, centred at `(x, y)`: a dot, a
     /// square, a diamond, a triangle.
-    fn marker(&mut self, sev: Severity, x: f64, y: f64, size: f64) {
+    pub(crate) fn marker(&mut self, sev: Severity, x: f64, y: f64, size: f64) {
         let r = size / 2.0;
         let c = sev.colour();
         match sev {
@@ -767,7 +767,7 @@ impl Painter<'_> {
 
     /// A bar of `w × h` at `(x, y)`: its track, then `parts` stacked from
     /// the left, each its share of `max`.
-    fn bar(&mut self, x: f64, y: f64, w: f64, h: f64, parts: &[(f64, [f32; 4])], max: f64) {
+    pub(crate) fn bar(&mut self, x: f64, y: f64, w: f64, h: f64, parts: &[(f64, [f32; 4])], max: f64) {
         self.rect(x, y, w, h, srgb(TRACK, 1.0));
         if max <= 0.0 {
             return;
@@ -781,7 +781,7 @@ impl Painter<'_> {
     }
 
     /// A badge: the severity's colour behind `text`, its marker before it.
-    fn badge(&mut self, x: f64, y: f64, sev: Severity, text: &str) -> f64 {
+    pub(crate) fn badge(&mut self, x: f64, y: f64, sev: Severity, text: &str) -> f64 {
         let w = self.width(text, EM) + 22.0;
         let mut bg = sev.colour();
         bg[3] = 0.28;
@@ -934,6 +934,12 @@ pub fn draw(
             layers(&mut p, s, view, y);
         }
     }
+    finish(p, scale)
+}
+
+/// The painter's work as a [`Drawing`]: its extent plus a margin, over the
+/// panel's background.
+pub(crate) fn finish(p: Painter<'_>, scale: f64) -> Drawing {
     let (w, h) = (p.extent.0 + MARGIN, p.extent.1 + MARGIN);
     // The background, under everything: the triangles drawn so far go
     // after it.
@@ -3052,6 +3058,11 @@ pub enum BoardKey {
     Cumulative,
     Reset,
     Issues,
+    /// The preload reservoir or the board; its level up, down, or auto.
+    Reservoir,
+    LevelUp,
+    LevelDown,
+    LevelAuto,
 }
 
 /// The budget window's scroll, pointer and focus: where it is scrolled to,

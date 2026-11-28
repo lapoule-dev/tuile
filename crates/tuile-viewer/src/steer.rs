@@ -267,6 +267,10 @@ pub(crate) enum WindowAsk {
     /// Shown, listing only the levels with an issue (`true`) or every
     /// level (`false`).
     Levels(bool),
+    /// Shown as the preload reservoir (`true`) or as the board (`false`).
+    Reservoir(bool),
+    /// The reservoir's level: this one, or the auto one (`None`).
+    ReservoirLevel(Option<u32>),
 }
 
 /// One thing the view can be told to do, whoever is telling it.
@@ -663,6 +667,14 @@ pub(crate) fn parse_url_among(
                         "issues" => true,
                         _ => return Err(format!("window_levels is all or issues, not {text:?}")),
                     }))),
+                    "reservoir_level" => out.push(Command::BudgetWindow(WindowAsk::ReservoirLevel(
+                        match *text {
+                            "auto" => None,
+                            n => Some(n.parse().map_err(|_| {
+                                format!("reservoir_level is a level or auto, not {n:?}")
+                            })?),
+                        },
+                    ))),
                     "window" => out.push(Command::BudgetWindow(match *text {
                         "on" => WindowAsk::Show(true),
                         "off" => WindowAsk::Show(false),
@@ -671,17 +683,18 @@ pub(crate) fn parse_url_among(
                         "reset" => WindowAsk::Reset,
                         "table" => WindowAsk::Tables(true),
                         "graph" => WindowAsk::Tables(false),
+                        "reservoir" => WindowAsk::Reservoir(true),
                         _ => {
                             return Err(format!(
-                                "window is on, off, instant, cumulative, reset, table or graph, \
-                                 not {text:?}"
+                                "window is on, off, instant, cumulative, reset, table, graph or \
+                                 reservoir, not {text:?}"
                             ))
                         }
                     })),
                     _ => {
                         return Err(format!(
                             "budget takes spec=, margin=, horizon_ms=, speculation_slots=, \
-                             line=, window=, window_levels=, prediction=context and the prediction's {}, not {key:?}",
+                             line=, window=, window_levels=, reservoir_level=, prediction=context and the prediction's {}, not {key:?}",
                             tuile_camera::predict::QUERY_KEYS.join("=, ")
                         ))
                     }
@@ -1456,6 +1469,7 @@ mod tests {
             ("reset", WindowAsk::Reset),
             ("table", WindowAsk::Tables(true)),
             ("graph", WindowAsk::Tables(false)),
+            ("reservoir", WindowAsk::Reservoir(true)),
         ] {
             assert_eq!(
                 parse_url(&format!("tuile://budget?window={text}")),
@@ -1463,6 +1477,15 @@ mod tests {
             );
         }
         assert!(parse_url("tuile://budget?window=maybe").is_err());
+        assert_eq!(
+            parse_url("tuile://budget?reservoir_level=14"),
+            Ok(vec![Command::BudgetWindow(WindowAsk::ReservoirLevel(Some(14)))])
+        );
+        assert_eq!(
+            parse_url("tuile://budget?reservoir_level=auto"),
+            Ok(vec![Command::BudgetWindow(WindowAsk::ReservoirLevel(None))])
+        );
+        assert!(parse_url("tuile://budget?reservoir_level=deep").is_err());
         assert_eq!(
             parse_url("tuile://budget?window_levels=issues"),
             Ok(vec![Command::BudgetWindow(WindowAsk::Levels(true))])

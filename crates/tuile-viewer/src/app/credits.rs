@@ -133,6 +133,8 @@ impl App {
         // top-left corner, clear of the on-screen control on the right.
         if !self.budget_window.wants_own_window() {
             let names = self.budget_layer_names();
+            let eye = self.reservoir_eye();
+            self.budget_window.set_eye(eye);
             self.budget_window.lay_out(
                 tuile_core::metrics::budget().as_ref(),
                 size,

@@ -79,12 +79,32 @@ pub(super) struct BudgetWindow {
     /// The prediction section's rows, laid out under the budget's
     /// (`predicting::prediction_rows`).
     prediction: Vec<Vec<String>>,
+    /// The preload reservoir rather than the board: the tiles the budget
+    /// holds around and under the eye (`tuile_ui::reservoir`).
+    reservoir: bool,
+    /// Its level; `None`: the level most tiles are drawn at.
+    reservoir_level: Option<u32>,
+    /// The camera, for the reservoir's plan.
+    eye: Option<tuile_ui::reservoir::ReservoirEye>,
 }
 
 impl BudgetWindow {
     pub(super) fn ask(&mut self, ask: WindowAsk) {
         match ask {
             WindowAsk::Show(on) => self.shown = on,
+            WindowAsk::Reservoir(on) => {
+                self.shown = true;
+                self.reservoir = on;
+                if on {
+                    self.tables = false;
+                }
+            }
+            WindowAsk::ReservoirLevel(level) => {
+                self.shown = true;
+                self.reservoir = true;
+                self.tables = false;
+                self.reservoir_level = level;
+            }
             WindowAsk::Cumulative(on) => {
                 self.shown = true;
                 self.cumulative = on;
@@ -97,6 +117,9 @@ impl BudgetWindow {
             WindowAsk::Tables(on) => {
                 self.shown = true;
                 self.tables = on;
+                if on || !self.reservoir {
+                    self.reservoir = false;
+                }
             }
             WindowAsk::Levels(issues) => {
                 self.shown = true;
@@ -107,6 +130,21 @@ impl BudgetWindow {
         self.laid = None;
         if !self.shown {
             self.layout = None;
+        }
+        // The budget lists the reservoir's tiles only while a window shows
+        // it: a session without the view pays nothing for it.
+        tuile_core::metrics::want_reservoir(self.shown && self.reservoir);
+    }
+
+    /// Whether the reservoir is what the window shows.
+    pub(super) fn reservoir(&self) -> bool {
+        self.reservoir
+    }
+
+    /// The camera the reservoir's plan is drawn about.
+    pub(super) fn set_eye(&mut self, eye: Option<tuile_ui::reservoir::ReservoirEye>) {
+        if self.shown && self.reservoir {
+            self.eye = eye;
         }
     }
 
@@ -166,6 +204,23 @@ impl BudgetWindow {
             Some(K::Cumulative) => WindowAsk::Cumulative(!self.cumulative),
             Some(K::Reset) => WindowAsk::Reset,
             Some(K::Issues) => WindowAsk::Levels(!self.issues_only),
+            Some(K::Reservoir) => WindowAsk::Reservoir(!self.reservoir),
+            Some(K::LevelAuto) => WindowAsk::ReservoirLevel(None),
+            Some(k @ (K::LevelUp | K::LevelDown)) if self.reservoir => {
+                let at = self
+                    .reservoir_level
+                    .or_else(|| {
+                        tuile_core::metrics::budget()
+                            .and_then(|s| s.score_held)
+                            .and_then(|h| tuile_ui::reservoir::auto_level(&h))
+                    })
+                    .unwrap_or(10);
+                WindowAsk::ReservoirLevel(Some(if k == K::LevelUp {
+                    (at + 1).min(24)
+                } else {
+                    at.saturating_sub(1)
+                }))
+            }
             _ => return false,
         };
         self.ask(asked);
@@ -239,6 +294,15 @@ impl BudgetWindow {
             width,
             issues_only: self.issues_only,
         };
+        if self.reservoir {
+            return tuile_ui::reservoir::draw(
+                signals.and_then(|s| s.score_held.as_ref()),
+                self.eye.as_ref(),
+                self.reservoir_level,
+                texts,
+                scale,
+            );
+        }
         tuile_ui::budget_board::draw(signals, &view, texts, scale)
     }
 
