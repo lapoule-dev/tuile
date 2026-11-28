@@ -133,7 +133,7 @@ Tout ce qui suit est lu dans le code **[code]**, sans exécution.
    Je n'ai pas trouvé d'enregistrement des vues futures elles-mêmes (grep sur `tuile-record`
    et `tuile-tape`). Le rejeu du **runtime**, qui calcule le `Need` à partir des vues, ne
    peut donc pas les redonner. C'est à vérifier dans l'enregistreur MCAP de la télémétrie
-   avant F0 (§8).
+   avant la PR 0 (§6).
 8. **Le coût n'est pas borné.** `Predictor::frame` alloue un `Vec<Ahead>` à chaque image et
    clone les horizons (`predict.rs:880-888`). `views_ahead` alloue aussi, pour les listes
    de la glissade et du rejeu. C'est petit, mais ce n'est pas « sans allocation ».
@@ -262,6 +262,12 @@ génération change**. Un hôte interactif typique en remplit 1 × 16, soit 2,4 
 `101-113`) **[code]**. La fenêtre et l'échelle n'en font pas partie : tuile les a déjà. Il
 reconstruit la `ViewState` de chaque échantillon avec la fenêtre de la vue présente, comme
 `predicting.rs:171-181` le fait aujourd'hui.
+
+`Envelope` étend l'actuel `Reach` (`protocol.rs:165-171`). Ce sont les limites que la
+caméra déclare d'elle-même : panoramique maximal au sol, en hauteurs par seconde ; zoom
+arrière maximal ; vitesse de rotation maximale ; altitudes min et max ; amortissement ;
+glissade. Elle voyage avec le forecast, et elle est la source unique de ces nombres pour le
+budget (§9.2).
 
 ### 1.3 Unités et repères
 
@@ -532,7 +538,7 @@ retire des chemins parallèles.
 | `Future { Known, Certain, Interactive }` (`predict.rs:642-650`) | **disparaît** : `Path` interruptible, `Path` sûr, `MotionForecast` | trois implémentations du même trait |
 | `views_ahead` et `Futures` du viewer (`predicting.rs:204-257`) | **disparaît** : un `First(hôte, First(rejeu, First(glide, First(glissade, filtre))))` construit une fois | la chaîne de priorité devient une donnée |
 | `PreloadView::ahead`, `Priority::Ahead` (`frame_host.rs:136-175`) et le rapprochement à ±25 % | **remplacés** : `FrameHost` gagne une méthode `forecast` par défaut vide (0 échantillon = « rien de mieux que le viewer ») | l'hôte répond aux instants de tuile, sans rééchantillonnage |
-| `PredictConfig::horizons_s` | **déplacé** vers la spécification du budget (`L` et les `τ_k`) | c'est tuile qui sait quand il doit décider ; **décision D-F1** |
+| `PredictConfig::horizons_s` | **déplacé** vers la spécification du budget (`L` et les `τ_k`) | c'est tuile qui sait quand il doit décider ; **décision D-F2** |
 | `p = e^(−τ/λ)`, `PredictConfig::laplace_s` | **disparaît**, dans la PR B2 du budget et pas avant | l'incertitude passe par `σ` ; c'est déjà la mutation de T2 du budget |
 | `interrupt_s` | **reste**, comme paramètre de `Path` interruptible | c'est le poids d'une hypothèse, pas une dispersion |
 | `AheadView { view, in_us, p_permille }` | `issued_at` + échantillons `(at − issued_at, pose, lens, σ, poids)` | instants vérifiables, `σ` qui voyage |
@@ -542,8 +548,8 @@ retire des chemins parallèles.
 | `Vec` alloué à chaque image | tableau fourni par tuile, réutilisé | §1.5 |
 
 Le filtre (`Channel`, `MotionModel`, ses `q` et `r`, le modèle de Singer) ne change pas d'une
-ligne. Les messages envoyés ne changent que par leurs instants. La PR F1 (§7) le prouve par
-des condensés inchangés, à l'exception documentée des échéances.
+ligne. Les messages envoyés ne changent que par leurs instants. La PR 0 (§7) le prouve par des
+condensés inchangés ; les échéances ne changent qu'avec C2.
 
 ### 2.4 La dispersion « de repos »
 
@@ -652,7 +658,7 @@ ClientMessage::Forecast {
     generation: u64,             // the host's; unchanged ⇒ never sent again
     motion: Motion,              // declared, recorded, read by measures only
     hypotheses: Vec<Hypothesis>, // ≤ 4; each ≤ 64 ForecastSample, ascending `at`
-    reach: Reach,                // unchanged (P8's envelope)
+    envelope: Envelope,          // `Reach` extended: the camera's declared limits (§9.2)
     model: u64,                  // unchanged (the predictor's numbers' digest)
 }
 ```
@@ -673,7 +679,7 @@ données (§3.3).
 | Fichier | Type ou élément | Changement | Cassant ? |
 |---|---|---|---|
 | `tuile-core/src/forecast.rs` (nouveau) | `CameraForecast`, `ForecastAsk`, `Forecast`, `Hypothesis`, `ForecastSample`, `Spread`, `Lens`, `Motion`, `Tolerance`, `Still`, `Path`, `First`, `conformance` | ajout | non |
-| `tuile-core/src/protocol.rs:107-171` | `ClientMessage::Ahead`, `AheadView` | **remplacés** par `ClientMessage::Forecast` ; `Reach` inchangé | **oui** pour qui construit le message à la main (bake, tests, hôtes en aval) |
+| `tuile-core/src/protocol.rs:107-171` | `ClientMessage::Ahead`, `AheadView`, `Reach` | **remplacés** par `ClientMessage::Forecast` ; `Reach` devient `Envelope`, qui l'étend | **oui** pour qui construit le message à la main (bake, tests, hôtes en aval) |
 | `tuile-core/src/runtime.rs:1112-1131`, `1240-1259` | champs `ahead`, `ahead_when`, `ahead_moved`, `AHEAD_EVERY` | remplacés par un état de forecast préalloué : génération, hypothèses, clés, pas de la dernière traversée | non (privé) |
 | `tuile-core/src/runtime.rs:1672-1737` | l'anneau et `AheadUse` | lus depuis les hypothèses ; `AheadUse` **inchangé** jusqu'à B2 du budget | non |
 | `tuile-budget/src/need.rs:551-575` | `Need.ahead: Option<AheadUse>` | **inchangé** ici (B2 le change en `[AheadSample; K]`) | non |
@@ -914,6 +920,19 @@ la chaîne de priorité du viewer ; les faux instants du bake ; l'absence de por
 - **le comportement de l'horloge du bake pendant la convergence** (§4.5) ;
 - **la part du retard visible que le besoin décalé corrige vraiment**, devant celle qui
   vient de la sélection (#323, #333) : le budget pose la même question.
+- **le coût réel de la traversée sur les poses prévues**, par scénario : `traversal_seconds`
+  ne sépare pas aujourd'hui la passe présente de la passe prévue. Le budget de 0,5 ms au
+  pire pas (§A) n'est appuyé sur aucune mesure ;
+- **le `decide` d'aujourd'hui** : le seul relevé publié (1,1 ms moyenne immobile, 6,9 ms p99
+  en zoom) date d'octobre, sur ce Mac, avant l'I6 incrémental. Il faut un relevé neuf de
+  `budget_decide` avant la PR 0 ;
+- **les limites réelles des gestes du contrôleur** (panoramique, zoom, rotation), qui
+  remplaceraient les `reach_*` supposés : je ne les ai pas dérivées de `drag`, `zoom` et
+  `tilt` (`lib.rs:675-850`) ;
+- **qui, en aval, utilise `PreloadView::ahead`** ou construit `ClientMessage::Ahead` à la main :
+  c'est ce qui décide de la durée de l'adaptateur `#[deprecated]` (§3.5) ;
+- **le seuil de l'hôte lent** (4 × l'étalon, §4.6) et `κ = 1/4`, `N_c = 2` : supposés,
+  à balayer avec le démonstrateur.
 
 ---
 
@@ -921,43 +940,307 @@ la chaîne de priorité du viewer ; les faux instants du bake ; l'absence de por
 
 Une PR de comportement à la fois, chacune testée à la main par Laurent sur le viewer avant
 la suivante (mémoire « un merge, puis Laurent teste »). Chaque test rouge est écrit d'abord
-et vu échouer contre la mutation indiquée. Les PR « mesure » ne changent aucune décision, et
+et vu échouer contre la mutation indiquée. Les PR de mesure ne changent aucune décision, et
 des condensés inchangés le prouvent.
 
 | PR | Nature | Contenu | Rouges (et mutation) | Avant / après |
 |---|---|---|---|---|
-| **F0** | mesure | `issued_at` dans `ClientMessage::Ahead` ; enregistrement MCAP des vues futures reçues ; mesure de l'âge des messages à l'application, par coquille (natif, worker web) | `ahead_messages_are_recorded_and_replayed` (mutation : ne pas enregistrer) ; `message_age_is_measured` | goldens et `recorded.txt` inchangés, sauf le format du fil ; âge p50 et p99 par coquille |
-| **F1** | refonte, sans changement de décision | trait `CameraForecast`, `Still`, `Path`, `First` dans `tuile-core` ; `MotionForecast` dans `tuile-camera` ; la chaîne `views_ahead` réécrite en `First(...)` ; `FrameHost::forecast` par défaut vide ; suite de conformité, passée par les quatre implémentations ; plus d'allocation par image | conformité 1 à 6 et 8 (mutations : écrire au-delà de `n`, allouer, `σ ≠ 0` pour un rejeu, instants décalés de 16 ms) ; les tests de `predicting.rs` gardés tels quels | condensés de `budget_sim` **inchangés** : mêmes vues, mêmes `p` ; coût par image avant et après |
-| **F2** | comportement (échéances) | les instants deviennent absolus, sur l'horloge de la session ; le bake passe aux vrais instants du film ; l'horloge web devient obligatoire | `bake_ahead_instants_are_the_films` (mutation : `order`) ; `stale_forecast_is_absent` (mutation : ignorer `A_max`) | `budget_sim` re-blessé, chaque condensé qui bouge expliqué ; un rendu de film ouvert avant et après |
+| **PR 0, le démonstrateur** (§10) | **mesure seule** | trait et types dans `tuile-core` (`forecast.rs`), `Still`, `Path`, `First` ; `MotionForecast` dans `tuile-camera` (adaptateur sur `MotionModel`, inchangé) ; la chaîne `views_ahead` réécrite en `First(...)`, qui produit **le même** `ClientMessage::Ahead` qu'aujourd'hui ; `issued_at` et l'âge des messages mesurés ; la conflation **comptée et non appliquée** (« traversées évitables ») ; suite de conformité ; surcouche, route et menu ; scénarios scriptés et headless ; métriques et canal MCAP | conformité 1 à 11 (mutations : allouer, `σ ≠ 0` pour un Glide, instants décalés de 16 ms, génération incrémentée à chaque image, hôte artificiellement lent) ; `views_ahead_through_the_trait_send_the_same_messages` | condensés de `budget_sim` et goldens **inchangés** ; le tableau du §10.4 sur `main` (#282) et sur la PR |
+| **C1** | comportement | la conflation **appliquée** : la passe sur les poses prévues n'a lieu que si une clé change, à la cadence `N_c` ; `AHEAD_EVERY` disparaît | `an_unchanged_forecast_walks_nothing` (mutation : remettre `ahead_moved = true` à chaque message) ; `a_glide_is_walked_once` | `decide` et traversée p50/p99 par scénario ; trous = 0 ; tuiles sous le besoin non dégradées |
+| **C2** | comportement (échéances) | instants absolus sur l'horloge de la session ; `ClientMessage::Forecast` (hypothèses, `σ`, poids, génération) remplace `Ahead` ; le bake passe aux vrais instants du film ; l'horloge web devient obligatoire | `bake_ahead_instants_are_the_films` (mutation : `order`) ; `stale_forecast_is_absent` (mutation : ignorer `A_max`) | `budget_sim` re-blessé, chaque condensé qui bouge expliqué ; un rendu de film ouvert avant et après |
+| **C3** | comportement (interactif) | la composition du §1.8 : l'amortissement vers la cible du contrôleur exposé comme trajectoire exacte, le filtre ramené au taux du geste | gain sur « immobile » et calibration du §1.8 sur le corpus (mutation : `MotionModel` seul) | erreur par horizon avant/après, sur le corpus MCAP et les scénarios |
 | **F3** | parité | ressource `Forecast` dans `tuile-bevy` ; adaptateur JS pour la façade web ; la suite passée par l'hôte de démonstration de chaque coquille | conformité dans la CI de chaque coquille | même scénario en natif, web et bevy : mêmes échantillons au condensé près |
-| *B2 du budget* | *comportement, déjà prévu* | *`σ` et les poids voyagent et sont lus par `P_k` ; `laplace_s` disparaît* | *T1, T2, T9 du budget* | *celui du budget* |
+| *B2 du budget* | *comportement, déjà prévu* | *`σ` et les poids lus par `P_k` ; `laplace_s` disparaît* | *T1, T2, T9 du budget* | *celui du budget* |
 | *N1 du budget* | *comportement, déjà prévu* | *l'instant `now + L` est demandé ; le besoin lit `p_L`* | *ceux de N1* | *celui du budget* |
 
-F0 et F1 ne changent aucune décision et peuvent partir dès que le document est validé. F2 est
-la seule PR de comportement propre à ce chantier, et elle corrige un défaut mesurable (les
-échéances). B2 et N1 appartiennent au plan du budget : ils lisent ce forecast et n'en sont
-pas changés. Leur ordre reste la décision D1 du budget.
-
-La calibration par source (§3.4) arrive avec F1, comme mesure : elle alimente directement M1
-du budget (diagramme de fiabilité, NIS par canal).
+La PR 0 peut partir dès que le document est validé : elle ne change aucune décision, et le
+démonstrateur en sort. C1, C2 et C3 sont les comportements propres à ce chantier, un à la
+fois. B2 et N1 appartiennent au plan du budget : ils lisent ce forecast et n'en sont pas
+changés. Leur ordre reste la décision D1 du budget.
 
 ---
 
-## 8. Décisions demandées à Laurent
+## 8. Ce qui ne change pas
 
-- **D-F1. Les horizons appartiennent à tuile, pas à la caméra.** Les instants demandés
-  (`L` et les `τ_k`) quittent `PredictConfig` et entrent dans la spécification du budget,
-  par contexte d'usage. La caméra répond aux instants qu'on lui donne. C'est conforme au
-  partage `[0, L]` et `]L, H]` du budget, mais cela déplace un réglage de la route
+Pour lever toute ambiguïté, voici ce que ce chantier ne touche pas, dans le plan du budget
+(`budget-preload-by-expected-value.md`) :
+
+- les lois P1–P12, l'ensemble candidat `C_prévu ∪ C_plancher`, le score `V`, `U`, `L` et sa
+  quantification (§1 à §3 du budget) ;
+- la définition du besoin à `t + L`, sa garde `Π`, sa conflation et la calibration de `L`
+  (§2.5 du budget) : ce document en fournit l'entrée `p_L` et nomme sa conflation, il ne
+  la redéfinit pas ;
+- la loi 8 par Little, la préemption et l'admission (§3 du budget) ;
+- les garanties G1 à G4, les tests T1 à T13, le découpage M1, M2, B1, B2, B3, R, N1 et les
+  décisions D1 à D3 du budget.
+
+Le seul point de contact est au §3.2 : la somme pondérée des hypothèses dans `P_k`. Elle est
+neutre pour une hypothèse unique de poids 1000, c'est-à-dire pour tout ce que le budget
+suppose aujourd'hui.
+
+---
+
+## 9. Le lien entre la spécification du budget et celle de la caméra
+
+Le plan du budget n'est pas modifié. Cette section décrit **qui définit quoi**, pour que
+chaque nombre n'ait qu'une source de vérité. Elle ne refait pas la spécification du budget.
+
+### 9.1 L'inventaire : aujourd'hui, des nombres en double ou à l'envers
+
+| Grandeur | Défini aujourd'hui dans | Lu par | Constat **[code]** | Source de vérité proposée |
+|---|---|---|---|---|
+| L'horizon `H` | `Params::horizon` (`spec.rs:397` : 1 s interactif, 2 s FPV, 8 s chemin connu, 10 s film) **et** le plus grand `PredictConfig::horizons_s` (2 s, `predict.rs:275`) | le budget ; le prédicteur | **en double et incohérent** : en interactif, le prédicteur échantillonne jusqu'à 2 s quand le budget a un horizon de 1 s | le budget (`Params::horizon`) |
+| Les instants `τ_k` et `L` | `PredictConfig::horizons_s` ; `L` n'existe pas encore | le prédicteur | dans la caméra alors que c'est tuile qui décide | le budget (spécification), transmis par `ForecastAsk` |
+| Les gestes les plus rapides (`reach_*`) | `PredictConfig` (3 h/s, ×4/s), **[supposé]** | P8 du budget, par `Reach` | posés dans le prédicteur, sans lien avec le contrôleur qui produit les gestes | la caméra : ses limites réelles, déclarées |
+| La glissade (`coast_s`) | `PredictConfig::coast_s`, **recopié dans** `controller.inertia.coast_s` (`predicting.rs:103`) | le contrôleur, le prédicteur | **à l'envers** : la configuration de la prédiction règle la physique de la caméra | la caméra (`Inertia`) ; le forecast la lit |
+| L'amortissement (`SETTLE_SECONDS = 0,08 s`) | constante locale du contrôleur (`lib.rs:1027`) | le contrôleur | invisible au forecast, qui en a besoin pour une trajectoire exacte (§1.8) | la caméra, déclarée |
+| L'interruption `T_i` (`interrupt_s`) | `PredictConfig` | le prédicteur | c'est une propriété des usagers, par contexte, à mesurer | la caméra, par contexte |
+| `q`, `r`, `rate_decay_s` | `PredictConfig` | le filtre | à sa place | la caméra (le filtre) |
+| `laplace_s` | `PredictConfig` | le prédicteur | disparaît avec B2 | — |
+| La latence de présentation, la période d'image | implicite (`refresh_hz` du viewer) ; `FrameDeadline::time` par image (`deadline.rs:21-31`) | l'exécuteur | deux lectures du même affichage | l'hôte (son affichage), une fois : le forecast la contient (« affichée à `at` », §1.4), `FrameDeadline` en dérive |
+| Les altitudes min et max | `CameraController::min_altitude`, `max_altitude` | le contrôleur | l'enveloppe atteignable en dépend (zoom arrière borné) | la caméra, déclarée |
+| Le temps de chargement mesuré `F_c` | `TierSample`, puis l'histogramme de M1 du budget | le budget | la caméra n'en sait rien | le budget ; la caméra **peut** le lire (§9.2) |
+| Le contexte d'usage | `SpecKind` (`spec.rs:36`) **et** `PredictConfig::for_context(label: &str)` (`predict.rs:143`), reliés par une **chaîne** (`predicting.rs:95-101`) | les deux | un libellé inconnu donne silencieusement les défauts | `SpecKind`, un seul enum, apparié exhaustivement (§9.3) |
+
+### 9.2 Qui lit quoi : une seule source, deux sens de lecture
+
+- **Le budget lit la caméra, sans la redéfinir.** Les limites de la caméra forment une
+  **enveloppe** déclarée par elle : vitesse de panoramique au sol, en hauteurs par seconde ;
+  zoom arrière maximal ; vitesse de rotation maximale ; altitudes min et max ;
+  amortissement ; glissade. Elle voyage avec le forecast, à la place de l'actuel `Reach`
+  qu'elle étend. Le runtime la quantifie une fois et elle est enregistrée. P8 du budget
+  (`C_plancher`, `v_pan`) la lit au lieu de ses défauts supposés. C'est déjà ce que le
+  budget demande : « il faut les prendre au contrôleur de gestes » (§2.2 b et §8 du budget).
+- **La caméra lit le budget, sans le redéfinir.** Par `ForecastAsk`, elle reçoit les
+  instants (`L`, `τ_k`), l'horizon `until` et la tolérance de conflation. Ce sont des nombres
+  de la spécification du budget. Elle n'a plus d'horizons à elle.
+- **Le temps de chargement, en lecture seule.** Un hôte peut vouloir régler un vol sur ce
+  que le réseau peut suivre : un Glide plus lent si le sol d'arrivée n'est pas encore là.
+  Il lit alors `BudgetSignals` (le q50 et le q95 de `F_c`, publiés). Ce n'est **jamais** une
+  entrée de `decide` venue de la caméra, et ce n'est pas dans ce chantier. Je le signale
+  parce que c'est le seul sens « budget → comportement de la caméra », et qu'il doit rester
+  une lecture de métriques, sans boucle cachée.
+
+### 9.3 Un seul choix de contexte, pour les deux
+
+Le contexte d'usage est choisi **une fois**, par l'hôte, sous la forme d'un `SpecKind`. Il
+donne à la fois `Specification::for_kind` (le budget) et `CameraSpec::for_kind` (la
+caméra : filtre, `T_i`, enveloppe par défaut). Le second est un `match` exhaustif sur le même
+enum, et non une chaîne : ajouter un contexte est une erreur de compilation tant que la
+caméra ne l'a pas traité.
+
+| Contexte | Spécification du budget | Forecast | Enveloppe |
+|---|---|---|---|
+| Viewer, à la main | `interactive` (`H` = 1 s) | `MotionForecast`, composé avec l'amortissement (§1.8) | les limites du `CameraController` |
+| Glide, `goto` | `interactive`, ou `known_path` pendant le vol | `Path` exact, interruptible | idem |
+| Rejeu de bande | `known_path` | `Path` exact, poids 1000 | celle de la bande enregistrée |
+| Film, bake | `film` (`H` = 10 s) | `Path` exact sur la trajectoire du film | aucune (la trajectoire est toute connue) |
+| FPV | `fpv` (`H` = 2 s) | `MotionForecast` aux paramètres FPV | celle du simulateur |
+| Jeu (Bevy) | `interactive` ou `fpv`, au choix de l'hôte | celui du jeu, ou `MotionForecast` | celle que le jeu déclare |
+| Casque | `interactive` | OpenXR, puis `MotionForecast` (§4.4) | celle de la tête (vitesses mesurées) |
+
+Changer de contexte en cours de session (un Glide qui part) reste un changement de
+spécification, avec son fondu (loi 12). Rien de nouveau.
+
+### 9.4 Où vit le contrat partagé, sans cycle
+
+```
+                 ┌──────────────────────────────────────────────────────────────┐
+                 │ tuile-budget  (au fond du graphe, entiers seuls)             │
+                 │  Specification, SpecKind, Params                             │
+                 │  + instants L, τ_k ; κ, N_c, A_max (nombres du forecast)     │
+                 │  Need.ahead (quantifié)        BudgetSignals (publiées)      │
+                 └───────────────▲──────────────────────────────┬───────────────┘
+                                 │ dépend de                    │ métriques (lecture seule)
+                 ┌───────────────┴──────────────────────────────┼───────────────┐
+                 │ tuile-core   (réexporte tuile-budget en `budget`)            │
+                 │  forecast : CameraForecast, ForecastAsk, Forecast,           │
+                 │             Hypothesis, Spread, Motion, Envelope,            │
+                 │             Still, Path, First, conformance                  │
+                 │  protocol : ClientMessage::Forecast                          │
+                 │  runtime  : validation, clés de conflation, traversée,       │
+                 │             quantification → Need                            │
+                 └───────────────▲──────────────────────────────┼───────────────┘
+                                 │ dépend de                    │
+                 ┌───────────────┴──────────────────────────────┼───────────────┐
+                 │ tuile-camera                                 │               │
+                 │  CameraController (enveloppe : sa source)    │               │
+                 │  MotionForecast (nalgebra), CameraSpec::for_kind(SpecKind)   │
+                 └───────────────▲──────────────────────────────┼───────────────┘
+                                 │ dépend de                    ▼
+   tuile-viewer · tuile-bevy · tuile-web · tuile-bake · hôtes  (composent First(...), lient, affichent)
+```
+
+Les flux de données, à chaque image :
+
+```
+ spécification (budget) ── instants, until, tolérance ──► ForecastAsk ──► hôte : CameraForecast
+                                                                            │ generation(), forecast()
+ enveloppe (caméra) ───────────────────────────────┐                        ▼
+                                                   └──► ClientMessage::Forecast (enregistré, MCAP)
+                                                                            │
+                                                     runtime : clé changée ? ── non ──► rien
+                                                                            │ oui (≤ 1 / N_c images)
+                                                                            ▼
+                                                     traversée sur les poses prévues ──► Need quantifié
+                                                                            │
+                                                                            ▼
+                                                     decide (entiers) ──► BudgetSignals ──► (lecture par l'hôte)
+```
+
+- **Aucun cycle.** `tuile-budget` ne voit aucun type de caméra : il reçoit des entiers par
+  `Need` et `Params`. `tuile-core` ne dépend pas de `tuile-camera`. `tuile-camera` voit le
+  budget par la réexportation `tuile_core::budget`, comme aujourd'hui
+  (`predicting.rs:99`) **[code]**.
+- **Le trait et l'enveloppe sont dans `tuile-core`** : un hôte Bevy, web ou Hydra les
+  implémente sans dépendre de `tuile-camera` (D-F2).
+- **Les nombres du forecast côté tuile** (`κ`, `N_c`, `A_max`, les instants) sont des
+  `Params` de la spécification du budget. Ils ont donc son condensé, son fondu et son
+  enregistrement, et ils passent par la grammaire `tuile://budget?…`.
+
+---
+
+## 10. Démonstrateur
+
+Ce n'est pas seulement de la conception : la PR 0 est un démonstrateur exécutable que Laurent
+lance et regarde. Il mesure, et il ne change aucune décision de tuile (§7).
+
+### 10.1 Ce qu'il démontre
+
+1. **Le trait implémenté par la caméra du viewer** en interactif : `MotionForecast` (le
+   filtre existant, `nalgebra`), avec son `σ`.
+2. **Le trait implémenté par un vol connu** : le Glide (`app/flight.rs`) et le rejeu de bande
+   (`app/tape.rs`), en `Path` exact, à `σ = 0`, en un seul appel pour tout le vol.
+3. **tuile qui consomme le forecast** : les messages construits depuis le trait, identiques
+   aux messages d'aujourd'hui, ce qui prouve que l'interface tient sans rien changer.
+4. **La conflation** : le compteur de génération de l'hôte, la clé d'empreinte côté tuile, et
+   le nombre de traversées **qu'elle aurait évitées**. Ce nombre est compté, sans être
+   appliqué : l'appliquer est C1.
+5. **Le temps de décision** : `decide` et la traversée p50/p99 par scénario, face aux 2 ms,
+   avec la part du forecast isolée (§A).
+
+### 10.2 Où il vit
+
+- **Le viewer natif** (`tuile-viewer`, lancé par `examples/wgpu-viewer`) est le principal.
+  Une **surcouche** y montre la trajectoire prévue (une polyligne sur le globe), `σ` en
+  ellipses au sol à chaque instant `τ_k`, l'horizon `H` et `now + L` marqués, la génération du
+  forecast, l'état déclaré (`motion`) et le compteur de traversées évitables. La surcouche
+  est une couche de `tuile-overlay` posée par l'application (`OverlayLayers`,
+  `frame_host.rs:424`) **[code]**. Les chiffres vont dans la fenêtre du budget, à côté de la
+  section « Prediction » d'aujourd'hui (`predicting.rs:259-308`).
+- **On l'active** par le menu (une case « Forecast ») ou par `tuile://forecast?show=on|off`,
+  une route nouvelle de `steer.rs`. C'est un **affichage** de l'application, et non un
+  interrupteur du moteur : le moteur calcule et mesure la même chose que la surcouche soit
+  là ou non (règle « pas d'interrupteurs »).
+- **Le web** : le même code de viewer compilé en wasm (`examples/web-viewer`), si la PR 0 le
+  permet sans retard. Sinon il vient avec F3. La surcouche est la même.
+- **Headless** : il n'y a pas d'`examples/headless` dans l'arbre (vérifié). Le scénario
+  headless vit donc dans `tuile-budget-sim`, qui dépend déjà de `tuile-camera` **[code]** :
+  `tests/forecast.rs` et un binaire `forecast_demo`. Il passe les caméras du catalogue
+  (`tour`, `aggressive-sequence`, `catalogue.rs:139-300`) par un `CameraController` piloté
+  par des gestes synthétiques, de sorte que le forecast ne voie pas le futur (le mode
+  « comme une main »). C'est là que tourne la CI. Il ne fait pas de rendu.
+
+### 10.3 Les scénarios reproductibles
+
+Ce sont des mains scriptées, sur le mécanisme existant `TUILE_TOUCH_SCRIPT`
+(`app/script.rs`, aujourd'hui `tour`) **[code]**. Elles passent par le vrai contrôleur, donc
+par la vraie inertie et le vrai amortissement. Les mêmes scénarios existent en headless.
+
+| Scénario | Geste | Ce qu'il éprouve |
+|---|---|---|
+| `zoom` | zoom avant puis arrière, à la molette, sur un relief | `ln h`, le niveau voulu qui change vite, la clé de conflation |
+| `orbit` | rotation régulière du cap autour d'un point | une génération stable à vitesse constante (§1.7, règle 5) |
+| `u-turn` | panoramique rapide, puis demi-tour brusque | l'erreur après violation du modèle, la récupération, 0 trou |
+| `glide` | `tuile://goto?…&seconds=6` Paris → Mont-Blanc | l'exactitude, un seul calcul pour le vol, l'interruption par une main à mi-vol |
+| `stop` | lancer, glissade, puis arrêt net d'un clic | la glissade exacte, puis la bascule au repos |
+| `aggressive` | la séquence de Laurent (`AGGRESSIVE_PHASES`) | tout ensemble, pour comparer avec le budget |
+
+**Métriques par scénario**, exportées vers Prometheus (`job="tuile-viewer"`, étiquette
+`vcs_ref_head_revision`, comme le §5.4 du budget) et dans le MCAP de la session (canal du
+forecast et pas enregistrés), **jamais en CSV** :
+
+- l'erreur du forecast par horizon et par canal (p50, p90), la couverture à 1σ et 2σ, et le
+  gain sur « immobile » : `tuile_forecast_error_*` ;
+- le temps d'appel de l'API : `tuile_forecast_call_seconds` ;
+- les générations, et les traversées faites et évitables :
+  `tuile_forecast_generations_total`, `tuile_forecast_walks_total{outcome="walked"|"avoidable"}` ;
+- `decide` en ms, p50 et p99 (`tuile_budget_decide_seconds`, `_peak_seconds`), et la
+  traversée par passe, présente et prévue (`traversal_seconds`, séparée par passe) ;
+- les trous, qui doivent rester à 0 (`EyeCoverage::lost`, `observe.rs:118-125`) ;
+- les tuiles sous le besoin (`tuile_budget_under_need_tiles`) ;
+- l'âge des messages à leur application (`issued_at`).
+
+### 10.4 Le critère de réussite, et la comparaison avec #282
+
+On fait tourner les mêmes scénarios sur `main` (le viewer de #282) et sur la PR 0, puis on
+les compare par révision.
+
+| Critère | Seuil |
+|---|---|
+| Décisions inchangées | condensés `budget_sim` et goldens identiques ; même `under_need`, mêmes trous (0) |
+| Coût d'exposer | p99 ≤ 10 µs natif (`forecast`), ≤ 2 µs (`generation`) ; la suite échoue sinon |
+| Part du forecast dans la décision | moyenne ≤ 20 µs ; le pire pas mesuré et rapporté face au budget de 0,5 ms |
+| `decide` | rapporté face aux 2 ms, par scénario ; la PR 0 n'ajoute pas plus de 2 % au p99 |
+| Vol connu | erreur nulle à l'interpolation près ; 1 génération par vol non interrompu |
+| Conflation (comptée) | au repos, 100 % des traversées prévues évitables ; Glide ≥ 95 % ; `orbit` ≥ 50 % **[supposé]** |
+| Interactif | erreur p50 meilleure que « immobile » à chaque horizon ≤ `H` ; couverture à 2σ : 95 % ± 5 points, **ou l'écart rapporté tel quel** (c'est une mesure, pas un rouge, tant que C3 n'est pas livrée) |
+
+Ce que la comparaison doit montrer avec #282 : les mêmes messages et les mêmes décisions ;
+la calibration de `σ`, que #282 calculait sans l'exposer ; l'âge réel des messages, que #282
+ne pouvait pas voir ; et le nombre de traversées que #282 fait à chaque pas en mouvement et
+que C1 évitera.
+
+**Ouvrir ce qu'on mesure.** Chaque scénario se regarde dans le viewer avec la surcouche,
+avant tout chiffre (règle « damier à chaque itération »). Une trajectoire prévue qui part de
+travers se voit avant de se compter.
+
+### 10.5 Coût de construction et ce que le Mac supporte
+
+| Crate | Fichiers | Taille estimée |
+|---|---|---|
+| `tuile-core` | `forecast.rs` (types, `Still`, `Path`, `First`), `forecast/conformance.rs` ; `protocol.rs` (`issued_at`), `runtime.rs` (compteurs, clés) | ≈ 700 lignes, la moitié de tests |
+| `tuile-camera` | `predict.rs` : `MotionForecast` sur `MotionModel` | ≈ 150 |
+| `tuile-viewer` | `app/predicting.rs` (composition), `app/forecast_overlay.rs` (nouveau), `steer.rs` (route), `menu.rs` (case), `app/script.rs` (scénarios) | ≈ 600 |
+| `tuile-telemetry` | métriques `tuile_forecast_*`, canal MCAP | ≈ 150 |
+| `tuile-budget-sim` | `tests/forecast.rs`, `bin/forecast_demo.rs` | ≈ 300 |
+
+Ces tailles sont **[supposé]**. Il n'y a ni nouvelle dépendance ni nouveau crate.
+
+**Sur le Mac**, que Laurent utilise pour tester des viewers : rien de lourd. Les tests, les
+compilations du viewer et du wasm passent par le builder k8s, dans les créneaux donnés par la
+session principale (mémoire « rien en local »). En local, au plus `CARGO_BUILD_JOBS=2 nice
+-n 19 cargo check -p tuile-core` (ou `-p tuile-camera`), un seul job à la fois, avec
+`uptime` sous 12. Le viewer que Laurent lance vient du builder ou d'une compilation niced
+dans un créneau convenu.
+
+**Prototype.** Je n'ai pas prototypé de squelette sur la branche. La machine était chargée
+(charge sur 5 et 15 minutes à 18 et 22 au début de la session) et Laurent y teste des viewers.
+La forme des types (§1.2) n'utilise que `glam` et des tableaux de taille fixe, déjà présents
+dans `tuile-core`. Le risque de compilation est faible, mais il n'est pas vérifié.
+
+---
+
+## 11. Décisions demandées à Laurent
+
+- **D-F1. Plusieurs hypothèses pondérées, un poids par échantillon.** Le contrat accepte
+  jusqu'à 4 hypothèses, chacune une trajectoire avec `σ` et un poids par échantillon (en
+  ‰, de somme ≤ 1000 à chaque instant, le reste allant au plancher). Ce poids remplace la
+  probabilité par vue d'aujourd'hui et la « survie » d'une version antérieure de ce document. Un Glide
+  interruptible donne deux hypothèses, « il continue » et « il s'arrête ». L'autre voie,
+  une seule hypothèse avec une survie, ne sait pas dire « l'un de deux personnages ».
+  **Je recommande plusieurs hypothèses, plafonnées à 4.**
+- **D-F2. Une seule source de vérité, réparti ainsi.** La spécification du budget possède
+  les instants (`L`, `τ_k`), `H`, `κ`, `N_c` et `A_max`. La caméra possède son enveloppe
+  (vitesses, zoom, amortissement, glissade, altitudes), qu'elle déclare dans le message, et
+  son filtre (`q`, `r`, `T_i`). `PredictConfig` perd ses horizons, ses `reach_*` et
+  `coast_s`. Le contexte est un seul `SpecKind`, apparié exhaustivement des deux côtés. Le
+  trait et l'enveloppe vivent dans `tuile-core`. Cela déplace la route
   `tuile://budget?horizons=` vers la grammaire de la spécification. **Je recommande oui.**
-- **D-F2. La survie à part de la dispersion.** Un chemin connu mais interruptible (Glide,
-  glissade) porte `σ = 0` et une survie `e^(−τ/T_i)`. Un estimateur porte `σ` et une survie
-  de 1. La survie multiplie `P_k` dans le budget : c'est le seul ajout à sa formule, neutre
-  pour le filtre. L'autre voie serait de tout replier dans `σ` (un Glide interruptible
-  aurait un `σ` qui gonfle), mais un Glide qui continue est exact, et un `σ` gonflé
-  disperserait ses préchargements. **Je recommande la survie à part.**
-- **D-F3. Le trait vit dans `tuile-core`.** Les types et le trait n'utilisent que `glam`,
-  déjà là, et ils compilent pour wasm. Ainsi `tuile-bevy`, `tuile-web`, `tuile-bake` et un
-  hôte Hydra l'implémentent sans dépendre de `tuile-camera`, et le filtre reste dans
-  `tuile-camera`. L'autre voie est de tout mettre dans `tuile-camera`, et chaque coquille en
-  dépendrait. **Je recommande `tuile-core`.**
+- **D-F3. Ce que couvrent les 2 ms, et l'ordre.** Est-ce `decide` seul, ou le pas entier
+  (traversées, besoin, diff, `decide`) ? Je propose **le pas entier hors chargements**, avec
+  au plus 0,5 ms au pire pas pour la traversée prévue. Aujourd'hui, `decide` seul dépasse
+  déjà 2 ms en zoom (6,9 ms p99, relevé d'octobre). Je propose aussi l'ordre suivant : la
+  PR 0 (démonstrateur, mesure seule), puis C1 (la conflation appliquée, le gain de temps le
+  plus sûr), puis C2, puis C3. **À trancher avant la PR 0**, parce que la PR 0 affiche ce
+  critère.
