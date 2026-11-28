@@ -15,7 +15,7 @@ règle « un maillage avec son drapé » a sa propre section (§2), parce qu'ell
 part d'un état des lieux mesuré et qu'elle laisse une question ouverte à
 Laurent.
 
-Statut : **lois écrites, implémentation en cours** sur `feat/budget-regulator`.
+Statut : **lois écrites (révisées le 28 nov. : un seul mécanisme, l'enveloppe), implémentation en cours** sur `feat/budget-regulator`.
 
 ---
 
@@ -49,115 +49,97 @@ Trois défauts découlent de ces paliers.
 
 ---
 
-## 1. Les lois
+## 1. Les lois : un seul mécanisme
 
-Les lois sont numérotées R1–R12 (R pour régulateur), pour ne pas les
-confondre avec les lois 1–13 du spec ni avec P1–P12 du chantier du score.
-**Les lois absolues restent au-dessus de tout** : le sol n'est jamais noir ;
-une tuile dessinée, sa chaîne de repli et le plancher épinglé ne sont jamais
-retirés par la régulation ; le nouveau est actif avant que l'ancien parte.
+L'objectif est celui de Laurent (28 nov.) : **un préchargement n'a jamais
+d'effet sur la vue principale, ni en RAM, ni en charge GPU.** Il est tenu
+par un mécanisme unique, l'**enveloppe** : le préchargement ne vit que dans
+ce que le besoin présent n'utilise pas, réserve comprise. Il n'y a ni
+paliers, ni parts fixes, ni files virtuelles, ni seconde boucle.
 
-### Ce qui est régulé
+Les lois absolues restent au-dessus de tout : le sol n'est jamais noir ; une
+tuile dessinée, sa chaîne de repli et le plancher épinglé ne sont jamais
+retirés ; le nouveau est actif avant que l'ancien parte.
 
-- **R1. Le préchargement a une marge à tenir, pas une part.** Pour chaque
-  classe du pool (maillages, drapés), la place libre sous la cible ne doit
-  pas descendre sous une consigne de marge `m_c`. Le préchargement remplit
-  le reste. Aucune classe n'a de taille réservée : la cible de chaque classe
-  reste celle que le pool partagé lui laisse (D-A3), et cette part suit la
-  vue.
-- **R2. La consigne de marge suit le rythme réel des besoins (loi de
-  Little), et vaut zéro au repos.** `m_c = (1 + κ) · λ_c · W_c` :
-  - `λ_c`, les octets par pas que le besoin présent demande dans la classe
-    (filtrés) ;
-  - `W_c`, le temps de chargement en pas ;
-  - `κ`, la marge d'erreur de l'estimation.
-  Une vue immobile ne demande rien : `λ = 0`, `m = 0`, et le préchargement
-  peut tout prendre.
-- **R3. La consigne monte tout de suite et redescend lentement.** Le filtre
-  de `λ_c` réagit à une hausse au premier pas (attaque) et décroît d'une
-  fraction par pas (relâche). La marge est donc là avant que le geste
-  n'arrive à l'urgence, et elle ne retombe pas entre deux à-coups d'un même
-  geste. *(Voir §4, question Q1 : le plan dit « monte lentement, descend
-  vite » ; je l'applique au débit du préchargement, R6, pas à la marge.)*
+**Vocabulaire.**
 
-### Ce que le préchargement a le droit de faire
+- Le **besoin présent**, c'est ce qui est dessiné, protégé (groupes
+  d'échange, transit, plancher) ou voulu à une urgence de la vue : `Floor`,
+  `Hole`, `Blocker`, `Drape`, et la chaîne d'ancêtres qui sert de repli.
+- Un **préchargement**, c'est une copie voulue à une urgence de prévision
+  (`Ring`, `Refresh` et les drapés d'un ancêtre) et non dessinée. Le
+  régulateur ne connaît ni l'anneau ni la chaîne. Il ne voit qu'une entrée :
+  une ressource, sa classe, sa taille et sa clé (valeur, échéance). L'anneau
+  peut donc disparaître au profit du plancher « atteignable » sans que rien
+  ne change ici.
+- Le **cache**, ce sont les copies que plus rien ne veut. Toute admission
+  les prend en premier, comme aujourd'hui.
 
-- **R4. Pas d'admission d'un préchargement sans marge à sa livraison
-  prévue.** Un préchargement n'est lancé que si ses octets estimés, ajoutés
-  à ceux des préchargements déjà en vol ou décodés pour la classe, tiennent
-  sous `cible − m_c`. Il est livré sous la même ligne. Ce qu'on admet au
-  chargement est donc livrable, et plus rien ne s'accumule en tâches
-  décodées.
-- **R5. Une tâche refusée faute de place sort de la file et se réveille
-  quand la place revient dans sa classe.** Un préchargement décodé que la
-  livraison refuse (la marge a monté entre-temps) est mis en attente. Il
-  n'est plus reclassé à chaque pas. Il revient quand la place libre de sa
-  classe dépasse `m_c` plus ses octets. S'il attend plus que l'horizon du
-  balayage, il est relâché (il n'était qu'une prévision).
-- **R6. Le débit du préchargement monte lentement et chute vite (PANDA),
-  sans emballement.** Les octets de préchargement admis par pas suivent une
-  allocation `a_c`. Elle croît d'un incrément fixe à chaque pas où la marge
-  tient. Elle est multipliée par β < 1 au premier pas où elle ne tient plus.
-  Elle est bornée en haut par ce que la marge laisse (anti-emballement,
-  anti-windup) : elle ne s'accumule pas pendant qu'on ne peut rien en faire.
-- **R7. Un seul réglage, V, arbitre qualité contre marge
-  (drift-plus-penalty).** Le régulateur tient trois files virtuelles :
-  - `Q_gpu`, le manque de marge GPU accumulé ;
-  - `Q_ram`, le manque de marge du niveau décodé ;
-  - `Q_vol`, l'excès d'octets en vol.
-  Chacune grossit quand sa marge manque et se vide quand elle est tenue. Un
-  préchargement de valeur `v` et d'octets `b` n'est admis que si
-  `V · v ≥ (Q_gpu + Q_ram + Q_vol) · b`. Marges tenues : les files sont
-  vides et tout préchargement de valeur positive passe (sous R4). Marges
-  entamées : seuls passent les plus utiles par octet, jusqu'à ce que les
-  files se vident. V grand favorise la qualité, V petit la marge ; c'est le
-  seul nombre à régler.
+**Les lois.**
 
-### Ce que le régulateur libère
+- **E1. L'enveloppe.** Pour chaque ressource `d` :
+  - les octets GPU de chaque classe du pool ;
+  - les octets décodés en RAM ;
+  - le crédit de livraison, c'est-à-dire les octets en route vers le GPU,
+    donc la charge d'envoi.
 
-- **R8. On libère dès que la marge manque, pas au palier, par petits pas
-  plafonnés (seau à jetons).** Quand la place libre d'une classe est sous
-  `m_c`, le régulateur libère au plus `min(m_c − libre, jetons)` octets par
-  pas, sous la loi du balayage : jamais ce que la vue veut maintenant, ni ce
-  qu'elle a voulu dans l'horizon (`sweep_keep_poses`). Les jetons se
-  remplissent d'un débit fixe par pas jusqu'à une profondeur fixe. Le pic
-  d'évictions par pas est donc borné par construction. Au-dessus de la
-  cible, le retour sous la cible reste immédiat et sans jetons (I2, loi
-  existante).
-- **R9. Le besoin présent ne passe jamais derrière un préchargement (loi 8
-  du spec), par une réserve qui suit son rythme.** Les emplacements réseau
-  de la classe gardent `⌈μ_c · W_c⌉` places pour le besoin présent, où
-  `μ_c` est le débit filtré de ses départs (Little). Le reste est au
-  préchargement, et la réserve est nulle au repos. En plus de la réserve :
-  la priorité par besoin actuel puis par score, et la préemption d'un
-  préchargement en vol quand la réserve ne suffit pas (existante). Cette loi
-  remplace `speculation.slots_permille`.
-- **R10. Le préchargement n'affiche rien.** Ce qui est préchargé est un
-  réservoir de mémoire GPU : il n'entre dans le dessin qu'en devenant le
-  besoin. La vue présente reste le besoin.
+  À chaque pas, `présent_d + préchargé_d + réserve_d ≤ capacité_d`, où la
+  capacité est la cible du pas (la part que le pool laisse à la classe, la
+  cible du décodé, le crédit).
+- **E2. La réserve suit le rythme du besoin présent (loi de Little), et
+  vaut zéro au repos.** `réserve_d = λ_d · W` :
+  - `λ_d`, les octets que le besoin présent a consommés par pas dans `d`
+    (livrés, décodés, envoyés), filtrés ;
+  - `W`, le temps de chargement en pas (paramètre tant que M1 ne le mesure
+    pas).
 
-### Ce qui borne le régulateur
+  Le filtre monte vite et redescend lentement. La place est donc libérée
+  quand le geste commence, avant que le besoin n'arrive, et elle n'est pas
+  rendue au préchargement entre deux à-coups du même geste.
+- **E3. Le préchargement n'entre que dans l'enveloppe, et en sort le
+  premier.**
+  - *Entrer* : un préchargement est lancé, livré ou envoyé seulement si ses
+    octets, estimés au lancement puis exacts à la livraison, tiennent dans
+    l'enveloppe de chaque ressource qu'il occupera. Ce qu'on lance est donc
+    livrable.
+  - *Attendre* : un préchargement décodé que l'enveloppe refuse sort de la
+    file et n'est plus classé. Il revient quand la place revient dans sa
+    classe.
+  - *Sortir* : quand l'enveloppe se resserre (le besoin ou la réserve
+    monte), les préchargements sont relâchés dans l'ordre d'éviction
+    jusqu'à ce qu'elle tienne. Cela se fait avant que le besoin présent ne
+    demande la place, jamais à sa place. Le cache sous la cible est libéré
+    de la même façon, jusqu'à `cible − réserve` : c'est ce qui remplace les
+    paliers.
+- **E4. Un préchargement arrive avec son drapé** (§2, lecture (c)) : un
+  maillage préchargé veut le drapé de sa tuile au niveau dont il aura besoin
+  une fois dessiné. Les deux passent ensemble par E3.
 
-- **R11. Pas d'interrupteur.** Le régulateur remplace les paliers :
-  `Watermarks` disparaît, et `speculation` disparaît quand R9 est en place.
-  Seuls les nombres se règlent, tous dans `Params` (donc dans la
-  spécification, son digest et sa requête `tuile://budget?…`) : V, κ, les
-  coefficients du filtre, W tant que M1 ne le mesure pas, l'incrément et le
-  β de R6, le débit et la profondeur du seau de R8. Aucun nombre n'est codé
-  en dur.
-- **R12. Tout se rejoue.** Le régulateur est en entiers (‰, octets, pas),
-  sans flottant dans `engine` ni `state`. Son état est celui du décideur.
-  Ses signaux sont calculés à partir des entrées enregistrées :
-  - les arrivées et les acquittements ;
-  - le besoin ;
-  - les temps de chargement, qui entrent en paramètre, puis comme entrée
-    enregistrée quand M1 les fournira.
+**Ce qui découle de ces lois sans en être une de plus :**
 
-  Aucune mesure de l'exécuteur n'entre dans `decide` autrement. Le coût par
-  pas est borné : quelques entiers par classe, et le réveil de R5 lit la
-  tête d'une file triée.
+- la loi 8 du spec (un besoin présent ne passe jamais derrière un
+  préchargement) ;
+- la fin des paliers (`Watermarks` disparaît) ;
+- la fin des parts fixes de mémoire.
 
----
+**Les nombres.** Ce sont `W` et les deux coefficients du filtre (montée et
+descente), dans `Params`, donc dans la spécification, son digest et sa
+requête. Il n'y a aucun interrupteur. Le régulateur est en entiers, ses
+signaux viennent des entrées enregistrées, et aucune mesure de l'exécuteur
+n'entre dans `decide`.
+
+**Écarté, et pourquoi.** Le plan citait plusieurs mécanismes :
+drift-plus-penalty avec V, AIMD (PANDA), seau à jetons (Kalyvianaki). Je
+les écarte : chacun ajoute un état et un réglage pour un effet que
+l'enveloppe donne déjà.
+
+- La réserve filtrée anticipe, et c'est elle qui lisse les libérations.
+- Un préchargement relâché ne coûte rien à la vue : il n'est pas dessiné.
+  Le seul coût est le rechargement, que le thrash et le gaspillage mesurent.
+
+Si les mesures SASO montrent un pic d'évictions que la réserve ne lisse
+pas, un plafond par pas viendra *dans* E3. Ce ne sera pas une boucle de
+plus.
 
 ## 2. La règle « un maillage avec son drapé »
 
@@ -280,7 +262,7 @@ Proposition, en deux parties.
   - le maillage et son drapé sont lancés, livrés et relâchés ensemble,
     comme le groupe du plancher (D-A1) ;
   - un préchargement qui n'a pas de place pour les deux n'est pas lancé
-    (R4) ;
+    (E3) ;
   - relâcher le maillage relâche ses drapés ;
   - un drapé n'est pas relâché seul tant que son maillage est résident,
     sauf s'il est remplacé par un plus fin ou par le niveau dont la tuile a
@@ -322,22 +304,21 @@ pas tranché.**
 
 ---
 
-## 3. Quantités, consignes, signaux, bornes
+## 3. Propriétés testables
 
-| Loi | Quantité régulée | Consigne | Signaux (entrées enregistrées) | Borne SASO |
-|---|---|---|---|---|
-| R1–R3 | place libre GPU par classe, `cible_c − utilisé_c` | `m_c = (1+κ)·λ_c·W_c` | octets du besoin présent lancés par pas (du besoin), `W` (Params, puis M1) | dépassement : `utilisé ≤ cible` hors besoin présent ; jamais `> dur` |
-| R4 | octets de préchargement engagés (en vol + décodés non livrés) | `≤ cible_c − m_c − utilisé_c` | tailles des arrivées (moyenne par classe, des événements) | aucune tâche de préchargement décodée en attente au-delà de l'horizon |
-| R5 | tâches refusées faute de place | réveil quand `libre_c ≥ m_c + b` | ledger | travail de tri par pas : celui de main (P6.4) |
-| R6 | octets de préchargement admis par pas, `a_c` | AIMD : `+α` si marge tenue, `×β` sinon, `≤ libre − m` | marge tenue ou non | établissement : nombre de pas après l'arrêt du geste |
-| R7 | `Q_gpu`, `Q_ram`, `Q_vol` | 0 (files vides) | manque de marge, octets en vol | files bornées (`q_max`) |
-| R8 | évictions par pas | `≤ min(m_c − libre, jetons)` | jetons | pic d'évictions par pas et sur 10 pas |
-| R9 | emplacements réseau du besoin présent | `⌈μ_c·W_c⌉` | départs du besoin présent par pas | un besoin présent n'attend jamais un préchargement |
-| — | envois par image | plafond existant (`upload_bytes_per_frame`, I18) | plan d'envoi | pic d'envois par image ≤ celui de main |
+| # | Propriété | Où elle est testée |
+|---|---|---|
+| T1 | **Invariant dur, à chaque pas** : pour chaque ressource, les octets préchargés ≤ `capacité − présent − réserve` | vérifié à chaque pas de `budget_sim` (`server.rs`, `check`), donc dans tous les scénarios |
+| T2 | Un besoin présent n'est jamais refusé ni retardé faute de place prise par un préchargement : quand une livraison présente est bloquée, aucun préchargement évinçable n'est sur le GPU de sa classe | `check` de `budget_sim` |
+| T3 | Charge GPU : les envois et le crédit de livraison des préchargements tiennent dans ce que le présent laisse, et un plan d'envoi ne commence jamais par un préchargement s'il dépasse le plafond de l'image | `check` de `budget_sim` |
+| T4 | Propriétés sur des scripts aléatoires de caméra et de pression (proptest) : T1–T3 et zéro trou | `budget_properties` |
+| T5 | Avec ou sans préchargement, la vue présente est identique ou meilleure, jamais pire : trous, éléments dessinés exacts, p95 de l'attente des besoins | `tuile-budget-sim/tests/regulator.rs` |
+| T6 | SASO sur la séquence agressive, avant/après : dépassement, établissement en pas, pic d'évictions, pic d'envois par image | `tuile-budget-sim/tests/regulator.rs` |
+| T7 | #364 : un préchargement porte ses drapés | `budget_preload_imagery` |
+| T8 | Mutations : retirer chaque loi (E1–E4, chacune des trois ressources) fait échouer au moins un test | tableau de la PR |
 
-**Bornes SASO** (critères de Laurent ; mesurées sur la séquence d'acceptation
-et sur le combiné téléphone à son plancher, 160 Mio, sous pression), avant
-et après :
+Les bornes SASO (critères de Laurent) se mesurent sur la séquence
+d'acceptation et sur le téléphone à son plancher (160 Mio, sous pression) :
 
 - **dépassement** : le pire pas au-dessus de la cible, en ‰ de la cible ;
   jamais au-dessus de la limite dure ;
@@ -346,10 +327,6 @@ et après :
   sous son besoin, pour de bon ;
 - **pic du taux d'éviction** : le pire pas, et la pire fenêtre de 10 pas ;
 - **pic d'envois par image** : les éléments et les octets du plan.
-
-Avec ces bornes : trous 0, gaspillage, thrash, écart de qualité en flouz et
-travail par pas, par profil (desktop, handheld, web), dans le tableau de la
-PR.
 
 **Avant (main `1efa54f1`, les paliers)**, séquence d'acceptation, 1 080 pas :
 
@@ -373,12 +350,12 @@ Ce qu'on lit dans ce tableau :
 
 ## 4. Questions ouvertes
 
-- **Q1 (sens de « monte lentement et descend vite »).** Je l'applique au
-  débit du préchargement (R6, PANDA : on sonde doucement, on recule
-  vite). La consigne de marge fait l'inverse (R3 : elle monte tout de
-  suite, elle redescend lentement). Appliquer la lenteur à la montée de la
-  marge la ferait arriver après le geste, c'est-à-dire à l'urgence, ce que
-  Laurent veut éviter. À confirmer.
+- **Q1 (sens de « monte lentement et descend vite »).** Pour la place du
+  préchargement, c'est exactement E2 : la réserve monte vite, donc la place
+  du préchargement descend vite ; la réserve redescend lentement, donc
+  cette place remonte lentement. Si la phrase visait la réserve elle-même,
+  la réserve arriverait après le geste, à l'urgence. À confirmer par
+  Laurent.
 - **Q2 (la règle maillage + drapé)** : voir §2.3.
 - **Q3 (W avant M1).** Tant que M1 n'a pas livré les distributions de temps
   de chargement, `W_c` est un paramètre : 30 pas, soit 0,5 s à 60 Hz.
