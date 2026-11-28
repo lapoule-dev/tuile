@@ -480,6 +480,51 @@ impl App {
             .collect()
     }
 
+    /// Adds the outline of the picked terrain tile to the labels' overlay.
+    fn outline_the_picked_tile(&mut self, tile: (u32, u64, u64)) {
+        use tuile_core::geo::{geodetic_to_ecef, Geodetic};
+        let cam = self.controller.camera;
+        let clearance = self.controller.height_above_ground();
+        let view_proj = glam::Mat4::from_cols_array(&cam.view_proj_with_clearance(
+            cam.position,
+            self.aspect(),
+            clearance,
+        ));
+        let scale = self.active.as_ref().map_or(1.0, |a| a.scale);
+        let size = self.viewport();
+        let ecef = |lon: f64, lat: f64| {
+            geodetic_to_ecef(Geodetic {
+                lon,
+                lat,
+                height: 0.0,
+            }) - cam.position
+        };
+        // Unclipped: the pixel a ground point lands on, `None` behind the eye.
+        let project = |lon: f64, lat: f64| {
+            let at = ecef(lon, lat);
+            let clip = view_proj * glam::Vec4::new(at.x as f32, at.y as f32, at.z as f32, 1.0);
+            (clip.w > 1e-6).then(|| {
+                (
+                    (f64::from(clip.x / clip.w) + 1.0) / 2.0 * size.0,
+                    (1.0 - f64::from(clip.y / clip.w)) / 2.0 * size.1,
+                )
+            })
+        };
+        let (w, s, e, n) = tuile_ui::reservoir::tile_rect(tile.0, tile.1, tile.2);
+        let distance = ecef((w + e) / 2.0, (s + n) / 2.0).length();
+        let colour = tuile_core::metrics::budget()
+            .and_then(|b| b.score_held)
+            .and_then(|h| {
+                tuile_ui::reservoir::terrain_tiles(&h)
+                    .get(&tile)
+                    .map(|t| tuile_ui::reservoir::state_colour(t.state, t.terms.score))
+            })
+            .unwrap_or([1.0, 1.0, 1.0, 1.0]);
+        let o = tuile_ui::reservoir::outline(tile, colour, &project, size, distance, scale);
+        self.tile_labels.background.extend(o.mesh);
+        self.tile_labels.placed.extend(o.labels);
+    }
+
     /// Builds the on-screen control's geometry for the camera as it now stands,
     /// so the needle agrees with the frame it is drawn over.
     fn upload_the_control(&mut self, indicator: Option<tuile_ui::Spinner>) {
@@ -500,6 +545,12 @@ impl App {
             let view = self.viewport();
             self.tile_labels
                 .place(&view_proj, cam.position, view, scale);
+        }
+        // The tile picked in the budget window's reservoir: its outline (or
+        // an arrow to it) over the view, lines in the overlay — nothing in
+        // the ground's mesh, and nothing at all without a pick.
+        if let Some(tile) = self.budget_window.selected() {
+            self.outline_the_picked_tile(tile);
         }
         let Some(active) = self.active.as_mut() else {
             return;

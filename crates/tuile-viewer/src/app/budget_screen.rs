@@ -102,6 +102,13 @@ pub(super) fn panel_event(event: &WindowEvent, scale: f64) -> PanelEvent {
                 Key::Character("c" | "C") => K::Cumulative,
                 Key::Character("r" | "R") => K::Reset,
                 Key::Character("i" | "I") => K::Issues,
+                Key::Character("v" | "V") => K::Reservoir,
+                Key::Character("]" | "+") => K::LevelUp,
+                Key::Character("[" | "-") => K::LevelDown,
+                Key::Character("a" | "A") => K::LevelAuto,
+                Key::Character("b" | "B") => K::Below,
+                Key::Character("u" | "U") => K::Above,
+                Key::Character("w" | "W") => K::Span,
                 Key::Named(NamedKey::Tab | NamedKey::ArrowDown) => K::Next,
                 Key::Named(NamedKey::ArrowUp) => K::Previous,
                 Key::Named(NamedKey::Backspace | NamedKey::Delete) => K::Clear,
@@ -462,6 +469,44 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// The camera as the reservoir's plan draws it: its place, heading and
+    /// the ground its frame sees. `None` while no window shows the
+    /// reservoir.
+    pub(super) fn reservoir_eye(&self) -> Option<tuile_ui::reservoir::ReservoirEye> {
+        if !(self.budget_window.shown() && self.budget_window.reservoir()) {
+            return None;
+        }
+        let cam = &self.controller.camera;
+        let g = cam.geodetic();
+        let (w, h) = self.viewport();
+        // The tiles marked drawn that no frustum sees: measured against the
+        // present eyes, then those and the host's views as well.
+        let report = tuile_core::metrics::budget().and_then(|s| s.score_held);
+        let all = self.eye_views();
+        let present = self.eyes().len().min(all.len());
+        let (outside_present, outside_any) = report.map_or_else(Default::default, |r| {
+            (
+                tuile_ui::reservoir::drawn_outside(&r, &all[..present]),
+                tuile_ui::reservoir::drawn_outside(&r, &all),
+            )
+        });
+        let selected_in_view = self
+            .budget_window
+            .selected()
+            .map(|t| tuile_ui::reservoir::tile_in_views(t, &all[..present]));
+        Some(tuile_ui::reservoir::ReservoirEye {
+            selected_in_view,
+            truncated: tuile_core::metrics::metrics().traversals_truncated.get(),
+            outside_present,
+            outside_any,
+            lon: g.lon,
+            lat: g.lat,
+            height_m: g.height,
+            heading: cam.heading(),
+            footprint: cam.ground_footprint(w / h.max(1.0)),
+        })
+    }
+
     /// Opens, draws or closes the budget window's own window, as it is
     /// asked. `event_loop` is the loop's, when the turn has it: an
     /// operating-system window is opened only from there. Nothing here
@@ -501,6 +546,8 @@ impl App {
         }
 
         let names = self.budget_layer_names();
+        let eye = self.reservoir_eye();
+        self.budget_window.set_eye(eye);
         let Some(active) = self.active.as_ref() else {
             return;
         };
@@ -854,6 +901,7 @@ mod tests {
             .expect("a row with a legend")
             .clone();
         let blank = Hit {
+            pick: None,
             rect: row.rect,
             lines: vec![
                 Legend {

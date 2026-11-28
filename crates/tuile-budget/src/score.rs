@@ -393,6 +393,102 @@ impl HeldState {
     }
 }
 
+/// What a resource of the reservoir view is, drawn-first: the state
+/// the preload view colours it by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RingState {
+    /// Held on the GPU and drawn.
+    Drawn,
+    /// Held, the floor: never released.
+    Floor,
+    /// Held, in a swap the view waits on: never released.
+    Kept,
+    /// Held, not drawn, wanted this step (a preload, an ancestor).
+    Wanted,
+    /// Held, no longer wanted: released first, by its score.
+    Left,
+    /// Not held, a load or a transit in flight.
+    InFlight,
+    /// Not held, wanted, not started: queued or waiting for a slot.
+    Queued,
+    /// Not held, wanted on screen and not drawable: a hole.
+    Hole,
+}
+
+impl RingState {
+    /// Every state, drawn first.
+    pub const ALL: [RingState; 8] = [
+        RingState::Drawn,
+        RingState::Floor,
+        RingState::Kept,
+        RingState::Wanted,
+        RingState::Left,
+        RingState::InFlight,
+        RingState::Queued,
+        RingState::Hole,
+    ];
+
+    /// Its label.
+    pub fn label(self) -> &'static str {
+        match self {
+            RingState::Drawn => "drawn",
+            RingState::Floor => "floor",
+            RingState::Kept => "kept",
+            RingState::Wanted => "held, wanted",
+            RingState::Left => "held, left",
+            RingState::InFlight => "in flight",
+            RingState::Queued => "queued",
+            RingState::Hole => "missing (hole)",
+        }
+    }
+}
+
+/// One resource of the reservoir view ([`HeldReport::ring`]): where it is
+/// (its resource's tile), what it is, its score's terms as the decider
+/// holds them, and why the step ranked it, if it did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RingTile {
+    /// The resource.
+    pub resource: ResourceId,
+    /// Its class.
+    pub class: Class,
+    /// Its tile's level.
+    pub level: u32,
+    /// Its distance band.
+    pub band: u8,
+    /// Its terms (a resource not held: as if it were, at the reference
+    /// size).
+    pub terms: Terms,
+    /// What it is.
+    pub state: RingState,
+    /// Why the budget holds or wants it: an open category label the view
+    /// shows as published ("ancestor", "floor", "left over", "unranked", and
+    /// whatever else the budget names). Empty when the tile is drawn. A view
+    /// must not rely on the set of names.
+    pub reason: &'static str,
+}
+
+impl RingTile {
+    /// The category label of a tile in `state` that the step ranked at
+    /// `urgency` (if it did).
+    pub fn reason_of(state: RingState, urgency: Option<crate::priority::Urgency>) -> &'static str {
+        use crate::priority::Urgency as U;
+        match (state, urgency) {
+            (RingState::Drawn, _) => "",
+            (RingState::Floor, _) => "floor",
+            (RingState::Left, _) => "left over",
+            (_, Some(U::Ring)) => "ring",
+            (_, Some(U::Ancestor)) => "ancestor",
+            (_, Some(U::Floor)) => "floor",
+            (_, Some(_)) => "other",
+            (_, None) => "unranked",
+        }
+    }
+}
+
+/// The most resources [`HeldReport::ring`] lists.
+pub const RING_LISTED: usize = 16_384;
+
 /// How many held resources a [`HeldReport`] lists at each end of the
 /// score order.
 pub const HELD_LISTED: usize = 32;
@@ -411,6 +507,10 @@ pub struct HeldReport {
     pub lowest: Vec<HeldTile>,
     /// The highest scores, highest first.
     pub highest: Vec<HeldTile>,
+    /// Every resource the reservoir view shows (held, in flight, wanted),
+    /// at most [`RING_LISTED`]; empty unless asked for
+    /// ([`crate::Budget::reservoir_report`]).
+    pub ring: Vec<RingTile>,
 }
 
 /// The parameters of the score in force, for the window's header and the

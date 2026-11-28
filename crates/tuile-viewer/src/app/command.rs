@@ -292,6 +292,7 @@ impl App {
                 budget_window_cumulative: self.budget_window.cumulative(),
                 budget_window_tables: self.budget_window.tables(),
                 budget_window_issues: self.budget_window.issues_only(),
+                budget_window_reservoir: self.budget_window.reservoir(),
                 compressed: self.imagery_compression != tuile_wgpu::ImageryCompression::Off,
                 lit: self.views.lighting.is_on(),
             },
@@ -332,6 +333,7 @@ impl App {
             budget_window_cumulative: self.budget_window.cumulative(),
             budget_window_tables: self.budget_window.tables(),
             budget_window_issues: self.budget_window.issues_only(),
+            budget_window_reservoir: self.budget_window.reservoir(),
             compression: self.imagery_compression,
             lighting: self.views.lighting,
             ..Snapshot::of(&self.controller, size)

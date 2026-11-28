@@ -285,6 +285,47 @@ impl GlobeCamera {
         self.up.dot(right).atan2(self.up.dot(level_up))
     }
 
+    /// Where the view's frustum meets the ground, as `(longitude, latitude)`
+    /// in radians: the eight points around the frame (corners and edge
+    /// middles, from bottom left, clockwise), for a frame `aspect` wide
+    /// (width over height). A ray that misses the ellipsoid lands on the
+    /// horizon, the nearest point of its line to the globe. For a map
+    /// drawing the view's footprint, never for a decision.
+    pub fn ground_footprint(&self, aspect: f64) -> Vec<(f64, f64)> {
+        let half_h = (self.fovy * 0.5).tan();
+        let half_w = half_h * aspect;
+        let right = self.direction.cross(self.up).normalize_or_zero();
+        // The ellipsoid as a unit sphere.
+        let k = DVec3::new(1.0 / WGS84_A, 1.0 / WGS84_A, 1.0 / WGS84_B);
+        let o = self.position * k;
+        [
+            (-1.0, -1.0),
+            (0.0, -1.0),
+            (1.0, -1.0),
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (0.0, 1.0),
+            (-1.0, 1.0),
+            (-1.0, 0.0),
+        ]
+        .into_iter()
+        .map(|(sx, sy)| {
+            let d =
+                (self.direction + right * (sx * half_w) + self.up * (sy * half_h)).normalize() * k;
+            let (a, b, c) = (d.length_squared(), o.dot(d), o.length_squared() - 1.0);
+            let disc = b * b - a * c;
+            let t = if disc >= 0.0 && (-b - disc.sqrt()) / a > 0.0 {
+                (-b - disc.sqrt()) / a
+            } else {
+                (-b / a).max(0.0)
+            };
+            let hit = (o + d * t).normalize() / k;
+            let g = ecef_to_geodetic(hit);
+            (g.lon, g.lat)
+        })
+        .collect()
+    }
+
     /// The eye's geodetic position: longitude and latitude in radians,
     /// height above the ellipsoid in metres.
     pub fn geodetic(&self) -> Geodetic {
@@ -1707,6 +1748,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Looking straight down from 1 000 m, the footprint is a small box
+    /// about the point under the eye, and it is centred on it.
+    #[test]
+    fn the_footprint_of_a_nadir_view_surrounds_the_ground_under_the_eye() {
+        let cam = GlobeCamera::from_geodetic(
+            0.78,
+            -0.009,
+            1_000.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+            0.8,
+        );
+        let f = cam.ground_footprint(1.5);
+        assert_eq!(f.len(), 8);
+        let (lon, lat) = (-0.009, 0.78);
+        let (mut lo, mut hi) = ((f64::MAX, f64::MAX), (f64::MIN, f64::MIN));
+        for (x, y) in &f {
+            lo = (lo.0.min(*x), lo.1.min(*y));
+            hi = (hi.0.max(*x), hi.1.max(*y));
+        }
+        assert!(lo.0 < lon && lon < hi.0 && lo.1 < lat && lat < hi.1);
+        // About 1 000 m × tan(0.4) × 1.5 wide: a few hundred metres.
+        assert!((hi.1 - lo.1) * 6.37e6 < 2_000.0);
     }
 
     #[test]

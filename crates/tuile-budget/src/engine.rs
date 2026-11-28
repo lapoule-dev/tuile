@@ -4430,8 +4430,10 @@ impl Budget {
 
     /// [`Budget::held_report`]: the GPU copies by score, a walk of the
     /// arena — statistics, never a decision's work.
-    pub(super) fn held_report_impl(&self) -> super::score::HeldReport {
-        use super::score::{HeldReport, HeldState, HeldTile, HELD_LISTED};
+    pub(super) fn held_report_impl(&self, ring: bool) -> super::score::HeldReport {
+        use super::score::{
+            HeldReport, HeldState, HeldTile, RingState, RingTile, HELD_LISTED, RING_LISTED,
+        };
         let a = &self.arena;
         let mut report = HeldReport {
             step: self.steps,
@@ -4481,6 +4483,48 @@ impl Budget {
             let mut high = tiles[len - n..].to_vec();
             high.sort_unstable_by_key(|t| std::cmp::Reverse(key(t)));
             report.highest = high;
+        }
+        if ring {
+            for s in a.iter() {
+                if report.ring.len() >= RING_LISTED {
+                    break;
+                }
+                let gpu = a.has_gpu(s);
+                let flying = a.loading(s) || a.has_transit(s);
+                // Why it is wanted if it is (the want tier), else why it is ranked.
+                let urgency = self.wanted_urgency(a.id(s)).or_else(|| a.urgency(s));
+                let state = if gpu {
+                    if a.marked(s, Mark::Drawn) {
+                        RingState::Drawn
+                    } else if self.is_floor(a.class(s), a.level(s)) {
+                        RingState::Floor
+                    } else if self.kept(s) {
+                        RingState::Kept
+                    } else if a.marked(s, Mark::Wanted) {
+                        RingState::Wanted
+                    } else {
+                        RingState::Left
+                    }
+                } else if flying {
+                    RingState::InFlight
+                } else if urgency == Some(Urgency::Hole) {
+                    RingState::Hole
+                } else if a.marked(s, Mark::Wanted) || urgency.is_some() {
+                    RingState::Queued
+                } else {
+                    continue;
+                };
+                let (_, _, band) = a.place(s);
+                report.ring.push(RingTile {
+                    resource: a.id(s),
+                    class: a.class(s),
+                    level: a.level(s),
+                    band: u8::try_from(band).unwrap_or(u8::MAX),
+                    terms: self.held_terms(s),
+                    state,
+                    reason: RingTile::reason_of(state, urgency),
+                });
+            }
         }
         report
     }

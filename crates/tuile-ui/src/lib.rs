@@ -7,6 +7,7 @@ pub mod budget_board;
 mod credits;
 mod nav;
 mod panel;
+pub mod reservoir;
 mod spinner;
 #[cfg(feature = "statusbar")]
 mod statusbar;

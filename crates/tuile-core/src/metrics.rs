@@ -1034,6 +1034,21 @@ pub fn budget() -> Option<crate::budget::BudgetSignals> {
     budget_slot().lock().ok().and_then(|s| s.clone())
 }
 
+/// Whether a window wants the reservoir's tiles ([`reservoir_wanted`]):
+/// the budget lists them in its held report only while one does, so a
+/// session without the window pays nothing for it.
+static RESERVOIR_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A window shows (or stops showing) the preload reservoir.
+pub fn want_reservoir(on: bool) {
+    RESERVOIR_WANTED.store(on, Ordering::Relaxed);
+}
+
+/// Whether a window shows the preload reservoir now.
+pub fn reservoir_wanted() -> bool {
+    RESERVOIR_WANTED.load(Ordering::Relaxed)
+}
+
 /// Publishes a session's budget signals: see [`budget`]. The decisions
 /// they carry with their score (`score_events`) and the held set's picture
 /// also join the queue the telemetry's log records drain
@@ -1045,7 +1060,10 @@ pub fn publish_budget(signals: crate::budget::BudgetSignals) {
         q.decisions.extend_from_slice(&signals.score_events[..take]);
         q.dropped += (signals.score_events.len() - take) as u64;
         if let Some(h) = &signals.score_held {
-            q.held = Some(h.clone());
+            let mut held = h.clone();
+            // The window's tiles are not the log records'.
+            held.ring.clear();
+            q.held = Some(held);
         }
     }
     if let Ok(mut slot) = budget_slot().lock() {

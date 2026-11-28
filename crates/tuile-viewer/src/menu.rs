@@ -64,6 +64,7 @@ pub(crate) enum Ask {
     ToggleBudgetWindowCumulative,
     ToggleBudgetWindowTables,
     ToggleBudgetWindowIssues,
+    ToggleBudgetWindowReservoir,
     /// A diagnostic override of the budget's specification; `None` back to
     /// the context's.
     BudgetSpec(Option<tuile_core::budget::SpecKind>),
@@ -146,6 +147,8 @@ pub(crate) struct State {
     pub budget_window_tables: bool,
     /// The budget window listing only the levels with an issue.
     pub budget_window_issues: bool,
+    /// The budget window on the preload reservoir rather than its board.
+    pub budget_window_reservoir: bool,
     /// The imagery held compressed: any choice but off.
     pub compressed: bool,
     /// The ground lit (`crate::lighting`): off by default.
@@ -171,6 +174,7 @@ impl State {
             budget_window_cumulative: snapshot.budget_window_cumulative,
             budget_window_tables: snapshot.budget_window_tables,
             budget_window_issues: snapshot.budget_window_issues,
+            budget_window_reservoir: snapshot.budget_window_reservoir,
             compressed: snapshot.compression != tuile_wgpu::ImageryCompression::Off,
             lit: snapshot.lighting.is_on(),
         }
@@ -212,6 +216,9 @@ impl Ask {
             Self::ToggleBudgetWindowTables => {
                 Command::BudgetWindow(crate::steer::WindowAsk::Tables(!now.budget_window_tables))
             }
+            Self::ToggleBudgetWindowReservoir => Command::BudgetWindow(
+                crate::steer::WindowAsk::Reservoir(!now.budget_window_reservoir),
+            ),
             Self::ToggleBudgetWindowIssues => {
                 Command::BudgetWindow(crate::steer::WindowAsk::Levels(!now.budget_window_issues))
             }
@@ -289,6 +296,7 @@ impl Ask {
             Self::ToggleBudgetWindowCumulative => Some(now.budget_window_cumulative),
             Self::ToggleBudgetWindowTables => Some(now.budget_window_tables),
             Self::ToggleBudgetWindowIssues => Some(now.budget_window_issues),
+            Self::ToggleBudgetWindowReservoir => Some(now.budget_window_reservoir),
             Self::BudgetSpec(kind) => Some(now.budget_spec == kind),
             Self::Diagnostic(view) => Some(now.diagnostic == view),
             Self::Imagery(layer) => Some(now.layer == layer),
@@ -457,6 +465,10 @@ pub(crate) fn layout(
         item(
             "Budget Window: Levels With an Issue",
             Ask::ToggleBudgetWindowIssues,
+        ),
+        item(
+            "Budget Window: Preload Reservoir",
+            Ask::ToggleBudgetWindowReservoir,
         ),
         item(
             "Budget Window: Sum From Now",
@@ -803,6 +815,7 @@ impl Default for State {
             budget_window_cumulative: false,
             budget_window_tables: false,
             budget_window_issues: false,
+            budget_window_reservoir: false,
             compressed: false,
             lit: false,
         }
@@ -961,6 +974,7 @@ mod tests {
             budget_window_cumulative: false,
             budget_window_tables: false,
             budget_window_issues: false,
+            budget_window_reservoir: false,
             compressed: true,
             lit: true,
         };
@@ -1067,6 +1081,7 @@ mod tests {
             budget_window_cumulative: false,
             budget_window_tables: false,
             budget_window_issues: false,
+            budget_window_reservoir: false,
             compressed: true,
             lit: true,
         };

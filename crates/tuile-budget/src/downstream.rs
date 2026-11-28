@@ -1170,6 +1170,17 @@ impl Budget {
         }
     }
 
+    /// The urgency tier this resource was wanted at by the last step, if
+    /// it was: why a held copy is held. Read only, for the reservoir view.
+    pub(super) fn wanted_urgency(&self, r: ResourceId) -> Option<Urgency> {
+        let k = ByTile(r);
+        self.down
+            .wants
+            .get(&k)
+            .or_else(|| self.down.refresh.get(&k))
+            .map(|w| w.urgency)
+    }
+
     /// Puts back what the step took.
     pub(super) fn put_back(&mut self, t: Taken) {
         self.down.wants = t.wants;

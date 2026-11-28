@@ -553,7 +553,14 @@ impl Budget {
     /// scored copies outside the floor. A walk of the tracked resources:
     /// for a host's periodic report, never called by a step.
     pub fn held_report(&self) -> score::HeldReport {
-        self.held_report_impl()
+        self.held_report_impl(false)
+    }
+
+    /// [`Budget::held_report`] with, in [`score::HeldReport::ring`], every
+    /// resource the reservoir view shows: held, in flight, wanted. Read
+    /// only; a host asks for it while the view is open, never in a step.
+    pub fn reservoir_report(&self) -> score::HeldReport {
+        self.held_report_impl(true)
     }
 
     /// One decision step: applies the recorded arrivals, then decides.

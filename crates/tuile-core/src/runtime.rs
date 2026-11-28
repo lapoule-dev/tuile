@@ -2198,7 +2198,11 @@ impl State {
                 self.published_at = Some(now);
                 // The held set by score: a walk of the budget's resources,
                 // once a publish, never in a step.
-                meter.set_held(self.budget.held_report());
+                meter.set_held(if crate::metrics::reservoir_wanted() {
+                    self.budget.reservoir_report()
+                } else {
+                    self.budget.held_report()
+                });
                 let mut signals = meter.publish();
                 // The disk tier, from the loader's stores' ledgers: no I/O.
                 let mut disk = crate::budget::DiskTiers::default();
