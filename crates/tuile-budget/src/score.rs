@@ -461,8 +461,29 @@ pub struct RingTile {
     pub terms: Terms,
     /// What it is.
     pub state: RingState,
-    /// Why the step ranked it for loading (the urgency tier), if it did.
-    pub urgency: Option<crate::priority::Urgency>,
+    /// Why the budget holds or wants it: an open category label the view
+    /// shows as published ("ancestor", "floor", "left over", "unranked", and
+    /// whatever else the budget names). Empty when the tile is drawn. A view
+    /// must not rely on the set of names.
+    pub reason: &'static str,
+}
+
+impl RingTile {
+    /// The category label of a tile in `state` that the step ranked at
+    /// `urgency` (if it did).
+    pub fn reason_of(state: RingState, urgency: Option<crate::priority::Urgency>) -> &'static str {
+        use crate::priority::Urgency as U;
+        match (state, urgency) {
+            (RingState::Drawn, _) => "",
+            (RingState::Floor, _) => "floor",
+            (RingState::Left, _) => "left over",
+            (_, Some(U::Ring)) => "ring",
+            (_, Some(U::Ancestor)) => "ancestor",
+            (_, Some(U::Floor)) => "floor",
+            (_, Some(_)) => "other",
+            (_, None) => "unranked",
+        }
+    }
 }
 
 /// The most resources [`HeldReport::ring`] lists.

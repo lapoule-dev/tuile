@@ -354,77 +354,58 @@ pub fn drawn_outside(
     out.into_values().collect()
 }
 
-/// Why a tile is held and not drawn, as the budget's report says it: the
-/// urgency tier that ranked it this step, or that nothing did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Why {
-    /// The prefetch ring (the need's ring membership).
-    Ring,
-    /// A preloaded ancestor of the drawn cut.
-    Ancestor,
-    /// The pinned coarse floor.
-    Floor,
-    /// Ranked for another reason: a hole, a blocker, a drape, a refresh.
-    Other,
-    /// Held, no longer wanted by any need: left from an older one.
-    LeftOver,
-    /// Held and wanted or kept, not ranked for loading this step.
-    Unranked,
+/// How a reason is marked on a cell. A table of configuration: the view
+/// does not know which reasons the budget publishes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Mark {
+    /// A frame of this colour.
+    Frame(u32),
+    /// A dark square in the middle.
+    Square,
 }
 
-impl Why {
-    pub const ALL: [Why; 6] = [
-        Why::Ring,
-        Why::Ancestor,
-        Why::Floor,
-        Why::Other,
-        Why::LeftOver,
-        Why::Unranked,
-    ];
+/// The marks of the reasons the view has a colour for.
+pub const MARKS: [(&str, Mark); 3] = [
+    ("ring", Mark::Frame(0xFFFFFF)),
+    ("ancestor", Mark::Frame(0xE69F00)),
+    ("left over", Mark::Square),
+];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Why::Ring => "ring",
-            Why::Ancestor => "ancestors",
-            Why::Floor => "floor",
-            Why::Other => "other",
-            Why::LeftOver => "left over",
-            Why::Unranked => "unranked",
+/// The mark of any other reason: a thin grey frame, never nothing.
+pub const NEUTRAL_MARK: Mark = Mark::Frame(0x888888);
+
+/// The mark of a reason.
+pub fn mark_of(reason: &str) -> Mark {
+    MARKS
+        .iter()
+        .find(|(r, _)| *r == reason)
+        .map_or(NEUTRAL_MARK, |(_, m)| *m)
+}
+
+/// The reason a tile held and not drawn is held, as the report publishes
+/// it; `None` for a tile that is drawn or not held.
+pub fn why(t: &RingTile) -> Option<&'static str> {
+    match t.state {
+        RingState::Floor | RingState::Kept | RingState::Wanted | RingState::Left => {
+            Some(if t.reason.is_empty() {
+                "unranked"
+            } else {
+                t.reason
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The held, undrawn terrain tiles by published reason.
+pub fn why_counts(report: &HeldReport) -> std::collections::BTreeMap<&'static str, usize> {
+    let mut out = std::collections::BTreeMap::new();
+    for t in report.ring.iter().filter(|t| t.class == Class::TerrainMesh) {
+        if let Some(w) = why(t) {
+            *out.entry(w).or_default() += 1;
         }
     }
-}
-
-/// The reason a tile held and not drawn is held; `None` for a tile that is
-/// drawn or not held.
-pub fn why(t: &RingTile) -> Option<Why> {
-    use tuile_core::budget::priority::Urgency as U;
-    match t.state {
-        RingState::Floor => return Some(Why::Floor),
-        RingState::Left => return Some(Why::LeftOver),
-        RingState::Kept | RingState::Wanted => {}
-        _ => return None,
-    }
-    Some(match t.urgency {
-        Some(U::Ring) => Why::Ring,
-        Some(U::Ancestor) => Why::Ancestor,
-        Some(U::Floor) => Why::Floor,
-        Some(_) => Why::Other,
-        None => Why::Unranked,
-    })
-}
-
-/// The held, undrawn terrain tiles by reason.
-pub fn why_counts(report: &HeldReport) -> [(Why, usize); 6] {
-    Why::ALL.map(|w| {
-        (
-            w,
-            report
-                .ring
-                .iter()
-                .filter(|t| t.class == Class::TerrainMesh && why(t) == Some(w))
-                .count(),
-        )
-    })
+    out
 }
 
 /// What the plan shows of the levels around the selected one.
@@ -526,24 +507,11 @@ pub fn cells<'a>(
     out
 }
 
-/// The urgency tier that ranked a resource, in words.
-pub fn reason(t: &RingTile) -> &'static str {
-    if t.state == RingState::Left {
-        return "left over from an older need (no longer wanted)";
-    }
-    if t.state == RingState::Drawn {
-        return "drawn now; the tier it was wanted at is not its reason";
-    }
-    use tuile_core::budget::priority::Urgency as U;
-    match t.urgency {
-        Some(U::Floor) => "the floor",
-        Some(U::Hole) => "a hole under the view",
-        Some(U::Blocker) => "a child a held parent waits on",
-        Some(U::Drape) => "a drape a drawn tile needs",
-        Some(U::Ring) => "the prefetch ring",
-        Some(U::Ancestor) => "a preloaded ancestor",
-        Some(U::Refresh) => "a refresh of resident content",
-        None => "not ranked this step",
+/// The reason of a tile in words: the category the report publishes.
+pub fn reason(t: &RingTile) -> String {
+    match t.state {
+        RingState::Drawn => "drawn now".to_owned(),
+        _ => format!("reason: {}", why(t).unwrap_or("not held")),
     }
 }
 
@@ -632,14 +600,13 @@ fn frame(p: &mut Painter<'_>, r: (f64, f64, f64, f64), w: f64, c: [f32; 4]) {
     p.rect(r.2 - w, r.1, w, r.3 - r.1, c);
 }
 
-/// The mark of a reason on a cell: a white frame for the ring, an orange
-/// one for the ancestors, a dark square for what is left over. Never a
+/// The mark of a reason on a cell, from [`MARKS`] or neutral. Never a
 /// fill: the score's colour stays under it.
-fn mark(p: &mut Painter<'_>, why: Option<Why>, r: (f64, f64, f64, f64)) {
-    match why {
-        Some(Why::Ring) => frame(p, r, 1.5, srgb(0xFFFFFF, 1.0)),
-        Some(Why::Ancestor) => frame(p, r, 1.5, srgb(0xE69F00, 1.0)),
-        Some(Why::LeftOver) => {
+fn mark(p: &mut Painter<'_>, why: Option<&str>, r: (f64, f64, f64, f64)) {
+    let Some(why) = why else { return };
+    match mark_of(why) {
+        Mark::Frame(c) => frame(p, r, 1.5, srgb(c, 1.0)),
+        Mark::Square => {
             let (w, h) = (r.2 - r.0, r.3 - r.1);
             p.rect(
                 r.0 + w * 0.35,
@@ -649,7 +616,6 @@ fn mark(p: &mut Painter<'_>, why: Option<Why>, r: (f64, f64, f64, f64)) {
                 srgb(0x101010, 0.85),
             );
         }
-        _ => {}
     }
 }
 
@@ -744,8 +710,7 @@ pub fn draw(
     );
     let held_why = why_counts(report)
         .iter()
-        .filter(|(_, c)| *c > 0)
-        .map(|(w, c)| format!("{} {c}", w.label()))
+        .map(|(w, c)| format!("{w} {c}"))
         .collect::<Vec<_>>()
         .join(" · ");
     p.text(
@@ -758,7 +723,7 @@ pub fn draw(
     p.text(
         MARGIN,
         MARGIN + 126.0,
-        "marks: white frame = ring · orange frame = ancestors · dark square = left over · yellow = picked",
+        "marks: white frame = ring · orange frame = ancestor · dark square = left over · grey frame = any other reason · yellow = picked",
         EM - 1.0,
         dim,
     );
@@ -1119,7 +1084,7 @@ mod tests {
                 ..Terms::default()
             },
             state,
-            urgency: None,
+            reason: "",
         }
     }
 
@@ -1303,20 +1268,42 @@ mod tests {
         );
     }
 
-    /// The reasons of held tiles come from the published urgency.
+    /// The reason of a held tile is what the report publishes; a reason the
+    /// view has no colour for is marked neutrally and counted, and the plan
+    /// still draws it; taking the ring's reason out of a report breaks nothing.
     #[test]
-    fn a_held_tile_has_the_reason_the_report_gives() {
-        use tuile_core::budget::priority::Urgency;
+    fn a_held_tile_has_the_reason_the_report_publishes() {
         let mut t = tile(10, 1, 1, RingState::Wanted, 7);
-        assert_eq!(why(&t), Some(Why::Unranked));
-        t.urgency = Some(Urgency::Ring);
-        assert_eq!(why(&t), Some(Why::Ring));
-        t.urgency = Some(Urgency::Ancestor);
-        assert_eq!(why(&t), Some(Why::Ancestor));
-        t.state = RingState::Left;
-        assert_eq!(why(&t), Some(Why::LeftOver));
+        assert_eq!(why(&t), Some("unranked"));
+        t.reason = "ancestor";
+        assert_eq!(why(&t), Some("ancestor"));
+        t.reason = "a category nobody told the view about";
+        assert_eq!(why(&t), t.reason.into());
+        assert_eq!(mark_of(t.reason), NEUTRAL_MARK);
         t.state = RingState::Drawn;
         assert_eq!(why(&t), None);
+
+        // A report with an unknown reason, and one with the ring's reason
+        // removed: both draw, and the header counts what is published.
+        let mut r = HeldReport::default();
+        for (i, reason) in ["ring", "mystery", "mystery", "ancestor"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut t = tile(12, i as u64, 0, RingState::Wanted, 9);
+            t.reason = reason;
+            r.ring.push(t);
+        }
+        r.ring.push(tile(12, 9, 0, RingState::Drawn, 1));
+        let mut cache = TextCache::default();
+        let eye = None;
+        let d = draw(Some(&r), eye, &Options::default(), None, &mut cache, 1.0);
+        assert!(!d.hits.is_empty());
+        assert_eq!(why_counts(&r).get("mystery"), Some(&2));
+        r.ring.retain(|t| t.reason != "ring");
+        assert_eq!(why_counts(&r).get("ring"), None);
+        let d = draw(Some(&r), eye, &Options::default(), None, &mut cache, 1.0);
+        assert!(!d.hits.is_empty());
     }
 
     /// The mosaic shows every level, each tile at its own size, and what it

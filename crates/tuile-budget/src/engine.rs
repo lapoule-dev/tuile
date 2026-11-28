@@ -4522,7 +4522,7 @@ impl Budget {
                     band: u8::try_from(band).unwrap_or(u8::MAX),
                     terms: self.held_terms(s),
                     state,
-                    urgency,
+                    reason: RingTile::reason_of(state, urgency),
                 });
             }
         }
