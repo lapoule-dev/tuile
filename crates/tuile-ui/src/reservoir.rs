@@ -144,10 +144,17 @@ const RING_MIN: u32 = 3;
 /// held and not drawn (a preload, a kept tile, a left one; not the floor),
 /// at least [`RING_MIN`] of them — the level where the ring can be seen.
 /// Failing that, the level of most drawn tiles (the finest on a tie).
-pub fn auto_level(report: &HeldReport) -> Option<u32> {
+pub fn auto_level(report: &HeldReport, near: Option<(f64, f64)>) -> Option<u32> {
     let mut ahead: HashMap<u32, u32> = HashMap::new();
     let mut drawn: HashMap<u32, u32> = HashMap::new();
-    for (&(l, ..), t) in &terrain_tiles(report) {
+    for (&(l, x, y), t) in &terrain_tiles(report) {
+        // Near the eye only, when it is known: what the plan can show.
+        if let Some((lon, lat)) = near {
+            let (ex, ey) = tile_at(l, lon, lat);
+            if x.abs_diff(ex) as f64 > PLAN_TILES || y.abs_diff(ey) as f64 > PLAN_TILES {
+                continue;
+            }
+        }
         match t.state {
             RingState::Wanted | RingState::Kept | RingState::Left => {
                 *ahead.entry(l).or_default() += 1;
@@ -551,7 +558,7 @@ pub fn draw(
         return finish(p, scale);
     };
     let tiles = terrain_tiles(report);
-    let shown = level.or_else(|| auto_level(report));
+    let shown = level.or_else(|| auto_level(report, eye.map(|e| (e.lon, e.lat))));
     let top = MARGIN + 44.0;
     let left = MARGIN;
     let counts = counts(report);
@@ -906,7 +913,7 @@ mod tests {
         for i in 0..2 {
             r.ring.push(tile(13, i, 0, RingState::Drawn, 5));
         }
-        assert_eq!(auto_level(&r), Some(12), "no ring: the most drawn level");
+        assert_eq!(auto_level(&r, None), Some(12), "no ring: the most drawn level");
         for i in 0..4 {
             r.ring.push(tile(13, i + 10, 0, RingState::Wanted, 50));
         }
@@ -916,11 +923,13 @@ mod tests {
             r.ring.push(tile(14, i, 0, RingState::Kept, 9));
         }
         assert_eq!(
-            auto_level(&r),
+            auto_level(&r, None),
             Some(14),
             "the finest level with a ring: a stray at 15 and the floor at 16 do not count"
         );
-        assert_eq!(auto_level(&HeldReport::default()), None);
+        assert_eq!(auto_level(&HeldReport::default(), None), None);
+        // Near an eye far from every tile, none is shown at a level of its own.
+        assert_eq!(auto_level(&r, Some((2.0, -1.0))), None, "nothing near the eye");
         assert_eq!(terrain_tiles(&r).len(), 16);
     }
 

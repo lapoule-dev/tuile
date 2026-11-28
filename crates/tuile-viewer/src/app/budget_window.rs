@@ -221,7 +221,7 @@ impl BudgetWindow {
                     .or_else(|| {
                         tuile_core::metrics::budget()
                             .and_then(|s| s.score_held)
-                            .and_then(|h| tuile_ui::reservoir::auto_level(&h))
+                            .and_then(|h| tuile_ui::reservoir::auto_level(&h, self.eye.as_ref().map(|e| (e.lon, e.lat))))
                     })
                     .unwrap_or(10);
                 WindowAsk::ReservoirLevel(Some(if k == K::LevelUp {
