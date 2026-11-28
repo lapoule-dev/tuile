@@ -2226,6 +2226,54 @@ mod draw {
         assert_eq!(d.stats.lost, 0);
     }
 
+    /// The same stand-in on both sides of Greenwich: a geographic grid has
+    /// two tiles at level 0, so a level-`l` tile's column runs to `2^(l+1)`
+    /// and the eastern hemisphere's are `x ≥ 2^l`. A drawn tile wears its
+    /// parent's drape while its own loads, east exactly as west — at the
+    /// roots' level, the next, a middle one and a deep one, on the two
+    /// columns either side of the meridian (`2^l - 1` and `2^l`) and on the
+    /// antimeridian's eastern edge (`2^(l+1) - 1`). Red with the quadtree
+    /// coordinate refusing `x ≥ 2^l`: the parent finds no children, asks
+    /// for no stand-in, and the tile wears nothing better than what is
+    /// resident far up the chain — the coarse squares seen east of
+    /// Greenwich (2026-11-28).
+    #[test]
+    fn a_drawn_tile_wears_its_parents_drape_on_both_sides_of_the_meridian() {
+        for l in [0u32, 1, 3, 17] {
+            let n = 1u64 << l;
+            for x in [n - 1, n, 2 * n - 1] {
+                let a = t(l, x, 0);
+                let mut r = Rig::interactive();
+                let k = children(a)[1];
+                let need = NeedSet {
+                    drawn: vec![(k, draped(k, l + 1))],
+                    ancestors: vec![(a, draped(a, l))],
+                    ..NeedSet::new()
+                };
+                let own =
+                    |res: ResourceId| matches!(res, ResourceId::Drape { tile, .. } if tile == k);
+                let mut d = r.step(&need);
+                for _ in 0..10 {
+                    r.load_where(|res| !own(res));
+                    r.upload(&d);
+                    d = r.step(&need);
+                }
+                let at = format!("level {l}, column {x}");
+                assert!(
+                    r.pending.contains_key(&dr(k, l + 1)),
+                    "{at}: its own drape still loads"
+                );
+                let item = d.draw.get(mesh(k));
+                assert_eq!(
+                    item.and_then(base_drape).map(|c| c.resource),
+                    Some(dr(a, l)),
+                    "{RED}: the parent's drape, {at}"
+                );
+                assert_eq!(d.stats.lost, 0, "{at}");
+            }
+        }
+    }
+
     /// The ancestors' drapes are asked for **once**, then the step goes
     /// quiet: a still view that has everything (the drawn tile's drapes and
     /// its ancestor's) starts, cancels and evicts nothing, and the ancestor's
