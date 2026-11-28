@@ -42,6 +42,8 @@ pub struct ReservoirEye {
     pub outside_any: Vec<Outside>,
     /// Whether the tile picked is inside the present view's frustum.
     pub selected_in_view: Option<bool>,
+    /// Traversals cut short by their node bound since the session began.
+    pub truncated: u64,
 }
 
 /// The plan's half-extent, in tiles of the level shown.
@@ -621,7 +623,8 @@ pub fn draw(
             MARGIN,
             MARGIN + 84.0,
             &format!(
-                "drawn out of the present view: {o} of {d} ({oa} out of every view, the host's included) · by level: {}",
+                "drawn out of the present view: {o} of {d} ({oa} out of every view, the host's included) · traversals truncated: {} · by level: {}",
+                e.truncated,
                 if worst.is_empty() { "none".to_owned() } else { worst.join(", ") }
             ),
             EM - 1.0,

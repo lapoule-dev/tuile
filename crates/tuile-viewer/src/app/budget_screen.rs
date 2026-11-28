@@ -493,6 +493,7 @@ impl App {
             .map(|t| tuile_ui::reservoir::tile_in_views(t, &all[..present]));
         Some(tuile_ui::reservoir::ReservoirEye {
             selected_in_view,
+            truncated: tuile_core::metrics::metrics().traversals_truncated.get(),
             outside_present,
             outside_any,
             lon: g.lon,
