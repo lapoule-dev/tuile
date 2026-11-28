@@ -866,8 +866,8 @@ Lecture, et ce que cela prouve **et ne prouve pas** :
   créneaux qu'un candidat peut consommer ; le contrat ne lui demande rien de plus : un
   candidat n'a que `protected = false` et une valeur. Une pose `Exact` à `P = 1` peut
   atteindre le plafond du régulateur ; on ne le contourne pas, on le règle.
-- **M1** (`feat/budget-measure-m1`, en cours). Les `F_c` mesurés fixent `T_exp` et donc la
-  marge maximale : je ne fixe aucun nombre avant eux.
+- **M1** (`feat/budget-measure-m1`, en cours). Les `F_c` mesurés **règlent** `T_exp` et donc la
+  marge maximale ; ils ne conditionnent pas la suppression de l'anneau.
 - **Un maillage va toujours avec son drapé** (régulateur §2.3, lectures a/b/c). Ce contrat
   est **neutre** : une tuile candidate voulue par une pose est voulue **avec** ses drapés au
   niveau que la pose demande. Pour un candidat, cela veut dire : le maillage et son drapé
@@ -912,26 +912,72 @@ présente remplacée par rien, comptée au dessin, pas seulement « sélectionn�
 5. *Film sans spéculation.* En `Exact`, aucune requête n'est émise pour une tuile hors du
    calendrier.
 
-### 7bis.8 Décisions pour Laurent (D4 à D9)
+### 7bis.8 Décisions (D4 à D8 décidées par Laurent le 28 nov. ; D9 ouverte)
 
-- **D4. Le contrat : un résultat de traversée par pose, étiqueté `Present | Predicted | Exact`,
+> Laurent : « L'anneau doit évidemment être supprimé, il n'y a rien d'optionnel ; on veut une
+> vraie approche des scores. » D4 à D8 sont **décidées**, plus à trancher.
+
+- **D4 (décidée). Le contrat : un résultat de traversée par pose, étiqueté `Present | Predicted | Exact`,
   fusionné par le score.** Recommandé : oui. Le « tout dans une traversée élargie » est
   abandonné ; la passe unique n'est qu'une optimisation pour les poses de même source et
   de même échéance.
-- **D5. Format de l'entrée enregistrée : `Need.ahead` devient une liste de `(source, P,
+- **D5 (décidée). Format de l'entrée enregistrée : `Need.ahead` devient une liste de `(source, P,
   échéance)` fusionnée à la lecture.** Recommandé : oui, nouvelle version du journal, anciens
   enregistrements relus avec `Source::Predicted`.
-- **D6. Le film est un calendrier exact sans spéculation et sans plancher atteignable.**
+- **D6 (décidée). Le film est un calendrier exact sans spéculation et sans plancher atteignable.**
   Recommandé : oui, c'est ce qui rend le plan reproductible.
-- **D7. Les bornes : `max_visits` par passe (#375), une borne séparée pour les passes
+- **D7 (décidée). Les bornes : `max_visits` par passe (#375), une borne séparée pour les passes
   candidates, conflation par génération, plafond `MAX_INSTANTS`.** Recommandé : la borne
   candidate = `max_visits` du présent / `AHEAD_VISITS_DIVISOR`, déjà en place. Un seuil
   chiffré en ms n'est pas fixé tant que le coût par nœud n'est pas mesuré en wasm.
-- **D8. Le plancher atteignable est une pose prédite synthétique, pas un anneau.** Recommandé :
-  oui ; l'anneau, `Proximity` et `reach_tiles` sont supprimés dans la PR de bascule (pas
-  d'interrupteur).
+- **D8 (décidée). Le plancher atteignable est une pose prédite synthétique, et l'anneau est
+  supprimé** dans la PR du score, sans interrupteur, preuve par les tests : `Membership::Ring`,
+  `neighbourhood.rs`, `Need::proximity`, `reach_tiles`, `per_level` et la liste de l'anneau
+  disparaissent. Rien d'optionnel, rien de conditionné à M1 (M1 règle des nombres, pas
+  l'existence de la bascule).
 - **D9. Lecture du « maillage avec son drapé » : (b) du régulateur.** Recommandé : (b),
   avec `G` unique. À trancher avec la décision du régulateur.
+
+### 7bis.9 Plan de la PR du score (B2), pas de code avant le go de Laurent
+
+**Ordre.** La PR #377 (sélection exacte : volume englobant du terrain par plage parente,
+`TileTree::can_refine` ; draft, branche `fix/no-selection-outside-view`) passe **d'abord**. La
+branche du score est **rebasée** dessus (rebase, jamais merge ; un conflit se résout). Le
+contrat de §7bis.2 suppose la sélection exacte de #377 : sans elle, « présent » reste gonflé de
+tuiles hors champ et les mesures avant/après seraient faussées.
+
+**Fichiers (un seul changement de comportement, sans interrupteur).**
+
+| Fichier | Changement |
+|---|---|
+| `tuile-core/src/neighbourhood.rs` | **supprimé** (`per_level`, `Neighbourhood`, `tile_size`) |
+| `tuile-core/src/runtime.rs` | le runtime remet au budget un ensemble de `PoseNeed` ; plus de `Neighbourhood::update` ; passes anticipées par groupe (même source, même échéance) ; `Present` en passe séparée |
+| `tuile-core/src/traversal.rs` | inchangé dans sa sélection ; au plus la sortie par pose (faits géométriques) ; `max_visits` par passe réutilisé |
+| `tuile-core/src/protocol.rs` | `AheadView` porte `σ` et le poids (forecast §2.3) ; `Source` |
+| `tuile-budget/src/need.rs`, `need_state.rs` | `Membership::Ring` et `Need::proximity` supprimés ; `Need.ahead` = liste `(Source, P, échéance)` fusionnée ; `NeedDelta` suit |
+| `tuile-budget/src/value.rs`, `priority.rs`, `engine.rs`, `spec.rs` | score par valeur attendue (§2.3), fusion de 7bis.4, `C_plancher` comme pose prédite synthétique, `Predicate::Membership` sans `Ring` |
+| `tuile-budget-sim` | scénarios S1 à S6 de 7bis.7 ; le test ignoré de `prediction.rs` devient actif |
+| `docs/` | spec et ce document mis à jour ; note de version du journal (D5) |
+
+**Tests rouges, chacun vu échouer contre sa mutation.**
+
+| Test | Mutation qui doit le faire échouer |
+|---|---|
+| indépendance du présent (sélection identique avec 0 ou N poses prédites, même tronquées) | laisser une pose prédite alimenter `selected` |
+| protégé (un candidat de valeur maximale ne retarde ni n'évince une tuile `Present`) | retirer `protected` |
+| fusion (`P = 1 − Π(1 − Pj)`, échéance min, statut du présent) | prendre le max au lieu de l'agrégat ; prendre la dernière échéance |
+| troncature (candidats perdus, présent intact) | jeter la sélection d'une passe tronquée du présent |
+| film sans spéculation (aucune requête hors calendrier en `Exact`) | traiter `Exact` comme `Predicted` |
+| plancher atteignable (zoom-in, pan, tilt, rotation, zoom-out sans perte, 0 sol noir) | supprimer la pose synthétique : le test de la loi 2b doit échouer |
+| anneau absent (aucun `Membership::Ring` ni `neighbourhood` dans le crate ; compilation) | réintroduire la variante |
+| déterminisme/rejeu (même journal, mêmes décisions, bit à bit) | une entrée non enregistrée dans `decide` |
+
+**Mesures `budget_sim`, avant/après**, sur les mêmes scénarios, séquences et réseau simulé :
+nœuds visités (présent / par pose / total), tuiles dessinées, tuiles préchargées par pose,
+requêtes parties hors présent, tuiles dessinées hors champ, **trous = 0** compté au dessin,
+nombre de `Preempted` après convergence, temps de `decide` (< 2 ms). Seuil d'acceptation :
+aucune régression d'une mesure du présent, et trous = 0 partout. À rebaser sur #377 avant de
+prendre « avant », pour que l'écart ne soit que celui du score.
 
 **Ce qui n'est pas établi** : le coût en temps (seulement des nœuds, une scène, résidence
 vide) ; la valeur réelle de `T_exp` (M1) ; la précision des poses prédites sur un globe
