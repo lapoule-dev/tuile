@@ -458,6 +458,9 @@ pub struct Sim {
     /// the ring with their predicted use, as the runtime lists them. Empty,
     /// the default: no prediction, the need exactly as without one.
     pub ahead: Vec<(Camera, Micros, u16)>,
+    /// Preload nothing: the need's ring is dropped before every step, so a
+    /// run can be compared with and without preloads (the regulator's T5).
+    pub no_ring: bool,
 }
 
 impl Sim {
@@ -528,6 +531,7 @@ impl Sim {
             pressure_set: Pressure::Normal,
             city: false,
             ahead: Vec::new(),
+            no_ring: false,
             profile,
         }
     }
@@ -645,6 +649,9 @@ impl Sim {
         );
         if !self.ahead.is_empty() {
             self.add_the_ring_ahead(&mut need, drawn_last);
+        }
+        if self.no_ring {
+            need.ring.clear();
         }
         // The first step reads the whole need; every later one what changed
         // since the step before (built outside what is timed and counted).

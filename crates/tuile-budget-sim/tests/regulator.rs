@@ -81,6 +81,12 @@ pub struct Saso {
     pub last_drawn: u64,
     pub last_resident_bare: u64,
     pub last_resident: u64,
+    /// The present view: footprint holes once the floor is in, tiles drawn
+    /// exact (summed over steps), and the p95 of the wait from wanted to
+    /// drawable of the present need's meshes, ms.
+    pub holes: u64,
+    pub exact: u64,
+    pub wait_p95_ms: f64,
     /// The run broke an invariant of the simulation: its message.
     pub broke: Option<String>,
 }
@@ -88,9 +94,12 @@ pub struct Saso {
 impl Saso {
     pub fn line(&self) -> String {
         format!(
-            "{:<13} steps {:>5} | over {:>4}‰ hard+{} settle {:>5} | evict pk {:>4} pk10 {:>5} tot {:>6} | upl pk {:>3} {:>6} KiB | start pk {:>3} | thrash {:>4} waste {:>5} under {:>7} | work max {:>6} mean {:>5} | drawn own {:>6} coarse {:>5} anc {:>5} (gaps {:?} max {} ≥3 {}) bare {} | resident bare drawn {} undrawn {} (smear {}) of {} | last: anc {}/{} drawn, bare {}/{} resident{}",
+            "{:<13} steps {:>5} | holes {} exact {} wait p95 {:.0} ms | over {:>4}‰ hard+{} settle {:>5} | evict pk {:>4} pk10 {:>5} tot {:>6} | upl pk {:>3} {:>6} KiB | start pk {:>3} | thrash {:>4} waste {:>5} under {:>7} | work max {:>6} mean {:>5} | drawn own {:>6} coarse {:>5} anc {:>5} (gaps {:?} max {} ≥3 {}) bare {} | resident bare drawn {} undrawn {} (smear {}) of {} | last: anc {}/{} drawn, bare {}/{} resident{}",
             self.profile,
             self.steps,
+            self.holes,
+            self.exact,
+            self.wait_p95_ms,
             self.overshoot_permille,
             self.over_hard,
             self.settling_steps
@@ -134,8 +143,13 @@ fn first_line(s: &str) -> &str {
 
 /// Runs the acceptance sequence on `profile` and measures it.
 pub fn measure(profile: Profile) -> Saso {
+    measure_with(profile, false)
+}
+
+/// [`measure`], the ring dropped when `no_ring`.
+pub fn measure_with(profile: Profile, no_ring: bool) -> Saso {
     let name = profile.name;
-    let run = std::panic::catch_unwind(move || measure_inner(profile));
+    let run = std::panic::catch_unwind(move || measure_inner(profile, no_ring));
     match run {
         Ok(s) => s,
         Err(e) => Saso {
@@ -151,13 +165,14 @@ pub fn measure(profile: Profile) -> Saso {
     }
 }
 
-fn measure_inner(profile: Profile) -> Saso {
+fn measure_inner(profile: Profile, no_ring: bool) -> Saso {
     let s = named("aggressive-sequence").expect("in the catalogue");
     let mut o = Saso {
         profile: profile.name,
         ..Saso::default()
     };
     let mut sim = Sim::unchecked(profile, 101);
+    sim.no_ring = no_ring;
     sim.budget
         .specify(Specification::interactive())
         .expect("a valid specification");
@@ -170,8 +185,13 @@ fn measure_inner(profile: Profile) -> Saso {
     while sim.now < end {
         let t = sim.now.0 as f64 / 1e6;
         let cam = (s.path)(t.min(s.seconds));
+        let views = sim.views(cam);
         let (_, d) = sim.step(cam);
         o.steps += 1;
+        if sim.floor_at.is_some() {
+            o.holes += u64::from(tuile_budget_sim::objective::holes(&d, &views));
+        }
+        o.exact += u64::from(d.stats.exact);
         let st = &d.stats;
         // Bytes against the target and the hard limit, over the classes.
         let gpu: u64 = st.gpu.iter().map(|(_, b)| b.0).sum();
@@ -288,6 +308,12 @@ fn measure_inner(profile: Profile) -> Saso {
         o.last_resident_bare = o.resident_bare_drawn + o.resident_bare_undrawn - bare0;
     }
     o.settling_steps = quiet_since;
+    let mut w: Vec<f64> = sim.waits.iter().map(|x| x.1).collect();
+    w.sort_by(f64::total_cmp);
+    o.wait_p95_ms = w
+        .get(((w.len().max(1) - 1) as f64 * 0.95).round() as usize)
+        .copied()
+        .unwrap_or(0.0);
     o.work_mean = work_sum / o.steps.max(1);
     o
 }
@@ -311,4 +337,47 @@ fn saso_of_the_acceptance_sequence() {
     for p in profiles() {
         eprintln!("{}", measure(p).line());
     }
+}
+
+/// T5: the present view with and without preloading (the neighbourhood's
+/// ring off: `reach_tiles` 0), printed side by side.
+#[test]
+#[ignore = "a measurement: prints the present view with and without preloads"]
+fn the_present_view_with_and_without_preloads() {
+    for p in profiles() {
+        eprintln!("with    {}", measure(p.clone()).line());
+        eprintln!("without {}", measure_with(p, true).line());
+    }
+}
+
+/// T5, the gate (Laurent, 2026-11-28: a preload never affects the main
+/// view): with preloads, the present view is the same or better than
+/// without — no more holes, no more tile·steps under their need, no longer
+/// a p95 wait for the present need's meshes.
+#[test]
+#[ignore = "red: on main the preloads take the present need's room (handheld, web, handheld-low)"]
+fn preloads_never_worsen_the_present_view() {
+    let mut worse = Vec::new();
+    for p in profiles() {
+        let with = measure(p.clone());
+        let without = measure_with(p, true);
+        assert!(with.broke.is_none(), "{}", with.line());
+        assert!(without.broke.is_none(), "{}", without.line());
+        if with.holes > without.holes
+            || with.under_tile_steps > without.under_tile_steps
+            || with.wait_p95_ms > without.wait_p95_ms
+        {
+            worse.push(format!(
+                "{}: holes {} vs {}, under {} vs {}, wait p95 {:.0} vs {:.0} ms",
+                with.profile,
+                with.holes,
+                without.holes,
+                with.under_tile_steps,
+                without.under_tile_steps,
+                with.wait_p95_ms,
+                without.wait_p95_ms
+            ));
+        }
+    }
+    assert!(worse.is_empty(), "preloads worsen the present view:\n{}", worse.join("\n"));
 }
